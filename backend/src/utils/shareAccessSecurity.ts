@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 
-const SHARE_GRANT_TTL_MS = 60 * 60 * 1000;
+const SHARE_PASSWORD_GRANT_TTL_MS = 60 * 60 * 1000;
+const SHARE_VISIT_GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const COMBINED_ATTEMPT_LIMIT = 5;
 const COMBINED_WINDOW_MS = 60 * 1000;
 const TOKEN_ATTEMPT_LIMIT = 25;
@@ -27,9 +28,24 @@ interface AttemptBucket {
 export interface ShareLinkOptions {
   expiresAt: Date | null;
   maxUses: number | null;
+  rateLimitMaxRequests: number | null;
+  rateLimitWindowSeconds: number | null;
 }
 
 export type ShareLinkAvailability = 'active' | 'disabled' | 'expired' | 'exhausted';
+
+/**
+ * A share link has exactly one coherent credential mode. Treat every other
+ * persisted shape as unavailable: a public link must not retain a credential,
+ * while a private link must always have a usable (non-empty) password hash.
+ */
+export function shareCredentialStateIsValid(
+  link: { isPublic: boolean; passwordHash?: string | null },
+): boolean {
+  return link.isPublic
+    ? link.passwordHash === null
+    : typeof link.passwordHash === 'string' && link.passwordHash.length > 0;
+}
 
 export function shareLinkAvailability(
   link: { isActive: boolean; expiresAt?: Date | string | null; maxUses?: number | null; currentUses?: number },
@@ -51,7 +67,12 @@ export function isValidShareToken(token: unknown): token is string {
 }
 
 export function parseShareLinkOptions(
-  input: { expiresAt?: unknown; maxUses?: unknown },
+  input: {
+    expiresAt?: unknown;
+    maxUses?: unknown;
+    rateLimitMaxRequests?: unknown;
+    rateLimitWindowSeconds?: unknown;
+  },
   now = Date.now(),
 ): ShareLinkOptions {
   let expiresAt: Date | null = null;
@@ -72,7 +93,41 @@ export function parseShareLinkOptions(
     maxUses = parsed;
   }
 
-  return { expiresAt, maxUses };
+  const hasRateLimitMaxRequests = input.rateLimitMaxRequests !== undefined
+    && input.rateLimitMaxRequests !== null
+    && input.rateLimitMaxRequests !== '';
+  const hasRateLimitWindowSeconds = input.rateLimitWindowSeconds !== undefined
+    && input.rateLimitWindowSeconds !== null
+    && input.rateLimitWindowSeconds !== '';
+
+  if (!hasRateLimitMaxRequests && hasRateLimitWindowSeconds) {
+    throw new Error('Rate limit request count is required when a rate limit window is set');
+  }
+
+  let rateLimitMaxRequests: number | null = null;
+  let rateLimitWindowSeconds: number | null = null;
+  if (hasRateLimitMaxRequests) {
+    const parsedMax = typeof input.rateLimitMaxRequests === 'number'
+      ? input.rateLimitMaxRequests
+      : Number(input.rateLimitMaxRequests);
+    if (!Number.isSafeInteger(parsedMax) || parsedMax < 1 || parsedMax > 1_000_000) {
+      throw new Error('Rate limit requests must be a whole number between 1 and 1000000');
+    }
+
+    const parsedWindow = hasRateLimitWindowSeconds
+      ? (typeof input.rateLimitWindowSeconds === 'number'
+        ? input.rateLimitWindowSeconds
+        : Number(input.rateLimitWindowSeconds))
+      : 60;
+    if (!Number.isSafeInteger(parsedWindow) || ![60, 300, 3600].includes(parsedWindow)) {
+      throw new Error('Rate limit window must be 60, 300, or 3600 seconds');
+    }
+
+    rateLimitMaxRequests = parsedMax;
+    rateLimitWindowSeconds = parsedWindow;
+  }
+
+  return { expiresAt, maxUses, rateLimitMaxRequests, rateLimitWindowSeconds };
 }
 
 export function validateSharePassword(password: unknown): string {
@@ -91,10 +146,11 @@ export function issueShareGrant(
   secret: string,
   now = Date.now(),
 ): string {
+  const maxTtlMs = shareGrantTtlMs(payload.kind);
   if (!isValidShareToken(payload.token)
     || !payload.linkId
     || payload.expiresAt <= now
-    || payload.expiresAt - now > SHARE_GRANT_TTL_MS) {
+    || payload.expiresAt - now > maxTtlMs) {
     throw new Error('Invalid share access grant');
   }
   const encoded = Buffer.from(JSON.stringify({ v: 1, ...payload } satisfies ShareGrantPayload)).toString('base64url');
@@ -116,6 +172,7 @@ export function verifyShareGrant(
     if (supplied.length !== wanted.length || !crypto.timingSafeEqual(supplied, wanted)) return false;
 
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as ShareGrantPayload;
+    const maxTtlMs = shareGrantTtlMs(parsed.kind);
     return parsed.v === 1
       && parsed.kind === expected.kind
       && parsed.token === expected.token
@@ -123,10 +180,14 @@ export function verifyShareGrant(
       && parsed.binding === expected.binding
       && Number.isFinite(parsed.expiresAt)
       && parsed.expiresAt > now
-      && parsed.expiresAt - now <= SHARE_GRANT_TTL_MS;
+      && parsed.expiresAt - now <= maxTtlMs;
   } catch {
     return false;
   }
+}
+
+export function shareGrantTtlMs(kind: ShareGrantKind): number {
+  return kind === 'visit' ? SHARE_VISIT_GRANT_TTL_MS : SHARE_PASSWORD_GRANT_TTL_MS;
 }
 
 export function sharePasswordBinding(passwordHash: string): string {
@@ -205,7 +266,8 @@ export class SharePasswordAttemptLimiter {
 }
 
 export const __shareAccessSecurityTest = {
-  SHARE_GRANT_TTL_MS,
+  SHARE_PASSWORD_GRANT_TTL_MS,
+  SHARE_VISIT_GRANT_TTL_MS,
   COMBINED_ATTEMPT_LIMIT,
   TOKEN_ATTEMPT_LIMIT,
   MAX_ATTEMPT_BUCKETS,

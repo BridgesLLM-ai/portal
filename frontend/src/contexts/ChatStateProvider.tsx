@@ -30,7 +30,10 @@ import {
 } from '../utils/chatStream';
 import {
   OpenClawGatewayClient,
+  clientMessageIdFromDirectGatewayIdempotencyKey,
   createGatewayDirectUrl,
+  gatewayActiveTurnConflictFromError,
+  gatewayUnconfirmedSendFromError,
   type GatewayEvent,
   type GatewayChatMessage,
 } from '../utils/openclawGatewayClient';
@@ -135,6 +138,7 @@ export interface TextSegment {
   kind?: 'text' | 'thinking';
   ts?: number;
   order?: number;
+  source?: 'status' | 'reasoning' | 'preamble' | 'text';
 }
 
 interface StreamSegment {
@@ -143,6 +147,7 @@ interface StreamSegment {
   ts: number;
   kind: 'text' | 'thinking';
   order: number;
+  lane?: 'raw' | 'preamble';
 }
 
 type ChatStreamTransport = 'portal' | 'direct' | 'sse';
@@ -163,6 +168,12 @@ interface ActiveSseTransport {
 interface PendingWsAbortResult {
   readonly timer: ReturnType<typeof setTimeout>;
   readonly resolve: (ok: boolean) => void;
+}
+
+interface OutstandingChatDispatch {
+  readonly clientMessageId: string;
+  readonly assistantId: string;
+  readonly sessionKey: string;
 }
 
 const STEERING_INTERRUPTED_MARKER = '*(interrupted by steering message)*';
@@ -191,6 +202,8 @@ export interface ChatMessage {
   toolName?: string;
   /** Text segments with their position relative to tool calls (for history reconstruction) */
   segments?: TextSegment[];
+  /** Exact active run carried only by Portal runtime-history overlays. */
+  runtimeRunId?: string;
 }
 
 export interface MessageQueueItem {
@@ -692,6 +705,9 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     model: typeof m.model === 'string' ? m.model : undefined,
     thinkingContent: rawThinkingContent || undefined,
     thinkingSubject: rawThinkingSubject || undefined,
+    runtimeRunId: m?.__portal?.kind === 'runtime-turn-event-history'
+      ? normalizeRunId(m?.__portal?.runId) || undefined
+      : undefined,
   };
   if (m.toolCalls) {
     msg.toolCalls = normalizeToolCalls(m.toolCalls, 'done');
@@ -702,6 +718,9 @@ function parseHistoryMessage(m: any): ChatMessage | null {
       const kind = segment?.kind === 'thinking' ? 'thinking' as const : 'text' as const;
       const text = typeof segment?.text === 'string' ? sanitizeAssistantContent(segment.text) : '';
       const subject = kind === 'thinking' ? sanitizeThinkingSubject(segment?.subject) : '';
+      const source = ['status', 'reasoning', 'preamble', 'text'].includes(String(segment?.source || ''))
+        ? segment.source as TextSegment['source']
+        : undefined;
       if (!text.trim() && !subject) return [];
       return [{
         text,
@@ -712,6 +731,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
         kind,
         ts: typeof segment?.ts === 'number' && Number.isFinite(segment.ts) ? segment.ts : undefined,
         order: Number.isSafeInteger(segment?.order) ? segment.order : undefined,
+        ...(source ? { source } : {}),
       }];
     });
   }
@@ -985,11 +1005,15 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
     model: typeof (msg as any).model === 'string' ? (msg as any).model : undefined,
     toolCalls,
     thinkingContent: thinking,
+    runtimeRunId: (msg as any)?.__portal?.kind === 'runtime-turn-event-history'
+      ? normalizeRunId((msg as any)?.__portal?.runId) || undefined
+      : undefined,
   };
 }
 
 const HISTORY_REPLAY_DUPLICATE_WINDOW_MS = 5_000;
 const LOCAL_PENDING_ACK_WINDOW_MS = 120_000;
+const ACTIVE_ASSISTANT_USER_BOUNDARY_TOLERANCE_MS = 10_000;
 const LOCAL_OPTIMISTIC_ASSISTANT_TAIL_WINDOW_MS = 30_000;
 
 function normalizeHistoryReplayContent(content: string): string {
@@ -1133,6 +1157,10 @@ function isEquivalentCompactionNotice(previous: ChatMessage | undefined, next: C
 
 function isLikelyHistoryReplayDuplicate(previous: ChatMessage | undefined, next: ChatMessage): boolean {
   if (!previous || previous.role !== next.role || next.role !== 'user') return false;
+  // Distinct upstream IDs are distinct user actions, even when the user sends
+  // identical text twice inside the replay window. Heuristic content/time
+  // matching is reserved for rows where at least one side lacks identity.
+  if (previous.id && next.id && previous.id !== next.id) return false;
 
   const previousContent = normalizeHistoryReplayContent(previous.content);
   const nextContent = normalizeHistoryReplayContent(next.content);
@@ -1598,6 +1626,23 @@ function appendTurnMarker(content: string, marker: string): string {
   return `${String(content || '').trimEnd()}\n\n${marker}`;
 }
 
+function historyStreamSnapshotIsAuthoritative(
+  snapshot: any,
+  fence: { localTurnEpoch: number; runId: string | null; wasActive: boolean } | undefined,
+  current: { localTurnEpoch: number; runId: string | null; active: boolean },
+): boolean {
+  if (!fence) return true;
+  const snapshotRunId = normalizeRunId(snapshot?.runId);
+  const authorityChanged = current.localTurnEpoch !== fence.localTurnEpoch
+    || current.runId !== fence.runId
+    || current.active !== fence.wasActive;
+  if (!authorityChanged) return true;
+  return snapshot?.active === true
+    && Boolean(snapshotRunId)
+    && Boolean(current.runId)
+    && snapshotRunId === current.runId;
+}
+
 function preserveInterruptedLiveTurnSnapshot(
   message: ChatMessage,
   snapshot: {
@@ -1610,7 +1655,7 @@ function preserveInterruptedLiveTurnSnapshot(
   // Only the real steer path may claim a steering interruption; recovery
   // paths detach the live VIEW while the agent keeps working, and labeling
   // that "interrupted by steering" reads as a false interruption.
-  marker: string = STEERING_INTERRUPTED_MARKER,
+  marker: string | null = STEERING_INTERRUPTED_MARKER,
 ): ChatMessage {
   const segments: TextSegment[] = [];
   const seenSegments = new Set<string>();
@@ -1664,9 +1709,8 @@ function preserveInterruptedLiveTurnSnapshot(
     addSegment(snapshot.thinking, 'thinking', Date.now(), 'before', snapshot.thinkingSubject);
   }
 
-  const nextContent = snapshot.text.trim()
-    ? appendTurnMarker(snapshot.text, marker)
-    : appendTurnMarker(message.content, marker);
+  const visibleContent = snapshot.text.trim() ? snapshot.text : message.content;
+  const nextContent = marker ? appendTurnMarker(visibleContent, marker) : visibleContent;
 
   return {
     ...message,
@@ -1681,18 +1725,93 @@ function assistantToolSignature(message: ChatMessage): string {
   return calls.map((tool) => resolveToolName(tool.name)).filter(Boolean).join('|');
 }
 
+function assistantRowsCanShareActiveSplitProjection(
+  messages: ChatMessage[],
+  toolOnly: ChatMessage,
+  visible: ChatMessage,
+  activeRunId: string | null,
+  initiatingUserBoundaryTs: number,
+): boolean {
+  const toolOnlyIndex = messages.indexOf(toolOnly);
+  const visibleIndex = messages.indexOf(visible);
+  if (toolOnlyIndex < 0 || visibleIndex <= toolOnlyIndex) return false;
+
+  const toolRunId = normalizeRunId(toolOnly.runtimeRunId);
+  const visibleRunId = normalizeRunId(visible.runtimeRunId);
+  if (
+    (toolRunId && toolRunId !== activeRunId)
+    || (visibleRunId && visibleRunId !== activeRunId)
+  ) {
+    return false;
+  }
+  if (
+    activeRunId
+    && toolRunId === activeRunId
+    && visibleRunId === activeRunId
+  ) {
+    return true;
+  }
+  if (messages.slice(toolOnlyIndex + 1, visibleIndex).some((message) => message.role === 'user')) {
+    return false;
+  }
+
+  if (Number.isFinite(initiatingUserBoundaryTs)) {
+    const toolTs = toolOnly.createdAt instanceof Date ? toolOnly.createdAt.getTime() : NaN;
+    const visibleTs = visible.createdAt instanceof Date ? visible.createdAt.getTime() : NaN;
+    if (!Number.isFinite(toolTs) || !Number.isFinite(visibleTs)) return false;
+    const earliestCurrentTurnTs = initiatingUserBoundaryTs - ACTIVE_ASSISTANT_USER_BOUNDARY_TOLERANCE_MS;
+    return toolTs >= earliestCurrentTurnTs && visibleTs >= earliestCurrentTurnTs;
+  }
+  return true;
+}
+
 function removeDuplicateToolOnlyAssistantProjection(
   messages: ChatMessage[],
   localMessage: ChatMessage,
   keepIndex: number,
+  runtimeAuthority?: { activeRunId: string | null; initiatingUserBoundaryTs: number },
 ): void {
   const localToolSig = assistantToolSignature(localMessage);
   if (!localToolSig) return;
+  const keepMessage = messages[keepIndex];
+  if (!keepMessage) return;
+  const localToolIds = new Set((localMessage.toolCalls || [])
+    .map((tool) => String(tool.id || '').trim())
+    .filter(Boolean));
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (index === keepIndex) continue;
     const candidate = messages[index];
     if (candidate?.role !== 'assistant') continue;
+    const candidateRuntimeRunId = normalizeRunId(candidate.runtimeRunId);
+    if (
+      runtimeAuthority
+      && candidateRuntimeRunId
+      && candidateRuntimeRunId !== runtimeAuthority.activeRunId
+    ) {
+      continue;
+    }
+    if (
+      runtimeAuthority
+      && !(candidate.toolCalls || []).some((tool) => {
+        const toolId = String(tool.id || '').trim();
+        return Boolean(toolId && localToolIds.has(toolId));
+      })
+    ) {
+      continue;
+    }
+    if (
+      runtimeAuthority
+      && !assistantRowsCanShareActiveSplitProjection(
+        messages,
+        candidate,
+        keepMessage,
+        runtimeAuthority.activeRunId,
+        runtimeAuthority.initiatingUserBoundaryTs,
+      )
+    ) {
+      continue;
+    }
     if (normalizeHistoryReplayContent(candidate.content)) continue;
     if (assistantToolSignature(candidate) !== localToolSig) continue;
     messages.splice(index, 1);
@@ -1704,6 +1823,7 @@ function mergeLoadedHistoryWithLocalMessages(
   currentMessages: ChatMessage[],
   options?: {
     activeAssistantId?: string | null;
+    activeRunId?: string | null;
     preserveActiveAssistant?: boolean;
   },
 ): ChatMessage[] {
@@ -1713,12 +1833,30 @@ function mergeLoadedHistoryWithLocalMessages(
     ? options.activeAssistantId.trim()
     : null;
   const preserveActiveAssistant = Boolean(options?.preserveActiveAssistant && activeAssistantId);
+  const activeRunId = preserveActiveAssistant ? normalizeRunId(options?.activeRunId) : null;
   const merged = [...loadedMessages];
+  const consumedCommittedUserMatches = new Set<ChatMessage>();
   const now = Date.now();
   const latestLoadedTs = loadedMessages.reduce((latest, message) => {
     const ts = message.createdAt instanceof Date ? message.createdAt.getTime() : NaN;
     return Number.isFinite(ts) ? Math.max(latest, ts) : latest;
   }, 0);
+  const activeLocalAssistant = preserveActiveAssistant
+    ? currentMessages.find((message) => (
+        message.role === 'assistant' && message.id === activeAssistantId
+      ))
+    : undefined;
+  const activeLocalAssistantTs = activeLocalAssistant?.createdAt instanceof Date
+    ? activeLocalAssistant.createdAt.getTime()
+    : NaN;
+  const initiatingUserBoundaryTs = Number.isFinite(activeLocalAssistantTs)
+    ? currentMessages.reduce((latest, message) => {
+        if (message.role !== 'user' || !(message.createdAt instanceof Date)) return latest;
+        const messageTs = message.createdAt.getTime();
+        if (!Number.isFinite(messageTs) || messageTs > activeLocalAssistantTs) return latest;
+        return Math.max(latest, messageTs);
+      }, Number.NEGATIVE_INFINITY)
+    : Number.NEGATIVE_INFINITY;
 
   const isRecentOptimisticAssistant = (message: ChatMessage): boolean => {
     if (message.role !== 'assistant') return false;
@@ -1739,16 +1877,201 @@ function mergeLoadedHistoryWithLocalMessages(
     if (message.queued) return true;
     if (message.role === 'system' && message.provenance === 'live-steer') return true;
     if (message.role === 'user' && message.pendingAck) return true;
+    if (message.role === 'user' && message.provenance === 'live-foreign-user') return true;
     if (preserveActiveAssistant && message.id === activeAssistantId) return true;
     if (isRecentOptimisticAssistant(message)) return true;
     return false;
   };
 
+  const preserveMatchedActiveAssistantIdentity = (
+    existing: ChatMessage,
+    candidate: ChatMessage,
+  ) => {
+    const existingRuntimeRunId = normalizeRunId(existing.runtimeRunId);
+    if (
+      !preserveActiveAssistant
+      || candidate.role !== 'assistant'
+      || candidate.id !== activeAssistantId
+      || existing.role !== 'assistant'
+      || (existingRuntimeRunId && existingRuntimeRunId !== activeRunId)
+    ) {
+      return;
+    }
+    const currentIndex = merged.indexOf(existing);
+    if (currentIndex < 0) return;
+    // A reconnect history read can commit the visible R1 projection while the
+    // replacement run is still recovering. Keep the live identity on that
+    // durable row; otherwise streamingAssistantIdRef points at a removed local
+    // row and the following stream_resume recreates the same R1 bubble.
+    merged[currentIndex] = {
+      ...existing,
+      id: candidate.id,
+    };
+  };
+
+  const preferredActiveAssistantMatch = (candidate: ChatMessage): ChatMessage | null => {
+    if (
+      !preserveActiveAssistant
+      || candidate.role !== 'assistant'
+      || candidate.id !== activeAssistantId
+    ) {
+      return null;
+    }
+    const candidateContent = normalizeHistoryReplayContent(candidate.content);
+    const candidateTs = candidate.createdAt instanceof Date ? candidate.createdAt.getTime() : NaN;
+    const candidateToolSig = assistantToolSignature(candidate);
+    const candidateToolIds = new Set((candidate.toolCalls || [])
+      .map((tool) => String(tool.id || '').trim())
+      .filter(Boolean));
+    const hasActiveRuntimeAuthority = (message: ChatMessage) => {
+      const runtimeRunId = normalizeRunId(message.runtimeRunId);
+      return !runtimeRunId || runtimeRunId === activeRunId;
+    };
+    let preferred: { message: ChatMessage; rank: number[] } | null = null;
+    const outranks = (rank: number[], current: number[]) => {
+      for (let index = 0; index < rank.length; index += 1) {
+        if (rank[index] === current[index]) continue;
+        return rank[index] > current[index];
+      }
+      return false;
+    };
+    for (let index = 0; index < merged.length; index += 1) {
+      const message = merged[index];
+      if (message.role !== 'assistant') continue;
+      const runtimeRunId = normalizeRunId(message.runtimeRunId);
+      // A runtime projection from another run remains valid transcript history,
+      // but it can never consume or inherit the current live assistant identity.
+      if (!hasActiveRuntimeAuthority(message)) continue;
+
+      const messageContent = normalizeHistoryReplayContent(message.content);
+      const messageTs = message.createdAt instanceof Date ? message.createdAt.getTime() : NaN;
+      const delta = Number.isFinite(candidateTs) && Number.isFinite(messageTs)
+        ? Math.abs(candidateTs - messageTs)
+        : Number.POSITIVE_INFINITY;
+      const sameRun = Boolean(activeRunId && runtimeRunId === activeRunId);
+      const sameMessageId = Boolean(candidate.id && message.id && candidate.id === message.id);
+      const sharesToolCallId = (message.toolCalls || []).some((tool) => {
+        const toolId = String(tool.id || '').trim();
+        return Boolean(toolId && candidateToolIds.has(toolId));
+      });
+      const exactContent = Boolean(candidateContent && candidateContent === messageContent);
+      const prefixContent = Boolean(
+        candidateContent
+        && messageContent
+        && (candidateContent.includes(messageContent) || messageContent.includes(candidateContent))
+      );
+      const matchingToolNames = Boolean(
+        candidateToolSig
+        && candidateToolSig === assistantToolSignature(message)
+      );
+
+      // Enhanced history can split one assistant into a tool-only row followed
+      // by its visible text row. Prefer the visible row even when the earlier
+      // projection shares the exact tool-call ID; it will absorb the live tools
+      // and the redundant tool-only projection will then be removed.
+      const hasMatchingVisibleAssistant = Boolean(candidateContent && !messageContent) && merged.some((other, otherIndex) => (
+        otherIndex !== index
+        && other.role === 'assistant'
+        && hasActiveRuntimeAuthority(other)
+        && Boolean(normalizeHistoryReplayContent(other.content))
+        && (
+          candidateContent.includes(normalizeHistoryReplayContent(other.content))
+          || normalizeHistoryReplayContent(other.content).includes(candidateContent)
+        )
+        && assistantRowsCanShareActiveSplitProjection(
+          merged,
+          message,
+          other,
+          activeRunId,
+          initiatingUserBoundaryTs,
+        )
+      ));
+      if (hasMatchingVisibleAssistant) continue;
+
+      const inheritsSplitToolCallId = prefixContent && merged.some((other, otherIndex) => {
+        if (
+          otherIndex === index
+          || other.role !== 'assistant'
+          || normalizeHistoryReplayContent(other.content)
+        ) {
+          return false;
+        }
+        if (!hasActiveRuntimeAuthority(other)) return false;
+        if (!assistantRowsCanShareActiveSplitProjection(
+          merged,
+          other,
+          message,
+          activeRunId,
+          initiatingUserBoundaryTs,
+        )) return false;
+        return (other.toolCalls || []).some((tool) => {
+          const toolId = String(tool.id || '').trim();
+          return Boolean(toolId && candidateToolIds.has(toolId));
+        });
+      });
+      const sharesExactId = sameMessageId || sharesToolCallId || inheritsSplitToolCallId;
+
+      const weakMatchIsTimely = (exactContent || prefixContent || matchingToolNames)
+        && delta <= LOCAL_PENDING_ACK_WINDOW_MS
+        && Number.isFinite(initiatingUserBoundaryTs)
+        && Number.isFinite(messageTs)
+        && messageTs >= initiatingUserBoundaryTs - ACTIVE_ASSISTANT_USER_BOUNDARY_TOLERANCE_MS;
+      if (!sameRun && !sharesExactId && !weakMatchIsTimely) continue;
+
+      const rank = [
+        sameRun ? 1 : 0,
+        sharesExactId ? 1 : 0,
+        index,
+        Number.isFinite(delta) ? -delta : Number.NEGATIVE_INFINITY,
+      ];
+      const isBetter = !preferred || outranks(rank, preferred.rank);
+      if (isBetter) preferred = { message, rank };
+    }
+    return preferred ? preferred.message : null;
+  };
+
   const alreadyRepresented = (candidate: ChatMessage): boolean => {
+    const isActiveAssistantCandidate = preserveActiveAssistant
+      && candidate.role === 'assistant'
+      && candidate.id === activeAssistantId;
+    const preferredActiveMatch = isActiveAssistantCandidate
+      ? preferredActiveAssistantMatch(candidate)
+      : null;
     return merged.some((existing, existingIndex) => {
-      if (existing.id && candidate.id && existing.id === candidate.id) return true;
-      if (candidate.role === 'user' && candidate.pendingAck) {
-        return isLikelyCommittedPendingUser(candidate, existing);
+      if (isActiveAssistantCandidate && existing.role === 'assistant') {
+        if (existing !== preferredActiveMatch) return false;
+        enrichAssistantHistoryFromLocalProjection(existing, candidate);
+        const existingContent = normalizeHistoryReplayContent(existing.content);
+        const candidateContent = normalizeHistoryReplayContent(candidate.content);
+        if (candidateContent && (!existingContent || candidateContent.startsWith(existingContent))) {
+          existing.content = candidate.content;
+        }
+        removeDuplicateToolOnlyAssistantProjection(merged, candidate, existingIndex, {
+          activeRunId,
+          initiatingUserBoundaryTs,
+        });
+        preserveMatchedActiveAssistantIdentity(existing, candidate);
+        return true;
+      }
+      if (existing.id && candidate.id && existing.id === candidate.id) {
+        if (
+          candidate.role === 'user'
+          && (candidate.pendingAck || candidate.provenance === 'live-foreign-user')
+        ) {
+          consumedCommittedUserMatches.add(existing);
+        }
+        return true;
+      }
+      if (
+        candidate.role === 'user'
+        && (candidate.pendingAck || candidate.provenance === 'live-foreign-user')
+      ) {
+        if (consumedCommittedUserMatches.has(existing)) return false;
+        if (isLikelyCommittedPendingUser(candidate, existing)) {
+          consumedCommittedUserMatches.add(existing);
+          return true;
+        }
+        return false;
       }
       if (candidate.role === 'assistant' && existing.role === 'assistant') {
         const candidateContent = normalizeHistoryReplayContent(candidate.content);
@@ -1951,6 +2274,7 @@ export interface ChatStateContextValue {
   lastProvenance: string | null;
   thinkingContent: string;
   thinkingSubject: string;
+  streamingAssistantId: string | null;
   streamSegments: Array<{text: string; subject?: string; ts: number; kind: 'text' | 'thinking'; order: number}>;
   activityTitles: Readonly<Record<string, string>>;
   compactionPhase: 'idle' | 'compacting' | 'compacted';
@@ -2479,6 +2803,45 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return next;
     });
   }, []);
+  const appendLiveUserMessage = useCallback((data: any) => {
+    const content = typeof data?.content === 'string' ? data.content : '';
+    if (!content.trim()) return;
+    const rawId = typeof data?.messageId === 'string' && data.messageId.trim()
+      ? data.messageId.trim()
+      : `live-user-${String(data?.messageTimestamp || Date.now())}-${content.slice(0, 64)}`;
+    const rawTimestamp = Number(data?.messageTimestamp);
+    const timestampMs = Number.isFinite(rawTimestamp) && rawTimestamp > 0
+      ? (rawTimestamp < 10_000_000_000 ? rawTimestamp * 1000 : rawTimestamp)
+      : Date.now();
+    const matchingLocal = messagesRef.current.find((message) => (
+      message.id === rawId && message.role === 'user'
+    ));
+    if (matchingLocal) {
+      if (outstandingChatDispatchRef.current?.clientMessageId === rawId) {
+        outstandingChatDispatchRef.current = null;
+      }
+      if (matchingLocal.pendingAck) {
+        setMessages((previous) => {
+          const next = previous.map((message) => message.id === rawId
+            ? { ...message, pendingAck: false }
+            : message);
+          messagesRef.current = next;
+          return next;
+        });
+      }
+      return;
+    }
+    appendLocalMessage({
+      id: rawId,
+      role: 'user',
+      content,
+      createdAt: new Date(timestampMs),
+      // Durable history can lag live cross-channel events during a long turn.
+      // Preserve this row across forced history merges until an exact/content
+      // match proves the transcript has caught up.
+      provenance: 'live-foreign-user',
+    });
+  }, [appendLocalMessage]);
   const removeLocalMessageById = useCallback((messageId: string) => {
     messagesRef.current = messagesRef.current.filter(message => message.id !== messageId);
     setMessages(prev => {
@@ -2501,10 +2864,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
   const thinkingContentRef = useRef('');
+  const reasoningLaneRef = useRef<'raw' | 'preamble' | null>(null);
   useEffect(() => { thinkingContentRef.current = thinkingContent; }, [thinkingContent]);
   const [thinkingSubject, setThinkingSubject] = useState<string>('');
   const thinkingSubjectRef = useRef('');
   useEffect(() => { thinkingSubjectRef.current = thinkingSubject; }, [thinkingSubject]);
+  useEffect(() => {
+    if (!thinkingContent && !thinkingSubject) reasoningLaneRef.current = null;
+  }, [thinkingContent, thinkingSubject]);
   const [activityTitles, setActivityTitles] = useState<Record<string, string>>({});
   const activityTitleRunsRef = useRef(new Map<string, string>());
   const activityTitleTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
@@ -2591,6 +2958,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const pendingWsAbortResultsRef = useRef<Map<string, PendingWsAbortResult>>(new Map());
   const cancelStreamPromiseRef = useRef<Promise<void> | null>(null);
   const currentRunIdRef = useRef<string | null>(null);
+  const outstandingChatDispatchRef = useRef<OutstandingChatDispatch | null>(null);
+  const prepareVerifiedContinuationAdoptionRef = useRef<() => void>(() => {});
   const lastTerminalRunIdRef = useRef<string | null>(null);
   const retiredRunIdsRef = useRef<RetiredRunEpoch[]>([]);
   const streamingAssistantIdRef = useRef<string | null>(null);
@@ -2607,6 +2976,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // switch or clearMessages. Any async history load that started in a previous
   // generation simply discards its result, eliminating race conditions.
   const historyGenRef = useRef(0);
+  const localTurnEpochRef = useRef(0);
   const historyBeforeCursorRef = useRef<string | null>(null);
   const historyHasMoreBeforeRef = useRef(false);
   const historyLoadedScopeRef = useRef<string | null>(null);
@@ -2626,6 +2996,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const drainNextQueuedMessageRef = useRef<() => void>(() => {});
   const portalTurnSequenceRef = useRef<number | null>(null);
   const portalTurnSequenceScopeRef = useRef<string | null>(null);
+  const reasoningSequenceRef = useRef<{ runId: string | null; seq: number | null }>({
+    runId: null,
+    seq: null,
+  });
+  const runtimeOverlayOrderOffsetRef = useRef<{ runId: string; offset: number } | null>(null);
+
+  // React state setters are asynchronous. Recovery frames can arrive
+  // back-to-back in one socket task, so every live-lane reset must clear the
+  // matching refs synchronously before an R2 event is allowed to hydrate.
+  const resetLiveThinkingTimeline = useCallback(() => {
+    thinkingContentRef.current = '';
+    thinkingSubjectRef.current = '';
+    reasoningLaneRef.current = null;
+    streamSegmentsRef.current = [];
+    runtimeOverlayOrderOffsetRef.current = null;
+    setThinkingContent('');
+    setThinkingSubject('');
+    setStreamSegments([]);
+  }, []);
   const lastForegroundReconcileAtRef = useRef(0);
   // Throttle refs for streaming text updates — batch text deltas to reduce re-renders
   const textThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2712,10 +3101,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       setIsRunning(false);
       setStreamingPhase('idle');
       setStatusText(null);
-      setThinkingContent('');
-      setThinkingSubject('');
-      thinkingSubjectRef.current = '';
-      setStreamSegments([]);
+      resetLiveThinkingTimeline();
       setActiveToolName(null);
       activeStreamToolCallsRef.current = [];
       streamActivityOrderRef.current = 0;
@@ -2742,6 +3128,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                   kind: segment.kind,
                   ts: segment.ts,
                   order: segment.order,
+                  ...(segment.kind === 'thinking'
+                    ? { source: segment.lane === 'preamble' ? 'preamble' as const : 'reasoning' as const }
+                    : { source: 'text' as const }),
                 }))
               : message.segments,
             toolCalls: mergeToolCallSnapshots(message.toolCalls, recoveredToolCalls),
@@ -2757,7 +3146,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       });
       void loadHistoryInternalRef.current?.(sessionKey, providerName, { force: true, refreshActiveSnapshot: true });
     }, STREAM_RECOVERY_GRACE_MS);
-  }, []);
+  }, [resetLiveThinkingTimeline]);
   useEffect(() => { markStreamRecoveryRef.current = markStreamRecovery; }, [markStreamRecovery]);
 
   // Sync refs immediately when state changes. Note: the refs are ALSO updated
@@ -2934,6 +3323,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           });
       }
     }, Math.max(0, delayMs));
+  }, [clearPostTurnHistorySync]);
+
+  // The provider can unmount with a delayed terminal reconciliation still
+  // pending (route change, test teardown, logout). Do not let that stale
+  // closure reload another chat after ownership has moved elsewhere.
+  useEffect(() => () => {
+    clearPostTurnHistorySync();
   }, [clearPostTurnHistorySync]);
 
   const ensureSessionControlsMetadataLoaded = useCallback(async (options?: { force?: boolean }) => {
@@ -3460,6 +3856,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     });
     currentRunIdRef.current = result.state.currentRunId;
     retiredRunIdsRef.current = result.state.retiredRunIds;
+    if (result.decision === 'adopt' && options?.continuationVerified === true) {
+      // Every transport (Portal WS, direct gateway, SSE, and history snapshot)
+      // must freeze the visible predecessor before a replacement run starts
+      // sending cumulative/replace frames.
+      prepareVerifiedContinuationAdoptionRef.current();
+    }
     if (result.state.currentRunId !== previousRunId) {
       pendingQuestionPollGenerationRef.current += 1;
       pendingUserQuestionsReadyRef.current = false;
@@ -3469,6 +3871,21 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     return result.decision;
   }, [replacePendingUserQuestions]);
+
+  const recordReasoningTurnSequence = useCallback((payload: any) => {
+    const turnEvent = payload?.turnEvent;
+    if (turnEvent?.type !== 'assistant_reasoning') return;
+    const runId = normalizeRunId(turnEvent.runId || payload?.runId);
+    const seq = Number(turnEvent.seq);
+    if (!runId || !Number.isFinite(seq) || seq < 0) return;
+    const current = reasoningSequenceRef.current;
+    reasoningSequenceRef.current = {
+      runId,
+      seq: current.runId === runId && current.seq !== null
+        ? Math.max(current.seq, seq)
+        : seq,
+    };
+  }, []);
 
   const resetDirectSnapshotCursor = useCallback(() => {
     directSnapshotCursorRef.current = { ...EMPTY_CUMULATIVE_SNAPSHOT_CURSOR };
@@ -3601,10 +4018,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         toolCounterRef.current = 0;
         streamActivityOrderRef.current = 0;
         hasRealToolEventsRef.current = false;
-        setThinkingContent('');
-        setThinkingSubject('');
-        thinkingSubjectRef.current = '';
-        setStreamSegments([]);
+        resetLiveThinkingTimeline();
       }
     }
 
@@ -3628,9 +4042,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }];
     });
     return { assistantId, created };
-  }, [resetDirectSnapshotCursor]);
+  }, [resetDirectSnapshotCursor, resetLiveThinkingTimeline]);
 
-  const appendStreamSegment = useCallback((kind: StreamSegment['kind'], text: string, subject?: string) => {
+  const appendStreamSegment = useCallback((
+    kind: StreamSegment['kind'],
+    text: string,
+    subject?: string,
+    lane?: StreamSegment['lane'],
+  ) => {
     const value = typeof text === 'string' ? text : '';
     const safeSubject = kind === 'thinking' ? sanitizeThinkingSubject(subject) : '';
     if (!value.trim() && !safeSubject) return false;
@@ -3642,6 +4061,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         ts: Date.now(),
         kind,
         order: streamActivityOrderRef.current++,
+        ...(kind === 'thinking' && lane ? { lane } : {}),
       },
     ];
     streamSegmentsRef.current = nextSegments;
@@ -3667,13 +4087,30 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const currentThinking = thinkingContentRef.current;
     const currentSubject = thinkingSubjectRef.current;
     if (!currentThinking.trim() && !currentSubject) return false;
-    appendStreamSegment('thinking', currentThinking, currentSubject);
+    appendStreamSegment(
+      'thinking',
+      currentThinking,
+      currentSubject,
+      reasoningLaneRef.current || undefined,
+    );
     thinkingContentRef.current = '';
+    reasoningLaneRef.current = null;
     setThinkingContent('');
     thinkingSubjectRef.current = '';
     setThinkingSubject('');
     return true;
   }, [appendStreamSegment]);
+
+  const prepareVerifiedContinuationAdoption = useCallback(() => {
+    const continuingAssistantId = streamingAssistantIdRef.current;
+    if (!continuingAssistantId) return;
+    graduateLiveThinkingSegment();
+    if (assembledRef.current.trim()) graduateLiveTextSegment(continuingAssistantId);
+    lastSegmentStartRef.current = 0;
+    lastRawTextLenRef.current = 0;
+    resetDirectSnapshotCursor();
+  }, [graduateLiveTextSegment, graduateLiveThinkingSegment, resetDirectSnapshotCursor]);
+  prepareVerifiedContinuationAdoptionRef.current = prepareVerifiedContinuationAdoption;
 
   const buildGraduatedSegments = useCallback((segments: StreamSegment[], finalContent: string): TextSegment[] => {
     const graduatedSegments: TextSegment[] = [];
@@ -3685,6 +4122,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         kind: seg.kind,
         ts: seg.ts,
         order: seg.order,
+        ...(seg.kind === 'thinking'
+          ? { source: seg.lane === 'preamble' ? 'preamble' as const : 'reasoning' as const }
+          : { source: 'text' as const }),
       });
     }
     const finalTail = reconcileCumulativeFinalTail(
@@ -3703,12 +4143,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return graduatedSegments;
   }, []);
 
-  const appendThinkingChunk = useCallback((_assistantId: string | null, chunk: string, opts?: { replace?: boolean }) => {
+  const appendThinkingChunk = useCallback((
+    _assistantId: string | null,
+    chunk: string,
+    opts?: { replace?: boolean; lane?: 'raw' | 'preamble' },
+  ) => {
     if (!chunk) return;
+    const nextLane = opts?.lane || 'raw';
+    if (
+      reasoningLaneRef.current
+      && reasoningLaneRef.current !== nextLane
+      && (thinkingContentRef.current.trim() || thinkingSubjectRef.current)
+    ) {
+      graduateLiveThinkingSegment();
+    }
+    reasoningLaneRef.current = nextLane;
     const nextThinking = mergeThinkingStream(thinkingContentRef.current, chunk, opts);
     thinkingContentRef.current = nextThinking;
     setThinkingContent(nextThinking);
-  }, []);
+  }, [graduateLiveThinkingSegment]);
 
   const applyThinkingSubject = useCallback((assistantId: string | null, rawSubject: unknown) => {
     const subject = sanitizeThinkingSubject(rawSubject);
@@ -3752,21 +4205,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setIsRunning(false);
     setStreamingPhase('idle');
     setStatusText(null);
-    setThinkingContent('');
-    setThinkingSubject('');
-    thinkingSubjectRef.current = '';
-    setStreamSegments([]);
+    resetLiveThinkingTimeline();
     setActiveToolName(null);
     activeStreamToolCallsRef.current = [];
     streamActivityOrderRef.current = 0;
     applyCompactionSnapshotState('idle');
-  }, [applyCompactionSnapshotState, clearPendingTextRender, clearStreamRecoveryTimer, clearStreamWatchdog, resetDirectSnapshotCursor]);
+  }, [applyCompactionSnapshotState, clearPendingTextRender, clearStreamRecoveryTimer, clearStreamWatchdog, resetDirectSnapshotCursor, resetLiveThinkingTimeline]);
 
   // Clear live stream UI without discarding visible turn output. Recovery paths
   // (stream_status safeToClear, idle active-stream snapshots) can fire while the
   // bubble still holds un-graduated thinking/text/tool state; dropping it makes
   // thought bubbles vanish until a manual refresh reloads durable history.
-  const preserveLiveTurnThenClear = useCallback(() => {
+  const preserveLiveTurnThenClear = useCallback((options?: { terminal?: boolean }) => {
     const interruptedAssistantId = streamingAssistantIdRef.current;
     const interruptedSnapshot = {
       text: assembledRef.current,
@@ -3786,7 +4236,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (interruptedAssistantId && hasVisibleLiveState) {
       setMessages(prev => prev.map((message) => {
         if (message.id !== interruptedAssistantId) return message;
-        return preserveInterruptedLiveTurnSnapshot(message, interruptedSnapshot, LIVE_VIEW_DETACHED_MARKER);
+        return preserveInterruptedLiveTurnSnapshot(
+          message,
+          interruptedSnapshot,
+          options?.terminal ? null : LIVE_VIEW_DETACHED_MARKER,
+        );
       }));
     }
   }, [clearActiveStreamState]);
@@ -3830,6 +4284,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                   kind: segment.kind,
                   ts: segment.ts,
                   order: segment.order,
+                  ...(segment.kind === 'thinking'
+                    ? { source: segment.lane === 'preamble' ? 'preamble' as const : 'reasoning' as const }
+                    : { source: 'text' as const }),
                 }))
               : message.segments,
             toolCalls: liveToolCalls.length > 0 ? liveToolCalls : message.toolCalls,
@@ -3845,6 +4302,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setIsRunning(false);
     setThinkingContent('');
     thinkingContentRef.current = '';
+    reasoningLaneRef.current = null;
     setThinkingSubject('');
     thinkingSubjectRef.current = '';
     setStreamSegments([]);
@@ -3906,7 +4364,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       : '';
     const snapshotToolCalls = normalizeToolCalls(snapshot.toolCalls, 'running') || [];
     const preservedToolCalls = activeStreamToolCallsRef.current;
-    const effectiveToolCalls = snapshotToolCalls.length > 0 ? snapshotToolCalls : preservedToolCalls;
+    const effectiveToolCalls = snapshotToolCalls.length > 0
+      ? (mergeToolCallSnapshots(preservedToolCalls, snapshotToolCalls) || [])
+      : preservedToolCalls;
     const runningToolCall = effectiveToolCalls.find((toolCall) => toolCall.status === 'running') || effectiveToolCalls[effectiveToolCalls.length - 1];
     const toolNameCandidate = snapshot.toolName || snapshot.name || runningToolCall?.name || activeToolNameRef.current;
     const snapshotToolName = typeof toolNameCandidate === 'string' && toolNameCandidate.trim()
@@ -3914,17 +4374,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       : null;
     const rawStatusText = getRailSafeStatusText(typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '');
     const isMaintenanceStatusOnly = Boolean(rawStatusText && isControlOrMaintenanceAssistantContent(rawStatusText));
-    const currentStreamText = assembledRef.current;
-    const normalizedSnapshotContent = normalizeHistoryReplayContent(snapshotContent);
-    const snapshotDuplicatesGraduatedText = Boolean(normalizedSnapshotContent)
-      && !currentStreamText.trim()
-      && streamSegmentsRef.current.some((segment) => (
-        segment.kind === 'text'
-        && normalizeHistoryReplayContent(segment.text) === normalizedSnapshotContent
-      ));
-    const effectiveSnapshotContent = snapshotDuplicatesGraduatedText ? '' : snapshotContent;
-    const shouldReplaceSnapshotText = Boolean(effectiveSnapshotContent)
-      && (!currentStreamText || effectiveSnapshotContent.length >= currentStreamText.length || effectiveSnapshotContent.includes(currentStreamText));
     let assistantId = streamingAssistantIdRef.current;
     const hasStatusSignal = Boolean(rawStatusText && !isMaintenanceStatusOnly);
     const hasMaintenanceSignal = isMaintenanceStatusOnly
@@ -3937,7 +4386,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       || snapshot.phase === 'tool'
       || snapshot.phase === 'streaming'
     );
-    const hasLiveSnapshotSignal = Boolean(effectiveSnapshotContent)
+    const hasLiveSnapshotSignal = Boolean(snapshotContent)
       || Boolean(snapshotToolName)
       || effectiveToolCalls.length > 0
       || hasStatusSignal
@@ -3951,7 +4400,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (!shouldHydrateLiveState) {
       return false;
     }
-    const shouldMaterializeBubble = Boolean(effectiveSnapshotContent)
+    let shouldMaterializeBubble = Boolean(snapshotContent)
       || Boolean(snapshotToolName)
       || effectiveToolCalls.length > 0
       || Boolean(assistantId);
@@ -3959,10 +4408,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     isStreamActiveRef.current = true;
     streamTransportRef.current = options?.source || 'portal';
     const snapshotRunId = normalizeRunId(snapshot.runId);
+    let snapshotEpochDecision: ReturnType<typeof reconcileIncomingRunEpoch> | null = null;
     if (snapshotRunId) {
-      const epochDecision = reconcileIncomingRunEpoch(snapshotRunId, { continuationVerified: true });
-      if (epochDecision === 'reject') return false;
+      snapshotEpochDecision = reconcileIncomingRunEpoch(snapshotRunId, { continuationVerified: true });
+      if (snapshotEpochDecision === 'reject') return false;
     }
+    // Verified replacement adoption may have just graduated and cleared the
+    // predecessor's cumulative text. Compare the snapshot against that
+    // post-adoption state, not against the stale R1 buffer captured beforehand.
+    const currentStreamText = assembledRef.current;
+    const normalizedSnapshotContent = normalizeHistoryReplayContent(snapshotContent);
+    const snapshotDuplicatesGraduatedText = Boolean(normalizedSnapshotContent)
+      && !currentStreamText.trim()
+      && streamSegmentsRef.current.some((segment) => (
+        segment.kind === 'text'
+        && normalizeHistoryReplayContent(segment.text) === normalizedSnapshotContent
+      ));
+    const effectiveSnapshotContent = snapshotDuplicatesGraduatedText ? '' : snapshotContent;
+    const shouldReplaceSnapshotText = Boolean(effectiveSnapshotContent)
+      && (!currentStreamText || effectiveSnapshotContent.length >= currentStreamText.length || effectiveSnapshotContent.includes(currentStreamText));
     if (providerRef.current === 'OPENCLAW') {
       directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
     }
@@ -3978,17 +4442,38 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         segment.kind === 'thinking'
         && (Boolean(segment.text.trim()) || Boolean(segment.subject))
       ));
-    if (!hasLocalThinking && snapshotTurnEvents.length > 0) {
-      const reasoningEvents = selectSnapshotReasoningEvents(snapshotTurnEvents, snapshotRunId);
+    if (snapshotTurnEvents.length > 0) {
+      const knownReasoningSequence = reasoningSequenceRef.current.runId === snapshotRunId
+        ? reasoningSequenceRef.current.seq
+        : null;
+      const reasoningEvents = selectSnapshotReasoningEvents(snapshotTurnEvents, snapshotRunId)
+        .filter((event) => {
+          if (snapshotEpochDecision === 'adopt' || !hasLocalThinking) return true;
+          const seq = Number(event?.seq);
+          return knownReasoningSequence !== null
+            && Number.isFinite(seq)
+            && seq > knownReasoningSequence;
+        });
       for (const event of reasoningEvents) {
         applyThinkingSubject(null, event.subject);
         appendThinkingChunk(
           null,
           extractThinkingChunk('thinking', event.text, Boolean(assembledRef.current)),
-          { replace: event.replace === true },
+          {
+            replace: event.replace === true,
+            lane: event?.source?.preambleProgress === true ? 'preamble' : 'raw',
+          },
         );
+        recordReasoningTurnSequence({ turnEvent: event, runId: snapshotRunId });
       }
     }
+    shouldMaterializeBubble = shouldMaterializeBubble
+      || Boolean(thinkingContentRef.current.trim())
+      || Boolean(thinkingSubjectRef.current)
+      || streamSegmentsRef.current.some((segment) => (
+        segment.kind === 'thinking'
+        && (Boolean(segment.text.trim()) || Boolean(segment.subject))
+      ));
     const snapshotPhase = runningToolCall
       ? 'tool'
       : snapshot.phase === 'tool'
@@ -4051,14 +4536,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     resetStreamWatchdog({ visible: Boolean(effectiveSnapshotContent) });
     return true;
-  }, [appendThinkingChunk, applyCompactionSnapshotState, applyThinkingSubject, ensureStreamingAssistantBubble, mergeStreamText, reconcileIncomingRunEpoch, resetStreamWatchdog]);
+  }, [appendThinkingChunk, applyCompactionSnapshotState, applyThinkingSubject, ensureStreamingAssistantBubble, mergeStreamText, reconcileIncomingRunEpoch, recordReasoningTurnSequence, resetStreamWatchdog]);
   applyOpenClawActiveStreamSnapshotRef.current = applyOpenClawActiveStreamSnapshot;
 
   const hydrateActiveStream = useCallback(async (
     sessionKey: string,
     prov?: string,
     snapshot?: any,
-    options?: { clearIfInactive?: boolean; reconnect?: boolean; refreshIfActive?: boolean },
+    options?: {
+      clearIfInactive?: boolean;
+      reconnect?: boolean;
+      refreshIfActive?: boolean;
+      historyFence?: { localTurnEpoch: number; runId: string | null; wasActive: boolean };
+    },
   ) => {
     const streamProvider = String(prov || providerRef.current || 'OPENCLAW').trim().toUpperCase();
     if (!sessionKey || !providerUsesPortalStreamBus(streamProvider)) return false;
@@ -4092,6 +4582,26 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         });
         return false;
       }
+      if (options?.historyFence) {
+        const fence = options.historyFence;
+        const currentRunId = normalizeRunId(currentRunIdRef.current);
+        const snapshotRunId = normalizeRunId(data?.runId);
+        if (!historyStreamSnapshotIsAuthoritative(data, fence, {
+          localTurnEpoch: localTurnEpochRef.current,
+          runId: currentRunId,
+          active: isStreamActiveRef.current,
+        })) {
+          debugLog('[ChatState] Ignoring history snapshot captured before a newer turn', {
+            expectedTurnEpoch: fence.localTurnEpoch,
+            currentTurnEpoch: localTurnEpochRef.current,
+            expectedRunId: fence.runId,
+            currentRunId,
+            snapshotRunId,
+            snapshotActive: data?.active === true,
+          });
+          return false;
+        }
+      }
       const manager = wsManagerRef.current;
       if (!data?.active) {
         if (options?.clearIfInactive && isStreamActiveRef.current) {
@@ -4117,7 +4627,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             return true;
           }
           debugLog('[ChatState] Active-stream snapshot is idle — clearing stale stream UI');
-          preserveLiveTurnThenClear();
+          preserveLiveTurnThenClear({ terminal: data?.inactiveReason === 'terminal' });
         }
         return false;
       }
@@ -4173,6 +4683,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (!sessionKey || (isStreamActiveRef.current && !options?.force)) return false;
     // Snapshot the current generation — if it changes while we await, discard results.
     const myGen = ++historyGenRef.current;
+    const historyFence = {
+      localTurnEpoch: localTurnEpochRef.current,
+      runId: normalizeRunId(currentRunIdRef.current),
+      wasActive: isStreamActiveRef.current,
+    };
     const effectiveProvider = prov || providerRef.current || 'OPENCLAW';
     const historyScope = `${effectiveProvider}:${sessionKey}`;
     if (historyLoadedScopeRef.current !== historyScope) {
@@ -4304,12 +4819,200 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                 messagesRef.current,
                 {
                   activeAssistantId: streamingAssistantIdRef.current,
+                  activeRunId: isStreamActiveRef.current ? normalizeRunId(currentRunIdRef.current) : null,
                   preserveActiveAssistant: isStreamActiveRef.current,
                 },
               ))),
             );
-        messagesRef.current = reconciledHistory;
-        setMessages(reconciledHistory);
+        const historySnapshotAuthoritative = historyStreamSnapshotIsAuthoritative(
+          historyActiveStream,
+          historyFence,
+          {
+            localTurnEpoch: localTurnEpochRef.current,
+            runId: normalizeRunId(currentRunIdRef.current),
+            active: isStreamActiveRef.current,
+          },
+        );
+        const currentAuthoritativeLiveRunId = isStreamActiveRef.current
+          ? normalizeRunId(currentRunIdRef.current)
+          : null;
+        let historyToInstall = historySnapshotAuthoritative
+          ? reconciledHistory
+          : reconciledHistory.filter((message) => (
+              !message.runtimeRunId
+              || message.runtimeRunId === currentAuthoritativeLiveRunId
+            ));
+        const exactActiveRunId = historyActiveStream?.active === true
+          && historySnapshotAuthoritative
+          ? normalizeRunId(historyActiveStream?.runId)
+          : null;
+        const reconciledActiveRuntimeOverlays = exactActiveRunId
+          ? reconciledHistory.filter((message) => (
+              message.role === 'assistant' && message.runtimeRunId === exactActiveRunId
+            ))
+          : [];
+        const loadedActiveRuntimeOverlays = exactActiveRunId
+          ? normalizedHistoryWindow.filter((message) => (
+              message.role === 'assistant' && message.runtimeRunId === exactActiveRunId
+            ))
+          : [];
+        const activeRuntimeOverlays = loadedActiveRuntimeOverlays.length > 0
+          ? loadedActiveRuntimeOverlays
+          : reconciledActiveRuntimeOverlays;
+        if (activeRuntimeOverlays.length > 0 && exactActiveRunId) {
+          const overlay = activeRuntimeOverlays[activeRuntimeOverlays.length - 1];
+          const priorLiveAssistantId = streamingAssistantIdRef.current;
+          const epochDecision = reconcileIncomingRunEpoch(exactActiveRunId, {
+            continuationVerified: true,
+          });
+          if (epochDecision === 'reject') {
+            historyToInstall = reconciledHistory.filter((message) => (
+              message.role !== 'assistant' || message.runtimeRunId !== exactActiveRunId
+            ));
+          } else {
+            const rawOverlaySegments = activeRuntimeOverlays.flatMap((message) => message.segments || []);
+            const rawOverlayToolCalls = activeRuntimeOverlays.reduce<ToolCall[]>((calls, message) => (
+              mergeToolCallSnapshots(calls, message.toolCalls || []) || calls
+            ), []);
+            const preservedOrders = [
+              ...streamSegmentsRef.current.map((segment) => segment.order),
+              ...activeStreamToolCallsRef.current
+                .map((tool) => tool.order)
+                .filter((order): order is number => typeof order === 'number' && Number.isFinite(order)),
+            ];
+            const incomingOrders = [
+              ...rawOverlaySegments
+                .map((segment) => segment.order)
+                .filter((order): order is number => typeof order === 'number' && Number.isFinite(order)),
+              ...rawOverlayToolCalls
+                .map((tool) => tool.order)
+                .filter((order): order is number => typeof order === 'number' && Number.isFinite(order)),
+            ];
+            const maxPreservedOrder = preservedOrders.length > 0 ? Math.max(...preservedOrders) : -1;
+            const minIncomingOrder = incomingOrders.length > 0 ? Math.min(...incomingOrders) : 0;
+            const priorOverlayOffset = runtimeOverlayOrderOffsetRef.current?.runId === exactActiveRunId
+              ? runtimeOverlayOrderOffsetRef.current.offset
+              : null;
+            const replacementOrderOffset = epochDecision === 'adopt'
+              ? Math.max(0, maxPreservedOrder + 1 - minIncomingOrder)
+              : (priorOverlayOffset ?? 0);
+            runtimeOverlayOrderOffsetRef.current = {
+              runId: exactActiveRunId,
+              offset: replacementOrderOffset,
+            };
+            const overlaySegments: StreamSegment[] = rawOverlaySegments.map((segment) => ({
+              text: segment.text,
+              ...(segment.subject ? { subject: segment.subject } : {}),
+              ts: typeof segment.ts === 'number' ? segment.ts : overlay.createdAt.getTime(),
+              kind: segment.kind === 'thinking' ? 'thinking' : 'text',
+              order: typeof segment.order === 'number'
+                ? segment.order + replacementOrderOffset
+                : streamActivityOrderRef.current++,
+              ...(segment.kind === 'thinking' && segment.source === 'preamble'
+                ? { lane: 'preamble' as const }
+                : segment.kind === 'thinking'
+                    && (segment.source === 'reasoning' || segment.source === 'status')
+                  ? { lane: 'raw' as const }
+                  : {}),
+            }));
+            const overlayToolCalls = rawOverlayToolCalls.map((tool) => ({
+              ...tool,
+              ...(typeof tool.order === 'number'
+                ? { order: tool.order + replacementOrderOffset }
+                : {}),
+            }));
+            const mergedSegments = [...streamSegmentsRef.current];
+            const representedSegments = new Set(mergedSegments.map((segment) => (
+              `${segment.kind}|${segment.lane || ''}|${segment.subject || ''}|${normalizeHistoryReplayContent(segment.text)}`
+            )));
+            let lastOverlayThinkingIndex = -1;
+            for (let index = overlaySegments.length - 1; index >= 0; index -= 1) {
+              if (overlaySegments[index].kind === 'thinking') {
+                lastOverlayThinkingIndex = index;
+                break;
+              }
+            }
+            const currentThinking = normalizeHistoryReplayContent(thinkingContentRef.current);
+            const currentThinkingSubject = sanitizeThinkingSubject(thinkingSubjectRef.current);
+            for (const [index, segment] of overlaySegments.entries()) {
+              const segmentText = normalizeHistoryReplayContent(segment.text);
+              const sameLiveThinkingLane = index === lastOverlayThinkingIndex
+                && segment.kind === 'thinking'
+                && Boolean(segment.lane)
+                && segment.lane === reasoningLaneRef.current
+                && sanitizeThinkingSubject(segment.subject) === currentThinkingSubject;
+              if (sameLiveThinkingLane && currentThinking && segmentText) {
+                if (currentThinking === segmentText || currentThinking.startsWith(segmentText)) {
+                  continue;
+                }
+                if (epochDecision !== 'adopt' && segmentText.startsWith(currentThinking)) {
+                  thinkingContentRef.current = segment.text;
+                  setThinkingContent(segment.text);
+                  continue;
+                }
+              }
+              const key = `${segment.kind}|${segment.lane || ''}|${segment.subject || ''}|${segmentText}`;
+              if (representedSegments.has(key)) continue;
+              representedSegments.add(key);
+              mergedSegments.push(segment);
+            }
+            const targetAssistantId = priorLiveAssistantId || overlay.id;
+            streamingAssistantIdRef.current = targetAssistantId;
+            const latestOverlayContent = [...activeRuntimeOverlays]
+              .reverse()
+              .map((message) => message.content)
+              .find((content) => Boolean(content?.trim())) || '';
+            if (epochDecision === 'adopt' || !assembledRef.current.trim()) {
+              assembledRef.current = latestOverlayContent;
+            }
+            streamSegmentsRef.current = mergedSegments;
+            activeStreamToolCallsRef.current = mergeToolCallSnapshots(
+              activeStreamToolCallsRef.current,
+              overlayToolCalls,
+            ) || [];
+            hasRealToolEventsRef.current = activeStreamToolCallsRef.current.length > 0;
+            const mergedOrders = [
+              ...mergedSegments.map((segment) => segment.order),
+              ...activeStreamToolCallsRef.current
+                .map((tool) => tool.order)
+                .filter((order): order is number => typeof order === 'number' && Number.isFinite(order)),
+            ];
+            if (mergedOrders.length > 0) {
+              streamActivityOrderRef.current = Math.max(
+                streamActivityOrderRef.current,
+                Math.max(...mergedOrders) + 1,
+              );
+            }
+            setStreamSegments(mergedSegments);
+            let targetFound = false;
+            historyToInstall = reconciledHistory.flatMap((message) => {
+              if (message.id === targetAssistantId && !targetFound) {
+                targetFound = true;
+                return [{
+                  ...message,
+                  runtimeRunId: exactActiveRunId,
+                  content: assembledRef.current,
+                  segments: undefined,
+                  toolCalls: activeStreamToolCallsRef.current,
+                }];
+              }
+              if (message.role === 'assistant' && message.runtimeRunId === exactActiveRunId) return [];
+              if (message.id === targetAssistantId) return [];
+              return [message];
+            });
+            if (!targetFound) {
+              historyToInstall.push({
+                ...overlay,
+                id: targetAssistantId,
+                content: assembledRef.current,
+                segments: undefined,
+                toolCalls: activeStreamToolCallsRef.current,
+              });
+            }
+          }
+        }
+        messagesRef.current = historyToInstall;
+        setMessages(historyToInstall);
         historyLoadedScopeRef.current = historyScope;
         if (!preserveOlderPages) {
           historyBeforeCursorRef.current = historyPagination.beforeCursor;
@@ -4324,6 +5027,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             clearIfInactive: Boolean(options?.force),
             reconnect: effectiveProvider !== 'OPENCLAW' || !useDirectGateway,
             refreshIfActive: Boolean(options?.refreshActiveSnapshot) || Boolean(options?.force),
+            historyFence,
           });
         }
       }
@@ -4343,7 +5047,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
     }
     return false;
-  }, [hydrateActiveStream, resolveOpenClawSessionKey, useDirectGateway]);
+  }, [hydrateActiveStream, reconcileIncomingRunEpoch, resolveOpenClawSessionKey, useDirectGateway]);
 
   useEffect(() => {
     loadHistoryInternalRef.current = loadHistoryInternal;
@@ -4524,10 +5228,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return complete;
   }, []);
 
-  // Explicitly select a session from the sidebar — resets any stale stream state
-  // and force-loads history, bypassing the isStreamActive guard.
+  // Explicitly select a session from the sidebar. Navigation must detach the
+  // browser from an SSE fallback before changing sessionRef: otherwise the old
+  // response can keep writing events into the newly selected chat. "handoff"
+  // stops only the browser transport; the server-owned run continues and is
+  // recoverable from the Portal stream bus/history. It must never share the
+  // explicit Stop button's chat.abort path.
   const selectSession = useCallback(async (sessionKey: string) => {
     if (!sessionKey) return;
+    const activeSse = activeSseTransportRef.current;
+    if (activeSse) {
+      const manager = wsManagerRef.current;
+      const handedOff = activeSse.sessionResolved && manager?.isConnected()
+        ? await handoffActiveSseToPortalRef.current(manager)
+        : false;
+      if (!handedOff) {
+        await stopActiveSseTransportRef.current('handoff');
+      }
+    }
     historyGenRef.current++;
     historyBeforeCursorRef.current = null;
     historyHasMoreBeforeRef.current = false;
@@ -4623,6 +5341,80 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, []);
+
+  const handleActiveTurnConflict = useCallback((data: any) => {
+    const clientMessageId = typeof data?.clientMessageId === 'string'
+      ? data.clientMessageId.trim()
+      : '';
+    const outstanding = outstandingChatDispatchRef.current;
+    const eventSession = resolveOpenClawSessionKey(
+      typeof data?.sessionKey === 'string' ? data.sessionKey : sessionRef.current,
+    );
+    const currentSession = resolveOpenClawSessionKey(sessionRef.current);
+    if (
+      !clientMessageId
+      || !outstanding
+      || outstanding.clientMessageId !== clientMessageId
+      || outstanding.assistantId !== streamingAssistantIdRef.current
+      || outstanding.sessionKey !== eventSession
+      || (currentSession && eventSession !== currentSession)
+    ) {
+      debugLog('[ChatState] Ignoring uncorrelated active-turn conflict', {
+        clientMessageId: clientMessageId || null,
+        outstandingClientMessageId: outstanding?.clientMessageId || null,
+        eventSession: eventSession || null,
+        currentSession: currentSession || null,
+      });
+      return false;
+    }
+
+    const attempted = messagesRef.current.find((message) => (
+      message.id === clientMessageId && message.role === 'user'
+    ));
+    if (!attempted) return false;
+
+    // Consume the correlation before changing any UI. Replayed/duplicate
+    // conflict frames must never tear down the authoritative stream we attach
+    // immediately afterward.
+    outstandingChatDispatchRef.current = null;
+    if (!messageQueueRef.current.some((item) => item.id === attempted.id)) {
+      const queuedItem = {
+        id: attempted.id,
+        text: attempted.content,
+        createdAt: attempted.createdAt.getTime(),
+      };
+      messageQueueRef.current = [...messageQueueRef.current, queuedItem];
+      setMessageQueue((previous) => (
+        previous.some((item) => item.id === queuedItem.id) ? previous : [...previous, queuedItem]
+      ));
+    }
+
+    const optimisticAssistantId = outstanding.assistantId;
+    setMessages((previous) => {
+      const next = previous
+        .filter((message) => message.id !== optimisticAssistantId)
+        .map((message) => message.id === clientMessageId
+          ? { ...message, pendingAck: false, queued: true }
+          : message);
+      messagesRef.current = next;
+      return next;
+    });
+    clearPendingTextRender();
+    streamingAssistantIdRef.current = null;
+    currentRunIdRef.current = null;
+    // Keep the queue fenced while the backend resolves the authoritative
+    // active run. Marking this idle would immediately drain and resend the
+    // same message, creating the exact conflict loop this path repairs.
+    isStreamActiveRef.current = true;
+    streamTransportRef.current = streamTransportRef.current === 'sse' ? 'sse' : 'portal';
+    assembledRef.current = '';
+    resetLiveThinkingTimeline();
+    setActiveToolName(null);
+    setStreamingPhase('thinking');
+    setIsRunning(true);
+    markStreamRecovery('Reconnecting to the active turn…');
+    return true;
+  }, [clearPendingTextRender, markStreamRecovery, resetLiveThinkingTimeline, resolveOpenClawSessionKey]);
 
   // WS event handler — processes events even when chat page is unmounted
   const handleWsEvent = useCallback((data: any) => {
@@ -4757,11 +5549,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         });
         return;
       }
+      recordReasoningTurnSequence(data);
     } else if (data?.type === 'stream_resume' && Array.isArray(data.turnEvents)) {
       const resumeSequence = latestTurnSequence(data.turnEvents);
       if (resumeSequence !== null) portalTurnSequenceRef.current = resumeSequence;
     }
-    if (data?.type && ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'stream_resume', 'stream_ended', 'run_resumed', 'compaction_start', 'compaction_end'].includes(data.type)) {
+    if (data?.type && ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status', 'segment_break', 'done', 'stream_resume', 'stream_ended', 'run_resumed', 'compaction_start', 'compaction_end', 'user_message', 'history_changed'].includes(data.type)) {
       setWsConnected(true);
     }
     // Temp debug: log tool-related events to diagnose missing tool cards
@@ -4776,7 +5569,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // Only process stream events if we have an active assistant message.
     // Some event types are allowed without a bubble so we can wait for visible
     // content before materializing a resumed turn.
-    const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_status', 'stream_ended', 'run_resumed'];
+    const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_status', 'stream_ended', 'run_resumed', 'user_message', 'history_changed', 'active_turn_conflict'];
     const autoCreateBubbleTypes = ['text', 'thinking', 'status', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['thinking', 'done', 'error'];
     if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOrMaintenanceAssistantContent(data.content)) {
@@ -4799,8 +5592,31 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (assistantId || isStreamActiveRef.current) {
       resetStreamWatchdog();
     }
+    if (data.type === 'done' || data.type === 'error' || data.type === 'stream_ended') {
+      outstandingChatDispatchRef.current = null;
+    }
 
     switch (data.type) {
+      case 'active_turn_conflict': {
+        handleActiveTurnConflict(data);
+        break;
+      }
+      case 'user_message': {
+        appendLiveUserMessage(data);
+        scheduleSessionTelemetryRefresh(200);
+        break;
+      }
+      case 'history_changed': {
+        const targetSession = resolvedPortalSession || resolvedCurrentSession;
+        if (targetSession) {
+          void loadHistoryInternalRef.current?.(targetSession, providerRef.current, {
+            force: true,
+            refreshActiveSnapshot: true,
+            preserveLocalMessages: true,
+          });
+        }
+        break;
+      }
       case 'session': {
         if (data.sessionId) {
           setSessionAvailability('present');
@@ -4832,10 +5648,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         const runningToolName = getRunningToolName();
         if (!maintenanceRail.isMaintenanceStatus && !runningToolName && data.preambleProgress !== true) {
           const statusThinkingChunk = extractThinkingChunk('status', data.content, assembledRef.current.length > 0);
-          appendThinkingChunk(assistantId, statusThinkingChunk);
+          appendThinkingChunk(assistantId, statusThinkingChunk, { lane: 'raw' });
           if (statusThinkingChunk) resetStreamWatchdog({ visible: true });
         }
         if (data.preambleProgress === true && !runningToolName) {
+          // OpenClaw marks provider-authored preamble progress explicitly. For
+          // Opus turns whose private reasoning body is encrypted/empty, this is
+          // the only readable thinking signal. Keep its cumulative snapshot in
+          // the violet timeline so the following tool transition graduates it
+          // instead of replacing it as transient rail text.
+          const preambleThinking = extractThinkingChunk(
+            'thinking',
+            data.content,
+            assembledRef.current.length > 0,
+          );
+          appendThinkingChunk(assistantId, preambleThinking, {
+            replace: data.replace === true,
+            lane: 'preamble',
+          });
+          if (preambleThinking) resetStreamWatchdog({ visible: true });
           setStatusText(sanitizeThinkingSubject(data.content) || null);
           setStreamingPhase('thinking');
         }
@@ -4848,7 +5679,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (!assistantId && !isStreamActiveRef.current) break;
         applyThinkingSubject(assistantId, data.subject);
         const thinkingChunk = extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0);
-        appendThinkingChunk(assistantId, thinkingChunk, { replace: data.replace === true });
+        const isPreambleThinking = data.preambleProgress === true
+          || data?.turnEvent?.source?.preambleProgress === true;
+        appendThinkingChunk(assistantId, thinkingChunk, {
+          replace: data.replace === true,
+          lane: isPreambleThinking ? 'preamble' : 'raw',
+        });
         if (thinkingChunk) resetStreamWatchdog({ visible: true });
         if (!assembledRef.current || getRunningToolName()) {
           setLiveRunPhase('thinking', null);
@@ -5078,6 +5914,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               ts: Date.now(),
               kind: 'thinking' as const,
               order: streamActivityOrderRef.current++,
+              ...(reasoningLaneRef.current ? { lane: reasoningLaneRef.current } : {}),
             }]
           : currentStreamSegs;
         const shouldHideTurn = !finalContent.trim() && finalStreamSegs.length === 0 && !hadToolEvents;
@@ -5088,10 +5925,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
         setStatusText(null);
         setStreamingPhase('idle');
-        setThinkingContent('');
-        setThinkingSubject('');
-        thinkingSubjectRef.current = '';
-        setStreamSegments([]);
+        resetLiveThinkingTimeline();
         setActiveToolName(null);
         setLastProvenance(prov);
         setIsRunning(false);
@@ -5164,6 +5998,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
         directClientRef.current?.setActiveStreamSession(null);
         assembledRef.current = '';
+        resetLiveThinkingTimeline();
         break;
       }
       case 'exec_approval': {
@@ -5197,7 +6032,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           break;
         }
         if (canSafelyClear && isStreamActiveRef.current) {
-          preserveLiveTurnThenClear();
+          preserveLiveTurnThenClear({ terminal: data.inactiveReason === 'terminal' });
           schedulePostTurnHistorySync(900);
         }
         break;
@@ -5212,22 +6047,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'stream_ended': {
-        clearStreamWatchdog();
-        clearPendingTextRender();
         lastTerminalRunIdRef.current = incomingPortalRunId || currentRunIdRef.current;
-        setStatusText(null);
-        setStreamingPhase('idle');
-        setThinkingContent('');
-        setThinkingSubject('');
-        thinkingSubjectRef.current = '';
-        setActiveToolName(null);
-        setIsRunning(false);
-        isStreamActiveRef.current = false;
-        streamTransportRef.current = null;
-        streamingAssistantIdRef.current = null;
-        activeStreamToolCallsRef.current = [];
-        currentRunIdRef.current = null;
-        directClientRef.current?.setActiveStreamSession(null);
+        // Authoritative inactive reconciliation can replace a terminal frame
+        // that was missed during an outage. Preserve whatever the user could
+        // already see before clearing live refs, or preamble/reasoning/tool
+        // state disappears until the delayed durable-history merge.
+        preserveLiveTurnThenClear({ terminal: true });
         clearPostTurnHistorySync();
         if (providerUsesPortalStreamBus(providerRef.current)) {
           schedulePostTurnHistorySync(900);
@@ -5238,7 +6063,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'keepalive':
         break;
     }
-  }, [applyOpenClawActiveStreamSnapshot, preserveLiveTurnThenClear, clearPendingTextRender, clearPostTurnHistorySync, clearStreamRecoveryTimer, ensureStreamingAssistantBubble, getCurrentToolStatusText, markStreamRecovery, normalizeAgentError, observeSessionActivityTitle, reconcileIncomingRunEpoch, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyThinkingSubject, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, resolveOpenClawSessionKey, schedulePendingTextRender, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, scheduleStreamContinuityRepair, setLiveRunPhase, settleCancelledTurn]);
+  }, [appendLiveUserMessage, applyOpenClawActiveStreamSnapshot, preserveLiveTurnThenClear, clearPendingTextRender, clearPostTurnHistorySync, clearStreamRecoveryTimer, ensureStreamingAssistantBubble, getCurrentToolStatusText, handleActiveTurnConflict, markStreamRecovery, normalizeAgentError, observeSessionActivityTitle, reconcileIncomingRunEpoch, recordReasoningTurnSequence, resetLiveThinkingTimeline, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyThinkingSubject, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, resolveOpenClawSessionKey, schedulePendingTextRender, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, scheduleStreamContinuityRepair, setLiveRunPhase, settleCancelledTurn]);
 
   // Keep handleWsEvent in a ref so the WS handler always calls the latest version
   const handleWsEventRef = useRef(handleWsEvent);
@@ -5293,6 +6118,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           ts: Date.now(),
           kind: 'thinking' as const,
           order: streamActivityOrderRef.current++,
+          ...(reasoningLaneRef.current ? { lane: reasoningLaneRef.current } : {}),
         }]
       : currentStreamSegs;
     const shouldHideTurn = !finalContent.trim() && finalStreamSegs.length === 0 && !hadToolEvents;
@@ -5303,10 +6129,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
     setStatusText(null);
     setStreamingPhase('idle');
-    setThinkingContent('');
-    setThinkingSubject('');
-    thinkingSubjectRef.current = '';
-    setStreamSegments([]);
+    resetLiveThinkingTimeline();
     setActiveToolName(null);
     if (prov) setLastProvenance(prov);
     setIsRunning(false);
@@ -5357,7 +6180,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (providerRef.current === 'OPENCLAW') {
       schedulePostTurnHistorySync(450, 2500);
     }
-  }, [buildGraduatedSegments, clearDirectPendingEmptyFinal, clearPendingTextRender, clearStreamWatchdog, ensureStreamingAssistantBubble, resetDirectSnapshotCursor, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh]);
+  }, [buildGraduatedSegments, clearDirectPendingEmptyFinal, clearPendingTextRender, clearStreamWatchdog, ensureStreamingAssistantBubble, resetDirectSnapshotCursor, resetLiveThinkingTimeline, resolveCurrentStreamModel, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh]);
 
   /**
    * Handle events from the direct gateway client.
@@ -5377,6 +6200,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const expectedRunId = currentRunIdRef.current;
     const isDirectTerminalEvent = evt.event === 'chat' && (payload?.state === 'final' || payload?.state === 'aborted' || payload?.state === 'error');
     const effectiveTerminalRunId = incomingRunId || expectedRunId;
+    if (isDirectTerminalEvent) outstandingChatDispatchRef.current = null;
 
     if (isDirectTerminalEvent && !isStreamActiveRef.current && !streamingAssistantIdRef.current) {
       if (!effectiveTerminalRunId || lastTerminalRunIdRef.current === effectiveTerminalRunId) {
@@ -5443,6 +6267,35 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const messageToolSourceReplyText = extractMessageToolSourceReplyTextFromGatewayPayload(payload);
       const pendingEmptyFinal = directPendingEmptyFinalRef.current;
       const canCompleteFromSessionMessage = Boolean(pendingEmptyFinal) || isStreamActiveRef.current || Boolean(currentRunIdRef.current);
+
+      if (role === 'user' && visibleText) {
+        const rawIdempotencyKey = typeof message?.idempotencyKey === 'string'
+          ? message.idempotencyKey.trim()
+          : '';
+        const echoedClientMessageId = clientMessageIdFromDirectGatewayIdempotencyKey(
+          rawIdempotencyKey,
+        );
+        const matchesOptimisticLocal = echoedClientMessageId
+          && messagesRef.current.some((candidate) => (
+            candidate.id === echoedClientMessageId
+            && candidate.role === 'user'
+            && candidate.pendingAck
+          ));
+        appendLiveUserMessage({
+          content: visibleText,
+          messageId: matchesOptimisticLocal
+            ? echoedClientMessageId
+            : (message?.id || message?.messageId || message?.idempotencyKey),
+          messageTimestamp: message?.timestamp || payload?.ts,
+          sourceChannel: message?.sourceChannel,
+        });
+        if (incomingRunId && !currentRunIdRef.current) {
+          reconcileIncomingRunEpoch(incomingRunId, { continuationVerified: true });
+          directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+        }
+        scheduleSessionTelemetryRefresh(200);
+        return;
+      }
 
       if (messageToolSourceReplyText && !isControlOrMaintenanceAssistantContent(messageToolSourceReplyText) && canCompleteFromSessionMessage) {
         const pending = clearDirectPendingEmptyFinal();
@@ -5546,6 +6399,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             appendThinkingChunk(
               assistantId,
               extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0),
+              { lane: 'raw' },
             );
             if (!assembledRef.current && assistantId) setStreamingPhase('thinking');
           }
@@ -5649,6 +6503,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           currentRunIdRef.current = null;
           directClientRef.current?.setActiveStreamSession(null);
           assembledRef.current = '';
+          resetLiveThinkingTimeline();
 
           if (cid) {
             setMessages(prev => prev.map(m =>
@@ -5678,6 +6533,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           appendThinkingChunk(
             assistantId,
             extractThinkingChunk('status', codexProgressStatus, assembledRef.current.length > 0),
+            { lane: 'raw' },
           );
         }
         setLiveRunPhase('thinking', codexProgressStatus);
@@ -5755,6 +6611,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setIsRunning(true);
         setSessionAvailability('present');
         directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+        const preambleThinking = extractThinkingChunk(
+          'thinking',
+          cumulativePreamble,
+          assembledRef.current.length > 0,
+        );
+        appendThinkingChunk(assistantId, preambleThinking, { replace: true, lane: 'preamble' });
         setStatusText(sanitizeThinkingSubject(cumulativePreamble) || null);
         setStreamingPhase('thinking');
         setLiveRunPhase('thinking', null);
@@ -5791,7 +6653,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setSessionAvailability('present');
         directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
         applyThinkingSubject(assistantId, rawData?.subject);
-        appendThinkingChunk(assistantId, thinkingChunk);
+        appendThinkingChunk(assistantId, thinkingChunk, { lane: 'raw' });
         setLiveRunPhase('thinking', null);
         resetStreamWatchdog({ visible: true });
         return;
@@ -5809,7 +6671,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           setIsRunning(true);
           setSessionAvailability('present');
           directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
-          appendThinkingChunk(assistantId, extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0));
+          appendThinkingChunk(
+            assistantId,
+            extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0),
+            { lane: 'raw' },
+          );
           setLiveRunPhase('thinking', null);
           resetStreamWatchdog({ visible: true });
         }
@@ -6005,7 +6871,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [clearDirectPendingEmptyFinal, clearStreamRecoveryTimer, completeDirectAssistantTurn, ensureStreamingAssistantBubble, getCurrentToolStatusText, isAbortTerminalError, normalizeAgentError, reconcileIncomingRunEpoch, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, appendThinkingChunk, applyThinkingSubject, applyCompactionState, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePendingTextRender, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase, settleCancelledTurn]);
+  }, [appendLiveUserMessage, clearDirectPendingEmptyFinal, clearStreamRecoveryTimer, completeDirectAssistantTurn, ensureStreamingAssistantBubble, getCurrentToolStatusText, isAbortTerminalError, normalizeAgentError, reconcileIncomingRunEpoch, resetLiveThinkingTimeline, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, appendThinkingChunk, applyThinkingSubject, applyCompactionState, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePendingTextRender, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase, settleCancelledTurn]);
 
   // The direct gateway connection can remain open for hours. Keep the callback
   // identity passed to it stable, while dispatching each frame through the
@@ -6342,10 +7208,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setLastProvenance(null);
     setStreamingPhase('idle');
     setActiveToolName(null);
-    setThinkingContent('');
-    setThinkingSubject('');
-    thinkingSubjectRef.current = '';
-    setStreamSegments([]);
+    resetLiveThinkingTimeline();
     compactionPhaseRef.current = 'idle';
     setCompactionPhase('idle');
     assembledRef.current = '';
@@ -6358,6 +7221,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     activeStreamToolCallsRef.current = [];
     streamingAssistantIdRef.current = null;
     currentRunIdRef.current = null;
+    outstandingChatDispatchRef.current = null;
     isStreamActiveRef.current = false;
     streamTransportRef.current = null;
     directClientRef.current?.setActiveStreamSession(null);
@@ -6366,7 +7230,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     clearStreamWatchdog();
     if (postTurnHistorySyncTimerRef.current) { clearTimeout(postTurnHistorySyncTimerRef.current); postTurnHistorySyncTimerRef.current = null; }
     setIsRunning(false);
-  }, [clearStreamWatchdog, resetDirectSnapshotCursor]);
+  }, [clearStreamWatchdog, resetDirectSnapshotCursor, resetLiveThinkingTimeline]);
 
   // Resolve exec approval
   const resolveApproval = useCallback(async (
@@ -6651,11 +7515,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     pendingUserQuestionsReadyRef.current = false;
     replacePendingUserQuestions([]);
 
+    // Fence every history/stream-status observation that began before this
+    // accepted local turn. A delayed inactive R1 snapshot must never clear R2.
+    localTurnEpochRef.current += 1;
+
     // Each accepted user turn starts a fresh backend runtime sequence. This is
     // required for native providers as well as OpenClaw: some continuations do
     // not publish a separate run_resumed control frame before seq=1 arrives.
     portalTurnSequenceRef.current = null;
     portalTurnSequenceScopeRef.current = `${providerRef.current}:${sessionRef.current || 'main'}`;
+    reasoningSequenceRef.current = { runId: null, seq: null };
 
     // Add user message to UI
     const userMsg: ChatMessage = {
@@ -6679,10 +7548,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     streamActivityOrderRef.current = 0;
     hasRealToolEventsRef.current = false;
     activeStreamToolCallsRef.current = [];
-    setThinkingContent('');
-    setThinkingSubject('');
-    thinkingSubjectRef.current = '';
-    setStreamSegments([]);
+    resetLiveThinkingTimeline();
     setStatusText(null);
     setStreamingPhase('thinking');
     setActiveToolName(null);
@@ -6697,6 +7563,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       createdAt: new Date(),
     };
     appendLocalMessage(assistantMsg);
+    outstandingChatDispatchRef.current = {
+      clientMessageId: userMsg.id,
+      assistantId,
+      sessionKey: resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main',
+    };
     setIsRunning(true);
     setSessionAvailability('present');
     isStreamActiveRef.current = true;
@@ -6715,21 +7586,103 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // Wait briefly on the first user-initiated run so direct mode does not
     // silently route the initial message through the portal WS fallback.
     if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+      const currentSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
       try {
         streamTransportRef.current = 'direct';
-        const currentSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
         if (currentSession !== sessionRef.current) {
           sessionRef.current = currentSession;
           setSessionRaw(currentSession);
           persistStoredSession(providerRef.current, currentSession, agentIdRef.current);
         }
         debugLog('[ChatState] Sending via direct gateway to session:', currentSession);
-        const runId = await directClient.sendMessage(currentSession, normalized);
+        const runId = await directClient.sendMessage(currentSession, normalized, userMsg.id);
         currentRunIdRef.current = runId;
+        if (outstandingChatDispatchRef.current?.clientMessageId === userMsg.id) {
+          outstandingChatDispatchRef.current = null;
+        }
         debugLog('[ChatState] Direct send initiated, runId:', runId || '(pending)');
         // Events will come through handleDirectGatewayEvent
       } catch (err: any) {
         console.error('[ChatState] Direct gateway send failed:', err);
+        const unconfirmedSend = gatewayUnconfirmedSendFromError(err, {
+          clientMessageId: userMsg.id,
+          sessionKey: currentSession,
+        });
+        if (unconfirmedSend) {
+          // The frame may already be running upstream; do not turn an absent
+          // ACK into a false terminal error or queue a duplicate retry. The
+          // backend keeps the exact idempotency reservation fenced while the
+          // Portal bus discovers/adopts the correlated replacement run.
+          directClient.setActiveStreamSession(currentSession);
+          streamTransportRef.current = 'portal';
+          isStreamActiveRef.current = true;
+          setIsRunning(true);
+          setStreamingPhase('thinking');
+          markStreamRecovery('The send was accepted or interrupted; reconnecting to verify the active turn…');
+          const manager = wsManagerRef.current;
+          const reconnectSent = manager?.isConnected()
+            ? manager.send({
+                type: 'reconnect',
+                session: currentSession,
+                provider: 'OPENCLAW',
+                streamClientId: streamClientIdRef.current,
+              })
+            : false;
+          if (!reconnectSent) manager?.reconnect();
+          void loadHistoryInternalRef.current?.(currentSession, 'OPENCLAW', {
+            force: true,
+            refreshActiveSnapshot: true,
+            preserveLocalMessages: true,
+          });
+          return;
+        }
+        const directConflict = gatewayActiveTurnConflictFromError(err, {
+          clientMessageId: userMsg.id,
+          sessionKey: currentSession,
+        });
+        if (directConflict && handleActiveTurnConflict(directConflict)) {
+          const activeStream = directConflict.activeStream;
+          if (activeStream?.active === true) {
+            applyOpenClawActiveStreamSnapshot(activeStream, {
+              statusTextWhenNoTool: 'Reconnecting to stream…',
+              source: 'portal',
+            });
+          } else if (
+            activeStream?.safeToClear === true
+            || activeStream?.inactiveReason === 'terminal'
+            || activeStream?.inactiveReason === 'stale'
+          ) {
+            preserveLiveTurnThenClear({ terminal: true });
+            schedulePostTurnHistorySync(250);
+            return;
+          } else {
+            directClient.setActiveStreamSession(currentSession);
+            markStreamRecovery('Reconnecting to the active turn…');
+          }
+
+          // TURN_ACTIVE means the direct write did not start this optimistic
+          // turn. Hand ownership to the Portal's exact run-reconciliation path
+          // and attach its bus lane instead of rendering a terminal send error.
+          const manager = wsManagerRef.current;
+          const reconnectSent = manager?.isConnected()
+            ? manager.send({
+                type: 'reconnect',
+                session: currentSession,
+                provider: 'OPENCLAW',
+                streamClientId: streamClientIdRef.current,
+              })
+            : false;
+          if (!reconnectSent) manager?.reconnect();
+          void loadHistoryInternalRef.current?.(currentSession, 'OPENCLAW', {
+            force: true,
+            refreshActiveSnapshot: true,
+            preserveLocalMessages: true,
+          });
+          return;
+        }
+        if (outstandingChatDispatchRef.current?.clientMessageId === userMsg.id) {
+          outstandingChatDispatchRef.current = null;
+        }
         setMessages(prev => prev.map(m =>
           m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(err, 'Send failed') } : m
         ));
@@ -6749,6 +7702,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const payload: Record<string, unknown> = {
         type: 'send',
         message: normalized,
+        clientMessageId: userMsg.id,
         session: resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main',
       };
       if (providerRef.current) payload.provider = providerRef.current;
@@ -6759,6 +7713,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         try {
           await sendViaSSERef.current(normalized, assistantId);
         } catch (err: any) {
+          if (outstandingChatDispatchRef.current?.clientMessageId === userMsg.id) {
+            outstandingChatDispatchRef.current = null;
+          }
           setMessages(prev => prev.map(m =>
             m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(err, 'Send failed') } : m
           ));
@@ -6775,6 +7732,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamTransportRef.current = 'portal';
         await sendViaSSERef.current(normalized, assistantId);
       } catch (err: any) {
+        if (outstandingChatDispatchRef.current?.clientMessageId === userMsg.id) {
+          outstandingChatDispatchRef.current = null;
+        }
         setMessages(prev => prev.map(m =>
           m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(err, 'Send failed') } : m
         ));
@@ -6785,7 +7745,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
       }
     }
-  }, [appendLocalMessage, clearPendingTextRender, clearPostTurnHistorySync, normalizeAgentError, refreshPendingUserQuestions, replacePendingUserQuestions, resetDirectSnapshotCursor, resetStreamWatchdog, resolveOpenClawSessionKey, settlePendingUserQuestion, useDirectGateway, waitForDirectGatewayClient]);
+  }, [appendLocalMessage, applyOpenClawActiveStreamSnapshot, clearPendingTextRender, clearPostTurnHistorySync, handleActiveTurnConflict, markStreamRecovery, normalizeAgentError, preserveLiveTurnThenClear, refreshPendingUserQuestions, replacePendingUserQuestions, resetDirectSnapshotCursor, resetLiveThinkingTimeline, resetStreamWatchdog, resolveOpenClawSessionKey, schedulePostTurnHistorySync, settlePendingUserQuestion, useDirectGateway, waitForDirectGatewayClient]);
 
   const drainNextQueuedMessage = useCallback(() => {
     if (isStreamActiveRef.current || isQueueDrainActiveRef.current) return;
@@ -6812,7 +7772,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   // SSE fallback sender
   const sendViaSSE = useCallback(async (text: string, initialAssistantId: string) => {
     let assembled = '';
-    const assistantId = initialAssistantId;
+    let assistantId = initialAssistantId;
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
     const activeSse: ActiveSseTransport = {
@@ -6836,6 +7796,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         message: text,
         session: resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main',
         streamClientId: activeSse.streamClientId,
+        clientMessageId: outstandingChatDispatchRef.current?.assistantId === assistantId
+          ? outstandingChatDispatchRef.current.clientMessageId
+          : undefined,
       };
       if (providerRef.current) body.provider = providerRef.current;
       if (modelRef.current) body.model = modelRef.current;
@@ -6883,6 +7846,22 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           const evt = JSON.parse(payload);
           if (activeSse.stopReason) continue;
           streamTransportRef.current = 'sse';
+          if (evt?.type === 'active_turn_conflict') {
+            if (handleActiveTurnConflict(evt)) assistantId = '';
+            continue;
+          }
+          if (streamingAssistantIdRef.current) {
+            assistantId = streamingAssistantIdRef.current;
+          }
+          if (
+            !assistantId
+            && ['text', 'thinking', 'status', 'tool_start', 'tool_update', 'tool_end', 'tool_used'].includes(evt?.type)
+          ) {
+            assistantId = ensureStreamingAssistantBubble({
+              idPrefix: 'sse-resume',
+              content: '',
+            }).assistantId;
+          }
           const incomingSseRunId = normalizeRunId(evt?.runId);
           if (incomingSseRunId) {
             const epochDecision = reconcileIncomingRunEpoch(incomingSseRunId, {
@@ -6890,6 +7869,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             });
             if (epochDecision === 'reject') continue;
           }
+          recordReasoningTurnSequence(evt);
           if (SSE_LIVE_EVENT_TYPES.has(evt.type)) {
             const visibleSseActivity = (
               evt.type === 'text'
@@ -6932,9 +7912,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             const maintenanceRail = resolveMaintenanceRailStatus(evt);
             if (maintenanceRail.update) applyCompactionState(maintenanceRail.update);
             const runningToolName = getRunningToolName();
-            if (!maintenanceRail.isMaintenanceStatus && !runningToolName) {
+            if (!maintenanceRail.isMaintenanceStatus && !runningToolName && evt.preambleProgress === true) {
+              const preambleThinking = extractThinkingChunk('thinking', evt.content, assembled.length > 0);
+              appendThinkingChunk(assistantId, preambleThinking, {
+                replace: evt.replace === true,
+                lane: 'preamble',
+              });
+              if (preambleThinking) resetStreamWatchdog({ visible: true });
+              setStatusText(sanitizeThinkingSubject(evt.content) || null);
+              setStreamingPhase('thinking');
+            } else if (!maintenanceRail.isMaintenanceStatus && !runningToolName) {
               const thinkingChunk = extractThinkingChunk('status', evt.content, assembled.length > 0);
-              appendThinkingChunk(assistantId, thinkingChunk);
+              appendThinkingChunk(assistantId, thinkingChunk, { lane: 'raw' });
               if (thinkingChunk) resetStreamWatchdog({ visible: true });
             }
             if (!assembled || runningToolName) {
@@ -6943,7 +7932,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           } else if (evt.type === 'thinking') {
             applyThinkingSubject(assistantId, evt.subject);
             const thinkingChunk = extractThinkingChunk('thinking', evt.content, assembled.length > 0);
-            appendThinkingChunk(assistantId, thinkingChunk, { replace: evt.replace === true });
+            appendThinkingChunk(assistantId, thinkingChunk, { replace: evt.replace === true, lane: 'raw' });
             if (!assembled || getRunningToolName()) {
               setLiveRunPhase('thinking', null);
             }
@@ -6963,6 +7952,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             });
           } else if (evt.type === 'stream_resume') {
             applyOpenClawActiveStreamSnapshot({ ...evt, active: true }, { statusTextWhenNoTool: 'Reconnecting to stream…', source: 'sse' });
+            // The snapshot hydrator owns the authoritative cumulative text.
+            // Keep this transport-local cursor in lockstep or the next append
+            // delta will rebuild from the pre-reconnect value and erase the
+            // resumed prefix.
+            assembled = assembledRef.current;
+            assistantId = streamingAssistantIdRef.current || assistantId;
           } else if (evt.type === 'run_resumed') {
             isStreamActiveRef.current = true;
             setIsRunning(true);
@@ -7076,29 +8071,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           } else if (evt.type === 'segment_break') {
             // Don't create a new bubble — keep all text in a single streaming message.
           } else if (evt.type === 'stream_ended') {
-            clearStreamWatchdog();
-            clearPendingTextRender();
-            setStatusText(null);
-            setStreamingPhase('idle');
-            setThinkingContent('');
-            setThinkingSubject('');
-            thinkingSubjectRef.current = '';
-            setActiveToolName(null);
-            setIsRunning(false);
-            isStreamActiveRef.current = false;
-            streamTransportRef.current = null;
-            streamingAssistantIdRef.current = null;
-            activeStreamToolCallsRef.current = [];
-            currentRunIdRef.current = null;
-            directClientRef.current?.setActiveStreamSession(null);
+            outstandingChatDispatchRef.current = null;
+            lastTerminalRunIdRef.current = incomingSseRunId || currentRunIdRef.current;
+            preserveLiveTurnThenClear({ terminal: true });
             assembled = '';
-            assembledRef.current = '';
-            thinkingContentRef.current = '';
-            streamSegmentsRef.current = [];
             if (providerRef.current === 'OPENCLAW') {
               void loadHistoryInternalRef.current?.(sessionRef.current || 'main', providerRef.current, { force: true, refreshActiveSnapshot: true });
             }
           } else if (evt.type === 'done') {
+            outstandingChatDispatchRef.current = null;
             if (isAbortedDoneEvent(evt)) {
               assembled = '';
               settleCancelledTurn(incomingSseRunId);
@@ -7121,6 +8102,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                   ts: Date.now(),
                   kind: 'thinking' as const,
                   order: streamActivityOrderRef.current++,
+                  ...(reasoningLaneRef.current ? { lane: reasoningLaneRef.current } : {}),
                 }]
               : currentStreamSegs;
             const graduatedSegments = finalStreamSegs.length > 0 || hasRealToolEventsRef.current
@@ -7137,10 +8119,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             setStreamingPhase('idle');
             setActiveToolName(null);
             setIsRunning(false);
-            setThinkingContent('');
-            setThinkingSubject('');
-            thinkingSubjectRef.current = '';
-            setStreamSegments([]);
+            resetLiveThinkingTimeline();
             setLastProvenance(prov);
             isStreamActiveRef.current = false;
             streamTransportRef.current = null;
@@ -7150,12 +8129,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             directClientRef.current?.setActiveStreamSession(null);
             assembled = '';
             assembledRef.current = '';
-            thinkingContentRef.current = '';
-            streamSegmentsRef.current = [];
             if (providerUsesPortalStreamBus(providerRef.current)) {
               schedulePostTurnHistorySync(450, 2500);
             }
           } else if (evt.type === 'error') {
+            outstandingChatDispatchRef.current = null;
             clearStreamWatchdog();
             if (compactionTimerRef.current) {
               clearTimeout(compactionTimerRef.current);
@@ -7178,6 +8156,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             directClientRef.current?.setActiveStreamSession(null);
             assembled = '';
             assembledRef.current = '';
+            resetLiveThinkingTimeline();
           } else if (evt.type === 'exec_approval') {
             if (evt.approval?.id) {
               setPendingApprovals((prev) => upsertExecApproval(prev, evt.approval));
@@ -7201,7 +8180,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       activeSse.resolveSettled();
     }
-  }, [appendThinkingChunk, applyThinkingSubject, applyCompactionState, applyOpenClawActiveStreamSnapshot, buildGraduatedSegments, clearPendingTextRender, clearStreamWatchdog, getCurrentToolStatusText, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, normalizeAgentError, reconcileIncomingRunEpoch, resetStreamWatchdog, resolveOpenClawSessionKey, schedulePostTurnHistorySync, setLiveRunPhase, settleCancelledTurn]);
+  }, [appendThinkingChunk, applyThinkingSubject, applyCompactionState, applyOpenClawActiveStreamSnapshot, buildGraduatedSegments, clearPendingTextRender, clearStreamWatchdog, ensureStreamingAssistantBubble, getCurrentToolStatusText, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, handleActiveTurnConflict, normalizeAgentError, preserveLiveTurnThenClear, reconcileIncomingRunEpoch, recordReasoningTurnSequence, resetLiveThinkingTimeline, resetStreamWatchdog, resolveOpenClawSessionKey, schedulePostTurnHistorySync, setLiveRunPhase, settleCancelledTurn]);
   sendViaSSERef.current = sendViaSSE;
 
   stopActiveSseTransportRef.current = async (reason) => {
@@ -7570,6 +8549,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     lastProvenance,
     thinkingContent,
     thinkingSubject,
+    streamingAssistantId: streamingAssistantIdRef.current,
     streamSegments,
     activityTitles,
     compactionPhase,

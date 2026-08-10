@@ -239,6 +239,49 @@ describe('provider setup active-session cancellation', () => {
     });
   });
 
+  it('waits for accepted xAI cleanup instead of reporting the background proof as a failed cancel', async () => {
+    mocks.post
+      .mockResolvedValueOnce({
+        status: 202,
+        data: {
+          success: false,
+          status: 'cancelled',
+          provider: 'xai',
+          cleanupPending: true,
+          credentialState: 'indeterminate',
+          error: 'Portal is verifying that xAI did not save a credential.',
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: { success: true, status: 'cancelled' },
+      });
+    mocks.get.mockResolvedValueOnce({
+      status: 200,
+      data: {
+        provider: 'xai',
+        status: 'cancelled',
+        cleanupPending: false,
+        credentialState: 'absent',
+      },
+    });
+
+    await expect(cancelOAuthSession('/ai-setup', 'xai-background-proof')).resolves.toEqual({
+      outcome: 'cancelled',
+      confirmed: true,
+    });
+    expect(mocks.get).toHaveBeenCalledWith(
+      '/ai-setup/oauth/status/xai-background-proof',
+      { timeout: 10_000 },
+    );
+    expect(mocks.post).toHaveBeenNthCalledWith(
+      2,
+      '/ai-setup/oauth/cancel',
+      { sessionId: 'xai-background-proof' },
+      { timeout: 10_000 },
+    );
+  });
+
   it('keeps Claude setup open on 409 and closes only after cancellation is confirmed', async () => {
     const user = userEvent.setup();
     const onCancel = vi.fn();

@@ -17,6 +17,7 @@ import { canUseInteractivePortal, isElevated } from '../utils/authz';
 import { isRouteOperationOwned, useRouteOperationGuard } from '../contexts/RouteOperationContext';
 import { gatewayAPI } from '../api/endpoints';
 import type { GatewayPendingQuestion } from '../api/endpoints';
+import { resolvePortalLogoUrl } from '../utils/portalBranding';
 import {
   LayoutDashboard, Terminal, Rocket, MessageCircle, Settings, Monitor, FolderOpen,
   LogOut, Menu, X, ChevronRight, Bug, Shield, Mail, Wrench
@@ -282,7 +283,8 @@ export default function Layout() {
   const publicSettings = usePublicSettings();
   const isMobile = useIsMobile();
   const assistantName = publicSettings?.assistantName || 'Assistant';
-  const logoUrl = publicSettings?.logoUrl || '';
+  const portalName = publicSettings?.portalName?.trim() || 'BridgesLLM';
+  const logoUrl = resolvePortalLogoUrl(publicSettings?.logoUrl);
   const { logout, user } = useAuthStore();
   const userId = user?.id || '';
   const userRole = user?.role || '';
@@ -447,8 +449,8 @@ export default function Layout() {
           <button ref={mobileMenuButtonRef} disabled={routeOperationActive} onClick={() => { if (!isRouteOperationOwned()) setMobileOpen(true); }} aria-label="Open navigation menu" aria-expanded={mobileOpen} aria-controls="portal-mobile-navigation" className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-slate-400 hover:text-white disabled:cursor-wait disabled:opacity-40">
             {mobileOpen ? <X size={22} /> : <Menu size={22} />}
           </button>
-          {logoUrl ? <img src={logoUrl} alt="Portal logo" className="w-7 h-7 rounded object-cover" /> : null}
-          <span className="font-semibold">Bridges<span className="accent-text">LLM</span></span>
+          <img src={logoUrl} alt={`${portalName} logo`} className="h-7 w-7 rounded object-contain" />
+          <span className="min-w-0 truncate font-semibold">{portalName}</span>
           {pendingQuestionTotal > 0 && (
             <button
               type="button"

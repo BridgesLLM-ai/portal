@@ -27,7 +27,7 @@ export interface ProjectProviderQualificationFailure {
   message: string;
   code: string;
   retryable: boolean;
-  recovery: 'HOST_MAINTENANCE' | null;
+  recovery: 'HOST_MAINTENANCE' | 'AI_SETTINGS' | null;
   retryAt: string | null;
   suppressionExpiresAt?: string | null;
   operatorDiagnostic?: {
@@ -53,6 +53,18 @@ export function projectQualificationRecoveryAction(
     return {
       href: '/agent-chats',
       label: 'Open Agent Chat to repair host',
+    };
+  }
+  return null;
+}
+
+export function projectQualificationAuthRecoveryAction(
+  role: ProjectQualificationRecoveryRole,
+): Readonly<{ href: string; label: string }> | null {
+  if (role === 'OWNER' || role === 'SUB_ADMIN') {
+    return {
+      href: '/settings?tab=ai-providers',
+      label: 'Reconnect in AI Settings',
     };
   }
   return null;
@@ -108,11 +120,16 @@ interface ProjectProviderMenuProps {
   qualificationPending: boolean;
   onSelect: (provider: ProjectChatProviderName) => void;
   onQualify: (provider: ProjectChatProviderName) => void;
+  onReviewAgentZero: () => void;
   agentZeroModel: string;
   agentZeroModels: ProjectProviderModelOption[];
   agentZeroModelsLoading: boolean;
   agentZeroModelsError: string | null;
   onAgentZeroModelChange: (model: string) => void;
+  reviewRequest?: Readonly<{
+    provider: ProjectChatProviderName;
+    token: number;
+  }> | null;
 }
 
 const PROVIDER_MARKS: Record<ProjectChatProviderName, string> = {
@@ -177,23 +194,27 @@ export default function ProjectProviderMenu({
   qualificationPending,
   onSelect,
   onQualify,
+  onReviewAgentZero,
   agentZeroModel,
   agentZeroModels,
   agentZeroModelsLoading,
   agentZeroModelsError,
   onAgentZeroModelChange,
+  reviewRequest,
 }: ProjectProviderMenuProps) {
   const [open, setOpen] = useState(false);
   const [focusedProvider, setFocusedProvider] = useState<ProjectChatProviderName>(selectedProvider);
   const [pendingPreparedProvider, setPendingPreparedProvider] = useState<ProjectChatProviderName | null>(null);
   const menuId = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const handledReviewRequestTokenRef = useRef<number | null>(null);
   const [menuElement, setMenuElement] = useState<HTMLDivElement | null>(null);
   const selectedCapability = useMemo(
     () => providers.find((provider) => provider.provider === selectedProvider) || null,
     [providers, selectedProvider],
   );
   const hostRecoveryAction = projectQualificationRecoveryAction(hostRecoveryRole);
+  const authRecoveryAction = projectQualificationAuthRecoveryAction(hostRecoveryRole);
 
   useEffect(() => {
     setFocusedProvider(selectedProvider);
@@ -202,6 +223,18 @@ export default function ProjectProviderMenu({
   useEffect(() => {
     if (disabled) setOpen(false);
   }, [disabled]);
+
+  useEffect(() => {
+    if (
+      !reviewRequest
+      || disabled
+      || handledReviewRequestTokenRef.current === reviewRequest.token
+    ) return;
+    handledReviewRequestTokenRef.current = reviewRequest.token;
+    setFocusedProvider(reviewRequest.provider);
+    setOpen(true);
+    if (reviewRequest.provider === 'AGENT_ZERO') onReviewAgentZero();
+  }, [disabled, onReviewAgentZero, reviewRequest]);
 
   useEffect(() => {
     if (!pendingPreparedProvider || qualificationPending) return;
@@ -280,6 +313,7 @@ export default function ProjectProviderMenu({
       onQualify(capability.provider);
       return;
     }
+    if (capability.provider === 'AGENT_ZERO') onReviewAgentZero();
     setFocusedProvider(capability.provider);
   };
 
@@ -473,6 +507,40 @@ export default function ProjectProviderMenu({
                           </button>
                         </div>
                       )}
+                      {qualificationFailure?.recovery === 'AI_SETTINGS' && (
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          {authRecoveryAction ? (
+                            <a
+                              href={authRecoveryAction.href}
+                              role="menuitem"
+                              data-project-provider-focusable="true"
+                              className="inline-flex rounded-lg border border-violet-400/25 bg-violet-500/10 px-2.5 py-1.5 text-[10px] font-medium text-violet-100 transition-colors hover:bg-violet-500/20"
+                            >
+                              {authRecoveryAction.label}
+                            </a>
+                          ) : (
+                            <p className="text-[10px] font-medium text-amber-200">
+                              Contact an Owner or Sub Admin to reconnect this provider.
+                            </p>
+                          )}
+                          <button
+                            type="button"
+                            role="menuitem"
+                            data-project-provider-focusable="true"
+                            aria-label={`Recheck ${capability.displayName} after reconnecting`}
+                            disabled={qualificationPending}
+                            onClick={() => {
+                              setPendingPreparedProvider(capability.provider);
+                              setOpen(false);
+                              triggerRef.current?.focus();
+                              onQualify(capability.provider);
+                            }}
+                            className="inline-flex rounded-lg border border-theme-border bg-theme-bg px-2.5 py-1.5 text-[10px] font-medium text-theme-text transition-colors hover:bg-theme-surface disabled:cursor-wait disabled:opacity-50"
+                          >
+                            Recheck after reconnecting
+                          </button>
+                        </div>
+                      )}
                       {retryDeferred && qualificationFailure?.retryAt && (
                         <p
                           role="status"
@@ -551,7 +619,7 @@ export default function ProjectProviderMenu({
 
           <div className="flex items-center gap-1.5 border-t border-theme-border bg-theme-bg px-3 py-2 text-[9px] text-theme-text-muted">
             <ShieldCheck size={10} className="text-emerald-400" />
-            Portal prepares and checks each isolated project runtime automatically.
+            Choose Prepare provider to verify an isolated runtime before using it.
           </div>
         </div>
       </AnchoredPopover>

@@ -21,6 +21,7 @@ import { DEFAULT_REGISTRATION_MODE } from '../utils/securityDefaults';
 import ViewportOverlay from '../components/ViewportOverlay';
 import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 import FeatureReadinessPanel from '../components/settings/FeatureReadinessPanel';
+import EmbedSecurityPolicyManager from '../components/settings/EmbedSecurityPolicyManager';
 import {
   refreshPublicSettings,
   usePublicSettings,
@@ -38,6 +39,7 @@ import {
   settingsTabIdsForRole,
   type SettingsTabId,
 } from './settingsAdminContract';
+import { resolvePortalLogoUrl } from '../utils/portalBranding';
 
 const LazyBackupsTab = lazy(() => import('../components/settings/BackupsTab'));
 const LazyAiProviderSetup = lazy(() => import('../components/ai-setup/AiProviderSetup'));
@@ -387,6 +389,12 @@ function GeneralTab({ settings, draftSettings, updateSetting, setSettingValue, s
   } = useTheme();
   const currentTheme = settings['appearance.theme'] || theme;
   const currentAccent = settings['appearance.accentColor'] || accentColor;
+  const portalLogoUrl = resolvePortalLogoUrl(settings['appearance.logoUrl']);
+
+  const handleLogoSaved = (url: string | null) => {
+    setSettingValue('appearance.logoUrl', url ? url.split('?')[0] : '');
+    void refreshPublicSettings().catch(() => null);
+  };
 
   const handleThemeChange = (t: string) => {
     updateSetting('appearance.theme', t);
@@ -572,7 +580,7 @@ function GeneralTab({ settings, draftSettings, updateSetting, setSettingValue, s
           <div>
             <FieldLabel label="Portal Logo" description="Upload and crop the logo shown across the portal" />
             <div className="flex items-center gap-3">
-              {settings['appearance.logoUrl'] ? <img src={settings['appearance.logoUrl']} alt="Portal logo" className="w-10 h-10 rounded-lg object-cover border border-white/10" /> : <div className="w-10 h-10 rounded-lg bg-white/5 border border-white/10" />}
+              <img src={portalLogoUrl} alt="Portal logo" className="h-10 w-10 rounded-lg border border-white/10 object-contain" />
               <button type="button" onClick={() => setLogoEditorOpen(true)} className="min-h-[44px] px-3 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-sm text-slate-200 hover:bg-white/[0.08]">Upload and Crop</button>
             </div>
             <div className="mt-2">
@@ -648,7 +656,7 @@ function GeneralTab({ settings, draftSettings, updateSetting, setSettingValue, s
             <LazyImagePickerCropper
               isOpen={logoEditorOpen}
               onClose={() => setLogoEditorOpen(false)}
-              onSaved={(url) => setSettingValue('appearance.logoUrl', url ? url.split('?')[0] : '')}
+              onSaved={handleLogoSaved}
               currentImageUrl={settings['appearance.logoUrl'] || null}
               uploadEndpoint="/admin/appearance/logo"
               deleteEndpoint="/admin/appearance/logo"
@@ -1240,13 +1248,15 @@ function EmailTab({ capability, settings, updateSetting, onSave, isDirty, addToa
 
 // ── Security Tab ──────────────────────────────────────────────────────
 
-function SecurityTab({ mailCapability, settings, updateSetting, onSave, isDirty, addToast, claimMutation, releaseMutation, mutationOwner }: {
+function SecurityTab({ mailCapability, settings, updateSetting, onSave, isDirty, addToast, claimMutation, releaseMutation, mutationOwner, embedPolicyNavigationAttemptVersion, onEmbedPolicyDirtyChange }: {
   mailCapability?: PortalFeatureAvailability;
   settings: Record<string, string>;
   updateSetting: (k: string, v: string) => void;
   onSave: () => SettingsActionResult;
   isDirty: boolean;
   addToast: (type: 'success' | 'error', msg: string) => void;
+  embedPolicyNavigationAttemptVersion: number;
+  onEmbedPolicyDirtyChange: (dirty: boolean) => void;
 } & SettingsMutationProps) {
   const twoFactorMutationBusy = Boolean(mutationOwner?.startsWith('settings:security:2fa'));
   return (
@@ -1327,6 +1337,15 @@ function SecurityTab({ mailCapability, settings, updateSetting, onSave, isDirty,
           </div>
         </div>
       </SectionCard>
+
+      <EmbedSecurityPolicyManager
+        addToast={addToast}
+        claimMutation={claimMutation}
+        releaseMutation={releaseMutation}
+        mutationOwner={mutationOwner}
+        navigationAttemptVersion={embedPolicyNavigationAttemptVersion}
+        onDirtyChange={onEmbedPolicyDirtyChange}
+      />
 
       {/* Two-Factor Authentication (admin sees it here) */}
       <TwoFactorSection
@@ -1899,7 +1918,7 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
         <SectionCard title="OpenClaw Compatibility Hotfix">
           <div className="space-y-3">
             <p className="text-sm text-slate-400">
-              Installer and updater runs usually auto-apply this temporary OpenClaw patch now. Use this fallback if OpenClaw was upgraded separately or this install is still missing the relay and Gemini compatibility markers. Applying it patches the installed OpenClaw runtime files and restarts the OpenClaw gateway.
+              Installer and updater runs usually auto-apply this temporary OpenClaw patch now. Use this fallback if OpenClaw was upgraded separately or this install is still missing the relay, Gemini, or Claude ask-question compatibility markers. Applying it patches the installed OpenClaw runtime files and restarts the OpenClaw gateway.
             </p>
 
             {compatHotfixLoading ? (
@@ -1920,8 +1939,10 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
                     <div>Reply bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.replyBundle || 'missing'}</span></div>
                     <div>Execute runtime: <span className="font-mono text-slate-400">{compatHotfixStatus.executeRuntime || 'missing'}</span></div>
                     <div>Gemini CLI backend: <span className="font-mono text-slate-400">{compatHotfixStatus.geminiCliBackend || 'missing'}</span></div>
+                    <div>Claude CLI shared bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.claudeCliShared || 'missing'}</span></div>
                     <div>Relay patches: <span className="text-slate-400">detector {compatHotfixStatus.detectorPatched ? '✓' : '✗'}, relay {compatHotfixStatus.relayPatched ? '✓' : '✗'}, reply {compatHotfixStatus.replyPatched ? '✓' : '✗'}</span></div>
                     <div>Gemini patches: <span className="text-slate-400">cli {compatHotfixStatus.geminiCliPatched ? '✓' : '✗'}, yolo {compatHotfixStatus.geminiCliYoloPatched ? '✓' : '✗'}, runtime {compatHotfixStatus.geminiRuntimePatched ? '✓' : '✗'}</span></div>
+                    <div>Claude questions: <span className="text-slate-400">route {compatHotfixStatus.claudeAskUserPatched ? '✓' : '✗'}, bridge {compatHotfixStatus.claudeAskUserBridgeReady ? '✓' : '✗'}, timers {compatHotfixStatus.claudeAskUserTimeoutsReady ? '✓' : '✗'}</span></div>
                     {compatHotfixStatus.note && <div className="text-slate-400">{compatHotfixStatus.note}</div>}
                   </div>
                 </div>
@@ -3593,6 +3614,9 @@ export default function SettingsPage() {
   const { toasts, add: addToast } = useToasts();
   const settingsMutationOwnerRef = useRef<string | null>(null);
   const [settingsMutationOwner, setSettingsMutationOwner] = useState<string | null>(null);
+  const embedPolicyDirtyRef = useRef(false);
+  const [embedPolicyDirty, setEmbedPolicyDirty] = useState(false);
+  const [embedPolicyNavigationAttemptVersion, setEmbedPolicyNavigationAttemptVersion] = useState(0);
   const releaseNavigationLockRef = useRef<(() => void) | null>(null);
   const mutationNavigationGuardRef = useRef<{
     url: string;
@@ -3605,6 +3629,11 @@ export default function SettingsPage() {
     releaseNavigationLockRef.current = null;
     mutationNavigationGuardRef.current = null;
   }, []);
+
+  const releaseNavigationLockIfIdle = useCallback(() => {
+    if (settingsMutationOwnerRef.current || embedPolicyDirtyRef.current) return;
+    releaseNavigationLock();
+  }, [releaseNavigationLock]);
 
   const acquireNavigationLock = useCallback(() => {
     if (releaseNavigationLockRef.current) return;
@@ -3643,8 +3672,25 @@ export default function SettingsPage() {
     if (settingsMutationOwnerRef.current !== owner) return;
     settingsMutationOwnerRef.current = null;
     setSettingsMutationOwner(null);
-    releaseNavigationLock();
-  }, [releaseNavigationLock]);
+    releaseNavigationLockIfIdle();
+  }, [releaseNavigationLockIfIdle]);
+
+  const handleEmbedPolicyDirtyChange = useCallback((dirty: boolean) => {
+    if (embedPolicyDirtyRef.current === dirty) return;
+    embedPolicyDirtyRef.current = dirty;
+    setEmbedPolicyDirty(dirty);
+    if (dirty) {
+      acquireNavigationLock();
+      return;
+    }
+    setEmbedPolicyNavigationAttemptVersion(0);
+    releaseNavigationLockIfIdle();
+  }, [acquireNavigationLock, releaseNavigationLockIfIdle]);
+
+  const reportEmbedPolicyNavigationAttempt = useCallback(() => {
+    if (!embedPolicyDirtyRef.current) return;
+    setEmbedPolicyNavigationAttemptVersion((current) => current + 1);
+  }, []);
 
   const mutationCoordinator = useMemo(() => ({
     owner: settingsMutationOwner,
@@ -3715,11 +3761,15 @@ export default function SettingsPage() {
 
   const selectTab = useCallback((tab: TabId) => {
     if (settingsMutationOwnerRef.current) return;
+    if (embedPolicyDirtyRef.current) {
+      reportEmbedPolicyNavigationAttempt();
+      return;
+    }
     const next = new URLSearchParams(searchParams);
     next.set('tab', tab);
     next.delete('setup');
     setSearchParams(next, { replace: true });
-  }, [searchParams, setSearchParams]);
+  }, [reportEmbedPolicyNavigationAttempt, searchParams, setSearchParams]);
 
   const handleTailnetStatus = useCallback((
     status: OllamaTailnetStatus,
@@ -3806,18 +3856,20 @@ export default function SettingsPage() {
       );
     };
     const preventMutationUnload = (event: BeforeUnloadEvent) => {
-      if (!settingsMutationOwnerRef.current) return;
+      if (!settingsMutationOwnerRef.current && !embedPolicyDirtyRef.current) return;
       event.preventDefault();
       event.returnValue = '';
     };
     const preventOutsideSettingsInteraction = (event: Event) => {
-      if (!settingsMutationOwnerRef.current || ownsSettingsInteraction(event.target)) return;
+      if ((!settingsMutationOwnerRef.current && !embedPolicyDirtyRef.current) || ownsSettingsInteraction(event.target)) return;
+      reportEmbedPolicyNavigationAttempt();
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
     };
     const preventHistoryTraversal = (event: PopStateEvent) => {
-      if (!settingsMutationOwnerRef.current) return;
+      if (!settingsMutationOwnerRef.current && !embedPolicyDirtyRef.current) return;
+      reportEmbedPolicyNavigationAttempt();
       const guard = mutationNavigationGuardRef.current;
       if (!guard) return;
       event.preventDefault();
@@ -3842,7 +3894,7 @@ export default function SettingsPage() {
       document.removeEventListener('pointerdown', preventOutsideSettingsInteraction, true);
       document.removeEventListener('click', preventOutsideSettingsInteraction, true);
     };
-  }, []);
+  }, [reportEmbedPolicyNavigationAttempt]);
 
   useEffect(() => releaseNavigationLock, [releaseNavigationLock]);
 
@@ -3875,6 +3927,9 @@ export default function SettingsPage() {
       try {
         const updated = await settingsAPI.updatePortalSettings(snapshot);
         setSettings(prev => ({ ...prev, ...updated }));
+        if (tab === 'general') {
+          void refreshPublicSettings().catch(() => null);
+        }
         setDraftSettings((prev) => {
           const next = { ...prev };
           for (const key of keys) {
@@ -3941,7 +3996,7 @@ export default function SettingsPage() {
 
       <div className={`mb-6 rounded-xl border px-4 py-3 text-xs leading-5 ${isOwner ? 'border-fuchsia-500/20 bg-fuchsia-500/5 text-fuchsia-100' : user?.role === 'SUB_ADMIN' ? 'border-purple-500/20 bg-purple-500/5 text-purple-100' : 'border-white/[0.08] bg-white/[0.03] text-slate-300'}`}>
         {isOwner
-          ? <>Portal-wide configuration belongs here. User authority, approvals, and guarded server maintenance live in <Link to="/admin" aria-disabled={Boolean(settingsMutationOwner)} onClick={(event) => { if (settingsMutationOwnerRef.current) event.preventDefault(); }} className="font-semibold underline underline-offset-2">Admin</Link>.</>
+          ? <>Portal-wide configuration belongs here. User authority, approvals, and guarded server maintenance live in <Link to="/admin" aria-disabled={Boolean(settingsMutationOwner) || embedPolicyDirty} onClick={(event) => { if (settingsMutationOwnerRef.current || embedPolicyDirtyRef.current) { event.preventDefault(); reportEmbedPolicyNavigationAttempt(); } }} className="font-semibold underline underline-offset-2">Admin</Link>.</>
           : user?.role === 'SUB_ADMIN'
             ? <>Feature Readiness is intentionally read-only. As a root-equivalent host operator you can inspect maintenance in <Link to="/admin?tab=maintenance" aria-disabled={Boolean(settingsMutationOwner)} onClick={(event) => { if (settingsMutationOwnerRef.current) event.preventDefault(); }} className="font-semibold underline underline-offset-2">Admin</Link>, but only the Owner can change Portal or server configuration.</>
             : 'Portal-wide configuration is Owner-managed. These settings affect only your account and browser preferences.'}
@@ -4011,7 +4066,7 @@ export default function SettingsPage() {
                     Unavailable
                   </span>
                 )}
-                {dirtyTabs.has(id) && <span className="text-amber-400 text-xs ml-auto">*</span>}
+                {(dirtyTabs.has(id) || (id === 'security' && embedPolicyDirty)) && <span className="text-amber-400 text-xs ml-auto">*</span>}
               </button>
             ))}
           </div>
@@ -4090,6 +4145,8 @@ export default function SettingsPage() {
                   claimMutation={claimMutation}
                   releaseMutation={releaseMutation}
                   mutationOwner={settingsMutationOwner}
+                  embedPolicyNavigationAttemptVersion={embedPolicyNavigationAttemptVersion}
+                  onEmbedPolicyDirtyChange={handleEmbedPolicyDirtyChange}
                 />
               )}
               {activeTab === 'agents' && (

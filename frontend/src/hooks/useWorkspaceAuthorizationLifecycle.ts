@@ -9,6 +9,7 @@ import {
   setWorkspaceAuthorizationBaseline,
   type WorkspaceAuthorizationChangeDetail,
 } from '../utils/workspaceAuthorization';
+import { resolvePortalLogoUrl } from '../utils/portalBranding';
 
 const PRIVACY_CURTAIN_ID = 'portal-workspace-authorization-curtain';
 const PRIVACY_CURTAIN_STYLE_ID = 'portal-workspace-authorization-curtain-style';
@@ -17,15 +18,16 @@ const PRIVACY_CURTAIN_STYLE_ID = 'portal-workspace-authorization-curtain-style';
 // everything below. The opaque base colour is applied to the curtain element
 // itself, synchronously, so the workspace is covered on the first frame -- only
 // the ornamental layers fade in. And nothing here may block on the network: the
-// mark is read from the favicon link the app already maintains, and if it is
-// missing or fails to decode the composition still reads as deliberate.
+// mark resolves directly to the install's high-resolution display asset, and
+// if it fails to decode the composition still reads as deliberate.
 const CURTAIN_INK = '#0A0E27';
 const CURTAIN_EMERALD = '16, 185, 129';
 
-function portalMarkUrl(): string {
-  const link = document.querySelector<HTMLLinkElement>("link[data-portal-favicon='true']");
-  const href = link?.href?.trim();
-  return href || '/favicon.ico';
+function curtainBackgroundImage(logoUrl: string): string {
+  // A Portal owner can enter the generic logo URL as text. JSON string syntax
+  // is also valid inside CSS url(), and safely quotes backslashes, quotes, and
+  // control characters before the value reaches CSSOM.
+  return `url(${JSON.stringify(logoUrl)})`;
 }
 
 function ensureCurtainStyles(): void {
@@ -55,8 +57,9 @@ function curtainLayer(styles: Partial<CSSStyleDeclaration>): HTMLDivElement {
   return layer;
 }
 
-export function showWorkspacePrivacyCurtain(): void {
+export function showWorkspacePrivacyCurtain(logoUrl?: string | null): void {
   if (typeof document === 'undefined') return;
+  const resolvedLogoUrl = resolvePortalLogoUrl(logoUrl);
   const root = document.getElementById('root');
   if (root) {
     if (!root.dataset.authorizationPreviousVisibility) {
@@ -65,7 +68,12 @@ export function showWorkspacePrivacyCurtain(): void {
     root.style.visibility = 'hidden';
     root.setAttribute('aria-hidden', 'true');
   }
-  if (document.getElementById(PRIVACY_CURTAIN_ID)) return;
+  const existingCurtain = document.getElementById(PRIVACY_CURTAIN_ID);
+  if (existingCurtain) {
+    const existingMark = existingCurtain.querySelector<HTMLElement>('[data-portal-curtain-layer="mark"]');
+    if (existingMark) existingMark.style.backgroundImage = curtainBackgroundImage(resolvedLogoUrl);
+    return;
+  }
   ensureCurtainStyles();
 
   const curtain = document.createElement('div');
@@ -107,7 +115,7 @@ export function showWorkspacePrivacyCurtain(): void {
   // means any uploaded logo -- whatever its palette -- resolves into the same
   // cool register instead of fighting the theme.
   const mark = curtainLayer({
-    backgroundImage: `url("${portalMarkUrl()}")`,
+    backgroundImage: curtainBackgroundImage(resolvedLogoUrl),
     backgroundRepeat: 'no-repeat',
     backgroundPosition: 'center 46%',
     backgroundSize: 'min(78vmin, 880px)',
@@ -246,8 +254,9 @@ export function quarantineWorkspaceAuthorization(
   userId: string,
   authorizationVersion: number,
   navigate: (url: string) => void = (url) => window.location.replace(url),
+  logoUrl?: string | null,
 ): void {
-  showWorkspacePrivacyCurtain();
+  showWorkspacePrivacyCurtain(logoUrl);
   try {
     clearWorkspaceClientState();
   } catch {
@@ -273,9 +282,18 @@ export function quarantineWorkspaceAuthorization(
 
 export function useWorkspaceAuthorizationLifecycle(
   navigate?: (url: string) => void,
+  logoUrl?: string | null,
 ): void {
   const { user, isAuthenticated, sessionRestoreError, restoreSession } = useAuthStore();
   const quarantinedRef = useRef(false);
+  const logoUrlRef = useRef<string | null | undefined>(logoUrl);
+  logoUrlRef.current = logoUrl;
+
+  useEffect(() => {
+    if (document.getElementById(PRIVACY_CURTAIN_ID)) {
+      showWorkspacePrivacyCurtain(logoUrl);
+    }
+  }, [logoUrl]);
 
   useEffect(() => {
     if (!isAuthenticated || !user?.id || sessionRestoreError) {
@@ -285,7 +303,7 @@ export function useWorkspaceAuthorizationLifecycle(
 
     const userId = user.id;
     const localVersion = Number(user.authorizationVersion ?? 1);
-    showWorkspacePrivacyCurtain();
+    showWorkspacePrivacyCurtain(logoUrlRef.current);
     const wsUrl = import.meta.env.VITE_WS_URL
       || import.meta.env.VITE_API_URL?.replace('/api', '')
       || window.location.origin;
@@ -297,7 +315,7 @@ export function useWorkspaceAuthorizationLifecycle(
     const quarantine = (version: number) => {
       if (quarantinedRef.current) return;
       quarantinedRef.current = true;
-      quarantineWorkspaceAuthorization(userId, version, navigate);
+      quarantineWorkspaceAuthorization(userId, version, navigate, logoUrlRef.current);
     };
 
     // A response may observe a newer generation between React effect teardown
@@ -354,7 +372,7 @@ export function useWorkspaceAuthorizationLifecycle(
         return;
       }
       if (!Number.isSafeInteger(version) || version !== localVersion) {
-        showWorkspacePrivacyCurtain();
+        showWorkspacePrivacyCurtain(logoUrlRef.current);
         verifyAfterTransportLoss();
         return;
       }
@@ -370,19 +388,19 @@ export function useWorkspaceAuthorizationLifecycle(
     });
     socket.on('disconnect', () => {
       trustedSocketVersion = null;
-      if (!quarantinedRef.current) showWorkspacePrivacyCurtain();
+      if (!quarantinedRef.current) showWorkspacePrivacyCurtain(logoUrlRef.current);
     });
     socket.on('connect_error', () => {
       trustedSocketVersion = null;
-      if (!quarantinedRef.current) showWorkspacePrivacyCurtain();
+      if (!quarantinedRef.current) showWorkspacePrivacyCurtain(logoUrlRef.current);
       verifyAfterTransportLoss();
     });
 
-    const onPageHide = () => showWorkspacePrivacyCurtain();
+    const onPageHide = () => showWorkspacePrivacyCurtain(logoUrlRef.current);
     const onPageShow = (event: PageTransitionEvent) => {
       if (!event.persisted || quarantinedRef.current) return;
       pageRestorePending = true;
-      showWorkspacePrivacyCurtain();
+      showWorkspacePrivacyCurtain(logoUrlRef.current);
       verifyAfterTransportLoss();
       if (!socket?.connected || trustedSocketVersion !== localVersion) socket?.connect();
     };

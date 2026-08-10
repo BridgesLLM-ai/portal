@@ -313,6 +313,36 @@ function assertProjectContext(
   }
 }
 
+function assertHistoricalProjectContext(
+  context: ProjectSandboxExecutionContext,
+  profile: NativeCliProjectRuntimeProfile,
+): void {
+  assertProfile(profile);
+  assertExecutionContextBinding(context, context.userId, 'PROJECT_SANDBOX');
+  const expectedPolicyPrefix = profile.provider === 'CLAUDE_CODE'
+    ? 'portal-claude-code-project-sandbox-v'
+    : 'portal-antigravity-project-sandbox-v';
+  if (!new RegExp(`^${expectedPolicyPrefix}[1-9][0-9]*$`).test(context.runtimePolicyVersion)) {
+    fail('RUNTIME_POLICY', `${profile.displayName} historical runtime policy version is invalid`);
+  }
+  if (!/^portal-project-egress-v[1-9][0-9]*$/.test(context.egressPolicyVersion)) {
+    fail('EGRESS_POLICY', `${profile.displayName} historical egress policy version is invalid`);
+  }
+  requirePinnedImage(context.runtimeImageDigest);
+  if (context.policyFingerprint !== nativeCliContextPolicyFingerprint(context, profile)) {
+    fail('POLICY_FINGERPRINT', `${profile.displayName} historical policy fingerprint is invalid`);
+  }
+  const root = attestProjectRoot(context.canonicalRoot);
+  if (
+    root.canonicalRoot !== context.canonicalRoot
+    || root.rootDevice !== context.rootDevice
+    || root.rootInode !== context.rootInode
+    || root.rootBirthtimeNs !== context.rootBirthtimeNs
+  ) {
+    fail('PROJECT_ROOT_IDENTITY', `${profile.displayName} Project root no longer matches its immutable identity`);
+  }
+}
+
 function assertEgressIdentity(
   context: ProjectSandboxExecutionContext,
   profile: NativeCliProjectRuntimeProfile,
@@ -1560,6 +1590,137 @@ async function stopExactCurrentRuntimeAfterFailure(input: {
     // Never fall back to the deterministic name: it may now belong to an
     // unrelated container. Preserving the original failure is safer.
   }
+}
+
+function assertNativeCliProjectRuntimeStopTarget(input: {
+  inspect: DockerContainerInspect;
+  context: ProjectSandboxExecutionContext;
+  profile: NativeCliProjectRuntimeProfile;
+}): string {
+  const { inspect, context, profile } = input;
+  const containerId = String(inspect.Id || '').toLowerCase();
+  const labels = inspect.Config?.Labels || {};
+  if (
+    !/^[a-f0-9]{64}$/.test(containerId)
+    || !new RegExp(`^/?${profile.containerNamePrefix}-[a-f0-9]{24}$`).test(String(inspect.Name || ''))
+    || String(inspect.Image || '').toLowerCase() !== context.runtimeImageDigest.toLowerCase()
+    || String(inspect.Config?.Image || '').toLowerCase() !== context.runtimeImageDigest.toLowerCase()
+    || labels[RUNTIME_POLICY_LABEL] !== context.runtimePolicyVersion
+    || labels[NATIVE_CLI_PROJECT_RUNTIME_PROVIDER_LABEL] !== profile.provider
+    || labels[NATIVE_CLI_PROJECT_RUNTIME_ACTOR_LABEL]
+      !== hashNativeCliProjectRuntimeLabelIdentity(context.userId)
+    || labels[NATIVE_CLI_PROJECT_RUNTIME_IDENTITY_LABEL]
+      !== hashNativeCliProjectRuntimeLabelIdentity(context.projectId)
+    || inspect.Config?.User !== NATIVE_CLI_PROJECT_CONTAINER_USER
+    || inspect.Config?.WorkingDir !== NATIVE_CLI_PROJECT_CONTAINER_ROOT
+    || !valuesEqual(inspect.Config?.Entrypoint || [], ['node'])
+    || !valuesEqual(inspect.Config?.Cmd || [], ['-e', IDLE_SCRIPT])
+  ) {
+    fail(
+      'RUNTIME_STOP_IDENTITY',
+      `Refusing to stop an unattested ${profile.displayName} Project runtime`,
+    );
+  }
+  assertExactMounts(inspect, context.canonicalRoot);
+  return containerId;
+}
+
+/**
+ * Stop every shared native-CLI runtime bound to one exact actor/project and
+ * provider identity. This deliberately performs no ensure/convergence work:
+ * restart recovery uses it only after the expired durable Project CAS proves
+ * that no newer operation can own this project. Full immutable IDs, the
+ * provider-specific labels, pinned image, fixed idle process, and exact
+ * Project mount are all re-attested before and after the stop.
+ */
+export async function stopNativeCliProjectRuntimesForContext(
+  context: ProjectSandboxExecutionContext,
+  profile: NativeCliProjectRuntimeProfile,
+  executor: ProjectEgressCommandExecutor = nativeCliProjectEgressCommandExecutor,
+): Promise<readonly string[]> {
+  return stopNativeCliProjectRuntimes(context, profile, executor, false);
+}
+
+/** Stop-only recovery for a server-persisted context from an older release. */
+export async function stopNativeCliProjectRuntimesForRecoveryContext(
+  context: ProjectSandboxExecutionContext,
+  profile: NativeCliProjectRuntimeProfile,
+  executor: ProjectEgressCommandExecutor = nativeCliProjectEgressCommandExecutor,
+): Promise<readonly string[]> {
+  return stopNativeCliProjectRuntimes(context, profile, executor, true);
+}
+
+async function stopNativeCliProjectRuntimes(
+  context: ProjectSandboxExecutionContext,
+  profile: NativeCliProjectRuntimeProfile,
+  executor: ProjectEgressCommandExecutor,
+  historical: boolean,
+): Promise<readonly string[]> {
+  if (historical) assertHistoricalProjectContext(context, profile);
+  else assertProjectContext(context, profile);
+  const actorLabel = hashNativeCliProjectRuntimeLabelIdentity(context.userId);
+  const projectLabel = hashNativeCliProjectRuntimeLabelIdentity(context.projectId);
+  const listed = await executor.run('docker', [
+    'container', 'ls', '-a', '--no-trunc',
+    '--filter', `label=${NATIVE_CLI_PROJECT_RUNTIME_PROVIDER_LABEL}=${profile.provider}`,
+    '--filter', `label=${NATIVE_CLI_PROJECT_RUNTIME_ACTOR_LABEL}=${actorLabel}`,
+    '--filter', `label=${NATIVE_CLI_PROJECT_RUNTIME_IDENTITY_LABEL}=${projectLabel}`,
+    '--format', '{{.ID}}',
+  ]);
+  const containerIds = listed.stdout
+    .split(/\r?\n/)
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  if (
+    containerIds.length > 8
+    || new Set(containerIds).size !== containerIds.length
+    || containerIds.some((entry) => !/^[a-f0-9]{64}$/.test(entry))
+  ) {
+    fail('RUNTIME_STOP_DISCOVERY', `${profile.displayName} Project runtime discovery was ambiguous`);
+  }
+
+  const attested = [] as Array<{ containerId: string; running: boolean }>;
+  for (const discoveredId of containerIds) {
+    const inspect = await strictInspectContainer(executor, discoveredId);
+    if (!inspect) continue;
+    const containerId = assertNativeCliProjectRuntimeStopTarget({ inspect, context, profile });
+    if (containerId !== discoveredId) {
+      fail(
+        'RUNTIME_STOP_IDENTITY',
+        `${profile.displayName} Project runtime changed during stop attestation`,
+      );
+    }
+    if (typeof inspect.State?.Running !== 'boolean') {
+      fail('RUNTIME_STOP_STATE', `${profile.displayName} Project runtime state is ambiguous`);
+    }
+    attested.push({ containerId, running: inspect.State.Running });
+  }
+
+  const stopped: string[] = [];
+  for (const candidate of attested) {
+    const { containerId } = candidate;
+    if (candidate.running) {
+      await executor.run(
+        'docker',
+        ['container', 'stop', '--time', '3', containerId],
+        { allowExitCodes: [0, 1] },
+      );
+    }
+    const after = await strictInspectContainer(executor, containerId);
+    if (after) {
+      const afterId = assertNativeCliProjectRuntimeStopTarget({ inspect: after, context, profile });
+      if (afterId !== containerId || after.State?.Running !== false) {
+        fail(
+          'RUNTIME_STOP_UNCONFIRMED',
+          `${profile.displayName} Project runtime remained active after stop`,
+        );
+      }
+    }
+    stopped.push(containerId);
+  }
+  if (historical) assertHistoricalProjectContext(context, profile);
+  else assertProjectContext(context, profile);
+  return Object.freeze(stopped);
 }
 
 async function ensureRuntimeLocked(input: {

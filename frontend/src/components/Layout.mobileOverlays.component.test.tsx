@@ -135,6 +135,20 @@ describe('Layout mobile overlay ownership', () => {
     shellMocks.pendingQuestions.mockReset().mockResolvedValue({ questions: [] });
   });
 
+  it('renders the configured portal name and custom mark in the mobile header', () => {
+    shellMocks.publicSettings = {
+      portalName: 'Acme Operations',
+      assistantName: 'Atlas',
+      logoUrl: '/static-assets/branding/acme.gif',
+      mail: { available: true, reason: null },
+    };
+    renderMobileLayout();
+
+    expect(screen.getByText('Acme Operations')).toBeVisible();
+    expect(screen.getByRole('img', { name: 'Acme Operations logo' }))
+      .toHaveAttribute('src', '/static-assets/branding/acme.gif');
+  });
+
   it('shows a cross-section badge that links a waiting Project question back to Projects', async () => {
     shellMocks.pendingQuestions.mockResolvedValue({
       questions: [{

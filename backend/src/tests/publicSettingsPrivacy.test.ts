@@ -71,4 +71,23 @@ describe('public settings privacy boundary', () => {
       expect.stringContaining('private, no-store'),
     );
   });
+
+  it('normalizes legacy logo and accent rows before they reach public HTML consumers', async () => {
+    mockFindMany.mockResolvedValue([
+      { key: 'appearance.logoUrl', value: 'javascript:alert(1)' },
+      { key: 'appearance.accentColor', value: 'red; background:url(evil)' },
+    ]);
+
+    const { payload } = await invokeHandler('/public');
+    expect(payload.logoUrl).toBe('');
+    expect(payload.accentColor).toBe('#6366f1');
+
+    mockFindMany.mockResolvedValue([
+      { key: 'appearance.logoUrl', value: '/static-assets/branding/tenant.gif?rev=2' },
+      { key: 'appearance.accentColor', value: '#AABBCC' },
+    ]);
+    const valid = await invokeHandler('/public');
+    expect(valid.payload.logoUrl).toBe('/static-assets/branding/tenant.gif?rev=2');
+    expect(valid.payload.accentColor).toBe('#aabbcc');
+  });
 });

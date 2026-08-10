@@ -1,13 +1,33 @@
-import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense, useContext, type ReactNode } from 'react';
+import {
+  Component,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useMemo,
+  lazy,
+  Suspense,
+  useContext,
+  type ErrorInfo,
+  type ReactNode,
+} from 'react';
 import { UNSAFE_NavigationContext, useLocation, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useDropzone } from 'react-dropzone';
 import {
   projectsAPI,
   aiAPI,
+  projectRuntimeRecoveryCompletion,
   type ProjectIdentityProof,
+  type ProjectDeploymentProcessState,
+  type ProjectLifecycleAction,
+  type ProjectRuntimeManagement,
+  type ProjectRuntimeRecoveryReplayProof,
+  type ProjectRuntimeStatusSource,
+  type ProjectShareLink,
   type ProjectSummary,
   type ProjectTreeEntry,
+  type ShareRateLimitWindowSeconds,
 } from '../api/endpoints';
 import { extractError, logError } from '../utils/errorHelpers';
 import {
@@ -15,6 +35,7 @@ import {
   workspaceAuthorizedFetch,
 } from '../utils/workspaceAuthorizedFetch';
 import { useAuthStore } from '../contexts/AuthContext';
+import { isOwner } from '../utils/authz';
 import { useTheme } from '../contexts/ThemeContext';
 import {
   claimRouteOperation,
@@ -22,6 +43,8 @@ import {
   releaseRouteOperation,
 } from '../contexts/RouteOperationContext';
 import ConfirmDialog from '../components/ConfirmDialog';
+import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
+import { projectRuntimeImageRepairAPI } from '../api/projectRuntimeImageRepair';
 import ViewportOverlay from '../components/ViewportOverlay';
 import ViewportModal from '../components/ViewportModal';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -50,7 +73,7 @@ import {
   Diff, History, Maximize2, Minimize2, Search,
   Activity, FileQuestion, Zap, AlertCircle, CheckCircle,
   PanelLeftClose, PanelLeft, Command, Lock, Edit3,
-  Image, Film, Music, Volume2, ZoomIn, ZoomOut, Mail, SendHorizonal
+  Image, Film, Music, Volume2, ZoomIn, ZoomOut, Mail, SendHorizonal, Users, Gauge
 } from 'lucide-react';
 const LazyMonacoEditor = lazy(() => import('../components/projects/LazyMonacoEditor'));
 const LazyProjectPdfViewer = lazy(() => import('../components/projects/ProjectPdfViewer'));
@@ -59,6 +82,44 @@ const LazyProjectTextPreviewViewer = lazy(() => import('../components/projects/P
 const LazyProjectBinaryViewer = lazy(() => import('../components/projects/ProjectBinaryViewer'));
 const LazyMarkdownPreviewFrame = lazy(() => import('../components/projects/MarkdownPreviewFrame'));
 const LazyProjectChatPanel = lazy(() => import('../components/chat/ProjectChatPanel'));
+
+class ProjectChatChunkBoundary extends Component<{
+  resetKey: string;
+  onClose: () => void;
+  children: ReactNode;
+}, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    logError(error, `Loading Project Chat (${info.componentStack ? 'component' : 'chunk'})`);
+  }
+
+  componentDidUpdate(previous: Readonly<{ resetKey: string }>) {
+    if (previous.resetKey !== this.props.resetKey && this.state.failed) {
+      this.setState({ failed: false });
+    }
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div role="alert" className="flex w-[340px] max-w-full flex-col justify-center gap-3 border-l border-white/5 bg-[#080B20]/95 p-5 text-sm">
+        <div>
+          <p className="font-medium text-red-200">Project Chat didn’t load</p>
+          <p className="mt-1 text-xs leading-relaxed text-slate-400">The chat code could not be opened. Your project and files are unchanged.</p>
+        </div>
+        <div className="flex gap-2">
+          <button type="button" onClick={() => window.location.reload()} className="rounded-lg bg-purple-500/20 px-3 py-2 text-xs text-purple-200 hover:bg-purple-500/30">Reload Projects</button>
+          <button type="button" onClick={this.props.onClose} className="rounded-lg bg-white/5 px-3 py-2 text-xs text-slate-300 hover:bg-white/10">Close</button>
+        </div>
+      </div>
+    );
+  }
+}
 
 // --- Types ---
 type TreeEntry = ProjectTreeEntry;
@@ -71,18 +132,253 @@ interface EnhancedCommit {
   message: string; refs: string; parentHash?: string;
   stats: { filesChanged: number; insertions: number; deletions: number; files: Array<{ path: string; additions: number; deletions: number }> };
 }
-interface ShareLink { id: string; token: string; isActive: boolean; isPublic: boolean; currentUses: number; maxUses: number | null; expiresAt: string | null; createdAt: string; }
+type ShareLink = ProjectShareLink;
 interface ActivityEntry { id: string; action: string; resource: string; resourceId?: string; severity: string; createdAt: string; }
-interface DeploymentProcessState {
-  status: string;
-  deployType: string;
-  supportedActions: string[];
-  port?: number;
-  logs: string[];
-  restartCount: number;
-  lastError?: string;
+
+type RuntimeImageRepairRetryAction = 'deploy' | 'start' | 'restart';
+type RuntimeImageRepairReplayOutcome = 'completed' | 'stale' | 'indeterminate' | 'failed';
+
+type RuntimeImageRepairRetryOwner = Readonly<{
+  projectName: string;
+  projectGeneration: number;
+  retryAction: RuntimeImageRepairRetryAction;
+  recoveryReplay: ProjectRuntimeRecoveryReplayProof;
+}>;
+
+interface DeploymentControlFailure {
+  message: string;
+  detail?: string;
   limitation?: string;
-  message?: string;
+  code?: string;
+  recoveryAction?: 'REPAIR_PROJECT_RUNTIME_IMAGE' | 'UNDEPLOY_CURRENT_DEPLOYMENT';
+  recoveryReplay?: ProjectRuntimeRecoveryReplayProof;
+  retryAction?: RuntimeImageRepairRetryAction;
+  retryOwner?: Omit<RuntimeImageRepairRetryOwner, 'retryAction'>;
+}
+
+function boundedDeploymentText(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  return normalized.length <= maxLength
+    ? normalized
+    : `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function projectRuntimeRecoveryReplayProof(value: unknown): ProjectRuntimeRecoveryReplayProof | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).some((key) => ![
+      'proof',
+      'action',
+      'projectIdentity',
+      'expectedAppId',
+      'expectedDeployType',
+      'sourceDigest',
+    ].includes(key))
+    || typeof record.proof !== 'string'
+    || !/^v1\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/.test(record.proof)
+    || !['deploy', 'start', 'restart'].includes(String(record.action))
+    || !record.projectIdentity
+    || typeof record.projectIdentity !== 'object'
+    || Array.isArray(record.projectIdentity)
+  ) return undefined;
+  const identity = record.projectIdentity as Record<string, unknown>;
+  if (
+    Object.keys(identity).some((key) => key !== 'id' && key !== 'generation')
+    || typeof identity.id !== 'string'
+    || !identity.id
+    || identity.id.length > 128
+    || identity.id.trim() !== identity.id
+    || !Number.isSafeInteger(identity.generation)
+    || (identity.generation as number) < 1
+    || (record.expectedAppId !== null && (
+      typeof record.expectedAppId !== 'string'
+      || !record.expectedAppId
+      || record.expectedAppId.length > 128
+      || record.expectedAppId.trim() !== record.expectedAppId
+    ))
+  ) return undefined;
+  const action = record.action as ProjectRuntimeRecoveryReplayProof['action'];
+  if (
+    action === 'deploy'
+      ? record.expectedDeployType !== 'fullstack'
+        || typeof record.sourceDigest !== 'string'
+        || !/^[a-f0-9]{64}$/.test(record.sourceDigest)
+      : record.expectedDeployType !== undefined
+        || record.sourceDigest !== undefined
+        || record.expectedAppId === null
+  ) return undefined;
+  return Object.freeze({
+    proof: record.proof,
+    action,
+    projectIdentity: Object.freeze({
+      id: identity.id,
+      generation: identity.generation as number,
+    }),
+    expectedAppId: record.expectedAppId as string | null,
+    ...(action === 'deploy' ? {
+      expectedDeployType: 'fullstack' as const,
+      sourceDigest: record.sourceDigest as string,
+    } : {}),
+  });
+}
+
+function projectRuntimeRecoveryTransportFailure(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const record = error as Record<string, unknown>;
+  if (record.code === 'ERR_CANCELED' || record.name === 'CanceledError') return false;
+  return record.response === undefined && (
+    record.isAxiosError === true
+    || record.request !== undefined
+    || ['ERR_NETWORK', 'ECONNABORTED', 'ETIMEDOUT'].includes(String(record.code || ''))
+  );
+}
+
+function projectRuntimeRecoveryReplayFailureOutcome(
+  failure: Pick<DeploymentControlFailure, 'code'>,
+): Exclude<RuntimeImageRepairReplayOutcome, 'completed'> {
+  if (
+    failure.code === 'PROJECT_RUNTIME_RECOVERY_IN_PROGRESS'
+    || failure.code === 'PROJECT_RUNTIME_RECOVERY_INDETERMINATE'
+  ) return 'indeterminate';
+  if (
+    failure.code === 'PROJECT_RUNTIME_RECOVERY_STALE'
+    || failure.code === 'PROJECT_RUNTIME_RECOVERY_REPLAY_STALE'
+    || failure.code === 'PROJECT_RUNTIME_RECOVERY_PROOF_EXPIRED'
+    || failure.code === 'PROJECT_RUNTIME_RECOVERY_PROOF_MISMATCH'
+  ) return 'stale';
+  return 'failed';
+}
+
+async function executeProjectRuntimeRecoveryReplay<T>(
+  request: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await request();
+  } catch (firstError) {
+    if (!projectRuntimeRecoveryTransportFailure(firstError)) throw firstError;
+  }
+
+  try {
+    // The durable server receipt makes one bounded application retry safe: it
+    // claims the action once, returns its stored completion, or reports that
+    // the first execution is still reconciling.
+    return await request();
+  } catch (secondError) {
+    if (!projectRuntimeRecoveryTransportFailure(secondError)) throw secondError;
+    throw Object.assign(new Error(
+      'Portal did not confirm the recovered Project action. It may still be reconciling; refresh Deployment status before taking another action.',
+    ), { code: 'PROJECT_RUNTIME_RECOVERY_INDETERMINATE' });
+  }
+}
+
+function deploymentControlFailure(
+  error: unknown,
+  fallback: string,
+): DeploymentControlFailure {
+  const errorRecord = error && typeof error === 'object'
+    ? error as Record<string, unknown>
+    : null;
+  const responseRecord = errorRecord?.response && typeof errorRecord.response === 'object'
+    ? errorRecord.response as Record<string, unknown>
+    : null;
+  const dataRecord = responseRecord?.data && typeof responseRecord.data === 'object'
+    ? responseRecord.data as Record<string, unknown>
+    : null;
+  // When the server returned a structured body, consume only the explicitly
+  // approved singular fields below. In particular, never surface the legacy
+  // plural `details` payload, which may contain raw runtime diagnostics.
+  const extracted = dataRecord
+    ? undefined
+    : boundedDeploymentText(extractError(error).message, 500);
+  const code = boundedDeploymentText(dataRecord?.code ?? errorRecord?.code, 80);
+  const detail = boundedDeploymentText(dataRecord?.detail, 2_000);
+  const limitation = boundedDeploymentText(dataRecord?.limitation, 2_000);
+  const recoveryReplay = projectRuntimeRecoveryReplayProof(dataRecord?.recoveryReplay);
+  const recoveryAction = code === 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE'
+    && dataRecord?.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+    && recoveryReplay
+    ? 'REPAIR_PROJECT_RUNTIME_IMAGE' as const
+    : code === 'PROJECT_DEPLOY_TYPE_TRANSITION_REQUIRES_UNDEPLOY'
+      && dataRecord?.recoveryAction === 'UNDEPLOY_CURRENT_DEPLOYMENT'
+      ? 'UNDEPLOY_CURRENT_DEPLOYMENT' as const
+      : undefined;
+  return {
+    message: boundedDeploymentText(dataRecord?.error, 500)
+      || boundedDeploymentText(dataRecord?.message, 500)
+      || extracted
+      || fallback,
+    ...(detail ? { detail } : {}),
+    ...(limitation ? { limitation } : {}),
+    ...(code && /^[A-Z][A-Z0-9_]{1,79}$/.test(code) ? { code } : {}),
+    ...(recoveryAction ? { recoveryAction } : {}),
+    ...(recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE' && recoveryReplay
+      ? { recoveryReplay }
+      : {}),
+  };
+}
+
+function projectLifecycleActionAllowed(
+  project: Project | null | undefined,
+  action: ProjectLifecycleAction,
+): boolean {
+  if (!project?.deployment) return true;
+  return project.deployment.supportedLifecycleActions.includes(action);
+}
+
+function deploymentFailureText(error: DeploymentControlFailure | null): string | null {
+  if (!error) return null;
+  return [
+    error.message,
+    error.detail,
+    error.limitation,
+    error.code ? `Code: ${error.code}` : undefined,
+  ].filter((part): part is string => Boolean(part)).join('\n\n');
+}
+
+function deploymentFailureWithoutRuntimeRepair(
+  failure: DeploymentControlFailure,
+): DeploymentControlFailure {
+  const sanitized = { ...failure };
+  delete sanitized.recoveryAction;
+  delete sanitized.recoveryReplay;
+  delete sanitized.retryAction;
+  delete sanitized.retryOwner;
+  return sanitized;
+}
+
+function runtimeManagementLabel(value: ProjectRuntimeManagement): string {
+  switch (value) {
+    case 'portal-container': return 'Portal-managed container';
+    case 'external-loopback': return 'External service';
+    case 'desktop-session': return 'Remote Desktop session';
+    case 'static': return 'Static files';
+  }
+}
+
+function runtimeStatusSourceLabel(value: ProjectRuntimeStatusSource): string {
+  switch (value) {
+    case 'portal-manager': return 'Portal runtime manager';
+    case 'persisted-app': return 'Saved deployment state';
+    case 'external-binding': return 'External routing';
+    case 'deployment-record': return 'Deployment record';
+  }
+}
+
+function deploymentProgressAnnouncement(
+  busy: 'start' | 'stop' | 'restart' | 'refresh' | 'undeploy' | null,
+  status: string,
+): string {
+  switch (busy) {
+    case 'start': return 'Starting deployment.';
+    case 'stop': return 'Stopping deployment.';
+    case 'restart': return 'Restarting deployment.';
+    case 'refresh': return 'Refreshing deployment status.';
+    case 'undeploy': return 'Removing deployment.';
+    default: return `Deployment status: ${status}.`;
+  }
 }
 
 type ProjectOperation = Readonly<{
@@ -154,6 +450,33 @@ type ShareActionOwner = Readonly<{
 
 
 type ShareLinkAvailability = 'active' | 'disabled' | 'expired' | 'exhausted';
+
+const SHARE_VISITOR_PRESETS = [
+  { value: '1', label: 'One', detail: '1' },
+  { value: '10', label: 'Small', detail: '10' },
+  { value: '100', label: 'Large', detail: '100' },
+  { value: '', label: 'Unlimited', detail: '∞' },
+] as const;
+
+const SHARE_RATE_LIMIT_WINDOWS: ReadonlyArray<{
+  value: ShareRateLimitWindowSeconds;
+  label: string;
+}> = [
+  { value: 60, label: 'per minute' },
+  { value: 300, label: 'per 5 minutes' },
+  { value: 3600, label: 'per hour' },
+];
+
+function shareRateLimitWindowLabel(seconds: number | null | undefined): string {
+  if (seconds === 60) return 'minute';
+  if (seconds === 300) return '5 minutes';
+  if (seconds === 3600) return 'hour';
+  return 'configured window';
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
 
 function getShareLinkAvailability(link: ShareLink, now = Date.now()): ShareLinkAvailability {
   if (link.expiresAt) {
@@ -692,8 +1015,11 @@ export default function AppsPage() {
   const isLocalPortalOrigin = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [tree, setTree] = useState<TreeEntry[]>([]);
+  const [treeLoading, setTreeLoading] = useState(false);
+  const [treeError, setTreeError] = useState<string | null>(null);
   const [expandedDirs, setExpandedDirs] = useState<Record<string, TreeEntry[]>>({});
   const [openFile, setOpenFile] = useState<{ path: string; content: string; language: string } | null>(null);
   const [openMedia, setOpenMedia] = useState<{ path: string; category: FileCategory; url: string; note?: string } | null>(null);
@@ -706,10 +1032,17 @@ export default function AppsPage() {
   const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'success' | 'failed'>('idle');
   const [isRuntimeProject, setIsRuntimeProject] = useState(false);
   const [checkingProject, setCheckingProject] = useState(false);
-  const [deploymentProcess, setDeploymentProcess] = useState<DeploymentProcessState | null>(null);
+  const [deploymentProcess, setDeploymentProcess] = useState<ProjectDeploymentProcessState | null>(null);
   const [deploymentControlBusy, setDeploymentControlBusy] = useState<'start' | 'stop' | 'restart' | 'refresh' | 'undeploy' | null>(null);
-  const [deploymentControlError, setDeploymentControlError] = useState<string | null>(null);
+  const [deploymentControlError, setDeploymentControlError] = useState<DeploymentControlFailure | null>(null);
   const [pendingUndeploy, setPendingUndeploy] = useState<string | null>(null);
+  const [runtimeImageRepairDialog, setRuntimeImageRepairDialog] = useState<Readonly<{
+    confirmationPhrase: string;
+  } & RuntimeImageRepairRetryOwner> | null>(null);
+  const [runtimeImageRepairPhase, setRuntimeImageRepairPhase] = useState<'idle' | 'preparing' | 'running'>('idle');
+  const [runtimeImageRepairError, setRuntimeImageRepairError] = useState<string | null>(null);
+  const runtimeImageRepairInFlightRef = useRef(false);
+  const runtimeImageRepairReplayOutcomeRef = useRef<RuntimeImageRepairReplayOutcome>('stale');
   
   // Progress notification state for deploy/install flow
   const [progressNotification, setProgressNotification] = useState<ProgressNotificationProps | null>(null);
@@ -818,6 +1151,24 @@ export default function AppsPage() {
   const [sharePasswordConfirm, setSharePasswordConfirm] = useState('');
   const [shareExpiresAt, setShareExpiresAt] = useState('');
   const [shareMaxUses, setShareMaxUses] = useState('');
+  const [shareRateLimitEnabled, setShareRateLimitEnabled] = useState(false);
+  const [shareRateLimitMaxRequests, setShareRateLimitMaxRequests] = useState('');
+  const [shareRateLimitWindowSeconds, setShareRateLimitWindowSeconds] = useState<ShareRateLimitWindowSeconds>(60);
+  const [shareCreateError, setShareCreateError] = useState<string | null>(null);
+  const sharePasswordByteLength = utf8ByteLength(sharePassword);
+  const shareMaxUsesNumber = Number(shareMaxUses);
+  const shareMaxUsesInvalid = shareMaxUses !== '' && (
+    !Number.isSafeInteger(shareMaxUsesNumber)
+    || shareMaxUsesNumber < 1
+    || shareMaxUsesNumber > 1_000_000
+  );
+  const shareRateLimitMaxRequestsNumber = Number(shareRateLimitMaxRequests);
+  const shareRateLimitMaxRequestsInvalid = shareRateLimitEnabled && (
+    shareRateLimitMaxRequests === ''
+    || !Number.isSafeInteger(shareRateLimitMaxRequestsNumber)
+    || shareRateLimitMaxRequestsNumber < 1
+    || shareRateLimitMaxRequestsNumber > 1_000_000
+  );
   const [confirmPublicId, setConfirmPublicId] = useState<string | null>(null);
   const [shareCreating, setShareCreating] = useState(false);
   const [shareMutationIds, setShareMutationIds] = useState<Set<string>>(() => new Set());
@@ -877,7 +1228,21 @@ export default function AppsPage() {
   const openFileHandlerRef = useRef<(filePath: string, preserveDeepLink?: boolean) => Promise<void>>();
   const editorContentRef = useRef(editorContent);
   const editorRevisionRef = useRef(0);
+  const projectInventoryLoadGenerationRef = useRef(0);
   const projectLoadGenerationRef = useRef(0);
+  const deploymentStatusGenerationRef = useRef(0);
+  const deploymentStatusReadRef = useRef<Readonly<{
+    generation: number;
+    projectName: string;
+    projectGeneration: number;
+    appId: string;
+  }> | null>(null);
+  const deploymentProcessOwnerRef = useRef<Readonly<{
+    projectName: string;
+    projectGeneration: number;
+    appId: string;
+  }> | null>(null);
+  const shareLoadGenerationRef = useRef(0);
   const treeRefreshGenerationRef = useRef(0);
   const fileLoadGenerationRef = useRef(0);
   const directoryLoadGenerationRef = useRef(new Map<string, number>());
@@ -915,6 +1280,12 @@ export default function AppsPage() {
   const shareDeleteInFlightRef = useRef(false);
   const shareMakePublicInFlightRef = useRef(false);
   const shareActionOwnerRef = useRef<ShareActionOwner | null>(null);
+
+  const invalidateDeploymentStatusReads = useCallback(() => {
+    deploymentStatusGenerationRef.current += 1;
+    deploymentStatusReadRef.current = null;
+    setDeploymentControlBusy((current) => current === 'refresh' ? null : current);
+  }, []);
 
   const releaseProjectNavigationLock = useCallback(() => {
     projectNavigationReleaseRef.current?.();
@@ -1125,12 +1496,21 @@ export default function AppsPage() {
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info'; detail?: string; hint?: string } | null>(null);
   const [toastExpanded, setToastExpanded] = useState(false);
   const [toastCopied, setToastCopied] = useState(false);
-  const [pendingDelete, setPendingDelete] = useState<{
-    kind: 'project' | 'file';
-    name: string;
-    projectName: string;
-    path?: string;
-  } | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<
+    | {
+      kind: 'project';
+      name: string;
+      projectName: string;
+      identity: ProjectIdentityProof;
+    }
+    | {
+      kind: 'file';
+      name: string;
+      projectName: string;
+      path: string;
+    }
+    | null
+  >(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   // Shown while a delete waits out a chat turn's runtime lease instead of
   // failing at the user for a condition that clears itself.
@@ -1212,13 +1592,37 @@ export default function AppsPage() {
   }, [cloneUrl, newName]);
 
   // --- Data Loading ---
-  const loadProjects = useCallback(async () => {
+  const loadProjects = useCallback(async (): Promise<boolean> => {
+    const loadGeneration = ++projectInventoryLoadGenerationRef.current;
+    setLoading(true);
     try {
       const data = await projectsAPI.list();
+      if (
+        !mountedRef.current
+        || projectInventoryLoadGenerationRef.current !== loadGeneration
+      ) return false;
       projectsRef.current = data.projects;
       setProjects(data.projects);
-    } catch (err) { showErrorToast(err, 'Loading projects'); } finally { setLoading(false); }
-  }, [showErrorToast]);
+      setProjectsError(null);
+      return true;
+    } catch (err) {
+      if (
+        !mountedRef.current
+        || projectInventoryLoadGenerationRef.current !== loadGeneration
+      ) return false;
+      const extracted = extractError(err, 'Loading projects');
+      // This failure has a durable inline retry surface. Keep diagnostics in
+      // the browser console without also sounding the global error alarm.
+      console.error('[Projects] Loading projects failed:', err);
+      setProjectsError(extracted.message);
+      return false;
+    } finally {
+      if (
+        mountedRef.current
+        && projectInventoryLoadGenerationRef.current === loadGeneration
+      ) setLoading(false);
+    }
+  }, []);
 
   useEffect(() => { loadProjects(); }, [loadProjects]);
 
@@ -1254,6 +1658,8 @@ export default function AppsPage() {
 
   const selectProject = useCallback(async (name: string) => {
     if (projectOperationRef.current || deleteInFlightRef.current || isShareActionInFlight()) return;
+    const requestedProject = projectsRef.current.find((project) => project.name === name);
+    if (!requestedProject || requestedProject.availability?.available === false) return;
     const previousProject = selectedProjectRef.current;
     const previousFile = openFileRef.current;
     try {
@@ -1265,11 +1671,13 @@ export default function AppsPage() {
       showErrorToast(error, `Saving ${previousFile?.path || 'the open file'} before switching projects`);
       return;
     }
-    // A deploy or provider qualification may have claimed this project while
-    // the save barrier was settling. Do not let a previously admitted click
-    // switch the project after that immutable operation owns the workspace.
-    if (projectOperationRef.current || deleteInFlightRef.current) return;
+    // A deploy, provider qualification, or share mutation may have claimed this
+    // project while the save barrier was settling. Do not let a previously
+    // admitted click switch projects after that immutable operation owns it.
+    if (projectOperationRef.current || deleteInFlightRef.current || isShareActionInFlight()) return;
+    invalidateDeploymentStatusReads();
     const generation = ++projectLoadGenerationRef.current;
+    shareLoadGenerationRef.current += 1;
     treeRefreshGenerationRef.current += 1;
     gitStatusGenerationRef.current += 1;
     gitLogGenerationRef.current += 1;
@@ -1286,6 +1694,8 @@ export default function AppsPage() {
     setOpenFile(null);
     setOpenMedia(null);
     setTree([]);
+    setTreeError(null);
+    setTreeLoading(true);
     setExpandedDirs({});
     setModified(false);
     setSelectedDiff(null);
@@ -1296,12 +1706,22 @@ export default function AppsPage() {
     setBranches([]);
     setShares([]);
     setShareRefreshError(null);
+    setShareIsPublic(true);
+    setSharePassword('');
+    setSharePasswordConfirm('');
+    setShareExpiresAt('');
+    setShareMaxUses('');
+    setShareRateLimitEnabled(false);
+    setShareRateLimitMaxRequests('');
+    setShareRateLimitWindowSeconds(60);
+    setShareCreateError(null);
     setEmailingLinkId(null);
     setShareEmailInput('');
     setShareEmailSuccess(null);
     setActivityLogs([]);
     setDeployStatus('idle');
     setIsRuntimeProject(false);
+    deploymentProcessOwnerRef.current = null;
     setDeploymentProcess(null);
     setDeploymentControlError(null);
     try {
@@ -1313,29 +1733,22 @@ export default function AppsPage() {
       }
       setTree(data.tree);
       setExpandedDirs({});
-      
-      // Check if this is a runtime project (Python, C++, or Node CLI)
-      const fileNames = data.tree.filter((e: TreeEntry) => e.type === 'file').map((e: TreeEntry) => e.name);
-      const hasMainPy = fileNames.includes('main.py');
-      const hasRequirementsTxt = fileNames.includes('requirements.txt');
-      const hasMainCpp = fileNames.includes('main.cpp');
-      const hasMakefile = fileNames.includes('Makefile');
-      const hasPackageJson = fileNames.includes('package.json');
-      const hasIndexHtml = fileNames.includes('index.html');
-      
-      // Runtime if: Python/C++ without package.json, or Node without start script and without index.html
-      if ((hasMainPy || hasRequirementsTxt) && !hasPackageJson) {
-        setIsRuntimeProject(true);
-      } else if ((hasMainCpp || hasMakefile) && !hasPackageJson && !hasIndexHtml) {
-        setIsRuntimeProject(true);
-      }
-      // Note: Node CLI detection requires checking package.json contents, handled server-side
+      // The backend reads package metadata and the full source tree. It is the
+      // sole authority for runtime/fullstack/static classification; filename
+      // guesses here misclassified existing Node and mixed-language projects.
+      setIsRuntimeProject(inventoryProject.detectedDeployType === 'runtime');
     } catch (err) {
       if (generation === projectLoadGenerationRef.current && selectedProjectRef.current === name) {
-        showErrorToast(err, `Loading project "${name}"`);
+        const extracted = extractError(err, `Loading project "${name}"`);
+        console.error(`[Projects] Loading project "${name}" failed:`, err);
+        setTreeError(extracted.message);
+      }
+    } finally {
+      if (generation === projectLoadGenerationRef.current && selectedProjectRef.current === name) {
+        setTreeLoading(false);
       }
     }
-  }, [flushPendingAutoSave, isShareActionInFlight, showErrorToast]);
+  }, [flushPendingAutoSave, invalidateDeploymentStatusReads, isShareActionInFlight, showErrorToast]);
 
   useEffect(() => {
     if (!projectDeepLinkPresent || projectDeepLink) return;
@@ -1349,8 +1762,8 @@ export default function AppsPage() {
       if (!projectDeepLinkPresent) projectDeepLinkSelectionRef.current = null;
       return;
     }
-    const targetExists = projects.some((project) => project.name === projectDeepLink.project);
-    if (!targetExists) {
+    const targetProject = projects.find((project) => project.name === projectDeepLink.project);
+    if (!targetProject || targetProject.availability?.available === false) {
       projectDeepLinkSelectionRef.current = null;
       projectDeepLinkFileRef.current = null;
       navigate('/projects', { replace: true });
@@ -1371,8 +1784,8 @@ export default function AppsPage() {
     try {
       const lastSelected = localStorage.getItem(LAST_SELECTED_PROJECT_KEY);
       if (!lastSelected) return;
-      const stillExists = projects.some(project => project.name === lastSelected);
-      if (!stillExists) {
+      const restorableProject = projects.find(project => project.name === lastSelected);
+      if (!restorableProject || restorableProject.availability?.available === false) {
         localStorage.removeItem(LAST_SELECTED_PROJECT_KEY);
         return;
       }
@@ -1385,6 +1798,8 @@ export default function AppsPage() {
     const generation = projectLoadGenerationRef.current;
     const refreshGeneration = ++treeRefreshGenerationRef.current;
     const expandedPaths = Object.keys(expandedDirs);
+    setTreeLoading(true);
+    setTreeError(null);
     try {
       const [data, expandedResults] = await Promise.all([
         projectsAPI.getTree(projectName),
@@ -1397,7 +1812,7 @@ export default function AppsPage() {
             }
             return [dirPath, result.tree] as const;
           } catch (err) {
-            logError(err, `Refreshing subdirectory: ${dirPath}`);
+            console.error(`[Projects] Refreshing subdirectory "${dirPath}" failed:`, err);
             return [dirPath, null] as const;
           }
         })),
@@ -1417,7 +1832,26 @@ export default function AppsPage() {
         if (entries) newExpanded[dirPath] = entries;
       });
       setExpandedDirs(newExpanded);
-    } catch (err) { logError(err, 'Refreshing file tree'); }
+      if (expandedResults.some(([, entries]) => entries === null)) {
+        setTreeError('One or more folders could not be refreshed. Try again to reload the file tree.');
+      }
+    } catch (err) {
+      if (
+        generation === projectLoadGenerationRef.current
+        && refreshGeneration === treeRefreshGenerationRef.current
+        && selectedProjectRef.current === projectName
+      ) {
+        const extracted = extractError(err, 'Refreshing file tree');
+        console.error('[Projects] Refreshing file tree failed:', err);
+        setTreeError(extracted.message);
+      }
+    } finally {
+      if (
+        generation === projectLoadGenerationRef.current
+        && refreshGeneration === treeRefreshGenerationRef.current
+        && selectedProjectRef.current === projectName
+      ) setTreeLoading(false);
+    }
   };
 
   // Git operations
@@ -1481,20 +1915,24 @@ export default function AppsPage() {
   const loadShares = useCallback(async (requestedProject = selectedProjectRef.current) => {
     if (!requestedProject) return false;
     const projectName = requestedProject;
+    const loadGeneration = ++shareLoadGenerationRef.current;
+    const ownsShareReadback = () => (
+      mountedRef.current
+      && selectedProjectRef.current === projectName
+      && shareLoadGenerationRef.current === loadGeneration
+    );
     try {
       const data = await projectsAPI.listShares(projectName);
-      if (selectedProjectRef.current === projectName) {
-        setShares(data.shares || []);
-        setShareRefreshError(null);
-      }
+      if (!ownsShareReadback()) return false;
+      setShares(data.shares || []);
+      setShareRefreshError(null);
       return true;
     } catch (err) {
+      if (!ownsShareReadback()) return false;
       logError(err, 'Loading shares');
-      if (selectedProjectRef.current === projectName) {
-        const extracted = extractError(err, 'Refreshing share links');
-        setShares([]);
-        setShareRefreshError(`${extracted.message} The list was cleared so stale links cannot be changed. Retry the refresh.`);
-      }
+      const extracted = extractError(err, 'Refreshing share links');
+      setShares([]);
+      setShareRefreshError(`${extracted.message} The list was cleared so stale links cannot be changed. Retry the refresh.`);
       return false;
     }
   }, []);
@@ -1535,39 +1973,73 @@ export default function AppsPage() {
 
   const loadDeploymentProcess = useCallback(async (
     requestedProject = selectedProjectRef.current,
+    ownerOperation?: ProjectOperation,
   ) => {
     const projectName = requestedProject;
     if (!projectName) return;
-    const generation = projectLoadGenerationRef.current;
+    if (selectedProjectRef.current !== projectName) return;
+    const activeOperation = projectOperationRef.current;
+    if (activeOperation && activeOperation !== ownerOperation) return;
+    const projectGeneration = projectLoadGenerationRef.current;
     const inventory = projectsRef.current.find((project) => project.name === projectName);
     if (!inventory?.deployment) {
-      if (selectedProjectRef.current === projectName) setDeploymentProcess(null);
+      invalidateDeploymentStatusReads();
+      if (selectedProjectRef.current === projectName) {
+        deploymentProcessOwnerRef.current = null;
+        setDeploymentProcess(null);
+      }
       return;
     }
+    const read = Object.freeze({
+      generation: ++deploymentStatusGenerationRef.current,
+      projectName,
+      projectGeneration,
+      appId: inventory.deployment.appId,
+    });
+    // A newly admitted status read is authoritative for this exact App. Drop
+    // the previous snapshot synchronously so a failed refresh can never leave
+    // stale process controls or logs actionable in the panel.
+    deploymentProcessOwnerRef.current = null;
+    setDeploymentProcess(null);
+    deploymentStatusReadRef.current = read;
+    const readIsCurrent = () => (
+      mountedRef.current
+      && deploymentStatusReadRef.current === read
+      && deploymentStatusGenerationRef.current === read.generation
+      && selectedProjectRef.current === read.projectName
+      && projectLoadGenerationRef.current === read.projectGeneration
+      && projectsRef.current.find((project) => project.name === read.projectName)?.deployment?.appId
+        === read.appId
+    );
     setDeploymentControlBusy((current) => current || 'refresh');
-    setDeploymentControlError(null);
+    setDeploymentControlError((current) => (
+      current?.recoveryAction === 'UNDEPLOY_CURRENT_DEPLOYMENT'
+        ? current
+        : null
+    ));
     try {
       const status = await projectsAPI.appProcess(projectName, 'status');
-      if (
-        selectedProjectRef.current !== projectName
-        || projectLoadGenerationRef.current !== generation
-      ) return;
+      if (!readIsCurrent()) return;
+      deploymentProcessOwnerRef.current = Object.freeze({
+        projectName: read.projectName,
+        projectGeneration: read.projectGeneration,
+        appId: read.appId,
+      });
       setDeploymentProcess(status);
     } catch (error) {
-      if (
-        selectedProjectRef.current !== projectName
-        || projectLoadGenerationRef.current !== generation
-      ) return;
-      setDeploymentControlError(extractError(error).message || 'Could not load deployment status');
+      if (!readIsCurrent()) return;
+      setDeploymentControlError((current) => (
+        current?.recoveryAction === 'UNDEPLOY_CURRENT_DEPLOYMENT'
+          ? current
+          : deploymentControlFailure(error, 'Could not load deployment status')
+      ));
     } finally {
-      if (
-        selectedProjectRef.current === projectName
-        && projectLoadGenerationRef.current === generation
-      ) {
+      if (deploymentStatusReadRef.current === read) {
+        deploymentStatusReadRef.current = null;
         setDeploymentControlBusy((current) => current === 'refresh' ? null : current);
       }
     }
-  }, []);
+  }, [invalidateDeploymentStatusReads]);
 
   // Load panel data
   useEffect(() => {
@@ -1674,7 +2146,13 @@ export default function AppsPage() {
         ) {
           setExpandedDirs(prev => ({ ...prev, [dirPath]: data.tree }));
         }
-      } catch (err) { logError(err, `Expanding directory: ${dirPath}`); }
+      } catch (err) {
+        console.error(`[Projects] Expanding directory "${dirPath}" failed:`, err);
+        if (selectedProjectRef.current === projectName) {
+          const extracted = extractError(err, `Opening folder "${dirPath}"`);
+          setTreeError(extracted.message);
+        }
+      }
       finally {
         if (directoryLoadGenerationRef.current.get(dirPath) === generation) {
           pendingDirectoryLoadsRef.current.delete(dirPath);
@@ -1921,9 +2399,17 @@ export default function AppsPage() {
   const requestDeleteProject = (name: string) => {
     if (projectOperationRef.current || deleteInFlightRef.current) return;
     const project = projectsRef.current.find((entry) => entry.name === name);
-    if (!project?.destructiveActions.allowed) return;
+    if (
+      !project?.destructiveActions.allowed
+      || !projectLifecycleActionAllowed(project, 'delete-project')
+    ) return;
     setDeleteError(null);
-    setPendingDelete({ kind: 'project', name, projectName: name });
+    setPendingDelete({
+      kind: 'project',
+      name,
+      projectName: name,
+      identity: project.identity,
+    });
   };
 
   const [renamingProject, setRenamingProject] = useState<string | null>(null);
@@ -1957,7 +2443,10 @@ export default function AppsPage() {
   const startRenameProject = async (name: string) => {
     if (projectOperationRef.current) return;
     const sourceProject = projectsRef.current.find((project) => project.name === name);
-    if (!sourceProject?.destructiveActions.allowed) return;
+    if (
+      !sourceProject?.destructiveActions.allowed
+      || !projectLifecycleActionAllowed(sourceProject, 'rename-project')
+    ) return;
     // The operation owner is bound to the selected project. A rename dialog
     // opened from an unselected row must operate on that row's project, so
     // select it before arming anything.
@@ -2267,6 +2756,10 @@ export default function AppsPage() {
       setRenameProjectError('The source project is no longer present in the verified project inventory.');
       return;
     }
+    if (!projectLifecycleActionAllowed(sourceProject, 'rename-project')) {
+      setRenameProjectError('This deployment is externally managed, so Portal cannot safely rename its Project.');
+      return;
+    }
     // The dialog owns exactly the project it was opened for; the operation is
     // never rebound to whichever project happens to be globally selected.
     const operation = Object.freeze({
@@ -2296,6 +2789,14 @@ export default function AppsPage() {
         if (!isMountedProjectRenameOwner(operation)) return;
         await fileWriteQueueRef.current.waitFor(oldName, openFileRef.current.path);
         if (!isMountedProjectRenameOwner(operation)) return;
+      }
+      const currentSourceProject = projectsRef.current.find((project) => project.name === oldName);
+      if (
+        !currentSourceProject
+        || !projectIdentitiesMatch(currentSourceProject.identity, operation.renameIdentity!)
+        || !projectLifecycleActionAllowed(currentSourceProject, 'rename-project')
+      ) {
+        throw new Error('The Project deployment no longer permits rename. Refresh Projects and review its deployment manager.');
       }
       const preflight = await projectsAPI.getTree(oldName);
       if (!isMountedProjectRenameOwner(operation)) return;
@@ -2419,6 +2920,7 @@ export default function AppsPage() {
         kind: 'project' as const,
         name: pendingDelete.name,
         projectName: pendingDelete.projectName,
+        identity: pendingDelete.identity,
       })
       : pendingDelete.path
         ? Object.freeze({
@@ -2428,7 +2930,25 @@ export default function AppsPage() {
           path: pendingDelete.path,
         })
         : null;
-    if (!request || !claimRouteOperation(request)) return;
+    if (!request) return;
+    if (request.kind === 'project') {
+      const currentProjectForDelete = projectsRef.current.find((project) => project.name === request.projectName);
+      if (
+        !currentProjectForDelete?.destructiveActions.allowed
+        || !projectLifecycleActionAllowed(currentProjectForDelete, 'delete-project')
+      ) {
+        setDeleteError('This deployment is externally managed, so Portal cannot safely delete its Project.');
+        return;
+      }
+      if (
+        currentProjectForDelete.identity.id !== request.identity.id
+        || currentProjectForDelete.identity.generation !== request.identity.generation
+      ) {
+        setDeleteError('The Project identity changed. Refresh Projects before deleting it.');
+        return;
+      }
+    }
+    if (!claimRouteOperation(request)) return;
     deleteInFlightRef.current = request;
     acquireProjectNavigationLock();
     setDeleteBusy(true);
@@ -2440,9 +2960,19 @@ export default function AppsPage() {
           await flushPendingAutoSave();
           await fileWriteQueueRef.current.waitFor(request.projectName, openFileRef.current.path);
         }
+        const currentProjectForDelete = projectsRef.current.find((project) => (
+          project.name === request.projectName
+        ));
+        if (
+          !currentProjectForDelete
+          || currentProjectForDelete.identity.id !== request.identity.id
+          || currentProjectForDelete.identity.generation !== request.identity.generation
+        ) {
+          throw new Error('The Project identity changed. Refresh Projects before deleting it.');
+        }
         await awaitProjectDeleteSettle(
           request.projectName,
-          (name) => projectsAPI.delete(name),
+          (name) => projectsAPI.delete(name, request.identity),
           {
             onWaiting: (waitMs) => {
               if (deleteInFlightRef.current !== request) return;
@@ -2765,11 +3295,33 @@ export default function AppsPage() {
     void openFileHandlerRef.current?.(projectDeepLink.file, true);
   }, [projectDeepLink, projectOperation, selectedProject]);
 
-  const deployProject = async () => {
+  const deployProject = async (
+    expectedRetryOwner?: RuntimeImageRepairRetryOwner,
+  ): Promise<boolean> => {
     const projectName = selectedProjectRef.current;
-    if (!projectName || projectOperationRef.current) return;
+    if (
+      !projectName
+      || projectOperationRef.current
+      || deploymentStatusReadRef.current
+      || deploymentControlBusy !== null
+    ) return false;
+    if (
+      expectedRetryOwner
+      && (
+        expectedRetryOwner.retryAction !== 'deploy'
+        || expectedRetryOwner.projectName !== projectName
+        || expectedRetryOwner.projectGeneration !== projectLoadGenerationRef.current
+      )
+    ) return false;
+    const inventoryProject = projectsRef.current.find((project) => project.name === projectName);
+    if (
+      expectedRetryOwner
+      && expectedRetryOwner.recoveryReplay.expectedAppId
+        !== (inventoryProject?.deployment?.appId || null)
+    ) return false;
+    if (!projectLifecycleActionAllowed(inventoryProject, 'redeploy')) return false;
     const projectGeneration = projectLoadGenerationRef.current;
-    const runtime = isRuntimeProject;
+    const runtime = inventoryProject?.detectedDeployType === 'runtime';
     // Runtime (Python/C++/desktop) projects demo inside Remote Desktop, which
     // is deliberately restricted to Owner/Sub-Admin. Tell non-elevated users
     // up front instead of failing after a deploy.
@@ -2782,7 +3334,7 @@ export default function AppsPage() {
         statusText: REMOTE_DESKTOP_RUNTIME_WARNING,
         onDismiss: () => setProgressNotification(null),
       });
-      return;
+      return false;
     }
     const operation = Object.freeze({
       kind: 'deploy' as const,
@@ -2791,7 +3343,11 @@ export default function AppsPage() {
       token: ++projectOperationTokenRef.current,
       runtime,
     });
-    if (!claimProjectOperation(operation)) return;
+    if (!claimProjectOperation(operation)) return false;
+    invalidateDeploymentStatusReads();
+    deploymentProcessOwnerRef.current = null;
+    setDeploymentProcess(null);
+    setDeploymentControlError(null);
     const operationIsCurrent = () => (
       projectOperationRef.current === operation
       && selectedProjectRef.current === operation.projectName
@@ -2803,7 +3359,7 @@ export default function AppsPage() {
       if (operation.runtime) {
         try {
           const depsResult = await projectsAPI.checkDeps(operation.projectName);
-          if (!operationIsCurrent()) return;
+          if (!operationIsCurrent()) return false;
           if (depsResult.needsInstall && depsResult.packages?.length > 0) {
             setProgressNotification({
               id: `deps-${operation.projectName}`,
@@ -2817,16 +3373,16 @@ export default function AppsPage() {
               },
             });
             const installSuccess = await installDependencies(operation.projectName);
-            if (!operationIsCurrent()) return;
+            if (!operationIsCurrent()) return false;
             if (!installSuccess) {
               showErrorToast(new Error('Dependency installation cancelled or failed'), 'Installing dependencies');
-              return;
+              return false;
             }
             await new Promise(r => setTimeout(r, 300));
-            if (!operationIsCurrent()) return;
+            if (!operationIsCurrent()) return false;
           }
         } catch (err) {
-          if (!operationIsCurrent()) return;
+          if (!operationIsCurrent()) return false;
           // Dependency check failure is advisory; the deploy endpoint performs
           // its own authoritative validation.
           console.warn('Dependency check failed:', err);
@@ -2845,31 +3401,49 @@ export default function AppsPage() {
         },
       });
 
-      const data = await projectsAPI.deploy(operation.projectName);
-      if (!operationIsCurrent()) return;
+      const data = expectedRetryOwner
+        ? await executeProjectRuntimeRecoveryReplay(() => projectsAPI.deploy(
+            operation.projectName,
+            expectedRetryOwner.recoveryReplay,
+          ))
+        : await projectsAPI.deploy(operation.projectName);
+      if (!operationIsCurrent()) return false;
+      const deploySuccess = 'deployType' in data ? data : null;
+      const recoveredCompletion = expectedRetryOwner
+        ? projectRuntimeRecoveryCompletion(data, expectedRetryOwner.recoveryReplay)
+        : null;
+      if (!deploySuccess && !recoveredCompletion) {
+        throw new Error('Portal returned an invalid Project deployment response. Refresh Deployment status before retrying.');
+      }
       setProgressNotification(prev => prev ? {
         ...prev,
         status: 'complete',
         progress: 100,
-        statusText: data.deployType === 'runtime' ? 'Running on Desktop!' : `Deployed to ${data.url}`,
+        statusText: recoveredCompletion
+          ? 'Recovered deployment confirmed'
+          : deploySuccess?.deployType === 'runtime'
+            ? 'Running on Desktop!'
+            : `Deployed to ${deploySuccess?.url}`,
       } : null);
       
       setDeployStatus('success');
 
-      if (data.deployType === 'runtime') {
+      if (deploySuccess?.deployType === 'runtime') {
         await loadProjects();
-        if (!operationIsCurrent()) return;
+        if (!operationIsCurrent()) return false;
         await new Promise(r => setTimeout(r, 1500));
-        if (!operationIsCurrent()) return;
+        if (!operationIsCurrent()) return false;
         setDeployStatus('idle');
         setProgressNotification(null);
         setDeploying(false);
         releaseProjectOperation(operation);
         navigate('/desktop');
-        return;
+        return true;
       } else {
         await loadProjects();
-        if (!operationIsCurrent()) return;
+        if (!operationIsCurrent()) return false;
+        await loadDeploymentProcess(operation.projectName, operation);
+        if (!operationIsCurrent()) return false;
         setTimeout(() => {
           if (
             selectedProjectRef.current === operation.projectName
@@ -2878,13 +3452,42 @@ export default function AppsPage() {
         }, 3000);
       }
     } catch (err) {
-      if (!operationIsCurrent()) return;
-      const errObj = extractError(err);
+      if (!operationIsCurrent()) return false;
+      const failure = deploymentControlFailure(err, 'Deploy failed');
+      if (expectedRetryOwner) {
+        runtimeImageRepairReplayOutcomeRef.current = projectRuntimeRecoveryReplayFailureOutcome(failure);
+      }
+      const replay = failure.recoveryReplay;
+      const retryCanBeBound = failure.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+        && replay?.action === 'deploy'
+        && replay.projectIdentity.id === inventoryProject?.identity.id
+        && replay.projectIdentity.generation === inventoryProject?.identity.generation
+        && replay.expectedAppId === (inventoryProject?.deployment?.appId || null);
+      const ownedFailure = retryCanBeBound && replay
+        ? {
+            ...failure,
+            retryAction: 'deploy' as const,
+            retryOwner: Object.freeze({
+              projectName: operation.projectName,
+              projectGeneration: operation.projectGeneration,
+              recoveryReplay: replay,
+            }),
+          }
+        : failure.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+          ? deploymentFailureWithoutRuntimeRepair(failure)
+          : failure;
+      setDeploymentControlError(ownedFailure);
+      if (
+        failure.recoveryAction === 'UNDEPLOY_CURRENT_DEPLOYMENT'
+        || failure.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+      ) {
+        setActivePanel('deployment');
+      }
       setProgressNotification(prev => prev ? {
         ...prev,
         status: 'error' as const,
         statusText: 'Deploy failed',
-        error: errObj.message || String(errObj),
+        error: failure.message,
       } : null);
       
       setDeployStatus('failed');
@@ -2894,51 +3497,134 @@ export default function AppsPage() {
           && projectLoadGenerationRef.current === operation.projectGeneration
         ) setDeployStatus('idle');
       }, 5000);
+      return false;
     } finally {
       if (projectOperationRef.current === operation) {
         setDeploying(false);
         releaseProjectOperation(operation);
       }
     }
+    return true;
   };
 
-  const controlDeploymentProcess = async (action: 'start' | 'stop' | 'restart') => {
-    const projectName = selectedProjectRef.current;
-    if (!projectName || projectOperationRef.current || deploymentControlBusy) return;
+  const executeDeploymentProcessAction = async (request: Readonly<{
+    action: 'start' | 'stop' | 'restart';
+    projectName: string;
+    projectGeneration: number;
+    appId: string;
+    recoveryReplay?: ProjectRuntimeRecoveryReplayProof;
+  }>): Promise<boolean> => {
+    const { action, projectName, projectGeneration, appId, recoveryReplay } = request;
+    if (
+      projectOperationRef.current
+      || deploymentStatusReadRef.current
+      || selectedProjectRef.current !== projectName
+      || projectLoadGenerationRef.current !== projectGeneration
+    ) return false;
+    const inventory = projectsRef.current.find((project) => project.name === projectName);
+    if (!inventory?.deployment || inventory.deployment.appId !== appId) return false;
     const operation = Object.freeze({
       kind: 'deploy' as const,
       projectName,
-      projectGeneration: projectLoadGenerationRef.current,
+      projectGeneration,
       token: ++projectOperationTokenRef.current,
       runtime: false,
     });
-    if (!claimProjectOperation(operation)) return;
+    if (!claimProjectOperation(operation)) return false;
+    invalidateDeploymentStatusReads();
     const operationIsCurrent = () => (
       projectOperationRef.current === operation
       && selectedProjectRef.current === projectName
       && projectLoadGenerationRef.current === operation.projectGeneration
+      && projectsRef.current.find((project) => project.name === projectName)?.deployment?.appId === appId
     );
     setDeploymentControlBusy(action);
     setDeploymentControlError(null);
     try {
-      const status = await projectsAPI.appProcess(projectName, action);
-      if (!operationIsCurrent()) return;
+      const status = recoveryReplay
+        ? await executeProjectRuntimeRecoveryReplay(() => projectsAPI.appProcess(
+            projectName,
+            action,
+            recoveryReplay,
+          ))
+        : await projectsAPI.appProcess(projectName, action);
+      if (!operationIsCurrent()) return false;
+      deploymentProcessOwnerRef.current = Object.freeze({
+        projectName,
+        projectGeneration: operation.projectGeneration,
+        appId,
+      });
       setDeploymentProcess(status);
       await loadProjects();
       if (
         projectOperationRef.current === operation
         && selectedProjectRef.current === projectName
       ) {
-        await loadDeploymentProcess(projectName);
+        await loadDeploymentProcess(projectName, operation);
       }
     } catch (error) {
       if (projectOperationRef.current === operation) {
-        setDeploymentControlError(extractError(error).message || `Could not ${action} deployment`);
+        deploymentProcessOwnerRef.current = null;
+        setDeploymentProcess(null);
+        const failure = deploymentControlFailure(error, `Could not ${action} deployment`);
+        if (recoveryReplay) {
+          runtimeImageRepairReplayOutcomeRef.current = projectRuntimeRecoveryReplayFailureOutcome(failure);
+        }
+        const replay = failure.recoveryReplay;
+        const retryCanBeBound = action !== 'stop'
+          && failure.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+          && replay?.action === action
+          && replay.projectIdentity.id === inventory.identity.id
+          && replay.projectIdentity.generation === inventory.identity.generation
+          && replay.expectedAppId === appId;
+        setDeploymentControlError(
+          retryCanBeBound && replay
+            ? {
+                ...failure,
+                retryAction: action as 'start' | 'restart',
+                retryOwner: Object.freeze({
+                  projectName,
+                  projectGeneration,
+                  recoveryReplay: replay,
+                }),
+              }
+            : failure.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+              ? deploymentFailureWithoutRuntimeRepair(failure)
+              : failure,
+        );
       }
+      return false;
     } finally {
       if (projectOperationRef.current === operation) releaseProjectOperation(operation);
       setDeploymentControlBusy(null);
     }
+    return true;
+  };
+
+  const controlDeploymentProcess = async (action: 'start' | 'stop' | 'restart') => {
+    const projectName = selectedProjectRef.current;
+    if (
+      !projectName
+      || projectOperationRef.current
+      || deploymentStatusReadRef.current
+      || deploymentControlBusy
+    ) return;
+    const inventory = projectsRef.current.find((project) => project.name === projectName);
+    const processOwner = deploymentProcessOwnerRef.current;
+    if (
+      !inventory?.deployment
+      || !deploymentProcess?.supportedActions.includes(action)
+      || !processOwner
+      || processOwner.projectName !== projectName
+      || processOwner.projectGeneration !== projectLoadGenerationRef.current
+      || processOwner.appId !== inventory.deployment.appId
+    ) return;
+    await executeDeploymentProcessAction({
+      action,
+      projectName,
+      projectGeneration: projectLoadGenerationRef.current,
+      appId: inventory.deployment.appId,
+    });
   };
 
   const undeployProject = async () => {
@@ -2947,8 +3633,12 @@ export default function AppsPage() {
       !projectName
       || selectedProjectRef.current !== projectName
       || projectOperationRef.current
+      || deploymentStatusReadRef.current
       || deploymentControlBusy
     ) return;
+    const inventory = projectsRef.current.find((project) => project.name === projectName);
+    if (!inventory?.deployment || !projectLifecycleActionAllowed(inventory, 'undeploy')) return;
+    const appId = inventory.deployment.appId;
     const operation = Object.freeze({
       kind: 'deploy' as const,
       projectName,
@@ -2957,10 +3647,14 @@ export default function AppsPage() {
       runtime: false,
     });
     if (!claimProjectOperation(operation)) return;
+    invalidateDeploymentStatusReads();
+    deploymentProcessOwnerRef.current = null;
+    setDeploymentProcess(null);
     const operationIsCurrent = () => (
       projectOperationRef.current === operation
       && selectedProjectRef.current === projectName
       && projectLoadGenerationRef.current === operation.projectGeneration
+      && projectsRef.current.find((project) => project.name === projectName)?.deployment?.appId === appId
     );
     setDeploymentControlBusy('undeploy');
     setDeploymentControlError(null);
@@ -2968,17 +3662,251 @@ export default function AppsPage() {
       await projectsAPI.undeploy(projectName);
       if (!operationIsCurrent()) return;
       await loadProjects();
+      deploymentProcessOwnerRef.current = null;
       setDeploymentProcess(null);
       setPendingUndeploy(null);
       setActivePanel(null);
       showToast('Deployment removed. Project source and chat were preserved.', 'success');
     } catch (error) {
       if (projectOperationRef.current === operation) {
-        setDeploymentControlError(extractError(error).message || 'Could not remove deployment');
+        setDeploymentControlError(deploymentControlFailure(error, 'Could not remove deployment'));
       }
     } finally {
       if (projectOperationRef.current === operation) releaseProjectOperation(operation);
       setDeploymentControlBusy(null);
+    }
+  };
+
+  const retryProjectActionAfterRuntimeImageRepair = async (
+    owner: RuntimeImageRepairRetryOwner,
+  ): Promise<RuntimeImageRepairReplayOutcome> => {
+    runtimeImageRepairReplayOutcomeRef.current = 'stale';
+    if (!await loadProjects()) {
+      runtimeImageRepairReplayOutcomeRef.current = 'failed';
+      setDeploymentControlError({
+        message: 'Portal could not verify the current Project inventory, so the recovered action was not replayed.',
+        detail: 'Refresh Projects and retry from the current Deployment controls.',
+        code: 'PROJECT_RUNTIME_RECOVERY_INVENTORY_UNAVAILABLE',
+      });
+      return 'failed';
+    }
+    if (
+      !mountedRef.current
+      || selectedProjectRef.current !== owner.projectName
+      || projectLoadGenerationRef.current !== owner.projectGeneration
+    ) return 'stale';
+    const current = projectsRef.current.find((project) => project.name === owner.projectName);
+    if (
+      !current
+      || current.availability?.available === false
+      || current.identity.id !== owner.recoveryReplay.projectIdentity.id
+      || current.identity.generation !== owner.recoveryReplay.projectIdentity.generation
+      || owner.recoveryReplay.action !== owner.retryAction
+    ) return 'stale';
+
+    if (owner.retryAction === 'deploy') {
+      if (
+        owner.recoveryReplay.expectedAppId
+          !== (current.deployment?.appId || null)
+      ) return 'stale';
+      if (!projectLifecycleActionAllowed(current, 'redeploy')) return 'stale';
+      // Once the receipt-backed request leaves the browser, anything except a
+      // proved stale response is ambiguous until the server says otherwise.
+      runtimeImageRepairReplayOutcomeRef.current = 'indeterminate';
+      setDeploymentControlError(null);
+      return await deployProject(owner)
+        ? 'completed'
+        : runtimeImageRepairReplayOutcomeRef.current;
+    }
+
+    const expectedAppId = owner.recoveryReplay.expectedAppId;
+    if (!expectedAppId || current.deployment?.appId !== expectedAppId) return 'stale';
+    const freshStatus = await projectsAPI.appProcess(owner.projectName, 'status');
+    if (
+      freshStatus.runtimeManagement !== 'portal-container'
+      || !freshStatus.supportedActions.includes(owner.retryAction)
+    ) return 'stale';
+    deploymentProcessOwnerRef.current = Object.freeze({
+      projectName: owner.projectName,
+      projectGeneration: owner.projectGeneration,
+      appId: expectedAppId,
+    });
+    setDeploymentProcess(freshStatus);
+    runtimeImageRepairReplayOutcomeRef.current = 'indeterminate';
+    setDeploymentControlError(null);
+    return await executeDeploymentProcessAction({
+      action: owner.retryAction,
+      projectName: owner.projectName,
+      projectGeneration: owner.projectGeneration,
+      appId: expectedAppId,
+      recoveryReplay: owner.recoveryReplay,
+    }) ? 'completed' : runtimeImageRepairReplayOutcomeRef.current;
+  };
+
+  const prepareRuntimeImageRepair = async () => {
+    if (
+      runtimeImageRepairInFlightRef.current
+      || runtimeImageRepairPhase !== 'idle'
+      || !isOwner(user)
+      || deploymentControlError?.recoveryAction !== 'REPAIR_PROJECT_RUNTIME_IMAGE'
+      || !deploymentControlError.retryAction
+      || !deploymentControlError.retryOwner
+      || selectedProjectRef.current !== deploymentControlError.retryOwner.projectName
+      || projectLoadGenerationRef.current !== deploymentControlError.retryOwner.projectGeneration
+    ) return;
+    const retryOwner: RuntimeImageRepairRetryOwner = Object.freeze({
+      ...deploymentControlError.retryOwner,
+      retryAction: deploymentControlError.retryAction,
+    });
+    setRuntimeImageRepairPhase('preparing');
+    setRuntimeImageRepairError(null);
+    try {
+      const status = await projectRuntimeImageRepairAPI.status();
+      if (
+        status.ownerOnly !== true
+        || status.changesSystem !== true
+        || status.restartExpected !== true
+        || status.confirmationPhrase !== 'REPAIR PROJECT RUNTIME IMAGE'
+      ) {
+        throw new Error('Portal returned an invalid Project runtime repair contract. No repair was started.');
+      }
+      if (status.state === 'ready') {
+        const replayOutcome = await retryProjectActionAfterRuntimeImageRepair(retryOwner);
+        if (replayOutcome === 'indeterminate') {
+          setDeploymentControlError({
+            message: 'The recovered Project action is still reconciling.',
+            detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+            code: 'PROJECT_RUNTIME_RECOVERY_IN_PROGRESS',
+          });
+          showToast('Runtime image is ready; the recovered action is still reconciling.', 'info');
+          return;
+        }
+        if (replayOutcome === 'stale') {
+          setDeploymentControlError({
+            message: 'The runtime image is ready, but the original Project action is stale and was not replayed.',
+            detail: 'Refresh this Project, then use its current Deployment controls.',
+          });
+          showToast('Runtime image is ready; the stale Project action was not replayed.', 'info');
+          return;
+        }
+        if (replayOutcome === 'failed') {
+          showToast('Runtime image is ready, but the recovered Project action failed. Review Deployment details.', 'error');
+          return;
+        }
+        showToast(`The runtime image is ready. Portal retried ${retryOwner.retryAction}.`, 'success');
+        return;
+      }
+      if (
+        status.state === 'unavailable'
+        && status.unavailableReason !== 'image-missing'
+      ) {
+        setRuntimeImageRepairError(
+          status.unavailableReason === 'unit-state-unknown'
+            ? 'Portal cannot verify the repair service state. Check Dashboard → Server Maintenance, then check this repair again. No repair was started.'
+            : 'Portal cannot verify Docker image state. Check Dashboard → Server Maintenance, then check this repair again. No repair was started.',
+        );
+        return;
+      }
+      setRuntimeImageRepairDialog({
+        confirmationPhrase: status.confirmationPhrase,
+        ...retryOwner,
+      });
+    } catch (error) {
+      setRuntimeImageRepairError(extractError(error).message || 'Could not load the Project runtime repair contract.');
+    } finally {
+      setRuntimeImageRepairPhase('idle');
+    }
+  };
+
+  const runRuntimeImageRepair = async (confirmation: string) => {
+    const owner = runtimeImageRepairDialog;
+    if (!owner || runtimeImageRepairInFlightRef.current || !isOwner(user)) return;
+    runtimeImageRepairInFlightRef.current = true;
+    setRuntimeImageRepairPhase('running');
+    setRuntimeImageRepairError(null);
+    let submissionError: string | null = null;
+    let acceptedState: 'ready' | 'running' | null = null;
+    try {
+      try {
+        const accepted = await projectRuntimeImageRepairAPI.repair(confirmation);
+        acceptedState = accepted.state;
+      } catch (error) {
+        // The repair restarts Portal after committing a new immutable image.
+        // A disconnected POST is therefore indeterminate, not a safe reason
+        // to launch a second host mutation. Reconcile through the read-only
+        // status endpoint below before offering another submission.
+        submissionError = extractError(error).message || 'Portal did not acknowledge the repair request.';
+      }
+
+      let unavailableReads = 0;
+      let transportFailures = 0;
+      for (let attempt = 0; attempt < 180; attempt += 1) {
+        if (!mountedRef.current) return;
+        if (acceptedState === 'ready') break;
+        try {
+          const status = await projectRuntimeImageRepairAPI.status();
+          transportFailures = 0;
+          if (status.state === 'ready') {
+            acceptedState = 'ready';
+            break;
+          }
+          if (status.state === 'failed') {
+            throw new Error('Project runtime image repair failed. Review the retained server log before retrying.');
+          }
+          if (status.state === 'unavailable') {
+            unavailableReads += 1;
+            if (unavailableReads >= 3) {
+              throw new Error(submissionError || 'Project runtime image repair did not start. Retry the same repair after checking server maintenance.');
+            }
+          } else {
+            unavailableReads = 0;
+          }
+        } catch (error) {
+          const message = extractError(error).message;
+          if (/repair (?:failed|did not start)|response is malformed/i.test(message)) throw error;
+          transportFailures += 1;
+          if (transportFailures >= 20) {
+            throw new Error(submissionError || 'Portal did not return after the Project runtime repair restart. Check server health before retrying.');
+          }
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 3_000));
+      }
+
+      if (acceptedState !== 'ready') {
+        throw new Error('Project runtime image repair is still running. Leave this dialog open or check server maintenance before retrying.');
+      }
+      if (!mountedRef.current) return;
+      const replayOutcome = await retryProjectActionAfterRuntimeImageRepair(owner);
+      setRuntimeImageRepairDialog(null);
+      if (replayOutcome === 'indeterminate') {
+        setDeploymentControlError({
+          message: 'The recovered Project action is still reconciling.',
+          detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+          code: 'PROJECT_RUNTIME_RECOVERY_IN_PROGRESS',
+        });
+        showToast('Runtime image repaired; the recovered action is still reconciling.', 'info');
+        return;
+      }
+      if (replayOutcome === 'stale') {
+        setDeploymentControlError({
+          message: 'The runtime image was repaired, but the original Project action is stale and was not replayed.',
+          detail: 'Refresh this Project, then use its current Deployment controls.',
+        });
+        showToast('Runtime image repaired; the stale Project action was not replayed.', 'info');
+        return;
+      }
+      if (replayOutcome === 'failed') {
+        showToast('Runtime image repaired, but the recovered Project action failed. Review Deployment details.', 'error');
+        return;
+      }
+      showToast(`Project runtime image repaired. Portal retried ${owner.retryAction}.`, 'success');
+    } catch (error) {
+      if (mountedRef.current) {
+        setRuntimeImageRepairError(extractError(error).message || 'Project runtime image repair failed.');
+      }
+    } finally {
+      runtimeImageRepairInFlightRef.current = false;
+      if (mountedRef.current) setRuntimeImageRepairPhase('idle');
     }
   };
   
@@ -3045,19 +3973,49 @@ export default function AppsPage() {
       passwordConfirm: sharePasswordConfirm,
       expiresAtInput: shareExpiresAt,
       maxUsesInput: shareMaxUses,
+      rateLimitEnabled: shareRateLimitEnabled,
+      rateLimitMaxRequestsInput: shareRateLimitMaxRequests,
+      rateLimitWindowSeconds: shareRateLimitWindowSeconds,
+    };
+    setShareCreateError(null);
+    const rejectSharePolicy = (message: string) => {
+      setShareCreateError(message);
     };
     if (!request.isPublic) {
-      if (request.password.length < 8) { showToast('Password must be at least 8 characters', 'error'); return; }
-      if (request.password !== request.passwordConfirm) { showToast('Passwords do not match', 'error'); return; }
+      if (request.password.length < 8) { rejectSharePolicy('Password must be at least 8 characters'); return; }
+      if (utf8ByteLength(request.password) > 72) { rejectSharePolicy('Password must be at most 72 UTF-8 bytes'); return; }
+      if (request.password !== request.passwordConfirm) { rejectSharePolicy('Passwords do not match'); return; }
     }
     const expiresAt = request.expiresAtInput ? new Date(request.expiresAtInput) : null;
     if (expiresAt && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) {
-      showToast('Expiration must be in the future', 'error');
+      rejectSharePolicy('Expiration must be in the future');
       return;
     }
     const maxUses = request.maxUsesInput ? Number(request.maxUsesInput) : null;
     if (maxUses !== null && (!Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 1_000_000)) {
-      showToast('Visit limit must be a whole number from 1 to 1,000,000', 'error');
+      rejectSharePolicy('Visitor slots must be a whole number from 1 to 1,000,000');
+      return;
+    }
+    const rateLimitMaxRequests = request.rateLimitEnabled
+      ? Number(request.rateLimitMaxRequestsInput)
+      : null;
+    if (
+      request.rateLimitEnabled
+      && (
+        rateLimitMaxRequests === null
+        || !Number.isSafeInteger(rateLimitMaxRequests)
+        || rateLimitMaxRequests < 1
+        || rateLimitMaxRequests > 1_000_000
+      )
+    ) {
+      rejectSharePolicy('API request limit must be a whole number from 1 to 1,000,000');
+      return;
+    }
+    if (
+      request.rateLimitEnabled
+      && !SHARE_RATE_LIMIT_WINDOWS.some(({ value }) => value === request.rateLimitWindowSeconds)
+    ) {
+      rejectSharePolicy('Choose a valid API request window');
       return;
     }
     const owner = Object.freeze({
@@ -3075,11 +4033,19 @@ export default function AppsPage() {
         ...(request.isPublic ? {} : { password: request.password }),
         ...(expiresAt ? { expiresAt: expiresAt.toISOString() } : {}),
         ...(maxUses !== null ? { maxUses } : {}),
+        ...(rateLimitMaxRequests !== null ? {
+          rateLimitMaxRequests,
+          rateLimitWindowSeconds: request.rateLimitWindowSeconds,
+        } : {}),
       });
       setSharePassword('');
       setSharePasswordConfirm('');
       setShareExpiresAt('');
       setShareMaxUses('');
+      setShareRateLimitEnabled(false);
+      setShareRateLimitMaxRequests('');
+      setShareRateLimitWindowSeconds(60);
+      setShareCreateError(null);
       setShareIsPublic(true);
       if (await loadShares(request.projectName)) showToast('Share link created');
     } catch (err) { showErrorToast(err, 'Creating share link'); }
@@ -3099,7 +4065,7 @@ export default function AppsPage() {
       showToast(
         availability === 'expired'
           ? 'Expired links cannot be reactivated; create a new link.'
-          : 'Links that reached their visit limit cannot be reactivated; create a new link.',
+          : 'Links that reached their visitor slot limit cannot be reactivated; create a new link.',
         'error',
       );
       return;
@@ -3281,6 +4247,8 @@ export default function AppsPage() {
 
   const openAgentChat = useCallback(() => {
     if (!selectedProject || projectOperationRef.current) return;
+    const inventoryProject = projectsRef.current.find((project) => project.name === selectedProject);
+    if (inventoryProject?.availability?.available === false) return;
     setAgentChatOpen(true);
   }, [selectedProject]);
 
@@ -3302,9 +4270,13 @@ export default function AppsPage() {
     }
     const wasActive = localStorage.getItem(`agent-active-${selectedProject}`) === 'true';
     agentAutoRestoreAttempted.current = selectedProject;
-    if (wasActive) {
-      setTimeout(() => openAgentChat(), 300);
-    }
+    if (!wasActive) return undefined;
+    const timer = window.setTimeout(() => {
+      if (selectedProjectRef.current === selectedProject && !projectOperationRef.current) {
+        openAgentChat();
+      }
+    }, 300);
+    return () => window.clearTimeout(timer);
   }, [selectedProject, agentChatOpen, openAgentChat]);
 
   const analyzeFile = async () => {
@@ -3576,6 +4548,64 @@ export default function AppsPage() {
   });
 
   const currentProject = projects.find(p => p.name === selectedProject);
+  const deploymentProcessOwner = deploymentProcessOwnerRef.current;
+  const ownedDeploymentProcess = deploymentProcess
+    && deploymentProcessOwner
+    && currentProject?.deployment
+    && deploymentProcessOwner.projectName === selectedProject
+    && deploymentProcessOwner.projectGeneration === projectLoadGenerationRef.current
+    && deploymentProcessOwner.appId === currentProject.deployment.appId
+    ? deploymentProcess
+    : null;
+  const displayedRuntimeManagement = ownedDeploymentProcess?.runtimeManagement
+    ?? currentProject?.deployment?.runtimeManagement;
+  const displayedRuntimeStatusSource = ownedDeploymentProcess?.statusSource
+    ?? currentProject?.deployment?.statusSource;
+  const displayedDeploymentStatus = ownedDeploymentProcess?.status
+    ?? (displayedRuntimeManagement === 'static'
+      ? 'deployed'
+      : displayedRuntimeStatusSource === 'portal-manager'
+        ? currentProject?.deployment?.processStatus
+        : 'unknown')
+    ?? 'unknown';
+  const displayedPersistedStatus = ownedDeploymentProcess?.persistedStatus
+    ?? (displayedRuntimeStatusSource === 'persisted-app'
+      || displayedRuntimeStatusSource === 'external-binding'
+      ? currentProject?.deployment?.processStatus
+      : null);
+  const displayedDeploymentPort = displayedRuntimeManagement === 'portal-container'
+    ? ownedDeploymentProcess?.port ?? currentProject?.deployment?.port
+    : null;
+  const deploymentSupportedActions = ownedDeploymentProcess?.supportedActions ?? [];
+  const canRedeployCurrentProject = projectLifecycleActionAllowed(currentProject, 'redeploy');
+  const canUndeployCurrentProject = projectLifecycleActionAllowed(currentProject, 'undeploy');
+  const deploymentPanelAvailable = Boolean(
+    currentProject?.deployment
+    || (
+      deploymentControlError?.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+      && deploymentControlError.retryOwner
+    )
+  );
+  const deploymentLiveStatusText = deploymentProgressAnnouncement(
+    deploymentControlBusy,
+    displayedDeploymentStatus,
+  );
+  const currentProjectAvailable = !selectedProject
+    || Boolean(currentProject && currentProject.availability?.available !== false);
+  useEffect(() => {
+    if (!selectedProject || currentProjectAvailable) return;
+    if (agentChatOpen) setAgentChatOpen(false);
+    selectedProjectRef.current = null;
+    openFileRef.current = null;
+    setSelectedProject(null);
+    setOpenFile(null);
+    setOpenMedia(null);
+    setTree([]);
+    setExpandedDirs({});
+    setTreeError(null);
+    setTreeLoading(false);
+    try { localStorage.removeItem(LAST_SELECTED_PROJECT_KEY); } catch {}
+  }, [agentChatOpen, currentProjectAvailable, selectedProject]);
 
   // Collect all file paths for search
   const collectAllPaths = (entries: TreeEntry[], expanded: Record<string, TreeEntry[]>): string[] => {
@@ -3814,6 +4844,34 @@ export default function AppsPage() {
     </Suspense>
   );
 
+  const runtimeImageRepairRecovery = deploymentControlError?.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+    ? isOwner(user) ? (
+      <div className="space-y-1.5 pt-1 text-red-100/90">
+        <button
+          type="button"
+          onClick={() => { void prepareRuntimeImageRepair(); }}
+          disabled={runtimeImageRepairPhase !== 'idle'}
+          aria-busy={runtimeImageRepairPhase === 'preparing'}
+          className="inline-flex min-h-[36px] items-center justify-center rounded-lg border border-red-300/20 bg-red-300/10 px-3 py-1.5 text-xs font-medium text-red-50 hover:bg-red-300/20 disabled:cursor-wait disabled:opacity-40"
+        >
+          {runtimeImageRepairPhase === 'preparing'
+            ? <><Loader2 size={12} className="mr-1.5 animate-spin" /> Checking repair…</>
+            : 'Repair runtime image and retry'}
+        </button>
+        <p className="text-[10px] leading-relaxed">
+          This narrow host repair verifies a new immutable image, restarts Portal once, then safely retries the exact failed Project action if its Project and App identity are unchanged.
+        </p>
+        {runtimeImageRepairError && (
+          <p role="alert" className="text-[10px] leading-relaxed text-red-100">{runtimeImageRepairError}</p>
+        )}
+      </div>
+    ) : (
+      <p className="pt-1 text-[10px] leading-relaxed text-red-100/90">
+        Ask the Portal Owner to run this Project runtime image repair. Portal will verify the image and retry the exact failed Project action only if its identity is still current. No repair has started.
+      </p>
+    )
+    : null;
+
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="h-full flex flex-col">
       {/* Enhanced Toast with expandable details */}
@@ -4000,20 +5058,22 @@ export default function AppsPage() {
                   {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                 </button>
               )}
-              <button
-                onClick={deployProject}
-                disabled={deploying}
-                aria-label={deploying ? (isRuntimeProject ? 'Starting project…' : 'Deploying project…') : (isRuntimeProject ? 'Run project' : 'Deploy project')}
-                aria-busy={deploying}
-                className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium min-w-[44px] min-h-[44px] justify-center ${
-                  deployStatus === 'success' ? 'bg-emerald-500/20 text-emerald-300' :
-                  deployStatus === 'failed' ? 'bg-red-500/20 text-red-300' :
-                  isRuntimeProject ? 'bg-green-500 text-white' : 'bg-emerald-500 text-white'
-                } disabled:opacity-50`}>
-                {deploying ? <Loader2 size={14} className="animate-spin" /> :
-                 deployStatus === 'success' ? <CheckCircle size={14} /> :
-                 isRuntimeProject ? <Play size={14} /> : <Upload size={14} />}
-              </button>
+              {canRedeployCurrentProject && (
+                <button
+                  onClick={() => { void deployProject(); }}
+                  disabled={deploying || deploymentControlBusy !== null}
+                  aria-label={deploying ? (isRuntimeProject ? 'Starting project…' : 'Deploying project…') : (isRuntimeProject ? 'Run project' : 'Deploy project')}
+                  aria-busy={deploying}
+                  className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium min-w-[44px] min-h-[44px] justify-center ${
+                    deployStatus === 'success' ? 'bg-emerald-500/20 text-emerald-300' :
+                    deployStatus === 'failed' ? 'bg-red-500/20 text-red-300' :
+                    isRuntimeProject ? 'bg-green-500 text-white' : 'bg-emerald-500 text-white'
+                  } disabled:opacity-50`}>
+                  {deploying ? <Loader2 size={14} className="animate-spin" /> :
+                   deployStatus === 'success' ? <CheckCircle size={14} /> :
+                   isRuntimeProject ? <Play size={14} /> : <Upload size={14} />}
+                </button>
+              )}
               <MobileOverflowMenu actions={[
                 ...(openFile ? [
                   { label: 'Fullscreen Editor', icon: <Maximize2 size={16} />, onClick: () => setEditorFullscreen(true) },
@@ -4027,13 +5087,13 @@ export default function AppsPage() {
                 { label: 'Git', icon: <GitBranch size={16} />, onClick: () => toggleActivePanel('git'), active: activePanel === 'git', disabled: shareActionActive && activePanel === 'share' },
                 { label: 'Activity', icon: <Activity size={16} />, onClick: () => toggleActivePanel('activity'), active: activePanel === 'activity', disabled: shareActionActive && activePanel === 'share' },
                 { label: 'Share', icon: <Share2 size={16} />, onClick: () => toggleActivePanel('share'), active: activePanel === 'share', disabled: shareActionActive && activePanel === 'share' },
-                ...(currentProject?.deployment ? [{
+                ...(deploymentPanelAvailable ? [{
                   label: 'Deployment controls',
                   icon: <Rocket size={16} />,
                   onClick: () => toggleActivePanel('deployment'),
                   active: activePanel === 'deployment',
                 }] : []),
-                { label: 'Project Chat', icon: <Bot size={16} />, onClick: () => agentChatOpen ? closeAgentChat() : openAgentChat(), active: agentChatOpen },
+                { label: 'Project Chat', icon: <Bot size={16} />, onClick: () => agentChatOpen ? closeAgentChat() : openAgentChat(), active: agentChatOpen, disabled: !currentProjectAvailable },
                 { label: 'Download (Full)', icon: <Download size={16} />, onClick: () => downloadProject('full') },
                 { label: 'Download (Clean)', icon: <Download size={16} />, onClick: () => downloadProject('clean') },
                 { label: 'Download (Stripped)', icon: <Download size={16} />, onClick: () => downloadProject('stripped'), variant: 'danger' as const },
@@ -4098,7 +5158,7 @@ export default function AppsPage() {
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${activePanel === 'share' ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30' : 'bg-violet-500/10 text-violet-400 hover:bg-violet-500/20'}`}>
                     <Share2 size={12} /> Share
                   </button>
-                  {currentProject?.deployment && (
+                  {deploymentPanelAvailable && (
                     <button
                       onClick={() => toggleActivePanel('deployment')}
                       aria-pressed={activePanel === 'deployment'}
@@ -4108,26 +5168,28 @@ export default function AppsPage() {
                           : 'bg-sky-500/10 text-sky-400 hover:bg-sky-500/20'
                       }`}
                     >
-                      <Rocket size={12} /> Runtime
+                      <Rocket size={12} /> Deployment
                     </button>
                   )}
                   {/* Deploy button for static/fullstack, Run button for runtime */}
-                  <button onClick={deployProject} disabled={deploying}
-                    aria-busy={deploying}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors font-medium ${
-                      deployStatus === 'success' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' :
-                      deployStatus === 'failed' ? 'bg-red-500/20 text-red-300 border border-red-500/30' :
-                      isRuntimeProject ? 'bg-green-500 text-white hover:bg-green-400' : 'bg-emerald-500 text-white hover:bg-emerald-400'
-                    } disabled:opacity-50`}>
-                    {deploying ? <Loader2 size={12} className="animate-spin" /> :
-                     deployStatus === 'success' ? <CheckCircle size={12} /> :
-                     deployStatus === 'failed' ? <AlertCircle size={12} /> :
-                     isRuntimeProject ? <Play size={12} /> : <Upload size={12} />}
-                    {deploying ? (isRuntimeProject ? 'Starting…' : 'Deploying…') :
-                     deployStatus === 'success' ? (isRuntimeProject ? 'Running!' : 'Deployed!') :
-                     deployStatus === 'failed' ? 'Failed' : 
-                     isRuntimeProject ? 'Run' : 'Deploy'}
-                  </button>
+                  {canRedeployCurrentProject && (
+                    <button onClick={() => { void deployProject(); }} disabled={deploying || deploymentControlBusy !== null}
+                      aria-busy={deploying}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors font-medium ${
+                        deployStatus === 'success' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' :
+                        deployStatus === 'failed' ? 'bg-red-500/20 text-red-300 border border-red-500/30' :
+                        isRuntimeProject ? 'bg-green-500 text-white hover:bg-green-400' : 'bg-emerald-500 text-white hover:bg-emerald-400'
+                      } disabled:opacity-50`}>
+                      {deploying ? <Loader2 size={12} className="animate-spin" /> :
+                       deployStatus === 'success' ? <CheckCircle size={12} /> :
+                       deployStatus === 'failed' ? <AlertCircle size={12} /> :
+                       isRuntimeProject ? <Play size={12} /> : <Upload size={12} />}
+                      {deploying ? (isRuntimeProject ? 'Starting…' : 'Deploying…') :
+                       deployStatus === 'success' ? (isRuntimeProject ? 'Running!' : 'Deployed!') :
+                       deployStatus === 'failed' ? 'Failed' :
+                       isRuntimeProject ? 'Run' : 'Deploy'}
+                    </button>
+                  )}
                   
                   {/* Download buttons */}
                   <div className="flex gap-1">
@@ -4159,9 +5221,10 @@ export default function AppsPage() {
               {selectedProject && (
                 <button
                   onClick={() => agentChatOpen ? closeAgentChat() : openAgentChat()}
-                  disabled={projectOperation !== null}
+                  disabled={projectOperation !== null || !currentProjectAvailable}
                   aria-label={agentChatOpen ? 'Close Project Chat' : 'Open Project Chat'}
                   aria-pressed={agentChatOpen}
+                  title={!currentProjectAvailable ? currentProject?.availability?.message : undefined}
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${agentChatOpen ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30' : 'bg-purple-500/10 text-purple-400 hover:bg-purple-500/20'}`}>
                   <Bot size={12} /> Project Chat
                 </button>
@@ -4214,9 +5277,16 @@ export default function AppsPage() {
                 aria-label="Project list"
                 className={`min-h-0 overflow-y-auto ${selectedProject ? 'max-h-[42%] flex-none' : 'flex-1'}`}
               >
-                {loading ? (
+                {projectsError && (
+                  <div role="alert" className="m-2 rounded-lg border border-red-400/20 bg-red-500/10 p-3 text-xs text-red-100">
+                    <p className="font-medium">Projects couldn’t be loaded</p>
+                    <p className="mt-1 break-words text-[11px] leading-relaxed text-red-200/75">{projectsError}</p>
+                    <button type="button" onClick={() => { void loadProjects(); }} disabled={loading} className="mt-2 rounded-md bg-red-400/15 px-2 py-1 text-[11px] hover:bg-red-400/25 disabled:opacity-50">Try again</button>
+                  </div>
+                )}
+                {loading && projects.length === 0 ? (
                   <div className="flex justify-center py-8"><Loader2 size={20} className="animate-spin text-emerald-400" /></div>
-                ) : projects.length === 0 ? (
+                ) : projects.length === 0 && !projectsError ? (
                   <div className="text-center py-8 px-4">
                     <Globe size={32} className="mx-auto mb-2 text-slate-600" />
                     <p className="text-slate-500 text-xs">No projects yet</p>
@@ -4243,15 +5313,27 @@ export default function AppsPage() {
                         {projects.length - (selectedProject ? 1 : 0)} more project{projects.length - (selectedProject ? 1 : 0) === 1 ? '' : 's'} hidden — show all
                       </button>
                     )}
-                    {visibleSidebarProjects.map(p => (
+                    {visibleSidebarProjects.map((p) => {
+                      const canRenameProject = p.destructiveActions.allowed
+                        && projectLifecycleActionAllowed(p, 'rename-project');
+                      const canDeleteProject = p.destructiveActions.allowed
+                        && projectLifecycleActionAllowed(p, 'delete-project');
+                      const projectActionLimitation = p.destructiveActions.reason
+                        || ((!canRenameProject || !canDeleteProject)
+                          ? 'The server-managed deployment policy does not allow Portal to rename or delete this Project.'
+                          : null);
+                      const projectActionsLimited = !canRenameProject || !canDeleteProject;
+                      return (
                       <div key={p.name} className="group">
                           <div
                             className={`flex items-center w-full text-xs rounded-lg transition-colors ${
-                              selectedProject === p.name ? 'accent-active border' : 'text-slate-300 hover:bg-white/5'
+                              p.availability?.available === false
+                                ? 'border border-amber-400/15 bg-amber-500/[0.06] text-amber-100/70'
+                                : selectedProject === p.name ? 'accent-active border' : 'text-slate-300 hover:bg-white/5'
                             }`}
                           >
                             <button
-                              disabled={shareActionActive || projectOperation !== null || deleteBusy}
+                              disabled={p.availability?.available === false || shareActionActive || projectOperation !== null || deleteBusy}
                               onClick={() => {
                                 if (projectOperationRef.current) return;
                                 if (projectDeepLinkPresent) navigate('/projects', { replace: true });
@@ -4259,9 +5341,13 @@ export default function AppsPage() {
                               }}
                               onDoubleClick={(e) => { e.preventDefault(); void startRenameProject(p.name); }}
                               aria-current={selectedProject === p.name ? 'page' : undefined}
+                              aria-describedby={p.availability?.available === false ? `project-availability-${p.identity.id}` : undefined}
+                              title={p.availability?.available === false ? p.availability.message : undefined}
                               className="flex flex-1 items-center gap-1.5 min-w-0 px-2 py-1.5 text-left disabled:cursor-not-allowed disabled:opacity-50"
                             >
-                              <Globe size={13} className="flex-shrink-0" />
+                              {p.availability?.available === false
+                                ? <AlertCircle size={13} className="flex-shrink-0 text-amber-300" />
+                                : <Globe size={13} className="flex-shrink-0" />}
                               <span className="truncate">{p.name}</span>
                               {p.deployedUrl && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" title="Deployed" />}
                               {p.currentBranch && p.currentBranch !== 'main' && p.currentBranch !== 'master' && (
@@ -4271,36 +5357,48 @@ export default function AppsPage() {
                             <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-all flex-shrink-0">
                               <button
                                 aria-label={`Rename project ${p.name}`}
-                                aria-describedby={!p.destructiveActions.allowed ? `project-actions-${p.identity.id}` : undefined}
-                                disabled={!p.destructiveActions.allowed || projectOperation !== null || deleteBusy}
+                                aria-describedby={!canRenameProject ? `project-actions-${p.identity.id}` : undefined}
+                                disabled={!canRenameProject || projectOperation !== null || deleteBusy}
                                 onClick={(e) => { e.stopPropagation(); void startRenameProject(p.name); }}
                                 className="inline-flex size-8 items-center justify-center hover:text-emerald-300 transition-all disabled:cursor-not-allowed disabled:opacity-40"
-                                title={p.destructiveActions.allowed ? 'Rename project' : p.destructiveActions.reason || undefined}
+                                title={canRenameProject ? 'Rename project' : projectActionLimitation || undefined}
                               >
                                 <Edit3 size={11} />
                               </button>
                               <button
                                 aria-label={`Delete project ${p.name}`}
-                                aria-describedby={!p.destructiveActions.allowed ? `project-actions-${p.identity.id}` : undefined}
-                                disabled={!p.destructiveActions.allowed || projectOperation !== null || deleteBusy}
+                                aria-describedby={!canDeleteProject ? `project-actions-${p.identity.id}` : undefined}
+                                disabled={!canDeleteProject || projectOperation !== null || deleteBusy}
                                 onClick={(e) => { e.stopPropagation(); requestDeleteProject(p.name); }}
                                 className="inline-flex size-8 items-center justify-center hover:text-red-400 transition-all disabled:cursor-not-allowed disabled:opacity-40"
-                                title={p.destructiveActions.allowed ? 'Delete project' : p.destructiveActions.reason || undefined}
+                                title={canDeleteProject ? 'Delete project' : projectActionLimitation || undefined}
                               >
                                 <Trash2 size={11} />
                               </button>
                             </div>
                           </div>
-                          {!p.destructiveActions.allowed && selectedProject === p.name && (
+                          {p.availability?.available === false && (
+                            <div id={`project-availability-${p.identity.id}`} className="px-2 pb-2 pt-1 text-[10px] leading-relaxed text-amber-100/70">
+                              <p>{p.availability.message}</p>
+                              {p.availability.retryable && (
+                                <button type="button" onClick={() => { void loadProjects(); }} disabled={loading} className="mt-1 text-amber-300 underline-offset-2 hover:underline disabled:opacity-50">Check again</button>
+                              )}
+                              {!p.availability.retryable && (
+                                <p className="mt-1 font-medium text-amber-200">Administrator reconciliation is required.</p>
+                              )}
+                            </div>
+                          )}
+                          {projectActionsLimited && selectedProject === p.name && (
                             <p
                               id={`project-actions-${p.identity.id}`}
                               className="px-2 pb-1.5 pt-1 text-[10px] leading-relaxed text-amber-200/80"
                             >
-                              {p.destructiveActions.reason}
+                              {projectActionLimitation}
                             </p>
                           )}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -4319,13 +5417,22 @@ export default function AppsPage() {
                         <button aria-label="Create file" onClick={() => { setShowNewFile(true); setNewFileIsDir(false); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="New File"><FilePlus size={12} /></button>
                         <button aria-label="Create folder" onClick={() => { setShowNewFile(true); setNewFileIsDir(true); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="New Folder"><FolderPlus size={12} /></button>
                         <button aria-label="Upload project files" onClick={() => openUploadDialog()} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-emerald-400" title="Upload Files"><Upload size={12} /></button>
-                        <button aria-label="Refresh project files" onClick={() => { void refreshTree(); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white" title="Refresh"><RefreshCw size={12} /></button>
+                        <button aria-label="Refresh project files" aria-busy={treeLoading} disabled={treeLoading} onClick={() => { void refreshTree(); }} className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white disabled:opacity-50" title="Refresh"><RefreshCw size={12} className={treeLoading ? 'animate-spin' : undefined} /></button>
                       </div>
                     </div>
                     <div className="min-h-0 flex-1 overflow-y-auto px-1 pb-2">
-                      {tree.length > 0 ? renderTree(tree) : (
-                        <p className="px-2 py-3 text-[10px] text-slate-600">No files yet</p>
+                      {treeError && (
+                        <div role="alert" className="mx-1 mb-2 rounded-lg border border-red-400/20 bg-red-500/10 p-2 text-[11px] text-red-100">
+                          <p className="font-medium">Files couldn’t be loaded</p>
+                          <p className="mt-1 break-words leading-relaxed text-red-200/70">{treeError}</p>
+                          <button type="button" onClick={() => { void refreshTree(); }} disabled={treeLoading} className="mt-2 rounded bg-red-400/15 px-2 py-1 hover:bg-red-400/25 disabled:opacity-50">Try again</button>
+                        </div>
                       )}
+                      {treeLoading && tree.length === 0 ? (
+                        <div role="status" className="flex items-center gap-2 px-2 py-3 text-[10px] text-slate-500"><Loader2 size={12} className="animate-spin" /> Loading files…</div>
+                      ) : tree.length > 0 ? renderTree(tree) : !treeError ? (
+                        <p className="px-2 py-3 text-[10px] text-slate-600">No files yet</p>
+                      ) : null}
                     </div>
                 </div>
               )}
@@ -4721,6 +5828,49 @@ export default function AppsPage() {
             </ResponsiveProjectPanel>
           )}
 
+          {/* A first full-stack deploy can fail before an App row exists. Keep
+              the structured repair reachable even without deployment inventory. */}
+          {activePanel === 'deployment'
+            && selectedProject
+            && currentProject
+            && !currentProject.deployment
+            && deploymentControlError?.recoveryAction === 'REPAIR_PROJECT_RUNTIME_IMAGE'
+            && (
+              <ResponsiveProjectPanel
+                isMobile={isMobile}
+                mobileLabel="Project deployment recovery"
+                onDismiss={() => {
+                  if (runtimeImageRepairPhase === 'idle') setActivePanel(null);
+                }}
+              >
+                <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
+                  <span className="flex items-center gap-1.5 text-xs font-medium">
+                    <Rocket size={13} className="text-sky-400" /> Deployment recovery
+                  </span>
+                  <button
+                    aria-label="Close deployment recovery"
+                    onClick={() => setActivePanel(null)}
+                    disabled={runtimeImageRepairPhase !== 'idle'}
+                    className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white disabled:cursor-wait disabled:opacity-40"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+                <div className="flex-1 overflow-auto p-3">
+                  <div role="alert" className="space-y-1.5 rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-200">
+                    <p className="font-medium">{deploymentControlError.message}</p>
+                    {deploymentControlError.detail && (
+                      <p className="whitespace-pre-wrap leading-relaxed text-red-100/90">{deploymentControlError.detail}</p>
+                    )}
+                    {deploymentControlError.code && (
+                      <p className="font-mono text-[10px] text-red-300">Code: {deploymentControlError.code}</p>
+                    )}
+                    {runtimeImageRepairRecovery}
+                  </div>
+                </div>
+              </ResponsiveProjectPanel>
+            )}
+
           {/* Deployment controls */}
           {activePanel === 'deployment' && selectedProject && currentProject?.deployment && (
             <ResponsiveProjectPanel
@@ -4737,6 +5887,7 @@ export default function AppsPage() {
                 <div className="flex items-center gap-1">
                   <button
                     aria-label="Refresh deployment status"
+                    aria-busy={deploymentControlBusy === 'refresh'}
                     onClick={() => { void loadDeploymentProcess(selectedProject); }}
                     disabled={deploymentControlBusy !== null}
                     className="inline-flex size-8 items-center justify-center text-slate-500 hover:text-white disabled:cursor-wait disabled:opacity-40"
@@ -4754,104 +5905,215 @@ export default function AppsPage() {
                 </div>
               </div>
               <div className="flex-1 overflow-auto p-3 space-y-3">
+                <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+                  {deploymentLiveStatusText}
+                </p>
                 {deploymentControlError && (
-                  <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-200">
-                    {deploymentControlError}
+                  <div role="alert" className="space-y-1.5 rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-xs text-red-200">
+                    <p className="font-medium">{deploymentControlError.message}</p>
+                    {deploymentControlError.detail && (
+                      <p className="whitespace-pre-wrap leading-relaxed text-red-100/90">{deploymentControlError.detail}</p>
+                    )}
+                    {deploymentControlError.limitation && (
+                      <p className="whitespace-pre-wrap leading-relaxed text-amber-100">{deploymentControlError.limitation}</p>
+                    )}
+                    {deploymentControlError.code && (
+                      <p className="font-mono text-[10px] text-red-300">Code: {deploymentControlError.code}</p>
+                    )}
+                    {runtimeImageRepairRecovery}
+                    {deploymentControlError.recoveryAction === 'UNDEPLOY_CURRENT_DEPLOYMENT' && (
+                      canUndeployCurrentProject ? (
+                        <div className="space-y-1.5 pt-1 text-red-100/90">
+                          <button
+                            type="button"
+                            onClick={() => setPendingUndeploy(currentProject.name)}
+                            disabled={deploymentControlBusy !== null}
+                            className="inline-flex min-h-[36px] items-center justify-center rounded-lg border border-red-300/20 bg-red-300/10 px-3 py-1.5 text-xs font-medium text-red-50 hover:bg-red-300/20 disabled:cursor-wait disabled:opacity-40"
+                          >
+                            Remove current deployment
+                          </button>
+                          <p className="text-[10px] leading-relaxed">
+                            You will confirm removal before anything changes. Project source, Git history, and Project Chat are preserved.
+                          </p>
+                        </div>
+                      ) : (
+                        <p className="pt-1 text-[10px] leading-relaxed text-red-100/90">
+                          Refresh the Project inventory. Portal will not remove a deployment unless the server confirms that action is supported.
+                        </p>
+                      )
+                    )}
                   </div>
                 )}
                 <div className="rounded-lg border border-white/5 bg-white/[0.02] p-3 text-xs">
                   <div className="flex items-center justify-between gap-3">
                     <span className="text-slate-500">Type</span>
-                    <span className="font-medium text-slate-200">{deploymentProcess?.deployType || currentProject.deployment.deployType}</span>
+                    <span className="font-medium text-slate-200">{ownedDeploymentProcess?.deployType || currentProject.deployment.deployType}</span>
                   </div>
+                  {displayedRuntimeManagement && (
+                    <div className="mt-2 flex items-center justify-between gap-3">
+                      <span className="text-slate-500">Managed by</span>
+                      <span className="text-right font-medium text-slate-200">
+                        {runtimeManagementLabel(displayedRuntimeManagement)}
+                      </span>
+                    </div>
+                  )}
+                  {displayedRuntimeStatusSource && (
+                    <div className="mt-2 flex items-center justify-between gap-3">
+                      <span className="text-slate-500">Status source</span>
+                      <span className="text-right text-slate-300">
+                        {runtimeStatusSourceLabel(displayedRuntimeStatusSource)}
+                      </span>
+                    </div>
+                  )}
                   <div className="mt-2 flex items-center justify-between gap-3">
                     <span className="text-slate-500">Status</span>
                     <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                      (deploymentProcess?.status || currentProject.deployment.processStatus) === 'running'
+                      displayedDeploymentStatus === 'running'
                         ? 'bg-emerald-500/10 text-emerald-300'
-                        : (deploymentProcess?.status || currentProject.deployment.processStatus) === 'error'
+                        : displayedDeploymentStatus === 'error'
                           ? 'bg-red-500/10 text-red-300'
-                          : 'bg-slate-500/10 text-slate-300'
+                          : displayedDeploymentStatus === 'unknown' || displayedDeploymentStatus === 'unavailable'
+                            ? 'bg-amber-500/10 text-amber-300'
+                            : 'bg-slate-500/10 text-slate-300'
                     }`}>
-                      {deploymentProcess?.status || currentProject.deployment.processStatus}
+                      {displayedDeploymentStatus}
                     </span>
                   </div>
-                  {(deploymentProcess?.port || currentProject.deployment.port) && (
+                  {displayedDeploymentPort && (
                     <div className="mt-2 flex items-center justify-between gap-3">
                       <span className="text-slate-500">Internal port</span>
-                      <code className="text-slate-300">{deploymentProcess?.port || currentProject.deployment.port}</code>
+                      <code className="text-slate-300">{displayedDeploymentPort}</code>
                     </div>
                   )}
-                  {typeof deploymentProcess?.restartCount === 'number' && (
+                  {displayedPersistedStatus && displayedPersistedStatus !== displayedDeploymentStatus && (
+                    <div className="mt-2 flex items-center justify-between gap-3">
+                      <span className="text-slate-500">Last saved state</span>
+                      <span className="text-slate-300">{displayedPersistedStatus}</span>
+                    </div>
+                  )}
+                  {typeof ownedDeploymentProcess?.restartCount === 'number' && (
                     <div className="mt-2 flex items-center justify-between gap-3">
                       <span className="text-slate-500">Restarts</span>
-                      <span className="text-slate-300">{deploymentProcess.restartCount}</span>
+                      <span className="text-slate-300">{ownedDeploymentProcess.restartCount}</span>
                     </div>
                   )}
                 </div>
 
-                {deploymentProcess?.limitation && (
+                {displayedRuntimeManagement === 'external-loopback' && (
+                  <div className="space-y-1 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] leading-relaxed text-amber-100">
+                    <p className="font-medium">
+                      {currentProject.deployment.bindingStatus === 'invalid'
+                        ? 'Deployment configuration needs attention'
+                        : 'Read-only external deployment'}
+                    </p>
+                    <p>
+                      {ownedDeploymentProcess?.limitation
+                        || currentProject.deployment.limitation
+                        || 'Portal routes this deployment to an external service, but cannot start, stop, restart, or inspect that service. Manage it with the service controls on its host.'}
+                    </p>
+                  </div>
+                )}
+                {displayedRuntimeManagement !== 'external-loopback' && ownedDeploymentProcess?.limitation && (
                   <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] leading-relaxed text-amber-100">
-                    {deploymentProcess.limitation}
+                    {ownedDeploymentProcess.limitation}
                   </div>
                 )}
-                {deploymentProcess?.lastError && (
+                {ownedDeploymentProcess?.recoveryRequired && (
+                  <div role="alert" className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] leading-relaxed text-amber-100">
+                    Live status could not be verified. The saved deployment state is shown for context, not as proof that the app is stopped or running. The actions below are the server-approved recovery choices; Restart remains unavailable until the runtime is recovered.
+                  </div>
+                )}
+                {ownedDeploymentProcess?.lastError && (
                   <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-[11px] text-red-200">
-                    {deploymentProcess.lastError}
+                    {ownedDeploymentProcess.lastError}
                   </div>
                 )}
 
-                {deploymentProcess?.supportedActions.includes('start') && (
-                  <div className="grid grid-cols-3 gap-2">
-                    <button
-                      onClick={() => { void controlDeploymentProcess('start'); }}
-                      disabled={deploymentControlBusy !== null || deploymentProcess.status === 'running'}
-                      className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-emerald-500/10 text-xs text-emerald-300 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      {deploymentControlBusy === 'start' ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Start
-                    </button>
-                    <button
-                      onClick={() => { void controlDeploymentProcess('stop'); }}
-                      disabled={deploymentControlBusy !== null || deploymentProcess.status === 'stopped'}
-                      className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-amber-500/10 text-xs text-amber-300 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      {deploymentControlBusy === 'stop' ? <Loader2 size={12} className="animate-spin" /> : <Circle size={11} />} Stop
-                    </button>
-                    <button
-                      onClick={() => { void controlDeploymentProcess('restart'); }}
-                      disabled={deploymentControlBusy !== null || deploymentProcess.status === 'stopped'}
-                      className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-sky-500/10 text-xs text-sky-300 hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      {deploymentControlBusy === 'restart' ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Restart
-                    </button>
+                {deploymentSupportedActions.some((action) => (
+                  action === 'start' || action === 'stop' || action === 'restart'
+                )) && (
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    {deploymentSupportedActions.includes('start') && (
+                      <button
+                        onClick={() => { void controlDeploymentProcess('start'); }}
+                        disabled={deploymentControlBusy !== null || displayedDeploymentStatus === 'running'}
+                        aria-busy={deploymentControlBusy === 'start'}
+                        className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-emerald-500/10 text-xs text-emerald-300 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {deploymentControlBusy === 'start' ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Start
+                      </button>
+                    )}
+                    {deploymentSupportedActions.includes('stop') && (
+                      <button
+                        onClick={() => { void controlDeploymentProcess('stop'); }}
+                        disabled={deploymentControlBusy !== null || displayedDeploymentStatus === 'stopped'}
+                        aria-busy={deploymentControlBusy === 'stop'}
+                        className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-amber-500/10 text-xs text-amber-300 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {deploymentControlBusy === 'stop' ? <Loader2 size={12} className="animate-spin" /> : <Circle size={11} />} Stop
+                      </button>
+                    )}
+                    {deploymentSupportedActions.includes('restart') && (
+                      <button
+                        onClick={() => { void controlDeploymentProcess('restart'); }}
+                        disabled={deploymentControlBusy !== null || displayedDeploymentStatus === 'stopped'}
+                        aria-busy={deploymentControlBusy === 'restart'}
+                        className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-sky-500/10 text-xs text-sky-300 hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {deploymentControlBusy === 'restart' ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Restart
+                      </button>
+                    )}
                   </div>
                 )}
 
-                {deploymentProcess?.deployType === 'fullstack' && (
+                {deploymentSupportedActions.includes('logs') && ownedDeploymentProcess && (
                   <div className="rounded-lg border border-white/5 bg-black/20">
                     <div className="border-b border-white/5 px-3 py-2 text-[10px] font-medium uppercase tracking-wider text-slate-500">
                       Recent logs
                     </div>
                     <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-words p-3 text-[10px] leading-relaxed text-slate-300">
-                      {deploymentProcess.logs.length > 0 ? deploymentProcess.logs.join('\n') : 'No runtime logs yet.'}
+                      {ownedDeploymentProcess.logs.length > 0 ? ownedDeploymentProcess.logs.join('\n') : 'No runtime logs yet.'}
                     </pre>
                   </div>
                 )}
 
-                <button
-                  onClick={() => {
-                    setDeploymentControlError(null);
-                    setPendingUndeploy(selectedProject);
-                  }}
-                  disabled={deploymentControlBusy !== null}
-                  className="inline-flex min-h-[42px] w-full items-center justify-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/20 disabled:cursor-wait disabled:opacity-40"
-                >
-                  {deploymentControlBusy === 'undeploy' ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
-                  Remove deployment
-                </button>
-                <p className="text-[10px] leading-relaxed text-slate-600">
-                  Project source, Git history, and Project Chat remain. Hosted files, runtime state, and deployment share links are removed.
-                </p>
+                {currentProject.deployedUrl && (
+                  <a
+                    href={currentProject.deployedUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex min-h-[42px] w-full items-center justify-center gap-2 rounded-lg border border-sky-500/20 bg-sky-500/10 px-3 py-2 text-xs font-medium text-sky-200 hover:bg-sky-500/20"
+                  >
+                    <ExternalLink size={13} /> Open App
+                  </a>
+                )}
+
+                {!canUndeployCurrentProject ? (
+                  <p className="rounded-lg border border-white/5 bg-white/[0.02] p-3 text-[10px] leading-relaxed text-slate-400">
+                    Removal is unavailable because the server-managed deployment policy does not allow Portal to remove this deployment.
+                    {displayedRuntimeManagement === 'external-loopback'
+                      ? ' Manage or disconnect the external service with the controls on its host.'
+                      : ''}
+                  </p>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => {
+                        setDeploymentControlError(null);
+                        setPendingUndeploy(selectedProject);
+                      }}
+                      disabled={deploymentControlBusy !== null}
+                      aria-busy={deploymentControlBusy === 'undeploy'}
+                      className="inline-flex min-h-[42px] w-full items-center justify-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/20 disabled:cursor-wait disabled:opacity-40"
+                    >
+                      {deploymentControlBusy === 'undeploy' ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
+                      Remove deployment
+                    </button>
+                    <p className="text-[10px] leading-relaxed text-slate-600">
+                      Project source, Git history, and Project Chat remain. Hosted files, runtime state, and deployment share links are removed.
+                    </p>
+                  </>
+                )}
               </div>
             </ResponsiveProjectPanel>
           )}
@@ -4964,13 +6226,13 @@ export default function AppsPage() {
                     <fieldset disabled={shareActionActive || Boolean(shareRefreshError)} className="min-w-0 bg-white/[0.02] border border-white/5 rounded-lg p-3 space-y-3 disabled:opacity-70">
                       <div className="text-[10px] text-slate-500 uppercase font-medium tracking-wider">New Share Link</div>
                       <div className="flex gap-2">
-                        <button aria-pressed={shareIsPublic} onClick={() => setShareIsPublic(true)}
+                        <button type="button" aria-pressed={shareIsPublic} onClick={() => { setShareIsPublic(true); setShareCreateError(null); }}
                           className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[11px] font-medium transition-all ${
                             shareIsPublic ? 'bg-green-500/10 text-green-400 border border-green-500/30' : 'bg-white/5 text-slate-500 border border-white/10'
                           }`}>
                           <Globe size={12} /> Public
                         </button>
-                        <button aria-pressed={!shareIsPublic} onClick={() => setShareIsPublic(false)}
+                        <button type="button" aria-pressed={!shareIsPublic} onClick={() => { setShareIsPublic(false); setShareCreateError(null); }}
                           className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[11px] font-medium transition-all ${
                             !shareIsPublic ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30' : 'bg-white/5 text-slate-500 border border-white/10'
                           }`}>
@@ -4979,51 +6241,153 @@ export default function AppsPage() {
                       </div>
                       {!shareIsPublic && (
                         <div className="space-y-2">
-                          <input aria-label="Share link password" type="password" maxLength={128} value={sharePassword} onChange={e => setSharePassword(e.target.value)}
+                          <input aria-label="Share link password" aria-describedby={`share-password-requirements${sharePasswordByteLength > 72 ? ' share-password-byte-error' : ''}`} aria-invalid={sharePassword.length > 0 && (sharePassword.length < 8 || sharePasswordByteLength > 72)} type="password" maxLength={72} value={sharePassword} onChange={e => { setSharePassword(e.target.value); setShareCreateError(null); }}
                             placeholder="Password (min 8 chars)"
                             className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-xs text-white placeholder-slate-600 focus:border-amber-500/30 focus:outline-none" />
-                          <input aria-label="Confirm share link password" type="password" maxLength={128} value={sharePasswordConfirm} onChange={e => setSharePasswordConfirm(e.target.value)}
+                          <input aria-label="Confirm share link password" aria-describedby={sharePasswordConfirm.length > 0 && sharePassword !== sharePasswordConfirm ? 'share-password-mismatch-error' : undefined} aria-invalid={sharePasswordConfirm.length > 0 && sharePassword !== sharePasswordConfirm} type="password" maxLength={72} value={sharePasswordConfirm} onChange={e => { setSharePasswordConfirm(e.target.value); setShareCreateError(null); }}
                             placeholder="Confirm password"
                             className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-xs text-white placeholder-slate-600 focus:border-amber-500/30 focus:outline-none" />
-                          {sharePassword.length > 0 && sharePassword.length < 8 && (
+                          <p id="share-password-requirements" className="text-[9px] text-slate-500">8 characters minimum · 72 UTF-8 bytes maximum</p>
+                          {sharePasswordByteLength > 72 ? (
+                            <p id="share-password-byte-error" role="alert" className="text-[10px] text-red-400">
+                              Password is {sharePasswordByteLength} UTF-8 bytes; maximum 72. Shorten it by {sharePasswordByteLength - 72} byte{sharePasswordByteLength - 72 === 1 ? '' : 's'}.
+                            </p>
+                          ) : sharePassword.length > 0 && sharePassword.length < 8 ? (
                             <p className="text-[10px] text-red-400">Min 8 characters ({8 - sharePassword.length} more needed)</p>
-                          )}
-                          {sharePassword.length >= 8 && sharePassword.length < 12 && (
+                          ) : sharePassword.length >= 8 && sharePassword.length < 12 ? (
                             <p className="text-[10px] text-amber-400">Good — 12+ characters recommended</p>
-                          )}
-                          {sharePassword.length >= 12 && (
+                          ) : sharePassword.length >= 12 ? (
                             <p className="text-[10px] text-green-400">Strong password ✓</p>
+                          ) : null}
+                          {sharePasswordConfirm.length > 0 && sharePassword !== sharePasswordConfirm && (
+                            <p id="share-password-mismatch-error" role="alert" className="text-[10px] text-red-400">Passwords do not match.</p>
                           )}
                         </div>
                       )}
-                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <label className="space-y-1 text-[10px] text-slate-500">
+                        <span>Expires (optional)</span>
+                        <input
+                          aria-label="Share link expiration"
+                          type="datetime-local"
+                          value={shareExpiresAt}
+                          onChange={event => { setShareExpiresAt(event.target.value); setShareCreateError(null); }}
+                          className="w-full px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[11px] text-white focus:border-violet-500/30 focus:outline-none"
+                        />
+                      </label>
+
+                      <div className="space-y-2 rounded-lg border border-white/[0.07] bg-black/10 p-2.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="flex items-center gap-1 text-[10px] font-medium text-slate-300"><Users size={10} /> Visitor slots</span>
+                          <span className="text-[9px] text-slate-600">Default: unlimited</span>
+                        </div>
+                        <div role="group" aria-label="Visitor slot presets" className="grid grid-cols-4 gap-1">
+                          {SHARE_VISITOR_PRESETS.map((preset) => (
+                            <button
+                              key={preset.label}
+                              type="button"
+                              aria-label={preset.value
+                                ? `${preset.label} audience: ${preset.value} visitor slot${preset.value === '1' ? '' : 's'}`
+                                : 'Unlimited visitor slots'}
+                              aria-pressed={shareMaxUses === preset.value}
+                              onClick={() => { setShareMaxUses(preset.value); setShareCreateError(null); }}
+                              className={`min-w-0 rounded-md border px-1 py-1.5 text-center transition ${
+                                shareMaxUses === preset.value
+                                  ? 'border-violet-400/40 bg-violet-500/15 text-violet-200'
+                                  : 'border-white/[0.08] bg-white/[0.03] text-slate-500 hover:text-slate-300'
+                              }`}
+                            >
+                              <span className="block truncate text-[9px] font-medium">{preset.label}</span>
+                              <span className="block text-[10px]">{preset.detail}</span>
+                            </button>
+                          ))}
+                        </div>
                         <label className="space-y-1 text-[10px] text-slate-500">
-                          <span>Expires (optional)</span>
+                          <span>Custom visitor slots</span>
                           <input
-                            aria-label="Share link expiration"
-                            type="datetime-local"
-                            value={shareExpiresAt}
-                            onChange={event => setShareExpiresAt(event.target.value)}
-                            className="w-full px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[11px] text-white focus:border-violet-500/30 focus:outline-none"
-                          />
-                        </label>
-                        <label className="space-y-1 text-[10px] text-slate-500">
-                          <span>Visit limit (optional)</span>
-                          <input
-                            aria-label="Share link visit limit"
+                            aria-label="Share link visitor slots"
+                            aria-describedby={`share-visitor-slots-hint${shareCreateError ? ' share-create-error' : ''}`}
+                            aria-invalid={shareMaxUsesInvalid}
                             type="number"
                             min={1}
                             max={1_000_000}
                             step={1}
                             value={shareMaxUses}
-                            onChange={event => setShareMaxUses(event.target.value)}
+                            onChange={event => { setShareMaxUses(event.target.value); setShareCreateError(null); }}
                             placeholder="Unlimited"
-                            className="w-full px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[11px] text-white placeholder-slate-600 focus:border-violet-500/30 focus:outline-none"
+                            className="w-full rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] text-white placeholder-slate-600 focus:border-violet-500/30 focus:outline-none"
                           />
                         </label>
+                        <p id="share-visitor-slots-hint" className="text-[9px] leading-relaxed text-slate-500">
+                          Each slot grants one browser up to 30 days of access while the link remains active. Clearing cookies or switching browsers can use another slot.
+                        </p>
                       </div>
-                      <button onClick={createShareLink}
-                        disabled={shareActionActive || (!shareIsPublic && (sharePassword.length < 8 || sharePassword !== sharePasswordConfirm))}
+
+                      <div className="space-y-2 rounded-lg border border-white/[0.07] bg-black/10 p-2.5">
+                        <label className="flex min-h-8 cursor-pointer items-center justify-between gap-3 text-[10px] text-slate-300">
+                          <span className="flex items-center gap-1 font-medium"><Gauge size={10} /> Limit API requests</span>
+                          <span className="flex items-center gap-2 text-[9px] text-slate-500">
+                            {shareRateLimitEnabled ? 'Enabled' : 'Unlimited'}
+                            <input
+                              aria-label="Limit share link API requests"
+                              type="checkbox"
+                              checked={shareRateLimitEnabled}
+                              onChange={event => {
+                                setShareRateLimitEnabled(event.target.checked);
+                                if (!event.target.checked) setShareRateLimitMaxRequests('');
+                                setShareCreateError(null);
+                              }}
+                              className="size-4 accent-violet-500"
+                            />
+                          </span>
+                        </label>
+                        {shareRateLimitEnabled && (
+                          <div className="grid grid-cols-[minmax(0,1fr)_minmax(110px,0.9fr)] gap-2">
+                            <label className="space-y-1 text-[10px] text-slate-500">
+                              <span>API requests</span>
+                              <input
+                                aria-label="Share link API request limit"
+                                aria-describedby={`share-api-rate-hint${shareCreateError ? ' share-create-error' : ''}`}
+                                aria-invalid={shareRateLimitMaxRequestsInvalid}
+                                type="number"
+                                min={1}
+                                max={1_000_000}
+                                step={1}
+                                value={shareRateLimitMaxRequests}
+                                onChange={event => { setShareRateLimitMaxRequests(event.target.value); setShareCreateError(null); }}
+                                placeholder="Requests"
+                                className="w-full rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] text-white placeholder-slate-600 focus:border-violet-500/30 focus:outline-none"
+                              />
+                            </label>
+                            <label className="space-y-1 text-[10px] text-slate-500">
+                              <span>Window</span>
+                              <select
+                                aria-label="Share link API request window"
+                                value={shareRateLimitWindowSeconds}
+                                onChange={event => {
+                                  setShareRateLimitWindowSeconds(Number(event.target.value) as ShareRateLimitWindowSeconds);
+                                  setShareCreateError(null);
+                                }}
+                                className="w-full rounded-lg border border-white/10 bg-[#10142d] px-2 py-1.5 text-[11px] text-white focus:border-violet-500/30 focus:outline-none"
+                              >
+                                {SHARE_RATE_LIMIT_WINDOWS.map((window) => (
+                                  <option key={window.value} value={window.value}>{window.label}</option>
+                                ))}
+                              </select>
+                            </label>
+                          </div>
+                        )}
+                        <p id="share-api-rate-hint" className="text-[9px] leading-relaxed text-slate-500">
+                          Shared by everyone using this link. Counts dynamic API requests only; static files are excluded.
+                        </p>
+                      </div>
+
+                      {shareCreateError && (
+                        <p id="share-create-error" role="alert" className="rounded-md border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[10px] text-red-200">
+                          {shareCreateError}
+                        </p>
+                      )}
+                      <button type="button" onClick={createShareLink}
+                        disabled={shareActionActive || (!shareIsPublic && (sharePassword.length < 8 || sharePasswordByteLength > 72 || sharePassword !== sharePasswordConfirm))}
                         aria-busy={shareCreating}
                         className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-violet-500/10 text-violet-400 text-[11px] hover:bg-violet-500/20 transition-colors disabled:opacity-30 font-medium">
                         {shareCreating ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
@@ -5080,15 +6444,27 @@ export default function AppsPage() {
                                   {copiedId === link.id ? <Check size={10} className="text-emerald-400" /> : <Copy size={10} />}
                                 </button>
                               </div>
-                              <div className="flex items-center gap-2 mb-1.5 text-[10px]">
-                                <span className={link.isPublic ? 'text-green-400/70' : 'text-amber-400/70'}>
-                                  {link.isPublic ? 'Public' : 'Password-Protected'}
-                                </span>
-                                <span className="text-slate-700">•</span>
-                                <span className="text-slate-600">{link.currentUses} visits{link.maxUses ? ` / ${link.maxUses} max` : ''}</span>
-                                {link.expiresAt && (
-                                  <><span className="text-slate-700">•</span><span className="text-slate-600">expires {new Date(link.expiresAt).toLocaleString()}</span></>
-                                )}
+                              <div className="mb-1.5 space-y-1 text-[10px] text-slate-600">
+                                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                  <span className={link.isPublic ? 'text-green-400/70' : 'text-amber-400/70'}>
+                                    {link.isPublic ? 'Public' : 'Password-Protected'}
+                                  </span>
+                                  {link.expiresAt && (
+                                    <><span className="text-slate-700">•</span><span>expires {new Date(link.expiresAt).toLocaleString()}</span></>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <Users size={9} className="flex-shrink-0 text-violet-400/70" />
+                                  <span>{link.maxUses !== null && link.maxUses !== undefined
+                                    ? `${link.currentUses} / ${link.maxUses} visitor slots used`
+                                    : `${link.currentUses} visitor slot${link.currentUses === 1 ? '' : 's'} used · unlimited`}</span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <Gauge size={9} className="flex-shrink-0 text-sky-400/70" />
+                                  <span>{link.rateLimitMaxRequests && link.rateLimitWindowSeconds
+                                    ? `${link.rateLimitMaxRequests} API requests / ${shareRateLimitWindowLabel(link.rateLimitWindowSeconds)} · shared`
+                                    : 'Unlimited API requests'}</span>
+                                </div>
                               </div>
                               <div className="flex items-center justify-between text-[10px] text-slate-600">
                                 <span>{timeAgo(link.createdAt)}</span>
@@ -5230,18 +6606,24 @@ export default function AppsPage() {
         {/* Project Chat Panel */}
         <AnimatePresence>
           {agentChatOpen && selectedProject && (
-            <Suspense fallback={null}>
-              <LazyProjectChatPanel
-                key={`project-agent-chat:${selectedProject}`}
-                projectName={selectedProject}
-                onClose={closeAgentChat}
-                onProjectPrepared={async (preparedProjectName) => {
-                  await loadProjects();
-                  await selectProject(preparedProjectName);
-                }}
-                onActivityChange={handleProjectChatActivity}
-              />
-            </Suspense>
+            <ProjectChatChunkBoundary resetKey={selectedProject} onClose={closeAgentChat}>
+              <Suspense fallback={(
+                <div role="status" className="flex w-[340px] max-w-full items-center justify-center gap-2 border-l border-white/5 bg-[#080B20]/95 p-5 text-xs text-slate-400">
+                  <Loader2 size={14} className="animate-spin text-purple-300" /> Loading Project Chat…
+                </div>
+              )}>
+                <LazyProjectChatPanel
+                  key={`project-agent-chat:${selectedProject}`}
+                  projectName={selectedProject}
+                  onClose={closeAgentChat}
+                  onProjectPrepared={async (preparedProjectName) => {
+                    await loadProjects();
+                    await selectProject(preparedProjectName);
+                  }}
+                  onActivityChange={handleProjectChatActivity}
+                />
+              </Suspense>
+            </ProjectChatChunkBoundary>
           )}
         </AnimatePresence>
       </div>
@@ -5594,12 +6976,38 @@ export default function AppsPage() {
         )}
       </ViewportModal>
 
+      <TypedConfirmationDialog
+        open={!!runtimeImageRepairDialog}
+        title="Repair runtime image and retry?"
+        description="Portal will rebuild and attest the isolated Project runtime image, update only its immutable image pin, restart the Portal service once, then retry the exact failed Project action only if its server-verified Project, App, and source identity are unchanged."
+        confirmationPhrase={runtimeImageRepairDialog?.confirmationPhrase || null}
+        confirmLabel="Repair runtime image"
+        busy={runtimeImageRepairPhase === 'running'}
+        busyLabel="Repairing image and waiting for Portal…"
+        tone="warning"
+        details={runtimeImageRepairError ? (
+          <div role="alert" className="rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+            {runtimeImageRepairError}
+          </div>
+        ) : (
+          <p className="text-sm leading-6 text-theme-text-muted">
+            When the repair finishes, Portal will safely retry the original {runtimeImageRepairDialog?.retryAction || 'Project'} action. If anything changed while the repair ran, the retry is rejected and you will refresh before acting again.
+          </p>
+        )}
+        onConfirm={(confirmation) => { void runRuntimeImageRepair(confirmation); }}
+        onCancel={() => {
+          if (runtimeImageRepairInFlightRef.current) return;
+          setRuntimeImageRepairError(null);
+          setRuntimeImageRepairDialog(null);
+        }}
+      />
+
       {/* Delete Confirmation */}
       <ConfirmDialog
         open={!!pendingDelete}
         title={pendingDelete?.kind === 'project' ? `⚠️ Delete project "${pendingDelete.name}"?` : `⚠️ Delete ${pendingDelete?.name || 'file'}?`}
         message={pendingDelete?.kind === 'project' ? 'All files, commit history, and deployments will be permanently lost.' : 'This file will be permanently deleted.'}
-        detail={pendingDelete?.path}
+        detail={pendingDelete?.kind === 'file' ? pendingDelete.path : undefined}
         confirmLabel="Delete"
         variant="danger"
         icon={pendingDelete?.kind === 'project' ? 'shield' : 'trash'}
@@ -5624,7 +7032,7 @@ export default function AppsPage() {
         confirmLabel="Remove deployment"
         variant="danger"
         icon="trash"
-        error={deploymentControlError}
+        error={deploymentFailureText(deploymentControlError)}
         busy={deploymentControlBusy === 'undeploy'}
         busyLabel="Removing deployment…"
         onConfirm={() => { void undeployProject(); }}

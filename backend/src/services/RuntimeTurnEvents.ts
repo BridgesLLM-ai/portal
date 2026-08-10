@@ -40,6 +40,8 @@ export interface RuntimeTurnEvent {
     transport: 'portal-stream-event-bus';
     eventType: StreamEvent['type'];
     eventProvenance?: string;
+    /** Provider-attested OpenClaw item.preamble progress, rendered as reasoning. */
+    preambleProgress?: true;
   };
 }
 
@@ -109,6 +111,7 @@ export function normalizeRuntimeTurnEvent(params: {
       transport: 'portal-stream-event-bus',
       eventType: event.type,
       ...(cleanText(event.provenance) ? { eventProvenance: cleanText(event.provenance) } : {}),
+      ...(event.preambleProgress === true ? { preambleProgress: true as const } : {}),
     },
     ...extra,
   });
@@ -134,7 +137,26 @@ export function normalizeRuntimeTurnEvent(params: {
       });
     }
 
-    case 'status':
+    case 'status': {
+      // Opus can expose its only readable live reasoning as an attested
+      // item.preamble progress frame. It remains a status-shaped transport
+      // event for compatibility, but its durable/runtime projection must be
+      // reasoning so reconnect snapshots restore the violet thought bubble.
+      if (event.preambleProgress === true) {
+        const rawPreamble = typeof event.content === 'string' ? event.content : '';
+        if (!rawPreamble.trim() && !subject) return null;
+        return base('assistant_reasoning', {
+          ...(rawPreamble ? { text: rawPreamble } : {}),
+          ...(subject ? { subject } : {}),
+          visible: true,
+        });
+      }
+      return base('assistant_status', {
+        ...(text ? { text } : {}),
+        visible: Boolean(text),
+      });
+    }
+
     case 'run_resumed':
     case 'compaction_start':
     case 'compaction_end':

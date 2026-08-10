@@ -37,6 +37,7 @@ export interface RuntimeTurnEvent {
   source?: {
     transport?: string;
     eventType?: string;
+    preambleProgress?: true;
   };
 }
 
@@ -54,6 +55,7 @@ export interface PortalStreamEventFromTurnEvent {
   toolResult?: unknown;
   status?: 'running' | 'done' | 'error';
   replace?: boolean;
+  preambleProgress?: boolean;
   turnEvent?: RuntimeTurnEvent;
   [key: string]: unknown;
 }
@@ -128,6 +130,7 @@ export function normalizePortalStreamEventFromTurnEvent<T extends Record<string,
     provenance: turnEvent.provenance || payload?.provenance,
     sessionKey: turnEvent.sessionKey || payload?.sessionKey,
     ...(turnEvent.replace === true ? { replace: true } : {}),
+    ...(turnEvent.source?.preambleProgress === true ? { preambleProgress: true } : {}),
     ...(toolName ? { toolName } : {}),
     ...(toolCallId ? { toolCallId } : {}),
     ...(turnEvent.tool?.arguments !== undefined ? { toolArgs: turnEvent.tool.arguments } : {}),

@@ -349,7 +349,7 @@ client.interceptors.response.use(
 
     // Report 5xx + network errors to backend activity log (skip report-error endpoint to avoid loops)
     const responseStatus = error.response?.status;
-    if ((!error.response || (responseStatus && responseStatus >= 500)) && !originalRequest?.url?.includes('report-error') && !originalRequest?._errorReported) {
+    if (!originalRequest?._silent && (!error.response || (responseStatus && responseStatus >= 500)) && !originalRequest?.url?.includes('report-error') && !originalRequest?._errorReported) {
       originalRequest._errorReported = true;
       const serverMsg = error.response?.data ? 
         ((error.response.data as any).detail || (error.response.data as any).error || error.message) : 

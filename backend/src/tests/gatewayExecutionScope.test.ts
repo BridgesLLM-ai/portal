@@ -10,6 +10,10 @@ import {
   AGENT_ZERO_OPENROUTER_FALLBACK_MESSAGE,
 } from '../agents/providers/agentZero/AgentZeroDiagnostics';
 import { prisma } from '../config/database';
+import {
+  buildPortalOpenClawIdempotencyKey,
+  portalClientMessageIdFromIdempotencyKey,
+} from '../agents/providers/PortalMessageIdentity';
 
 function sendRouteHandler(): (req: any, res: any) => Promise<void> {
   const layer = (gatewayRouter as any).stack.find((entry: any) => entry.route?.path === '/send');
@@ -708,11 +712,206 @@ describe('Agent Chat execution boundary', () => {
     }
   });
 
-  test('direct chat reservation expires server-side when its acknowledgement never arrives', () => {
+  test('direct proxy settles its synthetic reservation before forwarding chat.send success', async () => {
+    const sessionKey = 'direct-proxy-response-ack';
+    const reservationRunId = 'direct-response-reservation';
+    const upstreamRunId = 'direct-response-upstream';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(sessionKey, (event) => events.push(event));
+
+    try {
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        reservationRunId,
+      )).toBe(true);
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: upstreamRunId,
+        stream: 'thinking',
+        data: { text: 'Buffered before the direct acknowledgement.' },
+      });
+
+      const response = await __gatewayExecutionScopeTest.settleDirectGatewayChatSendResponse(
+        {
+          method: 'chat.send',
+          sessionKey,
+          reservationRunId,
+          clientMessageId: 'msg-direct-ack',
+        },
+        { type: 'res', ok: true, payload: { runId: upstreamRunId } },
+      );
+
+      expect(response).toMatchObject({ ok: true, payload: { runId: upstreamRunId } });
+      expect(streamEventBus.getTrackedStream(sessionKey)).toMatchObject({
+        active: true,
+        runId: upstreamRunId,
+      });
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'run_resumed', runId: upstreamRunId }),
+        expect.objectContaining({
+          type: 'thinking',
+          content: 'Buffered before the direct acknowledgement.',
+          runId: upstreamRunId,
+        }),
+      ]));
+    } finally {
+      unsubscribe();
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('direct proxy parks a success response without a run ID until the exact user mirror adopts it', async () => {
+    const sessionKey = 'direct-proxy-response-missing-run';
+    const reservationRunId = 'direct-response-missing-run-reservation';
+    const upstreamRunId = 'direct-response-missing-run-recovered';
+    const idempotencyKey = 'portal-direct-response-request:client:msg-direct-missing-run';
+
+    try {
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        reservationRunId,
+      )).toBe(true);
+
+      const response = await __gatewayExecutionScopeTest.settleDirectGatewayChatSendResponse(
+        {
+          method: 'chat.send',
+          sessionKey,
+          reservationRunId,
+          clientMessageId: 'msg-direct-missing-run',
+          idempotencyKey,
+        },
+        { type: 'res', ok: true, payload: { status: 'accepted' } },
+      );
+
+      expect(response).toMatchObject({
+        ok: false,
+        error: {
+          code: 'CHAT_SEND_UNCONFIRMED',
+          sessionKey,
+          clientMessageId: 'msg-direct-missing-run',
+        },
+      });
+      expect(streamEventBus.getTrackedStream(sessionKey)).toEqual(expect.objectContaining({
+        active: true,
+        runId: reservationRunId,
+      }));
+
+      __persistentGatewayWsTest.handleSessionMessageEvent({
+        sessionKey,
+        activeRunIds: [upstreamRunId],
+        message: {
+          role: 'user',
+          content: 'Recover the accepted response without an ACK run ID.',
+          idempotencyKey: `${idempotencyKey}:user`,
+        },
+      });
+      await expect(__persistentGatewayWsTest.finalizeAmbiguousRunDispatch(
+        sessionKey,
+        upstreamRunId,
+      )).resolves.toBe(true);
+      __persistentGatewayWsTest.handleChatEvent({
+        sessionKey,
+        runId: upstreamRunId,
+        state: 'final',
+        message: { role: 'assistant', content: 'Recovered missing-run response.' },
+      });
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        'direct-after-missing-run',
+      )).toBe(true);
+    } finally {
+      __gatewayExecutionScopeTest.failDirectGatewayChatRun(sessionKey, 'direct-after-missing-run');
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('direct proxy reconciles an upstream TURN_ACTIVE response and returns exact browser identity', async () => {
+    const sessionKey = 'agent:main:portal-owner-1-direct-turn-active';
+    const reservationRunId = 'direct-turn-active-reservation';
+    const upstreamRunId = 'direct-turn-active-upstream';
+    jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockResolvedValue({
+      ok: true,
+      data: {
+        sessions: [{ key: sessionKey, hasActiveRun: true, activeRunIds: [upstreamRunId] }],
+      },
+    } as any);
+
+    try {
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        reservationRunId,
+      )).toBe(true);
+
+      const response = await __gatewayExecutionScopeTest.settleDirectGatewayChatSendResponse(
+        {
+          method: 'chat.send',
+          sessionKey,
+          reservationRunId,
+          clientMessageId: 'msg-direct-conflict',
+        },
+        {
+          type: 'res',
+          ok: false,
+          error: { code: 'TURN_ACTIVE', message: 'A different run is already active.' },
+        },
+      );
+
+      expect(response).toMatchObject({
+        ok: false,
+        error: {
+          code: 'TURN_ACTIVE',
+          sessionKey,
+          clientMessageId: 'msg-direct-conflict',
+          activeStream: { active: true, runId: upstreamRunId },
+        },
+      });
+      expect(streamEventBus.getTrackedStream(sessionKey)).toMatchObject({
+        active: true,
+        runId: upstreamRunId,
+      });
+    } finally {
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('normalizes Portal direct idempotency keys back to their optimistic message id', () => {
+    expect(__gatewayExecutionScopeTest.normalizeDirectGatewayClientMessageId(
+      'portal-msg-1786150000000-7:user',
+    )).toBe('msg-1786150000000-7');
+    expect(__gatewayExecutionScopeTest.normalizeDirectGatewayClientMessageId(
+      'msg-legacy-direct-1',
+    )).toBe('msg-legacy-direct-1');
+    expect(__gatewayExecutionScopeTest.normalizeDirectGatewayClientMessageId('portal-')).toBeUndefined();
+  });
+
+  test('keeps server entropy when two sessions reuse the same optimistic browser message id', () => {
+    const first = buildPortalOpenClawIdempotencyKey(
+      'server-request-a',
+      'msg-1786150000000-1',
+    );
+    const second = buildPortalOpenClawIdempotencyKey(
+      'server-request-b',
+      'msg-1786150000000-1',
+    );
+
+    expect(first).not.toBe(second);
+    expect(first).toBe('portal-server-request-a:client:msg-1786150000000-1');
+    expect(second).toBe('portal-server-request-b:client:msg-1786150000000-1');
+    expect(portalClientMessageIdFromIdempotencyKey(`${first}:user`))
+      .toBe('msg-1786150000000-1');
+    expect(portalClientMessageIdFromIdempotencyKey(`${second}:user`))
+      .toBe('msg-1786150000000-1');
+  });
+
+  test('direct pre-ack timeout parks, adopts the correlated run, and releases the next send', async () => {
     jest.useFakeTimers();
     const sessionKey = 'direct-ack-timeout';
     const reservationRunId = 'direct-timeout-reservation';
+    const upstreamRunId = 'direct-timeout-recovered-run';
+    const idempotencyKey = 'portal-msg-direct-timeout';
     const onExpire = jest.fn();
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(sessionKey, (event) => events.push(event));
 
     try {
       expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
@@ -722,6 +921,7 @@ describe('Agent Chat execution boundary', () => {
       __gatewayExecutionScopeTest.scheduleDirectGatewayChatRunTimeout(
         sessionKey,
         reservationRunId,
+        idempotencyKey,
         onExpire,
       );
 
@@ -734,12 +934,492 @@ describe('Agent Chat execution boundary', () => {
       jest.advanceTimersByTime(1);
 
       expect(onExpire).toHaveBeenCalledTimes(1);
-      expect(streamEventBus.getStreamStatus(sessionKey)).toBeNull();
-      expect(streamEventBus.getTrackedStream(sessionKey)).toBeNull();
+      expect(streamEventBus.getTrackedStream(sessionKey)).toEqual(expect.objectContaining({
+        active: true,
+        runId: reservationRunId,
+      }));
+
+      // OpenClaw accepted before the ACK was lost. Its durable/live user mirror
+      // binds the replacement run to this exact idempotency key; only then may
+      // the buffered lane be adopted.
+      __persistentGatewayWsTest.handleSessionMessageEvent({
+        sessionKey,
+        activeRunIds: [upstreamRunId],
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'Recover this direct send.' }],
+          idempotencyKey: `${idempotencyKey}:user`,
+        },
+      });
+      await expect(__persistentGatewayWsTest.finalizeAmbiguousRunDispatch(
+        sessionKey,
+        upstreamRunId,
+      )).resolves.toBe(true);
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: upstreamRunId,
+        stream: 'thinking',
+        data: { text: 'Recovered reasoning', delta: 'Recovered reasoning' },
+      });
+      __persistentGatewayWsTest.handleChatEvent({
+        sessionKey,
+        runId: upstreamRunId,
+        state: 'final',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Recovered final.' }] },
+      });
+
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'run_resumed', runId: upstreamRunId }),
+        expect.objectContaining({ type: 'thinking', content: 'Recovered reasoning', runId: upstreamRunId }),
+        expect.objectContaining({ type: 'done', content: 'Recovered final.', runId: upstreamRunId }),
+      ]));
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        'direct-next-run',
+      )).toBe(true);
     } finally {
+      unsubscribe();
+      __gatewayExecutionScopeTest.failDirectGatewayChatRun(sessionKey, 'direct-next-run');
       __gatewayExecutionScopeTest.failDirectGatewayChatRun(sessionKey, reservationRunId);
       __persistentGatewayWsTest.resetSession(sessionKey);
       jest.useRealTimers();
+    }
+  });
+
+  test('upstream-only OpenClaw conflicts rebuild an empty local lane from one exact live run', async () => {
+    const sessionKey = 'agent:main:portal-owner-1-upstream-conflict';
+    const routeRunId = 'portal-route-reservation';
+    const upstreamRunId = 'openclaw-live-run';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(sessionKey, (event) => events.push(event));
+
+    try {
+      // Mirror the upstream rejection path: the pending Portal reservation is
+      // failed and StreamEventBus is empty before conflict recovery begins.
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        routeRunId,
+      )).toBe(true);
+      __gatewayExecutionScopeTest.failDirectGatewayChatRun(sessionKey, routeRunId);
+      expect(streamEventBus.getTrackedStream(sessionKey)).toBeNull();
+
+      const rpc = jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockImplementation(async (
+        method: string,
+        params: Record<string, any>,
+      ) => {
+        expect(method).toBe('sessions.list');
+        expect(params).toEqual({ agentId: 'main', search: sessionKey, limit: 50 });
+        return {
+          ok: true,
+          data: {
+            sessions: [
+              { key: 'agent:main:other', hasActiveRun: true, activeRunIds: ['wrong-run'] },
+              { key: sessionKey, hasActiveRun: true, activeRunIds: [upstreamRunId] },
+            ],
+          },
+        };
+      });
+
+      const snapshot = await __gatewayExecutionScopeTest.reconcileOpenClawActiveTurnConflict(sessionKey);
+
+      expect(rpc).toHaveBeenCalledTimes(1);
+      expect(snapshot).toMatchObject({
+        active: true,
+        phase: 'thinking',
+        runId: upstreamRunId,
+      });
+      expect(streamEventBus.getTrackedStream(sessionKey)).toMatchObject({
+        active: true,
+        runId: upstreamRunId,
+      });
+
+      // The repair must clear PersistentGatewayWs's failed-reservation fence,
+      // not merely paint an active StreamEventBus snapshot for the browser.
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: upstreamRunId,
+        stream: 'thinking',
+        data: { text: 'Recovered live reasoning', delta: 'Recovered live reasoning' },
+      });
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'run_resumed', runId: upstreamRunId }),
+        expect.objectContaining({
+          type: 'thinking',
+          content: 'Recovered live reasoning',
+          runId: upstreamRunId,
+        }),
+      ]));
+    } finally {
+      unsubscribe();
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('an exact inactive OpenClaw conflict row settles the local recovery fence', async () => {
+    const sessionKey = 'agent:main:portal-owner-1-settled-conflict';
+    jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockResolvedValue({
+      ok: true,
+      data: {
+        sessions: [{ key: sessionKey, hasActiveRun: false, activeRunIds: [] }],
+      },
+    } as any);
+
+    try {
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        'stale-local-conflict-run',
+      )).toBe(true);
+      const snapshot = await __gatewayExecutionScopeTest.reconcileOpenClawActiveTurnConflict(sessionKey);
+      expect(snapshot).toEqual({ active: false, inactiveReason: 'terminal', safeToClear: true });
+      expect(streamEventBus.getTrackedStream(sessionKey)).toBeNull();
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        'next-run-after-exact-inactive',
+      )).toBe(true);
+    } finally {
+      __gatewayExecutionScopeTest.failDirectGatewayChatRun(sessionKey, 'next-run-after-exact-inactive');
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('serializes per-session global delivery even when the first authorization check is delayed or rejects', async () => {
+    const chains = new Map<string, Promise<void>>();
+    const delivered: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+
+    const first = __gatewayExecutionScopeTest.enqueueOrderedSessionDelivery(
+      chains,
+      'ordered-session',
+      async () => {
+        await firstGate;
+        delivered.push('reasoning-seq-1');
+      },
+    );
+    const second = __gatewayExecutionScopeTest.enqueueOrderedSessionDelivery(
+      chains,
+      'ordered-session',
+      async () => { delivered.push('tool-seq-2'); },
+    );
+
+    await Promise.resolve();
+    expect(delivered).toEqual([]);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(delivered).toEqual(['reasoning-seq-1', 'tool-seq-2']);
+
+    await expect(__gatewayExecutionScopeTest.enqueueOrderedSessionDelivery(
+      chains,
+      'ordered-session',
+      async () => { throw new Error('authorization generation changed'); },
+    )).rejects.toThrow('authorization generation changed');
+    await __gatewayExecutionScopeTest.enqueueOrderedSessionDelivery(
+      chains,
+      'ordered-session',
+      async () => { delivered.push('final-after-rejected-delivery'); },
+    );
+    expect(delivered).toEqual([
+      'reasoning-seq-1',
+      'tool-seq-2',
+      'final-after-rejected-delivery',
+    ]);
+  });
+
+  test('a stale active conflict probe cannot replace a newer local reservation', async () => {
+    const sessionKey = 'agent:main:portal-owner-1-conflict-active-race';
+    let resolveProbe!: (value: any) => void;
+    const probeResult = new Promise<any>((resolve) => { resolveProbe = resolve; });
+    jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockReturnValue(probeResult);
+
+    try {
+      const recovery = __gatewayExecutionScopeTest.reconcileOpenClawActiveTurnConflict(sessionKey);
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        'newer-local-run',
+      )).toBe(true);
+      resolveProbe({
+        ok: true,
+        data: {
+          sessions: [{ key: sessionKey, hasActiveRun: true, activeRunIds: ['stale-upstream-run'] }],
+        },
+      });
+
+      await expect(recovery).resolves.toEqual({
+        active: false,
+        inactiveReason: 'unknown',
+        safeToClear: false,
+      });
+      expect(streamEventBus.getTrackedStream(sessionKey)).toEqual(expect.objectContaining({
+        active: true,
+        runId: 'newer-local-run',
+      }));
+    } finally {
+      __gatewayExecutionScopeTest.failDirectGatewayChatRun(sessionKey, 'newer-local-run');
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('a stale inactive conflict probe cannot clear a newer local reservation', async () => {
+    const sessionKey = 'agent:main:portal-owner-1-conflict-inactive-race';
+    let resolveProbe!: (value: any) => void;
+    const probeResult = new Promise<any>((resolve) => { resolveProbe = resolve; });
+    jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockReturnValue(probeResult);
+
+    try {
+      const recovery = __gatewayExecutionScopeTest.reconcileOpenClawActiveTurnConflict(sessionKey);
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        'newer-local-run',
+      )).toBe(true);
+      resolveProbe({
+        ok: true,
+        data: {
+          sessions: [{ key: sessionKey, hasActiveRun: false, activeRunIds: [] }],
+        },
+      });
+
+      await expect(recovery).resolves.toEqual({
+        active: false,
+        inactiveReason: 'unknown',
+        safeToClear: false,
+      });
+      expect(streamEventBus.getTrackedStream(sessionKey)).toEqual(expect.objectContaining({
+        active: true,
+        runId: 'newer-local-run',
+      }));
+    } finally {
+      __gatewayExecutionScopeTest.failDirectGatewayChatRun(sessionKey, 'newer-local-run');
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('a stale exact active conflict row cannot resurrect a tombstoned run', async () => {
+    const sessionKey = 'agent:main:portal-owner-1-tombstoned-conflict';
+    const completedRunId = 'openclaw-completed-run';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(sessionKey, (event) => events.push(event));
+    jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockResolvedValue({
+      ok: true,
+      data: {
+        sessions: [{ key: sessionKey, hasActiveRun: true, activeRunIds: [completedRunId] }],
+      },
+    } as any);
+
+    try {
+      expect(__gatewayExecutionScopeTest.reserveDirectGatewayChatRun(
+        sessionKey,
+        completedRunId,
+      )).toBe(true);
+      expect(__gatewayExecutionScopeTest.acknowledgeDirectGatewayChatRun(
+        sessionKey,
+        completedRunId,
+        completedRunId,
+      )).toBe(true);
+      __persistentGatewayWsTest.handleChatEvent({
+        sessionKey,
+        runId: completedRunId,
+        state: 'final',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Completed before stale conflict probe.' }],
+        },
+      });
+      expect(streamEventBus.getTrackedStream(sessionKey)).toEqual(expect.objectContaining({
+        active: false,
+        runId: completedRunId,
+      }));
+      events.length = 0;
+
+      const snapshot = await __gatewayExecutionScopeTest.reconcileOpenClawActiveTurnConflict(sessionKey);
+      expect(snapshot).toEqual({ active: false, inactiveReason: 'unknown', safeToClear: false });
+      expect(events.some((event) => event.type === 'run_resumed')).toBe(false);
+      expect(streamEventBus.getTrackedStream(sessionKey)).toEqual(expect.objectContaining({
+        active: false,
+        runId: completedRunId,
+      }));
+    } finally {
+      unsubscribe();
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('WebSocket conflict recovery attaches the browser when provider state vanished locally', async () => {
+    const userId = '44444444-4444-4444-8444-444444444444';
+    const sessionKey = `agent:main:portal-${userId}-upstream-conflict`;
+    const upstreamRunId = 'openclaw-upstream-only-run';
+    jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun')
+      .mockImplementation(async (handle) => handle);
+    jest.spyOn(openClawHostRunJournal, 'quarantineOpenClawHostRun').mockResolvedValue();
+    jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockImplementation(async (method: string) => {
+      if (method === 'sessions.describe') {
+        return { ok: true, data: { session: { key: sessionKey, displayName: 'Existing chat' } } };
+      }
+      if (method === 'sessions.list') {
+        return {
+          ok: true,
+          data: {
+            sessions: [{ key: sessionKey, hasActiveRun: true, activeRunIds: [upstreamRunId] }],
+          },
+        };
+      }
+      return { ok: false, error: `Unexpected RPC ${method}` };
+    });
+    const provider = {
+      providerName: 'OPENCLAW',
+      displayName: 'OpenClaw',
+      sendMessage: jest.fn(async (...args: any[]) => {
+        const sender = args[5] as { requestId?: string };
+        __gatewayExecutionScopeTest.failDirectGatewayChatRun(
+          sessionKey,
+          String(sender.requestId || ''),
+        );
+        throw new Error(`chat.send failed: A different run is already active for ${sessionKey}`);
+      }),
+    };
+    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+
+    try {
+      await __gatewayExecutionScopeTest.handleWsSend(
+        socket as any,
+        {
+          type: 'send',
+          message: 'queue this after the active turn',
+          provider: 'OPENCLAW',
+          session: sessionKey,
+          clientMessageId: 'client-message-conflict-1',
+        },
+        { userId, email: 'owner@example.com', role: 'OWNER' } as any,
+      );
+
+      const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+      expect(payloads).toContainEqual(expect.objectContaining({
+        type: 'active_turn_conflict',
+        sessionKey,
+        clientMessageId: 'client-message-conflict-1',
+      }));
+      expect(payloads).toContainEqual(expect.objectContaining({
+        type: 'stream_resume',
+        sessionKey,
+        runId: upstreamRunId,
+      }));
+      expect(payloads.some((payload) => payload.type === 'error')).toBe(false);
+
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: upstreamRunId,
+        stream: 'thinking',
+        data: { text: 'Visible after attach', delta: 'Visible after attach' },
+      });
+      const afterLiveEvent = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+      expect(afterLiveEvent).toContainEqual(expect.objectContaining({
+        type: 'thinking',
+        content: 'Visible after attach',
+        runId: upstreamRunId,
+      }));
+    } finally {
+      socket.emit('close');
+      __persistentGatewayWsTest.resetSession(sessionKey);
+    }
+  });
+
+  test('SSE conflict recovery keeps the attempted message correlated and reattaches the live run', async () => {
+    const userId = '45454545-4545-4545-8545-454545454545';
+    const sessionKey = `agent:main:portal-${userId}-upstream-sse-conflict`;
+    const upstreamRunId = 'openclaw-upstream-sse-run';
+    jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun')
+      .mockImplementation(async (handle) => handle);
+    jest.spyOn(openClawHostRunJournal, 'quarantineOpenClawHostRun').mockResolvedValue();
+    jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockImplementation(async (method: string) => {
+      if (method === 'sessions.describe') {
+        return { ok: true, data: { session: { key: sessionKey, displayName: 'Existing SSE chat' } } };
+      }
+      if (method === 'sessions.list') {
+        return {
+          ok: true,
+          data: {
+            sessions: [{ key: sessionKey, hasActiveRun: true, activeRunIds: [upstreamRunId] }],
+          },
+        };
+      }
+      return { ok: false, error: `Unexpected RPC ${method}` };
+    });
+    const provider = {
+      providerName: 'OPENCLAW',
+      displayName: 'OpenClaw',
+      sendMessage: jest.fn(async (...args: any[]) => {
+        const sender = args[5] as { requestId?: string };
+        __gatewayExecutionScopeTest.failDirectGatewayChatRun(
+          sessionKey,
+          String(sender.requestId || ''),
+        );
+        throw new Error(`chat.send failed: A different run is already active for ${sessionKey}`);
+      }),
+    };
+    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+    const req = Object.assign(new EventEmitter(), {
+      body: {
+        message: 'queue this SSE attempt',
+        provider: 'OPENCLAW',
+        session: sessionKey,
+        streamClientId: 'browser_stream_client_1234',
+        clientMessageId: 'client-message-sse-conflict-1',
+      },
+      query: { stream: '1' },
+      headers: { accept: 'text/event-stream' },
+      user: { userId, email: 'owner@example.com', role: 'OWNER', authorizationVersion: 1 },
+    });
+    const res = {
+      socket: { setNoDelay: jest.fn() },
+      setHeader: jest.fn(),
+      flushHeaders: jest.fn(),
+      write: jest.fn(),
+      end: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+
+    try {
+      await sendRouteHandler()(req as any, res as any);
+      const payloads = res.write.mock.calls
+        .map(([raw]) => String(raw))
+        .flatMap((raw) => raw.split('\n'))
+        .filter((line) => line.startsWith('data: {'))
+        .map((line) => JSON.parse(line.slice('data: '.length)));
+      expect(payloads).toContainEqual(expect.objectContaining({
+        type: 'active_turn_conflict',
+        sessionKey,
+        clientMessageId: 'client-message-sse-conflict-1',
+      }));
+      expect(payloads).toContainEqual(expect.objectContaining({
+        type: 'stream_resume',
+        sessionKey,
+        runId: upstreamRunId,
+      }));
+      expect(payloads.some((payload) => payload.type === 'error')).toBe(false);
+      expect(res.end).not.toHaveBeenCalled();
+
+      __persistentGatewayWsTest.handleAgentEvent({
+        sessionKey,
+        runId: upstreamRunId,
+        stream: 'thinking',
+        data: { text: 'Visible on the SSE recovery lane', delta: 'Visible on the SSE recovery lane' },
+      });
+      const afterLiveEvent = res.write.mock.calls
+        .map(([raw]) => String(raw))
+        .flatMap((raw) => raw.split('\n'))
+        .filter((line) => line.startsWith('data: {'))
+        .map((line) => JSON.parse(line.slice('data: '.length)));
+      expect(afterLiveEvent).toContainEqual(expect.objectContaining({
+        type: 'thinking',
+        content: 'Visible on the SSE recovery lane',
+        runId: upstreamRunId,
+      }));
+    } finally {
+      req.emit('close');
+      __persistentGatewayWsTest.resetSession(sessionKey);
     }
   });
 
@@ -1040,6 +1720,42 @@ describe('Agent Chat execution boundary', () => {
     },
   );
 
+  test('captures global stream delivery ownership at publication time', () => {
+    // Attaching after publication cannot suppress the only global copy.
+    const publishedWithoutDirectOwner = __gatewayExecutionScopeTest.shouldSendGlobalStreamCopy(
+      false,
+      { type: 'thinking' } as any,
+    );
+    expect(publishedWithoutDirectOwner).toBe(true);
+
+    // Detaching after publication cannot create a duplicate terminal copy.
+    const publishedWithDirectOwner = __gatewayExecutionScopeTest.shouldSendGlobalStreamCopy(
+      true,
+      { type: 'done' } as any,
+    );
+    expect(publishedWithDirectOwner).toBe(false);
+
+    // Maintenance deliberately travels both lanes so the rail and durable
+    // marker survive a subscription transition.
+    expect(__gatewayExecutionScopeTest.shouldSendGlobalStreamCopy(
+      true,
+      { type: 'compaction_start', maintenanceKind: 'maintenance' } as any,
+    )).toBe(true);
+  });
+
+  test('requires explicit active truth before adopting a sessions.list run identity', () => {
+    const sessionKey = 'agent:main:strict-conflict-attestation';
+    expect(__gatewayExecutionScopeTest.parseExactOpenClawConflictRun({
+      sessions: [{ key: sessionKey, activeRunIds: ['run-without-active-flag'] }],
+    }, sessionKey)).toEqual({ state: 'unknown' });
+    expect(__gatewayExecutionScopeTest.parseExactOpenClawConflictRun({
+      sessions: [{ key: sessionKey, hasActiveRun: false, activeRunIds: ['contradictory-run'] }],
+    }, sessionKey)).toEqual({ state: 'unknown' });
+    expect(__gatewayExecutionScopeTest.parseExactOpenClawConflictRun({
+      sessions: [{ key: sessionKey, hasActiveRun: true, activeRunIds: ['exact-run'] }],
+    }, sessionKey)).toEqual({ state: 'active', runId: 'exact-run' });
+  });
+
   test('route-owned Agent Zero SSE callbacks are mirrored once and sanitize terminal metadata', async () => {
     jest.spyOn(agentZeroOAuthModels, 'validateAgentZeroOAuthModelSelection').mockResolvedValue({
       id: 'codex_oauth/gpt-5.6-terra',
@@ -1290,8 +2006,8 @@ describe('Agent Chat execution boundary', () => {
     expect(streamEventBus.getStreamStatus('concurrent-route-session')).toMatchObject({ active: true });
     const secondPayloads = secondSocket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
     expect(secondPayloads).toContainEqual(expect.objectContaining({
-      type: 'error',
-      content: 'This chat already has an active turn.',
+      type: 'active_turn_conflict',
+      content: expect.stringContaining('reconnecting'),
     }));
 
     releaseFirst();

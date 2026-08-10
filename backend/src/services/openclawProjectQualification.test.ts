@@ -425,6 +425,11 @@ describe('OpenClaw Project qualification evidence', () => {
       secret: SECRET,
       now: () => NOW,
     })).toMatchObject({ status: 'INVALID', selectable: false });
+    expect(getOpenClawProjectQualificationStatus({ context: changed, egress: egress(changed) }, {
+      evidenceRoot,
+      secret: SECRET,
+      now: () => new Date(NOW.getTime() + 2 * 60 * 60_000),
+    })).toMatchObject({ status: 'EXPIRED', selectable: false });
   });
 
   test('rejects evidence signed by another secret', async () => {

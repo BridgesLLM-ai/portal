@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   getPortalSettings: vi.fn(),
   updatePortalSettings: vi.fn(),
   updateSearchVisibility: vi.fn(),
+  getEmbedOriginPolicy: vi.fn(),
+  updateEmbedOriginPolicy: vi.fn(),
   sendTestEmail: vi.fn(),
   clientGet: vi.fn(),
   clientPost: vi.fn(),
@@ -61,6 +63,8 @@ vi.mock('../api/settings', () => ({
     getPortalSettings: mocks.getPortalSettings,
     updatePortalSettings: mocks.updatePortalSettings,
     updateSearchVisibility: mocks.updateSearchVisibility,
+    getEmbedOriginPolicy: mocks.getEmbedOriginPolicy,
+    updateEmbedOriginPolicy: mocks.updateEmbedOriginPolicy,
     sendTestEmail: mocks.sendTestEmail,
   },
 }));
@@ -178,7 +182,26 @@ vi.mock('../components/settings/OllamaTailnetSetup', async () => {
   };
 });
 vi.mock('../components/settings/FeatureReadinessPanel', () => ({ default: () => <div>Readiness</div> }));
-vi.mock('../components/ImagePickerCropper', () => ({ default: () => null }));
+vi.mock('../components/ImagePickerCropper', () => ({
+  default: ({
+    isOpen,
+    onClose,
+    onSaved,
+  }: {
+    isOpen: boolean;
+    onClose: () => void;
+    onSaved: (url: string | null) => void;
+  }) => isOpen ? (
+    <div role="dialog" aria-label="Mock portal logo editor">
+      <button type="button" onClick={() => { onSaved('/static-assets/branding/new-logo.gif?t=1'); onClose(); }}>
+        Complete logo upload
+      </button>
+      <button type="button" onClick={() => { onSaved(null); onClose(); }}>
+        Complete logo removal
+      </button>
+    </div>
+  ) : null,
+}));
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -240,6 +263,24 @@ describe('SettingsPage synchronous action ownership', () => {
     });
     mocks.updatePortalSettings.mockResolvedValue({});
     mocks.updateSearchVisibility.mockResolvedValue({});
+    mocks.getEmbedOriginPolicy.mockResolvedValue({
+      version: 1,
+      revision: 'a'.repeat(64),
+      status: 'ready',
+      entries: [],
+      defaultOrigins: ['https://www.youtube.com', 'https://www.youtube-nocookie.com'],
+      limits: { maxOrigins: 32, maxOriginBytes: 512, maxPolicyBytes: 8192 },
+      updatedAt: null,
+    });
+    mocks.updateEmbedOriginPolicy.mockResolvedValue({
+      version: 1,
+      revision: 'b'.repeat(64),
+      status: 'ready',
+      entries: [],
+      defaultOrigins: ['https://www.youtube.com', 'https://www.youtube-nocookie.com'],
+      limits: { maxOrigins: 32, maxOriginBytes: 512, maxPolicyBytes: 8192 },
+      updatedAt: '2026-08-08T20:00:00.000Z',
+    });
     mocks.sendTestEmail.mockResolvedValue({ message: 'sent' });
     mocks.twoFactorStatus.mockResolvedValue({ enabled: false, method: null, backupCodesRemaining: 0 });
     mocks.twoFactorSetup.mockResolvedValue({ method: 'email', message: 'sent' });
@@ -926,6 +967,31 @@ describe('SettingsPage synchronous action ownership', () => {
     expect(portalName).toBeEnabled();
   });
 
+  it('refreshes public branding after general saves, logo uploads, and logo removal', async () => {
+    renderSettings('general');
+    const panel = await screen.findByRole('tabpanel');
+    const defaultPreview = within(panel).getByRole('img', { name: 'Portal logo' });
+    expect(defaultPreview).toHaveAttribute('src', '/logo-display.png');
+
+    fireEvent.change(within(panel).getByLabelText('Portal name'), {
+      target: { value: 'Renamed Portal' },
+    });
+    fireEvent.click(within(panel).getByRole('button', { name: 'Save Changes' }));
+    await waitFor(() => expect(mocks.refreshPublicSettings).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(within(panel).getByRole('button', { name: 'Upload and Crop' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Complete logo upload' }));
+    await waitFor(() => expect(mocks.refreshPublicSettings).toHaveBeenCalledTimes(2));
+    expect(within(panel).getByRole('img', { name: 'Portal logo' }))
+      .toHaveAttribute('src', '/static-assets/branding/new-logo.gif');
+
+    fireEvent.click(within(panel).getByRole('button', { name: 'Upload and Crop' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Complete logo removal' }));
+    await waitFor(() => expect(mocks.refreshPublicSettings).toHaveBeenCalledTimes(3));
+    expect(within(panel).getByRole('img', { name: 'Portal logo' }))
+      .toHaveAttribute('src', '/logo-display.png');
+  });
+
   it('blocks global links and browser Back while a Settings mutation owns the route', async () => {
     window.history.replaceState({}, '', '/before-settings');
     window.history.pushState({}, '', '/settings?tab=general');
@@ -1288,5 +1354,143 @@ describe('SettingsPage synchronous action ownership', () => {
     });
     expect(await within(dialog).findByRole('alert')).toHaveTextContent('Gateway restart was refused');
     expect(dialog).toBeVisible();
+  });
+
+  it('mounts embed-origin policy only for the Owner Security tab', async () => {
+    const ownerView = renderSettings('security');
+    expect(await screen.findByRole('region', { name: 'Hosted content embeds' })).toBeVisible();
+    expect(mocks.getEmbedOriginPolicy).toHaveBeenCalled();
+    ownerView.unmount();
+
+    mocks.getEmbedOriginPolicy.mockClear();
+    mocks.authUser.current = {
+      id: 'sub-admin-1',
+      email: 'sub-admin@example.com',
+      username: 'sub-admin',
+      role: 'SUB_ADMIN',
+    };
+    renderSettings('security');
+
+    expect(await screen.findByRole('tabpanel')).toHaveAttribute('id', 'settings-panel-readiness');
+    expect(screen.queryByRole('region', { name: 'Hosted content embeds' })).not.toBeInTheDocument();
+    expect(mocks.getEmbedOriginPolicy).not.toHaveBeenCalled();
+  });
+
+  it('protects an unsaved embed draft across tab, SPA, Back, and unload attempts until reset', async () => {
+    window.history.replaceState({}, '', '/before-settings');
+    window.history.pushState({}, '', '/settings?tab=security');
+    render(
+      <BrowserRouter>
+        <Routes>
+          <Route path="/settings" element={<><Link to="/outside">Leave Settings with draft</Link><SettingsPage /></>} />
+          <Route path="/before-settings" element={<div>Before Settings</div>} />
+          <Route path="/outside" element={<div>Outside Settings</div>} />
+        </Routes>
+      </BrowserRouter>,
+    );
+
+    const manager = await screen.findByRole('region', { name: 'Hosted content embeds' });
+    await userEvent.click(within(manager).getByRole('button', { name: 'Add origin' }));
+    const origin = within(manager).getByRole('textbox', { name: 'Origin 1' });
+    await userEvent.type(origin, 'https://draft.example.com');
+
+    expect(within(manager).getByText(/Unsaved embed-origin changes are protected/i)).toBeVisible();
+    expect(screen.getByRole('tab', { name: /Security/ })).toHaveTextContent('*');
+    expect(within(manager).getByRole('button', { name: 'Reset draft' })).toBeEnabled();
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Profile' }));
+    expect(screen.getByRole('tab', { name: /Security/ })).toHaveAttribute('aria-selected', 'true');
+    expect(origin).toHaveValue('https://draft.example.com');
+    expect(within(manager).getByText(/Navigation paused to protect this draft/i)).toBeVisible();
+
+    await userEvent.click(screen.getByRole('link', { name: 'Leave Settings with draft' }));
+    expect(window.location.pathname).toBe('/settings');
+    expect(origin).toHaveValue('https://draft.example.com');
+
+    await act(async () => {
+      window.history.back();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(window.location.pathname).toBe('/settings'));
+    expect(screen.queryByText('Before Settings')).not.toBeInTheDocument();
+    expect(origin).toHaveValue('https://draft.example.com');
+
+    const guardedUnload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(guardedUnload);
+    expect(guardedUnload.defaultPrevented).toBe(true);
+
+    await userEvent.click(within(manager).getByRole('button', { name: 'Reset draft' }));
+    await waitFor(() => expect(within(manager).queryByText(/changes are protected|protect this draft/i)).not.toBeInTheDocument());
+    expect(screen.getByRole('tab', { name: /Security/ })).not.toHaveTextContent('*');
+
+    const releasedUnload = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(releasedUnload);
+    expect(releasedUnload.defaultPrevented).toBe(false);
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Profile' }));
+    expect(await screen.findByRole('tabpanel')).toHaveAttribute('id', 'settings-panel-profile');
+  });
+
+  it('does not clear generic Security dirtiness when the embed draft resets', async () => {
+    renderSettings('security');
+    const panel = await screen.findByRole('tabpanel');
+    const manager = await within(panel).findByRole('region', { name: 'Hosted content embeds' });
+
+    await userEvent.click(within(panel).getByRole('button', { name: /closed/i }));
+    await userEvent.click(within(manager).getByRole('button', { name: 'Add origin' }));
+    await userEvent.type(
+      within(manager).getByRole('textbox', { name: 'Origin 1' }),
+      'https://draft.example.com',
+    );
+    await userEvent.click(within(manager).getByRole('button', { name: 'Reset draft' }));
+
+    expect(screen.getByRole('tab', { name: /Security/ })).toHaveTextContent('*');
+    expect(within(panel).getByRole('button', { name: 'Save Changes' })).toBeEnabled();
+    await userEvent.click(screen.getByRole('tab', { name: 'Profile' }));
+    expect(await screen.findByRole('tabpanel')).toHaveAttribute('id', 'settings-panel-profile');
+    expect(screen.getByRole('tab', { name: /Security/ })).toHaveTextContent('*');
+  });
+
+  it('lets the embed-origin mutation own Settings navigation until its exact save settles', async () => {
+    const pendingSave = deferred<any>();
+    mocks.updateEmbedOriginPolicy.mockReturnValueOnce(pendingSave.promise);
+    renderSettings('security');
+    const panel = await screen.findByRole('tabpanel');
+    const manager = await within(panel).findByRole('region', { name: 'Hosted content embeds' });
+
+    await userEvent.click(within(manager).getByRole('button', { name: 'Add origin' }));
+    const origin = within(manager).getByRole('textbox', { name: 'Origin 1' });
+    await userEvent.type(origin, 'https://embed.example.com');
+    const save = within(manager).getByRole('button', { name: 'Save embed policy' });
+
+    act(() => {
+      save.click();
+      save.click();
+      screen.getByRole('tab', { name: 'Profile' }).click();
+      fireEvent.change(origin, { target: { value: 'https://late.example.com' } });
+    });
+
+    expect(mocks.updateEmbedOriginPolicy).toHaveBeenCalledTimes(1);
+    expect(mocks.updateEmbedOriginPolicy).toHaveBeenCalledWith({
+      expectedRevision: 'a'.repeat(64),
+      entries: [{ origin: 'https://embed.example.com', camera: false, microphone: false }],
+    });
+    expect(origin).toHaveValue('https://embed.example.com');
+    expect(screen.getByRole('tab', { name: 'Profile' })).toBeDisabled();
+
+    await act(async () => {
+      pendingSave.resolve({
+        version: 1,
+        revision: 'b'.repeat(64),
+        status: 'ready',
+        entries: [{ origin: 'https://embed.example.com', camera: false, microphone: false }],
+        defaultOrigins: ['https://www.youtube.com', 'https://www.youtube-nocookie.com'],
+        limits: { maxOrigins: 32, maxOriginBytes: 512, maxPolicyBytes: 8192 },
+        updatedAt: '2026-08-08T20:20:00.000Z',
+      });
+      await pendingSave.promise;
+    });
+
+    expect(screen.getByRole('tab', { name: 'Profile' })).toBeEnabled();
   });
 });

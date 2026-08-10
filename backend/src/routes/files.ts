@@ -18,6 +18,11 @@ import {
   resolveContainedPath,
   safeRelativePath,
 } from '../services/containedPath';
+import {
+  assignProjectRuntimeOwnership,
+  ensureProjectRuntimeOwnedDirectory,
+  ProjectRuntimeOwnershipError,
+} from '../services/projectRuntimeOwnership';
 import { generateBoundedThumbnail, ThumbnailError } from '../services/fileThumbnail';
 import { issueFileCapabilityToken, verifyFileCapabilityToken } from '../services/fileCapabilityToken';
 import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
@@ -919,6 +924,7 @@ router.patch('/:id/rename', authenticateToken, requireApproved, async (req: Requ
 
 // POST /:id/copy-to-project - Copy file to a project
 router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let copiedProjectDestination: string | null = null;
   try {
     const ownerId = await getScopedOwnerId(req);
     const { id } = req.params;
@@ -987,7 +993,7 @@ router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (r
     // Ensure destination directory exists
     const destDir = path.dirname(destPath);
     const relativeDestDir = path.relative(projectDir, destDir).split(path.sep).join('/');
-    if (relativeDestDir) ensureContainedDirectory(projectDir, relativeDestDir);
+    if (relativeDestDir) ensureProjectRuntimeOwnedDirectory(projectDir, relativeDestDir);
 
     // Check if file already exists
     if (fs.existsSync(destPath)) {
@@ -996,6 +1002,8 @@ router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (r
     }
 
     fs.copyFileSync(sourcePath, destPath, fs.constants.COPYFILE_EXCL);
+    copiedProjectDestination = destPath;
+    assignProjectRuntimeOwnership(projectDir, destPath, 'file');
 
     if (moveFile) {
       const quarantined: QuarantinedFilePath[] = [];
@@ -1024,8 +1032,20 @@ router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (r
       action: moveFile ? 'moved' : 'copied',
       destination: path.relative(projectDir, destPath),
     });
+    copiedProjectDestination = null;
   } catch (error) {
+    if (copiedProjectDestination) {
+      try { fs.unlinkSync(copiedProjectDestination); } catch {}
+    }
     console.error('Copy to project error:', error);
+    if (error instanceof ProjectRuntimeOwnershipError) {
+      res.status(503).json({
+        error: 'Project storage is temporarily unavailable. Try again.',
+        code: error.code,
+        retryable: error.retryable,
+      });
+      return;
+    }
     res.status(500).json({ error: 'Failed to copy file to project' });
   }
 });

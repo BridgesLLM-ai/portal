@@ -14,10 +14,23 @@ readonly BRIDGE_GROUP='bridgesllm-a0-bridge'
 readonly BRIDGE_PORT='18991'
 readonly BRIDGE_STATE_ROOT='/var/lib/bridgesllm/agent-zero-project-model-bridge'
 readonly BRIDGE_CREDENTIAL_ROOT="${BRIDGE_STATE_ROOT}/credentials"
+readonly BRIDGE_RUNTIME_ROOT="${BRIDGE_STATE_ROOT}/runtime"
 readonly BRIDGE_ENV_FILE='/etc/bridgesllm/agent-zero-project-model-bridge.env'
 readonly BRIDGE_UNIT_FILE="/etc/systemd/system/${BRIDGE_SERVICE}"
-readonly BRIDGE_ENTRYPOINT='/opt/bridgesllm/portal/backend/dist/agents/providers/agentZero/AgentZeroProjectModelBridge.js'
-readonly BRIDGE_CREDENTIAL_MODULE='/opt/bridgesllm/portal/backend/dist/agents/providers/agentZero/AgentZeroProjectModelBridgeCredential.js'
+readonly BRIDGE_SOURCE_ENTRYPOINT='/opt/bridgesllm/portal/backend/dist/agents/providers/agentZero/AgentZeroProjectModelBridge.js'
+readonly BRIDGE_SOURCE_CREDENTIAL_MODULE='/opt/bridgesllm/portal/backend/dist/agents/providers/agentZero/AgentZeroProjectModelBridgeCredential.js'
+readonly BRIDGE_RUNTIME_ENTRYPOINT_NAME='AgentZeroProjectModelBridge.js'
+readonly BRIDGE_RUNTIME_CREDENTIAL_MODULE_NAME='AgentZeroProjectModelBridgeCredential.js'
+readonly BRIDGE_RUNTIME_GENERATION_FILE="${BRIDGE_RUNTIME_ROOT}/active-generation"
+readonly BRIDGE_RUNTIME_SOURCE_MAX_BYTES='524288'
+readonly BRIDGE_RUNTIME_OWNER_UID='0'
+readonly BRIDGE_RUNTIME_SOURCE_GID='0'
+# Old content-addressed generations are deliberately retained. The bridge is
+# converged before the wider updater transaction commits, so deleting the prior
+# generation here could strand rollback or an already-running process. Each
+# generation contains exactly two files capped at 512 KiB apiece; clean-slate
+# uninstall removes the state tree. Any future GC needs updater-transaction and
+# live-process authority rather than a best-effort lifecycle sweep.
 readonly A0_CONTAINER='bridgesllm-agent-zero'
 readonly A0_LOOPBACK_PORT='50001'
 # Keep in lockstep with Portal's tested Codex CLI pin and the managed Agent Zero
@@ -41,9 +54,409 @@ root_protected_file() {
   [[ "$(stat -c '%u' "$file")" == '0' && "$(stat -c '%a' "$file")" == "$expected_mode" ]]
 }
 
+root_protected_release_file() {
+  local file="$1" mode size
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  mode="$(stat -c '%a' "$file")"
+  size="$(stat -c '%s' "$file")"
+  [[ "$(stat -c '%u:%g:%h' "$file")" == '0:0:1' \
+    && "$size" =~ ^[0-9]+$ \
+    && "$size" -gt 0 \
+    && "$size" -le "$BRIDGE_RUNTIME_SOURCE_MAX_BYTES" ]] \
+    || return 1
+  (( (8#${mode} & 0022) == 0 ))
+}
+
 bridge_runtime_sources_ready() {
-  root_protected_file "$BRIDGE_ENTRYPOINT" 644 \
-    && root_protected_file "$BRIDGE_CREDENTIAL_MODULE" 644
+  root_protected_release_file "$BRIDGE_SOURCE_ENTRYPOINT" \
+    && root_protected_release_file "$BRIDGE_SOURCE_CREDENTIAL_MODULE"
+}
+
+ensure_managed_directory() {
+  local directory="$1" mode="$2" owner="$3" group="$4"
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] \
+      || die "Managed bridge directory is linked or not a directory: ${directory}"
+  fi
+  install -d -m "$mode" -o "$owner" -g "$group" "$directory"
+  [[ "$(stat -c '%U:%G:%a' "$directory")" == "${owner}:${group}:${mode#0}" ]] \
+    || die "Managed bridge directory has unsafe ownership or mode: ${directory}"
+}
+
+bridge_runtime_contract() {
+  local mode="$1"
+  python3 - \
+    "$mode" \
+    "$BRIDGE_GROUP" \
+    "$BRIDGE_RUNTIME_ROOT" \
+    "$BRIDGE_RUNTIME_GENERATION_FILE" \
+    "$BRIDGE_RUNTIME_SOURCE_MAX_BYTES" \
+    "$BRIDGE_RUNTIME_OWNER_UID" \
+    "$BRIDGE_RUNTIME_SOURCE_GID" \
+    "$BRIDGE_SOURCE_ENTRYPOINT" "$BRIDGE_RUNTIME_ENTRYPOINT_NAME" \
+    "$BRIDGE_SOURCE_CREDENTIAL_MODULE" "$BRIDGE_RUNTIME_CREDENTIAL_MODULE_NAME" <<'PY'
+import grp
+import hashlib
+import os
+import re
+import secrets
+import stat
+import sys
+
+(
+    mode,
+    group_name,
+    runtime_root,
+    generation_file,
+    max_bytes_raw,
+    owner_uid_raw,
+    source_gid_raw,
+    *path_values,
+) = sys.argv[1:]
+if mode not in {"stage", "activate", "verify", "active-root"} or len(path_values) != 4:
+    raise SystemExit("invalid bridge runtime convergence arguments")
+if not hasattr(os, "O_NOFOLLOW"):
+    raise SystemExit("bridge runtime convergence requires O_NOFOLLOW")
+
+max_bytes = int(max_bytes_raw)
+owner_uid = int(owner_uid_raw)
+source_gid = int(source_gid_raw)
+group_gid = grp.getgrnam(group_name).gr_gid
+pairs = [
+    (path_values[0], path_values[1]),
+    (path_values[2], path_values[3]),
+]
+leaves = [leaf for _, leaf in pairs]
+if (
+    len(set(leaves)) != len(leaves)
+    or any(os.path.basename(leaf) != leaf for leaf in leaves)
+    or any(not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", leaf) for leaf in leaves)
+):
+    raise RuntimeError("bridge runtime filenames are invalid")
+
+def file_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+def directory_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+def read_descriptor(descriptor, limit):
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise RuntimeError("bridge runtime file exceeds its bounded size")
+    return b"".join(chunks)
+
+def validate_regular(metadata, expected_uid, expected_gid, expected_mode, label):
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != expected_mode
+        or metadata.st_size < 0
+        or metadata.st_size > max_bytes
+    ):
+        raise RuntimeError(f"{label} is unsafe")
+
+def read_regular_at(parent_descriptor, leaf, expected_uid, expected_gid, expected_mode, label):
+    metadata = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+    validate_regular(metadata, expected_uid, expected_gid, expected_mode, label)
+    descriptor = os.open(
+        leaf,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if file_identity(opened) != file_identity(metadata):
+            raise RuntimeError(f"{label} changed before open")
+        content = read_descriptor(descriptor, max_bytes)
+        if file_identity(os.fstat(descriptor)) != file_identity(opened):
+            raise RuntimeError(f"{label} changed while reading")
+    finally:
+        os.close(descriptor)
+    if file_identity(os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)) \
+            != file_identity(metadata):
+        raise RuntimeError(f"{label} changed after reading")
+    return metadata, content
+
+def write_staged_file(parent_descriptor, leaf, content):
+    descriptor = os.open(
+        leaf,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError("could not write managed bridge runtime")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchown(descriptor, owner_uid, group_gid)
+        os.fchmod(descriptor, 0o640)
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        validate_regular(metadata, owner_uid, group_gid, 0o640, "staged bridge runtime file")
+        if metadata.st_size != len(content):
+            raise RuntimeError("staged bridge runtime file has the wrong size")
+    finally:
+        os.close(descriptor)
+
+runtime_path = os.path.abspath(runtime_root)
+generation_path = os.path.abspath(generation_file)
+if os.path.dirname(generation_path) != runtime_path \
+        or os.path.basename(generation_path) != "active-generation":
+    raise RuntimeError("bridge runtime generation receipt escaped its managed directory")
+runtime_metadata = os.lstat(runtime_path)
+if (
+    not stat.S_ISDIR(runtime_metadata.st_mode)
+    or stat.S_ISLNK(runtime_metadata.st_mode)
+    or runtime_metadata.st_uid != owner_uid
+    or runtime_metadata.st_gid != group_gid
+    or stat.S_IMODE(runtime_metadata.st_mode) != 0o750
+):
+    raise RuntimeError("bridge runtime directory is unsafe")
+
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+runtime_descriptor = os.open(runtime_path, directory_flags)
+temporary_files = []
+temporary_directories = []
+try:
+    if directory_identity(os.fstat(runtime_descriptor)) != directory_identity(runtime_metadata):
+        raise RuntimeError("bridge runtime directory changed before use")
+
+    sources = []
+    for source, leaf in pairs:
+        source_metadata = os.lstat(source)
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or stat.S_ISLNK(source_metadata.st_mode)
+            or source_metadata.st_uid != owner_uid
+            or source_metadata.st_gid != source_gid
+            or source_metadata.st_nlink != 1
+            or stat.S_IMODE(source_metadata.st_mode) & 0o022
+            or source_metadata.st_size <= 0
+            or source_metadata.st_size > max_bytes
+        ):
+            raise RuntimeError("compiled bridge runtime source is unsafe")
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            opened_metadata = os.fstat(source_descriptor)
+            if file_identity(opened_metadata) != file_identity(source_metadata):
+                raise RuntimeError("compiled bridge runtime source changed before open")
+            content = read_descriptor(source_descriptor, max_bytes)
+            if file_identity(os.fstat(source_descriptor)) != file_identity(opened_metadata):
+                raise RuntimeError("compiled bridge runtime source changed while reading")
+        finally:
+            os.close(source_descriptor)
+        if file_identity(os.lstat(source)) != file_identity(source_metadata):
+            raise RuntimeError("compiled bridge runtime source changed after reading")
+        sources.append((leaf, content))
+
+    generation_hash = hashlib.sha256(b"bridgesllm-agent-zero-bridge-runtime-v1\0")
+    for leaf, content in sources:
+        generation_hash.update(leaf.encode("ascii"))
+        generation_hash.update(b"\0")
+        generation_hash.update(len(content).to_bytes(8, "big"))
+        generation_hash.update(content)
+    desired_generation = f"generation-{generation_hash.hexdigest()}"
+
+    def verify_generation(generation, expected_sources=None):
+        metadata = os.stat(generation, dir_fd=runtime_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != owner_uid
+            or metadata.st_gid != group_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o750
+        ):
+            raise RuntimeError("managed bridge runtime generation is unsafe")
+        descriptor = os.open(generation, directory_flags, dir_fd=runtime_descriptor)
+        try:
+            if directory_identity(os.fstat(descriptor)) != directory_identity(metadata):
+                raise RuntimeError("managed bridge runtime generation changed before open")
+            if sorted(os.listdir(descriptor)) != sorted(leaves):
+                raise RuntimeError("managed bridge runtime generation has unexpected members")
+            observed = []
+            for leaf in leaves:
+                _, content = read_regular_at(
+                    descriptor,
+                    leaf,
+                    owner_uid,
+                    group_gid,
+                    0o640,
+                    "managed bridge runtime generation file",
+                )
+                observed.append((leaf, content))
+            if directory_identity(os.stat(generation, dir_fd=runtime_descriptor, follow_symlinks=False)) \
+                    != directory_identity(metadata):
+                raise RuntimeError("managed bridge runtime generation changed while reading")
+        finally:
+            os.close(descriptor)
+        if expected_sources is not None and observed != expected_sources:
+            raise RuntimeError("managed bridge runtime generation does not match the verified release")
+
+    try:
+        verify_generation(desired_generation, sources)
+    except FileNotFoundError:
+        if mode != "stage":
+            raise RuntimeError("managed bridge runtime generation is missing")
+        temporary = f".generation.tmp.{secrets.token_hex(16)}"
+        temporary_directories.append(temporary)
+        os.mkdir(temporary, 0o700, dir_fd=runtime_descriptor)
+        descriptor = os.open(temporary, directory_flags, dir_fd=runtime_descriptor)
+        try:
+            os.fchown(descriptor, owner_uid, group_gid)
+            for leaf, content in sources:
+                write_staged_file(descriptor, leaf, content)
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o750)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.rename(
+            temporary,
+            desired_generation,
+            src_dir_fd=runtime_descriptor,
+            dst_dir_fd=runtime_descriptor,
+        )
+        temporary_directories.remove(temporary)
+        os.fsync(runtime_descriptor)
+        verify_generation(desired_generation, sources)
+
+    def read_generation_receipt(required):
+        try:
+            _, content = read_regular_at(
+                runtime_descriptor,
+                "active-generation",
+                owner_uid,
+                group_gid,
+                0o640,
+                "bridge runtime generation receipt",
+            )
+        except FileNotFoundError:
+            if required:
+                raise RuntimeError("bridge runtime generation receipt is missing")
+            return None
+        try:
+            receipt = content.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("bridge runtime generation receipt is malformed") from error
+        if not re.fullmatch(r"generation-[a-f0-9]{64}\n", receipt):
+            raise RuntimeError("bridge runtime generation receipt is malformed")
+        return receipt.rstrip("\n")
+
+    if mode == "activate":
+        current_generation = read_generation_receipt(required=False)
+        if current_generation is not None:
+            verify_generation(current_generation)
+        if current_generation != desired_generation:
+            temporary = f".active-generation.tmp.{secrets.token_hex(16)}"
+            temporary_files.append(temporary)
+            write_staged_file(
+                runtime_descriptor,
+                temporary,
+                f"{desired_generation}\n".encode("ascii"),
+            )
+            os.replace(
+                temporary,
+                "active-generation",
+                src_dir_fd=runtime_descriptor,
+                dst_dir_fd=runtime_descriptor,
+            )
+            temporary_files.remove(temporary)
+            os.fsync(runtime_descriptor)
+    elif mode in {"verify", "active-root"}:
+        if read_generation_receipt(required=True) != desired_generation:
+            raise RuntimeError("bridge runtime generation receipt is stale")
+
+    if mode in {"activate", "verify", "active-root"}:
+        if read_generation_receipt(required=True) != desired_generation:
+            raise RuntimeError("bridge runtime generation receipt did not converge")
+        verify_generation(desired_generation, sources)
+
+    if mode in {"stage", "active-root"}:
+        print(os.path.join(runtime_path, desired_generation))
+finally:
+    for temporary in temporary_files:
+        try:
+            os.unlink(temporary, dir_fd=runtime_descriptor)
+        except FileNotFoundError:
+            pass
+    for temporary in temporary_directories:
+        try:
+            descriptor = os.open(temporary, directory_flags, dir_fd=runtime_descriptor)
+        except FileNotFoundError:
+            continue
+        try:
+            for leaf in os.listdir(descriptor):
+                os.unlink(leaf, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+        os.rmdir(temporary, dir_fd=runtime_descriptor)
+    os.close(runtime_descriptor)
+
+if directory_identity(os.lstat(runtime_path)) != directory_identity(runtime_metadata):
+    raise RuntimeError("bridge runtime directory changed during convergence")
+PY
+}
+
+publish_bridge_runtime() {
+  local staged_root active_root
+  staged_root="$(bridge_runtime_contract stage)" || return 1
+  bridge_runtime_service_user_check "$staged_root" || return 1
+  bridge_runtime_contract activate || return 1
+  active_root="$(bridge_runtime_contract active-root)" || return 1
+  [[ "$active_root" == "$staged_root" ]]
+}
+
+bridge_runtime_service_user_check() {
+  local staged_root="$1"
+  runuser --user "$BRIDGE_USER" -- \
+    /usr/bin/node --check "${staged_root}/${BRIDGE_RUNTIME_ENTRYPOINT_NAME}" >/dev/null \
+    || return 1
+  runuser --user "$BRIDGE_USER" -- \
+    /usr/bin/node --check "${staged_root}/${BRIDGE_RUNTIME_CREDENTIAL_MODULE_NAME}" >/dev/null \
+    || return 1
+}
+
+bridge_runtime_active_root() {
+  bridge_runtime_contract active-root
+}
+
+bridge_runtime_ready() {
+  bridge_runtime_sources_ready \
+    && bridge_runtime_contract verify
 }
 
 ensure_identity_and_directories() {
@@ -56,9 +469,10 @@ ensure_identity_and_directories() {
   fi
   [[ "$(id -gn "$BRIDGE_USER")" == "$BRIDGE_GROUP" ]] \
     || die 'Managed bridge user has an unexpected primary group.'
-  install -d -m 0750 -o root -g "$BRIDGE_GROUP" "$BRIDGE_STATE_ROOT"
-  install -d -m 2750 -o root -g "$BRIDGE_GROUP" "$BRIDGE_CREDENTIAL_ROOT"
-  install -d -m 0750 -o root -g root /etc/bridgesllm
+  ensure_managed_directory "$BRIDGE_STATE_ROOT" 0750 root "$BRIDGE_GROUP"
+  ensure_managed_directory "$BRIDGE_CREDENTIAL_ROOT" 2750 root "$BRIDGE_GROUP"
+  ensure_managed_directory "$BRIDGE_RUNTIME_ROOT" 0750 root "$BRIDGE_GROUP"
+  ensure_managed_directory /etc/bridgesllm 0750 root root
 }
 
 generate_upstream_token() {
@@ -161,7 +575,10 @@ raise SystemExit(0 if ok else 4)
 }
 
 write_systemd_unit() {
-  local temporary="${BRIDGE_UNIT_FILE}.tmp.$$"
+  local temporary="${BRIDGE_UNIT_FILE}.tmp.$$" active_root runtime_entrypoint
+  active_root="$(bridge_runtime_active_root)" \
+    || die 'Active Agent Zero Project model bridge runtime could not be resolved.'
+  runtime_entrypoint="${active_root}/${BRIDGE_RUNTIME_ENTRYPOINT_NAME}"
   cat >"$temporary" <<EOF
 [Unit]
 Description=BridgesLLM Agent Zero Project model bridge
@@ -174,7 +591,7 @@ Type=simple
 User=${BRIDGE_USER}
 Group=${BRIDGE_GROUP}
 EnvironmentFile=${BRIDGE_ENV_FILE}
-ExecStart=/usr/bin/node ${BRIDGE_ENTRYPOINT}
+ExecStart=/usr/bin/node ${runtime_entrypoint}
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=30
@@ -207,6 +624,14 @@ EOF
   mv -f "$temporary" "$BRIDGE_UNIT_FILE"
 }
 
+bridge_unit_runtime_ready() {
+  local active_root expected
+  root_protected_file "$BRIDGE_UNIT_FILE" 644 || return 1
+  active_root="$(bridge_runtime_active_root)" || return 1
+  expected="ExecStart=/usr/bin/node ${active_root}/${BRIDGE_RUNTIME_ENTRYPOINT_NAME}"
+  [[ "$(grep -Fxc -- "$expected" "$BRIDGE_UNIT_FILE")" == '1' ]]
+}
+
 bridge_http_ready() {
   local provider status
   for provider in codex github-copilot gemini-api xai-grok; do
@@ -227,14 +652,20 @@ wait_bridge_http_ready() {
 
 install_bridge_service() {
   require_root
-  for command in curl getent groupadd id install node python3 seq sleep stat systemctl useradd; do
+  for command in curl getent groupadd id install node python3 runuser seq sleep stat systemctl useradd; do
     require_command "$command"
   done
   ensure_identity_and_directories
   bridge_runtime_sources_ready \
     || die 'Compiled Agent Zero Project model bridge runtime is missing or unsafe.'
+  publish_bridge_runtime \
+    || die 'Compiled Agent Zero Project model bridge runtime could not be published safely.'
+  bridge_runtime_ready \
+    || die 'Published Agent Zero Project model bridge runtime is missing or unsafe.'
   ensure_bridge_environment
   write_systemd_unit
+  bridge_unit_runtime_ready \
+    || die 'Agent Zero Project model bridge service unit did not bind the active runtime generation.'
   systemctl daemon-reload
   systemctl enable "$BRIDGE_SERVICE" >/dev/null
   systemctl restart "$BRIDGE_SERVICE"
@@ -245,14 +676,16 @@ install_bridge_service() {
 
 status_bridge() {
   require_root
-  require_command curl
-  require_command docker
-  require_command systemctl
+  for command in curl docker getent groupadd id install python3 stat systemctl useradd; do
+    require_command "$command"
+  done
   ensure_identity_and_directories
   read_env_token >/dev/null
   assert_agent_zero_upstream
-  bridge_runtime_sources_ready \
-    || die 'Compiled Agent Zero Project model bridge runtime is missing or unsafe.'
+  bridge_runtime_ready \
+    || die 'Published Agent Zero Project model bridge runtime is missing, stale, or unsafe.'
+  bridge_unit_runtime_ready \
+    || die 'Agent Zero Project model bridge service is not bound to the active runtime generation.'
   systemctl is-active --quiet "$BRIDGE_SERVICE" \
     || die 'Agent Zero Project model bridge service is not active.'
   bridge_http_ready || die 'Agent Zero Project model bridge did not return its fail-closed HTTP contract.'

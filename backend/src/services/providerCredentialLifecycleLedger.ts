@@ -614,7 +614,7 @@ export function claimProviderCredentialLifecycle(
     const removalFence = ledger.records[providerRemovalFenceNamespace(namespace)];
     if (removalFence) {
       throw new DurableCredentialLifecycleConflictError(
-        'Provider credential removal currently owns this credential domain. Wait for verified removal before starting another sign-in.',
+        retainedFenceMessage(Date.parse(removalFence.reviewAfter), Date.now()),
       );
     }
     const existing = ledger.records[namespace];
@@ -1253,6 +1253,9 @@ export async function reconcileProviderCredentialLifecycleBeforeAdmission(
     killWaitMs?: number;
   } = {},
 ): Promise<void> {
+  // A retained write fence on the same domain blocks admission just as hard
+  // as a primary record, so recover it with the same evidence standard first.
+  await reconcileProviderCredentialRemovalFenceBeforeAdmission(namespace, readFingerprint, options);
   const record = getProviderCredentialLifecycleRecord(namespace);
   if (!record) return;
   const recoveryClaim = { namespace, leaseId: record.leaseId };
@@ -1375,6 +1378,209 @@ export async function reconcileProviderCredentialLifecycleBeforeAdmission(
   }
 
   releaseProviderCredentialLifecycleAfterVerifiedAbsence(recoveryClaim);
+}
+
+/**
+ * Reconcile a retained provider-removal fence before admitting new work on its
+ * credential domain.
+ *
+ * A failed API-key or setup-token save parks its write fence indeterminate,
+ * and that fence used to be a permanent hard-block: every later sign-in threw
+ * a conflict, every later save 409'd on a fresh operation UUID, and nothing
+ * ever re-examined the fence. One rejected paste bricked the provider until a
+ * human edited the ledger. After the review window, with no surviving process,
+ * three stable reads proving absolute absence — or restoration to the fence's
+ * own pre-write baseline — are the same evidence the primary reconcile
+ * accepts, so accept them here too.
+ */
+export async function reconcileProviderCredentialRemovalFenceBeforeAdmission(
+  targetNamespace: string,
+  readFingerprint: () => Promise<string | ProviderCredentialLifecycleFingerprintProof>,
+  options: {
+    now?: () => number;
+    delay?: (milliseconds: number) => Promise<unknown>;
+    stableReads?: number;
+    intervalMs?: number;
+    /**
+     * The exact durable write operation this admission retries, if any. A
+     * fence retained for that exact envelope must reach the claim path, whose
+     * resume semantics give the authoritative answer for the original
+     * request; reconciliation only recovers fences left by *other* operations.
+     */
+    exactWriteOperation?: { ownerId: string; operationId: string; requestFingerprint: string };
+  } = {},
+): Promise<void> {
+  const fenceNamespace = providerRemovalFenceNamespace(targetNamespace);
+  const record = getProviderCredentialLifecycleRecord(fenceNamespace);
+  if (!record) return;
+  const fenceClaim = { namespace: fenceNamespace, leaseId: record.leaseId };
+
+  const exact = options.exactWriteOperation;
+  if (exact && record.lifecycleKind.startsWith('api-key-save-')) {
+    const matchesExactOperation = withLedgerLock((_ledgerPath, ledger, key) => {
+      const fence = ledger.records[fenceNamespace];
+      if (!fence || fence.leaseId !== record.leaseId) return false;
+      return fence.ownerDigest === digest(key, 'owner', exact.ownerId)
+        && fence.requestDigest === digest(
+          key,
+          'request',
+          writeRequestEnvelope(exact.operationId, exact.requestFingerprint),
+        );
+    });
+    if (matchesExactOperation) return;
+  }
+
+  if (providerCredentialLifecycleProcessState(record) === 'alive') {
+    throw new DurableCredentialLifecycleConflictError(
+      'A credential operation is still running for this provider. Wait for it to finish before starting another sign-in.',
+    );
+  }
+
+  const now = options.now || Date.now;
+  const reviewAfter = Date.parse(record.reviewAfter);
+  const reviewElapsed = Number.isFinite(reviewAfter) && now() >= reviewAfter;
+
+  // An active fence inside its review window belongs to an operation that can
+  // still be resumed exactly (same operation UUID). The claim path owns those
+  // recovery semantics; reconciliation must not shadow them.
+  if (record.state === 'active' && !reviewElapsed) return;
+
+  if (!reviewElapsed) {
+    throw new DurableCredentialLifecycleRecoveryRequiredError(
+      retainedFenceMessage(reviewAfter, now()),
+    );
+  }
+
+  const delay = options.delay || ((milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  const stableReads = Math.max(2, options.stableReads ?? 3);
+  const intervalMs = Math.max(1, options.intervalMs ?? 150);
+  let lastFingerprint: string | null = null;
+  let stableAbsence = true;
+  for (let index = 0; index < stableReads; index += 1) {
+    let currentFingerprint: string;
+    try {
+      const proof = await readFingerprint();
+      currentFingerprint = typeof proof === 'string' ? proof : proof.fingerprint;
+      if (!currentFingerprint) throw new Error('credential-domain proof is missing its fingerprint');
+      stableAbsence = stableAbsence && typeof proof !== 'string' && proof.absent === true;
+    } catch {
+      markProviderCredentialLifecycle(fenceClaim, 'indeterminate');
+      throw new DurableCredentialLifecycleRecoveryRequiredError(
+        'Portal could not attest the provider credential inventory while recovering a failed credential operation. The domain remains locked for review.',
+      );
+    }
+    if (lastFingerprint !== null && currentFingerprint !== lastFingerprint) {
+      markProviderCredentialLifecycle(fenceClaim, 'indeterminate');
+      throw new DurableCredentialLifecycleRecoveryRequiredError(
+        'The provider credential inventory was unstable while recovering a failed credential operation. The domain remains locked for review.',
+      );
+    }
+    lastFingerprint = currentFingerprint;
+    if (index + 1 < stableReads) await delay(intervalMs);
+  }
+
+  if (stableAbsence) {
+    if (!clearProviderCredentialLifecycleAfterVerifiedRemoval(fenceNamespace, record.leaseId)) {
+      throw ownershipChangedMessage();
+    }
+    return;
+  }
+
+  const comparison = lastFingerprint === null
+    ? 'unavailable'
+    : attestProviderCredentialLifecycleFingerprint(fenceNamespace, lastFingerprint, record.leaseId);
+  if (comparison === 'ownership_changed') throw ownershipChangedMessage();
+  if (comparison === 'unchanged') {
+    if (!clearProviderCredentialLifecycleAfterVerifiedRemoval(fenceNamespace, record.leaseId)) {
+      throw ownershipChangedMessage();
+    }
+    return;
+  }
+  if (comparison === 'changed') {
+    markProviderCredentialLifecycle(fenceClaim, 'committed', lastFingerprint);
+    throw new DurableCredentialLifecycleConflictError(
+      'A failed credential operation left a credential behind for this provider. Disconnect the provider or use "Reset stuck sign-in" before signing in again.',
+    );
+  }
+  markProviderCredentialLifecycle(fenceClaim, 'indeterminate');
+  throw new DurableCredentialLifecycleRecoveryRequiredError(
+    'A failed credential operation has no trustworthy pre-write inventory proof. Use "Reset stuck sign-in" to clear it.',
+  );
+}
+
+/**
+ * Settle a failed credential write honestly instead of parking every failure.
+ *
+ * "The CLI rejected the pasted value" and "the transaction crashed halfway
+ * through" are different failures with opposite remedies, but both used to
+ * park the domain for 15 minutes. When three stable reads prove the domain is
+ * absent or byte-identical to this write's own admission baseline, the secret
+ * provably did not land and the fence can be released immediately.
+ */
+export async function settleProviderCredentialWriteFailure(
+  claim: ClaimedProviderCredentialLifecycle,
+  readFingerprint: () => Promise<string | ProviderCredentialLifecycleFingerprintProof>,
+  options: {
+    delay?: (milliseconds: number) => Promise<unknown>;
+    stableReads?: number;
+    intervalMs?: number;
+  } = {},
+): Promise<'released' | 'parked'> {
+  const delay = options.delay || ((milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  const stableReads = Math.max(2, options.stableReads ?? 3);
+  const intervalMs = Math.max(1, options.intervalMs ?? 150);
+  let lastFingerprint: string | null = null;
+  let stableAbsence = true;
+  try {
+    for (let index = 0; index < stableReads; index += 1) {
+      const proof = await readFingerprint();
+      const currentFingerprint = typeof proof === 'string' ? proof : proof.fingerprint;
+      if (!currentFingerprint) throw new Error('credential-domain proof is missing its fingerprint');
+      if (lastFingerprint !== null && currentFingerprint !== lastFingerprint) {
+        parkProviderCredentialRemovalLifecycle(claim);
+        return 'parked';
+      }
+      lastFingerprint = currentFingerprint;
+      stableAbsence = stableAbsence && typeof proof !== 'string' && proof.absent === true;
+      if (index + 1 < stableReads) await delay(intervalMs);
+    }
+  } catch {
+    parkProviderCredentialRemovalLifecycle(claim);
+    return 'parked';
+  }
+
+  if (stableAbsence) {
+    releaseProviderCredentialLifecycle(claim);
+    return 'released';
+  }
+  const comparison = lastFingerprint === null
+    ? 'unavailable'
+    : attestProviderCredentialLifecycleFingerprint(claim.namespace, lastFingerprint, claim.leaseId);
+  if (comparison === 'unchanged') {
+    releaseProviderCredentialLifecycle(claim);
+    return 'released';
+  }
+  parkProviderCredentialRemovalLifecycle(claim);
+  return 'parked';
+}
+
+/**
+ * True for any lifecycle-control error (conflict or recovery-required). Route
+ * error paths use this to avoid settling a fence they no longer own, without
+ * naming the conflict class directly — envelope-mismatch classification must
+ * stay independent of the conflict hierarchy.
+ */
+export function isProviderCredentialLifecycleControlError(error: unknown): boolean {
+  return error instanceof DurableCredentialLifecycleConflictError
+    || error instanceof DurableCredentialLifecycleRecoveryRequiredError;
+}
+
+function retainedFenceMessage(reviewAfterMs: number, nowMs: number): string {
+  if (Number.isFinite(reviewAfterMs) && reviewAfterMs > nowMs) {
+    const remainingMinutes = Math.max(1, Math.ceil((reviewAfterMs - nowMs) / 60_000));
+    return `A failed credential change for this provider is being retained for review for about ${remainingMinutes} more minute${remainingMinutes === 1 ? '' : 's'}. Wait for that window to pass and retry, or use "Reset stuck sign-in" to clear it now.`;
+  }
+  return 'A failed credential change still owns this provider. Retry the sign-in so Portal can verify and clear it, or use "Reset stuck sign-in".';
 }
 
 export function bindProviderCredentialLifecycle(

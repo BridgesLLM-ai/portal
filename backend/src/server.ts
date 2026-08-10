@@ -9,7 +9,8 @@ import {
   APP_API_ID_HEADER,
   addConfiguredAppApiSecret,
   buildAppApiTargetUrl,
-  configuredAppApiTarget,
+  configuredAppApiTargetBinding,
+  invalidAppApiTargetResponse,
 } from './utils/appApiProxyAuth';
 import { createAppApiAbortContext, serializeAppApiRequestBody, streamAppApiResponse } from './utils/appApiProxy';
 import helmet from 'helmet';
@@ -19,6 +20,14 @@ import { config } from './config/env';
 import { corsConfig } from './middleware/cors';
 import { errorHandler } from './middleware/errorHandler';
 import { prisma } from './config/database';
+import {
+  DEFAULT_PORTAL_LOGO_PATH,
+  absolutePortalBrandingAssetUrl,
+  injectConfiguredPortalIconLinks,
+  isVendorBrandingSurface,
+  resolvePortalBrandingLogoPath,
+} from './services/portalBranding';
+import { createSpaStaticAssetMiddleware } from './services/spaStaticAssets';
 import authRoutes from './routes/auth';
 import fileRoutes, { initializeFileStorage } from './routes/files';
 import appsRoutes, { initializeAppsStorage, shareRouter } from './routes/apps';
@@ -161,6 +170,12 @@ import {
   stopStartupStatusServer,
   setStartupPhase,
 } from './services/startupStatusServer';
+import {
+  applyAppContentEmbedSecurityHeaders,
+  buildPortalContentSecurityPolicyDirectives,
+  initializeEmbedSecurityPolicy,
+  preserveAppContentSecurityHeadersOnProxy,
+} from './services/embedSecurityPolicy';
 
 export const PORTAL_UPDATE_VALIDATION_MODE = process.env.PORTAL_UPDATE_VALIDATION_MODE === '1';
 export const PORTAL_UPDATE_VALIDATION_CONTRACT = 'BRIDGESLLM_UPDATE_VALIDATION_CONTRACT_V1';
@@ -440,24 +455,9 @@ app.set('trust proxy', 'loopback');
 // Security middleware
 app.use(helmet({
   contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://cdn.jsdelivr.net", "https://cdn.sheetjs.com"], // Vite/React needs these + Monaco CDN loader + SheetJS for Excel viewer worker
-      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdn.jsdelivr.net"], // Inline styles for theming + Google Fonts stylesheet + Monaco editor CSS
-      imgSrc: ["'self'", "data:", "blob:", "https:"],
-      fontSrc: ["'self'", "data:", "https://fonts.gstatic.com"],
-      connectSrc: ["'self'", "wss:", "ws:"],
-      mediaSrc: ["'self'", "blob:", "data:"],
-      workerSrc: ["'self'", "blob:"],
-      frameSrc: ["'self'", "blob:", "data:", "https://www.youtube.com", "https://www.youtube-nocookie.com"],
-      objectSrc: ["'none'"],
-      baseUri: ["'self'"],
-      formAction: ["'self'"],
-      // Only upgrade insecure requests when actually serving over HTTPS.
-      // On plain HTTP (pre-domain setup), this directive makes browsers
-      // try HTTPS for every asset → ERR_CONNECTION_REFUSED.
-      upgradeInsecureRequests: process.env.CORS_ORIGIN?.startsWith('https') ? [] : null,
-    },
+    // Custom embed origins are deliberately absent here. They apply only to
+    // the isolated app-content origin below, never to the authenticated Portal.
+    directives: buildPortalContentSecurityPolicyDirectives() as any,
   },
   crossOriginEmbedderPolicy: false,
   // Disable COOP and Origin-Agent-Cluster on plain HTTP — they're ignored by
@@ -601,8 +601,7 @@ app.use((req, res, next) => {
   }
   res.setHeader('X-Robots-Tag', 'noindex, nofollow');
   res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
-  next();
+  applyAppContentEmbedSecurityHeaders(req, res, next);
 });
 
 // Admin-gated noVNC — portal JWT required and elevated role only
@@ -981,13 +980,22 @@ app.use('/hosted/:deployId/api/*', requireHostedAppAccess, async (req: any, res:
   const query = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
   const hostedApp = req.hostedApp as HostedAppRecord;
   const deployId = String(req.params.deployId || '');
-  const registeredTarget = getAppTarget(deployId);
-  const baseTarget = configuredAppApiTarget(hostedApp.id)
-    || registeredTarget
-    || undefined;
+  const configuredBinding = configuredAppApiTargetBinding(hostedApp.id);
+  if (configuredBinding.status === 'invalid') {
+    res.status(503).json(invalidAppApiTargetResponse());
+    settleWorkspaceAuthorizationRequest(req);
+    return;
+  }
+  const registeredTarget = configuredBinding.status === 'absent'
+    ? getAppTarget(deployId)
+    : null;
+  const baseTarget = configuredBinding.status === 'configured'
+    ? configuredBinding.target
+    : registeredTarget || undefined;
   const targetUrl = baseTarget ? buildAppApiTargetUrl(baseTarget, proxiedPath, query) : undefined;
   if (!targetUrl) {
     res.status(502).json({ error: 'App API backend is not configured' });
+    settleWorkspaceAuthorizationRequest(req);
     return;
   }
 
@@ -1056,7 +1064,15 @@ app.use('/hosted/:deployId', requireHostedAppAccess, async (req: any, res: any, 
 
   // A running full-stack app owns non-/api paths. Timeouts prevent a wedged
   // app from holding Portal sockets indefinitely.
-  const appTarget = getAppTarget(deployId);
+  const configuredBinding = configuredAppApiTargetBinding(hostedApp.id);
+  if (configuredBinding.status === 'invalid' && hostedApp.deployType === 'fullstack') {
+    res.status(503).send('This App runtime has an invalid server configuration.');
+    settleWorkspaceAuthorizationRequest(req);
+    return;
+  }
+  const appTarget = configuredBinding.status === 'absent'
+    ? getAppTarget(deployId)
+    : null;
   if (appTarget) {
     const proxy = createProxyMiddleware({
       target: appTarget,
@@ -1083,6 +1099,7 @@ app.use('/hosted/:deployId', requireHostedAppAccess, async (req: any, res: any, 
           proxyReq.once('error', () => settleWorkspaceAuthorizationRequest(req));
         },
         proxyRes: (proxyRes: any) => {
+          preserveAppContentSecurityHeadersOnProxy(proxyRes.headers, res);
           const settle = () => settleWorkspaceAuthorizationRequest(req);
           proxyRes.once('end', settle);
           proxyRes.once('close', settle);
@@ -1603,15 +1620,25 @@ if (config.nodeEnv === 'production') {
     });
 
     const settings = new Map(rows.map((row) => [row.key, row.value]));
-    const siteName = settings.get('system.siteName') || settings.get('appearance.portalName') || 'BridgesLLM Portal';
-    const siteDescription = settings.get('system.siteDescription') || '';
+    const vendorBrandingSurface = isVendorBrandingSurface(req.path);
+    const siteName = vendorBrandingSurface
+      ? 'BridgesLLM Portal'
+      : settings.get('appearance.portalName') || settings.get('system.siteName') || 'BridgesLLM Portal';
+    const siteDescription = vendorBrandingSurface ? '' : settings.get('system.siteDescription') || '';
     const searchEngineVisibility = settings.get('system.searchEngineVisibility') || 'hidden';
-    const configuredLogo = settings.get('system.logo') || settings.get('appearance.logoUrl') || '';
-    const detectedLogo = detectBrandingLogoPath();
-    const logoPath = detectedLogo || configuredLogo;
-    const absoluteLogoUrl = logoPath
-      ? (logoPath.startsWith('http://') || logoPath.startsWith('https://') ? logoPath : buildAbsoluteUrl(req, logoPath))
-      : '';
+    const appearanceLogoSetting = settings.get('appearance.logoUrl');
+    const appearanceLogoUrl = vendorBrandingSurface ? '' : appearanceLogoSetting || '';
+    const logoPath = vendorBrandingSurface
+      ? DEFAULT_PORTAL_LOGO_PATH
+      : resolvePortalBrandingLogoPath({
+        appearanceLogoUrl: appearanceLogoSetting,
+        detectedLogoPath: detectBrandingLogoPath(),
+        legacyLogoUrl: settings.get('system.logo'),
+      });
+    const absoluteLogoUrl = absolutePortalBrandingAssetUrl(
+      `${req.protocol}://${req.get('host') || ''}`,
+      logoPath,
+    );
     const absolutePageUrl = buildAbsoluteUrl(req, req.originalUrl || req.path || '/');
     const settingsSignature = JSON.stringify({
       settings: Object.fromEntries(settings.entries()),
@@ -1648,13 +1675,19 @@ if (config.nodeEnv === 'production') {
       metaTags.push('<meta name="robots" content="noindex, nofollow" />');
     }
 
-    const injectedHtml = sourceHtml.replace('</head>', `  ${metaTags.join('\n  ')}\n</head>`);
+    const iconReadyHtml = vendorBrandingSurface
+      ? sourceHtml
+      : injectConfiguredPortalIconLinks(sourceHtml, appearanceLogoUrl);
+    const injectedHtml = iconReadyHtml.replace('</head>', `  ${metaTags.join('\n  ')}\n</head>`);
     spaRenderCache.htmlByRequestUrl.set(requestCacheKey, injectedHtml);
     return injectedHtml;
   };
 
   if (fs.existsSync(frontendDist)) {
-    app.use(express.static(frontendDist));
+    // Do not let express.static answer `/` with raw index.html. Every SPA
+    // navigation must pass through renderSpaHtml so custom icons and metadata
+    // are present in the first response, before React or a browser paint.
+    app.use(createSpaStaticAssetMiddleware(frontendDist));
     app.get('*', async (req, res, next) => {
       const nonSpaPrefixes = ['/api', '/share', '/hosted', '/novnc', '/static-assets', '/assets'];
       if (nonSpaPrefixes.some(prefix => req.path === prefix || req.path.startsWith(`${prefix}/`))) {
@@ -1860,6 +1893,7 @@ export const startServer = async () => {
     setStartupPhase('database-connection');
     await prisma.$queryRaw`SELECT 1`;
     console.log('✅ Database connection successful');
+    await initializeEmbedSecurityPolicy();
 
     const terminalScopeRecovery = await initializeTerminalSystemdScopeRuntime();
     if (terminalScopeRecovery.recovered > 0) {

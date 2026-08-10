@@ -4,6 +4,7 @@ import {
   resolveContainedPath,
   writeContainedFileAtomic,
 } from './containedPath';
+import { writeProjectRuntimeOwnedFileAtomic } from './projectRuntimeOwnership';
 
 export const PROJECT_METADATA_MAX_BYTES = 1024 * 1024;
 export const PROJECT_DOCUMENT_MAX_BYTES = 2 * 1024 * 1024;
@@ -129,6 +130,24 @@ export function writeProjectTextFile(
 ): string {
   try {
     return writeContainedFileAtomic(projectRoot, relativePath, content, { maxBytes });
+  } catch (error) {
+    if (error instanceof ContainedPathError) {
+      const code = /exceeds the configured limit/i.test(error.message) ? 'TOO_LARGE' : 'INVALID_PATH';
+      throw new ProjectFilePolicyError(code, error.message);
+    }
+    throw error;
+  }
+}
+
+/** Write Portal-managed Project content for the confined provider identity. */
+export function writeProjectRuntimeTextFile(
+  projectRoot: string,
+  relativePath: string,
+  content: string,
+  maxBytes = PROJECT_DOCUMENT_MAX_BYTES,
+): string {
+  try {
+    return writeProjectRuntimeOwnedFileAtomic(projectRoot, relativePath, content, { maxBytes });
   } catch (error) {
     if (error instanceof ContainedPathError) {
       const code = /exceeds the configured limit/i.test(error.message) ? 'TOO_LARGE' : 'INVALID_PATH';

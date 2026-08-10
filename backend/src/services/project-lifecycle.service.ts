@@ -8,7 +8,7 @@
  * environment.
  */
 
-import { ChildProcess, execFileSync, spawn } from 'child_process';
+import { ChildProcess, execFile, execFileSync, spawn } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -51,9 +51,30 @@ function configuredProjectRuntimeImage(): string {
 
 export const PROJECT_RUNTIME_IMAGE = configuredProjectRuntimeImage();
 
+export class ProjectRuntimeImageUnavailableError extends Error {
+  readonly code = 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE';
+  readonly retryable = true;
+
+  constructor() {
+    super('The Project runtime image is unavailable. Re-run the Portal installer or update, then try again.');
+    this.name = 'ProjectRuntimeImageUnavailableError';
+  }
+}
+
+export async function assertProjectRuntimeImageAvailable(
+  executor: ProjectEgressCommandExecutor = projectEgressCommandExecutor,
+): Promise<string> {
+  return resolvePinnedProjectRuntimeImage(PROJECT_RUNTIME_IMAGE, executor).catch(() => {
+    // Keep the configured image identity out of all HTTP-facing errors.
+    throw new ProjectRuntimeImageUnavailableError();
+  });
+}
+
 const DOCKER_BIN = '/usr/bin/docker';
 const PROJECT_MOUNT = '/workspace/project';
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+const PROJECT_CHAT_WORKSPACE_PREPARATION_TIMEOUT_MS = 60_000;
+const PROJECT_CHAT_WORKSPACE_PREPARATION_MAX_OUTPUT_BYTES = 64 * 1024;
 const ALLOWED_COMMANDS = new Set([
   'npm',
   'node',
@@ -164,6 +185,57 @@ export function prepareProjectLifecycleWorkspace(workspace: string): string {
   return resolved;
 }
 
+export class ProjectLifecycleWorkspacePreparationError extends Error {
+  readonly code = 'PROJECT_WORKSPACE_PREPARATION_FAILED';
+  readonly retryable = true;
+  readonly cause: unknown;
+
+  constructor(message: string, cause: unknown) {
+    super(message);
+    this.name = 'ProjectLifecycleWorkspacePreparationError';
+    this.cause = cause;
+  }
+}
+
+/**
+ * Project Chat uses the same exact canonical workspace and ownership contract
+ * as lifecycle jobs, but chown must run outside the Express event loop. Large
+ * repositories can legitimately take time to traverse; awaiting execFile
+ * keeps other requests responsive while retaining a hard process deadline.
+ */
+export async function prepareProjectChatLifecycleWorkspace(workspace: string): Promise<string> {
+  const resolved = assertSafeWorkspace(workspace);
+  await new Promise<void>((resolve, reject) => {
+    execFile('/usr/bin/chown', [
+      '-R',
+      '--no-dereference',
+      `${PROJECT_RUNTIME_UID}:${PROJECT_RUNTIME_GID}`,
+      resolved,
+    ], {
+      encoding: 'utf8',
+      timeout: PROJECT_CHAT_WORKSPACE_PREPARATION_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+      maxBuffer: PROJECT_CHAT_WORKSPACE_PREPARATION_MAX_OUTPUT_BYTES,
+      windowsHide: true,
+      env: dockerCliEnvironment(),
+    }, (error) => {
+      if (!error) {
+        resolve();
+        return;
+      }
+      const timedOut = Boolean((error as any).killed)
+        || (error as any).code === 'ETIMEDOUT';
+      reject(new ProjectLifecycleWorkspacePreparationError(
+        timedOut
+          ? 'Project workspace ownership preparation exceeded 60 seconds.'
+          : 'Project workspace ownership preparation failed.',
+        error,
+      ));
+    });
+  });
+  return resolved;
+}
+
 export function buildProjectContainerArgs(
   options: ProjectLifecycleCommand,
   containerName: string,
@@ -228,11 +300,7 @@ async function prepareLifecyclePlan(
     mode === 'app' ? 'bridgesllm-project-app' : 'bridgesllm-project-job',
     `${options.actorId}\0${options.projectId}\0${mode}\0${workloadId}`,
   );
-  const image = await resolvePinnedProjectRuntimeImage(PROJECT_RUNTIME_IMAGE, executor).catch(() => {
-    throw new Error(
-      `Project runtime image ${PROJECT_RUNTIME_IMAGE} is unavailable. Re-run the Portal installer/update before executing project code.`,
-    );
-  });
+  const image = await assertProjectRuntimeImageAvailable(executor);
   const environment: Record<string, string> = {
     HOME: '/tmp/project-home',
     CI: 'true',
@@ -572,14 +640,69 @@ const STATIC_DEPLOYMENT_PRIVATE_FILES = new Set([
 const STATIC_DEPLOYMENT_PRIVATE_SUFFIXES = ['.key', '.p12', '.pfx', '.pem'];
 
 export interface ProjectDeploymentPromotion {
+  sourceDigest: string;
+  promote: () => void;
   finalize: () => void;
   rollback: () => void;
 }
 
-function copyDeploymentTree(
+export class ProjectDeploymentReplayStaleError extends Error {
+  readonly code = 'PROJECT_RUNTIME_RECOVERY_REPLAY_STALE';
+
+  constructor() {
+    super('The Project source changed after the failed runtime action, so Portal did not replay it.');
+    this.name = 'ProjectDeploymentReplayStaleError';
+  }
+}
+
+function fingerprintCopiedDeploymentTree(root: string): string {
+  const digest = crypto.createHash('sha256');
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const walk = (current: string, relative: string): void => {
+    const entry = fs.lstatSync(current);
+    const mode = entry.mode & 0o777;
+    if (entry.isDirectory()) {
+      digest.update(`d\0${relative}\0${mode.toString(8)}\0`);
+      for (const child of fs.readdirSync(current).sort()) {
+        walk(path.join(current, child), relative ? `${relative}/${child}` : child);
+      }
+      return;
+    }
+    if (!entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error('Deployment source contains an unsupported filesystem entry');
+    }
+    digest.update(`f\0${relative}\0${mode.toString(8)}\0${entry.size}\0`);
+    const descriptor = fs.openSync(current, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    try {
+      let offset = 0;
+      while (offset < entry.size) {
+        const bytesRead = fs.readSync(
+          descriptor,
+          buffer,
+          0,
+          Math.min(buffer.length, entry.size - offset),
+          offset,
+        );
+        if (bytesRead <= 0) throw new Error('Deployment source changed while it was being fingerprinted');
+        digest.update(buffer.subarray(0, bytesRead));
+        offset += bytesRead;
+      }
+      if (fs.fstatSync(descriptor).size !== entry.size) {
+        throw new Error('Deployment source changed while it was being fingerprinted');
+      }
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    digest.update('\0');
+  };
+  walk(root, '');
+  return digest.digest('hex');
+}
+
+function prepareDeploymentTree(
   source: string,
   destination: string,
-  options: { excludeStaticPrivateFiles: boolean },
+  options: { excludeStaticPrivateFiles: boolean; expectedSourceDigest?: string },
 ): ProjectDeploymentPromotion {
   const sourceRoot = assertSafeWorkspace(source);
   const destinationRoot = path.resolve(destination);
@@ -634,8 +757,7 @@ function copyDeploymentTree(
   const nonce = `${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
   const stagingRoot = path.join(destinationParent, `.${path.basename(destinationRoot)}.deploy-${nonce}`);
   const previousRoot = path.join(destinationParent, `.${path.basename(destinationRoot)}.previous-${nonce}`);
-  let previousMoved = false;
-  let promoted = false;
+  let sourceDigest = '';
   try {
     fs.cpSync(sourceRoot, stagingRoot, {
       recursive: true,
@@ -643,41 +765,95 @@ function copyDeploymentTree(
       filter: shouldInclude,
     });
     assertNoLinks(stagingRoot);
-    if (existingEntry) {
-      fs.renameSync(destinationRoot, previousRoot);
-      previousMoved = true;
+    sourceDigest = fingerprintCopiedDeploymentTree(stagingRoot);
+    if (
+      options.expectedSourceDigest !== undefined
+      && sourceDigest !== options.expectedSourceDigest
+    ) {
+      throw new ProjectDeploymentReplayStaleError();
     }
-    fs.renameSync(stagingRoot, destinationRoot);
-    promoted = true;
   } catch (error) {
-    if (previousMoved && !fs.existsSync(destinationRoot) && fs.existsSync(previousRoot)) {
-      try {
-        fs.renameSync(previousRoot, destinationRoot);
-      } catch (rollbackError: any) {
-        throw Object.assign(
-          new Error(`Deployment promotion failed and the prior deployment could not be restored: ${rollbackError.message}`),
-          { cause: error },
-        );
-      }
-    }
+    try { fs.rmSync(stagingRoot, { recursive: true, force: true }); } catch {}
     throw error;
-  } finally {
-    if (!promoted) {
-      try { fs.rmSync(stagingRoot, { recursive: true, force: true }); } catch {}
-    }
   }
 
+  const stagingEntry = fs.lstatSync(stagingRoot);
+  const sameEntry = (left: fs.Stats, right: fs.Stats): boolean => (
+    left.dev === right.dev && left.ino === right.ino
+  );
+  const currentDestinationEntry = (): fs.Stats | null => {
+    try { return fs.lstatSync(destinationRoot); } catch (error: any) {
+      if (error?.code === 'ENOENT') return null;
+      throw error;
+    }
+  };
+  let previousMoved = false;
+  let promoted = false;
   let settled = false;
   return {
+    sourceDigest,
+    promote: () => {
+      if (settled) throw new Error('Deployment preparation has already been settled');
+      if (promoted) return;
+      const currentEntry = currentDestinationEntry();
+      if (
+        (existingEntry === null) !== (currentEntry === null)
+        || (existingEntry && currentEntry && !sameEntry(existingEntry, currentEntry))
+      ) {
+        throw new Error('Deployment destination changed before promotion');
+      }
+      if (currentEntry?.isSymbolicLink()) {
+        throw new Error('Static deployment destination cannot be a symbolic link');
+      }
+      try {
+        if (currentEntry) {
+          fs.renameSync(destinationRoot, previousRoot);
+          previousMoved = true;
+        }
+        fs.renameSync(stagingRoot, destinationRoot);
+        const promotedEntry = fs.lstatSync(destinationRoot);
+        if (!sameEntry(stagingEntry, promotedEntry)) {
+          throw new Error('Deployment staging identity changed during promotion');
+        }
+        promoted = true;
+      } catch (error) {
+        if (previousMoved && !fs.existsSync(destinationRoot) && fs.existsSync(previousRoot)) {
+          try {
+            fs.renameSync(previousRoot, destinationRoot);
+            previousMoved = false;
+          } catch (rollbackError: any) {
+            throw Object.assign(
+              new Error(`Deployment promotion failed and the prior deployment could not be restored: ${rollbackError.message}`),
+              { cause: error },
+            );
+          }
+        }
+        throw error;
+      }
+    },
     finalize: () => {
       if (settled) return;
+      if (!promoted) throw new Error('Deployment preparation was not promoted');
       if (previousMoved) fs.rmSync(previousRoot, { recursive: true, force: true });
       settled = true;
     },
     rollback: () => {
       if (settled) return;
+      if (!promoted) {
+        const currentStaging = fs.lstatSync(stagingRoot);
+        if (!sameEntry(stagingEntry, currentStaging)) {
+          throw new Error('Deployment staging identity changed before rollback');
+        }
+        fs.rmSync(stagingRoot, { recursive: true, force: true });
+        settled = true;
+        return;
+      }
       const failedRoot = path.join(destinationParent, `.${path.basename(destinationRoot)}.failed-${nonce}`);
-      if (fs.existsSync(destinationRoot)) fs.renameSync(destinationRoot, failedRoot);
+      const promotedEntry = currentDestinationEntry();
+      if (!promotedEntry || !sameEntry(stagingEntry, promotedEntry)) {
+        throw new Error('Promoted deployment identity changed before rollback');
+      }
+      fs.renameSync(destinationRoot, failedRoot);
       let restored = !previousMoved;
       try {
         if (previousMoved) {
@@ -694,11 +870,30 @@ function copyDeploymentTree(
 }
 
 export function copyStaticDeploymentTree(source: string, destination: string): void {
-  copyDeploymentTree(source, destination, { excludeStaticPrivateFiles: true }).finalize();
+  const promotion = prepareDeploymentTree(source, destination, { excludeStaticPrivateFiles: true });
+  promotion.promote();
+  promotion.finalize();
 }
 
-export function copyFullstackDeploymentTree(source: string, destination: string): ProjectDeploymentPromotion {
-  return copyDeploymentTree(source, destination, { excludeStaticPrivateFiles: false });
+export function prepareFullstackDeploymentTree(
+  source: string,
+  destination: string,
+  expectedSourceDigest?: string,
+): ProjectDeploymentPromotion {
+  return prepareDeploymentTree(source, destination, {
+    excludeStaticPrivateFiles: false,
+    ...(expectedSourceDigest ? { expectedSourceDigest } : {}),
+  });
+}
+
+export function copyFullstackDeploymentTree(
+  source: string,
+  destination: string,
+  expectedSourceDigest?: string,
+): ProjectDeploymentPromotion {
+  const promotion = prepareFullstackDeploymentTree(source, destination, expectedSourceDigest);
+  promotion.promote();
+  return promotion;
 }
 
 /**
@@ -708,7 +903,9 @@ export function copyFullstackDeploymentTree(source: string, destination: string)
  * redeploy as stale host-executed code.
  */
 export function copyDesktopRuntimeDeploymentTree(source: string, destination: string): void {
-  copyDeploymentTree(source, destination, { excludeStaticPrivateFiles: false }).finalize();
+  const promotion = prepareDeploymentTree(source, destination, { excludeStaticPrivateFiles: false });
+  promotion.promote();
+  promotion.finalize();
 }
 
 export const __projectLifecycleTest = {

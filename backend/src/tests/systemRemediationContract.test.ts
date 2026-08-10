@@ -19,6 +19,7 @@ describe('system remediation privilege contract', () => {
     ['terminal', 'REPAIR TERMINAL'],
     ['fileManager', 'REPAIR FILE MANAGER'],
     ['agentTools', 'VERIFY AGENT TOOLS'],
+    ['projectRuntimeImage', 'REPAIR PROJECT RUNTIME IMAGE'],
   ])('requires the exact typed confirmation for %s', (feature, phrase) => {
     const contract = getSystemRemediationContract(feature);
     expect(contract).toMatchObject({ ownerOnly: true, confirmationPhrase: phrase });

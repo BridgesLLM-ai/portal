@@ -35,7 +35,7 @@ import ImagePickerCropper from '../ImagePickerCropper';
 import AnchoredPopover from '../AnchoredPopover';
 import ViewportModal from '../ViewportModal';
 import TypedConfirmationDialog from '../TypedConfirmationDialog';
-import AiProviderSetup from '../ai-setup/AiProviderSetup';
+import AiProviderSetup, { type NativeCliSetupProvider } from '../ai-setup/AiProviderSetup';
 import { useAuthStore } from '../../contexts/AuthContext';
 import { isElevated, isOwner } from '../../utils/authz';
 import { workspaceAuthorizedFetch } from '../../utils/workspaceAuthorizedFetch';
@@ -335,6 +335,32 @@ const providerCommandsCache = new Map<string, {
   capabilities?: ProviderCapabilities;
 }>();
 
+export function getAgentChatNativeRecoveryTarget(
+  providerName: string,
+  entry?: AgentChatProviderCatalogEntry,
+): NativeCliSetupProvider | null {
+  // A stale/error row can retain last-known auth fields. Only a fresh,
+  // settled, installed native runtime may turn needs_login into an actionable
+  // sign-in button; every other state keeps the ordinary availability recheck.
+  if (
+    !entry
+    || entry.availabilityState !== 'ready'
+    || entry.checking === true
+    || entry.stale === true
+    || entry.installed !== true
+    || entry.implemented === false
+    || entry.native !== true
+    || entry.nativeAuthStatus !== 'needs_login'
+  ) return null;
+  const targets: Partial<Record<string, NativeCliSetupProvider>> = {
+    CLAUDE_CODE: 'claude-code',
+    CODEX: 'codex',
+    GEMINI: 'gemini',
+    GROK: 'grok',
+  };
+  return targets[providerName] || null;
+}
+
 interface ProviderCapabilities {
   implemented?: boolean;
   requiresGateway?: boolean;
@@ -357,10 +383,14 @@ export function ProviderAvailabilityBarrier({
   assessment,
   loading = false,
   onRetry,
+  recoveryLabel,
+  onRecover,
 }: {
   assessment: AgentChatProviderAvailabilityAssessment;
   loading?: boolean;
   onRetry?: () => void;
+  recoveryLabel?: string;
+  onRecover?: () => void;
 }) {
   if (assessment.canSend || !assessment.message) return null;
   const checking = assessment.status === 'checking' && !assessment.retryable;
@@ -369,19 +399,28 @@ export function ProviderAvailabilityBarrier({
       id="agent-chat-provider-availability"
       role={checking ? 'status' : 'alert'}
       aria-live={checking ? 'polite' : 'assertive'}
-      className="flex items-center gap-2 border-b border-amber-500/15 bg-amber-500/[0.07] px-3 py-2 text-xs text-amber-100"
+      className="flex flex-wrap items-center gap-2 border-b border-amber-500/15 bg-amber-500/[0.07] px-3 py-2 text-xs text-amber-100"
     >
       {checking || loading ? (
         <Loader2 size={14} className="shrink-0 animate-spin text-amber-300" aria-hidden="true" />
       ) : (
         <ShieldAlert size={14} className="shrink-0 text-amber-300" aria-hidden="true" />
       )}
-      <span className="min-w-0 flex-1">{assessment.message}</span>
+      <span className="min-w-0 flex-1 basis-[14rem]">{assessment.message}</span>
+      {onRecover && recoveryLabel && !loading && (
+        <button
+          type="button"
+          onClick={onRecover}
+          className="min-h-[32px] shrink-0 rounded-lg border border-violet-300/25 bg-violet-500/10 px-2.5 font-medium text-violet-50 hover:bg-violet-500/20"
+        >
+          {recoveryLabel}
+        </button>
+      )}
       {assessment.retryable && onRetry && !loading && (
         <button
           type="button"
           onClick={onRetry}
-          className="min-h-[32px] rounded-lg border border-amber-300/20 px-2.5 font-medium text-amber-50 hover:bg-amber-500/10"
+          className="min-h-[32px] shrink-0 rounded-lg border border-amber-300/20 px-2.5 font-medium text-amber-50 hover:bg-amber-500/10"
         >
           Retry provider availability
         </button>
@@ -1423,7 +1462,7 @@ export function SessionControls({
                     <Wrench size={14} className={compatibilityHotfixStatus?.applied ? 'text-emerald-400' : 'text-amber-400'} />
                     <div className="min-w-0 flex-1">
                       <div className="text-xs font-medium text-white">Compatibility Hotfix</div>
-                      <div className="text-[10px] text-slate-500">Installer/update usually auto-applies this OpenClaw relay and Gemini compatibility patch. Use this fallback after a separate OpenClaw upgrade or if the expected markers are missing. Applying it restarts the gateway.</div>
+                      <div className="text-[10px] text-slate-500">Installer/update usually auto-applies the OpenClaw relay, Gemini, and Claude ask-question compatibility patch. Use this fallback after a separate OpenClaw upgrade or if the expected markers are missing. Applying it restarts the gateway.</div>
                     </div>
                   </div>
                   <div className={`rounded border px-2 py-1 text-[10px] leading-relaxed ${compatibilityHotfixStatus?.applied ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/20 bg-amber-500/10 text-amber-200'}`}>
@@ -1558,7 +1597,7 @@ export function CompatibilityHotfixConfirmationDialog({
 
 /* ─── Agent Settings Drawer (providers + tools) ───────────────────────── */
 
-export function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete, onNativeModelSelected }: { open: boolean; onClose: () => void; onAiProviderSetupComplete?: () => void; onNativeModelSelected?: (provider: 'GEMINI', model: string) => Promise<boolean | void> | boolean | void }) {
+export function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete, onNativeModelSelected, initialNativeCliProvider }: { open: boolean; onClose: () => void; onAiProviderSetupComplete?: () => void; onNativeModelSelected?: (provider: 'GEMINI', model: string) => Promise<boolean | void> | boolean | void; initialNativeCliProvider?: NativeCliSetupProvider | null }) {
   const { user } = useAuthStore();
   const isAdmin = isElevated(user);
   const owner = isOwner(user);
@@ -1668,6 +1707,7 @@ export function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete, 
                   mode="settings"
                   apiBase="/ai-setup"
                   compact
+                  initialNativeCliProvider={initialNativeCliProvider}
                   onComplete={onAiProviderSetupComplete}
                   onNativeModelSelected={onNativeModelSelected}
                   additionalProviderCards={owner ? (
@@ -2470,11 +2510,12 @@ export const AssistantThinkingBubble = React.memo(function AssistantThinkingBubb
   );
 });
 
-const AssistantBubble = React.memo(function AssistantBubble({
+export const AssistantBubble = React.memo(function AssistantBubble({
   agent,
   message,
   avatarUrl,
   isLast,
+  isLive = false,
   isStreaming,
   liveThinkingContent,
   liveThinkingSubject,
@@ -2486,6 +2527,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   message: ChatMessage;
   avatarUrl?: string;
   isLast: boolean;
+  isLive?: boolean;
   isStreaming: boolean;
   liveThinkingContent?: string;
   liveThinkingSubject?: string;
@@ -2497,7 +2539,7 @@ const AssistantBubble = React.memo(function AssistantBubble({
   const provenance = message.provenance || agent.provenance;
   const modelLabel = message.model ? getShortModelLabel(message.model) : '';
   const toolCalls = message.toolCalls || [];
-  const isCurrentlyStreaming = isLast && isStreaming;
+  const isCurrentlyStreaming = isLive && isStreaming;
   const hasContent = !!message.content;
   const visibleThinkingContent = (typeof liveThinkingContent === 'string' && liveThinkingContent.trim())
     ? liveThinkingContent
@@ -2681,6 +2723,15 @@ export function isAssistantContentRepresentedByTimeline(
   if (representedText.length === 0) return false;
   if (representedText.some((segment) => segment === content)) return true;
   return !reconcileCumulativeFinalTail(representedText, content).trim();
+}
+
+export function isAgentChatStreamingAssistant(
+  message: Pick<ChatMessage, 'id' | 'role'>,
+  streamingAssistantId: string | null | undefined,
+): boolean {
+  return message.role === 'assistant'
+    && Boolean(streamingAssistantId)
+    && message.id === streamingAssistantId;
 }
 
 const TimelineSegmentBubble = React.memo(function TimelineSegmentBubble({
@@ -2895,6 +2946,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const sessionTelemetry = chatState.sessionTelemetry;
   const sessionAvailability = chatState.sessionAvailability;
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [providerRecoveryTarget, setProviderRecoveryTarget] = useState<NativeCliSetupProvider | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [agentZeroRecoveryPending, setAgentZeroRecoveryPending] = useState(false);
   const [providerModels, setProviderModels] = useState<Record<string, string[]>>({ OPENCLAW: OPENCLAW_MODEL_FALLBACK });
@@ -3271,6 +3323,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     invalidateAgentChatProviderModelsCache();
     providerCommandsCache.clear();
     agentZeroAutoSelectionAttemptRef.current = null;
+    setProviderRecoveryTarget(null);
+    setProviderCatalogRefreshNonce((nonce) => nonce + 1);
     for (const providerName of new Set(['OPENCLAW', 'GEMINI', provider])) {
       void ensureProviderModelsLoaded(providerName, { force: true }).catch(() => undefined);
     }
@@ -3391,6 +3445,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       loading: providerCatalogLoading,
       loadError: providerCatalogLoadError,
     },
+  );
+  const nativeProviderRecoveryTarget = getAgentChatNativeRecoveryTarget(
+    provider,
+    currentProviderCatalogEntry,
   );
   const agentZeroStoredModelCandidate = provider === 'AGENT_ZERO' && typeof window !== 'undefined'
     ? String(localStorage.getItem('agentChats.lastModel.AGENT_ZERO') || '').trim()
@@ -3681,6 +3739,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     compactionPhase,
     thinkingContent,
     thinkingSubject,
+    streamingAssistantId,
     streamSegments,
     activityTitles,
   } = useAgentRuntime({
@@ -3961,7 +4020,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     });
   }, []);
 
-  const startNewSession = useCallback(async (options?: { cancelRunning?: boolean }): Promise<boolean> => {
+  const startNewSession = useCallback(async (): Promise<boolean> => {
     if (blockForChatContextMutation('starting a new chat')) return false;
     if (newSessionLeaseRef.current) return false;
     const snapshot = Object.freeze({
@@ -3984,9 +4043,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     let resolvedSessionKey = nextSession;
     let sessionCommitted = false;
     try {
-      if (options?.cancelRunning) await chatState.cancelStream();
-      if (!isCurrent()) return false;
-
       if (snapshot.provider === 'OPENCLAW') {
         try {
           const created = await gatewayAPI.createSession(nextSession, snapshot.provider);
@@ -3999,10 +4055,9 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         }
       }
 
-      chatState.clearMessages();
       resolvedSessionRef.current = null;
       newSessionTargetRef.current = resolvedSessionKey;
-      chatState.setSession(resolvedSessionKey);
+      await chatState.selectSession(resolvedSessionKey);
       setPendingAttachments([]);
       sessionCommitted = true;
       return true;
@@ -4266,8 +4321,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const handleNewChat = useCallback(() => {
     if (blockForChatContextMutation('starting a new chat')) return;
     sounds.click();
-    void startNewSession({ cancelRunning: isRunning });
-  }, [blockForChatContextMutation, isRunning, startNewSession]);
+    void startNewSession();
+  }, [blockForChatContextMutation, startNewSession]);
 
   // Build attachment text to prepend to message
   const buildAttachmentText = useCallback(
@@ -4478,6 +4533,15 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
           <ProviderAvailabilityBarrier
             assessment={currentProviderAvailability}
             loading={providerCatalogLoading}
+            recoveryLabel={isAdmin && nativeProviderRecoveryTarget
+              ? `Reconnect ${currentProviderCatalogEntry?.displayName || providerLabel}`
+              : undefined}
+            onRecover={isAdmin && nativeProviderRecoveryTarget
+              ? () => {
+                  setProviderRecoveryTarget(nativeProviderRecoveryTarget);
+                  setSettingsOpen(true);
+                }
+              : undefined}
             onRetry={() => setProviderCatalogRefreshNonce((nonce) => nonce + 1)}
           />
 
@@ -4679,6 +4743,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                       visibleIdx === 0 || !prevMsg ||
                       msg.createdAt.toDateString() !== prevMsg.createdAt.toDateString();
                     const isQueuedUserMessage = msg.role === 'user' && chatState.messageQueue.some((queued) => queued.id === msg.id);
+                    const isStreamingAssistant = isAgentChatStreamingAssistant(msg, streamingAssistantId);
 
                     return (
                       <React.Fragment key={msg.id}>
@@ -4698,7 +4763,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                 For history: use msg.segments with position info to reconstruct the timeline. */}
                             {(() => {
                               const toolCalls = msg.toolCalls || [];
-                              const isLiveTimeline = idx === messages.length - 1 && streamSegments.length > 0;
+                              const isLiveTimeline = isStreamingAssistant && streamSegments.length > 0;
                               const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
                               
                               if (!isLiveTimeline && !hasHistorySegments) return null;
@@ -4707,7 +4772,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                               // live/resumed stream then carries in grown form. Drop history thinking
                               // segments that are strict prefixes of the current live thinking so the
                               // same thought never renders twice.
-                              const liveThinkingForDedupe = idx === messages.length - 1 ? (thinkingContent || '').trim() : '';
+                              const liveThinkingForDedupe = isStreamingAssistant ? (thinkingContent || '').trim() : '';
                               const dropStalePartialThoughts = (segs: NonNullable<typeof msg.segments>) => (
                                 liveThinkingForDedupe
                                   ? segs.filter((seg) => !(
@@ -4804,7 +4869,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                             })()}
                             {/* Current/final bubble — shows live text OR historical content after tools */}
                             {(() => {
-                              const isLiveTimeline = idx === messages.length - 1 && streamSegments.length > 0;
+                              const isLiveTimeline = isStreamingAssistant && streamSegments.length > 0;
                               const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
                               const renderedBeforeSegments = isLiveTimeline
                                 ? streamSegments
@@ -4839,8 +4904,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                 && Boolean(lastRenderedThinkingSegment)
                                 && (!bubbleThinking || isSameGrowingThought(lastRenderedThinkingText, bubbleThinking))
                                 && (!bubbleThinkingSubject || lastRenderedThinkingSubject === bubbleThinkingSubject);
-                              const liveThinkingValue = idx === messages.length - 1 ? thinkingContent : undefined;
-                              const liveThinkingSubjectValue = idx === messages.length - 1 ? thinkingSubject : undefined;
+                              const liveThinkingValue = isStreamingAssistant ? thinkingContent : undefined;
+                              const liveThinkingSubjectValue = isStreamingAssistant ? thinkingSubject : undefined;
                               const liveThinkingText = liveThinkingValue?.trim() || '';
                               const liveThinkingSubjectText = liveThinkingSubjectValue?.trim() || '';
                               const liveThinkingAlreadyRendered = Boolean(liveThinkingText || liveThinkingSubjectText)
@@ -4857,7 +4922,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                 : bubbleMessage;
                               const effectiveLiveThinkingContent = liveThinkingAlreadyRendered ? undefined : liveThinkingValue;
                               const effectiveLiveThinkingSubject = liveThinkingAlreadyRendered ? undefined : liveThinkingSubjectValue;
-                              const effectiveLiveStatusText = idx === messages.length - 1 && isRunning
+                              const effectiveLiveStatusText = isStreamingAssistant && isRunning
                                 ? String(statusText || '').trim()
                                 : '';
                               const hasVisibleBubble = Boolean(
@@ -4878,7 +4943,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                                   agent={agent}
                                   avatarUrl={agentAvatars[agent.providerName]}
                                   isLast={idx === messages.length - 1}
-                                  isStreaming={isRunning}
+                                  isLive={isStreamingAssistant}
+                                  isStreaming={isRunning && isStreamingAssistant}
                                   liveThinkingContent={effectiveLiveThinkingContent}
                                   liveThinkingSubject={effectiveLiveThinkingSubject}
                                   liveStatusText={effectiveLiveStatusText}
@@ -5263,7 +5329,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
           }}
         />
 
-        <AgentSettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} onAiProviderSetupComplete={handleAiProviderSetupComplete} onNativeModelSelected={handleNativeSetupModelSelected} />
+        <AgentSettingsDrawer
+          open={settingsOpen}
+          onClose={() => {
+            setSettingsOpen(false);
+            setProviderRecoveryTarget(null);
+          }}
+          onAiProviderSetupComplete={handleAiProviderSetupComplete}
+          onNativeModelSelected={handleNativeSetupModelSelected}
+          initialNativeCliProvider={providerRecoveryTarget}
+        />
 
         {/* Exec Approval Modal — keyed per approval so isResolving/isClosing
             state can never leak from one queued approval into the next. */}

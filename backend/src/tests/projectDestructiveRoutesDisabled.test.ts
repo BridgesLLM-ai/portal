@@ -84,7 +84,10 @@ describe('Portal 4.0 bounded destructive Project admission', () => {
   test('project inventory exposes destructive capability before the user can act', () => {
     const inventory = routeBlock("router.get('/', authenticateToken");
     expect(routeSource).toContain("const allowed = identity.legacyOpenClawMigrationStatus === 'CURRENT';");
-    expect(inventory).toContain('destructiveActions: projectDestructiveActionCapability(identity)');
+    expect(inventory).toContain('const identityDestructiveActions = projectDestructiveActionCapability(identity)');
+    expect(inventory).toContain("authoritativeRuntimeManagement === 'external-loopback'");
+    expect(inventory).toContain('|| invalidRuntimeBinding');
+    expect(inventory).toContain('destructiveActions,');
     expect(routeSource).toContain('Move this older project into a new Portal project before renaming or deleting it.');
   });
 
@@ -145,10 +148,34 @@ describe('Portal 4.0 bounded destructive Project admission', () => {
     }
   });
 
+  test('/:name/share persists both validated request-rate policy fields', () => {
+    const share = routeBlock("router.post('/:name/share'");
+    expect(share).toContain('rateLimitMaxRequests: shareOptions.rateLimitMaxRequests');
+    expect(share).toContain('rateLimitWindowSeconds: shareOptions.rateLimitWindowSeconds');
+  });
+
+  test('/:name/share rejects a password that would protect nothing on a public link', () => {
+    const share = routeBlock("router.post('/:name/share'");
+    expect(share).toContain("typeof req.body.password === 'string' ? req.body.password : ''");
+    expect(share).toContain('SHARE_PASSWORD_REQUIRES_PRIVATE_LINK');
+    expect(share).toContain('A share password requires a private link');
+  });
+
+  test('/:name/share/:linkId rejects orphan passwords and validates the prospective credential state', () => {
+    const update = routeBlock("router.patch('/:name/share/:linkId'");
+    expect(update).toContain('password !== undefined && isPublic !== false');
+    expect(update).toContain('SHARE_PASSWORD_REQUIRES_PRIVATE_LINK');
+    expect(update).toContain('const prospectiveCredentialState = {');
+    expect(update).toContain('shareCredentialStateIsValid(prospectiveCredentialState)');
+    expect(update).toContain('SHARE_CREDENTIAL_STATE_INVALID');
+    expect(update.indexOf('shareCredentialStateIsValid(prospectiveCredentialState)'))
+      .toBeLessThan(update.indexOf('prisma.appShareLink.update({'));
+  });
+
   test('/:name/deploy preserves Remote Desktop runtimes and gates hosted deployment before mutation', () => {
     const deploy = routeBlock("router.post('/:name/deploy'");
     const detection = deploy.indexOf('const deployType = detectDeployType(projectDir)');
-    const hostedBranch = deploy.indexOf("if (deployType !== 'runtime')");
+    const hostedBranch = deploy.indexOf("if (!recoveryReplay && deployType !== 'runtime')");
     const guard = deploy.indexOf("portalFeatureUnavailableResponse('appHosting')");
     const identityMutation = deploy.indexOf('const projectIdentity = await ensureProjectIdentity({');
     const databaseRead = deploy.indexOf('const existingProjectApp = await findProjectAppForIdentity({');

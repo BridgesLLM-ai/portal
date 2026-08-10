@@ -1,5 +1,33 @@
 import client from './client';
 
+export type EmbedOriginPolicyEntry = {
+  origin: string;
+  camera: boolean;
+  microphone: boolean;
+};
+
+export type EmbedOriginPolicy = {
+  version: 1;
+  revision: string;
+  status: 'ready' | 'invalid';
+  entries: EmbedOriginPolicyEntry[];
+  defaultOrigins?: string[];
+  /** Compatibility with the immediately preceding candidate API. */
+  builtInOrigins?: string[];
+  limits: {
+    maxOrigins: number;
+    maxOriginBytes: number;
+    maxPolicyBytes: number;
+  };
+  updatedAt: string | null;
+  warning?: string;
+};
+
+export type UpdateEmbedOriginPolicyRequest = {
+  expectedRevision: string;
+  entries: EmbedOriginPolicyEntry[];
+};
+
 export const settingsAPI = {
   getPortalSettings: async (): Promise<Record<string, string>> => {
     const { data } = await client.get('/admin/settings');
@@ -18,6 +46,16 @@ export const settingsAPI = {
 
   updateSearchVisibility: async (visibility: 'visible' | 'hidden'): Promise<{ visibility: 'visible' | 'hidden' }> => {
     const { data } = await client.put('/admin/search-visibility', { visibility });
+    return data;
+  },
+
+  getEmbedOriginPolicy: async (signal?: AbortSignal): Promise<EmbedOriginPolicy> => {
+    const { data } = await client.get('/admin/security/embed-origins', { signal });
+    return data;
+  },
+
+  updateEmbedOriginPolicy: async (request: UpdateEmbedOriginPolicyRequest): Promise<EmbedOriginPolicy> => {
+    const { data } = await client.put('/admin/security/embed-origins', request);
     return data;
   },
 

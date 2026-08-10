@@ -16,7 +16,9 @@ import {
   commitClaudeSetupTokenCredential,
   completeNativeCliFlow,
   completeOAuthFlow,
+  forceReleaseCredentialLifecycleLease,
   getClaudeSetupToken,
+  getCredentialLifecycleNamespaceForNativeProvider,
   getCredentialLifecycleNamespaceForOpenClawProvider,
   getOAuthFlowStatus,
   isClaudeSetupTokenLeaseReleasable,
@@ -74,10 +76,13 @@ import {
   DurableCredentialOperationEnvelopeMismatchError,
   DurableCredentialLifecycleRecoveryRequiredError,
   getProviderCredentialLifecycleRecord,
+  isProviderCredentialLifecycleControlError,
   parkProviderCredentialRemovalLifecycle,
+  reconcileProviderCredentialRemovalFenceBeforeAdmission,
   releaseProviderCredentialLifecycle,
   resetStuckProviderCredentialLifecycle,
   setProviderCredentialWriteAdmissionBaseline,
+  settleProviderCredentialWriteFailure,
   verifyAndReleaseProviderCredentialRemovalLifecycle,
   verifyProviderCredentialWriteCompletionReceipt,
   type ClaimedProviderCredentialLifecycle,
@@ -2980,7 +2985,13 @@ export function createAiSetupRouter(): Router {
   // any parked removal fence) so a fresh sign-in can start; it never touches
   // the credential store — the operator's next sign-in overwrites it.
   router.post('/oauth/reset-lifecycle', async (req: Request, res: Response) => {
-    const parsed = oauthStartSchema.pick({ provider: true }).safeParse(req.body);
+    // Every provider with a credential-lifecycle domain must be resettable.
+    // This deliberately includes anthropic: the Claude wizard has its own
+    // start route, so validating against oauthStartSchema silently made the
+    // one provider most likely to hold a stuck fence impossible to reset.
+    const parsed = z.object({
+      provider: z.enum(['anthropic', 'openai-codex', 'google-gemini-cli', 'google-antigravity', 'qwen-portal', 'xai']),
+    }).safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'A valid provider is required.' });
       return;
@@ -2993,7 +3004,9 @@ export function createAiSetupRouter(): Router {
       if (provider === 'xai') {
         try { forceReleaseActiveXaiSetup(); } catch { /* best effort */ }
       }
-      const namespace = getCredentialLifecycleNamespaceForOpenClawProvider(provider);
+      const namespace = provider === 'google-antigravity'
+        ? getCredentialLifecycleNamespaceForNativeProvider('gemini')
+        : getCredentialLifecycleNamespaceForOpenClawProvider(provider);
       const result = resetStuckProviderCredentialLifecycle(namespace, ownerId);
       if (result.reason === 'owner_mismatch') {
         res.status(409).json({ success: false, code: 'PROVIDER_LIFECYCLE_OWNER_MISMATCH', error: 'This provider authorization belongs to another account.' });
@@ -3003,10 +3016,17 @@ export function createAiSetupRouter(): Router {
         res.status(409).json({ success: false, code: 'PROVIDER_LIFECYCLE_BUSY', error: 'A provider sign-in is still running. Cancel it, then reset.' });
         return;
       }
+      // The durable ledger is clean; the in-memory lease for this domain must
+      // not stay behind to refuse the very sign-in this reset promises.
+      const leaseRelease = forceReleaseCredentialLifecycleLease(namespace);
+      if (leaseRelease === 'busy') {
+        res.status(409).json({ success: false, code: 'PROVIDER_LIFECYCLE_BUSY', error: 'A provider sign-in is still running. Cancel it, then reset.' });
+        return;
+      }
       res.json({
         success: true,
-        cleared: result.cleared,
-        message: result.cleared
+        cleared: result.cleared || leaseRelease === 'released',
+        message: (result.cleared || leaseRelease === 'released')
           ? 'Cleared the stuck provider authorization. You can start the sign-in again.'
           : 'No stuck provider authorization was found; you can start the sign-in.',
       });
@@ -3076,8 +3096,13 @@ export function createAiSetupRouter(): Router {
         return;
       }
     }
-    res.status(result.success ? 200 : 409).json({
+    const cleanupAccepted = !result.success
+      && result.cleanupPending === true
+      && reconciled?.provider === 'xai';
+    if (cleanupAccepted) res.setHeader('Retry-After', '1');
+    res.status(result.success ? 200 : cleanupAccepted ? 202 : 409).json({
       ...result,
+      ...(reconciled?.provider ? { provider: reconciled.provider } : {}),
       ...(reconciled?.cleanupPending ? { cleanupPending: true } : {}),
       ...(reconciled?.credentialState ? { credentialState: reconciled.credentialState } : {}),
     });
@@ -3252,6 +3277,14 @@ export function createAiSetupRouter(): Router {
       writeClaim = null;
     };
     try {
+      // A retained fence from an earlier failed save must not brick this
+      // provider forever: recover it with the standard evidence first. An
+      // exact retry of the retained operation skips this and resumes.
+      await reconcileProviderCredentialRemovalFenceBeforeAdmission(
+        lifecycleNamespace,
+        () => readOpenClawAndPortalCredentialProof(provider, authProviderId),
+        { exactWriteOperation: { ownerId, operationId, requestFingerprint } },
+      );
       const admission = claimProviderCredentialWriteLifecycle(
         lifecycleNamespace,
         ownerId,
@@ -3438,6 +3471,26 @@ export function createAiSetupRouter(): Router {
       const safeToRelease = writeDisposition === 'admitted'
         && !mutationStarted
         && (!(error instanceof ProviderApiKeySaveError) || error.credentialState === 'absent');
+      if (!safeToRelease
+        && writeClaim
+        && provider !== 'xai'
+        && writeDisposition === 'admitted'
+        && !credentialCommitIndeterminate
+        && !isProviderCredentialLifecycleControlError(error)) {
+        // The write step refused the key or died early. When three stable
+        // reads prove the domain is absent or identical to this request's own
+        // admission baseline, the secret did not land — release instead of
+        // locking the provider for the review window.
+        try {
+          await settleProviderCredentialWriteFailure(
+            writeClaim,
+            () => readOpenClawAndPortalCredentialProof(provider, authProviderId),
+          );
+        } catch {
+          parkProviderCredentialRemovalLifecycle(writeClaim);
+        }
+        writeClaim = null;
+      }
       settleFailedWriteClaim(safeToRelease);
       const operationNotAdmitted = credentialOperationWasNotAdmitted(error, {
         claim: writeClaim,
@@ -3448,6 +3501,7 @@ export function createAiSetupRouter(): Router {
         success: false,
         credentialSaved,
         credentialState: credentialCommitIndeterminate ? 'indeterminate' : (credentialSaved ? 'committed' : 'absent'),
+        ...(typeof (error as any)?.code === 'string' ? { code: (error as any).code } : {}),
         ...(operationNotAdmitted ? { operationDisposition: 'not_admitted' } : {}),
         error: credentialSaved && provider === 'xai'
           ? `The xAI credential was saved, but final setup failed and configuration changes were rolled back: ${detail}`
@@ -3564,6 +3618,14 @@ export function createAiSetupRouter(): Router {
     let mutationStarted = false;
 
     try {
+      // A retained fence from an earlier failed save must not brick this
+      // provider forever: recover it with the standard evidence first. An
+      // exact retry of the retained operation skips this and resumes.
+      await reconcileProviderCredentialRemovalFenceBeforeAdmission(
+        lifecycleNamespace,
+        () => readOpenClawAndPortalCredentialProof(provider, authProviderId),
+        { exactWriteOperation: { ownerId, operationId, requestFingerprint } },
+      );
       const admission = claimProviderCredentialWriteLifecycle(
         lifecycleNamespace,
         ownerId,
@@ -3665,13 +3727,31 @@ export function createAiSetupRouter(): Router {
         mutationStarted,
       });
       if (writeClaim) {
-        if (writeDisposition === 'admitted' && !mutationStarted) releaseProviderCredentialLifecycle(writeClaim);
-        else parkProviderCredentialRemovalLifecycle(writeClaim);
+        if (writeDisposition === 'admitted' && !mutationStarted) {
+          releaseProviderCredentialLifecycle(writeClaim);
+        } else if (writeDisposition === 'admitted'
+          && !isProviderCredentialLifecycleControlError(error)) {
+          // `openclaw models auth paste-token` rejecting the pasted value is a
+          // clean failure that wrote nothing. Prove the domain is untouched
+          // and release, instead of locking the provider for the review
+          // window over a typo.
+          try {
+            await settleProviderCredentialWriteFailure(
+              writeClaim,
+              () => readOpenClawAndPortalCredentialProof(provider, authProviderId),
+            );
+          } catch {
+            parkProviderCredentialRemovalLifecycle(writeClaim);
+          }
+        } else {
+          parkProviderCredentialRemovalLifecycle(writeClaim);
+        }
         writeClaim = null;
       }
       res.status(providerSetupErrorStatus(error))
         .json({
           success: false,
+          ...(typeof (error as any)?.code === 'string' ? { code: (error as any).code } : {}),
           ...(operationNotAdmitted ? { operationDisposition: 'not_admitted' } : {}),
           error: error?.message || 'Failed to save setup-token',
         });

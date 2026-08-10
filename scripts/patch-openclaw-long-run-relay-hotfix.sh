@@ -3,12 +3,19 @@ set -euo pipefail
 
 ROOT="${1:-/usr/lib/node_modules/openclaw/dist}"
 STRICT_MODE="${PORTAL_OPENCLAW_HOTFIX_STRICT:-0}"
-REQUIRED_PACKAGE_VERSION="${PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION:-}"
+REQUIRED_PACKAGE_VERSION="${PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION:-2026.7.1-2}"
+
+case "${STRICT_MODE}" in
+  0|1) ;;
+  *)
+    echo "invalid PORTAL_OPENCLAW_HOTFIX_STRICT value: ${STRICT_MODE}" >&2
+    exit 2
+    ;;
+esac
 
 [[ -d "${ROOT}" ]] || { echo "OpenClaw dist directory not found: ${ROOT}" >&2; exit 1; }
 
-if [[ -n "${REQUIRED_PACKAGE_VERSION}" ]]; then
-  python3 - "${ROOT}" "${REQUIRED_PACKAGE_VERSION}" <<'PY'
+python3 - "${ROOT}" "${REQUIRED_PACKAGE_VERSION}" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -26,7 +33,6 @@ if package.get("name") != "openclaw" or package.get("version") != expected:
         f"expected openclaw@{expected}"
     )
 PY
-fi
 
 resolve_bundle() {
   python3 - "$ROOT" "$@" <<'PY'
@@ -201,6 +207,79 @@ else:
 PY
 else
   echo "skipping memory flush transcript-size guard patch: agent runner runtime bundle not found under $ROOT"
+fi
+
+# OpenClaw 2026.7.1-2: a generic gateway chat.send steer supplies a
+# userTurnTranscriptRecorder but no Portal-only onTurnAdopted callback. The
+# stock conditional therefore returns before the active embedded runtime owns
+# the new user turn. Gateway fallback persistence can then append the same turn
+# externally, and the next tool yield fails with EmbeddedAttemptSessionTakeoverError.
+# Wait for the recorder commit whenever either ownership finalizer is present.
+if [[ -n "$AGENT_RUNNER_RUNTIME" && -f "$AGENT_RUNNER_RUNTIME" ]]; then
+python3 - "$AGENT_RUNNER_RUNTIME" "$STRICT_MODE" <<'PY' || FAILED_PATCHES+=("active-steer-transcript-commit")
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+strict = sys.argv[2] == "1"
+text = p.read_text()
+
+call_marker = "const steerOutcome = await queueEmbeddedAgentMessageWithOutcomeAsync(steerSessionId, followupRun.prompt, {"
+recorder_forwarding = "...followupRun.userTurnTranscriptRecorder ? { userTurnTranscriptRecorder: followupRun.userTurnTranscriptRecorder } : {}"
+hotfix_marker = "bridgesllm-openclaw-active-steer-transcript-commit-v1"
+old_line = "\t\t\t...opts?.onTurnAdopted ? { waitForTranscriptCommit: true } : {},"
+patched_line = "\t\t\t...opts?.onTurnAdopted || followupRun.userTurnTranscriptRecorder ? { waitForTranscriptCommit: true } : {},"
+native_lines = (
+    patched_line,
+    "\t\t\t...(opts?.onTurnAdopted || followupRun.userTurnTranscriptRecorder) ? { waitForTranscriptCommit: true } : {},",
+    "\t\t\t...followupRun.userTurnTranscriptRecorder || opts?.onTurnAdopted ? { waitForTranscriptCommit: true } : {},",
+    "\t\t\twaitForTranscriptCommit: Boolean(opts?.onTurnAdopted || followupRun.userTurnTranscriptRecorder),",
+    "\t\t\twaitForTranscriptCommit: Boolean(followupRun.userTurnTranscriptRecorder || opts?.onTurnAdopted),",
+)
+
+call_count = text.count(call_marker)
+if call_count != 1:
+    message = f"active steer transcript-commit call site drifted in {p} (found {call_count})"
+    if strict:
+        raise SystemExit(message)
+    print(f"skipping active steer transcript-commit patch: {message}")
+    raise SystemExit(0)
+
+call_start = text.index(call_marker)
+call_end = text.find("\n\t\t});", call_start)
+if call_end < 0:
+    raise SystemExit(f"active steer transcript-commit options block is incomplete in {p}")
+block = text[call_start:call_end]
+if recorder_forwarding not in block:
+    raise SystemExit(f"active steer transcript recorder forwarding drifted in {p}")
+
+marker_count = text.count(hotfix_marker)
+if marker_count:
+    if marker_count != 1 or hotfix_marker not in block or block.count(patched_line) != 1:
+        raise SystemExit(f"active steer transcript-commit marker is partial or duplicated in {p}")
+    print(f"active steer transcript-commit already patched: {p}")
+    raise SystemExit(0)
+
+native_matches = [line for line in native_lines if line in block]
+if native_matches:
+    if len(native_matches) != 1 or block.count(native_matches[0]) != 1 or old_line in block:
+        raise SystemExit(f"active steer transcript-commit native contract is ambiguous in {p}")
+    print(f"active steer transcript-commit already native: {p}")
+    raise SystemExit(0)
+
+if text.count(old_line) != 1 or old_line not in block:
+    message = f"active steer transcript-commit target not found in {p}"
+    if strict:
+        raise SystemExit(message)
+    print(f"skipping active steer transcript-commit patch: {message}")
+    raise SystemExit(0)
+
+replacement = f'\t\t\t// {hotfix_marker}\n{patched_line}'
+p.write_text(text.replace(old_line, replacement, 1))
+print(f"patched active steer transcript-commit wait: {p}")
+PY
+else
+  echo "skipping active steer transcript-commit patch: agent runner runtime bundle not found under $ROOT"
 fi
 
 if [[ -n "$HEARTBEAT_DETECTOR_FILE" ]]; then
@@ -408,21 +487,26 @@ else
 fi
 
 if [[ -n "$CLAUDE_CLI_SHARED" && -f "$CLAUDE_CLI_SHARED" ]]; then
-python3 - "$CLAUDE_CLI_SHARED" <<'PY' || FAILED_PATCHES+=("claude-root-permission")
+python3 - "$CLAUDE_CLI_SHARED" <<'PY' || FAILED_PATCHES+=("claude-runtime-normalization")
 from pathlib import Path
+import os
+import subprocess
 import sys
+import tempfile
 
 p = Path(sys.argv[1])
 text = p.read_text()
-marker = 'process.getuid() === 0'
-old = '''function resolveClaudePermissionMode(context) {
+changed = False
+
+permission_marker = 'process.getuid() === 0'
+permission_old = '''function resolveClaudePermissionMode(context) {
 \treturn isOpenClawRequestedYolo(context) ? {
 \t\tmode: CLAUDE_BYPASS_PERMISSION_MODE,
 \t\toverrideExisting: false
 \t} : { overrideExisting: false };
 }
 '''
-new = '''function resolveClaudePermissionMode(context) {
+permission_new = '''function resolveClaudePermissionMode(context) {
 \tif (isOpenClawRequestedYolo(context) && typeof process.getuid === "function" && process.getuid() === 0) return {
 \t\tmode: CLAUDE_DEFAULT_PERMISSION_MODE,
 \t\toverrideExisting: true
@@ -433,16 +517,161 @@ new = '''function resolveClaudePermissionMode(context) {
 \t} : { overrideExisting: false };
 }
 '''
-if marker in text:
-    print(f"claude root permission mode already patched: {p}")
-elif old in text:
-    p.write_text(text.replace(old, new, 1))
-    print(f"patched claude root permission mode: {p}")
+if permission_marker in text:
+    if text.count(permission_marker) != 1:
+        raise SystemExit(f"Claude root permission marker is ambiguous in {p}")
+elif text.count(permission_old) == 1:
+    text = text.replace(permission_old, permission_new, 1)
+    changed = True
 else:
     raise SystemExit(f"Claude permission resolver target not found in {p}")
+
+# User cliBackends overrides replace the registered backend's args/resumeArgs
+# arrays before this normalizer runs. Enforce the native AskUserQuestion deny
+# here, after that merge, so no valid override can restore Claude Code's
+# headless-only tool. The Portal-owned MCP ask_user_question remains available.
+ask_marker = 'const BRIDGESLLM_CLAUDE_ASK_USER_ROUTE_MARKER = "bridgesllm-openclaw-claude-ask-user-route-v2";'
+ask_old = '''function normalizeClaudeBackendConfig(config, context) {
+\tconst output = config.output ?? "jsonl";
+\tconst input = config.input ?? "stdin";
+\tconst permission = resolveClaudePermissionMode(context);
+\treturn {
+\t\t...config,
+\t\targs: normalizeClaudePermissionArgs(normalizeClaudeSettingSourcesArgs(config.args), permission),
+\t\tresumeArgs: normalizeClaudePermissionArgs(normalizeClaudeSettingSourcesArgs(config.resumeArgs), permission),
+\t\toutput,
+\t\tliveSession: config.liveSession ?? (output === "jsonl" && input === "stdin" ? "claude-stdio" : void 0),
+\t\tinput
+\t};
+}
+'''
+ask_new = '''const BRIDGESLLM_CLAUDE_ASK_USER_ROUTE_MARKER = "bridgesllm-openclaw-claude-ask-user-route-v2";
+const CLAUDE_DISALLOWED_TOOLS_ARGS = /* @__PURE__ */ new Set([
+\tCLAUDE_DISALLOWED_TOOLS_ARG,
+\t"--disallowed-tools"
+]);
+const CLAUDE_ASK_USER_TOOL_NAME = "AskUserQuestion";
+function claudeToolListContainsExact(value, toolName) {
+\treturn value.split(/[,\\s]+/u).some((entry) => entry === toolName);
+}
+function ensureClaudeDisallowedTool(args, toolName) {
+\tif (!args) return args;
+\tconst normalized = [...args];
+\tconst sentinelIndex = normalized.indexOf("--");
+\tlet scanLimit = sentinelIndex >= 0 ? sentinelIndex : normalized.length;
+\tlet foundFlag = false;
+\tfor (let i = 0; i < scanLimit; i += 1) {
+\t\tconst arg = normalized[i] ?? "";
+\t\tconst equalsIndex = arg.indexOf("=");
+\t\tconst argName = equalsIndex > 0 ? arg.slice(0, equalsIndex) : arg;
+\t\tif (!CLAUDE_DISALLOWED_TOOLS_ARGS.has(argName)) continue;
+\t\tfoundFlag = true;
+\t\tif (equalsIndex > 0) {
+\t\t\tconst value = arg.slice(equalsIndex + 1);
+\t\t\tif (!claudeToolListContainsExact(value, toolName)) normalized[i] = `${argName}=${value ? `${value},${toolName}` : toolName}`;
+\t\t\tcontinue;
+\t\t}
+\t\tlet valueEnd = i + 1;
+\t\tlet containsTool = false;
+\t\twhile (valueEnd < scanLimit) {
+\t\t\tconst value = normalized[valueEnd] ?? "";
+\t\t\tif (value === "--" || value.startsWith("-")) break;
+\t\t\tcontainsTool ||= claudeToolListContainsExact(value, toolName);
+\t\t\tvalueEnd += 1;
+\t\t}
+\t\tif (!containsTool) {
+\t\t\tnormalized.splice(valueEnd, 0, toolName);
+\t\t\tscanLimit += 1;
+\t\t}
+\t}
+\tif (!foundFlag) {
+\t\tconst insertAt = normalized.indexOf("--");
+\t\tnormalized.splice(insertAt >= 0 ? insertAt : normalized.length, 0, CLAUDE_DISALLOWED_TOOLS_ARG, toolName);
+\t}
+\treturn normalized;
+}
+function normalizeClaudeBackendConfig(config, context) {
+\tconst output = config.output ?? "jsonl";
+\tconst input = config.input ?? "stdin";
+\tconst permission = resolveClaudePermissionMode(context);
+\treturn {
+\t\t...config,
+\t\targs: ensureClaudeDisallowedTool(normalizeClaudePermissionArgs(normalizeClaudeSettingSourcesArgs(config.args), permission), CLAUDE_ASK_USER_TOOL_NAME),
+\t\tresumeArgs: ensureClaudeDisallowedTool(normalizeClaudePermissionArgs(normalizeClaudeSettingSourcesArgs(config.resumeArgs), permission), CLAUDE_ASK_USER_TOOL_NAME),
+\t\toutput,
+\t\tliveSession: config.liveSession ?? (output === "jsonl" && input === "stdin" ? "claude-stdio" : void 0),
+\t\tinput
+\t};
+}
+'''
+
+if ask_marker in text:
+    if (
+        text.count(ask_marker) != 1
+        or text.count('function ensureClaudeDisallowedTool(args, toolName) {\n\tif (!args) return args;\n\tconst normalized = [...args];') != 1
+        or text.count('args: ensureClaudeDisallowedTool(') != 1
+        or text.count('resumeArgs: ensureClaudeDisallowedTool(') != 1
+        or ask_old in text
+    ):
+        raise SystemExit(f"Claude CLI ask-user normalization contract is incomplete in {p}")
+elif text.count(ask_old) == 1:
+    text = text.replace(ask_old, ask_new, 1)
+    changed = True
+else:
+    raise SystemExit(f"Claude CLI ask-user normalization target not found in {p}")
+
+if (
+    text.count(permission_marker) != 1
+    or text.count(ask_marker) != 1
+    or text.count('function ensureClaudeDisallowedTool(args, toolName) {\n\tif (!args) return args;\n\tconst normalized = [...args];') != 1
+    or text.count('args: ensureClaudeDisallowedTool(') != 1
+    or text.count('resumeArgs: ensureClaudeDisallowedTool(') != 1
+):
+    raise SystemExit(f"Claude runtime normalization post-patch verification failed in {p}")
+if changed:
+    if subprocess.run(
+        ["node", "--input-type=module", "--check", "-"],
+        input=text,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode != 0:
+        raise SystemExit(f"generated Claude runtime normalization is not valid JavaScript in {p}")
+    temporary_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=p.parent,
+            prefix=f".{p.name}.bridgesllm-claude-ask-user-",
+            suffix=".js",
+            delete=False,
+        ) as stream:
+            temporary_name = stream.name
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_name, p.stat().st_mode & 0o7777)
+        os.replace(temporary_name, p)
+        temporary_name = ""
+        directory_fd = os.open(p.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+    print(f"patched Claude runtime normalization: {p}")
+else:
+    print(f"Claude runtime normalization already patched: {p}")
 PY
 else
-  echo "skipping Claude root permission patch: cli-shared bundle not found under $ROOT"
+  echo "skipping Claude runtime normalization patch: cli-shared bundle not found under $ROOT"
 fi
 
 if [[ -n "$GEMINI_PARSER_TARGET" ]]; then
@@ -889,6 +1118,14 @@ fi
 if [[ -n "$CLI_BACKEND" && -f "$CLI_BACKEND" ]]; then
   grep -n 'stream-json\|gemini-stream-json' "$CLI_BACKEND" || [[ "${STRICT_MODE}" != "1" ]]
 fi
+if [[ -n "$CLAUDE_CLI_SHARED" && -f "$CLAUDE_CLI_SHARED" ]]; then
+  grep -nF 'bridgesllm-openclaw-claude-ask-user-route-v2' "$CLAUDE_CLI_SHARED" \
+    || [[ "${STRICT_MODE}" != "1" ]]
+  [[ "$(grep -cF 'ensureClaudeDisallowedTool(' "$CLAUDE_CLI_SHARED")" -eq 3 ]] \
+    || [[ "${STRICT_MODE}" != "1" ]]
+  grep -nF $'\tif (!args) return args;' "$CLAUDE_CLI_SHARED" \
+    || [[ "${STRICT_MODE}" != "1" ]]
+fi
 if [[ -n "$COMPACT_TOOLS_BUNDLE" && -f "$COMPACT_TOOLS_BUNDLE" ]]; then
   grep -nF 'memoryFlushWritePath: params.memoryFlushWritePath' "$COMPACT_TOOLS_BUNDLE" || true
 fi
@@ -955,9 +1192,34 @@ PY
     grep -nF 'onToolEvent: (event) => {' "$EXECUTE_RUNTIME"
   fi
   grep -nF 'process.getuid() === 0' "$CLAUDE_CLI_SHARED"
+  grep -nF 'bridgesllm-openclaw-claude-ask-user-route-v2' "$CLAUDE_CLI_SHARED"
+  [[ "$(grep -cF 'ensureClaudeDisallowedTool(' "$CLAUDE_CLI_SHARED")" -eq 3 ]]
+  grep -nF $'\tif (!args) return args;' "$CLAUDE_CLI_SHARED"
   grep -nF 'params.model.cost && params.model.cost.input === cost.input' "$REGISTER_RUNTIME_BUNDLE"
   grep -nF 'minMs: 9e5' "$WATCHDOG_DEFAULTS_BUNDLE"
   [[ "$(grep -cF 'minMs: 9e5' "$WATCHDOG_DEFAULTS_BUNDLE")" -ge 2 ]]
+  python3 - "$AGENT_RUNNER_RUNTIME" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+call_marker = "const steerOutcome = await queueEmbeddedAgentMessageWithOutcomeAsync(steerSessionId, followupRun.prompt, {"
+call_start = text.index(call_marker)
+call_end = text.find("\n\t\t});", call_start)
+if call_end < 0:
+    raise SystemExit("active steer transcript-commit verification block is incomplete")
+block = text[call_start:call_end]
+safe_contracts = (
+    "\t\t\t...opts?.onTurnAdopted || followupRun.userTurnTranscriptRecorder ? { waitForTranscriptCommit: true } : {},",
+    "\t\t\t...(opts?.onTurnAdopted || followupRun.userTurnTranscriptRecorder) ? { waitForTranscriptCommit: true } : {},",
+    "\t\t\t...followupRun.userTurnTranscriptRecorder || opts?.onTurnAdopted ? { waitForTranscriptCommit: true } : {},",
+    "\t\t\twaitForTranscriptCommit: Boolean(opts?.onTurnAdopted || followupRun.userTurnTranscriptRecorder),",
+    "\t\t\twaitForTranscriptCommit: Boolean(followupRun.userTurnTranscriptRecorder || opts?.onTurnAdopted),",
+)
+matches = [contract for contract in safe_contracts if contract in block]
+if len(matches) != 1 or block.count(matches[0]) != 1:
+    raise SystemExit("active steer transcript-commit post-patch verification failed")
+PY
 fi
 
 validate_js_bundle() {

@@ -128,6 +128,80 @@ test('an absent binding returns an honest uninitialized result without creating 
   expect(forbiddenWrite).not.toHaveBeenCalled();
 });
 
+test('read-only presentation can recover from sandbox context drift without exposing the stale session', async () => {
+  const binding = codexBinding();
+  const driftedContext = {
+    ...context(),
+    policyFingerprint: '6'.repeat(64),
+  };
+  const loadSession = jest.fn(() => {
+    throw new Error('stale native session must not be loaded');
+  });
+  const result = await readExistingProjectChatBinding({
+    actorUserId: 'actor-1',
+    provider: 'CODEX',
+    executionContext: driftedContext,
+    allowStaleContext: true,
+  }, {
+    database: {
+      projectChatProviderBinding: { findUnique: jest.fn(async () => binding) },
+      projectChatSession: { findFirst: jest.fn(async () => null) },
+    } as any,
+    loadSession,
+  });
+
+  expect(result).toMatchObject({
+    binding: null,
+    staleBinding: binding,
+    staleReason: 'CONTEXT_DRIFT',
+    providerSessionKey: null,
+    nativeSession: null,
+  });
+  expect(loadSession).not.toHaveBeenCalled();
+});
+
+test('sandbox context drift still fails closed for default and provider-session reads', async () => {
+  const binding = codexBinding();
+  const driftedContext = {
+    ...context(),
+    policyFingerprint: '6'.repeat(64),
+  };
+  const database = {
+    projectChatProviderBinding: { findUnique: jest.fn(async () => binding) },
+    projectChatSession: { findFirst: jest.fn(async () => null) },
+  } as any;
+
+  await expect(readExistingProjectChatBinding({
+    actorUserId: 'actor-1',
+    provider: 'CODEX',
+    executionContext: driftedContext,
+  }, { database })).rejects.toThrow(/immutable sandbox context/i);
+
+  await expect(readExistingProjectChatBinding({
+    actorUserId: 'actor-1',
+    provider: 'CODEX',
+    executionContext: driftedContext,
+    allowStaleContext: true,
+    requireProviderSession: true,
+  }, { database })).rejects.toThrow(/immutable sandbox context/i);
+});
+
+test('identity drift is never downgraded to a recoverable read-only context mismatch', async () => {
+  await expect(readExistingProjectChatBinding({
+    actorUserId: 'actor-1',
+    provider: 'CODEX',
+    executionContext: context(),
+    allowStaleContext: true,
+  }, {
+    database: {
+      projectChatProviderBinding: {
+        findUnique: jest.fn(async () => ({ ...codexBinding(), userId: 'different-actor' })),
+      },
+      projectChatSession: { findFirst: jest.fn(async () => null) },
+    } as any,
+  })).rejects.toThrow(/immutable identity/i);
+});
+
 test('rejects a native session whose actor or immutable context does not match', async () => {
   await expect(readExistingProjectChatBinding({
     actorUserId: 'actor-1',

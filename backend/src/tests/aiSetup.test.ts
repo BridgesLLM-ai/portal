@@ -50,6 +50,72 @@ describe('xAI provider operation serialization', () => {
     expect(getExpectedXaiProbeModel('anthropic', true, 'anthropic/claude-sonnet-4-6')).toBeUndefined();
   });
 
+  test('returns accepted while xAI cancellation finishes its authoritative background proof', async () => {
+    const sessionId = 'xai-accepted-background-cancel';
+    let settle!: (resolution: 'committed' | 'absent') => void;
+    const profileReconciliationPromise = new Promise<'committed' | 'absent'>((resolve) => {
+      settle = resolve;
+    });
+    const session = {
+      id: sessionId,
+      provider: 'xai',
+      mode: 'device_code',
+      ownerId: 'user:owner',
+      process: { kill: jest.fn() },
+      processExited: true,
+      processExitCode: 143,
+      authUrl: null,
+      callbackHintUrl: null,
+      deviceCode: 'REDACTED',
+      verificationUrl: 'https://accounts.x.ai/oauth2/device',
+      localPort: null,
+      oauthState: null,
+      status: 'polling_device',
+      error: null,
+      output: '',
+      cleanOutput: '',
+      createdAt: Date.now(),
+      completedAt: null,
+      profileKeyBefore: [],
+      profileReconciliationPending: true,
+      profileReconciliationPromise,
+    } as unknown as OAuthSession;
+    __setOAuthSessionForTests(session);
+
+    try {
+      const router = createAiSetupRouter();
+      const layer = (router as any).stack.find((entry: any) => (
+        entry.route?.path === '/oauth/cancel' && entry.route?.methods?.post
+      ));
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+      const response: any = {
+        status: jest.fn(),
+        setHeader: jest.fn(),
+        json: jest.fn(),
+      };
+      response.status.mockReturnValue(response);
+      response.json.mockReturnValue(response);
+
+      await handler({
+        body: { sessionId },
+        user: { userId: 'owner' },
+      }, response);
+
+      expect(response.setHeader).toHaveBeenCalledWith('Retry-After', '1');
+      expect(response.status).toHaveBeenCalledWith(202);
+      expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: false,
+        status: 'cancelled',
+        provider: 'xai',
+        cleanupPending: true,
+        credentialState: 'indeterminate',
+      }));
+    } finally {
+      settle('absent');
+      __deleteOAuthSessionForTests(sessionId);
+    }
+  });
+
   test('CAS rollback never overwrites concurrent provider configuration bytes', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-xai-cas-'));
     const configPath = path.join(dir, 'openclaw.json');

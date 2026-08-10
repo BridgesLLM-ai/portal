@@ -143,7 +143,7 @@ function installRuntime(
 
 function method(
   registrations: Map<string, { handler: GatewayHandler; options: Record<string, unknown> }>,
-  name: 'pending' | 'answer' | 'dismiss' | 'steer',
+  name: 'probe' | 'pending' | 'answer' | 'dismiss' | 'steer',
 ): GatewayHandler {
   const registered = registrations.get(askUserPlugin.__test.GATEWAY_METHODS[name]);
   if (!registered) throw new Error(`${name} gateway method was not registered`);
@@ -217,6 +217,7 @@ describe('OpenClaw exact-run ask-user plugin', () => {
     expect(askUserPlugin.register.constructor.name).toBe('Function');
     const registrations = register();
     expect([...registrations.keys()]).toEqual([
+      'bridgesllm.ask_user.probe',
       'bridgesllm.ask_user.pending',
       'bridgesllm.ask_user.answer',
       'bridgesllm.ask_user.dismiss',
@@ -236,6 +237,25 @@ describe('OpenClaw exact-run ask-user plugin', () => {
       name: 'ask_user_question',
       parameters: expect.objectContaining({ type: 'object' }),
     }));
+  });
+
+  test('runs the live semantic probe through the real tool execute and settlement paths', async () => {
+    const response = await invoke(method(register(), 'probe'), {
+      nonce: '0123456789abcdef01234567',
+    });
+
+    expect(response).toEqual({
+      ok: true,
+      payload: {
+        ok: true,
+        code: 'SEMANTIC_PROBE_OK',
+        toolName: 'ask_user_question',
+        answer: true,
+        dismiss: true,
+        steer: true,
+      },
+      error: undefined,
+    });
   });
 
   test('reads the real request identity and structured questions from the exact run', async () => {

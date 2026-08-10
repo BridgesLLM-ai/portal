@@ -137,6 +137,8 @@ portal/backend/prisma/migrations/20260723_ollama_backend_binding/migration.sql
 portal/backend/prisma/migrations/20260723_user_authorization_version/migration.sql
 portal/backend/prisma/migrations/20260726_native_ollama_backend_binding/migration.sql
 portal/backend/prisma/migrations/20260729_project_authorization_transition/migration.sql
+portal/backend/prisma/migrations/20260808_share_link_rate_limits/migration.sql
+portal/backend/prisma/migrations/20260809_project_runtime_recovery_replay/migration.sql
 portal/backend/prisma/migrations/migration_lock.toml
 portal/backend/prisma/schema.prisma
 portal/backup-full.sh
@@ -159,12 +161,14 @@ portal/installer/grok-build-runtime.sh
 portal/installer/index.html
 portal/installer/install-windows.ps1
 portal/installer/install.sh
+portal/installer/install.sh.sig
 portal/installer/ollama-tailnet-README.txt
 portal/installer/openclaw-ask-user-plugin/index.js
 portal/installer/openclaw-ask-user-plugin/openclaw.plugin.json
 portal/installer/openclaw-ask-user-plugin/package.json
 portal/installer/openclaw-ask-user-plugin/register.py
 portal/installer/portal-recovery-archive.py
+portal/installer/project-runtime-image-repair-launcher.py
 portal/installer/release-required-members.txt
 portal/installer/release-signing-ed25519.pub.pem
 portal/installer/scripts/bridges-rd-healthcheck.sh

@@ -616,15 +616,15 @@ describe('Project Chat provider bindings', () => {
     expect(send).not.toMatch(/onComplete:[\s\S]{0,1200}projectChatMessage\.upsert/);
   });
 
-  test('prepares the shared uid/gid workspace before native Project dispatch', () => {
+  test('does not recursively traverse the workspace on native Project dispatch', () => {
     const routeSource = fs.readFileSync(path.resolve(__dirname, '../routes/projects.ts'), 'utf8');
     const sendStart = routeSource.indexOf("router.post('/:name/assistant/send'");
     const nativeStart = routeSource.indexOf('if (isNativeProjectChatRouteProvider(provider))', sendStart);
     const openClawStart = routeSource.indexOf("if (provider !== 'OPENCLAW')", nativeStart);
     const nativeSend = routeSource.slice(nativeStart, openClawStart);
-    expect(nativeSend.indexOf('prepareProjectLifecycleWorkspace(projectDir)')).toBeLessThan(
-      nativeSend.indexOf('startProjectNativeRun'),
-    );
+    expect(nativeSend).not.toContain('prepareProjectChatLifecycleWorkspace(projectDir)');
+    expect(nativeSend).toContain('Warm sends never traverse the repository');
+    expect(nativeSend).toContain('startProjectNativeRun');
   });
 
   test('claims durable runtime admission before every route operation that can interrupt an active turn', () => {
@@ -841,6 +841,62 @@ describe('Project Chat provider bindings', () => {
     expect(reads[4]).toContain('readExistingProjectChatBinding');
     expect(reads[4]).toContain('activeProviderTurn');
     expect(reads[4]).toContain('requireProviderSession: selectedTurnActive');
+  });
+
+  test('history and session status present stale bindings as recoverable without exposing old session identities', () => {
+    const routeSource = fs.readFileSync(path.resolve(__dirname, '../routes/projects.ts'), 'utf8');
+    const routeBlock = (signature: string) => {
+      const start = routeSource.indexOf(signature);
+      expect(start).toBeGreaterThan(-1);
+      const next = routeSource.indexOf('\nrouter.', start + signature.length);
+      return routeSource.slice(start, next === -1 ? routeSource.length : next);
+    };
+    const history = routeBlock("router.get('/:name/chat/history'");
+    const status = routeBlock("router.get('/:name/chat/session-status'");
+
+    for (const block of [history, status]) {
+      expect(block).toContain('allowStaleContext: true');
+      expect(block).toContain('requiresPreparation: true');
+      expect(block).toContain("staleReason");
+    }
+    const staleHistoryBinding = history.slice(
+      history.indexOf('} : staleBinding ? {'),
+      history.indexOf('} : null,', history.indexOf('} : staleBinding ? {')),
+    );
+    expect(staleHistoryBinding).not.toContain('sessionKey');
+    expect(status).toContain('sessionKey: null');
+    expect(status).not.toContain('existing.staleBinding.sessionKey');
+    expect(status).not.toContain('existing.staleBinding.externalSessionId');
+  });
+
+  test('fresh Project Chat selects existing qualified evidence before the OpenClaw fallback', () => {
+    const routeSource = fs.readFileSync(path.resolve(__dirname, '../routes/projects.ts'), 'utf8');
+    const providersStart = routeSource.indexOf("router.get('/:name/chat/providers'");
+    const providersEnd = routeSource.indexOf('const projectOpenClawModelCatalogLimiter', providersStart);
+    const providersRoute = routeSource.slice(providersStart, providersEnd);
+    const qualifiedFallback = 'PROJECT_CHAT_ROUTE_PROVIDERS.find((provider) => qualifications[provider].selectable)';
+
+    expect(providersRoute).toContain(qualifiedFallback);
+    expect(providersRoute.indexOf(qualifiedFallback)).toBeLessThan(
+      providersRoute.indexOf("|| 'OPENCLAW',"),
+    );
+  });
+
+  test('provider discovery and switching reserve 403 for authorization failures', () => {
+    const routeSource = fs.readFileSync(path.resolve(__dirname, '../routes/projects.ts'), 'utf8');
+    const providersStart = routeSource.indexOf("router.get('/:name/chat/providers'");
+    const providersEnd = routeSource.indexOf('const projectOpenClawModelCatalogLimiter', providersStart);
+    const switchStart = routeSource.indexOf("router.post('/:name/chat/provider'");
+    const switchEnd = routeSource.indexOf('// --- Portal-owned Project Chat transcript routes', switchStart);
+    const providersRoute = routeSource.slice(providersStart, providersEnd);
+    const switchRoute = routeSource.slice(switchStart, switchEnd);
+
+    expect(providersRoute).toContain("code: 'PROJECT_PROVIDER_DISCOVERY_FAILED'");
+    expect(providersRoute).toContain('res.status(503).json({');
+    expect(providersRoute).not.toContain("res.status(403).json({ error: 'Project sandbox could not be verified' });");
+    expect(switchRoute).toContain("code: 'PROJECT_PROVIDER_SWITCH_FAILED'");
+    expect(switchRoute).toContain('res.status(503).json({');
+    expect(switchRoute).not.toContain("res.status(403).json({ error: 'Project sandbox could not be verified' });");
   });
 
   test('closes admission and proves zero runtime residue before deleting project data', () => {

@@ -6,8 +6,15 @@ import {
   PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED,
   PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX,
   projectChatTurnDispatchStage,
+  recoverExpiredProjectChatOperationAfterNativeQuiescence,
   recoverExpiredProjectChatTurnAfterProviderTerminal,
+  type ProjectChatPersistedProvider,
 } from './projectChatTurnLease';
+import {
+  nativeProjectRestartRecoveryTargetProvider,
+  quiesceNativeProjectOperationAfterRestart,
+  type NativeProjectRestartQuiescenceEvidence,
+} from './projectChatNativeRestartQuiescence';
 
 const OPENCLAW_RESTART_RECOVERY_INITIAL_DELAY_MS = 5_000;
 const OPENCLAW_RESTART_RECOVERY_RETRY_MS = 15_000;
@@ -24,7 +31,7 @@ export interface ProjectChatRestartRecoveryCandidate {
   id: string;
   actorUserId: string;
   projectIdentityId: string;
-  provider: 'OPENCLAW';
+  provider: ProjectChatPersistedProvider;
   runtime: string;
   requestId: string;
   leaseOwner: string;
@@ -127,9 +134,17 @@ export interface ProjectChatRestartRecoveryDependencies {
   shouldStop(): boolean;
   hasActiveProcessLocalRun(candidate: ProjectChatRestartRecoveryCandidate): boolean;
   readOpenClawHistory(sessionKey: string): Promise<unknown | null>;
+  quiesceNativeOperation(
+    candidate: ProjectChatRestartRecoveryCandidate,
+  ): Promise<NativeProjectRestartQuiescenceEvidence | null>;
   recover(
     candidate: ProjectChatRestartRecoveryCandidate,
     evidence: OpenClawRestartRecoveryEvidence,
+    now: Date,
+  ): Promise<void>;
+  recoverNative(
+    candidate: ProjectChatRestartRecoveryCandidate,
+    evidence: NativeProjectRestartQuiescenceEvidence,
     now: Date,
   ): Promise<void>;
 }
@@ -172,10 +187,8 @@ const defaultDependencies: ProjectChatRestartRecoveryDependencies = {
   async listCandidates(now) {
     const turns = await prisma.projectChatTurn.findMany({
       where: {
-        provider: 'OPENCLAW',
         status: { in: ['RUNNING', 'ABORTING'] },
         leaseExpiresAt: { lte: now },
-        NOT: { requestId: { startsWith: PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX } },
         ...(recoveryCursor
           ? {
               OR: [
@@ -205,7 +218,7 @@ const defaultDependencies: ProjectChatRestartRecoveryDependencies = {
       id: turn.id,
       actorUserId: turn.actorUserId,
       projectIdentityId: turn.projectIdentityId,
-      provider: 'OPENCLAW' as const,
+      provider: turn.provider as ProjectChatPersistedProvider,
       runtime: turn.runtime,
       requestId: turn.requestId,
       leaseOwner: turn.leaseOwner,
@@ -220,10 +233,13 @@ const defaultDependencies: ProjectChatRestartRecoveryDependencies = {
   leaseOwnerIsInactive: leaseOwnerBelongsToDeadLocalPortalProcess,
   shouldStop: () => recoveryStopped,
   hasActiveProcessLocalRun(candidate) {
+    const provider = nativeProjectRestartRecoveryTargetProvider(candidate.runtime)
+      || (candidate.provider === 'OPENCLAW' ? 'OPENCLAW' : null);
+    if (!provider) return false;
     return Boolean(getProjectNativeRunSnapshot({
       userId: candidate.actorUserId,
       projectId: candidate.projectIdentityId,
-      provider: 'OPENCLAW',
+      provider,
     })?.active);
   },
   async readOpenClawHistory(sessionKey) {
@@ -233,6 +249,7 @@ const defaultDependencies: ProjectChatRestartRecoveryDependencies = {
     }, OPENCLAW_RESTART_RECOVERY_RPC_TIMEOUT_MS);
     return result.ok ? result.data || null : null;
   },
+  quiesceNativeOperation: quiesceNativeProjectOperationAfterRestart,
   async recover(candidate, evidence, now) {
     await recoverExpiredProjectChatTurnAfterProviderTerminal({
       actorUserId: candidate.actorUserId,
@@ -248,6 +265,21 @@ const defaultDependencies: ProjectChatRestartRecoveryDependencies = {
       now,
     });
   },
+  async recoverNative(candidate, evidence, now) {
+    await recoverExpiredProjectChatOperationAfterNativeQuiescence({
+      actorUserId: candidate.actorUserId,
+      projectIdentityId: candidate.projectIdentityId,
+      turnId: candidate.id,
+      expectedSelectedProvider: candidate.provider,
+      expectedRuntime: candidate.runtime,
+      expectedLeaseOwner: candidate.leaseOwner,
+      quiescedProvider: evidence.provider,
+      quiescenceBoundary: evidence.boundary,
+      quiescenceEvidence: evidence.evidence,
+      providerSessionId: candidate.providerSessionId,
+      now,
+    });
+  },
 };
 
 export async function reconcileExpiredProjectChatTurnsAfterRestart(
@@ -260,14 +292,47 @@ export async function reconcileExpiredProjectChatTurnsAfterRestart(
   let quarantined = 0;
   for (const candidate of candidates) {
     if (dependencies.shouldStop()) break;
+    const runtimeAdmission = candidate.requestId.startsWith(
+      PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX,
+    );
+    const nativeTargetProvider = nativeProjectRestartRecoveryTargetProvider(candidate.runtime);
     if (
       candidate.activeTurnId !== candidate.id
-      || candidate.selectedProvider !== 'OPENCLAW'
-      || candidate.requestId.startsWith(PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX)
+      || candidate.selectedProvider !== candidate.provider
       || !dependencies.leaseOwnerIsInactive(candidate.leaseOwner)
+      || dependencies.hasActiveProcessLocalRun(candidate)
+    ) {
+      quarantined += 1;
+      continue;
+    }
+    if (nativeTargetProvider) {
+      if (!runtimeAdmission && (
+        candidate.provider !== nativeTargetProvider
+        || !candidate.providerSessionId
+      )) {
+        quarantined += 1;
+        continue;
+      }
+      inspected += 1;
+      try {
+        const evidence = await dependencies.quiesceNativeOperation(candidate);
+        if (dependencies.shouldStop()) break;
+        if (!evidence || evidence.provider !== nativeTargetProvider) {
+          quarantined += 1;
+          continue;
+        }
+        await dependencies.recoverNative(candidate, evidence, now);
+        recovered += 1;
+      } catch {
+        quarantined += 1;
+      }
+      continue;
+    }
+    if (
+      runtimeAdmission
+      || candidate.provider !== 'OPENCLAW'
       || !candidate.providerSessionId
       || projectChatTurnDispatchStage(candidate) !== PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED
-      || dependencies.hasActiveProcessLocalRun(candidate)
     ) {
       quarantined += 1;
       continue;
@@ -304,7 +369,7 @@ function scheduleRestartRecovery(delayMs: number): void {
       .then((result) => {
         if (result.recovered > 0) {
           console.warn(
-            `[Project Chat] Expired ${result.recovered} interrupted turn(s) after bound provider-session quiescence.`,
+            `[Project Chat] Expired ${result.recovered} interrupted operation(s) after exact provider-runtime quiescence.`,
           );
         }
       })

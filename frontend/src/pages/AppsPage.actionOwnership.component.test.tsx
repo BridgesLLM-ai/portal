@@ -19,9 +19,11 @@ const TEST_WORKSPACE_BINDING = {
 };
 
 const mocks = vi.hoisted(() => ({
+  userRole: 'OWNER',
   listProjects: vi.fn(),
   getTree: vi.fn(),
   readFile: vi.fn(),
+  writeFile: vi.fn(),
   deleteProject: vi.fn(),
   deleteFile: vi.fn(),
   renameProject: vi.fn(),
@@ -36,9 +38,12 @@ const mocks = vi.hoisted(() => ({
   projectSessionControl: vi.fn(),
   projectProviderTransition: vi.fn(),
   projectModelSwitch: vi.fn(),
+  share: vi.fn(),
   listShares: vi.fn(),
   updateShare: vi.fn(),
   ollamaStatus: vi.fn(),
+  runtimeRepairStatus: vi.fn(),
+  runtimeRepair: vi.fn(),
 }));
 
 vi.mock('../api/endpoints', () => ({
@@ -46,6 +51,7 @@ vi.mock('../api/endpoints', () => ({
     list: mocks.listProjects,
     getTree: mocks.getTree,
     readFile: mocks.readFile,
+    writeFile: mocks.writeFile,
     delete: mocks.deleteProject,
     deleteFile: mocks.deleteFile,
     rename: mocks.renameProject,
@@ -56,6 +62,7 @@ vi.mock('../api/endpoints', () => ({
     undeploy: mocks.undeploy,
     appProcess: mocks.appProcess,
     checkDeps: mocks.checkDeps,
+    share: mocks.share,
     listShares: mocks.listShares,
     updateShare: mocks.updateShare,
   },
@@ -64,12 +71,19 @@ vi.mock('../api/endpoints', () => ({
   },
 }));
 
+vi.mock('../api/projectRuntimeImageRepair', () => ({
+  projectRuntimeImageRepairAPI: {
+    status: mocks.runtimeRepairStatus,
+    repair: mocks.runtimeRepair,
+  },
+}));
+
 vi.mock('../contexts/AuthContext', () => {
   const useAuthStore = Object.assign(
     () => ({
       user: {
         id: 'owner-1',
-        role: 'OWNER',
+        role: mocks.userRole,
         authorizationVersion: 7,
       },
     }),
@@ -77,7 +91,7 @@ vi.mock('../contexts/AuthContext', () => {
       getState: () => ({
         user: {
           id: 'owner-1',
-          role: 'OWNER',
+          role: mocks.userRole,
           authorizationVersion: 7,
         },
       }),
@@ -133,7 +147,14 @@ vi.mock('framer-motion', async () => {
 });
 
 vi.mock('../components/projects/LazyMonacoEditor', () => ({
-  default: ({ value }: { value: string }) => <output data-testid="editor-value">{value}</output>,
+  default: ({ value, onChange }: { value: string; onChange?: (value: string) => void }) => (
+    <textarea
+      aria-label="Mock project editor"
+      data-testid="editor-value"
+      value={value}
+      onChange={(event) => onChange?.(event.target.value)}
+    />
+  ),
 }));
 
 vi.mock('../components/chat/ProjectChatPanel', async () => {
@@ -295,6 +316,19 @@ vi.mock('../components/chat/ProjectChatPanel', async () => {
             setTransitionBusy(null);
           });
       };
+      const dismissPanel = () => {
+        if (sessionLeaseRef.current || transitionLeaseRef.current) {
+          onClose();
+          return;
+        }
+        const qualificationLease = leaseRef.current;
+        if (qualificationLease) {
+          if (onActivityChange?.(qualificationLease, false) === false) return;
+          leaseRef.current = null;
+          setBusy(false);
+        }
+        onClose();
+      };
       return (
         <section aria-label={`Project Chat ${projectName}`}>
           <button type="button" onClick={beginQualification} aria-busy={busy}>
@@ -319,7 +353,7 @@ vi.mock('../components/chat/ProjectChatPanel', async () => {
           </button>
           {sessionError && <div role="alert">{sessionError}</div>}
           {transitionError && <div role="alert">{transitionError}</div>}
-          <button type="button" onClick={onClose}>Close project chat</button>
+          <button type="button" onClick={dismissPanel}>Close project chat</button>
         </section>
       );
   }
@@ -341,10 +375,17 @@ function deferred<T>() {
 const alphaIdentity = { id: 'project-alpha-id', generation: 3 };
 const renamedAlphaIdentity = { ...alphaIdentity, generation: alphaIdentity.generation + 1 };
 const betaIdentity = { id: 'project-beta-id', generation: 1 };
+const managedLifecycleActions = [
+  'redeploy',
+  'undeploy',
+  'rename-project',
+  'delete-project',
+] as const;
 
 const projects = [
   {
     name: 'alpha',
+    detectedDeployType: 'static' as const,
     hasGit: true,
     currentBranch: 'main',
     deployedUrl: '/apps/alpha',
@@ -355,6 +396,7 @@ const projects = [
   },
   {
     name: 'beta',
+    detectedDeployType: 'static' as const,
     hasGit: false,
     currentBranch: 'main',
     deployedUrl: '/apps/beta',
@@ -446,6 +488,7 @@ describe('AppsPage share action ownership', () => {
   beforeEach(() => {
     localStorage.clear();
     sessionStorage.clear();
+    mocks.userRole = 'OWNER';
     mocks.listProjects.mockReset().mockResolvedValue({ projects });
     mocks.getTree.mockReset().mockImplementation(async (projectName: string, path = '') => ({
       tree: projectName === 'alpha'
@@ -460,6 +503,7 @@ describe('AppsPage share action ownership', () => {
       content: `${projectName}:${filePath}`,
       language: 'typescript',
     }));
+    mocks.writeFile.mockReset().mockResolvedValue({ ok: true });
     mocks.deleteProject.mockReset().mockResolvedValue({ ok: true });
     mocks.deleteFile.mockReset().mockResolvedValue({ ok: true });
     mocks.renameProject.mockReset().mockImplementation(async (
@@ -491,16 +535,36 @@ describe('AppsPage share action ownership', () => {
     mocks.appProcess.mockReset().mockImplementation(async (_projectName: string, action: string) => ({
       status: action === 'stop' ? 'stopped' : 'running',
       deployType: 'fullstack',
+      runtimeManagement: 'portal-container',
+      statusSource: 'portal-manager',
       supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
       port: 5001,
       logs: ['ready'],
       restartCount: 0,
+      persistedStatus: action === 'stop' ? 'stopped' : 'running',
+      recoveryRequired: false,
     }));
     mocks.checkDeps.mockReset().mockResolvedValue({ needsInstall: false, packages: [] });
     mocks.projectQualification.mockReset().mockResolvedValue({ ok: true });
     mocks.projectSessionControl.mockReset().mockResolvedValue({ ok: true });
     mocks.projectProviderTransition.mockReset().mockResolvedValue({ ok: true });
     mocks.projectModelSwitch.mockReset().mockResolvedValue({ ok: true });
+    mocks.share.mockReset().mockResolvedValue({
+      shareLink: {
+        id: 'created-link',
+        token: 'created-token',
+        isActive: true,
+        isPublic: true,
+        currentUses: 0,
+        maxUses: null,
+        rateLimitMaxRequests: null,
+        rateLimitWindowSeconds: null,
+        expiresAt: null,
+        createdAt: '2026-07-21T12:00:00.000Z',
+      },
+      url: '/share/created-token',
+      hostedUrl: '/hosted/owner-1-alpha/',
+    });
     mocks.listShares.mockReset().mockResolvedValue({ shares: [] });
     mocks.updateShare.mockReset().mockResolvedValue({ ok: true });
     mocks.ollamaStatus.mockReset().mockResolvedValue({
@@ -508,6 +572,15 @@ describe('AppsPage share action ownership', () => {
       models: [],
       defaultModel: 'qwen3.5:4b',
     });
+    mocks.runtimeRepairStatus.mockReset().mockResolvedValue({
+      state: 'unavailable',
+      unavailableReason: 'image-missing',
+      confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+      ownerOnly: true,
+      changesSystem: true,
+      restartExpected: true,
+    });
+    mocks.runtimeRepair.mockReset().mockResolvedValue({ ok: true, state: 'running', started: true });
   });
 
   it('scrubs mismatched and legacy project targets without resolving them', async () => {
@@ -528,6 +601,19 @@ describe('AppsPage share action ownership', () => {
   });
 
   it('shows honest fullstack process controls, logs, and restart status', async () => {
+    const restart = deferred<Record<string, unknown>>();
+    const liveManagerStatus = {
+      status: 'running',
+      deployType: 'fullstack',
+      runtimeManagement: 'portal-container',
+      statusSource: 'portal-manager',
+      supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
+      port: 5001,
+      logs: ['ready'],
+      restartCount: 0,
+      persistedStatus: 'running',
+      recoveryRequired: false,
+    };
     const deployedProjects = projects.map((project) => project.name === 'alpha'
       ? {
           ...project,
@@ -535,24 +621,42 @@ describe('AppsPage share action ownership', () => {
             appId: 'app-alpha',
             deployType: 'fullstack',
             processStatus: 'running',
+            runtimeManagement: 'portal-container',
+            statusSource: 'persisted-app',
+            supportedLifecycleActions: [...managedLifecycleActions],
             port: 5001,
             isActive: true,
           },
         }
       : project);
     mocks.listProjects.mockResolvedValue({ projects: deployedProjects });
+    mocks.appProcess.mockImplementation(async (_projectName: string, action: string) => (
+      action === 'restart' ? restart.promise : liveManagerStatus
+    ));
     renderApps();
     await waitForAlphaFile();
     const user = userEvent.setup();
 
-    await user.click(screen.getByRole('button', { name: 'Runtime' }));
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
     await waitFor(() => expect(mocks.appProcess).toHaveBeenCalledWith('alpha', 'status'));
+    expect(screen.getByText('Portal-managed container')).toBeVisible();
+    expect(screen.getByText('Portal runtime manager')).toBeVisible();
     expect(await screen.findByText('Recent logs')).toBeVisible();
     expect(screen.getByText('ready')).toBeVisible();
 
-    await user.click(screen.getByRole('button', { name: 'Restart' }));
+    const restartButton = screen.getByRole('button', { name: 'Restart' });
+    expect(restartButton).toHaveAttribute('aria-busy', 'false');
+    await user.click(restartButton);
     await waitFor(() => expect(mocks.appProcess).toHaveBeenCalledWith('alpha', 'restart'));
+    expect(restartButton).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByText('Restarting deployment.')).toBeInTheDocument();
+
+    await act(async () => {
+      restart.resolve(liveManagerStatus);
+      await restart.promise;
+    });
     expect(mocks.appProcess).toHaveBeenLastCalledWith('alpha', 'status');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Restart' })).toHaveAttribute('aria-busy', 'false'));
   });
 
   it('undeploys without deleting Project source after explicit confirmation', async () => {
@@ -563,7 +667,62 @@ describe('AppsPage share action ownership', () => {
             appId: 'app-alpha',
             deployType: 'static',
             processStatus: 'stopped',
+            runtimeManagement: 'static',
+            statusSource: 'deployment-record',
+            supportedLifecycleActions: [...managedLifecycleActions],
             port: null,
+            isActive: true,
+          },
+        }
+      : project);
+    const undeployedProjects = deployedProjects.map((project) => project.name === 'alpha'
+      ? { ...project, deployedUrl: '', deployment: null }
+      : project);
+    mocks.listProjects.mockImplementation(async () => ({
+      projects: mocks.undeploy.mock.calls.length > 0
+        ? undeployedProjects
+        : deployedProjects,
+    }));
+    mocks.appProcess.mockResolvedValue({
+      status: 'deployed',
+      deployType: 'static',
+      runtimeManagement: 'static',
+      statusSource: 'deployment-record',
+      supportedActions: [],
+      logs: [],
+      restartCount: 0,
+      persistedStatus: 'deployed',
+      recoveryRequired: false,
+      limitation: 'Static deployments have no application process to control.',
+    });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    expect(await screen.findByText(/static deployments have no application process/i)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Remove deployment' }));
+    const dialog = screen.getByRole('alertdialog');
+    expect(dialog).toHaveTextContent(/project source, git history, and project chat will be preserved/i);
+    await user.click(within(dialog).getByRole('button', { name: 'Remove deployment' }));
+
+    await waitFor(() => expect(mocks.undeploy).toHaveBeenCalledWith('alpha'));
+    expect(mocks.deleteProject).not.toHaveBeenCalled();
+    expect(await screen.findByText(/deployment removed. project source and chat were preserved/i)).toBeVisible();
+  });
+
+  it('turns a deployment-type conflict into a confirmed one-click undeploy recovery', async () => {
+    const deployedProjects = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          deployment: {
+            appId: 'app-alpha',
+            deployType: 'fullstack',
+            processStatus: 'stopped',
+            runtimeManagement: 'portal-container' as const,
+            statusSource: 'persisted-app' as const,
+            supportedLifecycleActions: [...managedLifecycleActions],
+            port: 5001,
             isActive: true,
           },
         }
@@ -574,28 +733,1178 @@ describe('AppsPage share action ownership', () => {
     mocks.listProjects
       .mockResolvedValueOnce({ projects: deployedProjects })
       .mockResolvedValue({ projects: undeployedProjects });
-    mocks.appProcess.mockResolvedValue({
-      status: 'deployed',
-      deployType: 'static',
-      supportedActions: [],
-      logs: [],
-      restartCount: 0,
-      limitation: 'Static deployments have no application process to control.',
+    mocks.deploy.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: {
+          code: 'PROJECT_DEPLOY_TYPE_TRANSITION_REQUIRES_UNDEPLOY',
+          error: 'This Project is already deployed as fullstack. Remove the current deployment before deploying it as static.',
+          detail: 'Removing the deployment stops and clears its current runtime while preserving the Project source. You can then deploy the new type.',
+          priorDeployType: 'fullstack',
+          nextDeployType: 'static',
+          recoveryAction: 'UNDEPLOY_CURRENT_DEPLOYMENT',
+          details: 'raw runtime state must not be displayed',
+          recoveryActionUrl: 'https://untrusted.invalid/remove',
+        },
+      },
     });
     renderApps();
     await waitForAlphaFile();
     const user = userEvent.setup();
 
-    await user.click(screen.getByRole('button', { name: 'Runtime' }));
-    expect(await screen.findByText(/static deployments have no application process/i)).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Remove deployment' }));
-    const dialog = screen.getByRole('alertdialog');
+    await user.click(screen.getByRole('button', { name: 'Deploy' }));
+
+    const recoveryButton = await screen.findByRole('button', { name: 'Remove current deployment' });
+    const alert = recoveryButton.closest('[role="alert"]');
+    expect(alert).not.toBeNull();
+    expect(alert).toHaveTextContent(/already deployed as fullstack/i);
+    expect(alert).toHaveTextContent(/preserving the project source/i);
+    expect(alert).toHaveTextContent('PROJECT_DEPLOY_TYPE_TRANSITION_REQUIRES_UNDEPLOY');
+    expect(alert).not.toHaveTextContent('raw runtime state');
+    expect(alert).not.toHaveTextContent('untrusted.invalid');
+    expect(mocks.undeploy).not.toHaveBeenCalled();
+
+    await user.click(recoveryButton);
+    const dialog = screen.getByRole('alertdialog', { name: 'Remove deployment for "alpha"?' });
     expect(dialog).toHaveTextContent(/project source, git history, and project chat will be preserved/i);
     await user.click(within(dialog).getByRole('button', { name: 'Remove deployment' }));
 
     await waitFor(() => expect(mocks.undeploy).toHaveBeenCalledWith('alpha'));
     expect(mocks.deleteProject).not.toHaveBeenCalled();
     expect(await screen.findByText(/deployment removed. project source and chat were preserved/i)).toBeVisible();
+  });
+
+  it('shows an honest static deployment state while its status read is pending', async () => {
+    const status = deferred<{
+      status: string;
+      deployType: string;
+      runtimeManagement: string;
+      statusSource: string;
+      supportedActions: string[];
+      logs: string[];
+      restartCount: number;
+      persistedStatus: string;
+      recoveryRequired: boolean;
+    }>();
+    mocks.listProjects.mockResolvedValue({
+      projects: projects.map((project) => project.name === 'alpha'
+        ? {
+            ...project,
+            deployment: {
+              appId: 'app-alpha',
+              deployType: 'static',
+              processStatus: 'stopped',
+              runtimeManagement: 'static' as const,
+              statusSource: 'deployment-record' as const,
+              supportedLifecycleActions: [...managedLifecycleActions],
+              port: null,
+              isActive: true,
+            },
+          }
+        : project),
+    });
+    mocks.appProcess.mockReturnValue(status.promise);
+    renderApps();
+    await waitForAlphaFile();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Deployment' }));
+
+    expect(await screen.findByText('deployed')).toBeVisible();
+    expect(screen.queryByText('stopped')).not.toBeInTheDocument();
+
+    await act(async () => {
+      status.resolve({
+        status: 'deployed',
+        deployType: 'static',
+        runtimeManagement: 'static',
+        statusSource: 'deployment-record',
+        supportedActions: [],
+        logs: [],
+        restartCount: 0,
+        persistedStatus: 'stopped',
+        recoveryRequired: false,
+      });
+      await status.promise;
+    });
+  });
+
+  it('blocks redeploy behind an old status read and refreshes the replacement App status', async () => {
+    const oldStatus = deferred<{
+      status: string;
+      deployType: string;
+      runtimeManagement: string;
+      statusSource: string;
+      supportedActions: string[];
+      port: number;
+      logs: string[];
+      restartCount: number;
+      persistedStatus: string;
+      recoveryRequired: boolean;
+    }>();
+    const oldInventory = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          deployment: {
+            appId: 'app-old',
+            deployType: 'fullstack',
+            processStatus: 'running',
+            runtimeManagement: 'portal-container' as const,
+            statusSource: 'persisted-app' as const,
+            supportedLifecycleActions: [...managedLifecycleActions],
+            port: 5001,
+            isActive: true,
+          },
+        }
+      : project);
+    const newInventory = oldInventory.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          deployment: {
+            appId: 'app-new',
+            deployType: 'fullstack',
+            processStatus: 'starting',
+            runtimeManagement: 'portal-container' as const,
+            statusSource: 'persisted-app' as const,
+            supportedLifecycleActions: [...managedLifecycleActions],
+            port: 5002,
+            isActive: true,
+          },
+        }
+      : project);
+    mocks.listProjects
+      .mockResolvedValueOnce({ projects: oldInventory })
+      .mockResolvedValue({ projects: newInventory });
+    mocks.appProcess
+      .mockReturnValueOnce(oldStatus.promise)
+      .mockResolvedValue({
+        status: 'running',
+        deployType: 'fullstack',
+        runtimeManagement: 'portal-container',
+        statusSource: 'portal-manager',
+        supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
+        port: 5002,
+        logs: ['ready-new-app'],
+        restartCount: 0,
+        persistedStatus: 'running',
+        recoveryRequired: false,
+      });
+    mocks.deploy.mockResolvedValue({ deployType: 'fullstack', url: '/apps/alpha' });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    const deployButton = screen.getByRole('button', { name: 'Deploy' });
+    await waitFor(() => expect(deployButton).toBeDisabled());
+    fireEvent.click(deployButton);
+    expect(mocks.deploy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      oldStatus.resolve({
+        status: 'running',
+        deployType: 'fullstack',
+        runtimeManagement: 'portal-container',
+        statusSource: 'portal-manager',
+        supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
+        port: 5001,
+        logs: ['old-app-status'],
+        restartCount: 0,
+        persistedStatus: 'running',
+        recoveryRequired: false,
+      });
+      await oldStatus.promise;
+    });
+    await waitFor(() => expect(deployButton).toBeEnabled());
+
+    await user.click(deployButton);
+
+    await waitFor(() => expect(mocks.deploy).toHaveBeenCalledWith('alpha'));
+    await waitFor(() => expect(mocks.appProcess).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('ready-new-app')).toBeVisible();
+    expect(screen.queryByText('old-app-status')).not.toBeInTheDocument();
+  });
+
+  it('shows externally managed deployments as read-only with an honest Open App path', async () => {
+    const deployedProjects = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          deployment: {
+            appId: 'app-alpha',
+            deployType: 'fullstack',
+            processStatus: 'running',
+            runtimeManagement: 'external-loopback' as const,
+            statusSource: 'external-binding' as const,
+            supportedLifecycleActions: [],
+            port: null,
+            isActive: true,
+          },
+        }
+      : project);
+    mocks.listProjects.mockResolvedValue({ projects: deployedProjects });
+    mocks.appProcess.mockResolvedValue({
+      status: 'running',
+      deployType: 'fullstack',
+      runtimeManagement: 'external-loopback',
+      statusSource: 'external-binding',
+      supportedActions: [],
+      logs: [],
+      restartCount: 0,
+      persistedStatus: 'running',
+      recoveryRequired: false,
+      limitation: 'Portal routes this app, but its external service must be managed on the host.',
+    });
+    renderApps();
+    await waitForAlphaFile();
+
+    expect(screen.queryByRole('button', { name: 'Deploy' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Rename project alpha' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete project alpha' })).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Deployment' }));
+
+    expect(await screen.findByText('External service')).toBeVisible();
+    expect(screen.getByText('External routing')).toBeVisible();
+    expect(screen.getByText('Read-only external deployment')).toBeVisible();
+    expect(screen.getByText(/external service must be managed on the host/i)).toBeVisible();
+    expect(screen.getByRole('link', { name: 'Open App' })).toHaveAttribute('href', '/apps/alpha');
+    expect(screen.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Restart' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Remove deployment' })).not.toBeInTheDocument();
+    expect(screen.getByText(/removal is unavailable because/i)).toBeVisible();
+  });
+
+  it('renders an invalid external binding as a blocked configuration with no lifecycle controls', async () => {
+    const deployedProjects = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          destructiveActions: {
+            allowed: false,
+            reason: 'The server-managed target must be repaired.',
+          },
+          deployment: {
+            appId: 'app-alpha',
+            deployType: 'static',
+            processStatus: 'stopped',
+            runtimeManagement: 'external-loopback' as const,
+            statusSource: 'external-binding' as const,
+            supportedLifecycleActions: [],
+            bindingStatus: 'invalid' as const,
+            configurationCode: 'PROJECT_RUNTIME_BINDING_INVALID' as const,
+            limitation: 'The server-managed target must be repaired.',
+            port: null,
+            isActive: true,
+          },
+        }
+      : project);
+    mocks.listProjects.mockResolvedValue({ projects: deployedProjects });
+    mocks.appProcess.mockImplementation(() => new Promise(() => {}));
+    renderApps();
+    await waitForAlphaFile();
+
+    expect(screen.queryByRole('button', { name: 'Deploy' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Rename project alpha' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete project alpha' })).toBeDisabled();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Deployment' }));
+    expect(await screen.findByText('Deployment configuration needs attention')).toBeVisible();
+    expect(screen.getAllByText('The server-managed target must be repaired.')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Restart' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Remove deployment' })).not.toBeInTheDocument();
+  });
+
+  it('preserves redeploy only for a static Project with an external API binding', async () => {
+    const deployedProjects = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          destructiveActions: {
+            allowed: false,
+            reason: 'This Project uses an externally managed service.',
+          },
+          deployment: {
+            appId: 'app-alpha',
+            deployType: 'static',
+            processStatus: 'running',
+            runtimeManagement: 'external-loopback' as const,
+            statusSource: 'external-binding' as const,
+            supportedLifecycleActions: ['redeploy' as const],
+            port: null,
+            isActive: true,
+          },
+        }
+      : project);
+    mocks.listProjects.mockResolvedValue({ projects: deployedProjects });
+    mocks.appProcess.mockResolvedValue({
+      status: 'running',
+      deployType: 'static',
+      runtimeManagement: 'external-loopback',
+      statusSource: 'external-binding',
+      supportedActions: [],
+      logs: [],
+      restartCount: 0,
+      persistedStatus: 'running',
+      recoveryRequired: false,
+      limitation: 'Portal routes this static app to an external API service.',
+    });
+    renderApps();
+    await waitForAlphaFile();
+
+    expect(screen.getByRole('button', { name: 'Deploy' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Rename project alpha' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Delete project alpha' })).toBeDisabled();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Deployment' }));
+    expect(await screen.findByText('Read-only external deployment')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Remove deployment' })).not.toBeInTheDocument();
+  });
+
+  it('renders the exact live-manager deployment control set', async () => {
+    const deployedProjects = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          deployment: {
+            appId: 'app-alpha',
+            deployType: 'fullstack',
+            processStatus: 'running',
+            runtimeManagement: 'portal-container' as const,
+            statusSource: 'persisted-app' as const,
+            supportedLifecycleActions: [...managedLifecycleActions],
+            port: 5001,
+            isActive: true,
+          },
+        }
+      : project);
+    mocks.listProjects.mockResolvedValue({ projects: deployedProjects });
+    mocks.appProcess.mockResolvedValue({
+      status: 'running',
+      deployType: 'fullstack',
+      runtimeManagement: 'portal-container',
+      statusSource: 'portal-manager',
+      supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
+      port: 5001,
+      logs: ['live-manager-log'],
+      restartCount: 0,
+      persistedStatus: 'running',
+      recoveryRequired: false,
+    });
+    renderApps();
+    await waitForAlphaFile();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Deployment' }));
+
+    expect(await screen.findByRole('button', { name: 'Stop' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Restart' })).toBeVisible();
+    expect(screen.getByText('Recent logs')).toBeVisible();
+    expect(screen.getByText('live-manager-log')).toBeVisible();
+  });
+
+  it('drops stale controls and logs when an authoritative status refresh fails', async () => {
+    const failedRefresh = deferred<never>();
+    const deployedProjects = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          deployment: {
+            appId: 'app-alpha',
+            deployType: 'fullstack',
+            processStatus: 'running',
+            runtimeManagement: 'portal-container' as const,
+            statusSource: 'persisted-app' as const,
+            supportedLifecycleActions: [...managedLifecycleActions],
+            port: 5001,
+            isActive: true,
+          },
+        }
+      : project);
+    mocks.listProjects.mockResolvedValue({ projects: deployedProjects });
+    mocks.appProcess
+      .mockResolvedValueOnce({
+        status: 'running',
+        deployType: 'fullstack',
+        runtimeManagement: 'portal-container',
+        statusSource: 'portal-manager',
+        supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
+        port: 5001,
+        logs: ['verified-before-refresh'],
+        restartCount: 0,
+        persistedStatus: 'running',
+        recoveryRequired: false,
+      })
+      .mockReturnValueOnce(failedRefresh.promise);
+    renderApps();
+    await waitForAlphaFile();
+    await userEvent.click(screen.getByRole('button', { name: 'Deployment' }));
+
+    const staleStartButton = await screen.findByRole('button', { name: 'Start' });
+    expect(screen.getByText('verified-before-refresh')).toBeVisible();
+    const refreshButton = screen.getByRole('button', { name: 'Refresh deployment status' });
+
+    fireEvent.click(refreshButton);
+    // Exercise the old DOM node in the same tick. The synchronous owner fence,
+    // not merely the subsequent render, must prevent a stale mutation.
+    fireEvent.click(staleStartButton);
+
+    await waitFor(() => expect(refreshButton).toHaveAttribute('aria-busy', 'true'));
+    expect(screen.getByText('Refreshing deployment status.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Restart' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Recent logs')).not.toBeInTheDocument();
+    expect(mocks.appProcess.mock.calls).toEqual([
+      ['alpha', 'status'],
+      ['alpha', 'status'],
+    ]);
+
+    await act(async () => {
+      failedRefresh.reject({
+        response: {
+          status: 503,
+          data: {
+            error: 'Deployment status could not be verified.',
+            code: 'PROJECT_RUNTIME_REQUEST_FAILED',
+          },
+        },
+      });
+      await failedRefresh.promise.catch(() => undefined);
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Deployment status could not be verified.');
+    expect(refreshButton).toHaveAttribute('aria-busy', 'false');
+    expect(screen.getByText('Deployment status: unknown.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument();
+    expect(screen.queryByText('verified-before-refresh')).not.toBeInTheDocument();
+    expect(mocks.appProcess.mock.calls).toEqual([
+      ['alpha', 'status'],
+      ['alpha', 'status'],
+    ]);
+  });
+
+  it('distinguishes an unverified live runtime from its last saved state', async () => {
+    const deployedProjects = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          deployment: {
+            appId: 'app-alpha',
+            deployType: 'fullstack',
+            processStatus: 'running',
+            runtimeManagement: 'portal-container' as const,
+            statusSource: 'persisted-app' as const,
+            supportedLifecycleActions: [...managedLifecycleActions],
+            port: null,
+            isActive: true,
+          },
+        }
+      : project);
+    mocks.listProjects.mockResolvedValue({ projects: deployedProjects });
+    mocks.appProcess.mockResolvedValue({
+      status: 'unknown',
+      deployType: 'fullstack',
+      runtimeManagement: 'portal-container',
+      statusSource: 'persisted-app',
+      supportedActions: ['start', 'stop', 'status'],
+      logs: [],
+      restartCount: 0,
+      persistedStatus: 'running',
+      recoveryRequired: true,
+    });
+    renderApps();
+    await waitForAlphaFile();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Deployment' }));
+
+    expect(await screen.findByText('unknown')).toBeVisible();
+    expect(screen.getByText('Last saved state')).toBeVisible();
+    expect(screen.getByText(/live status could not be verified/i)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Start' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Restart' })).not.toBeInTheDocument();
+  });
+
+  it('runs the Owner repair and replays only the server-bound failed Start action', async () => {
+    const deployedProjects = projects.map((project) => project.name === 'alpha'
+      ? {
+          ...project,
+          deployment: {
+            appId: 'app-alpha',
+            deployType: 'fullstack',
+            processStatus: 'stopped',
+            runtimeManagement: 'portal-container' as const,
+            statusSource: 'persisted-app' as const,
+            supportedLifecycleActions: [...managedLifecycleActions],
+            port: null,
+            isActive: true,
+          },
+        }
+      : project);
+    mocks.listProjects.mockResolvedValue({ projects: deployedProjects });
+    const recoveryReplay = {
+      proof: 'v1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      action: 'start' as const,
+      projectIdentity: alphaIdentity,
+      expectedAppId: 'app-alpha',
+    };
+    let initialStartFailed = false;
+    mocks.appProcess.mockImplementation(async (
+      _projectName: string,
+      action: string,
+      replay?: typeof recoveryReplay,
+    ) => {
+      if (action === 'status') {
+        return {
+          status: replay ? 'running' : 'stopped',
+          deployType: 'fullstack',
+          runtimeManagement: 'portal-container',
+          statusSource: 'persisted-app',
+          supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
+          logs: [],
+          restartCount: 0,
+          persistedStatus: replay ? 'running' : 'stopped',
+          recoveryRequired: false,
+        };
+      }
+      if (action === 'start' && replay) {
+        return {
+          status: 'running',
+          deployType: 'fullstack',
+          runtimeManagement: 'portal-container',
+          statusSource: 'portal-manager',
+          supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
+          logs: [],
+          restartCount: 0,
+          persistedStatus: 'running',
+          recoveryRequired: false,
+        };
+      }
+      initialStartFailed = true;
+      throw {
+        response: {
+          status: 503,
+          data: {
+            error: 'The Project runtime image is unavailable.',
+            detail: 'Re-run the Portal installer or update, then try again.',
+            limitation: 'No application process was changed.',
+            code: 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE',
+            recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+            recoveryReplay,
+            details: 'raw engine digest and host diagnostics must stay private',
+            recoveryActionUrl: 'https://untrusted.invalid/update',
+          },
+        },
+      };
+    });
+    mocks.runtimeRepairStatus
+      .mockReset()
+      .mockResolvedValueOnce({
+        state: 'unavailable',
+        unavailableReason: 'image-missing',
+        confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+        ownerOnly: true,
+        changesSystem: true,
+        restartExpected: true,
+      })
+      .mockResolvedValueOnce({
+        state: 'ready',
+        confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+        ownerOnly: true,
+        changesSystem: true,
+        restartExpected: true,
+      });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    await user.click(await screen.findByRole('button', { name: 'Start' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('The Project runtime image is unavailable.');
+    expect(alert).toHaveTextContent('Re-run the Portal installer or update, then try again.');
+    expect(alert).toHaveTextContent('No application process was changed.');
+    expect(alert).toHaveTextContent('PROJECT_RUNTIME_IMAGE_UNAVAILABLE');
+    expect(alert).not.toHaveTextContent('raw engine digest');
+    expect(alert).not.toHaveTextContent('untrusted.invalid');
+    expect(initialStartFailed).toBe(true);
+
+    await user.click(within(alert).getByRole('button', { name: 'Repair runtime image and retry' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Repair runtime image and retry?' });
+    await user.type(within(dialog).getByLabelText(/REPAIR PROJECT RUNTIME IMAGE/), 'REPAIR PROJECT RUNTIME IMAGE');
+    await user.click(within(dialog).getByRole('button', { name: 'Repair runtime image' }));
+
+    await waitFor(() => expect(mocks.runtimeRepair).toHaveBeenCalledWith('REPAIR PROJECT RUNTIME IMAGE'));
+    await waitFor(() => expect(mocks.appProcess).toHaveBeenCalledWith('alpha', 'start', recoveryReplay));
+    expect(mocks.deploy).not.toHaveBeenCalled();
+  });
+
+  it('does not open a repair confirmation when systemd ownership is unknown', async () => {
+    mocks.listProjects.mockResolvedValue({
+      projects: projects.map((project) => project.name === 'alpha'
+        ? {
+            ...project,
+            deployment: {
+              appId: 'app-alpha',
+              deployType: 'fullstack',
+              processStatus: 'stopped',
+              runtimeManagement: 'portal-container' as const,
+              statusSource: 'persisted-app' as const,
+              supportedLifecycleActions: [...managedLifecycleActions],
+              port: null,
+              isActive: true,
+            },
+          }
+        : project),
+    });
+    const recoveryReplay = {
+      proof: 'v1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      action: 'start' as const,
+      projectIdentity: alphaIdentity,
+      expectedAppId: 'app-alpha',
+    };
+    mocks.appProcess.mockImplementation(async (_projectName: string, action: string) => {
+      if (action === 'status') {
+        return {
+          status: 'stopped',
+          deployType: 'fullstack',
+          runtimeManagement: 'portal-container',
+          statusSource: 'persisted-app',
+          supportedActions: ['start', 'status'],
+          logs: [],
+          restartCount: 0,
+          persistedStatus: 'stopped',
+          recoveryRequired: false,
+        };
+      }
+      throw {
+        response: {
+          status: 503,
+          data: {
+            error: 'The Project runtime image is unavailable.',
+            code: 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE',
+            recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+            recoveryReplay,
+          },
+        },
+      };
+    });
+    mocks.runtimeRepairStatus.mockReset().mockResolvedValue({
+      state: 'unavailable',
+      unavailableReason: 'unit-state-unknown',
+      confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+      ownerOnly: true,
+      changesSystem: true,
+      restartExpected: true,
+    });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    await user.click(await screen.findByRole('button', { name: 'Start' }));
+    await user.click(await screen.findByRole('button', { name: 'Repair runtime image and retry' }));
+
+    expect(await screen.findByText(/cannot verify the repair service state/i)).toBeVisible();
+    expect(screen.queryByRole('dialog', { name: 'Repair runtime image and retry?' })).not.toBeInTheDocument();
+    expect(mocks.runtimeRepair).not.toHaveBeenCalled();
+  });
+
+  it('keeps a lost-response replay truthful when the durable receipt is still running', async () => {
+    mocks.listProjects.mockResolvedValue({
+      projects: projects.map((project) => project.name === 'alpha'
+        ? {
+            ...project,
+            deployment: {
+              appId: 'app-alpha',
+              deployType: 'fullstack',
+              processStatus: 'stopped',
+              runtimeManagement: 'portal-container' as const,
+              statusSource: 'persisted-app' as const,
+              supportedLifecycleActions: [...managedLifecycleActions],
+              port: null,
+              isActive: true,
+            },
+          }
+        : project),
+    });
+    const recoveryReplay = {
+      proof: 'v1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      action: 'start' as const,
+      projectIdentity: alphaIdentity,
+      expectedAppId: 'app-alpha',
+    };
+    let initialFailureSent = false;
+    let replayAttempts = 0;
+    mocks.appProcess.mockImplementation(async (_projectName: string, action: string, replay?: unknown) => {
+      if (action === 'status') {
+        return {
+          status: 'stopped',
+          deployType: 'fullstack',
+          runtimeManagement: 'portal-container',
+          statusSource: 'persisted-app',
+          supportedActions: ['start', 'status'],
+          logs: [],
+          restartCount: 0,
+          persistedStatus: 'stopped',
+          recoveryRequired: false,
+        };
+      }
+      if (!replay && !initialFailureSent) {
+        initialFailureSent = true;
+        throw {
+          response: {
+            status: 503,
+            data: {
+              error: 'The Project runtime image is unavailable.',
+              code: 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE',
+              recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+              recoveryReplay,
+            },
+          },
+        };
+      }
+      replayAttempts += 1;
+      if (replayAttempts === 1) {
+        throw { isAxiosError: true, code: 'ERR_NETWORK', request: {} };
+      }
+      throw {
+        response: {
+          status: 409,
+          data: {
+            code: 'PROJECT_RUNTIME_RECOVERY_IN_PROGRESS',
+            error: 'The recovered Project action is still reconciling.',
+            detail: 'Refresh Deployment status before taking another action.',
+            retryable: false,
+          },
+        },
+      };
+    });
+    mocks.runtimeRepairStatus.mockReset().mockResolvedValue({
+      state: 'ready',
+      confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+      ownerOnly: true,
+      changesSystem: true,
+      restartExpected: true,
+    });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    await user.click(await screen.findByRole('button', { name: 'Start' }));
+    await user.click(await screen.findByRole('button', { name: 'Repair runtime image and retry' }));
+
+    await waitFor(() => expect(replayAttempts).toBe(2));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/still reconciling/i);
+    expect(alert).toHaveTextContent(/will not execute this recovery twice/i);
+    expect(alert).not.toHaveTextContent(/stale and was not replayed/i);
+    expect(mocks.runtimeRepair).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: 'two consecutive transport losses',
+      replayError: () => ({ isAxiosError: true, code: 'ERR_NETWORK', request: {} }),
+      expectedAttempts: 2,
+      expectedText: /still reconciling/i,
+      rejectedText: /stale and was not replayed/i,
+    },
+    {
+      label: 'a durable failed receipt',
+      replayError: () => ({
+        response: {
+          status: 409,
+          data: {
+            code: 'PROJECT_RUNTIME_RECOVERY_FAILED',
+            error: 'The recovered Project action failed after it was admitted.',
+            detail: 'No second execution was started.',
+          },
+        },
+      }),
+      expectedAttempts: 1,
+      expectedText: /failed after it was admitted/i,
+      rejectedText: /stale and was not replayed/i,
+    },
+  ])('does not mislabel $label as stale', async ({
+    replayError,
+    expectedAttempts,
+    expectedText,
+    rejectedText,
+  }) => {
+    mocks.listProjects.mockResolvedValue({
+      projects: projects.map((project) => project.name === 'alpha'
+        ? {
+            ...project,
+            deployment: {
+              appId: 'app-alpha',
+              deployType: 'fullstack',
+              processStatus: 'stopped',
+              runtimeManagement: 'portal-container' as const,
+              statusSource: 'persisted-app' as const,
+              supportedLifecycleActions: [...managedLifecycleActions],
+              port: null,
+              isActive: true,
+            },
+          }
+        : project),
+    });
+    const recoveryReplay = {
+      proof: 'v1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      action: 'start' as const,
+      projectIdentity: alphaIdentity,
+      expectedAppId: 'app-alpha',
+    };
+    let initialFailureSent = false;
+    let replayAttempts = 0;
+    mocks.appProcess.mockImplementation(async (_projectName: string, action: string, replay?: unknown) => {
+      if (action === 'status') {
+        return {
+          status: 'stopped',
+          deployType: 'fullstack',
+          runtimeManagement: 'portal-container',
+          statusSource: 'persisted-app',
+          supportedActions: ['start', 'status'],
+          logs: [],
+          restartCount: 0,
+          persistedStatus: 'stopped',
+          recoveryRequired: false,
+        };
+      }
+      if (!replay && !initialFailureSent) {
+        initialFailureSent = true;
+        throw {
+          response: {
+            status: 503,
+            data: {
+              error: 'The Project runtime image is unavailable.',
+              code: 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE',
+              recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+              recoveryReplay,
+            },
+          },
+        };
+      }
+      replayAttempts += 1;
+      throw replayError();
+    });
+    mocks.runtimeRepairStatus.mockReset().mockResolvedValue({
+      state: 'ready',
+      confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+      ownerOnly: true,
+      changesSystem: true,
+      restartExpected: true,
+    });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    await user.click(await screen.findByRole('button', { name: 'Start' }));
+    await user.click(await screen.findByRole('button', { name: 'Repair runtime image and retry' }));
+
+    await waitFor(() => expect(replayAttempts).toBe(expectedAttempts));
+    const alerts = await screen.findAllByRole('alert');
+    const alert = alerts.find((candidate) => expectedText.test(candidate.textContent || ''));
+    expect(alert).toBeDefined();
+    if (!alert) throw new Error('Expected replay outcome alert was not rendered');
+    expect(alert).toHaveTextContent(expectedText);
+    expect(alert).not.toHaveTextContent(rejectedText);
+    expect(mocks.runtimeRepair).not.toHaveBeenCalled();
+  });
+
+  it('does not call an unverified inventory refresh stale', async () => {
+    const inventory = {
+      projects: projects.map((project) => project.name === 'alpha'
+        ? {
+            ...project,
+            deployment: {
+              appId: 'app-alpha',
+              deployType: 'fullstack',
+              processStatus: 'stopped',
+              runtimeManagement: 'portal-container' as const,
+              statusSource: 'persisted-app' as const,
+              supportedLifecycleActions: [...managedLifecycleActions],
+              port: null,
+              isActive: true,
+            },
+          }
+        : project),
+    };
+    mocks.listProjects
+      .mockResolvedValueOnce(inventory)
+      .mockRejectedValueOnce(new Error('inventory transport unavailable'));
+    const recoveryReplay = {
+      proof: 'v1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      action: 'start' as const,
+      projectIdentity: alphaIdentity,
+      expectedAppId: 'app-alpha',
+    };
+    let initialFailureSent = false;
+    mocks.appProcess.mockImplementation(async (_projectName: string, action: string) => {
+      if (action === 'status') {
+        return {
+          status: 'stopped',
+          deployType: 'fullstack',
+          runtimeManagement: 'portal-container',
+          statusSource: 'persisted-app',
+          supportedActions: ['start', 'status'],
+          logs: [],
+          restartCount: 0,
+          persistedStatus: 'stopped',
+          recoveryRequired: false,
+        };
+      }
+      if (!initialFailureSent) {
+        initialFailureSent = true;
+        throw {
+          response: {
+            status: 503,
+            data: {
+              error: 'The Project runtime image is unavailable.',
+              code: 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE',
+              recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+              recoveryReplay,
+            },
+          },
+        };
+      }
+      throw new Error('replay must not be sent without verified inventory');
+    });
+    mocks.runtimeRepairStatus.mockReset().mockResolvedValue({
+      state: 'ready',
+      confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+      ownerOnly: true,
+      changesSystem: true,
+      restartExpected: true,
+    });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    await user.click(await screen.findByRole('button', { name: 'Start' }));
+    await user.click(await screen.findByRole('button', { name: 'Repair runtime image and retry' }));
+
+    const alerts = await screen.findAllByRole('alert');
+    const alert = alerts.find((candidate) => /could not verify the current Project inventory/i.test(
+      candidate.textContent || '',
+    ));
+    expect(alert).toBeDefined();
+    if (!alert) throw new Error('Expected inventory verification alert was not rendered');
+    expect(alert).toHaveTextContent(/could not verify the current Project inventory/i);
+    expect(alert).not.toHaveTextContent(/stale and was not replayed/i);
+    expect(mocks.appProcess).toHaveBeenCalledTimes(2);
+    expect(mocks.runtimeRepair).not.toHaveBeenCalled();
+  });
+
+  it('keeps the runtime-image repair role-aware for a non-Owner', async () => {
+    mocks.userRole = 'SUB_ADMIN';
+    mocks.listProjects.mockResolvedValue({
+      projects: projects.map((project) => project.name === 'alpha'
+        ? {
+            ...project,
+            deployment: {
+              appId: 'app-alpha',
+              deployType: 'fullstack',
+              processStatus: 'stopped',
+              runtimeManagement: 'portal-container' as const,
+              statusSource: 'persisted-app' as const,
+              supportedLifecycleActions: [...managedLifecycleActions],
+              port: null,
+              isActive: true,
+            },
+          }
+        : project),
+    });
+    const recoveryReplay = {
+      proof: 'v1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      action: 'start' as const,
+      projectIdentity: alphaIdentity,
+      expectedAppId: 'app-alpha',
+    };
+    mocks.appProcess.mockImplementation(async (_projectName: string, action: string) => {
+      if (action === 'status') {
+        return {
+          status: 'stopped',
+          deployType: 'fullstack',
+          runtimeManagement: 'portal-container',
+          statusSource: 'persisted-app',
+          supportedActions: ['start', 'status'],
+          logs: [],
+          restartCount: 0,
+          persistedStatus: 'stopped',
+          recoveryRequired: false,
+        };
+      }
+      throw {
+        response: {
+          status: 503,
+          data: {
+            error: 'The Project runtime image is unavailable.',
+            code: 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE',
+            recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+            recoveryReplay,
+          },
+        },
+      };
+    });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    await user.click(await screen.findByRole('button', { name: 'Start' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/ask the portal owner to run this project runtime image repair/i);
+    expect(alert).toHaveTextContent(/no repair has started/i);
+    expect(within(alert).queryByRole('button', { name: 'Repair runtime image and retry' })).not.toBeInTheDocument();
+    expect(mocks.runtimeRepairStatus).not.toHaveBeenCalled();
+    expect(mocks.runtimeRepair).not.toHaveBeenCalled();
+  });
+
+  it('keeps first-deploy repair reachable without an App row and replays the exact source-bound Deploy', async () => {
+    const firstDeployProjects = projects.map((project) => project.name === 'alpha'
+      ? { ...project, detectedDeployType: 'fullstack' as const, deployedUrl: null }
+      : project);
+    mocks.listProjects.mockResolvedValue({ projects: firstDeployProjects });
+    const recoveryReplay = {
+      proof: 'v1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      action: 'deploy' as const,
+      projectIdentity: alphaIdentity,
+      expectedAppId: null,
+      expectedDeployType: 'fullstack' as const,
+      sourceDigest: 'a'.repeat(64),
+    };
+    mocks.deploy
+      .mockReset()
+      .mockRejectedValueOnce({
+        response: {
+          status: 503,
+          data: {
+            error: 'The Project runtime image is unavailable.',
+            code: 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE',
+            recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+            recoveryReplay,
+          },
+        },
+      })
+      .mockResolvedValueOnce({ deployType: 'fullstack', url: '/apps/alpha' });
+    mocks.runtimeRepairStatus
+      .mockReset()
+      .mockResolvedValueOnce({
+        state: 'unavailable',
+        unavailableReason: 'image-missing',
+        confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+        ownerOnly: true,
+        changesSystem: true,
+        restartExpected: true,
+      })
+      .mockResolvedValueOnce({
+        state: 'ready',
+        confirmationPhrase: 'REPAIR PROJECT RUNTIME IMAGE',
+        ownerOnly: true,
+        changesSystem: true,
+        restartExpected: true,
+      });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deploy' }));
+    await user.click(await screen.findByRole('button', { name: 'Repair runtime image and retry' }));
+
+    const confirmation = await screen.findByRole('dialog', { name: 'Repair runtime image and retry?' });
+    await user.type(within(confirmation).getByLabelText(/REPAIR PROJECT RUNTIME IMAGE/), 'REPAIR PROJECT RUNTIME IMAGE');
+    await user.click(within(confirmation).getByRole('button', { name: 'Repair runtime image' }));
+
+    await waitFor(() => expect(mocks.deploy).toHaveBeenNthCalledWith(2, 'alpha', recoveryReplay));
+    expect(mocks.appProcess).not.toHaveBeenCalledWith('alpha', 'start', expect.anything());
+  });
+
+  it('suppresses recovery controls for a non-allowlisted server action', async () => {
+    mocks.listProjects.mockResolvedValue({
+      projects: projects.map((project) => project.name === 'alpha'
+        ? {
+            ...project,
+            deployment: {
+              appId: 'app-alpha',
+              deployType: 'fullstack',
+              processStatus: 'stopped',
+              runtimeManagement: 'portal-container' as const,
+              statusSource: 'persisted-app' as const,
+              supportedLifecycleActions: [...managedLifecycleActions],
+              port: null,
+              isActive: true,
+            },
+          }
+        : project),
+    });
+    mocks.appProcess.mockImplementation(async (_projectName: string, action: string) => {
+      if (action === 'status') {
+        return {
+          status: 'stopped',
+          deployType: 'fullstack',
+          runtimeManagement: 'portal-container',
+          statusSource: 'persisted-app',
+          supportedActions: ['start', 'status'],
+          logs: [],
+          restartCount: 0,
+          persistedStatus: 'stopped',
+          recoveryRequired: false,
+        };
+      }
+      throw {
+        response: {
+          status: 503,
+          data: {
+            error: 'Runtime unavailable',
+            code: 'PROJECT_RUNTIME_START_FAILED',
+            recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+            recoveryReplay: {
+              proof: 'v1.11111111-1111-4111-8111-111111111111.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+              action: 'start',
+              projectIdentity: alphaIdentity,
+              expectedAppId: 'app-alpha',
+            },
+            recoveryActionUrl: 'https://untrusted.invalid/update',
+          },
+        },
+      };
+    });
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole('button', { name: 'Deployment' }));
+    await user.click(await screen.findByRole('button', { name: 'Start' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Runtime unavailable');
+    expect(alert).toHaveTextContent('PROJECT_RUNTIME_START_FAILED');
+    expect(alert).not.toHaveTextContent('untrusted.invalid');
+    expect(within(alert).queryByRole('button', { name: 'Repair runtime image and retry' })).not.toBeInTheDocument();
+  });
+
+  it('uses the server classification for runtime projects instead of filename guesses', async () => {
+    mocks.listProjects.mockResolvedValue({
+      projects: projects.map((project) => project.name === 'alpha'
+        ? { ...project, detectedDeployType: 'runtime' as const }
+        : project),
+    });
+    mocks.getTree.mockResolvedValue({
+      tree: [
+        { name: 'package.json', type: 'file', path: 'package.json' },
+        { name: 'cli.ts', type: 'file', path: 'cli.ts' },
+      ],
+      currentPath: '',
+      identity: alphaIdentity,
+    });
+    renderApps('/projects?project=alpha&file=cli.ts');
+    await waitFor(() => expect(mocks.readFile).toHaveBeenCalledWith('alpha', 'cli.ts'));
+
+    expect(screen.getByRole('button', { name: 'Check' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Run' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Preview' })).not.toBeInTheDocument();
   });
 
   it('keeps the selected project and its file tree in view with a 50-project inventory', async () => {
@@ -628,7 +1937,163 @@ describe('AppsPage share action ownership', () => {
     expect(projectList).not.toContainElement(fileTree);
   });
 
-  it('keeps Project Chat qualification attached to its exact project until the sandbox roundtrip settles', async () => {
+  it('shows a durable retry state instead of claiming the project inventory is empty', async () => {
+    mocks.listProjects
+      .mockRejectedValueOnce(new Error('Inventory temporarily unavailable'))
+      .mockResolvedValueOnce({ projects });
+
+    renderApps('/projects', false);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Projects couldn’t be loaded');
+    expect(alert).toHaveTextContent('Inventory temporarily unavailable');
+    expect(screen.queryByText('No projects yet')).not.toBeInTheDocument();
+
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByRole('button', { name: 'alpha' })).toBeVisible();
+    await waitFor(() => expect(screen.queryByText('Projects couldn’t be loaded')).not.toBeInTheDocument());
+  });
+
+  it('keeps the newest project inventory when overlapping refreshes settle out of order', async () => {
+    const firstInventory = deferred<{ projects: typeof projects }>();
+    const blockedProjects = [{
+      ...projects[0],
+      availability: {
+        available: false as const,
+        code: 'PROJECT_IDENTITY_RECONCILIATION_REQUIRED' as const,
+        message: 'Newest inventory says this project needs reconciliation.',
+        action: 'RECONCILE_PROJECT_IDENTITY' as const,
+        retryable: false,
+      },
+      destructiveActions: {
+        allowed: false,
+        reason: 'Newest inventory says this project needs reconciliation.',
+      },
+    }];
+    mocks.listProjects
+      .mockReturnValueOnce(firstInventory.promise)
+      .mockResolvedValueOnce({ projects: blockedProjects });
+    const user = userEvent.setup();
+
+    renderApps('/projects', false);
+    await waitFor(() => expect(mocks.listProjects).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole('button', { name: 'Refresh projects' }));
+
+    const newestProject = await screen.findByRole('button', { name: 'alpha' });
+    expect(newestProject).toBeDisabled();
+    expect(screen.getByText('Newest inventory says this project needs reconciliation.')).toBeVisible();
+
+    await act(async () => {
+      firstInventory.resolve({ projects });
+      await firstInventory.promise;
+    });
+
+    expect(screen.getByRole('button', { name: 'alpha' })).toBeDisabled();
+    expect(screen.getByText('Newest inventory says this project needs reconciliation.')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'beta' })).not.toBeInTheDocument();
+  });
+
+  it('shows file-load recovery without presenting a failed tree as an empty project', async () => {
+    mocks.getTree
+      .mockRejectedValueOnce(new Error('Tree read failed'))
+      .mockResolvedValueOnce({
+        tree: alphaTree,
+        currentPath: '',
+        identity: alphaIdentity,
+      });
+
+    renderApps('/projects?project=alpha');
+
+    const fileRegion = await screen.findByRole('region', { name: 'Files for alpha' });
+    const alert = await within(fileRegion).findByRole('alert');
+    expect(alert).toHaveTextContent('Files couldn’t be loaded');
+    expect(alert).toHaveTextContent('Tree read failed');
+    expect(within(fileRegion).queryByText('No files yet')).not.toBeInTheDocument();
+
+    await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+    expect(await within(fileRegion).findByRole('button', { name: 'one.ts' })).toBeVisible();
+    await waitFor(() => expect(within(fileRegion).queryByText('Files couldn’t be loaded')).not.toBeInTheDocument());
+  });
+
+  it('keeps a blocked project visible with its recovery reason and disables Project Chat', async () => {
+    mocks.listProjects.mockResolvedValueOnce({
+      projects: [{
+        ...projects[0],
+        availability: {
+          available: false as const,
+          code: 'PROJECT_IDENTITY_RECONCILIATION_REQUIRED' as const,
+          message: 'This project directory changed outside Portal.',
+          action: 'RECONCILE_PROJECT_IDENTITY' as const,
+          retryable: false,
+        },
+        destructiveActions: {
+          allowed: false,
+          reason: 'This project directory changed outside Portal.',
+        },
+      }],
+    });
+
+    renderApps('/projects', false);
+
+    const project = await screen.findByRole('button', { name: 'alpha' });
+    expect(project).toBeDisabled();
+    expect(screen.getByText('This project directory changed outside Portal.')).toBeVisible();
+    expect(screen.getByText('Administrator reconciliation is required.')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Open Project Chat' })).not.toBeInTheDocument();
+  });
+
+  it('refuses a blocked Project deep link without loading its file tree', async () => {
+    mocks.listProjects.mockResolvedValueOnce({
+      projects: [{
+        ...projects[0],
+        availability: {
+          available: false as const,
+          code: 'PROJECT_IDENTITY_RECONCILIATION_REQUIRED' as const,
+          message: 'This project directory changed outside Portal.',
+          action: 'RECONCILE_PROJECT_IDENTITY' as const,
+          retryable: false,
+        },
+        destructiveActions: {
+          allowed: false,
+          reason: 'This project directory changed outside Portal.',
+        },
+      }],
+    });
+
+    renderApps('/projects?project=alpha');
+
+    expect(await screen.findByRole('button', { name: 'alpha' })).toBeDisabled();
+    await waitFor(() => expect(screen.getByTestId('apps-route')).toHaveTextContent('/projects'));
+    expect(mocks.getTree).not.toHaveBeenCalledWith('alpha');
+  });
+
+  it('does not restore a blocked Project from local storage', async () => {
+    localStorage.setItem('projects-last-selected', 'alpha');
+    mocks.listProjects.mockResolvedValueOnce({
+      projects: [{
+        ...projects[0],
+        availability: {
+          available: false as const,
+          code: 'PROJECT_LIFECYCLE_RECONCILIATION_REQUIRED' as const,
+          message: 'Portal found conflicting lifecycle records for this project.',
+          action: 'RECONCILE_PROJECT_LIFECYCLE' as const,
+          retryable: false,
+        },
+        destructiveActions: {
+          allowed: false,
+          reason: 'Portal found conflicting lifecycle records for this project.',
+        },
+      }],
+    });
+
+    renderApps('/projects', false);
+
+    expect(await screen.findByRole('button', { name: 'alpha' })).toBeDisabled();
+    await waitFor(() => expect(localStorage.getItem('projects-last-selected')).toBeNull());
+    expect(mocks.getTree).not.toHaveBeenCalledWith('alpha');
+  });
+
+  it('keeps Project Chat qualification owned until dismissal, then releases it while preparation continues', async () => {
     const qualification = deferred<{ ok: boolean }>();
     mocks.projectQualification.mockReturnValueOnce(qualification.promise);
     renderApps();
@@ -645,7 +2110,6 @@ describe('AppsPage share action ownership', () => {
     act(() => {
       qualify.click();
       qualify.click();
-      close.click();
       beta.click();
       secondFile.click();
       deepLink.click();
@@ -661,15 +2125,20 @@ describe('AppsPage share action ownership', () => {
     const unload = new Event('beforeunload', { cancelable: true });
     expect(window.dispatchEvent(unload)).toBe(false);
 
+    await user.click(close);
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Project Chat alpha' })).not.toBeInTheDocument());
+    const releasedUnload = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(releasedUnload)).toBe(true);
+
+    await user.click(screen.getByRole('button', { name: 'beta' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'beta' })).toHaveAttribute('aria-current', 'page'));
+    expect(mocks.getTree).toHaveBeenCalledWith('beta');
+
     await act(async () => {
       qualification.resolve({ ok: true });
       await qualification.promise;
     });
-    expect(await screen.findByRole('button', { name: 'Qualify provider' })).toBeEnabled();
-
-    await user.click(beta);
-    await waitFor(() => expect(screen.getByRole('button', { name: 'beta' })).toHaveAttribute('aria-current', 'page'));
-    expect(mocks.getTree).toHaveBeenCalledWith('beta');
+    expect(mocks.projectQualification).toHaveBeenCalledTimes(1);
   });
 
   it('owns Project session-control readback across same-frame close, project, and deep-link switches', async () => {
@@ -1424,6 +2893,11 @@ describe('AppsPage share action ownership', () => {
 
   it('releases the project navigation guard before an admitted runtime deploy opens Remote Desktop', async () => {
     const deploy = deferred<{ deployType: string; url: string }>();
+    mocks.listProjects.mockResolvedValue({
+      projects: projects.map((project) => project.name === 'alpha'
+        ? { ...project, detectedDeployType: 'runtime' as const }
+        : project),
+    });
     mocks.getTree.mockImplementation(async (projectName: string, path = '') => ({
       tree: projectName === 'alpha'
         ? [{ name: 'main.py', type: 'file' as const, path: 'main.py' }]
@@ -1645,6 +3119,7 @@ describe('AppsPage share action ownership', () => {
     });
 
     await waitFor(() => expect(mocks.deleteProject).toHaveBeenCalledTimes(1));
+    expect(mocks.deleteProject).toHaveBeenCalledWith('alpha', alphaIdentity);
     expect(await within(dialog).findByRole('button', { name: 'Deleting project…' })).toHaveAttribute('aria-busy', 'true');
     expect(screen.queryByText('Deleting Project')).not.toBeInTheDocument();
     expect(screen.queryByText(/Retiring "alpha"/)).not.toBeInTheDocument();
@@ -1654,6 +3129,75 @@ describe('AppsPage share action ownership', () => {
       await deletion.promise;
     });
     await waitFor(() => expect(screen.queryByRole('alertdialog', { name: '⚠️ Delete project "alpha"?' })).not.toBeInTheDocument());
+  });
+
+  it('refuses a confirmed Project deletion after inventory reports a replacement identity', async () => {
+    const replacementIdentity = { id: 'project-alpha-replacement', generation: 1 };
+    mocks.listProjects
+      .mockResolvedValueOnce({ projects })
+      .mockResolvedValue({
+        projects: projects.map((project) => project.name === 'alpha'
+          ? { ...project, identity: replacementIdentity }
+          : project),
+      });
+    renderApps();
+    await waitForAlphaFile();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Delete project alpha' }));
+    const dialog = screen.getByRole('alertdialog', { name: '⚠️ Delete project "alpha"?' });
+    const refreshButton = document.querySelector<HTMLButtonElement>('button[aria-label="Refresh projects"]');
+    expect(refreshButton).not.toBeNull();
+    fireEvent.click(refreshButton!);
+    await waitFor(() => expect(mocks.listProjects).toHaveBeenCalledTimes(2));
+    await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
+
+    expect(await within(dialog).findByText(/project identity changed/i)).toBeVisible();
+    expect(mocks.deleteProject).not.toHaveBeenCalled();
+  });
+
+  it('rechecks Project identity after deferred autosave settles before deleting', async () => {
+    const autosave = deferred<{ ok: boolean }>();
+    const replacementIdentity = { id: 'project-alpha-replacement-after-save', generation: 1 };
+    mocks.writeFile.mockReturnValueOnce(autosave.promise);
+    mocks.listProjects
+      .mockResolvedValueOnce({ projects })
+      .mockResolvedValue({
+        projects: projects.map((project) => project.name === 'alpha'
+          ? { ...project, identity: replacementIdentity }
+          : project),
+      });
+    renderApps();
+    await waitForAlphaFile();
+
+    const user = userEvent.setup();
+    fireEvent.change(screen.getByLabelText('Mock project editor'), {
+      target: { value: 'alpha:changed before delete' },
+    });
+    await user.click(screen.getByRole('button', { name: 'Delete project alpha' }));
+    const dialog = screen.getByRole('alertdialog', { name: '⚠️ Delete project "alpha"?' });
+    await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(mocks.writeFile).toHaveBeenCalledWith(
+      'alpha',
+      'one.ts',
+      'alpha:changed before delete',
+    ));
+    expect(screen.getByTestId('route-operation-owner')).toHaveTextContent('owned');
+
+    const refreshButton = document.querySelector<HTMLButtonElement>('button[aria-label="Refresh projects"]');
+    expect(refreshButton).not.toBeNull();
+    fireEvent.click(refreshButton!);
+    await waitFor(() => expect(mocks.listProjects).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      autosave.resolve({ ok: true });
+      await autosave.promise;
+    });
+
+    expect(await within(dialog).findByText(/project identity changed/i)).toBeVisible();
+    expect(mocks.deleteProject).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByTestId('route-operation-owner')).toHaveTextContent('idle'));
+    expect(within(dialog).getByRole('button', { name: 'Delete' })).toBeEnabled();
   });
 
   it('single-flights file deletion, blocks dismissal, and retains a retryable failure in the dialog', async () => {
@@ -1709,6 +3253,239 @@ describe('AppsPage share action ownership', () => {
     await waitFor(() => expect(screen.queryByRole('alertdialog', { name: '⚠️ Delete one.ts?' })).not.toBeInTheDocument());
     expect(mocks.deleteFile).toHaveBeenCalledTimes(2);
     expect(mocks.deleteFile).toHaveBeenLastCalledWith('alpha', 'one.ts');
+  });
+
+  it('creates a share with visitor slots and an enabled shared API throttle, then restores unlimited defaults', async () => {
+    renderApps('/projects?project=alpha');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page'));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Share' }));
+
+    expect(await screen.findByRole('button', { name: 'Unlimited visitor slots' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('checkbox', { name: 'Limit share link API requests' })).not.toBeChecked();
+    expect(screen.getByText(/Each slot grants one browser up to 30 days of access while the link remains active/i)).toBeVisible();
+    expect(screen.getByText(/dynamic API requests only; static files are excluded/i)).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Small audience: 10 visitor slots' }));
+    await user.click(screen.getByRole('checkbox', { name: 'Limit share link API requests' }));
+    await user.type(screen.getByLabelText('Share link API request limit'), '25');
+    await user.selectOptions(screen.getByLabelText('Share link API request window'), '300');
+    await user.click(screen.getByRole('button', { name: 'Create Public Link' }));
+
+    await waitFor(() => expect(mocks.share).toHaveBeenCalledWith('alpha', {
+      isPublic: true,
+      maxUses: 10,
+      rateLimitMaxRequests: 25,
+      rateLimitWindowSeconds: 300,
+    }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Unlimited visitor slots' })).toHaveAttribute('aria-pressed', 'true'));
+    expect(screen.getByLabelText('Share link visitor slots')).toHaveValue(null);
+    expect(screen.getByRole('checkbox', { name: 'Limit share link API requests' })).not.toBeChecked();
+    expect(screen.queryByLabelText('Share link API request limit')).not.toBeInTheDocument();
+  });
+
+  it('blocks a multibyte share password above the backend UTF-8 byte ceiling', async () => {
+    renderApps('/projects?project=alpha');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page'));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Share' }));
+    await user.click(screen.getByRole('button', { name: 'Password' }));
+
+    const password = 'é'.repeat(37);
+    const passwordInput = screen.getByLabelText('Share link password');
+    const confirmationInput = screen.getByLabelText('Confirm share link password');
+    expect(passwordInput).toHaveAttribute('maxlength', '72');
+    fireEvent.change(passwordInput, { target: { value: password } });
+    fireEvent.change(confirmationInput, { target: { value: password } });
+
+    expect(passwordInput).toHaveAttribute('aria-invalid', 'true');
+    expect(passwordInput).toHaveAttribute('aria-describedby', expect.stringContaining('share-password-byte-error'));
+    const byteError = screen.getByText('Password is 74 UTF-8 bytes; maximum 72. Shorten it by 2 bytes.');
+    expect(byteError).toHaveAttribute('id', 'share-password-byte-error');
+    expect(byteError).toHaveAttribute('role', 'alert');
+    expect(screen.getByRole('button', { name: 'Create Password-Protected Link' })).toBeDisabled();
+    expect(mocks.share).not.toHaveBeenCalled();
+
+    fireEvent.change(passwordInput, { target: { value: 'correct horse battery staple' } });
+    fireEvent.change(confirmationInput, { target: { value: 'correct horse battery stapler' } });
+    expect(confirmationInput).toHaveAttribute('aria-invalid', 'true');
+    expect(confirmationInput).toHaveAttribute('aria-describedby', 'share-password-mismatch-error');
+    const mismatchError = screen.getByText('Passwords do not match.');
+    expect(mismatchError).toHaveAttribute('id', 'share-password-mismatch-error');
+    expect(mismatchError).toHaveAttribute('role', 'alert');
+  });
+
+  it('rejects out-of-range share policies inline and displays configured policies on retained links', async () => {
+    mocks.listShares.mockResolvedValue({
+      shares: [{
+        id: 'policy-link',
+        token: 'policy-token',
+        isActive: true,
+        isPublic: true,
+        currentUses: 2,
+        maxUses: 10,
+        rateLimitMaxRequests: 25,
+        rateLimitWindowSeconds: 300,
+        expiresAt: null,
+        createdAt: '2026-07-21T12:00:00.000Z',
+      }],
+    });
+    renderApps('/projects?project=alpha');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page'));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Share' }));
+
+    expect(await screen.findByText('2 / 10 visitor slots used')).toBeVisible();
+    expect(screen.getByText('25 API requests / 5 minutes · shared')).toBeVisible();
+
+    await user.type(screen.getByLabelText('Share link visitor slots'), '1000001');
+    expect(screen.getByLabelText('Share link visitor slots')).toHaveAttribute('aria-invalid', 'true');
+    await user.click(screen.getByRole('button', { name: 'Create Public Link' }));
+    expect(await screen.findByText('Visitor slots must be a whole number from 1 to 1,000,000', { selector: '#share-create-error' })).toHaveAttribute('role', 'alert');
+    expect(mocks.share).not.toHaveBeenCalled();
+
+    await user.clear(screen.getByLabelText('Share link visitor slots'));
+    await user.click(screen.getByRole('checkbox', { name: 'Limit share link API requests' }));
+    await user.type(screen.getByLabelText('Share link API request limit'), '1000001');
+    expect(screen.getByLabelText('Share link API request limit')).toHaveAttribute('aria-invalid', 'true');
+    await user.click(screen.getByRole('button', { name: 'Create Public Link' }));
+    expect(await screen.findByText('API request limit must be a whole number from 1 to 1,000,000', { selector: '#share-create-error' })).toHaveAttribute('role', 'alert');
+    expect(mocks.share).not.toHaveBeenCalled();
+  });
+
+  it('does not let a delayed older share success replace a newer authoritative list', async () => {
+    const olderRead = deferred<{ shares: Array<Record<string, unknown>> }>();
+    const newerRead = deferred<{ shares: Array<Record<string, unknown>> }>();
+    const share = (id: string, token: string) => ({
+      id,
+      token,
+      isActive: true,
+      isPublic: true,
+      currentUses: 0,
+      maxUses: null,
+      rateLimitMaxRequests: null,
+      rateLimitWindowSeconds: null,
+      expiresAt: null,
+      createdAt: '2026-07-21T12:00:00.000Z',
+    });
+    mocks.listShares
+      .mockReturnValueOnce(olderRead.promise)
+      .mockReturnValueOnce(newerRead.promise);
+
+    renderApps('/projects?project=alpha');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page'));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Share' }));
+    await waitFor(() => expect(mocks.listShares).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole('button', { name: 'Close sharing panel' }));
+    await user.click(screen.getByRole('button', { name: 'Share' }));
+    await waitFor(() => expect(mocks.listShares).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      newerRead.resolve({ shares: [share('newer-link', 'newer-token')] });
+      await newerRead.promise;
+    });
+    expect(await screen.findByText('/share/newer-token')).toBeVisible();
+
+    await act(async () => {
+      olderRead.resolve({ shares: [share('older-link', 'older-token')] });
+      await olderRead.promise;
+    });
+    expect(screen.getByText('/share/newer-token')).toBeVisible();
+    expect(screen.queryByText('/share/older-token')).not.toBeInTheDocument();
+  });
+
+  it('does not let a delayed older share failure clear a newer authoritative list', async () => {
+    const olderRead = deferred<{ shares: Array<Record<string, unknown>> }>();
+    const newerRead = deferred<{ shares: Array<Record<string, unknown>> }>();
+    mocks.listShares
+      .mockReturnValueOnce(olderRead.promise)
+      .mockReturnValueOnce(newerRead.promise);
+
+    renderApps('/projects?project=alpha');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page'));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Share' }));
+    await waitFor(() => expect(mocks.listShares).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole('button', { name: 'Close sharing panel' }));
+    await user.click(screen.getByRole('button', { name: 'Share' }));
+    await waitFor(() => expect(mocks.listShares).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      newerRead.resolve({
+        shares: [{
+          id: 'newer-link',
+          token: 'newer-token',
+          isActive: true,
+          isPublic: true,
+          currentUses: 0,
+          maxUses: null,
+          rateLimitMaxRequests: null,
+          rateLimitWindowSeconds: null,
+          expiresAt: null,
+          createdAt: '2026-07-21T12:00:00.000Z',
+        }],
+      });
+      await newerRead.promise;
+    });
+    expect(await screen.findByText('/share/newer-token')).toBeVisible();
+
+    await act(async () => {
+      olderRead.reject(new Error('Delayed obsolete share failure.'));
+      await olderRead.promise.catch(() => undefined);
+    });
+    expect(screen.getByText('/share/newer-token')).toBeVisible();
+    expect(screen.queryByText(/Delayed obsolete share failure/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry refresh' })).not.toBeInTheDocument();
+  });
+
+  it('rechecks share ownership after autosave settles before switching projects', async () => {
+    const autosave = deferred<{ ok: boolean }>();
+    const mutation = deferred<{ ok: boolean }>();
+    const activeShare = {
+      id: 'autosave-share',
+      token: 'autosave-token',
+      isActive: true,
+      isPublic: true,
+      currentUses: 0,
+      maxUses: null,
+      rateLimitMaxRequests: null,
+      rateLimitWindowSeconds: null,
+      expiresAt: null,
+      createdAt: '2026-07-21T12:00:00.000Z',
+    };
+    mocks.writeFile.mockReturnValueOnce(autosave.promise);
+    mocks.updateShare.mockReturnValueOnce(mutation.promise);
+    mocks.listShares
+      .mockResolvedValueOnce({ shares: [activeShare] })
+      .mockResolvedValueOnce({ shares: [{ ...activeShare, isActive: false }] });
+
+    renderApps();
+    await waitForAlphaFile();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Share' }));
+    expect(await screen.findByText('/share/autosave-token')).toBeVisible();
+    fireEvent.change(screen.getByLabelText('Mock project editor'), { target: { value: 'alpha:changed while sharing' } });
+
+    const beta = screen.getByRole('button', { name: 'beta' });
+    act(() => { beta.click(); });
+    await waitFor(() => expect(mocks.writeFile).toHaveBeenCalledWith('alpha', 'one.ts', 'alpha:changed while sharing'));
+    act(() => { screen.getByRole('button', { name: 'Active' }).click(); });
+    expect(mocks.updateShare).toHaveBeenCalledWith('alpha', 'autosave-share', { isActive: false });
+    expect(screen.getByTestId('route-operation-owner')).toHaveTextContent('owned');
+
+    await act(async () => {
+      autosave.resolve({ ok: true });
+      await autosave.promise;
+    });
+    expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page');
+    expect(mocks.getTree).not.toHaveBeenCalledWith('beta');
+
+    await act(async () => {
+      mutation.resolve({ ok: true });
+      await mutation.promise;
+    });
+    await waitFor(() => expect(screen.getByTestId('route-operation-owner')).toHaveTextContent('idle'));
   });
 
   it('clears stale share controls after failed readback and single-flights an explicit retry', async () => {

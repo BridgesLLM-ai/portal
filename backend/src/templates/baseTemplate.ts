@@ -16,10 +16,14 @@
  * The card-based design ensures readability regardless of outer bg.
  */
 
-import { PrismaClient } from '@prisma/client';
 import { APPEARANCE_DEFAULTS } from '../config/settings.schema';
-
-const prisma = new PrismaClient();
+import { prisma } from '../config/database';
+import {
+  DEFAULT_PORTAL_LOGO_PATH,
+  absolutePortalBrandingAssetUrl,
+  normalizePortalAccentColor,
+  normalizePortalBrandingAssetUrl,
+} from '../services/portalBranding';
 
 export interface EmailBranding {
   portalName: string;
@@ -28,37 +32,55 @@ export interface EmailBranding {
   siteUrl: string;       // e.g. "https://bridgesllm.com"
 }
 
-const DEFAULT_BRANDING: EmailBranding = {
-  portalName: APPEARANCE_DEFAULTS.portalName,
-  logoUrl: '',
-  accentColor: APPEARANCE_DEFAULTS.accentColor,
-  siteUrl: process.env.PORTAL_URL || 'https://localhost',
-};
+export const EMAIL_BRANDING_SETTING_KEYS = Object.freeze([
+  'appearance.portalName',
+  'appearance.logoUrl',
+  'appearance.accentColor',
+] as const);
+
+export function isEmailBrandingSettingKey(key: string): boolean {
+  return (EMAIL_BRANDING_SETTING_KEYS as readonly string[]).includes(key);
+}
+
+function getDefaultBranding(): EmailBranding {
+  const siteUrl = process.env.PORTAL_URL || 'https://localhost';
+  return {
+    portalName: APPEARANCE_DEFAULTS.portalName,
+    logoUrl: absolutePortalBrandingAssetUrl(siteUrl, DEFAULT_PORTAL_LOGO_PATH),
+    accentColor: APPEARANCE_DEFAULTS.accentColor,
+    siteUrl,
+  };
+}
 
 /**
  * Load portal branding from the database.
  * Call this once per email send, pass the result to baseTemplate.
  */
 export async function getEmailBranding(): Promise<EmailBranding> {
+  const defaultBranding = getDefaultBranding();
   try {
-    const keys = ['appearance.portalName', 'appearance.logoUrl', 'appearance.accentColor'];
-    const settings = await prisma.systemSetting.findMany({ where: { key: { in: keys } } });
+    const settings = await prisma.systemSetting.findMany({
+      where: { key: { in: [...EMAIL_BRANDING_SETTING_KEYS] } },
+    });
     const map: Record<string, string> = {};
     for (const s of settings) map[s.key] = s.value;
 
-    const siteUrl = process.env.PORTAL_URL || 'https://localhost';
-    const logoPath = map['appearance.logoUrl'] || '';
-    // Convert relative logo path to absolute URL
-    const logoUrl = logoPath && !logoPath.startsWith('http') ? `${siteUrl}${logoPath}` : logoPath;
+    const logoUrl = absolutePortalBrandingAssetUrl(
+      defaultBranding.siteUrl,
+      map['appearance.logoUrl'] || DEFAULT_PORTAL_LOGO_PATH,
+    ) || defaultBranding.logoUrl;
 
     return {
-      portalName: map['appearance.portalName'] || DEFAULT_BRANDING.portalName,
+      portalName: map['appearance.portalName'] || defaultBranding.portalName,
       logoUrl,
-      accentColor: map['appearance.accentColor'] || DEFAULT_BRANDING.accentColor,
-      siteUrl,
+      accentColor: normalizePortalAccentColor(
+        map['appearance.accentColor'],
+        defaultBranding.accentColor,
+      ),
+      siteUrl: defaultBranding.siteUrl,
     };
   } catch {
-    return { ...DEFAULT_BRANDING };
+    return defaultBranding;
   }
 }
 
@@ -81,29 +103,55 @@ function getInitial(name: string): string {
   return (name.charAt(0) || 'B').toUpperCase();
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 /**
  * Cache branding for up to 5 minutes so we don't hit the DB on every email.
  */
 let _cachedBranding: EmailBranding | null = null;
 let _cacheTs = 0;
+let _cacheGeneration = 0;
 const CACHE_TTL = 5 * 60 * 1000;
 
 export async function getCachedBranding(): Promise<EmailBranding> {
   if (_cachedBranding && Date.now() - _cacheTs < CACHE_TTL) return _cachedBranding;
-  _cachedBranding = await getEmailBranding();
-  _cacheTs = Date.now();
-  return _cachedBranding;
+  const generation = _cacheGeneration;
+  const loaded = await getEmailBranding();
+  if (generation === _cacheGeneration) {
+    _cachedBranding = loaded;
+    _cacheTs = Date.now();
+  }
+  return loaded;
+}
+
+/** Clear the small in-process notification branding cache after a committed write. */
+export function invalidateEmailBrandingCache(): void {
+  _cacheGeneration += 1;
+  _cachedBranding = null;
+  _cacheTs = 0;
 }
 
 export function baseTemplate(content: string, preheaderText?: string, branding?: EmailBranding): string {
-  const b = branding || DEFAULT_BRANDING;
-  const accent = b.accentColor || '#6366f1';
+  const b = branding || getDefaultBranding();
+  const portalName = b.portalName || APPEARANCE_DEFAULTS.portalName;
+  const safePortalName = escapeHtml(portalName);
+  const normalizedLogoUrl = normalizePortalBrandingAssetUrl(b.logoUrl);
+  const safeLogoUrl = escapeHtml(normalizedLogoUrl);
+  const accent = normalizePortalAccentColor(b.accentColor, APPEARANCE_DEFAULTS.accentColor);
   const accentDark = darkenAccent(accent);
-  const initial = getInitial(b.portalName);
+  const initial = escapeHtml(getInitial(portalName));
+  const safePreheaderText = preheaderText ? escapeHtml(preheaderText) : '';
 
   // Logo: use custom image if available, otherwise letter in gradient box
-  const logoHtml = b.logoUrl
-    ? `<img src="${b.logoUrl}" alt="${b.portalName}" width="48" height="48" style="display:block; width:48px; height:48px; border-radius:12px; object-fit:contain;" />`
+  const logoHtml = normalizedLogoUrl
+    ? `<img src="${safeLogoUrl}" alt="${safePortalName}" width="48" height="48" style="display:block; width:48px; height:48px; border-radius:12px; object-fit:contain;" />`
     : `<!--[if mso]>
                     <v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" style="width:48px;height:48px;v-text-anchor:middle;" arcsize="25%" fillcolor="${accentDark}" strokecolor="${accent}" strokeweight="1px">
                       <v:textbox inset="0,0,0,0">
@@ -133,8 +181,8 @@ export function baseTemplate(content: string, preheaderText?: string, branding?:
     </xml>
   </noscript>
   <![endif]-->
-  <title>${b.portalName}</title>
-  ${preheaderText ? `<!--[if !mso]><!--><span style="display:none;font-size:0;color:#111827;max-height:0;overflow:hidden;mso-hide:all;">${preheaderText}</span><!--<![endif]-->` : ''}
+  <title>${safePortalName}</title>
+  ${safePreheaderText ? `<!--[if !mso]><!--><span style="display:none;font-size:0;color:#111827;max-height:0;overflow:hidden;mso-hide:all;">${safePreheaderText}</span><!--<![endif]-->` : ''}
   <style>
     :root { color-scheme: dark; supported-color-schemes: dark; }
     body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
@@ -192,7 +240,7 @@ export function baseTemplate(content: string, preheaderText?: string, branding?:
                 </tr>
               </table>
               <p style="margin:12px 0 0; font-size:20px; font-weight:700; color:#ffffff; letter-spacing:-0.3px;">
-                ${b.portalName}
+                ${safePortalName}
               </p>
             </td>
           </tr>
@@ -206,7 +254,7 @@ export function baseTemplate(content: string, preheaderText?: string, branding?:
           <tr>
             <td align="center" style="padding:20px 32px; background-color:#0a0f1e; border-top:1px solid #1e293b;" bgcolor="#0a0f1e">
               <p style="margin:0; font-size:11px; color:#64748b; line-height:1.6;">
-                ${b.portalName} &bull; Automated notification<br>
+                ${safePortalName} &bull; Automated notification<br>
                 You received this email because of your account activity.
               </p>
             </td>

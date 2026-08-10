@@ -1137,6 +1137,24 @@ function validatePayload(
   if (!timingSafeEqualText(envelope.mac, evidenceMac(payload, secret))) {
     fail('EVIDENCE_MAC', 'Project qualification evidence authentication failed');
   }
+  // Classify an authenticated, structurally current envelope as expired before
+  // comparing it with today's sandbox/runtime policy. Portal updates can
+  // legitimately change that policy after the evidence has already expired;
+  // reporting the old envelope as corrupt leaves the user with a scary dead
+  // end instead of the correct recovery action: prepare the provider again.
+  // The MAC and qualification version are verified first, so an attacker
+  // cannot forge timestamps to downgrade an invalid envelope into EXPIRED.
+  const qualifiedAt = Date.parse(payload.qualifiedAt);
+  const expiresAt = Date.parse(payload.expiresAt);
+  if (!Number.isFinite(qualifiedAt) || !Number.isFinite(expiresAt) || expiresAt <= qualifiedAt) {
+    fail('EVIDENCE_TIME', 'Project qualification evidence timestamps are invalid');
+  }
+  if (qualifiedAt > now.getTime() + 60_000) {
+    fail('EVIDENCE_FUTURE', 'Project qualification evidence was issued in the future');
+  }
+  if (expiresAt <= now.getTime()) {
+    fail('EVIDENCE_EXPIRED', 'Project qualification evidence has expired');
+  }
   // Ollama evidence carries the exact model tag and immutable digest proved by
   // the authenticated loopback bridge. Read-only capability/status checks do
   // not query Ollama, so reconstruct that selection only after the evidence
@@ -1240,17 +1258,6 @@ function validatePayload(
     if (payload[key as keyof OpenClawProjectQualificationPayload] !== value) {
       fail('EVIDENCE_CONTEXT_DRIFT', 'Project qualification evidence no longer matches the current sandbox policy');
     }
-  }
-  const qualifiedAt = Date.parse(payload.qualifiedAt);
-  const expiresAt = Date.parse(payload.expiresAt);
-  if (!Number.isFinite(qualifiedAt) || !Number.isFinite(expiresAt) || expiresAt <= qualifiedAt) {
-    fail('EVIDENCE_TIME', 'Project qualification evidence timestamps are invalid');
-  }
-  if (qualifiedAt > now.getTime() + 60_000) {
-    fail('EVIDENCE_FUTURE', 'Project qualification evidence was issued in the future');
-  }
-  if (expiresAt <= now.getTime()) {
-    fail('EVIDENCE_EXPIRED', 'Project qualification evidence has expired');
   }
   const requiredProbes = requiredProbesFor(provider);
   if (!Array.isArray(payload.probes) || payload.probes.length !== requiredProbes.length) {

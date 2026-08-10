@@ -1,12 +1,14 @@
 import { EventEmitter } from 'events';
 
 const execFileSyncMock = jest.fn();
+const execFileMock = jest.fn();
 const spawnMock = jest.fn();
 const prepareWorkloadMock = jest.fn();
 const removeWorkloadMock = jest.fn();
 const resolveImageMock = jest.fn();
 
 jest.mock('child_process', () => ({
+  execFile: execFileMock,
   execFileSync: execFileSyncMock,
   spawn: spawnMock,
 }));
@@ -28,9 +30,12 @@ import {
   copyDesktopRuntimeDeploymentTree,
   copyFullstackDeploymentTree,
   copyStaticDeploymentTree,
+  prepareFullstackDeploymentTree,
+  ProjectDeploymentReplayStaleError,
   PROJECT_RUNTIME_GID,
   PROJECT_RUNTIME_IMAGE,
   PROJECT_RUNTIME_UID,
+  prepareProjectChatLifecycleWorkspace,
   runProjectLifecycleCommand,
   spawnProjectLifecycleCommand,
 } from '../services/project-lifecycle.service';
@@ -60,6 +65,10 @@ function makeChild() {
 describe('project lifecycle sandbox', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    execFileMock.mockImplementation((_file, _args, _options, callback) => {
+      callback(null, '', '');
+      return makeChild();
+    });
     execFileSyncMock.mockReturnValue('');
     resolveImageMock.mockResolvedValue(`sha256:${'a'.repeat(64)}`);
     prepareWorkloadMock.mockImplementation(async (options: any) => ({
@@ -68,6 +77,70 @@ describe('project lifecycle sandbox', () => {
       egressSpec: options.networked ? { internalNetworkName: 'egress-internal' } : null,
     }));
     removeWorkloadMock.mockResolvedValue(undefined);
+  });
+
+  it('prepares Project Chat ownership asynchronously without using synchronous chown', async () => {
+    const workspace = makeWorkspace();
+    let finish: ((error: Error | null, stdout?: string, stderr?: string) => void) | null = null;
+    execFileMock.mockImplementation((_file, _args, _options, callback) => {
+      finish = callback;
+      return makeChild();
+    });
+    try {
+      let settled = false;
+      const preparation = prepareProjectChatLifecycleWorkspace(workspace).then((value) => {
+        settled = true;
+        return value;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(settled).toBe(false);
+      expect(execFileSyncMock).not.toHaveBeenCalled();
+      expect(execFileMock).toHaveBeenCalledWith('/usr/bin/chown', [
+        '-R',
+        '--no-dereference',
+        `${PROJECT_RUNTIME_UID}:${PROJECT_RUNTIME_GID}`,
+        workspace,
+      ], expect.objectContaining({
+        timeout: 60_000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 64 * 1024,
+      }), expect.any(Function));
+
+      finish!(null, '', '');
+      await expect(preparation).resolves.toBe(workspace);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds Project Chat ownership failures and preserves workspace link rejection', async () => {
+    const workspace = makeWorkspace();
+    const link = `${workspace}-link`;
+    symlinkSync(workspace, link);
+    try {
+      await expect(prepareProjectChatLifecycleWorkspace(link)).rejects.toThrow(
+        'Project lifecycle workspace cannot be a symbolic link',
+      );
+      expect(execFileMock).not.toHaveBeenCalled();
+
+      execFileMock.mockImplementationOnce((_file, _args, _options, callback) => {
+        callback(Object.assign(new Error('private chown detail'), {
+          killed: true,
+          code: 'ETIMEDOUT',
+        }), '', '');
+        return makeChild();
+      });
+      await expect(prepareProjectChatLifecycleWorkspace(workspace)).rejects.toMatchObject({
+        name: 'ProjectLifecycleWorkspacePreparationError',
+        code: 'PROJECT_WORKSPACE_PREPARATION_FAILED',
+        retryable: true,
+        message: 'Project workspace ownership preparation exceeded 60 seconds.',
+      });
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
   it('keeps the legacy builder non-root, one-bind, capability-free, and offline', () => {
@@ -273,6 +346,67 @@ describe('project lifecycle sandbox', () => {
       promotion.rollback();
       expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('old');
       expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
+  it('prepares a fullstack tree without changing the live deployment before admission', () => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-fullstack-prepare-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'server.js'), 'old');
+      copyFullstackDeploymentTree(workspace, destination).finalize();
+      writeFileSync(path.join(workspace, 'server.js'), 'new');
+
+      const prepared = prepareFullstackDeploymentTree(workspace, destination);
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('old');
+      expect(prepared.sourceDigest).toMatch(/^[a-f0-9]{64}$/);
+
+      prepared.rollback();
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('old');
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+
+      const admitted = prepareFullstackDeploymentTree(workspace, destination);
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('old');
+      admitted.promote();
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('new');
+      admitted.finalize();
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
+  it('replays a fullstack deployment only for the exact copied source digest', () => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-fullstack-replay-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'server.js'), 'attempted source');
+      const failedAttempt = copyFullstackDeploymentTree(workspace, destination);
+      expect(failedAttempt.sourceDigest).toMatch(/^[a-f0-9]{64}$/);
+      const attemptedDigest = failedAttempt.sourceDigest;
+      failedAttempt.rollback();
+      expect(() => readFileSync(path.join(destination, 'server.js'), 'utf8')).toThrow();
+
+      writeFileSync(path.join(workspace, 'server.js'), 'changed in another tab');
+      expect(() => copyFullstackDeploymentTree(
+        workspace,
+        destination,
+        attemptedDigest,
+      )).toThrow(ProjectDeploymentReplayStaleError);
+      expect(() => readFileSync(path.join(destination, 'server.js'), 'utf8')).toThrow();
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+
+      writeFileSync(path.join(workspace, 'server.js'), 'attempted source');
+      const exactReplay = copyFullstackDeploymentTree(workspace, destination, attemptedDigest);
+      expect(exactReplay.sourceDigest).toBe(attemptedDigest);
+      exactReplay.finalize();
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('attempted source');
     } finally {
       rmSync(workspace, { recursive: true, force: true });
       rmSync(destinationParent, { recursive: true, force: true });

@@ -17,6 +17,32 @@ export interface ResolveContainedPathOptions {
   kind?: ContainedPathKind;
 }
 
+export interface ContainedPathOwnership {
+  uid: number;
+  gid: number;
+}
+
+export interface EnsureContainedDirectoryOptions {
+  ownership?: ContainedPathOwnership;
+}
+
+function assertValidOwnership(ownership: ContainedPathOwnership): void {
+  if (
+    !Number.isSafeInteger(ownership.uid)
+    || ownership.uid < 0
+    || !Number.isSafeInteger(ownership.gid)
+    || ownership.gid < 0
+  ) {
+    throw new ContainedPathError('Invalid contained path ownership');
+  }
+}
+
+function applyDescriptorOwnership(descriptor: number, ownership?: ContainedPathOwnership): void {
+  if (!ownership) return;
+  assertValidOwnership(ownership);
+  fs.fchownSync(descriptor, ownership.uid, ownership.gid);
+}
+
 function assertSafeRelativePath(requestedPath: unknown): string {
   if (typeof requestedPath !== 'string' || requestedPath.length === 0) {
     throw new ContainedPathError('A relative path is required');
@@ -120,7 +146,11 @@ export function resolveContainedPath(
 }
 
 /** Create missing directories one component at a time and reject link swaps. */
-export function ensureContainedDirectory(baseDir: string, requestedPath: string): string {
+export function ensureContainedDirectory(
+  baseDir: string,
+  requestedPath: string,
+  options: EnsureContainedDirectoryOptions = {},
+): string {
   const base = path.resolve(baseDir);
   const baseStat = fs.lstatSync(base);
   if (baseStat.isSymbolicLink() || !baseStat.isDirectory()) {
@@ -144,6 +174,30 @@ export function ensureContainedDirectory(baseDir: string, requestedPath: string)
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
       throw new ContainedPathError('Directory path contains a non-directory or symbolic link');
     }
+    if (options.ownership) {
+      const flags = fs.constants.O_RDONLY
+        | (fs.constants.O_DIRECTORY || 0)
+        | (fs.constants.O_NOFOLLOW || 0);
+      const descriptor = fs.openSync(next, flags);
+      try {
+        const opened = fs.fstatSync(descriptor);
+        if (!opened.isDirectory() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+          throw new ContainedPathError('Directory changed while ownership was being assigned');
+        }
+        applyDescriptorOwnership(descriptor, options.ownership);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+    }
+    const postOwnershipStat = fs.lstatSync(next);
+    if (
+      postOwnershipStat.isSymbolicLink()
+      || !postOwnershipStat.isDirectory()
+      || postOwnershipStat.dev !== stat.dev
+      || postOwnershipStat.ino !== stat.ino
+    ) {
+      throw new ContainedPathError('Directory changed while ownership was being assigned');
+    }
     current = fs.realpathSync(next);
     if (!isPathContained(canonicalBase, current)) {
       throw new ContainedPathError('Canonical directory escapes containment root');
@@ -161,13 +215,20 @@ export function writeContainedFileAtomic(
   baseDir: string,
   requestedPath: string,
   content: string | Buffer,
-  options: { encoding?: BufferEncoding; exclusive?: boolean; maxBytes?: number } = {},
+  options: {
+    encoding?: BufferEncoding;
+    exclusive?: boolean;
+    maxBytes?: number;
+    ownership?: ContainedPathOwnership;
+  } = {},
 ): string {
   const relative = assertSafeRelativePath(requestedPath);
   const parentRelative = path.dirname(relative);
   const parent = parentRelative === '.'
     ? fs.realpathSync(path.resolve(baseDir))
-    : ensureContainedDirectory(baseDir, parentRelative.split(path.sep).join('/'));
+    : ensureContainedDirectory(baseDir, parentRelative.split(path.sep).join('/'), {
+      ownership: options.ownership,
+    });
   const fileName = path.basename(relative);
   const finalPath = resolveContainedPath(baseDir, relative.split(path.sep).join('/'), { mustExist: false });
 
@@ -202,6 +263,7 @@ export function writeContainedFileAtomic(
     } else {
       fs.writeFileSync(fd, content, { encoding: options.encoding || 'utf8' });
     }
+    applyDescriptorOwnership(fd, options.ownership);
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;

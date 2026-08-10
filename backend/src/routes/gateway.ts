@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'fs';
 import { execFile, execFileSync } from 'child_process';
 import path from 'path';
 import { AgentRegistry, AgentProviderName } from '../agents';
@@ -74,6 +74,9 @@ import {
   reserveLogicalRun,
   acknowledgeRunReservation,
   failPendingRunReservation,
+  parkUnconfirmedRunReservation,
+  registerRun,
+  clearRun,
   isConnected as isPersistentWsConnected,
   reconnectNow as reconnectPersistentWs,
   type ExecApprovalRequest as PersistentApprovalRequest,
@@ -150,6 +153,11 @@ import {
 import {
   assertOpenClawGatewayAuthorizationFenceReleased,
 } from '../services/openClawGatewayAuthorizationFence';
+import {
+  buildPortalOpenClawIdempotencyKey,
+  normalizePortalClientMessageId,
+  portalClientMessageIdFromIdempotencyKey,
+} from '../agents/providers/PortalMessageIdentity';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -970,6 +978,27 @@ function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
   }
 }
 
+function resolveOpenClawDistBundleWithMarkers(prefix: string, markers: string[]): string | null {
+  try {
+    const openClawDistDir = getOpenClawDistDir();
+    if (!existsSync(openClawDistDir)) return null;
+    const matches = readdirSync(openClawDistDir)
+      .filter((name) => name.startsWith(prefix) && name.endsWith('.js'))
+      .map((name) => path.join(openClawDistDir, name))
+      .filter((candidate) => {
+        const text = readFileSync(candidate, 'utf8');
+        return markers.every((marker) => text.includes(marker));
+      })
+      .sort((a, b) => {
+        const sizeDiff = statSync(b).size - statSync(a).size;
+        return sizeDiff !== 0 ? sizeDiff : path.basename(a).localeCompare(path.basename(b));
+      });
+    return matches.length === 1 ? matches[0] : null;
+  } catch {
+    return null;
+  }
+}
+
 function resolveOpenClawExtensionImportedBundle(extensionRelativePath: string, prefix: string | string[]): string | null {
   try {
     const openClawDistDir = getOpenClawDistDir();
@@ -996,6 +1025,11 @@ function getOpenClawCompatibilityHotfixStatus() {
   const replyBundlePath = resolveOpenClawDistBundle(['get-reply-', 'reply-']);
   const claudeLiveSessionPath = resolveOpenClawDistBundle('claude-live-session-');
   const executeRuntimePath = resolveOpenClawDistBundle('execute.runtime-');
+  const claudeCliSharedPath = resolveOpenClawDistBundleWithMarkers('cli-shared-', [
+    'const CLAUDE_DISALLOWED_TOOLS_ARG = "--disallowedTools";',
+    'function resolveClaudePermissionMode(context) {',
+    'function normalizeClaudeBackendConfig(config, context) {',
+  ]);
   const geminiCliBackendPath = resolveOpenClawExtensionImportedBundle('extensions/google/cli-backend.js', 'cli-backend-')
     || resolveOpenClawDistBundle('cli-backend-')
     || (existsSync(path.join(openClawDistDir, 'extensions/google/cli-backend.js'))
@@ -1019,6 +1053,9 @@ function getOpenClawCompatibilityHotfixStatus() {
     : '';
   const executeRuntimeText = executeRuntimePath && existsSync(executeRuntimePath)
     ? readFileSync(executeRuntimePath, 'utf8')
+    : '';
+  const claudeCliSharedText = claudeCliSharedPath && existsSync(claudeCliSharedPath)
+    ? readFileSync(claudeCliSharedPath, 'utf8')
     : '';
   const geminiCliBackendText = geminiCliBackendPath && existsSync(geminiCliBackendPath)
     ? readFileSync(geminiCliBackendPath, 'utf8')
@@ -1044,6 +1081,45 @@ function getOpenClawCompatibilityHotfixStatus() {
   const executeRuntimeWiringPatched = executeRuntimeNativeToolWiring
     || executeRuntimeText.includes('onToolEvent: (event) => {');
   const geminiRuntimePatched = geminiParserPatched && executeRuntimeWiringPatched;
+  const claudeAskUserSupported = Boolean(claudeCliSharedPath);
+  const claudeAskUserPatched = claudeCliSharedText.includes('bridgesllm-openclaw-claude-ask-user-route-v2')
+    && claudeCliSharedText.includes('function ensureClaudeDisallowedTool(args, toolName) {')
+    && claudeCliSharedText.includes('\tif (!args) return args;')
+    && claudeCliSharedText.includes('args: ensureClaudeDisallowedTool(')
+    && claudeCliSharedText.includes('resumeArgs: ensureClaudeDisallowedTool(');
+  let claudeAskUserBridgeReady = false;
+  let claudeAskUserTimeoutsReady = false;
+  let askUserPluginVersionReady = false;
+  try {
+    const stateRoot = path.join(process.env.HOME || '/root', '.openclaw');
+    const config = JSON.parse(readFileSync(path.join(stateRoot, 'openclaw.json'), 'utf8'));
+    const pluginEntry = config?.plugins?.entries?.['bridgesllm-ask-user'];
+    const allow = config?.plugins?.allow;
+    const claudeBackend = config?.agents?.defaults?.cliBackends?.['claude-cli'];
+    const claudeEnv = claudeBackend?.env;
+    claudeAskUserTimeoutsReady = typeof claudeBackend?.command === 'string'
+      && claudeBackend.command.trim().length > 0
+      && claudeEnv?.MCP_TOOL_TIMEOUT === '660000'
+      && claudeEnv?.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT === '660000';
+    const bundledPackage = JSON.parse(readFileSync(
+      path.join(PORTAL_ROOT, 'installer/openclaw-ask-user-plugin/package.json'),
+      'utf8',
+    ));
+    const installedPackage = JSON.parse(readFileSync(
+      path.join(stateRoot, 'extensions/bridgesllm-ask-user/package.json'),
+      'utf8',
+    ));
+    askUserPluginVersionReady = typeof bundledPackage?.version === 'string'
+      && bundledPackage.version.length > 0
+      && installedPackage?.version === bundledPackage.version;
+    claudeAskUserBridgeReady = config?.plugins?.enabled !== false
+      && pluginEntry?.enabled === true
+      && (allow === undefined || (Array.isArray(allow) && allow.includes('bridgesllm-ask-user')))
+      && askUserPluginVersionReady
+      && claudeAskUserTimeoutsReady;
+  } catch {
+    claudeAskUserBridgeReady = false;
+  }
   const relaySupported = Boolean(heartbeatRunnerPath) && Boolean(replyBundlePath);
   const geminiSupported = Boolean(executeRuntimePath) && Boolean(geminiCliBackendPath);
 
@@ -1051,12 +1127,23 @@ function getOpenClawCompatibilityHotfixStatus() {
   if (!relaySupported && !geminiSupported) issues.push('Could not locate the OpenClaw runtime bundles targeted by the compatibility hotfix.');
   if ((heartbeatRunnerPath || replyBundlePath) && !relaySupported) issues.push('Could not locate both relay hotfix bundles (heartbeat runner and get-reply).');
   if ((claudeLiveSessionPath || executeRuntimePath || geminiCliBackendPath) && !geminiSupported) issues.push('Could not locate the Gemini CLI hotfix targets (execute runtime and google cli backend).');
+  if (!claudeAskUserSupported) issues.push('Could not locate exactly one Claude CLI normalization bundle for ask-user routing.');
+  if (!claudeAskUserBridgeReady) issues.push('The Portal ask-user plugin and both 11-minute Claude MCP timeout settings must be installed before patching native Claude question routing.');
+
+  const supported = scriptExists
+    && issues.length === 0
+    && (relaySupported || geminiSupported)
+    && claudeAskUserSupported
+    && claudeAskUserBridgeReady;
+  const applied = supported
+    && (relaySupported ? detectorPatched && relayPatched && replyPatched : true)
+    && (geminiSupported ? geminiCliPatched && geminiCliYoloPatched && geminiRuntimePatched : true)
+    && claudeAskUserPatched;
 
   return {
     scriptExists,
-    supported: scriptExists && issues.length === 0 && (relaySupported || geminiSupported),
-    applied: (relaySupported ? detectorPatched && relayPatched && replyPatched : true)
-      && (geminiSupported ? geminiCliPatched && geminiCliYoloPatched && geminiRuntimePatched : true),
+    supported,
+    applied,
     relaySupported,
     geminiSupported,
     detectorPatched,
@@ -1065,12 +1152,237 @@ function getOpenClawCompatibilityHotfixStatus() {
     geminiCliPatched,
     geminiCliYoloPatched,
     geminiRuntimePatched,
+    claudeAskUserSupported,
+    claudeAskUserPatched,
+    claudeAskUserBridgeReady,
+    claudeAskUserTimeoutsReady,
+    askUserPluginVersionReady,
     executeRuntimeNativeToolWiring,
     heartbeatRunner: heartbeatRunnerPath ? path.basename(heartbeatRunnerPath) : null,
     replyBundle: replyBundlePath ? path.basename(replyBundlePath) : null,
     executeRuntime: executeRuntimePath ? path.basename(executeRuntimePath) : null,
+    claudeCliShared: claudeCliSharedPath ? path.basename(claudeCliSharedPath) : null,
     geminiCliBackend: geminiCliBackendPath ? path.relative(openClawDistDir, geminiCliBackendPath) : null,
     issues,
+  };
+}
+
+interface OpenClawAskUserRuntimeReadiness {
+  ready: boolean;
+  pluginLoaded: boolean;
+  toolExecutionCallable: boolean;
+  pendingMethodCallable: boolean;
+  answerMethodCallable: boolean;
+  dismissMethodCallable: boolean;
+  steerMethodCallable: boolean;
+  issue?: string;
+}
+
+interface OpenClawAskUserRuntimeReadinessDependencies {
+  runCli: typeof runOpenClawCli;
+  callGatewayRpc: typeof gatewayRpcCall;
+  readBundledVersion: () => string;
+  resolveRealPath: (target: string) => string;
+  stateRoot: string;
+}
+
+const REQUIRED_ASK_USER_GATEWAY_METHODS = new Set([
+  'bridgesllm.ask_user.probe',
+  'bridgesllm.ask_user.pending',
+  'bridgesllm.ask_user.answer',
+  'bridgesllm.ask_user.dismiss',
+  'bridgesllm.ask_user.steer',
+]);
+
+function askUserRuntimeReportIsReady(params: {
+  report: any;
+  expectedVersion: string;
+  expectedRoot: string;
+  expectedSource: string;
+  resolveRealPath: (target: string) => string;
+}): boolean {
+  const { report, expectedVersion, expectedRoot, expectedSource, resolveRealPath } = params;
+  const plugin = report?.plugin;
+  const toolNames = plugin?.toolNames;
+  const typedHooks = report?.typedHooks;
+  const gatewayMethods = report?.gatewayMethods;
+  const diagnostics = report?.diagnostics;
+  let pluginPathsReady = false;
+  try {
+    pluginPathsReady = typeof plugin?.rootDir === 'string'
+      && typeof plugin?.source === 'string'
+      && resolveRealPath(plugin.rootDir) === resolveRealPath(expectedRoot)
+      && resolveRealPath(plugin.source) === resolveRealPath(expectedSource);
+  } catch {
+    pluginPathsReady = false;
+  }
+  return Boolean(
+    expectedVersion
+    && plugin?.id === 'bridgesllm-ask-user'
+    && plugin?.version === expectedVersion
+    && plugin?.status === 'loaded'
+    && plugin?.enabled === true
+    && plugin?.activated === true
+    && !plugin?.error
+    && pluginPathsReady
+    && Array.isArray(toolNames)
+    && toolNames.includes('ask_user_question')
+    && plugin?.hookCount === 1
+    && Array.isArray(typedHooks)
+    && typedHooks.some((item: any) => item?.name === 'before_tool_call')
+    && Array.isArray(gatewayMethods)
+    && [...REQUIRED_ASK_USER_GATEWAY_METHODS].every((method) => gatewayMethods.includes(method))
+    && Array.isArray(diagnostics)
+    && !diagnostics.some((item: any) => item?.level === 'error')
+  );
+}
+
+async function getOpenClawAskUserRuntimeReadiness(
+  dependencyOverrides: Partial<OpenClawAskUserRuntimeReadinessDependencies> = {},
+): Promise<OpenClawAskUserRuntimeReadiness> {
+  const defaultStateRoot = path.join(process.env.HOME || '/root', '.openclaw');
+  const dependencies: OpenClawAskUserRuntimeReadinessDependencies = {
+    runCli: runOpenClawCli,
+    callGatewayRpc: gatewayRpcCall,
+    readBundledVersion: () => {
+      const bundledPackage = JSON.parse(readFileSync(
+        path.join(PORTAL_ROOT, 'installer/openclaw-ask-user-plugin/package.json'),
+        'utf8',
+      ));
+      return typeof bundledPackage?.version === 'string' ? bundledPackage.version : '';
+    },
+    resolveRealPath: (target) => realpathSync(target),
+    stateRoot: defaultStateRoot,
+    ...dependencyOverrides,
+  };
+  let expectedVersion = '';
+  try {
+    expectedVersion = dependencies.readBundledVersion();
+  } catch {
+    return {
+      ready: false,
+      pluginLoaded: false,
+      toolExecutionCallable: false,
+      pendingMethodCallable: false,
+      answerMethodCallable: false,
+      dismissMethodCallable: false,
+      steerMethodCallable: false,
+      issue: 'Could not read the bundled ask-user plugin version.',
+    };
+  }
+
+  const inspection = await dependencies.runCli(
+    ['plugins', 'inspect', 'bridgesllm-ask-user', '--json', '--runtime'],
+    12_000,
+  );
+  const report = inspection.ok ? parseJsonLoose(inspection.stdout) : null;
+  const expectedRoot = path.join(
+    dependencies.stateRoot,
+    'extensions/bridgesllm-ask-user',
+  );
+  const pluginLoaded = askUserRuntimeReportIsReady({
+    report,
+    expectedVersion,
+    expectedRoot,
+    expectedSource: path.join(expectedRoot, 'index.js'),
+    resolveRealPath: dependencies.resolveRealPath,
+  });
+  if (!pluginLoaded) {
+    return {
+      ready: false,
+      pluginLoaded: false,
+      toolExecutionCallable: false,
+      pendingMethodCallable: false,
+      answerMethodCallable: false,
+      dismissMethodCallable: false,
+      steerMethodCallable: false,
+      issue: inspection.ok
+        ? 'The ask-user plugin is installed but its runtime tool, hook, or gateway methods are not fully active.'
+        : `OpenClaw could not inspect the ask-user plugin runtime: ${inspection.stderr || inspection.error || 'unknown error'}`,
+    };
+  }
+
+  const nonce = randomUUID();
+  const sessionKey = `agent:main:bridgesllm-ask-user-readiness-${nonce}`;
+  const expectedRunId = `readiness-${nonce}`;
+  const requestId = `readiness-request-${nonce}`;
+  const semanticProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.probe', {
+    nonce,
+  }, 10_000);
+  const toolExecutionCallable = semanticProbe.ok
+    && semanticProbe.data?.ok === true
+    && semanticProbe.data?.code === 'SEMANTIC_PROBE_OK'
+    && semanticProbe.data?.toolName === 'ask_user_question'
+    && semanticProbe.data?.answer === true
+    && semanticProbe.data?.dismiss === true
+    && semanticProbe.data?.steer === true;
+
+  const pendingProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.pending', {
+    sessionKey,
+    expectedRunId,
+  }, 10_000);
+  const pendingMethodCallable = pendingProbe.ok
+    && pendingProbe.data?.pending === false
+    && pendingProbe.data?.code === 'NO_ACTIVE_RUN';
+
+  const answerProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.answer', {
+    sessionKey,
+    expectedRunId,
+    requestId,
+    text: 'BridgesLLM readiness probe.',
+  }, 10_000);
+  const answerMethodCallable = answerProbe.ok
+    && answerProbe.data?.accepted === false
+    && answerProbe.data?.code === 'NO_ACTIVE_RUN'
+    && answerProbe.data?.requestId === requestId;
+
+  const dismissProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.dismiss', {
+    sessionKey,
+    expectedRunId,
+    requestId,
+  }, 10_000);
+  const dismissMethodCallable = dismissProbe.ok
+    && dismissProbe.data?.accepted === false
+    && dismissProbe.data?.code === 'NO_ACTIVE_RUN'
+    && dismissProbe.data?.requestId === requestId;
+
+  const steerProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.steer', {
+    sessionKey,
+    expectedRunId,
+    requestId,
+    text: 'BridgesLLM readiness probe.',
+  }, 10_000);
+  const steerMethodCallable = steerProbe.ok
+    && steerProbe.data?.accepted === false
+    && steerProbe.data?.code === 'NO_ACTIVE_RUN'
+    && steerProbe.data?.requestId === requestId;
+  const ready = toolExecutionCallable
+    && pendingMethodCallable
+    && answerMethodCallable
+    && dismissMethodCallable
+    && steerMethodCallable;
+  const failedProbe = !toolExecutionCallable
+    ? ['tool execution', semanticProbe]
+    : !pendingMethodCallable
+      ? ['pending', pendingProbe]
+      : !answerMethodCallable
+        ? ['answer', answerProbe]
+        : !dismissMethodCallable
+          ? ['dismiss', dismissProbe]
+          : !steerMethodCallable
+            ? ['steer', steerProbe]
+            : null;
+  return {
+    ready,
+    pluginLoaded: true,
+    toolExecutionCallable,
+    pendingMethodCallable,
+    answerMethodCallable,
+    dismissMethodCallable,
+    steerMethodCallable,
+    ...(ready ? {} : {
+      issue: `The ask-user plugin loaded, but its ${failedProbe?.[0]} semantic probe failed: ${(failedProbe?.[1] as any)?.errorMessage || (failedProbe?.[1] as any)?.error || 'unexpected response'}`,
+    }),
   };
 }
 
@@ -2974,6 +3286,121 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
   return inactiveOpenClawSnapshot('unknown', false);
 }
 
+type OpenClawConflictRunProbe =
+  | { state: 'active'; runId: string }
+  | { state: 'inactive' }
+  | { state: 'unknown' };
+
+function exactOpenClawSessionRows(payload: any, agentId: string): any[] {
+  if (Array.isArray(payload?.sessions)) return payload.sessions;
+  const requested = payload?.agents?.[agentId]?.sessions;
+  if (Array.isArray(requested)) return requested;
+  if (!payload?.agents || typeof payload.agents !== 'object') return [];
+  return Object.values(payload.agents).flatMap((agent: any) => (
+    Array.isArray(agent?.sessions) ? agent.sessions : []
+  ));
+}
+
+function parseExactOpenClawConflictRun(
+  payload: any,
+  sessionKey: string,
+): OpenClawConflictRunProbe {
+  const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
+  const exactRows = exactOpenClawSessionRows(payload, agentId)
+    .filter((candidate: any) => candidate?.key === sessionKey);
+  if (exactRows.length !== 1) return { state: 'unknown' };
+
+  const row = exactRows[0];
+  const runIds: string[] = Array.isArray(row.activeRunIds)
+    ? [...new Set<string>(row.activeRunIds
+      .map((value: unknown) => typeof value === 'string' ? value.trim() : '')
+      .filter(Boolean))]
+    : [];
+  if (runIds.length === 1 && row.hasActiveRun === true) {
+    return { state: 'active', runId: runIds[0] };
+  }
+  if (runIds.length === 0 && row.hasActiveRun === false) {
+    return { state: 'inactive' };
+  }
+  return { state: 'unknown' };
+}
+
+/**
+ * A chat.send conflict can come from OpenClaw after the Portal's pending
+ * reservation has already been cleared. In that state sessions.describe does
+ * not expose the replacement run identity, so attaching its projection leaves
+ * the browser fenced forever. Rebuild the local lane only from one exact
+ * sessions.list identity; contradictory/multiple results remain fail-closed.
+ */
+async function reconcileOpenClawActiveTurnConflict(
+  sessionKey: string,
+): Promise<OpenClawActiveStreamSnapshot> {
+  const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
+  // sessions.list is an asynchronous observation. Bind its result to the
+  // exact local lane that existed when the probe began so a new tab/queued
+  // send cannot be replaced or cleared by an older upstream snapshot.
+  const predecessorWasTracked = Boolean(streamEventBus.getTrackedStream(sessionKey));
+  const predecessorIdentity = captureHostStreamRunIdentity(sessionKey);
+  let result: Awaited<ReturnType<typeof gatewayRpcCall>>;
+  try {
+    result = await gatewayRpcCall('sessions.list', {
+      agentId,
+      search: sessionKey,
+      limit: 50,
+    }, 10_000);
+  } catch {
+    return inactiveOpenClawSnapshot('unknown', false);
+  }
+  if (!result.ok) return inactiveOpenClawSnapshot('unknown', false);
+
+  const currentTracked = streamEventBus.getTrackedStream(sessionKey);
+  const predecessorIsCurrent = predecessorWasTracked
+    ? hostStreamRunIdentityMatches(currentTracked, predecessorIdentity)
+    : currentTracked === null;
+  if (!predecessorIsCurrent) {
+    return inactiveOpenClawSnapshot('unknown', false);
+  }
+
+  const probe = parseExactOpenClawConflictRun(result.data, sessionKey);
+  if (probe.state === 'inactive') {
+    // The exact upstream row proves the conflicting turn is gone. Clear any
+    // stale local reservation and the exact captured bus lane so the queued
+    // browser message can proceed. clearRun owns provider correlation state;
+    // the bus is a separate concurrency fence and must be CAS-cleared too.
+    clearRun(sessionKey);
+    clearHostStreamIfCurrentRun(sessionKey, predecessorIdentity);
+    return inactiveOpenClawSnapshot('terminal', true);
+  }
+  if (probe.state !== 'active') return inactiveOpenClawSnapshot('unknown', false);
+
+  const trackedRunId = normalizeHostStreamRunId(streamEventBus.getTrackedStream(sessionKey)?.runId);
+  if (trackedRunId && trackedRunId !== probe.runId) {
+    // Exact predecessor CAS: never replace an in-memory lane merely because an
+    // unrelated run appeared somewhere in the sessions.list response.
+    if (!registerRun(sessionKey, probe.runId, trackedRunId)) {
+      return inactiveOpenClawSnapshot('unknown', false);
+    }
+  }
+
+  // reserve+ack clears the provider's failed-reservation fence as well as
+  // installing the exact run in StreamEventBus. Calling startStream alone
+  // would look healthy in the browser while PersistentGatewayWs still dropped
+  // every subsequent frame.
+  if (!reserveLogicalRun(sessionKey, probe.runId)) {
+    return inactiveOpenClawSnapshot('unknown', false);
+  }
+  if (!acknowledgeRunReservation(sessionKey, probe.runId, probe.runId)) {
+    failPendingRunReservation(sessionKey, probe.runId);
+    return inactiveOpenClawSnapshot('unknown', false);
+  }
+  streamEventBus.publish(sessionKey, {
+    type: 'run_resumed',
+    content: '',
+    runId: probe.runId,
+  });
+  return getProviderOwnedBusStreamSnapshot(sessionKey);
+}
+
 function normalizeRuntimeHistoryMatchText(text: unknown): string {
   return sanitizeHistoryText(typeof text === 'string' ? text : '')
     .replace(/\s+/g, ' ')
@@ -3047,7 +3474,7 @@ type RuntimeHistorySegment = {
   subject?: string;
   position: 'before' | 'after' | 'between';
   kind: 'thinking' | 'text';
-  source?: 'status' | 'reasoning' | 'text';
+  source?: 'status' | 'reasoning' | 'preamble' | 'text';
   ts: number;
   order: number;
 };
@@ -3227,7 +3654,7 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
           event.text || '',
           event.ts,
           event.replace === true,
-          'reasoning',
+          event.source?.preambleProgress === true ? 'preamble' : 'reasoning',
           event.subject,
         );
       } else if (event.type === 'tool_started' || event.type === 'tool_output') {
@@ -3297,23 +3724,769 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
   });
 }
 
-function reconcileMergedRuntimeHistoryContent(existing: any, runtimeMessage: any): string {
+const RUNTIME_HISTORY_MATCH_WINDOW_MS = 5 * 60_000;
+const RUNTIME_HISTORY_ACTIVITY_MAX_SPAN_MS = 24 * 60 * 60_000;
+const RUNTIME_HISTORY_INDEX_WORK_LIMIT = 200_000;
+const RUNTIME_HISTORY_OWNERSHIP_ENTRY_LIMIT = 20_000;
+
+type RuntimeHistoryWorkBudget = { remaining: number; exhausted?: boolean };
+
+type RuntimeHistoryWorkLimits = {
+  turnIndex?: number;
+  ownership?: number;
+  match?: number;
+  prune?: number;
+};
+
+type RuntimeHistoryTurnIndex = {
+  sourceTurns: number[];
+  users: Array<{ timestamp: number; turn: number }>;
+  assistantsByTurn: Map<number, number[]>;
+  exactAssistants: Map<string, number[]>;
+};
+
+type RuntimeHistoryRepresentation = {
+  ownerIndex: number;
+  timestamp: number;
+  explicit: boolean;
+};
+
+type RuntimeHistoryToolRepresentation = RuntimeHistoryRepresentation & { tool: any };
+
+type RuntimeHistoryOwnershipIndex = {
+  segments: Map<string, RuntimeHistoryRepresentation[]>;
+  tools: Map<string, RuntimeHistoryToolRepresentation[]>;
+};
+
+type RuntimeHistoryMatch = {
+  runtimeMessage: any;
+  matchIndex: number;
+  coherentRepresentedText: string[];
+};
+
+function consumeRuntimeHistoryWork(budget: RuntimeHistoryWorkBudget, amount = 1): boolean {
+  if (amount <= 0) return true;
+  if (budget.remaining < amount) {
+    budget.remaining = 0;
+    budget.exhausted = true;
+    return false;
+  }
+  budget.remaining -= amount;
+  return true;
+}
+
+function runtimeHistoryWorkLimit(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : RUNTIME_HISTORY_INDEX_WORK_LIMIT;
+}
+
+function finiteRuntimeHistoryTimestamp(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  if (typeof value !== 'string') return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function isCanonicalRuntimeHistoryAssistant(message: any): boolean {
+  if (message?.role !== 'assistant' || message?.__portal?.kind === 'runtime-turn-event-history') return false;
+  const provenance = typeof message?.provenance === 'string'
+    ? message.provenance.trim().toLowerCase()
+    : '';
+  return !['gemini-cli-import', 'trajectory-recovery', 'runtime-turn-event-history'].includes(provenance);
+}
+
+function runtimeHistoryTurnContentKey(turn: number, content: string): string {
+  return JSON.stringify([turn, content]);
+}
+
+function normalizeRuntimeHistorySegmentSource(kind: 'text' | 'thinking', value: unknown): string {
+  return typeof value === 'string' && value.trim()
+    ? value.trim().toLowerCase()
+    : kind === 'thinking' ? 'reasoning' : 'text';
+}
+
+function normalizeRuntimeHistorySegmentPosition(value: unknown): 'before' | 'between' | 'after' {
+  return value === 'between' || value === 'after' ? value : 'before';
+}
+
+function runtimeHistorySegmentKey(
+  turn: number,
+  kind: 'text' | 'thinking',
+  text: string,
+  subject: unknown,
+  source: unknown,
+  position: unknown,
+): string {
+  return JSON.stringify([
+    turn,
+    kind,
+    kind === 'thinking' ? sanitizeThinkingSubject(subject) : '',
+    normalizeRuntimeHistorySegmentSource(kind, source),
+    normalizeRuntimeHistorySegmentPosition(position),
+    text,
+  ]);
+}
+
+function runtimeHistoryToolMergeKey(tool: any): string {
+  const id = typeof tool?.id === 'string' ? tool.id.trim() : '';
+  if (id) return JSON.stringify(['id', id]);
+  return JSON.stringify(['fallback',
+    typeof tool?.name === 'string' ? tool.name.trim() : '',
+    typeof tool?.startedAt === 'number' ? tool.startedAt : null,
+    typeof tool?.endedAt === 'number' ? tool.endedAt : null,
+  ]);
+}
+
+function runtimeHistoryToolOwnershipKey(tool: any): string {
+  return runtimeHistoryToolMergeKey(tool);
+}
+
+function normalizeRuntimeHistoryToolValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value.replace(/\r\n/g, '\n');
+  try {
+    return JSON.stringify(value) || '';
+  } catch {
+    return null;
+  }
+}
+
+function runtimeHistoryTerminalStatus(value: unknown): 'done' | 'error' | null {
+  return value === 'done' || value === 'error' ? value : null;
+}
+
+function buildRuntimeHistoryTurnIndex(
+  messages: any[],
+  budget: RuntimeHistoryWorkBudget,
+): RuntimeHistoryTurnIndex | null {
+  const sourceTurns: number[] = [];
+  const users: RuntimeHistoryTurnIndex['users'] = [];
+  const assistantsByTurn = new Map<number, number[]>();
+  const exactAssistants = new Map<string, number[]>();
+  let turn = -1;
+
+  for (let index = 0; index < messages.length; index += 1) {
+    if (!consumeRuntimeHistoryWork(budget)) return null;
+    const message = messages[index];
+    if (message?.role === 'user') {
+      const timestamp = finiteRuntimeHistoryTimestamp(message?.timestamp);
+      // An unorderable user prompt is a hard turn fence. Guessing around it can
+      // prune a different turn's evidence, so disable reconciliation entirely.
+      if (timestamp === null) return null;
+      turn += 1;
+      users.push({ timestamp, turn });
+      sourceTurns[index] = turn;
+      continue;
+    }
+    sourceTurns[index] = turn;
+    if (!isCanonicalRuntimeHistoryAssistant(message) || isToolOnlyAssistantHistoryMessage(message)) continue;
+    const assistants = assistantsByTurn.get(turn) || [];
+    assistants.push(index);
+    assistantsByTurn.set(turn, assistants);
+    const content = normalizeRuntimeHistoryMatchText(message?.content);
+    if (!content) continue;
+    const key = runtimeHistoryTurnContentKey(turn, content);
+    const exact = exactAssistants.get(key) || [];
+    exact.push(index);
+    exactAssistants.set(key, exact);
+  }
+
+  return { sourceTurns, users, assistantsByTurn, exactAssistants };
+}
+
+function resolveRuntimeHistoryTurnAt(
+  turnIndex: RuntimeHistoryTurnIndex,
+  timestamp: number,
+): number | null {
+  let low = 0;
+  let high = turnIndex.users.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (turnIndex.users[middle].timestamp < timestamp) low = middle + 1;
+    else high = middle;
+  }
+  // Millisecond timestamps do not establish whether the event came before or
+  // after a user row at the same instant. Keep evidence instead of guessing.
+  if (low < turnIndex.users.length && turnIndex.users[low].timestamp === timestamp) return null;
+  return low > 0 ? turnIndex.users[low - 1].turn : -1;
+}
+
+function buildRuntimeHistoryOwnershipIndex(
+  messages: any[],
+  turnIndex: RuntimeHistoryTurnIndex,
+  budget: RuntimeHistoryWorkBudget,
+): RuntimeHistoryOwnershipIndex | null {
+  const segments = new Map<string, RuntimeHistoryRepresentation[]>();
+  const tools = new Map<string, RuntimeHistoryToolRepresentation[]>();
+  let entries = 0;
+  const addSegment = (
+    ownerIndex: number,
+    kind: 'text' | 'thinking',
+    textValue: unknown,
+    timestampValue: unknown,
+    subjectValue?: unknown,
+    sourceValue?: unknown,
+    positionValue?: unknown,
+    explicit = false,
+  ): boolean => {
+    if (typeof textValue !== 'string' || !textValue.trim()) return true;
+    if (!consumeRuntimeHistoryWork(budget)) return false;
+    const timestamp = finiteRuntimeHistoryTimestamp(timestampValue);
+    const text = normalizeRuntimeHistoryMatchText(textValue);
+    if (timestamp === null || !text) return true;
+    entries += 1;
+    if (entries > RUNTIME_HISTORY_OWNERSHIP_ENTRY_LIMIT) {
+      budget.exhausted = true;
+      return false;
+    }
+    const key = runtimeHistorySegmentKey(
+      turnIndex.sourceTurns[ownerIndex] ?? -1,
+      kind,
+      text,
+      subjectValue,
+      sourceValue,
+      positionValue,
+    );
+    const owners = segments.get(key) || [];
+    owners.push({ ownerIndex, timestamp, explicit });
+    segments.set(key, owners);
+    return true;
+  };
+
+  for (let ownerIndex = 0; ownerIndex < messages.length; ownerIndex += 1) {
+    if (!consumeRuntimeHistoryWork(budget)) return null;
+    const message = messages[ownerIndex];
+    if (!isCanonicalRuntimeHistoryAssistant(message)) continue;
+    const messageTimestamp = finiteRuntimeHistoryTimestamp(message?.timestamp);
+    if (messageTimestamp === null) continue;
+    if (!addSegment(ownerIndex, 'text', message?.content, messageTimestamp, '', 'text', 'before')) return null;
+    if (!addSegment(
+      ownerIndex,
+      'thinking',
+      message?.thinkingContent,
+      messageTimestamp,
+      '',
+      'reasoning',
+      'before',
+    )) return null;
+    for (const segment of Array.isArray(message?.segments) ? message.segments : []) {
+      if (!addSegment(
+        ownerIndex,
+        segment?.kind === 'thinking' ? 'thinking' : 'text',
+        segment?.text,
+        segment?.ts ?? messageTimestamp,
+        segment?.subject,
+        segment?.source,
+        segment?.position,
+        true,
+      )) return null;
+    }
+    for (const tool of Array.isArray(message?.toolCalls) ? message.toolCalls : []) {
+      if (!consumeRuntimeHistoryWork(budget)) return null;
+      const timestamp = finiteRuntimeHistoryTimestamp(tool?.startedAt ?? messageTimestamp);
+      if (timestamp === null) continue;
+      entries += 1;
+      if (entries > RUNTIME_HISTORY_OWNERSHIP_ENTRY_LIMIT) {
+        budget.exhausted = true;
+        return null;
+      }
+      const key = JSON.stringify([
+        turnIndex.sourceTurns[ownerIndex] ?? -1,
+        runtimeHistoryToolOwnershipKey(tool),
+      ]);
+      const owners = tools.get(key) || [];
+      owners.push({ ownerIndex, timestamp, explicit: true, tool });
+      tools.set(key, owners);
+    }
+  }
+
+  return { segments, tools };
+}
+
+function isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage: any, timestamp: number): boolean {
+  const terminalTimestamp = finiteRuntimeHistoryTimestamp(runtimeMessage?.timestamp);
+  return terminalTimestamp !== null
+    && timestamp >= terminalTimestamp - RUNTIME_HISTORY_ACTIVITY_MAX_SPAN_MS
+    && timestamp <= terminalTimestamp + RUNTIME_HISTORY_MATCH_WINDOW_MS;
+}
+
+function findUniqueRuntimeHistorySegmentOwner(
+  runtimeMessage: any,
+  segment: any,
+  turnIndex: RuntimeHistoryTurnIndex,
+  ownership: RuntimeHistoryOwnershipIndex,
+  allowedIndexes: ReadonlySet<number>,
+  excludedIndex: number,
+  budget: RuntimeHistoryWorkBudget,
+): number {
+  const timestamp = finiteRuntimeHistoryTimestamp(segment?.ts);
+  const text = normalizeRuntimeHistoryMatchText(segment?.text);
+  if (timestamp === null || !text || !isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage, timestamp)) return -1;
+  const turn = resolveRuntimeHistoryTurnAt(turnIndex, timestamp);
+  if (turn === null) return -1;
+  const key = runtimeHistorySegmentKey(
+    turn,
+    segment?.kind === 'thinking' ? 'thinking' : 'text',
+    text,
+    segment?.subject,
+    segment?.source,
+    segment?.position,
+  );
+  const owners = new Set<number>();
+  for (const entry of ownership.segments.get(key) || []) {
+    if (!consumeRuntimeHistoryWork(budget)) return -1;
+    if (
+      (entry.ownerIndex === excludedIndex && !entry.explicit)
+      || !allowedIndexes.has(entry.ownerIndex)
+      || Math.abs(entry.timestamp - timestamp) > RUNTIME_HISTORY_MATCH_WINDOW_MS
+    ) continue;
+    owners.add(entry.ownerIndex);
+    if (owners.size > 1) return -1;
+  }
+  return owners.size === 1 ? [...owners][0] : -1;
+}
+
+function durableToolFullyRepresentsRuntimeTool(durable: any, runtime: any): boolean {
+  const runtimeName = typeof runtime?.name === 'string' ? runtime.name.trim() : '';
+  const durableName = typeof durable?.name === 'string' ? durable.name.trim() : '';
+  if (runtimeName && durableName !== runtimeName) return false;
+  const runtimeArguments = normalizeRuntimeHistoryToolValue(runtime?.arguments);
+  const durableArguments = normalizeRuntimeHistoryToolValue(durable?.arguments);
+  if (runtimeArguments !== null && durableArguments !== runtimeArguments) return false;
+  const runtimeResult = normalizeRuntimeHistoryToolValue(runtime?.result);
+  const durableResult = normalizeRuntimeHistoryToolValue(durable?.result);
+  if (runtimeResult !== null && durableResult !== runtimeResult) return false;
+  const runtimeStatus = runtimeHistoryTerminalStatus(runtime?.status);
+  const durableStatus = runtimeHistoryTerminalStatus(durable?.status);
+  return !runtimeStatus || durableStatus === runtimeStatus;
+}
+
+function hasUniqueRuntimeHistoryToolOwner(
+  runtimeMessage: any,
+  runtimeTool: any,
+  turnIndex: RuntimeHistoryTurnIndex,
+  ownership: RuntimeHistoryOwnershipIndex,
+  allowedIndexes: ReadonlySet<number>,
+  budget: RuntimeHistoryWorkBudget,
+): boolean {
+  const timestamp = finiteRuntimeHistoryTimestamp(runtimeTool?.startedAt);
+  if (timestamp === null || !isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage, timestamp)) return false;
+  const hasEndedAt = runtimeTool?.endedAt !== undefined;
+  const rawEndedAt = finiteRuntimeHistoryTimestamp(runtimeTool?.endedAt);
+  if (
+    hasEndedAt
+    && (
+      rawEndedAt === null
+      || rawEndedAt < timestamp
+      || !isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage, rawEndedAt)
+    )
+  ) return false;
+  const endedAt = rawEndedAt !== null
+    ? rawEndedAt
+    : null;
+  const turn = resolveRuntimeHistoryTurnAt(turnIndex, timestamp);
+  if (turn === null) return false;
+  const key = JSON.stringify([turn, runtimeHistoryToolOwnershipKey(runtimeTool)]);
+  const entriesByOwner = new Map<number, RuntimeHistoryToolRepresentation[]>();
+  for (const entry of ownership.tools.get(key) || []) {
+    if (!consumeRuntimeHistoryWork(budget)) return false;
+    if (
+      !allowedIndexes.has(entry.ownerIndex)
+      || Math.min(
+        Math.abs(entry.timestamp - timestamp),
+        endedAt === null ? Number.POSITIVE_INFINITY : Math.abs(entry.timestamp - endedAt),
+      ) > RUNTIME_HISTORY_MATCH_WINDOW_MS
+    ) continue;
+    const entries = entriesByOwner.get(entry.ownerIndex) || [];
+    entries.push(entry);
+    entriesByOwner.set(entry.ownerIndex, entries);
+  }
+  if (entriesByOwner.size !== 1) return false;
+  const entries = [...entriesByOwner.values()][0];
+  return entries.length > 0 && entries.every((entry) => (
+    durableToolFullyRepresentsRuntimeTool(entry.tool, runtimeTool)
+  ));
+}
+
+function reconcileMergedRuntimeHistoryContent(
+  existing: any,
+  runtimeMessage: any,
+  coherentRepresentedRuntimeText?: string[],
+): string {
   const existingContent = typeof existing?.content === 'string' ? existing.content : '';
   const runtimeContent = typeof runtimeMessage?.content === 'string' ? runtimeMessage.content : '';
   if (!runtimeContent.trim()) return existingContent;
-  const representedRuntimeText = (Array.isArray(runtimeMessage?.segments) ? runtimeMessage.segments : [])
-    .filter((segment: any) => segment?.kind === 'text' && typeof segment?.text === 'string')
-    .map((segment: any) => segment.text);
+  const representedRuntimeText = coherentRepresentedRuntimeText
+    ?? (Array.isArray(runtimeMessage?.segments) ? runtimeMessage.segments : [])
+      .filter((segment: any) => segment?.kind === 'text' && typeof segment?.text === 'string')
+      .map((segment: any) => segment.text);
   if (representedRuntimeText.length === 0) return existingContent;
 
+  const runtimeResidual = reconcileRuntimeCumulativeFinalTail(representedRuntimeText, runtimeContent);
   const existingResidual = reconcileRuntimeCumulativeFinalTail(
     representedRuntimeText,
     existingContent,
   );
   return normalizeRuntimeHistoryMatchText(existingResidual)
-    === normalizeRuntimeHistoryMatchText(runtimeContent)
-    ? runtimeContent
+    === normalizeRuntimeHistoryMatchText(runtimeResidual)
+    ? runtimeResidual
     : existingContent;
+}
+
+function residualRuntimeHistoryTimestamp(
+  runtimeMessage: any,
+  segments: any[],
+  tools: any[],
+): unknown {
+  const terminalTimestamp = finiteRuntimeHistoryTimestamp(runtimeMessage?.timestamp);
+  if (terminalTimestamp === null) return runtimeMessage?.timestamp;
+  const activityTimestamps = [
+    ...segments.map((segment) => finiteRuntimeHistoryTimestamp(segment?.ts)),
+    ...tools.map((tool) => finiteRuntimeHistoryTimestamp(tool?.startedAt)),
+  ].filter((timestamp): timestamp is number => (
+    timestamp !== null
+    && timestamp <= terminalTimestamp
+    && isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage, timestamp)
+  ));
+  return activityTimestamps.length > 0
+    ? new Date(Math.min(...activityTimestamps)).toISOString()
+    : runtimeMessage?.timestamp;
+}
+
+function findRuntimeHistoryTerminalMatch(
+  messages: any[],
+  runtimeMessage: any,
+  turnIndex: RuntimeHistoryTurnIndex,
+  ownership: RuntimeHistoryOwnershipIndex | null,
+  allSourceIndexes: ReadonlySet<number>,
+  availableIndexes: ReadonlySet<number>,
+  budget: RuntimeHistoryWorkBudget,
+): { matchIndex: number; coherentRepresentedText: string[] } {
+  const runtimeTimestamp = finiteRuntimeHistoryTimestamp(runtimeMessage?.timestamp);
+  const runtimeText = normalizeRuntimeHistoryMatchText(runtimeMessage?.content);
+  if (runtimeTimestamp === null || !runtimeText) return { matchIndex: -1, coherentRepresentedText: [] };
+  const turn = resolveRuntimeHistoryTurnAt(turnIndex, runtimeTimestamp);
+  if (turn === null) return { matchIndex: -1, coherentRepresentedText: [] };
+
+  const coherentRepresentedText: string[] = [];
+  if (ownership) {
+    for (const segment of Array.isArray(runtimeMessage?.segments) ? runtimeMessage.segments : []) {
+      if (!consumeRuntimeHistoryWork(budget)) return { matchIndex: -1, coherentRepresentedText: [] };
+      if (
+        segment?.kind === 'text'
+        && segment?.source === 'text'
+        && findUniqueRuntimeHistorySegmentOwner(
+          runtimeMessage,
+          segment,
+          turnIndex,
+          ownership,
+          allSourceIndexes,
+          -1,
+          budget,
+        ) >= 0
+      ) coherentRepresentedText.push(segment.text);
+    }
+  }
+
+  const candidates = new Set<number>();
+  for (const index of turnIndex.exactAssistants.get(runtimeHistoryTurnContentKey(turn, runtimeText)) || []) {
+    if (!consumeRuntimeHistoryWork(budget)) return { matchIndex: -1, coherentRepresentedText: [] };
+    candidates.add(index);
+  }
+  for (const index of turnIndex.assistantsByTurn.get(turn) || []) {
+    if (!consumeRuntimeHistoryWork(budget)) return { matchIndex: -1, coherentRepresentedText: [] };
+    const hasExactStructuredTerminal = (Array.isArray(messages[index]?.segments)
+      ? messages[index].segments
+      : []).some((segment: any) => (
+      segment?.position === 'after'
+      && segment?.kind !== 'thinking'
+      && normalizeRuntimeHistoryMatchText(segment?.text) === runtimeText
+    ));
+    if (hasExactStructuredTerminal) candidates.add(index);
+  }
+  if (coherentRepresentedText.length > 0) {
+    const runtimeResidual = normalizeRuntimeHistoryMatchText(
+      reconcileRuntimeCumulativeFinalTail(coherentRepresentedText, runtimeMessage.content),
+    );
+    for (const index of turnIndex.assistantsByTurn.get(turn) || []) {
+      if (!consumeRuntimeHistoryWork(budget)) return { matchIndex: -1, coherentRepresentedText: [] };
+      const candidateResidual = normalizeRuntimeHistoryMatchText(
+        reconcileRuntimeCumulativeFinalTail(coherentRepresentedText, messages[index]?.content || ''),
+      );
+      if (candidateResidual && candidateResidual === runtimeResidual) candidates.add(index);
+    }
+  }
+
+  const eligible = [...candidates].filter((index) => {
+    if (!availableIndexes.has(index)) return false;
+    const candidateTimestamp = finiteRuntimeHistoryTimestamp(messages[index]?.timestamp);
+    return candidateTimestamp !== null
+      && Math.abs(candidateTimestamp - runtimeTimestamp) <= RUNTIME_HISTORY_MATCH_WINDOW_MS;
+  });
+  return eligible.length === 1
+    ? { matchIndex: eligible[0], coherentRepresentedText }
+    : { matchIndex: -1, coherentRepresentedText };
+}
+
+function getRuntimeHistoryPreviewRetainedSourceIndexes(
+  messages: any[],
+  overlayMessages: any[],
+  limit: number,
+  budget: RuntimeHistoryWorkBudget,
+): { sourceIndexes: ReadonlySet<number>; overlayIndexes: ReadonlySet<number> } | null {
+  if (!consumeRuntimeHistoryWork(
+    budget,
+    messages.length + overlayMessages.length,
+  )) return null;
+  const retained = [
+    ...messages.map((message, sourceIndex) => ({ message, sourceIndex, overlayIndex: -1 })),
+    ...overlayMessages.map((message, overlayIndex) => ({ message, sourceIndex: -1, overlayIndex })),
+  ]
+    .sort((left, right) => (
+      toHistoryTimestampMs(left.message?.timestamp) - toHistoryTimestampMs(right.message?.timestamp)
+    ))
+    .slice(-Math.max(limit, 1));
+  return {
+    sourceIndexes: new Set(retained.flatMap((entry) => (
+      entry.sourceIndex >= 0 ? [entry.sourceIndex] : []
+    ))),
+    overlayIndexes: new Set(retained.flatMap((entry) => (
+      entry.overlayIndex >= 0 ? [entry.overlayIndex] : []
+    ))),
+  };
+}
+
+function failClosedRuntimeHistory(
+  messages: any[],
+  runtimeMessages: any[],
+  limit: number,
+): any[] {
+  return [...messages, ...runtimeMessages]
+    .sort((left, right) => toHistoryTimestampMs(left?.timestamp) - toHistoryTimestampMs(right?.timestamp))
+    .slice(-Math.max(limit, 1));
+}
+
+function mergeRuntimeHistoryMessages(
+  messages: any[],
+  runtimeMessages: any[],
+  limit = 200,
+  workLimits: RuntimeHistoryWorkLimits = {},
+): any[] {
+  if (runtimeMessages.length === 0) return messages;
+  const combined = messages
+    .map((message) => ({ ...message }))
+    .sort((left, right) => toHistoryTimestampMs(left?.timestamp) - toHistoryTimestampMs(right?.timestamp));
+  const turnIndexBudget: RuntimeHistoryWorkBudget = {
+    remaining: runtimeHistoryWorkLimit(workLimits.turnIndex),
+  };
+  const turnIndex = buildRuntimeHistoryTurnIndex(
+    combined,
+    turnIndexBudget,
+  );
+  if (!turnIndex) return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+  const ownershipBudget: RuntimeHistoryWorkBudget = {
+    remaining: runtimeHistoryWorkLimit(workLimits.ownership),
+  };
+  const ownership = buildRuntimeHistoryOwnershipIndex(
+    combined,
+    turnIndex,
+    ownershipBudget,
+  );
+  if (!ownership) return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+  const matchBudget: RuntimeHistoryWorkBudget = {
+    remaining: runtimeHistoryWorkLimit(workLimits.match),
+  };
+  const allSourceIndexes = new Set(combined.map((_message, index) => index));
+  const availableIndexes = new Set(allSourceIndexes);
+  const matches: RuntimeHistoryMatch[] = runtimeMessages.map((runtimeMessage) => {
+    const match = findRuntimeHistoryTerminalMatch(
+      combined,
+      runtimeMessage,
+      turnIndex,
+      ownership,
+      allSourceIndexes,
+      availableIndexes,
+      matchBudget,
+    );
+    if (match.matchIndex >= 0) availableIndexes.delete(match.matchIndex);
+    return { runtimeMessage, ...match };
+  });
+  if (matchBudget.exhausted) return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+
+  const unmatchedRuntimeIndexes = new Set<number>();
+  matches.forEach((entry, index) => {
+    if (entry.matchIndex < 0) unmatchedRuntimeIndexes.add(index);
+  });
+  let plannedCombined: any[] | null = null;
+  let unmatchedRuntimeMessages: any[] = [];
+  let residualRuntimeMessages: any[] = [];
+  const pruneBudget: RuntimeHistoryWorkBudget = {
+    remaining: runtimeHistoryWorkLimit(workLimits.prune),
+  };
+  const initialRetainedIndexes = getRuntimeHistoryPreviewRetainedSourceIndexes(
+    combined,
+    [],
+    limit,
+    pruneBudget,
+  );
+  if (!initialRetainedIndexes) return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+  let retainedIndexes: ReadonlySet<number> = initialRetainedIndexes.sourceIndexes;
+  while (!plannedCombined) {
+    let changed = false;
+    matches.forEach((entry, index) => {
+      if (
+        entry.matchIndex >= 0
+        && !retainedIndexes.has(entry.matchIndex)
+        && !unmatchedRuntimeIndexes.has(index)
+      ) {
+        unmatchedRuntimeIndexes.add(index);
+        changed = true;
+      }
+    });
+    if (changed) continue;
+
+    const staged = combined.map((message) => ({ ...message }));
+    const stagedResidualRuntimeMessages: any[] = [];
+    const stagedResidualRuntimeIndexes: number[] = [];
+    const contentUnsafeRuntimeIndexes = new Set<number>();
+    for (let runtimeIndex = 0; runtimeIndex < matches.length; runtimeIndex += 1) {
+      const entry = matches[runtimeIndex];
+      if (unmatchedRuntimeIndexes.has(runtimeIndex)) continue;
+      const existing = staged[entry.matchIndex];
+      const runtimeSegments = Array.isArray(entry.runtimeMessage?.segments)
+        ? entry.runtimeMessage.segments
+        : [];
+      const runtimeTools = Array.isArray(entry.runtimeMessage?.toolCalls)
+        ? entry.runtimeMessage.toolCalls
+        : [];
+      const remainingSegments: any[] = [];
+      const retainedRepresentedText: string[] = [];
+      for (const segment of runtimeSegments) {
+        const ownerIndex = findUniqueRuntimeHistorySegmentOwner(
+          entry.runtimeMessage,
+          segment,
+          turnIndex,
+          ownership,
+          retainedIndexes,
+          entry.matchIndex,
+          pruneBudget,
+        );
+        if (ownerIndex < 0) remainingSegments.push(segment);
+        else if (segment?.kind === 'text' && segment?.source === 'text') {
+          retainedRepresentedText.push(segment.text);
+        }
+      }
+      const remainingTools: any[] = [];
+      for (const tool of runtimeTools) {
+        if (!hasUniqueRuntimeHistoryToolOwner(
+          entry.runtimeMessage,
+          tool,
+          turnIndex,
+          ownership,
+          retainedIndexes,
+          pruneBudget,
+        )) remainingTools.push(tool);
+      }
+      if (pruneBudget.exhausted) {
+        return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+      }
+      const runtimeText = normalizeRuntimeHistoryMatchText(entry.runtimeMessage?.content);
+      const exactContent = normalizeRuntimeHistoryMatchText(existing?.content) === runtimeText;
+      const exactStructuredTerminal = (Array.isArray(existing?.segments) ? existing.segments : [])
+        .some((segment: any) => (
+          segment?.position === 'after'
+          && segment?.kind !== 'thinking'
+          && normalizeRuntimeHistoryMatchText(segment?.text) === runtimeText
+        ));
+      const reconciledContent = reconcileMergedRuntimeHistoryContent(
+        existing,
+        entry.runtimeMessage,
+        retainedRepresentedText,
+      );
+      const cumulativeContent = normalizeRuntimeHistoryMatchText(reconciledContent)
+        === normalizeRuntimeHistoryMatchText(reconcileRuntimeCumulativeFinalTail(
+          retainedRepresentedText,
+          entry.runtimeMessage?.content || '',
+        ));
+      if (!exactContent && !exactStructuredTerminal && !cumulativeContent) {
+        contentUnsafeRuntimeIndexes.add(runtimeIndex);
+        continue;
+      }
+      if (reconciledContent !== existing?.content) {
+        staged[entry.matchIndex] = { ...existing, content: reconciledContent };
+      }
+      const residualRuntimeMessage = {
+        ...entry.runtimeMessage,
+        content: '',
+        timestamp: residualRuntimeHistoryTimestamp(
+          entry.runtimeMessage,
+          remainingSegments,
+          remainingTools,
+        ),
+        segments: remainingSegments.length > 0 ? remainingSegments : undefined,
+        toolCalls: remainingTools.length > 0 ? remainingTools : undefined,
+      };
+      if (
+        remainingSegments.length > 0
+        || remainingTools.length > 0
+        || (typeof residualRuntimeMessage.thinkingContent === 'string'
+          && residualRuntimeMessage.thinkingContent.trim())
+      ) {
+        stagedResidualRuntimeMessages.push(residualRuntimeMessage);
+        stagedResidualRuntimeIndexes.push(runtimeIndex);
+      }
+    }
+    if (contentUnsafeRuntimeIndexes.size > 0) {
+      contentUnsafeRuntimeIndexes.forEach((index) => unmatchedRuntimeIndexes.add(index));
+      continue;
+    }
+    const stagedUnmatchedRuntimeMessages = matches.flatMap((entry, index) => (
+      unmatchedRuntimeIndexes.has(index) ? [entry.runtimeMessage] : []
+    ));
+    const actualRetainedIndexes = getRuntimeHistoryPreviewRetainedSourceIndexes(
+      staged,
+      [...stagedUnmatchedRuntimeMessages, ...stagedResidualRuntimeMessages],
+      limit,
+      pruneBudget,
+    );
+    if (!actualRetainedIndexes || pruneBudget.exhausted) {
+      return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+    }
+    const unretainedResidualRuntimeIndexes = stagedResidualRuntimeIndexes.filter((_, index) => (
+      !actualRetainedIndexes.overlayIndexes.has(stagedUnmatchedRuntimeMessages.length + index)
+    ));
+    if (unretainedResidualRuntimeIndexes.length > 0) {
+      unretainedResidualRuntimeIndexes.forEach((index) => unmatchedRuntimeIndexes.add(index));
+      continue;
+    }
+    const narrowedRetainedIndexes = new Set(
+      [...retainedIndexes].filter((index) => actualRetainedIndexes.sourceIndexes.has(index)),
+    );
+    if (narrowedRetainedIndexes.size !== retainedIndexes.size) {
+      retainedIndexes = narrowedRetainedIndexes;
+      continue;
+    }
+    plannedCombined = staged;
+    unmatchedRuntimeMessages = stagedUnmatchedRuntimeMessages;
+    residualRuntimeMessages = stagedResidualRuntimeMessages;
+  }
+
+  const seen = new Set<string>();
+  return [...plannedCombined, ...unmatchedRuntimeMessages, ...residualRuntimeMessages]
+    .filter((message, index, all) => (
+      message?.__portal?.kind === 'runtime-turn-event-history'
+      || !isDuplicateToolOnlyAssistantHistoryMessage(message, index, all)
+    ))
+    .filter((message) => {
+      const id = typeof message?.id === 'string' ? message.id : '';
+      const key = id || `${message?.role}:${message?.timestamp}:${normalizeRuntimeHistoryMatchText(message?.content)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
+    .slice(-Math.max(limit, 1));
 }
 
 function mergeRuntimeTurnEventHistory(sessionKey: string, messages: any[], limit = 200): any[] {
@@ -3335,72 +4508,11 @@ function mergeRuntimeTurnEventHistory(sessionKey: string, messages: any[], limit
     eventLimit = Math.min(eventLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
   }
 
-  const runtimeMessages = buildRuntimeHistoryMessages(runtimeEvents);
-  if (runtimeMessages.length === 0) return messages;
-
-  const combined = messages.map((message) => ({ ...message }));
-  const findMatchingAssistantIndex = (runtimeMessage: any): number => {
-    const runtimeText = normalizeRuntimeHistoryMatchText(runtimeMessage?.content);
-    const runtimeTs = toHistoryTimestampMs(runtimeMessage?.timestamp);
-    let fallbackIndex = -1;
-    let fallbackDistance = Number.POSITIVE_INFINITY;
-
-    for (let index = 0; index < combined.length; index += 1) {
-      const candidate = combined[index];
-      if (candidate?.role !== 'assistant') continue;
-      const candidateText = normalizeRuntimeHistoryMatchText(candidate?.content);
-      const candidateTs = toHistoryTimestampMs(candidate?.timestamp);
-      const distance = runtimeTs && candidateTs ? Math.abs(runtimeTs - candidateTs) : Number.POSITIVE_INFINITY;
-
-      if (runtimeText && candidateText && runtimeText === candidateText) return index;
-      if (runtimeText && candidateText && (runtimeText.includes(candidateText) || candidateText.includes(runtimeText)) && distance < fallbackDistance) {
-        fallbackIndex = index;
-        fallbackDistance = distance;
-      } else if (!runtimeText && distance < 5 * 60 * 1000 && distance < fallbackDistance) {
-        fallbackIndex = index;
-        fallbackDistance = distance;
-      }
-    }
-
-    return fallbackIndex;
-  };
-
-  for (const runtimeMessage of runtimeMessages) {
-    const matchIndex = findMatchingAssistantIndex(runtimeMessage);
-    if (matchIndex >= 0) {
-      const existing = combined[matchIndex];
-      const existingSegments = Array.isArray(existing.segments) ? existing.segments : [];
-      const runtimeSegments = Array.isArray(runtimeMessage.segments) ? runtimeMessage.segments : [];
-      const existingTools = Array.isArray(existing.toolCalls) ? existing.toolCalls : [];
-      const runtimeTools = Array.isArray(runtimeMessage.toolCalls) ? runtimeMessage.toolCalls : [];
-      const mergedSegments = mergeHistorySegments(existingSegments, runtimeSegments);
-      const mergedTools = mergeHistoryToolCalls(existingTools, runtimeTools);
-      combined[matchIndex] = {
-        ...existing,
-        content: reconcileMergedRuntimeHistoryContent(existing, runtimeMessage),
-        model: existing.model || runtimeMessage.model,
-        provenance: existing.provenance || runtimeMessage.provenance,
-        segments: mergedSegments.length > 0 ? mergedSegments : existing.segments,
-        toolCalls: mergedTools.length > 0 ? mergedTools : existing.toolCalls,
-      };
-      continue;
-    }
-
-    combined.push(runtimeMessage);
-  }
-
-  const seen = new Set<string>();
-  return combined
-    .filter((message, index, all) => !isDuplicateToolOnlyAssistantHistoryMessage(message, index, all))
-    .filter((message) => {
-      const id = typeof message?.id === 'string' ? message.id : '';
-      const key = id || `${message?.role}:${message?.timestamp}:${normalizeRuntimeHistoryMatchText(message?.content)}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
-    .slice(-Math.max(limit, 1));
+  return mergeRuntimeHistoryMessages(
+    messages,
+    buildRuntimeHistoryMessages(runtimeEvents),
+    limit,
+  );
 }
 
 function getHistoryToolIds(message: any): string[] {
@@ -3411,6 +4523,7 @@ function getHistoryToolIds(message: any): string[] {
 
 function isToolOnlyAssistantHistoryMessage(message: any): boolean {
   if (!message || message.role !== 'assistant') return false;
+  if (message?.__portal?.kind === 'runtime-turn-event-history') return false;
   const content = typeof message.content === 'string' ? message.content.trim() : '';
   const hasThinking = typeof message.thinkingContent === 'string' && message.thinkingContent.trim().length > 0;
   const hasSegments = Array.isArray(message.segments) && message.segments.length > 0;
@@ -3591,6 +4704,12 @@ function collapseFragmentedToolOnlyAssistantHistory(messages: any[]): any[] {
   for (const message of messages) {
     if (isToolOnlyAssistantHistoryMessage(message)) {
       pendingToolOnly.push(message);
+      continue;
+    }
+
+    if (message?.__portal?.kind === 'runtime-turn-event-history' && pendingToolOnly.length > 0) {
+      flushPendingAsAggregate();
+      collapsed.push(message);
       continue;
     }
 
@@ -4007,10 +5126,12 @@ export const __gatewayHistoryTest = {
   readBoundedJsonlTailText,
   mergeHistorySegments,
   mergeHistoryToolCalls,
+  collapseFragmentedToolOnlyAssistantHistory,
   readBestOpenClawSessionMessagesForSessionKey,
   getOpenClawRuntimeActiveStreamSnapshot,
   getOpenClawActiveStreamSnapshot,
   buildRuntimeHistoryMessages,
+  mergeRuntimeHistoryMessages,
   mergeRuntimeText,
   reconcileRuntimeCumulativeFinalTail,
   reconcileMergedRuntimeHistoryContent,
@@ -4950,13 +6071,137 @@ function failDirectGatewayChatRun(sessionId: string, reservationRunId: string): 
   failPendingRunReservation(sessionId, reservationRunId);
 }
 
+interface DirectGatewayChatSendMeta {
+  method?: string;
+  sessionKey?: string;
+  reservationRunId?: string;
+  clientMessageId?: string;
+  idempotencyKey?: string;
+}
+
+function normalizeDirectGatewayClientMessageId(value: unknown): string | undefined {
+  const embedded = portalClientMessageIdFromIdempotencyKey(value);
+  if (embedded) return embedded;
+  if (typeof value !== 'string') return undefined;
+  let normalized = value.trim();
+  if (!normalized || normalized.length > 512 || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    return undefined;
+  }
+  if (normalized.endsWith(':user')) normalized = normalized.slice(0, -':user'.length);
+  if (normalized.startsWith('portal-')) normalized = normalized.slice('portal-'.length);
+  return normalizePortalClientMessageId(normalized);
+}
+
+function isDirectGatewayActiveTurnError(error: unknown): boolean {
+  if (typeof error === 'string') return /different run is already active|already has an active turn/i.test(error);
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as Record<string, unknown>;
+  if (typeof candidate.code === 'string' && candidate.code.trim().toUpperCase() === 'TURN_ACTIVE') {
+    return true;
+  }
+  const message = [candidate.message, candidate.error]
+    .find((value) => typeof value === 'string');
+  return typeof message === 'string'
+    && /different run is already active|already has an active turn/i.test(message);
+}
+
+async function buildDirectGatewayActiveTurnError(
+  sessionKey: string,
+  clientMessageId?: string,
+): Promise<Record<string, unknown>> {
+  let activeStream = getProviderOwnedBusStreamSnapshot(sessionKey);
+  if (!activeStream.active) {
+    activeStream = await reconcileOpenClawActiveTurnConflict(sessionKey);
+  }
+  return {
+    code: 'TURN_ACTIVE',
+    message: 'This chat already has an active turn. The Portal is reconnecting to it and queued your message.',
+    sessionKey,
+    ...(clientMessageId ? { clientMessageId } : {}),
+    activeStream: browserSafeActiveStreamSnapshot('OPENCLAW', activeStream),
+  };
+}
+
+/**
+ * Settle the direct proxy's synthetic run reservation before exposing the
+ * upstream chat.send response to the browser. Fast frames can arrive before
+ * this response and are buffered behind the reservation; forwarding success
+ * first leaves those frames quarantined forever and wedges the next send.
+ */
+async function settleDirectGatewayChatSendResponse(
+  meta: DirectGatewayChatSendMeta | undefined,
+  response: Record<string, any>,
+): Promise<Record<string, any>> {
+  if (
+    meta?.method !== 'chat.send'
+    || !meta.sessionKey
+    || !meta.reservationRunId
+  ) {
+    return response;
+  }
+
+  if (response.ok === true) {
+    const upstreamRunId = normalizeHostStreamRunId(
+      response.payload?.runId ?? response.result?.runId,
+    );
+    if (
+      upstreamRunId
+      && acknowledgeDirectGatewayChatRun(
+        meta.sessionKey,
+        meta.reservationRunId,
+        upstreamRunId,
+      )
+    ) {
+      return response;
+    }
+
+    // An accepted response without a usable run identity is ambiguous, not a
+    // rejection. Park the exact origin fence so a later trusted user mirror,
+    // sessions.list probe, or durable-history match can adopt the real run.
+    // Marking it failed here would tombstone the accepted turn while the
+    // browser is explicitly entering recovery.
+    parkUnconfirmedRunReservation(
+      meta.sessionKey,
+      meta.reservationRunId,
+      meta.idempotencyKey || '',
+    );
+    return {
+      ...response,
+      ok: false,
+      payload: undefined,
+      result: undefined,
+      error: {
+        code: 'CHAT_SEND_UNCONFIRMED',
+        message: upstreamRunId
+          ? 'The gateway acknowledged a stale chat turn. Reconnect and retry.'
+          : 'The gateway did not identify the accepted chat turn. Reconnect and retry.',
+        sessionKey: meta.sessionKey,
+        ...(meta.clientMessageId ? { clientMessageId: meta.clientMessageId } : {}),
+      },
+    };
+  }
+
+  failDirectGatewayChatRun(meta.sessionKey, meta.reservationRunId);
+  if (!isDirectGatewayActiveTurnError(response.error)) return response;
+
+  return {
+    ...response,
+    ok: false,
+    error: await buildDirectGatewayActiveTurnError(
+      meta.sessionKey,
+      meta.clientMessageId,
+    ),
+  };
+}
+
 function scheduleDirectGatewayChatRunTimeout(
   sessionId: string,
   reservationRunId: string,
+  idempotencyKey: string,
   onExpire: () => void,
 ): ReturnType<typeof setTimeout> {
   return setTimeout(() => {
-    failDirectGatewayChatRun(sessionId, reservationRunId);
+    parkUnconfirmedRunReservation(sessionId, reservationRunId, idempotencyKey);
     onExpire();
   }, DIRECT_GATEWAY_CHAT_SEND_TIMEOUT_MS);
 }
@@ -5413,6 +6658,15 @@ router.post('/compatibility-hotfix/apply', authenticateToken, requireOwner, asyn
       res.status(500).json({ error: 'This OpenClaw install does not expose the runtime bundles expected by the compatibility hotfix.', status: before });
       return;
     }
+    const beforeAskUserRuntime = await getOpenClawAskUserRuntimeReadiness();
+    if (!beforeAskUserRuntime.ready) {
+      res.status(500).json({
+        error: 'The Portal ask-user bridge is not active in the running OpenClaw gateway; refusing to disable Claude native questions.',
+        status: before,
+        askUserRuntime: beforeAskUserRuntime,
+      });
+      return;
+    }
 
     const openClawDistDir = getOpenClawDistDir();
     const patchRun = await execFileText('bash', [OPENCLAW_COMPAT_HOTFIX_SCRIPT, openClawDistDir], 30000, {
@@ -5421,16 +6675,19 @@ router.post('/compatibility-hotfix/apply', authenticateToken, requireOwner, asyn
     });
     const restartOutput = await restartOpenClawGateway();
     const after = getOpenClawCompatibilityHotfixStatus();
+    const afterAskUserRuntime = await getOpenClawAskUserRuntimeReadiness();
+    const applied = after.applied && afterAskUserRuntime.ready;
 
     res.json({
-      ok: after.applied,
+      ok: applied,
       alreadyApplied: before.applied,
       status: after,
+      askUserRuntime: afterAskUserRuntime,
       patchOutput: [patchRun.stdout, patchRun.stderr].filter(Boolean).join('\n'),
       restartOutput,
-      message: after.applied
-        ? 'Compatibility hotfix applied and OpenClaw gateway restarted.'
-        : 'Hotfix command ran, but the expected patch markers were not detected afterward.',
+      message: applied
+        ? 'Compatibility hotfix applied; OpenClaw restarted with the ask-user runtime bridge active.'
+        : 'Hotfix command ran, but the patched runtime and callable ask-user bridge were not both verified afterward.',
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to apply compatibility hotfix', detail: err.message });
@@ -6650,7 +7907,12 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
         : await readSessionMessages(sessionId, limit, sessionsDir);
 
       if (!fileId && messages.length === 0) {
-        res.json({ messages: [] });
+        const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
+        const activeStream = browserSafeActiveStreamSnapshot(
+          providerName,
+          resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate) || activeStreamCandidate,
+        );
+        res.json({ messages: [], sessionId, activeStream });
         return;
       }
 
@@ -6675,8 +7937,15 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
     });
 
     if (!fileId && page.messages.length === 0) {
+      const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
+      const activeStream = browserSafeActiveStreamSnapshot(
+        providerName,
+        resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate) || activeStreamCandidate,
+      );
       res.json({
         messages: [],
+        sessionId,
+        activeStream,
         pagination: { beforeCursor: null, hasMoreBefore: false, pageSize: limit },
       });
       return;
@@ -6894,6 +8163,11 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         void provider.abortActiveRun?.(sessionId, routeRunId).catch(() => false);
         finishSse();
       });
+      const streamStartedAtMs = Date.now();
+      const requestedStreamModel = normalizeGatewayModelId(
+        typeof requestedModel === 'string' ? requestedModel : '',
+      ) || undefined;
+      const clientMessageId = normalizeDirectGatewayClientMessageId(req.body?.clientMessageId);
       const senderIdentity = req.user
         ? {
             label: req.user.email,
@@ -6901,30 +8175,86 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
             role: req.user.role,
             authorizationVersion: Number(req.user.authorizationVersion ?? 1),
             requestId: routeRunId,
+            ...(clientMessageId ? { clientMessageId } : {}),
           }
         : undefined;
-      const streamStartedAtMs = Date.now();
-      const requestedStreamModel = normalizeGatewayModelId(
-        typeof requestedModel === 'string' ? requestedModel : '',
-      ) || undefined;
+      const recoverSseActiveTurnConflict = async () => {
+        if (fallbackTimer) {
+          clearTimeout(fallbackTimer);
+          fallbackTimer = null;
+        }
+        gotRealStatus = true;
+        sseWrite(`data: ${JSON.stringify({
+          type: 'active_turn_conflict',
+          content: 'This chat already has an active turn. The Portal is reconnecting to it and queued your message.',
+          sessionKey: sessionId,
+          clientMessageId,
+        })}\n\n`);
+
+        let activeStream: OpenClawActiveStreamSnapshot;
+        if (provider.providerName === 'OPENCLAW') {
+          // A local active snapshot without an exact run ID is not safe to
+          // attach: its dynamic matcher can bind to an unrelated future run
+          // or wait forever. Every OpenClaw conflict crosses the authoritative
+          // sessions.list fence before browser ownership transfers.
+          activeStream = await reconcileOpenClawActiveTurnConflict(sessionId);
+        } else {
+          const candidate = await getProviderActiveStreamSnapshot(provider.providerName, sessionId);
+          activeStream = (resolveAttachableHostStreamSnapshot(sessionId, candidate) || candidate) as OpenClawActiveStreamSnapshot;
+        }
+
+        if (streamUnsub) {
+          streamUnsub();
+          streamUnsub = null;
+        }
+        if (activeStream.active) {
+          streamUnsub = attachSseToSessionStream({
+            sessionKey: sessionId,
+            providerName: provider.providerName,
+            streamInfo: activeStream,
+            user: req.user!,
+            write: sseWrite,
+            finish: finishSse,
+          });
+          if (streamUnsub) return;
+        }
+        if (activeStream.safeToClear) {
+          sseWrite(`data: ${JSON.stringify({
+            type: 'stream_ended',
+            sessionKey: sessionId,
+            inactiveReason: activeStream.inactiveReason,
+            safeToClear: true,
+          })}\n\n`);
+          finishSse();
+          return;
+        }
+        // Unknown/multiple upstream identities remain fail-closed. Keep this
+        // delivery alive so the independently reconnecting Portal WS can take
+        // it over instead of converting uncertainty into a fake terminal.
+        sseWrite(`data: ${JSON.stringify({
+          type: 'stream_status',
+          sessionKey: sessionId,
+          active: false,
+          inactiveReason: activeStream.inactiveReason || 'unknown',
+          safeToClear: false,
+        })}\n\n`);
+      };
 
       if (providerUsesHostStreamBus(provider.providerName)) {
         // Single-path SSE delivery for bus-owning providers. OpenClaw's
         // persistent gateway and host-native CLI providers both publish their
         // complete turn into StreamEventBus. The response forwards that bus
         // directly and leaves provider callbacks as no-ops.
-        if (!reserveHostStreamRoute({
-          sessionId,
-          runId: routeRunId,
-          provenance,
-          model: requestedStreamModel,
-        })) {
-          sseWrite(`data: ${JSON.stringify({
-            type: 'error',
-            content: 'This chat already has an active turn.',
-            runId: routeRunId,
-          })}\n\n`);
-          finishSse();
+        const routeReserved = provider.providerName === 'OPENCLAW'
+          ? reserveDirectGatewayChatRun(sessionId, routeRunId)
+          : reserveHostStreamRoute({
+              sessionId,
+              runId: routeRunId,
+              provenance,
+              model: requestedStreamModel,
+            });
+        if (!routeReserved) {
+          await recoverSseActiveTurnConflict();
           return;
         }
 
@@ -7069,6 +8399,11 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
               result: { fullText: '', metadata: {} },
               aborted: true,
             });
+            return;
+          }
+          const errMsg = err instanceof Error ? err.message : String(err);
+          if (provider.providerName === 'OPENCLAW' && /different run is already active/i.test(errMsg)) {
+            await recoverSseActiveTurnConflict();
             return;
           }
           const friendlyError = humanizeProviderError(provider.providerName, err?.message || String(err));
@@ -8109,6 +9444,101 @@ function attachBrowserWsToSessionStream(params: {
   return true;
 }
 
+function attachSseToSessionStream(params: {
+  sessionKey: string;
+  providerName: AgentProviderName;
+  streamInfo: StreamInfo | OpenClawActiveStreamSnapshot;
+  user: JwtPayload;
+  write: (data: string) => void;
+  finish: () => void;
+}): (() => void) | null {
+  const { sessionKey, providerName, streamInfo, user, write, finish } = params;
+  const status = resolveAttachableHostStreamSnapshot(sessionKey, streamInfo);
+  if (!status?.active) return null;
+
+  const revalidatedRunId = normalizeHostStreamRunId(status.runId);
+  const runMatcher = revalidatedRunId
+    ? createHostStreamRunMatcher(providerName, revalidatedRunId, { openClawRunIdKnown: true })
+    : createHostStreamRunMatcher(providerName, '', { openClawRunIdKnown: false });
+  let closed = false;
+  const unsubscribe = streamEventBus.subscribe(sessionKey, (event: StreamEvent) => {
+    if (closed || !runMatcher.matches(event)) return;
+    if (isPreliminaryOpenClawStreamError(providerName, event)) return;
+    const runtimeEvent = event as any;
+    if (runtimeEvent.type === 'exec_approval' && runtimeEvent.approval && !isElevatedRole(user.role)) {
+      void denyExecApprovalForUnauthorizedUser(runtimeEvent.approval as ExecApprovalRequest, user);
+      try {
+        write(`data: ${JSON.stringify({
+          type: 'status',
+          content: 'Command approval is only available to portal admins. This request was denied automatically.',
+          sessionKey,
+          runId: revalidatedRunId || undefined,
+        })}\n\n`);
+      } catch {
+        finish();
+      }
+      return;
+    }
+    const eventRunId = normalizeHostStreamRunId(event.runId) || runMatcher.currentRunId();
+    try {
+      write(`data: ${JSON.stringify({
+        ...event,
+        sessionKey,
+        ...(eventRunId ? { runId: eventRunId } : {}),
+      })}\n\n`);
+    } catch {
+      finish();
+      return;
+    }
+    if (event.type === 'done' || event.type === 'error') finish();
+  });
+
+  const phase = status.phase || 'thinking';
+  const snapshotContent = 'content' in status && typeof status.content === 'string'
+    ? status.content
+    : '';
+  const snapshotLatestText = 'latestText' in status && typeof status.latestText === 'string'
+    ? status.latestText
+    : '';
+  const latestText = snapshotContent || streamEventBus.getLatestText(sessionKey) || snapshotLatestText || '';
+  const rawTurnEvents = 'turnEvents' in status && Array.isArray(status.turnEvents)
+    ? status.turnEvents
+    : streamEventBus.getRecentTurnEvents(sessionKey, 100);
+  const turnEvents = rawTurnEvents.filter((event) => {
+    if (event.terminal || event.type === 'turn_error' || event.type === 'assistant_final' || event.type === 'turn_done') {
+      return false;
+    }
+    return !revalidatedRunId || !event.runId || event.runId === revalidatedRunId;
+  });
+  try {
+    write(`data: ${JSON.stringify({
+      type: 'stream_resume',
+      sessionKey,
+      phase,
+      toolName: status.toolName || null,
+      toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
+      statusText: status.statusText || null,
+      provenance: status.provenance || null,
+      model: status.model || null,
+      compactionPhase: status.compactionPhase || 'idle',
+      runId: status.runId || null,
+      content: latestText || undefined,
+      turnEvents,
+    })}\n\n`);
+  } catch {
+    closed = true;
+    unsubscribe();
+    finish();
+    return null;
+  }
+
+  return () => {
+    if (closed) return;
+    closed = true;
+    unsubscribe();
+  };
+}
+
 async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
   const providerName = normalizeProviderName(msg.provider);
   const sessionKey = providerName === 'OPENCLAW'
@@ -8388,20 +9818,54 @@ async function handleWsSend(
       // the 'done' event is emitted once from PersistentGatewayWs, and both
       // subscribers see it in the same publish() call.
 
-      if (!reserveHostStreamRoute({
-        sessionId,
-        runId: routeRunId,
-        provenance,
-        model: requestedStreamModel,
-      })) {
+      const routeReserved = isOpenClawProvider
+        ? reserveDirectGatewayChatRun(sessionId, routeRunId)
+        : reserveHostStreamRoute({
+            sessionId,
+            runId: routeRunId,
+            provenance,
+            model: requestedStreamModel,
+          });
+      if (!routeReserved) {
         clearTimeout(fallbackTimer);
         if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
         wsSend(ws, {
-          type: 'error',
-          content: 'This chat already has an active turn.',
+          type: 'active_turn_conflict',
+          content: 'This chat already has an active turn. The Portal is reconnecting to it and queued your message.',
           sessionKey: sessionId,
-          runId: routeRunId,
+          clientMessageId: typeof msg.clientMessageId === 'string' ? msg.clientMessageId : undefined,
         });
+        const activeStreamCandidate = provider.providerName === 'OPENCLAW'
+          ? await reconcileOpenClawActiveTurnConflict(sessionId)
+          : await getProviderActiveStreamSnapshot(provider.providerName, sessionId);
+        const activeStream: OpenClawActiveStreamSnapshot = provider.providerName === 'OPENCLAW'
+          ? activeStreamCandidate
+          : (resolveAttachableHostStreamSnapshot(sessionId, activeStreamCandidate) || activeStreamCandidate) as OpenClawActiveStreamSnapshot;
+        if (activeStream.active) {
+          attachBrowserWsToSessionStream({
+            ws,
+            sessionKey: sessionId,
+            providerName: provider.providerName,
+            streamInfo: activeStream,
+            sendResume: true,
+            keepSubscriptionAfterDone: isOpenClawProvider,
+          });
+        } else if (activeStream.safeToClear) {
+          wsSend(ws, {
+            type: 'stream_ended',
+            sessionKey: sessionId,
+            inactiveReason: activeStream.inactiveReason,
+            safeToClear: true,
+          });
+        } else {
+          wsSend(ws, {
+            type: 'stream_status',
+            sessionKey: sessionId,
+            active: false,
+            inactiveReason: activeStream.inactiveReason || 'unknown',
+            safeToClear: false,
+          });
+        }
         return;
       }
       reservedStream = { sessionId, runId: routeRunId };
@@ -8522,12 +9986,14 @@ async function handleWsSend(
               event: { type: 'exec_approval', approval },
             });
           };
+      const clientMessageId = normalizeDirectGatewayClientMessageId(msg.clientMessageId);
       const senderIdentity = {
         label: user.email,
         userId: user.userId,
         role: user.role,
         authorizationVersion: Number(user.authorizationVersion ?? 1),
         requestId: routeRunId,
+        ...(clientMessageId ? { clientMessageId } : {}),
       };
 
       try {
@@ -8572,6 +10038,41 @@ async function handleWsSend(
           return;
         }
         const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+        if (provider.providerName === 'OPENCLAW' && /different run is already active/i.test(errMsg)) {
+          wsSend(ws, {
+            type: 'active_turn_conflict',
+            content: 'This chat already has an active turn. The Portal is reconnecting to it and queued your message.',
+            sessionKey: sessionId,
+            clientMessageId: typeof msg.clientMessageId === 'string' ? msg.clientMessageId : undefined,
+          });
+          const activeStream = await reconcileOpenClawActiveTurnConflict(sessionId);
+          if (activeStream.active) {
+            attachBrowserWsToSessionStream({
+              ws,
+              sessionKey: sessionId,
+              providerName: provider.providerName,
+              streamInfo: activeStream,
+              sendResume: true,
+              keepSubscriptionAfterDone: true,
+            });
+          } else if (activeStream.safeToClear) {
+            wsSend(ws, {
+              type: 'stream_ended',
+              sessionKey: sessionId,
+              inactiveReason: activeStream.inactiveReason,
+              safeToClear: true,
+            });
+          } else {
+            wsSend(ws, {
+              type: 'stream_status',
+              sessionKey: sessionId,
+              active: false,
+              inactiveReason: activeStream.inactiveReason || 'unknown',
+              safeToClear: false,
+            });
+          }
+          return;
+        }
         const shouldAttemptRecovery = shouldAttemptOpenClawReplyRecovery(
           provider.providerName,
           pendingStreamError,
@@ -8898,6 +10399,34 @@ async function pendingApprovalsForUser(user: JwtPayload): Promise<ExecApprovalRe
   return visible;
 }
 
+function enqueueOrderedSessionDelivery(
+  chains: Map<string, Promise<void>>,
+  sessionKey: string,
+  deliver: () => Promise<void>,
+): Promise<void> {
+  const previous = chains.get(sessionKey) || Promise.resolve();
+  // A rejected delivery must not break ordering for later events. Return the
+  // original promise to callers/tests, while the stored fence always settles
+  // and is removed once the exact tail completes.
+  const current = previous.then(deliver, deliver);
+  const settled = current.catch(() => undefined);
+  chains.set(sessionKey, settled);
+  void settled.then(() => {
+    if (chains.get(sessionKey) === settled) chains.delete(sessionKey);
+  });
+  return current;
+}
+
+function shouldSendGlobalStreamCopy(
+  socketHadDirectSubscription: boolean,
+  evt: Pick<StreamEvent, 'type' | 'maintenanceKind'>,
+): boolean {
+  const isMaintenanceEvent = evt.type === 'compaction_start'
+    || evt.type === 'compaction_end'
+    || evt.maintenanceKind === 'maintenance';
+  return !socketHadDirectSubscription || isMaintenanceEvent;
+}
+
 function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   (ws as any).__portalUser = user;
   const authorizationBinding = (ws as any).__portalAuthorizationBinding as
@@ -8909,6 +10438,7 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   const pingTimer = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) try { ws.ping(); } catch {}
   }, 15000);
+  const globalDeliveryChains = new Map<string, Promise<void>>();
 
   // Subscribe to global StreamEventBus events.
   // This serves two purposes:
@@ -8918,7 +10448,24 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   //    Without this, events from PersistentGatewayWs are received but never
   //    reach the browser (no per-session subscriber exists yet).
   const unsubGlobal = streamEventBus.subscribeGlobal((sessionKey, evt) => {
-    void (async () => {
+    // Capture subscription ownership synchronously with publication. The
+    // authorization checks below can await database work; consulting mutable
+    // subscription state afterward can either drop the only copy (attached
+    // after publish) or duplicate it (detached after publish).
+    const socketHadDirectSubscription = wsHasSessionStreamSubscription(ws, sessionKey);
+    const sendGlobalCopy = shouldSendGlobalStreamCopy(socketHadDirectSubscription, evt);
+    const activityType = evt.type;
+    const activitySubject = activityType === 'thinking'
+      ? sanitizeThinkingSubject(evt.subject)
+      : '';
+    const needsActivityEnvelope = Boolean(
+      activitySubject
+      || activityType === 'done'
+      || activityType === 'error'
+      || activityType === 'run_resumed',
+    );
+    if (!sendGlobalCopy && !needsActivityEnvelope) return;
+    void enqueueOrderedSessionDelivery(globalDeliveryChains, sessionKey, async () => {
       let releaseAuthorizationLease: (() => void) | null = null;
       try {
         releaseAuthorizationLease = acquireWorkspaceAuthorizationMutationLease(user.userId);
@@ -8930,10 +10477,6 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
         // the short event-delivery lease.
         recordMaintenanceHistoryMarker(sessionKey, evt);
 
-        const activityType = evt.type;
-        const activitySubject = activityType === 'thinking'
-          ? sanitizeThinkingSubject(evt.subject)
-          : '';
         if (
           activitySubject
           || activityType === 'done'
@@ -8960,11 +10503,7 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
         // Skip the global copy only when this exact browser socket already owns
         // a direct subscription. Maintenance events deliberately use both
         // paths so the composer rail and durable marker survive transitions.
-        const socketHasDirectSubscription = wsHasSessionStreamSubscription(ws, sessionKey);
-        const isMaintenanceEvent = evt.type === 'compaction_start'
-          || evt.type === 'compaction_end'
-          || evt.maintenanceKind === 'maintenance';
-        if (socketHasDirectSubscription && !isMaintenanceEvent) return;
+        if (!sendGlobalCopy) return;
 
         await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
         if (ws.readyState === WebSocket.OPEN) {
@@ -8975,7 +10514,7 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
       } finally {
         releaseAuthorizationLease?.();
       }
-    })();
+    });
   });
 
   ws.on('message', async (raw: Buffer | string) => {
@@ -9319,12 +10858,9 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
 
   // Track browser→gateway id mapping so we can convert string IDs back to numeric
   const idMap = new Map<string, number>(); // gateway string ID → browser numeric ID
-  type DirectRequestMeta = {
-    method?: string;
-    sessionKey?: string;
+  type DirectRequestMeta = DirectGatewayChatSendMeta & {
     limit?: number;
     expectedRunId?: string | null;
-    reservationRunId?: string;
     browserRequestId?: string | number;
     timeoutTimer?: ReturnType<typeof setTimeout>;
   };
@@ -9355,6 +10891,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     meta.timeoutTimer = scheduleDirectGatewayChatRunTimeout(
       meta.sessionKey,
       meta.reservationRunId,
+      meta.idempotencyKey || '',
       () => {
         if (requestMeta.get(gatewayId) !== meta) return;
         requestMeta.delete(gatewayId);
@@ -9367,8 +10904,10 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
               id: meta.browserRequestId ?? gatewayId,
               ok: false,
               error: {
-                code: 'CHAT_SEND_TIMEOUT',
-                message: 'The gateway did not acknowledge the chat turn in time.',
+                code: 'CHAT_SEND_UNCONFIRMED',
+                message: 'The gateway did not acknowledge the chat turn before the recovery window began.',
+                sessionKey: meta.sessionKey,
+                ...(meta.clientMessageId ? { clientMessageId: meta.clientMessageId } : {}),
               },
             }));
           } catch {}
@@ -9381,7 +10920,12 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     for (const meta of requestMeta.values()) {
       if (meta.timeoutTimer) clearTimeout(meta.timeoutTimer);
       if (meta.sessionKey && meta.reservationRunId) {
-        failDirectGatewayChatRun(meta.sessionKey, meta.reservationRunId);
+        const parked = meta.method === 'chat.send' && parkUnconfirmedRunReservation(
+          meta.sessionKey,
+          meta.reservationRunId,
+          meta.idempotencyKey || '',
+        );
+        if (!parked) failDirectGatewayChatRun(meta.sessionKey, meta.reservationRunId);
       }
     }
     requestMeta.clear();
@@ -9443,10 +10987,11 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
           if (msg.ok && meta?.method === 'chat.history' && meta.sessionKey) {
             msg.payload = augmentDirectHistoryPayload(msg.payload, meta.sessionKey, meta.limit || 200);
           }
+          const browserResponse = await settleDirectGatewayChatSendResponse(meta, msg);
           const browserRequestId = meta?.browserRequestId ?? idMap.get(gatewayId) ?? gatewayId;
           clearDirectRequestMeta(gatewayId);
-          msg.id = browserRequestId;
-          browserWs.send(JSON.stringify(msg));
+          browserResponse.id = browserRequestId;
+          browserWs.send(JSON.stringify(browserResponse));
         });
         return;
       }
@@ -9655,15 +11200,30 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       if (frameMethod === 'chat.send') {
         await ensurePortalAgentChatLabel(frameSessionKey, user, frame.params?.message).catch(() => undefined);
         directReservationRunId = `direct-${randomUUID()}`;
+        const directClientMessageId = normalizeDirectGatewayClientMessageId(
+          frame.params?.idempotencyKey,
+        );
         if (!reserveDirectGatewayChatRun(frameSessionKey, directReservationRunId)) {
+          subscribeBackendToLiveSessionEvents(frameSessionKey);
           browserWs.send(JSON.stringify({
             type: 'res',
             id: frame.id,
             ok: false,
-            error: { code: 'TURN_ACTIVE', message: 'This chat already has an active turn.' },
+            error: await buildDirectGatewayActiveTurnError(
+              frameSessionKey,
+              directClientMessageId,
+            ),
           }));
           return;
         }
+        // Never expose the browser-controlled optimistic ID as OpenClaw's
+        // global chat.send idempotency/run identity. Bind it behind fresh
+        // server entropy, while retaining it as a separately parseable echo
+        // identity for same-tab acknowledgement and cross-tab visibility.
+        frame.params.idempotencyKey = buildPortalOpenClawIdempotencyKey(
+          directReservationRunId,
+          directClientMessageId,
+        );
         directExpectedRunId = directReservationRunId;
       } else {
         directExpectedRunId = normalizeHostStreamRunId(
@@ -9684,6 +11244,10 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
         sessionKey: frameSessionKey,
         expectedRunId: directExpectedRunId,
         reservationRunId: directReservationRunId,
+        clientMessageId: normalizeDirectGatewayClientMessageId(frame.params?.idempotencyKey),
+        idempotencyKey: typeof frame.params?.idempotencyKey === 'string'
+          ? frame.params.idempotencyKey
+          : undefined,
         browserRequestId: numericId,
         limit: typeof frame.params?.limit === 'number' && Number.isFinite(frame.params.limit)
           ? frame.params.limit
@@ -9706,6 +11270,10 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
           sessionKey: frameSessionKey,
           expectedRunId: directExpectedRunId,
           reservationRunId: directReservationRunId,
+          clientMessageId: normalizeDirectGatewayClientMessageId(frame.params?.idempotencyKey),
+          idempotencyKey: typeof frame.params?.idempotencyKey === 'string'
+            ? frame.params.idempotencyKey
+            : undefined,
           browserRequestId: stringId,
           limit: typeof frame.params?.limit === 'number' && Number.isFinite(frame.params.limit)
             ? frame.params.limit
@@ -9953,9 +11521,12 @@ export const __gatewayExecutionScopeTest = {
   providerPublishesHostStream,
   providerUsesHostStreamBus,
   getProviderOwnedBusStreamSnapshot,
+  parseExactOpenClawConflictRun,
+  reconcileOpenClawActiveTurnConflict,
   browserSafeActiveStreamSnapshot,
   attachBrowserWsToSessionStream,
   wsHasSessionStreamSubscription,
+  shouldSendGlobalStreamCopy,
   captureHostStreamRunIdentity,
   clearHostStreamIfCurrentRun,
   shouldAttemptOpenClawReplyRecovery,
@@ -9964,6 +11535,10 @@ export const __gatewayExecutionScopeTest = {
   reserveDirectGatewayChatRun,
   acknowledgeDirectGatewayChatRun,
   failDirectGatewayChatRun,
+  normalizeDirectGatewayClientMessageId,
+  isDirectGatewayActiveTurnError,
+  buildDirectGatewayActiveTurnError,
+  settleDirectGatewayChatSendResponse,
   scheduleDirectGatewayChatRunTimeout,
   normalizeRequestedModel,
   isProviderModelResetAlias,
@@ -9985,6 +11560,7 @@ export const __gatewayExecutionScopeTest = {
   handleWsSend,
   handleWsAbort,
   handleWsReconnect,
+  enqueueOrderedSessionDelivery,
 };
 
 // Narrow test surface for the dashboard's OpenClaw version checks. The
@@ -9993,6 +11569,11 @@ export const __gatewayExecutionScopeTest = {
 export const __gatewayVersionProbeTest = {
   probeOpenClawVersionStatusWithDependencies,
   OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS,
+};
+
+export const __gatewayCompatibilityHotfixTest = {
+  askUserRuntimeReportIsReady,
+  getOpenClawAskUserRuntimeReadiness,
 };
 
 export default router;

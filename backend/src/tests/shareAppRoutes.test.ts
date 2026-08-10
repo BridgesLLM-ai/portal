@@ -1,8 +1,11 @@
 import http from 'http';
 import express from 'express';
 import cookieParser from 'cookie-parser';
+import bcrypt from 'bcrypt';
+import { issueShareGrant, shareGrantCookieName, shareGrantTtlMs } from '../utils/shareAccessSecurity';
 
 const findFirstMock = jest.fn();
+const findUniqueMock = jest.fn();
 const updateManyMock = jest.fn();
 const updateMock = jest.fn();
 const getAppTargetMock = jest.fn();
@@ -11,6 +14,7 @@ jest.mock('../config/database', () => ({
   prisma: {
     appShareLink: {
       findFirst: findFirstMock,
+      findUnique: findUniqueMock,
       updateMany: updateManyMock,
       update: updateMock,
     },
@@ -29,17 +33,24 @@ async function request(
   path: string,
   cookie?: string,
   headers: Record<string, string> = {},
+  method = 'GET',
+  body?: unknown,
 ): Promise<TestResponse> {
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Server is not listening');
+  const encodedBody = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname: '127.0.0.1',
       port: address.port,
       path,
-      method: 'GET',
+      method,
       headers: {
         ...headers,
+        ...(encodedBody ? {
+          'content-type': 'application/json',
+          'content-length': String(encodedBody.length),
+        } : {}),
         ...(cookie ? { cookie } : {}),
       },
     }, (res) => {
@@ -52,6 +63,7 @@ async function request(
       }));
     });
     req.on('error', reject);
+    if (encodedBody) req.write(encodedBody);
     req.end();
   });
 }
@@ -74,6 +86,10 @@ describe('share app routes', () => {
     expiresAt: null,
     maxUses: 1,
     currentUses: 0,
+    rateLimitMaxRequests: null,
+    rateLimitWindowSeconds: null,
+    rateLimitRequestCount: 0,
+    rateLimitWindowStartedAt: null,
     app: {
       id: appId,
       userId: 'user-1',
@@ -159,6 +175,24 @@ describe('share app routes', () => {
     findFirstMock.mockResolvedValueOnce(mismatched);
     const response = await request(server, `/${token}/api/auth/login`);
     expect(response.status).toBe(404);
+    expect(updateManyMock).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['public link with a retained hash', { isPublic: true, passwordHash: 'bcrypt-hash' }, `/${token}/api/session`],
+    ['public link with an empty hash', { isPublic: true, passwordHash: '' }, `/${token}`],
+    ['private link with a null hash', { isPublic: false, passwordHash: null }, `/${token}/progress`],
+    ['private link with an empty hash', { isPublic: false, passwordHash: '' }, `/${token}/app.js`],
+  ])('fails closed centrally for credential drift: %s', async (_label, credentialState, requestPath) => {
+    findFirstMock.mockResolvedValueOnce({ ...makeLink(), ...credentialState });
+
+    const response = await request(server, requestPath);
+
+    expect(response.status).toBe(404);
+    expect(updateManyMock).not.toHaveBeenCalled();
+    expect(findUniqueMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
@@ -168,5 +202,190 @@ describe('share app routes', () => {
     expect(response.status).toBe(200);
     expect((global.fetch as jest.Mock).mock.calls[0][0])
       .toBe('http://172.30.0.4:5002/api/auth/login');
+  });
+
+  test('claims the dynamic request window before consuming a visitor slot', async () => {
+    findFirstMock.mockResolvedValue({
+      ...makeLink(),
+      maxUses: 5,
+      rateLimitMaxRequests: 3,
+      rateLimitWindowSeconds: 60,
+    });
+    updateManyMock
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 1 });
+
+    const response = await request(server, `/${token}/api/session`);
+
+    expect(response.status).toBe(200);
+    expect(updateManyMock).toHaveBeenCalledTimes(2);
+    expect(updateManyMock.mock.calls[0][0].data).toEqual({
+      rateLimitWindowStartedAt: expect.any(Date),
+      rateLimitRequestCount: 1,
+    });
+    expect(updateManyMock.mock.calls[1][0].data).toEqual({ currentUses: { increment: 1 } });
+  });
+
+  test.each([
+    ['API proxy', `/${token}/api/session`, 'GET'],
+    ['progress read', `/${token}/progress`, 'GET'],
+    ['progress write', `/${token}/progress`, 'PUT'],
+  ])('returns durable 429 before visitor or downstream work on %s', async (_label, requestPath, method) => {
+    const windowStartedAt = new Date(Date.now() - 10_000);
+    findFirstMock.mockResolvedValue({
+      ...makeLink(),
+      maxUses: 5,
+      rateLimitMaxRequests: 1,
+      rateLimitWindowSeconds: 60,
+      rateLimitRequestCount: 1,
+      rateLimitWindowStartedAt: windowStartedAt,
+    });
+
+    const response = await request(server, requestPath, undefined, {}, method);
+
+    expect(response.status).toBe(429);
+    expect(response.headers['retry-after']).toBeDefined();
+    expect(JSON.parse(response.body)).toEqual(expect.objectContaining({
+      code: 'SHARE_RATE_LIMITED',
+      retryAfterSeconds: expect.any(Number),
+    }));
+    expect(updateManyMock.mock.calls.some(([args]) => args.data?.currentUses)).toBe(false);
+    expect(updateManyMock).not.toHaveBeenCalled();
+    expect(findUniqueMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('fails closed before visitor admission when persisted rate policy drifts', async () => {
+    findFirstMock.mockResolvedValue({
+      ...makeLink(),
+      maxUses: 5,
+      rateLimitMaxRequests: 1,
+      rateLimitWindowSeconds: 60,
+    });
+    updateManyMock.mockResolvedValue({ count: 0 });
+    findUniqueMock.mockResolvedValue({
+      isActive: true,
+      expiresAt: null,
+      rateLimitMaxRequests: 2,
+      rateLimitWindowSeconds: 60,
+      rateLimitRequestCount: 2,
+      rateLimitWindowStartedAt: new Date(),
+    });
+
+    const response = await request(server, `/${token}/progress`);
+
+    expect(response.status).toBe(503);
+    expect(JSON.parse(response.body)).toEqual(expect.objectContaining({
+      code: 'SHARE_RATE_LIMIT_UNAVAILABLE',
+      retryable: true,
+    }));
+    expect(updateManyMock.mock.calls.some(([args]) => args.data?.currentUses)).toBe(false);
+  });
+
+  test('does not charge rate budget when a new browser is already out of visitor slots', async () => {
+    findFirstMock.mockResolvedValue({
+      ...makeLink(),
+      maxUses: 1,
+      currentUses: 1,
+      rateLimitMaxRequests: 3,
+      rateLimitWindowSeconds: 60,
+    });
+
+    const response = await request(server, `/${token}/progress`);
+
+    expect(response.status).toBe(404);
+    expect(updateManyMock).not.toHaveBeenCalled();
+    expect(findUniqueMock).not.toHaveBeenCalled();
+  });
+
+  test('lets an existing signed visitor use rate budget after the visitor cap is reached', async () => {
+    const issuedAt = Date.now();
+    const grant = issueShareGrant({
+      kind: 'visit',
+      token,
+      linkId: 'link-1',
+      expiresAt: issuedAt + shareGrantTtlMs('visit'),
+    }, 'test-share-secret', issuedAt);
+    const visitCookie = `${shareGrantCookieName('visit', token)}=${grant}`;
+    findFirstMock.mockResolvedValue({
+      ...makeLink(),
+      maxUses: 1,
+      currentUses: 1,
+      rateLimitMaxRequests: 3,
+      rateLimitWindowSeconds: 60,
+    });
+    updateManyMock.mockResolvedValue({ count: 1 });
+
+    const response = await request(server, `/${token}/progress`, visitCookie);
+
+    expect(response.status).toBe(200);
+    expect(updateManyMock).toHaveBeenCalledTimes(1);
+    expect(updateManyMock.mock.calls[0][0].data).toEqual({
+      rateLimitWindowStartedAt: expect.any(Date),
+      rateLimitRequestCount: 1,
+    });
+  });
+
+  test('rejects malformed, unavailable, and password-locked links before rate admission', async () => {
+    const malformed = await request(server, '/short/progress');
+    expect(malformed.status).toBe(404);
+    expect(updateManyMock).not.toHaveBeenCalled();
+
+    findFirstMock.mockResolvedValueOnce(null);
+    const unavailable = await request(server, `/${token}/progress`);
+    expect(unavailable.status).toBe(404);
+    expect(updateManyMock).not.toHaveBeenCalled();
+
+    findFirstMock.mockResolvedValueOnce({
+      ...makeLink(),
+      isPublic: false,
+      passwordHash: 'bcrypt-password-hash',
+      rateLimitMaxRequests: 3,
+      rateLimitWindowSeconds: 60,
+    });
+    const passwordLocked = await request(server, `/${token}/progress`);
+    expect(passwordLocked.status).toBe(401);
+    expect(updateManyMock).not.toHaveBeenCalled();
+  });
+
+  test('does not charge the request window for static navigation', async () => {
+    findFirstMock.mockResolvedValue({
+      ...makeLink(),
+      maxUses: 5,
+      rateLimitMaxRequests: 1,
+      rateLimitWindowSeconds: 60,
+    });
+    updateManyMock.mockResolvedValue({ count: 1 });
+
+    await request(server, `/${token}`);
+
+    expect(updateManyMock).toHaveBeenCalledTimes(1);
+    expect(updateManyMock).toHaveBeenCalledWith(expect.objectContaining({
+      data: { currentUses: { increment: 1 } },
+    }));
+    expect(findUniqueMock).not.toHaveBeenCalled();
+  });
+
+  test('does not charge the request window for password authentication', async () => {
+    const password = 'correct horse battery staple';
+    findFirstMock.mockResolvedValue({
+      ...makeLink(),
+      maxUses: 5,
+      isPublic: false,
+      passwordHash: await bcrypt.hash(password, 4),
+      rateLimitMaxRequests: 1,
+      rateLimitWindowSeconds: 60,
+    });
+    updateManyMock.mockResolvedValue({ count: 1 });
+
+    const response = await request(server, `/${token}/auth`, undefined, {}, 'POST', { password });
+
+    expect(response.status).toBe(200);
+    expect(updateManyMock).toHaveBeenCalledTimes(1);
+    expect(updateManyMock).toHaveBeenCalledWith(expect.objectContaining({
+      data: { currentUses: { increment: 1 } },
+    }));
+    expect(findUniqueMock).not.toHaveBeenCalled();
   });
 });

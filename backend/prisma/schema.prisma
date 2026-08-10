@@ -2,7 +2,8 @@
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
 generator client {
-  provider = "prisma-client-js"
+  provider   = "prisma-client-js"
+  engineType = "client"
 }
 
 datasource db {
@@ -182,6 +183,10 @@ model AppShareLink {
   expiresAt    DateTime?
   maxUses      Int?
   currentUses  Int       @default(0)
+  rateLimitMaxRequests     Int?
+  rateLimitWindowSeconds   Int?
+  rateLimitRequestCount    Int       @default(0)
+  rateLimitWindowStartedAt DateTime?
   isActive     Boolean   @default(true)
   isPublic     Boolean   @default(true)
   passwordHash String?
@@ -609,12 +614,58 @@ model ProjectIdentity {
   legacyOpenClawImports         LegacyOpenClawProjectImport[]         @relation("LegacyOpenClawImportProject")
   legacyOpenClawQuarantines     LegacyOpenClawProjectQuarantine[]     @relation("LegacyOpenClawQuarantineProject")
   legacyOpenClawClearTombstones LegacyOpenClawProjectClearTombstone[] @relation("LegacyOpenClawClearProject")
+  deploymentLifecycleRevision   ProjectDeploymentLifecycleRevision?
 
   @@unique([workspaceOwnerId, projectName])
   @@unique([workspaceOwnerId, canonicalRoot])
   @@unique([workspaceOwnerId, renameTargetName])
   @@index([workspaceOwnerId])
   @@index([lifecycleStatus])
+}
+
+// Project deployment intent has its own monotonic generation. Runtime status
+// probes and boot-time process reconciliation must never advance this row;
+// only an admitted user lifecycle mutation or recovery-proof claim may do so.
+model ProjectDeploymentLifecycleRevision {
+  projectIdentityId String   @id
+  revision          BigInt   @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+
+  projectIdentity ProjectIdentity                   @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
+  operations      ProjectRuntimeRecoveryOperation[]
+}
+
+// Durable idempotency receipt for the one-click Project runtime recovery
+// replay. The UUID and proof hash are server-generated; snapshot fields are
+// immutable and bind the exact owner, ProjectIdentity generation, App, source,
+// and deployment-lifecycle revision that originally failed.
+model ProjectRuntimeRecoveryOperation {
+  id                         String    @id @default(uuid())
+  projectIdentityId          String
+  ownerUserId                String
+  projectIdentityGeneration  Int
+  action                     String    @db.VarChar(16)
+  expectedAppId              String?
+  expectedDeploymentRevision BigInt
+  claimedDeploymentRevision  BigInt?
+  expectedFullstack          Boolean?
+  sourceDigest               String?   @db.VarChar(64)
+  proofSecretHash            String    @unique @db.VarChar(64)
+  status                     String    @default("ISSUED") @db.VarChar(16)
+  result                     Json?
+  failureCode                String?   @db.VarChar(64)
+  expiresAt                  DateTime
+  claimedAt                  DateTime?
+  completedAt                DateTime?
+  failedAt                   DateTime?
+  createdAt                  DateTime  @default(now())
+  updatedAt                  DateTime  @default(now()) @updatedAt
+
+  deploymentLifecycle ProjectDeploymentLifecycleRevision @relation(fields: [projectIdentityId], references: [projectIdentityId], onDelete: Cascade)
+
+  @@index([projectIdentityId, status])
+  @@index([expiresAt])
 }
 
 // One normalized namespace for both current names and in-flight rename

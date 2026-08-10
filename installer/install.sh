@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="4.0.12"
+readonly VERSION="4.0.13"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -51,6 +51,8 @@ readonly UPDATE_BACKUP_ROOT="${INSTALL_ROOT}/backups/update-transactions"
 readonly UPDATE_STAGE_ROOT="${INSTALL_ROOT}/update-staging"
 readonly UPDATE_BOOT_FENCE_DROPIN_DIR="/etc/systemd/system/bridgesllm-product.service.d"
 readonly UPDATE_BOOT_FENCE_DROPIN="${UPDATE_BOOT_FENCE_DROPIN_DIR}/20-update-transaction-fence.conf"
+readonly LEGACY_DOCKER_PRUNE_CRON_PATH="/etc/cron.d/docker-image-prune"
+readonly LEGACY_DOCKER_PRUNE_QUARANTINE_PATH="/etc/bridgesllm/quarantine/docker-image-prune.legacy"
 readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER="/var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1"
 readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR="/etc/systemd/system/openclaw-gateway.service.d"
 readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
@@ -85,7 +87,7 @@ readonly MIN_DISK_GB=35
 readonly PIN_OPENCLAW_RUNTIME_VERSION="2026.7.1"
 readonly PIN_OPENCLAW_CORE_PACKAGE_VERSION="2026.7.1-2"
 readonly PIN_OPENCLAW_CODEX_PLUGIN_VERSION="2026.7.1-1"
-readonly PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION="3.2.0"
+readonly PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION="3.3.0"
 readonly PIN_CODEX_CLI_VERSION="0.145.0"
 readonly PIN_CLAUDE_CODE_VERSION="2.1.220"
 readonly PIN_CLAWHUB_VERSION="0.23.1"
@@ -105,6 +107,7 @@ readonly OLLAMA_PROJECT_SANDBOX_IMAGE_TAG="bridgesllm-ollama-project-runtime:v1"
 readonly AGENT_ZERO_PROJECT_SANDBOX_IMAGE_TAG="bridgesllm-agent-zero-project-runtime:v1"
 readonly PROJECT_EGRESS_PROXY_IMAGE_TAG="bridgesllm-project-egress-proxy:v1"
 readonly PORTAL_PROJECT_RUNTIME_IMAGE_TAG="bridgesllm-project-runtime:bookworm-node22"
+readonly PORTAL_PROJECT_RUNTIME_RECIPE_LABEL="com.bridgesllm.portal-project-runtime.recipe-sha256"
 readonly PROJECT_RUNTIME_APPARMOR_PROFILE_NAME="bridgesllm-project-runtime-v1"
 readonly PROJECT_RUNTIME_APPARMOR_PROFILE_SOURCE="${PORTAL_DIR}/installer/bridgesllm-project-runtime-v1.apparmor"
 readonly PROJECT_RUNTIME_APPARMOR_PROFILE_PATH="/etc/apparmor.d/bridgesllm-project-runtime-v1"
@@ -178,6 +181,7 @@ TAILNET_DNS_NAME=""
 DRY_RUN=false
 UPDATE_MODE=false
 UNINSTALL_MODE=false
+REPAIR_PROJECT_RUNTIME_IMAGE=false
 RESIDUE_POLICY=""
 UNINSTALL_RESIDUE_WIPE_BACKUP_DIR=""
 UNINSTALL_RESIDUE_PLAN_DIGEST=""
@@ -213,12 +217,31 @@ OPENCLAW_PENDING_INPUT_HOTFIX_APPLIED=false
 OPENCLAW_PENDING_INPUT_HOTFIX_TARGET=""
 OPENCLAW_PENDING_INPUT_HOTFIX_BACKUP=""
 OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED=false
+OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED=false
+OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET=""
+OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP=""
+OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=false
+OPENCLAW_ASK_USER_TRANSACTION_ARMED=false
+OPENCLAW_ASK_USER_TRANSACTION_COMMITTED=false
+OPENCLAW_ASK_USER_TRANSACTION_DIR=""
+OPENCLAW_ASK_USER_STATE_DIR=""
+OPENCLAW_ASK_USER_GATEWAY_WAS_ACTIVE=false
+OPENCLAW_ASK_USER_LIVE_ATTESTED=false
+OPENCLAW_COMPAT_HOTFIX_PID=""
+OPENCLAW_TESTED_PAIR_COMMIT_RECORD="/root/.openclaw/.bridgesllm-tested-pair-commit-v3.json"
 
 # Generated during install
 DB_PASSWORD=""
 JWT_SECRET=""
 JWT_REFRESH_SECRET=""
 PORTAL_UPDATE_PROBE_TOKEN=""
+PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR=""
+PROJECT_RUNTIME_REPAIR_ENV_FILE=""
+PROJECT_RUNTIME_REPAIR_ACTIVE_LOG_FILE=""
+PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID=""
+PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_KIND=""
+PROJECT_RUNTIME_REPAIR_TRANSACTION_ROOT=""
+PORTAL_PROJECT_RUNTIME_RECIPE_SHA256=""
 OPENCLAW_TOKEN=""
 OPENCLAW_PROJECT_SANDBOX_IMAGE_ID=""
 CODEX_PROJECT_SANDBOX_IMAGE_ID=""
@@ -366,6 +389,13 @@ fail() {
   trap - ERR
   trap '' SIGINT TERM HUP
   set +e
+  if [[ "${REPAIR_PROJECT_RUNTIME_IMAGE:-false}" == "true" ]]; then
+    echo "" >&2
+    echo -e "  ${RED}${BOLD}Project runtime image repair failed:${NC} $1" >&2
+    [[ -f "${LOG_FILE}" ]] \
+      && echo -e "  ${DIM}Log: ${LOG_FILE}${NC}" >&2
+    exit 1
+  fi
   echo ""
   echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo -e "  ${RED}${BOLD}  ERROR${NC}  ${CYAN}${CURRENT_STEP}${NC}"
@@ -380,6 +410,10 @@ fail() {
     tail -5 "$LOG_FILE" 2>/dev/null | sed 's/^/    /'
   fi
   echo ""
+  if declare -F settle_openclaw_compatibility_hotfix_process >/dev/null 2>&1; then
+    settle_openclaw_compatibility_hotfix_process \
+      || warn "The OpenClaw compatibility patch process could not be proven stopped before recovery."
+  fi
   local database_operation_settled=true
   if declare -F settle_active_update_database_operation >/dev/null 2>&1; then
     settle_active_update_database_operation || database_operation_settled=false
@@ -737,6 +771,230 @@ ensure_build_tools() {
   fi
 }
 
+verify_prisma_client_runtime() {
+  local backend_dir="$1" check_label="${2:-prisma-runtime-check}"
+  [[ -d "${backend_dir}" && ! -L "${backend_dir}" ]] || return 1
+  (
+    cd "${backend_dir}"
+    node - "${check_label}" <<'NODE'
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const label = process.argv[2] || 'prisma-runtime-check';
+const fail = (message) => {
+  console.error(`[${label}] ${message}`);
+  process.exit(1);
+};
+for (const name of [
+  'PRISMA_CLIENT_ENGINE_TYPE',
+  'PRISMA_QUERY_ENGINE_BINARY',
+  'PRISMA_QUERY_ENGINE_LIBRARY',
+  'PRISMA_CLIENT_GET_TIME',
+  'NODE_PG_FORCE_NATIVE',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+  'PGUSER',
+  'PGDATABASE',
+  'PGPORT',
+  'PGHOST',
+  'PGPASSWORD',
+  'PGBINARY',
+  'PGOPTIONS',
+  'PGSSLMODE',
+  'PGSSLNEGOTIATION',
+  'PGCLIENT_ENCODING',
+  'PGREPLICATION',
+  'PGAPPNAME',
+  'PGCONNECT_TIMEOUT',
+]) {
+  if (Object.prototype.hasOwnProperty.call(process.env, name)) {
+    fail(`installer environment contains forbidden Prisma engine override ${name}`);
+  }
+}
+const readPackage = (name) => {
+  const packagePath = path.join(
+    process.cwd(),
+    'node_modules',
+    ...name.split('/'),
+    'package.json',
+  );
+  const stat = fs.lstatSync(packagePath);
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.uid !== process.geteuid()
+    || (stat.mode & 0o022) !== 0
+  ) {
+    fail(`unsafe installed package metadata for ${name}`);
+  }
+  const value = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+  if (value.name !== name) {
+    fail(`installed package identity differs for ${name}`);
+  }
+  return { path: packagePath, value };
+};
+const assertSecureRegularFile = (filePath, minimumSize, maximumSize) => {
+  const stat = fs.lstatSync(filePath);
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.uid !== process.geteuid()
+    || (stat.mode & 0o022) !== 0
+    || stat.size < minimumSize
+    || stat.size > maximumSize
+  ) {
+    fail(`unsafe generated runtime file: ${path.basename(filePath)}`);
+  }
+  return stat;
+};
+
+const rootPackage = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+const declared = rootPackage.dependencies || {};
+const nodeModulesPath = path.join(process.cwd(), 'node_modules');
+const nodeModulesStat = fs.lstatSync(nodeModulesPath);
+if (
+  !nodeModulesStat.isDirectory()
+  || nodeModulesStat.isSymbolicLink()
+  || nodeModulesStat.uid !== process.geteuid()
+  || (nodeModulesStat.mode & 0o022) !== 0
+) {
+  fail('node_modules directory is unsafe');
+}
+const client = readPackage('@prisma/client');
+const adapter = readPackage('@prisma/adapter-pg');
+const prisma = readPackage('prisma');
+const pg = readPackage('pg');
+for (const [name, installed] of [
+  ['@prisma/client', client.value.version],
+  ['@prisma/adapter-pg', adapter.value.version],
+  ['prisma', prisma.value.version],
+  ['pg', pg.value.version],
+]) {
+  if (!/^\d+\.\d+\.\d+$/.test(declared[name] || '')) {
+    fail(`${name} must have an exact declared version`);
+  }
+  if (declared[name] !== installed) {
+    fail(`${name} declared and installed versions differ`);
+  }
+}
+if (
+  client.value.version !== adapter.value.version
+  || client.value.version !== prisma.value.version
+) {
+  fail('Prisma client, adapter, and CLI versions must match exactly');
+}
+
+const generatedRoot = path.join(process.cwd(), 'node_modules', '.prisma', 'client');
+const generatedRootStat = fs.lstatSync(generatedRoot);
+if (
+  !generatedRootStat.isDirectory()
+  || generatedRootStat.isSymbolicLink()
+  || generatedRootStat.uid !== process.geteuid()
+  || (generatedRootStat.mode & 0o022) !== 0
+) {
+  fail('generated Prisma client directory is unsafe');
+}
+
+const generatedSchemaPath = path.join(generatedRoot, 'schema.prisma');
+const generatedIndexPath = path.join(generatedRoot, 'index.js');
+const generatedWasmPath = path.join(generatedRoot, 'query_compiler_bg.wasm');
+const generatedCompilerWrapperPath = path.join(
+  generatedRoot,
+  'query_compiler_bg.js',
+);
+assertSecureRegularFile(generatedSchemaPath, 100, 8 * 1024 * 1024);
+assertSecureRegularFile(generatedIndexPath, 1_000, 32 * 1024 * 1024);
+assertSecureRegularFile(generatedWasmPath, 100_000, 64 * 1024 * 1024);
+assertSecureRegularFile(generatedCompilerWrapperPath, 1_000, 4 * 1024 * 1024);
+
+const generatedSchema = fs.readFileSync(generatedSchemaPath, 'utf8');
+const clientGenerator = generatedSchema.match(/generator\s+client\s*\{([\s\S]*?)\}/);
+if (
+  !clientGenerator
+  || !/provider\s*=\s*["']prisma-client-js["']/.test(clientGenerator[1])
+  || !/engineType\s*=\s*["']client["']/.test(clientGenerator[1])
+) {
+  fail('generated Prisma schema is not the Rust-free client engine');
+}
+
+const generatedIndex = fs.readFileSync(generatedIndexPath, 'utf8');
+if (!/["']engineType["']\s*:\s*["']client["']/.test(generatedIndex)) {
+  fail('generated Prisma metadata does not attest engineType=client');
+}
+
+const forbiddenRuntime = /^(?:libquery_engine-|query-engine-)/;
+const pendingGeneratedDirectories = [generatedRoot];
+let generatedEntryCount = 0;
+while (pendingGeneratedDirectories.length > 0) {
+  const directory = pendingGeneratedDirectories.pop();
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    generatedEntryCount += 1;
+    if (generatedEntryCount > 512) {
+      fail('generated Prisma client contains too many runtime entries');
+    }
+    const entryPath = path.join(directory, entry.name);
+    const entryStat = fs.lstatSync(entryPath);
+    if (
+      entryStat.isSymbolicLink()
+      || entryStat.uid !== process.geteuid()
+      || (entryStat.mode & 0o022) !== 0
+    ) {
+      fail(`generated Prisma client contains unsafe entry ${entry.name}`);
+    }
+    if (forbiddenRuntime.test(entry.name)) {
+      fail(`generated Prisma client contains forbidden native runtime ${entry.name}`);
+    }
+    if (entry.isDirectory()) {
+      pendingGeneratedDirectories.push(entryPath);
+    } else if (!entry.isFile()) {
+      fail(`generated Prisma client contains unsupported entry ${entry.name}`);
+    }
+  }
+}
+
+const wasmBytes = fs.readFileSync(generatedWasmPath);
+if (!wasmBytes.subarray(0, 4).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d]))) {
+  fail('generated Prisma query compiler is not a WebAssembly module');
+}
+const clientRoot = path.dirname(client.path);
+const compilerSourcePath = path.join(
+  clientRoot,
+  'runtime',
+  'query_compiler_bg.postgresql.wasm-base64.js',
+);
+const compilerWrapperSourcePath = path.join(
+  clientRoot,
+  'runtime',
+  'query_compiler_bg.postgresql.js',
+);
+assertSecureRegularFile(compilerSourcePath, 100_000, 64 * 1024 * 1024);
+assertSecureRegularFile(compilerWrapperSourcePath, 1_000, 4 * 1024 * 1024);
+if (
+  !fs.readFileSync(generatedCompilerWrapperPath).equals(
+    fs.readFileSync(compilerWrapperSourcePath),
+  )
+) {
+  fail('generated Prisma compiler wrapper differs from the installed client package');
+}
+const compilerSource = require(compilerSourcePath);
+if (typeof compilerSource.wasm !== 'string') {
+  fail('installed Prisma client is missing the PostgreSQL compiler source');
+}
+const trustedWasmBytes = Buffer.from(compilerSource.wasm, 'base64');
+if (!wasmBytes.equals(trustedWasmBytes)) {
+  fail('generated Prisma compiler bytes differ from the installed client package');
+}
+
+for (const name of ['@prisma/client', '@prisma/adapter-pg', 'pg']) {
+  require(name);
+}
+console.log(
+  `[${label}] ok engine=client prisma=${client.value.version} pg=${pg.value.version} wasm_sha256=${crypto.createHash('sha256').update(wasmBytes).digest('hex')}`,
+);
+NODE
+  )
+}
+
 install_backend_runtime_dependencies() {
   local backend_dir="${PORTAL_DIR}/backend"
   [[ -d "${backend_dir}" ]] || fail "Backend directory not found at ${backend_dir}"
@@ -778,6 +1036,8 @@ install_backend_runtime_dependencies() {
   if ! (cd "${backend_dir}" && node <<'NODE' >> "$LOG_FILE" 2>&1
 const checks = [
   ['@prisma/client', () => require('@prisma/client')],
+  ['@prisma/adapter-pg', () => require('@prisma/adapter-pg')],
+  ['pg', () => require('pg')],
   ['bcrypt', () => require('bcrypt')],
   ['sharp', () => require('sharp')],
   ['node-pty', () => require('node-pty')],
@@ -794,6 +1054,10 @@ for (const [name, load] of checks) {
 NODE
   ); then
     fail "Runtime dependency verification failed — check ${LOG_FILE}"
+  fi
+  if ! verify_prisma_client_runtime "${backend_dir}" runtime-prisma-check \
+      >> "${LOG_FILE}" 2>&1; then
+    fail "Rust-free database runtime verification failed — check ${LOG_FILE}"
   fi
 
   ok "Runtime dependencies verified"
@@ -835,6 +1099,8 @@ prepare_staged_backend_runtime_dependencies() {
     node <<'NODE'
 const checks = [
   ['@prisma/client', () => require('@prisma/client')],
+  ['@prisma/adapter-pg', () => require('@prisma/adapter-pg')],
+  ['pg', () => require('pg')],
   ['bcrypt', () => require('bcrypt')],
   ['sharp', () => require('sharp')],
   ['node-pty', () => require('node-pty')],
@@ -849,28 +1115,39 @@ for (const [name, load] of checks) {
 }
 NODE
   ) >> "${LOG_FILE}" 2>&1 || return 1
+  verify_prisma_client_runtime "${backend_dir}" candidate-prisma-check \
+    >> "${LOG_FILE}" 2>&1 || return 1
 
   ok "Candidate dependencies prepared and verified"
 }
 
 pg_url_component() {
   local db_url="$1" component="$2"
+  pg_url_uses_supported_prisma_adapter_options "${db_url}" || return 1
   printf '%s' "${db_url}" | python3 /dev/fd/3 "${component}" 3<<'PY2'
+import re
 import sys
 from urllib.parse import unquote, urlsplit
 
 raw = sys.stdin.read()
-if not raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+if (not raw or len(raw.encode("utf-8")) > 128000 or "#" in raw
+        or re.search(r"%(?![0-9A-Fa-f]{2})", raw)
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
     raise SystemExit(1)
 try:
     parsed = urlsplit(raw)
     _, separator, host_part = parsed.netloc.rpartition("@")
     host = unquote(parsed.hostname or "", errors="strict")
-    port_number = parsed.port or 5432
+    port_number = 5432 if parsed.port is None else parsed.port
     database = unquote((parsed.path or "").lstrip("/"), errors="strict")
     user = unquote(parsed.username or "", errors="strict")
     password = unquote(parsed.password or "", errors="strict")
     decoded_host_part = unquote(host_part, errors="strict")
+    raw_port_suffix = (
+        host_part[host_part.find("]") + 1:]
+        if host_part.startswith("[")
+        else f":{host_part.rsplit(':', 1)[1]}" if ":" in host_part else ""
+    )
 except (UnicodeDecodeError, ValueError):
     raise SystemExit(1)
 identity_or_secret = {
@@ -878,16 +1155,33 @@ identity_or_secret = {
     "host", "hostaddr", "port", "user", "dbname", "database",
 }
 for raw_pair in parsed.query.split("&") if parsed.query else ():
+    if "+" in raw_pair:
+        raise SystemExit(1)
+    raw_key, pair_separator, raw_value = raw_pair.partition("=")
+    if "=" in raw_value:
+        raise SystemExit(1)
     try:
-        key = unquote(raw_pair.partition("=")[0], errors="strict").lower()
+        key = unquote(raw_key, errors="strict").lower()
+        value = unquote(raw_value, errors="strict")
     except UnicodeDecodeError:
         raise SystemExit(1)
-    if (not key or key in identity_or_secret
-            or any(ord(char) < 32 or ord(char) == 127 for char in key)):
+    if (not pair_separator or not key or key in identity_or_secret
+            or any(ord(char) < 32 or ord(char) == 127
+                   for value_part in (key, value) for char in value_part)):
         raise SystemExit(1)
 if (parsed.scheme not in {"postgres", "postgresql"} or parsed.fragment
-        or not separator or not 1 <= port_number <= 65535
-        or "," in decoded_host_part):
+        or re.search(r"%(?:23|24|26|2b|2c|2f|3a|3b|3d|3f|40)", parsed.path, re.I)
+        or not parsed.path.startswith("/") or parsed.path.count("/") != 1
+        or database in {".", ".."} or "/" in database
+        or not separator or parsed.netloc.count("@") != 1
+        or host_part.startswith("[") or not 1 <= port_number <= 65535
+        or "," in decoded_host_part or "%" in host
+        or "%" in (parsed.hostname or "")
+        or (raw_port_suffix
+            and not re.fullmatch(r":[1-9][0-9]*", raw_port_suffix))
+        or re.search(r"[<>\\^|]", host)
+        or host_part != host_part.lower() or not host.isascii()
+        or any(char.isspace() for char in host)):
     raise SystemExit(1)
 component = sys.argv[1]
 values = {"host": host, "port": str(port_number), "database": database, "user": user, "password": password}
@@ -901,41 +1195,174 @@ PY2
 pg_url_uses_public_schema() {
   local db_url="$1"
   printf '%s' "${db_url}" | python3 /dev/fd/3 3<<'PY2'
+import re
 import sys
 from urllib.parse import unquote, urlsplit
 
 raw = sys.stdin.read()
-if not raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+if (not raw or len(raw.encode("utf-8")) > 128000 or "#" in raw
+        or re.search(r"%(?![0-9A-Fa-f]{2})", raw)
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
     raise SystemExit(1)
 try:
     parsed = urlsplit(raw)
 except ValueError:
     raise SystemExit(1)
+if re.search(r"%(?:23|24|26|2b|2c|2f|3a|3b|3d|3f|40)", parsed.path, re.I):
+    raise SystemExit(1)
 schemas = []
 for raw_pair in parsed.query.split("&") if parsed.query else ():
+    if "+" in raw_pair:
+        raise SystemExit(1)
     raw_key, separator, raw_value = raw_pair.partition("=")
+    if "=" in raw_value:
+        raise SystemExit(1)
     try:
         key = unquote(raw_key, errors="strict").lower()
         value = unquote(raw_value, errors="strict")
     except UnicodeDecodeError:
         raise SystemExit(1)
+    if (not separator or any(ord(char) < 32 or ord(char) == 127
+            for char in value)):
+        raise SystemExit(1)
     if key == "schema":
-        if not separator:
-            raise SystemExit(1)
         schemas.append(value)
 if len(schemas) > 1 or (schemas and schemas[0] != "public"):
     raise SystemExit(1)
 PY2
 }
 
-libpq_database_url() {
+pg_url_uses_supported_prisma_adapter_options() {
   local db_url="$1"
   printf '%s' "${db_url}" | python3 /dev/fd/3 3<<'PY2'
+import os
+import re
+import sys
+from urllib.parse import unquote, urlsplit
+
+raw = sys.stdin.read()
+if (not raw or len(raw.encode("utf-8")) > 128000 or "#" in raw
+        or re.search(r"%(?![0-9A-Fa-f]{2})", raw)
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
+    raise SystemExit(1)
+try:
+    parsed = urlsplit(raw)
+except ValueError:
+    raise SystemExit(1)
+if re.search(r"%(?:23|24|26|2b|2c|2f|3a|3b|3d|3f|40)", parsed.path, re.I):
+    raise SystemExit(1)
+
+security_relevant = {
+    "schema", "connection_limit", "connect_timeout", "pool_timeout",
+    "socket_timeout", "pgbouncer", "statement_cache_size",
+    "max_idle_connection_lifetime", "max_connection_lifetime", "sslmode",
+    "sslcert", "sslkey", "sslrootcert", "sslidentity", "sslpassword",
+    "sslaccept", "channel_binding", "uselibpqcompat",
+}
+preserved = {
+    "application_name", "fallback_application_name", "options",
+    "client_encoding", "replication",
+}
+allowed = security_relevant | preserved
+unsupported = {
+    "sslcert", "sslkey", "sslidentity", "sslpassword", "sslaccept",
+    "channel_binding", "uselibpqcompat"
+}
+seen = set()
+values = {}
+for raw_pair in parsed.query.split("&") if parsed.query else ():
+    if "+" in raw_pair:
+        raise SystemExit(1)
+    raw_key, separator, raw_value = raw_pair.partition("=")
+    if "=" in raw_value:
+        raise SystemExit(1)
+    try:
+        key = unquote(raw_key, errors="strict")
+        value = unquote(raw_value, errors="strict")
+    except UnicodeDecodeError:
+        raise SystemExit(1)
+    if (not separator or any(ord(char) < 32 or ord(char) == 127
+            for char in value)):
+        raise SystemExit(1)
+    normalized = key.lower()
+    if normalized not in allowed:
+        raise SystemExit(1)
+    if key != normalized or normalized in seen:
+        raise SystemExit(1)
+    seen.add(normalized)
+    if normalized in security_relevant:
+        if normalized in unsupported:
+            raise SystemExit(1)
+        values[normalized] = value
+if values.get("sslmode") == "prefer":
+    raise SystemExit(1)
+if "sslmode" in values and values["sslmode"] not in {
+    "disable", "require", "verify-ca", "verify-full"
+}:
+    raise SystemExit(1)
+if "sslmode" not in values and (parsed.hostname or "") not in {
+    "localhost", "127.0.0.1", "::1"
+}:
+    raise SystemExit(1)
+ssl_root_cert = values.get("sslrootcert")
+if ssl_root_cert is not None and not os.path.isabs(ssl_root_cert):
+    raise SystemExit(1)
+if ssl_root_cert is not None and values.get("sslmode") not in {
+    "require", "verify-ca", "verify-full"
+}:
+    raise SystemExit(1)
+if values.get("sslmode") in {"verify-ca", "verify-full"} \
+        and ssl_root_cert is None:
+    raise SystemExit(1)
+
+def bounded_integer(name, minimum, maximum, default):
+    value = values.get(name)
+    if value is None:
+        return default
+    if not re.fullmatch(r"[0-9]+", value):
+        raise SystemExit(1)
+    parsed_value = int(value)
+    if not minimum <= parsed_value <= maximum:
+        raise SystemExit(1)
+    return parsed_value
+
+bounded_integer("connection_limit", 1, 1000, None)
+connect_timeout = bounded_integer("connect_timeout", 0, 86400, 5)
+pool_timeout = bounded_integer("pool_timeout", 0, 86400, 10)
+bounded_integer("socket_timeout", 0, 86400, None)
+bounded_integer("max_idle_connection_lifetime", 0, 86400, None)
+bounded_integer("max_connection_lifetime", 0, 86400, None)
+bounded_integer("statement_cache_size", 0, 1000000, None)
+if (("connect_timeout" in values or "pool_timeout" in values)
+        and connect_timeout != pool_timeout):
+    raise SystemExit(1)
+if values.get("pgbouncer") not in {None, "true", "false"}:
+    raise SystemExit(1)
+schema = values.get("schema")
+if schema is not None and (not schema or len(schema.encode("utf-8")) > 63
+        or any(ord(char) < 32 or ord(char) == 127 for char in schema)):
+    raise SystemExit(1)
+for tls_path_name in ("sslrootcert",):
+    tls_path = values.get(tls_path_name)
+    if tls_path is not None and (not tls_path
+            or any(ord(char) < 32 or ord(char) == 127 for char in tls_path)):
+        raise SystemExit(1)
+PY2
+}
+
+libpq_database_url() {
+  local db_url="$1"
+  pg_url_uses_supported_prisma_adapter_options "${db_url}" || return 1
+  printf '%s' "${db_url}" | python3 /dev/fd/3 3<<'PY2'
+import os
+import re
 import sys
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 raw = sys.stdin.read()
-if not raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+if (not raw or len(raw.encode("utf-8")) > 128000 or "#" in raw
+        or re.search(r"%(?![0-9A-Fa-f]{2})", raw)
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
     raise SystemExit(1)
 try:
     parsed = urlsplit(raw)
@@ -943,16 +1370,32 @@ try:
     username_raw = credentials.split(":", 1)[0] if separator else ""
     host = unquote(parsed.hostname or "", errors="strict")
     user = unquote(parsed.username or "", errors="strict")
+    password = unquote(parsed.password or "", errors="strict")
     database = unquote((parsed.path or "").lstrip("/"), errors="strict")
-    port = parsed.port or 5432
+    port = 5432 if parsed.port is None else parsed.port
     decoded_host_part = unquote(host_part, errors="strict")
+    raw_port_suffix = (
+        host_part[host_part.find("]") + 1:]
+        if host_part.startswith("[")
+        else f":{host_part.rsplit(':', 1)[1]}" if ":" in host_part else ""
+    )
 except (UnicodeDecodeError, ValueError):
     raise SystemExit(1)
 if (parsed.scheme not in {"postgres", "postgresql"} or parsed.fragment
-        or not all((separator, username_raw, host, user, database))
+        or re.search(r"%(?:23|24|26|2b|2c|2f|3a|3b|3d|3f|40)", parsed.path, re.I)
+        or not parsed.path.startswith("/") or parsed.path.count("/") != 1
+        or database in {".", ".."} or "/" in database
+        or not all((separator, username_raw, host, user, password, database))
+        or parsed.netloc.count("@") != 1 or host_part.startswith("[")
         or not 1 <= port <= 65535 or "," in decoded_host_part
+        or (raw_port_suffix
+            and not re.fullmatch(r":[1-9][0-9]*", raw_port_suffix))
+        or "%" in host or "%" in (parsed.hostname or "")
+        or re.search(r"[<>\\^|]", host)
+        or host_part != host_part.lower() or not host.isascii()
+        or any(char.isspace() for char in host)
         or any(ord(char) < 32 or ord(char) == 127
-               for value in (host, user, database) for char in value)):
+               for value in (host, user, password, database) for char in value)):
     raise SystemExit(1)
 
 # Prisma accepts ORM/pool options that libpq rejects as unknown URI
@@ -965,7 +1408,14 @@ prisma_only = {
     "pgbouncer",
     "statement_cache_size",
     "socket_timeout",
+    "max_idle_connection_lifetime",
+    "max_connection_lifetime",
 }
+preserved = {
+    "connect_timeout", "sslmode", "sslrootcert", "application_name",
+    "fallback_application_name", "options", "client_encoding", "replication",
+}
+allowed = prisma_only | preserved
 identity_or_secret = {
     "password",
     "sslpassword",
@@ -980,19 +1430,54 @@ identity_or_secret = {
     "database",
 }
 query = []
+security = {}
+seen = set()
 if parsed.query:
     for raw_pair in parsed.query.split("&"):
-        raw_key = raw_pair.partition("=")[0]
+        if "+" in raw_pair:
+            raise SystemExit(1)
+        raw_key, pair_separator, raw_value = raw_pair.partition("=")
+        if "=" in raw_value:
+            raise SystemExit(1)
         try:
-            key = unquote(raw_key, errors="strict").lower()
+            decoded_key = unquote(raw_key, errors="strict")
+            key = decoded_key.lower()
+            decoded_value = unquote(raw_value, errors="strict")
         except UnicodeDecodeError:
             raise SystemExit(1)
-        if not key or any(ord(char) < 32 or ord(char) == 127 for char in key):
+        if (not pair_separator or not key
+                or any(ord(char) < 32 or ord(char) == 127
+                       for value_part in (key, decoded_value)
+                       for char in value_part)):
             raise SystemExit(1)
         if key in identity_or_secret:
             raise SystemExit(1)
+        if decoded_key != key or key not in allowed or key in seen:
+            raise SystemExit(1)
+        seen.add(key)
+        if key in {"sslmode", "sslrootcert"}:
+            security[key] = decoded_value
         if key not in prisma_only:
             query.append(raw_pair)
+
+ssl_mode = security.get("sslmode")
+ssl_root_cert = security.get("sslrootcert")
+if ssl_mode is not None and ssl_mode not in {
+    "disable", "require", "verify-ca", "verify-full"
+}:
+    raise SystemExit(1)
+if ssl_root_cert is not None and (
+    not ssl_root_cert
+    or not os.path.isabs(ssl_root_cert)
+    or any(ord(char) < 32 or ord(char) == 127 for char in ssl_root_cert)
+):
+    raise SystemExit(1)
+if ssl_root_cert is not None and ssl_mode not in {
+    "require", "verify-ca", "verify-full"
+}:
+    raise SystemExit(1)
+if ssl_mode in {"verify-ca", "verify-full"} and ssl_root_cert is None:
+    raise SystemExit(1)
 
 # The postflight URI is passed to psql as an explicit --dbname argument, so it
 # must never carry the password; credentials travel through a 0600 pgpass file
@@ -1007,6 +1492,7 @@ update_pgpass_runner_python() {
 import os
 import select
 import ctypes
+import re
 import signal
 import sys
 
@@ -1024,12 +1510,12 @@ from urllib.parse import unquote, urlsplit
 raw_parts = []
 raw_size = 0
 while True:
-    part = os.read(3, min(65536, 131073 - raw_size))
+    part = os.read(3, min(65536, 128001 - raw_size))
     if not part:
         break
     raw_parts.append(part)
     raw_size += len(part)
-    if raw_size > 131072:
+    if raw_size > 128000:
         raise SystemExit(1)
 os.close(3)
 raw_bytes = b"".join(raw_parts)
@@ -1039,17 +1525,24 @@ except UnicodeDecodeError:
     raise SystemExit(1)
 if raw.endswith("\n"):
     raw = raw[:-1]
-if not raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+if (not raw or len(raw.encode("utf-8")) > 128000 or "#" in raw
+        or re.search(r"%(?![0-9A-Fa-f]{2})", raw)
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
     raise SystemExit(1)
 try:
     parsed = urlsplit(raw)
     _, separator, host_part = parsed.netloc.rpartition("@")
     host = unquote(parsed.hostname or "", errors="strict")
-    port_number = parsed.port or 5432
+    port_number = 5432 if parsed.port is None else parsed.port
     database = unquote((parsed.path or "").lstrip("/"), errors="strict")
     user = unquote(parsed.username or "", errors="strict")
     password = unquote(parsed.password or "", errors="strict")
     decoded_host_part = unquote(host_part, errors="strict")
+    raw_port_suffix = (
+        host_part[host_part.find("]") + 1:]
+        if host_part.startswith("[")
+        else f":{host_part.rsplit(':', 1)[1]}" if ":" in host_part else ""
+    )
 except (UnicodeDecodeError, ValueError):
     raise SystemExit(1)
 identity_or_secret = {
@@ -1057,16 +1550,33 @@ identity_or_secret = {
     "host", "hostaddr", "port", "user", "dbname", "database",
 }
 for raw_pair in parsed.query.split("&") if parsed.query else ():
+    if "+" in raw_pair:
+        raise SystemExit(1)
+    raw_key, pair_separator, raw_value = raw_pair.partition("=")
+    if "=" in raw_value:
+        raise SystemExit(1)
     try:
-        key = unquote(raw_pair.partition("=")[0], errors="strict").lower()
+        key = unquote(raw_key, errors="strict").lower()
+        value = unquote(raw_value, errors="strict")
     except UnicodeDecodeError:
         raise SystemExit(1)
-    if (not key or key in identity_or_secret
-            or any(ord(char) < 32 or ord(char) == 127 for char in key)):
+    if (not pair_separator or not key or key in identity_or_secret
+            or any(ord(char) < 32 or ord(char) == 127
+                   for value_part in (key, value) for char in value_part)):
         raise SystemExit(1)
 if (parsed.scheme not in {"postgres", "postgresql"} or parsed.fragment
-        or not separator or not 1 <= port_number <= 65535
-        or "," in decoded_host_part):
+        or re.search(r"%(?:23|24|26|2b|2c|2f|3a|3b|3d|3f|40)", parsed.path, re.I)
+        or not parsed.path.startswith("/") or parsed.path.count("/") != 1
+        or database in {".", ".."} or "/" in database
+        or not separator or parsed.netloc.count("@") != 1
+        or host_part.startswith("[") or not 1 <= port_number <= 65535
+        or "," in decoded_host_part or "%" in host
+        or "%" in (parsed.hostname or "")
+        or (raw_port_suffix
+            and not re.fullmatch(r":[1-9][0-9]*", raw_port_suffix))
+        or re.search(r"[<>\\^|]", host)
+        or host_part != host_part.lower() or not host.isascii()
+        or any(char.isspace() for char in host)):
     raise SystemExit(1)
 port = str(port_number)
 values = (host, port, database, user, password)
@@ -1109,6 +1619,7 @@ run_with_update_pgpass() {
   local db_url="$1"
   shift
   [[ "$#" -gt 0 ]] || return 1
+  pg_url_uses_supported_prisma_adapter_options "${db_url}" || return 1
   local runner_source
   runner_source="$(update_pgpass_runner_python)" || return 1
   local -a clean_environment=(
@@ -4850,9 +5361,11 @@ verify_update_database_guard_identity() {
   python3 - "${expected_token}" <<'PY2'
 import json
 import os
+import re
 import secrets
 import stat
 import sys
+import time
 
 try:
     expected = json.loads(sys.argv[1])
@@ -5163,6 +5676,7 @@ update_database_operation_supervisor_python() {
   cat <<'PY2'
 import ctypes
 import os
+import re
 import signal
 import sys
 
@@ -5278,12 +5792,12 @@ from urllib.parse import unquote, urlsplit
 raw_parts = []
 raw_size = 0
 while True:
-    part = os.read(3, min(65536, 131073 - raw_size))
+    part = os.read(3, min(65536, 128001 - raw_size))
     if not part:
         break
     raw_parts.append(part)
     raw_size += len(part)
-    if raw_size > 131072:
+    if raw_size > 128000:
         raise SystemExit(92)
 os.close(3)
 raw_bytes = b"".join(raw_parts)
@@ -5293,7 +5807,9 @@ except UnicodeDecodeError:
     raise SystemExit(92)
 if database_url.endswith("\n"):
     database_url = database_url[:-1]
-if not database_url or any(
+if not database_url or "#" in database_url or re.search(
+    r"%(?![0-9A-Fa-f]{2})", database_url
+) or any(
     ord(character) < 32 or ord(character) == 127
     for character in database_url
 ):
@@ -5305,11 +5821,16 @@ def pgpass_payload(raw):
         parsed = urlsplit(raw)
         _, separator, host_part = parsed.netloc.rpartition("@")
         host = unquote(parsed.hostname or "", errors="strict")
-        port_number = parsed.port or 5432
+        port_number = 5432 if parsed.port is None else parsed.port
         database = unquote((parsed.path or "").lstrip("/"), errors="strict")
         user = unquote(parsed.username or "", errors="strict")
         password = unquote(parsed.password or "", errors="strict")
         decoded_host_part = unquote(host_part, errors="strict")
+        raw_port_suffix = (
+            host_part[host_part.find("]") + 1:]
+            if host_part.startswith("[")
+            else f":{host_part.rsplit(':', 1)[1]}" if ":" in host_part else ""
+        )
     except (UnicodeDecodeError, ValueError):
         raise SystemExit(92)
     forbidden = {
@@ -5317,24 +5838,52 @@ def pgpass_payload(raw):
         "host", "hostaddr", "port", "user", "dbname", "database",
     }
     for raw_pair in parsed.query.split("&") if parsed.query else ():
+        if "+" in raw_pair:
+            raise SystemExit(92)
+        raw_key, pair_separator, raw_value = raw_pair.partition("=")
+        if "=" in raw_value:
+            raise SystemExit(92)
         try:
-            key = unquote(
-                raw_pair.partition("=")[0], errors="strict"
-            ).lower()
+            key = unquote(raw_key, errors="strict").lower()
+            value = unquote(raw_value, errors="strict")
         except UnicodeDecodeError:
             raise SystemExit(92)
         if (
-            not key
+            not pair_separator
+            or not key
             or key in forbidden
-            or any(ord(character) < 32 or ord(character) == 127 for character in key)
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for value_part in (key, value)
+                for character in value_part
+            )
         ):
             raise SystemExit(92)
     if (
         parsed.scheme not in {"postgres", "postgresql"}
         or parsed.fragment
+        or re.search(
+            r"%(?:23|24|26|2b|2c|2f|3a|3b|3d|3f|40)",
+            parsed.path,
+            re.I,
+        )
+        or not parsed.path.startswith("/")
+        or parsed.path.count("/") != 1
+        or database in {".", ".."}
+        or "/" in database
         or not separator
+        or parsed.netloc.count("@") != 1
+        or host_part.startswith("[")
         or not 1 <= port_number <= 65535
         or "," in decoded_host_part
+        or (raw_port_suffix
+            and not re.fullmatch(r":[1-9][0-9]*", raw_port_suffix))
+        or "%" in host
+        or "%" in (parsed.hostname or "")
+        or re.search(r"[<>\\^|]", host)
+        or host_part != host_part.lower()
+        or not host.isascii()
+        or any(character.isspace() for character in host)
     ):
         raise SystemExit(92)
     values = (host, str(port_number), database, user, password)
@@ -6495,6 +7044,10 @@ run_migrations_safe() {
   ) >> "${LOG_FILE}" 2>&1; then
     fail "Database client generation failed — check ${LOG_FILE}."
   fi
+  if ! verify_prisma_client_runtime "${backend_dir}" migration-prisma-check \
+      >> "${LOG_FILE}" 2>&1; then
+    fail "Rust-free database runtime verification failed after migrations — check ${LOG_FILE}."
+  fi
   ok "Database ready ${DIM}(${table_count} tables, ${migration_count} migrations)${NC}"
 }
 
@@ -7173,6 +7726,7 @@ converge_openclaw_core_package() {
 rollback_openclaw_package_update() {
   $OPENCLAW_ROLLBACK_IN_PROGRESS && return 1
   OPENCLAW_ROLLBACK_IN_PROGRESS=true
+  local defer_gateway_restart="${1:-false}"
   local rollback_ok=true
   local restart_gateway=false
   if $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED || $OPENCLAW_PACKAGE_UPDATED || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; then
@@ -7208,7 +7762,7 @@ rollback_openclaw_package_update() {
     rollback_ok=false
   fi
 
-  if $restart_gateway; then
+  if $restart_gateway && [[ "${defer_gateway_restart}" != "true" ]]; then
     systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
     if [[ -z "${OPENCLAW_PREUPDATE_RUNTIME_VERSION:-}" ]] \
       || ! verify_openclaw_gateway_stable "${OPENCLAW_PREUPDATE_RUNTIME_VERSION}" 18; then
@@ -7741,7 +8295,79 @@ spin_apt() {
 rand_hex()  { openssl rand -hex "${1:-32}"; }
 rand_pass() { openssl rand -base64 48 | tr -dc 'a-zA-Z0-9' | head -c "${1:-24}"; }
 
+settle_openclaw_compatibility_hotfix_process() {
+  local pid="${OPENCLAW_COMPAT_HOTFIX_PID:-}" state="" attempt
+  [[ -n "${pid}" ]] || return 0
+  if [[ ! "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+    OPENCLAW_COMPAT_HOTFIX_PID=""
+    return 1
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null \
+      || kill -TERM "${pid}" 2>/dev/null \
+      || true
+    for attempt in {1..50}; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        break
+      fi
+      state="$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || true)"
+      [[ "${state}" == "Z" ]] && break
+      sleep 0.1
+    done
+    if kill -0 "${pid}" 2>/dev/null \
+      && [[ "$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || true)" != "Z" ]]; then
+      kill -KILL -- "-${pid}" 2>/dev/null \
+        || kill -KILL "${pid}" 2>/dev/null \
+        || true
+    fi
+  fi
+  wait "${pid}" 2>/dev/null || true
+  OPENCLAW_COMPAT_HOTFIX_PID=""
+  ! kill -0 "${pid}" 2>/dev/null
+}
+
+run_openclaw_compatibility_hotfix() {
+  local hotfix_script="$1" openclaw_dist="$2"
+  local hotfix_log="${3:-${LOG_FILE}}" status=0 observed_pgid=""
+  local pgid_attempt
+  command -v setsid >/dev/null 2>&1 || return 1
+  setsid env \
+    PORTAL_OPENCLAW_HOTFIX_STRICT=1 \
+    PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION="${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" \
+    bash "${hotfix_script}" "${openclaw_dist}" \
+      >> "${hotfix_log}" 2>&1 &
+  OPENCLAW_COMPAT_HOTFIX_PID=$!
+  for pgid_attempt in {1..20}; do
+    observed_pgid="$(ps -o pgid= -p "${OPENCLAW_COMPAT_HOTFIX_PID}" 2>/dev/null \
+      | tr -d '[:space:]')"
+    [[ -z "${observed_pgid}" \
+      || "${observed_pgid}" == "${OPENCLAW_COMPAT_HOTFIX_PID}" ]] && break
+    sleep 0.05
+  done
+  if [[ -z "${observed_pgid}" ]]; then
+    if wait "${OPENCLAW_COMPAT_HOTFIX_PID}"; then
+      status=0
+    else
+      status=$?
+    fi
+    OPENCLAW_COMPAT_HOTFIX_PID=""
+    return "${status}"
+  fi
+  if [[ "${observed_pgid}" != "${OPENCLAW_COMPAT_HOTFIX_PID}" ]]; then
+    settle_openclaw_compatibility_hotfix_process || true
+    return 1
+  fi
+  if wait "${OPENCLAW_COMPAT_HOTFIX_PID}"; then
+    status=0
+  else
+    status=$?
+  fi
+  OPENCLAW_COMPAT_HOTFIX_PID=""
+  return "${status}"
+}
+
 recover_uncommitted_openclaw_after_signal() {
+  settle_openclaw_compatibility_hotfix_process || return 1
   if [[ "${UPDATE_RECOVERY_ARMED:-false}" != "true" \
     && "${OPENCLAW_UPGRADE_COMMITTED:-false}" != "true" ]] \
     && declare -F rollback_openclaw_tested_pair >/dev/null 2>&1; then
@@ -7804,6 +8430,10 @@ handle_installer_signal() {
   echo ""
   echo -e "\n  ${YELLOW}⚠  ${message}${NC}"
   echo ""
+  if ! settle_openclaw_compatibility_hotfix_process; then
+    warn "The OpenClaw compatibility patch process could not be proven stopped. Recovery was not started."
+    exit "${exit_code}"
+  fi
   if declare -F settle_active_update_database_operation >/dev/null 2>&1 \
     && ! settle_active_update_database_operation; then
     warn "The active database operation could not be proven stopped. Recovery was not started; the Portal remains boot-fenced."
@@ -7838,6 +8468,10 @@ handle_update_transaction_err() {
   trap - ERR
   trap '' SIGINT TERM HUP
   set +e
+  if ! settle_openclaw_compatibility_hotfix_process; then
+    warn "The OpenClaw compatibility patch process could not be proven stopped. Recovery was not started."
+    exit "${exit_code}"
+  fi
   if declare -F settle_active_update_database_operation >/dev/null 2>&1 \
     && ! settle_active_update_database_operation; then
     warn "The active database operation could not be proven stopped. Recovery was not started; the Portal remains boot-fenced."
@@ -7960,6 +8594,65 @@ except (OSError, UnicodeError):
     raise SystemExit(2)
 raise SystemExit(0 if found else 1)
 PY2
+}
+
+assert_database_process_environment_safe() {
+  local key
+  for key in \
+    PRISMA_CLIENT_ENGINE_TYPE \
+    PRISMA_QUERY_ENGINE_BINARY \
+    PRISMA_QUERY_ENGINE_LIBRARY \
+    PRISMA_CLIENT_GET_TIME \
+    NODE_PG_FORCE_NATIVE \
+    NODE_TLS_REJECT_UNAUTHORIZED \
+    PGUSER \
+    PGDATABASE \
+    PGPORT \
+    PGHOST \
+    PGPASSWORD \
+    PGBINARY \
+    PGOPTIONS \
+    PGSSLMODE \
+    PGSSLNEGOTIATION \
+    PGCLIENT_ENCODING \
+    PGREPLICATION \
+    PGAPPNAME \
+    PGCONNECT_TIMEOUT; do
+    [[ ! -v "${key}" ]] || return 1
+  done
+}
+
+assert_prisma_runtime_environment_safe() {
+  local env_file="$1" key status
+  assert_database_process_environment_safe || return 1
+  assert_env_file_no_duplicate_keys "${env_file}" || return 1
+  for key in \
+    PRISMA_CLIENT_ENGINE_TYPE \
+    PRISMA_QUERY_ENGINE_BINARY \
+    PRISMA_QUERY_ENGINE_LIBRARY \
+    PRISMA_CLIENT_GET_TIME \
+    NODE_PG_FORCE_NATIVE \
+    NODE_TLS_REJECT_UNAUTHORIZED \
+    PGUSER \
+    PGDATABASE \
+    PGPORT \
+    PGHOST \
+    PGPASSWORD \
+    PGBINARY \
+    PGOPTIONS \
+    PGSSLMODE \
+    PGSSLNEGOTIATION \
+    PGCLIENT_ENCODING \
+    PGREPLICATION \
+    PGAPPNAME \
+    PGCONNECT_TIMEOUT; do
+    status=0
+    env_file_has_assignment "${env_file}" "${key}" || status=$?
+    case "${status}" in
+      1) ;;
+      *) return 1 ;;
+    esac
+  done
 }
 
 remove_env_assignment_atomic() {
@@ -8154,20 +8847,22 @@ verify_release_bundle() {
     rm -f -- "${public_key}"
     return 1
   fi
-  rm -f -- "${public_key}"
 
-  python3 - "${manifest}" "${artifact}" "${VERSION}" <<'PY2'
+  if ! python3 - "${manifest}" "${artifact}" "${VERSION}" "${public_key}" <<'PY2'
 import base64
 import datetime
 import hashlib
 import json
 import os
 import re
+import stat
+import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import PurePosixPath
 
-manifest_path, artifact_path, expected_version = sys.argv[1:4]
+manifest_path, artifact_path, expected_version, public_key_path = sys.argv[1:5]
 raw = open(manifest_path, "rb").read()
 if b"\x00" in raw or b"\r" in raw:
     raise SystemExit("invalid manifest encoding")
@@ -8261,6 +8956,8 @@ required_current_migrations = {
     "portal/backend/prisma/migrations/20260723_user_authorization_version/migration.sql",
     "portal/backend/prisma/migrations/20260726_native_ollama_backend_binding/migration.sql",
     "portal/backend/prisma/migrations/20260729_project_authorization_transition/migration.sql",
+    "portal/backend/prisma/migrations/20260808_share_link_rate_limits/migration.sql",
+    "portal/backend/prisma/migrations/20260809_project_runtime_recovery_replay/migration.sql",
 }
 required_current_skill = {
     "portal/skills/bridgesllm-portal/SKILL.md",
@@ -8336,10 +9033,12 @@ required_baseline_members = {
     "portal/installer/bridgesllm-project-runtime-v1.apparmor",
     "portal/installer/bridgesllm-project-runtime-v1.seccomp.json",
     "portal/installer/caddy-managed-config.py",
+    "portal/installer/project-runtime-image-repair-launcher.py",
     "portal/installer/update-transaction-state.py",
     "portal/installer/update-validation-protocol-v1",
     "portal/installer/grok-build-runtime.sh",
     "portal/installer/install.sh",
+    "portal/installer/install.sh.sig",
     "portal/installer/Setup-OllamaTailnet.ps1",
     "portal/installer/Start-Here.cmd",
     "portal/installer/ollama-tailnet-README.txt",
@@ -8493,6 +9192,112 @@ with tarfile.open(artifact_path, "r:gz") as archive:
         if hasher.hexdigest() != expected_hash:
             raise SystemExit(f"release content digest mismatch: {name}")
 
+    launcher_name = "portal/installer/project-runtime-image-repair-launcher.py"
+    installer_name = "portal/installer/install.sh"
+    signature_name = "portal/installer/install.sh.sig"
+    public_key_name = "portal/installer/release-signing-ed25519.pub.pem"
+    for name, required_mode in (
+        (launcher_name, 0o644),
+        (installer_name, 0o755),
+        (signature_name, 0o644),
+        (public_key_name, 0o644),
+    ):
+        info = member_index[name]
+        if info.uid != 0 or info.gid != 0 or stat.S_IMODE(info.mode) != required_mode:
+            raise SystemExit(f"invalid release authority metadata: {name}")
+    launcher_payload = read_member(launcher_name, 128 * 1024)
+    bundled_public_key = read_member(public_key_name, 16 * 1024)
+    with open(public_key_path, "rb") as public_key_handle:
+        trusted_public_key = public_key_handle.read(16 * 1024 + 1)
+    if bundled_public_key != trusted_public_key:
+        raise SystemExit("release bundle public key does not match installer trust")
+    launcher_keys = re.findall(
+        rb'^RELEASE_PUBLIC_KEY = b"""(-----BEGIN PUBLIC KEY-----\n'
+        rb'[A-Za-z0-9+/=\n]+-----END PUBLIC KEY-----\n)"""$',
+        launcher_payload,
+        re.MULTILINE,
+    )
+    if launcher_keys != [trusted_public_key]:
+        raise SystemExit("runtime repair launcher public key does not match installer trust")
+
+    installer_payload = read_member(installer_name, 2 * 1024 * 1024)
+    installer_signature = read_member(signature_name, 64)
+    if len(installer_signature) != 64:
+        raise SystemExit("Project runtime repair installer signature is malformed")
+    current_launcher_matches = re.findall(
+        rb'^PORTAL_RUNTIME_REPAIR_LAUNCHER_CURRENT = '
+        rb'\(([0-9]+), "([0-9a-f]{64})"\)$',
+        installer_payload,
+        re.MULTILINE,
+    )
+    launcher_identity = (
+        len(launcher_payload), hashlib.sha256(launcher_payload).hexdigest()
+    )
+    if len(current_launcher_matches) != 1 or (
+        int(current_launcher_matches[0][0]),
+        current_launcher_matches[0][1].decode("ascii")
+    ) != launcher_identity:
+        raise SystemExit("runtime repair launcher identity is stale")
+    launcher_releases = re.search(
+        rb"PORTAL_RUNTIME_REPAIR_LAUNCHER_RELEASES = \{(.*?)^\}",
+        installer_payload,
+        re.MULTILINE | re.DOTALL,
+    )
+    if (
+        launcher_releases is None
+        or len(re.findall(
+            rb"^\s*PORTAL_RUNTIME_REPAIR_LAUNCHER_CURRENT,\s*$",
+            launcher_releases.group(1),
+            re.MULTILINE,
+        )) != 1
+    ):
+        raise SystemExit("runtime repair launcher is not scanner-admitted")
+    with tempfile.TemporaryDirectory(
+        prefix=".repair-signature-", dir=os.path.dirname(artifact_path)
+    ) as verification_dir:
+        installer_copy = os.path.join(verification_dir, "install.sh")
+        signature_copy = os.path.join(verification_dir, "install.sh.sig")
+        for target, payload in (
+            (installer_copy, installer_payload),
+            (signature_copy, installer_signature),
+        ):
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise SystemExit("Project runtime repair signature staging stalled")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        verification = subprocess.run(
+            [
+                "/usr/bin/openssl", "pkeyutl", "-verify", "-pubin",
+                "-inkey", public_key_path, "-rawin", "-in", installer_copy,
+                "-sigfile", signature_copy,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={
+                "HOME": "/root",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "OPENSSL_CONF": "/dev/null",
+                "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            },
+            timeout=15,
+            check=False,
+        )
+        if verification.returncode != 0:
+            raise SystemExit("Project runtime repair installer signature is invalid")
+
     def decoded(name, maximum=4 * 1024 * 1024):
         return read_member(name, maximum).decode("utf-8")
 
@@ -8613,6 +9418,11 @@ with tarfile.open(artifact_path, "r:gz") as archive:
         if f"portal/frontend/dist{asset}" not in seen:
             raise SystemExit(f"frontend entrypoint references a missing asset: {asset}")
 PY2
+  then
+    rm -f -- "${public_key}"
+    return 1
+  fi
+  rm -f -- "${public_key}"
 }
 
 record_verified_release_identity() {
@@ -9102,6 +9912,36 @@ acquire_portal_operation_lock() {
   [[ ! -e "${restore_journal}" && ! -L "${restore_journal}" ]] \
     || fail "An interrupted restore must recover before install, update, or uninstall can mutate the host."
   sweep_stale_release_stage_dirs
+}
+
+acquire_project_runtime_image_repair_lock() {
+  # This narrow repair shares the installer/update/uninstall lock, but it must
+  # never recover, resume, sweep, or otherwise join those transactions. Any
+  # durable operation state therefore blocks repair without being changed.
+  local lock_path="${1:-${PORTAL_OPERATION_LOCK_PATH}}"
+  local expected_inode actual_inode journal resolved
+  expected_inode="$(prepare_portal_operation_lock "${lock_path}")" \
+    || fail "Portal operation lock could not be prepared safely."
+  exec 9<>"${lock_path}" \
+    || fail "Portal operation lock could not be opened safely."
+  actual_inode="$(stat -Lc '%d:%i:%u:%g:%a:%h:%s' /proc/$$/fd/9 2>/dev/null)" \
+    || fail "Portal operation lock descriptor could not be attested."
+  [[ "${actual_inode}" == "${expected_inode}" ]] \
+    || fail "Portal operation lock changed while it was being opened."
+  flock -n 9 \
+    || fail "Another BridgesLLM install, update, uninstall, backup, restore, or repair operation is already running."
+
+  for journal in \
+    "${UPDATE_ACTIVE_JOURNAL}" \
+    "${UPDATE_CUTOVER_JOURNAL}" \
+    "${UNINSTALL_ACTIVE_JOURNAL}" \
+    "${BACKUP_QUIESCENCE_JOURNAL}" \
+    "${RESTORE_ACTIVE_JOURNAL}"; do
+    resolved="$(update_transaction_state_path "${journal}")" \
+      || fail "A durable Portal operation path is invalid."
+    [[ ! -e "${resolved}" && ! -L "${resolved}" ]] \
+      || fail "A durable install, update, uninstall, backup, or restore operation must settle before Project runtime image repair."
+  done
 }
 
 sweep_stale_release_stage_dirs() {
@@ -9765,6 +10605,10 @@ Options:
                      usually optional)
   --reinstall       Force a fresh install over an existing one
   --uninstall       Remove BridgesLLM portal
+  --repair-project-runtime-image
+                    Repair only the installed Portal's canonical full-stack
+                    Project runtime image. This Owner-triggered maintenance
+                    mode accepts no other option and restarts only Portal.
   --residue-policy MODE
                     With --uninstall Clean slate, decide leftover managed
                     runtime residue from an earlier partial cleanup without a
@@ -9785,6 +10629,16 @@ EOF
 }
 
 parse_args() {
+  local original_count=$# repair_argument_count=0 argument
+  for argument in "$@"; do
+    [[ "${argument}" == "--repair-project-runtime-image" ]] \
+      && repair_argument_count=$((repair_argument_count + 1))
+  done
+  if (( repair_argument_count > 0 )); then
+    REPAIR_PROJECT_RUNTIME_IMAGE=true
+    (( repair_argument_count == 1 && original_count == 1 )) \
+      || fail "--repair-project-runtime-image is a mutually exclusive maintenance operation and accepts no other option."
+  fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --domain)
@@ -9813,6 +10667,7 @@ parse_args() {
       --update)         UPDATE_MODE=true; shift ;;
       --reinstall)      FORCE_FRESH=true; shift ;;
       --uninstall)      UNINSTALL_MODE=true; shift ;;
+      --repair-project-runtime-image) REPAIR_PROJECT_RUNTIME_IMAGE=true; shift ;;
       --residue-policy)
         [[ "${2:-}" == "safe" || "${2:-}" == "wipe" ]] \
           || fail "--residue-policy requires 'safe' or 'wipe'."
@@ -9839,8 +10694,9 @@ parse_args() {
   $UPDATE_MODE && operation_count=$((operation_count + 1))
   $FORCE_FRESH && operation_count=$((operation_count + 1))
   $UNINSTALL_MODE && operation_count=$((operation_count + 1))
+  $REPAIR_PROJECT_RUNTIME_IMAGE && operation_count=$((operation_count + 1))
   (( operation_count <= 1 )) \
-    || fail "--update, --reinstall, and --uninstall are mutually exclusive operations."
+    || fail "--update, --reinstall, --uninstall, and --repair-project-runtime-image are mutually exclusive operations."
 }
 
 load_existing_origin_for_forced_reinstall() {
@@ -9964,6 +10820,3336 @@ validate_selected_origin() {
 # Step 1: Preflight
 # ═══════════════════════════════════════════════════════════════
 
+# Retire the one known Portal-created all-images prune job and fail closed on
+# literal unsafe prune commands in effective installed root scheduler
+# definitions and their bounded, strict absolute helper-script chain. Opaque
+# executables, arbitrary shell variables, relative helpers, and external
+# program construction remain outside a static installer inspection.
+# The optional root argument is only for isolated installer fixtures.
+converge_unsafe_docker_prune_automation() {
+  local host_root="${1:-/}"
+  command -v python3 >/dev/null 2>&1 \
+    || { warn "Python 3 is required to inspect scheduled Docker cleanup jobs safely."; return 1; }
+
+  python3 - \
+    "${host_root}" \
+    "${LEGACY_DOCKER_PRUNE_CRON_PATH}" \
+    "${LEGACY_DOCKER_PRUNE_QUARANTINE_PATH}" <<'PY2'
+import codecs
+import ctypes
+import errno
+import hashlib
+import os
+import re
+import shlex
+import stat
+import sys
+
+LIMIT = 1024 * 1024
+HELPER_FILE_LIMIT = 128 * 1024
+HELPER_TOTAL_LIMIT = 1024 * 1024
+HELPER_FILE_COUNT_LIMIT = 96
+HELPER_LINE_LIMIT = 16384
+HELPER_DEPTH_LIMIT = 4
+WRAPPER_DEPTH_LIMIT = 16
+SCHEDULER_ENTRY_LIMIT = 16384
+PORTAL_AUDITED_HELPER_LIMIT = 512 * 1024
+# Exact backup-full.sh payloads from installable Portal 4.0 releases through
+# 4.0.13. The backup service legitimately schedules this larger audited
+# entrypoint. Keep arbitrary operator helpers on the generic 128 KiB per-file,
+# 96-file, 1 MiB aggregate, and 16,384 executable-line work bounds.
+PORTAL_BACKUP_HELPER_RELEASES = {
+    (223518, "4988ba5be75e7e78e9c0f0981684c0a9203c7175f353eb07f890d337df8e1b1b"),
+    (224956, "fc6751d6844589e081911e425c551afb317a3ded4b9d465b754dc7113c3c9454"),
+    (227908, "a25a3d3562dfc2b51798916b893070f811e91074ef9c40430f296f22afd5a736"),
+    (229463, "cba9826305c93de11f99699437937d6f7f89e1ae9869f415df903b047c5f2816"),
+    (248156, "5b42a047fa07e3b5af2752b85f6d3e22e5944778c660799cf2eaade18f868143"),
+    (263283, "337d15eb7289a63f77429aee7677ebb8c1aa4a037698111c591565a3496a1a85"),
+    (268494, "384e21ade857380bdced2855671184f0a624338dcc20da3f21bea09cdc6178c9"),
+}
+PORTAL_RUNTIME_REPAIR_LAUNCHER = (
+    "/opt/bridgesllm/portal/installer/"
+    "project-runtime-image-repair-launcher.py"
+)
+PORTAL_RUNTIME_REPAIR_UNIT = (
+    "/run/systemd/transient/"
+    "bridgesllm-project-runtime-image-repair.service"
+)
+PORTAL_RUNTIME_REPAIR_LAUNCHER_CURRENT = (8641, "9bb962ad51725c2025d4813bb84c1887c115f47ca891134a5f3e70abfa8bc9ee")
+PORTAL_RUNTIME_REPAIR_LAUNCHER_RELEASES = {
+    PORTAL_RUNTIME_REPAIR_LAUNCHER_CURRENT,
+}
+LEGACY = b'13 0 * * * root docker image prune -af --filter "until=24h"\n'
+SEPARATORS = {";", "&", "&&", "|", "||"}
+EXEC_KEYS = {
+    "ExecCondition", "ExecReload", "ExecStart", "ExecStartPost",
+    "ExecStartPre", "ExecStop", "ExecStopPost",
+}
+UNIT_SUFFIXES = {
+    ".automount", ".path", ".scope", ".service", ".slice",
+    ".socket", ".swap", ".target", ".timer",
+}
+SHELL_NAMES = {"bash", "dash", "ksh", "sh", "zsh"}
+PERL_NAMES = {"perl"}
+RUBY_NAMES = {"ruby"}
+NODE_NAMES = {"node", "nodejs"}
+BUILTIN_WRAPPERS = {"command", "exec"}
+SHELL_CONTROL_PREFIXES = {"!", "{", "coproc", "do", "elif", "else", "if", "then", "until", "while"}
+DOCKER_TRUE_VALUES = {"1", "t", "true"}
+DOCKER_FALSE_VALUES = {"0", "f", "false"}
+
+
+def fail(message):
+    print(f"Unsafe Docker prune guard: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+root = os.path.abspath(sys.argv[1])
+source_logical, quarantine_logical = sys.argv[2:4]
+
+
+def host_path(logical):
+    value = os.path.normpath(os.path.join(root, logical.lstrip("/")))
+    if root != "/" and value != root and not value.startswith(root + os.sep):
+        fail(f"mapped path escapes the fixture root: {logical}")
+    return value
+
+
+def display(path):
+    if root == "/":
+        return path
+    relative = os.path.relpath(path, root)
+    return "/" if relative == "." else "/" + relative
+
+
+def lstat_or_none(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        fail(f"could not inspect {display(path)}: {exc}")
+
+
+def read_root_file(path, modes=None, single_link=False, require_root_group=False):
+    before = lstat_or_none(path)
+    if before is None:
+        return None, None
+    mode = stat.S_IMODE(before.st_mode)
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        fail(f"{display(path)} is not a regular file; inspect it manually")
+    if before.st_uid != 0 or (require_root_group and before.st_gid != 0):
+        expected_owner = "root:root" if require_root_group else "root"
+        fail(f"{display(path)} is not owned by {expected_owner}; inspect it manually")
+    if single_link and before.st_nlink != 1:
+        fail(f"{display(path)} has unexpected hard links; inspect it manually")
+    if modes is not None and mode not in modes:
+        expected = ", ".join(f"{item:04o}" for item in sorted(modes))
+        fail(f"{display(path)} has mode {mode:04o}, expected {expected}")
+    if before.st_size > LIMIT:
+        fail(f"{display(path)} exceeds the 1 MiB job inspection limit")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"could not open {display(path)} without following links: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        before_id = (
+            before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+            before.st_gid, before.st_nlink, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        )
+        opened_id = (
+            opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+            opened.st_gid, opened.st_nlink, opened.st_size,
+            opened.st_mtime_ns, opened.st_ctime_ns,
+        )
+        if opened_id != before_id:
+            fail(f"{display(path)} changed during inspection")
+        payload = b""
+        while len(payload) <= LIMIT:
+            chunk = os.read(descriptor, min(65536, LIMIT + 1 - len(payload)))
+            if not chunk:
+                break
+            payload += chunk
+        if len(payload) > LIMIT:
+            fail(f"{display(path)} exceeds the 1 MiB job inspection limit")
+        after = os.fstat(descriptor)
+        after_id = (
+            after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+            after.st_gid, after.st_nlink, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if after_id != opened_id:
+            fail(f"{display(path)} changed while it was read")
+        return payload, before
+    finally:
+        os.close(descriptor)
+
+
+def require_secure_directory(
+    path,
+    metadata,
+    context,
+    *,
+    allow_standard_crontab_spool=False,
+    require_root_group=True,
+):
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        allow_standard_crontab_spool
+        and display(path) == "/var/spool/cron/crontabs"
+        and stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == 0
+        and mode == 0o1730
+    ):
+        # Debian/Ubuntu deliberately use root:crontab 1730 here so the
+        # setgid crontab helper can install per-user spools. Its sticky bit,
+        # lack of world access, and root ownership are the supported secure
+        # exception to the otherwise root:root/non-writable chain.
+        return
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or (require_root_group and metadata.st_gid != 0)
+        or mode & 0o022
+    ):
+        fail(
+            f"{context} directory {display(path)} is linked, non-root-owned, "
+            "or writable by another account"
+        )
+
+
+def resolve_secure_path(
+    path,
+    *,
+    allow_missing=False,
+    allow_mask=False,
+    final_kind,
+    require_root_group=True,
+    require_root_group_directories=True,
+    require_owner_readable=False,
+    allow_standard_crontab_spool=False,
+):
+    normalized = os.path.normpath(path)
+    if root != "/" and normalized != root and not normalized.startswith(root + os.sep):
+        fail(f"secure path escapes the host root: {path}")
+    relative = os.path.relpath(normalized, root)
+    pending = [] if relative == "." else relative.split(os.sep)
+    current = root
+    root_stat = lstat_or_none(root)
+    if root_stat is None:
+        fail("host root disappeared during scheduler inspection")
+    require_secure_directory(
+        root,
+        root_stat,
+        "scheduler",
+        allow_standard_crontab_spool=allow_standard_crontab_spool,
+    )
+    symlink_count = 0
+    visited_links = set()
+    required_link_target_components = 0
+
+    while pending:
+        component = pending.pop(0)
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            fail(f"secure path escapes the host root: {path}")
+        candidate = os.path.join(current, component)
+        metadata = lstat_or_none(candidate)
+        if metadata is None:
+            if allow_missing and required_link_target_components == 0:
+                return None, False
+            fail(f"scheduled path {display(candidate)} is missing or a link target is broken")
+        if stat.S_ISLNK(metadata.st_mode):
+            if metadata.st_uid != 0 or metadata.st_gid != 0:
+                fail(f"scheduled path link {display(candidate)} is not owned by root:root")
+            symlink_count += 1
+            if symlink_count > 32:
+                fail(f"scheduled path {display(path)} has too many link indirections")
+            link_identity = (metadata.st_dev, metadata.st_ino)
+            if link_identity in visited_links:
+                fail(f"scheduled path {display(path)} contains a link cycle")
+            visited_links.add(link_identity)
+            try:
+                link_target = os.readlink(candidate)
+            except OSError as exc:
+                fail(f"could not read scheduled path link {display(candidate)}: {exc}")
+            target = (
+                host_path(link_target)
+                if os.path.isabs(link_target)
+                else os.path.normpath(os.path.join(os.path.dirname(candidate), link_target))
+            )
+            if root != "/" and target != root and not target.startswith(root + os.sep):
+                fail(f"scheduled path link {display(candidate)} escapes the host root")
+            if allow_mask and not pending and target == host_path("/dev/null"):
+                return None, True
+            target_relative = os.path.relpath(target, root)
+            target_parts = [] if target_relative == "." else target_relative.split(os.sep)
+            required_link_target_components = (
+                len(target_parts)
+                + max(required_link_target_components - 1, 0)
+            )
+            pending = target_parts + pending
+            current = root
+            continue
+        if required_link_target_components > 0:
+            required_link_target_components -= 1
+        if pending:
+            require_secure_directory(
+                candidate,
+                metadata,
+                "scheduler",
+                allow_standard_crontab_spool=allow_standard_crontab_spool,
+                require_root_group=require_root_group_directories,
+            )
+        current = candidate
+
+    metadata = lstat_or_none(current)
+    if metadata is None:
+        if allow_missing and symlink_count == 0:
+            return None, False
+        fail(f"scheduled path {display(current)} disappeared during inspection")
+    if final_kind == "directory":
+        require_secure_directory(
+            current,
+            metadata,
+            "scheduler",
+            allow_standard_crontab_spool=allow_standard_crontab_spool,
+            require_root_group=require_root_group_directories,
+        )
+    elif final_kind == "file":
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or (require_root_group and metadata.st_gid != 0)
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or (require_owner_readable and not metadata.st_mode & stat.S_IRUSR)
+        ):
+            if not require_owner_readable:
+                fail(
+                    f"scheduled definition or helper {display(current)} is non-regular, "
+                    "non-root-owned, or writable by another account"
+                )
+            fail(
+                f"scheduled definition or helper {display(current)} is non-regular, "
+                "unreadable, non-root-owned, or writable by another account"
+            )
+    elif final_kind == "either":
+        if stat.S_ISDIR(metadata.st_mode):
+            require_secure_directory(
+                current,
+                metadata,
+                "scheduler",
+                allow_standard_crontab_spool=allow_standard_crontab_spool,
+                require_root_group=require_root_group_directories,
+            )
+        elif (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or (require_root_group and metadata.st_gid != 0)
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or (require_owner_readable and not metadata.st_mode & stat.S_IRUSR)
+        ):
+            if not require_owner_readable:
+                fail(
+                    f"scheduled definition or helper {display(current)} is non-regular, "
+                    "non-root-owned, or writable by another account"
+                )
+            fail(
+                f"scheduled definition or helper {display(current)} is non-regular, "
+                "unreadable, non-root-owned, or writable by another account"
+            )
+    else:
+        fail(f"unsupported secure-path kind: {final_kind}")
+    return current, False
+
+
+def tokens(value):
+    try:
+        lexer = shlex.shlex(value, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        return list(lexer)
+    except ValueError:
+        return re.findall(r"&&|\|\||[;&|]|[^\s;&|]+", value)
+
+
+def word(value):
+    cleaned = value.strip("$(){}[]<>,\"'")
+    prefix_match = re.match(r"^[-+!:@]+", cleaned)
+    if prefix_match:
+        prefix = prefix_match.group(0)
+        return prefix + os.path.basename(cleaned[len(prefix):])
+    return os.path.basename(cleaned)
+
+
+def systemd_effective_argv(arguments):
+    argv = list(arguments)
+    if not argv:
+        return argv
+    prefix_match = re.match(r"^[-+!:@]+", argv[0])
+    prefix = prefix_match.group(0) if prefix_match else ""
+    executable = argv[0][len(prefix):] if prefix else argv[0]
+    if not executable:
+        return []
+    if "@" not in prefix:
+        return [executable, *argv[1:]]
+    # systemd's @ executable prefix consumes the next word as the overridden
+    # argv[0]. It is not part of the called program's argument vector. The
+    # prefix has no such meaning in cron's ordinary shell grammar.
+    if len(argv) < 2:
+        return []
+    return [executable, *argv[2:]]
+
+
+def command_segments(value):
+    result = []
+    start = 0
+    index = 0
+    quote = None
+    end = len(value)
+    while index < len(value):
+        character = value[index]
+        if quote == "'":
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if character == "\\":
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if character == "\\":
+            index += 2
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if quote is None and character == "#" and (
+            index == 0
+            or value[index - 1].isspace()
+            or value[index - 1] in ";&|()"
+        ):
+            end = index
+            break
+        separator_length = 0
+        if quote is None and character in {"(", ")"} and not (
+            character == "(" and index > 0 and value[index - 1] == "$"
+        ):
+            separator_length = 1
+        elif quote is None and character in {";", "\n"}:
+            separator_length = 1
+        elif quote is None and character in {"&", "|"}:
+            if (
+                (index > 0 and value[index - 1] in {">", "<"})
+                or (
+                    character == "&"
+                    and index + 1 < len(value)
+                    and value[index + 1] == ">"
+                )
+            ):
+                index += 1
+                continue
+            separator_length = (
+                2
+                if index + 1 < len(value)
+                and value[index + 1] in {character, "&"}
+                else 1
+            )
+        if separator_length:
+            segment = value[start:index].strip()
+            if segment:
+                result.append(tokens(segment))
+            index += separator_length
+            start = index
+            continue
+        index += 1
+    segment = value[start:end].strip()
+    if segment:
+        result.append(tokens(segment))
+    return result
+
+
+def systemd_command_segments(value):
+    # systemd supports multiple Exec*= commands only when a semicolon appears
+    # as its own unquoted, unescaped word. Pipes, ampersands, substitutions,
+    # and escaped/quoted semicolons are ordinary argv data, not shell syntax.
+    result = []
+    start = 0
+    index = 0
+    quote = None
+    while index < len(value):
+        character = value[index]
+        if character == "\\":
+            index += 2
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if character == ";" and (
+            index == 0 or value[index - 1].isspace()
+        ) and (
+            index + 1 == len(value) or value[index + 1].isspace()
+        ):
+            segment = value[start:index].strip()
+            if segment:
+                result.append(tokens(segment))
+            start = index + 1
+        index += 1
+    segment = value[start:].strip()
+    if segment:
+        result.append(tokens(segment))
+    return result
+
+
+def shell_segment_plan(arguments):
+    argv = []
+    stdin_source = None
+    raw = list(arguments)
+    index = 0
+    redirection = re.compile(
+        r"^(?:(?P<descriptor>[0-9]+))?"
+        r"(?P<operator><<<|<<|<>|>>|>|<)(?P<suffix>.*)$"
+    )
+    while index < len(raw):
+        item = raw[index]
+        # shlex separates the `&` in &> and descriptor duplication. Keep
+        # shell redirections out of the executed argv without treating the
+        # duplication ampersand as a command-list separator.
+        if item == "&" and index + 1 < len(raw):
+            following = redirection.fullmatch(raw[index + 1])
+            if following and following.group("operator").startswith(">"):
+                item = raw[index + 1]
+                index += 1
+            else:
+                argv.append(item)
+                index += 1
+                continue
+        match = redirection.fullmatch(item)
+        if match:
+            descriptor = match.group("descriptor")
+            operator = match.group("operator")
+            suffix = match.group("suffix")
+            target = suffix
+            descriptor_duplication = target.startswith("&")
+            if descriptor_duplication:
+                target = target[1:]
+            index += 1
+            if not suffix and index < len(raw):
+                if raw[index] in {"&", "|"}:
+                    descriptor_duplication = raw[index] == "&"
+                    index += 1
+                    if index < len(raw):
+                        target = raw[index]
+                        index += 1
+                else:
+                    target = raw[index]
+                    index += 1
+            effective_descriptor = (
+                int(descriptor)
+                if descriptor is not None
+                else (0 if operator.startswith("<") else 1)
+            )
+            if effective_descriptor == 0 and operator.startswith("<"):
+                if operator == "<<<":
+                    stdin_source = (
+                        ("here-string", target)
+                        if target != ""
+                        else ("here-string", "")
+                    )
+                elif operator == "<<":
+                    # The body of a here-document is outside this bounded
+                    # single-command tokenizer. A stdin-driven shell must not
+                    # be admitted on an unknowable command source.
+                    stdin_source = ("opaque", "here-document")
+                elif descriptor_duplication:
+                    stdin_source = (
+                        ("closed", None)
+                        if target == "-"
+                        else ("opaque", "descriptor duplication")
+                    )
+                elif target:
+                    stdin_source = ("file", target)
+                else:
+                    stdin_source = ("opaque", "missing redirection target")
+            continue
+        argv.append(item)
+        index += 1
+    while argv and argv[0] in SHELL_CONTROL_PREFIXES:
+        argv.pop(0)
+    return argv, stdin_source
+
+
+def shell_segment_argv(arguments):
+    return shell_segment_plan(arguments)[0]
+
+
+def shell_invocation_plan(arguments, stdin_source):
+    """Resolve whether a shell reads -c, a script, or its effective stdin."""
+    index = 0
+    noexec = False
+    stdin_mode = False
+    command = None
+    terminal = False
+    while index < len(arguments):
+        item = arguments[index]
+        if item == "--":
+            index += 1
+            break
+        if item in {"--help", "--version"}:
+            terminal = True
+            break
+        if item == "--noexec":
+            noexec = True
+            index += 1
+            continue
+        if item in {"-O", "+O", "-o", "+o", "--init-file", "--rcfile"}:
+            if index + 1 >= len(arguments):
+                terminal = True
+                break
+            option_value = arguments[index + 1]
+            if item in {"-o", "+o"} and option_value == "noexec":
+                noexec = item == "-o"
+            index += 2
+            continue
+        if item.startswith(("-", "+")) and item not in {"-", "+"}:
+            sign = item[0]
+            cluster = item[1:]
+            if not cluster.isalpha():
+                # An unmodelled shell option can change how the remaining
+                # argv is interpreted. Reject an stdin-driven invocation
+                # later rather than guessing that it is harmless.
+                return {
+                    "kind": "opaque", "value": "unsupported shell option",
+                    "noexec": noexec,
+                }
+            if "n" in cluster:
+                noexec = sign == "-"
+            if "s" in cluster:
+                stdin_mode = sign == "-"
+            if "c" in cluster:
+                if index + 1 >= len(arguments):
+                    terminal = True
+                else:
+                    command = arguments[index + 1]
+                index = len(arguments)
+                break
+            index += 1
+            continue
+        break
+    if noexec or terminal:
+        return {"kind": "nonexecuting", "value": None, "noexec": noexec}
+    if command is not None:
+        return {"kind": "command", "value": command, "noexec": False}
+    if not stdin_mode and index < len(arguments) and arguments[index] != "-":
+        return {"kind": "script", "value": arguments[index], "noexec": False}
+    if stdin_source is None or stdin_source[0] == "closed":
+        return {"kind": "empty-stdin", "value": None, "noexec": False}
+    return {"kind": stdin_source[0], "value": stdin_source[1], "noexec": False}
+
+
+def env_command_argv(arguments):
+    index = 0
+    while index < len(arguments):
+        item = arguments[index]
+        if item == "--":
+            index += 1
+            break
+        if item in {"-u", "--unset", "-C", "--chdir"}:
+            if index + 1 >= len(arguments):
+                return []
+            index += 2
+            continue
+        split_value = None
+        split_tail = []
+        if item in {"-S", "--split-string"}:
+            if index + 1 >= len(arguments):
+                return []
+            split_value = arguments[index + 1]
+            split_tail = arguments[index + 2:]
+        elif item.startswith("-S") and item != "-S":
+            split_value = item[2:]
+            split_tail = arguments[index + 1:]
+        elif item.startswith("--split-string="):
+            split_value = item.split("=", 1)[1]
+            split_tail = arguments[index + 1:]
+        if split_value is not None:
+            try:
+                split_arguments = shlex.split(
+                    split_value, comments=False, posix=True
+                )
+            except ValueError:
+                # GNU env rejects an unterminated split string before it can
+                # execute a command. Treat that invocation as non-executing.
+                return []
+            return split_arguments + list(split_tail)
+        if item.startswith("-") or re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*", item
+        ):
+            index += 1
+            continue
+        break
+    return list(arguments[index:])
+
+
+def docker_all_value(argument):
+    if argument == "--all":
+        return True
+    if argument.startswith("--all="):
+        explicit = argument.split("=", 1)[1].strip().lower()
+        if explicit in DOCKER_TRUE_VALUES:
+            return True
+        if explicit in DOCKER_FALSE_VALUES:
+            return False
+        return None
+    if not argument.startswith("-") or argument.startswith("--"):
+        return None
+    shorthand = argument[1:]
+    flags, separator, explicit = shorthand.partition("=")
+    if "a" not in flags:
+        return None
+    # pflag evaluates a compact Boolean shorthand from left to right. An
+    # explicit value belongs to the final shorthand; preceding `a` flags have
+    # already taken their no-option default of true.
+    if not separator or flags.index("a") < len(flags) - 1:
+        return True
+    explicit = explicit.strip().lower()
+    if explicit in DOCKER_TRUE_VALUES:
+        return True
+    if explicit in DOCKER_FALSE_VALUES:
+        return False
+    return None
+
+
+def docker_prune_kind(arguments):
+    index = 0
+    global_value_options = {
+        "-H", "--config", "--context", "--host", "-l", "--log-level",
+        "--tlscacert", "--tlscert", "--tlskey",
+    }
+    global_boolean_options = {"-D", "--debug", "--tls", "--tlsverify"}
+    global_nonexecuting_options = {"-h", "--help", "-v", "--version"}
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            index += 1
+            break
+        if argument in global_nonexecuting_options:
+            return None
+        if argument in global_value_options:
+            if index + 1 >= len(arguments):
+                return None
+            index += 2
+            continue
+        if any(argument.startswith(option + "=") for option in global_value_options):
+            index += 1
+            continue
+        if (
+            (argument.startswith("-H") and argument != "-H")
+            or (argument.startswith("-l") and argument != "-l")
+        ):
+            index += 1
+            continue
+        if argument in global_boolean_options:
+            index += 1
+            continue
+        if any(argument.startswith(option + "=") for option in global_boolean_options):
+            explicit = argument.split("=", 1)[1].strip().lower()
+            if explicit not in (DOCKER_TRUE_VALUES | DOCKER_FALSE_VALUES):
+                return None
+            index += 1
+            continue
+        if argument.startswith("-"):
+            return None
+        break
+    if index + 1 >= len(arguments):
+        return None
+    kind = word(arguments[index])
+    if kind not in {"image", "system"} or word(arguments[index + 1]) != "prune":
+        return None
+    index += 2
+    all_enabled = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            if index + 1 < len(arguments):
+                return None
+            break
+        if argument == "--filter":
+            if index + 1 >= len(arguments):
+                return None
+            index += 2
+            continue
+        if argument.startswith("--filter="):
+            index += 1
+            continue
+        if argument == "--all" or argument.startswith("--all="):
+            all_value = docker_all_value(argument)
+            if all_value is None:
+                return None
+            all_enabled = all_value
+            index += 1
+            continue
+        if argument in {"--force", "-f"}:
+            index += 1
+            continue
+        if argument.startswith("--force="):
+            if argument.split("=", 1)[1].strip().lower() not in (
+                DOCKER_TRUE_VALUES | DOCKER_FALSE_VALUES
+            ):
+                return None
+            index += 1
+            continue
+        if kind == "system" and argument == "--volumes":
+            index += 1
+            continue
+        if kind == "system" and argument.startswith("--volumes="):
+            if argument.split("=", 1)[1].strip().lower() not in (
+                DOCKER_TRUE_VALUES | DOCKER_FALSE_VALUES
+            ):
+                return None
+            index += 1
+            continue
+        if argument.startswith("-") and not argument.startswith("--"):
+            shorthand, separator, explicit = argument[1:].partition("=")
+            if not shorthand or any(flag not in {"a", "f"} for flag in shorthand):
+                return None
+            if separator and explicit.strip().lower() not in (
+                DOCKER_TRUE_VALUES | DOCKER_FALSE_VALUES
+            ):
+                return None
+            if "a" in shorthand:
+                all_value = docker_all_value(argument)
+                if all_value is None:
+                    return None
+                all_enabled = all_value
+            index += 1
+            continue
+        return None
+    return kind if all_enabled else None
+
+
+def shell_command_substitutions(value):
+    """Return statically delimited substitutions that a shell will execute."""
+    substitutions = []
+    index = 0
+    quote = None
+    while index < len(value):
+        character = value[index]
+        if quote == "'":
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character == "\\":
+            if (
+                quote == '"'
+                and index + 1 < len(value)
+                and value[index + 1] not in {'$', '`', '"', "\\", "\n"}
+            ):
+                index += 1
+            else:
+                index += 2
+            continue
+        if quote is None and character == "'":
+            quote = "'"
+            index += 1
+            continue
+        if character == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if quote is None and character == "#" and (
+            index == 0
+            or value[index - 1].isspace()
+            or value[index - 1] in ";&|()"
+        ):
+            break
+        if character == "`":
+            end = index + 1
+            while end < len(value):
+                if value[end] == "\\":
+                    end += 2
+                    continue
+                if value[end] == "`":
+                    substitutions.append(value[index + 1:end])
+                    index = end + 1
+                    break
+                end += 1
+            else:
+                return substitutions
+            continue
+        if character == "$" and index + 1 < len(value) and value[index + 1] == "(":
+            start = index + 2
+            end = start
+            depth = 1
+            inner_quote = None
+            while end < len(value):
+                inner = value[end]
+                if inner_quote == "'":
+                    if inner == "'":
+                        inner_quote = None
+                    end += 1
+                    continue
+                if inner == "\\":
+                    if (
+                        inner_quote == '"'
+                        and end + 1 < len(value)
+                        and value[end + 1] not in {'$', '`', '"', "\\", "\n"}
+                    ):
+                        end += 1
+                    else:
+                        end += 2
+                    continue
+                if inner_quote is None and inner == "'":
+                    inner_quote = "'"
+                    end += 1
+                    continue
+                if inner == '"':
+                    inner_quote = None if inner_quote == '"' else '"'
+                    end += 1
+                    continue
+                if inner_quote is None and inner == "(":
+                    depth += 1
+                elif inner_quote is None and inner == ")":
+                    depth -= 1
+                    if depth == 0:
+                        substitutions.append(value[start:end])
+                        index = end + 1
+                        break
+                end += 1
+            else:
+                return substitutions
+            continue
+        index += 1
+    return substitutions
+
+
+def language_execution_commands(value, kind):
+    # These APIs execute one literal string through a command shell. Arbitrary
+    # strings, assignments, logging calls, and dynamically constructed values
+    # are intentionally not interpreted as executable commands.
+    call_names = {
+        "python": (("os.system",), False, "#"),
+        "perl": (("system", "exec"), True, "#"),
+        "ruby": (("system", "exec"), True, "#"),
+        "node": (("execSync", "exec"), False, "//"),
+    }
+    configuration = call_names.get(kind)
+    if configuration is None:
+        return []
+    names, optional_parenthesis, comment = configuration
+    commands = []
+    index = 0
+    quote = None
+    while index < len(value):
+        character = value[index]
+        if quote is not None:
+            if character == "\\":
+                index += 2
+                continue
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if value.startswith(comment, index):
+            break
+        matched = next(
+            (
+                name for name in sorted(names, key=len, reverse=True)
+                if value.startswith(name, index)
+                and (index == 0 or not (value[index - 1].isalnum() or value[index - 1] == "_"))
+                and (
+                    index + len(name) == len(value)
+                    or not (
+                        value[index + len(name)].isalnum()
+                        or value[index + len(name)] == "_"
+                    )
+                )
+            ),
+            None,
+        )
+        if matched is None:
+            index += 1
+            continue
+        cursor = index + len(matched)
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        if cursor < len(value) and value[cursor] == "(":
+            cursor += 1
+            while cursor < len(value) and value[cursor].isspace():
+                cursor += 1
+        elif not optional_parenthesis:
+            index += len(matched)
+            continue
+        if cursor >= len(value) or value[cursor] not in {"'", '"'}:
+            index += len(matched)
+            continue
+        argument_quote = value[cursor]
+        cursor += 1
+        argument = []
+        while cursor < len(value):
+            if value[cursor] == "\\" and cursor + 1 < len(value):
+                argument.extend(value[cursor:cursor + 2])
+                cursor += 2
+                continue
+            if value[cursor] == argument_quote:
+                commands.append("".join(argument))
+                cursor += 1
+                break
+            argument.append(value[cursor])
+            cursor += 1
+        index = max(cursor, index + len(matched))
+    return commands
+
+
+def dangerous_argv(arguments, depth, stdin_source=None):
+    if depth > WRAPPER_DEPTH_LIMIT:
+        fail(
+            f"scheduled command wrapper inspection exceeded depth "
+            f"{WRAPPER_DEPTH_LIMIT}"
+        )
+    argv = list(arguments)
+    while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+        argv.pop(0)
+    if not argv:
+        return None
+    name = word(argv[0])
+    rest = argv[1:]
+
+    if name == "docker":
+        return docker_prune_kind(rest)
+
+    if name in BUILTIN_WRAPPERS:
+        if name == "command" and any(item in {"-v", "-V"} for item in rest):
+            return None
+        index = 0
+        while index < len(rest) and rest[index].startswith("-"):
+            if rest[index] == "--":
+                index += 1
+                break
+            if name == "exec" and rest[index] == "-a" and index + 1 < len(rest):
+                index += 2
+            else:
+                index += 1
+        return dangerous_argv(rest[index:], depth + 1, stdin_source)
+
+    if name == "eval":
+        return dangerous(" ".join(rest), shell_syntax=True, depth=depth + 1)
+
+    if name == "env":
+        return dangerous_argv(env_command_argv(rest), depth + 1, stdin_source)
+
+    if name == "timeout":
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-k", "--kill-after", "-s", "--signal"}:
+                index += 2
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        return (
+            dangerous_argv(rest[index + 1:], depth + 1, stdin_source)
+            if index < len(rest) else None
+        )
+
+    if name == "flock":
+        for index, item in enumerate(rest):
+            if item in {"-c", "--command"} and index + 1 < len(rest):
+                return dangerous(rest[index + 1], shell_syntax=True, depth=depth + 1)
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-w", "--wait", "-E", "--conflict-exit-code"}:
+                index += 2
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        return (
+            dangerous_argv(rest[index + 1:], depth + 1, stdin_source)
+            if index < len(rest) else None
+        )
+
+    if name == "nice":
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-n", "--adjustment"}:
+                index += 2
+                continue
+            if re.fullmatch(r"-\d+", item) or item.startswith("--adjustment="):
+                index += 1
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        return dangerous_argv(rest[index:], depth + 1, stdin_source)
+
+    if name == "time":
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-f", "--format", "-o", "--output"}:
+                index += 2
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        return dangerous_argv(rest[index:], depth + 1, stdin_source)
+
+    if name == "nohup":
+        return dangerous_argv(
+            rest[1:] if rest[:1] == ["--"] else rest,
+            depth + 1,
+            stdin_source,
+        )
+
+    if name == "sudo":
+        index = 0
+        value_options = {
+            "-C", "--close-from", "-D", "--chdir", "-g", "--group",
+            "-h", "--host", "-p", "--prompt", "-R", "--chroot",
+            "-T", "--command-timeout", "-u", "--user",
+        }
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in value_options:
+                index += 2
+                continue
+            if item.startswith("-") or re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*=.*", item
+            ):
+                index += 1
+                continue
+            break
+        return dangerous_argv(rest[index:], depth + 1, stdin_source)
+
+    kind = interpreter_kind(name)
+    if kind == "shell":
+        plan = shell_invocation_plan(rest, stdin_source)
+        if plan["kind"] == "command":
+            return dangerous(plan["value"], shell_syntax=True, depth=depth + 1)
+        if plan["kind"] == "here-string":
+            return dangerous(plan["value"], shell_syntax=True, depth=depth + 1)
+        if plan["kind"] == "opaque":
+            fail(
+                "scheduled stdin-driven shell uses a command source that "
+                f"cannot be inspected safely ({plan['value']})"
+            )
+        return None
+    if kind in {"python", "perl", "ruby", "node"}:
+        plan = interpreter_invocation(kind, rest)
+        for source in plan["inline"]:
+            for command in language_execution_commands(source, kind):
+                finding = dangerous(command, shell_syntax=True, depth=depth + 1)
+                if finding:
+                    return finding
+        return None
+    return None
+
+
+def dangerous(value, *, shell_syntax=False, systemd_syntax=False, depth=0):
+    parts = tokens(value) if isinstance(value, str) else list(value)
+    if isinstance(value, str) and shell_syntax:
+        segments = command_segments(value)
+    elif isinstance(value, str) and systemd_syntax:
+        segments = systemd_command_segments(value)
+    else:
+        segments = [parts]
+    for segment in segments:
+        stdin_source = None
+        if shell_syntax:
+            segment, stdin_source = shell_segment_plan(segment)
+        elif systemd_syntax:
+            segment = systemd_effective_argv(segment)
+        finding = dangerous_argv(segment, depth, stdin_source)
+        if finding:
+            return finding
+    if shell_syntax and isinstance(value, str):
+        for substitution in shell_command_substitutions(value):
+            finding = dangerous(
+                substitution, shell_syntax=True, depth=depth + 1
+            )
+            if finding:
+                return finding
+    return None
+
+
+def cron_commands(payload, kind):
+    text = payload.decode("utf-8", errors="replace").replace("\\\n", " ")
+    for number, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if kind == "run-parts":
+            yield number, raw
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", stripped):
+            continue
+        if kind == "anacron":
+            fields = stripped.split(None, 3)
+            if len(fields) == 4:
+                yield number, fields[3]
+            continue
+        if kind == "root-spool":
+            if stripped.startswith("@"):
+                fields = stripped.split(None, 1)
+                if len(fields) == 2:
+                    yield number, fields[1]
+            else:
+                fields = stripped.split(None, 5)
+                if len(fields) == 6:
+                    yield number, fields[5]
+            continue
+        if stripped.startswith("@"):
+            fields = stripped.split(None, 2)
+            if len(fields) == 3 and fields[1] == "root":
+                yield number, fields[2]
+        else:
+            fields = stripped.split(None, 6)
+            if len(fields) == 7 and fields[5] == "root":
+                yield number, fields[6]
+
+
+def systemd_service_directives(payload):
+    text = payload.decode("utf-8", errors="replace").replace("\\\n", " ")
+    section = None
+    for number, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip()
+            continue
+        if section != "Service" or "=" not in stripped:
+            continue
+        key, command = stripped.split("=", 1)
+        yield number, key.strip(), command
+
+
+def systemd_directives(payload):
+    for number, key, command in systemd_service_directives(payload):
+        if key in EXEC_KEYS:
+            yield number, key, command
+
+
+def systemd_unescaped_reference(value):
+    simple = {
+        "a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+        "s": " ", "t": "\t", "v": "\v", "\\": "\\", '"': '"', "'": "'",
+    }
+    result = []
+    index = 0
+    while index < len(value):
+        if value[index] != "\\" or index + 1 >= len(value):
+            result.append(value[index])
+            index += 1
+            continue
+        marker = value[index + 1]
+        if marker in simple:
+            result.append(simple[marker])
+            index += 2
+            continue
+        widths = {"x": 2, "u": 4, "U": 8}
+        width = widths.get(marker)
+        if width is not None:
+            encoded = value[index + 2:index + 2 + width]
+            if len(encoded) == width and re.fullmatch(r"[0-9A-Fa-f]+", encoded):
+                try:
+                    result.append(chr(int(encoded, 16)))
+                    index += 2 + width
+                    continue
+                except ValueError:
+                    pass
+        octal = re.match(r"[0-7]{1,3}", value[index + 1:])
+        if octal is not None:
+            result.append(chr(int(octal.group(0), 8)))
+            index += 1 + len(octal.group(0))
+            continue
+        result.extend(("\\", marker))
+        index += 2
+    return "".join(result)
+
+
+def secure_cron_file(path, *, allow_missing, periodic, allow_crontab_spool):
+    resolved, masked = resolve_secure_path(
+        path,
+        allow_missing=allow_missing,
+        allow_mask=False,
+        final_kind="file",
+        require_root_group=False,
+        require_owner_readable=True,
+        allow_standard_crontab_spool=allow_crontab_spool,
+    )
+    if masked or resolved is None:
+        return None
+    metadata = lstat_or_none(resolved)
+    if metadata is None:
+        fail(f"cron scheduler target {display(resolved)} disappeared")
+    if periodic and not stat.S_IMODE(metadata.st_mode) & 0o111:
+        return None
+    return resolved
+
+
+def bounded_directory_entries(directory, entry_budget, context):
+    entries = []
+    try:
+        with os.scandir(directory) as iterator:
+            for entry in iterator:
+                entry_budget[0] += 1
+                if entry_budget[0] > SCHEDULER_ENTRY_LIMIT:
+                    fail(
+                        f"scheduler inspection exceeded its "
+                        f"{SCHEDULER_ENTRY_LIMIT}-entry aggregate budget"
+                    )
+                entries.append(entry)
+    except OSError as exc:
+        fail(f"could not enumerate {context} {display(directory)}: {exc}")
+    entries.sort(key=lambda entry: entry.name)
+    return entries
+
+
+def is_unit_name_activation_link(relative, path, metadata):
+    parts = relative.split(os.sep)
+    if (
+        len(parts) != 2
+        or not parts[0].endswith((".wants", ".requires"))
+        or os.path.splitext(parts[1])[1] not in UNIT_SUFFIXES
+        or not stat.S_ISLNK(metadata.st_mode)
+    ):
+        return False
+    if metadata.st_uid != 0 or metadata.st_gid != 0:
+        fail(f"scheduled path link {display(path)} is not owned by root:root")
+    try:
+        target = os.readlink(path)
+    except OSError as exc:
+        fail(f"could not read scheduled path link {display(path)}: {exc}")
+    current = lstat_or_none(path)
+    if current is None:
+        fail(f"systemd scheduler entry {display(path)} disappeared")
+    before_identity = (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode,
+        metadata.st_uid, metadata.st_gid, metadata.st_nlink,
+        metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+    current_identity = (
+        current.st_dev, current.st_ino, current.st_mode,
+        current.st_uid, current.st_gid, current.st_nlink,
+        current.st_size, current.st_mtime_ns, current.st_ctime_ns,
+    )
+    if current_identity != before_identity:
+        fail(f"systemd scheduler entry {display(path)} changed during inspection")
+    # systemd permits .wants/.requires dependency links to name a unit in the
+    # global load path even when the relative filesystem target is dangling.
+    # Defer only the canonical same-name form; a concrete definition elsewhere
+    # in the load path must still win, and a missing definition remains fatal.
+    return target == f"../{parts[1]}"
+
+
+def secure_cron_directory(logical, kind, entry_budget, seen_directories=None):
+    lexical_root = host_path(logical)
+    resolved_root, masked = resolve_secure_path(
+        lexical_root,
+        allow_missing=True,
+        allow_mask=False,
+        final_kind="directory",
+    )
+    if masked or resolved_root is None:
+        return
+    root_metadata = lstat_or_none(resolved_root)
+    if root_metadata is None:
+        fail(f"cron scheduler root {display(resolved_root)} disappeared")
+    root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+    if seen_directories is not None:
+        if root_identity in seen_directories:
+            return
+        seen_directories.add(root_identity)
+    entries = bounded_directory_entries(
+        resolved_root, entry_budget, "cron scheduler root"
+    )
+    for entry in entries:
+        lexical = os.path.join(lexical_root, entry.name)
+        resolved, entry_masked = resolve_secure_path(
+            lexical,
+            allow_missing=False,
+            allow_mask=False,
+            final_kind="either",
+            require_root_group=False,
+            require_owner_readable=True,
+        )
+        if entry_masked or resolved is None:
+            continue
+        metadata = lstat_or_none(resolved)
+        if metadata is None:
+            fail(f"cron scheduler entry {display(resolved)} disappeared")
+        if stat.S_ISDIR(metadata.st_mode):
+            # cron.d and run-parts do not recurse into subdirectories. The
+            # directory was still securely resolved and attested above.
+            continue
+        if kind == "run-parts" and not stat.S_IMODE(metadata.st_mode) & 0o111:
+            continue
+        yield lexical, kind, resolved
+
+
+def collect_systemd_root(logical, resolved_root, entry_budget):
+    records = []
+    pending = [(resolved_root, "")]
+    visited = set()
+    while pending:
+        directory, relative_prefix = pending.pop()
+        metadata = lstat_or_none(directory)
+        if metadata is None:
+            fail(f"systemd scheduler directory {display(directory)} disappeared")
+        require_secure_directory(directory, metadata, "systemd scheduler")
+        visit_key = (metadata.st_dev, metadata.st_ino, relative_prefix)
+        if visit_key in visited:
+            continue
+        visited.add(visit_key)
+        entries = bounded_directory_entries(
+            directory, entry_budget, "systemd scheduler directory"
+        )
+        for entry in entries:
+            path = entry.path
+            relative = os.path.join(relative_prefix, entry.name) if relative_prefix else entry.name
+            try:
+                entry_metadata = os.lstat(path)
+            except OSError as exc:
+                fail(f"could not inspect systemd scheduler entry {display(path)}: {exc}")
+            if stat.S_ISDIR(entry_metadata.st_mode):
+                require_secure_directory(path, entry_metadata, "systemd scheduler")
+                pending.append((path, relative))
+                continue
+            if is_unit_name_activation_link(relative, path, entry_metadata):
+                records.append((relative, path, None, False))
+                continue
+            resolved, entry_masked = resolve_secure_path(
+                path,
+                allow_missing=False,
+                allow_mask=True,
+                final_kind="either",
+            )
+            if entry_masked:
+                records.append((relative, path, None, True))
+                continue
+            if resolved is None:
+                fail(f"systemd scheduler entry {display(path)} disappeared")
+            resolved_metadata = lstat_or_none(resolved)
+            if resolved_metadata is None:
+                fail(f"systemd scheduler target {display(resolved)} disappeared")
+            if stat.S_ISDIR(resolved_metadata.st_mode):
+                pending.append((resolved, relative))
+                continue
+            records.append((relative, path, resolved, False))
+    return records
+
+
+def systemd_dropin_owners(unit_name):
+    stem, suffix = os.path.splitext(unit_name)
+    owners = [unit_name]
+    if "@" in stem:
+        owners.append(stem.split("@", 1)[0] + "@" + suffix)
+    prefix = stem
+    while "-" in prefix:
+        prefix = prefix.rsplit("-", 1)[0]
+        owners.append(prefix + "-" + suffix)
+    owners.append(suffix.lstrip("."))
+    return list(dict.fromkeys(owners))
+
+
+def effective_systemd_definitions(logical_roots, entry_budget):
+    selected_main = {}
+    activation_fallback = {}
+    selected_dropins = {}
+    seen_roots = set()
+    for logical in logical_roots:
+        lexical_root = host_path(logical)
+        resolved_root, masked = resolve_secure_path(
+            lexical_root,
+            allow_missing=True,
+            allow_mask=True,
+            final_kind="directory",
+        )
+        if masked:
+            fail(f"systemd scheduler root {logical} cannot be masked")
+        if resolved_root is None:
+            continue
+        root_metadata = lstat_or_none(resolved_root)
+        if root_metadata is None:
+            fail(f"systemd scheduler root {logical} disappeared")
+        root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+        if root_identity in seen_roots:
+            continue
+        seen_roots.add(root_identity)
+        for relative, definition, target, entry_masked in collect_systemd_root(
+            logical, resolved_root, entry_budget
+        ):
+            parts = relative.split(os.sep)
+            basename = parts[-1]
+            suffix = os.path.splitext(basename)[1]
+            if len(parts) == 1 and suffix in UNIT_SUFFIXES:
+                selected_main.setdefault(
+                    basename, (definition, target, entry_masked)
+                )
+                continue
+            if (
+                len(parts) == 2
+                and parts[0].endswith((".wants", ".requires"))
+                and suffix in UNIT_SUFFIXES
+            ):
+                activation_fallback.setdefault(
+                    basename, (definition, target, entry_masked)
+                )
+                continue
+            if (
+                len(parts) == 2
+                and parts[0].endswith(".d")
+                and basename.endswith(".conf")
+            ):
+                owner = parts[0][:-2]
+                selected_dropins.setdefault(
+                    (owner, basename), (definition, target, entry_masked)
+                )
+
+    for unit_name, fallback in activation_fallback.items():
+        selected_main.setdefault(unit_name, fallback)
+
+    for unit_name in sorted(selected_main):
+        definition, target, masked = selected_main[unit_name]
+        if masked:
+            continue
+        if target is None:
+            fail(f"effective systemd definition {display(definition)} has no target")
+        definitions = [(definition, target)]
+        owner_rank = {
+            owner: rank
+            for rank, owner in enumerate(systemd_dropin_owners(unit_name))
+        }
+        effective_dropins = {}
+        for (owner, basename), record in selected_dropins.items():
+            if owner not in owner_rank:
+                continue
+            previous = effective_dropins.get(basename)
+            if previous is None or owner_rank[owner] < previous[0]:
+                effective_dropins[basename] = (owner_rank[owner], record)
+        for basename in sorted(effective_dropins):
+            _, (dropin, dropin_target, dropin_masked) = effective_dropins[basename]
+            if dropin_masked:
+                continue
+            if dropin_target is None:
+                fail(f"effective systemd drop-in {display(dropin)} has no target")
+            definitions.append((dropin, dropin_target))
+        yield unit_name, definitions
+
+
+def jobs(scheduler_entry_budget, scheduler_directories):
+    for logical, kind in (
+        ("/etc/crontab", "system-cron"),
+        ("/etc/anacrontab", "anacron"),
+        ("/var/spool/cron/crontabs/root", "root-spool"),
+        ("/var/spool/cron/root", "root-spool"),
+    ):
+        lexical = host_path(logical)
+        target = secure_cron_file(
+            lexical,
+            allow_missing=True,
+            periodic=False,
+            allow_crontab_spool=kind == "root-spool",
+        )
+        if target is not None:
+            yield lexical, kind, target
+    for logical, kind in (
+        ("/etc/cron.d", "system-cron"),
+        ("/etc/cron.hourly", "run-parts"),
+        ("/etc/cron.daily", "run-parts"),
+        ("/etc/cron.weekly", "run-parts"),
+        ("/etc/cron.monthly", "run-parts"),
+        ("/etc/cron.yearly", "run-parts"),
+    ):
+        yield from secure_cron_directory(
+            logical, kind, scheduler_entry_budget, scheduler_directories
+        )
+
+    system_roots = (
+        "/etc/systemd/system.control",
+        "/run/systemd/system.control",
+        "/run/systemd/transient",
+        "/run/systemd/generator.early",
+        "/etc/systemd/system",
+        "/etc/systemd/system.attached",
+        "/run/systemd/system",
+        "/run/systemd/system.attached",
+        "/run/systemd/generator",
+        "/usr/local/lib/systemd/system",
+        "/usr/lib/systemd/system",
+        "/lib/systemd/system",
+        "/run/systemd/generator.late",
+    )
+    root_user_roots = (
+        "/root/.config/systemd/user.control",
+        "/run/user/0/systemd/user.control",
+        "/run/user/0/systemd/transient",
+        "/run/user/0/systemd/generator.early",
+        "/root/.config/systemd/user",
+        "/etc/xdg/systemd/user",
+        "/etc/systemd/user",
+        "/run/user/0/systemd/user",
+        "/run/systemd/user",
+        "/root/.local/share/systemd/user",
+        "/usr/local/share/systemd/user",
+        "/usr/share/systemd/user",
+        "/usr/local/lib/systemd/user",
+        "/usr/lib/systemd/user",
+        "/run/user/0/systemd/generator",
+        "/run/user/0/systemd/generator.late",
+    )
+    for roots in (system_roots, root_user_roots):
+        for unit_name, definitions in effective_systemd_definitions(
+            roots, scheduler_entry_budget
+        ):
+            yield unit_name, "systemd", definitions
+
+
+def is_audited_portal_backup_helper(logical_path, path, metadata):
+    expected_path = "/opt/bridgesllm/portal/backup-full.sh"
+    if (
+        os.path.normpath(logical_path) != expected_path
+        or display(path) != expected_path
+    ):
+        return False
+    if metadata.st_size > PORTAL_AUDITED_HELPER_LIMIT:
+        fail(
+            "scheduled Portal backup helper exceeds its 512 KiB audited "
+            "release limit"
+        )
+    if metadata.st_size not in {
+        release_size for release_size, _ in PORTAL_BACKUP_HELPER_RELEASES
+    }:
+        fail(
+            "scheduled Portal backup helper does not match a known shipped "
+            "BridgesLLM release; restore it through a signed update before "
+            "retrying"
+        )
+    payload, current = read_root_file(
+        path,
+        single_link=True,
+        require_root_group=True,
+    )
+    expected_identity = (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode,
+        metadata.st_uid, metadata.st_gid, metadata.st_nlink,
+        metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+    current_identity = (
+        current.st_dev, current.st_ino, current.st_mode,
+        current.st_uid, current.st_gid, current.st_nlink,
+        current.st_size, current.st_mtime_ns, current.st_ctime_ns,
+    )
+    if current_identity != expected_identity:
+        fail(
+            "scheduled Portal backup helper changed before release "
+            "attestation"
+        )
+    digest = hashlib.sha256(payload).hexdigest()
+    if (
+        os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") == "1"
+        and root != "/"
+        and os.environ.get("BRIDGESLLM_DOCKER_PRUNE_TEST_HOOK", "")
+        == "portal-helper-post-read-replacement"
+    ):
+        replacement = path + ".test-replacement"
+        displaced = path + ".test-old"
+        if os.path.lexists(displaced) or not os.path.isfile(replacement):
+            fail("Portal helper replacement fixture is incomplete")
+        os.rename(path, displaced)
+        os.rename(replacement, path)
+    final = lstat_or_none(path)
+    if final is None:
+        fail("scheduled Portal backup helper disappeared after attestation")
+    final_identity = (
+        final.st_dev, final.st_ino, final.st_mode,
+        final.st_uid, final.st_gid, final.st_nlink,
+        final.st_size, final.st_mtime_ns, final.st_ctime_ns,
+    )
+    if final_identity != expected_identity:
+        fail(
+            "scheduled Portal backup helper changed during release "
+            "attestation"
+        )
+    if (metadata.st_size, digest) not in PORTAL_BACKUP_HELPER_RELEASES:
+        fail(
+            "scheduled Portal backup helper does not match a known shipped "
+            "BridgesLLM release; restore it through a signed update before "
+            "retrying"
+        )
+    return True
+
+
+def is_audited_portal_runtime_repair_launcher(logical_path, path, metadata):
+    if (
+        os.path.normpath(logical_path) != PORTAL_RUNTIME_REPAIR_LAUNCHER
+        or display(path) != PORTAL_RUNTIME_REPAIR_LAUNCHER
+    ):
+        return False
+    strict_path, strict_masked = resolve_secure_path(
+        host_path(PORTAL_RUNTIME_REPAIR_LAUNCHER),
+        allow_missing=False,
+        allow_mask=False,
+        final_kind="file",
+        require_root_group=True,
+        require_root_group_directories=True,
+    )
+    if strict_masked or strict_path != path:
+        fail("scheduled Project runtime repair launcher path is unsafe")
+    if metadata.st_size not in {
+        release_size
+        for release_size, _ in PORTAL_RUNTIME_REPAIR_LAUNCHER_RELEASES
+    }:
+        fail(
+            "scheduled Project runtime repair launcher does not match a "
+            "known shipped BridgesLLM release"
+        )
+    payload, current = read_root_file(
+        path,
+        modes={0o600, 0o644},
+        single_link=True,
+        require_root_group=True,
+    )
+    expected_identity = (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode,
+        metadata.st_uid, metadata.st_gid, metadata.st_nlink,
+        metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+    current_identity = (
+        current.st_dev, current.st_ino, current.st_mode,
+        current.st_uid, current.st_gid, current.st_nlink,
+        current.st_size, current.st_mtime_ns, current.st_ctime_ns,
+    )
+    if current_identity != expected_identity:
+        fail("scheduled Project runtime repair launcher changed before attestation")
+    digest = hashlib.sha256(payload).hexdigest()
+    final = lstat_or_none(path)
+    if final is None:
+        fail("scheduled Project runtime repair launcher disappeared after attestation")
+    final_identity = (
+        final.st_dev, final.st_ino, final.st_mode,
+        final.st_uid, final.st_gid, final.st_nlink,
+        final.st_size, final.st_mtime_ns, final.st_ctime_ns,
+    )
+    if final_identity != expected_identity:
+        fail("scheduled Project runtime repair launcher changed during attestation")
+    if (metadata.st_size, digest) not in PORTAL_RUNTIME_REPAIR_LAUNCHER_RELEASES:
+        fail(
+            "scheduled Project runtime repair launcher does not match a "
+            "known shipped BridgesLLM release"
+        )
+    return True
+
+
+class HelperBudget:
+    def __init__(self, scheduler_entries, scheduler_directories):
+        self.files = 0
+        self.bytes = 0
+        self.lines = 0
+        self.inspected = set()
+        self.scheduler_entries = scheduler_entries
+        self.scheduler_directories = scheduler_directories
+
+    def admit(self, logical_path, path, metadata):
+        identity = (metadata.st_dev, metadata.st_ino)
+        is_runtime_repair_launcher = (
+            os.path.normpath(logical_path) == PORTAL_RUNTIME_REPAIR_LAUNCHER
+        )
+        if is_runtime_repair_launcher:
+            is_audited_portal_runtime_repair_launcher(
+                logical_path, path, metadata
+            )
+        if identity in self.inspected:
+            return False
+        if self.files + 1 > HELPER_FILE_COUNT_LIMIT:
+            fail("scheduled helper inspection exceeded its 96-file work budget")
+        if self.bytes + metadata.st_size > HELPER_TOTAL_LIMIT:
+            fail("scheduled helper inspection exceeded its 1 MiB aggregate budget")
+        if is_runtime_repair_launcher:
+            self.inspected.add(identity)
+            self.files += 1
+            self.bytes += metadata.st_size
+            return False
+        if metadata.st_size > HELPER_FILE_LIMIT:
+            if is_audited_portal_backup_helper(logical_path, path, metadata):
+                # Its exact bytes were reviewed and shipped by BridgesLLM. Do
+                # not spend the generic line budget parsing it, but retain the
+                # aggregate file/byte work accounting.
+                self.inspected.add(identity)
+                self.files += 1
+                self.bytes += metadata.st_size
+                return False
+            fail(f"scheduled helper {display(path)} exceeds 128 KiB")
+        self.inspected.add(identity)
+        self.files += 1
+        self.bytes += metadata.st_size
+        return True
+
+    def admit_line(self):
+        self.lines += 1
+        if self.lines > HELPER_LINE_LIMIT:
+            fail("scheduled helper inspection exceeded its 16384-line work budget")
+
+
+def absolute_token(value):
+    cleaned = value.strip("$(){}[]<>,\"'")
+    return cleaned if cleaned.startswith("/") else None
+
+
+def interpreter_kind(name):
+    if name in SHELL_NAMES:
+        return "shell"
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", name):
+        return "python"
+    if name in PERL_NAMES:
+        return "perl"
+    if name in RUBY_NAMES:
+        return "ruby"
+    if name in NODE_NAMES:
+        return "node"
+    return None
+
+
+def interpreter_inline_argument(kind, arguments, index):
+    argument = arguments[index]
+    following = arguments[index + 1] if index + 1 < len(arguments) else None
+    match = None
+    if kind == "python":
+        # Python permits no-value short switches to be clustered before -c,
+        # including the common `-BcCODE` form.
+        match = re.fullmatch(r"-[bBdEiIOPqRsSuvx]*c(.*)", argument)
+    elif kind == "perl":
+        # Perl accepts attached -e/-E code and clusters such as -weCODE.
+        # Its -0 and -l switches can also carry an attached octal value before
+        # a later execution switch (for example `-0777eCODE`). Parse that
+        # cluster deterministically: a nested-regex spelling permits
+        # catastrophic backtracking on a long, safe nonmatch.
+        if argument.startswith("-") and not argument.startswith("--"):
+            body = argument[1:]
+            cursor = 0
+            simple = set("wWTtnpsSUdD")
+            while cursor < len(body):
+                option = body[cursor]
+                if option in {"e", "E"}:
+                    source = body[cursor + 1:]
+                    if source:
+                        return source, 1
+                    return (following, 2) if following is not None else (None, 1)
+                if option in simple:
+                    cursor += 1
+                    continue
+                if option == "0":
+                    cursor += 1
+                    octal_digits = 0
+                    while (
+                        cursor < len(body)
+                        and octal_digits < 3
+                        and body[cursor] in "01234567"
+                    ):
+                        cursor += 1
+                        octal_digits += 1
+                    continue
+                if option == "l":
+                    cursor += 1
+                    octal_digits = 0
+                    while (
+                        cursor < len(body)
+                        and octal_digits < 4
+                        and body[cursor] in "01234567"
+                    ):
+                        cursor += 1
+                        octal_digits += 1
+                    continue
+                break
+        return None
+    elif kind == "ruby":
+        # Ruby accepts attached -e code and no-value clusters such as -weCODE.
+        match = re.fullmatch(r"-[wWvdlnpsa]*e(.*)", argument)
+    elif kind == "node":
+        if argument.startswith("--eval="):
+            return argument.split("=", 1)[1], 1
+        if argument in {"-e", "-p", "--eval", "--print"}:
+            return (following, 2) if following is not None else (None, 1)
+        if re.fullmatch(r"-[ep].+", argument):
+            # Shipped Node rejects attached short-form source (`-eCODE` and
+            # `-pCODE`) before it can execute a main script.
+            return None, 1
+    if match is None:
+        return None
+    attached = match.group(1)
+    if attached:
+        return attached, 1
+    return (following, 2) if following is not None else (None, 1)
+
+
+def interpreter_invocation(kind, arguments):
+    inline = []
+    preloads = []
+    node_print_mode = False
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            index += 1
+            break
+        if kind == "node" and argument.startswith("--print="):
+            # Node treats the equals suffix as an ignored value for the print
+            # switch. The first later non-option is the expression, if any;
+            # with no such argument this invocation prints `undefined` and
+            # does not execute the suffix.
+            node_print_mode = True
+            index += 1
+            continue
+        if kind == "node" and (
+            re.fullmatch(r"-r.+", argument)
+            or (
+                argument.startswith("--require")
+                and argument != "--require"
+                and not argument.startswith("--require=")
+            )
+            or (
+                argument.startswith("--import")
+                and argument != "--import"
+                and not argument.startswith("--import=")
+            )
+        ):
+            # These attached spellings are rejected by shipped Node before a
+            # main script can run. Only -r VALUE, --require[=]VALUE, and
+            # --import[=]VALUE are executable preload contracts.
+            return {
+                "inline": inline, "preloads": preloads,
+                "script": None, "terminal": True,
+            }
+        parsed_inline = interpreter_inline_argument(kind, arguments, index)
+        if parsed_inline is not None:
+            source, consumed = parsed_inline
+            if source is None:
+                return {
+                    "inline": inline, "preloads": preloads,
+                    "script": None, "terminal": True,
+                }
+            inline.append(source)
+            index += consumed
+            if kind in {"python", "node"}:
+                return {
+                    "inline": inline, "preloads": preloads,
+                    "script": None, "terminal": True,
+                }
+            continue
+        if kind == "python" and (
+            argument == "-m" or (argument.startswith("-m") and argument != "-m")
+        ):
+            return {
+                "inline": inline, "preloads": preloads,
+                "script": None, "terminal": True,
+            }
+        if argument.startswith("-"):
+            preload_value = None
+            preload_consumed = 1
+            if kind in {"node", "ruby"}:
+                preload_options = (
+                    {"-r", "--require", "--import"}
+                    if kind == "node" else {"-r", "--require"}
+                )
+                if argument in preload_options:
+                    if index + 1 >= len(arguments):
+                        return {
+                            "inline": inline, "preloads": preloads,
+                            "script": None, "terminal": True,
+                        }
+                    preload_value = arguments[index + 1]
+                    preload_consumed = 2
+                elif (
+                    argument.startswith("--require=")
+                    or (kind == "node" and argument.startswith("--import="))
+                ):
+                    preload_value = argument.split("=", 1)[1]
+                elif (
+                    kind == "ruby"
+                    and argument.startswith("-r")
+                    and argument != "-r"
+                ):
+                    preload_value = argument[2:]
+            if preload_value is not None:
+                preload = absolute_token(preload_value)
+                if preload is not None:
+                    preloads.append(preload)
+                index += preload_consumed
+                continue
+            value_options = {
+                "python": {"-W", "-X", "--check-hash-based-pycs"},
+                "perl": {"-I", "-M", "-m"},
+                "ruby": {"-I", "-r"},
+                "node": {"-r", "--require", "--import"},
+            }.get(kind, set())
+            if argument in value_options:
+                if index + 1 >= len(arguments):
+                    return {
+                        "inline": inline, "preloads": preloads,
+                        "script": None, "terminal": True,
+                    }
+                index += 2
+                continue
+            if any(
+                argument.startswith(option + "=")
+                for option in value_options
+                if option.startswith("--")
+            ):
+                index += 1
+                continue
+            if any(
+                argument.startswith(option) and argument != option
+                for option in value_options
+                if option.startswith("-") and not option.startswith("--")
+            ):
+                index += 1
+                continue
+            index += 1
+            continue
+        break
+    if kind == "node" and node_print_mode:
+        if index < len(arguments):
+            inline.append(arguments[index])
+        return {
+            "inline": inline,
+            "preloads": preloads,
+            "script": None,
+            "terminal": True,
+        }
+    script = absolute_token(arguments[index]) if index < len(arguments) else None
+    return {
+        "inline": inline,
+        "preloads": preloads,
+        "script": script,
+        "terminal": bool(inline),
+    }
+
+
+def recurse_argv(arguments, depth, direct_invocation, stdin_source=None):
+    if depth > WRAPPER_DEPTH_LIMIT:
+        fail(
+            f"scheduled command wrapper inspection exceeded depth "
+            f"{WRAPPER_DEPTH_LIMIT}"
+        )
+    return helper_candidates_from_argv(
+        arguments, depth, direct_invocation, stdin_source
+    )
+
+
+def interpreter_candidates(
+    kind, arguments, depth, direct_invocation, stdin_source=None
+):
+    if kind == "shell":
+        plan = shell_invocation_plan(arguments, stdin_source)
+        if plan["kind"] in {"command", "here-string"}:
+            return helper_candidates(
+                plan["value"], depth + 1, "shell-fallback"
+            )
+        if plan["kind"] == "script":
+            script = absolute_token(plan["value"])
+            if script is None:
+                fail(
+                    "scheduled shell script path is not a literal absolute path"
+                )
+            return [(script, "interpreter:shell")]
+        if plan["kind"] == "file":
+            script = absolute_token(plan["value"])
+            if script is None:
+                fail(
+                    "scheduled shell stdin path is not a literal absolute path"
+                )
+            return [(script, "shell-source")]
+        if plan["kind"] == "opaque":
+            fail(
+                "scheduled stdin-driven shell uses a command source that "
+                f"cannot be inspected safely ({plan['value']})"
+            )
+        return []
+
+    plan = interpreter_invocation(kind, arguments)
+    candidates = [
+        (preload, f"interpreter:{kind}") for preload in plan["preloads"]
+    ]
+    for source in plan["inline"]:
+        for command in language_execution_commands(source, kind):
+            candidates.extend(
+                helper_candidates(command, depth + 1, "shell-fallback")
+            )
+    if plan["terminal"]:
+        return candidates
+    if plan["script"]:
+        candidates.append((plan["script"], f"interpreter:{kind}"))
+    return candidates
+
+
+def run_parts_directory(arguments):
+    index = 0
+    value_options = {"--arg", "--regex", "--umask"}
+    nonexecuting_options = {"--help", "--list", "--test", "--version"}
+    options_end = (
+        arguments.index("--") if "--" in arguments else len(arguments)
+    )
+    if any(argument in nonexecuting_options for argument in arguments[:options_end]):
+        return None
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            index += 1
+            break
+        if argument in value_options:
+            index += 2
+            continue
+        if any(argument.startswith(option + "=") for option in value_options):
+            index += 1
+            continue
+        if argument.startswith("-"):
+            index += 1
+            continue
+        break
+    if index >= len(arguments):
+        return None
+    return absolute_token(arguments[index])
+
+
+def helper_candidates_from_argv(
+    arguments, depth, direct_invocation, stdin_source=None
+):
+    if depth > WRAPPER_DEPTH_LIMIT:
+        fail(
+            f"scheduled command wrapper inspection exceeded depth "
+            f"{WRAPPER_DEPTH_LIMIT}"
+        )
+    argv = list(arguments)
+    while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+        argv.pop(0)
+    if not argv:
+        return []
+    if any(PORTAL_RUNTIME_REPAIR_LAUNCHER in item for item in argv):
+        if (
+            direct_invocation != "systemd"
+            or len(argv) != 6
+            or argv[:4] != [
+                "/usr/bin/python3",
+                "-I",
+                "-S",
+                PORTAL_RUNTIME_REPAIR_LAUNCHER,
+            ]
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", argv[4]) is None
+            or re.fullmatch(
+                r"/opt/bridgesllm/logs/"
+                r"project-runtime-image-repair-[A-Za-z0-9_.:-]+\.log",
+                argv[5],
+            ) is None
+        ):
+            fail("scheduled Project runtime repair launcher command is malformed")
+        return [
+            (PORTAL_RUNTIME_REPAIR_LAUNCHER, "portal-runtime-repair-launcher")
+        ]
+    name = word(argv[0])
+    rest = argv[1:]
+
+    if direct_invocation == "shell-fallback" and argv[0] in {".", "source"}:
+        # Shell source builtins execute only their first positional operand;
+        # later values become the sourced file's positional arguments. Limit
+        # recursion to a literal absolute file so dynamic PATH lookup remains
+        # outside this bounded static inspection.
+        sourced = absolute_token(rest[0]) if rest else None
+        return [(sourced, "shell-source")] if sourced is not None else []
+
+    if name in BUILTIN_WRAPPERS:
+        if name == "command" and any(item in {"-v", "-V"} for item in rest):
+            return []
+        index = 0
+        while index < len(rest) and rest[index].startswith("-"):
+            if rest[index] == "--":
+                index += 1
+                break
+            if name == "exec" and rest[index] == "-a" and index + 1 < len(rest):
+                index += 2
+            else:
+                index += 1
+        return recurse_argv(
+            rest[index:], depth + 1, direct_invocation, stdin_source
+        )
+
+    if name == "env":
+        return recurse_argv(
+            env_command_argv(rest), depth + 1, "shell-fallback", stdin_source
+        )
+
+    if name == "time":
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-f", "--format", "-o", "--output"}:
+                index += 2
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        return recurse_argv(
+            rest[index:], depth + 1, "shell-fallback", stdin_source
+        )
+
+    if name == "timeout":
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-k", "--kill-after", "-s", "--signal"}:
+                index += 2
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        if index >= len(rest):
+            return []
+        return recurse_argv(
+            rest[index + 1:], depth + 1, "shell-fallback", stdin_source
+        )
+
+    if name == "flock":
+        for index, item in enumerate(rest):
+            if item in {"-c", "--command"} and index + 1 < len(rest):
+                return helper_candidates(
+                    rest[index + 1], depth + 1, "shell-fallback"
+                )
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-w", "--wait", "-E", "--conflict-exit-code"}:
+                index += 2
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        if index >= len(rest):
+            return []
+        return recurse_argv(
+            rest[index + 1:], depth + 1, "shell-fallback", stdin_source
+        )
+
+    if name == "nice":
+        index = 0
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-n", "--adjustment"}:
+                index += 2
+                continue
+            if re.fullmatch(r"-\d+", item) or item.startswith("--adjustment="):
+                index += 1
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+        return recurse_argv(
+            rest[index:], depth + 1, "shell-fallback", stdin_source
+        )
+
+    if name == "nohup":
+        return recurse_argv(
+            rest[1:] if rest[:1] == ["--"] else rest,
+            depth + 1,
+            "shell-fallback",
+            stdin_source,
+        )
+
+    if name == "sudo":
+        index = 0
+        value_options = {
+            "-C", "--close-from", "-D", "--chdir", "-g", "--group",
+            "-h", "--host", "-p", "--prompt", "-R", "--chroot",
+            "-T", "--command-timeout", "-u", "--user",
+        }
+        while index < len(rest):
+            item = rest[index]
+            if item == "--":
+                index += 1
+                break
+            if item in value_options:
+                index += 2
+                continue
+            if item.startswith("-") or re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*=.*", item
+            ):
+                index += 1
+                continue
+            break
+        return recurse_argv(
+            rest[index:], depth + 1, "shell-fallback", stdin_source
+        )
+
+    kind = interpreter_kind(name)
+    if kind:
+        return interpreter_candidates(
+            kind, rest, depth, direct_invocation, stdin_source
+        )
+
+    if name == "run-parts":
+        directory = run_parts_directory(rest)
+        candidates = []
+        executable = absolute_token(argv[0])
+        if executable is not None:
+            candidates.append((executable, direct_invocation))
+        if directory is not None:
+            candidates.append((directory, "run-parts"))
+        return candidates
+
+    executable = absolute_token(argv[0])
+    if executable is None:
+        return []
+    return [(executable, direct_invocation)]
+
+
+def helper_candidates(command, depth=0, direct_invocation="direct"):
+    candidates = []
+    if direct_invocation == "shell-fallback":
+        segments = command_segments(command)
+    elif direct_invocation == "systemd":
+        segments = systemd_command_segments(command)
+    else:
+        segments = [tokens(command)]
+    for segment in segments:
+        stdin_source = None
+        if direct_invocation == "shell-fallback":
+            segment, stdin_source = shell_segment_plan(segment)
+        elif direct_invocation == "systemd":
+            segment = systemd_effective_argv(segment)
+        candidates.extend(
+            helper_candidates_from_argv(
+                segment, depth, direct_invocation, stdin_source
+            )
+        )
+    return candidates
+
+
+def read_root_prefix(path, expected, maximum=4096):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"could not open scheduled helper {display(path)} safely: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+            opened.st_gid, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns,
+        ) != (
+            expected.st_dev, expected.st_ino, expected.st_mode, expected.st_uid,
+            expected.st_gid, expected.st_size,
+            expected.st_mtime_ns, expected.st_ctime_ns,
+        ):
+            fail(f"scheduled helper {display(path)} changed before type inspection")
+        payload = os.read(descriptor, maximum)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+            after.st_gid, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+        ) != (
+            opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+            opened.st_gid, opened.st_size,
+            opened.st_mtime_ns, opened.st_ctime_ns,
+        ):
+            fail(f"scheduled helper {display(path)} changed during type inspection")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def supported_shebang_invocation(payload):
+    first_line = payload.splitlines()[0] if payload.splitlines() else b""
+    if not first_line.startswith(b"#!"):
+        return None
+    try:
+        declaration = first_line[2:].decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    if not declaration:
+        return None
+    # Linux passes everything after the interpreter pathname as one optional
+    # argv item. Quotes and spaces in that tail are not shell syntax. GNU env
+    # is the deliberate exception: -S/--split-string parses its tail into the
+    # final interpreter argv.
+    shebang_match = re.fullmatch(r"(\S+)(?:[ \t]+(.*))?", declaration)
+    if shebang_match is None:
+        return None
+    interpreter = shebang_match.group(1)
+    optional_tail = shebang_match.group(2)
+    arguments = [optional_tail] if optional_tail else []
+    name = word(interpreter)
+    if name == "env":
+        remaining = env_command_argv(arguments)
+        if not remaining:
+            return None
+        name = word(remaining[0])
+        arguments = remaining
+    else:
+        arguments = [interpreter, *arguments]
+    kind = interpreter_kind(name)
+    return (kind, arguments[1:]) if kind is not None else None
+
+
+def printable_utf8_text(payload):
+    if b"\0" in payload:
+        return False
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return all(character in "\t\r\n" or character.isprintable() for character in text)
+
+
+def printable_utf8_prefix(payload):
+    if b"\0" in payload:
+        return False
+    try:
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        text = decoder.decode(payload, final=False)
+    except UnicodeDecodeError:
+        return False
+    return all(character in "\t\r\n" or character.isprintable() for character in text)
+
+
+def inspect_helper(path_logical, invocation, budget, depth):
+    if depth > HELPER_DEPTH_LIMIT:
+        fail(f"scheduled helper recursion exceeded depth {HELPER_DEPTH_LIMIT}")
+    lexical = host_path(path_logical)
+    resolved, masked = resolve_secure_path(
+        lexical,
+        allow_missing=True,
+        allow_mask=False,
+        final_kind="file",
+        # A dedicated service may need read/traverse access to its immutable
+        # root-owned helper. Group identity is not mutation authority when no
+        # traversed directory or final file grants group/world write. Keep
+        # scheduler roots and definitions on the stricter root:root path.
+        require_root_group=False,
+        require_root_group_directories=False,
+    )
+    if masked or resolved is None:
+        # A missing command cannot execute. If it appears later, a subsequent
+        # installer run will inspect it like every other absolute helper.
+        return None
+    metadata = lstat_or_none(resolved)
+    if metadata is None:
+        fail(f"scheduled helper {path_logical} disappeared")
+    prefix = read_root_prefix(resolved, metadata)
+    has_shebang = prefix.startswith(b"#!")
+    shebang = supported_shebang_invocation(prefix)
+    shebang_kind = shebang[0] if shebang is not None else None
+    if invocation in {"direct", "systemd"} and shebang_kind is None:
+        # A directly executed custom program is a statically inspectable
+        # script only when its kernel interpreter contract is explicit. ELF,
+        # other binaries, and non-shebang text executables remain opaque.
+        return None
+    if invocation == "shell-fallback" and shebang_kind is None:
+        # Cron invokes its command through a shell, while the supported process
+        # wrappers use execvp-style ENOEXEC fallback. In both cases an
+        # executable, printable UTF-8 file without a shebang is interpreted by
+        # /bin/sh. Binary and non-executable files remain opaque just as they
+        # would for the real execution path.
+        if (
+            has_shebang
+            or not metadata.st_mode & 0o111
+            or not printable_utf8_prefix(prefix)
+        ):
+            return None
+    if invocation == "shell-source" and not printable_utf8_prefix(prefix):
+        # A sourced binary or non-text payload fails as shell syntax; it is not
+        # a statically inspectable helper command.
+        return None
+    if not budget.admit(path_logical, resolved, metadata):
+        return None
+    payload, _ = read_root_file(resolved, require_root_group=False)
+    if (
+        invocation in {"shell-fallback", "shell-source"}
+        and (shebang_kind is None or invocation == "shell-source")
+        and not printable_utf8_text(payload)
+    ):
+        return None
+    if b"\0" in payload:
+        fail(f"scheduled helper {display(resolved)} is not a text script")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        fail(f"scheduled helper {display(resolved)} is not UTF-8 text")
+    if invocation == "shell-source":
+        # The current shell interprets sourced content. A leading shebang is
+        # merely a comment and cannot change the source language.
+        language = "shell"
+    elif invocation.startswith("interpreter:"):
+        language = invocation.split(":", 1)[1]
+    elif shebang_kind is not None:
+        language = shebang_kind
+    else:
+        language = "shell"
+
+    def inspect_literal_commands(commands, line_number):
+        for command in commands:
+            prune_kind = dangerous(command, shell_syntax=True)
+            if prune_kind:
+                return prune_kind, display(resolved), line_number
+            for nested, nested_invocation in helper_candidates(
+                command, direct_invocation="shell-fallback"
+            ):
+                if nested_invocation == "run-parts":
+                    finding = inspect_run_parts_directory(
+                        nested, budget, depth + 1
+                    )
+                else:
+                    finding = inspect_helper(
+                        nested, nested_invocation, budget, depth + 1
+                    )
+                if finding:
+                    return finding
+        return None
+
+    if shebang is not None and shebang_kind in {"python", "perl", "ruby", "node"}:
+        shebang_plan = interpreter_invocation(
+            shebang_kind, [*shebang[1], display(resolved)]
+        )
+        for preload in shebang_plan["preloads"]:
+            finding = inspect_helper(
+                preload, f"interpreter:{shebang_kind}", budget, depth + 1
+            )
+            if finding:
+                return finding
+        for source in shebang_plan["inline"]:
+            budget.admit_line()
+            finding = inspect_literal_commands(
+                language_execution_commands(source, shebang_kind), 1
+            )
+            if finding:
+                return finding
+        if shebang_plan["terminal"]:
+            return None
+
+    logical_text = text.replace("\\\n", " ")
+    for line_number, raw in enumerate(logical_text.splitlines(), 1):
+        stripped = raw.strip()
+        if (
+            not stripped
+            or stripped.startswith("#")
+            or (language == "node" and stripped.startswith("//"))
+        ):
+            continue
+        budget.admit_line()
+        commands = (
+            [raw] if language == "shell"
+            else language_execution_commands(raw, language)
+        )
+        finding = inspect_literal_commands(commands, line_number)
+        if finding:
+            return finding
+    return None
+
+
+def inspect_run_parts_directory(path_logical, budget, depth):
+    if depth > HELPER_DEPTH_LIMIT:
+        fail(f"scheduled helper recursion exceeded depth {HELPER_DEPTH_LIMIT}")
+    for definition, _, target in secure_cron_directory(
+        path_logical,
+        "run-parts",
+        budget.scheduler_entries,
+        budget.scheduler_directories,
+    ):
+        finding = inspect_helper(display(definition), "direct", budget, depth)
+        if finding:
+            prune_kind, helper_path, helper_line = finding
+            return (
+                prune_kind,
+                display(definition) if helper_path == display(target) else helper_path,
+                helper_line,
+            )
+    return None
+
+
+def inspect_scheduled_command(command, budget, direct_invocation):
+    prune_kind = dangerous(
+        command,
+        shell_syntax=direct_invocation == "shell-fallback",
+        systemd_syntax=direct_invocation == "systemd",
+    )
+    if prune_kind:
+        return prune_kind, None, None
+    for helper, invocation in helper_candidates(
+        command, direct_invocation=direct_invocation
+    ):
+        if invocation == "run-parts":
+            finding = inspect_run_parts_directory(helper, budget, 1)
+        else:
+            finding = inspect_helper(helper, invocation, budget, 1)
+        if finding:
+            return finding
+    return None
+
+
+def unsafe_jobs(excluded):
+    findings, inspected = [], set()
+    scheduler_entry_budget = [0]
+    scheduler_directories = set()
+    helper_budget = HelperBudget(scheduler_entry_budget, scheduler_directories)
+    systemd_cache = {}
+    for definition, kind, resolved_target in jobs(
+        scheduler_entry_budget, scheduler_directories
+    ):
+        if excluded is not None and (
+            os.path.normpath(definition) == os.path.normpath(excluded)
+        ):
+            continue
+        if kind == "systemd":
+            effective = {key: [] for key in sorted(EXEC_KEYS)}
+            service_assignments = []
+            for origin, target in resolved_target:
+                metadata = lstat_or_none(target)
+                if metadata is None:
+                    fail(f"systemd definition {display(target)} disappeared")
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != 0
+                    or metadata.st_gid != 0
+                    or stat.S_IMODE(metadata.st_mode) & 0o022
+                ):
+                    fail(
+                        f"systemd definition {display(target)} is non-regular, "
+                        "non-root-owned, or writable by another account"
+                    )
+                identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+                cached = systemd_cache.get(identity)
+                if cached is None:
+                    payload, _ = read_root_file(
+                        target, require_root_group=True
+                    )
+                    assignments = list(systemd_service_directives(payload))
+                    directives = [
+                        item for item in assignments if item[1] in EXEC_KEYS
+                    ]
+                    cached = (directives, assignments)
+                    systemd_cache[identity] = cached
+                directives, assignments = cached
+                service_assignments.extend(
+                    (origin, number, key, value)
+                    for number, key, value in assignments
+                )
+                for number, key, command in directives:
+                    if not command.strip():
+                        effective[key] = []
+                    else:
+                        effective[key].append((origin, number, command))
+            is_runtime_repair_unit = (
+                definition == os.path.basename(PORTAL_RUNTIME_REPAIR_UNIT)
+            )
+            references_runtime_repair = any(
+                PORTAL_RUNTIME_REPAIR_LAUNCHER
+                in systemd_unescaped_reference(value)
+                for _, _, _, value in service_assignments
+            )
+            if is_runtime_repair_unit or references_runtime_repair:
+                expected_origin = PORTAL_RUNTIME_REPAIR_UNIT
+                if (
+                    not is_runtime_repair_unit
+                    or len(resolved_target) != 1
+                    or any(
+                        display(origin) != expected_origin
+                        or display(target) != expected_origin
+                        for origin, target in resolved_target
+                    )
+                ):
+                    fail(
+                        "scheduled Project runtime repair launcher is outside "
+                        "its exact transient unit"
+                    )
+                service_shape = [
+                    (key, value.strip())
+                    for _, _, key, value in service_assignments
+                ]
+                environment_values = [
+                    value for key, value in service_shape
+                    if key == "Environment"
+                ]
+                exec_start_values = [
+                    value for key, value in service_shape
+                    if key == "ExecStart"
+                ]
+                other_service_keys = [
+                    key for key, _ in service_shape
+                    if key not in {"Environment", "ExecStart"}
+                ]
+                nonempty_exec_start = [
+                    value for value in exec_start_values if value
+                ]
+                if (
+                    other_service_keys
+                    or len(environment_values) != 1
+                    or tokens(environment_values[0]) != ["HOME=/root"]
+                    or len(exec_start_values) != 2
+                    or exec_start_values.count("") != 1
+                    or len(nonempty_exec_start) != 1
+                ):
+                    fail(
+                        "scheduled Project runtime repair unit properties "
+                        "are malformed"
+                    )
+                repair_candidates = helper_candidates(
+                    nonempty_exec_start[0], direct_invocation="systemd"
+                )
+                if repair_candidates != [
+                    (
+                        PORTAL_RUNTIME_REPAIR_LAUNCHER,
+                        "portal-runtime-repair-launcher",
+                    )
+                ]:
+                    fail(
+                        "scheduled Project runtime repair launcher command "
+                        "is malformed"
+                    )
+            unit_found = False
+            for key in sorted(effective):
+                for origin, number, command in effective[key]:
+                    finding = inspect_scheduled_command(
+                        command, helper_budget, "systemd"
+                    )
+                    if finding:
+                        prune_kind, helper_path, helper_line = finding
+                        findings.append(
+                            (
+                                helper_path or display(origin),
+                                helper_line or number,
+                                prune_kind,
+                            )
+                        )
+                        unit_found = True
+                        break
+                if unit_found:
+                    break
+            continue
+        target = resolved_target
+        if target is None:
+            continue
+        metadata = lstat_or_none(target)
+        if metadata is None:
+            continue
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or not metadata.st_mode & stat.S_IRUSR
+        ):
+            fail(
+                f"cron definition {display(target)} is non-regular, unreadable, "
+                "non-root-owned, or writable by another account"
+            )
+        identity = (metadata.st_dev, metadata.st_ino, kind)
+        if identity in inspected:
+            continue
+        inspected.add(identity)
+        if kind == "run-parts":
+            finding = inspect_helper(
+                display(definition), "direct", helper_budget, 1
+            )
+            if finding:
+                prune_kind, helper_path, helper_line = finding
+                finding_path = (
+                    display(definition)
+                    if helper_path == display(target)
+                    else helper_path or display(definition)
+                )
+                findings.append(
+                    (finding_path, helper_line or 1, prune_kind)
+                )
+            continue
+        payload, _ = read_root_file(target)
+        commands = cron_commands(payload, kind)
+        for number, command in commands:
+            finding = inspect_scheduled_command(
+                command,
+                helper_budget,
+                "shell-fallback",
+            )
+            if finding:
+                prune_kind, helper_path, helper_line = finding
+                findings.append(
+                    (helper_path or display(definition), helper_line or number, prune_kind)
+                )
+                break
+    return findings
+
+
+def ensure_quarantine_parent(path):
+    relative = os.path.relpath(os.path.dirname(path), root)
+    if relative.startswith(".."):
+        fail("quarantine path escapes the host root")
+    current = root
+    components = [] if relative == "." else relative.split(os.sep)
+    for index, component in enumerate(components):
+        current = os.path.join(current, component)
+        metadata = lstat_or_none(current)
+        if metadata is None:
+            os.mkdir(current, 0o700 if index == len(components) - 1 else 0o755)
+            metadata = lstat_or_none(current)
+        if (
+            metadata is None
+            or not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            fail(f"quarantine parent {display(current)} is linked or has unsafe metadata")
+        if index == len(components) - 1 and stat.S_IMODE(metadata.st_mode) != 0o700:
+            fail(f"quarantine directory {display(current)} must have mode 0700")
+
+
+def fsync_dir(path):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def open_secure_directory_fd(path, context):
+    normalized = os.path.normpath(path)
+    relative = os.path.relpath(normalized, root)
+    if relative == ".." or relative.startswith(".." + os.sep):
+        fail(f"{context} directory escapes the host root")
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as exc:
+        fail(f"could not bind the host root for {context}: {exc}")
+    current = root
+    try:
+        require_secure_directory(current, os.fstat(descriptor), context)
+        components = [] if relative == "." else relative.split(os.sep)
+        for component in components:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except OSError as exc:
+                fail(
+                    f"could not bind {context} directory "
+                    f"{display(os.path.join(current, component))}: {exc}"
+                )
+            os.close(descriptor)
+            descriptor = child
+            current = os.path.join(current, component)
+            require_secure_directory(current, os.fstat(descriptor), context)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def open_attested_legacy(parent_fd, name, expected):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        fail(f"could not open {source_logical} for inode-bound quarantine: {exc}")
+    try:
+        metadata = os.fstat(descriptor)
+        identity = (
+            metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+            metadata.st_gid, metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns,
+        )
+        expected_identity = (
+            expected.st_dev, expected.st_ino, expected.st_mode, expected.st_uid,
+            expected.st_gid, expected.st_nlink, expected.st_size, expected.st_mtime_ns,
+        )
+        if identity != expected_identity:
+            fail(f"{source_logical} changed before inode-bound quarantine")
+        payload = b""
+        while len(payload) <= LIMIT:
+            chunk = os.read(descriptor, min(65536, LIMIT + 1 - len(payload)))
+            if not chunk:
+                break
+            payload += chunk
+        if payload != LEGACY:
+            fail(f"{source_logical} content changed before inode-bound quarantine")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor, metadata
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def fixture_race_hook(
+    stage,
+    source,
+    source_parent_fd,
+    source_name,
+    quarantine_name,
+    quarantine_dir_fd,
+):
+    hook = ""
+    if os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") == "1" and root != "/":
+        hook = os.environ.get("BRIDGESLLM_DOCKER_PRUNE_TEST_HOOK", "")
+    if not hook:
+        return
+    if hook == "destination-collision" and stage == "before-link":
+        descriptor = os.open(
+            quarantine_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=quarantine_dir_fd,
+        )
+        try:
+            os.write(descriptor, b"operator collision\n")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(quarantine_dir_fd)
+        return
+    if hook in {"source-replacement", "post-check-source-replacement"}:
+        expected_stage = (
+            "before-link" if hook == "source-replacement" else "post-source-check"
+        )
+        if stage != expected_stage:
+            return
+        replacement = source + ".test-replacement"
+        displaced = source + ".test-old"
+        if os.path.lexists(displaced):
+            fail("source-replacement test hook found an existing displaced path")
+        replacement_payload, _ = read_root_file(
+            replacement, {0o644}, True, True
+        )
+        if replacement_payload is None:
+            fail("source-replacement test hook has no replacement fixture")
+        os.rename(
+            source_name,
+            source_name + ".test-old",
+            src_dir_fd=source_parent_fd,
+            dst_dir_fd=source_parent_fd,
+        )
+        os.rename(
+            source_name + ".test-replacement",
+            source_name,
+            src_dir_fd=source_parent_fd,
+            dst_dir_fd=source_parent_fd,
+        )
+        os.fsync(source_parent_fd)
+        return
+    if hook == "final-source-reappearance":
+        return
+    if hook and stage != "before-link":
+        return
+    fail(f"unknown Docker prune fixture hook: {hook}")
+
+
+def unlink_destination_if_held_inode(directory_fd, name, held):
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+        fail("quarantine destination changed identity during rollback")
+    os.unlink(name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
+def rename_noreplace(source_dir_fd, source_name, target_dir_fd, target_name):
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        fail("this Linux libc does not expose renameat2 for no-replace quarantine")
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        source_dir_fd,
+        os.fsencode(source_name),
+        target_dir_fd,
+        os.fsencode(target_name),
+        1,  # RENAME_NOREPLACE
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def restore_tombstone(source_parent_fd, tombstone_name, source_name):
+    try:
+        rename_noreplace(
+            source_parent_fd,
+            tombstone_name,
+            source_parent_fd,
+            source_name,
+        )
+    except OSError as exc:
+        fail(
+            f"source replacement was preserved as {tombstone_name}, but could "
+            f"not be restored to {source_logical}: {exc}"
+        )
+    os.fsync(source_parent_fd)
+
+
+def quarantine_legacy_inode(source, quarantine, expected):
+    source_directory = os.path.dirname(source)
+    source_name = os.path.basename(source)
+    quarantine_directory = os.path.dirname(quarantine)
+    quarantine_name = os.path.basename(quarantine)
+    source_parent_fd = open_secure_directory_fd(
+        source_directory, "legacy source-parent"
+    )
+    try:
+        source_fd, held = open_attested_legacy(source_parent_fd, source_name, expected)
+    except BaseException:
+        os.close(source_parent_fd)
+        raise
+    try:
+        quarantine_dir_fd = open_secure_directory_fd(
+            quarantine_directory, "quarantine"
+        )
+    except BaseException:
+        os.close(source_fd)
+        os.close(source_parent_fd)
+        raise
+    linked = False
+    tombstone_name = None
+    try:
+        fixture_race_hook(
+            "before-link",
+            source,
+            source_parent_fd,
+            source_name,
+            quarantine_name,
+            quarantine_dir_fd,
+        )
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = getattr(libc, "linkat", None)
+        if linkat is None:
+            fail("this Linux libc does not expose linkat for inode-bound quarantine")
+        linkat.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+        ]
+        linkat.restype = ctypes.c_int
+        if linkat(source_fd, b"", quarantine_dir_fd, os.fsencode(quarantine_name), 0x1000) != 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                fail(
+                    f"{quarantine_logical} appeared during quarantine; "
+                    "the active legacy job was left untouched"
+                )
+            fail(
+                "inode-bound no-replace quarantine was unavailable; "
+                f"the active legacy job was left untouched ({os.strerror(error_number)})"
+            )
+        linked = True
+        os.fsync(quarantine_dir_fd)
+
+        source_now = os.stat(
+            source_name, dir_fd=source_parent_fd, follow_symlinks=False
+        )
+        destination_now = os.stat(
+            quarantine_name, dir_fd=quarantine_dir_fd, follow_symlinks=False
+        )
+        held_now = os.fstat(source_fd)
+        held_identity = (held.st_dev, held.st_ino)
+        if (
+            (source_now.st_dev, source_now.st_ino) != held_identity
+            or (destination_now.st_dev, destination_now.st_ino) != held_identity
+            or (held_now.st_dev, held_now.st_ino) != held_identity
+            or held_now.st_nlink != 2
+        ):
+            unlink_destination_if_held_inode(
+                quarantine_dir_fd, quarantine_name, held
+            )
+            linked = False
+            fail(
+                f"{source_logical} changed at the final quarantine boundary; "
+                "no recovery copy was installed"
+            )
+
+        fixture_race_hook(
+            "post-source-check",
+            source,
+            source_parent_fd,
+            source_name,
+            quarantine_name,
+            quarantine_dir_fd,
+        )
+        tombstone_name = (
+            f".{source_name}.bridgesllm-tombstone-{os.getpid()}-"
+            f"{os.urandom(16).hex()}"
+        )
+        try:
+            rename_noreplace(
+                source_parent_fd,
+                source_name,
+                source_parent_fd,
+                tombstone_name,
+            )
+        except OSError as exc:
+            unlink_destination_if_held_inode(
+                quarantine_dir_fd, quarantine_name, held
+            )
+            linked = False
+            fail(f"could not tombstone the attested legacy source: {exc}")
+        tombstone = os.stat(
+            tombstone_name, dir_fd=source_parent_fd, follow_symlinks=False
+        )
+        if (tombstone.st_dev, tombstone.st_ino) != held_identity:
+            restore_tombstone(source_parent_fd, tombstone_name, source_name)
+            tombstone_name = None
+            unlink_destination_if_held_inode(
+                quarantine_dir_fd, quarantine_name, held
+            )
+            linked = False
+            fail(
+                f"{source_logical} changed after its final identity check; "
+                "the replacement survived and no recovery copy was installed"
+            )
+        os.unlink(tombstone_name, dir_fd=source_parent_fd)
+        tombstone_name = None
+        os.fchmod(source_fd, 0o600)
+        os.fsync(source_fd)
+        os.fsync(source_parent_fd)
+        os.fsync(quarantine_dir_fd)
+        final = os.fstat(source_fd)
+        if final.st_nlink != 1 or stat.S_IMODE(final.st_mode) != 0o600:
+            fail("inode-bound quarantine did not settle to one sealed recovery link")
+    except BaseException:
+        if tombstone_name is not None:
+            try:
+                tombstone = os.stat(
+                    tombstone_name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                tombstone = None
+            if tombstone is not None and (
+                tombstone.st_dev, tombstone.st_ino
+            ) == (held.st_dev, held.st_ino):
+                restore_tombstone(source_parent_fd, tombstone_name, source_name)
+                tombstone_name = None
+        if linked:
+            try:
+                current = os.stat(
+                    source_name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                current = None
+            if current is not None:
+                unlink_destination_if_held_inode(
+                    quarantine_dir_fd, quarantine_name, held
+                )
+        raise
+    finally:
+        os.close(quarantine_dir_fd)
+        os.close(source_fd)
+        os.close(source_parent_fd)
+
+
+def attest_secure_directory_chain(path):
+    relative = os.path.relpath(path, root)
+    if relative == ".." or relative.startswith(".." + os.sep):
+        fail(f"scheduler directory {display(path)} escapes the host root")
+    current = root
+    components = [] if relative == "." else relative.split(os.sep)
+    for component in [None, *components]:
+        if component is not None:
+            current = os.path.join(current, component)
+        metadata = lstat_or_none(current)
+        if metadata is None:
+            return False
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            fail(
+                f"scheduler directory chain component {display(current)} is "
+                "linked, non-root-owned, or writable by another account"
+            )
+    return True
+
+
+def fixture_final_scan_hook(source):
+    if not (
+        os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") == "1"
+        and root != "/"
+        and os.environ.get("BRIDGESLLM_DOCKER_PRUNE_TEST_HOOK", "")
+        == "final-source-reappearance"
+    ):
+        return
+    parent = os.path.dirname(source)
+    parent_fd = open_secure_directory_fd(parent, "legacy final-scan source-parent")
+    try:
+        descriptor = os.open(
+            os.path.basename(source),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o644,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(descriptor, LEGACY)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+root_metadata = lstat_or_none(root)
+if (
+    root_metadata is None
+    or not stat.S_ISDIR(root_metadata.st_mode)
+    or stat.S_ISLNK(root_metadata.st_mode)
+    or root_metadata.st_uid != 0
+    or root != os.path.realpath(root)
+):
+    fail("host root must be an existing canonical root-owned directory")
+
+source = host_path(source_logical)
+quarantine = host_path(quarantine_logical)
+source_parent_exists = attest_secure_directory_chain(os.path.dirname(source))
+source_exists = source_parent_exists and os.path.lexists(source)
+quarantine_exists = os.path.lexists(quarantine)
+source_metadata = None
+
+if source_exists:
+    payload, source_metadata = read_root_file(source, {0o644}, True, True)
+    if payload != LEGACY:
+        fail(
+            f"{source_logical} differs from the one known legacy job; "
+            "disable or replace it manually, then retry"
+        )
+if quarantine_exists:
+    ensure_quarantine_parent(quarantine)
+    payload, _ = read_root_file(quarantine, {0o600}, True, True)
+    if payload != LEGACY:
+        fail(f"{quarantine_logical} is not the known recovery copy; resolve it manually")
+
+findings = unsafe_jobs(source)
+if findings:
+    print(
+        "Unsafe Docker prune guard: refusing install/update because another "
+        "effective installed root scheduler definition contains a literal "
+        "command that can delete retained Docker images:",
+        file=sys.stderr,
+    )
+    for path, number, kind in findings[:32]:
+        print(f"  - {path}:{number} (docker {kind} prune with --all/-a)", file=sys.stderr)
+    if len(findings) > 32:
+        print(f"  - and {len(findings) - 32} more", file=sys.stderr)
+    print(
+        "Disable the definition or change it to dangling-only cleanup, such as "
+        "docker image prune --force, then rerun. No unknown job was changed.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+if source_exists and quarantine_exists:
+    fail(
+        f"both {source_logical} and {quarantine_logical} exist; "
+        "verify the recovery copy before removing the active file"
+    )
+if source_exists:
+    ensure_quarantine_parent(quarantine)
+    payload, current = read_root_file(source, {0o644}, True, True)
+    if payload != LEGACY or (
+        current.st_dev, current.st_ino, current.st_mtime_ns
+    ) != (
+        source_metadata.st_dev, source_metadata.st_ino, source_metadata.st_mtime_ns
+    ):
+        fail(f"{source_logical} changed before quarantine")
+    quarantine_legacy_inode(source, quarantine, current)
+    print(f"Quarantined the retired all-images Docker prune job at {quarantine_logical}.")
+
+if os.path.lexists(source):
+    fail(f"{source_logical} still exists after convergence")
+fixture_final_scan_hook(source)
+if os.path.lexists(quarantine):
+    payload, _ = read_root_file(quarantine, {0o600}, True, True)
+    if payload != LEGACY:
+        fail(f"{quarantine_logical} failed final attestation")
+if unsafe_jobs(None):
+    fail(
+        "an unsafe Docker prune definition appeared during convergence; "
+        "inspect installed scheduler definitions and retry"
+    )
+if os.path.lexists(source):
+    fail(f"{source_logical} reappeared during final convergence")
+PY2
+}
+
 ensure_media_toolchain() {
   if command -v ffmpeg >/dev/null 2>&1 \
     && command -v ffprobe >/dev/null 2>&1; then
@@ -10086,13 +14272,13 @@ preflight() {
 
   # Core tools — always ensure lsb-release is present (needed by PostgreSQL repo setup)
   local missing=""
-  for cmd in curl git openssl rsync lsb_release zstd; do
+  for cmd in curl git openssl rsync lsb_release zstd python3; do
     command -v "$cmd" &>/dev/null || missing+=" $cmd"
   done
   if [[ -n "$missing" ]]; then
     $APT_AVAILABLE || fail "Missing:${missing} — and apt is not available"
     info "Installing core tools..."
-    run "apt-get update -qq && apt-get install -y -qq curl git openssl rsync ca-certificates gnupg lsb-release ffmpeg python3-venv zstd"
+    run "apt-get update -qq && apt-get install -y -qq curl git openssl rsync ca-certificates gnupg lsb-release ffmpeg python3 python3-venv zstd"
   fi
   ensure_media_toolchain \
     || fail "Animated GIF uploads require ffmpeg and ffprobe, but the FFmpeg package could not be installed. Check ${LOG_FILE}, repair apt, and rerun the installer."
@@ -10329,6 +14515,8 @@ install_native_provider_tools() {
 setup_database() {
   step_header "Setting up database"
   CURRENT_STEP="database"
+  assert_database_process_environment_safe \
+    || fail "The installer process environment overrides the attested database runtime. Remove Prisma engine switches, node-postgres PG* fallbacks, NODE_PG_FORCE_NATIVE, and NODE_TLS_REJECT_UNAUTHORIZED before installing."
 
   # A forced reinstall over an existing Portal must not create/alter the
   # installer's default local database when the Portal is configured for a
@@ -10336,6 +14524,9 @@ setup_database() {
   # validated and used unchanged later by run_migrations_safe().
   local existing_database_url=""
   if [[ -f "${PORTAL_DIR}/backend/.env.production" ]]; then
+    assert_prisma_runtime_environment_safe \
+      "${PORTAL_DIR}/backend/.env.production" \
+      || fail "The retained backend environment overrides the attested database runtime; repair it before reinstalling."
     existing_database_url="$(read_env_value "${PORTAL_DIR}/backend/.env.production" "DATABASE_URL" || true)"
   fi
   if [[ -n "${existing_database_url}" ]]; then
@@ -10343,7 +14534,10 @@ setup_database() {
       && pg_url_component "${existing_database_url}" port >/dev/null \
       && pg_url_component "${existing_database_url}" database >/dev/null \
       && pg_url_component "${existing_database_url}" user >/dev/null \
+      && pg_url_component "${existing_database_url}" password >/dev/null \
       || fail "Existing DATABASE_URL is invalid; refusing to alter a fallback database during reinstall."
+    pg_url_uses_supported_prisma_adapter_options "${existing_database_url}" \
+      || fail "Existing DATABASE_URL has an ambiguous or unsupported database-driver option. Remote databases must set sslmode=disable, require, verify-ca, or verify-full. An absolute sslrootcert is required for verify-ca/verify-full; sslcert/client identities/keys, sslaccept, and channel_binding are not supported. Only lowercase application_name, fallback_application_name, options, client_encoding, replication, and documented Prisma pool controls may be supplied; literal plus signs must be percent-encoded. Custom connect_timeout and pool_timeout values must match. Repair the URL before reinstalling."
     info "Preserving the configured PostgreSQL database; local fallback creation is skipped"
     return 0
   fi
@@ -10696,6 +14890,9 @@ SETUP_HANDOFF_EXPIRES_AT=${SETUP_HANDOFF_EXPIRES_AT}
 TELEMETRY_INSTALL_ID=${TELEMETRY_INSTALL_ID}
 ENVEOF
   chmod 600 "${PORTAL_DIR}/backend/.env.production"
+  assert_prisma_runtime_environment_safe \
+    "${PORTAL_DIR}/backend/.env.production" \
+    || fail "The generated backend environment did not preserve the attested database runtime."
 
   # Create .env symlink so dotenv.config() finds the production env file
   ln -sf .env.production "${PORTAL_DIR}/backend/.env"
@@ -11428,6 +15625,59 @@ capture_managed_project_egress_inventory() (
   local -a labelled_network_ids=()
   local -A seen_resource_ids=()
 
+  report_project_egress_inventory_failure() {
+    local reason="$1"
+    local source row diagnostic_id diagnostic_name extra separator=""
+    local resources="" container_command="" network_command=""
+    local -A reported=()
+    for source in "${all_containers:-}" "${managed_containers:-}"; do
+      while IFS= read -r row; do
+        [[ -n "${row}" ]] || continue
+        read -r diagnostic_id diagnostic_name extra <<<"${row}"
+        [[ -z "${extra:-}" \
+          && "${diagnostic_id}" =~ ^[a-f0-9]{64}$ \
+          && "${diagnostic_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ \
+          && ( "${diagnostic_name}" =~ ^p4e-proxy-[a-f0-9]{20}$ \
+            || "${source}" == "${managed_containers:-}" ) ]] || continue
+        [[ -z "${reported["container:${diagnostic_id}"]:-}" ]] || continue
+        reported["container:${diagnostic_id}"]=1
+        resources+="${separator}proxy ${diagnostic_name} (${diagnostic_id})"
+        separator=", "
+        container_command+=" ${diagnostic_id}"
+      done <<<"${source}"
+    done
+    for source in "${all_networks:-}" "${managed_networks:-}"; do
+      while IFS= read -r row; do
+        [[ -n "${row}" ]] || continue
+        read -r diagnostic_id diagnostic_name extra <<<"${row}"
+        [[ -z "${extra:-}" \
+          && "${diagnostic_id}" =~ ^[a-f0-9]{64}$ \
+          && "${diagnostic_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ \
+          && ( "${diagnostic_name}" =~ ^p4e-(in|out)-[a-f0-9]{20}$ \
+            || "${source}" == "${managed_networks:-}" ) ]] || continue
+        [[ -z "${reported["network:${diagnostic_id}"]:-}" ]] || continue
+        reported["network:${diagnostic_id}"]=1
+        resources+="${separator}network ${diagnostic_name} (${diagnostic_id})"
+        separator=", "
+        network_command+=" ${diagnostic_id}"
+      done <<<"${source}"
+    done
+    printf '%s\n' \
+      "Managed Project egress inventory validation failed (${reason}) for ${resources:-unresolved reserved resources}." >&2
+    if [[ -n "${container_command}" || -n "${network_command}" ]]; then
+      printf 'Remediation:' >&2
+      [[ -z "${container_command}" ]] \
+        || printf ' docker container inspect%s;' "${container_command}" >&2
+      [[ -z "${network_command}" ]] \
+        || printf ' docker network inspect%s;' "${network_command}" >&2
+      printf '%s\n' \
+        ' stop attached Project runtimes, then retry the Portal update. Remove only a fully empty parentless network pair.' >&2
+    else
+      printf '%s\n' \
+        'Remediation: docker container ls --all --no-trunc; docker network ls --no-trunc; stop attached Project runtimes, then retry the Portal update.' >&2
+    fi
+  }
+
   all_containers="$(docker container ls --all --no-trunc \
     --format '{{.ID}} {{.Names}}' 2>/dev/null | LC_ALL=C sort)" \
     || return 2
@@ -11446,10 +15696,15 @@ capture_managed_project_egress_inventory() (
   while IFS= read -r row; do
     [[ -n "${row}" ]] || continue
     read -r resource_id resource_name extra <<<"${row}"
-    [[ -z "${extra:-}" && "${resource_id}" =~ ^[a-f0-9]{64}$ ]] \
-      || return 3
+    [[ -z "${extra:-}" && "${resource_id}" =~ ^[a-f0-9]{64}$ ]] || {
+      report_project_egress_inventory_failure "invalid container inventory"
+      return 3
+    }
     [[ -z "${seen_resource_ids["container:${resource_id}"]:-}" ]] \
-      || return 3
+      || {
+        report_project_egress_inventory_failure "duplicate container identity"
+        return 3
+      }
     seen_resource_ids["container:${resource_id}"]=1
     if [[ "${resource_name}" =~ ^p4e-proxy-[a-f0-9]{20}$ ]]; then
       reserved_proxy_ids+=("${resource_id}")
@@ -11462,17 +15717,25 @@ capture_managed_project_egress_inventory() (
     [[ -z "${extra:-}" \
       && "${resource_id}" =~ ^[a-f0-9]{64}$ \
       && "${resource_name}" =~ ^p4e-proxy-[a-f0-9]{20}$ ]] \
-      || return 3
+      || {
+        report_project_egress_inventory_failure "managed proxy name or identity drift"
+        return 3
+      }
     labelled_proxy_ids+=("${resource_id}")
   done <<<"${managed_containers}"
 
   while IFS= read -r row; do
     [[ -n "${row}" ]] || continue
     read -r resource_id resource_name extra <<<"${row}"
-    [[ -z "${extra:-}" && "${resource_id}" =~ ^[a-f0-9]{64}$ ]] \
-      || return 3
+    [[ -z "${extra:-}" && "${resource_id}" =~ ^[a-f0-9]{64}$ ]] || {
+      report_project_egress_inventory_failure "invalid network inventory"
+      return 3
+    }
     [[ -z "${seen_resource_ids["network:${resource_id}"]:-}" ]] \
-      || return 3
+      || {
+        report_project_egress_inventory_failure "duplicate network identity"
+        return 3
+      }
     seen_resource_ids["network:${resource_id}"]=1
     if [[ "${resource_name}" =~ ^p4e-(in|out)-[a-f0-9]{20}$ ]]; then
       reserved_network_ids+=("${resource_id}")
@@ -11485,13 +15748,19 @@ capture_managed_project_egress_inventory() (
     [[ -z "${extra:-}" \
       && "${resource_id}" =~ ^[a-f0-9]{64}$ \
       && "${resource_name}" =~ ^p4e-(in|out)-[a-f0-9]{20}$ ]] \
-      || return 3
+      || {
+        report_project_egress_inventory_failure "managed network name or identity drift"
+        return 3
+      }
     labelled_network_ids+=("${resource_id}")
   done <<<"${managed_networks}"
 
   [[ "${#reserved_proxy_ids[@]}" -eq "${#labelled_proxy_ids[@]}" \
     && "${#reserved_network_ids[@]}" -eq "${#labelled_network_ids[@]}" ]] \
-    || return 3
+    || {
+      report_project_egress_inventory_failure "reserved names and managed labels disagree"
+      return 3
+    }
   for resource_id in "${reserved_proxy_ids[@]}"; do
     found=false
     for actual_id in "${labelled_proxy_ids[@]}"; do
@@ -11500,7 +15769,10 @@ capture_managed_project_egress_inventory() (
         break
       fi
     done
-    ${found} || return 3
+    ${found} || {
+      report_project_egress_inventory_failure "reserved proxy lacks exact managed ownership"
+      return 3
+    }
   done
   for resource_id in "${reserved_network_ids[@]}"; do
     found=false
@@ -11510,16 +15782,16 @@ capture_managed_project_egress_inventory() (
         break
       fi
     done
-    ${found} || return 3
+    ${found} || {
+      report_project_egress_inventory_failure "reserved network lacks exact managed ownership"
+      return 3
+    }
   done
 
   if ((${#reserved_proxy_ids[@]} == 0 \
     && ${#reserved_network_ids[@]} == 0)); then
     return 1
   fi
-
-  ((${#reserved_network_ids[@]} == ${#reserved_proxy_ids[@]} * 2)) \
-    || return 3
 
   snapshot_root="$(mktemp -d)" || return 2
   [[ -n "${snapshot_root}" && -d "${snapshot_root}" ]] || return 2
@@ -11585,6 +15857,8 @@ capture_managed_project_egress_inventory() (
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const inputArgs = process.argv.slice(2);
+const diagnosticSnapshotRoot = inputArgs[0];
 
 try {
   const [
@@ -11601,7 +15875,7 @@ try {
     fingerprintLabel,
     tokenHashLabel,
     runtimeFingerprintLabel,
-  ] = process.argv.slice(2);
+  ] = inputArgs;
   const immutableId = /^[a-f0-9]{64}$/;
   const digest = /^[a-f0-9]{64}$/;
   const imageId = /^sha256:[a-f0-9]{64}$/;
@@ -11908,7 +16182,27 @@ try {
   const topologyRecords = [];
   for (const plane of planes.values()) {
     const { identity, proxy, internal, publicNetwork } = plane;
-    if (!proxy || !internal || !publicNetwork
+    if (!proxy) {
+      if (!internal || !publicNetwork
+        || identity.policyFingerprint !== internal.labels[fingerprintLabel]
+        || identity.policyFingerprint !== publicNetwork.labels[fingerprintLabel]) fail();
+      const referenced = (network) => [...containers.values()].some((container) => (
+        Object.prototype.hasOwnProperty.call(container.networks, network.name)
+        || [network.id, network.name].includes(container.networkMode.toLowerCase())
+      ));
+      if (Object.keys(internal.members).length !== 0
+        || Object.keys(publicNetwork.members).length !== 0
+        || referenced(internal)
+        || referenced(publicNetwork)) fail();
+      const orphanTopology = canonical({ identity, internal, publicNetwork });
+      topologyRecords.push(
+        `orphan-network|${internal.id}|${internal.name}|internal`,
+        `orphan-network|${publicNetwork.id}|${publicNetwork.name}|proxy-public`,
+        `orphan-plane|${identity.identityFingerprint}|${sha256(JSON.stringify(orphanTopology))}|`,
+      );
+      continue;
+    }
+    if (!internal || !publicNetwork
       || identity.policyFingerprint !== internal.labels[fingerprintLabel]
       || identity.policyFingerprint !== publicNetwork.labels[fingerprintLabel]) fail();
 
@@ -12009,6 +16303,35 @@ try {
   if (planes.size === 0) fail();
   process.stdout.write(`${topologyRecords.sort().join('\n')}\n`);
 } catch {
+  const resources = [];
+  const containerIds = [];
+  const networkIds = [];
+  try {
+    for (const [kind, file, namePattern] of [
+      ['proxy', 'container-list', /^p4e-proxy-[a-f0-9]{20}$/],
+      ['network', 'network-list', /^p4e-(?:in|out)-[a-f0-9]{20}$/],
+    ]) {
+      const raw = fs.readFileSync(path.join(diagnosticSnapshotRoot, file), 'utf8').trim();
+      if (!raw) continue;
+      for (const line of raw.split('\n')) {
+        const fields = line.split(/\s+/);
+        if (fields.length === 2
+          && /^[a-f0-9]{64}$/.test(fields[0])
+          && namePattern.test(fields[1])) {
+          resources.push(`${kind} ${fields[1]} (${fields[0]})`);
+          (kind === 'proxy' ? containerIds : networkIds).push(fields[0]);
+        }
+      }
+    }
+  } catch {
+    // Keep the primary validation failure authoritative when diagnostics race.
+  }
+  console.error(
+    `Managed Project egress inventory validation failed for ${resources.join(', ') || 'unresolved reserved resources'}. `
+      + `Remediation: ${containerIds.length ? `docker container inspect ${containerIds.join(' ')}; ` : ''}`
+      + `${networkIds.length ? `docker network inspect ${networkIds.join(' ')}; ` : ''}`
+      + 'stop attached Project runtimes, then retry the Portal update. Remove only a fully empty parentless network pair.',
+  );
   process.exit(3);
 }
 NODE
@@ -12018,41 +16341,120 @@ discover_unique_managed_project_egress_proxy_image_id() {
   # Two complete immutable snapshots make image selection a CAS boundary.
   # Any create/remove/relabel between them is a race, not a generation the
   # updater may guess through.
-  local first_inventory="" second_inventory=""
-  local first_status=0 second_status=0 row kind resource_id name image_id
-  local selected_image_id=""
+  local first_inventory="" second_inventory="" barrier_inventory=""
+  local first_status=0 second_status=0 barrier_status=0
+  local row kind resource_id name detail selected_image_id="" index
+  local cleanup_attempted=false resource_summary="" separator=""
+  local -a orphan_network_ids=()
+  local -a orphan_network_names=()
 
-  if first_inventory="$(capture_managed_project_egress_inventory)"; then
-    first_status=0
-  else
-    first_status=$?
-  fi
-  if second_inventory="$(capture_managed_project_egress_inventory)"; then
-    second_status=0
-  else
-    second_status=$?
-  fi
-  if [[ "${first_status}" != "${second_status}" \
-    || "${first_inventory}" != "${second_inventory}" ]]; then
-    return 5
-  fi
-  case "${first_status}" in
-    0) ;;
-    1|2|3) return "${first_status}" ;;
-    *) return 5 ;;
-  esac
-
-  while IFS='|' read -r kind resource_id name image_id; do
-    [[ "${kind}" == "container" ]] || continue
-    valid_docker_image_id "${image_id}" || return 3
-    if [[ -n "${selected_image_id}" \
-      && "${selected_image_id}" != "${image_id}" ]]; then
-      return 4
+  while true; do
+    first_inventory=""
+    second_inventory=""
+    selected_image_id=""
+    orphan_network_ids=()
+    orphan_network_names=()
+    if first_inventory="$(capture_managed_project_egress_inventory)"; then
+      first_status=0
+    else
+      first_status=$?
     fi
-    selected_image_id="${image_id}"
-  done <<<"${first_inventory}"
-  valid_docker_image_id "${selected_image_id}" || return 3
-  printf '%s\n' "${selected_image_id}"
+    if second_inventory="$(capture_managed_project_egress_inventory)"; then
+      second_status=0
+    else
+      second_status=$?
+    fi
+    if [[ "${first_status}" != "${second_status}" \
+      || "${first_inventory}" != "${second_inventory}" ]]; then
+      return 5
+    fi
+    case "${first_status}" in
+      0) ;;
+      1|2|3) return "${first_status}" ;;
+      *) return 5 ;;
+    esac
+
+    while IFS='|' read -r kind resource_id name detail; do
+      case "${kind}" in
+        container)
+          [[ "${resource_id}" =~ ^[a-f0-9]{64}$ \
+            && "${name}" =~ ^/p4e-proxy-[a-f0-9]{20}$ ]] \
+            || return 3
+          valid_docker_image_id "${detail}" || return 3
+          if [[ -n "${selected_image_id}" \
+            && "${selected_image_id}" != "${detail}" ]]; then
+            return 4
+          fi
+          selected_image_id="${detail}"
+          ;;
+        network)
+          [[ "${resource_id}" =~ ^[a-f0-9]{64}$ \
+            && "${name}" =~ ^p4e-(in|out)-[a-f0-9]{20}$ \
+            && ( "${detail}" == "internal" || "${detail}" == "proxy-public" ) ]] \
+            || return 3
+          ;;
+        topology|orphan-plane)
+          [[ "${resource_id}" =~ ^[a-f0-9]{64}$ \
+            && "${name}" =~ ^[a-f0-9]{64}$ \
+            && -z "${detail}" ]] \
+            || return 3
+          ;;
+        orphan-network)
+          [[ "${resource_id}" =~ ^[a-f0-9]{64}$ \
+            && "${name}" =~ ^p4e-(in|out)-[a-f0-9]{20}$ \
+            && ( "${detail}" == "internal" || "${detail}" == "proxy-public" ) ]] \
+            || return 3
+          orphan_network_ids+=("${resource_id}")
+          orphan_network_names+=("${name}")
+          ;;
+        *) return 3 ;;
+      esac
+    done <<<"${first_inventory}"
+
+    if ((${#orphan_network_ids[@]} > 0)); then
+      if ${cleanup_attempted} || ((${#orphan_network_ids[@]} % 2 != 0)); then
+        return 5
+      fi
+      barrier_inventory=""
+      if barrier_inventory="$(capture_managed_project_egress_inventory)"; then
+        barrier_status=0
+      else
+        barrier_status=$?
+      fi
+      if [[ "${barrier_status}" != "0" \
+        || "${barrier_inventory}" != "${first_inventory}" ]]; then
+        return 5
+      fi
+      resource_summary=""
+      separator=""
+      for ((index = 0; index < ${#orphan_network_ids[@]}; index++)); do
+        resource_summary+="${separator}${orphan_network_names[index]} (${orphan_network_ids[index]})"
+        separator=", "
+      done
+      printf '%s\n' \
+        "Reclaiming empty parentless Project egress networks: ${resource_summary}." >&2
+      for ((index = 0; index < ${#orphan_network_ids[@]}; index++)); do
+        if ! docker network rm "${orphan_network_ids[index]}" \
+          >> "${LOG_FILE}" 2>&1; then
+          printf '%s\n' \
+            "Could not reclaim Project egress networks ${resource_summary}. Remediation: docker network inspect ${orphan_network_ids[*]}; stop attached Project runtimes, then retry the Portal update. Do not remove a network that still has endpoints." >&2
+          return 3
+        fi
+        if docker network inspect "${orphan_network_ids[index]}" \
+          >/dev/null 2>&1; then
+          printf '%s\n' \
+            "Project egress network ${orphan_network_names[index]} (${orphan_network_ids[index]}) remained after exact removal. Remediation: docker network inspect ${orphan_network_ids[index]}; retry the Portal update after all endpoints are gone." >&2
+          return 3
+        fi
+      done
+      cleanup_attempted=true
+      continue
+    fi
+
+    valid_docker_image_id "${selected_image_id}" || return 3
+    printf '%s\n' "${selected_image_id}"
+    return 0
+  done
 }
 
 install_project_runtime_confinement_file() {
@@ -13497,44 +17899,647 @@ ensure_project_egress_proxy_image() {
   ok "Project egress proxy image ${image_id:0:19}… (pinned)"
 }
 
-ensure_portal_project_runtime_image() {
-  local image="${1:-${PORTAL_PROJECT_RUNTIME_IMAGE_TAG}}"
-  local prepared_env_file="${2:-}"
-  if ! command -v docker &>/dev/null; then
-    fail "Docker is required for isolated project installs, builds, and full-stack apps."
-  fi
-  valid_local_image_tag "${image}" \
-    || fail "Portal project runtime image tag is invalid."
-  if [[ -n "${prepared_env_file}" ]]; then
-    [[ -f "${prepared_env_file}" && ! -L "${prepared_env_file}" ]] \
-      || fail "Prepared Project runtime environment is unavailable."
-  fi
+attest_project_runtime_image_repair_authority() {
+  local installed_script="$1" installed_env="$2" executing_script="$3"
+  local source_only="${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}"
+  python3 - "${installed_script}" "${installed_env}" \
+    "${executing_script}" "${source_only}" <<'PY'
+import os
+import re
+import stat
+import sys
 
-  systemctl start docker >> "$LOG_FILE" 2>&1 || true
+script_path, env_path, executing_path, source_only = sys.argv[1:]
+expected_script = "/opt/bridgesllm/portal/installer/install.sh"
+expected_env = "/opt/bridgesllm/portal/backend/.env.production"
+if source_only != "1" and (script_path != expected_script or env_path != expected_env):
+    raise SystemExit("Project runtime repair authority is not the fixed installed Portal")
+if source_only != "1" and not re.fullmatch(r"/proc/(?:self|[0-9]+)/fd/[0-9]+", executing_path):
+    raise SystemExit("Project runtime repair was not launched through its attested script descriptor")
 
-  local verify_command='test "$(id -u)" = 1000 && test "$(id -g)" = 1000 && node --version >/dev/null 2>&1 && npm --version >/dev/null 2>&1 && python3 --version >/dev/null 2>&1 && python3 -m venv --help >/dev/null 2>&1 && command -v g++ >/dev/null 2>&1 && command -v make >/dev/null 2>&1'
-  local image_ready=false
-  if docker image inspect "$image" >/dev/null 2>&1; then
-    local existing_entrypoint
-    existing_entrypoint="$(
-      docker image inspect --format '{{len .Config.Entrypoint}}' \
-        "$image" 2>/dev/null || echo 1
-    )"
-    if [[ "$existing_entrypoint" == "0" ]] \
-      && docker run --rm --entrypoint sh "$image" -lc "$verify_command" >> "$LOG_FILE" 2>&1; then
-      ok "Portal project runtime image"
-      image_ready=true
-    else
-      warn "Existing Portal project runtime image is incomplete; rebuilding."
-      docker image rm --force "$image" >> "$LOG_FILE" 2>&1 || true
+def secure_open(path, *, environment=False):
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise SystemExit("Project runtime repair authority path is not canonical")
+    parts = [part for part in path.split("/") if part]
+    directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    opened = [directory_fd]
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            opened.append(next_fd)
+            info = os.fstat(next_fd)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != 0
+                or info.st_gid != 0
+                or info.st_mode & 0o022
+            ):
+                raise SystemExit("Project runtime repair authority directory is unsafe")
+            directory_fd = next_fd
+        descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOATIME", 0),
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_nlink != 1
+            or info.st_mode & 0o022
+            or (environment and stat.S_IMODE(info.st_mode) != 0o600)
+        ):
+            os.close(descriptor)
+            raise SystemExit("Project runtime repair authority file is unsafe")
+        return descriptor, info
+    finally:
+        for opened_fd in reversed(opened):
+            os.close(opened_fd)
+
+script_fd, script_info = secure_open(script_path)
+env_fd, _ = secure_open(env_path, environment=True)
+try:
+    current_fd = os.open(
+        executing_path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOATIME", 0),
+    )
+    try:
+        current_info = os.fstat(current_fd)
+        if (current_info.st_dev, current_info.st_ino) != (
+            script_info.st_dev,
+            script_info.st_ino,
+        ):
+            raise SystemExit("Executing repair script is not the installed Portal script")
+    finally:
+        os.close(current_fd)
+finally:
+    os.close(script_fd)
+    os.close(env_fd)
+PY
+}
+
+verify_project_runtime_repair_health() {
+  local service_name="${1:-bridgesllm-product.service}"
+  local health_url="${2:-http://127.0.0.1:4001/health}"
+  local timeout_secs="${3:-60}" waited=0 payload=""
+  while (( waited < timeout_secs )); do
+    if systemctl is-active --quiet "${service_name}"; then
+      payload="$(curl -fsS --max-time 2 "${health_url}" 2>/dev/null || true)"
+      if printf '%s' "${payload}" | python3 /dev/fd/3 "${VERSION}" 3<<'PY'
+import json
+import sys
+
+expected = sys.argv[1]
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+if payload.get("status") not in {"ok", "degraded"}:
+    raise SystemExit(1)
+if payload.get("version") != expected:
+    raise SystemExit(1)
+PY
+      then
+        return 0
+      fi
     fi
-  fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  return 1
+}
 
-  if ! ${image_ready}; then
-    local build_dir
-    build_dir="$(mktemp -d)"
-    cat > "${build_dir}/Dockerfile" <<'PROJECT_RUNTIME_DOCKERFILE'
+project_runtime_repair_environment_transaction() {
+  local action="$1" env_file="$2" transaction_dir="$3"
+  local image_id="${4:-}"
+  python3 - "${action}" "${env_file}" "${transaction_dir}" \
+    "${image_id}" <<'PY'
+import base64
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+import time
+
+action, env_path, transaction_path, image_id = sys.argv[1:]
+key = b"PORTAL_PROJECT_RUNTIME_IMAGE_ID"
+maximum_size = 1024 * 1024
+
+def fail(message):
+    raise SystemExit(message)
+
+def stat_record(info):
+    return {
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "atime_ns": info.st_atime_ns,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+    }
+
+def identity_matches(info, record):
+    current = stat_record(info)
+    return all(current[name] == record[name] for name in (
+        "dev", "ino", "mode", "uid", "gid", "nlink", "size",
+        "mtime_ns", "ctime_ns",
+    ))
+
+def open_regular(path):
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOATIME", 0),
+    )
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or info.st_mode & 0o022
+        or info.st_size > maximum_size
+    ):
+        os.close(descriptor)
+        fail("Project runtime repair environment is unsafe")
+    return descriptor, info
+
+def read_descriptor(descriptor):
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(65536, maximum_size + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum_size:
+            fail("Project runtime repair environment exceeds 1 MiB")
+    return b"".join(chunks)
+
+def descriptor_xattrs(descriptor):
+    values = {}
+    for name in os.listxattr(descriptor):
+        values[name] = base64.b64encode(os.getxattr(descriptor, name)).decode("ascii")
+    return values
+
+def write_private(path, payload):
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail("Project runtime repair transaction write stalled")
+            view = view[written:]
+        os.fsync(descriptor)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+
+def read_private(path, *, limit=maximum_size):
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOATIME", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > limit
+        ):
+            fail("Project runtime repair transaction artifact is unsafe")
+        return read_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+transaction_info = os.lstat(transaction_path)
+if (
+    not stat.S_ISDIR(transaction_info.st_mode)
+    or stat.S_ISLNK(transaction_info.st_mode)
+    or transaction_info.st_uid != 0
+    or transaction_info.st_gid != 0
+    or stat.S_IMODE(transaction_info.st_mode) != 0o700
+):
+    fail("Project runtime repair transaction directory is unsafe")
+
+original_path = os.path.join(transaction_path, "original.env")
+original_meta_path = os.path.join(transaction_path, "original.json")
+committed_path = os.path.join(transaction_path, "committed.env")
+committed_meta_path = os.path.join(transaction_path, "committed.json")
+
+transaction_artifact_sets = {
+    "empty": frozenset(),
+    "snapshot": frozenset({"original.env", "original.json"}),
+    "staged": frozenset({"original.env", "original.json", "committed.env"}),
+    "durable": frozenset({
+        "original.env", "original.json", "committed.env", "committed.json"
+    }),
+}
+
+def fsync_transaction_directory():
+    directory_fd = os.open(
+        transaction_path,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+def require_transaction_artifact_set(*allowed_states):
+    directory_fd = os.open(
+        transaction_path,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        names = os.listdir(directory_fd)
+        if len(names) != len(set(names)):
+            fail("Project runtime repair transaction artifact inventory is ambiguous")
+        observed = frozenset(names)
+        state = next(
+            (
+                candidate
+                for candidate in allowed_states
+                if observed == transaction_artifact_sets[candidate]
+            ),
+            None,
+        )
+        if state is None:
+            fail("Project runtime repair transaction has an unexpected artifact set")
+        for name in names:
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != 0
+                or info.st_gid != 0
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > maximum_size
+            ):
+                fail("Project runtime repair transaction artifact is unsafe")
+        return state
+    finally:
+        os.close(directory_fd)
+
+if action not in {
+    "snapshot", "commit", "inspect", "reconcile", "recover-commit", "restore"
+}:
+    fail("Unsupported Project runtime repair transaction action")
+
+if action == "snapshot":
+    require_transaction_artifact_set("empty")
+    descriptor, before = open_regular(env_path)
+    try:
+        payload = read_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        if not identity_matches(after, stat_record(before)):
+            fail("Project runtime repair environment changed during snapshot")
+        metadata = stat_record(before)
+        metadata["sha256"] = hashlib.sha256(payload).hexdigest()
+        metadata["xattrs"] = descriptor_xattrs(descriptor)
+        metadata["environmentPath"] = env_path
+    finally:
+        os.close(descriptor)
+    write_private(original_path, payload)
+    write_private(
+        original_meta_path,
+        (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+    )
+    require_transaction_artifact_set("snapshot")
+    fsync_transaction_directory()
+    parent_fd = os.open(os.path.dirname(transaction_path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    raise SystemExit(0)
+
+transaction_state = require_transaction_artifact_set(
+    "snapshot", "staged", "durable"
+)
+if action == "commit" and transaction_state != "snapshot":
+    fail("Project runtime repair transaction is not ready for commit")
+if action == "recover-commit" and transaction_state != "staged":
+    fail("Project runtime repair transaction is not a staged commit")
+if action == "restore" and transaction_state != "durable":
+    fail("Project runtime repair transaction has no durable commit receipt")
+
+try:
+    original = read_private(original_path)
+    metadata = json.loads(read_private(original_meta_path))
+except Exception:
+    fail("Project runtime repair snapshot is incomplete")
+if hashlib.sha256(original).hexdigest() != metadata.get("sha256"):
+    fail("Project runtime repair snapshot checksum is invalid")
+if metadata.get("environmentPath") != env_path:
+    fail("Project runtime repair snapshot belongs to another environment")
+
+def install_payload(payload, restore_times):
+    parent = os.path.dirname(env_path)
+    leaf = os.path.basename(env_path)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    temporary = f".{leaf}.runtime-repair-{secrets.token_hex(12)}"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.fchown(descriptor, metadata["uid"], metadata["gid"])
+        os.fchmod(descriptor, metadata["mode"])
+        for name, encoded in metadata.get("xattrs", {}).items():
+            os.setxattr(descriptor, name, base64.b64decode(encoded))
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail("Project runtime repair environment write stalled")
+            view = view[written:]
+        if restore_times:
+            os.utime(
+                descriptor,
+                ns=(metadata["atime_ns"], metadata["mtime_ns"]),
+            )
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
+
+if action == "commit":
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", image_id):
+        fail("Project runtime repair image identity is invalid")
+    descriptor, current_info = open_regular(env_path)
+    try:
+        current = read_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+    if not identity_matches(current_info, metadata) or current != original:
+        fail("Project runtime repair environment changed before commit")
+
+    lines = original.splitlines(keepends=True)
+    matches = []
+    for index, line in enumerate(lines):
+        body = line.rstrip(b"\r\n")
+        if body.startswith(key + b"="):
+            matches.append(index)
+    if len(matches) > 1:
+        fail("Project runtime repair environment contains duplicate image keys")
+    replacement = key + b"=" + image_id.encode("ascii")
+    if matches:
+        index = matches[0]
+        ending = lines[index][len(lines[index].rstrip(b"\r\n")):]
+        if lines[index].rstrip(b"\r\n") == replacement:
+            print("unchanged")
+            raise SystemExit(0)
+        lines[index] = replacement + ending
+        committed = b"".join(lines)
+    else:
+        separator = b"" if not original or original.endswith((b"\n", b"\r")) else b"\n"
+        committed = original + separator + replacement + b"\n"
+    write_private(committed_path, committed)
+    # The staged payload must be durably discoverable before the installed
+    # environment can expose it. A crash after replacement can then always be
+    # classified as a recoverable pre-receipt transaction.
+    fsync_transaction_directory()
+    require_transaction_artifact_set("staged")
+    install_payload(committed, False)
+    test_hook = os.environ.get("BRIDGESLLM_PROJECT_RUNTIME_REPAIR_TEST_HOOK")
+    if (
+        os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") == "1"
+        and test_hook == "pause-after-replace-before-receipt"
+    ):
+        marker = os.environ.get("BRIDGESLLM_PROJECT_RUNTIME_REPAIR_TEST_MARKER", "")
+        if not marker or not os.path.isabs(marker):
+            fail("Project runtime repair signal-test marker is invalid")
+        write_private(marker, b"replaced\n")
+        time.sleep(300)
+    if (
+        os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") == "1"
+        and test_hook == "commit-after-replace"
+    ):
+        fail("Injected Project runtime repair failure after environment replacement")
+    descriptor, committed_info = open_regular(env_path)
+    try:
+        installed = read_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+    if installed != committed:
+        # Best-effort immediate restoration before reporting a failed commit.
+        install_payload(original, True)
+        fail("Project runtime repair environment commit did not verify")
+    committed_metadata = stat_record(committed_info)
+    committed_metadata["sha256"] = hashlib.sha256(committed).hexdigest()
+    write_private(
+        committed_meta_path,
+        (json.dumps(committed_metadata, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+    )
+    require_transaction_artifact_set("durable")
+    fsync_transaction_directory()
+    print("changed")
+    raise SystemExit(0)
+
+def original_visible(info, payload, xattrs):
+    return (
+        payload == original
+        and stat.S_IMODE(info.st_mode) == metadata["mode"]
+        and info.st_uid == metadata["uid"]
+        and info.st_gid == metadata["gid"]
+        and info.st_nlink == metadata["nlink"]
+        and info.st_atime_ns == metadata["atime_ns"]
+        and info.st_mtime_ns == metadata["mtime_ns"]
+        and xattrs == metadata.get("xattrs", {})
+    )
+
+def read_current():
+    descriptor, info = open_regular(env_path)
+    try:
+        payload = read_descriptor(descriptor)
+        xattrs = descriptor_xattrs(descriptor)
+    finally:
+        os.close(descriptor)
+    return info, payload, xattrs
+
+def verify_restored_original(message):
+    info, payload, xattrs = read_current()
+    if not original_visible(info, payload, xattrs):
+        fail(message)
+
+if action in {"inspect", "reconcile"}:
+    committed_exists = transaction_state in {"staged", "durable"}
+    receipt_exists = transaction_state == "durable"
+
+    current_info, current, current_xattrs = read_current()
+    if not committed_exists:
+        if not original_visible(current_info, current, current_xattrs):
+            fail("Project runtime repair snapshot no longer matches the installed environment")
+        print("snapshot")
+        raise SystemExit(0)
+
+    try:
+        committed = read_private(committed_path)
+    except Exception:
+        fail("Project runtime repair staged commit is incomplete")
+
+    if not receipt_exists:
+        if current == committed:
+            if action == "reconcile":
+                install_payload(original, True)
+        elif not original_visible(current_info, current, current_xattrs):
+            fail("Project runtime repair environment is neither the original nor staged commit")
+        if action == "reconcile":
+            verify_restored_original(
+                "Project runtime repair pre-receipt recovery did not verify"
+            )
+        print("staged")
+        raise SystemExit(0)
+
+    try:
+        committed_metadata = json.loads(read_private(committed_meta_path))
+    except Exception:
+        fail("Project runtime repair commit receipt is incomplete")
+    if hashlib.sha256(committed).hexdigest() != committed_metadata.get("sha256"):
+        fail("Project runtime repair committed payload checksum is invalid")
+    if current == committed:
+        if not identity_matches(current_info, committed_metadata):
+            fail("Project runtime repair committed environment changed after receipt")
+        if action == "reconcile":
+            install_payload(original, True)
+    elif not original_visible(current_info, current, current_xattrs):
+        fail("Project runtime repair durable commit no longer matches the installed environment")
+    if action == "reconcile":
+        verify_restored_original(
+            "Project runtime repair durable-commit recovery did not verify"
+        )
+    print("durable")
+    raise SystemExit(0)
+
+if action == "recover-commit":
+    try:
+        committed = read_private(committed_path)
+    except Exception:
+        fail("Project runtime repair staged commit is incomplete")
+    descriptor, current_info = open_regular(env_path)
+    try:
+        current = read_descriptor(descriptor)
+        current_xattrs = descriptor_xattrs(descriptor)
+    finally:
+        os.close(descriptor)
+    if current == committed:
+        install_payload(original, True)
+    elif current == original:
+        if (
+            stat.S_IMODE(current_info.st_mode) != metadata["mode"]
+            or current_info.st_uid != metadata["uid"]
+            or current_info.st_gid != metadata["gid"]
+            or current_info.st_atime_ns != metadata["atime_ns"]
+            or current_info.st_mtime_ns != metadata["mtime_ns"]
+            or current_xattrs != metadata.get("xattrs", {})
+        ):
+            fail("Project runtime repair original environment metadata changed during failed commit")
+    else:
+        fail("Project runtime repair environment is neither the original nor staged commit")
+    descriptor, restored_info = open_regular(env_path)
+    try:
+        restored = read_descriptor(descriptor)
+        restored_xattrs = descriptor_xattrs(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        restored != original
+        or stat.S_IMODE(restored_info.st_mode) != metadata["mode"]
+        or restored_info.st_uid != metadata["uid"]
+        or restored_info.st_gid != metadata["gid"]
+        or restored_info.st_atime_ns != metadata["atime_ns"]
+        or restored_info.st_mtime_ns != metadata["mtime_ns"]
+        or restored_xattrs != metadata.get("xattrs", {})
+    ):
+        fail("Project runtime repair failed-commit recovery did not verify")
+    raise SystemExit(0)
+
+if action == "restore":
+    try:
+        committed = read_private(committed_path)
+        committed_metadata = json.loads(read_private(committed_meta_path))
+    except Exception:
+        fail("Project runtime repair commit receipt is incomplete")
+    descriptor, current_info = open_regular(env_path)
+    try:
+        current = read_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        not identity_matches(current_info, committed_metadata)
+        or current != committed
+        or hashlib.sha256(current).hexdigest() != committed_metadata.get("sha256")
+    ):
+        fail("Project runtime repair environment changed after commit; refusing to overwrite it")
+    install_payload(original, True)
+    descriptor, restored_info = open_regular(env_path)
+    try:
+        restored = read_descriptor(descriptor)
+        restored_xattrs = descriptor_xattrs(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        restored != original
+        or stat.S_IMODE(restored_info.st_mode) != metadata["mode"]
+        or restored_info.st_uid != metadata["uid"]
+        or restored_info.st_gid != metadata["gid"]
+        or restored_info.st_atime_ns != metadata["atime_ns"]
+        or restored_info.st_mtime_ns != metadata["mtime_ns"]
+        or restored_xattrs != metadata.get("xattrs", {})
+    ):
+        fail("Project runtime repair environment rollback did not verify")
+    raise SystemExit(0)
+
+fail("Unsupported Project runtime repair transaction action")
+PY
+}
+
+write_portal_project_runtime_dockerfile() {
+  local target="$1"
+  cat > "${target}" <<'PROJECT_RUNTIME_DOCKERFILE'
 FROM node:22.16.0-bookworm-slim
+ARG PORTAL_RECIPE_SHA256
+LABEL com.bridgesllm.portal-project-runtime.recipe-sha256="${PORTAL_RECIPE_SHA256}"
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -13554,17 +18559,79 @@ WORKDIR /workspace/project
 ENTRYPOINT []
 CMD ["node", "--version"]
 PROJECT_RUNTIME_DOCKERFILE
+}
 
-    if ! spin "Building isolated Portal project runtime" "docker build -t '${image}' '${build_dir}'"; then
+verify_portal_project_runtime_image() {
+  local image="$1" expected_recipe="$2" existing_entrypoint=""
+  [[ "${expected_recipe}" =~ ^[a-f0-9]{64}$ ]] || return 1
+  valid_docker_image_id "$(docker_image_id "${image}" || true)" || return 1
+  [[ "$(docker_image_label "${image}" "${PORTAL_PROJECT_RUNTIME_RECIPE_LABEL}" || true)" \
+    == "${expected_recipe}" ]] || return 1
+  existing_entrypoint="$(
+    docker image inspect --format '{{len .Config.Entrypoint}}' \
+      "${image}" 2>/dev/null || echo 1
+  )"
+  [[ "${existing_entrypoint}" == "0" ]] || return 1
+  docker run --rm --entrypoint sh "${image}" -lc \
+    'test "$(id -u)" = 1000 && test "$(id -g)" = 1000 && node --version >/dev/null 2>&1 && npm --version >/dev/null 2>&1 && python3 --version >/dev/null 2>&1 && python3 -m venv --help >/dev/null 2>&1 && command -v g++ >/dev/null 2>&1 && command -v make >/dev/null 2>&1' \
+    >> "${LOG_FILE}" 2>&1
+}
+
+ensure_portal_project_runtime_image() {
+  local image="${1:-${PORTAL_PROJECT_RUNTIME_IMAGE_TAG}}"
+  local prepared_env_file="${2:-}"
+  local may_start_docker="${3:-true}"
+  if ! command -v docker &>/dev/null; then
+    fail "Docker is required for isolated project installs, builds, and full-stack apps."
+  fi
+  valid_local_image_tag "${image}" \
+    || fail "Portal project runtime image tag is invalid."
+  if [[ -n "${prepared_env_file}" ]]; then
+    [[ -f "${prepared_env_file}" && ! -L "${prepared_env_file}" ]] \
+      || fail "Prepared Project runtime environment is unavailable."
+  fi
+
+  local build_dir recipe_fingerprint
+  build_dir="$(mktemp -d)"
+  write_portal_project_runtime_dockerfile "${build_dir}/Dockerfile" \
+    || { rm -rf -- "${build_dir}"; fail "Canonical Project runtime recipe could not be staged."; }
+  recipe_fingerprint="$(sha256sum "${build_dir}/Dockerfile" | awk '{print $1}')"
+  [[ "${recipe_fingerprint}" =~ ^[a-f0-9]{64}$ ]] \
+    || { rm -rf -- "${build_dir}"; fail "Canonical Project runtime recipe fingerprint is invalid."; }
+  PORTAL_PROJECT_RUNTIME_RECIPE_SHA256="${recipe_fingerprint}"
+
+  if [[ "${may_start_docker}" == "true" ]]; then
+    systemctl start docker >> "$LOG_FILE" 2>&1 || true
+  elif [[ "${may_start_docker}" == "false" ]]; then
+    systemctl is-active --quiet docker \
+      || fail "Docker must already be active before Project runtime image repair."
+  else
+    fail "Project runtime Docker-management mode is invalid."
+  fi
+
+  local image_ready=false
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    if verify_portal_project_runtime_image "${image}" "${recipe_fingerprint}"; then
+      ok "Portal project runtime image"
+      image_ready=true
+    else
+      warn "Existing Portal project runtime image is incomplete; rebuilding."
+    fi
+  fi
+
+  if ! ${image_ready}; then
+    if ! spin "Building isolated Portal project runtime" \
+      "docker build --tag '${image}' --build-arg 'PORTAL_RECIPE_SHA256=${recipe_fingerprint}' '${build_dir}'"; then
       rm -rf "$build_dir"
       fail "Failed to build ${image}. Project code execution remains disabled."
     fi
-    rm -rf "$build_dir"
   fi
 
-  if ! docker run --rm --entrypoint sh "$image" -lc "$verify_command" >> "$LOG_FILE" 2>&1; then
+  if ! verify_portal_project_runtime_image "${image}" "${recipe_fingerprint}"; then
+    rm -rf -- "${build_dir}"
     fail "Built ${image}, but its required project tools are unavailable."
   fi
+  rm -rf -- "${build_dir}"
 
   local image_id
   image_id="$(docker_image_id "${image}" || true)"
@@ -13576,6 +18643,410 @@ PROJECT_RUNTIME_DOCKERFILE
       || fail "Portal project runtime image ID could not be recorded for update cutover."
   fi
   ok "Portal project runtime image"
+}
+
+project_runtime_repair_transaction_root() {
+  local root="/run"
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && -n "${BRIDGESLLM_PROJECT_RUNTIME_REPAIR_TEST_ROOT:-}" ]]; then
+    root="${BRIDGESLLM_PROJECT_RUNTIME_REPAIR_TEST_ROOT}"
+  fi
+  python3 - "${root}" <<'PY'
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+if not os.path.isabs(root) or os.path.normpath(root) != root:
+    raise SystemExit("Project runtime repair transaction root is not canonical")
+descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_mode & 0o022
+    ):
+        raise SystemExit("Project runtime repair transaction root is unsafe")
+finally:
+    os.close(descriptor)
+print(root)
+PY
+}
+
+cleanup_project_runtime_image_repair_transaction() {
+  local directory="${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR:-}"
+  local root="${PROJECT_RUNTIME_REPAIR_TRANSACTION_ROOT:-}"
+  [[ -n "${directory}" ]] || return 0
+  [[ -n "${root}" \
+    && "$(dirname -- "${directory}")" == "${root}" \
+    && "$(basename -- "${directory}")" \
+      =~ ^bridgesllm-project-runtime-image-repair\.[A-Za-z0-9]{8}$ \
+    && -d "${directory}" && ! -L "${directory}" ]] || return 1
+  rm -rf -- "${directory}" || return 1
+  [[ ! -e "${directory}" && ! -L "${directory}" ]] || return 1
+  python3 - "${root}" <<'PY' || return 1
+import os
+import sys
+descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+  PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR=""
+}
+
+settle_project_runtime_image_repair_child() {
+  local pid="${PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID:-}"
+  local current child index
+  local -a pending=() descendants=()
+  [[ -n "${pid}" ]] || return 0
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  pending=("${pid}")
+  index=0
+  while (( index < ${#pending[@]} )); do
+    current="${pending[index]}"
+    index=$((index + 1))
+    if [[ -r "/proc/${current}/task/${current}/children" ]]; then
+      for child in $(<"/proc/${current}/task/${current}/children"); do
+        [[ "${child}" =~ ^[1-9][0-9]*$ ]] || continue
+        descendants+=("${child}")
+        pending+=("${child}")
+      done
+    fi
+  done
+  if (( ${#descendants[@]} > 0 )); then
+    kill -TERM "${descendants[@]}" >/dev/null 2>&1 || true
+  fi
+  kill -TERM "${pid}" >/dev/null 2>&1 || true
+  for _ in {1..50}; do
+    kill -0 "${pid}" >/dev/null 2>&1 || break
+    sleep 0.02
+  done
+  if kill -0 "${pid}" >/dev/null 2>&1; then
+    if (( ${#descendants[@]} > 0 )); then
+      kill -KILL "${descendants[@]}" >/dev/null 2>&1 || true
+    fi
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+  fi
+  wait "${pid}" >/dev/null 2>&1 || true
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID=""
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_KIND=""
+}
+
+run_project_runtime_repair_environment_commit() {
+  local env_file="$1" transaction_dir="$2" image_id="$3" status=0
+  (
+    trap - EXIT ERR SIGINT SIGTERM SIGHUP
+    project_runtime_repair_environment_transaction \
+      commit "${env_file}" "${transaction_dir}" "${image_id}"
+  ) >> "${PROJECT_RUNTIME_REPAIR_ACTIVE_LOG_FILE:-${LOG_FILE}}" 2>&1 &
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID=$!
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_KIND="environment-commit"
+  if wait "${PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID}"; then
+    status=0
+  else
+    status=$?
+  fi
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID=""
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_KIND=""
+  return "${status}"
+}
+
+run_project_runtime_repair_portal_restart() {
+  local status=0
+  (
+    trap - EXIT ERR SIGINT SIGTERM SIGHUP
+    systemctl restart bridgesllm-product.service
+  ) >> "${PROJECT_RUNTIME_REPAIR_ACTIVE_LOG_FILE:-${LOG_FILE}}" 2>&1 &
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID=$!
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_KIND="portal-restart"
+  if wait "${PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID}"; then
+    status=0
+  else
+    status=$?
+  fi
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID=""
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_KIND=""
+  return "${status}"
+}
+
+rollback_project_runtime_image_repair() {
+  local outcome=""
+  [[ -n "${PROJECT_RUNTIME_REPAIR_ENV_FILE:-}" \
+    && -n "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR:-}" ]] || return 1
+  outcome="$(
+    project_runtime_repair_environment_transaction \
+      reconcile \
+      "${PROJECT_RUNTIME_REPAIR_ENV_FILE}" \
+      "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR}"
+  )" || return 1
+  case "${outcome}" in
+    snapshot|staged)
+      return 0
+      ;;
+    durable)
+      systemctl restart bridgesllm-product.service \
+        >> "${PROJECT_RUNTIME_REPAIR_ACTIVE_LOG_FILE:-${LOG_FILE}}" 2>&1 \
+        || return 1
+      verify_project_runtime_repair_health \
+        bridgesllm-product.service http://127.0.0.1:4001/health 60 \
+        || return 1
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+recover_pending_project_runtime_image_repair() {
+  local installed_env="$1" root="$2" pending="" outcome=""
+  local -a candidates=()
+  shopt -s nullglob
+  candidates=("${root}"/bridgesllm-project-runtime-image-repair.*)
+  shopt -u nullglob
+  (( ${#candidates[@]} <= 1 )) \
+    || fail "Multiple interrupted Project runtime image repairs exist; refusing to guess recovery order."
+  (( ${#candidates[@]} == 1 )) || return 0
+  pending="${candidates[0]}"
+  [[ -d "${pending}" && ! -L "${pending}" \
+    && "$(basename -- "${pending}")" \
+      =~ ^bridgesllm-project-runtime-image-repair\.[A-Za-z0-9]{8}$ ]] \
+    || fail "An interrupted Project runtime image repair transaction is unsafe."
+  PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR="${pending}"
+  PROJECT_RUNTIME_REPAIR_TRANSACTION_ROOT="${root}"
+  PROJECT_RUNTIME_REPAIR_ENV_FILE="${installed_env}"
+  outcome="$(
+    project_runtime_repair_environment_transaction \
+      inspect "${installed_env}" "${pending}"
+  )" || fail "An interrupted Project runtime image repair could not be inspected safely. Its transaction was preserved."
+  rollback_project_runtime_image_repair \
+    || fail "An interrupted Project runtime image repair could not be reconciled safely. Its transaction was preserved."
+  cleanup_project_runtime_image_repair_transaction \
+    || fail "A reconciled Project runtime image repair transaction could not be removed."
+  info "Recovered interrupted Project runtime image repair (${outcome})."
+}
+
+abort_project_runtime_image_repair_after_commit() {
+  local message="$1"
+  trap '' SIGINT TERM HUP
+  trap - ERR
+  set +e
+  if rollback_project_runtime_image_repair; then
+    if cleanup_project_runtime_image_repair_transaction; then
+      fail "${message} The exact previous environment was restored and Portal is healthy on it."
+    fi
+    trap - EXIT
+    echo -e "  ${RED}${BOLD}Project runtime image repair rollback verified, but its transaction cleanup did not.${NC}" >&2
+    echo -e "  ${RED}The root-only transaction was preserved for the next locked repair.${NC}" >&2
+    exit 1
+  fi
+  trap - EXIT
+  echo "" >&2
+  echo -e "  ${RED}${BOLD}Project runtime image repair failed after environment commit.${NC}" >&2
+  echo -e "  ${RED}${message}${NC}" >&2
+  echo -e "  ${RED}Automatic environment/service recovery did not verify. The root-only repair log and transaction state require manual inspection.${NC}" >&2
+  exit 1
+}
+
+handle_project_runtime_image_repair_exit() {
+  local exit_code="${1:-1}"
+  trap - EXIT ERR SIGINT SIGTERM SIGHUP
+  set +e
+  settle_project_runtime_image_repair_child >/dev/null 2>&1 || true
+  if [[ -n "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR:-}" ]]; then
+    if rollback_project_runtime_image_repair; then
+      if ! cleanup_project_runtime_image_repair_transaction >/dev/null 2>&1; then
+        echo -e "  ${RED}${BOLD}Project runtime image repair transaction cleanup did not verify; its root-only state was preserved.${NC}" >&2
+        exit_code=1
+      fi
+    else
+      echo -e "  ${RED}${BOLD}Project runtime image repair exit recovery did not verify; its root-only transaction was preserved.${NC}" >&2
+      exit_code=1
+    fi
+  fi
+  [[ "${exit_code}" =~ ^[0-9]+$ ]] || exit_code=1
+  (( exit_code != 0 )) || exit_code=1
+  exit "${exit_code}"
+}
+
+handle_project_runtime_image_repair_signal() {
+  local exit_code="$1" label="$2"
+  trap '' SIGINT TERM HUP
+  trap - ERR
+  set +e
+  settle_project_runtime_image_repair_child >/dev/null 2>&1 || true
+  if [[ -n "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR:-}" ]] \
+    && ! rollback_project_runtime_image_repair; then
+    trap - EXIT
+    echo -e "  ${RED}${BOLD}${label}; automatic repair rollback did not verify and the root-only transaction was preserved.${NC}" >&2
+    exit "${exit_code}"
+  fi
+  if ! cleanup_project_runtime_image_repair_transaction >/dev/null 2>&1; then
+    trap - EXIT
+    echo -e "  ${RED}${BOLD}${label}; rollback verified but transaction cleanup did not. Root-only recovery state was preserved.${NC}" >&2
+    exit "${exit_code}"
+  fi
+  echo -e "  ${RED}${label}.${NC}" >&2
+  exit "${exit_code}"
+}
+
+handle_project_runtime_image_repair_err() {
+  local exit_code="${1:-1}" line="${2:-unknown}"
+  [[ "${exit_code}" =~ ^[1-9][0-9]*$ ]] || exit_code=1
+  handle_project_runtime_image_repair_signal \
+    "${exit_code}" "Unexpected Project runtime image repair error at line ${line}"
+}
+
+repair_project_runtime_image() {
+  local installed_script="${PORTAL_DIR}/installer/install.sh"
+  local installed_env="${PORTAL_DIR}/backend/.env.production"
+  local source_only="${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}"
+  local repair_log_file="${LOG_FILE}" repair_log_dir="${LOG_DIR}"
+  local image_id="" commit_state="" transaction_root=""
+
+  if (( $# > 0 )); then
+    [[ "${source_only}" == "1" && $# -eq 3 ]] \
+      || fail "Project runtime repair authority paths cannot be overridden."
+    installed_script="$1"
+    installed_env="$2"
+    repair_log_file="$3"
+    repair_log_dir="$(dirname -- "${repair_log_file}")"
+  fi
+
+  CURRENT_STEP="Project runtime image repair"
+  attest_project_runtime_image_repair_authority \
+    "${installed_script}" "${installed_env}" "${BASH_SOURCE[0]}" \
+    || fail "The installed repair script or production environment failed root authority attestation."
+
+  mkdir -p "${repair_log_dir}"
+  touch "${repair_log_file}"
+  chmod 0600 "${repair_log_file}"
+  PROJECT_RUNTIME_REPAIR_ACTIVE_LOG_FILE="${repair_log_file}"
+
+  transaction_root="$(project_runtime_repair_transaction_root)" \
+    || fail "The Project runtime repair transaction root failed authority attestation."
+  PROJECT_RUNTIME_REPAIR_TRANSACTION_ROOT="${transaction_root}"
+  PROJECT_RUNTIME_REPAIR_ENV_FILE="${installed_env}"
+  PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR=""
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_PID=""
+  PROJECT_RUNTIME_REPAIR_ACTIVE_CHILD_KIND=""
+  trap 'handle_project_runtime_image_repair_exit $?' EXIT
+  trap 'handle_project_runtime_image_repair_err $? $LINENO' ERR
+  trap 'handle_project_runtime_image_repair_signal 130 "Project runtime image repair was interrupted"' SIGINT
+  trap 'handle_project_runtime_image_repair_signal 143 "Project runtime image repair was terminated"' SIGTERM
+  trap 'handle_project_runtime_image_repair_signal 129 "Project runtime image repair session disconnected"' SIGHUP
+
+  # Holding the shared installer lock makes this the sole repair authority.
+  # Reconcile a hard-killed predecessor before image inspection or any
+  # idempotent no-restart decision can observe its staged environment.
+  recover_pending_project_runtime_image_repair \
+    "${installed_env}" "${transaction_root}"
+
+  converge_unsafe_docker_prune_automation \
+    || fail "Unsafe scheduled Docker cleanup remains active. Repair it before rebuilding a pinned Project runtime image."
+  verify_project_runtime_repair_health \
+    bridgesllm-product.service http://127.0.0.1:4001/health 10 \
+    || fail "Portal must be healthy before Project runtime image repair begins."
+
+  PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR="$(
+    mktemp -d "${transaction_root}/bridgesllm-project-runtime-image-repair.XXXXXXXX"
+  )" || fail "A private Project runtime repair transaction directory could not be created."
+  chmod 0700 "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR}" \
+    || fail "The Project runtime repair transaction could not be made private."
+
+  project_runtime_repair_environment_transaction \
+    snapshot "${installed_env}" "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR}" \
+    || fail "The exact installed Portal environment could not be snapshotted before repair."
+  parse_strict_systemd_environment_file \
+    "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR}/original.env" \
+    || fail "The installed Portal environment is not a strict systemd environment file."
+
+  # Docker must already be active. This mode never starts or restarts Docker,
+  # optional provider tools, Caddy, OpenClaw, or any other managed service.
+  ensure_portal_project_runtime_image \
+    "${PORTAL_PROJECT_RUNTIME_IMAGE_TAG}" "" false
+  image_id="$(docker_image_id "${PORTAL_PROJECT_RUNTIME_IMAGE_TAG}" || true)"
+  valid_docker_image_id "${image_id}" \
+    || fail "The repaired Project runtime tag did not resolve to an immutable image ID."
+  [[ "$(docker_image_id "${image_id}" || true)" == "${image_id}" ]] \
+    || fail "The repaired Project runtime image ID did not resolve exactly."
+  [[ "${PORTAL_PROJECT_RUNTIME_RECIPE_SHA256}" =~ ^[a-f0-9]{64}$ ]] \
+    || fail "The canonical Project runtime recipe fingerprint was not retained."
+  verify_portal_project_runtime_image \
+    "${image_id}" "${PORTAL_PROJECT_RUNTIME_RECIPE_SHA256}" \
+    || fail "The repaired immutable Project runtime image failed runtime attestation."
+
+  if ! run_project_runtime_repair_environment_commit \
+      "${installed_env}" "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR}" \
+      "${image_id}"; then
+    if rollback_project_runtime_image_repair; then
+      if cleanup_project_runtime_image_repair_transaction; then
+        fail "The Project runtime image ID commit failed; the exact previous environment was restored before any service restart."
+      fi
+      trap - EXIT
+      echo -e "  ${RED}${BOLD}The failed Project runtime image commit was rolled back, but transaction cleanup did not verify.${NC}" >&2
+      echo -e "  ${RED}The root-only transaction was preserved for the next locked repair; Portal was not restarted.${NC}" >&2
+      exit 1
+    fi
+    trap - EXIT
+    echo -e "  ${RED}${BOLD}Project runtime image environment commit failed and recovery could not be verified.${NC}" >&2
+    echo -e "  ${RED}The root-only repair transaction was preserved for automatic recovery by the next locked repair; Portal was not restarted.${NC}" >&2
+    exit 1
+  fi
+  commit_state="$(
+    project_runtime_repair_environment_transaction \
+      inspect "${installed_env}" "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR}"
+  )" || abort_project_runtime_image_repair_after_commit \
+    "The durable Project runtime image environment state could not be verified."
+  case "${commit_state}" in
+    snapshot)
+      verify_project_runtime_repair_health \
+        bridgesllm-product.service http://127.0.0.1:4001/health 10 \
+        || fail "Portal became unhealthy during an idempotent Project runtime image repair."
+      cleanup_project_runtime_image_repair_transaction \
+        || fail "The completed Project runtime repair transaction could not be removed."
+      trap - EXIT
+      ok "Project runtime image was already repaired ${DIM}(${image_id:0:19}…)${NC}"
+      return 0
+      ;;
+    durable)
+      ;;
+    *)
+      abort_project_runtime_image_repair_after_commit \
+        "Project runtime image repair returned an invalid durable environment state."
+      ;;
+  esac
+
+  if [[ "${source_only}" == "1" \
+    && "${BRIDGESLLM_PROJECT_RUNTIME_REPAIR_TEST_HOOK:-}" \
+      == "pause-after-receipt-before-restart" ]]; then
+    [[ -n "${BRIDGESLLM_PROJECT_RUNTIME_REPAIR_TEST_MARKER:-}" ]] \
+      || abort_project_runtime_image_repair_after_commit \
+        "The Project runtime repair signal-test marker is invalid."
+    printf '%s\n' 'receipt' \
+      > "${BRIDGESLLM_PROJECT_RUNTIME_REPAIR_TEST_MARKER}"
+    chmod 0600 "${BRIDGESLLM_PROJECT_RUNTIME_REPAIR_TEST_MARKER}"
+    while :; do sleep 0.05; done
+  fi
+
+  if ! run_project_runtime_repair_portal_restart; then
+    abort_project_runtime_image_repair_after_commit \
+      "Portal could not restart with the repaired Project runtime image."
+  fi
+  if ! verify_project_runtime_repair_health \
+      bridgesllm-product.service http://127.0.0.1:4001/health 60; then
+    abort_project_runtime_image_repair_after_commit \
+      "Portal did not become healthy with the repaired Project runtime image."
+  fi
+
+  cleanup_project_runtime_image_repair_transaction \
+    || fail "The completed Project runtime repair transaction could not be removed."
+  trap - EXIT
+  ok "Project runtime image repaired ${DIM}(${image_id:0:19}…)${NC}"
 }
 
 update_project_runtime_prepared_env_path() {
@@ -13738,6 +19209,7 @@ validate_prepared_update_project_runtime_environment() {
     && "$(stat -c '%u:%g:%a:%h' "${prepared_env}")" == "${expected_owner}" ]] \
     || return 1
   assert_env_file_no_duplicate_keys "${prepared_env}" || return 1
+  assert_prisma_runtime_environment_safe "${prepared_env}" || return 1
   [[ "$(read_env_value \
       "${prepared_env}" BRIDGESLLM_UPDATE_PROJECT_RUNTIMES_PREPARED || true)" \
       == "1" \
@@ -14746,14 +20218,790 @@ PY
   OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED=true
 }
 
+resolve_openclaw_claude_ask_user_hotfix_target() {
+  local openclaw_dist="$1"
+  python3 - "${openclaw_dist}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+dist = Path(sys.argv[1]).resolve()
+backup_suffix = ".bridgesllm-claude-ask-user-route-v2.bak"
+markers = (
+    'const CLAUDE_DISALLOWED_TOOLS_ARG = "--disallowedTools";',
+    "function resolveClaudePermissionMode(context) {",
+    "function normalizeClaudeBackendConfig(config, context) {",
+)
+matches = []
+for candidate in sorted(dist.glob("cli-shared-*.js")):
+    try:
+        metadata = os.lstat(candidate)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            continue
+    except OSError:
+        continue
+    texts = []
+    try:
+        texts.append(candidate.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        pass
+    backup = candidate.with_name(candidate.name + backup_suffix)
+    if os.path.lexists(backup):
+        try:
+            backup_metadata = os.lstat(backup)
+            if stat.S_ISREG(backup_metadata.st_mode) and not stat.S_ISLNK(backup_metadata.st_mode):
+                texts.append(backup.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            pass
+    if any(all(marker in text for marker in markers) for text in texts):
+        matches.append(candidate.resolve())
+if len(matches) != 1:
+    raise SystemExit(1)
+print(matches[0])
+PY
+}
+
+openclaw_claude_ask_user_hotfix_is_applied() {
+  local target="$1"
+  python3 - "${target}" <<'PY'
+from pathlib import Path
+import sys
+
+marker = 'const BRIDGESLLM_CLAUDE_ASK_USER_ROUTE_MARKER = "bridgesllm-openclaw-claude-ask-user-route-v2";'
+try:
+    text = Path(sys.argv[1]).read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+if (
+    text.count(marker) != 1
+    or text.count("function ensureClaudeDisallowedTool(args, toolName) {") != 1
+    or text.count(
+        "function ensureClaudeDisallowedTool(args, toolName) {\n"
+        "\tif (!args) return args;\n"
+        "\tconst normalized = [...args];"
+    ) != 1
+    or text.count("args: ensureClaudeDisallowedTool(") != 1
+    or text.count("resumeArgs: ensureClaudeDisallowedTool(") != 1
+):
+    raise SystemExit(1)
+PY
+}
+
+prepare_openclaw_claude_ask_user_hotfix_rollback() {
+  local target="$1"
+  local result backup
+  if ! result="$(python3 - "${target}" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+target = Path(sys.argv[1])
+backup = target.with_name(target.name + ".bridgesllm-claude-ask-user-route-v2.bak")
+marker = 'const BRIDGESLLM_CLAUDE_ASK_USER_ROUTE_MARKER = "bridgesllm-openclaw-claude-ask-user-route-v2";'
+
+def regular_single_link(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def valid_javascript(text):
+    for module_type in ("module", "commonjs"):
+        if subprocess.run(
+            ["node", f"--input-type={module_type}", "--check", "-"],
+            input=text,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0:
+            return True
+    return False
+
+def pristine_contract(text):
+    return (
+        marker not in text
+        and "function ensureClaudeDisallowedTool(args, toolName) {" not in text
+        and text.count("function normalizeClaudeBackendConfig(config, context) {") == 1
+        and text.count("args: normalizeClaudePermissionArgs(") == 1
+        and text.count("resumeArgs: normalizeClaudePermissionArgs(") == 1
+    )
+
+def applied_contract(text):
+    return (
+        text.count(marker) == 1
+        and text.count("function ensureClaudeDisallowedTool(args, toolName) {") == 1
+        and text.count(
+            "function ensureClaudeDisallowedTool(args, toolName) {\n"
+            "\tif (!args) return args;\n"
+            "\tconst normalized = [...args];"
+        ) == 1
+        and text.count("args: ensureClaudeDisallowedTool(") == 1
+        and text.count("resumeArgs: ensureClaudeDisallowedTool(") == 1
+    )
+
+try:
+    if not regular_single_link(target):
+        raise SystemExit(1)
+except OSError:
+    raise SystemExit(1)
+try:
+    target_text = target.read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    target_text = None
+
+backup_exists = os.path.lexists(backup)
+if backup_exists:
+    try:
+        if not regular_single_link(backup):
+            raise SystemExit(1)
+        backup_text = backup.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        backup_text = None
+    if (
+        backup_text is not None
+        and valid_javascript(backup_text)
+        and pristine_contract(backup_text)
+    ):
+        # A recovery artifact from an interrupted run owns the baseline even
+        # when the target stopped between write and marker verification.
+        print(backup)
+        raise SystemExit(0)
+    # Older builds wrote directly to the final backup name. A torn backup is
+    # safe to replace only while the live target is still a fully validated,
+    # pristine baseline. Never discard the sole recovery copy of a changed or
+    # unreadable target.
+    if (
+        target_text is None
+        or not valid_javascript(target_text)
+        or not pristine_contract(target_text)
+    ):
+        raise SystemExit(1)
+    backup.unlink()
+    directory_fd = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+if target_text is None or not valid_javascript(target_text):
+    raise SystemExit(1)
+if applied_contract(target_text):
+    print("committed")
+    raise SystemExit(0)
+if not pristine_contract(target_text):
+    raise SystemExit(1)
+
+target_mode = target.stat().st_mode & 0o7777
+temporary_name = ""
+try:
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=target.parent,
+        prefix=f".{target.name}.bridgesllm-claude-backup-",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        temporary_name = stream.name
+        stream.write(target.read_bytes())
+        stream.flush()
+        os.fsync(stream.fileno())
+    shutil.copystat(target, temporary_name, follow_symlinks=True)
+    os.chmod(temporary_name, target_mode)
+    if os.path.lexists(backup):
+        raise FileExistsError(backup)
+    # The package directory is root-owned and the installer operation lock
+    # excludes another writer. Publish only complete, fsynced bytes.
+    os.replace(temporary_name, backup)
+    temporary_name = ""
+    directory_fd = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    if temporary_name:
+        try:
+            Path(temporary_name).unlink()
+        except FileNotFoundError:
+            pass
+    raise
+print(backup)
+PY
+)"; then
+    return 1
+  fi
+  if [[ "${result}" == "committed" ]]; then
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=true
+    return 0
+  fi
+  backup="${target}.bridgesllm-claude-ask-user-route-v2.bak"
+  [[ "${result}" == "${backup}" && -f "${backup}" ]] || return 1
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET="${target}"
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP="${backup}"
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED=true
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=false
+}
+
+rollback_openclaw_claude_ask_user_hotfix() {
+  $OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED || return 0
+  $OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED && return 0
+  local target="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET:-}"
+  local backup="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP:-}"
+  [[ -n "${target}" && -n "${backup}" ]] || return 1
+  if ! python3 - "${target}" "${backup}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+
+target = Path(sys.argv[1])
+backup = Path(sys.argv[2])
+marker = 'const BRIDGESLLM_CLAUDE_ASK_USER_ROUTE_MARKER = "bridgesllm-openclaw-claude-ask-user-route-v2";'
+if backup != target.with_name(target.name + ".bridgesllm-claude-ask-user-route-v2.bak"):
+    raise SystemExit(1)
+
+def regular_single_link(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+try:
+    if not regular_single_link(target) or not regular_single_link(backup):
+        raise SystemExit(1)
+    backup_text = backup.read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+if (
+    marker in backup_text
+    or "function ensureClaudeDisallowedTool(args, toolName) {" in backup_text
+    or backup_text.count("function normalizeClaudeBackendConfig(config, context) {") != 1
+):
+    raise SystemExit(1)
+if not any(
+    subprocess.run(
+        ["node", f"--input-type={module_type}", "--check", "-"],
+        input=backup_text,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+    for module_type in ("module", "commonjs")
+):
+    raise SystemExit(1)
+os.replace(backup, target)
+directory_fd = os.open(target.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+  then
+    return 1
+  fi
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED=false
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET=""
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP=""
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=false
+}
+
+commit_openclaw_claude_ask_user_hotfix() {
+  if ! $OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED; then
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=true
+    return 0
+  fi
+  $OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED && return 0
+  local target="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET:-}"
+  local backup="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP:-}"
+  [[ -n "${target}" && -n "${backup}" ]] || return 1
+  openclaw_claude_ask_user_hotfix_is_applied "${target}" || return 1
+  if ! python3 - "${target}" "${backup}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+target = Path(sys.argv[1])
+backup = Path(sys.argv[2])
+marker = 'const BRIDGESLLM_CLAUDE_ASK_USER_ROUTE_MARKER = "bridgesllm-openclaw-claude-ask-user-route-v2";'
+if backup != target.with_name(target.name + ".bridgesllm-claude-ask-user-route-v2.bak"):
+    raise SystemExit(1)
+for path in (target, backup):
+    metadata = os.lstat(path)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+    ):
+        raise SystemExit(1)
+target_text = target.read_text(encoding="utf-8")
+backup_text = backup.read_text(encoding="utf-8")
+if target_text.count(marker) != 1 or marker in backup_text:
+    raise SystemExit(1)
+backup.unlink()
+directory_fd = os.open(target.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+  then
+    return 1
+  fi
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP=""
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=true
+}
+
+openclaw_tested_pair_commit_record_matches_target() {
+  local component="$1" target="$2"
+  local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"
+  python3 - "${record}" "${component}" "${target}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+record = Path(sys.argv[1])
+component = sys.argv[2]
+target = Path(sys.argv[3])
+if component not in {"claudeAskUser", "pendingInput"}:
+    raise SystemExit(1)
+backup_suffix = {
+    "pendingInput": ".bridgesllm-pending-input-v1.bak",
+    "claudeAskUser": ".bridgesllm-claude-ask-user-route-v2.bak",
+}[component]
+backup = target.with_name(target.name + backup_suffix)
+
+def safe_file(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def backup_identity(path):
+    metadata = os.lstat(path)
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "ctimeNs": metadata.st_ctime_ns,
+        "size": metadata.st_size,
+    }
+
+try:
+    record_stat = os.lstat(record)
+    if (
+        not stat.S_ISREG(record_stat.st_mode)
+        or stat.S_ISLNK(record_stat.st_mode)
+        or record_stat.st_nlink != 1
+        or record_stat.st_uid != 0
+        or record_stat.st_gid != 0
+        or stat.S_IMODE(record_stat.st_mode) != 0o600
+        or not safe_file(target)
+        or not safe_file(backup)
+    ):
+        raise SystemExit(1)
+    value = json.loads(record.read_text(encoding="utf-8"))
+    target_bytes = target.read_bytes()
+    observed_backup = backup_identity(backup)
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(value, dict):
+    raise SystemExit(1)
+entry = value.get(component)
+if (
+    value.get("schema") != "bridgesllm-openclaw-tested-pair-commit-v3"
+    or not isinstance(entry, dict)
+    or entry.get("path") != str(target.resolve())
+    or entry.get("sha256") != hashlib.sha256(target_bytes).hexdigest()
+    or entry.get("backup") != observed_backup
+):
+    raise SystemExit(1)
+PY
+}
+
+openclaw_tested_pair_commit_record_matches_ask_user_transaction() {
+  local transaction_dir="$1" target_dir="$2" config_path="$3"
+  local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"
+  python3 - \
+    "${record}" \
+    "${transaction_dir}" \
+    "${target_dir}" \
+    "${config_path}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+record = Path(sys.argv[1]).absolute()
+transaction = Path(sys.argv[2]).absolute()
+target = Path(sys.argv[3]).absolute()
+config = Path(sys.argv[4]).absolute()
+manifest = transaction / "manifest.json"
+
+def safe_file(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def safe_directory(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def tree_digest(root):
+    digest = hashlib.sha256()
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root)))]:
+        metadata = os.lstat(path)
+        relative = "." if path == root else str(path.relative_to(root))
+        digest.update(relative.encode("utf-8") + b"\0")
+        if stat.S_ISDIR(metadata.st_mode):
+            digest.update(b"d\0")
+        elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"f\0" + path.read_bytes())
+        elif stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"l\0" + os.readlink(path).encode("utf-8"))
+        else:
+            raise OSError(f"unsupported plugin entry: {path}")
+    return digest.hexdigest()
+
+try:
+    if (
+        not safe_file(record)
+        or stat.S_IMODE(os.lstat(record).st_mode) != 0o600
+        or not safe_directory(transaction)
+        or not safe_directory(target)
+        or not safe_file(config)
+        or stat.S_IMODE(os.lstat(config).st_mode) != 0o600
+        or not safe_file(manifest)
+    ):
+        raise OSError("unsafe ask-user commit artifacts")
+    value = json.loads(record.read_text(encoding="utf-8"))
+    ask_user = value.get("askUser")
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    value.get("schema") != "bridgesllm-openclaw-tested-pair-commit-v3"
+    or not isinstance(ask_user, dict)
+    or manifest_value.get("schema") != "bridgesllm-ask-user-tested-pair-v1"
+    or Path(manifest_value.get("targetDir", "")).absolute() != target
+    or Path(manifest_value.get("configPath", "")).absolute() != config
+    or ask_user.get("transactionPath") != str(transaction)
+    or ask_user.get("transactionManifestSha256")
+        != hashlib.sha256(manifest.read_bytes()).hexdigest()
+    or ask_user.get("pluginPath") != str(target)
+    or ask_user.get("pluginTreeSha256") != tree_digest(target)
+    or ask_user.get("configPath") != str(config)
+    or ask_user.get("configSha256") != hashlib.sha256(config.read_bytes()).hexdigest()
+):
+    raise SystemExit(1)
+PY
+}
+
+write_openclaw_tested_pair_commit_record() {
+  local pending_target="$1" claude_target="$2"
+  local ask_user_transaction="$3" ask_user_target="$4" ask_user_config="$5"
+  local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"
+  python3 - \
+    "${record}" \
+    "${pending_target}" \
+    "${claude_target}" \
+    "${ask_user_transaction}" \
+    "${ask_user_target}" \
+    "${ask_user_config}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+record = Path(sys.argv[1])
+pending_target = Path(sys.argv[2])
+claude_target = Path(sys.argv[3])
+ask_user_transaction = Path(sys.argv[4]).absolute()
+ask_user_target = Path(sys.argv[5]).absolute()
+ask_user_config = Path(sys.argv[6]).absolute()
+ask_user_manifest = ask_user_transaction / "manifest.json"
+parent = record.parent
+backup_specs = {
+    "pendingInput": (
+        pending_target,
+        pending_target.with_name(
+            pending_target.name + ".bridgesllm-pending-input-v1.bak"
+        ),
+    ),
+    "claudeAskUser": (
+        claude_target,
+        claude_target.with_name(
+            claude_target.name + ".bridgesllm-claude-ask-user-route-v2.bak"
+        ),
+    ),
+}
+
+def safe_file(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def safe_directory(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def tree_digest(root):
+    digest = hashlib.sha256()
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root)))]:
+        metadata = os.lstat(path)
+        relative = "." if path == root else str(path.relative_to(root))
+        digest.update(relative.encode("utf-8") + b"\0")
+        if stat.S_ISDIR(metadata.st_mode):
+            digest.update(b"d\0")
+        elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"f\0" + path.read_bytes())
+        elif stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"l\0" + os.readlink(path).encode("utf-8"))
+        else:
+            raise OSError(f"unsupported plugin entry: {path}")
+    return digest.hexdigest()
+
+def component_entry(target, backup):
+    entry = {
+        "path": str(target.resolve()),
+        "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+        "backup": None,
+    }
+    if os.path.lexists(backup):
+        if not safe_file(backup):
+            raise OSError(f"unsafe tested-pair backup: {backup}")
+        metadata = os.lstat(backup)
+        entry["backup"] = {
+            "path": str(backup.resolve()),
+            "sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "ctimeNs": metadata.st_ctime_ns,
+            "size": metadata.st_size,
+        }
+    return entry
+
+try:
+    parent_stat = os.lstat(parent)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or stat.S_ISLNK(parent_stat.st_mode)
+        or parent_stat.st_uid != 0
+        or parent_stat.st_gid != 0
+    ):
+        raise SystemExit(1)
+    for target in (pending_target, claude_target):
+        if not safe_file(target):
+            raise SystemExit(1)
+    if (
+        not safe_directory(ask_user_transaction)
+        or not safe_directory(ask_user_target)
+        or not safe_file(ask_user_config)
+        or stat.S_IMODE(os.lstat(ask_user_config).st_mode) != 0o600
+        or not safe_file(ask_user_manifest)
+    ):
+        raise SystemExit(1)
+    ask_user_manifest_value = json.loads(
+        ask_user_manifest.read_text(encoding="utf-8")
+    )
+    if (
+        ask_user_manifest_value.get("schema")
+            != "bridgesllm-ask-user-tested-pair-v1"
+        or Path(ask_user_manifest_value.get("targetDir", "")).absolute()
+            != ask_user_target
+        or Path(ask_user_manifest_value.get("configPath", "")).absolute()
+            != ask_user_config
+    ):
+        raise SystemExit(1)
+    if os.path.lexists(record) and not safe_file(record):
+        raise SystemExit(1)
+    value = {
+        "schema": "bridgesllm-openclaw-tested-pair-commit-v3",
+        **{
+            component: component_entry(target, backup)
+            for component, (target, backup) in backup_specs.items()
+        },
+        "askUser": {
+            "transactionPath": str(ask_user_transaction),
+            "transactionManifestSha256": hashlib.sha256(
+                ask_user_manifest.read_bytes()
+            ).hexdigest(),
+            "pluginPath": str(ask_user_target),
+            "pluginTreeSha256": tree_digest(ask_user_target),
+            "configPath": str(ask_user_config),
+            "configSha256": hashlib.sha256(ask_user_config.read_bytes()).hexdigest(),
+        },
+    }
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+temporary_name = ""
+try:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=parent,
+        prefix=".bridgesllm-tested-pair-commit-",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        temporary_name = stream.name
+        json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary_name, 0o600)
+    os.replace(temporary_name, record)
+    temporary_name = ""
+    directory_fd = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if temporary_name:
+        try:
+            Path(temporary_name).unlink()
+        except FileNotFoundError:
+            pass
+PY
+}
+
+retire_openclaw_tested_pair_commit_record_if_clean() {
+  local pending_target="$1" claude_target="$2" ask_user_transaction="$3"
+  local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"
+  python3 - \
+    "${record}" \
+    "${pending_target}" \
+    "${claude_target}" \
+    "${ask_user_transaction}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+record = Path(sys.argv[1])
+pending_target = Path(sys.argv[2])
+claude_target = Path(sys.argv[3])
+ask_user_transaction = Path(sys.argv[4])
+backups = (
+    pending_target.with_name(
+        pending_target.name + ".bridgesllm-pending-input-v1.bak"
+    ),
+    claude_target.with_name(
+        claude_target.name + ".bridgesllm-claude-ask-user-route-v2.bak"
+    ),
+)
+if any(os.path.lexists(path) for path in backups) or os.path.lexists(ask_user_transaction):
+    raise SystemExit(0)
+if not os.path.lexists(record):
+    raise SystemExit(0)
+try:
+    # A cleanup helper can unlink successfully and still fail its directory
+    # fsync. Re-prove durable absence in every artifact directory before
+    # retiring the only record that authorizes a backup which could reappear
+    # after power loss.
+    artifact_parents = {
+        path.parent.resolve() for path in (*backups, ask_user_transaction)
+    }
+    for directory in artifact_parents:
+        directory_metadata = os.lstat(directory)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or stat.S_ISLNK(directory_metadata.st_mode)
+            or directory_metadata.st_uid != 0
+            or directory_metadata.st_gid != 0
+        ):
+            raise SystemExit(1)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    metadata = os.lstat(record)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise SystemExit(1)
+    record.unlink()
+    directory_fd = os.open(record.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
 auto_apply_openclaw_compatibility_hotfix() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
+  fi
+  if ! $OPENCLAW_ASK_USER_LIVE_ATTESTED; then
+    fail "Refusing to disable native Claude questions before the replacement ask-user tool and all settlement methods pass live semantic probes."
   fi
 
   local hotfix_script="${PORTAL_DIR}/scripts/patch-openclaw-long-run-relay-hotfix.sh"
   local pending_input_hotfix_script="${PORTAL_DIR}/scripts/patch-openclaw-codex-pending-input-hotfix.sh"
   local openclaw_package_dir openclaw_dist pending_input_target
+  local claude_ask_user_target
   local pending_input_backup pending_input_hotfix_status=0
   local pending_input_hotfix_preexisted=false
   openclaw_package_dir="$(openclaw_core_package_dir || true)"
@@ -14773,6 +21021,26 @@ auto_apply_openclaw_compatibility_hotfix() {
     fail "Could not resolve the exact OpenClaw ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} package directory for required compatibility preparation."
   fi
 
+  claude_ask_user_target="$(
+    resolve_openclaw_claude_ask_user_hotfix_target "${openclaw_dist}" || true
+  )"
+  if [[ -z "${claude_ask_user_target}" ]]; then
+    fail "Could not resolve exactly one Claude CLI normalization bundle before compatibility preparation."
+  fi
+  if ! prepare_openclaw_claude_ask_user_hotfix_rollback \
+    "${claude_ask_user_target}"; then
+    fail "Could not preserve an exact Claude CLI normalization bundle before compatibility preparation."
+  fi
+  if $OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED \
+    && openclaw_claude_ask_user_hotfix_is_applied \
+      "${claude_ask_user_target}" \
+    && openclaw_tested_pair_commit_record_matches_target \
+      claudeAskUser "${claude_ask_user_target}"; then
+    if ! commit_openclaw_claude_ask_user_hotfix; then
+      fail "Could not retire a Claude ask-user recovery artifact already covered by the durable tested-pair commit record."
+    fi
+  fi
+
   pending_input_target="$(
     resolve_openclaw_pending_input_hotfix_target "${openclaw_dist}" || true
   )"
@@ -14790,15 +21058,38 @@ auto_apply_openclaw_compatibility_hotfix() {
         "${pending_input_target}"; then
       fail "The existing native pending-input hotfix recovery artifact is unsafe at ${pending_input_backup}; refusing to discard or overwrite it."
     fi
+    if $OPENCLAW_PENDING_INPUT_HOTFIX_APPLIED \
+      && openclaw_tested_pair_commit_record_matches_target \
+        pendingInput "${pending_input_target}"; then
+      if ! commit_openclaw_pending_input_hotfix; then
+        fail "Could not retire a native pending-input recovery artifact already covered by the durable tested-pair commit record."
+      fi
+    fi
   elif [[ -e "${pending_input_backup}" || -L "${pending_input_backup}" ]]; then
     fail "A stale native pending-input hotfix backup already exists at ${pending_input_backup}; refusing to overwrite an uncommitted recovery artifact."
   fi
 
+  # The commit record is needed only while at least one exact cleanup artifact
+  # survives. Retire it once both are gone. A later same-pin reinstall can
+  # therefore never reuse an old decision, and v3 artifact identities make even
+  # an interrupted cleanup record fail closed against newly created backups.
+  if ! retire_openclaw_tested_pair_commit_record_if_clean \
+    "${pending_input_target}" \
+    "${claude_ask_user_target}" \
+    "/root/.openclaw/.bridgesllm-ask-user-tested-pair-v1"; then
+    fail "Could not safely retire the completed OpenClaw tested-pair commit record."
+  fi
+
   chmod 755 "${hotfix_script}" "${pending_input_hotfix_script}" 2>/dev/null || true
 
-  if ! spin "Applying OpenClaw compatibility hotfix (if needed)" \
-    "PORTAL_OPENCLAW_HOTFIX_STRICT=1 PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION='${PIN_OPENCLAW_CORE_PACKAGE_VERSION}' bash '${hotfix_script}' '${openclaw_dist}'"; then
+  info "Applying OpenClaw compatibility hotfix (if needed)..."
+  if ! run_openclaw_compatibility_hotfix \
+    "${hotfix_script}" "${openclaw_dist}"; then
     fail "OpenClaw compatibility preparation failed or required markers were not verified; the tested-pair rollback remains armed."
+  fi
+  if ! openclaw_claude_ask_user_hotfix_is_applied \
+    "${claude_ask_user_target}"; then
+    fail "OpenClaw compatibility preparation returned without the required post-merge Claude ask-user routing contract."
   fi
 
   if spin "Applying OpenClaw native pending-input hotfix (if needed)" \
@@ -14820,16 +21111,14 @@ auto_apply_openclaw_compatibility_hotfix() {
     fail "OpenClaw native pending-input preparation returned without the required exact runtime marker."
   fi
 
-  # During a package upgrade the currently running gateway is still the known-
-  # good old version. Keep it alive until every migration prerequisite has been
-  # prepared; the version-parity check performs the one intentional restart.
-  if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1 && ! $OPENCLAW_PACKAGE_UPDATED; then
+  # The replacement ask-user bridge was installed and semantically attested
+  # before this function was allowed to patch native Claude routing. Restart
+  # now so no running gateway can retain a half-old compatibility generation.
+  if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
     if ! spin "Restarting OpenClaw gateway after compatibility hotfix" "systemctl restart openclaw-gateway"; then
       fail "OpenClaw gateway restart after required compatibility preparation failed."
     fi
     sleep 3
-  elif $OPENCLAW_PACKAGE_UPDATED; then
-    info "Deferring the OpenClaw gateway restart until compatibility preparation is complete"
   fi
 
   ok "OpenClaw compatibility hotfix checked"
@@ -15396,8 +21685,12 @@ rollback_openclaw_codex_plugin() {
 rollback_openclaw_tested_pair() {
   local core_rollback_pending=false
   local hotfix_rollback_pending=false
+  local claude_ask_user_rollback_pending=false
+  local ask_user_transaction_rollback_pending=false
   local core_rollback_ok=true
   local hotfix_rollback_ok=true
+  local claude_ask_user_rollback_ok=true
+  local ask_user_transaction_rollback_ok=true
   local plugin_rollback_ok=true
   local defer_plugin_restart=false
   local plugin_retry_restarted=false
@@ -15412,14 +21705,24 @@ rollback_openclaw_tested_pair() {
     && ! $OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED; then
     hotfix_rollback_pending=true
   fi
-  if $core_rollback_pending || $hotfix_rollback_pending; then
+  if $OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED \
+    && ! $OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED; then
+    claude_ask_user_rollback_pending=true
+  fi
+  if $OPENCLAW_ASK_USER_TRANSACTION_ARMED \
+    && ! $OPENCLAW_ASK_USER_TRANSACTION_COMMITTED; then
+    ask_user_transaction_rollback_pending=true
+  fi
+  if $core_rollback_pending || $hotfix_rollback_pending \
+    || $claude_ask_user_rollback_pending \
+    || $ask_user_transaction_rollback_pending; then
     defer_plugin_restart=true
   fi
 
-  # Restore the plugin package/config first while the currently installed CLI
-  # can still manage it, but defer the gateway restart while either the core
-  # package or its Portal-owned pending-input patch still needs restoration.
-  # This avoids booting a mixed byte/config generation.
+  # Keep the replacement ask-user bridge and its durable rollback journal in
+  # place until native Claude prompting is restored. If rollback itself loses
+  # power, that ordering guarantees at least one working question path rather
+  # than deleting the replacement while native AskUserQuestion is suppressed.
   if $OPENCLAW_CODEX_PLUGIN_UPDATE_ATTEMPTED; then
     rollback_openclaw_codex_plugin "${defer_plugin_restart}" || plugin_rollback_ok=false
   fi
@@ -15430,37 +21733,67 @@ rollback_openclaw_tested_pair() {
   if $hotfix_rollback_pending; then
     rollback_openclaw_pending_input_hotfix || hotfix_rollback_ok=false
   fi
+  if $claude_ask_user_rollback_pending; then
+    rollback_openclaw_claude_ask_user_hotfix \
+      || claude_ask_user_rollback_ok=false
+  fi
 
   if $core_rollback_pending; then
-    rollback_openclaw_package_update || core_rollback_ok=false
+    # Do not boot the restored core until the matching plugin/config baseline
+    # is back. One final restart below crosses the complete rollback boundary.
+    rollback_openclaw_package_update true || core_rollback_ok=false
   fi
 
   # If the new-core CLI could not restore the old plugin, retry after the old
   # core is back. This makes recovery resilient to cross-revision plugin CLI
   # incompatibility while preserving the original rollback artifacts.
   if $OPENCLAW_CODEX_PLUGIN_UPDATE_ATTEMPTED; then
-    if rollback_openclaw_codex_plugin false; then
+    if rollback_openclaw_codex_plugin "${ask_user_transaction_rollback_pending}"; then
       plugin_rollback_ok=true
-      plugin_retry_restarted=true
+      if ! $ask_user_transaction_rollback_pending; then
+        plugin_retry_restarted=true
+      fi
     else
       plugin_rollback_ok=false
     fi
+  fi
+
+  # Native/core bytes are safe now. Restore the previous bridge/config while
+  # preserving the journal until that restoration and the final gateway boot
+  # both succeed. The helper itself is idempotent, so a later recovery can
+  # repeat this exact step after interruption.
+  if $ask_user_transaction_rollback_pending; then
+    rollback_bridgesllm_ask_user_transaction true \
+      || ask_user_transaction_rollback_ok=false
   fi
 
   # A package rollback performs its own final restart. When only the exact
   # bundle bytes changed, restart an already-running gateway once after those
   # bytes and any plugin baseline are back. Never start a gateway that was
   # intentionally stopped.
-  if $hotfix_rollback_pending && ! $core_rollback_pending \
-    && $hotfix_rollback_ok && ! $plugin_retry_restarted \
-    && systemctl is-active --quiet openclaw-gateway >/dev/null 2>&1; then
-    if ! systemctl restart openclaw-gateway >> "$LOG_FILE" 2>&1 \
-      || ! verify_openclaw_gateway_stable "${PIN_OPENCLAW_RUNTIME_VERSION}" 18; then
+  if { $core_rollback_pending || $hotfix_rollback_pending \
+      || $claude_ask_user_rollback_pending \
+      || $ask_user_transaction_rollback_pending; } \
+    && $hotfix_rollback_ok && $claude_ask_user_rollback_ok \
+    && $ask_user_transaction_rollback_ok \
+    && ! $plugin_retry_restarted \
+    && { $OPENCLAW_GATEWAY_WAS_ACTIVE \
+      || systemctl is-active --quiet openclaw-gateway >/dev/null 2>&1; }; then
+    local rollback_gateway_version="${PIN_OPENCLAW_RUNTIME_VERSION}"
+    $core_rollback_pending \
+      && rollback_gateway_version="${OPENCLAW_PREUPDATE_RUNTIME_VERSION:-}"
+    if [[ -z "${rollback_gateway_version}" ]] \
+      || ! systemctl restart openclaw-gateway >> "$LOG_FILE" 2>&1 \
+      || ! verify_openclaw_gateway_stable "${rollback_gateway_version}" 18; then
       hotfix_rollback_ok=false
+      claude_ask_user_rollback_ok=false
+      ask_user_transaction_rollback_ok=false
     fi
   fi
 
-  $core_rollback_ok && $hotfix_rollback_ok && $plugin_rollback_ok
+  $core_rollback_ok && $hotfix_rollback_ok \
+    && $claude_ask_user_rollback_ok && $ask_user_transaction_rollback_ok \
+    && $plugin_rollback_ok
 }
 
 verify_openclaw_tested_pair() {
@@ -15468,14 +21801,24 @@ verify_openclaw_tested_pair() {
   # deep status probe has no retry of its own, so a single silent flake here
   # must not unwind an otherwise verified core/plugin migration. Retry the
   # runtime-facing probes over a bounded window and log what was observed.
-  local attempt observed_gateway=""
+  local attempt observed_gateway="" openclaw_package_dir=""
+  local claude_ask_user_target=""
   verify_openclaw_core_package_pin || return 1
+  openclaw_package_dir="$(openclaw_core_package_dir || true)"
+  claude_ask_user_target="$(
+    resolve_openclaw_claude_ask_user_hotfix_target \
+      "${openclaw_package_dir}/dist" || true
+  )"
+  [[ -n "${claude_ask_user_target}" ]] || return 1
+  openclaw_claude_ask_user_hotfix_is_applied \
+    "${claude_ask_user_target}" || return 1
   for attempt in 1 2 3 4 5 6; do
     observed_gateway="$(openclaw_gateway_version || true)"
     if [[ "${observed_gateway}" == "${PIN_OPENCLAW_RUNTIME_VERSION}" ]] \
       && OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 \
       && verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
-      && verify_openclaw_codex_plugin_pending_input_hotfix; then
+      && verify_openclaw_codex_plugin_pending_input_hotfix \
+      && verify_bridgesllm_ask_user_tested_pair; then
       return 0
     fi
     echo "tested-pair verify attempt ${attempt}: gateway version '${observed_gateway}' (expected '${PIN_OPENCLAW_RUNTIME_VERSION}')" >> "$LOG_FILE"
@@ -15518,6 +21861,20 @@ allow = plugins.get("allow")
 if allow is not None and (
     not isinstance(allow, list)
     or "bridgesllm-ask-user" not in allow
+):
+    raise SystemExit(1)
+agents = value.get("agents")
+defaults = agents.get("defaults") if isinstance(agents, dict) else None
+cli_backends = defaults.get("cliBackends") if isinstance(defaults, dict) else None
+claude_backend = cli_backends.get("claude-cli") if isinstance(cli_backends, dict) else None
+claude_env = claude_backend.get("env") if isinstance(claude_backend, dict) else None
+if (
+    not isinstance(claude_backend, dict)
+    or not isinstance(claude_backend.get("command"), str)
+    or not claude_backend["command"].strip()
+    or not isinstance(claude_env, dict)
+    or claude_env.get("MCP_TOOL_TIMEOUT") != "660000"
+    or claude_env.get("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT") != "660000"
 ):
     raise SystemExit(1)
 PY
@@ -15573,6 +21930,7 @@ if (
     )
     or not isinstance(methods, list)
     or not {
+        "bridgesllm.ask_user.probe",
         "bridgesllm.ask_user.pending",
         "bridgesllm.ask_user.answer",
         "bridgesllm.ask_user.dismiss",
@@ -15590,17 +21948,42 @@ PY
 
 verify_bridgesllm_ask_user_gateway_method() {
   local output_path="$1"
-  local nonce params
+  local nonce session_key run_id request_id method params probe_kind
   nonce="$(rand_hex 12)" || return 1
-  params="{\"sessionKey\":\"agent:main:bridgesllm-install-probe-${nonce}\",\"expectedRunId\":\"bridgesllm-install-probe-${nonce}\"}"
-  if ! OPENCLAW_ALLOW_ROOT=1 openclaw gateway call \
-      bridgesllm.ask_user.pending \
-      --json \
-      --timeout 10000 \
-      --params "${params}" > "${output_path}" 2>> "${LOG_FILE}"; then
-    return 1
-  fi
-  python3 - "${output_path}" <<'PY'
+  session_key="agent:main:bridgesllm-install-probe-${nonce}"
+  run_id="bridgesllm-install-probe-${nonce}"
+  request_id="bridgesllm-install-request-${nonce}"
+  for probe_kind in probe pending answer dismiss steer; do
+    case "${probe_kind}" in
+      probe)
+        method="bridgesllm.ask_user.probe"
+        params="{\"nonce\":\"${nonce}\"}"
+        ;;
+      pending)
+        method="bridgesllm.ask_user.pending"
+        params="{\"sessionKey\":\"${session_key}\",\"expectedRunId\":\"${run_id}\"}"
+        ;;
+      answer)
+        method="bridgesllm.ask_user.answer"
+        params="{\"sessionKey\":\"${session_key}\",\"expectedRunId\":\"${run_id}\",\"requestId\":\"${request_id}\",\"text\":\"BridgesLLM readiness probe.\"}"
+        ;;
+      dismiss)
+        method="bridgesllm.ask_user.dismiss"
+        params="{\"sessionKey\":\"${session_key}\",\"expectedRunId\":\"${run_id}\",\"requestId\":\"${request_id}\"}"
+        ;;
+      steer)
+        method="bridgesllm.ask_user.steer"
+        params="{\"sessionKey\":\"${session_key}\",\"expectedRunId\":\"${run_id}\",\"requestId\":\"${request_id}\",\"text\":\"BridgesLLM readiness probe.\"}"
+        ;;
+    esac
+    if ! OPENCLAW_ALLOW_ROOT=1 openclaw gateway call \
+        "${method}" \
+        --json \
+        --timeout 10000 \
+        --params "${params}" > "${output_path}" 2>> "${LOG_FILE}"; then
+      return 1
+    fi
+    if ! python3 - "${output_path}" "${probe_kind}" "${request_id}" <<'PY'
 import json
 import pathlib
 import sys
@@ -15609,13 +21992,392 @@ try:
     response = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError):
     raise SystemExit(1)
-if (
-    not isinstance(response, dict)
-    or response.get("pending") is not False
-    or response.get("code") != "NO_ACTIVE_RUN"
-):
+kind = sys.argv[2]
+request_id = sys.argv[3]
+if not isinstance(response, dict):
+    raise SystemExit(1)
+if kind == "probe":
+    valid = (
+        response.get("ok") is True
+        and response.get("code") == "SEMANTIC_PROBE_OK"
+        and response.get("toolName") == "ask_user_question"
+        and response.get("answer") is True
+        and response.get("dismiss") is True
+        and response.get("steer") is True
+    )
+elif kind == "pending":
+    valid = (
+        response.get("pending") is False
+        and response.get("code") == "NO_ACTIVE_RUN"
+    )
+else:
+    valid = (
+        response.get("accepted") is False
+        and response.get("code") == "NO_ACTIVE_RUN"
+        and response.get("requestId") == request_id
+    )
+if not valid:
     raise SystemExit(1)
 PY
+    then
+      return 1
+    fi
+  done
+}
+
+verify_bridgesllm_ask_user_tested_pair() {
+  local openclaw_state_dir="${1:-/root/.openclaw}"
+  local target_dir="${openclaw_state_dir}/extensions/bridgesllm-ask-user"
+  local config_path="${openclaw_state_dir}/openclaw.json"
+  local output_path status=0
+  output_path="$(mktemp /tmp/bridgesllm-ask-user-verify.XXXXXX)" \
+    || return 1
+  chmod 600 "${output_path}" 2>/dev/null || true
+  verify_bridgesllm_ask_user_plugin_config "${config_path}" \
+    && verify_bridgesllm_ask_user_plugin_runtime \
+      "${target_dir}" "${output_path}" \
+    && verify_bridgesllm_ask_user_gateway_method "${output_path}" \
+    || status=$?
+  rm -f -- "${output_path}"
+  return "${status}"
+}
+
+write_bridgesllm_ask_user_transaction_manifest() {
+  local transaction_dir="$1" openclaw_state_dir="$2" target_dir="$3"
+  local config_path="$4" target_preexisted="$5" config_preexisted="$6"
+  local gateway_was_active="$7"
+  python3 - \
+    "${transaction_dir}" \
+    "${openclaw_state_dir}" \
+    "${target_dir}" \
+    "${config_path}" \
+    "${target_preexisted}" \
+    "${config_preexisted}" \
+    "${gateway_was_active}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+transaction = Path(sys.argv[1]).absolute()
+state_root = Path(sys.argv[2]).absolute()
+target = Path(sys.argv[3]).absolute()
+config = Path(sys.argv[4]).absolute()
+target_preexisted = sys.argv[5] == "true"
+config_preexisted = sys.argv[6] == "true"
+gateway_was_active = sys.argv[7] == "true"
+manifest = transaction / "manifest.json"
+previous_config = transaction / "previous-openclaw.json"
+
+def safe_directory(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def safe_file(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def tree_digest(root):
+    digest = hashlib.sha256()
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root)))]:
+        metadata = os.lstat(path)
+        relative = "." if path == root else str(path.relative_to(root))
+        digest.update(relative.encode("utf-8") + b"\0")
+        if stat.S_ISDIR(metadata.st_mode):
+            digest.update(b"d\0")
+        elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"f\0" + path.read_bytes())
+        elif stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"l\0" + os.readlink(path).encode("utf-8"))
+        else:
+            raise OSError(f"unsupported plugin entry: {path}")
+    return digest.hexdigest()
+
+try:
+    if (
+        transaction != state_root / ".bridgesllm-ask-user-tested-pair-v1"
+        or target != state_root / "extensions" / "bridgesllm-ask-user"
+        or config != state_root / "openclaw.json"
+        or not safe_directory(state_root)
+        or not safe_directory(transaction)
+        or not safe_directory(target.parent)
+        or os.path.lexists(manifest)
+    ):
+        raise OSError("unsafe ask-user transaction paths")
+    if target_preexisted and not safe_directory(target):
+        raise OSError("unsafe previous ask-user plugin")
+    if config_preexisted and not safe_file(previous_config):
+        raise OSError("unsafe previous OpenClaw config")
+    value = {
+        "schema": "bridgesllm-ask-user-tested-pair-v1",
+        "stateRoot": str(state_root),
+        "targetDir": str(target),
+        "configPath": str(config),
+        "targetPreexisted": target_preexisted,
+        "configPreexisted": config_preexisted,
+        "gatewayWasActive": gateway_was_active,
+        "previousPluginSha256": tree_digest(target) if target_preexisted else None,
+        "previousConfigSha256": (
+            hashlib.sha256(previous_config.read_bytes()).hexdigest()
+            if config_preexisted
+            else None
+        ),
+    }
+except OSError:
+    raise SystemExit(1)
+
+temporary_name = ""
+try:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=transaction,
+        prefix=".manifest-",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        temporary_name = stream.name
+        json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary_name, 0o600)
+    os.replace(temporary_name, manifest)
+    temporary_name = ""
+    directory_fd = os.open(transaction, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if temporary_name:
+        try:
+            Path(temporary_name).unlink()
+        except FileNotFoundError:
+            pass
+PY
+}
+
+rollback_bridgesllm_ask_user_transaction() {
+  $OPENCLAW_ASK_USER_TRANSACTION_ARMED || return 0
+  $OPENCLAW_ASK_USER_TRANSACTION_COMMITTED && return 0
+  local defer_gateway_restart="${1:-false}"
+  local transaction_dir="${OPENCLAW_ASK_USER_TRANSACTION_DIR:-}"
+  local gateway_was_active=""
+  [[ -n "${transaction_dir}" ]] || return 1
+  if ! gateway_was_active="$(python3 - "${transaction_dir}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+import tempfile
+
+transaction = Path(sys.argv[1]).absolute()
+manifest_path = transaction / "manifest.json"
+previous_plugin = transaction / "previous-plugin"
+previous_config = transaction / "previous-openclaw.json"
+failed_plugin = transaction / "failed-plugin"
+failed_config = transaction / "failed-openclaw.json"
+
+def safe_directory(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def safe_file(path):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+    )
+
+def tree_digest(root):
+    digest = hashlib.sha256()
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root)))]:
+        metadata = os.lstat(path)
+        relative = "." if path == root else str(path.relative_to(root))
+        digest.update(relative.encode("utf-8") + b"\0")
+        if stat.S_ISDIR(metadata.st_mode):
+            digest.update(b"d\0")
+        elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"f\0" + path.read_bytes())
+        elif stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"l\0" + os.readlink(path).encode("utf-8"))
+        else:
+            raise OSError(f"unsupported plugin entry: {path}")
+    return digest.hexdigest()
+
+try:
+    if not safe_directory(transaction) or not safe_file(manifest_path):
+        raise OSError("unsafe transaction")
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    state_root = Path(value["stateRoot"]).absolute()
+    target = Path(value["targetDir"]).absolute()
+    config = Path(value["configPath"]).absolute()
+    if (
+        value.get("schema") != "bridgesllm-ask-user-tested-pair-v1"
+        or transaction != state_root / ".bridgesllm-ask-user-tested-pair-v1"
+        or target != state_root / "extensions" / "bridgesllm-ask-user"
+        or config != state_root / "openclaw.json"
+        or not safe_directory(state_root)
+        or not safe_directory(target.parent)
+    ):
+        raise OSError("invalid transaction manifest")
+
+    if value.get("targetPreexisted") is True:
+        expected_plugin_hash = value.get("previousPluginSha256")
+        if os.path.lexists(previous_plugin):
+            if not safe_directory(previous_plugin) or tree_digest(previous_plugin) != expected_plugin_hash:
+                raise OSError("previous plugin does not match transaction manifest")
+            if os.path.lexists(target):
+                if not safe_directory(target) or os.path.lexists(failed_plugin):
+                    raise OSError("unsafe candidate plugin")
+                os.replace(target, failed_plugin)
+            os.replace(previous_plugin, target)
+        elif not safe_directory(target) or tree_digest(target) != expected_plugin_hash:
+            raise OSError("previous plugin is unavailable")
+    elif os.path.lexists(target):
+        if not safe_directory(target) or os.path.lexists(failed_plugin):
+            raise OSError("unsafe fresh candidate plugin")
+        os.replace(target, failed_plugin)
+
+    if value.get("configPreexisted") is True:
+        expected_config_hash = value.get("previousConfigSha256")
+        if (
+            not safe_file(previous_config)
+            or hashlib.sha256(previous_config.read_bytes()).hexdigest() != expected_config_hash
+        ):
+            raise OSError("previous config does not match transaction manifest")
+        temporary_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=state_root,
+                prefix=".bridgesllm-ask-user-config-restore-",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary_name = stream.name
+                stream.write(previous_config.read_bytes())
+                stream.flush()
+                os.fsync(stream.fileno())
+            shutil.copystat(previous_config, temporary_name, follow_symlinks=True)
+            os.replace(temporary_name, config)
+            temporary_name = ""
+        finally:
+            if temporary_name:
+                try:
+                    Path(temporary_name).unlink()
+                except FileNotFoundError:
+                    pass
+    elif os.path.lexists(config):
+        if not safe_file(config) or os.path.lexists(failed_config):
+            raise OSError("unsafe fresh config")
+        os.replace(config, failed_config)
+
+    for directory in {state_root, target.parent}:
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+print("true" if value.get("gatewayWasActive") is True else "false")
+PY
+  )"; then
+    return 1
+  fi
+  if [[ "${gateway_was_active}" == "true" \
+    && "${defer_gateway_restart}" != "true" ]]; then
+    systemctl restart openclaw-gateway >> "${LOG_FILE}" 2>&1 || return 1
+    verify_openclaw_gateway_stable \
+      "${PIN_OPENCLAW_RUNTIME_VERSION}" 18 || return 1
+  fi
+  rm -rf -- "${transaction_dir}" || return 1
+  sync -f "$(dirname "${transaction_dir}")" 2>/dev/null || return 1
+  OPENCLAW_ASK_USER_TRANSACTION_ARMED=false
+  OPENCLAW_ASK_USER_TRANSACTION_COMMITTED=false
+  OPENCLAW_ASK_USER_TRANSACTION_DIR=""
+  OPENCLAW_ASK_USER_STATE_DIR=""
+  OPENCLAW_ASK_USER_GATEWAY_WAS_ACTIVE=false
+  OPENCLAW_ASK_USER_LIVE_ATTESTED=false
+}
+
+commit_bridgesllm_ask_user_transaction() {
+  local transaction_dir="${OPENCLAW_ASK_USER_TRANSACTION_DIR:-}"
+  local state_root="${OPENCLAW_ASK_USER_STATE_DIR:-}"
+  [[ -n "${transaction_dir}" && -n "${state_root}" ]] || return 1
+  $OPENCLAW_ASK_USER_TRANSACTION_COMMITTED || return 1
+  openclaw_tested_pair_commit_record_matches_ask_user_transaction \
+    "${transaction_dir}" \
+    "${state_root}/extensions/bridgesllm-ask-user" \
+    "${state_root}/openclaw.json" || return 1
+  local legacy_dir="${state_root}/plugins/bridgesllm-ask-user"
+  if [[ -d "${state_root}/plugins" && ! -L "${state_root}/plugins" \
+    && -d "${legacy_dir}" && ! -L "${legacy_dir}" \
+    && -f "${legacy_dir}/index.js" && ! -L "${legacy_dir}/index.js" ]] \
+    && ! mountpoint -q -- "${legacy_dir}"; then
+    rm -rf -- "${legacy_dir}" || return 1
+  fi
+  rm -rf -- "${transaction_dir}" || return 1
+  sync -f "${state_root}" 2>/dev/null || return 1
+  OPENCLAW_ASK_USER_TRANSACTION_ARMED=false
+  OPENCLAW_ASK_USER_TRANSACTION_DIR=""
+  OPENCLAW_ASK_USER_STATE_DIR=""
+  return 0
+}
+
+recover_or_retire_bridgesllm_ask_user_transaction() {
+  local openclaw_state_dir="$1"
+  local transaction_dir="${openclaw_state_dir}/.bridgesllm-ask-user-tested-pair-v1"
+  [[ -e "${transaction_dir}" || -L "${transaction_dir}" ]] || return 0
+  if [[ ! -d "${transaction_dir}" || -L "${transaction_dir}" \
+    || "$(stat -c '%u:%g' -- "${transaction_dir}" 2>/dev/null || true)" != "0:0" ]]; then
+    return 1
+  fi
+  if [[ ! -e "${transaction_dir}/manifest.json" ]]; then
+    rm -rf -- "${transaction_dir}" || return 1
+    sync -f "${openclaw_state_dir}" 2>/dev/null || return 1
+    return 0
+  fi
+  OPENCLAW_ASK_USER_TRANSACTION_ARMED=true
+  OPENCLAW_ASK_USER_TRANSACTION_COMMITTED=false
+  OPENCLAW_ASK_USER_TRANSACTION_DIR="${transaction_dir}"
+  OPENCLAW_ASK_USER_STATE_DIR="${openclaw_state_dir}"
+  if openclaw_tested_pair_commit_record_matches_ask_user_transaction \
+      "${transaction_dir}" \
+      "${openclaw_state_dir}/extensions/bridgesllm-ask-user" \
+      "${openclaw_state_dir}/openclaw.json"; then
+    OPENCLAW_ASK_USER_TRANSACTION_COMMITTED=true
+    commit_bridgesllm_ask_user_transaction
+  else
+    rollback_bridgesllm_ask_user_transaction
+  fi
 }
 
 install_bridgesllm_ask_user_plugin() {
@@ -15654,6 +22416,11 @@ install_bridgesllm_ask_user_plugin() {
     warn "OpenClaw state root is missing or unsafe; refusing plugin mutation."
     return 1
   fi
+  if ! recover_or_retire_bridgesllm_ask_user_transaction \
+      "${openclaw_state_dir}"; then
+    warn "An interrupted ask-question transaction could not be reconciled safely."
+    return 1
+  fi
   if [[ -e "${extensions_dir}" || -L "${extensions_dir}" ]] \
     && { [[ ! -d "${extensions_dir}" ]] || [[ -L "${extensions_dir}" ]]; }; then
     warn "OpenClaw extensions root is not a real directory; refusing plugin mutation."
@@ -15685,22 +22452,16 @@ install_bridgesllm_ask_user_plugin() {
   if ! mkdir -p "${extensions_dir}"; then
     return 1
   fi
-  local transaction_dir=""
-  transaction_dir="$(
-    mktemp -d "${extensions_dir}/.bridgesllm-ask-user-install.XXXXXX"
-  )" || return 1
-  chmod 700 "${transaction_dir}" || {
-    rm -rf -- "${transaction_dir}"
+  local transaction_dir="${openclaw_state_dir}/.bridgesllm-ask-user-tested-pair-v1"
+  if [[ -e "${transaction_dir}" || -L "${transaction_dir}" ]] \
+    || ! install -d -m 700 "${transaction_dir}"; then
     return 1
-  }
+  fi
   local stage_dir="${transaction_dir}/candidate"
   local previous_dir="${transaction_dir}/previous-plugin"
   local previous_config="${transaction_dir}/previous-openclaw.json"
   local inspect_output="${transaction_dir}/inspect.json"
   local rpc_output="${transaction_dir}/rpc.json"
-  local failed_path="${transaction_dir}/failed-plugin"
-  local failed_config="${transaction_dir}/failed-openclaw.json"
-  local restore_config="${openclaw_state_dir}/.bridgesllm-ask-user-config-restore.$(basename "${transaction_dir}")"
   local target_preexisted=false
   local config_preexisted=false
   local config_registration_attempted=false
@@ -15728,10 +22489,37 @@ install_bridgesllm_ask_user_plugin() {
         break
       fi
     done
+    if [[ -z "${failure_reason}" ]]; then
+      sync -f "${stage_dir}" 2>/dev/null \
+        || failure_reason="could not durably stage the plugin directory"
+    fi
   fi
   if [[ -z "${failure_reason}" ]] && $config_preexisted \
     && ! cp -a -- "${config_path}" "${previous_config}"; then
     failure_reason="could not preserve the OpenClaw config"
+  fi
+  if [[ -z "${failure_reason}" ]] && $config_preexisted \
+    && ! sync -f "${previous_config}" 2>/dev/null; then
+    failure_reason="could not durably preserve the OpenClaw config"
+  fi
+  if [[ -z "${failure_reason}" ]]; then
+    if ! write_bridgesllm_ask_user_transaction_manifest \
+        "${transaction_dir}" \
+        "${openclaw_state_dir}" \
+        "${target_dir}" \
+        "${config_path}" \
+        "${target_preexisted}" \
+        "${config_preexisted}" \
+        "${gateway_was_active}"; then
+      failure_reason="could not arm the durable ask-user rollback transaction"
+    else
+      OPENCLAW_ASK_USER_TRANSACTION_ARMED=true
+      OPENCLAW_ASK_USER_TRANSACTION_COMMITTED=false
+      OPENCLAW_ASK_USER_TRANSACTION_DIR="${transaction_dir}"
+      OPENCLAW_ASK_USER_STATE_DIR="${openclaw_state_dir}"
+      OPENCLAW_ASK_USER_GATEWAY_WAS_ACTIVE="${gateway_was_active}"
+      OPENCLAW_ASK_USER_LIVE_ATTESTED=false
+    fi
   fi
   if [[ -z "${failure_reason}" ]] && $target_preexisted; then
     if mv -T -- "${target_dir}" "${previous_dir}"; then
@@ -15743,6 +22531,8 @@ install_bridgesllm_ask_user_plugin() {
   if [[ -z "${failure_reason}" ]]; then
     if mv -T -- "${stage_dir}" "${target_dir}"; then
       plugin_installed=true
+      sync -f "${extensions_dir}" 2>/dev/null \
+        || failure_reason="could not durably publish the staged plugin directory"
     else
       failure_reason="could not publish the staged plugin directory"
     fi
@@ -15769,62 +22559,27 @@ install_bridgesllm_ask_user_plugin() {
       "${PIN_OPENCLAW_RUNTIME_VERSION}" 18; then
       failure_reason="the OpenClaw gateway was not stable after plugin activation"
     elif ! verify_bridgesllm_ask_user_gateway_method "${rpc_output}"; then
-      failure_reason="the running OpenClaw gateway did not expose the exact pending-input methods"
+      failure_reason="the running OpenClaw gateway failed ask-user execute and settlement semantics"
     fi
   fi
   [[ -z "${failure_reason}" ]] && install_succeeded=true
 
   if ! $install_succeeded; then
     local rollback_ok=true
-    # Move the rejected candidate aside before restoring the exact previous
-    # directory entry. Both renames remain on the OpenClaw state filesystem.
-    if $plugin_installed; then
-      mv -T -- "${target_dir}" "${failed_path}" || rollback_ok=false
-    fi
-    if $target_preexisted && $target_displaced; then
-      mv -T -- "${previous_dir}" "${target_dir}" || rollback_ok=false
-    fi
-
-    if $config_registration_attempted; then
-      if $config_preexisted; then
-        if cp -a -- "${previous_config}" "${restore_config}"; then
-          mv -Tf -- "${restore_config}" "${config_path}" || rollback_ok=false
-        else
-          rollback_ok=false
-        fi
-      elif [[ -e "${config_path}" || -L "${config_path}" ]]; then
-        mv -T -- "${config_path}" "${failed_config}" || rollback_ok=false
-      fi
-    fi
-
-    if $gateway_was_active && { $plugin_installed || $target_displaced; }; then
-      if ! systemctl restart openclaw-gateway >> "${LOG_FILE}" 2>&1 \
-        || ! verify_openclaw_gateway_stable \
-          "${PIN_OPENCLAW_RUNTIME_VERSION}" 18; then
-        rollback_ok=false
-      fi
-    fi
-    if $rollback_ok; then
-      rm -rf -- "${transaction_dir}"
+    if $OPENCLAW_ASK_USER_TRANSACTION_ARMED; then
+      rollback_bridgesllm_ask_user_transaction || rollback_ok=false
     else
+      rm -rf -- "${transaction_dir}" || rollback_ok=false
+    fi
+    if ! $rollback_ok; then
       warn "Ask-question plugin rollback needs manual recovery from ${transaction_dir}."
     fi
     warn "Ask-question plugin activation failed: ${failure_reason}."
     return 1
   fi
 
-  # Earlier 4.0 builds wrote the plugin to the unscanned `plugins` directory.
-  # Leaving it behind is inert but confusing. Retire only a real directory
-  # carrying our expected entry point, and only after the replacement is live.
-  if [[ -d "${openclaw_state_dir}/plugins" \
-    && ! -L "${openclaw_state_dir}/plugins" \
-    && -d "${legacy_dir}" && ! -L "${legacy_dir}" \
-    && -f "${legacy_dir}/index.js" && ! -L "${legacy_dir}/index.js" ]] \
-    && ! mountpoint -q -- "${legacy_dir}"; then
-    rm -rf -- "${legacy_dir}"
-  fi
-  rm -rf -- "${transaction_dir}"
-  ok "Ask-question answer channel installed, loaded, and verified"
+  $gateway_was_active && OPENCLAW_ASK_USER_LIVE_ATTESTED=true
+  ok "Ask-question answer channel installed and verified; tested-pair rollback remains armed"
 }
 
 ensure_openclaw_codex_plugin_compatible() {
@@ -15951,10 +22706,81 @@ apply_openclaw_codex_plugin_pending_input_hotfix() {
 }
 
 commit_openclaw_tested_pair() {
+  local openclaw_package_dir="" pending_target="" claude_target=""
+  local ask_user_transaction="" ask_user_state_root=""
+  local ask_user_target="" ask_user_config=""
+  local sigint_trap="" sigterm_trap="" sighup_trap=""
   verify_openclaw_tested_pair || return 1
-  commit_openclaw_pending_input_hotfix || return 1
+  openclaw_package_dir="$(openclaw_core_package_dir || true)"
+  pending_target="${OPENCLAW_PENDING_INPUT_HOTFIX_TARGET:-}"
+  claude_target="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET:-}"
+  if [[ -z "${pending_target}" ]]; then
+    pending_target="$(
+      resolve_openclaw_pending_input_hotfix_target \
+        "${openclaw_package_dir}/dist" || true
+    )"
+  fi
+  if [[ -z "${claude_target}" ]]; then
+    claude_target="$(
+      resolve_openclaw_claude_ask_user_hotfix_target \
+        "${openclaw_package_dir}/dist" || true
+    )"
+  fi
+  [[ -n "${pending_target}" && -n "${claude_target}" ]] || return 1
+  openclaw_pending_input_hotfix_is_applied "${pending_target}" || return 1
+  openclaw_claude_ask_user_hotfix_is_applied "${claude_target}" || return 1
+  $OPENCLAW_ASK_USER_TRANSACTION_ARMED || return 1
+  $OPENCLAW_ASK_USER_LIVE_ATTESTED || return 1
+  ask_user_transaction="${OPENCLAW_ASK_USER_TRANSACTION_DIR:-}"
+  ask_user_state_root="${OPENCLAW_ASK_USER_STATE_DIR:-}"
+  ask_user_target="${ask_user_state_root}/extensions/bridgesllm-ask-user"
+  ask_user_config="${ask_user_state_root}/openclaw.json"
+  [[ -n "${ask_user_transaction}" && -n "${ask_user_state_root}" ]] || return 1
+
+  # One fsynced record is the commit decision for both byte-level mutations.
+  # Block termination only across that short decision boundary. Once the
+  # record and in-memory flag exist, cleanup can be retried without rolling one
+  # half of the tested pair back independently.
+  sigint_trap="$(trap -p SIGINT || true)"
+  sigterm_trap="$(trap -p TERM || true)"
+  sighup_trap="$(trap -p HUP || true)"
+  trap '' SIGINT TERM HUP
+  if ! write_openclaw_tested_pair_commit_record \
+    "${pending_target}" \
+    "${claude_target}" \
+    "${ask_user_transaction}" \
+    "${ask_user_target}" \
+    "${ask_user_config}"; then
+    [[ -n "${sigint_trap}" ]] && eval "${sigint_trap}" || trap - SIGINT
+    [[ -n "${sigterm_trap}" ]] && eval "${sigterm_trap}" || trap - TERM
+    [[ -n "${sighup_trap}" ]] && eval "${sighup_trap}" || trap - HUP
+    return 1
+  fi
   OPENCLAW_UPGRADE_COMMITTED=true
   OPENCLAW_CODEX_PLUGIN_UPDATE_ATTEMPTED=false
+  OPENCLAW_ASK_USER_TRANSACTION_COMMITTED=true
+  [[ -n "${sigint_trap}" ]] && eval "${sigint_trap}" || trap - SIGINT
+  [[ -n "${sigterm_trap}" ]] && eval "${sigterm_trap}" || trap - TERM
+  [[ -n "${sighup_trap}" ]] && eval "${sighup_trap}" || trap - HUP
+
+  if ! commit_openclaw_pending_input_hotfix; then
+    warn "The tested pair committed, but the native pending-input backup could not be retired; the durable commit record will reconcile it on the next run."
+  fi
+  if ! commit_openclaw_claude_ask_user_hotfix; then
+    warn "The tested pair committed, but the Claude ask-user backup could not be retired; the durable commit record will reconcile it on the next run."
+  fi
+  if ! commit_bridgesllm_ask_user_transaction; then
+    warn "The tested pair committed, but the ask-user plugin/config rollback directory could not be retired; the durable commit record will reconcile it on the next run."
+  fi
+  OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED=true
+  OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=true
+  if ! retire_openclaw_tested_pair_commit_record_if_clean \
+    "${pending_target}" \
+    "${claude_target}" \
+    "${ask_user_transaction}"; then
+    warn "The tested pair committed, but its completed decision record could not be retired; backup-generation binding prevents stale replay."
+  fi
+  return 0
 }
 
 configure_openclaw_codex_harness_defaults() {
@@ -16016,18 +22842,30 @@ prepare_openclaw_runtime_for_portal() {
     fail "OpenClaw upgrade stopped before the first new gateway restart because legacy state could not be proven safe. No data was deleted and openclaw doctor --fix was not run."
   fi
 
-  # Only the byte-level compatibility patch is allowed before the first new
-  # gateway boot. Config/auth/plugin normalization happens after the upgraded
-  # runtime is proven healthy so rollback never mixes old code with new state.
-  auto_apply_openclaw_compatibility_hotfix
   if ! verify_openclaw_core_package_pin; then
     fail "OpenClaw core is not the tested ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} package / ${PIN_OPENCLAW_RUNTIME_VERSION} runtime pair. The updater will restore the preserved previous runtime when applicable."
   fi
+  # Publish the replacement tool/config under the same durable rollback
+  # decision as the core and native bundle patches. Native AskUserQuestion is
+  # still available throughout this first boot and live semantic attestation.
+  if ! install_bridgesllm_ask_user_plugin; then
+    fail "OpenClaw is healthy, but the Portal ask-question answer channel could not be installed and verified. The previous plugin/config were restored when possible."
+  fi
   if ! ensure_openclaw_gateway_boots_cleanly; then
-    fail "OpenClaw gateway did not boot cleanly after Portal compatibility preparation. Check: journalctl -u openclaw-gateway -n 100 --no-pager"
+    fail "OpenClaw gateway did not boot cleanly with the replacement ask-user bridge. Check: journalctl -u openclaw-gateway -n 100 --no-pager"
   fi
   if ! ensure_openclaw_gateway_matches_cli; then
     fail "OpenClaw gateway version/RPC readiness could not be verified. The updater will restore the previous OpenClaw runtime when applicable. Check: systemctl status openclaw-gateway"
+  fi
+  if ! verify_bridgesllm_ask_user_tested_pair; then
+    fail "The replacement ask-user tool or one of its live settlement methods failed semantic attestation before native Claude question routing could be changed."
+  fi
+  OPENCLAW_ASK_USER_LIVE_ATTESTED=true
+  auto_apply_openclaw_compatibility_hotfix
+  if ! ensure_openclaw_gateway_boots_cleanly \
+    || ! ensure_openclaw_gateway_matches_cli \
+    || ! verify_bridgesllm_ask_user_tested_pair; then
+    fail "OpenClaw did not retain the complete ask-user bridge after compatibility activation. The tested-pair rollback remains armed."
   fi
   if $OPENCLAW_PACKAGE_UPDATED || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; then
     local expected_gateway_version
@@ -16049,9 +22887,6 @@ prepare_openclaw_runtime_for_portal() {
   fi
   if ! apply_openclaw_codex_plugin_pending_input_hotfix; then
     fail "OpenClaw Codex is installed, but its active provider bundle could not be prepared for exact ask-question delivery. The previous plugin was restored when possible."
-  fi
-  if ! install_bridgesllm_ask_user_plugin; then
-    fail "OpenClaw is healthy, but the Portal ask-question answer channel could not be installed and verified. The previous plugin/config were restored when possible."
   fi
   if ! commit_openclaw_tested_pair; then
     fail "OpenClaw compatibility verification did not produce the tested core ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} / Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} / Portal answer-channel runtime."
@@ -16089,9 +22924,9 @@ configure_backup_timers() {
     if [[ -n "${portal_database_url}" ]] && command -v node >/dev/null 2>&1 \
       && [[ -d "${PORTAL_DIR}/backend/node_modules/@prisma/client" ]]; then
       configured_backup_base="$(
-        DATABASE_URL="${portal_database_url}" NODE_PATH="${PORTAL_DIR}/backend/node_modules" node -e '
-          const { PrismaClient } = require("@prisma/client");
-          const prisma = new PrismaClient();
+        cd "${PORTAL_DIR}/backend" && \
+        DATABASE_URL="${portal_database_url}" node -e '
+          const { prisma } = require("./dist/config/database");
           prisma.systemSetting.findUnique({ where: { key: "system.backupPath" } })
             .then((row) => { if (row?.value) process.stdout.write(row.value); })
             .finally(() => prisma.$disconnect());
@@ -17348,7 +24183,7 @@ backend, schema, prisma_cli = sys.argv[1:]
 secret = os.environ.get("DATABASE_URL", "").encode()
 if (
     not secret
-    or len(secret) > 131072
+    or len(secret) > 128000
     or any(byte < 32 or byte == 127 for byte in secret)
 ):
     raise SystemExit(1)
@@ -19425,8 +26260,11 @@ install_prepared_update_dependencies() {
   sync -f "${PORTAL_DIR}/backend/node_modules" || return 1
   (
     cd "${PORTAL_DIR}/backend"
-    node -e "for (const name of ['@prisma/client','bcrypt','sharp','node-pty']) require(name)"
-  ) >> "${LOG_FILE}" 2>&1
+    node -e "for (const name of ['@prisma/client','@prisma/adapter-pg','pg','bcrypt','sharp','node-pty']) require(name)"
+  ) >> "${LOG_FILE}" 2>&1 || return 1
+  verify_prisma_client_runtime \
+    "${PORTAL_DIR}/backend" installed-prisma-check \
+    >> "${LOG_FILE}" 2>&1
 }
 
 prepare_update_transaction_layout() {
@@ -20694,6 +27532,9 @@ do_update() {
   echo ""
   CURRENT_STEP="update"
 
+  converge_unsafe_docker_prune_automation \
+    || fail "Unsafe scheduled Docker cleanup remains active. Review the guard details above, disable the unknown job or repair the legacy-file drift, and retry."
+
   local previous_portal_version=""
   previous_portal_version="$(attest_existing_portal_for_update "${PORTAL_DIR}")" \
     || fail "The existing Portal runtime or configuration is incomplete, linked, writable by another account, or version-inconsistent. Repair it explicitly before updating."
@@ -20712,6 +27553,8 @@ do_update() {
     || fail "The existing backend environment file is missing, linked, or assigns a variable more than once; the installer and systemd would disagree about the effective configuration. Repair ${env_file} before updating."
   assert_env_file_no_duplicate_keys "${PORTAL_DIR}/frontend/.env" \
     || fail "The existing frontend environment file is missing, linked, or assigns a variable more than once. Repair ${PORTAL_DIR}/frontend/.env before updating."
+  assert_prisma_runtime_environment_safe "${env_file}" \
+    || fail "The existing backend or installer process environment overrides the attested database runtime. Remove Prisma engine switches, node-postgres PG* fallbacks, NODE_PG_FORCE_NATIVE, and NODE_TLS_REJECT_UNAUTHORIZED before updating."
   local validation_assignment_status=0
   env_file_has_assignment "${env_file}" "PORTAL_UPDATE_VALIDATION_MODE" \
     || validation_assignment_status=$?
@@ -20730,6 +27573,8 @@ do_update() {
   done
   pg_url_uses_public_schema "${existing_db_url}" \
     || fail "The existing DATABASE_URL selects a non-public or ambiguous Prisma schema. Portal rollback is defined only for the public schema; remove the schema option or set schema=public before updating."
+  pg_url_uses_supported_prisma_adapter_options "${existing_db_url}" \
+    || fail "The existing DATABASE_URL has an ambiguous or unsupported database-driver option. Remote databases must set sslmode=disable, require, verify-ca, or verify-full. An absolute sslrootcert is required for verify-ca/verify-full; sslcert/client identities/keys, sslaccept, and channel_binding are not supported. Only lowercase application_name, fallback_application_name, options, client_encoding, replication, and documented Prisma pool controls may be supplied; literal plus signs must be percent-encoded. Custom connect_timeout and pool_timeout values must match. Repair the URL before updating."
   PORTAL_UPDATE_PROBE_TOKEN="$(
     read_env_value "${env_file}" "PORTAL_UPDATE_PROBE_TOKEN" || true
   )"
@@ -21877,6 +28722,10 @@ finally:
 PY
 }
 
+portal_remote_desktop_watchdog_runtime_absent() {
+  [[ ! -e /run/bridges-rd && ! -L /run/bridges-rd ]]
+}
+
 remove_portal_remote_desktop_runtime() {
   local data_choice="${1:-1}"
   [[ "${data_choice}" == "1" || "${data_choice}" == "2" ]] \
@@ -22028,7 +28877,7 @@ remove_portal_remote_desktop_runtime() {
   fi
   rm -rf -- /tmp/bridges-rd-runtime /run/bridges-rd
   rm -f -- /run/lock/bridges-rd-healthcheck.lock
-  [[ ! -e /run/bridges-rd && ! -L /run/bridges-rd ]] \
+  portal_remote_desktop_watchdog_runtime_absent \
     || fail "Remote Desktop watchdog runtime state could not be removed safely."
   systemctl daemon-reload >/dev/null 2>&1 \
     || fail "Systemd could not forget removed Remote Desktop units; uninstall was aborted."
@@ -27826,6 +34675,13 @@ print_dry_run_plan() {
 
 main() {
   parse_args "$@"
+  if ${REPAIR_PROJECT_RUNTIME_IMAGE}; then
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] \
+      || fail "Must run Project runtime image repair as root."
+    acquire_project_runtime_image_repair_lock
+    repair_project_runtime_image
+    exit 0
+  fi
   detect_runtime_profile
   detect_retained_install_reconnect
   load_existing_origin_for_forced_reinstall
@@ -27909,6 +34765,8 @@ main() {
   banner
 
   preflight
+  converge_unsafe_docker_prune_automation \
+    || fail "Unsafe scheduled Docker cleanup remains active. Review the guard details above, disable the unknown job or repair the legacy-file drift, and retry."
   ensure_telemetry_install_id
   telemetry_event "install_start"
   if use_tailnet_profile; then

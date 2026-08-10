@@ -37,6 +37,7 @@ import {
   codexProjectDockerHostEnvironment,
   ensureCodexProjectEgressRuntime,
   stopCodexProjectRuntimesForContext,
+  stopCodexProjectRuntimesForRecoveryContext,
   type CodexProjectRuntimePlan,
 } from './CodexProjectEgressRuntime';
 
@@ -1581,6 +1582,76 @@ describe('Codex Project controlled-egress orchestration', () => {
     const listCall = executor.commands.find(({ args }) => args[0] === 'container' && args[1] === 'ls');
     expect(listCall?.args.join('\n')).toContain(`label=com.bridgesllm.codex-project.actor=${fixture.plan.expectedLabels['com.bridgesllm.codex-project.actor']}`);
     expect(listCall?.args.join('\n')).toContain(`label=com.bridgesllm.codex-project.project=${fixture.plan.expectedLabels['com.bridgesllm.codex-project.project']}`);
+    expect(listCall?.args.join('\n')).not.toContain('label=com.bridgesllm.codex-project.policy=');
+  });
+
+  test('stops an exact persisted Codex generation after policy and image drift', async () => {
+    const historicalSeed = {
+      ...fixture.context,
+      runtimePolicyVersion: CODEX_PROJECT_PREVIOUS_RUNTIME_POLICY_VERSION,
+      runtimeImageDigest: `sha256:${'9'.repeat(64)}`,
+    };
+    const historicalContext: ProjectSandboxExecutionContext = Object.freeze({
+      ...historicalSeed,
+      policyFingerprint: codexContextPolicyFingerprint(historicalSeed),
+    });
+    const historicalFixture: Fixture = {
+      ...fixture,
+      context: historicalContext,
+      plan: {
+        ...fixture.plan,
+        runtimeImage: historicalContext.runtimeImageDigest,
+        expectedLabels: {
+          ...fixture.plan.expectedLabels,
+          [__codexProjectEgressRuntimeTest.constants.RUNTIME_POLICY_LABEL]: historicalContext.runtimePolicyVersion,
+        },
+      },
+    };
+    const executor = new RuntimeExecutor(historicalFixture);
+    executor.exists = true;
+    executor.running = true;
+    const originalRun = executor.run.bind(executor);
+    executor.run = async (command, args) => {
+      if (command === 'docker' && args.slice(0, 3).join(' ') === 'container ls -a') {
+        await originalRun(command, args);
+        return { stdout: `${'d'.repeat(64)}\n`, stderr: '', exitCode: 0 };
+      }
+      return originalRun(command, args);
+    };
+
+    await expect(stopCodexProjectRuntimesForRecoveryContext(historicalContext, executor))
+      .resolves.toEqual(['d'.repeat(64)]);
+    expect(executor.running).toBe(false);
+  });
+
+  test('pre-attests the full Codex inventory before stopping any mixed generation', async () => {
+    const executor = new RuntimeExecutor(fixture);
+    executor.exists = true;
+    executor.running = true;
+    const firstId = 'd'.repeat(64);
+    const secondId = 'e'.repeat(64);
+    const originalRun = executor.run.bind(executor);
+    executor.run = async (command, args) => {
+      if (command === 'docker' && args.slice(0, 3).join(' ') === 'container ls -a') {
+        await originalRun(command, args);
+        return { stdout: `${firstId}\n${secondId}\n`, stderr: '', exitCode: 0 };
+      }
+      if (command === 'docker' && args[0] === 'container' && args[1] === 'inspect') {
+        const inspect = inspectFor(fixture, true);
+        inspect.Id = args[2];
+        if (args[2] === secondId) {
+          inspect.Config.Labels[__codexProjectEgressRuntimeTest.constants.RUNTIME_POLICY_LABEL]
+            = CODEX_PROJECT_PREVIOUS_RUNTIME_POLICY_VERSION;
+        }
+        return { stdout: JSON.stringify([inspect]), stderr: '', exitCode: 0 };
+      }
+      return originalRun(command, args);
+    };
+
+    await expect(stopCodexProjectRuntimesForContext(fixture.context, executor))
+      .rejects.toMatchObject({ code: 'RUNTIME_STOP_IDENTITY' });
+    expect(executor.commands.some(({ args }) => args[0] === 'container' && args[1] === 'stop'))
+      .toBe(false);
   });
 
   test('refuses a label-matched runtime whose Project mount drifted before stop', async () => {
@@ -1605,6 +1676,90 @@ describe('Codex Project controlled-egress orchestration', () => {
     await expect(stopCodexProjectRuntimesForContext(fixture.context, executor))
       .rejects.toMatchObject({ code: 'RUNTIME_MOUNTS' });
     expect(executor.commands.some(({ args }) => args[0] === 'container' && args[1] === 'stop')).toBe(false);
+  });
+
+  test('does not treat an ambiguous Docker inspect failure as Codex runtime absence', async () => {
+    const executor = new RuntimeExecutor(fixture);
+    executor.exists = true;
+    executor.running = true;
+    const originalRun = executor.run.bind(executor);
+    executor.run = async (command, args) => {
+      if (command === 'docker' && args.slice(0, 3).join(' ') === 'container ls -a') {
+        await originalRun(command, args);
+        return { stdout: `${'d'.repeat(64)}\n`, stderr: '', exitCode: 0 };
+      }
+      if (command === 'docker' && args[0] === 'container' && args[1] === 'inspect') {
+        await originalRun(command, args);
+        return {
+          stdout: '',
+          stderr: 'Cannot connect to the Docker daemon',
+          exitCode: 1,
+        };
+      }
+      return originalRun(command, args);
+    };
+
+    await expect(stopCodexProjectRuntimesForContext(fixture.context, executor))
+      .rejects.toMatchObject({ code: 'RUNTIME_INSPECT_FAILED' });
+    expect(executor.commands.some(({ args }) => args[0] === 'container' && args[1] === 'stop'))
+      .toBe(false);
+  });
+
+  test('refuses an ambiguous Codex running state before stop', async () => {
+    const executor = new RuntimeExecutor(fixture);
+    executor.exists = true;
+    executor.running = true;
+    const originalRun = executor.run.bind(executor);
+    executor.run = async (command, args) => {
+      if (command === 'docker' && args.slice(0, 3).join(' ') === 'container ls -a') {
+        await originalRun(command, args);
+        return { stdout: `${'d'.repeat(64)}\n`, stderr: '', exitCode: 0 };
+      }
+      const result = await originalRun(command, args);
+      if (command === 'docker' && args[0] === 'container' && args[1] === 'inspect'
+        && args[2] === 'd'.repeat(64)) {
+        const inspect = inspectFor(fixture, true);
+        inspect.State.Running = 'true';
+        return { stdout: JSON.stringify([inspect]), stderr: '', exitCode: 0 };
+      }
+      return result;
+    };
+
+    await expect(stopCodexProjectRuntimesForContext(fixture.context, executor))
+      .rejects.toMatchObject({ code: 'RUNTIME_STOP_UNCONFIRMED' });
+    expect(executor.commands.some(({ args }) => args[0] === 'container' && args[1] === 'stop'))
+      .toBe(false);
+  });
+
+  test('refuses an ambiguous Codex running state after stop', async () => {
+    const executor = new RuntimeExecutor(fixture);
+    executor.exists = true;
+    executor.running = true;
+    const originalRun = executor.run.bind(executor);
+    let runtimeInspectCount = 0;
+    executor.run = async (command, args) => {
+      if (command === 'docker' && args.slice(0, 3).join(' ') === 'container ls -a') {
+        await originalRun(command, args);
+        return { stdout: `${'d'.repeat(64)}\n`, stderr: '', exitCode: 0 };
+      }
+      const result = await originalRun(command, args);
+      if (command === 'docker' && args[0] === 'container' && args[1] === 'inspect'
+        && args[2] === 'd'.repeat(64)) {
+        runtimeInspectCount += 1;
+        if (runtimeInspectCount === 2) {
+          const inspect = inspectFor(fixture, false);
+          delete inspect.State.Running;
+          return { stdout: JSON.stringify([inspect]), stderr: '', exitCode: 0 };
+        }
+      }
+      return result;
+    };
+
+    await expect(stopCodexProjectRuntimesForContext(fixture.context, executor))
+      .rejects.toMatchObject({ code: 'RUNTIME_STOP_UNCONFIRMED' });
+    expect(executor.commands.some(({ args }) => (
+      args[0] === 'container' && args[1] === 'stop' && args.at(-1) === 'd'.repeat(64)
+    ))).toBe(true);
   });
 
   test.each([

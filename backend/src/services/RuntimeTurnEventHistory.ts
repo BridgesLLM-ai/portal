@@ -179,7 +179,14 @@ export function recordRuntimeTurnEvent(sessionKey: string, event: RuntimeTurnEve
     if (sanitized.type === 'assistant_reasoning') {
       flushPendingStatus(sessionKey, dir);
       const pending = pendingReasoningBySession.get(sessionKey);
-      if (sanitized.replace === true && pending && (pending.runId || '') === (sanitized.runId || '')) {
+      const sameReasoningLane = Boolean(sanitized.source?.preambleProgress)
+        === Boolean(pending?.source?.preambleProgress);
+      if (
+        sanitized.replace === true
+        && pending
+        && sameReasoningLane
+        && (pending.runId || '') === (sanitized.runId || '')
+      ) {
         pendingReasoningBySession.set(sessionKey, sanitized);
         return;
       }

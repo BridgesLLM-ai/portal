@@ -234,6 +234,24 @@ function capabilities(
   };
 }
 
+function persistedCodexCapabilities(): ProjectChatProviderCapabilitiesResponse {
+  const result = capabilities();
+  result.activeProvider = 'CODEX';
+  result.coordination.selectedProvider = 'CODEX';
+  result.qualifiedModels = { CODEX: 'openai/gpt-5.5' };
+  result.bindings = [{
+    provider: 'CODEX',
+    runtime: 'codex-project-adapter',
+    sessionKey: 'codex-project-session-1',
+    externalSessionId: null,
+    model: 'openai/gpt-5.5',
+    status: 'READY',
+    lastActivity: '2026-07-19T08:00:00.000Z',
+    policyFingerprint: 'policy-v1',
+  }];
+  return result;
+}
+
 function unqualifiedOpenClawCapabilities(
   projectId: string,
 ): ProjectChatProviderCapabilitiesResponse {
@@ -265,6 +283,24 @@ function unqualifiedOpenClawCapabilities(
     expiresAt: null,
     evidenceFingerprint: null,
   };
+  return result;
+}
+
+function unqualifiedAgentZeroCapabilities(): ProjectChatProviderCapabilitiesResponse {
+  const result = capabilities();
+  const agentZeroCapability: ProjectChatProviderCapability = {
+    ...codexCapability,
+    provider: 'AGENT_ZERO',
+    displayName: 'Agent Zero',
+    runtime: 'agent-zero-project-adapter',
+    selectable: false,
+    executionScope: null,
+    reason: 'Choose a connected Agent Zero model before preparation.',
+  };
+  result.activeProvider = 'AGENT_ZERO';
+  result.coordination.selectedProvider = 'AGENT_ZERO';
+  result.providers = [...result.providers, agentZeroCapability];
+  result.supportedProviders = [...result.supportedProviders, agentZeroCapability];
   return result;
 }
 
@@ -409,6 +445,447 @@ describe('ProjectChatPanel rendered provider contract', () => {
       }
       throw new Error(`Unexpected GET ${url}`);
     });
+  });
+
+  it('adopts a persisted Codex provider without restarting bootstrap admission', async () => {
+    const admission = deferred<{ data: Record<string, unknown> }>();
+    projectMocks.projectChatProviders.mockResolvedValue(persistedCodexCapabilities());
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      provider: 'CODEX',
+      sessionKey: 'codex-project-session-1',
+    }));
+    projectMocks.clientPost.mockImplementation((url: string) => {
+      if (url.endsWith('/assistant/ensure-session')) return admission.promise;
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    await waitFor(() => expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/ensure-session'),
+    )).toHaveLength(1));
+    expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      admission.resolve({
+        data: {
+          provider: 'CODEX',
+          stateVersion: 1,
+          sessionKey: 'codex-project-session-1',
+          agentId: 'codex-project-agent-1',
+          runtime: 'codex-project-adapter',
+          model: 'openai/gpt-5.5',
+          modelValidated: true,
+          modelVerified: true,
+        },
+      });
+      await admission.promise;
+    });
+
+    expect(await screen.findByText('Codex Project agent verified and ready')).toBeVisible();
+    expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(1);
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/ensure-session'),
+    )).toHaveLength(1);
+    expect(projectMocks.clientGet.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/resume-session'),
+    )).toHaveLength(0);
+  });
+
+  it('uses the cold-open transcript preload instead of requesting history twice after admission', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.chatHistory.mockResolvedValue({
+      messages: [{
+        id: 'history-preload-1',
+        role: 'assistant',
+        content: 'Transcript loaded before the provider handshake.',
+        timestamp: '2026-07-19T08:00:00.000Z',
+        provider: 'OPENCLAW',
+        runtime: 'openclaw-dedicated-project-agent',
+        model: 'openai/gpt-5.5',
+        modelValidated: true,
+        modelVerified: true,
+      }],
+      pagination: { hasMore: false, nextCursor: null, limit: 100 },
+    });
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('Transcript loaded before the provider handshake.')).toBeVisible();
+    expect(await screen.findByText('OpenClaw Project agent verified and ready')).toBeVisible();
+    await waitFor(() => expect(projectMocks.agentPoll).toHaveBeenCalled());
+    expect(projectMocks.chatHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces and retries a failed cold-open transcript without preparing an unqualified provider', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(
+      unqualifiedOpenClawCapabilities('project-history-retry'),
+    );
+    projectMocks.chatHistory
+      .mockRejectedValueOnce(new Error('history transport failed'))
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'history-retry-1',
+          role: 'assistant',
+          content: 'Recovered saved transcript.',
+          timestamp: '2026-07-19T08:00:00.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+          model: 'openai/gpt-5.5',
+          modelValidated: true,
+          modelVerified: true,
+        }],
+        pagination: { hasMore: false, nextCursor: null, limit: 100 },
+      });
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('Project chat history could not be loaded.')).toBeVisible();
+    expect(screen.getByText('history transport failed')).toBeVisible();
+    expect(projectMocks.clientPost).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Retry project chat history' }));
+
+    expect(await screen.findByText('Recovered saved transcript.')).toBeVisible();
+    await waitFor(() => expect(
+      screen.queryByRole('button', { name: 'Retry project chat history' }),
+    ).not.toBeInTheDocument());
+    expect(projectMocks.chatHistory).toHaveBeenCalledTimes(2);
+    expect(projectMocks.qualifyProjectChatProvider).not.toHaveBeenCalled();
+    expect(projectMocks.clientPost).not.toHaveBeenCalled();
+  });
+
+  it('refuses to render history bound to a different immutable Project', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(
+      unqualifiedOpenClawCapabilities('project-alpha'),
+    );
+    projectMocks.chatHistory.mockResolvedValue({
+      messages: [{
+        id: 'wrong-project-history',
+        role: 'assistant',
+        content: 'content from another project must never render',
+        timestamp: '2026-08-06T14:00:00.000Z',
+        provider: 'OPENCLAW',
+        runtime: 'openclaw-dedicated-project-agent',
+      }],
+      pagination: { hasMore: false, nextCursor: null, limit: 100 },
+      executionContext: {
+        scope: 'PROJECT_SANDBOX',
+        projectId: 'project-other',
+        policyFingerprint: 'policy-v1',
+      },
+    });
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('Project chat history could not be loaded.')).toBeVisible();
+    expect(screen.getByText(/saved chat history for a different Project/i)).toBeVisible();
+    expect(screen.queryByText('content from another project must never render')).not.toBeInTheDocument();
+    expect(projectMocks.qualifyProjectChatProvider).not.toHaveBeenCalled();
+    expect(projectMocks.clientPost).not.toHaveBeenCalled();
+  });
+
+  it('applies a custom native model once instead of switching on every keystroke', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(persistedCodexCapabilities());
+    projectMocks.gatewayModels.mockResolvedValue({ provider: 'CODEX', models: [] });
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      provider: 'CODEX',
+      sessionKey: 'codex-project-session-1',
+    }));
+    projectMocks.clientPost.mockImplementation(async (url: string, body?: Record<string, unknown>) => {
+      if (!url.endsWith('/assistant/ensure-session')) throw new Error(`Unexpected POST ${url}`);
+      const requestedModel = String(body?.model || 'openai/gpt-5.5');
+      return {
+        data: {
+          provider: 'CODEX',
+          stateVersion: requestedModel === 'openai/gpt-5.6-manual' ? 2 : 1,
+          sessionKey: 'codex-project-session-1',
+          agentId: 'codex-project-agent-1',
+          runtime: 'codex-project-adapter',
+          model: requestedModel,
+          modelValidated: true,
+          modelVerified: true,
+        },
+      };
+    });
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('Codex Project agent verified and ready')).toBeVisible();
+    const picker = screen.getByRole('button', { name: 'Select project chat model' });
+    await waitFor(() => expect(picker).toBeEnabled());
+    await user.click(picker);
+    await user.click(screen.getByRole('button', { name: 'Custom model…' }));
+    const customInput = screen.getByRole('textbox', { name: 'Custom model name' });
+    await user.clear(customInput);
+    await user.type(customInput, 'openai/gpt-5.6-manual');
+
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/ensure-session'),
+    )).toHaveLength(1);
+    await user.click(screen.getByRole('button', { name: 'Apply model' }));
+    await waitFor(() => expect(projectMocks.clientPost).toHaveBeenCalledWith(
+      '/projects/alpha/assistant/ensure-session',
+      expect.objectContaining({
+        provider: 'CODEX',
+        model: 'openai/gpt-5.6-manual',
+      }),
+      { _silent: true },
+    ));
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url, body]) => String(url).endsWith('/assistant/ensure-session')
+        && body?.model === 'openai/gpt-5.6-manual',
+    )).toHaveLength(1);
+  });
+
+  it('keeps a failed native model catalog visible and retryable', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(persistedCodexCapabilities());
+    projectMocks.gatewayModels
+      .mockRejectedValueOnce(new Error('catalog transport failed'))
+      .mockResolvedValueOnce({
+        provider: 'CODEX',
+        models: [{ id: 'openai/gpt-5.4', displayName: 'GPT-5.4' }],
+      });
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      provider: 'CODEX',
+      sessionKey: 'codex-project-session-1',
+    }));
+    projectMocks.clientPost.mockImplementation(async (url: string, body?: Record<string, unknown>) => {
+      if (!url.endsWith('/assistant/ensure-session')) throw new Error(`Unexpected POST ${url}`);
+      return {
+        data: {
+          provider: 'CODEX',
+          stateVersion: 1,
+          sessionKey: 'codex-project-session-1',
+          agentId: 'codex-project-agent-1',
+          runtime: 'codex-project-adapter',
+          model: String(body?.model || 'openai/gpt-5.5'),
+          modelValidated: true,
+          modelVerified: true,
+        },
+      };
+    });
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    const picker = await screen.findByRole('button', { name: 'Select project chat model' });
+    await waitFor(() => expect(picker).toHaveTextContent('Models unavailable'), { timeout: 2500 });
+    await user.click(picker);
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Codex models could not be loaded. Retry the catalog or enter an exact model ID.',
+    );
+    await user.click(screen.getByRole('button', { name: 'Retry model catalog' }));
+
+    await waitFor(() => expect(projectMocks.gatewayModels).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole('button', { name: 'Select model openai/gpt-5.4' })).toBeVisible();
+    expect(picker).toHaveAttribute('title', 'openai/gpt-5.5');
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/ensure-session'),
+    )).toHaveLength(1);
+  });
+
+  it('restores and unlocks a queued first-message draft after definitive send failure', async () => {
+    const admission = deferred<{ data: Record<string, unknown> }>();
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.clientPost.mockImplementation(async (url: string) => {
+      if (url.endsWith('/assistant/ensure-session')) return admission.promise;
+      if (url.endsWith('/assistant/send')) {
+        throw {
+          response: {
+            status: 409,
+            data: {
+              error: 'Provider rejected queued draft',
+              admissionStatus: 'never_admitted',
+            },
+          },
+        };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    const user = userEvent.setup();
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    await waitFor(() => expect(projectMocks.clientPost.mock.calls.some(
+      ([url]) => String(url).endsWith('/assistant/ensure-session'),
+    )).toBe(true));
+
+    const composer = screen.getByRole('textbox', { name: 'Message project agent' });
+    await user.type(composer, 'Keep this queued draft');
+    await user.click(screen.getByRole('button', { name: 'Send message to project agent' }));
+    await waitFor(() => expect(composer).toBeDisabled());
+    expect(composer).toHaveValue('');
+
+    await act(async () => {
+      admission.resolve({
+        data: {
+          provider: 'OPENCLAW',
+          stateVersion: 1,
+          sessionKey: 'project-session-1',
+          agentId: 'project-agent-1',
+          runtime: 'openclaw-dedicated-project-agent',
+          model: 'openai/gpt-5.5',
+          modelValidated: true,
+          modelVerified: true,
+        },
+      });
+      await admission.promise;
+    });
+
+    expect(await screen.findByText('Provider rejected queued draft')).toBeVisible();
+    await waitFor(() => expect(composer).toBeEnabled());
+    expect(composer).toHaveValue('Keep this queued draft');
+    expect(screen.getByRole('button', { name: 'Send message to project agent' })).toBeEnabled();
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/send'),
+    )).toHaveLength(1);
+  });
+
+  it('returns a queued first-message draft to the editable composer when bootstrap fails', async () => {
+    const admission = deferred<{ data: Record<string, unknown> }>();
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.clientPost.mockImplementation((url: string) => {
+      if (url.endsWith('/assistant/ensure-session')) return admission.promise;
+      throw new Error(`Unexpected POST ${url}`);
+    });
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    await waitFor(() => expect(projectMocks.clientPost.mock.calls.some(
+      ([url]) => String(url).endsWith('/assistant/ensure-session'),
+    )).toBe(true));
+    const composer = screen.getByRole('textbox', { name: 'Message project agent' });
+    await user.type(composer, 'Restore after failed admission');
+    await user.click(screen.getByRole('button', { name: 'Send message to project agent' }));
+    await waitFor(() => expect(composer).toBeDisabled());
+
+    await act(async () => {
+      admission.reject(new Error('runtime admission failed'));
+      await admission.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(composer).toBeEnabled());
+    expect(composer).toHaveValue('Restore after failed admission');
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/send'),
+    )).toHaveLength(0);
+  });
+
+  it('returns a queued draft for editing when the exact model catalog fails', async () => {
+    const admission = deferred<{ data: Record<string, unknown> }>();
+    const catalog = deferred<{ provider: string; models: never[] }>();
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.projectChatModels.mockReturnValue(catalog.promise);
+    projectMocks.clientPost.mockImplementation((url: string) => {
+      if (url.endsWith('/assistant/ensure-session')) return admission.promise;
+      throw new Error(`Unexpected POST ${url}`);
+    });
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    await waitFor(() => expect(projectMocks.projectChatModels).toHaveBeenCalledTimes(1));
+    const composer = screen.getByRole('textbox', { name: 'Message project agent' });
+    await user.type(composer, 'Edit after catalog failure');
+    await user.click(screen.getByRole('button', { name: 'Send message to project agent' }));
+    await waitFor(() => expect(composer).toBeDisabled());
+
+    await act(async () => {
+      catalog.reject(new Error('model catalog failed'));
+      await catalog.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(composer).toBeEnabled());
+    expect(composer).toHaveValue('Edit after catalog failure');
+
+    await act(async () => {
+      admission.resolve({
+        data: {
+          provider: 'OPENCLAW',
+          stateVersion: 1,
+          sessionKey: 'project-session-1',
+          agentId: 'project-agent-1',
+          runtime: 'openclaw-dedicated-project-agent',
+          model: 'openai/gpt-5.5',
+          modelValidated: true,
+          modelVerified: true,
+        },
+      });
+      await admission.promise;
+    });
+    await waitFor(() => expect(composer).toBeEnabled());
+    expect(composer).toHaveValue('Edit after catalog failure');
+    expect(screen.getByRole('button', { name: 'Send message to project agent' })).toBeDisabled();
+  });
+
+  it('restores a queued first-message draft after closing and reopening the panel', async () => {
+    const firstAdmission = deferred<{ data: Record<string, unknown> }>();
+    let admissionCount = 0;
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.clientPost.mockImplementation(async (url: string) => {
+      if (!url.endsWith('/assistant/ensure-session')) throw new Error(`Unexpected POST ${url}`);
+      admissionCount += 1;
+      if (admissionCount === 1) return firstAdmission.promise;
+      return {
+        data: {
+          provider: 'OPENCLAW',
+          stateVersion: 1,
+          sessionKey: 'project-session-1',
+          agentId: 'project-agent-1',
+          runtime: 'openclaw-dedicated-project-agent',
+          model: 'openai/gpt-5.5',
+          modelValidated: true,
+          modelVerified: true,
+        },
+      };
+    });
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    const firstPanel = render(<ProjectChatPanel projectName="alpha" onClose={onClose} />);
+    await waitFor(() => expect(admissionCount).toBe(1));
+    const firstComposer = screen.getByRole('textbox', { name: 'Message project agent' });
+    await user.type(firstComposer, 'Survive panel close');
+    await user.click(screen.getByRole('button', { name: 'Send message to project agent' }));
+    await waitFor(() => expect(firstComposer).toBeDisabled());
+    await user.click(screen.getByRole('button', { name: 'Close project chat' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    firstPanel.unmount();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    const restoredComposer = await screen.findByRole('textbox', { name: 'Message project agent' });
+    await waitFor(() => expect(restoredComposer).toHaveValue('Survive panel close'));
+    expect(restoredComposer).toBeEnabled();
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/send'),
+    )).toHaveLength(0);
+
+    await act(async () => {
+      firstAdmission.resolve({ data: {} });
+      await firstAdmission.promise;
+    });
+  });
+
+  it('restarts provider bootstrap when Retry is pressed during initial preparation', async () => {
+    const firstCapabilityRead = deferred<ProjectChatProviderCapabilitiesResponse>();
+    projectMocks.projectChatProviders
+      .mockReturnValueOnce(firstCapabilityRead.promise)
+      .mockResolvedValueOnce(capabilities());
+
+    const user = userEvent.setup();
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Retry now' }));
+    await waitFor(() => expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('OpenClaw Project agent verified and ready')).toBeVisible();
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/ensure-session'),
+    )).toHaveLength(1);
+
+    await act(async () => {
+      firstCapabilityRead.resolve(capabilities());
+      await firstCapabilityRead.promise;
+    });
+    expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(2);
   });
 
   it('renders and answers the exact broker question for a paused OpenClaw Project turn', async () => {
@@ -799,18 +1276,104 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps provider actions fail-closed while leaving the composer available to queue a first message', async () => {
+  it('keeps session mutations disabled after provider verification fails with a retained session key', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.agentPoll.mockRejectedValueOnce({
+      response: {
+        data: {
+          code: 'PROJECT_CHAT_VERSION_CONFLICT',
+          error: 'Project coordination changed during replay.',
+        },
+      },
+    });
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText(
+      'Project Chat could not prepare its current provider. Retry preparation for this project.',
+    )).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Session controls' }));
+    const dialog = screen.getByRole('dialog', { name: 'Session controls' });
+    expect(within(dialog).getByLabelText('Thinking level')).toBeDisabled();
+    expect(within(dialog).getByLabelText('Reasoning visibility')).toBeDisabled();
+    expect(within(dialog).getByRole('button', { name: 'Toggle Codex fast mode' })).toBeDisabled();
+    expect(within(dialog).getByRole('button', { name: 'New Session' })).toBeDisabled();
+
+    within(dialog).getByRole('button', { name: 'Toggle Codex fast mode' }).click();
+    expect(projectMocks.gatewayPatchSession).not.toHaveBeenCalled();
+  });
+
+  it('rejects a session-control response when provider verification changes mid-flight', async () => {
+    const replayAfterBootstrap = deferred<ReturnType<typeof replaySnapshot>>();
+    const patch = deferred<{ session: { fastMode: boolean } }>();
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities({
+      id: 'turn-session-control-race',
+      provider: 'OPENCLAW',
+      status: 'RUNNING',
+      requestId: 'message-session-control-race',
+      leaseExpiresAt: '2030-01-01T00:00:00.000Z',
+    }));
+    projectMocks.agentPoll
+      .mockResolvedValueOnce(replaySnapshot({
+        active: true,
+        isProcessing: true,
+        status: 'running',
+        runId: 'turn-session-control-race',
+      }))
+      .mockReturnValueOnce(replayAfterBootstrap.promise);
+    projectMocks.gatewayPatchSession.mockReturnValueOnce(patch.promise);
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByLabelText('Project transport connected')).toBeVisible();
+    await waitFor(() => expect(projectMocks.agentPoll).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole('button', { name: 'Session controls' }));
+    const dialog = screen.getByRole('dialog', { name: 'Session controls' });
+    const fastToggle = within(dialog).getByRole('button', { name: 'Toggle Codex fast mode' });
+    await waitFor(() => expect(fastToggle).toBeEnabled());
+    await user.click(fastToggle);
+    expect(projectMocks.gatewayPatchSession).toHaveBeenCalledTimes(1);
+    expect(fastToggle).toHaveAttribute('aria-pressed', 'true');
+
+    await act(async () => {
+      replayAfterBootstrap.reject({
+        response: {
+          data: {
+            code: 'PROJECT_CHAT_VERSION_CONFLICT',
+            error: 'Project coordination changed while the setting was pending.',
+          },
+        },
+      });
+      await replayAfterBootstrap.promise.catch(() => undefined);
+    });
+    await waitFor(() => expect(fastToggle).toBeDisabled());
+
+    await act(async () => {
+      patch.resolve({ session: { fastMode: true } });
+      await patch.promise;
+    });
+
+    await waitFor(() => expect(fastToggle).toHaveAttribute('aria-pressed', 'false'));
+    expect(projectMocks.gatewaySessionInfo).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the actual provider-discovery failure without inventing an OpenClaw preparation action', async () => {
     projectMocks.projectChatProviders.mockRejectedValue(new Error('runtime attestation failed'));
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
 
-    expect(await screen.findByText('No Project Chat provider is verified')).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Prepare OpenClaw for this project' })).toBeVisible();
+    expect(await screen.findByText('Project Chat could not open')).toBeVisible();
+    expect(screen.getByText('runtime attestation failed')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Prepare OpenClaw for this project' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible();
     // sending stays fail-closed, but choosing a different provider is
     // the recovery action and has to remain reachable. Every selection is
     // re-qualified server-side, so this picker is not the isolation boundary.
     expect(screen.getByRole('button', { name: 'Project chat provider' })).toBeEnabled();
     expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Send message to project agent' })).toBeDisabled();
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
     expect(projectMocks.clientPost).not.toHaveBeenCalled();
   });
 
@@ -840,7 +1403,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     );
     expect(within(panel).getByText(/creates a manifest-verified Project Chat copy with a new name/i)).toBeVisible();
     expect(within(panel).getByText(/legacy source, its share links, hosted apps, deployment, and older agent state stay untouched/i)).toBeVisible();
-    expect(screen.queryByText('No Project Chat provider is verified')).not.toBeInTheDocument();
+    expect(screen.queryByText('Prepare a provider to start chatting')).not.toBeInTheDocument();
     expect(projectMocks.chatHistory).not.toHaveBeenCalled();
     expect(projectMocks.agentPoll).not.toHaveBeenCalled();
     expect(projectMocks.clientPost).not.toHaveBeenCalled();
@@ -923,7 +1486,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     const status = await screen.findByRole('status');
     expect(status).toHaveAttribute('aria-live', 'polite');
     expect(status).toHaveAttribute('aria-atomic', 'true');
-    expect(status).toHaveTextContent('Preparing sandbox → Connecting agent');
+    expect(status).toHaveTextContent('Checking Project Chat providers…');
   });
 
   it('lets the server reconcile an automatic OpenClaw handshake instead of sending browser model state', async () => {
@@ -941,6 +1504,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
         provider: 'OPENCLAW',
         stateVersion: 1,
       },
+      { _silent: true },
     ));
   });
 
@@ -1024,6 +1588,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
         provider: 'OPENCLAW',
         model: 'xai/grok-4.20-beta-latest-reasoning',
       }),
+      { _silent: true },
     ));
   });
 
@@ -1107,19 +1672,24 @@ describe('ProjectChatPanel rendered provider contract', () => {
 
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
 
-    expect(await screen.findByText(
-      /No authenticated embedded model is available for this OpenClaw Project agent/i,
-      {},
+    const picker = await screen.findByRole(
+      'button',
+      { name: 'Select project chat model' },
       { timeout: 2500 },
-    )).toBeVisible();
+    );
+    await waitFor(() => expect(picker).toHaveTextContent('Models unavailable'));
+    await userEvent.click(picker);
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'No authenticated embedded model is available for this OpenClaw Project agent',
+    );
     expect(screen.queryByText('OpenClaw Project agent verified and ready')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Send message to project agent' })).toBeDisabled();
-    expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeDisabled();
+    expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeEnabled();
     expect(projectMocks.gatewayModels).not.toHaveBeenCalled();
     expect(localStorage.getItem('agent-model-alpha-OPENCLAW')).toBe('openai/gpt-5.6-sol');
   });
 
-  it('prepares OpenClaw automatically while keeping the composer available to queue', async () => {
+  it('opens an unqualified Project read-only and prepares OpenClaw only after an explicit click', async () => {
     const qualification = deferred<{
       provider: 'OPENCLAW';
       qualification: ReturnType<typeof capabilities>['qualifications']['OPENCLAW'];
@@ -1164,6 +1734,17 @@ describe('ProjectChatPanel rendered provider contract', () => {
     projectMocks.projectChatProviders
       .mockResolvedValueOnce(unqualified)
       .mockResolvedValue(qualified);
+    projectMocks.chatHistory.mockResolvedValue({
+      messages: [{
+        id: 'stale-history-1',
+        role: 'assistant',
+        content: 'Historical transcript remains readable before preparation.',
+        timestamp: '2026-07-19T08:00:00.000Z',
+        provider: 'OPENCLAW',
+        runtime: 'openclaw-dedicated-project-agent',
+      }],
+      pagination: { hasMore: false, nextCursor: null, limit: 100 },
+    });
     projectMocks.qualifyProjectChatProvider.mockReturnValueOnce(qualification.promise);
     projectMocks.agentPoll.mockResolvedValue(replaySnapshot({ stateVersion: 2 }));
     projectMocks.clientPost.mockImplementation(async (url: string) => {
@@ -1192,15 +1773,21 @@ describe('ProjectChatPanel rendered provider contract', () => {
       />,
     );
     const providerMenu = await screen.findByRole('button', { name: 'Project chat provider' });
+    expect(await screen.findByText('Historical transcript remains readable before preparation.')).toBeVisible();
+    expect(projectMocks.chatHistory).toHaveBeenCalledWith('alpha', 'OPENCLAW', { limit: 100 });
     expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeEnabled();
     expect(providerMenu).toHaveAttribute('title', 'OpenClaw is not verified for this project yet.');
     expect(document.body).not.toHaveTextContent('docker exec');
     expect(document.body).not.toHaveTextContent('/root/.openclaw');
     expect(document.body).not.toHaveTextContent('nonce=secret');
+    expect(projectMocks.qualifyProjectChatProvider).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
 
-    const close = screen.getByRole('button', { name: 'Close project chat' });
+    await userEvent.click(screen.getByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
+
     await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1));
-    close.click();
     expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1);
     expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledWith('alpha', 'OPENCLAW');
     expect(onClose).not.toHaveBeenCalled();
@@ -1216,13 +1803,14 @@ describe('ProjectChatPanel rendered provider contract', () => {
     await waitFor(() => {
       expect(screen.queryByRole('button', { name: 'Prepare OpenClaw for this project' })).not.toBeInTheDocument();
     });
-    expect(screen.queryByText('No Project Chat provider is verified')).not.toBeInTheDocument();
+    expect(screen.queryByText('Prepare a provider to start chatting')).not.toBeInTheDocument();
     const progress = screen.getByRole('status', { name: 'OpenClaw preparation progress' });
     expect(progress).toHaveTextContent('Request accepted');
     expect(progress).toHaveTextContent('Preparing sandbox');
     expect(progress).toHaveTextContent('Connecting agent');
+    expect(progress).toHaveTextContent('You can close this panel. Preparation will continue in the background');
     expect(progress.textContent).not.toMatch(/\d+%/);
-    expect(screen.getByRole('button', { name: 'Close project chat' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Close project chat' })).toBeEnabled();
     expect(projectMocks.projectChatModels).not.toHaveBeenCalled();
     expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeEnabled();
 
@@ -1247,7 +1835,218 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(onActivityChange.mock.calls[1][1]).toBe(false);
   });
 
-  it('suppresses a failed automatic qualification across remounts while allowing a manual retry', async () => {
+  it('reopens the chosen provider row when preparation fails before the provider switch', async () => {
+    const mixed = capabilities();
+    mixed.providers = mixed.providers.map((entry) => (
+      entry.provider === 'CODEX'
+        ? {
+            ...entry,
+            selectable: false,
+            executionScope: null,
+            reason: 'Codex is not verified for this project yet.',
+          }
+        : entry
+    ));
+    mixed.supportedProviders = mixed.supportedProviders.filter(
+      (entry) => entry.provider !== 'CODEX',
+    );
+    mixed.qualifications.CODEX = {
+      provider: 'CODEX',
+      status: 'UNQUALIFIED',
+      selectable: false,
+      reason: 'Codex is not verified for this project yet.',
+      qualifiedAt: null,
+      expiresAt: null,
+      evidenceFingerprint: null,
+    };
+    projectMocks.projectChatProviders.mockResolvedValue(mixed);
+    projectMocks.qualifyProjectChatProvider.mockRejectedValueOnce({
+      response: {
+        data: {
+          code: 'PROJECT_PROVIDER_AUTH_REQUIRED',
+          error: 'untrusted provider detail',
+        },
+      },
+    });
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    const picker = await screen.findByRole('button', { name: 'Project chat provider' });
+    expect(picker).toHaveTextContent('OpenClaw');
+    await user.click(picker);
+    await user.click(await screen.findByRole('menuitem', { name: 'Prepare Codex' }));
+
+    await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledWith(
+      'alpha',
+      'CODEX',
+    ));
+    const reopenedMenu = await screen.findByRole('menu', { name: 'Project chat providers' });
+    expect(within(reopenedMenu).getByText(
+      'Codex must be reconnected in AI Settings before it can be prepared for this project.',
+    )).toBeVisible();
+    expect(within(reopenedMenu).getByRole('menuitem', {
+      name: 'Reconnect in AI Settings',
+    })).toHaveAttribute('href', '/settings?tab=ai-providers');
+    expect(within(reopenedMenu).getByRole('menuitem', {
+      name: 'Recheck Codex after reconnecting',
+    })).toBeEnabled();
+    expect(picker).toHaveTextContent('OpenClaw');
+    expect(document.body).not.toHaveTextContent('untrusted provider detail');
+  });
+
+  it('allows dismissal during long provider preparation and releases activity exactly once', async () => {
+    const qualification = deferred<{
+      provider: 'OPENCLAW';
+      qualification: ReturnType<typeof capabilities>['qualifications']['OPENCLAW'];
+      stateVersion: number;
+    }>();
+    projectMocks.projectChatProviders.mockResolvedValue(
+      unqualifiedOpenClawCapabilities('project-dismiss-preparation'),
+    );
+    projectMocks.qualifyProjectChatProvider.mockReturnValueOnce(qualification.promise);
+    const onClose = vi.fn();
+    const onActivityChange = vi.fn<(
+      activity: Readonly<ProjectChatActivity>,
+      active: boolean,
+    ) => boolean>(() => true);
+    function PreparationHarness() {
+      const [open, setOpen] = React.useState(true);
+      if (!open) return <div>Project Chat closed</div>;
+      return (
+        <ProjectChatPanel
+          projectName="alpha"
+          onClose={() => {
+            onClose();
+            setOpen(false);
+          }}
+          onActivityChange={onActivityChange}
+        />
+      );
+    }
+    const user = userEvent.setup();
+
+    render(<PreparationHarness />);
+    await user.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
+    await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1));
+    const progress = screen.getByRole('status', { name: 'OpenClaw preparation progress' });
+    expect(progress).toHaveTextContent('Preparation will continue in the background');
+    const activity = onActivityChange.mock.calls[0][0];
+
+    await user.click(screen.getByRole('button', { name: 'Close project chat' }));
+
+    expect(await screen.findByText('Project Chat closed')).toBeVisible();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onActivityChange).toHaveBeenNthCalledWith(1, activity, true);
+    expect(onActivityChange).toHaveBeenNthCalledWith(2, activity, false);
+    expect(onActivityChange).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      qualification.resolve({
+        provider: 'OPENCLAW',
+        qualification: capabilities().qualifications.OPENCLAW,
+        stateVersion: 2,
+      });
+      await qualification.promise;
+    });
+    expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(1);
+    expect(onActivityChange).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps an unqualified draft editable and points to explicit preparation instead of queueing it', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(
+      unqualifiedOpenClawCapabilities('project-unqualified-draft'),
+    );
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="draft-project" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('Prepare a provider to start chatting')).toBeVisible();
+    const composer = screen.getByRole('textbox', { name: 'Message project agent' });
+    await user.type(composer, 'Keep this draft under my control');
+    await user.click(screen.getByRole('button', { name: 'Send message to project agent' }));
+
+    expect(composer).toBeEnabled();
+    expect(composer).toHaveValue('Keep this draft under my control');
+    expect(screen.getByText(
+      'Prepare OpenClaw before sending. Your draft is still in the composer.',
+    )).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Prepare OpenClaw for this project' })).toBeVisible();
+    expect(screen.queryByText('Preparing sandbox → Connecting agent')).not.toBeInTheDocument();
+    expect(projectMocks.clientPost).not.toHaveBeenCalled();
+  });
+
+  it('restores an unqualified submitted draft after preparation continues through close and reopen', async () => {
+    const projectId = 'project-preparation-draft';
+    const unqualified = unqualifiedOpenClawCapabilities(projectId);
+    const qualified = capabilities();
+    qualified.executionContext = {
+      scope: 'PROJECT_SANDBOX',
+      projectId,
+      policyFingerprint: 'policy-v1',
+    };
+    const qualification = deferred<{
+      provider: 'OPENCLAW';
+      qualification: typeof qualified.qualifications.OPENCLAW;
+      stateVersion: number;
+    }>();
+    projectMocks.projectChatProviders
+      .mockResolvedValueOnce(unqualified)
+      .mockResolvedValue(qualified);
+    projectMocks.qualifyProjectChatProvider.mockReturnValueOnce(qualification.promise);
+
+    function PreparationDraftHarness() {
+      const [open, setOpen] = React.useState(true);
+      return open ? (
+        <ProjectChatPanel
+          projectName="draft-project"
+          onClose={() => setOpen(false)}
+        />
+      ) : (
+        <button type="button" onClick={() => setOpen(true)}>Reopen Project Chat</button>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(<PreparationDraftHarness />);
+
+    expect(await screen.findByText('Prepare a provider to start chatting')).toBeVisible();
+    const composer = screen.getByRole('textbox', { name: 'Message project agent' });
+    await user.type(composer, 'Keep this draft through preparation');
+    await user.click(screen.getByRole('button', { name: 'Send message to project agent' }));
+    expect(composer).toHaveValue('Keep this draft through preparation');
+
+    await user.click(screen.getByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
+    await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('status', { name: 'OpenClaw preparation progress' })).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Close project chat' }));
+    expect(await screen.findByRole('button', { name: 'Reopen Project Chat' })).toBeVisible();
+
+    await act(async () => {
+      qualification.resolve({
+        provider: 'OPENCLAW',
+        qualification: qualified.qualifications.OPENCLAW,
+        stateVersion: 2,
+      });
+      await qualification.promise;
+    });
+    await user.click(screen.getByRole('button', { name: 'Reopen Project Chat' }));
+
+    expect(await screen.findByText('OpenClaw Project agent verified and ready')).toBeVisible();
+    const restoredComposer = screen.getByRole('textbox', { name: 'Message project agent' });
+    expect(restoredComposer).toBeEnabled();
+    expect(restoredComposer).toHaveValue('Keep this draft through preparation');
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/send'),
+    )).toHaveLength(0);
+  });
+
+  it('persists a failed explicit qualification across remounts while allowing a manual retry', async () => {
     const unqualified = capabilities();
     unqualified.providers = unqualified.providers.map((entry) => (
       entry.provider === 'OPENCLAW'
@@ -1289,36 +2088,44 @@ describe('ProjectChatPanel rendered provider contract', () => {
       });
 
     const first = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    expect(projectMocks.qualifyProjectChatProvider).not.toHaveBeenCalled();
+    await userEvent.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
     await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(
       'OpenClaw must be reconnected in AI Settings',
     ));
+    expect(screen.getByRole('link', { name: 'Reconnect in AI Settings' })).toHaveAttribute(
+      'href',
+      '/settings?tab=ai-providers',
+    );
+    expect(screen.getByRole('button', {
+      name: 'Recheck OpenClaw after reconnecting',
+    })).toBeEnabled();
     first.unmount();
 
     const second = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
-    const prepare = await screen.findByRole('button', {
-      name: 'Prepare OpenClaw for this project',
+    const recheck = await screen.findByRole('button', {
+      name: 'Recheck OpenClaw after reconnecting',
     });
     expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1);
 
     projectMocks.projectChatProviders.mockResolvedValue(capabilities());
-    await userEvent.click(prepare);
+    await userEvent.click(recheck);
     await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(3));
     second.unmount();
 
     projectMocks.projectChatProviders.mockResolvedValue(unqualified);
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
-    await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(3));
+    await screen.findByRole('button', { name: 'Prepare OpenClaw for this project' });
+    expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(2);
   });
 
-  it('retries an automatic qualification that was interrupted before it could fail', async () => {
-    // A first qualification on a new project takes 27-90s server-side. The
-    // panel used to claim the 15-minute suppression up front, so reloading or
-    // switching away mid-flight left a block behind for an attempt that never
-    // returned a verdict: the project came back permanently unqualified, with
-    // no automatic retry and no failure to explain it. Only a real failure may
-    // suppress.
+  it('does not restart an interrupted explicit qualification after remount', async () => {
+    // Opening Project Chat is read-only. If a manually started preparation is
+    // interrupted by navigation, reopening must not launch another mutation.
     const unqualified = capabilities();
     unqualified.providers = unqualified.providers.map((entry) => (
       entry.provider === 'OPENCLAW'
@@ -1353,19 +2160,19 @@ describe('ProjectChatPanel rendered provider contract', () => {
       });
 
     const first = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    await userEvent.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
     await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1));
     // The reload lands while the request is still outstanding.
     first.unmount();
 
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
-    await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(2));
+    await screen.findByRole('button', { name: 'Prepare OpenClaw for this project' });
+    expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1);
   });
 
-  it('stops after one automatic attempt when the host contradicts its own qualification', async () => {
-    // A host that answers "qualified" while its capability readback still
-    // reports the provider unqualified clears the suppression on every pass.
-    // Without a per-mount cap that disagreement spins this panel against the
-    // qualification endpoint for as long as the project stays open.
+  it('does not mutate provider state when capability readback reports an unqualified lane', async () => {
     const projectId = 'project-contradictory-host';
     const unqualified = capabilities();
     unqualified.executionContext = {
@@ -1403,25 +2210,15 @@ describe('ProjectChatPanel rendered provider contract', () => {
     });
 
     render(<ProjectChatPanel projectName="contradictory-host" onClose={vi.fn()} />);
-    await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1));
-    const refreshesAfterFirstAttempt = projectMocks.projectChatProviders.mock.calls.length;
-
-    // Let every queued capability refresh settle. Each one re-presents the
-    // provider as unqualified, which is exactly what used to re-arm the effect.
-    for (let pass = 0; pass < 10; pass += 1) {
-      await act(async () => { await Promise.resolve(); });
-    }
-
-    expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1);
-    expect(projectMocks.projectChatProviders.mock.calls.length)
-      .toBeLessThanOrEqual(refreshesAfterFirstAttempt + 1);
     expect(await screen.findByRole('button', {
       name: 'Prepare OpenClaw for this project',
     })).toBeEnabled();
+    expect(projectMocks.qualifyProjectChatProvider).not.toHaveBeenCalled();
+    expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(1);
   });
 
   it.each(['read', 'write'] as const)(
-    'keeps the in-memory qualification guard when sessionStorage %s fails',
+    'keeps an explicit qualification failure bounded when sessionStorage %s fails',
     async (failureMode) => {
       const projectId = `project-storage-${failureMode}`;
       const projectName = `storage-${failureMode}`;
@@ -1486,6 +2283,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
         const first = render(
           <ProjectChatPanel projectName={projectName} onClose={vi.fn()} />,
         );
+        await userEvent.click(await screen.findByRole('button', {
+          name: 'Prepare OpenClaw for this project',
+        }));
         await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1));
         await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(
           'OpenClaw must be reconnected in AI Settings',
@@ -1561,6 +2361,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
       <ProjectChatPanel projectName="host-maintenance" onClose={vi.fn()} />,
     );
 
+    await userEvent.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(
       'The provider’s confined project runtime did not pass its server security checks.',
     ));
@@ -1643,6 +2446,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
     const firstView = render(
       <ProjectChatPanel projectName="explicit-host-recheck" onClose={vi.fn()} />,
     );
+    await user.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
     const recheck = await screen.findByRole('button', {
       name: 'Recheck OpenClaw after host repair',
     });
@@ -1660,7 +2466,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(screen.queryByText(/host must be updated or repaired/)).not.toBeInTheDocument();
   });
 
-  it('expires a persisted host disposition and performs only one normal automatic recheck', async () => {
+  it('expires a persisted host disposition without launching an automatic recheck', async () => {
     const now = Date.parse('2026-07-27T22:00:00.000Z');
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
     vi.setSystemTime(now);
@@ -1676,14 +2482,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
         retryAt: null,
       }]),
     );
-    projectMocks.projectChatProviders
-      .mockResolvedValueOnce(unqualifiedOpenClawCapabilities(projectId))
-      .mockResolvedValue(capabilities());
-    projectMocks.qualifyProjectChatProvider.mockResolvedValueOnce({
-      provider: 'OPENCLAW',
-      qualification: capabilities().qualifications.OPENCLAW,
-      stateVersion: 2,
-    });
+    projectMocks.projectChatProviders.mockResolvedValue(
+      unqualifiedOpenClawCapabilities(projectId),
+    );
 
     render(<ProjectChatPanel projectName={projectName} onClose={vi.fn()} />);
     await vi.waitFor(() => {
@@ -1697,8 +2498,11 @@ describe('ProjectChatPanel rendered provider contract', () => {
       await vi.advanceTimersByTimeAsync(60_100);
     });
     await vi.waitFor(() => {
-      expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('button', {
+        name: 'Prepare OpenClaw for this project',
+      })).toBeEnabled();
     });
+    expect(projectMocks.qualifyProjectChatProvider).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', {
       name: 'Recheck OpenClaw after host repair',
     })).not.toBeInTheDocument();
@@ -1709,7 +2513,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(60_000);
     });
-    expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledTimes(1);
+    expect(projectMocks.qualifyProjectChatProvider).not.toHaveBeenCalled();
   });
 
   it('disables qualification actions until a validated 429 retry time', async () => {
@@ -1758,6 +2562,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
       <ProjectChatPanel projectName="rate-limited" onClose={vi.fn()} />,
     );
 
+    await userEvent.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(
       'Too many Project provider preparation attempts.',
     ));
@@ -1833,6 +2640,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
       <ProjectChatPanel projectName={projectName} onClose={vi.fn()} />,
     );
 
+    await userEvent.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(
       'Too many Project provider preparation attempts.',
     ));
@@ -1879,6 +2689,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
       const firstView = render(
         <ProjectChatPanel projectName={projectName} onClose={vi.fn()} />,
       );
+      await userEvent.click(await screen.findByRole('button', {
+        name: 'Prepare OpenClaw for this project',
+      }));
       await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(
         'Portal could not safely verify this project’s immutable identity',
       ));
@@ -1929,6 +2742,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
     const firstView = render(
       <ProjectChatPanel projectName={projectName} onClose={vi.fn()} />,
     );
+    await userEvent.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(
       'Portal could not prepare OpenClaw for this project.',
     ));
@@ -1985,6 +2801,9 @@ describe('ProjectChatPanel rendered provider contract', () => {
 
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
 
+    await userEvent.click(await screen.findByRole('button', {
+      name: 'Prepare OpenClaw for this project',
+    }));
     await waitFor(() => expect(projectMocks.qualifyProjectChatProvider).toHaveBeenCalledWith(
       'alpha',
       'OPENCLAW',
@@ -2024,8 +2843,13 @@ describe('ProjectChatPanel rendered provider contract', () => {
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
 
     const providerMenu = await screen.findByRole('button', { name: 'Project chat provider' });
+    await waitFor(() => expect(screen.getByText(
+      'OpenClaw Project agent verified and ready',
+    )).toBeVisible());
+    expect(projectMocks.agentZeroProjectModels).not.toHaveBeenCalled();
     await user.click(providerMenu);
     await user.click(screen.getByRole('menuitem', { name: 'Review Agent Zero' }));
+    await waitFor(() => expect(projectMocks.agentZeroProjectModels).toHaveBeenCalledTimes(1));
     const modelPicker = await screen.findByRole('combobox', { name: 'Agent Zero qualification model' });
     const qualify = screen.getByRole('button', { name: 'Qualify Agent Zero for this project' });
     expect(modelPicker).toHaveValue('');
@@ -2040,6 +2864,22 @@ describe('ProjectChatPanel rendered provider contract', () => {
       'AGENT_ZERO',
       'codex_oauth/gpt-5.5',
     ));
+  });
+
+  it('opens connected-model review from the active unqualified Agent Zero banner', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(unqualifiedAgentZeroCapabilities());
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    const review = await screen.findByRole('button', { name: 'Review Agent Zero connected models' });
+    expect(projectMocks.agentZeroProjectModels).not.toHaveBeenCalled();
+    await user.click(review);
+
+    expect(await screen.findByRole('menu', { name: 'Project chat providers' })).toBeVisible();
+    expect(await screen.findByRole('combobox', { name: 'Agent Zero qualification model' })).toBeVisible();
+    await waitFor(() => expect(projectMocks.agentZeroProjectModels).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText('Select a model from a currently connected Agent Zero OAuth provider before qualification.')).not.toBeInTheDocument();
   });
 
   it('bounds a resumed long turn, blocks provider switching, and exposes replay recovery', async () => {
@@ -2084,7 +2924,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(screen.getByRole('button', { name: 'Retry now' })).toBeVisible();
     expect(projectMocks.clientGet).toHaveBeenCalledWith(
       '/projects/alpha/assistant/resume-session',
-      { params: { provider: 'OPENCLAW', turnId: 'turn-1' } },
+      { params: { provider: 'OPENCLAW', turnId: 'turn-1' }, _silent: true },
     );
     expect(projectMocks.clientPost.mock.calls.filter(([url]) => String(url).endsWith('/assistant/ensure-session'))).toHaveLength(0);
 
@@ -2255,13 +3095,64 @@ describe('ProjectChatPanel rendered provider contract', () => {
       await providerSwitch.promise;
     });
 
-    expect(await screen.findByText('No Project Chat provider is verified')).toBeVisible();
+    expect(await screen.findByText('Project Chat could not open')).toBeVisible();
     // once the transition has settled, the picker must come back so a
     // different provider can be chosen. Leaving it disabled here was the wedge
     // that only a full page reload could clear.
     expect(providerSelect).toBeEnabled();
     expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeEnabled();
     await waitFor(() => expect(onActivityChange).toHaveBeenCalledWith(activity, false));
+    await user.click(screen.getByRole('button', { name: 'Close project chat' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases a successful provider transition without starting a duplicate bootstrap', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.selectProjectChatProvider.mockResolvedValue({
+      provider: 'CODEX',
+      stateVersion: 2,
+      sessionKey: 'codex-project-session-2',
+      agentId: 'codex-project-agent-2',
+      runtime: 'codex-project-adapter',
+      model: 'openai/gpt-5.6',
+      modelValidated: true,
+      modelVerified: true,
+      resumed: false,
+    });
+    const onClose = vi.fn();
+    const onActivityChange = vi.fn<(
+      activity: Readonly<ProjectChatActivity>,
+      active: boolean,
+    ) => boolean>(() => true);
+    const user = userEvent.setup();
+
+    render(
+      <ProjectChatPanel
+        projectName="alpha"
+        onClose={onClose}
+        onActivityChange={onActivityChange}
+      />,
+    );
+
+    expect(await screen.findByText('OpenClaw Project agent verified and ready')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Use Codex' }));
+    await user.click(await screen.findByRole('button', { name: 'Switch provider' }));
+
+    expect(await screen.findByText('Codex Project agent verified and ready')).toBeVisible();
+    expect(projectMocks.selectProjectChatProvider).toHaveBeenCalledTimes(1);
+    expect(projectMocks.projectChatProviders).toHaveBeenCalledTimes(1);
+    expect(projectMocks.clientPost.mock.calls.filter(
+      ([url]) => String(url).endsWith('/assistant/ensure-session'),
+    )).toHaveLength(1);
+    const activity = onActivityChange.mock.calls[0][0];
+    expect(activity).toMatchObject({
+      kind: 'provider-transition',
+      previousProvider: 'OPENCLAW',
+      provider: 'CODEX',
+    });
+    await waitFor(() => expect(onActivityChange).toHaveBeenCalledWith(activity, false));
+    expect(screen.getByRole('button', { name: 'Close project chat' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: 'Close project chat' }));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
@@ -2639,6 +3530,14 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(screen.queryByText(/Delivery confirmation is pending/i)).not.toBeInTheDocument();
     const rejectedMessageId = sentBodies[0]?.messageId;
 
+    const historyReadsBeforeRecovery = projectMocks.chatHistory.mock.calls.length;
+    await user.click(screen.getByRole('button', { name: 'Refresh Project Chat state' }));
+    await waitFor(() => expect(projectMocks.chatHistory.mock.calls.length).toBeGreaterThan(
+      historyReadsBeforeRecovery,
+    ));
+    await waitFor(() => expect(screen.queryByText('message was not admitted')).not.toBeInTheDocument());
+    await waitFor(() => expect(composer).toBeEnabled());
+
     await user.clear(composer);
     await user.type(composer, 'Corrected draft');
     await user.click(screen.getByRole('button', { name: 'Send message to project agent' }));
@@ -2809,6 +3708,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     await waitFor(() => expect(projectMocks.clientPost).toHaveBeenCalledWith(
       '/projects/alpha/assistant/reset',
       { provider: 'OPENCLAW', stateVersion: 1 },
+      { _silent: true },
     ));
     await waitFor(() => expect(localStorage.getItem(codexPendingKey)).toBeNull());
   });
@@ -3037,6 +3937,52 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(projectMocks.gatewayPatchSession).not.toHaveBeenCalled();
   });
 
+  it('offers the real destructive reset when preserved delivery state is corrupt', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    window.localStorage.setItem(
+      projectChatPendingSendStorageKey('user-1', 'project-alpha', 'OPENCLAW'),
+      '{corrupt-delivery-state',
+    );
+    projectMocks.clientPost.mockImplementation(async (url: string) => {
+      if (url.endsWith('/assistant/ensure-session')) {
+        return { data: {
+          provider: 'OPENCLAW', stateVersion: 1, sessionKey: 'project-session-1',
+          agentId: 'project-agent-1', runtime: 'openclaw-dedicated-project-agent',
+          model: 'openai/gpt-5.5', modelValidated: true, modelVerified: true,
+        } };
+      }
+      if (url.endsWith('/assistant/reset')) {
+        return { data: {
+          success: true,
+          provider: 'OPENCLAW',
+          stateVersion: 2,
+        } };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    const reset = await screen.findByRole('button', {
+      name: 'Clear Project Chat and start over',
+    });
+    await waitFor(() => expect(reset).toBeEnabled());
+    await user.click(reset);
+
+    await waitFor(() => expect(projectMocks.clientPost).toHaveBeenCalledWith(
+      '/projects/alpha/assistant/reset',
+      { provider: 'OPENCLAW', stateVersion: 1 },
+      { _silent: true },
+    ));
+    await waitFor(() => expect(
+      screen.queryByRole('button', { name: 'Clear Project Chat and start over' }),
+    ).not.toBeInTheDocument());
+    expect(window.localStorage.getItem(
+      projectChatPendingSendStorageKey('user-1', 'project-alpha', 'OPENCLAW'),
+    )).toBeNull();
+  });
+
   it('copies attachments into the verified project and sends only a project-relative path', async () => {
     projectMocks.projectChatProviders.mockResolvedValue(capabilities());
     projectMocks.clientPost.mockImplementation(async (url: string, body?: Record<string, unknown>) => {
@@ -3114,10 +4060,54 @@ describe('ProjectChatPanel rendered provider contract', () => {
         stateVersion: 1,
         message: expect.stringContaining('- project_path: .portal/attachments/upload-1/reference.png'),
       }),
+      { _silent: true },
     ));
     const sendCall = projectMocks.clientPost.mock.calls.find(([url]) => String(url).endsWith('/assistant/send'));
     const sentMessage = String(sendCall?.[1]?.message || '');
     expect(sentMessage).toContain('Use this reference.');
     expect(sentMessage).not.toMatch(/server_path|tool_url|portal_url|diskPath|originalDiskPath|\/api\/files/i);
+  });
+
+  it('shows the attachment failure and retries the exact file through the real upload route', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: async () => ({ error: 'Attachment scanner is temporarily unavailable.' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          projectPath: '.portal/attachments/upload-2/reference.png',
+          provider: 'OPENCLAW',
+          stateVersion: 1,
+        }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Attach files' })).toBeEnabled());
+    const file = new File(['image bytes'], 'reference.png', { type: 'image/png' });
+    await user.upload(screen.getByLabelText('Choose files to attach'), file);
+
+    expect(await screen.findByText(
+      'reference.png: Attachment scanner is temporarily unavailable.',
+    )).toBeVisible();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole('button', { name: 'Retry attachment reference.png' }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(
+      screen.queryByRole('button', { name: 'Retry attachment reference.png' }),
+    ).not.toBeInTheDocument());
+    expect(screen.getByText('reference.png')).toBeVisible();
+    const retriedBody = fetchMock.mock.calls[1]?.[1]?.body as FormData;
+    expect((retriedBody.get('file') as File).name).toBe('reference.png');
+    expect(retriedBody.get('provider')).toBe('OPENCLAW');
+    expect(retriedBody.get('stateVersion')).toBe('1');
   });
 });

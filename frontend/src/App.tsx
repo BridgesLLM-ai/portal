@@ -10,6 +10,10 @@ import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 import { RouteOperationProvider } from './contexts/RouteOperationContext';
 import { useWorkspaceAuthorizationLifecycle } from './hooks/useWorkspaceAuthorizationLifecycle';
+import {
+  isVendorPortalBrandingPath,
+  synchronizePortalIconLinks,
+} from './utils/portalBranding';
 
 const MODULE_RELOAD_PREFIX = 'portal-module-reload:';
 const SETUP_STATUS_TIMEOUT_MS = 8_000;
@@ -181,6 +185,24 @@ function LegacyAgentToolsRedirect({ tab }: { tab: 'automations' | 'usage' | 'ski
   return <Navigate to={`/agent-tools${search ? `?${search}` : ''}`} replace />;
 }
 
+function PortalBrandingLifecycle() {
+  const location = useLocation();
+  const publicSettings = usePublicSettings();
+  const vendorBrandingSurface = isVendorPortalBrandingPath(location.pathname);
+  const tenantLogoUrl = vendorBrandingSurface ? '' : publicSettings?.logoUrl;
+
+  useWorkspaceAuthorizationLifecycle(undefined, tenantLogoUrl);
+
+  useEffect(() => {
+    document.title = vendorBrandingSurface
+      ? 'BridgesLLM Portal'
+      : publicSettings?.portalName?.trim() || 'BridgesLLM Portal';
+    synchronizePortalIconLinks(tenantLogoUrl);
+  }, [publicSettings?.portalName, tenantLogoUrl, vendorBrandingSurface]);
+
+  return null;
+}
+
 export default function App() {
   const {
     restoreSession,
@@ -188,13 +210,11 @@ export default function App() {
     sessionRestoreError,
     abandonQuarantinedSession,
   } = useAuthStore();
-  useWorkspaceAuthorizationLifecycle();
   const heartbeatRef = useRef<ReturnType<typeof setInterval>>();
   const [setupChecked, setSetupChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState<boolean>(false);
   const [isReinstall, setIsReinstall] = useState<boolean>(false);
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
-  const publicSettings = usePublicSettings();
   const setupModeActive = needsSetup || isReinstall;
 
   useEffect(() => {
@@ -245,19 +265,6 @@ export default function App() {
     };
   }, [restoreSession, bootstrapAttempt]);
 
-
-  useEffect(() => {
-    document.title = publicSettings?.portalName?.trim() || 'BridgesLLM Portal';
-    let link = document.querySelector("link[data-portal-favicon='true']") as HTMLLinkElement | null;
-    if (!link) {
-      link = document.createElement('link');
-      link.rel = 'icon';
-      link.dataset.portalFavicon = 'true';
-      document.head.appendChild(link);
-    }
-    link.href = publicSettings?.logoUrl?.trim() || '/favicon.ico';
-  }, [publicSettings]);
-
   // Session heartbeat — update last_activity every 5 min
   useEffect(() => {
     if (!isAuthenticated || sessionRestoreError) return;
@@ -292,6 +299,7 @@ export default function App() {
 
   return (
     <BrowserRouter>
+      <PortalBrandingLifecycle />
       <RouteOperationProvider>
         <Routes>
         <Route

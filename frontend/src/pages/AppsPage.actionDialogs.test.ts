@@ -21,6 +21,8 @@ const responsiveProjectSidebar = sourceBetween('{/* Sidebar - Project List & Fil
 const responsiveProjectPanels = sourceBetween('{/* Right Panel - Git / Share / Activity */}', '{/* Confirm Delete Share Link */}');
 const createProjectHandler = sourceBetween('const createProject = async () => {', 'const requestDeleteProject');
 const createShareHandler = sourceBetween('const createShareLink = async () => {', 'const toggleShareActive');
+const loadSharesHandler = sourceBetween('const loadShares = useCallback', 'const retryLoadShares');
+const selectProjectHandler = sourceBetween('const selectProject = useCallback', 'useEffect(() => {\n    if (!projectDeepLinkPresent');
 const toggleShareHandler = sourceBetween('const toggleShareActive = async (linkId: string) => {', '// Download project');
 const shareEmailHandler = sourceBetween('const sendShareEmail = async (linkId: string) => {', 'const deleteSharePermanently');
 const deleteShareHandler = sourceBetween('const deleteSharePermanently = async () => {', 'const makeSharePublic');
@@ -70,9 +72,10 @@ describe('AppsPage action dialog ownership', () => {
     expect(responsiveProjectSidebar).not.toContain('fixed inset-0');
     expect(responsiveProjectSidebar).not.toContain("isMobile ? 'fixed left-0");
 
-    expect(responsiveProjectPanels.match(/<ResponsiveProjectPanel\b/g)).toHaveLength(5);
+    expect(responsiveProjectPanels.match(/<ResponsiveProjectPanel\b/g)).toHaveLength(6);
     expect(responsiveProjectPanels).toContain('mobileLabel="Project Git panel"');
     expect(responsiveProjectPanels).toContain('mobileLabel="Project analysis results"');
+    expect(responsiveProjectPanels).toContain('mobileLabel="Project deployment recovery"');
     expect(responsiveProjectPanels).toContain('mobileLabel="Project deployment controls"');
     expect(responsiveProjectPanels).toContain('mobileLabel="Project activity panel"');
     expect(responsiveProjectPanels).toContain('mobileLabel="Project sharing panel"');
@@ -134,6 +137,44 @@ describe('AppsPage action dialog ownership', () => {
     expect(responsiveProjectPanels).toContain('disabled={shareActionActive || shareEmailSuccess === link.id}');
     expect(responsiveProjectPanels).toContain('aria-busy={shareEmailSending}');
     expect(responsiveProjectPanels).toContain('role="alert"');
+  });
+
+  it('keeps visitor-slot and shared API throttle controls honest and bounded', () => {
+    expect(createShareHandler).toContain("Password must be at most 72 UTF-8 bytes");
+    expect(createShareHandler).toContain("Visitor slots must be a whole number from 1 to 1,000,000");
+    expect(createShareHandler).toContain("API request limit must be a whole number from 1 to 1,000,000");
+    expect(createShareHandler).toContain('rateLimitMaxRequests,');
+    expect(createShareHandler).toContain('rateLimitWindowSeconds: request.rateLimitWindowSeconds');
+    expect(toggleShareHandler).toContain('visitor slot limit cannot be reactivated');
+
+    expect(responsiveProjectPanels).toContain('aria-label="Visitor slot presets"');
+    expect(responsiveProjectPanels).toContain('72 UTF-8 bytes maximum');
+    expect(responsiveProjectPanels).toContain('id="share-password-byte-error" role="alert"');
+    expect(responsiveProjectPanels).toContain('id="share-password-mismatch-error" role="alert"');
+    expect(responsiveProjectPanels).toContain("' share-password-byte-error'");
+    expect(responsiveProjectPanels).toContain("'share-password-mismatch-error'");
+    expect(responsiveProjectPanels).toContain('aria-invalid={shareMaxUsesInvalid}');
+    expect(responsiveProjectPanels).toContain('aria-invalid={shareRateLimitMaxRequestsInvalid}');
+    expect(responsiveProjectPanels).toContain('aria-label="Limit share link API requests"');
+    expect(responsiveProjectPanels).toContain('Each slot grants one browser up to 30 days of access while the link remains active.');
+    expect(responsiveProjectPanels).toContain('Counts dynamic API requests only; static files are excluded.');
+    expect(responsiveProjectPanels).toContain("'Unlimited API requests'");
+    expect(responsiveProjectPanels).toContain('id="share-create-error" role="alert"');
+  });
+
+  it('gives share reads monotonic ownership and rechecks it after the project autosave barrier', () => {
+    expect(appsSource).toContain('const shareLoadGenerationRef = useRef(0);');
+    expect(loadSharesHandler).toContain('const loadGeneration = ++shareLoadGenerationRef.current;');
+    expect(loadSharesHandler).toContain('shareLoadGenerationRef.current === loadGeneration');
+    expect(loadSharesHandler.match(/if \(!ownsShareReadback\(\)\) return false;/g)).toHaveLength(2);
+
+    const autosaveBarrier = selectProjectHandler.indexOf('await flushPendingAutoSave();');
+    const postBarrierShareCheck = selectProjectHandler.indexOf(
+      'if (projectOperationRef.current || deleteInFlightRef.current || isShareActionInFlight()) return;',
+      autosaveBarrier,
+    );
+    expect(autosaveBarrier).toBeGreaterThan(-1);
+    expect(postBarrierShareCheck).toBeGreaterThan(autosaveBarrier);
   });
 
 });

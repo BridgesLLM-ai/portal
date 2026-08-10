@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   parseAskQuestionPayload,
   formatAskQuestionAnswer,
+  isUnansweredAskQuestionResult,
   __askQuestionCardTest,
 } from './AskQuestionCard';
 
@@ -121,5 +122,17 @@ describe('formatAskQuestionAnswer', () => {
 
   it('ignores whitespace-only free text', () => {
     expect(formatAskQuestionAnswer(payload, {}, { 0: '   ' })).toBe('');
+  });
+});
+
+describe('isUnansweredAskQuestionResult', () => {
+  it('recognizes Claude native questions that settled without a human answer', () => {
+    expect(isUnansweredAskQuestionResult('The user did not answer the questions.')).toBe(true);
+    expect(isUnansweredAskQuestionResult('  The user did not answer the question  ')).toBe(true);
+  });
+
+  it('does not relabel a real answer', () => {
+    expect(isUnansweredAskQuestionResult('Use the durable fix.')).toBe(false);
+    expect(isUnansweredAskQuestionResult(undefined)).toBe(false);
   });
 });

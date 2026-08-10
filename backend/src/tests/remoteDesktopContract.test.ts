@@ -293,6 +293,18 @@ describe('Remote Desktop release contract', () => {
     expect(skill).toContain('never guess a host root');
     expect(skill).toContain('`/api/files/<encoded-file-id>`');
     expect(skill).toContain('references/files-and-projects.md');
+    expect(skill).toContain('Settings → Security → Hosted content embeds');
+    expect(skill).toContain('applies immediately to every hosted app and project share');
+    expect(skill).toContain('removable defaults rather than permanent trust');
+    expect(skill).toContain('Saving an empty list allows no third-party frame origins');
+    expect(skill).toContain("authenticated Portal's CSP is never widened");
+    expect(skill).toContain('Remove any default or custom origin');
+    expect(skill).toContain('allow="camera; microphone"');
+    expect(skill).toContain('not private or per-project');
+    expect(skill).not.toContain('YouTube and YouTube No-Cookie are built in');
+    expect(skill).not.toContain('built-in embed origins');
+    expect(skill).not.toContain('There is no per-app embed allowlist in Settings yet');
+    expect(skill).not.toContain('exception is operator-owned Caddy configuration');
     expect(guide).toContain(
       '[Open the handoff](/root/.openclaw/workspace-main/audit/HANDOFF-project-chat-and-backups.md)',
     );

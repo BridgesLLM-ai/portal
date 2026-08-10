@@ -39,7 +39,19 @@ export function resolveNativeCliCredentialPaths(
     return [path.join(codexHome, 'auth.json')];
   }
   if (providerName === 'GEMINI') {
-    const paths = [path.join(home, '.gemini', 'antigravity-cli')];
+    // Attest only credential-bearing state, never the CLI's whole working
+    // tree. ~/.gemini/antigravity-cli also holds the self-updating binary
+    // under bin/ (~18 MB), logs, caches, and a conversation database, so a
+    // whole-directory walk outgrows any fixed attestation budget as soon as
+    // the tool is actually used — which surfaced as every Google sign-in
+    // being refused before it started.
+    const antigravityDir = path.join(home, '.gemini', 'antigravity-cli');
+    const paths = [
+      path.join(antigravityDir, 'jetski_state.pbtxt'),
+      path.join(antigravityDir, 'settings.json'),
+      path.join(antigravityDir, 'installation_id'),
+      path.join(home, '.gemini', 'config', 'config.json'),
+    ];
     const applicationCredentials = String(source.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
     if (applicationCredentials) paths.push(applicationCredentials);
     return paths;

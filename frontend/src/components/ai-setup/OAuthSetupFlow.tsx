@@ -454,7 +454,8 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
         && !startFailure.sessionId
         && startFailure.credentialState !== 'committed'
         && (conflictCode === 'PROVIDER_CREDENTIAL_LIFECYCLE_CONFLICT'
-          || /recovering the previous authorization lifecycle|already owns this provider credential/i.test(String(msg)));
+          || conflictCode === 'PROVIDER_CREDENTIAL_LIFECYCLE_RECOVERY_REQUIRED'
+          || /recovering the previous authorization lifecycle|already owns this provider credential|currently owns this credential domain|retained provider-removal lifecycle|retained for review|still owns this provider|Reset stuck sign-in/i.test(String(msg)));
       if (isLifecycleConflict) {
         setLifecycleConflict(true);
         setError(msg);

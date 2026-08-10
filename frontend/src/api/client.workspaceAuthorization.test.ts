@@ -184,4 +184,35 @@ describe('Axios workspace authorization request identity', () => {
     expect(useAuthStore.getState().isAuthenticated).toBe(false);
     expect(useAuthStore.getState().user).toBeNull();
   });
+
+  it('does not create a critical activity error for a silent expected-failure probe', async () => {
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      throw new AxiosError(
+        'Agent Zero is not connected',
+        'ERR_BAD_RESPONSE',
+        config,
+        undefined,
+        {
+          data: { error: 'Agent Zero is not connected' },
+          status: 503,
+          statusText: 'Service Unavailable',
+          headers: {
+            [PORTAL_AUTHORIZATION_VERSION_HEADER.toLowerCase()]: '3',
+          },
+          config,
+        },
+      );
+    });
+    client.defaults.adapter = adapter as AxiosAdapter;
+
+    await expect(client.get(
+      '/projects/alpha/chat/providers/agent-zero/models',
+      { _silent: true, _skipNetworkRetry: true } as any,
+    )).rejects.toMatchObject({ response: { status: 503 } });
+
+    expect(adapter).toHaveBeenCalledTimes(1);
+    expect(adapter.mock.calls.some(
+      ([config]) => String(config.url).includes('/activity/report-error'),
+    )).toBe(false);
+  });
 });

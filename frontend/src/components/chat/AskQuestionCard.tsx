@@ -97,6 +97,12 @@ export function formatAskQuestionAnswer(
   return parts.join('\n\n');
 }
 
+/** Claude Code's headless native prompt can settle without a human response. */
+export function isUnansweredAskQuestionResult(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  return /^the user did not answer the questions?\.?$/i.test(value.trim());
+}
+
 export function AskQuestionCard({
   payload,
   disabled,
@@ -110,6 +116,7 @@ export function AskQuestionCard({
 }) {
   const [selections, setSelections] = useState<Record<number, string[]>>({});
   const [freeText, setFreeText] = useState<Record<number, string>>({});
+  const unanswered = isUnansweredAskQuestionResult(answered);
 
   const canSubmit = useMemo(() => {
     if (disabled || answered) return false;
@@ -134,6 +141,19 @@ export function AskQuestionCard({
   };
 
   if (answered) {
+    if (unanswered) {
+      return (
+        <div className="my-2 rounded-2xl border border-amber-400/20 bg-amber-500/[0.06] px-4 py-2.5">
+          <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-amber-200/75">
+            <HelpCircle size={11} />
+            <span>not answered</span>
+          </div>
+          <div className="whitespace-pre-wrap text-[12px] leading-relaxed text-slate-300/95">
+            {answered}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="my-2 rounded-2xl border border-emerald-400/20 bg-emerald-500/[0.06] px-4 py-2.5">
         <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-emerald-200/75">

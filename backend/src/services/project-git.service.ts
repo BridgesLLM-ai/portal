@@ -397,7 +397,10 @@ export function buildProjectGitContainerArgs(
   return args;
 }
 
-function prepareOptions(options: ProjectGitCommandOptions): ProjectGitCommandOptions {
+function prepareOptions(
+  options: ProjectGitCommandOptions,
+  normalizeMutatingOwnership: boolean,
+): ProjectGitCommandOptions {
   const remoteUrls: string[] = [];
   const checked = assertSafeProjectGitRepository(
     options.workspace,
@@ -406,14 +409,17 @@ function prepareOptions(options: ProjectGitCommandOptions): ProjectGitCommandOpt
     remoteUrls,
   );
   if (options.args[0] === 'clone') remoteUrls.push(assertSafeProjectGitUrl(options.args[3]));
-  const workspace = commandMutatesWorkspace(options.args)
+  const workspace = normalizeMutatingOwnership && commandMutatesWorkspace(options.args)
     ? prepareProjectGitWorkspace(checked)
     : checked;
   return { ...options, workspace };
 }
 
-export async function spawnProjectGitCommand(options: ProjectGitCommandOptions): Promise<ProjectGitProcess> {
-  const prepared = prepareOptions(options);
+async function spawnProjectGitCommandInternal(
+  options: ProjectGitCommandOptions,
+  normalizeMutatingOwnership: boolean,
+): Promise<ProjectGitProcess> {
+  const prepared = prepareOptions(options, normalizeMutatingOwnership);
   const workloadId = crypto.randomUUID();
   const containerName = projectContainerName(
     `${prepared.actorId}\0${prepared.projectId}\0${workloadId}`,
@@ -537,13 +543,28 @@ export async function spawnProjectGitCommand(options: ProjectGitCommandOptions):
   return { process: child, containerName, result, cancel, cleanup, plan };
 }
 
+export async function spawnProjectGitCommand(options: ProjectGitCommandOptions): Promise<ProjectGitProcess> {
+  return spawnProjectGitCommandInternal(options, true);
+}
+
 export async function runProjectGitCommand(options: ProjectGitCommandOptions): Promise<string> {
   return (await spawnProjectGitCommand(options)).result;
+}
+
+/**
+ * Project Chat has already normalized legacy trees during provider preparation,
+ * and every Portal mutation boundary preserves the shared runtime UID/GID.
+ * Its post-turn checkpoint therefore must not recursively traverse the warm
+ * repository before each Git mutation.
+ */
+export async function runPreparedProjectGitCommand(options: ProjectGitCommandOptions): Promise<string> {
+  return (await spawnProjectGitCommandInternal(options, false)).result;
 }
 
 export const __projectGitTest = {
   dockerCliEnvironment,
   commandMutatesWorkspace,
+  prepareOptions,
   projectContainerName,
   safeGitConfig: SAFE_GIT_CONFIG,
 };

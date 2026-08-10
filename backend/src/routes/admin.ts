@@ -78,6 +78,18 @@ import {
   getPortalFeatureCapabilities,
   portalFeatureUnavailableResponse,
 } from '../utils/portalFeatureCapabilities';
+import {
+  EmbedSecurityPolicyRevisionConflictError,
+  EmbedSecurityPolicyValidationError,
+  MAX_CUSTOM_EMBED_ORIGINS,
+  MAX_EMBED_ORIGIN_BYTES,
+  readEmbedSecurityPolicyState,
+  updateEmbedSecurityPolicy,
+} from '../services/embedSecurityPolicy';
+import {
+  invalidateEmailBrandingCache,
+  isEmailBrandingSettingKey,
+} from '../templates/baseTemplate';
 
 const router = Router();
 
@@ -1038,6 +1050,53 @@ router.post('/registration-requests/:id/deny', requireOwner, async (req: Request
 
 // ── System Settings ───────────────────────────────────────────────
 
+const embedSecurityPolicySchema = z.object({
+  expectedRevision: z.string().regex(/^[a-f0-9]{64}$/),
+  entries: z.array(z.object({
+    origin: z.string().min(1).max(MAX_EMBED_ORIGIN_BYTES),
+    camera: z.boolean(),
+    microphone: z.boolean(),
+  }).strict()).max(MAX_CUSTOM_EMBED_ORIGINS),
+}).strict();
+
+router.get('/security/embed-origins', requireOwner, async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    res.json(await readEmbedSecurityPolicyState());
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.put('/security/embed-origins', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const input = embedSecurityPolicySchema.parse(req.body);
+    const state = await updateEmbedSecurityPolicy({
+      ...input,
+      actorUserId: req.user!.userId,
+      ipAddress: String(req.ip || '').slice(0, 128) || null,
+      userAgent: String(req.get('user-agent') || '').slice(0, 512) || null,
+    });
+    res.json(state);
+  } catch (error) {
+    if (error instanceof EmbedSecurityPolicyRevisionConflictError) {
+      res.status(409).json({
+        code: 'EMBED_SECURITY_POLICY_REVISION_CONFLICT',
+        error: error.message,
+        current: await readEmbedSecurityPolicyState().catch(() => undefined),
+      });
+      return;
+    }
+    if (error instanceof EmbedSecurityPolicyValidationError) {
+      res.status(400).json({
+        code: 'INVALID_EMBED_SECURITY_POLICY',
+        error: error.message,
+      });
+      return;
+    }
+    next(error);
+  }
+});
+
 /**
  * GET /api/admin/settings
  * Get all SystemSettings as a key-value object
@@ -1071,6 +1130,7 @@ const searchVisibilitySchema = z.object({
 router.put('/settings', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const normalizedData = parseAdminSettingsPatch(req.body);
+    const emailBrandingChanged = Object.keys(normalizedData).some(isEmailBrandingSettingKey);
     let preparedBackupRoot: string | null = null;
     let previousBackupRoot: string | null = null;
 
@@ -1146,6 +1206,7 @@ router.put('/settings', requireOwner, async (req: Request, res: Response, next: 
     } else {
       await commitSettingsPatch();
     }
+    if (emailBrandingChanged) invalidateEmailBrandingCache();
 
     // Log settings change
     await prisma.activityLog.create({
@@ -1275,6 +1336,16 @@ function sendImageUploadFailure(res: Response, error: unknown): boolean {
   return true;
 }
 
+function cleanupPortalLogoVariantsBestEffort(keepFilename?: string): void {
+  try {
+    cleanupBasenamePrefixVariants(BRANDING_DIR, 'portal-logo', keepFilename);
+  } catch {
+    // The setting write is already committed. Old files are inert because the
+    // explicit appearance row wins; report success and reconcile next upload.
+    console.error('[branding] Failed to clean up superseded Portal logo files');
+  }
+}
+
 router.post('/appearance/logo', requireOwner, uploadImage, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
@@ -1282,14 +1353,20 @@ router.post('/appearance/logo', requireOwner, uploadImage, async (req: Request, 
     const cropParams = parseCropParams(req.body);
     const basename = `portal-logo-${Date.now()}`;
     const { ext } = await processImageToTarget(req.file.path, req.file.mimetype, path.join(BRANDING_DIR, basename), cropParams, { staticSize: 512, gifSize: 256 });
-    cleanupBasenamePrefixVariants(BRANDING_DIR, 'portal-logo', `${basename}${ext}`);
 
     const logoUrl = `/static-assets/branding/${basename}${ext}`;
-    await prisma.systemSetting.upsert({
-      where: { key: 'appearance.logoUrl' },
-      update: { value: logoUrl },
-      create: { key: 'appearance.logoUrl', value: logoUrl },
-    });
+    try {
+      await prisma.systemSetting.upsert({
+        where: { key: 'appearance.logoUrl' },
+        update: { value: logoUrl },
+        create: { key: 'appearance.logoUrl', value: logoUrl },
+      });
+    } catch (error) {
+      cleanupFile(path.join(BRANDING_DIR, `${basename}${ext}`));
+      throw error;
+    }
+    invalidateEmailBrandingCache();
+    cleanupPortalLogoVariantsBestEffort(`${basename}${ext}`);
 
     return res.json({ success: true, logoUrl });
   } catch (error) {
@@ -1302,12 +1379,13 @@ router.post('/appearance/logo', requireOwner, uploadImage, async (req: Request, 
 
 router.delete('/appearance/logo', requireOwner, async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    cleanupBasenamePrefixVariants(BRANDING_DIR, 'portal-logo');
     await prisma.systemSetting.upsert({
       where: { key: 'appearance.logoUrl' },
       update: { value: '' },
       create: { key: 'appearance.logoUrl', value: '' },
     });
+    invalidateEmailBrandingCache();
+    cleanupPortalLogoVariantsBestEffort();
     return res.json({ success: true });
   } catch (error) {
     return next(error);

@@ -10,7 +10,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Bot, X, Trash2, Send, Loader2, ChevronRight, ChevronDown,
   Wrench, Sparkles, StopCircle, Paperclip, Copy, Check, Code2, Radio,
-  Mic, MicOff, XCircle, CheckCircle2, RotateCcw, MessageSquare
+  Mic, MicOff, XCircle, CheckCircle2, RotateCcw, RefreshCw, MessageSquare
 } from 'lucide-react';
 import MarkdownRenderer from './MarkdownRenderer';
 import SlashCommandMenu from './SlashCommandMenu';
@@ -19,6 +19,7 @@ import client from '../../api/client';
 import { gatewayAPI, projectsAPI } from '../../api/endpoints';
 import { workspaceAuthorizedFetch } from '../../utils/workspaceAuthorizedFetch';
 import type {
+  ProjectChatHistoryPage,
   ProjectChatPersistedMessage,
   ProjectChatProviderCapability,
   ProjectChatProviderName,
@@ -60,6 +61,7 @@ import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
 import ProjectProviderMenu, {
   normalizeProjectQualificationRetryAt,
+  projectQualificationAuthRecoveryAction,
   projectQualificationRecoveryAction,
   type ProjectProviderQualificationFailure,
   type ProjectQualificationRecoveryRole,
@@ -197,8 +199,12 @@ const AUTOMATIC_QUALIFICATION_SUPPRESSION_STORAGE_KEY =
 const AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS = 15 * 60_000;
 const MAX_AUTOMATIC_QUALIFICATION_SUPPRESSION_TTL_MS = 60 * 60_000;
 const MAX_AUTOMATIC_QUALIFICATION_SUPPRESSIONS = 64;
+const QUEUED_COMPOSER_DRAFT_STORAGE_PREFIX = 'portal:project-chat:queued-composer:v1';
+const MAX_QUEUED_COMPOSER_DRAFT_LENGTH = 256 * 1024;
+const QUEUED_COMPOSER_DRAFT_TTL_MS = 30 * 60_000;
 type AutomaticQualificationSuppressionDisposition =
   | 'AUTO_ONLY'
+  | 'AI_SETTINGS'
   | 'HOST_MAINTENANCE'
   | 'IDENTITY_UNAVAILABLE_NON_RETRYABLE'
   | 'NON_RETRYABLE'
@@ -210,6 +216,106 @@ type AutomaticQualificationSuppression = Readonly<{
   disposition: AutomaticQualificationSuppressionDisposition;
   retryAt: string | null;
 }>;
+
+type QueuedComposerDraftScope = Readonly<{
+  actorUserId: string;
+  projectId: string;
+  provider: ProjectChatProviderName;
+}>;
+
+function queuedComposerDraftStorageKey(scope: QueuedComposerDraftScope): string | null {
+  const actor = scope.actorUserId.trim();
+  const project = scope.projectId.trim();
+  if (!actor || !project || actor.length > 256 || project.length > 256) return null;
+  return `${QUEUED_COMPOSER_DRAFT_STORAGE_PREFIX}:${encodeURIComponent(actor)}:${encodeURIComponent(project)}:${scope.provider}`;
+}
+
+function queuedComposerDraftStorage(): Storage | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+function readQueuedComposerDraft(scope: QueuedComposerDraftScope): string | null {
+  const storage = queuedComposerDraftStorage();
+  const key = queuedComposerDraftStorageKey(scope);
+  if (!storage || !key) return null;
+  try {
+    const raw = storage.getItem(key);
+    if (!raw) return null;
+    if (raw.length > MAX_QUEUED_COMPOSER_DRAFT_LENGTH + 1_024) {
+      storage.removeItem(key);
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    const value = typeof parsed?.value === 'string' ? parsed.value : '';
+    const expiresAt = Number(parsed?.expiresAt);
+    if (
+      !value.trim()
+      || value.length > MAX_QUEUED_COMPOSER_DRAFT_LENGTH
+      || !Number.isSafeInteger(expiresAt)
+      || expiresAt <= Date.now()
+      || expiresAt > Date.now() + QUEUED_COMPOSER_DRAFT_TTL_MS
+    ) {
+      storage.removeItem(key);
+      return null;
+    }
+    return value;
+  } catch {
+    try {
+      storage.removeItem(key);
+    } catch {
+      // Ignore cleanup failure in a blocked store.
+    }
+    return null;
+  }
+}
+
+function writeQueuedComposerDraft(scope: QueuedComposerDraftScope, value: string): void {
+  const storage = queuedComposerDraftStorage();
+  const key = queuedComposerDraftStorageKey(scope);
+  if (!storage || !key) return;
+  try {
+    if (!value.trim()) {
+      storage.removeItem(key);
+      return;
+    }
+    // This is intentionally tab-scoped. Pending-send storage remains
+    // fingerprint-only; this short-lived copy exists solely so a queued draft
+    // can be returned to the composer after closing and reopening the panel.
+    if (value.length <= MAX_QUEUED_COMPOSER_DRAFT_LENGTH) {
+      storage.setItem(key, JSON.stringify({
+        value,
+        expiresAt: Date.now() + QUEUED_COMPOSER_DRAFT_TTL_MS,
+      }));
+    }
+  } catch {
+    // A blocked session store must not prevent queueing or sending a message.
+  }
+}
+
+function clearQueuedComposerDraft(scope: QueuedComposerDraftScope): void {
+  const storage = queuedComposerDraftStorage();
+  const key = queuedComposerDraftStorageKey(scope);
+  if (!storage || !key) return;
+  try {
+    storage.removeItem(key);
+  } catch {
+    // A blocked session store must not prevent normal Project Chat cleanup.
+  }
+}
+
+function projectChatHistoryErrorDetail(error: any): string {
+  const detail = String(
+    error?.response?.data?.error
+    || error?.message
+    || 'The saved transcript is temporarily unavailable.',
+  ).replace(/\s+/g, ' ').trim();
+  return detail.slice(0, 500) || 'The saved transcript is temporarily unavailable.';
+}
 
 const automaticQualificationMemorySuppressions = new Map<
   string,
@@ -345,10 +451,6 @@ function readAutomaticQualificationSuppression(
   return storedEntry;
 }
 
-function isAutomaticQualificationSuppressed(key: string, now = Date.now()): boolean {
-  return readAutomaticQualificationSuppression(key, now) !== null;
-}
-
 function suppressAutomaticQualification(
   key: string,
   options: Readonly<{
@@ -439,6 +541,16 @@ function failureFromAutomaticQualificationSuppression(
       suppressionExpiresAt: new Date(suppression.expiresAt).toISOString(),
     };
   }
+  if (suppression.disposition === 'AI_SETTINGS') {
+    return {
+      message: SAFE_PROJECT_QUALIFICATION_ERROR_MESSAGES.PROJECT_PROVIDER_AUTH_REQUIRED(label),
+      code: 'PROJECT_PROVIDER_AUTH_REQUIRED',
+      retryable: false,
+      recovery: 'AI_SETTINGS',
+      retryAt: null,
+      suppressionExpiresAt: new Date(suppression.expiresAt).toISOString(),
+    };
+  }
   if (suppression.disposition === 'IDENTITY_UNAVAILABLE_NON_RETRYABLE') {
     return {
       message: SAFE_PROJECT_QUALIFICATION_ERROR_MESSAGES.PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE(label),
@@ -481,6 +593,7 @@ function safeProjectQualificationError(
   const safeMessage = SAFE_PROJECT_QUALIFICATION_ERROR_MESSAGES[code];
   const safePayload = typeof safeMessage === 'function';
   const runtimePolicyFailure = code === 'PROJECT_RUNTIME_POLICY_FAILED';
+  const providerAuthRequired = code === 'PROJECT_PROVIDER_AUTH_REQUIRED';
   const rateLimited = code === 'PROJECT_QUALIFICATION_RATE_LIMITED';
   const explicitRetryable = typeof payload?.retryable === 'boolean'
     ? payload.retryable
@@ -518,12 +631,14 @@ function safeProjectQualificationError(
       ? safeMessage(label)
       : `Portal could not prepare ${label} for this project. Review the provider setup and try again.`,
     code: safePayload ? code : 'PROJECT_QUALIFICATION_FAILED',
-    retryable: runtimePolicyFailure
+    retryable: runtimePolicyFailure || providerAuthRequired
       ? false
       : explicitRetryable ?? true,
     recovery: runtimePolicyFailure
       ? 'HOST_MAINTENANCE'
-      : null,
+      : providerAuthRequired
+        ? 'AI_SETTINGS'
+        : null,
     retryAt: rateLimited
       ? (
           normalizeProjectQualificationRetryAt(payload?.retryAt)
@@ -605,6 +720,29 @@ export class ProjectReplayContractError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ProjectReplayContractError';
+  }
+}
+
+export function assertProjectChatHistoryIdentity(
+  page: Pick<ProjectChatHistoryPage, 'executionContext'>,
+  expectedProjectId: string | null,
+): void {
+  // projectsAPI validates this field for real HTTP responses. Keep the guard
+  // tolerant of older component fixtures while still rejecting any response
+  // that claims a different immutable Project or execution scope.
+  const context = page?.executionContext as ProjectChatHistoryPage['executionContext'] | undefined;
+  if (context === undefined) return;
+  const returnedProjectId = typeof context.projectId === 'string'
+    ? context.projectId.trim()
+    : '';
+  if (
+    context.scope !== 'PROJECT_SANDBOX'
+    || !expectedProjectId
+    || returnedProjectId !== expectedProjectId
+  ) {
+    throw new ProjectReplayContractError(
+      'Portal returned saved chat history for a different Project. Refresh Project Chat before retrying.',
+    );
   }
 }
 
@@ -1366,9 +1504,20 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function AttachmentChip({ attachment, onRemove }: { attachment: PendingAttachment; onRemove: () => void }) {
+function AttachmentChip({
+  attachment,
+  onRemove,
+  onRetry,
+}: {
+  attachment: PendingAttachment;
+  onRemove: () => void;
+  onRetry: () => void;
+}) {
   const isUploading = attachment.uploadStatus === 'uploading';
   const hasError = attachment.uploadStatus === 'error';
+  const visibleLabel = hasError
+    ? `${attachment.name}: ${attachment.uploadError || 'Upload failed'}`
+    : attachment.name;
   return (
     <div className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] ${
       hasError ? 'bg-red-500/10 border border-red-500/20 text-red-300' :
@@ -1376,8 +1525,18 @@ function AttachmentChip({ attachment, onRemove }: { attachment: PendingAttachmen
       'bg-white/[0.06] border border-white/[0.08] text-slate-300'
     }`}>
       {isUploading ? <Loader2 size={10} className="animate-spin text-amber-400" /> : <Paperclip size={10} className="text-slate-400" />}
-      <span className="max-w-[80px] truncate">{attachment.name}</span>
+      <span className="max-w-[180px] truncate" title={visibleLabel}>{visibleLabel}</span>
       {isUploading ? <span className="text-amber-400/60 text-[8px]">…</span> : null}
+      {hasError ? (
+        <button
+          type="button"
+          aria-label={`Retry attachment ${attachment.name}`}
+          onClick={onRetry}
+          className="ml-0.5 rounded p-0.5 text-red-200 transition-colors hover:bg-red-500/20 hover:text-white"
+        >
+          <RotateCcw size={9} />
+        </button>
+      ) : null}
       <button aria-label={`Remove attachment ${attachment.name}`} onClick={onRemove} className="ml-0.5 text-slate-500 hover:text-slate-200"><X size={9} /></button>
     </div>
   );
@@ -1452,26 +1611,50 @@ function ProjectModelPicker({
   value,
   onChange,
   models,
+  loading = false,
+  error = null,
   disabled = false,
   exactCatalogOnly = false,
+  onRetry,
 }: {
   value: string;
   onChange: (model: string) => void;
   models: string[];
+  loading?: boolean;
+  error?: string | null;
   disabled?: boolean;
   exactCatalogOnly?: boolean;
+  onRetry?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [custom, setCustom] = useState(false);
+  const [customDraft, setCustomDraft] = useState(value);
   const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const close = useCallback(() => {
+    setOpen(false);
+    setCustom(false);
+    setCustomDraft(value);
+  }, [value]);
+
+  const submitCustomModel = useCallback(() => {
+    const nextModel = customDraft.trim();
+    if (!nextModel) return;
+    onChange(nextModel);
+    close();
+  }, [close, customDraft, onChange]);
 
   useEffect(() => {
     if (!disabled) return;
-    setOpen(false);
-    setCustom(false);
-  }, [disabled]);
+    close();
+  }, [close, disabled]);
 
-  if (models.length === 0) return null;
+  // Native providers can accept an exact model id even when they do not
+  // publish a catalog. Exact-catalog providers stay visible on loading/error
+  // so the operator can retry instead of losing the only recovery control.
+  if (models.length === 0 && exactCatalogOnly && !loading && !error) return null;
+
+  const emptySelectionLabel = exactCatalogOnly ? 'Select model' : 'Default model';
 
   return (
     <div className="relative">
@@ -1480,26 +1663,73 @@ function ProjectModelPicker({
         type="button"
         aria-haspopup="dialog"
         aria-expanded={open}
+        aria-busy={loading}
         aria-label="Select project chat model"
         onClick={() => setOpen(!open)}
         disabled={disabled}
         className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-[11px] text-slate-400 hover:text-slate-200 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-        title={disabled ? 'Model selection is unavailable while the project runtime is changing' : value || 'Default model'}
+        title={disabled
+          ? 'Model selection is unavailable while the project runtime is changing'
+          : error || value || emptySelectionLabel}
       >
-        <Code2 size={13} className="sm:hidden flex-shrink-0" />
+        {loading
+          ? <Loader2 size={13} className="sm:hidden flex-shrink-0 animate-spin" />
+          : error
+            ? <XCircle size={13} className="flex-shrink-0 text-red-300" />
+            : <Code2 size={13} className="sm:hidden flex-shrink-0" />}
         <div className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[220px]">
-          {value ? <ModelMeta modelId={value} compact /> : <span className="truncate max-w-[140px]">Default model</span>}
+          {loading ? <Loader2 size={12} className="flex-shrink-0 animate-spin text-violet-300" /> : null}
+          {error
+            ? <span className="truncate max-w-[140px] text-red-300">Models unavailable</span>
+            : value
+              ? <ModelMeta modelId={value} compact />
+              : <span className="truncate max-w-[140px]">{emptySelectionLabel}</span>}
         </div>
         <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''} hidden sm:block`} />
       </button>
-      <ModelPickerDropdown open={open} anchorRef={triggerRef} onClose={() => { setOpen(false); setCustom(false); }}>
+      <ModelPickerDropdown open={open} anchorRef={triggerRef} onClose={close}>
         <div className="p-1 scrollbar-thin scrollbar-thumb-white/10">
-          {!exactCatalogOnly && <button onClick={() => { onChange(''); setCustom(false); setOpen(false); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${!value ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
+          {loading && (
+            <div className="flex items-center gap-2 border-b border-white/[0.06] px-3 py-2 text-[11px] text-slate-400">
+              <Loader2 size={12} className="animate-spin text-violet-300" />
+              Loading models…
+            </div>
+          )}
+          {error && (
+            <div role="alert" className="border-b border-red-500/15 bg-red-500/[0.06] px-3 py-2 text-[11px] text-red-200">
+              <div className="flex items-start gap-2">
+                <XCircle size={12} className="mt-0.5 flex-shrink-0" aria-hidden="true" />
+                <span className="min-w-0 flex-1">{error}</span>
+              </div>
+              {onRetry && (
+                <button
+                  type="button"
+                  onClick={onRetry}
+                  disabled={loading}
+                  className="mt-2 inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-red-400/20 bg-red-500/10 px-2.5 text-[11px] text-red-100 disabled:opacity-50"
+                >
+                  <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+                  Retry model catalog
+                </button>
+              )}
+            </div>
+          )}
+          {!loading && !error && models.length === 0 && !exactCatalogOnly && (
+            <div role="status" className="border-b border-white/[0.06] px-3 py-2 text-[11px] text-slate-500">
+              This provider does not publish a model catalog here. Enter the exact model ID manually.
+            </div>
+          )}
+          {!loading && !error && models.length === 0 && exactCatalogOnly && (
+            <div role="status" className="border-b border-amber-500/15 bg-amber-500/[0.06] px-3 py-2 text-[11px] text-amber-100">
+              No verified models are available for this Project provider.
+            </div>
+          )}
+          {!exactCatalogOnly && <button type="button" onClick={() => { onChange(''); close(); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${!value ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
             <span className="flex-1 text-left">Default</span>
             {!value && <Check size={12} className="text-violet-400" />}
           </button>}
           {models.map((m) => (
-            <button key={m} aria-label={`Select model ${m}`} onClick={() => { onChange(m); setCustom(false); setOpen(false); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${value === m ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
+            <button type="button" key={m} aria-label={`Select model ${m}`} onClick={() => { onChange(m); close(); }} className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs transition-colors ${value === m ? 'bg-violet-500/10 text-violet-300' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
               <ModelMeta modelId={m} />
               {value === m && <Check size={12} className="text-violet-400 flex-shrink-0" />}
             </button>
@@ -1507,10 +1737,29 @@ function ProjectModelPicker({
           {!exactCatalogOnly && <div className="border-t border-white/[0.06] mt-1 pt-1">
             {custom ? (
               <div className="px-2 py-1">
-                <input aria-label="Custom model name" autoFocus className="w-full bg-black/30 border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/40" placeholder="Custom model name" value={value} onChange={(e) => onChange(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') setOpen(false); }} />
+                <input
+                  aria-label="Custom model name"
+                  autoFocus
+                  className="w-full bg-black/30 border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/40"
+                  placeholder="Custom model name"
+                  value={customDraft}
+                  onChange={(event) => setCustomDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') submitCustomModel();
+                    if (event.key === 'Escape') close();
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={submitCustomModel}
+                  disabled={!customDraft.trim()}
+                  className="mt-2 inline-flex min-h-[36px] w-full items-center justify-center rounded-lg border border-violet-500/25 bg-violet-500/10 px-3 text-xs font-medium text-violet-100 disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  Apply model
+                </button>
               </div>
             ) : (
-              <button onClick={() => setCustom(true)} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-slate-400 hover:bg-white/[0.04] hover:text-slate-200">
+              <button type="button" onClick={() => { setCustomDraft(value); setCustom(true); }} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-slate-400 hover:bg-white/[0.04] hover:text-slate-200">
                 Custom model…
               </button>
             )}
@@ -1533,6 +1782,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       ? 'SUB_ADMIN'
       : 'USER';
   const hostRecoveryAction = projectQualificationRecoveryAction(hostRecoveryRole);
+  const authRecoveryAction = projectQualificationAuthRecoveryAction(hostRecoveryRole);
 
   // Session state
   const [sessionKey, setSessionKey] = useState<string | null>(null);
@@ -1557,9 +1807,18 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     )
   );
   const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelCatalogLoading, setModelCatalogLoading] = useState(false);
   const [modelCatalogError, setModelCatalogError] = useState<string | null>(null);
-  const [sessionReady, setSessionReady] = useState(false);
+  const sessionReadyRef = useRef(false);
+  const [sessionReady, setSessionReadyState] = useState(false);
+  const setSessionReady = useCallback((ready: boolean) => {
+    // Session-control mutations use this synchronous mirror to fail closed if
+    // provider verification changes while a gateway PATCH is still in flight.
+    sessionReadyRef.current = ready;
+    setSessionReadyState(ready);
+  }, []);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [sessionRecoveryPending, setSessionRecoveryPending] = useState(false);
   const [projectMoveNotice, setProjectMoveNotice] = useState<{
     projectId: string;
     title: string;
@@ -1570,6 +1829,10 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
   const [boundProviders, setBoundProviders] = useState<string[]>([]);
   const [pendingProviderSwitch, setPendingProviderSwitch] = useState<ProjectChatProviderName | null>(null);
+  const [providerReviewRequest, setProviderReviewRequest] = useState<{
+    provider: ProjectChatProviderName;
+    token: number;
+  } | null>(null);
   const selectedProviderCapability = useMemo(
     () => providerCapabilities.find((entry) => entry.provider === selectedProvider) || null,
     [providerCapabilities, selectedProvider],
@@ -1586,6 +1849,8 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isLoadingOlderHistory, setIsLoadingOlderHistory] = useState(false);
   const [isExportingChat, setIsExportingChat] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyRetryPending, setHistoryRetryPending] = useState(false);
   const [olderHistoryError, setOlderHistoryError] = useState<string | null>(null);
   const [historyPagination, setHistoryPagination] = useState<{
     hasMore: boolean;
@@ -1597,6 +1862,8 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   const [pendingSend, setPendingSend] = useState<PendingProjectChatSend | null>(null);
   const [queuedComposerMessage, setQueuedComposerMessage] = useState<string | null>(null);
   const queuedComposerMessageRef = useRef<string | null>(null);
+  const preservedQueuedComposerDraftScopeRef = useRef<QueuedComposerDraftScope | null>(null);
+  const [composerPreparationPrompt, setComposerPreparationPrompt] = useState<QualifiableProjectProvider | null>(null);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [pendingQuestionAnswerPending, setPendingQuestionAnswerPending] = useState(false);
   const [pendingSendStorageError, setPendingSendStorageError] = useState<string | null>(null);
@@ -1729,15 +1996,6 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   }, [projectName]);
   const qualificationLeaseRef = useRef<Readonly<ProjectChatActivity> | null>(null);
   const qualificationTokenRef = useRef(0);
-  /**
-   * Automatic qualification is a one-shot convenience, so cap it at a single
-   * attempt per mounted project/provider. Suppression bookkeeping alone is not
-   * a sufficient bound: a host that answers "qualified" while its capability
-   * readback still reports the provider unqualified clears the suppression on
-   * every pass and would otherwise spin this panel against the endpoint
-   * forever. Everything past the first attempt stays manual.
-   */
-  const automaticQualificationAttemptsRef = useRef<Set<string>>(new Set());
   const [projectTransitionActivity, setProjectTransitionActivity] = useState<ProjectTransitionActivity | null>(null);
   const projectTransitionActivityRef = useRef<ProjectTransitionActivity | null>(null);
   const projectTransitionActivityTokenRef = useRef(0);
@@ -1754,11 +2012,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     setQualificationProgress(null);
     queuedComposerMessageRef.current = null;
     setQueuedComposerMessage(null);
+    preservedQueuedComposerDraftScopeRef.current = null;
+    setComposerPreparationPrompt(null);
     setProjectMigrationPending(false);
     setProjectMigrationError(null);
   }, [projectName]);
 
   const directQualificationProvider = useMemo<QualifiableProjectProvider | null>(() => {
+    // Provider discovery and immutable-identity verification own their own
+    // retry state. Never manufacture a preparation target from an empty or
+    // failed capability response.
+    if (providerVerificationState !== 'ready') return null;
     const selectedQualification = selectedProvider === 'GROK'
       ? null
       : providerQualifications[selectedProvider];
@@ -1774,8 +2038,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       if (!qualification) continue;
       if (qualification.status !== 'QUALIFIED' && qualification.status !== 'UNAVAILABLE') return provider;
     }
-    return Object.keys(providerQualifications).length === 0 ? 'OPENCLAW' : null;
-  }, [providerQualifications, selectedProvider]);
+    return null;
+  }, [providerQualifications, providerVerificationState, selectedProvider]);
+
+  useEffect(() => {
+    setComposerPreparationPrompt(null);
+  }, [projectName, selectedProvider, sessionReady]);
 
   // Input state
   const [input, setInput] = useState('');
@@ -1940,6 +2208,36 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       ? { actorUserId, projectId: projectIdentityId, provider: selectedProvider }
       : null
   ), [actorUserId, projectIdentityId, selectedProvider]);
+
+  const queuedComposerDraftScope = useMemo<QueuedComposerDraftScope | null>(() => (
+    actorUserId && projectIdentityId
+      ? { actorUserId, projectId: projectIdentityId, provider: selectedProvider }
+      : null
+  ), [actorUserId, projectIdentityId, selectedProvider]);
+
+  const clearPreservedQueuedComposerDraft = useCallback(() => {
+    const scope = preservedQueuedComposerDraftScopeRef.current;
+    if (scope) clearQueuedComposerDraft(scope);
+    preservedQueuedComposerDraftScopeRef.current = null;
+  }, []);
+
+  const restoreQueuedComposerDraft = useCallback(() => {
+    const queued = queuedComposerMessageRef.current;
+    if (!queued) return false;
+    queuedComposerMessageRef.current = null;
+    setQueuedComposerMessage(null);
+    setInput((current) => current || queued);
+    setConnectionNotice(null);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (!queuedComposerDraftScope || queuedComposerMessageRef.current) return;
+    const restored = readQueuedComposerDraft(queuedComposerDraftScope);
+    if (!restored) return;
+    preservedQueuedComposerDraftScopeRef.current = queuedComposerDraftScope;
+    setInput((current) => current || restored);
+  }, [queuedComposerDraftScope]);
 
   const refreshPendingSendState = useCallback((scope: ProjectChatSendScope) => {
     try {
@@ -2158,7 +2456,16 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   }) && (
     !requiresExactModelCatalog || selectedModelIsAvailable
   ) && Boolean(projectIdentityId) && !pendingSendStorageError;
-  const modelCatalogBlocksInput = Boolean(modelCatalogError)
+  const providerModelSelectionAllowed = providerVerificationState === 'ready'
+    && serverSelectedProvider === selectedProvider
+    && selectedProviderCapability?.selectable === true
+    && selectedProviderCapability.executionScope === 'PROJECT_SANDBOX'
+    && sessionReady
+    && !providerTurnActive
+    && !providerTransitionPending
+    && Boolean(projectIdentityId);
+  const modelCatalogBlocksInput = requiresExactModelCatalog
+    && Boolean(modelCatalogError)
     && providerVerificationState === 'ready'
     && !qualificationPending;
   const providerAcceptsActiveInput = isRunning
@@ -2174,14 +2481,18 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     ? !pendingQuestionAnswerPending
     : !isRunning
       && !queuedComposerMessage
-      && !pendingSendStorageError
-      && !modelCatalogBlocksInput;
+      && !pendingSendStorageError;
   const hasVerifiedProjectConnection = providerVerificationState === 'ready'
     && !providerTransitionPending
     && sessionReady
+    && serverSelectedProvider === selectedProvider
     && selectedProviderCapability?.selectable === true
     && selectedProviderCapability.executionScope === 'PROJECT_SANDBOX'
+    && Boolean(sessionKey)
+    && Boolean(projectIdentityId)
     && (!requiresExactModelCatalog || selectedModelIsAvailable);
+  const projectSessionMutationControlsAllowed = hasVerifiedProjectConnection
+    && selectedProvider === 'OPENCLAW';
   // While a preparation is actively running, the progress panel owns the
   // truth; rendering this failure banner beside it told the operator the
   // check "did not complete" during its very first attempt.
@@ -2195,10 +2506,16 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   const directQualificationFailure = directQualificationProvider
     ? providerQualificationFailures[directQualificationProvider]
     : undefined;
+  const directAgentZeroNeedsModelReview = directQualificationProvider === 'AGENT_ZERO'
+    && !agentZeroProjectModels.some((option) => option.value === agentZeroQualificationModel);
+  const unavailableProviderIsFailure = providerVerificationState === 'failed'
+    || Boolean(directQualificationFailure);
   const unavailableProviderDetail = providerVerificationState === 'failed'
-    ? 'The isolated runtime check did not complete.'
-    : directQualificationFailure?.message
-      || 'This provider has not been prepared for this project yet.';
+    ? sessionError || 'Project Chat could not verify this project’s providers.'
+    : composerPreparationPrompt
+      ? `Prepare ${getProjectProviderLabel(composerPreparationPrompt)} before sending. Your draft is still in the composer.`
+      : directQualificationFailure?.message
+        || 'This provider has not been prepared for this project yet.';
   const directQualificationRetryAt = normalizeProjectQualificationRetryAt(
     directQualificationFailure?.retryAt,
     qualificationRetryClock,
@@ -2570,6 +2887,10 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     }
   }, [projectName]);
 
+  const reviewAgentZeroProjectModels = useCallback(() => {
+    void loadAgentZeroProjectModels().catch(() => undefined);
+  }, [loadAgentZeroProjectModels]);
+
   useEffect(() => {
     if (!agentZeroQualificationModel) return;
     localStorage.setItem(
@@ -2578,89 +2899,116 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     );
   }, [agentZeroQualificationModel, projectName]);
 
-  useEffect(() => {
-    const qualification = providerQualifications.AGENT_ZERO;
-    if (!qualification || qualification.status === 'QUALIFIED') return;
-    void loadAgentZeroProjectModels().catch(() => undefined);
-  }, [loadAgentZeroProjectModels, providerQualifications.AGENT_ZERO]);
-
   const loadAvailableModels = useCallback(async () => {
     const requestedProvider = selectedProvider;
     const capability = providerCapabilitiesRef.current.find((entry) => entry.provider === requestedProvider);
     if (capability?.supportsModelSelection !== true) {
       setAvailableModels([]);
+      setModelCatalogLoading(false);
       setModelCatalogError(null);
       return [];
     }
     if (
-      requestedProvider === 'OPENCLAW'
-      && providerQualifications.OPENCLAW?.status !== 'QUALIFIED'
+      (requestedProvider === 'OPENCLAW'
+        && providerQualifications.OPENCLAW?.status !== 'QUALIFIED')
+      || (requestedProvider === 'AGENT_ZERO'
+        && providerQualifications.AGENT_ZERO?.status !== 'QUALIFIED')
     ) {
       setAvailableModels([]);
+      setModelCatalogLoading(false);
       setModelCatalogError(null);
       return [];
     }
-    const models: string[] = requestedProvider === 'AGENT_ZERO'
-      ? await loadAgentZeroProjectModels()
-      : [];
-    if (requestedProvider !== 'AGENT_ZERO') {
-      const data = requestedProvider === 'OPENCLAW'
-        ? await projectsAPI.projectChatModels(projectName)
-        : await gatewayAPI.models(requestedProvider);
-      models.push(...(
-        Array.isArray(data?.models)
-          ? Array.from(new Set(data.models.map((m: any) => canonicalizePortalModelId(String(m?.id || '').trim())).filter(Boolean))) as string[]
-          : []
-      ));
+    setModelCatalogLoading(true);
+    setModelCatalogError(null);
+    setAvailableModels([]);
+    try {
+      const models: string[] = requestedProvider === 'AGENT_ZERO'
+        ? await loadAgentZeroProjectModels()
+        : [];
+      if (requestedProvider !== 'AGENT_ZERO') {
+        const data = requestedProvider === 'OPENCLAW'
+          ? await projectsAPI.projectChatModels(projectName)
+          : await gatewayAPI.models(requestedProvider, { silent: true });
+        models.push(...(
+          Array.isArray(data?.models)
+            ? Array.from(new Set(data.models.map((m: any) => canonicalizePortalModelId(String(m?.id || '').trim())).filter(Boolean))) as string[]
+            : []
+        ));
+      }
+      if (providerRef.current !== requestedProvider) return [];
+      setAvailableModels(models);
+      setModelCatalogError(
+        requestedProvider === 'OPENCLAW' && models.length === 0
+          ? 'No authenticated embedded model is available for this OpenClaw Project agent. Reconnect a supported provider, then retry.'
+          : requestedProvider === 'AGENT_ZERO' && models.length === 0
+            ? 'Connect an Agent Zero account and verify its live model catalog before using it in this project.'
+            : null,
+      );
+      if (
+        models.length === 0
+        && (requestedProvider === 'OPENCLAW' || requestedProvider === 'AGENT_ZERO')
+      ) {
+        restoreQueuedComposerDraft();
+      }
+      // Preserve a verified native model if its provider publishes no catalog;
+      // the manual model path remains usable. Exact-catalog providers instead
+      // clear stale choices that the current Project agent cannot attest.
+      setSelectedModel(prev => {
+        if (models.length === 0 && requestedProvider !== 'AGENT_ZERO') {
+          return prev;
+        }
+        if (requestedProvider === 'AGENT_ZERO') {
+          const exact = canonicalizePortalModelId(prev);
+          return models.includes(exact) ? exact : '';
+        }
+        const resolved = resolveAvailableModelId(prev, models);
+        // Catalog discovery is read-only. Do not silently present its first
+        // entry as selected before the Project session validates that change.
+        return resolved || prev;
+      });
+      return models;
+    } catch (error: any) {
+      if (providerRef.current === requestedProvider) {
+        setAvailableModels([]);
+        setModelCatalogError(
+          requestedProvider === 'OPENCLAW'
+            ? 'Portal could not verify an authenticated embedded model for this OpenClaw Project agent. Reconnect a supported provider, then retry.'
+            : requestedProvider === 'AGENT_ZERO'
+              ? 'Agent Zero’s connected model catalog could not be loaded. Retry after checking its provider connection.'
+              : `${getProjectProviderLabel(requestedProvider)} models could not be loaded. Retry the catalog or enter an exact model ID.`,
+        );
+        restoreQueuedComposerDraft();
+      }
+      throw error;
+    } finally {
+      if (providerRef.current === requestedProvider) setModelCatalogLoading(false);
     }
-    if (providerRef.current !== requestedProvider) return [];
-    setAvailableModels(models);
-    setModelCatalogError(
-      requestedProvider === 'OPENCLAW' && models.length === 0
-        ? 'No authenticated embedded model is available for this OpenClaw Project agent. Reconnect a supported provider, then retry.'
-        : null,
-    );
-    // If no model selected or selected model isn't available, pick the first discovered option.
-    // Provider-owned aliases are resolved against the live catalog while preserving
-    // the user's selected provider family when both aliases are present.
-    setSelectedModel(prev => {
-      if (requestedProvider === 'OPENCLAW' && models.length === 0) {
-        return prev;
-      }
-      if (requestedProvider === 'AGENT_ZERO') {
-        const exact = canonicalizePortalModelId(prev);
-        return models.includes(exact) ? exact : '';
-      }
-      const resolved = resolveAvailableModelId(prev, models);
-      return resolved || models[0] || '';
-    });
-    return models;
-  }, [loadAgentZeroProjectModels, projectName, providerQualifications.OPENCLAW?.status, selectedProvider]);
+  }, [loadAgentZeroProjectModels, projectName, providerQualifications.AGENT_ZERO?.status, providerQualifications.OPENCLAW?.status, restoreQueuedComposerDraft, selectedProvider]);
 
   useEffect(() => {
     if (!providerSupportsModelSelection) {
       setAvailableModels([]);
+      setModelCatalogLoading(false);
       setModelCatalogError(null);
       return;
     }
     if (
-      selectedProvider === 'OPENCLAW'
-      && providerQualifications.OPENCLAW?.status !== 'QUALIFIED'
+      (selectedProvider === 'OPENCLAW'
+        && providerQualifications.OPENCLAW?.status !== 'QUALIFIED')
+      || (selectedProvider === 'AGENT_ZERO'
+        && providerQualifications.AGENT_ZERO?.status !== 'QUALIFIED')
     ) {
       setAvailableModels([]);
+      setModelCatalogLoading(false);
       setModelCatalogError(null);
       return;
     }
     let cancelled = false;
+    setModelCatalogLoading(true);
     const timer = window.setTimeout(() => {
       loadAvailableModels().catch((err) => {
         if (!cancelled) {
-          setAvailableModels([]);
-          setModelCatalogError(
-            selectedProvider === 'OPENCLAW'
-              ? 'Portal could not verify an authenticated embedded model for this OpenClaw Project agent. Reconnect a supported provider, then retry.'
-              : null,
-          );
           console.error('[ProjectChatPanel] Failed to load models:', err);
         }
       });
@@ -2669,7 +3017,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [loadAvailableModels, providerQualifications.OPENCLAW?.status, providerSupportsModelSelection, selectedProvider]);
+  }, [loadAvailableModels, providerQualifications.AGENT_ZERO?.status, providerQualifications.OPENCLAW?.status, providerSupportsModelSelection, selectedProvider]);
 
   // Mark session as active for auto-restore
   useEffect(() => {
@@ -2769,7 +3117,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   }, []);
 
   const isStaleSessionLoad = useCallback((expectedSession: string, expectedGen: number) => {
-    return sessionKeyRef.current !== expectedSession || historyGenRef.current !== expectedGen;
+    // Before the provider handshake assigns a session key, transcript preload
+    // intentionally uses an empty sentinel. Treat the ref's initial null as
+    // the same state or every cold open discards its immediate history read
+    // and waits for a second request after admission.
+    return (sessionKeyRef.current || '') !== expectedSession || historyGenRef.current !== expectedGen;
   }, []);
 
   const applyActiveStreamSnapshot = useCallback((
@@ -2866,11 +3218,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   ) => {
     const expectedGen = options.expectedGen ?? historyGenRef.current;
     const provider = providerRef.current;
+    const expectedProjectId = projectIdentityIdRef.current;
     const portalData = await projectsAPI.chatHistory(projectName, provider, {
       limit: PROJECT_CHAT_HISTORY_PAGE_SIZE,
     });
 
-    if (isStaleSessionLoad(session, expectedGen)) return null;
+    if (
+      isStaleSessionLoad(session, expectedGen)
+      || providerRef.current !== provider
+      || projectIdentityIdRef.current !== expectedProjectId
+    ) return null;
+    assertProjectChatHistoryIdentity(portalData, expectedProjectId);
 
     const portalMessages = Array.isArray(portalData?.messages) ? portalData.messages : [];
     const pending = pendingSendRef.current;
@@ -2907,10 +3265,33 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
 
       return activeLocalMessages.length > 0 ? dedupeHistoryMessages([...next, ...activeLocalMessages]) : next;
     });
+    setHistoryError(null);
     setSessionError(null);
 
     return { messages: loaded };
   }, [confirmPendingSend, isStaleSessionLoad, projectName]);
+
+  const retryHistorySnapshot = useCallback(async () => {
+    const expectedGen = historyGenRef.current;
+    const expectedSession = sessionKeyRef.current || '';
+    setHistoryRetryPending(true);
+    setIsLoadingHistory(true);
+    try {
+      await loadHistorySnapshot(expectedSession, { expectedGen });
+    } catch (error: any) {
+      if (
+        historyGenRef.current === expectedGen
+        && (sessionKeyRef.current || '') === expectedSession
+      ) {
+        setHistoryError(projectChatHistoryErrorDetail(error));
+      }
+    } finally {
+      if (historyGenRef.current === expectedGen) {
+        setHistoryRetryPending(false);
+        setIsLoadingHistory(false);
+      }
+    }
+  }, [loadHistorySnapshot]);
 
   const loadOlderHistory = useCallback(async () => {
     if (
@@ -2922,6 +3303,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     const expectedGen = historyGenRef.current;
     const expectedSession = sessionKeyRef.current || '';
     const expectedProvider = providerRef.current;
+    const expectedProjectId = projectIdentityIdRef.current;
     const cursor = historyPagination.nextCursor;
     const container = scrollRef.current;
     if (container) {
@@ -2944,7 +3326,9 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         historyGenRef.current !== expectedGen
         || (sessionKeyRef.current || '') !== expectedSession
         || providerRef.current !== expectedProvider
+        || projectIdentityIdRef.current !== expectedProjectId
       ) return;
+      assertProjectChatHistoryIdentity(page, expectedProjectId);
 
       const olderPortalMessages = Array.isArray(page?.messages) ? page.messages : [];
       const pending = pendingSendRef.current;
@@ -2980,6 +3364,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         historyGenRef.current === expectedGen
         && (sessionKeyRef.current || '') === expectedSession
         && providerRef.current === expectedProvider
+        && projectIdentityIdRef.current === expectedProjectId
       ) {
         setIsLoadingOlderHistory(false);
       }
@@ -3585,12 +3970,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     messageRevealAnchorRef.current = null;
     setIsLoadingOlderHistory(false);
     setOlderHistoryError(null);
+    setHistoryError(null);
+    setHistoryRetryPending(false);
     setHistoryPagination({ hasMore: false, nextCursor: null });
 
     async function init() {
       let resolvedProviderState: ReturnType<typeof resolveProjectProviderCapabilities> | null = null;
       let sessionHandshakeCompleted = false;
-      let initialHistoryLoad: Promise<{ messages: ChatMessage[] } | null> | null = null;
+      let initialHistoryLoad: Promise<{
+        result: { messages: ChatMessage[] } | null;
+        failed: boolean;
+      }> | null = null;
       try {
         projectIdentityIdRef.current = null;
         setProjectIdentityId(null);
@@ -3610,7 +4000,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         setSessionError(null);
         setProjectMoveNotice(null);
         setTransportConnected(false);
-        setConnectionNotice('Preparing sandbox → Connecting agent');
+        setConnectionNotice('Checking Project Chat providers…');
 
         let capabilityData = await projectsAPI.projectChatProviders(projectName);
         if (capabilityData?.migration?.required === true) {
@@ -3694,19 +4084,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         providerRef.current = provider;
         runtimeRef.current = providerCapability.runtime;
         setSelectedRuntime(providerCapability.runtime);
-        if (provider !== selectedProvider) setSelectedProvider(provider);
-        if (resolvedProviderState.error) {
-          providerVerificationStateRef.current = 'ready';
-          setProviderVerificationState('ready');
-          providerTransitionPendingRef.current = false;
-          setProviderTransitionPending(false);
-          setConnectionNotice(null);
-          setQualificationProgress(null);
-          setSessionError(resolvedProviderState.error);
-          setIsLoadingHistory(false);
-          return;
-        }
-
+        // Adopting the provider selected by the server is presentation state,
+        // not a request to start a second bootstrap. Provider transitions
+        // explicitly advance providerRefreshNonce after the server accepts
+        // them, so this effect must not depend on its own rendered provider.
+        setSelectedProvider(provider);
         const providerModel = providerCapability.supportsModelSelection
           ? canonicalizePortalModelId(
               capabilityData?.qualifiedModels?.[provider as Exclude<ProjectChatProviderName, 'GROK'>]
@@ -3723,20 +4105,45 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           setSelectedModel(providerModel);
         }
         // Render the Portal-owned transcript immediately: switching between
-        // projects must feel instant. The sandbox handshake below only gates
-        // sending, not reading.
+        // projects must feel instant. Reading is actor/project scoped and must
+        // not depend on whether the selected runtime is currently qualified.
+        // The sandbox handshake below gates only sending.
         initialHistoryLoad = loadHistorySnapshot(sessionKeyRef.current || '', { expectedGen: myGen })
           .then((result) => {
             if (!cancelled && historyGenRef.current === myGen) setIsLoadingHistory(false);
-            return result;
+            return { result, failed: false };
           })
-          .catch(() => null);
+          .catch((error) => {
+            if (!cancelled && historyGenRef.current === myGen) {
+              setHistoryError(projectChatHistoryErrorDetail(error));
+              setIsLoadingHistory(false);
+            }
+            return { result: null, failed: true };
+          });
+
+        if (resolvedProviderState.error) {
+          providerVerificationStateRef.current = 'ready';
+          setProviderVerificationState('ready');
+          providerTransitionPendingRef.current = false;
+          setProviderTransitionPending(false);
+          setConnectionNotice(null);
+          setQualificationProgress(null);
+          // An unqualified lane is expected discovery state. Keep it read-only,
+          // load its existing transcript, and leave preparation explicit.
+          await initialHistoryLoad;
+          if (cancelled || historyGenRef.current !== myGen) return;
+          setSessionError(null);
+          setIsLoadingHistory(false);
+          return;
+        }
+
         setConnectionNotice(`Connecting to ${providerCapability.displayName} project runtime…`);
 
         const { data } = activeTurn
           ? await client.get(`/projects/${encodeURIComponent(projectName)}/assistant/resume-session`, {
               params: { provider, turnId: activeTurn.id },
-            })
+              _silent: true,
+            } as any)
           : await client.post(
               `/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`,
               {
@@ -3747,6 +4154,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                 // is never authoritative model-admission evidence.
                 ...(provider !== 'OPENCLAW' && providerModel ? { model: providerModel } : {}),
               },
+              { _silent: true } as any,
             );
         if (cancelled || historyGenRef.current !== myGen) return;
         if (data?.provider !== provider) {
@@ -3786,10 +4194,19 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         }
 
         replayCursorRef.current = 0;
-        const preloadedHistory = initialHistoryLoad ? await initialHistoryLoad : null;
-        if (!preloadedHistory) {
+        const preloadedHistory = initialHistoryLoad
+          ? await initialHistoryLoad
+          : { result: null, failed: false };
+        if (!preloadedHistory.result && !preloadedHistory.failed) {
           setIsLoadingHistory(true);
-          await loadHistorySnapshot(sk, { expectedGen: myGen });
+          try {
+            await loadHistorySnapshot(sk, { expectedGen: myGen });
+          } catch (error: any) {
+            if (!cancelled && historyGenRef.current === myGen) {
+              setHistoryError(projectChatHistoryErrorDetail(error));
+              setIsLoadingHistory(false);
+            }
+          }
         }
         if (cancelled || historyGenRef.current !== myGen || sessionKeyRef.current !== sk) return;
 
@@ -3873,15 +4290,20 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       } catch (err: any) {
         if (!cancelled && historyGenRef.current === myGen) {
           const reason = String(err?.response?.data?.error || err?.message || 'Failed to initialize session');
+          const providerDiscoveryFailure = (
+            !resolvedProviderState
+            || !resolvedProviderState.activeProvider
+          );
           const readinessFailure = (
             err instanceof ProjectReplayContractError
             || isProjectProviderReverificationError(err)
-            || !resolvedProviderState
-            || !resolvedProviderState.activeProvider
+            || providerDiscoveryFailure
           );
-          const displayReason = readinessFailure
-            ? 'Project Chat could not prepare its current provider. Retry preparation for this project.'
-            : reason;
+          const displayReason = providerDiscoveryFailure
+            ? reason
+            : readinessFailure
+              ? 'Project Chat could not prepare its current provider. Retry preparation for this project.'
+              : reason;
           if (readinessFailure) {
             activeReplayTurnIdRef.current = null;
             const failedCapabilities = buildUnavailableProjectProviderCapabilities(
@@ -3915,6 +4337,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           setQualificationProgress(null);
           setSessionError(displayReason);
           setIsLoadingHistory(false);
+          restoreQueuedComposerDraft();
         }
       }
     }
@@ -3927,7 +4350,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       if (watchdogRef.current) clearTimeout(watchdogRef.current);
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     };
-  }, [clearPendingLiveRenders, ensureStreamingAssistant, loadHistorySnapshot, projectName, providerRefreshNonce, resetWatchdog, selectedProvider]);
+  }, [clearPendingLiveRenders, ensureStreamingAssistant, loadHistorySnapshot, projectName, providerRefreshNonce, resetWatchdog, restoreQueuedComposerDraft, setSessionReady]);
 
   // Every qualified Project provider replays through the Portal-owned broker.
   // The cursor advances only through events actually projected, so bounded
@@ -4200,7 +4623,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (timer) clearTimeout(timer);
     };
-  }, [clearWatchdog, ensureStreamingAssistant, isRunning, loadHistorySnapshot, projectName, replayRetryNonce, resetWatchdog, selectedProvider, sessionReady, terminalHistoryPending]);
+  }, [clearWatchdog, ensureStreamingAssistant, isRunning, loadHistorySnapshot, projectName, replayRetryNonce, resetWatchdog, selectedProvider, sessionReady, setSessionReady, terminalHistoryPending]);
 
   // ── Send message ──
   const sendMessage = useCallback(async (text: string, draftText: string = text) => {
@@ -4273,13 +4696,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           rememberPendingSend(persistedPending);
         },
         dispatch: async (staged) => {
-          const { data } = await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/send`, {
-            provider,
-            stateVersion: requestStateVersion,
-            message: staged.payloadText,
-            messageId: staged.messageId,
-            ...(selectedCapability.supportsModelSelection ? { model: staged.model } : {}),
-          });
+          const { data } = await client.post(
+            `/projects/${encodeURIComponent(projectName)}/assistant/send`,
+            {
+              provider,
+              stateVersion: requestStateVersion,
+              message: staged.payloadText,
+              messageId: staged.messageId,
+              ...(selectedCapability.supportsModelSelection ? { model: staged.model } : {}),
+            },
+            { _silent: true } as any,
+          );
           if (data?.provider !== provider) {
             throw new ProjectReplayContractError(
               `Project send provider mismatch: expected ${provider}, received ${String(data?.provider || 'none')}`,
@@ -4428,6 +4855,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     replacePendingQuestions,
     rememberPendingSend,
     resetWatchdog,
+    setSessionReady,
   ]);
 
   const answerPendingProjectQuestion = useCallback(async (rawText: string) => {
@@ -4498,6 +4926,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
             requestId: steer.requestId,
             message: text,
           },
+          { _silent: true } as any,
         );
         if (
           data?.accepted !== true
@@ -4754,7 +5183,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       streamingAssistantIdRef.current = null;
     }
     return true;
-  }, [clearWatchdog, flushPendingLiveRenders, projectName]);
+  }, [clearWatchdog, flushPendingLiveRenders, projectName, setSessionReady]);
 
   // ── Clear chat ──
   const clearChat = useCallback(async () => {
@@ -4788,10 +5217,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         actorUserId,
         projectId: immutableProjectId,
         reset: async () => {
-          const { data } = await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/reset`, {
-            provider,
-            stateVersion,
-          });
+          const { data } = await client.post(
+            `/projects/${encodeURIComponent(projectName)}/assistant/reset`,
+            { provider, stateVersion },
+            { _silent: true } as any,
+          );
           if (data?.provider !== provider) {
             throw new ProjectReplayContractError(
               `Project reset provider mismatch: expected ${provider}, received ${String(data?.provider || 'none')}`,
@@ -4810,6 +5240,9 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       activeReplayTurnIdRef.current = null;
       setPendingSendStorageError(null);
       rememberPendingSend(null);
+      clearPreservedQueuedComposerDraft();
+      queuedComposerMessageRef.current = null;
+      setQueuedComposerMessage(null);
       clearPendingLiveRenders();
       setMessages([]);
       setStatusText(null);
@@ -4859,10 +5292,16 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       setProviderTransitionPending(false);
       setSessionError(reason);
     }
-  }, [actorUserId, cancelStream, clearPendingLiveRenders, projectName, rememberPendingSend]);
+  }, [actorUserId, cancelStream, clearPendingLiveRenders, clearPreservedQueuedComposerDraft, projectName, rememberPendingSend, setSessionReady]);
 
   // ── File upload ──
   const uploadFile = useCallback(async (file: File, attachId: string) => {
+    setPendingAttachments(prev => prev.map(a => a.id === attachId ? {
+      ...a,
+      projectPath: undefined,
+      uploadStatus: 'uploading' as const,
+      uploadError: undefined,
+    } : a));
     const formData = new FormData();
     formData.append('file', file);
     const provider = serverSelectedProviderRef.current;
@@ -5124,8 +5563,14 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   const showSessionStatus = useCallback(async () => {
     try {
       const [statusRes, modelRes] = await Promise.allSettled([
-        client.get(`/projects/${encodeURIComponent(projectName)}/chat/session-status`, { params: { provider: providerRef.current } }),
-        client.get(`/projects/${encodeURIComponent(projectName)}/assistant/active-model`, { params: { provider: providerRef.current } }),
+        client.get(`/projects/${encodeURIComponent(projectName)}/chat/session-status`, {
+          params: { provider: providerRef.current },
+          _silent: true,
+        } as any),
+        client.get(`/projects/${encodeURIComponent(projectName)}/assistant/active-model`, {
+          params: { provider: providerRef.current },
+          _silent: true,
+        } as any),
       ]);
       const statusData = statusRes.status === 'fulfilled' ? statusRes.value.data : null;
       const modelData = modelRes.status === 'fulfilled' ? modelRes.value.data : null;
@@ -5196,11 +5641,15 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         AGENT_ZERO: qualified.qualification,
       }));
     }
-    const { data } = await client.post(`/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`, {
-      provider,
-      stateVersion: admittedStateVersion,
-      model,
-    });
+    const { data } = await client.post(
+      `/projects/${encodeURIComponent(projectName)}/assistant/ensure-session`,
+      {
+        provider,
+        stateVersion: admittedStateVersion,
+        model,
+      },
+      { _silent: true } as any,
+    );
     if (data?.provider !== provider) {
       throw new ProjectReplayContractError(
         `Project model provider mismatch: expected ${provider}, received ${String(data?.provider || 'none')}`,
@@ -5368,7 +5817,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       default:
         return false;
     }
-  }, [appendSystemMessage, availableModels, cancelStream, claimProjectTransitionActivity, clearChat, ensureVerifiedProjectModel, exportChatMarkdown, input, isRunning, loadAvailableModels, projectName, showSessionStatus]);
+  }, [appendSystemMessage, availableModels, cancelStream, claimProjectTransitionActivity, clearChat, ensureVerifiedProjectModel, exportChatMarkdown, input, isRunning, loadAvailableModels, projectName, setSessionReady, showSessionStatus]);
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
@@ -5383,6 +5832,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         return;
       }
       if (await maybeExecuteSlashCommand()) {
+        clearPreservedQueuedComposerDraft();
         setInput('');
         setShowSlashMenu(false);
         setSlashCommands([]);
@@ -5391,6 +5841,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       }
       const sent = await answerPendingProjectQuestion(input);
       if (sent) {
+        clearPreservedQueuedComposerDraft();
         setInput('');
         setShowSlashMenu(false);
         setSlashCommands([]);
@@ -5407,16 +5858,42 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         setSessionError('Wait for the project agent to be ready before sending attachments.');
         return;
       }
+      if (
+        directQualificationProvider
+        || serverSelectedProviderRef.current !== selectedProvider
+        || selectedProviderCapability?.selectable !== true
+        || selectedProviderCapability.executionScope !== 'PROJECT_SANDBOX'
+      ) {
+        // Explicit preparation owns this transition. Keep the user's draft in
+        // the editable composer and point at the real action; do not imply that
+        // a request started or silently dispatch it later. Preserve the same
+        // actor/project/provider-scoped draft before returning so the panel's
+        // "continue in the background" dismissal cannot erase it.
+        if (queuedComposerDraftScope) {
+          preservedQueuedComposerDraftScopeRef.current = queuedComposerDraftScope;
+          writeQueuedComposerDraft(queuedComposerDraftScope, input);
+        }
+        if (directQualificationProvider) {
+          setComposerPreparationPrompt(directQualificationProvider);
+          setConnectionNotice(null);
+        }
+        return;
+      }
       const queued = input.trim();
       queuedComposerMessageRef.current = queued;
       setQueuedComposerMessage(queued);
+      if (queuedComposerDraftScope) {
+        preservedQueuedComposerDraftScopeRef.current = queuedComposerDraftScope;
+        writeQueuedComposerDraft(queuedComposerDraftScope, queued);
+      }
       setInput('');
-      setConnectionNotice('Preparing sandbox → Connecting agent');
+      setConnectionNotice('Connecting to the verified project runtime…');
       return;
     }
     const attachmentsReady = pendingAttachments.every(a => a.uploadStatus === 'done' && Boolean(a.projectPath));
     if (!attachmentsReady) return;
     if (await maybeExecuteSlashCommand()) {
+      clearPreservedQueuedComposerDraft();
       setInput('');
       setShowSlashMenu(false);
       setSlashCommands([]);
@@ -5428,6 +5905,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     const fullMessage = attachText + draftText;
     const sent = await sendMessage(fullMessage, draftText);
     if (sent) {
+      clearPreservedQueuedComposerDraft();
       setInput('');
       setPendingAttachments([]);
       setShowSlashMenu(false);
@@ -5436,13 +5914,18 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     }
   }, [
     buildAttachmentText,
+    clearPreservedQueuedComposerDraft,
     input,
     isRunning,
     maybeExecuteSlashCommand,
     modelCatalogError,
     pendingAttachments,
     providerAcceptsActiveInput,
+    directQualificationProvider,
     providerSendAllowed,
+    queuedComposerDraftScope,
+    selectedProvider,
+    selectedProviderCapability,
     answerPendingProjectQuestion,
     sendMessage,
   ]);
@@ -5453,12 +5936,16 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     queuedComposerMessageRef.current = null;
     setQueuedComposerMessage(null);
     void sendMessage(queued, queued).then((sent) => {
-      if (sent) return;
-      queuedComposerMessageRef.current = queued;
-      setQueuedComposerMessage(queued);
+      if (sent) {
+        clearPreservedQueuedComposerDraft();
+        return;
+      }
+      // A definitive send failure must return ownership of the draft to the
+      // user. Re-queueing here disabled the restored composer forever because
+      // this effect only runs when provider readiness changes.
       setInput((current) => current || queued);
     });
-  }, [providerSendAllowed, sendMessage]);
+  }, [clearPreservedQueuedComposerDraft, providerSendAllowed, sendMessage]);
 
   const handleProviderChange = useCallback(async (
     nextProvider: ProjectChatProviderName,
@@ -5545,6 +6032,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         throw new Error(`Project provider switch mismatch: expected ${nextProvider}, received ${String(result?.provider || 'none')}`);
       }
       const verifiedSwitchedModel = resolveVerifiedProjectModelResponse(capability, result);
+      if (!Number.isSafeInteger(result?.stateVersion) || result.stateVersion < 0) {
+        throw new Error('Portal did not confirm the Project Chat provider switch version.');
+      }
+      if (typeof result?.sessionKey !== 'string' || !result.sessionKey.trim()) {
+        throw new Error('Portal did not return the switched Project provider session.');
+      }
       serverSelectedProviderRef.current = nextProvider;
       activeReplayTurnIdRef.current = null;
       setServerSelectedProvider(nextProvider);
@@ -5559,19 +6052,21 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       setSelectedModel(switchedModel);
       setSelectedRuntime(runtimeRef.current);
       setSelectedProvider(nextProvider);
-      if (result.sessionKey) {
-        sessionKeyRef.current = result.sessionKey;
-        setSessionKey(result.sessionKey);
-      }
+      sessionKeyRef.current = result.sessionKey;
+      setSessionKey(result.sessionKey);
       if (result.agentId) setAgentId(result.agentId);
-      if (!Number.isSafeInteger(result?.stateVersion) || result.stateVersion < 0) {
-        throw new Error('Portal did not confirm the Project Chat provider switch version.');
-      }
       projectChatStateVersionRef.current = result.stateVersion;
       setProjectChatStateVersion(result.stateVersion);
       appendSystemNotice(
         `${result.resumed ? 'Resumed' : 'Created'} ${capability.displayName} project binding. Portal transcript preserved.`,
       );
+      providerVerificationStateRef.current = 'ready';
+      setProviderVerificationState('ready');
+      setTransportConnected(true);
+      setSessionReady(true);
+      providerTransitionPendingRef.current = false;
+      setProviderTransitionPending(false);
+      setConnectionNotice(null);
     } catch (error: any) {
       const reason = error?.response?.data?.error || error?.message || 'Provider switch failed';
       const failedCapabilities = buildUnavailableProjectProviderCapabilities(
@@ -5589,11 +6084,10 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       setConnectionNotice(null);
       setSessionError(reason);
     }
-  }, [appendSystemNotice, boundProviders, claimProjectTransitionActivity, pendingAttachments.length, projectName]);
+  }, [appendSystemNotice, boundProviders, claimProjectTransitionActivity, pendingAttachments.length, projectName, setSessionReady]);
 
   const handleProviderQualification = useCallback(async (
     provider: 'OPENCLAW' | 'CODEX' | 'CLAUDE_CODE' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA',
-    _options: { automatic?: boolean } = {},
   ) => {
     if (
       qualificationLeaseRef.current
@@ -5603,6 +6097,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       || providerTransitionPendingRef.current
     ) return;
     const label = getProjectProviderLabel(provider);
+    setComposerPreparationPrompt(null);
     const exactAgentZeroModel = canonicalizePortalModelId(agentZeroQualificationModel);
     if (provider === 'AGENT_ZERO'
       && !agentZeroProjectModels.some((option) => option.value === exactAgentZeroModel)) {
@@ -5626,14 +6121,10 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       projectIdentityIdRef.current,
       provider,
     );
-    // Suppression is a record of a *failed* attempt, so it must only be written
-    // once the attempt has actually failed. Claiming it up front persisted a
-    // 15-minute block into sessionStorage before the request was even sent, and
-    // a first qualification takes 27-90s on a new project. Anyone who reloaded
-    // the seemingly-frozen panel during that window came back to a project that
-    // would never auto-qualify again, with no retry and no explanation. Looping
-    // within a mount is already prevented by automaticQualificationAttemptsRef;
-    // the catch below records the real failure with its correct disposition.
+    // The durable disposition records a *failed* explicit attempt, so write it
+    // only after the request returns a verdict. A preparation can take 27-90s
+    // on a new project; persisting a failure before that request settles would
+    // turn ordinary navigation into a false auth/maintenance state.
     setQualificationPending(true);
     setQualificationProgress({
       projectName,
@@ -5691,15 +6182,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           suppressionKey,
           presentedError.recovery === 'HOST_MAINTENANCE' && presentedError.retryable === false
             ? { disposition: 'HOST_MAINTENANCE' }
-            : presentedError.code === 'PROJECT_QUALIFICATION_RATE_LIMITED'
-              ? { disposition: 'RATE_LIMITED', retryAt: presentedError.retryAt }
-              : presentedError.retryable === false
-                ? {
-                    disposition: presentedError.code === 'PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE'
-                      ? 'IDENTITY_UNAVAILABLE_NON_RETRYABLE'
-                      : 'NON_RETRYABLE',
-                  }
-              : { disposition: 'AUTO_ONLY' },
+            : presentedError.recovery === 'AI_SETTINGS'
+              ? { disposition: 'AI_SETTINGS' }
+              : presentedError.code === 'PROJECT_QUALIFICATION_RATE_LIMITED'
+                ? { disposition: 'RATE_LIMITED', retryAt: presentedError.retryAt }
+                : presentedError.retryable === false
+                  ? {
+                      disposition: presentedError.code === 'PROJECT_QUALIFICATION_IDENTITY_UNAVAILABLE'
+                        ? 'IDENTITY_UNAVAILABLE_NON_RETRYABLE'
+                        : 'NON_RETRYABLE',
+                    }
+                  : { disposition: 'AUTO_ONLY' },
         );
       }
       const presentedFailure = suppression && (
@@ -5716,6 +6209,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         ...current,
         [provider]: presentedFailure,
       }));
+      // Preparing a provider from the picker is intentionally one click. If
+      // that provider fails before it becomes the active binding, keep the
+      // failure attached to the row the user chose and reopen that row after
+      // the qualification lease releases. Otherwise the picker disappears
+      // and the still-active provider's banner hides the actual failure.
+      if (provider !== providerRef.current) {
+        setProviderReviewRequest((current) => ({
+          provider,
+          token: (current?.token || 0) + 1,
+        }));
+      }
     } finally {
       if (qualificationLeaseRef.current === lease) {
         qualificationLeaseRef.current = null;
@@ -5731,52 +6235,25 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     projectName,
   ]);
 
-  useEffect(() => {
-    if (
-      selectedProvider === 'GROK'
-      || qualificationPending
-      || projectTransitionActivity
-      || sessionControlMutation
-      || providerVerificationState !== 'ready'
-    ) return;
-    const qualification = providerQualifications[selectedProvider];
-    if (
-      !qualification
-      || qualification.status === 'QUALIFIED'
-      || qualification.status === 'UNAVAILABLE'
-    ) return;
-    const key = automaticQualificationSuppressionKey(
-      actorUserId,
-      projectIdentityId,
-      selectedProvider as QualifiableProjectProvider,
-    );
-    if (!key || isAutomaticQualificationSuppressed(key)) return;
-    if (automaticQualificationAttemptsRef.current.has(key)) return;
-    automaticQualificationAttemptsRef.current.add(key);
-    void handleProviderQualification(
-      selectedProvider as QualifiableProjectProvider,
-      { automatic: true },
-    );
-  }, [
-    actorUserId,
-    handleProviderQualification,
-    projectIdentityId,
-    projectName,
-    projectTransitionActivity,
-    providerQualifications,
-    providerVerificationState,
-    qualificationPending,
-    qualificationRetryClock,
-    selectedProvider,
-    sessionControlMutation,
-  ]);
-
   useEffect(() => () => {
     const lease = qualificationLeaseRef.current;
     if (!lease) return;
     qualificationLeaseRef.current = null;
     onActivityChangeRef.current?.(lease, false);
   }, []);
+
+  const dismissProjectChat = useCallback(() => {
+    if (sessionControlMutationRef.current || projectTransitionActivityRef.current) return;
+    const qualificationLease = qualificationLeaseRef.current;
+    if (qualificationLease) {
+      const released = onActivityChangeRef.current?.(qualificationLease, false);
+      if (released === false) return;
+      qualificationLeaseRef.current = null;
+      setQualificationPending(false);
+      setQualificationProgress(null);
+    }
+    onClose();
+  }, [onClose]);
 
   // ── Model change ──
   const handleModelChange = useCallback(async (newModel: string) => {
@@ -5842,6 +6319,9 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         const resolvedModel = canonicalizePortalModelId(String(data?.model || normalizedModel));
         setSelectedModel(resolvedModel);
         modelRef.current = resolvedModel;
+        // A server-verified manual model is sufficient for native Project
+        // providers even if their optional catalog request failed.
+        setModelCatalogError(null);
         setSessionReady(true);
       } catch (error: any) {
         setSelectedModel(previousModel);
@@ -5874,7 +6354,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       setProviderTransitionPending(false);
       setConnectionNotice(null);
     }
-  }, [appendSystemNotice, availableModels, claimProjectTransitionActivity, ensureVerifiedProjectModel, projectName, sessionReady]);
+  }, [appendSystemNotice, availableModels, claimProjectTransitionActivity, ensureVerifiedProjectModel, projectName, sessionReady, setSessionReady]);
 
   const applyProjectSessionControlValue = useCallback((
     kind: ProjectSessionControlKind,
@@ -5897,6 +6377,25 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     setFastModeEnabled(next);
   }, []);
 
+  const isVerifiedProjectSessionControlTarget = useCallback((
+    provider: ProjectChatProviderName,
+    session: string,
+  ) => {
+    const capability = providerCapabilitiesRef.current.find(
+      (entry) => entry.provider === provider,
+    );
+    return provider === 'OPENCLAW'
+      && sessionReadyRef.current
+      && providerVerificationStateRef.current === 'ready'
+      && !providerTransitionPendingRef.current
+      && serverSelectedProviderRef.current === provider
+      && providerRef.current === provider
+      && sessionKeyRef.current === session
+      && capability?.selectable === true
+      && capability.executionScope === 'PROJECT_SANDBOX'
+      && Boolean(projectIdentityIdRef.current);
+  }, []);
+
   const mutateProjectSessionControl = useCallback(async (
     kind: ProjectSessionControlKind,
     requested: ProjectSessionControlValue,
@@ -5908,7 +6407,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       !mutationSession
       || mutationProvider !== 'OPENCLAW'
       || projectTransitionActivityRef.current
-    ) return;
+      || !isVerifiedProjectSessionControlTarget(mutationProvider, mutationSession)
+    ) {
+      setSessionControlError('Project provider verification is required before changing session controls.');
+      return;
+    }
 
     const active = sessionControlMutationRef.current;
     if (active && active.session === mutationSession && active.provider === mutationProvider) return;
@@ -5938,12 +6441,23 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     setSessionControlError(null);
     applyProjectSessionControlValue(kind, requested);
 
-    const isCurrent = () => (
+    const ownsCurrentTarget = () => (
       sessionControlMutationRef.current === snapshot
       && sessionControlGenerationRef.current === snapshot.generation
       && sessionKeyRef.current === snapshot.session
       && providerRef.current === snapshot.provider
     );
+    const isCurrent = () => (
+      ownsCurrentTarget()
+      && isVerifiedProjectSessionControlTarget(snapshot.provider, snapshot.session)
+    );
+    const failClosedAfterVerificationChange = () => {
+      if (!ownsCurrentTarget()) return false;
+      // The provider/readiness surface already owns the recovery message.
+      // Revert the optimistic control without creating a second error banner.
+      applyProjectSessionControlValue(snapshot.kind, snapshot.previous);
+      return true;
+    };
     const setting = kind === 'thinking'
       ? { thinking: requested }
       : kind === 'reasoning'
@@ -5952,17 +6466,26 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
 
     try {
       const patchResult = await gatewayAPI.patchSession(snapshot.session, setting, snapshot.provider);
-      if (!isCurrent()) return;
+      if (!isCurrent()) {
+        failClosedAfterVerificationChange();
+        return;
+      }
       let canonical = readProjectSessionControlValue(patchResult, kind);
       if (canonical === undefined) {
         const fresh = await gatewayAPI.sessionInfo(snapshot.session, { silent: true });
-        if (!isCurrent()) return;
+        if (!isCurrent()) {
+          failClosedAfterVerificationChange();
+          return;
+        }
         canonical = readProjectSessionControlValue(fresh, kind);
       }
       if (canonical === undefined) throw new Error('The server did not confirm the updated session setting.');
       applyProjectSessionControlValue(kind, canonical);
     } catch (error: any) {
-      if (!isCurrent()) return;
+      if (!isCurrent()) {
+        failClosedAfterVerificationChange();
+        return;
+      }
       let canonical = snapshot.previous;
       try {
         const fresh = await gatewayAPI.sessionInfo(snapshot.session, { silent: true });
@@ -5987,7 +6510,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         setSessionControlMutation(null);
       }
     }
-  }, [applyProjectSessionControlValue, projectName]);
+  }, [applyProjectSessionControlValue, isVerifiedProjectSessionControlTarget, projectName]);
 
   const handleThinkingLevelChange = useCallback(async (nextLevel: ThinkingLevel) => {
     await mutateProjectSessionControl('thinking', nextLevel, thinkingLevelRef.current);
@@ -6062,7 +6585,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       }
       setProjectMoveNotice(null);
       await onProjectPrepared?.(result.projectName);
-      setConnectionNotice('Preparing sandbox → Connecting agent');
+      setConnectionNotice('Checking Project Chat providers…');
       setProviderRefreshNonce((value) => value + 1);
     } catch (error: any) {
       setProjectMigrationError(
@@ -6075,6 +6598,76 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       setProjectMigrationPending(false);
     }
   }, [onProjectPrepared, projectMigrationPending, projectMoveNotice?.projectId, projectName]);
+
+  const recoverProjectChatError = useCallback(async () => {
+    if (!sessionError || sessionRecoveryPending) return;
+    if (sessionError === 'This project was deleted.') {
+      dismissProjectChat();
+      return;
+    }
+
+    setSessionRecoveryPending(true);
+    setConnectionNotice('Refreshing Project Chat state…');
+    try {
+      if (modelCatalogError && sessionError === modelCatalogError) {
+        await loadAvailableModels();
+        setSessionError(null);
+        return;
+      }
+
+      if (
+        providerVerificationStateRef.current !== 'ready'
+        || !serverSelectedProviderRef.current
+      ) {
+        // The provider discovery request is itself the safe recovery path: it
+        // re-reads immutable identity, coordination, qualifications, runtime
+        // availability, and any recoverable expired lease before the panel can
+        // send again.
+        setSessionError(null);
+        setProviderRefreshNonce((value) => value + 1);
+        return;
+      }
+
+      const currentSession = sessionKeyRef.current || '';
+      await loadHistorySnapshot(currentSession);
+      await refreshPendingQuestions();
+      if (activeReplayTurnIdRef.current || isStreamActiveRef.current) {
+        setReplayRetryNonce((value) => value + 1);
+      } else {
+        setProviderRefreshNonce((value) => value + 1);
+      }
+      setSessionError(null);
+    } catch (error: any) {
+      setSessionError(
+        error?.response?.data?.error
+          || error?.message
+          || 'Project Chat recovery did not complete. Try again.',
+      );
+    } finally {
+      setConnectionNotice(null);
+      setSessionRecoveryPending(false);
+    }
+  }, [
+    dismissProjectChat,
+    loadAvailableModels,
+    loadHistorySnapshot,
+    modelCatalogError,
+    refreshPendingQuestions,
+    sessionError,
+    sessionRecoveryPending,
+  ]);
+
+  const sessionRecoveryLabel = sessionError === 'This project was deleted.'
+    ? 'Close Project Chat'
+    : modelCatalogError && sessionError === modelCatalogError
+      ? 'Retry model catalog'
+      : pendingSend
+        ? 'Check delivery state'
+        : isRunning
+          ? 'Reconnect active turn'
+          : providerVerificationState !== 'ready'
+            ? 'Recheck Project Chat provider'
+            : 'Refresh Project Chat state';
 
   // ── Render ──
   const projectMovePanel = projectMoveNotice ? (
@@ -6201,11 +6794,13 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
             onQualify={(provider) => {
               if (provider !== 'GROK') void handleProviderQualification(provider);
             }}
+            onReviewAgentZero={reviewAgentZeroProjectModels}
             agentZeroModel={agentZeroQualificationModel}
             agentZeroModels={agentZeroProjectModels}
             agentZeroModelsLoading={agentZeroModelsLoading}
             agentZeroModelsError={agentZeroModelsError}
             onAgentZeroModelChange={setAgentZeroQualificationModel}
+            reviewRequest={providerReviewRequest}
           />
           {/* Model selector */}
           {providerSupportsModelSelection && (
@@ -6213,8 +6808,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
               value={selectedModel}
               onChange={handleModelChange}
               models={availableModels}
-              disabled={!providerSendAllowed || sessionControlMutation !== null || projectTransitionActivity !== null}
+              loading={modelCatalogLoading}
+              error={modelCatalogError}
+              disabled={!providerModelSelectionAllowed || sessionControlMutation !== null || projectTransitionActivity !== null}
               exactCatalogOnly={selectedProvider === 'OPENCLAW' || selectedProvider === 'AGENT_ZERO'}
+              onRetry={() => { void loadAvailableModels().catch(() => undefined); }}
             />
           )}
           <button
@@ -6319,7 +6917,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                   max={THINKING_LEVELS.length - 1}
                   step={1}
                   value={Math.max(0, THINKING_LEVELS.indexOf(thinkingLevel))}
-                  disabled={!sessionKey || sessionControlMutation !== null}
+                  disabled={!projectSessionMutationControlsAllowed || sessionControlMutation !== null}
                   onChange={(e) => {
                     const next = THINKING_LEVELS[Number(e.target.value)] || 'off';
                     void handleThinkingLevelChange(next);
@@ -6342,7 +6940,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                   aria-label="Reasoning visibility"
                   value={reasoningVisibility}
                   onChange={(e) => { void handleReasoningVisibilityChange(e.target.value as ReasoningVisibility); }}
-                  disabled={!sessionKey || sessionControlMutation !== null}
+                  disabled={!projectSessionMutationControlsAllowed || sessionControlMutation !== null}
                   className="w-full rounded-lg border border-white/10 bg-[#111735] px-2 py-1.5 text-[11px] text-slate-200 disabled:opacity-50"
                 >
                   <option value="off">Hidden</option>
@@ -6369,7 +6967,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                       aria-label="Toggle Codex fast mode"
                       aria-pressed={fastModeEnabled}
                       onClick={() => { void handleFastModeToggle(); }}
-                      disabled={!sessionKey || sessionControlMutation !== null}
+                      disabled={!projectSessionMutationControlsAllowed || sessionControlMutation !== null}
                       className={`relative h-5 w-10 rounded-full transition-colors ${fastModeEnabled ? 'bg-amber-500' : 'bg-white/10'} disabled:opacity-50`}
                     >
                       <span
@@ -6393,7 +6991,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                   {isExportingChat ? 'Exporting…' : 'Export'}
                 </button>
                 <button onClick={() => { if (isRunning) void cancelStream(); setShowSessionControls(false); }} className="px-2 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-slate-200 disabled:opacity-50" disabled={!isRunning || !providerSupportsAbort || sessionControlMutation !== null}>Stop</button>
-                <button onClick={() => { void clearChat(); setShowSessionControls(false); }} disabled={!providerSupportsReset || sessionControlMutation !== null} className="px-2 py-2 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-xs text-amber-200 disabled:opacity-50">New Session</button>
+                <button onClick={() => { void clearChat(); setShowSessionControls(false); }} disabled={!hasVerifiedProjectConnection || !providerSupportsReset || sessionControlMutation !== null} className="px-2 py-2 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-xs text-amber-200 disabled:opacity-50">New Session</button>
               </div>
               <div className="rounded-lg border border-white/6 bg-black/20 px-2 py-2 text-[10px] text-slate-400 leading-relaxed">
                 Slash commands: <span className="text-slate-200">/new</span>, <span className="text-slate-200">/stop</span>, <span className="text-slate-200">/status</span>, <span className="text-slate-200">/models</span>, <span className="text-slate-200">/model &lt;id&gt;</span>, <span className="text-slate-200">/clear</span>, <span className="text-slate-200">/export</span>
@@ -6402,21 +7000,15 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           </AnchoredPopover>
           {/* Clear chat */}
           {messages.length > 0 && providerSupportsReset && (
-            <button onClick={clearChat} disabled={sessionControlMutation !== null} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-amber-400 transition-colors disabled:cursor-wait disabled:opacity-40" title="Clear chat">
+            <button onClick={clearChat} disabled={!hasVerifiedProjectConnection || sessionControlMutation !== null} className="p-1 rounded hover:bg-white/5 text-slate-600 hover:text-amber-400 transition-colors disabled:cursor-wait disabled:opacity-40" title="Clear chat">
               <Trash2 size={11} />
             </button>
           )}
           {/* Close */}
           <button
             aria-label="Close project chat"
-            disabled={sessionControlMutation !== null || qualificationPending || projectTransitionActivity !== null}
-            onClick={() => {
-              if (
-                !sessionControlMutationRef.current
-                && !qualificationLeaseRef.current
-                && !projectTransitionActivityRef.current
-              ) onClose();
-            }}
+            disabled={sessionControlMutation !== null || projectTransitionActivity !== null}
+            onClick={dismissProjectChat}
             className="p-1 rounded hover:bg-white/5 text-slate-500 hover:text-white transition-colors disabled:cursor-wait disabled:opacity-40"
           >
             <X size={14} />
@@ -6438,25 +7030,57 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         )}
       </AnimatePresence>
 
-      {/* Session error */}
-      {sessionError && (
-        <div role="alert" className="px-3 py-2 bg-red-500/10 border-b border-red-500/20 text-[11px] text-red-400 flex items-center gap-2">
-          <XCircle size={12} />
-          <span>{sessionError}</span>
+      {historyError && (
+        <div role="alert" className="flex items-center gap-2 border-b border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+          <MessageSquare size={12} className="flex-shrink-0 text-amber-300" />
+          <div className="min-w-0 flex-1">
+            <div className="font-medium">Project chat history could not be loaded.</div>
+            <div className="mt-0.5 break-words text-amber-200/80">{historyError}</div>
+          </div>
+          <button
+            type="button"
+            aria-label="Retry project chat history"
+            disabled={historyRetryPending}
+            onClick={() => { void retryHistorySnapshot(); }}
+            className="flex-shrink-0 rounded-md border border-amber-400/25 bg-amber-500/10 px-2 py-1 font-medium text-amber-100 transition-colors hover:bg-amber-500/20 disabled:cursor-wait disabled:opacity-50"
+          >
+            {historyRetryPending ? 'Retrying…' : 'Retry history'}
+          </button>
         </div>
       )}
 
-      {!sessionError && modelCatalogError && (
+      {/* Session error */}
+      {sessionError && !showUnavailableProviderBanner && (
         <div role="alert" className="px-3 py-2 bg-red-500/10 border-b border-red-500/20 text-[11px] text-red-400 flex items-center gap-2">
-          <XCircle size={12} />
-          <span>{modelCatalogError}</span>
+          <XCircle size={12} className="flex-shrink-0" />
+          <span className="min-w-0 flex-1 break-words">{sessionError}</span>
+          <button
+            type="button"
+            aria-label={sessionRecoveryLabel}
+            disabled={sessionRecoveryPending}
+            onClick={() => { void recoverProjectChatError(); }}
+            className="inline-flex flex-shrink-0 items-center gap-1 rounded-md border border-red-400/25 bg-red-500/10 px-2 py-1 font-medium text-red-100 transition-colors hover:bg-red-500/20 disabled:cursor-wait disabled:opacity-50"
+          >
+            {sessionRecoveryPending ? <Loader2 size={11} className="animate-spin" /> : <RotateCcw size={11} />}
+            {sessionRecoveryPending ? 'Recovering…' : sessionRecoveryLabel}
+          </button>
         </div>
       )}
 
       {pendingSendStorageError && (
         <div role="alert" className="flex items-center gap-2 border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
           <XCircle size={12} className="flex-shrink-0" />
-          <span>{pendingSendStorageError}</span>
+          <span className="min-w-0 flex-1 break-words">{pendingSendStorageError}</span>
+          <button
+            type="button"
+            aria-label="Clear Project Chat and start over"
+            disabled={!hasVerifiedProjectConnection || !providerSupportsReset || sessionControlMutation !== null}
+            onClick={() => { void clearChat(); }}
+            className="inline-flex flex-shrink-0 items-center gap-1 rounded-md border border-red-400/25 bg-red-500/10 px-2 py-1 font-medium text-red-100 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Trash2 size={11} />
+            Clear and start over
+          </button>
         </div>
       )}
 
@@ -6475,10 +7099,27 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       )}
 
       {showUnavailableProviderBanner && (
-        <div className="flex items-center gap-2 border-b border-red-500/15 bg-red-500/[0.04] px-3 py-2 text-[10px] text-theme-text-muted">
-          <XCircle size={12} className="flex-shrink-0 text-red-300" />
+        <div
+          role={unavailableProviderIsFailure ? 'alert' : 'status'}
+          className={`flex items-center gap-2 border-b px-3 py-2 text-[10px] text-theme-text-muted ${
+            unavailableProviderIsFailure
+              ? 'border-red-500/15 bg-red-500/[0.04]'
+              : 'border-amber-500/15 bg-amber-500/[0.04]'
+          }`}
+        >
+          {unavailableProviderIsFailure ? (
+            <XCircle size={12} className="flex-shrink-0 text-red-300" />
+          ) : (
+            <Radio size={12} className="flex-shrink-0 text-amber-300" />
+          )}
           <div className="min-w-0 flex-1">
-            <div className="font-medium text-red-300">No Project Chat provider is verified</div>
+            <div className={`font-medium ${unavailableProviderIsFailure ? 'text-red-300' : 'text-amber-200'}`}>
+              {providerVerificationState === 'failed'
+                ? 'Project Chat could not open'
+                : directQualificationFailure
+                  ? 'Provider preparation needs attention'
+                  : 'Prepare a provider to start chatting'}
+            </div>
             <div className="mt-0.5 truncate">{unavailableProviderDetail}</div>
             {hostRecoveryRole !== 'USER' && directQualificationFailure?.operatorDiagnostic && (
               <div className="mt-1 whitespace-pre-wrap break-words text-amber-200">
@@ -6496,12 +7137,25 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           {directQualificationProvider && !directQualificationRetryBlocked && (
             <button
               type="button"
-              aria-label={`Prepare ${getProjectProviderLabel(directQualificationProvider)} for this project`}
+              aria-label={directAgentZeroNeedsModelReview
+                ? 'Review Agent Zero connected models'
+                : `Prepare ${getProjectProviderLabel(directQualificationProvider)} for this project`}
               disabled={qualificationPending || projectTransitionActivity !== null || sessionControlMutation !== null}
-              onClick={() => { void handleProviderQualification(directQualificationProvider); }}
+              onClick={() => {
+                if (directAgentZeroNeedsModelReview) {
+                  setProviderReviewRequest((current) => ({
+                    provider: 'AGENT_ZERO',
+                    token: (current?.token || 0) + 1,
+                  }));
+                  return;
+                }
+                void handleProviderQualification(directQualificationProvider);
+              }}
               className="flex-shrink-0 rounded-md border border-amber-400/25 bg-amber-500/10 px-2 py-1 font-medium text-amber-100 transition-colors hover:bg-amber-500/20 disabled:cursor-wait disabled:opacity-50"
             >
-              Prepare {getProjectProviderLabel(directQualificationProvider)}
+              {directAgentZeroNeedsModelReview
+                ? 'Review Agent Zero models'
+                : `Prepare ${getProjectProviderLabel(directQualificationProvider)}`}
             </button>
           )}
           {directQualificationRetryBlocked ? (
@@ -6540,12 +7194,37 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                   Recheck after repair
                 </button>
               </div>
+            ) : directQualificationProvider
+              && directQualificationFailure?.recovery === 'AI_SETTINGS' ? (
+              <div className="flex flex-shrink-0 items-center gap-2">
+                {authRecoveryAction ? (
+                  <a
+                    href={authRecoveryAction.href}
+                    className="rounded-md border border-violet-400/25 bg-violet-500/10 px-2 py-1 font-medium text-violet-100 transition-colors hover:bg-violet-500/20"
+                  >
+                    {authRecoveryAction.label}
+                  </a>
+                ) : (
+                  <span className="font-medium text-amber-200">
+                    Contact an Owner or Sub Admin
+                  </span>
+                )}
+                <button
+                  type="button"
+                  aria-label={`Recheck ${getProjectProviderLabel(directQualificationProvider)} after reconnecting`}
+                  disabled={qualificationPending || projectTransitionActivity !== null || sessionControlMutation !== null}
+                  onClick={() => { void handleProviderQualification(directQualificationProvider); }}
+                  className="rounded-md border border-theme-border bg-theme-surface px-2 py-1 font-medium text-theme-text transition-colors hover:bg-theme-bg disabled:cursor-wait disabled:opacity-50"
+                >
+                  Recheck after reconnecting
+                </button>
+              </div>
             ) : (
               <span className="flex-shrink-0 font-medium text-amber-200">
-                Host repair required
+                Provider review required
               </span>
             )
-          ) : (
+          ) : directQualificationProvider ? null : (
             <button
               type="button"
               onClick={() => setProviderRefreshNonce((value) => value + 1)}
@@ -6613,6 +7292,9 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
               </span>
             ))}
           </div>
+          <p className="mt-1.5 text-amber-200/75">
+            You can close this panel. Preparation will continue in the background; reopen Project Chat to check the result.
+          </p>
         </div>
       )}
 
@@ -6628,8 +7310,13 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           {!transportConnected && (
             <button
               onClick={() => {
-                setConnectionNotice('Retrying Portal replay…');
-                setReplayRetryNonce((value) => value + 1);
+                if (sessionReady) {
+                  setConnectionNotice('Retrying Portal replay…');
+                  setReplayRetryNonce((value) => value + 1);
+                } else {
+                  setConnectionNotice('Retrying Project Chat provider check…');
+                  setProviderRefreshNonce((value) => value + 1);
+                }
               }}
               className="px-2 py-0.5 rounded-md border border-amber-500/20 hover:bg-amber-500/10 transition-colors text-[10px] font-medium"
             >
@@ -6931,9 +7618,14 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           {/* Attachment chips */}
           {pendingAttachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-2">
-              {pendingAttachments.map(att => (
-                <AttachmentChip key={att.id} attachment={att} onRemove={() => removeAttachment(att.id)} />
-              ))}
+          {pendingAttachments.map(att => (
+              <AttachmentChip
+                key={att.id}
+                attachment={att}
+                onRemove={() => removeAttachment(att.id)}
+                onRetry={() => { void uploadFile(att.file, att.id); }}
+              />
+            ))}
             </div>
           )}
 
@@ -6966,8 +7658,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                 ref={inputRef}
                 value={input}
                 onChange={e => {
-                  setInput(e.target.value);
-                  refreshSlashAutocomplete(e.target.value, e.target.selectionStart ?? e.target.value.length);
+                  const nextValue = e.target.value;
+                  const preservedScope = preservedQueuedComposerDraftScopeRef.current;
+                  if (preservedScope) {
+                    if (nextValue.trim()) {
+                      writeQueuedComposerDraft(preservedScope, nextValue);
+                    } else {
+                      clearPreservedQueuedComposerDraft();
+                    }
+                  }
+                  setInput(nextValue);
+                  refreshSlashAutocomplete(nextValue, e.target.selectionStart ?? nextValue.length);
                 }}
                 onKeyDown={e => {
                   if (showSlashMenu && slashCommands.length > 0) {
@@ -7006,8 +7707,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                   : queuedComposerMessage
                     ? 'Message queued while the sandbox is prepared…'
                   : providerVerificationState === 'ready'
-                    ? 'Message Agent…'
-                    : 'Message Agent while Portal prepares the sandbox…'}
+                    ? directQualificationProvider
+                      ? 'Draft a message, then prepare the provider to send…'
+                      : 'Message Agent…'
+                    : providerVerificationState === 'failed'
+                      ? 'Keep your draft here, then retry the provider check…'
+                      : 'Draft a message while Portal checks providers…'}
                 aria-haspopup="listbox"
                 aria-controls={showSlashMenu && slashCommands.length > 0 && providerSendAllowed ? slashMenuId : undefined}
                 aria-activedescendant={showSlashMenu && slashCommands.length > 0 && providerSendAllowed ? `${slashMenuId}-option-${selectedSlashIndex}` : undefined}
@@ -7103,7 +7808,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
               <button
                 type="submit"
                 aria-label="Send message to project agent"
-                disabled={!input.trim() || !composerAcceptsInput || pendingAttachments.some(a => a.uploadStatus !== 'done' || !a.projectPath)}
+                disabled={!input.trim() || !composerAcceptsInput || modelCatalogBlocksInput || pendingAttachments.some(a => a.uploadStatus !== 'done' || !a.projectPath)}
                 className="flex-shrink-0 p-2 rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               >
                 <Send size={14} />
@@ -7127,14 +7832,8 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   return (
     <ViewportModal
       open
-      onDismiss={() => {
-        if (
-          !sessionControlMutationRef.current
-          && !qualificationLeaseRef.current
-          && !projectTransitionActivityRef.current
-        ) onClose();
-      }}
-      dismissible={sessionControlMutation === null && !qualificationPending && projectTransitionActivity === null}
+      onDismiss={dismissProjectChat}
+      dismissible={sessionControlMutation === null && projectTransitionActivity === null}
       className="items-stretch justify-stretch bg-[#080B20]/98 backdrop-blur-sm"
     >
       {renderedPanelWithAnswerProvider}

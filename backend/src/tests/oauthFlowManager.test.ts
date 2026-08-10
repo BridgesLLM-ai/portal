@@ -43,6 +43,8 @@ import {
   extractClaudeSetupToken,
   extractDeviceCodeExpiry,
   extractDeviceCodeInstructions,
+  extractProviderCliErrorText,
+  forceReleaseCredentialLifecycleLease,
   expireOAuthSessionRecord,
   getOpenClawOAuthProviderId,
   GROK_BUILD_DEVICE_LOGIN_ARGS,
@@ -344,6 +346,44 @@ describe('oauthFlowManager terminal parsing', () => {
     const raw = 'P\r[2m\na\r[2m\ns\r[2m\nt\r[2m\ne\r[2m\n';
     expect(normalizeTerminalScreenText(raw)).toContain('P');
     expect(squashPromptText(raw)).toBe('paste');
+  });
+
+  test('surfaces the CLI\'s own Error line instead of a bare exit code', () => {
+    // Verbatim failure shape captured from OpenClaw 2026.7.1's gemini flow on
+    // the test box: the actionable install command must survive extraction.
+    const raw = [
+      'Gemini CLI OAuth failed',
+      'OAuth help',
+      'Trouble with OAuth? Ensure your Google account has Gemini CLI access.',
+      'Error: Gemini CLI not found. Install it first: brew install gemini-cli',
+      'or npm install -g @google/gemini-cli or set GEMINI_CLI_OAUTH_CLIENT_ID.',
+      'Details: Gemini CLI binary was not found in PATH during OAuth credential extraction.',
+    ].join('\r\n');
+    const extracted = extractProviderCliErrorText(raw);
+    expect(extracted).toContain('Gemini CLI not found');
+    expect(extracted).toContain('npm install -g @google/gemini-cli');
+  });
+
+  test('reports no CLI error text when the output never printed one', () => {
+    expect(extractProviderCliErrorText('Waiting for you to paste the callback URL\r\n')).toBeNull();
+    expect(extractProviderCliErrorText('')).toBeNull();
+  });
+
+  test('strips TUI box glyphs when a wrapped Error message continues across lines', () => {
+    const raw = [
+      '│ Error: something broke during sign-in',
+      '│ retry after installing the provider CLI',
+      '└─────',
+      '',
+    ].join('\n');
+    const extracted = extractProviderCliErrorText(raw);
+    expect(extracted).toContain('something broke during sign-in');
+    expect(extracted).not.toContain('│');
+    expect(extracted).not.toContain('└');
+  });
+
+  test('force-releasing an unknown credential-domain lease reports none', () => {
+    expect(forceReleaseCredentialLifecycleLease('credential-domain:never-claimed')).toBe('none');
   });
 
   test('detects OpenClaw Codex callback prompts rendered one glyph per line', () => {
@@ -2334,7 +2374,7 @@ describe('oauthFlowManager terminal parsing', () => {
   });
 
   test.each(['committed', 'absent'] as const)(
-    'joins the authoritative xAI exit reconciliation before reporting %s',
+    'accepts xAI cancellation while authoritative reconciliation is still proving %s',
     async (resolution) => {
       const sessionId = `xai_joined_exit_reconciliation_${resolution}`;
       let settle!: (value: 'committed' | 'absent') => void;
@@ -2368,22 +2408,28 @@ describe('oauthFlowManager terminal parsing', () => {
       __setOAuthSessionForTests(session);
 
       try {
-        const cancellation = cancelOAuthFlow(sessionId, 'user:owner');
-        let settled = false;
-        void cancellation.finally(() => { settled = true; });
-        await Promise.resolve();
-        expect(settled).toBe(false);
+        await expect(cancelOAuthFlow(sessionId, 'user:owner')).resolves.toMatchObject({
+          success: false,
+          status: 'cancelled',
+          cleanupPending: true,
+          credentialState: 'indeterminate',
+        });
 
         session.profileReconciliationPending = false;
+        session.credentialResolution = resolution;
+        session.status = resolution === 'committed' ? 'error' : 'cancelled';
+        session.error = resolution === 'committed'
+          ? 'The xAI credential committed before cancellation finished.'
+          : null;
         settle(resolution);
         if (resolution === 'committed') {
-          await expect(cancellation).resolves.toMatchObject({
+          await expect(cancelOAuthFlow(sessionId, 'user:owner')).resolves.toMatchObject({
             success: false,
             status: 'error',
             credentialState: 'committed',
           });
         } else {
-          await expect(cancellation).resolves.toEqual({
+          await expect(cancelOAuthFlow(sessionId, 'user:owner')).resolves.toEqual({
             success: true,
             status: 'cancelled',
           });

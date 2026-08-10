@@ -26,22 +26,55 @@ import {
   stopApp,
   forgetAppRuntime,
   getAppStatus,
+  ProjectRuntimeStateAttestationError,
 } from '../services/app-process.service';
 import { getWorkspaceOwnerId } from '../utils/workspaceScope';
 import { desktopExec, desktopExecManaged } from '../utils/desktopEnv';
 import {
   createProjectLifecycleWorkspace,
+  assertProjectRuntimeImageAvailable,
   copyDesktopRuntimeDeploymentTree,
-  copyFullstackDeploymentTree,
   copyStaticDeploymentTree,
-  prepareProjectLifecycleWorkspace,
+  prepareFullstackDeploymentTree,
+  ProjectDeploymentReplayStaleError,
+  ProjectLifecycleWorkspacePreparationError,
+  ProjectRuntimeImageUnavailableError,
   promoteProjectLifecycleArtifacts,
   runProjectLifecycleCommand,
   spawnProjectLifecycleCommand,
   type ProjectDeploymentPromotion,
 } from '../services/project-lifecycle.service';
 import {
+  assertProjectRuntimeLifecycleMutable,
+  projectExternalRuntimeConflict,
+  projectInvalidRuntimeBindingConflict,
+  ProjectExternalRuntimeLifecycleError,
+  ProjectInvalidRuntimeBindingError,
+  PROJECT_EXTERNAL_RUNTIME_ERROR_CODE,
+  PROJECT_EXTERNAL_RUNTIME_LIMITATION,
+  PROJECT_INVALID_RUNTIME_BINDING_ERROR_CODE,
+  PROJECT_INVALID_RUNTIME_BINDING_LIMITATION,
+  probeExternalLoopbackRuntime,
+  projectRuntimeManagement,
+  projectRuntimeStatusSource,
+  projectSupportedLifecycleActions,
+} from '../services/projectRuntimeManagement';
+import {
+  advanceProjectDeploymentLifecycleRevision,
+  claimProjectRuntimeRecoveryProof,
+  completeProjectRuntimeRecovery,
+  failProjectRuntimeRecovery,
+  issueProjectRuntimeRecoveryProof,
+  readProjectDeploymentLifecycleRevision,
+  readProjectRuntimeRecoveryStatus,
+  ProjectRuntimeRecoveryReplayError,
+  type ProjectRuntimeRecoveryResponse,
+  type ProjectRuntimeRecoveryScope,
+  type ProjectRuntimeRecoveryStatus,
+} from '../services/projectRuntimeRecoveryReplay';
+import {
   assertSafeProjectGitUrl,
+  runPreparedProjectGitCommand,
   runProjectGitCommand,
 } from '../services/project-git.service';
 import { getDefaultModel, getProviderStatusesAsync } from '../services/openclawConfigManager';
@@ -52,10 +85,14 @@ import {
   ContainedPathError,
   ensureContainedDirectory,
   resolveContainedPath,
-  writeContainedFileAtomic,
 } from '../services/containedPath';
 import { removeToolMirror, resolveFilePath } from './files';
-import { parseShareLinkOptions, shareLinkAvailability, validateSharePassword } from '../utils/shareAccessSecurity';
+import {
+  parseShareLinkOptions,
+  shareCredentialStateIsValid,
+  shareLinkAvailability,
+  validateSharePassword,
+} from '../utils/shareAccessSecurity';
 import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
 import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
 import {
@@ -67,8 +104,15 @@ import {
   readProjectTextFile,
   safeProjectDownloadName,
   statProjectRegularFile,
-  writeProjectTextFile,
+  writeProjectRuntimeTextFile,
 } from '../services/projectSurfacePolicy';
+import {
+  assignProjectRuntimeOwnership,
+  ensureProjectRuntimeOwnedDirectory,
+  ProjectRuntimeOwnershipError,
+  writeProjectRuntimeOwnedFileAtomic,
+} from '../services/projectRuntimeOwnership';
+import { ensureProjectChatWorkspaceOwnership } from '../services/projectChatWorkspaceOwnership';
 import type { AgentProviderName, ProjectSandboxExecutionContext } from '../agents/AgentProvider.interface';
 import {
   deleteNativeSession,
@@ -84,6 +128,12 @@ import {
   NATIVE_CLI_PROJECT_CONTAINER_ROOT,
 } from '../agents/providers/native/projectSandbox/NativeCliProjectEgressRuntime';
 import { presentProjectQualificationError } from '../services/projectQualificationErrorPresentation';
+import { writeProjectSessionProjectionBestEffort } from '../services/projectSessionProjection';
+import {
+  ProjectMemoryAccessError,
+  ensureProjectMemory,
+  readProjectMemory,
+} from '../services/projectMemory';
 import {
   abortProjectNativeRun,
   clearProjectNativeRun,
@@ -205,6 +255,7 @@ import {
   renameProjectIdentity,
   renewProjectIdentityRenameLease,
   ProjectIdentityLifecycleError,
+  ProjectIdentityMismatchError,
   type AttestedDirectoryIdentity,
   type AttestedProjectRoot,
   type ProjectIdentityRecord,
@@ -1146,6 +1197,11 @@ type ProjectIdentityProof = {
   generation: number;
 };
 
+type ProjectDeleteIdentityRequest =
+  | { kind: 'absent' }
+  | { kind: 'invalid' }
+  | { kind: 'valid'; proof: ProjectIdentityProof };
+
 const PROJECT_MOVE_REQUIRED_CODE = 'PROJECT_MOVE_REQUIRED';
 const PROJECT_DESTRUCTIVE_MOVE_REQUIRED_MESSAGE =
   'Move this older project into a new Portal project before renaming or deleting it.';
@@ -1166,6 +1222,55 @@ function serializeProjectIdentityProof(identity: { id: string; generation: numbe
     throw new Error('Project identity proof is invalid');
   }
   return { id: identity.id, generation: identity.generation };
+}
+
+function parseProjectDeleteIdentityRequest(body: unknown): ProjectDeleteIdentityRequest {
+  if (body === undefined || body === null) return { kind: 'absent' };
+  if (typeof body !== 'object' || Array.isArray(body)) return { kind: 'invalid' };
+
+  const record = body as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length === 0) return { kind: 'absent' };
+  if (
+    keys.length !== 2
+    || !Object.prototype.hasOwnProperty.call(record, 'projectIdentityId')
+    || !Object.prototype.hasOwnProperty.call(record, 'projectGeneration')
+  ) return { kind: 'invalid' };
+
+  const projectIdentityId = record.projectIdentityId;
+  const projectGeneration = record.projectGeneration;
+  if (
+    typeof projectIdentityId !== 'string'
+    || projectIdentityId.length < 1
+    || projectIdentityId.length > 128
+    || projectIdentityId.trim() !== projectIdentityId
+    || /[\u0000-\u001f\u007f]/.test(projectIdentityId)
+    || typeof projectGeneration !== 'number'
+    || !Number.isSafeInteger(projectGeneration)
+    || projectGeneration < 1
+  ) return { kind: 'invalid' };
+
+  return {
+    kind: 'valid',
+    proof: { id: projectIdentityId, generation: projectGeneration },
+  };
+}
+
+function projectDeleteIdentityMatches(
+  identity: Pick<ProjectIdentityRecord, 'id' | 'generation'>,
+  proof: ProjectIdentityProof,
+): boolean {
+  return identity.id === proof.id && identity.generation === proof.generation;
+}
+
+function sendProjectDeleteIdentityMismatch(res: Response): void {
+  res.status(409).json({
+    error: 'The Project identity changed before deletion admission. Refresh Projects before trying again.',
+    code: 'PROJECT_DELETE_IDENTITY_MISMATCH',
+    status: 'not_admitted',
+    admitted: false,
+    retryable: false,
+  });
 }
 
 function projectDestructiveActionCapability(identity: ProjectIdentityRecord) {
@@ -1424,6 +1529,413 @@ async function findProjectAppForIdentity(input: {
   return apps[0] || null;
 }
 
+async function findProjectAppBeforeIdentityMutation(input: {
+  workspaceOwnerId: string;
+  projectName: string;
+  deployPath: string;
+}): Promise<App | null> {
+  const storedIdentity = await prisma.projectIdentity.findUnique({
+    where: {
+      workspaceOwnerId_projectName: {
+        workspaceOwnerId: input.workspaceOwnerId,
+        projectName: input.projectName,
+      },
+    },
+  });
+  const apps = await prisma.app.findMany({
+    where: storedIdentity
+      ? projectAppAssociationWhere({
+        workspaceOwnerId: input.workspaceOwnerId,
+        projectIdentityId: storedIdentity.id,
+        projectName: input.projectName,
+        deployPath: input.deployPath,
+      })
+      : {
+        userId: input.workspaceOwnerId,
+        projectIdentityId: null,
+        name: input.projectName,
+        zipPath: input.deployPath,
+      },
+    take: 2,
+  });
+  if (apps.length > 1) {
+    throw new ProjectIdentityLifecycleError(
+      'More than one App claims the same Project deployment before identity enrollment',
+    );
+  }
+  return apps[0] || null;
+}
+
+function sendExternalRuntimeConflict(
+  res: Response,
+  action: string,
+): void {
+  res.status(409).json(projectExternalRuntimeConflict(
+    new ProjectExternalRuntimeLifecycleError(action),
+  ));
+}
+
+function sendInvalidRuntimeBindingConflict(
+  res: Response,
+  action: string,
+): void {
+  res.status(503).json(projectInvalidRuntimeBindingConflict(
+    new ProjectInvalidRuntimeBindingError(action),
+  ));
+}
+
+type ProjectDeployType = 'static' | 'fullstack' | 'runtime';
+
+function boundedProjectDeployType(value: unknown): ProjectDeployType {
+  if (value === 'static' || value === 'fullstack' || value === 'runtime') return value;
+  throw new ProjectIdentityLifecycleError('The stored Project deployment type is invalid');
+}
+
+function sendProjectDeployTypeTransitionConflict(
+  res: Response,
+  priorDeployType: ProjectDeployType,
+  nextDeployType: ProjectDeployType,
+): void {
+  res.status(409).json({
+    code: 'PROJECT_DEPLOY_TYPE_TRANSITION_REQUIRES_UNDEPLOY',
+    error: `This Project is already deployed as ${priorDeployType}. Remove the current deployment before deploying it as ${nextDeployType}.`,
+    detail: 'Removing the deployment stops and clears its current runtime while preserving the Project source. You can then deploy the new type.',
+    priorDeployType,
+    nextDeployType,
+    recoveryAction: 'UNDEPLOY_CURRENT_DEPLOYMENT',
+    retryable: false,
+  });
+}
+
+function sendDeployTypeTransitionConflictIfNeeded(
+  res: Response,
+  app: App | null | undefined,
+  nextDeployType: ProjectDeployType,
+): boolean {
+  if (!app) return false;
+  const priorDeployType = boundedProjectDeployType(app.deployType);
+  if (priorDeployType === nextDeployType) return false;
+  sendProjectDeployTypeTransitionConflict(
+    res,
+    priorDeployType,
+    nextDeployType,
+  );
+  return true;
+}
+
+function sendRuntimeOwnershipMutationConflict(
+  res: Response,
+  app: App | null | undefined,
+  action: string,
+): boolean {
+  if (!app) return false;
+  const management = projectRuntimeManagement(app);
+  if (management === 'invalid-external-binding') {
+    sendInvalidRuntimeBindingConflict(res, action);
+    return true;
+  }
+  if (management === 'external-loopback') {
+    sendExternalRuntimeConflict(res, action);
+    return true;
+  }
+  return false;
+}
+
+async function sendExternalRuntimeStatus(
+  res: Response,
+  app: App,
+): Promise<void> {
+  const status = await probeExternalLoopbackRuntime(app);
+  res.json({
+    status,
+    persistedStatus: app.processStatus || null,
+    statusSource: 'external-binding',
+    recoveryRequired: false,
+    deployType: app.deployType,
+    runtimeManagement: 'external-loopback',
+    supportedActions: [],
+    logs: [],
+    restartCount: 0,
+    limitation: 'Portal routes this App to an externally managed loopback service but cannot inspect or control that service process.',
+  });
+}
+
+function isProjectRuntimeImageUnavailable(error: unknown): boolean {
+  return error instanceof ProjectRuntimeImageUnavailableError
+    || (error as { code?: unknown } | null)?.code === 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE';
+}
+
+type ProjectRuntimeRecoveryReplayAction = 'deploy' | 'start' | 'restart';
+
+type ProjectRuntimeRecoveryReplayProof = Readonly<{
+  proof: string;
+  action: ProjectRuntimeRecoveryReplayAction;
+  projectIdentity: ProjectIdentityProof;
+  expectedAppId: string | null;
+  expectedDeployType?: 'fullstack';
+  sourceDigest?: string;
+}>;
+
+class ProjectRuntimeRecoveryReplayValidationError extends Error {
+  readonly code = 'PROJECT_RUNTIME_RECOVERY_REPLAY_INVALID';
+}
+
+function parseProjectRuntimeRecoveryReplay(
+  value: unknown,
+  expectedAction: ProjectRuntimeRecoveryReplayAction,
+): ProjectRuntimeRecoveryReplayProof | null {
+  if (value === undefined) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ProjectRuntimeRecoveryReplayValidationError('Runtime recovery replay proof is malformed');
+  }
+  const record = value as Record<string, unknown>;
+  const allowedKeys = new Set([
+    'proof',
+    'action',
+    'projectIdentity',
+    'expectedAppId',
+    'expectedDeployType',
+    'sourceDigest',
+  ]);
+  if (
+    Object.keys(record).some((key) => !allowedKeys.has(key))
+    || typeof record.proof !== 'string'
+    || !/^v1\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/.test(record.proof)
+    || record.action !== expectedAction
+  ) {
+    throw new ProjectRuntimeRecoveryReplayValidationError('Runtime recovery replay proof is malformed');
+  }
+  if (!record.projectIdentity || typeof record.projectIdentity !== 'object' || Array.isArray(record.projectIdentity)) {
+    throw new ProjectRuntimeRecoveryReplayValidationError('Runtime recovery Project identity is malformed');
+  }
+  const identity = record.projectIdentity as Record<string, unknown>;
+  if (
+    Object.keys(identity).some((key) => key !== 'id' && key !== 'generation')
+    || typeof identity.id !== 'string'
+    || !identity.id
+    || identity.id.length > 128
+    || identity.id.trim() !== identity.id
+    || !Number.isSafeInteger(identity.generation)
+    || (identity.generation as number) < 1
+    || (record.expectedAppId !== null && (
+      typeof record.expectedAppId !== 'string'
+      || !record.expectedAppId
+      || record.expectedAppId.length > 128
+      || record.expectedAppId.trim() !== record.expectedAppId
+    ))
+  ) {
+    throw new ProjectRuntimeRecoveryReplayValidationError('Runtime recovery replay proof is malformed');
+  }
+  if (
+    expectedAction === 'deploy'
+      ? record.expectedDeployType !== 'fullstack'
+        || typeof record.sourceDigest !== 'string'
+        || !/^[a-f0-9]{64}$/.test(record.sourceDigest)
+      : record.expectedDeployType !== undefined
+        || record.sourceDigest !== undefined
+        || record.expectedAppId === null
+  ) {
+    throw new ProjectRuntimeRecoveryReplayValidationError('Runtime recovery replay proof is malformed');
+  }
+  return Object.freeze({
+    proof: record.proof,
+    action: expectedAction,
+    projectIdentity: Object.freeze({
+      id: identity.id,
+      generation: identity.generation as number,
+    }),
+    expectedAppId: record.expectedAppId as string | null,
+    ...(expectedAction === 'deploy' ? {
+      expectedDeployType: 'fullstack' as const,
+      sourceDigest: record.sourceDigest as string,
+    } : {}),
+  });
+}
+
+function projectRuntimeRecoveryReplayScope(
+  ownerUserId: string,
+  replay: ProjectRuntimeRecoveryReplayProof,
+): ProjectRuntimeRecoveryScope & { proof: string } {
+  return {
+    proof: replay.proof,
+    ownerUserId,
+    projectIdentityId: replay.projectIdentity.id,
+    projectIdentityGeneration: replay.projectIdentity.generation,
+    action: replay.action,
+    expectedAppId: replay.expectedAppId,
+    expectedFullstack: true,
+    sourceDigest: replay.sourceDigest || null,
+  };
+}
+
+function assertProjectRuntimeRecoveryRouteIdentity(
+  replay: ProjectRuntimeRecoveryReplayProof,
+  projectIdentity: { id: string; generation: number },
+): void {
+  if (
+    replay.projectIdentity.id !== projectIdentity.id
+    || replay.projectIdentity.generation !== projectIdentity.generation
+  ) {
+    throw new ProjectDeploymentReplayStaleError();
+  }
+}
+
+function assertProjectRuntimeRecoveryRouteApp(
+  replay: ProjectRuntimeRecoveryReplayProof,
+  app: Pick<App, 'id'> | null | undefined,
+): void {
+  if (replay.expectedAppId !== (app?.id || null)) {
+    throw new ProjectDeploymentReplayStaleError();
+  }
+}
+
+function sendProjectRuntimeRecoveryStatus(
+  res: Response,
+  status: ProjectRuntimeRecoveryStatus,
+): boolean {
+  if (status.kind === 'issued' || status.kind === 'claimed') return false;
+  res.setHeader('Cache-Control', 'private, no-store');
+  if (status.kind === 'completed') {
+    res.status(status.result.statusCode).json(status.result.body);
+    return true;
+  }
+  if (status.kind === 'running') {
+    res.status(409).json({
+      code: 'PROJECT_RUNTIME_RECOVERY_IN_PROGRESS',
+      error: 'The recovered Project action is still reconciling.',
+      detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+      retryable: false,
+    });
+    return true;
+  }
+  res.status(409).json({
+    code: 'PROJECT_RUNTIME_RECOVERY_FAILED',
+    error: 'The recovered Project action did not complete.',
+    detail: 'Refresh this Project and use its current Deployment controls.',
+    failureCode: status.failureCode,
+    retryable: false,
+  });
+  return true;
+}
+
+function sendProjectRuntimeRecoveryReplayError(
+  res: Response,
+  error: unknown,
+): boolean {
+  if (!(error instanceof ProjectRuntimeRecoveryReplayError)) return false;
+  res.setHeader('Cache-Control', 'private, no-store');
+  const stale = [
+    'PROJECT_RUNTIME_RECOVERY_PROOF_EXPIRED',
+    'PROJECT_RUNTIME_RECOVERY_PROOF_MISMATCH',
+    'PROJECT_RUNTIME_RECOVERY_STALE',
+  ].includes(error.code);
+  const invalid = error.code === 'PROJECT_RUNTIME_RECOVERY_INVALID_INPUT'
+    || error.code === 'PROJECT_RUNTIME_RECOVERY_PROOF_INVALID';
+  res.status(invalid ? 400 : stale ? 409 : error.httpStatus).json({
+    code: invalid
+      ? 'PROJECT_RUNTIME_RECOVERY_REPLAY_INVALID'
+      : stale
+        ? 'PROJECT_RUNTIME_RECOVERY_REPLAY_STALE'
+        : error.code,
+    error: invalid
+      ? 'Runtime recovery replay proof is invalid.'
+      : stale
+        ? 'This recovered Project action is stale and was not executed.'
+        : 'Portal could not safely reconcile the recovered Project action.',
+    detail: stale
+      ? 'Refresh this Project and use its current Deployment controls.'
+      : 'Refresh Deployment status before retrying.',
+    retryable: false,
+  });
+  return true;
+}
+
+async function completeProjectRuntimeRecoveryOrThrow(
+  ownerUserId: string,
+  replay: ProjectRuntimeRecoveryReplayProof | null,
+  response: ProjectRuntimeRecoveryResponse,
+): Promise<void> {
+  if (!replay) return;
+  await completeProjectRuntimeRecovery({
+    ...projectRuntimeRecoveryReplayScope(ownerUserId, replay),
+    response,
+  });
+}
+
+async function failProjectRuntimeRecoveryOrThrow(
+  ownerUserId: string,
+  replay: ProjectRuntimeRecoveryReplayProof | null,
+  failureCode: string,
+): Promise<void> {
+  if (!replay) return;
+  await failProjectRuntimeRecovery({
+    ...projectRuntimeRecoveryReplayScope(ownerUserId, replay),
+    failureCode,
+  });
+}
+
+async function issueProjectRuntimeRecoveryReplay(input: Readonly<{
+  ownerUserId: string;
+  action: ProjectRuntimeRecoveryReplayAction;
+  projectIdentity: ProjectIdentityProof;
+  expectedAppId: string | null;
+  expectedDeploymentRevision: string;
+  sourceDigest?: string;
+}>): Promise<ProjectRuntimeRecoveryReplayProof> {
+  const issued = await issueProjectRuntimeRecoveryProof({
+    ownerUserId: input.ownerUserId,
+    projectIdentityId: input.projectIdentity.id,
+    projectIdentityGeneration: input.projectIdentity.generation,
+    action: input.action,
+    expectedAppId: input.expectedAppId,
+    expectedDeploymentRevision: input.expectedDeploymentRevision,
+    expectedFullstack: true,
+    sourceDigest: input.sourceDigest || null,
+  });
+  return Object.freeze({
+    proof: issued.proof,
+    action: input.action,
+    projectIdentity: input.projectIdentity,
+    expectedAppId: input.expectedAppId,
+    ...(input.action === 'deploy' ? {
+      expectedDeployType: 'fullstack' as const,
+      sourceDigest: input.sourceDigest,
+    } : {}),
+  });
+}
+
+function projectRuntimeRecoveryCompletion(input: Readonly<{
+  replay: ProjectRuntimeRecoveryReplayProof;
+  deploymentRevision: string;
+  appId: string;
+}>): ProjectRuntimeRecoveryResponse {
+  return {
+    statusCode: 200,
+    body: {
+      success: true,
+      action: input.replay.action,
+      projectIdentityId: input.replay.projectIdentity.id,
+      projectIdentityGeneration: input.replay.projectIdentity.generation,
+      appId: input.appId,
+      deploymentRevision: input.deploymentRevision,
+    },
+  };
+}
+
+function sendProjectRuntimeImageUnavailable(
+  res: Response,
+  recoveryReplay: ProjectRuntimeRecoveryReplayProof,
+): void {
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.status(503).json({
+    code: 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE',
+    error: 'The Project runtime image is unavailable. Repair it, then try this action again.',
+    retryable: true,
+    recoveryAction: 'REPAIR_PROJECT_RUNTIME_IMAGE',
+    recoveryReplay,
+  });
+}
+
 async function stopProjectDesktopRuntimesForLifecycle(input: {
   workspaceOwnerId: string;
   projectIdentityId: string;
@@ -1563,6 +2075,7 @@ async function retargetProjectAppsForRename(
   }
   const projectApp = projectApps[0];
   if (projectApp) {
+    assertProjectRuntimeLifecycleMutable(projectApp, 'rename-project');
     await transaction.app.update({
       where: { id: projectApp.id },
       data: {
@@ -1645,6 +2158,13 @@ async function completeInterruptedProjectRenameWithApps(input: {
   oldDeployPath: string;
   newDeployPath: string;
 }) {
+  const projectApp = await findProjectAppForIdentity({
+    workspaceOwnerId: input.workspaceOwnerId,
+    projectIdentityId: input.projectIdentityId,
+    projectName: input.oldProjectName,
+    deployPath: input.oldDeployPath,
+  });
+  assertProjectRuntimeLifecycleMutable(projectApp, 'rename-project');
   return prisma.$transaction(async (transaction) => {
     const recovered = await recoverInterruptedProjectIdentityRename({
       workspaceOwnerId: input.workspaceOwnerId,
@@ -1767,6 +2287,13 @@ async function convergeInterruptedProjectRenameForDestructiveOperation(input: {
   if (!journal) {
     return { projectName: input.projectName, projectDir: currentProjectDir, recovered: false };
   }
+  const journalApp = await findProjectAppForIdentity({
+    workspaceOwnerId: input.workspaceOwnerId,
+    projectIdentityId: journal.id,
+    projectName: journal.projectName,
+    deployPath: path.join(DEPLOY_DIR, `${input.workspaceOwnerId}-${journal.projectName}`),
+  });
+  assertProjectRuntimeLifecycleMutable(journalApp, 'rename-project');
   await assertMutationSafe(journal.id);
   await assertProjectChatDestructiveResetInactive(journal.id);
   await assertLegacyOpenClawProjectMigrationInactive(journal.id);
@@ -2529,7 +3056,7 @@ async function ensureNativeProjectChatBindingWithAuthorityLease(input: {
   let sessionKey = nativeSession?.sessionId || '';
   let createdNativeSession = false;
   if (!sessionKey) {
-    prepareProjectLifecycleWorkspace(input.projectDir);
+    await ensureProjectChatWorkspaceOwnership(input.executionContext, input.projectDir);
     sessionKey = await getProjectChatProviderAdapter(input.provider).startSession(input.actorUserId, {
       executionContext: input.executionContext,
       ...(cliModel ? { model: cliModel } : {}),
@@ -2743,6 +3270,14 @@ function resolveActorProjectChatWorkspace(req: Request, projectName: string) {
 
 function sendProjectFileMutationError(res: Response, error: unknown, fallback: string): void {
   const message = error instanceof Error ? error.message : fallback;
+  if (error instanceof ProjectRuntimeOwnershipError) {
+    res.status(503).json({
+      error: 'Project storage is temporarily unavailable. Try again.',
+      code: error.code,
+      retryable: error.retryable,
+    });
+    return;
+  }
   if (error instanceof ProjectFilePolicyError || error instanceof ContainedPathError) {
     const status = error instanceof ProjectFilePolicyError && error.code === 'TOO_LARGE'
       || /exceeds the configured limit/i.test(message)
@@ -2825,6 +3360,33 @@ function sendProjectChatProviderError(
   error: unknown,
   extra: Record<string, unknown> = {},
 ): boolean {
+  if (error instanceof ProjectRuntimeOwnershipError) {
+    res.status(503).json({
+      error: 'Project storage is temporarily unavailable. Try again.',
+      code: error.code,
+      retryable: error.retryable,
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof ProjectLifecycleWorkspacePreparationError) {
+    res.status(503).json({
+      error: 'Portal could not prepare this project workspace for its provider. Retry after the current filesystem operation finishes.',
+      code: error.code,
+      retryable: error.retryable,
+      ...extra,
+    });
+    return true;
+  }
+  if (error instanceof ProjectMemoryAccessError) {
+    res.status(error.httpStatus).json({
+      error: error.message,
+      code: error.code,
+      retryable: error.retryable,
+      ...extra,
+    });
+    return true;
+  }
   if (error instanceof OllamaAuthorityBarrierBusyError) {
     res.status(error.statusCode).json({
       error: error.message,
@@ -3279,6 +3841,48 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
     const userDir = getUserProjectDir(ownerId);
     const entries = fs.readdirSync(userDir, { withFileTypes: true });
     let lifecycleResidueSeen = false;
+    const blockedProject = (
+      projectName: string,
+      projectDir: string,
+      identity: ProjectIdentityRecord,
+      availability: Readonly<{
+        code: 'PROJECT_IDENTITY_RECONCILIATION_REQUIRED'
+          | 'PROJECT_LIFECYCLE_RECONCILIATION_REQUIRED'
+          | 'PROJECT_LIFECYCLE_RECOVERY_PENDING';
+        message: string;
+        action: 'RECONCILE_PROJECT_IDENTITY' | 'RECONCILE_PROJECT_LIFECYCLE' | 'RETRY';
+        retryable: boolean;
+      }>,
+    ) => {
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(projectDir);
+      } catch (error: any) {
+        // The directory snapshot can race a rename/delete that completed
+        // after readdir. A vanished entry is no longer inventory; it must not
+        // turn every otherwise healthy Project into a list-level 500.
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+      }
+      return {
+        name: projectName,
+        hasGit: fs.existsSync(path.join(projectDir, '.git')),
+        currentBranch: '',
+        deployedUrl: '',
+        deployment: null,
+        createdAt: stat.birthtime.toISOString(),
+        updatedAt: stat.mtime.toISOString(),
+        identity: serializeProjectIdentityProof(identity),
+        availability: {
+          available: false,
+          ...availability,
+        },
+        destructiveActions: {
+          allowed: false,
+          reason: availability.message,
+        },
+      };
+    };
     const projects = await Promise.all(entries
       // Dot-prefixed entries are the Portal's internal lifecycle namespace
       // (quarantine staging), never projects; listing one here once adopted
@@ -3303,68 +3907,155 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
           // list. Surface it with its controls disabled and one honest
           // sentence; recovery runs detached from this request.
           lifecycleResidueSeen = true;
-          const residueStat = fs.statSync(pDir);
+          const message = projectLifecycleBlockedMessage(storedIdentity);
+          return blockedProject(e.name, pDir, storedIdentity, {
+            code: 'PROJECT_LIFECYCLE_RECOVERY_PENDING',
+            message,
+            action: 'RETRY',
+            retryable: true,
+          });
+        }
+        try {
+          const stat = fs.statSync(pDir);
+          const detectedDeployType = detectDeployType(pDir);
+          const identity = await ensureProjectIdentity({
+            workspaceOwnerId: ownerId,
+            projectName: e.name,
+            projectRoot: pDir,
+          });
+          const hasGit = fs.existsSync(path.join(pDir, '.git'));
+          let currentBranch = '';
+          let deployedUrl = '';
+
+          if (hasGit) {
+            currentBranch = readProjectGitHead(pDir);
+          }
+
+          // Resolve deployment through the immutable Project association. A
+          // leftover directory without a matching App row is residue, not a
+          // supported deployment.
+          const deployId = `${ownerId}-${e.name}`;
+          const deployPath = path.join(DEPLOY_DIR, deployId);
+          const app = await findProjectAppForIdentity({
+            workspaceOwnerId: ownerId,
+            projectIdentityId: identity.id,
+            projectName: e.name,
+            deployPath,
+          });
+          if (app?.isActive && app.deployType !== 'runtime' && fs.existsSync(deployPath)) {
+            deployedUrl = `/hosted/${deployId}/`;
+          }
+          const identityDestructiveActions = projectDestructiveActionCapability(identity);
+          const authoritativeRuntimeManagement = app ? projectRuntimeManagement(app) : null;
+          const invalidRuntimeBinding = authoritativeRuntimeManagement === 'invalid-external-binding';
+          const runtimeManagement = invalidRuntimeBinding
+            ? 'external-loopback' as const
+            : authoritativeRuntimeManagement;
+          const destructiveActions = (
+            authoritativeRuntimeManagement === 'external-loopback'
+            || invalidRuntimeBinding
+          )
+            ? {
+              allowed: false,
+              reason: identityDestructiveActions.allowed
+                ? invalidRuntimeBinding
+                  ? PROJECT_INVALID_RUNTIME_BINDING_LIMITATION
+                  : PROJECT_EXTERNAL_RUNTIME_LIMITATION
+                : `${identityDestructiveActions.reason} ${invalidRuntimeBinding
+                  ? PROJECT_INVALID_RUNTIME_BINDING_LIMITATION
+                  : PROJECT_EXTERNAL_RUNTIME_LIMITATION}`,
+              code: invalidRuntimeBinding
+                ? PROJECT_INVALID_RUNTIME_BINDING_ERROR_CODE
+                : PROJECT_EXTERNAL_RUNTIME_ERROR_CODE,
+            }
+            : identityDestructiveActions;
+
           return {
             name: e.name,
-            hasGit: fs.existsSync(path.join(pDir, '.git')),
-            currentBranch: '',
-            deployedUrl: '',
-            deployment: null,
-            createdAt: residueStat.birthtime.toISOString(),
-            updatedAt: residueStat.mtime.toISOString(),
-            identity: serializeProjectIdentityProof(storedIdentity),
-            destructiveActions: {
-              allowed: false,
-              reason: projectLifecycleBlockedMessage(storedIdentity),
-            },
+            hasGit,
+            currentBranch,
+            detectedDeployType,
+            deployedUrl,
+            deployment: app ? {
+              appId: app.id,
+              deployType: app.deployType,
+              processStatus: app.processStatus,
+              port: app.port,
+              isActive: app.isActive,
+              runtimeManagement,
+              statusSource: projectRuntimeStatusSource(app),
+              ...(invalidRuntimeBinding ? {
+                bindingStatus: 'invalid',
+                configurationCode: PROJECT_INVALID_RUNTIME_BINDING_ERROR_CODE,
+                limitation: PROJECT_INVALID_RUNTIME_BINDING_LIMITATION,
+              } : {}),
+              supportedLifecycleActions: projectSupportedLifecycleActions(
+                app,
+                detectedDeployType,
+                identityDestructiveActions.allowed,
+              ),
+            } : null,
+            createdAt: stat.birthtime.toISOString(),
+            updatedAt: stat.mtime.toISOString(),
+            identity: serializeProjectIdentityProof(identity),
+            destructiveActions,
           };
+        } catch (error: any) {
+          if (error?.code === 'ENOENT') {
+            console.warn('[Projects] Project inventory entry disappeared during listing', {
+              projectName: e.name,
+            });
+            return null;
+          }
+          if (
+            !(error instanceof ProjectIdentityMismatchError)
+            && !(error instanceof ProjectIdentityLifecycleError)
+          ) {
+            throw error;
+          }
+
+          const blockedIdentity = storedIdentity || await prisma.projectIdentity.findFirst({
+            where: {
+              workspaceOwnerId: ownerId,
+              lifecycleStatus: 'RENAMING',
+              renameTargetName: e.name,
+            },
+          });
+          // Never invent an immutable identity merely to keep the list shape
+          // valid. An unbound directory is an unexpected server failure and
+          // remains fail-closed until it can be authoritatively identified.
+          if (!blockedIdentity) throw error;
+
+          const identityMismatch = error instanceof ProjectIdentityMismatchError;
+          const renameRecoveryPending = !storedIdentity
+            && blockedIdentity.lifecycleStatus === 'RENAMING';
+          const code = identityMismatch
+            ? 'PROJECT_IDENTITY_RECONCILIATION_REQUIRED' as const
+            : renameRecoveryPending
+              ? 'PROJECT_LIFECYCLE_RECOVERY_PENDING' as const
+              : 'PROJECT_LIFECYCLE_RECONCILIATION_REQUIRED' as const;
+          console.warn('[Projects] Project inventory entry is unavailable', {
+            projectName: e.name,
+            code,
+          });
+          if (renameRecoveryPending) lifecycleResidueSeen = true;
+          return blockedProject(e.name, pDir, blockedIdentity, identityMismatch ? {
+            code,
+            message: 'This project directory changed outside Portal. Its files are preserved, but Project actions are disabled until its identity is reconciled.',
+            action: 'RECONCILE_PROJECT_IDENTITY',
+            retryable: false,
+          } : renameRecoveryPending ? {
+            code,
+            message: 'This project has an interrupted lifecycle operation. Its files are preserved while Portal restores the operation.',
+            action: 'RETRY',
+            retryable: true,
+          } : {
+            code,
+            message: 'Portal found conflicting lifecycle records for this project. Its files are preserved, but Project actions are disabled until the records are reconciled.',
+            action: 'RECONCILE_PROJECT_LIFECYCLE',
+            retryable: false,
+          });
         }
-        const stat = fs.statSync(pDir);
-        const identity = await ensureProjectIdentity({
-          workspaceOwnerId: ownerId,
-          projectName: e.name,
-          projectRoot: pDir,
-        });
-        const hasGit = fs.existsSync(path.join(pDir, '.git'));
-        let currentBranch = '';
-        let deployedUrl = '';
-        
-        if (hasGit) {
-          currentBranch = readProjectGitHead(pDir);
-        }
-        
-        // Resolve deployment through the immutable Project association. A
-        // leftover directory without a matching App row is residue, not a
-        // supported deployment.
-        const deployId = `${ownerId}-${e.name}`;
-        const deployPath = path.join(DEPLOY_DIR, deployId);
-        const app = await findProjectAppForIdentity({
-          workspaceOwnerId: ownerId,
-          projectIdentityId: identity.id,
-          projectName: e.name,
-          deployPath,
-        });
-        if (app?.isActive && app.deployType !== 'runtime' && fs.existsSync(deployPath)) {
-          deployedUrl = `/hosted/${deployId}/`;
-        }
-        
-        return {
-          name: e.name,
-          hasGit,
-          currentBranch,
-          deployedUrl,
-          deployment: app ? {
-            appId: app.id,
-            deployType: app.deployType,
-            processStatus: app.processStatus,
-            port: app.port,
-            isActive: app.isActive,
-          } : null,
-          createdAt: stat.birthtime.toISOString(),
-          updatedAt: stat.mtime.toISOString(),
-          identity: serializeProjectIdentityProof(identity),
-          destructiveActions: projectDestructiveActionCapability(identity),
-        };
       }));
     if (lifecycleResidueSeen) {
       scheduleProjectLifecycleResidueRecovery({
@@ -3375,7 +4066,11 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
     res.json({ projects: projects.filter((project) => project !== null) });
   } catch (error) {
     console.error('List projects error:', error);
-    res.status(500).json({ error: 'Failed to list projects', detail: (error as any)?.message });
+    res.status(500).json({
+      error: 'Failed to list projects',
+      code: 'PROJECT_LIST_FAILED',
+      retryable: true,
+    });
   }
 });
 
@@ -3485,9 +4180,7 @@ router.post('/', authenticateToken, requireApproved, async (req: Request, res: R
 
     const tmpl = TEMPLATES[template];
     for (const [fname, content] of Object.entries(tmpl.files)) {
-      const filePath = path.join(stagingDir, fname);
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      fs.writeFileSync(filePath, content);
+      writeProjectRuntimeOwnedFileAtomic(stagingDir, fname, content);
     }
 
     // Init git
@@ -4029,7 +4722,7 @@ router.put('/:name/file', authenticateToken, requireApproved, projectPathSandbox
     const { path: filePath, content } = req.body;
     if (!filePath || typeof content !== 'string') { res.status(400).json({ error: 'path and string content required' }); return; }
 
-    writeContainedFileAtomic(projectDir, filePath, content, { maxBytes: PROJECT_EDIT_MAX_BYTES });
+    writeProjectRuntimeOwnedFileAtomic(projectDir, filePath, content, { maxBytes: PROJECT_EDIT_MAX_BYTES });
 
     res.json({ message: 'File saved', path: filePath });
   } catch (error) {
@@ -4048,7 +4741,7 @@ router.post('/:name/file', authenticateToken, requireApproved, projectPathSandbo
     if (!filePath || typeof content !== 'string') { res.status(400).json({ error: 'path and string content required' }); return; }
 
     try {
-      writeContainedFileAtomic(projectDir, filePath, content, { exclusive: true, maxBytes: PROJECT_EDIT_MAX_BYTES });
+      writeProjectRuntimeOwnedFileAtomic(projectDir, filePath, content, { exclusive: true, maxBytes: PROJECT_EDIT_MAX_BYTES });
     } catch (error: any) {
       if (/already exists/i.test(error?.message || '')) {
         res.status(409).json({ error: 'File already exists' });
@@ -4870,10 +5563,11 @@ router.post(
       }
 
       const attachmentSubdirectory = path.posix.join('.portal', 'attachments', crypto.randomUUID());
-      attachmentDir = ensureContainedDirectory(projectDir, attachmentSubdirectory);
+      attachmentDir = ensureProjectRuntimeOwnedDirectory(projectDir, attachmentSubdirectory);
       const destination = resolveContainedPath(attachmentDir, safeOriginalName, { mustExist: false });
       fs.copyFileSync(uploadedFile.path, destination, fs.constants.COPYFILE_EXCL);
       materializedPath = destination;
+      assignProjectRuntimeOwnership(projectDir, destination, 'file');
       fs.unlinkSync(uploadedFile.path);
       const confirmedCoordination = await requireSelectedProjectChatState({
         actorUserId,
@@ -4967,10 +5661,11 @@ router.post('/:name/upload', authenticateToken, requireApproved, projectPathSand
     let resolvedTarget: string;
     try {
       resolvedTarget = targetSubPath
-        ? ensureContainedDirectory(projectDir, targetSubPath)
+        ? ensureProjectRuntimeOwnedDirectory(projectDir, targetSubPath)
         : fs.realpathSync(projectDir);
-    } catch {
+    } catch (error) {
       uploadedFiles.forEach(f => { try { fs.unlinkSync(f.path); } catch {} });
+      if (error instanceof ProjectRuntimeOwnershipError) throw error;
       res.status(403).json({ error: 'Path traversal detected' });
       return;
     }
@@ -4992,9 +5687,21 @@ router.post('/:name/upload', authenticateToken, requireApproved, projectPathSand
         }
         const resolvedDest = resolveContainedPath(resolvedTarget, safeOriginalName, { mustExist: false });
         fs.copyFileSync(file.path, resolvedDest, fs.constants.COPYFILE_EXCL);
+        assignProjectRuntimeOwnership(projectDir, resolvedDest, 'file');
         fs.unlinkSync(file.path);
         results.push({ name: safeOriginalName, path: path.relative(projectDir, resolvedDest).split(path.sep).join('/'), size: file.size });
       } catch (err: any) {
+        if (err instanceof ProjectRuntimeOwnershipError) {
+          try {
+            const failedDestination = resolveContainedPath(
+              resolvedTarget,
+              path.posix.basename(file.originalname.replace(/\\/g, '/')).replace(/[\u0000-\u001f\u007f]/g, '_'),
+              { mustExist: false },
+            );
+            fs.unlinkSync(failedDestination);
+          } catch {}
+          throw err;
+        }
         errors.push({ name: file.originalname, error: err.message || 'Failed to copy' });
         // Clean up temp file
         try { fs.unlinkSync(file.path); } catch {}
@@ -5035,7 +5742,15 @@ router.post('/:name/upload', authenticateToken, requireApproved, projectPathSand
     console.error('File upload error:', error);
     // Clean up any remaining temp files
     if (uploadedFiles) uploadedFiles.forEach(f => { try { fs.unlinkSync(f.path); } catch {} });
-    res.status(500).json({ error: 'Failed to upload files', detail: error.message });
+    if (error instanceof ProjectRuntimeOwnershipError) {
+      res.status(503).json({
+        error: 'Project storage is temporarily unavailable. Try again.',
+        code: error.code,
+        retryable: error.retryable,
+      });
+      return;
+    }
+    res.status(500).json({ error: 'Failed to upload files' });
   }
 });
 
@@ -5088,6 +5803,15 @@ async function completeAdmittedProjectDeletion(input: {
   actorIdsBeforeBarrier?: readonly string[];
 }): Promise<Record<string, unknown>> {
   const { actorUserId, ownerId, projectName, projectDir, projectIdentity } = input;
+  const externalProjectApp = await findProjectAppForIdentity({
+    workspaceOwnerId: ownerId,
+    projectIdentityId: projectIdentity.id,
+    projectName,
+    deployPath: path.join(DEPLOY_DIR, `${ownerId}-${projectName}`),
+  });
+  // Defense in depth for startup residue recovery and already-admitted older
+  // deletions. New requests are rejected before the DELETING barrier below.
+  assertProjectRuntimeLifecycleMutable(externalProjectApp, 'delete-project');
   // Re-read after DELETING closes admission so an actor that admitted in the
   // narrow discovery/barrier interval cannot retain an in-process callback.
   const actorIds = Array.from(new Set([
@@ -5117,7 +5841,16 @@ async function completeAdmittedProjectDeletion(input: {
   const initialDeployAttestation = managedPathExists(deployPath)
     ? attestProjectRoot(deployPath)
     : null;
-  await stopApp(deployId);
+  if (externalProjectApp?.deployType === 'fullstack') {
+    await forgetAppRuntime(externalProjectApp.id, deployId, {
+      actorId: ownerId,
+      projectId: projectIdentity.id,
+      deployPath: externalProjectApp.zipPath,
+      port: externalProjectApp.port,
+    }, { settleStatus: 'stopped' });
+  } else {
+    await stopApp(deployId);
+  }
   const removedProjectWorkloads = await removePortalProjectWorkloadsForProject(projectIdentity.id);
 
   const cleanup = await cleanupProjectRuntime({
@@ -5226,17 +5959,41 @@ async function completeAdmittedProjectDeletion(input: {
 router.delete('/:name', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   let releaseDeletionLock: (() => void) | null = null;
   try {
+    const identityRequest = parseProjectDeleteIdentityRequest(req.body);
+    if (identityRequest.kind === 'invalid') {
+      res.status(400).json({
+        error: 'An exact immutable Project identity proof requires projectIdentityId and projectGeneration.',
+        code: 'PROJECT_DELETE_IDENTITY_REQUIRED',
+        status: 'not_admitted',
+        admitted: false,
+        retryable: false,
+      });
+      return;
+    }
+    const deletionIdentityProof = identityRequest.kind === 'valid'
+      ? identityRequest.proof
+      : null;
     const ownerId = await getScopedOwnerId(req);
-    const requestedIdentity = requireCurrentProjectDestructiveIdentity(
-      await prisma.projectIdentity.findUnique({
-        where: {
-          workspaceOwnerId_projectName: {
-            workspaceOwnerId: ownerId,
-            projectName: req.params.name,
-          },
+    const identityAtRequest = await prisma.projectIdentity.findUnique({
+      where: {
+        workspaceOwnerId_projectName: {
+          workspaceOwnerId: ownerId,
+          projectName: req.params.name,
         },
-      }),
-    );
+      },
+    });
+    if (!identityAtRequest && deletionIdentityProof) {
+      res.json({ message: 'Project deleted', alreadyAbsent: true });
+      return;
+    }
+    const requestedIdentity = requireCurrentProjectDestructiveIdentity(identityAtRequest);
+    if (
+      deletionIdentityProof
+      && !projectDeleteIdentityMatches(requestedIdentity, deletionIdentityProof)
+    ) {
+      sendProjectDeleteIdentityMismatch(res);
+      return;
+    }
     await assertLegacyOpenClawProjectMigrationInactive(requestedIdentity.id);
     releaseDeletionLock = await acquireProjectDeletionLock(
       projectDeletionLockKey(ownerId, req.params.name),
@@ -5246,12 +6003,50 @@ router.delete('/:name', authenticateToken, requireApproved, async (req: Request,
       where: { id: requestedIdentity.id },
     });
     if (!currentRequestedIdentity) {
+      if (deletionIdentityProof) {
+        const replacementIdentity = await prisma.projectIdentity.findUnique({
+          where: {
+            workspaceOwnerId_projectName: {
+              workspaceOwnerId: ownerId,
+              projectName: req.params.name,
+            },
+          },
+        });
+        if (
+          replacementIdentity
+          && !projectDeleteIdentityMatches(replacementIdentity, deletionIdentityProof)
+        ) {
+          sendProjectDeleteIdentityMismatch(res);
+          return;
+        }
+      }
       res.json({ message: 'Project deleted', alreadyAbsent: true });
+      return;
+    }
+    if (
+      deletionIdentityProof
+      && (
+        currentRequestedIdentity.workspaceOwnerId !== ownerId
+        || currentRequestedIdentity.projectName !== req.params.name
+        || !projectDeleteIdentityMatches(currentRequestedIdentity, deletionIdentityProof)
+      )
+    ) {
+      sendProjectDeleteIdentityMismatch(res);
       return;
     }
     requireCurrentProjectDestructiveIdentity(
       currentRequestedIdentity as unknown as ProjectIdentityRecord,
     );
+    const currentProjectApp = await findProjectAppForIdentity({
+      workspaceOwnerId: ownerId,
+      projectIdentityId: currentRequestedIdentity.id,
+      projectName: currentRequestedIdentity.projectName,
+      deployPath: path.join(
+        DEPLOY_DIR,
+        `${ownerId}-${currentRequestedIdentity.projectName}`,
+      ),
+    });
+    if (sendRuntimeOwnershipMutationConflict(res, currentProjectApp, 'delete-project')) return;
     if (currentRequestedIdentity.lifecycleStatus === 'DELETING') {
       const runtimeCleanup = await completeAdmittedProjectDeletion({
         actorUserId,
@@ -5298,6 +6093,13 @@ router.delete('/:name', authenticateToken, requireApproved, async (req: Request,
       });
     if (identityBeforeBarrier) {
       requireCurrentProjectDestructiveIdentity(identityBeforeBarrier);
+      if (
+        deletionIdentityProof
+        && !projectDeleteIdentityMatches(identityBeforeBarrier, deletionIdentityProof)
+      ) {
+        sendProjectDeleteIdentityMismatch(res);
+        return;
+      }
       if (identityBeforeBarrier.id !== requestedIdentity.id) {
         throw new ProjectIdentityLifecycleError('Project identity changed before deletion admission');
       }
@@ -5351,6 +6153,23 @@ router.delete('/:name', authenticateToken, requireApproved, async (req: Request,
         error: error.message,
         code: error.code,
         retryable: false,
+      });
+      return;
+    }
+    if (error instanceof ProjectExternalRuntimeLifecycleError) {
+      res.status(409).json(projectExternalRuntimeConflict(error));
+      return;
+    }
+    if (error instanceof ProjectInvalidRuntimeBindingError) {
+      res.status(503).json(projectInvalidRuntimeBindingConflict(error));
+      return;
+    }
+    if (error instanceof ProjectRuntimeStateAttestationError) {
+      res.status(409).json({
+        code: error.code,
+        error: error.message,
+        retryable: error.retryable,
+        recoveryAction: 'REVIEW_RUNTIME_STATE',
       });
       return;
     }
@@ -5575,6 +6394,16 @@ router.patch('/:name/rename', authenticateToken, requireApproved, async (req: Re
       projectDeletionLockKey(ownerId, sanitized),
     ])).sort()) {
       releaseLocks.push(await acquireProjectDeletionLock(lockKey));
+    }
+
+    if (!requestedIdentityMatchesCompletedRename) {
+      const lifecycleApp = await findProjectAppForIdentity({
+        workspaceOwnerId: ownerId,
+        projectIdentityId: requestedIdentity.id,
+        projectName: req.params.name,
+        deployPath: oldDeployPath,
+      });
+      if (sendRuntimeOwnershipMutationConflict(res, lifecycleApp, 'rename-project')) return;
     }
 
     if (!managedPathExists(oldDir)) {
@@ -5937,7 +6766,14 @@ router.patch('/:name/rename', authenticateToken, requireApproved, async (req: Re
     // before the durable cleanup marker, so crash recovery never reopens a
     // half-renamed project with a live old-path app.
     await removePortalProjectWorkloadsForProject(projectIdentity.id);
-    if (app?.deployType === 'fullstack') await stopApp(oldDeployId);
+    if (app?.deployType === 'fullstack') {
+      await forgetAppRuntime(app.id, oldDeployId, {
+        actorId: ownerId,
+        projectId: projectIdentity.id,
+        deployPath: app.zipPath,
+        port: app.port,
+      }, { settleStatus: 'stopped' });
+    }
     await stopProjectDesktopRuntimesForLifecycle({
       workspaceOwnerId: ownerId,
       projectIdentityId: projectIdentity.id,
@@ -6226,6 +7062,14 @@ router.patch('/:name/rename', authenticateToken, requireApproved, async (req: Re
         code: error.code,
         retryable: true,
       });
+      return;
+    }
+    if (error instanceof ProjectExternalRuntimeLifecycleError) {
+      res.status(409).json(projectExternalRuntimeConflict(error));
+      return;
+    }
+    if (error instanceof ProjectInvalidRuntimeBindingError) {
+      res.status(503).json(projectInvalidRuntimeBindingConflict(error));
       return;
     }
     if (error instanceof LegacyOpenClawProjectMigrationActiveError) {
@@ -6725,7 +7569,7 @@ function checkDepsCache(projectDir: string, packages: string[]): boolean {
 // Write deps cache marker
 function writeDepsCache(projectDir: string, packages: string[]): void {
   const hash = hashDependencies(packages);
-  writeProjectTextFile(projectDir, '.deps-installed', hash, 256);
+  writeProjectRuntimeTextFile(projectDir, '.deps-installed', hash, 256);
 }
 
 // GET /api/projects/:name/check-deps - check dependencies without installing
@@ -6739,7 +7583,7 @@ router.get('/:name/check-deps', authenticateToken, requireApproved, async (req: 
     }
 
     const result = await detectDependencies(projectDir);
-    
+
     // Check cache
     if (result.needsInstall && result.packages.length > 0) {
       if (checkDepsCache(projectDir, result.packages)) {
@@ -6964,17 +7808,50 @@ router.post('/:name/install-deps', authenticateToken, requireApproved, async (re
 
 // POST /api/projects/:name/deploy - deploy with build support (static + fullstack + runtime)
 router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let releaseProjectNameLock: (() => void) | null = null;
   let fullstackPromotion: ProjectDeploymentPromotion | null = null;
   let previousFullstackApp: App | null = null;
+  let projectIdentityForRecovery: ProjectIdentityProof | null = null;
+  let fullstackSourceDigestForRecovery: string | null = null;
   let fullstackAppRecordMutated = false;
   let fullstackAppIdForRecovery: string | null = null;
   let fullstackStartAttempted = false;
   let deployIdForRecovery: string | null = null;
   let deployPathForRecovery: string | null = null;
   let lifecycleScopeForRecovery: { actorId: string; projectId: string } | null = null;
+  let recoveryReplay: ProjectRuntimeRecoveryReplayProof | null = null;
+  let recoveryOwnerId: string | null = null;
+  let recoveryClaimedRevision: string | null = null;
+  let originalDeploymentRevision: string | null = null;
   try {
+    if (req.body?.recoveryReplay !== undefined) {
+      res.setHeader('Cache-Control', 'private, no-store');
+    }
     const ownerId = await getScopedOwnerId(req);
+    recoveryOwnerId = ownerId;
+    try {
+      recoveryReplay = parseProjectRuntimeRecoveryReplay(req.body?.recoveryReplay, 'deploy');
+    } catch (error) {
+      if (error instanceof ProjectRuntimeRecoveryReplayValidationError) {
+        res.status(400).json({ code: error.code, error: error.message, retryable: false });
+        return;
+      }
+      throw error;
+    }
     let projectDir: string;
+    try {
+      projectDir = getExistingProjectPathReadOnly(ownerId, req.params.name);
+    } catch (error: any) {
+      if (error instanceof ContainedPathError || error?.code === 'ENOENT') {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      throw error;
+    }
+
+    releaseProjectNameLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, req.params.name),
+    );
     try {
       projectDir = getExistingProjectPathReadOnly(ownerId, req.params.name);
     } catch (error: any) {
@@ -6990,7 +7867,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
     // static/full-stack deployment fails before identity, DB, build, or copy
     // mutation when the required isolated app-content origin is unavailable.
     const deployType = detectDeployType(projectDir);
-    if (deployType !== 'runtime') {
+    if (!recoveryReplay && deployType !== 'runtime') {
       const unavailable = portalFeatureUnavailableResponse('appHosting');
       if (unavailable) {
         res.status(409).json(unavailable);
@@ -6998,17 +7875,43 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       }
     }
 
+    const appName = req.params.name;
+    const deployId = `${ownerId}-${appName}`;
+    const deployPath = path.join(DEPLOY_DIR, deployId);
+    const preflightProjectApp = await findProjectAppBeforeIdentityMutation({
+      workspaceOwnerId: ownerId,
+      projectName: appName,
+      deployPath,
+    });
+    if (preflightProjectApp && !recoveryReplay) {
+      const preflightManagement = projectRuntimeManagement(preflightProjectApp);
+      if (preflightManagement === 'invalid-external-binding') {
+        sendInvalidRuntimeBindingConflict(res, 'redeploy');
+        return;
+      }
+      if (
+        preflightManagement === 'external-loopback'
+        && !(preflightProjectApp.deployType === 'static' && deployType === 'static')
+      ) {
+        sendExternalRuntimeConflict(res, 'redeploy');
+        return;
+      }
+      if (sendDeployTypeTransitionConflictIfNeeded(
+        res,
+        preflightProjectApp,
+        deployType,
+      )) return;
+    }
+
     const projectIdentity = await ensureProjectIdentity({
       workspaceOwnerId: ownerId,
       projectName: req.params.name,
       projectRoot: projectDir,
     });
+    projectIdentityForRecovery = serializeProjectIdentityProof(projectIdentity);
     const lifecycleScope = { actorId: req.user!.userId, projectId: projectIdentity.id };
     const appRuntimeIdentity = { actorId: ownerId, projectId: projectIdentity.id };
 
-    const appName = req.params.name;
-    const deployId = `${ownerId}-${appName}`;
-    const deployPath = path.join(DEPLOY_DIR, deployId);
     deployIdForRecovery = deployId;
     deployPathForRecovery = deployPath;
     lifecycleScopeForRecovery = appRuntimeIdentity;
@@ -7018,6 +7921,41 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       projectName: appName,
       deployPath,
     });
+    if (recoveryReplay) {
+      assertProjectRuntimeRecoveryRouteIdentity(recoveryReplay, projectIdentity);
+      const status = await readProjectRuntimeRecoveryStatus(
+        projectRuntimeRecoveryReplayScope(ownerId, recoveryReplay),
+      );
+      if (sendProjectRuntimeRecoveryStatus(res, status)) return;
+      assertProjectRuntimeRecoveryRouteApp(recoveryReplay, existingProjectApp);
+      if (deployType !== recoveryReplay.expectedDeployType) {
+        throw new ProjectDeploymentReplayStaleError();
+      }
+      const unavailable = portalFeatureUnavailableResponse('appHosting');
+      if (unavailable) {
+        res.status(409).json(unavailable);
+        return;
+      }
+    }
+    if (existingProjectApp) {
+      const existingManagement = projectRuntimeManagement(existingProjectApp);
+      if (existingManagement === 'invalid-external-binding') {
+        sendInvalidRuntimeBindingConflict(res, 'redeploy');
+        return;
+      }
+      if (
+        existingManagement === 'external-loopback'
+        && !(existingProjectApp.deployType === 'static' && deployType === 'static')
+      ) {
+        sendExternalRuntimeConflict(res, 'redeploy');
+        return;
+      }
+      if (sendDeployTypeTransitionConflictIfNeeded(
+        res,
+        existingProjectApp,
+        deployType,
+      )) return;
+    }
     if (!existingProjectApp && await prisma.app.count({
       where: { userId: ownerId, name: appName },
     }) > 0) {
@@ -7037,11 +7975,24 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       });
       return;
     }
+    if (!recoveryReplay) {
+      originalDeploymentRevision = (await readProjectDeploymentLifecycleRevision({
+        ownerUserId: ownerId,
+        projectIdentityId: projectIdentity.id,
+        projectIdentityGeneration: projectIdentity.generation,
+      })).deploymentRevision;
+    }
     let buildOutput = '';
     let sourceDir = projectDir;
     
     // For static apps: build if needed, copy dist
     if (deployType === 'static') {
+      await advanceProjectDeploymentLifecycleRevision({
+        ownerUserId: ownerId,
+        projectIdentityId: projectIdentity.id,
+        projectIdentityGeneration: projectIdentity.generation,
+        expectedDeploymentRevision: originalDeploymentRevision!,
+      });
       const packageJson = readProjectPackageJson(projectDir);
       let buildWorkspace: ReturnType<typeof createProjectLifecycleWorkspace> | null = null;
       try {
@@ -7089,11 +8040,50 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
     // For fullstack apps: copy everything, assign port, start process
     if (deployType === 'fullstack') {
       previousFullstackApp = existingProjectApp;
-      fullstackPromotion = copyFullstackDeploymentTree(projectDir, deployPath);
+      fullstackPromotion = prepareFullstackDeploymentTree(
+        projectDir,
+        deployPath,
+        recoveryReplay?.sourceDigest,
+      );
+      fullstackSourceDigestForRecovery = fullstackPromotion.sourceDigest;
+      // Staging has produced the exact replay digest, but no App row or live
+      // manager has changed yet. Fail here so rollback restores only the
+      // staged deployment tree and a currently running prior App stays live.
+      await assertProjectRuntimeImageAvailable();
+      if (recoveryReplay) {
+        const claim = await claimProjectRuntimeRecoveryProof(
+          projectRuntimeRecoveryReplayScope(ownerId, recoveryReplay),
+        );
+        if (claim.kind !== 'claimed') {
+          fullstackPromotion.rollback();
+          fullstackPromotion = null;
+          if (sendProjectRuntimeRecoveryStatus(res, claim)) return;
+          throw new ProjectRuntimeRecoveryReplayError(
+            'PROJECT_RUNTIME_RECOVERY_STATE_INVALID',
+            'Project runtime recovery claim returned an invalid state',
+            503,
+          );
+        }
+        recoveryClaimedRevision = claim.deploymentRevision;
+      } else {
+        await advanceProjectDeploymentLifecycleRevision({
+          ownerUserId: ownerId,
+          projectIdentityId: projectIdentity.id,
+          projectIdentityGeneration: projectIdentity.generation,
+          expectedDeploymentRevision: originalDeploymentRevision!,
+        });
+      }
+      fullstackPromotion.promote();
     }
     
     // For runtime apps: copy to bridgesrd user's projects directory and launch in xterm
     if (deployType === 'runtime') {
+      await advanceProjectDeploymentLifecycleRevision({
+        ownerUserId: ownerId,
+        projectIdentityId: projectIdentity.id,
+        projectIdentityGeneration: projectIdentity.generation,
+        expectedDeploymentRevision: originalDeploymentRevision!,
+      });
       const desktopIdentity = buildProjectDesktopRuntimeIdentity(projectIdentity.id, appName);
       const runtimeDir = desktopIdentity.runtimeDir;
       const files = listProjectRootRegularFiles(projectDir);
@@ -7347,6 +8337,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       } catch (e: any) {
         buildOutput += `\nProcess start failed: ${e.message}`;
         await prisma.app.update({ where: { id: app.id }, data: { processStatus: 'error' } });
+        if (isProjectRuntimeImageUnavailable(e)) throw e;
         throw new Error(`Fullstack app failed to start: ${e.message}`);
       }
     }
@@ -7356,6 +8347,36 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
     }).catch((activityError) => {
       console.warn('[Project Deploy] Failed to record activity:', activityError);
     });
+
+    if (recoveryReplay) {
+      if (!recoveryClaimedRevision) {
+        throw new ProjectRuntimeRecoveryReplayError(
+          'PROJECT_RUNTIME_RECOVERY_STATE_INVALID',
+          'Project runtime recovery completed without a durable claim',
+          503,
+        );
+      }
+      try {
+        await completeProjectRuntimeRecoveryOrThrow(
+          ownerId,
+          recoveryReplay,
+          projectRuntimeRecoveryCompletion({
+            replay: recoveryReplay,
+            deploymentRevision: recoveryClaimedRevision,
+            appId: app.id,
+          }),
+        );
+      } catch (completionError) {
+        console.error('[Project Deploy] Recovery receipt completion failed:', completionError);
+        res.status(503).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_INDETERMINATE',
+          error: 'The Project deployment finished, but Portal could not confirm its recovery receipt.',
+          detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+          retryable: false,
+        });
+        return;
+      }
+    }
 
     const hostedUrl = `/hosted/${deployId}/`;
     res.json({ 
@@ -7370,7 +8391,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
   } catch (error: any) {
     let recoveryError: Error | null = null;
     if (fullstackPromotion && deployIdForRecovery && deployPathForRecovery && lifecycleScopeForRecovery) {
-      if (fullstackStartAttempted) {
+      if (fullstackStartAttempted && !isProjectRuntimeImageUnavailable(error)) {
         try {
           await stopApp(deployIdForRecovery);
         } catch (stopError: any) {
@@ -7416,6 +8437,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
 
       const shouldRestartPriorApp = deploymentRestored
         && fullstackStartAttempted
+        && !isProjectRuntimeImageUnavailable(error)
         && previousFullstackApp?.deployType === 'fullstack'
         && previousFullstackApp.isActive
         && previousFullstackApp.port !== null
@@ -7437,19 +8459,131 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
         }
       }
     }
+    if (recoveryReplay && recoveryOwnerId && recoveryClaimedRevision) {
+      try {
+        await failProjectRuntimeRecoveryOrThrow(
+          recoveryOwnerId,
+          recoveryReplay,
+          isProjectRuntimeImageUnavailable(error)
+            ? 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE'
+            : recoveryError
+              ? 'PROJECT_DEPLOY_RECOVERY_FAILED'
+              : 'PROJECT_DEPLOY_FAILED',
+        );
+      } catch (receiptError) {
+        console.error('[Project Deploy] Recovery receipt failure settlement failed:', receiptError);
+        res.status(503).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_INDETERMINATE',
+          error: 'The recovered Project deployment stopped without a durable terminal receipt.',
+          detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+          retryable: false,
+        });
+        return;
+      }
+    }
     console.error('Deploy error:', error);
     if (recoveryError) console.error('Deploy recovery error:', recoveryError);
+    if (sendProjectRuntimeRecoveryReplayError(res, error)) return;
+    if (error instanceof ProjectDeploymentReplayStaleError) {
+      res.status(409).json({
+        code: error.code,
+        error: error.message,
+        detail: 'Refresh this Project and use its current Deployment controls.',
+        retryable: false,
+      });
+      return;
+    }
+    if (isProjectRuntimeImageUnavailable(error)) {
+      if (recoveryReplay) {
+        res.status(503).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_FAILED',
+          error: 'The Project runtime image became unavailable while replaying the recovered deployment.',
+          detail: 'Refresh Deployment status and run the repair again before taking another action.',
+          retryable: false,
+        });
+        return;
+      }
+      if (recoveryError) {
+        res.status(500).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_PROOF_UNAVAILABLE',
+          error: 'Portal could not safely restore the prior deployment after the runtime image failure.',
+          detail: 'Review Activity Logs and the current Deployment state before taking another action.',
+          retryable: false,
+        });
+        return;
+      }
+      if (
+        !projectIdentityForRecovery
+        || !fullstackSourceDigestForRecovery
+        || !lifecycleScopeForRecovery
+        || originalDeploymentRevision === null
+      ) {
+        res.status(500).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_PROOF_UNAVAILABLE',
+          error: 'Portal could not bind runtime repair to the failed Project action.',
+          detail: 'Refresh this Project and try Deploy again.',
+          retryable: true,
+        });
+        return;
+      }
+      const currentRecoveryApp = await prisma.app.findFirst({
+        where: {
+          userId: lifecycleScopeForRecovery.actorId,
+          projectIdentityId: projectIdentityForRecovery.id,
+        },
+        select: { id: true },
+      });
+      if (
+        previousFullstackApp
+          ? !currentRecoveryApp || currentRecoveryApp.id !== previousFullstackApp.id
+          : currentRecoveryApp !== null
+      ) {
+        res.status(500).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_PROOF_UNAVAILABLE',
+          error: 'Portal could not bind runtime repair to the recovered Project deployment.',
+          detail: 'Refresh this Project and review its current Deployment state before retrying.',
+          retryable: true,
+        });
+        return;
+      }
+      try {
+        const proof = await issueProjectRuntimeRecoveryReplay({
+          ownerUserId: lifecycleScopeForRecovery.actorId,
+          action: 'deploy',
+          projectIdentity: projectIdentityForRecovery,
+          expectedAppId: currentRecoveryApp?.id || null,
+          expectedDeploymentRevision: originalDeploymentRevision,
+          sourceDigest: fullstackSourceDigestForRecovery,
+        });
+        sendProjectRuntimeImageUnavailable(res, proof);
+      } catch (proofError) {
+        console.error('[Project Deploy] Failed to issue runtime recovery proof:', proofError);
+        res.status(500).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_PROOF_UNAVAILABLE',
+          error: 'Portal could not bind runtime repair to the failed Project action.',
+          detail: 'Refresh this Project and try Deploy again.',
+          retryable: true,
+        });
+      }
+      return;
+    }
     res.status(500).json({
+      code: 'PROJECT_DEPLOY_FAILED',
       error: 'Failed to deploy',
-      details: error.message,
-      ...(recoveryError ? { recoveryError: recoveryError.message } : {}),
+      detail: recoveryError
+        ? 'Deployment failed and the previous deployment could not be fully restored. Review Activity Logs before retrying.'
+        : 'Review the Project build and runtime configuration, then try again.',
+      retryable: !recoveryError,
     });
+  } finally {
+    releaseProjectNameLock?.();
   }
 });
 
 // DELETE /api/projects/:name/deploy — remove only the Project deployment.
 // Source, Git history, Project Chat, and immutable Project identity remain.
 router.delete('/:name/deploy', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let releaseProjectNameLock: (() => void) | null = null;
   try {
     const ownerId = await getScopedOwnerId(req);
     const appName = req.params.name;
@@ -7464,19 +8598,40 @@ router.delete('/:name/deploy', authenticateToken, requireApproved, async (req: R
       throw error;
     }
 
+    releaseProjectNameLock = await acquireProjectDeletionLock(
+      projectDeletionLockKey(ownerId, appName),
+    );
+    try {
+      projectDir = getExistingProjectPathReadOnly(ownerId, appName);
+    } catch (error: any) {
+      if (error instanceof ContainedPathError || error?.code === 'ENOENT') {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      throw error;
+    }
+
+    const deployId = `${ownerId}-${appName}`;
+    const deployPath = path.join(DEPLOY_DIR, deployId);
+    const preflightProjectApp = await findProjectAppBeforeIdentityMutation({
+      workspaceOwnerId: ownerId,
+      projectName: appName,
+      deployPath,
+    });
+    if (sendRuntimeOwnershipMutationConflict(res, preflightProjectApp, 'undeploy')) return;
+
     const projectIdentity = await ensureProjectIdentity({
       workspaceOwnerId: ownerId,
       projectName: appName,
       projectRoot: projectDir,
     });
-    const deployId = `${ownerId}-${appName}`;
-    const deployPath = path.join(DEPLOY_DIR, deployId);
     const app = await findProjectAppForIdentity({
       workspaceOwnerId: ownerId,
       projectIdentityId: projectIdentity.id,
       projectName: appName,
       deployPath,
     });
+    if (sendRuntimeOwnershipMutationConflict(res, app, 'undeploy')) return;
     const deployIdentity = managedPathExists(deployPath)
       ? attestProjectRoot(deployPath)
       : null;
@@ -7486,11 +8641,25 @@ router.delete('/:name/deploy', authenticateToken, requireApproved, async (req: R
       return;
     }
 
+    const undeployRevision = await readProjectDeploymentLifecycleRevision({
+      ownerUserId: ownerId,
+      projectIdentityId: projectIdentity.id,
+      projectIdentityGeneration: projectIdentity.generation,
+    });
+    await advanceProjectDeploymentLifecycleRevision({
+      ownerUserId: ownerId,
+      projectIdentityId: projectIdentity.id,
+      projectIdentityGeneration: projectIdentity.generation,
+      expectedDeploymentRevision: undeployRevision.deploymentRevision,
+    });
+
     if (app?.deployType === 'fullstack') {
       await forgetAppRuntime(app.id, deployId, {
         actorId: ownerId,
         projectId: projectIdentity.id,
-      });
+        deployPath: app.zipPath,
+        port: app.port,
+      }, { settleStatus: 'stopped' });
     } else {
       await stopApp(deployId);
     }
@@ -7563,54 +8732,184 @@ router.delete('/:name/deploy', authenticateToken, requireApproved, async (req: R
     });
   } catch (error: any) {
     console.error('Project undeploy error:', error);
-    res.status(error instanceof ProjectIdentityLifecycleError ? 409 : 500).json({
-      error: error instanceof ProjectIdentityLifecycleError
-        ? error.message
-        : 'Failed to remove Project deployment',
-      ...(error instanceof ProjectIdentityLifecycleError ? {} : { details: error.message }),
+    if (error instanceof ProjectRuntimeStateAttestationError) {
+      res.status(409).json({
+        code: error.code,
+        error: error.message,
+        retryable: error.retryable,
+        recoveryAction: 'REVIEW_RUNTIME_STATE',
+      });
+      return;
+    }
+    if (error instanceof ProjectExternalRuntimeLifecycleError) {
+      res.status(409).json(projectExternalRuntimeConflict(error));
+      return;
+    }
+    if (error instanceof ProjectInvalidRuntimeBindingError) {
+      res.status(503).json(projectInvalidRuntimeBindingConflict(error));
+      return;
+    }
+    if (error instanceof ProjectIdentityLifecycleError) {
+      res.status(409).json({
+        code: error.code,
+        error: error.message,
+        retryable: true,
+      });
+      return;
+    }
+    res.status(500).json({
+      code: 'PROJECT_UNDEPLOY_FAILED',
+      error: 'Failed to remove the Project deployment.',
+      detail: 'Refresh the Project and try again. No external service was stopped.',
+      retryable: true,
     });
+  } finally {
+    releaseProjectNameLock?.();
   }
 });
 
 // POST /api/projects/:name/app-process — manage fullstack app process (start/stop/restart/status/logs)
 router.post('/:name/app-process', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  let releaseProjectNameLock: (() => void) | null = null;
   try {
+    if (req.body?.recoveryReplay !== undefined) {
+      res.setHeader('Cache-Control', 'private, no-store');
+    }
     const ownerId = await getScopedOwnerId(req);
     const appName = req.params.name;
-    const projectDir = getProjectPath(ownerId, appName);
-    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
-    const projectIdentity = await ensureProjectIdentity({
-      workspaceOwnerId: ownerId,
-      projectName: appName,
-      projectRoot: projectDir,
-    });
     const deployId = `${ownerId}-${appName}`;
     const { action } = req.body;
-    const supportedActions = ['start', 'stop', 'restart', 'status', 'logs'] as const;
-    if (!supportedActions.includes(action)) {
+    const acceptedActions = ['start', 'stop', 'restart', 'status', 'logs'] as const;
+    if (!acceptedActions.includes(action)) {
       res.status(400).json({
         error: 'Invalid action. Use: start, stop, restart, status, logs',
       });
       return;
     }
-    
-    const app = await findProjectAppForIdentity({
+    let recoveryReplay: ProjectRuntimeRecoveryReplayProof | null = null;
+    if (req.body?.recoveryReplay !== undefined) {
+      if (action !== 'start' && action !== 'restart') {
+        res.status(400).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_REPLAY_INVALID',
+          error: 'Runtime recovery replay is supported only for Start or Restart.',
+          retryable: false,
+        });
+        return;
+      }
+      try {
+        recoveryReplay = parseProjectRuntimeRecoveryReplay(req.body.recoveryReplay, action);
+      } catch (error) {
+        if (error instanceof ProjectRuntimeRecoveryReplayValidationError) {
+          res.status(400).json({ code: error.code, error: error.message, retryable: false });
+          return;
+        }
+        throw error;
+      }
+    }
+    let projectDir = getProjectPath(ownerId, appName);
+    if (!fs.existsSync(projectDir)) { res.status(404).json({ error: 'Project not found' }); return; }
+    const mutatingAction = action === 'start' || action === 'stop' || action === 'restart';
+    if (mutatingAction) {
+      releaseProjectNameLock = await acquireProjectDeletionLock(
+        projectDeletionLockKey(ownerId, appName),
+      );
+      projectDir = getProjectPath(ownerId, appName);
+      if (!fs.existsSync(projectDir)) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+    }
+    const deployPath = path.join(DEPLOY_DIR, deployId);
+    const preflightProjectApp = await findProjectAppBeforeIdentityMutation({
       workspaceOwnerId: ownerId,
-      projectIdentityId: projectIdentity.id,
       projectName: appName,
-      deployPath: path.join(DEPLOY_DIR, deployId),
+      deployPath,
     });
+    if (preflightProjectApp && !recoveryReplay) {
+      const preflightManagement = projectRuntimeManagement(preflightProjectApp);
+      if (preflightManagement === 'invalid-external-binding') {
+        sendInvalidRuntimeBindingConflict(res, action);
+        return;
+      }
+      if (preflightManagement === 'external-loopback') {
+        if (action === 'status' || action === 'logs') {
+          await sendExternalRuntimeStatus(res, preflightProjectApp);
+        } else {
+          sendExternalRuntimeConflict(res, action);
+        }
+        return;
+      }
+    }
+
+    const projectIdentity = mutatingAction
+      ? await ensureProjectIdentity({
+        workspaceOwnerId: ownerId,
+        projectName: appName,
+        projectRoot: projectDir,
+      })
+      : null;
+    const app = projectIdentity
+      ? await findProjectAppForIdentity({
+        workspaceOwnerId: ownerId,
+        projectIdentityId: projectIdentity.id,
+        projectName: appName,
+        deployPath,
+      })
+      : preflightProjectApp;
     
     if (!app) {
       res.status(404).json({ error: 'Project deployment not found' });
       return;
     }
+    if (recoveryReplay) {
+      const mutationIdentity = projectIdentity;
+      if (!mutationIdentity) {
+        throw new ProjectDeploymentReplayStaleError();
+      }
+      assertProjectRuntimeRecoveryRouteIdentity(recoveryReplay, mutationIdentity);
+      const status = await readProjectRuntimeRecoveryStatus(
+        projectRuntimeRecoveryReplayScope(ownerId, recoveryReplay),
+      );
+      if (sendProjectRuntimeRecoveryStatus(res, status)) return;
+      assertProjectRuntimeRecoveryRouteApp(recoveryReplay, app);
+    }
+    const runtimeManagement = projectRuntimeManagement(app);
+    if (runtimeManagement === 'invalid-external-binding') {
+      sendInvalidRuntimeBindingConflict(res, action);
+      return;
+    }
+    if (runtimeManagement === 'external-loopback') {
+      if (action === 'status' || action === 'logs') {
+        await sendExternalRuntimeStatus(res, app);
+      } else {
+        sendExternalRuntimeConflict(res, action);
+      }
+      return;
+    }
+
+    const managerStatus = app.deployType === 'fullstack'
+      ? getAppStatus(deployId)
+      : null;
+    const recoveryRequired = app.deployType === 'fullstack'
+      && !managerStatus
+      && ['running', 'starting'].includes(app.processStatus);
+    const supportedActions = app.deployType !== 'fullstack'
+      ? []
+      : managerStatus
+        ? [...acceptedActions]
+        : recoveryRequired
+          ? ['start', 'stop', 'status']
+          : ['start', 'status'];
 
     if (app.deployType !== 'fullstack') {
       if (action === 'status') {
         res.json({
           status: app.deployType === 'runtime' ? app.processStatus : 'deployed',
+          persistedStatus: app.processStatus || null,
+          statusSource: projectRuntimeStatusSource(app),
+          recoveryRequired: false,
           deployType: app.deployType,
+          runtimeManagement,
           supportedActions: [],
           logs: [],
           restartCount: 0,
@@ -7626,18 +8925,113 @@ router.post('/:name/app-process', authenticateToken, requireApproved, async (req
           ? 'Remote Desktop Project runtimes do not support start, stop, restart, or log controls.'
           : 'Static Project deployments do not have a controllable application process.',
         deployType: app.deployType,
+        runtimeManagement,
         supportedActions: [],
       });
       return;
     }
+
+    const requireRuntimeMutationIdentity = () => {
+      if (!projectIdentity) {
+        throw new ProjectIdentityLifecycleError(
+          'Project runtime mutation did not retain its immutable Project identity',
+        );
+      }
+      return projectIdentity;
+    };
+
+    const originalProcessRevision = mutatingAction && !recoveryReplay && projectIdentity
+      ? (await readProjectDeploymentLifecycleRevision({
+          ownerUserId: ownerId,
+          projectIdentityId: projectIdentity.id,
+          projectIdentityGeneration: projectIdentity.generation,
+        })).deploymentRevision
+      : null;
+
+    const ensureRuntimeImageForProcessAction = async (
+      replayAction: 'start' | 'restart',
+      mutationIdentity: NonNullable<typeof projectIdentity>,
+    ): Promise<boolean> => {
+      try {
+        await assertProjectRuntimeImageAvailable();
+        return true;
+      } catch (error) {
+        if (!isProjectRuntimeImageUnavailable(error)) throw error;
+        if (recoveryReplay) {
+          sendProjectRuntimeImageUnavailable(res, recoveryReplay);
+          return false;
+        }
+        if (originalProcessRevision === null) {
+          throw new ProjectRuntimeRecoveryReplayError(
+            'PROJECT_RUNTIME_RECOVERY_STATE_INVALID',
+            'Project runtime recovery was not bound to a deployment revision',
+            503,
+          );
+        }
+        const proof = await issueProjectRuntimeRecoveryReplay({
+          ownerUserId: ownerId,
+          action: replayAction,
+          projectIdentity: serializeProjectIdentityProof(mutationIdentity),
+          expectedAppId: app.id,
+          expectedDeploymentRevision: originalProcessRevision,
+        });
+        sendProjectRuntimeImageUnavailable(res, proof);
+        return false;
+      }
+    };
+
+    const admitProcessAction = async (): Promise<{
+      responded: boolean;
+      recoveryRevision: string | null;
+    }> => {
+      const mutationIdentity = requireRuntimeMutationIdentity();
+      if (recoveryReplay) {
+        const claim = await claimProjectRuntimeRecoveryProof(
+          projectRuntimeRecoveryReplayScope(ownerId, recoveryReplay),
+        );
+        if (claim.kind !== 'claimed') {
+          return {
+            responded: sendProjectRuntimeRecoveryStatus(res, claim),
+            recoveryRevision: null,
+          };
+        }
+        return { responded: false, recoveryRevision: claim.deploymentRevision };
+      }
+      if (originalProcessRevision === null) {
+        throw new ProjectRuntimeRecoveryReplayError(
+          'PROJECT_RUNTIME_RECOVERY_STATE_INVALID',
+          'Project process mutation was not bound to a deployment revision',
+          503,
+        );
+      }
+      await advanceProjectDeploymentLifecycleRevision({
+        ownerUserId: ownerId,
+        projectIdentityId: mutationIdentity.id,
+        projectIdentityGeneration: mutationIdentity.generation,
+        expectedDeploymentRevision: originalProcessRevision,
+      });
+      return { responded: false, recoveryRevision: null };
+    };
     
     if (action === 'stop') {
-      await stopApp(deployId);
+      const mutationIdentity = requireRuntimeMutationIdentity();
+      const admission = await admitProcessAction();
+      if (admission.responded) return;
+      await forgetAppRuntime(app.id, deployId, {
+        actorId: ownerId,
+        projectId: mutationIdentity.id,
+        deployPath: app.zipPath,
+        port: app.port,
+      }, { settleStatus: 'stopped' });
       res.json({
         message: 'Stopped',
         status: 'stopped',
+        persistedStatus: 'stopped',
+        statusSource: 'persisted-app',
+        recoveryRequired: false,
         deployType: 'fullstack',
-        supportedActions,
+        runtimeManagement,
+        supportedActions: ['start', 'status'],
         logs: [],
         restartCount: 0,
       });
@@ -7645,69 +9039,246 @@ router.post('/:name/app-process', authenticateToken, requireApproved, async (req
     }
     
     if (action === 'start') {
+      const mutationIdentity = requireRuntimeMutationIdentity();
       if (!app.port || !app.zipPath) {
         res.status(400).json({ error: 'App not properly configured (missing port or path)' });
         return;
       }
+      if (!await ensureRuntimeImageForProcessAction('start', mutationIdentity)) return;
+      const admission = await admitProcessAction();
+      if (admission.responded) return;
       try {
         await startApp(app.id, deployId, app.zipPath, app.port, {
           actorId: ownerId,
-          projectId: projectIdentity.id,
+          projectId: mutationIdentity.id,
         });
-        res.json({
+        const responseBody = {
           ...(getAppStatus(deployId) || { logs: [], restartCount: 0 }),
           message: 'Running',
           status: 'running',
+          persistedStatus: 'running',
+          statusSource: 'portal-manager',
+          recoveryRequired: false,
           port: app.port,
           deployType: 'fullstack',
-          supportedActions,
-        });
+          runtimeManagement,
+          supportedActions: [...acceptedActions],
+        };
+        if (recoveryReplay) {
+          if (!admission.recoveryRevision) {
+            throw new ProjectRuntimeRecoveryReplayError(
+              'PROJECT_RUNTIME_RECOVERY_STATE_INVALID',
+              'Project runtime recovery completed without a durable claim',
+              503,
+            );
+          }
+          try {
+            await completeProjectRuntimeRecoveryOrThrow(
+              ownerId,
+              recoveryReplay,
+              projectRuntimeRecoveryCompletion({
+                replay: recoveryReplay,
+                deploymentRevision: admission.recoveryRevision,
+                appId: app.id,
+              }),
+            );
+          } catch (completionError) {
+            console.error('[Project Runtime] Start receipt completion failed:', completionError);
+            res.status(503).json({
+              code: 'PROJECT_RUNTIME_RECOVERY_INDETERMINATE',
+              error: 'The Project runtime started, but Portal could not confirm its recovery receipt.',
+              detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+              retryable: false,
+            });
+            return;
+          }
+        }
+        res.json(responseBody);
       } catch (e: any) {
-        res.status(500).json({ error: 'Failed to start', details: e.message });
+        if (recoveryReplay && admission.recoveryRevision) {
+          try {
+            await failProjectRuntimeRecoveryOrThrow(
+              ownerId,
+              recoveryReplay,
+              isProjectRuntimeImageUnavailable(e)
+                ? 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE'
+                : 'PROJECT_RUNTIME_START_FAILED',
+            );
+          } catch (receiptError) {
+            console.error('[Project Runtime] Start failure receipt settlement failed:', receiptError);
+            res.status(503).json({
+              code: 'PROJECT_RUNTIME_RECOVERY_INDETERMINATE',
+              error: 'The recovered Start action stopped without a durable terminal receipt.',
+              detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+              retryable: false,
+            });
+            return;
+          }
+        }
+        console.error('Project runtime start failed:', e);
+        res.status(500).json({
+          code: 'PROJECT_RUNTIME_START_FAILED',
+          error: 'Failed to start the Project runtime.',
+          detail: 'Check the Project start command and runtime logs, then try again.',
+          retryable: true,
+        });
       }
       return;
     }
 
     if (action === 'restart') {
+      const mutationIdentity = requireRuntimeMutationIdentity();
+      if (!managerStatus) {
+        res.status(409).json({
+          code: 'PROJECT_RUNTIME_RECOVERY_REQUIRED',
+          error: 'Portal no longer has a live manager record for this Project runtime.',
+          detail: 'Use Start to rebuild the Portal runtime, or Stop to clear its saved running state.',
+          runtimeManagement,
+          persistedStatus: app.processStatus || null,
+          recoveryRequired,
+          supportedActions,
+          retryable: true,
+        });
+        return;
+      }
       if (!app.port || !app.zipPath) {
         res.status(400).json({ error: 'App not properly configured (missing port or path)' });
         return;
       }
+      if (!await ensureRuntimeImageForProcessAction('restart', mutationIdentity)) return;
+      const admission = await admitProcessAction();
+      if (admission.responded) return;
       try {
         await restartApp(app.id, deployId, app.zipPath, app.port, {
           actorId: ownerId,
-          projectId: projectIdentity.id,
+          projectId: mutationIdentity.id,
         });
-        res.json({
+        const responseBody = {
           ...(getAppStatus(deployId) || { logs: [], restartCount: 0 }),
           message: 'Restarted',
           status: 'running',
+          persistedStatus: 'running',
+          statusSource: 'portal-manager',
+          recoveryRequired: false,
           port: app.port,
           deployType: 'fullstack',
-          supportedActions,
-        });
+          runtimeManagement,
+          supportedActions: [...acceptedActions],
+        };
+        if (recoveryReplay) {
+          if (!admission.recoveryRevision) {
+            throw new ProjectRuntimeRecoveryReplayError(
+              'PROJECT_RUNTIME_RECOVERY_STATE_INVALID',
+              'Project runtime recovery completed without a durable claim',
+              503,
+            );
+          }
+          try {
+            await completeProjectRuntimeRecoveryOrThrow(
+              ownerId,
+              recoveryReplay,
+              projectRuntimeRecoveryCompletion({
+                replay: recoveryReplay,
+                deploymentRevision: admission.recoveryRevision,
+                appId: app.id,
+              }),
+            );
+          } catch (completionError) {
+            console.error('[Project Runtime] Restart receipt completion failed:', completionError);
+            res.status(503).json({
+              code: 'PROJECT_RUNTIME_RECOVERY_INDETERMINATE',
+              error: 'The Project runtime restarted, but Portal could not confirm its recovery receipt.',
+              detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+              retryable: false,
+            });
+            return;
+          }
+        }
+        res.json(responseBody);
       } catch (e: any) {
-        res.status(500).json({ error: 'Failed to restart', details: e.message });
+        if (recoveryReplay && admission.recoveryRevision) {
+          try {
+            await failProjectRuntimeRecoveryOrThrow(
+              ownerId,
+              recoveryReplay,
+              isProjectRuntimeImageUnavailable(e)
+                ? 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE'
+                : 'PROJECT_RUNTIME_RESTART_FAILED',
+            );
+          } catch (receiptError) {
+            console.error('[Project Runtime] Restart failure receipt settlement failed:', receiptError);
+            res.status(503).json({
+              code: 'PROJECT_RUNTIME_RECOVERY_INDETERMINATE',
+              error: 'The recovered Restart action stopped without a durable terminal receipt.',
+              detail: 'Refresh Deployment status before taking another action. Portal will not execute this recovery twice.',
+              retryable: false,
+            });
+            return;
+          }
+        }
+        console.error('Project runtime restart failed:', e);
+        res.status(500).json({
+          code: 'PROJECT_RUNTIME_RESTART_FAILED',
+          error: 'Failed to restart the Project runtime.',
+          detail: 'Check the Project start command and runtime logs, then try again.',
+          retryable: true,
+        });
       }
       return;
     }
     
     if (action === 'status' || action === 'logs') {
-      const status = getAppStatus(deployId);
+      const persistedFallbackStatus = recoveryRequired
+        ? 'unknown'
+        : app.processStatus === 'error'
+          ? 'error'
+          : app.processStatus === 'stopped'
+            ? 'stopped'
+            : 'unknown';
       res.json({
-        ...(status || {
-          status: app.processStatus === 'starting' ? 'starting' : 'stopped',
+        ...(managerStatus || {
+          status: persistedFallbackStatus,
           logs: [],
           restartCount: 0,
         }),
+        persistedStatus: app.processStatus || null,
+        statusSource: managerStatus ? 'portal-manager' : 'persisted-app',
+        recoveryRequired,
         deployType: 'fullstack',
+        runtimeManagement,
         supportedActions,
       });
       return;
     }
   } catch (error: any) {
     console.error('App process error:', error);
-    res.status(500).json({ error: error.message });
+    if (sendProjectRuntimeRecoveryReplayError(res, error)) return;
+    if (error instanceof ProjectDeploymentReplayStaleError) {
+      res.status(409).json({
+        code: error.code,
+        error: error.message,
+        detail: 'Refresh this Project and use its current Deployment controls.',
+        retryable: false,
+      });
+      return;
+    }
+    if (error instanceof ProjectRuntimeStateAttestationError) {
+      res.status(409).json({
+        code: error.code,
+        error: error.message,
+        retryable: error.retryable,
+        recoveryAction: 'REVIEW_RUNTIME_STATE',
+      });
+      return;
+    }
+    res.status(500).json({
+      code: 'PROJECT_RUNTIME_REQUEST_FAILED',
+      error: 'The Project runtime request could not be completed.',
+      detail: 'Refresh the Project and try the action again.',
+      retryable: true,
+    });
+  } finally {
+    releaseProjectNameLock?.();
   }
 });
 // POST /api/projects/:name/doc-update - auto-update documentation
@@ -7776,9 +9347,9 @@ router.post('/:name/doc-update', authenticateToken, requireApproved, async (req:
 
     // All final sizes and both existing files are preflighted before writing.
     // Each replacement is atomic and rejects repository-controlled links.
-    writeProjectTextFile(projectDir, 'NOTES.md', notesContent, PROJECT_DOCUMENT_MAX_BYTES);
+    writeProjectRuntimeTextFile(projectDir, 'NOTES.md', notesContent, PROJECT_DOCUMENT_MAX_BYTES);
     if (readmeContent !== null) {
-      writeProjectTextFile(projectDir, 'README.md', readmeContent, PROJECT_DOCUMENT_MAX_BYTES);
+      writeProjectRuntimeTextFile(projectDir, 'README.md', readmeContent, PROJECT_DOCUMENT_MAX_BYTES);
     }
     
     // Auto-commit the doc changes
@@ -7863,7 +9434,7 @@ router.post('/:name/share', authenticateToken, requireApproved, async (req: Requ
 
     const token = nanoid(21);
     const isPublic = req.body.isPublic !== false; // default true
-    const password = req.body.password;
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
     let shareOptions;
     try {
       shareOptions = parseShareLinkOptions(req.body || {});
@@ -7885,6 +9456,12 @@ router.post('/:name/share', authenticateToken, requireApproved, async (req: Requ
     } else if (!isPublic && !password) {
       res.status(400).json({ error: 'Password required for password-protected links' });
       return;
+    } else if (password) {
+      res.status(400).json({
+        error: 'A share password requires a private link. Send isPublic: false with the password.',
+        code: 'SHARE_PASSWORD_REQUIRES_PRIVATE_LINK',
+      });
+      return;
     }
 
     const shareLink = await prisma.appShareLink.create({
@@ -7894,6 +9471,8 @@ router.post('/:name/share', authenticateToken, requireApproved, async (req: Requ
         token,
         expiresAt: shareOptions.expiresAt,
         maxUses: shareOptions.maxUses,
+        rateLimitMaxRequests: shareOptions.rateLimitMaxRequests,
+        rateLimitWindowSeconds: shareOptions.rateLimitWindowSeconds,
         isPublic,
         passwordHash,
       },
@@ -7947,6 +9526,13 @@ async function findOwnedShareLink(ownerId: string, projectName: string, linkId: 
 router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
     const { isPublic, password, isActive } = req.body;
+    if (password !== undefined && isPublic !== false) {
+      res.status(400).json({
+        error: 'A share password requires a private link. Send isPublic: false with the password.',
+        code: 'SHARE_PASSWORD_REQUIRES_PRIVATE_LINK',
+      });
+      return;
+    }
     const cleanupOnly = isActive === false && isPublic === undefined && password === undefined;
     if (!cleanupOnly) {
       const unavailable = portalFeatureUnavailableResponse('appHosting');
@@ -7956,6 +9542,12 @@ router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (
       }
     }
     const ownerId = await getScopedOwnerId(req);
+    const existingLink = await findOwnedShareLink(ownerId, req.params.name, req.params.linkId);
+    if (!existingLink) {
+      res.status(404).json({ error: 'Share link not found' });
+      return;
+    }
+
     const updateData: any = {};
 
     if (typeof isActive === 'boolean') {
@@ -7976,9 +9568,17 @@ router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (
       updateData.passwordHash = await bcrypt.hash(password, 12);
     }
 
-    const existingLink = await findOwnedShareLink(ownerId, req.params.name, req.params.linkId);
-    if (!existingLink) {
-      res.status(404).json({ error: 'Share link not found' });
+    const prospectiveCredentialState = {
+      isPublic: updateData.isPublic ?? existingLink.isPublic,
+      passwordHash: updateData.passwordHash !== undefined
+        ? updateData.passwordHash
+        : existingLink.passwordHash,
+    };
+    if (!shareCredentialStateIsValid(prospectiveCredentialState)) {
+      res.status(409).json({
+        error: 'Share link credential state is invalid; choose public or set a new private-link password',
+        code: 'SHARE_CREDENTIAL_STATE_INVALID',
+      });
       return;
     }
 
@@ -8105,7 +9705,8 @@ router.post('/:name/rename-file', authenticateToken, requireApproved, projectPat
     try {
       resolvedOld = resolveExistingProjectEntry(projectDir, oldPath, 'any');
       resolvedNew = resolveProjectTarget(projectDir, newPath);
-    } catch {
+    } catch (error) {
+      if (error instanceof ProjectRuntimeOwnershipError) throw error;
       res.status(403).json({ error: 'Forbidden' });
       return;
     }
@@ -8119,13 +9720,19 @@ router.post('/:name/rename-file', authenticateToken, requireApproved, projectPat
 
     try {
       const newParent = path.posix.dirname(String(newPath).replace(/\\/g, '/'));
-      if (newParent !== '.') ensureContainedDirectory(projectDir, newParent);
+      if (newParent !== '.') ensureProjectRuntimeOwnedDirectory(projectDir, newParent);
       resolvedNew = resolveProjectTarget(projectDir, newPath);
-    } catch {
+    } catch (error) {
+      if (error instanceof ProjectRuntimeOwnershipError) throw error;
       res.status(403).json({ error: 'Forbidden' });
       return;
     }
 
+    assignProjectRuntimeOwnership(
+      projectDir,
+      resolvedOld,
+      oldEntry.isDirectory() ? 'directory' : 'file',
+    );
     fs.renameSync(resolvedOld, resolvedNew);
     res.json({ message: 'Renamed' });
   } catch (error) {
@@ -8438,6 +10045,10 @@ router.get('/:name/chat/providers', authenticateToken, requireApproved, async (r
       || [...bindings]
         .filter((binding) => isProjectChatRouteProvider(binding.provider as AgentProviderName))
         .sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime())[0]?.provider
+      // A genuinely fresh project has no preference or binding. Start on the
+      // first provider whose existing, non-mutating qualification evidence is
+      // usable instead of durably selecting an unavailable OpenClaw lane.
+      || PROJECT_CHAT_ROUTE_PROVIDERS.find((provider) => qualifications[provider].selectable)
       || 'OPENCLAW',
     );
     const initialProvider = isProjectChatRouteProvider(initialProviderCandidate)
@@ -8504,7 +10115,11 @@ router.get('/:name/chat/providers', authenticateToken, requireApproved, async (r
     if (sendProjectChatProviderError(res, error)) return;
     if (sendProjectChatCoordinationError(res, error)) return;
     console.error('[Project Chat Providers] Error:', error?.message || error);
-    res.status(403).json({ error: 'Project sandbox could not be verified' });
+    res.status(503).json({
+      error: 'Project provider discovery is temporarily unavailable. Try again.',
+      code: 'PROJECT_PROVIDER_DISCOVERY_FAILED',
+      retryable: true,
+    });
   }
 });
 
@@ -8836,9 +10451,9 @@ function qualifyProjectChatProviderRoute(provider: ProjectChatRouteProvider) {
         actorUserId,
         actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
         projectIdentityId: projectIdentity.id,
-        // Qualification does not switch the selected provider. The admission
-        // only reserves the actor/project mutation slot while target runtime
-        // evidence is being replaced.
+        // Explicit preparation selects the qualified provider only in the
+        // same successful admission-completion CAS. A failed qualification
+        // leaves the prior provider and version untouched.
         provider: coordination.state.selectedProvider as ProjectChatPersistedProvider,
         runtime: descriptor.runtime,
         operation: projectChatRuntimeOperationId(
@@ -8848,14 +10463,16 @@ function qualifyProjectChatProviderRoute(provider: ProjectChatRouteProvider) {
         ),
         leaseOwner: PROJECT_CHAT_LEASE_OWNER,
         expectedVersion: coordination.state.version,
+        recoveryExecutionContext: executionContext,
         leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
+        requestedProviderAfterSuccess: toPersistedProjectChatProvider(provider),
       }, async () => {
         await repairTerminalProjectChatPresentations({
           actorUserId,
           projectIdentityId: projectIdentity.id,
           limit: 100,
         });
-        prepareProjectLifecycleWorkspace(projectDir);
+        await ensureProjectChatWorkspaceOwnership(executionContext, projectDir);
         if (provider === 'OPENCLAW') {
           // A genuinely new Project agent is absent from OpenClaw config.
           // Register and converge that exact identity before asking the pinned
@@ -9060,6 +10677,7 @@ router.post('/:name/chat/provider', authenticateToken, requireApproved, async (r
       operation: projectChatRuntimeOperationId('switch-provider', provider, bindingInput.model),
       leaseOwner: PROJECT_CHAT_LEASE_OWNER,
       expectedVersion: req.body?.stateVersion,
+      recoveryExecutionContext: executionContext,
       leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
       requestedProviderAfterSuccess: toPersistedProjectChatProvider(provider),
     }, async () => {
@@ -9070,7 +10688,7 @@ router.post('/:name/chat/provider', authenticateToken, requireApproved, async (r
       });
       let selectedBinding: Awaited<ReturnType<typeof ensureSelectedProjectChatBinding>>;
       if (provider === 'OPENCLAW') {
-        prepareProjectLifecycleWorkspace(projectDir);
+        await ensureProjectChatWorkspaceOwnership(executionContext, projectDir);
         const catalogScope = await ensureOpenClawProjectAgentCatalogScope(executionContext);
         const openClawModelResolution = await resolveAllowedOpenClawProjectModel(
           catalogScope.agentId,
@@ -9146,7 +10764,11 @@ router.post('/:name/chat/provider', authenticateToken, requireApproved, async (r
     if (sendProjectChatProviderError(res, error)) return;
     if (sendProjectChatCoordinationError(res, error)) return;
     console.error('[Project Chat Provider Switch] Error:', error?.message || error);
-    res.status(403).json({ error: 'Project sandbox could not be verified' });
+    res.status(503).json({
+      error: 'Project provider change did not complete. The previous provider remains selected.',
+      code: 'PROJECT_PROVIDER_SWITCH_FAILED',
+      retryable: true,
+    });
   }
 });
 
@@ -9578,8 +11200,9 @@ router.get('/:name/chat/history', authenticateToken, requireApproved, async (req
       actorUserId: userId,
       provider,
       executionContext,
+      allowStaleContext: true,
     });
-    const { binding } = bindingRead;
+    const { binding, staleBinding, staleReason } = bindingRead;
 
     const requestedLimit = req.query.limit == null ? 100 : Number(req.query.limit);
     if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
@@ -9635,7 +11258,15 @@ router.get('/:name/chat/history', authenticateToken, requireApproved, async (req
         nextCursor: hasMore ? messages[0]?.id || null : null,
         limit: requestedLimit,
       },
-      session: session ? {
+      session: staleBinding ? {
+        status: 'stale',
+        model: projectChatClientModel(provider, staleBinding.model),
+        activeProvider: provider,
+        runtime: staleBinding.runtime,
+        lastActivity: staleBinding.lastActivity.toISOString(),
+        requiresPreparation: true,
+        staleReason,
+      } : session ? {
         status: session.status,
         model: projectChatClientModel(provider, session.model),
         activeProvider: session.activeProvider,
@@ -9660,6 +11291,13 @@ router.get('/:name/chat/history', authenticateToken, requireApproved, async (req
         sessionKey: binding.sessionKey,
         externalSessionId: binding.externalSessionId,
         model: projectChatClientModel(provider, binding.model),
+      } : staleBinding ? {
+        provider,
+        runtime: staleBinding.runtime,
+        model: projectChatClientModel(provider, staleBinding.model),
+        status: 'stale',
+        requiresPreparation: true,
+        staleReason,
       } : null,
       executionContext: serializeProjectSandboxContext(executionContext),
     });
@@ -10197,6 +11835,7 @@ async function performProjectChatDestructiveReset(input: {
     operation: projectChatRuntimeOperationId('destructive-reset', input.provider),
     leaseOwner: PROJECT_CHAT_LEASE_OWNER,
     expectedVersion: quiescentState.version,
+    recoveryExecutionContext: input.executionContext,
   }, async (admission) => {
     await assertLegacyOpenClawProjectDestructiveMutationSafe();
     const identity = await ensureProjectAssistantIdentity(
@@ -10228,7 +11867,7 @@ async function performProjectChatDestructiveReset(input: {
     // commit cannot retain transcript plaintext. It is never used to decide
     // provider/session state, so a failed commit leaves the live database and
     // non-transcript session projection authoritative.
-    writeProjectTextFile(
+    writeProjectRuntimeTextFile(
       input.projectDir,
       '.agent-history.json',
       JSON.stringify({ messages: [], model: '' }),
@@ -10245,10 +11884,10 @@ async function performProjectChatDestructiveReset(input: {
     // failed transaction cannot falsely advertise an uninitialized session.
     // A post-commit write failure is safely retryable because DB bindings and
     // transcript state remain the sole authority.
-    writeProjectTextFile(input.projectDir, '.agent-session.json', JSON.stringify({
+    writeProjectSessionProjectionBestEffort(input.projectDir, {
       initialized: false,
       stableSlug: identity.stableSlug,
-    }, null, 2), PROJECT_METADATA_MAX_BYTES);
+    });
     for (const binding of terminated.bindings) {
       const boundProvider = fromPersistedProjectChatProvider(binding.provider as ProjectChatPersistedProvider);
       if (isQualifiableProjectProvider(boundProvider)) {
@@ -10370,7 +12009,28 @@ router.get('/:name/chat/session-status', authenticateToken, requireApproved, asy
       actorUserId: userId,
       provider,
       executionContext,
+      allowStaleContext: true,
     });
+    if (existing.staleBinding) {
+      res.json({
+        active: false,
+        running: false,
+        runStatus: 'idle',
+        model: null,
+        modelValidated: false,
+        modelVerified: false,
+        configuredModel: projectChatClientModel(provider, existing.staleBinding.model),
+        dbStatus: 'stale',
+        sessionKey: null,
+        provider,
+        runtime: existing.staleBinding.runtime,
+        stateVersion: null,
+        requiresPreparation: true,
+        staleReason: existing.staleReason,
+        executionContext: serializeProjectSandboxContext(executionContext),
+      });
+      return;
+    }
     if (!existing.binding) {
       res.json({
         active: false,
@@ -10557,7 +12217,7 @@ async function autoCommitProjectChanges(
   model?: string,
 ) {
   let transientShelved = false;
-  const git = (args: string[], timeoutMs = 15_000) => runProjectGitCommand({
+  const git = (args: string[], timeoutMs = 15_000) => runPreparedProjectGitCommand({
     actorId,
     projectId,
     workspace: projectDir,
@@ -10788,13 +12448,6 @@ async function checkpointProjectAfterProviderTurn(input: {
 // Session Management (rotation to prevent 200K token overflow)
 // ========================================
 
-interface SessionMeta {
-  initialized?: boolean;
-  model?: string;
-  lastActivity?: string;
-  stableSlug?: string;
-}
-
 // --- Legacy backward-compat: .assistant-* / .marcus-* → .agent-* ---
 // Auto-migrate known legacy internal files on first access.
 
@@ -10935,6 +12588,7 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
       operation: projectChatRuntimeOperationId('ensure-session', provider, req.body?.model || null),
       leaseOwner: PROJECT_CHAT_LEASE_OWNER,
       expectedVersion: coordination.state!.version,
+      recoveryExecutionContext: executionContext,
       leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
     }, async () => {
       await repairTerminalProjectChatPresentations({
@@ -10942,6 +12596,9 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
         projectIdentityId: executionContext.projectId,
         limit: 100,
       });
+      // Validate or create provider-owned memory before runtime preparation so
+      // the workspace ownership pass includes a newly created regular file.
+      ensureProjectMemory(projectDir, name);
       if (isNativeProjectChatRouteProvider(provider)) {
         const requestedModel = normalizePortalModelId(req.body?.model || '');
         const resolved = await ensureNativeProjectChatBinding({
@@ -10953,22 +12610,13 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
           executionContext,
           model: requestedModel || null,
         });
-        const memoryPath = path.join(projectDir, '.agent-memory.md');
-        if (!fs.existsSync(memoryPath)) {
-          fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
-        }
-        const sessionStatePath = path.join(projectDir, '.agent-session.json');
-        const previous = fs.existsSync(sessionStatePath)
-          ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf8'))
-          : {};
-        fs.writeFileSync(sessionStatePath, JSON.stringify({
-          ...previous,
+        writeProjectSessionProjectionBestEffort(projectDir, {
           initialized: true,
           model: resolved.configuredModel,
           modelConfigured: true,
           lastActivity: new Date().toISOString(),
           stableSlug: resolved.identity.stableSlug,
-        }, null, 2), 'utf8');
+        });
         return {
           sessionKey: resolved.sessionKey,
           agentId: resolved.agentId,
@@ -10997,7 +12645,7 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
 
       // Ownership preparation never follows project-created symlinks. The same
       // numeric identity is used by lifecycle, Git, and every Project provider.
-      prepareProjectLifecycleWorkspace(projectDir);
+      await ensureProjectChatWorkspaceOwnership(executionContext, projectDir);
       const catalogScope = await ensureOpenClawProjectAgentCatalogScope(executionContext);
       const modelResolution = await resolveAllowedOpenClawProjectModel(
         catalogScope.agentId,
@@ -11031,21 +12679,12 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
       const binding = modelVerification.binding;
       const verifiedModel = modelVerification.verified.model;
 
-      const sessionStatePath = path.join(projectDir, '.agent-session.json');
-      const memoryPath = path.join(projectDir, '.agent-memory.md');
-      if (!fs.existsSync(memoryPath)) {
-        fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
-      }
-      const previous = fs.existsSync(sessionStatePath)
-        ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf-8'))
-        : {};
-      fs.writeFileSync(sessionStatePath, JSON.stringify({
-        ...previous,
+      writeProjectSessionProjectionBestEffort(projectDir, {
         initialized: true,
         model: verifiedModel,
         lastActivity: new Date().toISOString(),
         stableSlug: identity.stableSlug,
-      }, null, 2), 'utf-8');
+      });
 
       return {
         sessionKey,
@@ -11212,8 +12851,7 @@ router.get('/:name/assistant/memory', authenticateToken, async (req: Request, re
       req.query.provider,
     );
 
-    const memoryPath = path.join(projectDir, '.agent-memory.md');
-    const content = fs.existsSync(memoryPath) ? fs.readFileSync(memoryPath, 'utf-8') : '';
+    const content = readProjectMemory(projectDir);
     res.json({ content, executionContext: serializeProjectSandboxContext(executionContext) });
   } catch (error) {
     if (sendProjectChatProviderError(res, error)) return;
@@ -12259,6 +13897,7 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
       operation: projectChatRuntimeOperationId('send', provider, messageId),
       leaseOwner: PROJECT_CHAT_LEASE_OWNER,
       expectedVersion: coordination.state!.version,
+      recoveryExecutionContext: executionContext,
       leaseDurationMs: PROJECT_CHAT_LEASE_DURATION_MS,
     });
     stopRuntimeAdmissionHeartbeat = startProjectChatLeaseHeartbeat({
@@ -12278,6 +13917,10 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
       projectIdentityId: executionContext.projectId,
       limit: 100,
     });
+    // Memory is repository-controlled input. Attest it before either provider
+    // can be admitted, then include a newly created file in ownership repair.
+    ensureProjectMemory(projectDir, name);
+    await ensureProjectChatWorkspaceOwnership(executionContext, projectDir);
 
     if (isNativeProjectChatRouteProvider(provider)) {
       const selectedModel = normalizePortalModelId(model || '');
@@ -12410,9 +14053,8 @@ ${message}`
         },
       });
 
-      // Portal files created while admitting the turn must be writable by the
-      // same numeric identity the confined native container runs as.
-      prepareProjectLifecycleWorkspace(projectDir);
+      // Warm sends never traverse the repository. Portal mutation boundaries
+      // and provider preparation own the exact runtime-ownership contract.
       let run;
       let dispatchAcceptanceFailed = false;
       let dispatchQuiescedAfterAcceptanceFailure = false;
@@ -12571,18 +14213,13 @@ ${message}`
         throw error;
       }
 
-      const sessionStatePath = path.join(projectDir, '.agent-session.json');
-      const previous = fs.existsSync(sessionStatePath)
-        ? JSON.parse(fs.readFileSync(sessionStatePath, 'utf8'))
-        : {};
-      fs.writeFileSync(sessionStatePath, JSON.stringify({
-        ...previous,
+      writeProjectSessionProjectionBestEffort(projectDir, {
         initialized: true,
         model: resolved.configuredModel,
         modelConfigured: true,
         lastActivity: now.toISOString(),
         stableSlug: resolved.identity.stableSlug,
-      }, null, 2), 'utf8');
+      });
 
       res.json({
         sent: true,
@@ -12616,7 +14253,8 @@ ${message}`
       },
     });
 
-    prepareProjectLifecycleWorkspace(projectDir);
+    // Provider preparation owns legacy-tree normalization. Warm OpenClaw
+    // sends do not recursively traverse or chown the Project workspace.
     const catalogScope = await ensureOpenClawProjectAgentCatalogScope(executionContext);
     const modelResolution = await resolveAllowedOpenClawProjectModel(
       catalogScope.agentId,
@@ -12670,10 +14308,6 @@ ${message}`
     const priorMessages = resolved.needsBootstrap ? handoffSuffix.messages : [];
     const handoff = buildProjectChatProviderHandoff(priorMessages);
     const assistantName = await getAssistantName();
-    const memoryPath = path.join(projectDir, '.agent-memory.md');
-    if (!fs.existsSync(memoryPath)) {
-      fs.writeFileSync(memoryPath, `# Project Memory — ${name}\n\n## Overview\n(Describe what this project does)\n`, 'utf-8');
-    }
     const fullMessage = resolved.needsBootstrap
       ? `[PORTAL PROJECT CONTEXT]
 You are ${assistantName}, an AI coding assistant working only on the Portal project "${name}".
@@ -12909,13 +14543,12 @@ ${message}`
       throw error;
     }
 
-    const sessionStatePath = path.join(projectDir, '.agent-session.json');
-    fs.writeFileSync(sessionStatePath, JSON.stringify({
+    writeProjectSessionProjectionBestEffort(projectDir, {
       initialized: true,
       model: selectedModel,
       lastActivity: now.toISOString(),
       stableSlug: resolved.identity.stableSlug,
-    } satisfies SessionMeta, null, 2), 'utf-8');
+    });
 
     res.json({
       sent: true,

@@ -720,14 +720,17 @@ describe('gateway history readers', () => {
 
       const messages = __gatewayHistoryTest.readSessionMessagesEnhancedForSessionKey(sessionKey, 20, sessionsDir);
       const assistant = messages.find((message: any) => message.id === 'a1');
+      const runtimeOverlay = messages.find((message: any) => (
+        message?.__portal?.kind === 'runtime-turn-event-history'
+      ));
 
       expect(assistant).toBeTruthy();
-      expect(assistant.segments.map((segment: any) => segment.text)).toEqual([
+      expect(runtimeOverlay?.segments.map((segment: any) => segment.text)).toEqual([
         'Starting Codex turn...',
         'I need to inspect the file first.',
         'Now I can answer with the verified detail.',
       ]);
-      expect(assistant.toolCalls).toEqual([
+      expect(runtimeOverlay?.toolCalls).toEqual([
         expect.objectContaining({
           id: 'tool-read',
           name: 'read',
@@ -741,7 +744,7 @@ describe('gateway history readers', () => {
     }
   });
 
-  test('enhanced session history merges recovered runtime reasoning into assistant messages that already have tool calls', () => {
+  test('enhanced session history keeps richer runtime evidence standalone when a durable tool is only partial', () => {
     const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-history-'));
     const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-turn-events-'));
     const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
@@ -785,6 +788,10 @@ describe('gateway history readers', () => {
         ...extra,
       });
 
+      const durableAssistantBefore = __gatewayHistoryTest
+        .readSessionMessagesEnhancedForSessionKey(sessionKey, 20, sessionsDir)
+        .find((message: any) => message.id === 'a1');
+
       recordRuntimeTurnEvent(sessionKey, event('assistant_reasoning', 1, Date.parse('2026-05-30T04:10:02.000Z'), {
         text: 'Recovered reasoning that used to disappear after steering.',
       }));
@@ -798,16 +805,20 @@ describe('gateway history readers', () => {
 
       const messages = __gatewayHistoryTest.readSessionMessagesEnhancedForSessionKey(sessionKey, 20, sessionsDir);
       const assistant = messages.find((message: any) => message.id === 'a1');
+      const runtimeOverlay = messages.find((message: any) => (
+        message?.__portal?.kind === 'runtime-turn-event-history'
+      ));
 
-      expect(assistant).toBeTruthy();
-      expect(assistant.segments.map((segment: any) => segment.text)).toEqual(expect.arrayContaining([
-        'Existing local segment.',
+      expect(assistant).toEqual(durableAssistantBefore);
+      expect(runtimeOverlay?.segments.map((segment: any) => segment.text)).toEqual(expect.arrayContaining([
         'Recovered reasoning that used to disappear after steering.',
       ]));
-      expect(assistant.toolCalls).toEqual([
+      expect(runtimeOverlay?.toolCalls).toEqual([
         expect.objectContaining({
           id: 'tool-read',
           name: 'read',
+          result: undefined,
+          status: 'done',
         }),
       ]);
     } finally {
@@ -935,13 +946,26 @@ describe('gateway history readers', () => {
       const messages = __gatewayHistoryTest.readSessionMessagesEnhancedForSessionKey(sessionKey, 20, sessionsDir);
       const roles = messages.map((message: any) => message.role);
       const final = messages.find((message: any) => message.id === 'a-final');
+      const runtimeOverlay = messages.find((message: any) => (
+        message?.__portal?.kind === 'runtime-turn-event-history'
+      ));
+      const retainedTools = [
+        ...(Array.isArray(final?.toolCalls) ? final.toolCalls : []),
+        ...(Array.isArray(runtimeOverlay?.toolCalls) ? runtimeOverlay.toolCalls : []),
+      ];
 
       expect(roles).toContain('user');
       expect(messages.some((message: any) => message.content === 'make the animation better')).toBe(true);
       expect(final).toBeTruthy();
-      expect(final.toolCalls).toHaveLength(toolOnlyCount);
-      expect(final.segments.map((segment: any) => segment.text)).toContain('I will inspect and improve the existing file.');
-      expect(messages.filter((message: any) => message.role === 'assistant' && !message.content && Array.isArray(message.toolCalls))).toHaveLength(0);
+      expect(new Set(retainedTools.map((tool: any) => tool.id)).size).toBe(toolOnlyCount);
+      expect(runtimeOverlay?.segments.map((segment: any) => segment.text))
+        .toContain('I will inspect and improve the existing file.');
+      expect(messages.filter((message: any) => (
+        message.role === 'assistant'
+        && !message.content
+        && Array.isArray(message.toolCalls)
+        && message?.__portal?.kind !== 'runtime-turn-event-history'
+      ))).toHaveLength(0);
     } finally {
       if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
       else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
@@ -1113,6 +1137,61 @@ describe('gateway history readers', () => {
     expect(messages).toHaveLength(1);
     const segments = messages[0].segments || [];
     expect(segments.map((segment: any) => segment.text)).toEqual(['Analyzing the failing migration files']);
+  });
+
+  test('runtime history keeps raw reasoning and attested preamble replacement lanes separate', () => {
+    const baseTs = Date.parse('2026-08-08T04:00:00.000Z');
+    const event = (
+      seq: number,
+      text: string,
+      preambleProgress = false,
+    ): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_reasoning',
+      sessionKey: 'agent:main:opus-preamble-history',
+      runId: 'run-opus-preamble-history',
+      seq,
+      ts: baseTs + seq * 100,
+      text,
+      replace: true,
+      visible: true,
+      source: {
+        transport: 'portal-stream-event-bus',
+        eventType: preambleProgress ? 'status' : 'thinking',
+        ...(preambleProgress ? { preambleProgress: true as const } : {}),
+      },
+    });
+
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      event(1, 'Private reasoning snapshot'),
+      event(2, 'Inspecting the affected files', true),
+      event(3, 'Private reasoning snapshot, expanded'),
+      event(4, 'Inspecting the affected files and tests', true),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].segments).toEqual([
+      expect.objectContaining({
+        kind: 'thinking',
+        source: 'reasoning',
+        text: 'Private reasoning snapshot',
+      }),
+      expect.objectContaining({
+        kind: 'thinking',
+        source: 'preamble',
+        text: 'Inspecting the affected files',
+      }),
+      expect.objectContaining({
+        kind: 'thinking',
+        source: 'reasoning',
+        text: 'Private reasoning snapshot, expanded',
+      }),
+      expect.objectContaining({
+        kind: 'thinking',
+        source: 'preamble',
+        text: 'Inspecting the affected files and tests',
+      }),
+    ]);
   });
 
   test('runtime history keeps the pre-tool segment and stores only the cumulative final tail', () => {

@@ -294,6 +294,32 @@ function assertProjectContext(
   }
 }
 
+function assertHistoricalProjectContext(context: ProjectSandboxExecutionContext): void {
+  assertExecutionContextBinding(context, context.userId, 'PROJECT_SANDBOX');
+  if (!/^portal-project-sandbox-v[1-9][0-9]*$/.test(context.runtimePolicyVersion)) {
+    fail('RUNTIME_POLICY', 'Codex Project historical runtime policy version is invalid');
+  }
+  if (!/^portal-project-egress-v[1-9][0-9]*$/.test(context.egressPolicyVersion)) {
+    fail('EGRESS_POLICY', 'Codex Project historical egress policy version is invalid');
+  }
+  requirePinnedImage(context.runtimeImageDigest);
+  if (context.policyFingerprint !== codexProjectPolicyFingerprint(
+    context,
+    context.runtimePolicyVersion,
+  )) {
+    fail('POLICY_FINGERPRINT', 'Codex Project historical policy fingerprint is invalid');
+  }
+  const root = attestProjectRoot(context.canonicalRoot);
+  if (
+    root.canonicalRoot !== context.canonicalRoot
+    || root.rootDevice !== context.rootDevice
+    || root.rootInode !== context.rootInode
+    || root.rootBirthtimeNs !== context.rootBirthtimeNs
+  ) {
+    fail('PROJECT_ROOT_IDENTITY', 'Codex Project root no longer matches its immutable identity');
+  }
+}
+
 function assertEgressIdentity(
   context: ProjectSandboxExecutionContext,
   egress: ProjectEgressPlaneConfig,
@@ -387,15 +413,6 @@ function dockerInspectOne(output: string, label: string): DockerContainerInspect
     fail('DOCKER_INSPECT_SHAPE', `${label} inspection returned an invalid shape`);
   }
   return parsed[0] as DockerContainerInspect;
-}
-
-async function inspectContainer(
-  executor: ProjectEgressCommandExecutor,
-  name: string,
-): Promise<DockerContainerInspect | null> {
-  const result = await executor.run('docker', ['container', 'inspect', name], { allowExitCodes: [0, 1] });
-  if (result.exitCode === 1) return null;
-  return dockerInspectOne(result.stdout, 'Codex Project runtime');
 }
 
 function isDockerContainerNotFound(result: ProjectEgressCommandResult): boolean {
@@ -1528,7 +1545,9 @@ function assertCodexProjectRuntimeStopTarget(
   if (
     !/^[a-f0-9]{64}$/.test(containerId)
     || !/^\/?p4cx-[a-f0-9]{24}$/.test(String(inspect.Name || ''))
-    || labels[RUNTIME_POLICY_LABEL] !== CODEX_PROJECT_RUNTIME_POLICY_VERSION
+    || String(inspect.Image || '').toLowerCase() !== context.runtimeImageDigest.toLowerCase()
+    || String(inspect.Config?.Image || '').toLowerCase() !== context.runtimeImageDigest.toLowerCase()
+    || labels[RUNTIME_POLICY_LABEL] !== context.runtimePolicyVersion
     || labels[CODEX_PROJECT_RUNTIME_ACTOR_LABEL] !== hashCodexProjectRuntimeLabelIdentity(context.userId)
     || labels[CODEX_PROJECT_RUNTIME_IDENTITY_LABEL] !== hashCodexProjectRuntimeLabelIdentity(context.projectId)
     || inspect.Config?.User !== CODEX_PROJECT_CONTAINER_USER
@@ -1553,12 +1572,28 @@ export async function stopCodexProjectRuntimesForContext(
   context: ProjectSandboxExecutionContext,
   executor: ProjectEgressCommandExecutor = codexProjectEgressCommandExecutor,
 ): Promise<readonly string[]> {
-  assertProjectContext(context);
+  return stopCodexProjectRuntimes(context, executor, false);
+}
+
+/** Stop-only recovery for a server-persisted context from an older release. */
+export async function stopCodexProjectRuntimesForRecoveryContext(
+  context: ProjectSandboxExecutionContext,
+  executor: ProjectEgressCommandExecutor = codexProjectEgressCommandExecutor,
+): Promise<readonly string[]> {
+  return stopCodexProjectRuntimes(context, executor, true);
+}
+
+async function stopCodexProjectRuntimes(
+  context: ProjectSandboxExecutionContext,
+  executor: ProjectEgressCommandExecutor,
+  historical: boolean,
+): Promise<readonly string[]> {
+  if (historical) assertHistoricalProjectContext(context);
+  else assertProjectContext(context);
   const actorLabel = hashCodexProjectRuntimeLabelIdentity(context.userId);
   const projectLabel = hashCodexProjectRuntimeLabelIdentity(context.projectId);
   const listed = await executor.run('docker', [
     'container', 'ls', '-a', '--no-trunc',
-    '--filter', `label=${RUNTIME_POLICY_LABEL}=${CODEX_PROJECT_RUNTIME_POLICY_VERSION}`,
     '--filter', `label=${CODEX_PROJECT_RUNTIME_ACTOR_LABEL}=${actorLabel}`,
     '--filter', `label=${CODEX_PROJECT_RUNTIME_IDENTITY_LABEL}=${projectLabel}`,
     '--format', '{{.ID}}',
@@ -1571,31 +1606,44 @@ export async function stopCodexProjectRuntimesForContext(
     fail('RUNTIME_STOP_DISCOVERY', 'Codex Project runtime discovery returned an unsafe identity');
   }
 
-  const stopped: string[] = [];
+  const attested = [] as Array<{ containerId: string; running: boolean }>;
   for (const discoveredId of containerIds) {
-    const inspect = await inspectContainer(executor, discoveredId);
+    const inspect = await strictInspectContainer(executor, discoveredId);
     if (!inspect) continue;
     const containerId = assertCodexProjectRuntimeStopTarget(inspect, context);
     if (containerId !== discoveredId.toLowerCase()) {
       fail('RUNTIME_STOP_IDENTITY', 'Codex Project runtime changed during stop attestation');
     }
-    if (inspect.State?.Running) {
+    if (typeof inspect.State?.Running !== 'boolean') {
+      fail(
+        'RUNTIME_STOP_UNCONFIRMED',
+        'Codex Project runtime state was ambiguous before stop',
+      );
+    }
+    attested.push({ containerId, running: inspect.State.Running });
+  }
+
+  const stopped: string[] = [];
+  for (const candidate of attested) {
+    const { containerId } = candidate;
+    if (candidate.running) {
       await executor.run(
         'docker',
         ['container', 'stop', '--time', '3', containerId],
         { allowExitCodes: [0, 1] },
       );
     }
-    const after = await inspectContainer(executor, containerId);
+    const after = await strictInspectContainer(executor, containerId);
     if (after) {
       const afterId = assertCodexProjectRuntimeStopTarget(after, context);
-      if (afterId !== containerId || after.State?.Running) {
+      if (afterId !== containerId || after.State?.Running !== false) {
         fail('RUNTIME_STOP_UNCONFIRMED', 'Codex Project runtime remained active after stop');
       }
     }
     stopped.push(containerId);
   }
-  assertProjectContext(context);
+  if (historical) assertHistoricalProjectContext(context);
+  else assertProjectContext(context);
   return Object.freeze(stopped);
 }
 

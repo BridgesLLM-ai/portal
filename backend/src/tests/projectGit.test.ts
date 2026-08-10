@@ -25,6 +25,7 @@ import {
   assertSafeProjectGitRepository,
   assertSafeProjectGitUrl,
   buildProjectGitContainerArgs,
+  runPreparedProjectGitCommand,
   spawnProjectGitCommand,
 } from '../services/project-git.service';
 import { PROJECT_RUNTIME_IMAGE } from '../services/project-lifecycle.service';
@@ -146,6 +147,40 @@ describe('isolated project Git runtime', () => {
       await expect(job.result).resolves.toBe('');
       await job.cleanup;
       expect(removeWorkloadMock).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps recursive ownership normalization on ordinary Git mutations', async () => {
+    const workspace = makeRepository();
+    const child = makeChild();
+    spawnMock.mockReturnValue(child);
+    try {
+      const job = await spawnProjectGitCommand({ ...SCOPE, workspace, args: ['add', '-A'] });
+      expect(execFileSyncMock).toHaveBeenCalledWith('/usr/bin/chown', [
+        '-R',
+        '--no-dereference',
+        '1000:1000',
+        workspace,
+      ], expect.objectContaining({ timeout: 60_000 }));
+      child.emit('close', 0, null);
+      await expect(job.result).resolves.toBe('');
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('skips recursive ownership traversal for a prepared Project Chat checkpoint', async () => {
+    const workspace = makeRepository();
+    const child = makeChild();
+    spawnMock.mockReturnValue(child);
+    try {
+      const result = runPreparedProjectGitCommand({ ...SCOPE, workspace, args: ['add', '-A'] });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(execFileSyncMock).not.toHaveBeenCalled();
+      child.emit('close', 0, null);
+      await expect(result).resolves.toBe('');
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }

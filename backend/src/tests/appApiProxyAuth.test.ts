@@ -5,6 +5,7 @@ import {
   appApiBindingKey,
   buildAppApiTargetUrl,
   configuredAppApiTarget,
+  configuredAppApiTargetBinding,
   configuredAppApiSecret,
 } from '../utils/appApiProxyAuth';
 
@@ -51,6 +52,30 @@ describe('app API proxy authentication', () => {
     expect(configuredAppApiTarget(appId, {
       APP_API_TARGET_AUTH: 'http://127.0.0.1:5005',
     })).toBeUndefined();
+  });
+
+  it('distinguishes an absent target from every present-but-invalid binding', () => {
+    expect(configuredAppApiTargetBinding(appId, {})).toEqual({ status: 'absent' });
+    for (const value of [
+      '',
+      '   ',
+      'not a URL',
+      'https://127.0.0.1:5005',
+      'http://10.0.0.1:5005',
+      'http://127.0.0.1',
+      'http://user:pass@127.0.0.1:5005',
+      'http://127.0.0.1:5005?target=other',
+      'http://127.0.0.1:5005/#fragment',
+      'http://127.0.0.1:5005\r\nunsafe',
+      'http://127.0.0.1:5005\\misleading',
+    ]) {
+      expect(configuredAppApiTargetBinding(appId, {
+        [`APP_API_TARGET_${binding}`]: value,
+      })).toEqual({ status: 'invalid' });
+    }
+    expect(configuredAppApiTargetBinding(appId, {
+      [`APP_API_TARGET_${binding}`]: '  http://127.0.0.1:5005/base/  ',
+    })).toEqual({ status: 'configured', target: 'http://127.0.0.1:5005/base' });
   });
 
   it('preserves the API path without allowing traversal to select another target', () => {

@@ -70,4 +70,22 @@ describe('project identity HTTP proof contract', () => {
     expect(rename).toContain('sendProjectRenameNotAdmitted(res, 409, attemptId, error.code, error.message)');
     expect(rename).not.toContain('rejectDestructiveProjectChatResetRouteForRelease');
   });
+
+  it('uses an optional exact identity proof to fence Project deletion before mutation', () => {
+    const deletion = routeBlock("router.delete('/:name'", "router.patch('/:name/rename'");
+    const admission = deletion.indexOf('await beginProjectIdentityDeletion({');
+
+    expect(deletion).toContain('parseProjectDeleteIdentityRequest(req.body)');
+    expect(deletion).toContain("'PROJECT_DELETE_IDENTITY_REQUIRED'");
+    expect(routeSource).toContain("code: 'PROJECT_DELETE_IDENTITY_MISMATCH'");
+    expect(deletion).toContain('projectDeleteIdentityMatches(requestedIdentity, deletionIdentityProof)');
+    expect(deletion).toContain('projectDeleteIdentityMatches(currentRequestedIdentity, deletionIdentityProof)');
+    expect(deletion).toContain('projectDeleteIdentityMatches(identityBeforeBarrier, deletionIdentityProof)');
+    expect(deletion.indexOf('projectDeleteIdentityMatches(requestedIdentity, deletionIdentityProof)'))
+      .toBeLessThan(admission);
+    expect(deletion.indexOf('projectDeleteIdentityMatches(currentRequestedIdentity, deletionIdentityProof)'))
+      .toBeLessThan(admission);
+    expect(deletion.indexOf('projectDeleteIdentityMatches(identityBeforeBarrier, deletionIdentityProof)'))
+      .toBeLessThan(admission);
+  });
 });

@@ -1,8 +1,23 @@
 const APP_API_SECRET_PREFIX = 'APP_API_SECRET_';
 const APP_API_TARGET_PREFIX = 'APP_API_TARGET_';
 
+export type ConfiguredAppApiTargetBinding =
+  | Readonly<{ status: 'absent' }>
+  | Readonly<{ status: 'invalid' }>
+  | Readonly<{ status: 'configured'; target: string }>;
+
 export const APP_API_SECRET_HEADER = 'x-portal-app-secret';
 export const APP_API_ID_HEADER = 'x-portal-app-id';
+export const APP_API_TARGET_INVALID_CODE = 'APP_API_TARGET_INVALID';
+
+export function invalidAppApiTargetResponse() {
+  return {
+    code: APP_API_TARGET_INVALID_CODE,
+    error: 'This App API backend has an invalid server configuration.',
+    detail: 'Ask the Portal operator to correct or remove the App-specific API target, then try again.',
+    retryable: false,
+  };
+}
 
 /**
  * Environment binding key for one concrete App row.
@@ -59,22 +74,44 @@ export function configuredAppApiTarget(
   appId: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
-  const normalized = appApiBindingKey(appId);
-  if (!normalized) return undefined;
+  const binding = configuredAppApiTargetBinding(appId, environment);
+  return binding.status === 'configured' ? binding.target : undefined;
+}
 
-  const raw = String(environment[`${APP_API_TARGET_PREFIX}${normalized}`] || '').trim();
-  if (!raw || raw.length > 512 || /[\r\n]/.test(raw)) return undefined;
+/**
+ * Distinguish an absent optional override from a present but unsafe one.
+ * Callers making runtime-ownership decisions must use this three-state result;
+ * treating an invalid binding as absent could silently start or proxy to a
+ * different Portal-managed runtime.
+ */
+export function configuredAppApiTargetBinding(
+  appId: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): ConfiguredAppApiTargetBinding {
+  const normalized = appApiBindingKey(appId);
+  if (!normalized) return { status: 'absent' };
+
+  const key = `${APP_API_TARGET_PREFIX}${normalized}`;
+  const configuredValue = environment[key];
+  if (configuredValue === undefined) return { status: 'absent' };
+  const raw = String(configuredValue).trim();
+  if (!raw || raw.length > 512 || /[\\\u0000-\u001f\u007f]/.test(raw)) {
+    return { status: 'invalid' };
+  }
 
   try {
     const parsed = new URL(raw);
-    if (parsed.protocol !== 'http:' || !isLoopbackHostname(parsed.hostname)) return undefined;
-    if (parsed.username || parsed.password || parsed.search || parsed.hash) return undefined;
+    if (parsed.protocol !== 'http:' || !isLoopbackHostname(parsed.hostname)) return { status: 'invalid' };
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) return { status: 'invalid' };
     const port = Number(parsed.port);
-    if (!parsed.port || !Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+    if (!parsed.port || !Number.isInteger(port) || port < 1 || port > 65535) return { status: 'invalid' };
     parsed.pathname = parsed.pathname.replace(/\/+$/, '');
-    return parsed.toString().replace(/\/$/, '');
+    return {
+      status: 'configured',
+      target: parsed.toString().replace(/\/$/, ''),
+    };
   } catch {
-    return undefined;
+    return { status: 'invalid' };
   }
 }
 

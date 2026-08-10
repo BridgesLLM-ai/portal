@@ -3,8 +3,10 @@ import '../../test/setup';
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  AssistantBubble,
   AssistantThinkingBubble,
   compareActivityTimelineItems,
+  isAgentChatStreamingAssistant,
   isAssistantContentRepresentedByTimeline,
 } from './ChatInterface';
 
@@ -38,6 +40,73 @@ describe('Agent Chat thinking subject presentation', () => {
 
     expect(screen.getByText('Preparing the review')).toBeInTheDocument();
     expect(screen.queryByText('Reading the relevant files.')).not.toBeInTheDocument();
+  });
+
+  it('keeps the active assistant live after a same-run user steer becomes the last message', () => {
+    const activeAssistant = {
+      id: 'assistant-live',
+      role: 'assistant' as const,
+      content: '',
+      createdAt: new Date(),
+    };
+    const laterUserSteer = {
+      id: 'discord-steer',
+      role: 'user' as const,
+      content: 'Also check the retry path',
+      createdAt: new Date(),
+    };
+
+    expect(isAgentChatStreamingAssistant(activeAssistant, activeAssistant.id)).toBe(true);
+    expect(isAgentChatStreamingAssistant(laterUserSteer, activeAssistant.id)).toBe(false);
+
+    const agent = {
+      name: 'OpenClaw',
+      initials: 'OC',
+      providerName: 'OPENCLAW',
+      color: '',
+      bgLight: '',
+      borderColor: '',
+      avatarBg: '',
+      avatarText: '',
+      accentRing: '',
+      sendBg: '',
+      sendHover: '',
+      sendShadow: '',
+      provenance: 'via OpenClaw',
+    };
+    const { rerender } = render(
+      <AssistantBubble
+        agent={agent}
+        message={activeAssistant}
+        isLast={false}
+        isLive
+        isStreaming
+        liveStatusText="Inspecting the retry path…"
+      />,
+    );
+
+    expect(screen.getByText('Inspecting the retry path…')).toBeInTheDocument();
+
+    rerender(
+      <AssistantBubble
+        agent={agent}
+        message={{
+          ...activeAssistant,
+          toolCalls: [{
+            id: 'read-after-steer',
+            name: 'Read',
+            startedAt: Date.now(),
+            status: 'running',
+          }],
+        }}
+        isLast={false}
+        isLive
+        isStreaming
+        liveThinkingContent="Reasoning remains visible after the steer"
+      />,
+    );
+    expect(screen.getByText('Reasoning remains visible after the steer')).toBeInTheDocument();
+    expect(screen.getByText(/Read/)).toBeInTheDocument();
   });
 
   it('keeps durable segment/tool chronology when provider clocks are skewed', () => {

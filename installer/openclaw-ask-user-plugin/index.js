@@ -29,6 +29,7 @@ const RUNTIME_SYMBOLS = Object.freeze([
 ]);
 const RUNTIME_SYMBOL = RUNTIME_SYMBOLS[1];
 const GATEWAY_METHODS = Object.freeze({
+  probe: 'bridgesllm.ask_user.probe',
   pending: 'bridgesllm.ask_user.pending',
   answer: 'bridgesllm.ask_user.answer',
   dismiss: 'bridgesllm.ask_user.dismiss',
@@ -574,6 +575,95 @@ const genericRuntimeApi = Object.freeze({
   },
 });
 
+async function runAskUserSemanticProbe(rawNonce) {
+  const nonce = boundedIdentifier(rawNonce, 64);
+  if (!nonce) return false;
+  const sessionKey = `agent:main:bridgesllm-ask-user-probe-${nonce}`;
+  const sessionId = `bridgesllm-ask-user-probe-session-${nonce}`;
+  const executions = [];
+
+  const begin = (action) => {
+    const runId = `bridgesllm-ask-user-probe-${action}-${nonce}`;
+    const toolCallId = `probe-${action}-${nonce}`;
+    const toolContext = { sessionKey, sessionId };
+    const tool = createAskUserQuestionTool(toolContext);
+    if (!tool || tool.name !== ASK_USER_TOOL_NAME || typeof tool.execute !== 'function') {
+      throw new Error('ask-user tool factory did not return an executable tool');
+    }
+    recordAskUserToolBinding(
+      { toolName: ASK_USER_TOOL_NAME, runId, toolCallId },
+      { toolName: ASK_USER_TOOL_NAME, sessionKey, sessionId, runId, toolCallId },
+    );
+    const execution = tool.execute(toolCallId, {
+      questions: [{ question: `BridgesLLM ask-user ${action} readiness probe?` }],
+    });
+    executions.push(execution);
+    const snapshot = genericRuntimeApi.read(sessionId, runId);
+    if (
+      !snapshot
+      || snapshot.requestId !== toolCallId
+      || snapshot.runId !== runId
+      || snapshot.questions?.[0]?.question
+        !== `BridgesLLM ask-user ${action} readiness probe?`
+    ) {
+      throw new Error('ask-user execute did not publish the exact pending request');
+    }
+    return { runId, toolCallId, execution };
+  };
+
+  try {
+    const answerProbe = begin('answer');
+    const answer = genericRuntimeApi.answer(
+      sessionId,
+      answerProbe.runId,
+      answerProbe.toolCallId,
+      'BridgesLLM semantic probe answered.',
+    );
+    if (answer?.ok !== true || answer.code !== 'ANSWERED') return false;
+    const answerResult = await answerProbe.execution;
+    if (answerResult?.content?.[0]?.text !== 'BridgesLLM semantic probe answered.') return false;
+
+    const dismissProbe = begin('dismiss');
+    const dismiss = genericRuntimeApi.dismiss(
+      sessionId,
+      dismissProbe.runId,
+      dismissProbe.toolCallId,
+    );
+    if (dismiss?.ok !== true || dismiss.code !== 'DISMISSED') return false;
+    const dismissResult = await dismissProbe.execution;
+    if (
+      dismissResult?.content?.[0]?.text
+      !== 'The user dismissed the question without answering.'
+    ) return false;
+
+    const steerProbe = begin('steer');
+    const steer = genericRuntimeApi.steer(sessionId, steerProbe.runId, 'Probe steering.');
+    if (steer?.ok !== false || steer.code !== 'PENDING_INPUT') return false;
+    const cleanup = genericRuntimeApi.dismiss(
+      sessionId,
+      steerProbe.runId,
+      steerProbe.toolCallId,
+    );
+    if (cleanup?.ok !== true || cleanup.code !== 'DISMISSED') return false;
+    await steerProbe.execution;
+    return true;
+  } catch {
+    return false;
+  } finally {
+    for (const request of [...genericPendingRequests.values()]) {
+      if (request.sessionId === sessionId) {
+        settleGenericPendingRequest(
+          request,
+          'dismissed',
+          'The readiness probe cleaned up its synthetic question.',
+        );
+      }
+    }
+    clearToolCallSessionState(sessionId);
+    await Promise.allSettled(executions);
+  }
+}
+
 const ASK_USER_TOOL_PARAMETERS = Object.freeze({
   type: 'object',
   additionalProperties: false,
@@ -850,6 +940,25 @@ function registerPendingMethod(api) {
   }, { scope: 'operator.write' });
 }
 
+function registerSemanticProbeMethod(api) {
+  api.registerGatewayMethod(GATEWAY_METHODS.probe, async ({ params, respond }) => {
+    const nonce = boundedIdentifier(params?.nonce, 64);
+    if (!nonce) {
+      respondInvalid(respond, 'nonce must be a valid bounded string.');
+      return;
+    }
+    const ready = await runAskUserSemanticProbe(nonce);
+    respond(true, {
+      ok: ready,
+      code: ready ? 'SEMANTIC_PROBE_OK' : 'SEMANTIC_PROBE_FAILED',
+      toolName: ASK_USER_TOOL_NAME,
+      answer: ready,
+      dismiss: ready,
+      steer: ready,
+    });
+  }, { scope: 'operator.write' });
+}
+
 function registerAnswerMethod(api) {
   api.registerGatewayMethod(GATEWAY_METHODS.answer, async ({ params, respond }) => {
     const sessionKey = boundedIdentifier(params?.sessionKey, MAX_SESSION_KEY_LENGTH);
@@ -1039,6 +1148,7 @@ module.exports = {
   name: 'bridgesllm-ask-user',
   register(api) {
     registerAskUserQuestionTool(api);
+    registerSemanticProbeMethod(api);
     registerPendingMethod(api);
     registerAnswerMethod(api);
     registerDismissMethod(api);

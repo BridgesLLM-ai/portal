@@ -57,6 +57,7 @@ import {
   verifyMailAttachmentCapabilityToken,
 } from '../services/mailAttachmentCapability';
 import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
+import { buildDefaultMailSignature } from '../services/defaultMailSignature';
 
 const router = Router();
 
@@ -898,17 +899,9 @@ router.get('/signature', async (req: Request, res: Response) => {
       });
     } else {
       // Auto-generate default signature for first time
-      const settings = await prisma.systemSetting.findFirst({ where: { key: 'portalName' } });
-      const logoSetting = await prisma.systemSetting.findFirst({ where: { key: 'logoUrl' } });
-      const portalName = settings?.value || 'BridgesLLM Portal';
-      const logoUrl = logoSetting?.value || '';
       const email = `${mailbox?.username || creds.username}@${getMailDomain()}`;
       const displayName = mailbox?.username || creds.username;
-
-      const defaultText = `${displayName}\n${email}\n${portalName}`;
-      const defaultHtml = generateDefaultSignatureHtml(displayName, email, portalName, logoUrl);
-      
-      res.json({ signature: defaultText, signatureHtml: defaultHtml });
+      res.json(await buildDefaultMailSignature(displayName, email));
     }
   } catch (error: any) {
     console.error('[mail] getSignature error:', error.message);
@@ -1112,37 +1105,6 @@ router.post('/credentials/reveal', credentialRevealLimiter, async (req: Request,
     res.status(500).json({ error: 'Failed to reveal credentials' });
   }
 });
-
-// HTML-escape user-controlled strings to prevent XSS in signatures
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-// Helper function to generate default HTML signature
-function generateDefaultSignatureHtml(name: string, email: string, portalName: string, logoUrl: string): string {
-  const safeName = escapeHtml(name);
-  const safeEmail = escapeHtml(email);
-  const safePortalName = escapeHtml(portalName);
-  const safeLogoUrl = escapeHtml(logoUrl);
-  const logoTag = safeLogoUrl 
-    ? `<img src="${safeLogoUrl}" alt="${safePortalName}" style="height:40px;width:auto;margin-bottom:8px;" /><br/>`
-    : '';
-  
-  return `<table cellpadding="0" cellspacing="0" border="0" style="font-family:system-ui,-apple-system,sans-serif;font-size:13px;color:#374151;line-height:1.5;">
-  <tr>
-    <td style="padding-right:16px;border-right:2px solid #8b5cf6;vertical-align:top;">
-      ${logoTag}
-    </td>
-    <td style="padding-left:16px;vertical-align:top;">
-      <div style="font-size:15px;font-weight:600;color:#111827;">${safeName}</div>
-      <div style="color:#6b7280;font-size:12px;margin-top:2px;">${safePortalName}</div>
-      <div style="margin-top:6px;">
-        <a href="mailto:${safeEmail}" style="color:#8b5cf6;text-decoration:none;font-size:12px;">${safeEmail}</a>
-      </div>
-    </td>
-  </tr>
-</table>`;
-}
 
 // ── POST /api/mail/attachments/:blobId/save-to-files ──────────
 const MAX_SAVE_SIZE = MAX_MAIL_ATTACHMENT_BYTES;

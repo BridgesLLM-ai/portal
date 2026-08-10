@@ -22,9 +22,9 @@ read_env_value() {
   local key="$2"
   [[ -f "$file" && ! -L "$file" ]] || return 1
   python3 - "$file" "$key" <<'PY'
-import os
 import re
 import stat
+import os
 import sys
 
 path, requested = sys.argv[1:]
@@ -3378,11 +3378,15 @@ assert_sealed_backup_bindings() {
 libpq_database_url() {
   local db_url="$1"
   printf '%s' "$db_url" | python3 /dev/fd/3 3<<'PY'
+import os
+import re
 import sys
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 raw = sys.stdin.read()
-if not raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+if (not raw or len(raw.encode("utf-8")) > 128000 or "#" in raw
+        or re.search(r"%(?![0-9A-Fa-f]{2})", raw)
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
     raise SystemExit(1)
 try:
     parsed = urlsplit(raw)
@@ -3390,16 +3394,32 @@ try:
     username_raw = credentials.split(":", 1)[0] if separator else ""
     host = unquote(parsed.hostname or "", errors="strict")
     user = unquote(parsed.username or "", errors="strict")
+    password = unquote(parsed.password or "", errors="strict")
     database = unquote((parsed.path or "").lstrip("/"), errors="strict")
-    port = parsed.port or 5432
+    port = 5432 if parsed.port is None else parsed.port
     decoded_host_part = unquote(host_part, errors="strict")
+    raw_port_suffix = (
+        host_part[host_part.find("]") + 1:]
+        if host_part.startswith("[")
+        else f":{host_part.rsplit(':', 1)[1]}" if ":" in host_part else ""
+    )
 except (UnicodeDecodeError, ValueError):
     raise SystemExit(1)
 if (parsed.scheme not in {"postgres", "postgresql"} or parsed.fragment
-        or not all((separator, username_raw, host, user, database))
+        or re.search(r"%(?:23|24|26|2b|2c|2f|3a|3b|3d|3f|40)", parsed.path, re.I)
+        or not parsed.path.startswith("/") or parsed.path.count("/") != 1
+        or database in {".", ".."} or "/" in database
+        or not all((separator, username_raw, host, user, password, database))
+        or parsed.netloc.count("@") != 1 or host_part.startswith("[")
         or not 1 <= port <= 65535 or "," in decoded_host_part
+        or (raw_port_suffix
+            and not re.fullmatch(r":[1-9][0-9]*", raw_port_suffix))
+        or "%" in host or "%" in (parsed.hostname or "")
+        or re.search(r"[<>\\^|]", host)
+        or host_part != host_part.lower() or not host.isascii()
+        or any(char.isspace() for char in host)
         or any(ord(char) < 32 or ord(char) == 127
-               for value in (host, user, database) for char in value)):
+               for value in (host, user, password, database) for char in value)):
     raise SystemExit(1)
 prisma_only = {
     "schema",
@@ -3408,7 +3428,14 @@ prisma_only = {
     "pgbouncer",
     "statement_cache_size",
     "socket_timeout",
+    "max_idle_connection_lifetime",
+    "max_connection_lifetime",
 }
+preserved = {
+    "connect_timeout", "sslmode", "sslrootcert", "application_name",
+    "fallback_application_name", "options", "client_encoding", "replication",
+}
+allowed = prisma_only | preserved
 identity_or_secret = {
     "password",
     "sslpassword",
@@ -3423,19 +3450,86 @@ identity_or_secret = {
     "database",
 }
 query = []
+security = {}
+values = {}
+seen = set()
 if parsed.query:
     for raw_pair in parsed.query.split("&"):
-        raw_key = raw_pair.partition("=")[0]
+        if "+" in raw_pair:
+            raise SystemExit(1)
+        raw_key, pair_separator, raw_value = raw_pair.partition("=")
+        if "=" in raw_value:
+            raise SystemExit(1)
         try:
-            key = unquote(raw_key, errors="strict").lower()
+            decoded_key = unquote(raw_key, errors="strict")
+            key = decoded_key.lower()
+            decoded_value = unquote(raw_value, errors="strict")
         except UnicodeDecodeError:
             raise SystemExit(1)
-        if not key or any(ord(char) < 32 or ord(char) == 127 for char in key):
+        if (not pair_separator or not key
+                or any(ord(char) < 32 or ord(char) == 127
+                       for value_part in (key, decoded_value)
+                       for char in value_part)):
             raise SystemExit(1)
         if key in identity_or_secret:
             raise SystemExit(1)
+        if decoded_key != key or key not in allowed or key in seen:
+            raise SystemExit(1)
+        seen.add(key)
+        values[key] = decoded_value
+        if key in {"sslmode", "sslrootcert"}:
+            security[key] = decoded_value
         if key not in prisma_only:
             query.append(raw_pair)
+
+ssl_mode = security.get("sslmode")
+ssl_root_cert = security.get("sslrootcert")
+if ssl_mode is not None and ssl_mode not in {
+    "disable", "require", "verify-ca", "verify-full"
+}:
+    raise SystemExit(1)
+if ssl_mode is None and host not in {"localhost", "127.0.0.1", "::1"}:
+    raise SystemExit(1)
+if ssl_root_cert is not None and (
+    not ssl_root_cert
+    or not os.path.isabs(ssl_root_cert)
+    or any(ord(char) < 32 or ord(char) == 127 for char in ssl_root_cert)
+):
+    raise SystemExit(1)
+if ssl_root_cert is not None and ssl_mode not in {
+    "require", "verify-ca", "verify-full"
+}:
+    raise SystemExit(1)
+if ssl_mode in {"verify-ca", "verify-full"} and ssl_root_cert is None:
+    raise SystemExit(1)
+
+def bounded_integer(name, minimum, maximum, default):
+    value = values.get(name)
+    if value is None:
+        return default
+    if not re.fullmatch(r"[0-9]+", value):
+        raise SystemExit(1)
+    parsed_value = int(value)
+    if not minimum <= parsed_value <= maximum:
+        raise SystemExit(1)
+    return parsed_value
+
+bounded_integer("connection_limit", 1, 1000, None)
+connect_timeout = bounded_integer("connect_timeout", 0, 86400, 5)
+pool_timeout = bounded_integer("pool_timeout", 0, 86400, 10)
+bounded_integer("socket_timeout", 0, 86400, None)
+bounded_integer("max_idle_connection_lifetime", 0, 86400, None)
+bounded_integer("max_connection_lifetime", 0, 86400, None)
+bounded_integer("statement_cache_size", 0, 1000000, None)
+if (("connect_timeout" in values or "pool_timeout" in values)
+        and connect_timeout != pool_timeout):
+    raise SystemExit(1)
+if values.get("pgbouncer") not in {None, "true", "false"}:
+    raise SystemExit(1)
+schema = values.get("schema")
+if schema is not None and (not schema or len(schema.encode("utf-8")) > 63
+        or any(ord(char) < 32 or ord(char) == 127 for char in schema)):
+    raise SystemExit(1)
 
 # pg_dump receives this URI through --dbname, so the password must not appear
 # in argv/process listings. Keep the encoded username and endpoint; the secret
@@ -3449,6 +3543,7 @@ backup_pg_dump_runner_python() {
   cat <<'PY'
 import ctypes
 import os
+import re
 import signal
 import sys
 from urllib.parse import unquote, urlsplit
@@ -3483,12 +3578,12 @@ if (
 raw_parts = []
 raw_size = 0
 while True:
-    part = os.read(3, min(65536, 131073 - raw_size))
+    part = os.read(3, min(65536, 128001 - raw_size))
     if not part:
         break
     raw_parts.append(part)
     raw_size += len(part)
-    if raw_size > 131072:
+    if raw_size > 128000:
         raise SystemExit(1)
 os.close(3)
 raw_bytes = b"".join(raw_parts)
@@ -3496,38 +3591,68 @@ try:
     raw = raw_bytes.decode("utf-8")
 except UnicodeDecodeError:
     raise SystemExit(1)
-if not raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+if (not raw or len(raw.encode("utf-8")) > 128000 or "#" in raw
+        or re.search(r"%(?![0-9A-Fa-f]{2})", raw)
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
     raise SystemExit(1)
 try:
     parsed = urlsplit(raw)
     _, separator, host_part = parsed.netloc.rpartition("@")
     host = unquote(parsed.hostname or "", errors="strict")
-    port_number = parsed.port or 5432
+    port_number = 5432 if parsed.port is None else parsed.port
     database = unquote((parsed.path or "").lstrip("/"), errors="strict")
     user = unquote(parsed.username or "", errors="strict")
     password = unquote(parsed.password or "", errors="strict")
     decoded_host_part = unquote(host_part, errors="strict")
+    raw_port_suffix = (
+        host_part[host_part.find("]") + 1:]
+        if host_part.startswith("[")
+        else f":{host_part.rsplit(':', 1)[1]}" if ":" in host_part else ""
+    )
 except (UnicodeDecodeError, ValueError):
     raise SystemExit(1)
 identity_or_secret = {
     "password", "sslpassword", "passfile", "service", "servicefile",
     "host", "hostaddr", "port", "user", "dbname", "database",
 }
+ssl_mode = None
 for raw_pair in parsed.query.split("&") if parsed.query else ():
+    if "+" in raw_pair:
+        raise SystemExit(1)
+    raw_key, pair_separator, raw_value = raw_pair.partition("=")
+    if "=" in raw_value:
+        raise SystemExit(1)
     try:
-        key = unquote(raw_pair.partition("=")[0], errors="strict").lower()
+        key = unquote(raw_key, errors="strict").lower()
+        value = unquote(raw_value, errors="strict")
     except UnicodeDecodeError:
         raise SystemExit(1)
-    if (not key or key in identity_or_secret
-            or any(ord(char) < 32 or ord(char) == 127 for char in key)):
+    if (not pair_separator or not key or key in identity_or_secret
+            or any(ord(char) < 32 or ord(char) == 127
+                   for value_part in (key, value) for char in value_part)):
         raise SystemExit(1)
+    if key == "sslmode":
+        if ssl_mode is not None:
+            raise SystemExit(1)
+        ssl_mode = value
 if (parsed.scheme not in {"postgres", "postgresql"} or parsed.fragment
-        or not separator or not 1 <= port_number <= 65535
-        or "," in decoded_host_part):
+        or re.search(r"%(?:23|24|26|2b|2c|2f|3a|3b|3d|3f|40)", parsed.path, re.I)
+        or not parsed.path.startswith("/") or parsed.path.count("/") != 1
+        or database in {".", ".."} or "/" in database
+        or not separator or parsed.netloc.count("@") != 1
+        or host_part.startswith("[") or not 1 <= port_number <= 65535
+        or "," in decoded_host_part or "%" in host
+        or "%" in (parsed.hostname or "")
+        or (raw_port_suffix
+            and not re.fullmatch(r":[1-9][0-9]*", raw_port_suffix))
+        or re.search(r"[<>\\^|]", host)
+        or host_part != host_part.lower() or not host.isascii()
+        or any(char.isspace() for char in host)
+        or (ssl_mode is None and host not in {"localhost", "127.0.0.1", "::1"})):
     raise SystemExit(1)
 port = str(port_number)
 values = (host, port, database, user, password)
-if not all(values[:4]) or any(ord(char) < 32 or ord(char) == 127 for value in values for char in value):
+if not all(values) or any(ord(char) < 32 or ord(char) == 127 for value in values for char in value):
     raise SystemExit(1)
 escape = lambda value: value.replace("\\", "\\\\").replace(":", "\\:")
 try:

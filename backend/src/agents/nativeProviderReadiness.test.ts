@@ -254,7 +254,9 @@ describe('nativeProviderReadiness cache and invalidation', () => {
     const previousGeminiKey = process.env.GEMINI_API_KEY;
     const previousGoogleKey = process.env.GOOGLE_API_KEY;
     const configDir = path.join(geminiHome, '.gemini', 'antigravity-cli');
-    const statePath = path.join(configDir, 'state.json');
+    // Credential attestation covers specific files, not the whole state
+    // directory; jetski_state.pbtxt is the credential-bearing one.
+    const statePath = path.join(configDir, 'jetski_state.pbtxt');
     fs.mkdirSync(configDir, { recursive: true });
     fs.writeFileSync(statePath, JSON.stringify({ credential: 'first-generation' }), { mode: 0o600 });
     process.env.HOME = geminiHome;

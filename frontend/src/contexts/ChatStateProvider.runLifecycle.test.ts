@@ -25,6 +25,22 @@ describe('Agent Chat transport and cancellation contract', () => {
     expect(stateSource).toContain('settleCancelledTurn(runId, currentSession)');
   });
 
+  it('treats session navigation as a transport detach, never an implicit run abort', () => {
+    const selectSessionStart = stateSource.indexOf('const selectSession = useCallback');
+    const selectSessionEnd = stateSource.indexOf('// Refresh: reload history', selectSessionStart);
+    const selectSessionSource = stateSource.slice(selectSessionStart, selectSessionEnd);
+    expect(selectSessionSource).toContain("await stopActiveSseTransportRef.current('handoff')");
+    expect(selectSessionSource).not.toContain('cancelStream');
+    expect(selectSessionSource).not.toContain("type: 'abort'");
+
+    const startNewSessionStart = interfaceSource.indexOf('const startNewSession = useCallback');
+    const startNewSessionEnd = interfaceSource.indexOf('// Model change handler', startNewSessionStart);
+    const startNewSessionSource = interfaceSource.slice(startNewSessionStart, startNewSessionEnd);
+    expect(startNewSessionSource).toContain('await chatState.selectSession(resolvedSessionKey)');
+    expect(startNewSessionSource).not.toContain('cancelRunning');
+    expect(startNewSessionSource).not.toContain('cancelStream');
+  });
+
   it('routes aborted done and failed SSE tools through shared settlement helpers', () => {
     expect(stateSource).toContain('if (isAbortedDoneEvent(data))');
     expect(stateSource).toContain('if (isAbortedDoneEvent(evt))');

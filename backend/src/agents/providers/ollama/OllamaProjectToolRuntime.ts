@@ -1029,3 +1029,146 @@ export async function cleanupOllamaProjectRuntimeByIdentity(input: {
   }
   return removed;
 }
+
+function requireOllamaHistoricalRecoveryContext(
+  context: ProjectSandboxExecutionContext,
+): string {
+  assertExecutionContextBinding(context, context.userId, 'PROJECT_SANDBOX');
+  if (!/^portal-ollama-project-sandbox-v[1-9][0-9]*$/.test(context.runtimePolicyVersion)) {
+    fail('RUNTIME_POLICY', 'Ollama Project historical runtime policy version is invalid');
+  }
+  if (!/^portal-project-egress-v[1-9][0-9]*$/.test(context.egressPolicyVersion)) {
+    fail('EGRESS_POLICY', 'Ollama Project historical egress policy version is invalid');
+  }
+  requirePinnedImage(context.runtimeImageDigest);
+  const expectedFingerprint = stableHash({
+    version: context.runtimePolicyVersion,
+    egressPolicyVersion: context.egressPolicyVersion,
+    provider: 'OLLAMA',
+    runtime: OLLAMA_PROJECT_RUNTIME,
+    runtimeImageDigest: context.runtimeImageDigest,
+    actorUserId: context.userId,
+    workspaceOwnerId: context.workspaceOwnerId,
+    projectId: context.projectId,
+    projectName: context.projectName,
+    canonicalRoot: context.canonicalRoot,
+    rootDevice: context.rootDevice,
+    rootInode: context.rootInode,
+    rootBirthtimeNs: context.rootBirthtimeNs,
+  });
+  if (context.policyFingerprint !== expectedFingerprint) {
+    fail('POLICY_FINGERPRINT', 'Ollama Project historical policy fingerprint is invalid');
+  }
+  const root = attestProjectRoot(context.canonicalRoot);
+  if (
+    root.canonicalRoot !== context.canonicalRoot
+    || root.rootDevice !== context.rootDevice
+    || root.rootInode !== context.rootInode
+    || root.rootBirthtimeNs !== context.rootBirthtimeNs
+  ) {
+    fail('PROJECT_IDENTITY', 'Ollama Project root identity changed');
+  }
+  return root.canonicalRoot;
+}
+
+function attestOllamaHistoricalRecoveryTarget(
+  inspect: DockerInspect,
+  context: ProjectSandboxExecutionContext,
+): { containerId: string; running: boolean } {
+  const containerId = String(inspect.Id || '').toLowerCase();
+  const labels = inspect.Config?.Labels || {};
+  const runtimeFingerprint = String(labels[OLLAMA_PROJECT_FINGERPRINT_LABEL] || '').toLowerCase();
+  const mounts = (inspect.Mounts || []).map((mount) => ({
+    type: mount.Type,
+    source: mount.Source ? path.resolve(mount.Source) : '',
+    destination: mount.Destination,
+    rw: mount.RW,
+    propagation: mount.Propagation || 'rprivate',
+  }));
+  if (
+    !/^[a-f0-9]{64}$/.test(containerId)
+    || !/^[a-f0-9]{64}$/.test(runtimeFingerprint)
+    || String(inspect.Name || '').replace(/^\//, '') !== `p4ol-${runtimeFingerprint.slice(0, 24)}`
+    || String(inspect.Image || '').toLowerCase() !== context.runtimeImageDigest.toLowerCase()
+    || String(inspect.Config?.Image || '').toLowerCase() !== context.runtimeImageDigest.toLowerCase()
+    || inspect.Config?.User !== OLLAMA_PROJECT_CONTAINER_USER
+    || inspect.Config?.WorkingDir !== OLLAMA_PROJECT_CONTAINER_ROOT
+    || !exactJson(inspect.Config?.Entrypoint || [], ['/bin/sh'])
+    || !exactJson(inspect.Config?.Cmd || [], ['-lc', IDLE_COMMAND])
+    || labels[OLLAMA_PROJECT_PROVIDER_LABEL] !== 'OLLAMA'
+    || labels[OLLAMA_PROJECT_ACTOR_LABEL] !== hashOllamaProjectRuntimeIdentity(context.userId)
+    || labels[OLLAMA_PROJECT_IDENTITY_LABEL] !== hashOllamaProjectRuntimeIdentity(context.projectId)
+    || labels[OLLAMA_PROJECT_POLICY_LABEL] !== context.runtimePolicyVersion
+    || !exactJson(mounts, [{
+      type: 'bind',
+      source: context.canonicalRoot,
+      destination: OLLAMA_PROJECT_CONTAINER_ROOT,
+      rw: true,
+      propagation: 'rprivate',
+    }])
+    || typeof inspect.State?.Running !== 'boolean'
+  ) {
+    fail('RECOVERY_ATTESTATION', 'Ollama Project restart target lost its immutable identity');
+  }
+  return { containerId, running: inspect.State.Running };
+}
+
+/**
+ * Stop, but never delete, every exact container generation owned by a
+ * server-persisted historical turn context.
+ */
+export async function stopOllamaProjectRuntimesForRecoveryContext(
+  context: ProjectSandboxExecutionContext,
+  executor: OllamaProjectCommandExecutor = ollamaProjectCommandExecutor,
+): Promise<readonly string[]> {
+  requireOllamaHistoricalRecoveryContext(context);
+  const actor = hashOllamaProjectRuntimeIdentity(context.userId);
+  const project = hashOllamaProjectRuntimeIdentity(context.projectId);
+  const listed = await executor.run('docker', [
+    'container', 'ls', '-a', '--no-trunc',
+    '--filter', `${OLLAMA_PROJECT_PROVIDER_LABEL}=OLLAMA`,
+    '--filter', `${OLLAMA_PROJECT_ACTOR_LABEL}=${actor}`,
+    '--filter', `${OLLAMA_PROJECT_IDENTITY_LABEL}=${project}`,
+    '--format', '{{.ID}}',
+  ]);
+  const ids = listed.stdout.split(/\r?\n/).map((value) => value.trim().toLowerCase()).filter(Boolean);
+  if (
+    ids.length > 8
+    || new Set(ids).size !== ids.length
+    || ids.some((value) => !/^[a-f0-9]{64}$/.test(value))
+  ) {
+    fail('RECOVERY_DISCOVERY', 'Ollama Project restart discovery was ambiguous');
+  }
+
+  const attested: Array<{ containerId: string; running: boolean }> = [];
+  for (const id of ids) {
+    const inspect = await inspectContainer(executor, id);
+    if (!inspect) continue;
+    const target = attestOllamaHistoricalRecoveryTarget(inspect, context);
+    if (target.containerId !== id) {
+      fail('RECOVERY_ATTESTATION', 'Ollama Project runtime changed during stop attestation');
+    }
+    attested.push(target);
+  }
+
+  const stopped: string[] = [];
+  for (const target of attested) {
+    if (target.running) {
+      await executor.run(
+        'docker',
+        ['container', 'stop', '--time', '3', target.containerId],
+        { allowExitCodes: [0, 1] },
+      );
+    }
+    const after = await inspectContainer(executor, target.containerId);
+    if (after) {
+      const reattested = attestOllamaHistoricalRecoveryTarget(after, context);
+      if (reattested.containerId !== target.containerId || reattested.running) {
+        fail('RECOVERY_UNCONFIRMED', 'Ollama Project runtime remained active after stop');
+      }
+    }
+    stopped.push(target.containerId);
+  }
+  requireOllamaHistoricalRecoveryContext(context);
+  return Object.freeze(stopped);
+}

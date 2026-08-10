@@ -77,6 +77,31 @@ describe('Project Chat authenticated-actor workspace isolation', () => {
     expect(frontendEndpoints).not.toContain('chatSaveMessages:');
   });
 
+  it('routes every Portal Project-memory read and creation through the bounded contained policy', () => {
+    const memoryRead = routeBlock("router.get('/:name/assistant/memory'");
+    const ensureSession = routeBlock("router.post('/:name/assistant/ensure-session'");
+    const send = routeBlock("router.post('/:name/assistant/send'");
+    const errorMapperStart = projectsRoute.indexOf('function sendProjectChatProviderError');
+    const errorMapperEnd = projectsRoute.indexOf('\nfunction sendProjectChatQualificationError', errorMapperStart);
+    const errorMapper = projectsRoute.slice(errorMapperStart, errorMapperEnd);
+
+    expect(memoryRead).toContain('readProjectMemory(projectDir)');
+    expect(ensureSession).toContain('ensureProjectMemory(projectDir, name)');
+    expect(send).toContain('ensureProjectMemory(projectDir, name)');
+    expect(ensureSession.indexOf('ensureProjectMemory(projectDir, name)'))
+      .toBeLessThan(ensureSession.indexOf('ensureNativeProjectChatBinding'));
+    expect(send.indexOf('ensureProjectMemory(projectDir, name)'))
+      .toBeLessThan(send.indexOf('ensureNativeProjectChatBinding'));
+    expect(errorMapper).toContain('error instanceof ProjectMemoryAccessError');
+    expect(errorMapper).toContain('code: error.code');
+    expect(errorMapper).toContain('retryable: error.retryable');
+
+    for (const block of [memoryRead, ensureSession, send]) {
+      expect(block).not.toContain("path.join(projectDir, '.agent-memory.md')");
+      expect(block).not.toMatch(/fs\.(?:existsSync|readFileSync|writeFileSync)\([^\n]*agent-memory/);
+    }
+  });
+
   it('serves Agent Zero model choices through the approved actor project without exposing OAuth account labels', () => {
     const block = routeBlock("router.get(\n  '/:name/chat/providers/agent-zero/models'");
 
@@ -263,7 +288,7 @@ describe('Project Chat authenticated-actor workspace isolation', () => {
     const end = projectsRoute.indexOf("\n// DELETE /api/projects/:name/chat/history", start);
     const helper = projectsRoute.slice(start, end);
     const historyWrite = helper.indexOf("'.agent-history.json'");
-    const sessionWrite = helper.indexOf("'.agent-session.json'");
+    const sessionWrite = helper.indexOf('writeProjectSessionProjectionBestEffort');
     const resetCommit = helper.indexOf('commitProjectChatDestructiveReset');
 
     expect(historyWrite).toBeGreaterThanOrEqual(0);
@@ -272,6 +297,7 @@ describe('Project Chat authenticated-actor workspace isolation', () => {
     expect(helper).toContain('database-derived projection');
     expect(helper).toContain('failed transaction cannot falsely advertise an uninitialized session');
     expect(helper).toContain('JSON.stringify({ messages: [], model: \'\' })');
+    expect(helper).not.toContain("writeProjectTextFile(input.projectDir, '.agent-session.json'");
   });
 
   it.each([

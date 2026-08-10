@@ -89,6 +89,12 @@ export interface SenderIdentity {
   /** Server-owned idempotency identity for a durable provider turn. */
   requestId?: string;
   /**
+   * Browser message identity attested by the Portal route. Providers may use
+   * this only for delivery-mirror deduplication; requestId remains the
+   * server-owned host-run/journal identity.
+   */
+  clientMessageId?: string;
+  /**
    * Internal server callback invoked immediately after the provider accepts
    * the external dispatch. Provider code must await it before exposing any
    * successful send settlement.

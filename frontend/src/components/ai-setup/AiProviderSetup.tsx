@@ -27,6 +27,8 @@ interface AiSetupStatusResponse {
   activeProfiles: string[];
 }
 
+export type NativeCliSetupProvider = 'claude-code' | 'codex' | 'gemini' | 'grok';
+
 interface AiProviderSetupProps {
   mode: 'wizard' | 'settings';
   apiBase: string;
@@ -34,9 +36,16 @@ interface AiProviderSetupProps {
   compact?: boolean;
   onNativeModelSelected?: (provider: 'GEMINI', model: string) => Promise<boolean | void> | boolean | void;
   additionalProviderCards?: ReactNode;
+  /**
+   * Opens the exact native-provider recovery flow requested by a parent
+   * surface (for example Agent Chat after a needs-login attestation). The
+   * parent must clear this value when its drawer closes so the same recovery
+   * can be requested again deliberately.
+   */
+  initialNativeCliProvider?: NativeCliSetupProvider | null;
 }
 
-export default function AiProviderSetup({ mode, apiBase, onComplete, compact = false, onNativeModelSelected, additionalProviderCards }: AiProviderSetupProps) {
+export default function AiProviderSetup({ mode, apiBase, onComplete, compact = false, onNativeModelSelected, additionalProviderCards, initialNativeCliProvider = null }: AiProviderSetupProps) {
   const settingsMutation = useSettingsMutationCoordinator();
   const settingsClaim = settingsMutation?.claim;
   const settingsRelease = settingsMutation?.release;
@@ -48,7 +57,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   const [activeSetup, setActiveSetup] = useState<ProviderUIConfig | null>(null);
   const [activeAuthType, setActiveAuthType] = useState<ProviderAuthType | null>(null);
   const [activeDeviceFlow, setActiveDeviceFlow] = useState(false);
-  const [activeNativeCliFlow, setActiveNativeCliFlow] = useState<'claude-code' | 'codex' | 'gemini' | 'grok' | null>(null);
+  const [activeNativeCliFlow, setActiveNativeCliFlow] = useState<NativeCliSetupProvider | null>(null);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
   const [removalTarget, setRemovalTarget] = useState<{
     provider: ProviderUIConfig;
@@ -58,6 +67,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   const [removingProvider, setRemovingProvider] = useState(false);
   const [removalError, setRemovalError] = useState<string | null>(null);
   const settingsFlowOwnerRef = useRef<string | null>(null);
+  const consumedInitialNativeCliProviderRef = useRef<NativeCliSetupProvider | null>(null);
 
   const claimSettingsFlow = useCallback((settingsOwner: string) => {
     if (settingsFlowOwnerRef.current) return false;
@@ -151,8 +161,8 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
     // Don't auto-advance the wizard — let user add more providers first
   };
 
-  const handleNativeCliLogin = (nativeProvider: string) => {
-    const providerMap: Record<string, 'claude-code' | 'codex' | 'gemini' | 'grok'> = {
+  const handleNativeCliLogin = useCallback((nativeProvider: string) => {
+    const providerMap: Record<string, NativeCliSetupProvider> = {
       'CLAUDE_CODE': 'claude-code',
       'CODEX': 'codex',
       'GEMINI': 'gemini',
@@ -165,8 +175,21 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
     const mapped = providerMap[nativeProvider];
     if (mapped && claimSettingsFlow(`settings:ai-provider:native:${mapped}`)) {
       setActiveNativeCliFlow(mapped);
+      return true;
     }
-  };
+    return false;
+  }, [claimSettingsFlow]);
+
+  useEffect(() => {
+    if (!initialNativeCliProvider) {
+      consumedInitialNativeCliProviderRef.current = null;
+      return;
+    }
+    if (consumedInitialNativeCliProviderRef.current === initialNativeCliProvider) return;
+    if (handleNativeCliLogin(initialNativeCliProvider)) {
+      consumedInitialNativeCliProviderRef.current = initialNativeCliProvider;
+    }
+  }, [handleNativeCliLogin, initialNativeCliProvider]);
 
   const beginProviderRemoval = (provider: ProviderUIConfig) => {
     if (!claimSettingsFlow(`settings:ai-provider:remove:${provider.id}`)) return;

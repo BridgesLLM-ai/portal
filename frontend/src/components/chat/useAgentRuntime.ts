@@ -159,6 +159,7 @@ export function useAgentRuntime(options: {
     activeToolName: ctx.activeToolName,
     thinkingContent: ctx.thinkingContent,
     thinkingSubject: ctx.thinkingSubject,
+    streamingAssistantId: ctx.streamingAssistantId,
     streamSegments: ctx.streamSegments,
     activityTitles: ctx.activityTitles,
     pendingApproval: ctx.pendingApproval,

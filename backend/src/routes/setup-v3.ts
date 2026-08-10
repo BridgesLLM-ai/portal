@@ -84,6 +84,7 @@ import {
 } from '../utils/portalFeatureCapabilities';
 import { assertNoProjectAuthorizationTransitionActive } from '../services/projectAuthorizationTransition';
 import { publishAuthorizationChanged } from '../services/authorizationChangeBus';
+import { invalidateEmailBrandingCache } from '../templates/baseTemplate';
 
 const router = Router();
 
@@ -1786,6 +1787,7 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
       return createdUser;
     }, { isolationLevel: 'Serializable', maxWait: 10_000, timeout: 30_000 });
     transactionCommitted = true;
+    invalidateEmailBrandingCache();
 
     try {
       tokenRemoval.commit();

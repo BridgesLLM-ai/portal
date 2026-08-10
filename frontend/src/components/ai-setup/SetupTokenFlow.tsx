@@ -43,6 +43,17 @@ async function withSetupDeadline<T>(operation: Promise<T>, timeoutMs: number, me
 
 type Step = 'prereqs' | 'starting' | 'waiting' | 'paste-code' | 'completing' | 'model' | 'manual-paste' | 'done' | 'error';
 
+function isStuckLifecycleRejection(err: any): boolean {
+  const status = err?.response?.status;
+  const code = err?.response?.data?.code;
+  const msg = String(err?.response?.data?.error || err?.message || '');
+  return status === 409
+    && (code === 'PROVIDER_CREDENTIAL_LIFECYCLE_CONFLICT'
+      || code === 'PROVIDER_CREDENTIAL_LIFECYCLE_RECOVERY_REQUIRED'
+      || code === 'PROVIDER_CREDENTIAL_OPERATION_RETAINED_ENVELOPE_MISMATCH'
+      || /currently owns this credential domain|retained provider-removal lifecycle|Reset stuck sign-in|remains locked for review|already owns this provider credential|recovered an unfinished authorization lifecycle/i.test(msg));
+}
+
 export default function SetupTokenFlow({ provider, status, apiBase, onComplete, onCancel, onNativeCliLogin: _onNativeCliLogin }: SetupTokenFlowProps) {
   const actorScope = useAuthStore((state) => state.user?.id ? `user:${state.user.id}` : 'setup:pending');
   const [step, setStep] = useState<Step>('prereqs');
@@ -62,6 +73,8 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
   const [cancellationError, setCancellationError] = useState<string | null>(null);
   const [recoverySession, setRecoverySession] = useState(false);
   const [reviewState, setReviewState] = useState<'committed' | 'review_required' | null>(null);
+  const [lifecycleConflict, setLifecycleConflict] = useState(false);
+  const [resettingLifecycle, setResettingLifecycle] = useState(false);
   const operationRef = React.useRef<string | null>(null);
   const [operation, setOperation] = useState<string | null>(null);
   const pollGenerationRef = React.useRef(0);
@@ -165,6 +178,14 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
       if (data.success) {
         setStep('model');
         setCompletingStartedAt(null);
+      } else if (data.retryable) {
+        // The CLI rejected the pasted code but the session is still alive.
+        // Send the person back to the paste box with the CLI's own reason
+        // instead of a terminal failure.
+        setError(data.error || 'Claude rejected the authorization code. Get a fresh code and paste it again.');
+        setStep('paste-code');
+        setCompletingStartedAt(null);
+        finalizationAttemptedSessionRef.current = null;
       } else {
         setError(data.error || 'Failed to capture setup token');
         setStep('error');
@@ -214,6 +235,17 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
             setError(`${detail}The interrupted Claude setup reached a terminal state, but Portal must still re-attest it through cancellation.`);
           } else if (data?.cleanupPending === true) {
             setError(data?.error || 'Portal is still stopping and reconciling the Claude setup process.');
+          }
+          return;
+        }
+
+        if (typeof data?.pasteRejection === 'string' && data.pasteRejection) {
+          // The CLI rejected the pasted code; the session accepts a fresh one.
+          setError(data.pasteRejection);
+          if (step === 'completing') {
+            setStep('paste-code');
+            setCompletingStartedAt(null);
+            finalizationAttemptedSessionRef.current = null;
           }
           return;
         }
@@ -286,6 +318,7 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
     setCancellationError(null);
     setPopupBlocked(false);
     setRecoverySession(false);
+    setLifecycleConflict(false);
     setStep('starting');
     try {
       const { data } = await client.post(`${apiBase}/claude/start`);
@@ -333,6 +366,14 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
     } catch (err: any) {
       const startFailure = readStructuredOAuthStartFailure(err?.response?.data);
       const msg = startFailure.error || err?.message || 'Failed to start Claude setup';
+      if (isStuckLifecycleRejection(err)) {
+        // A previous failed attempt still owns the credential domain. Offer
+        // the explicit reset instead of a dead-end failure.
+        setLifecycleConflict(true);
+        setError(msg);
+        setStep('error');
+        return;
+      }
       const disposition = getOAuthStartRecoveryDisposition(startFailure);
       if (disposition === 'cleanup_required' && startFailure.sessionId) {
         setSessionId(startFailure.sessionId);
@@ -406,10 +447,36 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
           return;
         }
       }
+      if (isStuckLifecycleRejection(err)) {
+        setLifecycleConflict(true);
+        setError(err?.response?.data?.error || err?.message || 'A previous sign-in attempt still owns this provider.');
+        setStep('error');
+        return;
+      }
       setError(err?.response?.data?.error || err?.message || 'Failed to save token');
     } finally {
       setLoading(false);
       releaseOperation('save-token');
+    }
+  };
+
+  const resetStuckLifecycle = async () => {
+    if (resettingLifecycle || operationRef.current) return;
+    setResettingLifecycle(true);
+    setError(null);
+    try {
+      await client.post(`${apiBase}/oauth/reset-lifecycle`, { provider: provider.id });
+      setLifecycleConflict(false);
+      setReviewState(null);
+      setRecoverySession(false);
+      setSessionId(null);
+      setAuthUrl(null);
+      setCompletingStartedAt(null);
+      setStep('prereqs');
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || 'Could not reset the previous sign-in. Try again in a moment.');
+    } finally {
+      setResettingLifecycle(false);
     }
   };
 
@@ -879,6 +946,17 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
                 </button>
               ) : (
                 <>
+                  {lifecycleConflict ? (
+                    <button
+                      type="button"
+                      onClick={() => { void resetStuckLifecycle(); }}
+                      disabled={resettingLifecycle || Boolean(operation)}
+                      className="flex w-full items-center justify-center gap-2 rounded-xl bg-theme-text px-5 py-3 text-sm font-semibold text-theme-surface shadow transition hover:opacity-90 disabled:cursor-wait disabled:opacity-50"
+                    >
+                      {resettingLifecycle ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                      Reset stuck sign-in and start over
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     onClick={() => { void cancelAndMove('prereqs'); }}

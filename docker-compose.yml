@@ -42,7 +42,7 @@ services:
       - ./backend/.env
     environment:
       NODE_ENV: production
-      DATABASE_URL: "postgresql://bridges:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD before running Docker Compose}@bridgesllm-db:5432/bridgesllm_portal"
+      DATABASE_URL: "postgresql://bridges:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD before running Docker Compose}@bridgesllm-db:5432/bridgesllm_portal?sslmode=disable"
       PORT: 3001
       HOST: 0.0.0.0
       CORS_ORIGIN: "${PORTAL_DOMAIN:-https://localhost}"

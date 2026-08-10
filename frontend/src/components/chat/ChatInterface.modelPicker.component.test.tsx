@@ -8,12 +8,81 @@ import {
   BlockedAgentChatSendButton,
   ModelPicker,
   ProviderAvailabilityBarrier,
+  getAgentChatNativeRecoveryTarget,
   planAgentChatSelection,
 } from './ChatInterface';
 
 const originalInnerWidth = window.innerWidth;
 
 describe('Agent Chat provider navigation', () => {
+  it.each([
+    ['CLAUDE_CODE', 'claude-code'],
+    ['CODEX', 'codex'],
+    ['GEMINI', 'gemini'],
+    ['GROK', 'grok'],
+  ] as const)('routes a needs-login %s row to its exact native setup flow', (provider, target) => {
+    const readyNeedsLogin = {
+      name: provider,
+      displayName: provider === 'CLAUDE_CODE' ? 'Claude Code' : provider,
+      installed: true,
+      implemented: true,
+      usable: false,
+      native: true,
+      availabilityState: 'ready' as const,
+      checking: false,
+      stale: false,
+      nativeAuthStatus: 'needs_login' as const,
+    };
+    expect(getAgentChatNativeRecoveryTarget(provider, readyNeedsLogin)).toBe(target);
+    expect(getAgentChatNativeRecoveryTarget(provider, {
+      ...readyNeedsLogin,
+      nativeAuthStatus: 'authenticated',
+    })).toBeNull();
+  });
+
+  it('never invents a native recovery flow for gateway or unsupported providers', () => {
+    const readyNeedsLogin = {
+      name: 'OPENCLAW',
+      displayName: 'OpenClaw',
+      installed: true,
+      implemented: true,
+      usable: false,
+      native: true,
+      availabilityState: 'ready' as const,
+      checking: false,
+      stale: false,
+      nativeAuthStatus: 'needs_login' as const,
+    };
+    expect(getAgentChatNativeRecoveryTarget('OPENCLAW', readyNeedsLogin)).toBeNull();
+    expect(getAgentChatNativeRecoveryTarget('AGENT_ZERO', {
+      ...readyNeedsLogin,
+      name: 'AGENT_ZERO',
+      displayName: 'Agent Zero',
+    })).toBeNull();
+  });
+
+  it.each([
+    ['stale row', { availabilityState: 'stale' as const, stale: true }],
+    ['checking row', { availabilityState: 'checking' as const, checking: true, installed: null }],
+    ['failed check', { availabilityState: 'error' as const }],
+    ['missing runtime', { installed: false }],
+    ['non-native adapter', { native: false }],
+  ])('keeps %s on availability recovery even when it retains needs_login', (_label, override) => {
+    expect(getAgentChatNativeRecoveryTarget('CLAUDE_CODE', {
+      name: 'CLAUDE_CODE',
+      displayName: 'Claude Code',
+      installed: true,
+      implemented: true,
+      usable: false,
+      native: true,
+      availabilityState: 'ready',
+      checking: false,
+      stale: false,
+      nativeAuthStatus: 'needs_login',
+      ...override,
+    })).toBeNull();
+  });
+
   it('lets a provider switch restore that provider\'s last session', () => {
     expect(planAgentChatSelection('OPENCLAW', undefined, {
       provider: 'CODEX',
@@ -303,6 +372,30 @@ describe('Agent Chat selected-provider availability barrier', () => {
     await user.click(screen.getByRole('button', { name: 'Retry provider availability' }));
     expect(onRetry).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(/model catalog/i)).not.toBeInTheDocument();
+  });
+
+  it('offers an exact provider recovery action without disguising recheck as repair', async () => {
+    const onRecover = vi.fn();
+    const onRetry = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <ProviderAvailabilityBarrier
+        assessment={{
+          status: 'unusable',
+          canSend: false,
+          message: 'Claude Code authentication was rejected.',
+          retryable: true,
+        }}
+        recoveryLabel="Reconnect Claude Code"
+        onRecover={onRecover}
+        onRetry={onRetry}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Reconnect Claude Code' }));
+    expect(onRecover).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Retry provider availability' })).toBeVisible();
   });
 
   it('renders no barrier for a ready current provider', () => {

@@ -27,6 +27,8 @@ import {
   buildNativeCliProjectRuntimePlan,
   ensureNativeCliProjectEgressRuntime,
   nativeCliProjectDockerHostEnvironment,
+  stopNativeCliProjectRuntimesForContext,
+  stopNativeCliProjectRuntimesForRecoveryContext,
   type NativeCliProjectRuntimePlan,
   type NativeCliProjectRuntimeProfile,
 } from './NativeCliProjectEgressRuntime';
@@ -706,6 +708,104 @@ describe('shared native CLI Project runtime orchestration', () => {
       constrainRuntime,
     };
   }
+
+  test.each([
+    ['Claude Code', PROFILE],
+    ['Google Antigravity', GEMINI_PROFILE],
+  ])('discovers and proves stop of only the exact %s actor/project runtime', async (_label, profile) => {
+    const providerFixture = makeFixture(profile);
+    const executor = new RuntimeExecutor(providerFixture);
+    executor.exists = true;
+    executor.running = true;
+    try {
+      await expect(stopNativeCliProjectRuntimesForContext(
+        providerFixture.context,
+        profile,
+        executor,
+      )).resolves.toEqual(['d'.repeat(64)]);
+      expect(executor.running).toBe(false);
+      const listCall = executor.commands.find(({ args }) => (
+        args[0] === 'container' && args[1] === 'ls'
+      ));
+      expect(listCall?.args.join('\n')).toContain(
+        `label=${NATIVE_CLI_PROJECT_RUNTIME_PROVIDER_LABEL}=${profile.provider}`,
+      );
+      expect(listCall?.args.join('\n')).not.toContain(
+        'label=com.bridgesllm.native-cli-project.policy=',
+      );
+      expect(executor.commands.some(({ args }) => (
+        args[0] === 'container' && args[1] === 'stop' && args.at(-1) === 'd'.repeat(64)
+      ))).toBe(true);
+    } finally {
+      fs.rmSync(providerFixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ['Claude Code', PROFILE, 'portal-claude-code-project-sandbox-v2'],
+    ['Google Antigravity', GEMINI_PROFILE, 'portal-antigravity-project-sandbox-v2'],
+  ])('stops an exact persisted %s generation after policy and image drift', async (
+    _label,
+    profile,
+    historicalPolicy,
+  ) => {
+    const providerFixture = makeFixture(profile);
+    const historicalSeed = {
+      ...providerFixture.context,
+      runtimePolicyVersion: historicalPolicy,
+      runtimeImageDigest: `sha256:${'9'.repeat(64)}`,
+    };
+    const historicalContext: ProjectSandboxExecutionContext = Object.freeze({
+      ...historicalSeed,
+      policyFingerprint: contextPolicyFingerprint(historicalSeed, profile),
+    });
+    const historicalFixture: Fixture = {
+      ...providerFixture,
+      context: historicalContext,
+      plan: {
+        ...providerFixture.plan,
+        runtimeImage: historicalContext.runtimeImageDigest,
+        expectedLabels: {
+          ...providerFixture.plan.expectedLabels,
+          [__nativeCliProjectEgressRuntimeTest.constants.RUNTIME_POLICY_LABEL]: historicalPolicy,
+        },
+      },
+    };
+    const executor = new RuntimeExecutor(historicalFixture);
+    executor.exists = true;
+    executor.running = true;
+    try {
+      await expect(stopNativeCliProjectRuntimesForRecoveryContext(
+        historicalContext,
+        profile,
+        executor,
+      )).resolves.toEqual(['d'.repeat(64)]);
+      expect(executor.running).toBe(false);
+    } finally {
+      fs.rmSync(providerFixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses a label-listed native CLI runtime whose provider identity drifted before stop', async () => {
+    const executor = new RuntimeExecutor(fixture);
+    executor.exists = true;
+    executor.running = true;
+    const originalRun = executor.run.bind(executor);
+    executor.run = async (command, args, options) => {
+      const result = await originalRun(command, args, options);
+      if (command === 'docker' && args[0] === 'container' && args[1] === 'inspect') {
+        const inspect = JSON.parse(result.stdout)[0];
+        inspect.Config.Labels[NATIVE_CLI_PROJECT_RUNTIME_PROVIDER_LABEL] = 'GEMINI';
+        return { ...result, stdout: JSON.stringify([inspect]) };
+      }
+      return result;
+    };
+
+    await expect(stopNativeCliProjectRuntimesForContext(fixture.context, PROFILE, executor))
+      .rejects.toMatchObject({ code: 'RUNTIME_STOP_IDENTITY' });
+    expect(executor.commands.some(({ args }) => args[0] === 'container' && args[1] === 'stop'))
+      .toBe(false);
+  });
 
   test.each([
     ['Claude Code', PROFILE],

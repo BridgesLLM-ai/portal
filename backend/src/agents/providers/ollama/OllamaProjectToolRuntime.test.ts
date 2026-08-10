@@ -17,6 +17,7 @@ import {
   attestOllamaProjectRuntimeContainer,
   buildOllamaProjectRuntimePlan,
   cleanupOllamaProjectRuntimeByIdentity,
+  stopOllamaProjectRuntimesForRecoveryContext,
   type OllamaProjectCommandExecutor,
   type OllamaProjectCommandOptions,
   type OllamaProjectCommandResult,
@@ -360,6 +361,77 @@ describe('confined Ollama Project coding tool runtime', () => {
         projectIdentityId: fixture.context.projectId,
         executor: cleanupExecutor,
       })).resolves.toBe(1);
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('restart recovery stops but does not remove an exact policy-and-image-drifted runtime', async () => {
+    const fixture = makeFixture();
+    const historicalSeed = {
+      ...fixture.context,
+      runtimePolicyVersion: 'portal-ollama-project-sandbox-v2',
+      runtimeImageDigest: `sha256:${'9'.repeat(64)}`,
+    };
+    const historicalContext: ProjectSandboxExecutionContext = Object.freeze({
+      ...historicalSeed,
+      policyFingerprint: crypto.createHash('sha256').update(JSON.stringify({
+        version: historicalSeed.runtimePolicyVersion,
+        egressPolicyVersion: historicalSeed.egressPolicyVersion,
+        provider: 'OLLAMA',
+        runtime: 'ollama-project-coding-agent-v1',
+        runtimeImageDigest: historicalSeed.runtimeImageDigest,
+        actorUserId: historicalSeed.userId,
+        workspaceOwnerId: historicalSeed.workspaceOwnerId,
+        projectId: historicalSeed.projectId,
+        projectName: historicalSeed.projectName,
+        canonicalRoot: historicalSeed.canonicalRoot,
+        rootDevice: historicalSeed.rootDevice,
+        rootInode: historicalSeed.rootInode,
+        rootBirthtimeNs: historicalSeed.rootBirthtimeNs,
+      })).digest('hex'),
+    });
+    const historicalFixture: Fixture = {
+      ...fixture,
+      context: historicalContext,
+      plan: {
+        ...fixture.plan,
+        runtimeImage: historicalContext.runtimeImageDigest,
+        expectedLabels: {
+          ...fixture.plan.expectedLabels,
+          'com.bridgesllm.ollama-project.policy': historicalContext.runtimePolicyVersion,
+        },
+      },
+    };
+    let running = true;
+    const calls: string[][] = [];
+    const executor: OllamaProjectCommandExecutor = {
+      async run(_command, args) {
+        calls.push([...args]);
+        if (args[0] === 'container' && args[1] === 'ls') {
+          return { stdout: `${'d'.repeat(64)}\n`, stderr: '', exitCode: 0 };
+        }
+        if (args[0] === 'container' && args[1] === 'inspect') {
+          return {
+            stdout: JSON.stringify([inspectFor(historicalFixture, running)]),
+            stderr: '',
+            exitCode: 0,
+          };
+        }
+        if (args[0] === 'container' && args[1] === 'stop') {
+          running = false;
+          return { stdout: String(args.at(-1)), stderr: '', exitCode: 0 };
+        }
+        throw new Error(`unexpected recovery command: ${args.join(' ')}`);
+      },
+    };
+    try {
+      await expect(stopOllamaProjectRuntimesForRecoveryContext(
+        historicalContext,
+        executor,
+      )).resolves.toEqual(['d'.repeat(64)]);
+      expect(calls.some((args) => args[0] === 'container' && args[1] === 'stop')).toBe(true);
+      expect(calls.some((args) => args[0] === 'container' && args[1] === 'rm')).toBe(false);
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }

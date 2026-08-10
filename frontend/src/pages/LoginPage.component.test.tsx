@@ -104,6 +104,15 @@ describe('public login shell', () => {
     expect(screen.queryByRole('button', { name: /sign up|request access/i })).not.toBeInTheDocument();
   });
 
+  it('uses the bundled display mark when no custom logo is configured', () => {
+    testState.settings.portalName = 'BridgesLLM';
+    testState.settings.logoUrl = '';
+    render(<MemoryRouter><LoginPage /></MemoryRouter>);
+
+    expect(screen.getByRole('img', { name: 'BridgesLLM logo' }))
+      .toHaveAttribute('src', '/logo-display.png');
+  });
+
   it('labels approval-mode registration as an access request', async () => {
     testState.settings.registrationMode = 'approval';
     render(<MemoryRouter><LoginPage /></MemoryRouter>);

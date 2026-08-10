@@ -97,6 +97,106 @@ interface PendingRequest {
   resolve: (value: any) => void;
   reject: (error: Error) => void;
   timeoutId: ReturnType<typeof setTimeout>;
+  method: string;
+  params?: any;
+}
+
+export class GatewayRequestError extends Error {
+  readonly code?: string;
+  readonly details: Readonly<Record<string, any>>;
+
+  constructor(message: string, errorPayload?: unknown) {
+    super(message);
+    this.name = 'GatewayRequestError';
+    const details = errorPayload && typeof errorPayload === 'object' && !Array.isArray(errorPayload)
+      ? { ...(errorPayload as Record<string, any>) }
+      : {};
+    this.details = details;
+    this.code = typeof details.code === 'string' && details.code.trim()
+      ? details.code.trim()
+      : undefined;
+  }
+}
+
+export interface GatewayActiveTurnConflict {
+  clientMessageId: string;
+  sessionKey: string;
+  activeStream?: Record<string, any>;
+}
+
+export interface GatewayUnconfirmedSend {
+  clientMessageId: string;
+  sessionKey: string;
+}
+
+export function gatewayUnconfirmedSendFromError(
+  error: unknown,
+  fallback: { clientMessageId: string; sessionKey: string },
+): GatewayUnconfirmedSend | null {
+  const candidate = error as Partial<GatewayRequestError> | null;
+  if (
+    !candidate
+    || typeof candidate.code !== 'string'
+    || candidate.code.toUpperCase() !== 'CHAT_SEND_UNCONFIRMED'
+  ) return null;
+  const details = candidate.details && typeof candidate.details === 'object'
+    ? candidate.details
+    : {};
+  const clientMessageId = typeof details.clientMessageId === 'string' && details.clientMessageId.trim()
+    ? details.clientMessageId.trim()
+    : fallback.clientMessageId.trim();
+  const sessionKey = typeof details.sessionKey === 'string' && details.sessionKey.trim()
+    ? details.sessionKey.trim()
+    : fallback.sessionKey.trim();
+  return clientMessageId && sessionKey ? { clientMessageId, sessionKey } : null;
+}
+
+export function gatewayActiveTurnConflictFromError(
+  error: unknown,
+  fallback: { clientMessageId: string; sessionKey: string },
+): GatewayActiveTurnConflict | null {
+  const candidate = error as Partial<GatewayRequestError> | null;
+  if (
+    !candidate
+    || typeof candidate.code !== 'string'
+    || candidate.code.toUpperCase() !== 'TURN_ACTIVE'
+  ) return null;
+  const details = candidate.details && typeof candidate.details === 'object'
+    ? candidate.details
+    : {};
+  const clientMessageId = typeof details.clientMessageId === 'string' && details.clientMessageId.trim()
+    ? details.clientMessageId.trim()
+    : fallback.clientMessageId.trim();
+  const sessionKey = typeof details.sessionKey === 'string' && details.sessionKey.trim()
+    ? details.sessionKey.trim()
+    : fallback.sessionKey.trim();
+  if (!clientMessageId || !sessionKey) return null;
+  const activeStream = details.activeStream && typeof details.activeStream === 'object'
+    && !Array.isArray(details.activeStream)
+    ? details.activeStream as Record<string, any>
+    : undefined;
+  return { clientMessageId, sessionKey, ...(activeStream ? { activeStream } : {}) };
+}
+
+export function createDirectGatewayIdempotencyKey(clientMessageId?: string): string {
+  const requested = typeof clientMessageId === 'string' ? clientMessageId.trim() : '';
+  const base = requested || clientRandomId();
+  return base.startsWith('portal-') ? base : `portal-${base}`;
+}
+
+export function clientMessageIdFromDirectGatewayIdempotencyKey(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  let normalized = value.trim();
+  if (!normalized) return '';
+  if (normalized.endsWith(':user')) normalized = normalized.slice(0, -':user'.length);
+  const clientMarker = ':client:';
+  const markerIndex = normalized.indexOf(clientMarker);
+  if (normalized.startsWith('portal-') && markerIndex > 'portal-'.length) {
+    return normalized.slice(markerIndex + clientMarker.length);
+  }
+  return normalized.startsWith('portal-')
+    ? normalized.slice('portal-'.length)
+    : '';
 }
 
 const REQUEST_TIMEOUT_MS = 30000;
@@ -285,7 +385,7 @@ export class OpenClawGatewayClient {
         } else {
           const errorMsg = typeof msg.error === 'string' ? msg.error 
             : msg.error?.message || msg.error?.error || JSON.stringify(msg.error) || 'Request failed';
-          pending.reject(new Error(errorMsg));
+          pending.reject(new GatewayRequestError(errorMsg, msg.error));
         }
       }
       return;
@@ -382,7 +482,21 @@ export class OpenClawGatewayClient {
     // Reject all pending requests
     for (const [id, pending] of this.pendingRequests) {
       clearTimeout(pending.timeoutId);
-      pending.reject(new Error('Connection closed'));
+      if (pending.method === 'chat.send') {
+        const sessionKey = typeof pending.params?.sessionKey === 'string'
+          ? pending.params.sessionKey.trim()
+          : '';
+        const clientMessageId = clientMessageIdFromDirectGatewayIdempotencyKey(
+          pending.params?.idempotencyKey,
+        );
+        pending.reject(new GatewayRequestError('The chat send acknowledgement was lost when the gateway connection closed.', {
+          code: 'CHAT_SEND_UNCONFIRMED',
+          ...(sessionKey ? { sessionKey } : {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
+        }));
+      } else {
+        pending.reject(new Error('Connection closed'));
+      }
       this.pendingRequests.delete(id);
     }
 
@@ -495,12 +609,24 @@ export class OpenClawGatewayClient {
     };
 
     return new Promise<T>((resolve, reject) => {
+      const timeoutMs = method === 'chat.send' ? REQUEST_TIMEOUT_MS + 5_000 : REQUEST_TIMEOUT_MS;
       const timeoutId = setTimeout(() => {
         this.pendingRequests.delete(id);
-        reject(new Error(`Request timeout: ${method}`));
-      }, REQUEST_TIMEOUT_MS);
+        if (method === 'chat.send') {
+          const requestParams = params && typeof params === 'object' ? params as Record<string, any> : {};
+          reject(new GatewayRequestError('The gateway did not acknowledge the chat send before recovery began.', {
+            code: 'CHAT_SEND_UNCONFIRMED',
+            ...(typeof requestParams.sessionKey === 'string' ? { sessionKey: requestParams.sessionKey } : {}),
+            ...(clientMessageIdFromDirectGatewayIdempotencyKey(requestParams.idempotencyKey)
+              ? { clientMessageId: clientMessageIdFromDirectGatewayIdempotencyKey(requestParams.idempotencyKey) }
+              : {}),
+          }));
+        } else {
+          reject(new Error(`Request timeout: ${method}`));
+        }
+      }, timeoutMs);
 
-      this.pendingRequests.set(id, { resolve, reject, timeoutId });
+      this.pendingRequests.set(id, { resolve, reject, timeoutId, method, params });
 
       try {
         this.ws!.send(JSON.stringify(frame));
@@ -516,11 +642,18 @@ export class OpenClawGatewayClient {
    * Send a chat message to the gateway.
    * Returns the real gateway runId from the `chat.send` acknowledgement when available.
    */
-  async sendMessage(sessionKey: string, message: string): Promise<string | null> {
+  async sendMessage(
+    sessionKey: string,
+    message: string,
+    clientMessageId?: string,
+  ): Promise<string | null> {
     this.currentSessionKey = sessionKey;
     this.activeRunSessionKey = sessionKey;
     await this.subscribeSession(sessionKey);
-    const idempotencyKey = clientRandomId();
+    // Reuse the Portal's optimistic user-message id when one is available.
+    // OpenClaw echoes this key on session.message, which lets the UI
+    // acknowledge the existing row instead of rendering its own send twice.
+    const idempotencyKey = createDirectGatewayIdempotencyKey(clientMessageId);
     const sessionId = this.sessionIdsByKey.get(sessionKey);
 
     const result = await this.request<{ runId?: string; status?: string }>('chat.send', {

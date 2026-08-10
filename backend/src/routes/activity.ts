@@ -79,6 +79,8 @@ function richTranslation(action: string, resource: string, metadata?: any): stri
       return `📁 Filesystem error${meta.errorMessage ? ': ' + String(meta.errorMessage).slice(0, 80) : ''}`;
     case 'TERMINAL_EXEC':
       return `💻 Terminal command executed`;
+    case 'EMBED_SECURITY_POLICY_UPDATED':
+      return '🛡️ Updated hosted-app embed origins';
     default:
       return `${action.replace(/_/g, ' ').toLowerCase()} on ${resource}`;
   }
@@ -150,7 +152,12 @@ router.get('/', async (req: Request, res: Response) => {
         { resource: { in: ['file', 'app'] } },
       ] });
     } else if (category === 'bot_traps' || category === 'security') {
-      filters.push({ action: { in: ['IP_BLOCKED', 'IP_UNBLOCKED', 'REGISTRATION_BLOCKED'] } });
+      filters.push({ action: { in: [
+        'IP_BLOCKED',
+        'IP_UNBLOCKED',
+        'REGISTRATION_BLOCKED',
+        'EMBED_SECURITY_POLICY_UPDATED',
+      ] } });
     } else if (category === 'errors') {
       filters.push({ OR: [
         { action: { endsWith: '_ERROR' } },
@@ -285,7 +292,7 @@ router.post('/archive', requireOwner, async (req: Request, res: Response) => {
       where: {
         createdAt: { lt: cutoff },
         severity: { notIn: ['ERROR', 'CRITICAL'] },
-        action: { notIn: ['IP_BLOCKED'] }, // Keep security entries
+        action: { notIn: ['IP_BLOCKED', 'EMBED_SECURITY_POLICY_UPDATED'] }, // Keep security entries
       },
     });
 

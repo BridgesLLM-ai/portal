@@ -104,6 +104,10 @@ export interface OAuthSession {
   nativeCredentialSnapshotBefore?: NativeCredentialSnapshot;
   credentialResolution?: 'absent' | 'committed' | 'indeterminate';
   credentialLeaseNamespace?: string;
+  /** CLI rejected the pasted authorization value; session can accept a fresh paste. */
+  pasteRejection?: string | null;
+  /** Offset of the last handled rejection in cleanOutput, so a retry's new error re-fires. */
+  pasteRejectionOutputIndex?: number;
   finalizationPending?: boolean;
   finalizationWarning?: string | null;
   lifecycleGeneration?: number;
@@ -139,9 +143,49 @@ function credentialLeaseIsReleasable(lease: CredentialLifecycleLease): boolean {
   if (!lease.sessionId) return false;
   const session = sessions.get(lease.sessionId);
   if (!session) return true;
+  if (session.processExited && !session.finalizationPending) {
+    // A native sign-in whose process died before its 2-second cancel window
+    // stayed "indeterminate" forever and held the whole credential domain
+    // until a service restart. The evidence to settle it — the attested
+    // credential files — is readable right now, so judge it here instead of
+    // refusing every future sign-in on stale ignorance.
+    settleExitedNativeSessionResolution(session);
+  }
   return Boolean(session.processExited)
     && !session.finalizationPending
     && session.credentialResolution === 'absent';
+}
+
+/**
+ * Resolve a terminal native-CLI session's credential state from its file
+ * attestation once the process is provably gone. Returns the resolution it
+ * settled on (or the one already present). Only 'unchanged' evidence may
+ * downgrade indeterminate to absent; anything else stays fail-closed.
+ */
+function settleExitedNativeSessionResolution(
+  session: OAuthSession,
+): OAuthSession['credentialResolution'] {
+  if (!session.processExited) return session.credentialResolution;
+  if (!session.nativeCredentialPaths?.length || !session.nativeCredentialSnapshotBefore) {
+    return session.credentialResolution;
+  }
+  if (session.credentialResolution && session.credentialResolution !== 'indeterminate') {
+    return session.credentialResolution;
+  }
+  if (!['cancelled', 'expired', 'error'].includes(session.status)) {
+    return session.credentialResolution;
+  }
+  const nativeState = nativeCredentialMutationState(session);
+  if (nativeState === 'unchanged') {
+    session.credentialResolution = 'absent';
+    if (session.status === 'cancelled') session.error = null;
+    releaseCredentialLifecycleLease(session);
+  } else if (nativeState === 'committed') {
+    session.credentialResolution = 'committed';
+    session.error = session.error
+      || 'A native CLI credential changed before this sign-in stopped. Remove or re-verify that provider before retrying.';
+  }
+  return session.credentialResolution;
 }
 
 function releaseCredentialLifecycleLease(session: OAuthSession, finalized = false): void {
@@ -159,6 +203,29 @@ function releaseCredentialLifecycleLease(session: OAuthSession, finalized = fals
     if (lease.durableClaim) releaseProviderCredentialLifecycle(lease.durableClaim);
     credentialLifecycleLeases.delete(namespace);
   }
+}
+
+/**
+ * Owner-initiated escape hatch for a credential domain whose in-memory lease
+ * outlived its process. The durable ledger has reset-lifecycle; this is the
+ * matching release for the in-process gate, without which "Cleared the stuck
+ * provider authorization" was true of the database and false of the server.
+ */
+export function forceReleaseCredentialLifecycleLease(namespace: string): 'released' | 'busy' | 'none' {
+  const lease = credentialLifecycleLeases.get(namespace);
+  if (!lease) return 'none';
+  const session = lease.sessionId ? sessions.get(lease.sessionId) : null;
+  if (session && !session.processExited && session.process) return 'busy';
+  if (!session && !lease.finalized) return 'busy';
+  if (lease.durableClaim) {
+    try {
+      releaseProviderCredentialLifecycle(lease.durableClaim);
+    } catch {
+      // The ledger reset that precedes this call already owns durable cleanup.
+    }
+  }
+  credentialLifecycleLeases.delete(namespace);
+  return 'released';
 }
 
 async function runCredentialLifecycleStart<T extends { sessionId: string }>(
@@ -497,6 +564,34 @@ export function extractClaudeSetupToken(text: string): string | null {
   return match?.[1]?.trim() || null;
 }
 
+/**
+ * A login PTY that dies with a bare exit code usually printed exactly why —
+ * OpenClaw's gemini flow, for example, says "Error: Gemini CLI not found.
+ * Install it first: …" — and the generic "exited with code 1" hid that from
+ * the person who could act on it. Pull the provider's own final Error line
+ * out of the captured output so the session error is the CLI's reason.
+ */
+export function extractProviderCliErrorText(output: string): string | null {
+  const normalized = normalizeTerminalScreenText(output)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let i = normalized.length - 1; i >= 0; i -= 1) {
+    const match = normalized[i].match(/(?:^|\s)Error:\s*(.+)$/i);
+    if (!match) continue;
+    // The TUI can wrap one message across following lines; keep them until
+    // the next blank-ish boundary so install commands survive intact.
+    const parts = [match[1].trim()];
+    for (let j = i + 1; j < normalized.length && parts.join(' ').length < 220; j += 1) {
+      if (/^[│└┌─|]+$/.test(normalized[j])) break;
+      parts.push(normalized[j].replace(/^[│└┌─|]+\s*/, '').trim());
+    }
+    const message = parts.join(' ').replace(/\s+/g, ' ').trim();
+    if (message.length >= 8) return message.slice(0, 300);
+  }
+  return null;
+}
+
 export function extractClaudeAuthUrl(text: string): string | null {
   const lines = normalizeTerminalScreenText(text).split(/\r?\n/);
 
@@ -541,6 +636,30 @@ export function maybeCaptureClaudeSetupToken(session: OAuthSession) {
     console.log(`[Claude] Setup token detected in PTY output (${token.length} chars; value redacted)`);
   }
   return token;
+}
+
+/**
+ * Surface a code-exchange failure the CLI reports interactively.
+ *
+ * After a rejected code, `claude setup-token` prints
+ * `OAuth error: <detail>` / `Press Enter to retry.` and keeps waiting. The
+ * Portal only ever parsed the success token, so the person pasting the code
+ * watched a silent spinner for up to three minutes while the CLI had already
+ * said what was wrong. Record the rejection, return the session to
+ * awaiting_callback, and let a fresh paste drive the CLI's own retry prompt.
+ */
+export function detectClaudeSetupCodeRejection(session: OAuthSession): void {
+  if (session.provider !== 'anthropic') return;
+  if (session.status !== 'processing') return;
+  const normalized = normalizeTerminalScreenText(session.cleanOutput);
+  const errorIndex = normalized.lastIndexOf('OAuth error:');
+  if (errorIndex === -1) return;
+  if (errorIndex <= (session.pasteRejectionOutputIndex ?? -1)) return;
+  const detail = normalized.slice(errorIndex).split('\n')[0].trim();
+  session.pasteRejectionOutputIndex = errorIndex;
+  session.pasteRejection = `Claude rejected the authorization code (${detail}). Codes are single-use and expire quickly — open the sign-in link again, copy a fresh code, and paste it here.`;
+  session.status = 'awaiting_callback';
+  console.log('[Claude] Authorization code rejected by the CLI; session accepts a fresh code.');
 }
 
 export function completeClaudeSetupTokenProcessExit(
@@ -701,7 +820,7 @@ function describeNativeCredentialAttestationFailure(provider: NativeCredentialPr
     }
   }
   if (unreadable.length > 0) {
-    return `Portal could not read this provider's credential files, so it will not start a sign-in that it cannot verify. Check permissions on: ${unreadable.join(', ')}.`;
+    return `Portal could not fully attest this provider's credential files, so it will not start a sign-in that it cannot verify. The paths below may be unreadable, replaced by a symlink, or too large to attest — check: ${unreadable.join(', ')}.`;
   }
 
   return `Portal could not verify ${cli ? cli.label : 'this provider'}'s credential files, so the sign-in was stopped before it started. Retry, and if it keeps failing check the server logs for this provider.`;
@@ -1443,6 +1562,23 @@ export function scheduleXaiExitProfileReconciliation(
           : `Provider login process exited with code ${exitCode}`;
         session.completedAt = Date.now();
       }
+      try {
+        // The exact Portal-owned xAI profile stayed absent across the strict
+        // post-exit visibility window. Release both in-memory and durable
+        // ownership now so an expired or abandoned device code cannot poison
+        // the next sign-in while nobody has the setup dialog open.
+        releaseCredentialLifecycleLease(session);
+      } catch {
+        // Credential absence is not enough if the durable ownership record
+        // could not be released. Keep reconciling fail-closed instead of
+        // exposing a clean terminal state that a restart would reject.
+        session.credentialResolution = 'indeterminate';
+        session.authStoreReadIndeterminate = true;
+        stableEmptyReads = 0;
+        scheduleAttempt(failureBackoffMs);
+        failureBackoffMs = Math.min(failureBackoffMs * 2, 10_000);
+        return;
+      }
       finish('absent');
       return;
     }
@@ -1805,7 +1941,10 @@ function attachPtyParsing(session: OAuthSession) {
     }
     if (!session.error) {
       session.status = 'error';
-      session.error = `Provider login process exited with code ${exitCode}`;
+      const cliReason = extractProviderCliErrorText(session.cleanOutput);
+      session.error = cliReason
+        ? `Provider login failed: ${cliReason}`
+        : `Provider login process exited with code ${exitCode}`;
     }
   });
 }
@@ -2012,6 +2151,18 @@ async function startOAuthFlowCore(
 }
 
 export async function startOAuthFlow(provider: string, options?: { googleProjectId?: string; ownerId?: string }) {
+  // OpenClaw's Google flow extracts its OAuth client credentials from the
+  // Gemini CLI binary, so without it the login dies after the confirmation
+  // prompt with an error the person never saw. Refuse up front, with the fix
+  // in hand, before any lifecycle bookkeeping is created for a doomed start.
+  if (provider === 'google-gemini-cli'
+    && !process.env.GEMINI_CLI_OAUTH_CLIENT_ID
+    && !nativeCliIsInstalled('gemini')) {
+    throw new Error(
+      'Google sign-in needs the Gemini CLI on this server. Install it with '
+      + '`npm install -g @google/gemini-cli` (as root), then start the sign-in again.',
+    );
+  }
   const domain = credentialLifecycleDomainForOpenClaw(provider);
   const namespace = `credential-domain:${domain.key}`;
   const readFingerprint = () => readCredentialLifecycleDomainProof(domain);
@@ -2535,8 +2686,7 @@ export async function cancelOAuthFlow(sessionId: string, ownerId?: string): Prom
   }
 
   if (session.provider === 'xai') {
-    const xaiResolution = await waitForXaiExitProfileReconciliation(session);
-    if (xaiResolution === 'committed') {
+    if (session.credentialResolution === 'committed') {
       session.credentialResolution = 'committed';
       session.status = 'error';
       session.error = 'Authorization completed before cancellation reached xAI. Use server credential maintenance for the saved credential.';
@@ -2548,26 +2698,31 @@ export async function cancelOAuthFlow(sessionId: string, ownerId?: string): Prom
         error: session.error,
       };
     }
-    if (xaiResolution === 'indeterminate') {
-      session.credentialResolution = 'indeterminate';
-      session.status = 'error';
-      session.error = 'Portal is still reconciling the xAI credential after stopping the sign-in.';
+    if (session.credentialResolution === 'absent' && !session.profileReconciliationPending) {
+      session.status = 'cancelled';
+      session.error = null;
       session.completedAt = Date.now();
-      return {
-        success: false,
-        status: 'error',
-        cleanupPending: true,
-        credentialState: 'indeterminate',
-        error: session.error,
-      };
+      releaseCredentialLifecycleLease(session);
+      return { success: true, status: 'cancelled' };
     }
 
-    session.credentialResolution = 'absent';
+    // OpenClaw's authoritative auth-store CLI can take close to ten seconds
+    // per strict read, and absence requires more than one stable read. Do not
+    // hold this HTTP request until an arbitrary deadline and then misreport
+    // routine background proof as a failed cancellation. Status polling owns
+    // the bounded wait while this one shared reconciliation runs.
+    scheduleXaiExitProfileReconciliation(session, session.processExitCode ?? 1);
+    session.credentialResolution = 'indeterminate';
     session.status = 'cancelled';
-    session.error = null;
+    session.error = 'Portal is verifying that xAI did not save a credential.';
     session.completedAt = Date.now();
-    releaseCredentialLifecycleLease(session);
-    return { success: true, status: 'cancelled' };
+    return {
+      success: false,
+      status: 'cancelled',
+      cleanupPending: true,
+      credentialState: 'indeterminate',
+      error: session.error,
+    };
   }
 
   invalidateOpenClawAuthStoreProfilesCache();
@@ -2843,6 +2998,7 @@ export function buildOAuthFlowStatusPayload(session: OAuthSession, createdProfil
     credentialState: session.credentialResolution ?? null,
     alreadyAuthenticated: Boolean(session.alreadyAuthenticated),
     reauthSupported: session.reauthSupported ?? null,
+    pasteRejection: session.pasteRejection ?? null,
   };
 }
 
@@ -3119,6 +3275,7 @@ async function startClaudeSetupTokenFlowCore(
     session.lastOutputAt = Date.now();
     session.processExited = false;
     maybeCaptureClaudeSetupToken(session);
+    detectClaudeSetupCodeRejection(session);
 
     // Check for Claude auth URL
     const firstUrl = extractClaudeAuthUrl(session.cleanOutput);
@@ -3242,7 +3399,7 @@ export async function startClaudeSetupTokenFlow(
   );
 }
 
-export async function pasteCodeToClaudeSession(sessionId: string, code: string, ownerId?: string): Promise<{ success: boolean; error?: string }> {
+export async function pasteCodeToClaudeSession(sessionId: string, code: string, ownerId?: string): Promise<{ success: boolean; error?: string; retryable?: boolean }> {
   const session = sessions.get(sessionId);
   if (!session || (session.ownerId && session.ownerId !== ownerId)) return { success: false, error: 'Session not found' };
   if (session.provider !== 'anthropic') return { success: false, error: 'Not a Claude session' };
@@ -3259,6 +3416,15 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string, 
   try {
     const writeError = terminalOAuthMutationError(session, 'writing the Claude authorization code');
     if (writeError) return { success: false, error: writeError };
+    if (session.pasteRejection) {
+      // The CLI is parked on its "Press Enter to retry." screen from the
+      // previous rejected code. Advance it back to the paste prompt first.
+      session.pasteRejection = null;
+      session.process.write('\r');
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const retryWriteError = terminalOAuthMutationError(session, 'writing the Claude authorization code');
+      if (retryWriteError) return { success: false, error: retryWriteError };
+    }
     session.status = 'processing';
     session.error = null;
     session.process.write(`${trimmedCode}\r\n`);
@@ -3282,6 +3448,13 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string, 
   }
   maybeCaptureClaudeSetupToken(session);
 
+  if (session.pasteRejection) {
+    // The CLI already rejected this code; say so now instead of letting the
+    // completion poll time out in silence. The session stays alive for a
+    // fresh paste.
+    return { success: false, error: session.pasteRejection, retryable: true };
+  }
+
   if (session.error) {
     return { success: false, error: session.error || 'Claude setup failed' };
   }
@@ -3289,7 +3462,7 @@ export async function pasteCodeToClaudeSession(sessionId: string, code: string, 
   return { success: true };
 }
 
-export async function getClaudeSetupToken(sessionId: string, ownerId?: string): Promise<{ success: boolean; token?: string; error?: string }> {
+export async function getClaudeSetupToken(sessionId: string, ownerId?: string): Promise<{ success: boolean; token?: string; error?: string; retryable?: boolean }> {
   const session = sessions.get(sessionId);
   if (!session || (session.ownerId && session.ownerId !== ownerId)) return { success: false, error: 'Session not found' };
   if (session.provider !== 'anthropic') return { success: false, error: 'Not a Claude session' };
@@ -3304,6 +3477,11 @@ export async function getClaudeSetupToken(sessionId: string, ownerId?: string): 
   while (Date.now() < deadline) {
     if (session.status === 'cancelled' || session.status === 'expired' || session.status === 'error') {
       return { success: false, error: `Claude setup-token session is ${session.status}.` };
+    }
+    if (session.pasteRejection && !session.capturedToken) {
+      // The CLI rejected the pasted code and is waiting for a retry. End this
+      // poll with the CLI's own reason; the session accepts a fresh paste.
+      return { success: false, error: session.pasteRejection, retryable: true };
     }
     capturedToken = capturedToken || session.capturedToken || extractClaudeSetupToken(session.cleanOutput);
     if (capturedToken) session.capturedToken = capturedToken;
@@ -4043,6 +4221,12 @@ async function startNativeCliFlowCore(
         console.log(`[NativeCLI] Warning: could not pre-configure Antigravity settings: ${err.message}`);
       }
 
+      // The pre-configure above writes settings.json — an attested file — so
+      // the pre-spawn snapshot no longer matches the state the gated child
+      // will first observe. Re-baseline before releasing the gate, or every
+      // clean cancel judges Portal's own write as a committed credential.
+      session.nativeCredentialSnapshotBefore = captureNativeCredentialSnapshot(nativeCredentialPaths);
+
       proc.onData((chunk: string) => {
         session.output += chunk;
         session.cleanOutput += stripAnsi(chunk);
@@ -4052,14 +4236,25 @@ async function startNativeCliFlowCore(
       proc.onExit(({ exitCode }) => {
         recordOAuthProcessExit(session, exitCode);
         console.log(`[NativeCLI] Antigravity PTY exited: code=${exitCode} status=${session.status}`);
-        if (isTerminalOAuthStop(session)) return;
+        if (isTerminalOAuthStop(session)) {
+          // The cancel response promised "Portal verifies after it stops" —
+          // this is where that verification actually runs. The Antigravity
+          // CLI can outlive the 2-second cancel window by a minute, and an
+          // unsettled session held the google domain until service restart.
+          const resolution = settleExitedNativeSessionResolution(session);
+          console.log(`[NativeCLI] Antigravity post-exit settlement: ${resolution ?? 'unresolved'}`);
+          return;
+        }
         if (checkAntigravityCredentials()) {
           session.status = 'complete';
           session.completedAt = Date.now();
           console.log('[NativeCLI] Antigravity credentials verified');
         } else if (session.status !== 'complete' && !session.error) {
           session.status = 'error';
-          session.error = `Antigravity CLI exited with code ${exitCode}`;
+          const cliReason = extractProviderCliErrorText(session.cleanOutput);
+          session.error = cliReason
+            ? `Antigravity sign-in failed: ${cliReason}`
+            : `Antigravity CLI exited with code ${exitCode}`;
         }
       });
 

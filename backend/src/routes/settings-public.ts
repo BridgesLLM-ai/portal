@@ -4,6 +4,10 @@ import { authenticateToken, requireAdmin } from '../middleware/auth';
 import { APPEARANCE_DEFAULTS } from '../config/settings.schema';
 import { normalizeRegistrationMode } from '../utils/registrationMode';
 import { getPortalFeatureCapabilities } from '../utils/portalFeatureCapabilities';
+import {
+  normalizePortalAccentColor,
+  normalizePortalBrandingAssetUrl,
+} from '../services/portalBranding';
 
 function normalizeBoolean(value?: string | null): boolean {
   const raw = String(value || '').trim().toLowerCase();
@@ -33,9 +37,12 @@ router.get('/public', async (_req: Request, res: Response, next: NextFunction) =
 
     res.json({
       theme: map['appearance.theme'] || APPEARANCE_DEFAULTS.theme,
-      accentColor: map['appearance.accentColor'] || APPEARANCE_DEFAULTS.accentColor,
+      accentColor: normalizePortalAccentColor(
+        map['appearance.accentColor'],
+        APPEARANCE_DEFAULTS.accentColor,
+      ),
       portalName: map['appearance.portalName'] || APPEARANCE_DEFAULTS.portalName,
-      logoUrl: map['appearance.logoUrl'] || APPEARANCE_DEFAULTS.logoUrl,
+      logoUrl: normalizePortalBrandingAssetUrl(map['appearance.logoUrl']) || APPEARANCE_DEFAULTS.logoUrl,
       assistantName: map['appearance.assistantName'] || 'Assistant',
       registrationMode: normalizeRegistrationMode(map['security.registrationMode'] || map.registrationMode),
       agentAvatars: {

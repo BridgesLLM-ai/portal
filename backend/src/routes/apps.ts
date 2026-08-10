@@ -4,7 +4,8 @@ import {
   APP_API_ID_HEADER,
   addConfiguredAppApiSecret,
   buildAppApiTargetUrl,
-  configuredAppApiTarget,
+  configuredAppApiTargetBinding,
+  invalidAppApiTargetResponse,
 } from '../utils/appApiProxyAuth';
 import { createAppApiAbortContext, serializeAppApiRequestBody, streamAppApiResponse } from '../utils/appApiProxy';
 import multer from 'multer';
@@ -30,14 +31,24 @@ import {
   isValidShareToken,
   issueShareGrant,
   parseShareLinkOptions,
+  shareCredentialStateIsValid,
+  shareGrantTtlMs,
   shareGrantCookieName,
   sharePasswordBinding,
   validateSharePassword,
   verifyShareGrant,
 } from '../utils/shareAccessSecurity';
+import { claimShareRateLimit } from '../services/shareRateLimit';
 import { APP_ZIP_LIMITS, safeExtractZipToNewDirectory } from '../services/safeZipExtraction';
 import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
 import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
+import {
+  ProjectExternalRuntimeLifecycleError,
+  ProjectInvalidRuntimeBindingError,
+  projectExternalRuntimeConflict,
+  projectInvalidRuntimeBindingConflict,
+  projectRuntimeManagement,
+} from '../services/projectRuntimeManagement';
 
 const router = Router();
 
@@ -254,6 +265,30 @@ router.delete('/:id', authenticateToken, requireApproved, async (req: Request, r
       return;
     }
 
+    const runtimeManagement = projectRuntimeManagement(app);
+    if (runtimeManagement === 'invalid-external-binding') {
+      res.status(503).json(projectInvalidRuntimeBindingConflict(
+        new ProjectInvalidRuntimeBindingError('delete-app'),
+      ));
+      return;
+    }
+    if (runtimeManagement === 'external-loopback') {
+      res.status(409).json(projectExternalRuntimeConflict(
+        new ProjectExternalRuntimeLifecycleError('delete-app'),
+      ));
+      return;
+    }
+    if (app.projectIdentityId) {
+      res.status(409).json({
+        code: 'PROJECT_APP_MANAGED_BY_PROJECT',
+        error: 'This App belongs to a Project deployment and must be removed from Projects.',
+        detail: 'Open the Project deployment panel and use Remove deployment so Portal can stop its runtime and verify cleanup before deleting the App record.',
+        recoveryAction: 'OPEN_PROJECT_DEPLOYMENT',
+        retryable: false,
+      });
+      return;
+    }
+
     // Delete only a real app directory inside one of the managed roots. A
     // database path or symlink must never turn this endpoint into recursive
     // deletion elsewhere on the host.
@@ -356,6 +391,8 @@ router.post('/:id/share', authenticateToken, requireApproved, async (req: Reques
         token,
         expiresAt: options.expiresAt,
         maxUses: options.maxUses,
+        rateLimitMaxRequests: options.rateLimitMaxRequests,
+        rateLimitWindowSeconds: options.rateLimitWindowSeconds,
         isPublic,
         passwordHash,
       },
@@ -368,7 +405,13 @@ router.post('/:id/share', authenticateToken, requireApproved, async (req: Reques
         resource: 'app',
         resourceId: app.id,
         severity: 'INFO',
-        metadata: { shareLinkId: shareLink.id, expiresAt: options.expiresAt, maxUses: options.maxUses },
+        metadata: {
+          shareLinkId: shareLink.id,
+          expiresAt: options.expiresAt,
+          maxUses: options.maxUses,
+          rateLimitMaxRequests: options.rateLimitMaxRequests,
+          rateLimitWindowSeconds: options.rateLimitWindowSeconds,
+        },
       },
     }).catch(() => {});
 
@@ -414,6 +457,13 @@ router.patch('/:id/share/:linkId', authenticateToken, requireApproved, async (re
       where: { id: req.params.linkId, appId: req.params.id, userId: req.user!.userId },
     });
     if (!link) { res.status(404).json({ error: 'Share link not found' }); return; }
+    if (!shareCredentialStateIsValid(link)) {
+      res.status(409).json({
+        error: 'Share link credential state is invalid; delete it and create a new link',
+        code: 'SHARE_CREDENTIAL_STATE_INVALID',
+      });
+      return;
+    }
 
     if (req.body.isActive) {
       if (link.expiresAt && link.expiresAt.getTime() <= Date.now()) {
@@ -496,21 +546,60 @@ function grantShareAccess(
   link: { id: string; token: string; passwordHash?: string | null },
   kind: 'password' | 'visit',
 ): void {
-  const expiresAt = Date.now() + 60 * 60 * 1000;
+  const maxAge = shareGrantTtlMs(kind);
+  const expiresAt = Date.now() + maxAge;
   const binding = kind === 'password' && link.passwordHash ? sharePasswordBinding(link.passwordHash) : undefined;
   const encoded = issueShareGrant({ kind, token: link.token, linkId: link.id, binding, expiresAt }, config.jwtSecret);
   res.cookie(shareGrantCookieName(kind, link.token), encoded, {
     httpOnly: true,
     secure: requestIsSecure(req),
     sameSite: 'strict',
-    maxAge: 60 * 60 * 1000,
+    maxAge,
     path: `/share/${link.token}`,
   });
 }
 
+async function enforceShareRateLimit(
+  link: {
+    id: string;
+    isActive: boolean;
+    expiresAt: Date | null;
+    rateLimitMaxRequests: number | null;
+    rateLimitWindowSeconds: number | null;
+    rateLimitRequestCount: number;
+    rateLimitWindowStartedAt: Date | null;
+  },
+  res: Response,
+): Promise<boolean> {
+  const claim = await claimShareRateLimit(link);
+  if (claim.status === 'allowed') return true;
+
+  res.setHeader('Cache-Control', 'no-store');
+  if (claim.status === 'limited') {
+    res.setHeader('Retry-After', String(claim.retryAfterSeconds));
+    res.status(429).json({
+      error: 'Share link request rate limit reached. Try again later.',
+      code: 'SHARE_RATE_LIMITED',
+      retryAfterSeconds: claim.retryAfterSeconds,
+    });
+    return false;
+  }
+
+  console.warn('[Share Rate Limit] Admission could not be verified', {
+    shareLinkId: link.id,
+    reason: claim.reason,
+  });
+  res.status(503).json({
+    error: 'Share link request rate limit could not be verified.',
+    code: 'SHARE_RATE_LIMIT_UNAVAILABLE',
+    retryable: true,
+  });
+  return false;
+}
+
 async function findShareLink(token: string) {
   if (!isValidShareToken(token)) return null;
-  return prisma.appShareLink.findFirst({
+  const link = await prisma.appShareLink.findFirst({
     where: {
       token,
       isActive: true,
@@ -518,6 +607,7 @@ async function findShareLink(token: string) {
     },
     include: { app: true },
   });
+  return link && shareCredentialStateIsValid(link) ? link : null;
 }
 
 async function enforceShareAccessWindow(
@@ -561,6 +651,23 @@ async function claimShareVisit(
   }
 
   grantShareAccess(req, res, link, 'visit');
+  return true;
+}
+
+function preflightShareVisit(
+  req: Request,
+  res: Response,
+  link: { id: string; token: string; maxUses: number | null; currentUses: number },
+): boolean {
+  if (hasShareGrant(req, link, 'visit')) return true;
+  if (link.maxUses !== null && link.currentUses >= link.maxUses) {
+    // The request-rate window resets in at most one hour; a visitor slot lasts
+    // 30 days. Reject a known-exhausted new browser before charging the shorter
+    // budget, while keeping the actual slot mutation after rate admission so a
+    // 429 can never consume a durable visitor slot.
+    res.status(404).send('Link expired or max uses reached');
+    return false;
+  }
   return true;
 }
 
@@ -836,6 +943,8 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
       }
     }
 
+    if (!preflightShareVisit(req, res, link)) return;
+    if (!(await enforceShareRateLimit(link, res))) return;
     if (!(await claimShareVisit(req, res, link))) return;
 
     // Do not read a potentially large request body until the share token,
@@ -850,10 +959,17 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
     // targets keyed by the App id (APP_API_TARGET_<APP_ID>). There is no
     // Portal self-proxy fallback.
     const deployId = `${link.userId}-${link.app.name}`;
-    const registeredTarget = getAppTarget(deployId);
-    const baseTarget = configuredAppApiTarget(link.app.id)
-      || registeredTarget
-      || undefined;
+    const configuredBinding = configuredAppApiTargetBinding(link.app.id);
+    if (configuredBinding.status === 'invalid') {
+      res.status(503).json(invalidAppApiTargetResponse());
+      return;
+    }
+    const registeredTarget = configuredBinding.status === 'absent'
+      ? getAppTarget(deployId)
+      : null;
+    const baseTarget = configuredBinding.status === 'configured'
+      ? configuredBinding.target
+      : registeredTarget || undefined;
     const targetUrl = baseTarget ? buildAppApiTargetUrl(baseTarget, proxiedPath, query) : undefined;
     if (!targetUrl) {
       res.status(502).json({ error: 'App API backend is not configured' });
@@ -935,6 +1051,8 @@ shareRouter.get('/:token/progress', async (req: Request, res: Response) => {
         res.status(401).json({ error: 'Unauthorized' }); return;
       }
     }
+    if (!preflightShareVisit(req, res, link)) return;
+    if (!(await enforceShareRateLimit(link, res))) return;
     if (!(await claimShareVisit(req, res, link))) return;
 
     res.json({ data: link.progressData || null });
@@ -958,6 +1076,8 @@ shareRouter.put('/:token/progress', async (req: Request, res: Response) => {
         res.status(401).json({ error: 'Unauthorized' }); return;
       }
     }
+    if (!preflightShareVisit(req, res, link)) return;
+    if (!(await enforceShareRateLimit(link, res))) return;
     if (!(await claimShareVisit(req, res, link))) return;
 
     // Validate payload size (max 1MB)

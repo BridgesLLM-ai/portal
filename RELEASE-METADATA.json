@@ -1,12 +1,13 @@
 {
   "schema": 1,
-  "version": "4.0.12",
-  "releasedAt": "2026-08-04",
-  "releaseClass": "hotfix",
+  "version": "4.0.13",
+  "releasedAt": "2026-08-10",
+  "releaseClass": "feature",
   "highlights": [
-    "OpenClaw Project qualification now authorizes the intended agents.list replacement and gives Owners a redacted gateway diagnostic when host policy still refuses it.",
-    "Comprehensive backups can fence a uniquely attested loopback Docker PostgreSQL database through its internal peer socket and restore access after capture or failure.",
-    "Standard backups snapshot live Codex goal and memory SQLite databases, run in the background with phase progress, and distinguish comprehensive capture downtime.",
-    "The managed BridgesLLM skill refreshes on Portal startup and teaches agents to return verified clickable workspace, Project, and Portal Files links."
+    "A gateway restart no longer destroys the Agent Chat turn you were watching; live runs reattach instead of being abandoned.",
+    "Share links can enforce an owner-selected request throttle, and embeddable origins are now one owner-controlled allowlist.",
+    "Project deployments declare whether Portal or an external service owns the runtime, with honest Refresh, Start, and Restart.",
+    "Stuck provider sign-ins can be reset from the wizard, and a refused login reports the real reason instead of an exit code.",
+    "Portal branding is consistent across auth, icons, metadata, and email, and all frontend dependency advisories are cleared."
   ]
 }

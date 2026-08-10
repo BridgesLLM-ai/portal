@@ -84,25 +84,19 @@ Do not hand-edit backend/dist, frontend/dist, the live database, OpenClaw config
 
 ## Hosted apps that embed a third party
 
-Portal 4.0 serves `/hosted/*` and `/share/*` from the isolated app-content
-origin, and every response there inherits the Portal's global CSP and
-Permissions-Policy: `frame-src` allows only `'self'`, `blob:`, `data:` and
-YouTube, and camera/microphone are denied. An app that embeds a video agent,
-payment widget, map, or captcha therefore renders a blank frame or dead
-media while its own code is perfectly correct.
+Portal serves `/hosted/*` and `/share/*` from an isolated app-content origin. Third-party iframe access is controlled by the OWNER in **Settings → Security → Hosted content embeds**. The saved policy is portal-wide, applies immediately to every hosted app and project share, and survives signed Portal updates. New installations may start with YouTube and YouTube No-Cookie in the editable list, but they are removable defaults rather than permanent trust. Saving an empty list allows no third-party frame origins. The authenticated Portal's CSP is never widened by this manager.
 
-Diagnose before touching the app: request the hosted URL on the app-content
-host and read the `content-security-policy` and `permissions-policy` response
-headers. A Portal-default policy on an app that needs a third-party frame is
-the bug; a console `Refused to frame …` violation confirms it.
+When a hosted app needs another provider:
 
-There is no per-app embed allowlist in Settings yet. Until that ships, an
-exception is operator-owned Caddy configuration, path-scoped to the one
-deploy id, and it must live **outside** the `BEGIN/END BridgesLLM App Content`
-markers — the Portal rewrites everything between those markers verbatim on
-every setup and update converge, so an edit inside them is silently dropped
-at the next update. Scope the exception to the narrowest origins the embed
-actually needs; never widen the shared Portal policy to fix one app.
+1. Inspect the iframe's actual `src` and reduce it to the exact HTTPS origin: scheme plus hostname, with no path, query, fragment, credentials, wildcard, IP address, private/special-use hostname, or nonstandard port.
+2. As OWNER, open **Settings → Security → Hosted content embeds**, add that exact origin, and leave camera/microphone off unless the embed genuinely needs them. Remove any default or custom origin the installation does not want to trust.
+3. If camera or microphone is required, enable only the needed capability. This only lets that origin request browser permission; it does not grant permission automatically. The app's iframe must also declare the corresponding `allow="camera; microphone"` tokens.
+4. Save the policy, reload both the authenticated hosted preview and any public share link, then verify the real embed. Re-read the saved manager state after the mutation.
+5. When diagnosing a failure, inspect the app-content response's `Content-Security-Policy` and `Permissions-Policy` headers plus the browser console. The origin must appear in `frame-src`; enabled media capabilities must name the exact quoted origin.
+
+The allowlist is not private or per-project. Configured origins are visible in response headers and browser developer tools across the app-content origin. A provider can still refuse framing with its own `X-Frame-Options` or `frame-ancestors` policy, and an iframe can impose stricter feature permissions by omitting `allow`.
+
+Never fix an embed by hand-editing Helmet, Caddy, the deployed runtime, or generated headers. Those changes bypass the OWNER audit/CAS path, do not represent product state, and can be overwritten by setup or update convergence.
 
 ## Load only the reference you need
 

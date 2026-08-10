@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import type { ProjectSandboxExecutionContext } from '../agents/AgentProvider.interface';
 import {
   AgentProviderType,
   Prisma,
@@ -10,6 +11,10 @@ import {
   type ProjectChatMessage,
 } from '@prisma/client';
 import { prisma } from '../config/database';
+import {
+  getProjectChatProviderRuntimeDescriptor,
+  type NativeProjectProvider,
+} from './projectChatProviderRegistry';
 
 export const PROJECT_CHAT_DEFAULT_LEASE_MS = 2 * 60_000;
 export const PROJECT_CHAT_MIN_LEASE_MS = 15_000;
@@ -395,6 +400,7 @@ export async function acquireProjectChatTurn(input: StateKey & {
   leaseDurationMs?: number;
   providerSessionId?: string | null;
   model?: string | null;
+  initialResultMetadata?: Prisma.InputJsonValue;
   now?: Date;
 }, database: ProjectChatLeaseDatabase = defaultDatabase): Promise<ProjectChatTurnLeaseGrant> {
   const key = normalizeStateKey(input);
@@ -411,6 +417,9 @@ export async function acquireProjectChatTurn(input: StateKey & {
     : crypto.randomBytes(32).toString('base64url');
   const tokenHash = leaseDigest(leaseToken);
   const expiresAt = new Date(now.getTime() + leaseDurationMs);
+  if (input.initialResultMetadata !== undefined) {
+    assertReplayPayload(input.initialResultMetadata);
+  }
 
   return serializable(database, async (transaction) => {
     await assertDurableActorAuthorization(
@@ -484,6 +493,7 @@ export async function acquireProjectChatTurn(input: StateKey & {
         heartbeatAt: now,
         providerSessionId: input.providerSessionId || null,
         model: input.model || null,
+        resultMetadata: input.initialResultMetadata,
         startedAt: now,
       },
     });
@@ -514,6 +524,45 @@ export interface ProjectChatRuntimeAdmissionGrant extends ProjectChatTurnLeaseGr
   operation: string;
 }
 
+function runtimeAdmissionRecoveryMetadata(
+  context: ProjectSandboxExecutionContext,
+  key: StateKey,
+): Prisma.InputJsonValue {
+  if (
+    context.scope !== 'PROJECT_SANDBOX'
+    || context.source !== 'PORTAL_SERVER'
+    || context.userId !== key.actorUserId
+    || context.projectId !== key.projectIdentityId
+    || !/^[a-f0-9]{64}$/.test(context.policyFingerprint)
+    || !/^sha256:[a-f0-9]{64}$/.test(context.runtimeImageDigest)
+  ) {
+    throw new ProjectChatLeaseError(
+      'INVALID_INPUT',
+      'Runtime admission recovery context does not match the actor and project',
+      400,
+    );
+  }
+  return {
+    runtimeAdmissionMetadataVersion: 1,
+    recoveryExecutionContext: {
+      scope: context.scope,
+      source: context.source,
+      userId: context.userId,
+      projectId: context.projectId,
+      workspaceOwnerId: context.workspaceOwnerId,
+      projectName: context.projectName,
+      canonicalRoot: context.canonicalRoot,
+      rootDevice: context.rootDevice,
+      rootInode: context.rootInode,
+      rootBirthtimeNs: context.rootBirthtimeNs,
+      runtimePolicyVersion: context.runtimePolicyVersion,
+      egressPolicyVersion: context.egressPolicyVersion,
+      runtimeImageDigest: context.runtimeImageDigest,
+      policyFingerprint: context.policyFingerprint,
+    },
+  } as Prisma.InputJsonObject;
+}
+
 /**
  * Claims the same durable, project-wide CAS slot as a user turn before a route
  * is allowed to attest, stop, recreate, or otherwise mutate provider runtime.
@@ -528,6 +577,7 @@ export async function acquireProjectChatRuntimeAdmission(input: StateKey & {
   operation: string;
   leaseOwner: string;
   expectedVersion: number;
+  recoveryExecutionContext?: ProjectSandboxExecutionContext;
   leaseDurationMs?: number;
   now?: Date;
 }, database: ProjectChatLeaseDatabase = defaultDatabase): Promise<ProjectChatRuntimeAdmissionGrant> {
@@ -544,6 +594,9 @@ export async function acquireProjectChatRuntimeAdmission(input: StateKey & {
     requestId: `${PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX}${operation}:${crypto.randomUUID()}`,
     leaseOwner: input.leaseOwner,
     expectedVersion: input.expectedVersion,
+    initialResultMetadata: input.recoveryExecutionContext
+      ? runtimeAdmissionRecoveryMetadata(input.recoveryExecutionContext, input)
+      : undefined,
     leaseDurationMs: input.leaseDurationMs,
     now: input.now,
   }, database);
@@ -886,6 +939,7 @@ export async function withProjectChatRuntimeAdmission<T>(input: StateKey & {
   operation: string;
   leaseOwner: string;
   expectedVersion: number;
+  recoveryExecutionContext?: ProjectSandboxExecutionContext;
   leaseDurationMs?: number;
   requestedProviderAfterSuccess?: ProjectChatPersistedProvider;
   now?: Date;
@@ -1326,6 +1380,206 @@ export async function recoverExpiredProjectChatTurnAfterProviderTerminal(input: 
       throw new ProjectChatLeaseError(
         'VERSION_CONFLICT',
         'Project Chat state changed during restart recovery',
+      );
+    }
+    return transaction.projectChatTurn.findUnique({ where: { id: turnId } }) as Promise<ProjectChatTurn>;
+  });
+}
+
+const NATIVE_RESTART_RECOVERY_PROVIDERS = new Set<AgentProviderType>([
+  AgentProviderType.CLAUDE_CODE,
+  AgentProviderType.CODEX,
+  AgentProviderType.AGENT_ZERO,
+  AgentProviderType.GEMINI,
+  AgentProviderType.OLLAMA,
+]);
+
+/**
+ * Release one expired native Project operation only after an out-of-
+ * transaction provider boundary has stopped/restarted the exact immutable
+ * actor/project runtime (or proved it absent). Unlike the OpenClaw history
+ * path above, this also covers management admissions: their route process can
+ * die while qualifying or switching a provider before a session exists.
+ */
+export async function recoverExpiredProjectChatOperationAfterNativeQuiescence(input: StateKey & {
+  turnId: string;
+  expectedSelectedProvider: ProjectChatPersistedProvider;
+  expectedRuntime: string;
+  expectedLeaseOwner: string;
+  quiescedProvider: ProjectChatPersistedProvider;
+  quiescenceBoundary: 'container-stopped' | 'container-restarted' | 'runtime-absent';
+  quiescenceEvidence: string;
+  providerSessionId?: string | null;
+  now?: Date;
+}, database: ProjectChatLeaseDatabase = defaultDatabase): Promise<ProjectChatTurn> {
+  const key = normalizeStateKey(input);
+  const turnId = requiredIdentifier(input.turnId, 'turn ID');
+  const expectedSelectedProvider = persistedProvider(input.expectedSelectedProvider);
+  const expectedRuntime = requiredIdentifier(input.expectedRuntime, 'Project runtime');
+  const expectedLeaseOwner = requiredIdentifier(input.expectedLeaseOwner, 'lease owner');
+  const quiescedProvider = persistedProvider(input.quiescedProvider);
+  if (!NATIVE_RESTART_RECOVERY_PROVIDERS.has(quiescedProvider)) {
+    throw new ProjectChatLeaseError(
+      'INVALID_INPUT',
+      'Restart recovery requires an attested native Project provider',
+      400,
+    );
+  }
+  const registeredRuntime = getProjectChatProviderRuntimeDescriptor(
+    quiescedProvider as NativeProjectProvider,
+  ).runtime;
+  if (registeredRuntime !== expectedRuntime) {
+    throw new ProjectChatLeaseError(
+      'PROVIDER_MISMATCH',
+      'Native quiescence provider does not own the expired Project runtime',
+    );
+  }
+  const boundary = String(input.quiescenceBoundary || '').trim();
+  if (!['container-stopped', 'container-restarted', 'runtime-absent'].includes(boundary)) {
+    throw new ProjectChatLeaseError('INVALID_INPUT', 'Invalid native quiescence boundary', 400);
+  }
+  const quiescenceEvidence = requiredIdentifier(input.quiescenceEvidence, 'native quiescence evidence');
+  if (!/^[a-f0-9]{64}$/.test(quiescenceEvidence)) {
+    throw new ProjectChatLeaseError('INVALID_INPUT', 'Invalid native quiescence evidence', 400);
+  }
+  const providerSessionId = input.providerSessionId == null
+    ? null
+    : requiredIdentifier(input.providerSessionId, 'provider session ID');
+  const now = input.now || new Date();
+
+  return serializable(database, async (transaction) => {
+    const turn = await transaction.projectChatTurn.findUnique({ where: { id: turnId } });
+    if (!turn || turn.actorUserId !== key.actorUserId || turn.projectIdentityId !== key.projectIdentityId) {
+      throw new ProjectChatLeaseError('TURN_NOT_FOUND', 'Project Chat turn was not found', 404);
+    }
+    if (isTerminal(turn.status)) return turn;
+    const runtimeAdmission = isProjectChatRuntimeAdmissionTurn(turn);
+    if (
+      turn.provider !== expectedSelectedProvider
+      || turn.runtime !== expectedRuntime
+      || turn.leaseOwner !== expectedLeaseOwner
+      || turn.leaseExpiresAt.getTime() > now.getTime()
+    ) {
+      throw new ProjectChatLeaseError(
+        'PROVIDER_MISMATCH',
+        'Native quiescence evidence does not match the expired Project operation',
+      );
+    }
+    if (!runtimeAdmission) {
+      if (
+        turn.provider !== quiescedProvider
+        || !providerSessionId
+        || turn.providerSessionId !== providerSessionId
+      ) {
+        throw new ProjectChatLeaseError(
+          'PROVIDER_MISMATCH',
+          'Native turn quiescence does not match its provider session',
+        );
+      }
+    }
+
+    const state = await transaction.projectChatState.findUnique({
+      where: { actorUserId_projectIdentityId: key },
+    });
+    if (
+      !state
+      || state.activeTurnId !== turnId
+      || state.selectedProvider !== expectedSelectedProvider
+    ) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'Expired native Project operation is detached from its project',
+        500,
+      );
+    }
+    if (!runtimeAdmission) {
+      const binding = await transaction.projectChatProviderBinding.findUnique({
+        where: {
+          userId_projectId_provider: {
+            userId: key.actorUserId,
+            projectId: key.projectIdentityId,
+            provider: quiescedProvider,
+          },
+        },
+      });
+      const boundSessions = new Set(
+        [binding?.sessionKey, binding?.externalSessionId]
+          .map((value) => String(value || '').trim())
+          .filter(Boolean),
+      );
+      if (
+        !binding
+        || binding.status !== 'active'
+        || binding.runtime !== expectedRuntime
+        || !providerSessionId
+        || !boundSessions.has(providerSessionId)
+      ) {
+        throw new ProjectChatLeaseError(
+          'STATE_CORRUPT',
+          'Expired native Project turn no longer matches its provider binding',
+          500,
+        );
+      }
+    }
+
+    const existingMetadata = turn.resultMetadata
+      && typeof turn.resultMetadata === 'object'
+      && !Array.isArray(turn.resultMetadata)
+      ? turn.resultMetadata as Record<string, unknown>
+      : {};
+    const finalized = await transaction.projectChatTurn.updateMany({
+      where: {
+        id: turnId,
+        status: { in: ACTIVE_TURN_STATUSES },
+        provider: expectedSelectedProvider,
+        runtime: expectedRuntime,
+        leaseOwner: expectedLeaseOwner,
+        leaseExpiresAt: { lte: now },
+        ...(runtimeAdmission
+          ? { requestId: { startsWith: PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX } }
+          : { providerSessionId }),
+      },
+      data: {
+        status: runtimeAdmission ? ProjectChatTurnStatus.ERROR : ProjectChatTurnStatus.EXPIRED,
+        activeProjectKey: null,
+        completedAt: now,
+        errorCode: runtimeAdmission
+          ? 'PORTAL_RESTART_NATIVE_RUNTIME_ADMISSION'
+          : 'PORTAL_RESTART_NATIVE_TURN_QUIESCENT',
+        errorMessage: runtimeAdmission
+          ? 'Portal restarted during a provider runtime operation. The exact native runtime was made quiescent; prepare the provider again.'
+          : 'Portal restarted before it could record the native provider result. The exact runtime is no longer running; retry the turn if needed.',
+        resultMetadata: {
+          ...existingMetadata,
+          restartRecoveryVersion: 2,
+          restartRecoveryKind: runtimeAdmission ? 'runtime-admission' : 'native-turn',
+          restartRecoveryProvider: quiescedProvider,
+          restartRecoveryBoundary: boundary,
+          restartRecoveryEvidence: quiescenceEvidence,
+          restartRecoveredAt: now.toISOString(),
+          presentationMaterialized: false,
+        } as Prisma.InputJsonValue,
+      },
+    });
+    if (finalized.count !== 1) {
+      throw new ProjectChatLeaseError(
+        'VERSION_CONFLICT',
+        'Native Project operation changed during restart recovery',
+      );
+    }
+    const detached = await transaction.projectChatState.updateMany({
+      where: {
+        id: state.id,
+        activeTurnId: turnId,
+        selectedProvider: expectedSelectedProvider,
+        version: state.version,
+      },
+      data: { activeTurnId: null, version: { increment: 1 } },
+    });
+    if (detached.count !== 1) {
+      throw new ProjectChatLeaseError(
+        'VERSION_CONFLICT',
+        'Project Chat state changed during native restart recovery',
       );
     }
     return transaction.projectChatTurn.findUnique({ where: { id: turnId } }) as Promise<ProjectChatTurn>;

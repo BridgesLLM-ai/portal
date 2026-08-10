@@ -20,6 +20,7 @@ import { getProviderCapabilities } from '../providerAvailability';
 import { assertExecutionContextBinding, assertProviderSupportsExecutionScope } from '../executionScope';
 import { prisma } from '../../config/database';
 import { isHostAdoptableOpenClawSession } from '../openclawSessionOwnership';
+import { buildPortalOpenClawIdempotencyKey } from './PortalMessageIdentity';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -498,7 +499,7 @@ export class OpenClawProvider implements AgentProvider {
       ? sender.requestId.trim()
       : '';
     const idempotencyKey = durableRequestId
-      ? `portal-${durableRequestId}`
+      ? buildPortalOpenClawIdempotencyKey(durableRequestId, sender?.clientMessageId)
       : `portal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     debugLog(`sendMessage: sessionId=${sessionId} idempotencyKey=${idempotencyKey} sender=${sender?.label || 'anonymous'}`);

@@ -5,6 +5,49 @@ import {
   workspaceAuthorizedFetch,
 } from '../utils/workspaceAuthorizedFetch';
 
+export type ShareRateLimitWindowSeconds = 60 | 300 | 3600;
+
+export interface ShareLinkPolicyOptions {
+  expiresAt?: string;
+  maxUses?: number;
+  rateLimitMaxRequests?: number;
+  rateLimitWindowSeconds?: ShareRateLimitWindowSeconds;
+}
+
+export interface ProjectShareCreateOptions extends ShareLinkPolicyOptions {
+  isPublic?: boolean;
+  password?: string;
+}
+
+export interface ProjectShareLink {
+  id: string;
+  token: string;
+  isActive: boolean;
+  isPublic: boolean;
+  currentUses: number;
+  maxUses: number | null;
+  rateLimitMaxRequests: number | null;
+  rateLimitWindowSeconds: ShareRateLimitWindowSeconds | null;
+  expiresAt: string | null;
+  createdAt: string;
+}
+
+export interface ProjectShareCreateResponse {
+  shareLink: ProjectShareLink;
+  url: string;
+  hostedUrl: string;
+}
+
+export interface ProjectShareListResponse {
+  shares: ProjectShareLink[];
+}
+
+export interface ProjectShareUpdateOptions {
+  isPublic?: boolean;
+  password?: string;
+  isActive?: boolean;
+}
+
 export type ProjectChatProviderName =
   | 'OPENCLAW'
   | 'CLAUDE_CODE'
@@ -49,6 +92,12 @@ export interface ProjectChatProviderBinding {
   policyFingerprint: string;
 }
 
+export interface ProjectChatExecutionContextRef {
+  scope: 'PROJECT_SANDBOX';
+  projectId: string;
+  policyFingerprint: string;
+}
+
 export interface ProjectChatProviderCapabilitiesResponse {
   migration?: {
     required: true;
@@ -60,11 +109,7 @@ export interface ProjectChatProviderCapabilitiesResponse {
   providers: ProjectChatProviderCapability[];
   supportedProviders: ProjectChatProviderCapability[];
   bindings: ProjectChatProviderBinding[];
-  executionContext: {
-    scope: 'PROJECT_SANDBOX';
-    projectId: string;
-    policyFingerprint: string;
-  } | null;
+  executionContext: ProjectChatExecutionContextRef | null;
   /**
    * Present when the server-selected provider's own runtime is not installed
    * on this server. This is a different problem from "not verified yet" and
@@ -145,9 +190,26 @@ export interface ProjectChatHistoryPage {
     nextCursor: string | null;
     limit: number;
   };
-  session?: Record<string, unknown> | null;
-  activeBinding?: Record<string, unknown> | null;
-  executionContext?: Record<string, unknown> | null;
+  session: {
+    status: string;
+    model: string | null;
+    activeProvider: ProjectChatProviderName;
+    runtime: string | null;
+    lastActivity: string | null;
+    requiresPreparation?: boolean;
+    staleReason?: string | null;
+  };
+  activeBinding: {
+    provider: ProjectChatProviderName;
+    runtime: string;
+    sessionKey?: string | null;
+    externalSessionId?: string | null;
+    model: string | null;
+    status?: string;
+    requiresPreparation?: boolean;
+    staleReason?: string | null;
+  } | null;
+  executionContext: ProjectChatExecutionContextRef;
 }
 
 export interface ProjectChatSendRequest {
@@ -232,7 +294,7 @@ export const appsAPI = {
     });
     return data;
   },
-  createShareLink: async (id: string, options?: { expiresAt?: string; maxUses?: number }) => {
+  createShareLink: async (id: string, options: ShareLinkPolicyOptions = {}) => {
     const { data } = await client.post(`/apps/${id}/share`, options || {});
     return data;
   },
@@ -371,8 +433,179 @@ export interface ProjectIdentityProof {
   generation: number;
 }
 
+export type ProjectRuntimeRecoveryReplayProof = Readonly<{
+  proof: string;
+  action: 'deploy' | 'start' | 'restart';
+  projectIdentity: ProjectIdentityProof;
+  expectedAppId: string | null;
+  expectedDeployType?: 'fullstack';
+  sourceDigest?: string;
+}>;
+
+export type ProjectRuntimeRecoveryCompletion = Readonly<{
+  success: true;
+  action: 'deploy' | 'start' | 'restart';
+  projectIdentityId: string;
+  projectIdentityGeneration: number;
+  appId: string;
+  deploymentRevision: string;
+}>;
+
+export type ProjectHostedDeploySuccess = Readonly<{
+  message: 'Deployed';
+  appId: string;
+  name: string;
+  url: string;
+  deployType: 'static' | 'fullstack';
+  port?: number;
+  buildOutput?: string;
+}>;
+
+export type ProjectDesktopRuntimeDeploySuccess = Readonly<{
+  message: 'Running on Remote Desktop';
+  appId: string;
+  name: string;
+  deployType: 'runtime';
+  buildOutput?: string;
+}>;
+
+export type ProjectDeploySuccess = ProjectHostedDeploySuccess | ProjectDesktopRuntimeDeploySuccess;
+
+export function projectRuntimeRecoveryCompletion(
+  value: unknown,
+  replay: ProjectRuntimeRecoveryReplayProof,
+): ProjectRuntimeRecoveryCompletion | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const expectedKeys = [
+    'action',
+    'appId',
+    'deploymentRevision',
+    'projectIdentityGeneration',
+    'projectIdentityId',
+    'success',
+  ];
+  if (
+    Object.keys(record).sort().some((key, index) => key !== expectedKeys[index])
+    || Object.keys(record).length !== expectedKeys.length
+    || record.success !== true
+    || record.action !== replay.action
+    || record.projectIdentityId !== replay.projectIdentity.id
+    || record.projectIdentityGeneration !== replay.projectIdentity.generation
+    || typeof record.appId !== 'string'
+    || !record.appId
+    || record.appId.length > 255
+    || (replay.expectedAppId !== null && record.appId !== replay.expectedAppId)
+    || !/^(?:0|[1-9][0-9]*)$/.test(String(record.deploymentRevision || ''))
+  ) return null;
+  return record as unknown as ProjectRuntimeRecoveryCompletion;
+}
+
+function validateProjectDeploySuccess(
+  value: unknown,
+  replay?: ProjectRuntimeRecoveryReplayProof,
+): ProjectDeploySuccess {
+  const record = requireRecord(value, 'Project deployment');
+  const commonKeys = ['appId', 'buildOutput', 'deployType', 'message', 'name'];
+  const runtimeResponse = record.deployType === 'runtime';
+  const allowedKeys = new Set(runtimeResponse
+    ? commonKeys
+    : [...commonKeys, 'port', 'url']);
+  if (
+    Object.keys(record).some((key) => !allowedKeys.has(key))
+    || typeof record.appId !== 'string'
+    || !record.appId
+    || record.appId.length > 255
+    || typeof record.name !== 'string'
+    || !record.name
+    || new TextEncoder().encode(record.name).byteLength > 255
+    || !['static', 'fullstack', 'runtime'].includes(String(record.deployType))
+    || (record.buildOutput !== undefined && typeof record.buildOutput !== 'string')
+    || (replay?.action === 'deploy' && replay.expectedDeployType !== record.deployType)
+    || (replay?.expectedAppId !== null && replay?.expectedAppId !== undefined && record.appId !== replay.expectedAppId)
+    || (runtimeResponse
+      ? record.message !== 'Running on Remote Desktop'
+        || record.url !== undefined
+        || record.port !== undefined
+      : record.message !== 'Deployed'
+        || typeof record.url !== 'string'
+        || !/^\/hosted\/[A-Za-z0-9_-]+\/$/.test(record.url)
+        || (record.port !== undefined && (!Number.isInteger(record.port) || Number(record.port) < 1 || Number(record.port) > 65535)))
+  ) {
+    throw new Error('Project deployment response is malformed');
+  }
+  if (runtimeResponse) {
+    return Object.freeze({
+      message: 'Running on Remote Desktop',
+      appId: record.appId as string,
+      name: record.name as string,
+      deployType: 'runtime',
+      ...(record.buildOutput !== undefined ? { buildOutput: record.buildOutput as string } : {}),
+    });
+  }
+  return Object.freeze({
+    message: 'Deployed',
+    appId: record.appId as string,
+    name: record.name as string,
+    url: record.url as string,
+    deployType: record.deployType as ProjectHostedDeploySuccess['deployType'],
+    ...(record.port !== undefined ? { port: Number(record.port) } : {}),
+    ...(record.buildOutput !== undefined ? { buildOutput: record.buildOutput } : {}),
+  });
+}
+
+export interface ProjectAvailability {
+  available: false;
+  code: 'PROJECT_IDENTITY_RECONCILIATION_REQUIRED'
+    | 'PROJECT_LIFECYCLE_RECONCILIATION_REQUIRED'
+    | 'PROJECT_LIFECYCLE_RECOVERY_PENDING';
+  message: string;
+  action: 'RECONCILE_PROJECT_IDENTITY' | 'RECONCILE_PROJECT_LIFECYCLE' | 'RETRY';
+  retryable: boolean;
+}
+
+export type ProjectRuntimeManagement =
+  | 'portal-container'
+  | 'external-loopback'
+  | 'desktop-session'
+  | 'static';
+
+export type ProjectRuntimeStatusSource =
+  | 'portal-manager'
+  | 'persisted-app'
+  | 'external-binding'
+  | 'deployment-record';
+
+export type ProjectProcessAction = 'start' | 'stop' | 'restart' | 'status' | 'logs';
+
+export type ProjectDetectedDeployType = 'static' | 'fullstack' | 'runtime';
+
+export type ProjectLifecycleAction =
+  | 'redeploy'
+  | 'undeploy'
+  | 'rename-project'
+  | 'delete-project';
+
+export interface ProjectDeploymentProcessState {
+  status: string;
+  deployType: string;
+  runtimeManagement: ProjectRuntimeManagement;
+  statusSource: ProjectRuntimeStatusSource;
+  supportedActions: ProjectProcessAction[];
+  port?: number;
+  logs: string[];
+  restartCount: number;
+  persistedStatus?: string | null;
+  recoveryRequired?: boolean;
+  lastError?: string;
+  limitation?: string;
+  message?: string;
+}
+
 export interface ProjectSummary {
   name: string;
+  /** Server-owned source classification. Unavailable lifecycle rows may omit it. */
+  detectedDeployType?: ProjectDetectedDeployType;
   hasGit: boolean;
   currentBranch: string;
   deployedUrl: string;
@@ -383,6 +616,13 @@ export interface ProjectSummary {
     appId: string;
     deployType: 'static' | 'fullstack' | 'runtime' | string;
     processStatus: string;
+    runtimeManagement: ProjectRuntimeManagement;
+    statusSource: ProjectRuntimeStatusSource;
+    supportedLifecycleActions: ProjectLifecycleAction[];
+    /** Present only when a server-managed APP_API_TARGET binding exists but is invalid. */
+    bindingStatus?: 'invalid';
+    configurationCode?: 'PROJECT_RUNTIME_BINDING_INVALID';
+    limitation?: string;
     port: number | null;
     isActive: boolean;
   } | null;
@@ -390,6 +630,7 @@ export interface ProjectSummary {
     allowed: boolean;
     reason: string | null;
   };
+  availability?: ProjectAvailability;
 }
 
 export interface ProjectTreeEntry {
@@ -411,6 +652,118 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
     throw new Error(`${label} is malformed`);
   }
   return value as Record<string, unknown>;
+}
+
+const projectRuntimeManagementValues = new Set<ProjectRuntimeManagement>([
+  'portal-container',
+  'external-loopback',
+  'desktop-session',
+  'static',
+]);
+
+const projectRuntimeStatusSourceValues = new Set<ProjectRuntimeStatusSource>([
+  'portal-manager',
+  'persisted-app',
+  'external-binding',
+  'deployment-record',
+]);
+
+const projectProcessActionValues = new Set<ProjectProcessAction>([
+  'start',
+  'stop',
+  'restart',
+  'status',
+  'logs',
+]);
+
+const portalManagerProcessActions: ProjectProcessAction[] = [
+  'start',
+  'stop',
+  'restart',
+  'status',
+  'logs',
+];
+const portalRecoveryProcessActions: ProjectProcessAction[] = ['start', 'stop', 'status'];
+const portalSettledProcessActions: ProjectProcessAction[] = ['start', 'status'];
+
+const projectDetectedDeployTypeValues = new Set<ProjectDetectedDeployType>([
+  'static',
+  'fullstack',
+  'runtime',
+]);
+
+const projectLifecycleActionValues = new Set<ProjectLifecycleAction>([
+  'redeploy',
+  'undeploy',
+  'rename-project',
+  'delete-project',
+]);
+
+function isProjectRuntimeManagement(value: unknown): value is ProjectRuntimeManagement {
+  return typeof value === 'string'
+    && projectRuntimeManagementValues.has(value as ProjectRuntimeManagement);
+}
+
+function isProjectRuntimeStatusSource(value: unknown): value is ProjectRuntimeStatusSource {
+  return typeof value === 'string'
+    && projectRuntimeStatusSourceValues.has(value as ProjectRuntimeStatusSource);
+}
+
+function projectRuntimeMetadataIsCoherent(
+  runtimeManagement: ProjectRuntimeManagement,
+  statusSource: ProjectRuntimeStatusSource,
+): boolean {
+  switch (runtimeManagement) {
+    case 'external-loopback': return statusSource === 'external-binding';
+    case 'static': return statusSource === 'deployment-record';
+    case 'desktop-session': return statusSource === 'persisted-app';
+    case 'portal-container': return statusSource === 'portal-manager' || statusSource === 'persisted-app';
+  }
+}
+
+function projectRuntimeDeployTypeIsCoherent(
+  deployType: string,
+  runtimeManagement: ProjectRuntimeManagement,
+): boolean {
+  switch (runtimeManagement) {
+    case 'portal-container': return deployType === 'fullstack';
+    case 'external-loopback': return deployType === 'fullstack' || deployType === 'static';
+    case 'desktop-session': return deployType === 'runtime';
+    case 'static': return deployType === 'static';
+  }
+}
+
+function projectLifecycleActionsAreCoherent(
+  deployType: string,
+  detectedDeployType: ProjectDetectedDeployType,
+  runtimeManagement: ProjectRuntimeManagement,
+  destructiveActionsAllowed: boolean,
+  actions: unknown[],
+  bindingStatus: 'invalid' | undefined,
+): boolean {
+  const expected: ProjectLifecycleAction[] = runtimeManagement === 'external-loopback'
+    ? bindingStatus === 'invalid'
+      ? []
+      : deployType === 'static' && detectedDeployType === 'static'
+        ? ['redeploy']
+        : []
+    : [
+        'redeploy',
+        'undeploy',
+        ...(destructiveActionsAllowed
+          ? ['rename-project', 'delete-project'] as ProjectLifecycleAction[]
+          : []),
+      ];
+  return actions.length === expected.length
+    && expected.every((action) => actions.includes(action));
+}
+
+function projectProcessActionsMatch(
+  actions: unknown[],
+  expected: ProjectProcessAction[],
+): boolean {
+  return actions.length === expected.length
+    && expected.every((action) => actions.includes(action));
 }
 
 export function validateProjectIdentityProof(value: unknown): ProjectIdentityProof {
@@ -437,9 +790,30 @@ function validateProjectSummary(value: unknown): ProjectSummary {
   const deployment = record.deployment === null || record.deployment === undefined
     ? null
     : requireRecord(record.deployment, 'Project deployment summary');
+  const availability = record.availability === null || record.availability === undefined
+    ? null
+    : requireRecord(record.availability, 'Project availability');
+  const availabilityCodes = new Set([
+    'PROJECT_IDENTITY_RECONCILIATION_REQUIRED',
+    'PROJECT_LIFECYCLE_RECONCILIATION_REQUIRED',
+    'PROJECT_LIFECYCLE_RECOVERY_PENDING',
+  ]);
+  const availabilityActions = new Set([
+    'RECONCILE_PROJECT_IDENTITY',
+    'RECONCILE_PROJECT_LIFECYCLE',
+    'RETRY',
+  ]);
+  const detectedDeployType = record.detectedDeployType as ProjectDetectedDeployType;
+  const deploymentBindingStatus = deployment?.bindingStatus === undefined
+    ? undefined
+    : deployment.bindingStatus;
   if (
     typeof record.name !== 'string'
     || !record.name
+    || (availability === null
+      ? !projectDetectedDeployTypeValues.has(record.detectedDeployType as ProjectDetectedDeployType)
+      : record.detectedDeployType !== undefined
+        && !projectDetectedDeployTypeValues.has(record.detectedDeployType as ProjectDetectedDeployType))
     || typeof record.hasGit !== 'boolean'
     || typeof record.currentBranch !== 'string'
     || typeof record.deployedUrl !== 'string'
@@ -447,12 +821,62 @@ function validateProjectSummary(value: unknown): ProjectSummary {
     || typeof record.updatedAt !== 'string'
     || typeof destructiveActions.allowed !== 'boolean'
     || (destructiveActions.reason !== null && typeof destructiveActions.reason !== 'string')
+    || (availability !== null && (
+      availability.available !== false
+      || typeof availability.code !== 'string'
+      || !availabilityCodes.has(availability.code)
+      || typeof availability.message !== 'string'
+      || !availability.message
+      || typeof availability.action !== 'string'
+      || !availabilityActions.has(availability.action)
+      || typeof availability.retryable !== 'boolean'
+    ))
     || (deployment !== null && (
       typeof deployment.appId !== 'string'
       || !deployment.appId
       || typeof deployment.deployType !== 'string'
       || !deployment.deployType
       || typeof deployment.processStatus !== 'string'
+      || !isProjectRuntimeManagement(deployment.runtimeManagement)
+      || !isProjectRuntimeStatusSource(deployment.statusSource)
+      || !projectRuntimeMetadataIsCoherent(
+        deployment.runtimeManagement as ProjectRuntimeManagement,
+        deployment.statusSource as ProjectRuntimeStatusSource,
+      )
+      || !projectRuntimeDeployTypeIsCoherent(
+        deployment.deployType,
+        deployment.runtimeManagement as ProjectRuntimeManagement,
+      )
+      || !Array.isArray(deployment.supportedLifecycleActions)
+      || deployment.supportedLifecycleActions.some((action) => (
+        typeof action !== 'string'
+        || !projectLifecycleActionValues.has(action as ProjectLifecycleAction)
+      ))
+      || new Set(deployment.supportedLifecycleActions).size
+        !== deployment.supportedLifecycleActions.length
+      || !projectLifecycleActionsAreCoherent(
+        deployment.deployType,
+        detectedDeployType,
+        deployment.runtimeManagement as ProjectRuntimeManagement,
+        destructiveActions.allowed,
+        deployment.supportedLifecycleActions,
+        deploymentBindingStatus as 'invalid' | undefined,
+      )
+      || (deployment.runtimeManagement === 'external-loopback'
+        && destructiveActions.allowed !== false)
+      || (deploymentBindingStatus !== undefined && (
+        deploymentBindingStatus !== 'invalid'
+        || deployment.runtimeManagement !== 'external-loopback'
+        || deployment.statusSource !== 'external-binding'
+        || deployment.configurationCode !== 'PROJECT_RUNTIME_BINDING_INVALID'
+        || typeof deployment.limitation !== 'string'
+        || !deployment.limitation
+        || deployment.limitation.length > 2_000
+      ))
+      || (deploymentBindingStatus === undefined && (
+        deployment.configurationCode !== undefined
+        || deployment.limitation !== undefined
+      ))
       || (deployment.port !== null && (
         typeof deployment.port !== 'number'
         || !Number.isSafeInteger(deployment.port)
@@ -466,6 +890,9 @@ function validateProjectSummary(value: unknown): ProjectSummary {
   }
   return {
     name: record.name,
+    ...(record.detectedDeployType === undefined ? {} : {
+      detectedDeployType: record.detectedDeployType as ProjectDetectedDeployType,
+    }),
     hasGit: record.hasGit,
     currentBranch: record.currentBranch,
     deployedUrl: record.deployedUrl,
@@ -476,6 +903,14 @@ function validateProjectSummary(value: unknown): ProjectSummary {
       appId: deployment.appId as string,
       deployType: deployment.deployType as string,
       processStatus: deployment.processStatus as string,
+      runtimeManagement: deployment.runtimeManagement as ProjectRuntimeManagement,
+      statusSource: deployment.statusSource as ProjectRuntimeStatusSource,
+      supportedLifecycleActions: deployment.supportedLifecycleActions as ProjectLifecycleAction[],
+      ...(deploymentBindingStatus === 'invalid' ? {
+        bindingStatus: 'invalid' as const,
+        configurationCode: 'PROJECT_RUNTIME_BINDING_INVALID' as const,
+        limitation: deployment.limitation as string,
+      } : {}),
       port: deployment.port as number | null,
       isActive: deployment.isActive as boolean,
     } : null,
@@ -483,6 +918,15 @@ function validateProjectSummary(value: unknown): ProjectSummary {
       allowed: destructiveActions.allowed,
       reason: destructiveActions.reason as string | null,
     },
+    ...(availability ? {
+      availability: {
+        available: false as const,
+        code: availability.code as ProjectAvailability['code'],
+        message: availability.message as string,
+        action: availability.action as ProjectAvailability['action'],
+        retryable: availability.retryable as boolean,
+      },
+    } : {}),
   };
 }
 
@@ -490,6 +934,80 @@ export function validateProjectListResponse(value: unknown): { projects: Project
   const record = requireRecord(value, 'Project inventory');
   if (!Array.isArray(record.projects)) throw new Error('Project inventory is malformed');
   return { projects: record.projects.map(validateProjectSummary) };
+}
+
+export function validateProjectDeploymentProcessState(value: unknown): ProjectDeploymentProcessState {
+  const record = requireRecord(value, 'Project deployment process');
+  const runtimeManagement = record.runtimeManagement as ProjectRuntimeManagement;
+  const statusSource = record.statusSource as ProjectRuntimeStatusSource;
+  const recoveryRequired = record.recoveryRequired === true;
+  const supportedActions = Array.isArray(record.supportedActions)
+    ? record.supportedActions
+    : [];
+  const logs = Array.isArray(record.logs) ? record.logs : [];
+  const restartCount = record.restartCount as number;
+  const portalManagerState = runtimeManagement === 'portal-container'
+    && statusSource === 'portal-manager';
+  const portalRecoveryState = runtimeManagement === 'portal-container'
+    && statusSource === 'persisted-app'
+    && recoveryRequired;
+  const portalSettledState = runtimeManagement === 'portal-container'
+    && statusSource === 'persisted-app'
+    && !recoveryRequired;
+  const actionsAreCoherent = runtimeManagement !== 'portal-container'
+    ? supportedActions.length === 0
+    : portalManagerState
+      ? projectProcessActionsMatch(supportedActions, portalManagerProcessActions)
+      : portalRecoveryState
+        ? projectProcessActionsMatch(supportedActions, portalRecoveryProcessActions)
+        : portalSettledState
+          ? projectProcessActionsMatch(supportedActions, portalSettledProcessActions)
+          : false;
+  const runtimeEvidenceIsCoherent = portalManagerState
+    ? record.port !== undefined && !recoveryRequired
+    : record.port === undefined
+      && logs.length === 0
+      && restartCount === 0
+      && (portalRecoveryState || !recoveryRequired);
+  if (
+    typeof record.status !== 'string'
+    || !record.status
+    || typeof record.deployType !== 'string'
+    || !record.deployType
+    || !isProjectRuntimeManagement(record.runtimeManagement)
+    || !isProjectRuntimeStatusSource(record.statusSource)
+    || !projectRuntimeMetadataIsCoherent(runtimeManagement, statusSource)
+    || !projectRuntimeDeployTypeIsCoherent(record.deployType, runtimeManagement)
+    || !Array.isArray(record.supportedActions)
+    || supportedActions.some((action) => (
+      typeof action !== 'string'
+      || !projectProcessActionValues.has(action as ProjectProcessAction)
+    ))
+    || new Set(supportedActions).size !== supportedActions.length
+    || !Array.isArray(record.logs)
+    || logs.some((entry) => typeof entry !== 'string')
+    || !Number.isSafeInteger(record.restartCount)
+    || (record.restartCount as number) < 0
+    || (record.port !== undefined && (
+      typeof record.port !== 'number'
+      || !Number.isSafeInteger(record.port)
+      || (record.port as number) < 1
+      || (record.port as number) > 65535
+    ))
+    || (record.persistedStatus !== undefined
+      && record.persistedStatus !== null
+      && typeof record.persistedStatus !== 'string')
+    || (record.recoveryRequired !== undefined && typeof record.recoveryRequired !== 'boolean')
+    || (record.lastError !== undefined && typeof record.lastError !== 'string')
+    || (record.limitation !== undefined && typeof record.limitation !== 'string')
+    || (record.message !== undefined && typeof record.message !== 'string')
+    || !actionsAreCoherent
+    || !runtimeEvidenceIsCoherent
+  ) {
+    throw new Error('Project deployment process response is malformed');
+  }
+
+  return record as unknown as ProjectDeploymentProcessState;
 }
 
 function validateProjectTreeEntry(value: unknown): ProjectTreeEntry {
@@ -573,9 +1091,79 @@ export interface AgentZeroProjectModelCatalog {
   }>;
 }
 
+const projectChatProviderNames = new Set<ProjectChatProviderName>([
+  'OPENCLAW',
+  'CLAUDE_CODE',
+  'CODEX',
+  'GROK',
+  'AGENT_ZERO',
+  'GEMINI',
+  'OLLAMA',
+]);
+
+function isProjectChatProviderName(value: unknown): value is ProjectChatProviderName {
+  return typeof value === 'string'
+    && projectChatProviderNames.has(value as ProjectChatProviderName);
+}
+
+/**
+ * Project Chat history carries the immutable project proof used to bind the
+ * rendered transcript. Treat a malformed response as a recoverable panel read
+ * failure instead of letting arbitrary records flow into session state.
+ */
+export function validateProjectChatHistoryPage(value: unknown): ProjectChatHistoryPage {
+  const record = requireRecord(value, 'Project Chat history');
+  const pagination = requireRecord(record.pagination, 'Project Chat history pagination');
+  const session = requireRecord(record.session, 'Project Chat history session');
+  const executionContext = requireRecord(
+    record.executionContext,
+    'Project Chat history execution context',
+  );
+  const activeBinding = record.activeBinding === null
+    ? null
+    : requireRecord(record.activeBinding, 'Project Chat history binding');
+
+  if (
+    !Array.isArray(record.messages)
+    || typeof pagination.hasMore !== 'boolean'
+    || (pagination.nextCursor !== null && typeof pagination.nextCursor !== 'string')
+    || !Number.isSafeInteger(pagination.limit)
+    || Number(pagination.limit) < 1
+    || Number(pagination.limit) > 100
+    || (pagination.hasMore === true && !(typeof pagination.nextCursor === 'string' && pagination.nextCursor))
+    || typeof session.status !== 'string'
+    || !isProjectChatProviderName(session.activeProvider)
+    || (session.model !== null && typeof session.model !== 'string')
+    || (session.runtime !== null && typeof session.runtime !== 'string')
+    || (session.lastActivity !== null && typeof session.lastActivity !== 'string')
+    || (session.requiresPreparation !== undefined && typeof session.requiresPreparation !== 'boolean')
+    || (session.staleReason !== undefined && session.staleReason !== null && typeof session.staleReason !== 'string')
+    || executionContext.scope !== 'PROJECT_SANDBOX'
+    || typeof executionContext.projectId !== 'string'
+    || !executionContext.projectId.trim()
+    || typeof executionContext.policyFingerprint !== 'string'
+    || !executionContext.policyFingerprint.trim()
+    || (activeBinding !== null && (
+      !isProjectChatProviderName(activeBinding.provider)
+      || typeof activeBinding.runtime !== 'string'
+      || !activeBinding.runtime
+      || (activeBinding.sessionKey !== undefined && activeBinding.sessionKey !== null && typeof activeBinding.sessionKey !== 'string')
+      || (activeBinding.externalSessionId !== undefined && activeBinding.externalSessionId !== null && typeof activeBinding.externalSessionId !== 'string')
+      || (activeBinding.model !== null && typeof activeBinding.model !== 'string')
+      || (activeBinding.status !== undefined && typeof activeBinding.status !== 'string')
+      || (activeBinding.requiresPreparation !== undefined && typeof activeBinding.requiresPreparation !== 'boolean')
+      || (activeBinding.staleReason !== undefined && activeBinding.staleReason !== null && typeof activeBinding.staleReason !== 'string')
+    ))
+  ) {
+    throw new Error('Project Chat history response is malformed');
+  }
+
+  return record as unknown as ProjectChatHistoryPage;
+}
+
 export const projectsAPI = {
   list: async () => {
-    const { data } = await client.get('/projects');
+    const { data } = await client.get('/projects', { _silent: true } as any);
     return validateProjectListResponse(data);
   },
   search: async (query: string, limit = 24, signal?: AbortSignal): Promise<ProjectSearchResponse> => {
@@ -590,8 +1178,16 @@ export const projectsAPI = {
     const { data } = await client.post('/projects/clone', { url, name });
     return data;
   },
-  delete: async (name: string) => {
-    const { data } = await client.delete(`/projects/${projectSegment(name)}`);
+  delete: async (name: string, identity?: ProjectIdentityProof) => {
+    const { data } = await client.delete(
+      `/projects/${projectSegment(name)}`,
+      identity ? {
+        data: {
+          projectIdentityId: identity.id,
+          projectGeneration: identity.generation,
+        },
+      } : undefined,
+    );
     return data;
   },
   rename: async (
@@ -608,7 +1204,10 @@ export const projectsAPI = {
     return validateProjectRenameResponse(data, { name: newName, ...attempt });
   },
   getTree: async (name: string, path?: string) => {
-    const { data } = await client.get(`/projects/${projectSegment(name)}/tree`, { params: { path } });
+    const { data } = await client.get(`/projects/${projectSegment(name)}/tree`, {
+      params: { path },
+      _silent: true,
+    } as any);
     return validateProjectTreeResponse(data);
   },
   readFile: async (name: string, path: string) => {
@@ -639,9 +1238,23 @@ export const projectsAPI = {
     const { data } = await client.post(`/projects/${projectSegment(name)}/git`, { action: 'revert', hash });
     return data;
   },
-  deploy: async (name: string) => {
-    const { data } = await client.post(`/projects/${projectSegment(name)}/deploy`);
-    return data;
+  deploy: async (name: string, recoveryReplay?: ProjectRuntimeRecoveryReplayProof) => {
+    const { data } = recoveryReplay
+      ? await client.post(
+          `/projects/${projectSegment(name)}/deploy`,
+          { recoveryReplay },
+          { _skipNetworkRetry: true } as any,
+        )
+      : await client.post(
+          `/projects/${projectSegment(name)}/deploy`,
+          undefined,
+          { _skipNetworkRetry: true } as any,
+        );
+    if (recoveryReplay) {
+      const completion = projectRuntimeRecoveryCompletion(data, recoveryReplay);
+      if (completion) return completion;
+    }
+    return validateProjectDeploySuccess(data, recoveryReplay);
   },
   undeploy: async (name: string) => {
     const { data } = await client.delete(`/projects/${projectSegment(name)}/deploy`);
@@ -649,20 +1262,22 @@ export const projectsAPI = {
   },
   appProcess: async (
     name: string,
-    action: 'start' | 'stop' | 'restart' | 'status' | 'logs',
-  ): Promise<{
-    status: string;
-    deployType: string;
-    supportedActions: string[];
-    port?: number;
-    logs: string[];
-    restartCount: number;
-    lastError?: string;
-    limitation?: string;
-    message?: string;
-  }> => {
-    const { data } = await client.post(`/projects/${projectSegment(name)}/app-process`, { action });
-    return data;
+    action: ProjectProcessAction,
+    recoveryReplay?: ProjectRuntimeRecoveryReplayProof,
+  ): Promise<ProjectDeploymentProcessState> => {
+    const url = `/projects/${projectSegment(name)}/app-process`;
+    const body = {
+      action,
+      ...(recoveryReplay ? { recoveryReplay } : {}),
+    };
+    const { data } = action === 'status' || action === 'logs'
+      ? await client.post(url, body)
+      : await client.post(url, body, { _skipNetworkRetry: true } as any);
+    if (recoveryReplay && projectRuntimeRecoveryCompletion(data, recoveryReplay)) {
+      const statusResponse = await client.post(url, { action: 'status' });
+      return validateProjectDeploymentProcessState(statusResponse.data);
+    }
+    return validateProjectDeploymentProcessState(data);
   },
   checkDeps: async (name: string) => {
     const { data } = await client.get(`/projects/${projectSegment(name)}/check-deps`);
@@ -672,15 +1287,15 @@ export const projectsAPI = {
     const { data } = await client.post(`/projects/${projectSegment(name)}/doc-update`, { type, description, details });
     return data;
   },
-  share: async (name: string, options?: { expiresAt?: string; maxUses?: number; isPublic?: boolean; password?: string }) => {
+  share: async (name: string, options: ProjectShareCreateOptions = {}): Promise<ProjectShareCreateResponse> => {
     const { data } = await client.post(`/projects/${projectSegment(name)}/share`, options);
     return data;
   },
-  listShares: async (name: string) => {
+  listShares: async (name: string): Promise<ProjectShareListResponse> => {
     const { data } = await client.get(`/projects/${projectSegment(name)}/shares`);
     return data;
   },
-  updateShare: async (name: string, linkId: string, updates: { isPublic?: boolean; password?: string; isActive?: boolean }) => {
+  updateShare: async (name: string, linkId: string, updates: ProjectShareUpdateOptions) => {
     const { data } = await client.patch(`/projects/${projectSegment(name)}/share/${projectLinkSegment(linkId)}`, updates);
     return data;
   },
@@ -713,7 +1328,10 @@ export const projectsAPI = {
   },
   // Portal-owned Project Chat transcript + fail-closed provider bindings.
   projectChatProviders: async (name: string): Promise<ProjectChatProviderCapabilitiesResponse> => {
-    const { data } = await client.get(`/projects/${encodeURIComponent(name)}/chat/providers`);
+    const { data } = await client.get(
+      `/projects/${encodeURIComponent(name)}/chat/providers`,
+      { _silent: true } as any,
+    );
     return data;
   },
   projectChatModels: async (name: string): Promise<{
@@ -728,7 +1346,7 @@ export const projectsAPI = {
   }> => {
     const { data } = await client.get(
       `/projects/${encodeURIComponent(name)}/chat/models`,
-      { params: { provider: 'OPENCLAW' } },
+      { params: { provider: 'OPENCLAW' }, _silent: true } as any,
     );
     return data;
   },
@@ -754,12 +1372,11 @@ export const projectsAPI = {
   },
   agentZeroProjectModels: async (name: string): Promise<AgentZeroProjectModelCatalog> => {
     // Expected-failure probe: hosts without a connected Agent Zero OAuth
-    // account fail this on every Project Chat open, and the provider menu
-    // already renders that state inline. Capturing it lit the global error
-    // badge during perfectly healthy cold opens.
+    // account can fail when the user explicitly reviews that provider, and
+    // the provider menu already renders that state inline.
     const { data } = await client.get(
       `/projects/${encodeURIComponent(name)}/chat/providers/agent-zero/models`,
-      { _silent: true } as any,
+      { _silent: true, _skipNetworkRetry: true } as any,
     );
     return data;
   },
@@ -767,7 +1384,7 @@ export const projectsAPI = {
     const { data } = await client.post(
       `/projects/${encodeURIComponent(name)}/chat/providers/openclaw/qualify`,
       {},
-      { _skipNetworkRetry: true } as any,
+      { _skipNetworkRetry: true, _silent: true } as any,
     );
     return data as {
       provider: 'OPENCLAW';
@@ -794,10 +1411,9 @@ export const projectsAPI = {
         : {},
       // Qualification is a rate-limited, stateful probe. Replaying one click
       // on a 5xx both hides the first failure and consumes the entire allowance.
-      // Keep one captured diagnostic as well as the inline message: the
-      // endpoint/code bundle is what lets an operator distinguish host policy
-      // drift from provider authentication or availability failures.
-      { _skipNetworkRetry: true } as any,
+      // Project Chat presents the bounded provider failure and operator
+      // diagnostic inline, so do not duplicate it in the global error panel.
+      { _skipNetworkRetry: true, _silent: true } as any,
     );
     return data as {
       provider: 'OPENCLAW' | 'CODEX' | 'CLAUDE_CODE' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA';
@@ -811,11 +1427,11 @@ export const projectsAPI = {
     stateVersion: number,
     model?: string,
   ) => {
-    const { data } = await client.post(`/projects/${encodeURIComponent(name)}/chat/provider`, {
-      provider,
-      stateVersion,
-      model,
-    });
+    const { data } = await client.post(
+      `/projects/${encodeURIComponent(name)}/chat/provider`,
+      { provider, stateVersion, model },
+      { _silent: true } as any,
+    );
     return data;
   },
   chatHistory: async (
@@ -828,8 +1444,14 @@ export const projectsAPI = {
       ...(page?.limit ? { limit: page.limit } : {}),
       ...(page?.before ? { before: page.before } : {}),
     };
-    const { data } = await client.get(`/projects/${encodeURIComponent(name)}/chat/history`, { params });
-    return data;
+    const { data } = await client.get(`/projects/${encodeURIComponent(name)}/chat/history`, {
+      params,
+      // The Project Chat panel owns a durable, local transcript error with an
+      // explicit retry. Do not duplicate the same expected read failure in the
+      // global Errors badge, sound, and activity feed.
+      _silent: true,
+    } as any);
+    return validateProjectChatHistoryPage(data);
   },
   chatClearHistory: async (
     name: string,
@@ -868,10 +1490,11 @@ export const projectsAPI = {
     return data;
   },
   agentAbort: async (name: string, provider: ProjectChatProviderName, stateVersion: number) => {
-    const { data } = await client.post(`/projects/${encodeURIComponent(name)}/assistant/abort`, {
-      provider,
-      stateVersion,
-    });
+    const { data } = await client.post(
+      `/projects/${encodeURIComponent(name)}/assistant/abort`,
+      { provider, stateVersion },
+      { _silent: true } as any,
+    );
     return data;
   },
   agentSend: async (name: string, request: ProjectChatSendRequest) => {
@@ -1004,10 +1627,16 @@ export interface CompatibilityHotfixStatus {
   geminiCliPatched?: boolean;
   geminiCliYoloPatched?: boolean;
   geminiRuntimePatched?: boolean;
+  claudeAskUserSupported?: boolean;
+  claudeAskUserPatched?: boolean;
+  claudeAskUserBridgeReady?: boolean;
+  claudeAskUserTimeoutsReady?: boolean;
+  askUserPluginVersionReady?: boolean;
   heartbeatRunner: string | null;
   replyBundle: string | null;
   executeRuntime?: string | null;
   geminiCliBackend?: string | null;
+  claudeCliShared?: string | null;
   issues: string[];
   note?: string;
   confirmationPhrase?: string;
@@ -1043,7 +1672,7 @@ export const gatewayAPI = {
     const { data } = await client.get('/gateway/sessions');
     return data;
   },
-  models: async (provider = 'OPENCLAW'): Promise<{ provider: string; capabilities?: { supportsModelSelection?: boolean; modelSelectionMode?: string; supportsCustomModelInput?: boolean; canEnumerateModels?: boolean; modelCatalogKind?: string; supportsInTurnSteering?: boolean; supportsQueuedFollowUps?: boolean; followUpMode?: string; adapterFamily?: string; adapterKey?: string }; models: Array<{ id: string; alias: string | null; displayName: string; provider: string; source?: string }>; unavailableModelIds?: string[] }> => {
+  models: async (provider = 'OPENCLAW', options: { silent?: boolean } = {}): Promise<{ provider: string; capabilities?: { supportsModelSelection?: boolean; modelSelectionMode?: string; supportsCustomModelInput?: boolean; canEnumerateModels?: boolean; modelCatalogKind?: string; supportsInTurnSteering?: boolean; supportsQueuedFollowUps?: boolean; followUpMode?: string; adapterFamily?: string; adapterKey?: string }; models: Array<{ id: string; alias: string | null; displayName: string; provider: string; source?: string }>; unavailableModelIds?: string[] }> => {
     const isAgentZero = String(provider || '').trim().toUpperCase() === 'AGENT_ZERO';
     const { data } = await client.get('/gateway/models', {
       params: { provider },
@@ -1051,6 +1680,7 @@ export const gatewayAPI = {
         timeout: AGENT_ZERO_MODEL_CATALOG_TIMEOUT_MS,
         _skipNetworkRetry: true,
       } : {}),
+      ...(options.silent ? { _silent: true } : {}),
     } as any);
     return data;
   },

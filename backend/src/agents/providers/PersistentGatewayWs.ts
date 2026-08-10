@@ -13,13 +13,15 @@
  *   4. Handle exec.approval events
  */
 import WebSocket from 'ws';
+import { createHash } from 'crypto';
 import { buildSignedDevice, getOrCreateDeviceKeys } from '../../utils/deviceIdentity';
 import { getOpenClawWsUrl } from '../../config/openclaw';
-import { streamEventBus } from '../../services/StreamEventBus';
+import { streamEventBus, type StreamEvent } from '../../services/StreamEventBus';
 import { sanitizeAssistantChunk, sanitizeAssistantText, isControlOnlyAssistantText } from '../../utils/chatText';
 import { getGatewayToken } from '../../utils/gatewayToken';
 import { redactNativeProviderText } from './native/NativeProviderDiagnostics';
 import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
+import { portalClientMessageIdFromIdempotencyKey } from './PortalMessageIdentity';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -232,7 +234,12 @@ type PreambleProgressState = {
   runId?: string;
   order: string[];
   textByItem: Map<string, string>;
+  textChars: number;
 };
+
+const MAX_PREAMBLE_PROGRESS_ITEMS = 64;
+const MAX_PREAMBLE_PROGRESS_CHARS = 48 * 1024;
+const PREAMBLE_PROGRESS_TRUNCATION_MARKER = '[Earlier progress truncated]\n';
 
 /**
  * OpenClaw item.preamble frames are cumulative progress snapshots, not a stream
@@ -275,10 +282,12 @@ type PendingRunFrame = {
   runId: string;
   payload: Record<string, unknown>;
   bytes: number;
+  sequence: number;
 };
 
 type PendingRunReservation = {
   reservationRunId: string;
+  userIdempotencyKey?: string;
   frames: PendingRunFrame[];
   bytes: number;
 };
@@ -287,6 +296,81 @@ const MAX_PENDING_RUN_FRAMES = 512;
 const MAX_PENDING_RUN_BYTES = 2 * 1024 * 1024;
 const pendingRunReservationsBySession = new Map<string, PendingRunReservation>();
 const failedRunReservationsBySession = new Set<string>();
+const failedRunReservationDetailsBySession = new Map<string, {
+  reservationRunId: string;
+  userIdempotencyKey: string;
+}>();
+
+type ReconnectRunRecovery = {
+  predecessorRunId: string;
+  originUserIdempotencyKey: string | null;
+  disconnectedAt: number;
+  probeWindowStartedAt: number;
+  deadlineAt: number;
+  probeAttempt: number;
+  lastLiveRunIds: string[] | null;
+  lastProbeAt: number;
+  inactiveHistoryAttempts: number;
+  probeInFlight: boolean;
+  probeTimer: ReturnType<typeof setTimeout> | null;
+};
+
+const RECONNECT_RUN_RECOVERY_WINDOW_MS = 120_000;
+const RECONNECT_RUN_PROBE_DELAYS_MS = [500, 1_500, 3_000, 5_000, 10_000, 15_000, 30_000];
+const RECONNECT_RUN_LIVE_EVIDENCE_MAX_AGE_MS = 45_000;
+const RECONNECT_INACTIVE_HISTORY_LIMIT = 1_000;
+const RECONNECT_INACTIVE_HISTORY_MAX_ATTEMPTS = 3;
+const RECONNECT_INACTIVE_HISTORY_RETRY_MS = 2_000;
+const reconnectRunRecoveryBySession = new Map<string, ReconnectRunRecovery>();
+const runOriginUserBySession = new Map<string, { runId: string; idempotencyKey: string }>();
+const ambiguousRunReservationsBySession = new Map<string, string>();
+type AmbiguousRunDispatch = {
+  reservationRunId: string;
+  expectedUserIdempotencyKey: string;
+  correlatedRunId: string | null;
+  settling: boolean;
+  accept(upstreamRunId: string): Promise<void>;
+  reject(error: Error): void;
+};
+const ambiguousRunDispatchesBySession = new Map<string, AmbiguousRunDispatch>();
+
+type QuarantinedRunFrame = {
+  kind: 'agent' | 'chat';
+  payload: Record<string, unknown>;
+  bytes: number;
+  sequence: number;
+};
+
+type RunFrameQuarantine = {
+  runId: string;
+  createdAt: number;
+  expiresAt: number;
+  frames: QuarantinedRunFrame[];
+  bytes: number;
+  expiryTimer: ReturnType<typeof setTimeout>;
+};
+
+// Run-only frames cannot be attributed until OpenClaw supplies an exact
+// run->session mapping. Keep a deliberately small, short-lived quarantine so
+// restart recovery can replay early R2 reasoning/tool frames without ever
+// guessing which subscribed session owns them.
+const RUN_FRAME_QUARANTINE_TTL_MS = 30_000;
+const MAX_QUARANTINED_RUNS = 16;
+const MAX_QUARANTINED_FRAMES_PER_RUN = 256;
+const MAX_QUARANTINED_BYTES_PER_RUN = 1024 * 1024;
+const MAX_QUARANTINED_FRAMES_TOTAL = 512;
+const MAX_QUARANTINED_BYTES_TOTAL = 2 * 1024 * 1024;
+const quarantinedRunFramesByRunId = new Map<string, RunFrameQuarantine>();
+let bufferedRunFrameSequence = 0;
+
+// Adjacent live event lanes can expose the same delivery mirror more than once.
+// Bound the dedupe cache so cross-channel prompts are forwarded once without
+// turning a long-lived Portal process into an unbounded message ledger.
+const seenUserMessageIdsBySession = new Map<string, Map<string, number>>();
+const MAX_SEEN_USER_MESSAGE_IDS = 256;
+const SEEN_USER_MESSAGE_TTL_MS = 6 * 60 * 60_000;
+const lastHistoryChangedAtBySession = new Map<string, number>();
+const HISTORY_CHANGED_MIN_INTERVAL_MS = 1_000;
 
 // Track session-message subscriptions on the singleton backend gateway socket.
 // OpenClaw's Control UI subscribes to live session events and handles runtime
@@ -673,6 +757,7 @@ function pruneRunTombstones(sessionKey: string, now = Date.now()): Map<string, n
 function tombstoneRun(sessionKey: string, runId?: string): void {
   const normalizedRunId = typeof runId === 'string' ? runId.trim() : '';
   if (!normalizedRunId) return;
+  dropQuarantinedRunFrames(normalizedRunId);
   const now = Date.now();
   const tombstones = pruneRunTombstones(sessionKey, now) || new Map<string, number>();
   tombstones.delete(normalizedRunId);
@@ -691,6 +776,139 @@ function isRunTombstoned(sessionKey: string, runId?: string): boolean {
   return Boolean(pruneRunTombstones(sessionKey)?.has(normalizedRunId));
 }
 
+function dropQuarantinedRunFrames(runId: string): void {
+  const quarantine = quarantinedRunFramesByRunId.get(runId);
+  if (!quarantine) return;
+  clearTimeout(quarantine.expiryTimer);
+  quarantinedRunFramesByRunId.delete(runId);
+}
+
+function pruneQuarantinedRunFrames(now = Date.now()): void {
+  for (const [runId, quarantine] of quarantinedRunFramesByRunId) {
+    if (quarantine.expiresAt <= now) dropQuarantinedRunFrames(runId);
+  }
+}
+
+function isRunTombstonedInAnyTrackedSession(runId: string): boolean {
+  for (const sessionKey of runTombstonesBySession.keys()) {
+    if (isRunTombstoned(sessionKey, runId)) return true;
+  }
+  return false;
+}
+
+function hasUnresolvedRunMappingWindow(): boolean {
+  return reconnectRunRecoveryBySession.size > 0
+    || pendingRunReservationsBySession.size > 0
+    || failedRunReservationsBySession.size > 0
+    || ambiguousRunDispatchesBySession.size > 0
+    || desiredSessionMessageSubscriptions.size > 0
+    || activeSessionMessageSubscriptions.size > 0;
+}
+
+function quarantineUnresolvedRunFrame(
+  kind: QuarantinedRunFrame['kind'],
+  runIdValue: unknown,
+  payload: Record<string, unknown>,
+): boolean {
+  const runId = normalizedRunId(runIdValue);
+  if (!runId) return false;
+  if (isRunTombstonedInAnyTrackedSession(runId)) {
+    debugLog(`Dropping run-only ${kind} frame for tombstoned runId=${runId}`);
+    return true;
+  }
+  if (!hasUnresolvedRunMappingWindow()) return false;
+
+  const now = Date.now();
+  pruneQuarantinedRunFrames(now);
+
+  let bytes = 0;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+  } catch {
+    debugLog(`Dropping unserializable run-only ${kind} frame for runId=${runId}`);
+    return true;
+  }
+  if (bytes > MAX_QUARANTINED_BYTES_PER_RUN || bytes > MAX_QUARANTINED_BYTES_TOTAL) {
+    debugLog(`Dropping oversized run-only ${kind} frame for runId=${runId}`);
+    return true;
+  }
+
+  let quarantine = quarantinedRunFramesByRunId.get(runId);
+  if (!quarantine) {
+    if (quarantinedRunFramesByRunId.size >= MAX_QUARANTINED_RUNS) {
+      debugLog(`Dropping run-only ${kind} frame outside run quarantine count bound for runId=${runId}`);
+      return true;
+    }
+    const expiresAt = now + RUN_FRAME_QUARANTINE_TTL_MS;
+    const expiryTimer = setTimeout(() => {
+      const current = quarantinedRunFramesByRunId.get(runId);
+      if (current?.expiresAt === expiresAt) quarantinedRunFramesByRunId.delete(runId);
+    }, RUN_FRAME_QUARANTINE_TTL_MS);
+    expiryTimer.unref?.();
+    quarantine = {
+      runId,
+      createdAt: now,
+      expiresAt,
+      frames: [],
+      bytes: 0,
+      expiryTimer,
+    };
+    quarantinedRunFramesByRunId.set(runId, quarantine);
+  }
+
+  let totalFrames = 0;
+  let totalBytes = 0;
+  for (const queued of quarantinedRunFramesByRunId.values()) {
+    totalFrames += queued.frames.length;
+    totalBytes += queued.bytes;
+  }
+  if (quarantine.frames.length >= MAX_QUARANTINED_FRAMES_PER_RUN
+    || quarantine.bytes + bytes > MAX_QUARANTINED_BYTES_PER_RUN
+    || totalFrames >= MAX_QUARANTINED_FRAMES_TOTAL
+    || totalBytes + bytes > MAX_QUARANTINED_BYTES_TOTAL) {
+    debugLog(`Dropping run-only ${kind} frame outside run quarantine bounds for runId=${runId}`);
+    if (quarantine.frames.length === 0) dropQuarantinedRunFrames(runId);
+    return true;
+  }
+
+  quarantine.frames.push({
+    kind,
+    payload,
+    bytes,
+    sequence: ++bufferedRunFrameSequence,
+  });
+  quarantine.bytes += bytes;
+  return true;
+}
+
+function takeQuarantinedRunFrames(
+  sessionKey: string,
+  runIdValue: unknown,
+): QuarantinedRunFrame[] {
+  const runId = normalizedRunId(runIdValue);
+  if (!runId) return [];
+  pruneQuarantinedRunFrames();
+  const quarantine = quarantinedRunFramesByRunId.get(runId);
+  if (!quarantine) return [];
+  if (activeRunIds.get(sessionKey) !== runId || isRunTombstoned(sessionKey, runId)) return [];
+
+  // Delete before returning. Re-entrant event handling and repeated
+  // authoritative probes can therefore never publish the same frame twice.
+  clearTimeout(quarantine.expiryTimer);
+  quarantinedRunFramesByRunId.delete(runId);
+  return [...quarantine.frames].sort((left, right) => left.sequence - right.sequence);
+}
+
+function replayQuarantinedRunFrames(sessionKey: string, runIdValue: unknown): boolean {
+  const frames = takeQuarantinedRunFrames(sessionKey, runIdValue);
+  if (frames.length === 0) return false;
+  for (const frame of frames) {
+    if (frame.kind === 'agent') handleAgentEvent(frame.payload);
+    else handleChatEvent(frame.payload);
+  }
+  return true;
+}
+
 function resetRunStreamState(sessionKey: string): void {
   clearTextArbitration(sessionKey);
   messageToolReplyBySession.delete(sessionKey);
@@ -700,6 +918,524 @@ function resetRunStreamState(sessionKey: string): void {
 
 function normalizedRunId(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function clearReconnectRunRecovery(sessionKey: string): void {
+  const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+  if (recovery?.probeTimer) clearTimeout(recovery.probeTimer);
+  reconnectRunRecoveryBySession.delete(sessionKey);
+}
+
+function beginReconnectRunRecovery(sessionKey: string, predecessorRunId: string): void {
+  const existing = reconnectRunRecoveryBySession.get(sessionKey);
+  if (existing?.predecessorRunId === predecessorRunId && existing.deadlineAt > Date.now()) return;
+  clearReconnectRunRecovery(sessionKey);
+  reconnectRunRecoveryBySession.set(sessionKey, {
+    predecessorRunId,
+    originUserIdempotencyKey: runOriginUserBySession.get(sessionKey)?.runId === predecessorRunId
+      ? runOriginUserBySession.get(sessionKey)!.idempotencyKey
+      : null,
+    disconnectedAt: Date.now(),
+    probeWindowStartedAt: 0,
+    deadlineAt: Date.now() + RECONNECT_RUN_RECOVERY_WINDOW_MS,
+    probeAttempt: 0,
+    lastLiveRunIds: null,
+    lastProbeAt: 0,
+    inactiveHistoryAttempts: 0,
+    probeInFlight: false,
+    probeTimer: null,
+  });
+}
+
+function armReconnectRunRecoveryAfterAuthentication(sessionKey: string): void {
+  const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+  if (!recovery) return;
+  const now = Date.now();
+  recovery.probeWindowStartedAt = now;
+  recovery.deadlineAt = now + RECONNECT_RUN_RECOVERY_WINDOW_MS;
+  recovery.probeAttempt = 0;
+  recovery.lastLiveRunIds = null;
+  recovery.lastProbeAt = 0;
+  recovery.inactiveHistoryAttempts = 0;
+}
+
+function adoptReconnectReplacementRun(
+  sessionKey: string,
+  predecessorRunId: string,
+  replacementRunId: string,
+  replayQuarantine = true,
+): boolean {
+  const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+  if (!recovery
+    || ambiguousRunDispatchesBySession.has(sessionKey)
+    || recovery.predecessorRunId !== predecessorRunId
+    || recovery.deadlineAt <= Date.now()
+    || activeRunIds.get(sessionKey) !== predecessorRunId) {
+    return false;
+  }
+  if (!adoptActiveRun(sessionKey, predecessorRunId, replacementRunId, true)) return false;
+  clearReconnectRunRecovery(sessionKey);
+  if (replayQuarantine) replayQuarantinedRunFrames(sessionKey, replacementRunId);
+  debugLog(`Adopted gateway-restart replacement run for ${sessionKey}: ${predecessorRunId} -> ${replacementRunId}`);
+  return true;
+}
+
+function tryAdoptReconnectRunFromTrustedEvent(
+  sessionKey: string,
+  expectedRunId: string,
+  eventRunId: string,
+  replayQuarantine = true,
+): boolean {
+  if (!eventRunId || eventRunId === expectedRunId || isRunTombstoned(sessionKey, eventRunId)) return false;
+  return adoptReconnectReplacementRun(
+    sessionKey,
+    expectedRunId,
+    eventRunId,
+    replayQuarantine,
+  );
+}
+
+function exactSessionRowsFromListPayload(payload: any, agentId: string): any[] {
+  if (Array.isArray(payload?.sessions)) return payload.sessions;
+  const requested = payload?.agents?.[agentId]?.sessions;
+  if (Array.isArray(requested)) return requested;
+  if (!payload?.agents || typeof payload.agents !== 'object') return [];
+  return Object.values(payload.agents).flatMap((agent: any) => (
+    Array.isArray(agent?.sessions) ? agent.sessions : []
+  ));
+}
+
+function liveRunIdsFromSessionList(payload: any, sessionKey: string): string[] | null {
+  const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
+  const rows = exactSessionRowsFromListPayload(payload, agentId)
+    .filter((candidate: any) => candidate?.key === sessionKey);
+  if (rows.length !== 1) return null;
+  const row = rows[0];
+  if (Array.isArray(row.activeRunIds)) {
+    const runIds = [...new Set(row.activeRunIds.map(normalizedRunId).filter(Boolean))] as string[];
+    if (row.hasActiveRun === false) return runIds.length === 0 ? [] : null;
+    return row.hasActiveRun === true && runIds.length > 0 ? runIds : null;
+  }
+  if (row.hasActiveRun === false) return [];
+  // `hasActiveRun: true` without identities cannot safely authorize a CAS.
+  return null;
+}
+
+function reconcileAuthoritativeLiveRun(sessionKey: string, liveRunId: string): boolean {
+  const exactRunId = normalizedRunId(liveRunId);
+  if (!exactRunId
+    || ambiguousRunDispatchesBySession.has(sessionKey)
+    || isRunTombstoned(sessionKey, exactRunId)) return false;
+
+  if (failedRunReservationsBySession.has(sessionKey)) {
+    const failed = failedRunReservationDetailsBySession.get(sessionKey);
+    if (exactRunId === failed?.reservationRunId) return false;
+    // sessions.list supplied one exact live identity after resubscription. It
+    // may be a Discord/Web UI turn whose user mirror was missed during the
+    // outage. Admit it as an independent run without correlating it to, or
+    // resurrecting, the failed Portal dispatch.
+    failedRunReservationsBySession.delete(sessionKey);
+    failedRunReservationDetailsBySession.delete(sessionKey);
+  }
+
+  const tracked = streamEventBus.getTrackedStream(sessionKey);
+  const trackedRunId = normalizedRunId(tracked?.runId) || null;
+  const currentRunId = activeRunIds.get(sessionKey) || trackedRunId;
+  const ambiguousReservation = ambiguousRunReservationsBySession.get(sessionKey) || null;
+  let accepted = false;
+  let resumeAlreadyPublished = false;
+
+  if (currentRunId === exactRunId) {
+    accepted = registerRun(sessionKey, exactRunId);
+  } else if (currentRunId) {
+    const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+    if (recovery?.predecessorRunId === currentRunId) {
+      accepted = adoptReconnectReplacementRun(sessionKey, currentRunId, exactRunId);
+      resumeAlreadyPublished = accepted;
+    } else if (ambiguousReservation === currentRunId || tracked?.active === false) {
+      accepted = registerRun(sessionKey, exactRunId, currentRunId);
+    }
+  } else {
+    accepted = registerRun(sessionKey, exactRunId);
+  }
+  if (!accepted) return false;
+
+  clearPendingRunReservation(sessionKey);
+  if (ambiguousReservation) {
+    ambiguousRunReservationsBySession.delete(sessionKey);
+    clearReconnectRunRecovery(sessionKey);
+  }
+  if (!resumeAlreadyPublished && (currentRunId !== exactRunId || ambiguousReservation)) {
+    streamEventBus.publish(sessionKey, { type: 'run_resumed', content: '', runId: exactRunId });
+  }
+  replayQuarantinedRunFrames(sessionKey, exactRunId);
+  return true;
+}
+
+async function reconcileSubscribedSessionLiveRun(sessionKey: string): Promise<void> {
+  try {
+    const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
+    const payload = await callGatewayRpc('sessions.list', {
+      agentId,
+      search: sessionKey,
+      limit: 50,
+    }, 10_000);
+    const liveRunIds = liveRunIdsFromSessionList(payload, sessionKey);
+    if (liveRunIds?.length === 1) {
+      if (ambiguousRunDispatchesBySession.has(sessionKey)) {
+        await tryFinalizeAmbiguousActiveRun(sessionKey, liveRunIds[0]);
+      } else {
+        reconcileAuthoritativeLiveRun(sessionKey, liveRunIds[0]);
+      }
+    }
+  } catch (error: any) {
+    debugLog(`Post-subscribe live-run reconciliation failed for ${sessionKey}: ${error?.message || error}`);
+  }
+}
+
+function scheduleReconnectRunProbe(sessionKey: string, delayMs?: number): void {
+  const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+  if (!recovery || recovery.probeInFlight || recovery.probeTimer) return;
+  const delay = delayMs ?? RECONNECT_RUN_PROBE_DELAYS_MS[
+    Math.min(recovery.probeAttempt, RECONNECT_RUN_PROBE_DELAYS_MS.length - 1)
+  ];
+  recovery.probeTimer = setTimeout(() => {
+    recovery.probeTimer = null;
+    void probeReconnectRun(sessionKey);
+  }, delay);
+  recovery.probeTimer.unref?.();
+}
+
+function reconcileReconnectRunProbeResult(
+  sessionKey: string,
+  liveRunIds: string[] | null,
+): boolean {
+  const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+  if (!recovery) return false;
+  recovery.lastLiveRunIds = liveRunIds;
+  recovery.lastProbeAt = Date.now();
+  if (liveRunIds?.length !== 0) recovery.inactiveHistoryAttempts = 0;
+
+  if (liveRunIds?.length === 1) {
+    const [liveRunId] = liveRunIds;
+    if (liveRunId !== recovery.predecessorRunId) {
+      return adoptReconnectReplacementRun(sessionKey, recovery.predecessorRunId, liveRunId);
+    }
+    // Seeing the predecessor again does not prove restart recovery is over.
+    // OpenClaw can expose R1 immediately after reconnect and create R2 several
+    // seconds later. Keep the exact CAS fence for the full bounded window so
+    // that delayed replacement remains admissible.
+    return false;
+  }
+  if (liveRunIds && liveRunIds.length > 1) {
+    streamEventBus.publish(sessionKey, {
+      type: 'status',
+      content: 'OpenClaw reconnected, but multiple active runs need to settle before the Portal can safely reattach.',
+      runId: recovery.predecessorRunId,
+    });
+  }
+  return false;
+}
+
+function findHistoryOriginUserIndex(messages: any[], expectedKey: string): number {
+  if (!expectedKey) return -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const role = typeof messages[index]?.role === 'string' ? messages[index].role.trim().toLowerCase() : '';
+    if (role === 'user'
+      && normalizedUserIdempotencyKey(messages[index]?.idempotencyKey) === expectedKey) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function nextDistinctHistoryTurnOriginIndex(
+  messages: any[],
+  userIndex: number,
+  expectedKey: string,
+  runId?: string,
+): number {
+  for (let index = userIndex + 1; index < messages.length; index += 1) {
+    const message = messages[index];
+    const role = typeof message?.role === 'string' ? message.role.trim().toLowerCase() : '';
+    if (role !== 'user') continue;
+    const observedKey = normalizedUserIdempotencyKey(message?.idempotencyKey);
+    if (observedKey && observedKey === expectedKey) continue;
+    // Steering/injection can add another user-shaped row inside the same run.
+    // Explicit same-run metadata keeps it inside the correlated turn; a
+    // different or missing durable origin key without that proof starts the
+    // next turn. Treating an unkeyed cross-channel prompt as part of the
+    // Portal-originated turn can misattribute its assistant reply and settle
+    // the wrong dispatch.
+    if (runId && explicitGatewayMessageRunId(message) === runId) continue;
+    return index;
+  }
+  return messages.length;
+}
+
+function durableAssistantTextAfter(
+  messages: any[],
+  userIndex: number,
+  runId?: string,
+  expectedOriginKey = '',
+): string {
+  const upperBound = expectedOriginKey
+    ? nextDistinctHistoryTurnOriginIndex(messages, userIndex, expectedOriginKey, runId)
+    : messages.length;
+  for (let index = upperBound - 1; index > userIndex; index -= 1) {
+    const message = messages[index];
+    const role = typeof message?.role === 'string' ? message.role.trim().toLowerCase() : '';
+    if (role !== 'assistant' || isReasoningMirrorMessage(message)) continue;
+    const explicitRunId = explicitGatewayMessageRunId(message);
+    if (runId && explicitRunId && explicitRunId !== runId) continue;
+    const text = extractTextFromContent(message?.content ?? message?.text ?? '').trim();
+    if (!text || isControlOnlyAssistantText(text) || messageContainsToolCall(message)) continue;
+    return text;
+  }
+  return '';
+}
+
+function correlateRecoveryHistory(
+  messages: any[],
+  recovery: ReconnectRunRecovery,
+): { matched: boolean; userIndex: number; finalText: string } {
+  const expectedKey = normalizedUserIdempotencyKey(recovery.originUserIdempotencyKey);
+  const originUserIndex = findHistoryOriginUserIndex(messages, expectedKey);
+  if (originUserIndex >= 0) {
+    return {
+      matched: true,
+      userIndex: originUserIndex,
+      finalText: durableAssistantTextAfter(
+        messages,
+        originUserIndex,
+        recovery.predecessorRunId,
+        expectedKey,
+      ),
+    };
+  }
+
+  // Compatibility fallback for an already-active run that predates origin-key
+  // tracking: accept only an assistant row carrying the exact run identity,
+  // never a nearby untagged response from a later turn.
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const role = typeof message?.role === 'string' ? message.role.trim().toLowerCase() : '';
+    if (role !== 'assistant'
+      || explicitGatewayMessageRunId(message) !== recovery.predecessorRunId
+      || isReasoningMirrorMessage(message)
+      || messageContainsToolCall(message)) continue;
+    const text = extractTextFromContent(message?.content ?? message?.text ?? '').trim();
+    if (!text || isControlOnlyAssistantText(text)) continue;
+    return { matched: true, userIndex: Math.max(-1, index - 1), finalText: text };
+  }
+  return { matched: false, userIndex: -1, finalText: '' };
+}
+
+async function reconcileInactiveReconnectHistory(
+  sessionKey: string,
+  recovery: ReconnectRunRecovery,
+  payload: any,
+): Promise<boolean> {
+  if (reconnectRunRecoveryBySession.get(sessionKey) !== recovery) return false;
+  const messages = Array.isArray(payload?.messages)
+    ? payload.messages
+    : Array.isArray(payload?.history?.messages)
+      ? payload.history.messages
+      : null;
+  if (!messages) return false;
+  let settledRunId = recovery.predecessorRunId;
+  let durableFinal = '';
+  const ambiguousDispatch = ambiguousRunDispatchesBySession.get(sessionKey);
+  if (ambiguousDispatch) {
+    const correlation = correlateAmbiguousDispatchFromHistory(sessionKey, payload);
+    if (!correlation.matched) return false;
+    durableFinal = durableAssistantTextAfter(
+      messages,
+      correlation.userIndex,
+      correlation.runId || undefined,
+      normalizedUserIdempotencyKey(ambiguousDispatch.expectedUserIdempotencyKey),
+    );
+    if (!correlation.runId) {
+      rejectAmbiguousRunDispatch(
+        sessionKey,
+        new Error('The interrupted dispatch was recorded, but OpenClaw did not preserve its run identity.'),
+      );
+      publishFatalRunError(
+        sessionKey,
+        'OpenClaw recorded the interrupted request without a verifiable run identity. The transcript was refreshed; retry the message if needed.',
+        recovery.predecessorRunId,
+      );
+      return true;
+    }
+    if (!await finalizeAmbiguousRunDispatch(sessionKey, correlation.runId)) return false;
+    settledRunId = correlation.runId;
+  } else {
+    const correlation = correlateRecoveryHistory(messages, recovery);
+    if (!correlation.matched) return false;
+    durableFinal = correlation.finalText;
+  }
+
+  streamEventBus.publish(sessionKey, {
+    type: 'history_changed',
+    content: '',
+    reason: 'reconnect-inactive-history-reconciled',
+  });
+  if (durableFinal) {
+    publishTextIfNew(sessionKey, durableFinal, settledRunId);
+    streamEventBus.publish(sessionKey, {
+      type: 'done',
+      content: durableFinal,
+      runId: settledRunId,
+    });
+    cleanupCompletedRun(sessionKey, settledRunId);
+  } else {
+    publishFatalRunError(
+      sessionKey,
+      'OpenClaw confirmed the interrupted turn is no longer running, but no final response was recorded. The transcript was refreshed and you can try again.',
+      settledRunId,
+    );
+  }
+  return true;
+}
+
+function extendUnresolvedReconnectRecovery(sessionKey: string, recovery: ReconnectRunRecovery): void {
+  if (reconnectRunRecoveryBySession.get(sessionKey) !== recovery) return;
+  recovery.deadlineAt = Date.now() + RECONNECT_RUN_RECOVERY_WINDOW_MS;
+  recovery.probeAttempt = 0;
+  streamEventBus.publish(sessionKey, {
+    type: 'status',
+    content: 'The Portal is still verifying the interrupted turn; new messages remain safely queued.',
+    runId: recovery.predecessorRunId,
+  });
+  scheduleReconnectRunProbe(sessionKey, 5_000);
+}
+
+function retryExactInactiveHistoryRecovery(sessionKey: string, recovery: ReconnectRunRecovery): void {
+  if (reconnectRunRecoveryBySession.get(sessionKey) !== recovery) return;
+  recovery.deadlineAt = Date.now() + RECONNECT_INACTIVE_HISTORY_RETRY_MS;
+  recovery.probeAttempt = 0;
+  streamEventBus.publish(sessionKey, {
+    type: 'status',
+    content: 'OpenClaw reports the interrupted turn has stopped; the Portal is refreshing its final history before releasing the chat.',
+    runId: recovery.predecessorRunId,
+  });
+  scheduleReconnectRunProbe(sessionKey, RECONNECT_INACTIVE_HISTORY_RETRY_MS);
+}
+
+function terminateExactInactiveRecovery(sessionKey: string, recovery: ReconnectRunRecovery): void {
+  if (reconnectRunRecoveryBySession.get(sessionKey) !== recovery) return;
+  streamEventBus.publish(sessionKey, {
+    type: 'history_changed',
+    content: '',
+    reason: 'reconnect-inactive-history-exhausted',
+  });
+  const terminalError = new Error(
+    'OpenClaw confirmed the interrupted dispatch is no longer active, but its origin could not be verified in durable history.',
+  );
+  try {
+    rejectAmbiguousRunDispatch(sessionKey, terminalError);
+  } catch (error: any) {
+    debugLog(`Reconnect inactive dispatch rejection callback failed for ${sessionKey}: ${error?.message || error}`);
+  }
+  publishFatalRunError(
+    sessionKey,
+    'OpenClaw confirmed the interrupted turn is no longer running, but the Portal could not verify its final response after repeated history refreshes. The transcript was refreshed and you can try again.',
+    recovery.predecessorRunId,
+  );
+}
+
+type ReconnectHistoryReader = (sessionKey: string, limit: number) => Promise<any>;
+
+const readReconnectHistory: ReconnectHistoryReader = (sessionKey, limit) => callGatewayRpc(
+  'chat.history',
+  { sessionKey, limit },
+  10_000,
+);
+
+async function settleExpiredReconnectRunRecovery(
+  sessionKey: string,
+  recovery: ReconnectRunRecovery,
+  historyReader: ReconnectHistoryReader = readReconnectHistory,
+): Promise<void> {
+  if (reconnectRunRecoveryBySession.get(sessionKey) !== recovery) return;
+  const predecessorRunId = recovery.predecessorRunId;
+  if (activeRunIds.get(sessionKey) !== predecessorRunId) {
+    clearReconnectRunRecovery(sessionKey);
+    return;
+  }
+  // An exact, authoritative sessions.list observation that R1 itself remains
+  // live means no identity adoption is needed. At the end of the bounded
+  // window, stop accepting replacements but leave that still-live run intact.
+  if (recovery.lastLiveRunIds?.length === 1
+    && recovery.lastLiveRunIds[0] === predecessorRunId
+    && recovery.lastProbeAt > 0
+    && Date.now() - recovery.lastProbeAt <= RECONNECT_RUN_LIVE_EVIDENCE_MAX_AGE_MS) {
+    clearReconnectRunRecovery(sessionKey);
+    streamEventBus.publish(sessionKey, {
+      type: 'status',
+      content: 'Reconnected to the active turn.',
+      runId: predecessorRunId,
+    });
+    return;
+  }
+  const hasRecentExactInactive = recovery.lastLiveRunIds?.length === 0
+    && recovery.lastProbeAt > 0
+    && Date.now() - recovery.lastProbeAt <= RECONNECT_RUN_LIVE_EVIDENCE_MAX_AGE_MS;
+  if (hasRecentExactInactive) {
+    recovery.inactiveHistoryAttempts += 1;
+    try {
+      const history = await historyReader(sessionKey, RECONNECT_INACTIVE_HISTORY_LIMIT);
+      if (await reconcileInactiveReconnectHistory(sessionKey, recovery, history)) return;
+    } catch (error: any) {
+      debugLog(`Reconnect history reconciliation failed for ${sessionKey}: ${error?.message || error}`);
+    }
+    if (reconnectRunRecoveryBySession.get(sessionKey) !== recovery) return;
+    if (recovery.inactiveHistoryAttempts >= RECONNECT_INACTIVE_HISTORY_MAX_ATTEMPTS) {
+      terminateExactInactiveRecovery(sessionKey, recovery);
+      return;
+    }
+    retryExactInactiveHistoryRecovery(sessionKey, recovery);
+    return;
+  }
+  // Missing identities, multiple identities, RPC failures, and stale probes are
+  // uncertainty—not proof of a terminal. Keep the lane fail-closed and retry.
+  extendUnresolvedReconnectRecovery(sessionKey, recovery);
+}
+
+async function probeReconnectRun(sessionKey: string): Promise<void> {
+  const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+  if (!recovery || recovery.probeInFlight) return;
+  if (recovery.deadlineAt <= Date.now()) {
+    await settleExpiredReconnectRunRecovery(sessionKey, recovery);
+    return;
+  }
+
+  recovery.probeInFlight = true;
+  recovery.probeAttempt += 1;
+  try {
+    const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
+    const payload = await callGatewayRpc('sessions.list', {
+      agentId,
+      search: sessionKey,
+      limit: 50,
+    }, 10_000);
+    const current = reconnectRunRecoveryBySession.get(sessionKey);
+    if (current !== recovery) return;
+    const liveRunIds = liveRunIdsFromSessionList(payload, sessionKey);
+    if (liveRunIds?.length === 1 && ambiguousRunDispatchesBySession.has(sessionKey)) {
+      await tryFinalizeAmbiguousActiveRun(sessionKey, liveRunIds[0]);
+    } else {
+      reconcileReconnectRunProbeResult(sessionKey, liveRunIds);
+    }
+  } catch (error: any) {
+    debugLog(`Reconnect run probe failed for ${sessionKey}: ${error?.message || error}`);
+  } finally {
+    const current = reconnectRunRecoveryBySession.get(sessionKey);
+    if (current === recovery) {
+      recovery.probeInFlight = false;
+      scheduleReconnectRunProbe(sessionKey);
+    }
+  }
 }
 
 function queuePendingRunFrame(
@@ -727,7 +1463,13 @@ function queuePendingRunFrame(
     return true;
   }
 
-  pending.frames.push({ kind, runId, payload, bytes });
+  pending.frames.push({
+    kind,
+    runId,
+    payload,
+    bytes,
+    sequence: ++bufferedRunFrameSequence,
+  });
   pending.bytes += bytes;
   return true;
 }
@@ -739,13 +1481,221 @@ function clearPendingRunReservation(sessionKey: string, reservationRunId?: strin
   pendingRunReservationsBySession.delete(sessionKey);
 }
 
+function setPendingRunUserIdempotency(
+  sessionKey: string,
+  reservationRunId: string,
+  idempotencyKey: unknown,
+): void {
+  const pending = pendingRunReservationsBySession.get(sessionKey);
+  const normalized = typeof idempotencyKey === 'string' ? idempotencyKey.trim() : '';
+  if (!pending || pending.reservationRunId !== reservationRunId || !normalized) return;
+  pending.userIdempotencyKey = normalized;
+}
+
+function rememberRunOriginUser(
+  sessionKey: string,
+  runId: string,
+  idempotencyKey: unknown,
+): void {
+  const normalizedKey = typeof idempotencyKey === 'string' ? idempotencyKey.trim() : '';
+  if (!normalizedKey) return;
+  runOriginUserBySession.set(sessionKey, { runId, idempotencyKey: normalizedKey });
+}
+
 export function failPendingRunReservation(sessionKey: string, reservationRunId: string): void {
   const pending = pendingRunReservationsBySession.get(sessionKey);
   if (!pending || pending.reservationRunId !== reservationRunId) return;
   pendingRunReservationsBySession.delete(sessionKey);
+  ambiguousRunDispatchesBySession.delete(sessionKey);
+  ambiguousRunReservationsBySession.delete(sessionKey);
   failedRunReservationsBySession.add(sessionKey);
+  failedRunReservationDetailsBySession.set(sessionKey, {
+    reservationRunId,
+    userIdempotencyKey: normalizedUserIdempotencyKey(pending.userIdempotencyKey),
+  });
+  tombstoneRun(sessionKey, reservationRunId);
   if (activeRunIds.get(sessionKey) === reservationRunId) activeRunIds.delete(sessionKey);
   streamEventBus.clearStream(sessionKey, reservationRunId);
+}
+
+function rejectAmbiguousRunDispatch(sessionKey: string, error: Error): void {
+  const dispatch = ambiguousRunDispatchesBySession.get(sessionKey);
+  if (!dispatch) return;
+  ambiguousRunDispatchesBySession.delete(sessionKey);
+  ambiguousRunReservationsBySession.delete(sessionKey);
+  clearPendingRunReservation(sessionKey, dispatch.reservationRunId);
+  dispatch.reject(error);
+}
+
+function markAmbiguousRunReservation(sessionKey: string, reservationRunId: string): void {
+  failedRunReservationsBySession.delete(sessionKey);
+  failedRunReservationDetailsBySession.delete(sessionKey);
+  ambiguousRunReservationsBySession.set(sessionKey, reservationRunId);
+  // Preserve the reservation as a CAS predecessor. The request may have
+  // reached OpenClaw even though its acknowledgement was lost with the socket.
+  beginReconnectRunRecovery(sessionKey, reservationRunId);
+  if (isConnected()) scheduleReconnectRunProbe(sessionKey, 250);
+}
+
+function parkAmbiguousRunDispatch(
+  sessionKey: string,
+  reservationRunId: string,
+  dispatch: Omit<AmbiguousRunDispatch, 'reservationRunId' | 'correlatedRunId' | 'settling'>,
+): void {
+  markAmbiguousRunReservation(sessionKey, reservationRunId);
+  setPendingRunUserIdempotency(sessionKey, reservationRunId, dispatch.expectedUserIdempotencyKey);
+  const existing = ambiguousRunDispatchesBySession.get(sessionKey);
+  if (existing?.reservationRunId === reservationRunId) return;
+  ambiguousRunDispatchesBySession.set(sessionKey, {
+    reservationRunId,
+    correlatedRunId: null,
+    settling: false,
+    ...dispatch,
+  });
+}
+
+/**
+ * Preserve a chat.send reservation whose frame may have reached OpenClaw but
+ * whose acknowledgement was lost on another transport (for example the
+ * browser direct-proxy socket). The singleton gateway lane remains the
+ * recovery authority and will adopt only a run correlated to this exact
+ * idempotency key.
+ */
+export function parkUnconfirmedRunReservation(
+  sessionKey: string,
+  reservationRunId: string,
+  expectedUserIdempotencyKey: string,
+): boolean {
+  const pending = pendingRunReservationsBySession.get(sessionKey);
+  if (!pending || pending.reservationRunId !== reservationRunId) return false;
+  parkAmbiguousRunDispatch(sessionKey, reservationRunId, {
+    expectedUserIdempotencyKey,
+    accept: async (runId: string) => {
+      if (!acknowledgeRunReservation(sessionKey, reservationRunId, runId)) {
+        throw new Error(`Stale recovered chat.send response ignored for ${sessionKey}`);
+      }
+    },
+    // Terminal reconciliation publishes the user-facing error/history signal.
+    // A detached direct-proxy request has no response promise left to reject.
+    reject: (error: Error) => {
+      debugLog(`Detached direct chat.send recovery settled for ${sessionKey}: ${error.message}`);
+    },
+  });
+  return true;
+}
+
+function normalizedUserIdempotencyKey(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const normalized = value.trim();
+  return normalized.endsWith(':user') ? normalized.slice(0, -':user'.length) : normalized;
+}
+
+function explicitGatewayMessageRunId(message: any): string | undefined {
+  return [
+    message?.runId,
+    message?.__openclaw?.runId,
+    message?.metadata?.runId,
+    message?.metadata?.__openclaw?.runId,
+  ].map(normalizedRunId).find(Boolean);
+}
+
+function correlateAmbiguousDispatchFromUserMessage(
+  sessionKey: string,
+  message: any,
+  exactActiveRunId?: string,
+): boolean {
+  const dispatch = ambiguousRunDispatchesBySession.get(sessionKey);
+  if (!dispatch) return false;
+  const expectedKey = normalizedUserIdempotencyKey(dispatch.expectedUserIdempotencyKey);
+  const observedKey = normalizedUserIdempotencyKey(message?.idempotencyKey);
+  if (!expectedKey || observedKey !== expectedKey) return false;
+  const correlatedRunId = normalizedRunId(exactActiveRunId) || explicitGatewayMessageRunId(message);
+  if (!correlatedRunId || isRunTombstoned(sessionKey, correlatedRunId)) return false;
+  dispatch.correlatedRunId = correlatedRunId;
+  return true;
+}
+
+function correlateAmbiguousDispatchFromHistory(
+  sessionKey: string,
+  payload: any,
+  exactActiveRunId?: string,
+): { matched: boolean; userIndex: number; runId: string | null; messages: any[] | null } {
+  const dispatch = ambiguousRunDispatchesBySession.get(sessionKey);
+  const messages = Array.isArray(payload?.messages)
+    ? payload.messages
+    : Array.isArray(payload?.history?.messages)
+      ? payload.history.messages
+      : null;
+  if (!dispatch || !messages) return { matched: false, userIndex: -1, runId: null, messages };
+  const expectedKey = normalizedUserIdempotencyKey(dispatch.expectedUserIdempotencyKey);
+  const originUserIndex = findHistoryOriginUserIndex(messages, expectedKey);
+  if (originUserIndex < 0) return { matched: false, userIndex: -1, runId: null, messages };
+  const userMessage = messages[originUserIndex];
+
+  let correlatedRunId = explicitGatewayMessageRunId(userMessage) || dispatch.correlatedRunId;
+  const boundary = nextDistinctHistoryTurnOriginIndex(
+    messages,
+    originUserIndex,
+    expectedKey,
+    correlatedRunId || normalizedRunId(exactActiveRunId),
+  );
+  for (let index = originUserIndex + 1; index < boundary && !correlatedRunId; index += 1) {
+    correlatedRunId = explicitGatewayMessageRunId(messages[index]) || null;
+  }
+  if (!correlatedRunId) correlatedRunId = normalizedRunId(exactActiveRunId) || null;
+  if (correlatedRunId && !isRunTombstoned(sessionKey, correlatedRunId)) {
+    dispatch.correlatedRunId = correlatedRunId;
+  }
+  return { matched: true, userIndex: originUserIndex, runId: correlatedRunId, messages };
+}
+
+async function tryFinalizeAmbiguousActiveRun(sessionKey: string, liveRunId: string): Promise<boolean> {
+  const dispatch = ambiguousRunDispatchesBySession.get(sessionKey);
+  if (!dispatch) return false;
+  if (dispatch.correlatedRunId === liveRunId) {
+    return finalizeAmbiguousRunDispatch(sessionKey, liveRunId);
+  }
+  try {
+    const history = await callGatewayRpc(
+      'chat.history',
+      { sessionKey, limit: RECONNECT_INACTIVE_HISTORY_LIMIT },
+      10_000,
+    );
+    const correlation = correlateAmbiguousDispatchFromHistory(sessionKey, history, liveRunId);
+    if (!correlation.matched || correlation.runId !== liveRunId) return false;
+    return finalizeAmbiguousRunDispatch(sessionKey, liveRunId);
+  } catch (error: any) {
+    debugLog(`Ambiguous dispatch correlation failed for ${sessionKey}: ${error?.message || error}`);
+    return false;
+  }
+}
+
+async function finalizeAmbiguousRunDispatch(
+  sessionKey: string,
+  upstreamRunId: string,
+): Promise<boolean> {
+  const dispatch = ambiguousRunDispatchesBySession.get(sessionKey);
+  const exactRunId = normalizedRunId(upstreamRunId);
+  if (!dispatch || dispatch.settling || !exactRunId || isRunTombstoned(sessionKey, exactRunId)) {
+    return false;
+  }
+  if (dispatch.correlatedRunId !== exactRunId) return false;
+  const pending = pendingRunReservationsBySession.get(sessionKey);
+  if (!pending || pending.reservationRunId !== dispatch.reservationRunId) return false;
+
+  dispatch.settling = true;
+  try {
+    await dispatch.accept(exactRunId);
+    ambiguousRunDispatchesBySession.delete(sessionKey);
+    ambiguousRunReservationsBySession.delete(sessionKey);
+    clearReconnectRunRecovery(sessionKey);
+    return true;
+  } catch (error: any) {
+    ambiguousRunDispatchesBySession.delete(sessionKey);
+    ambiguousRunReservationsBySession.delete(sessionKey);
+    dispatch.reject(error instanceof Error ? error : new Error(String(error)));
+    return false;
+  }
 }
 
 function adoptActiveRun(
@@ -755,7 +1705,11 @@ function adoptActiveRun(
   publishResume: boolean,
 ): boolean {
   const nextRunId = normalizedRunId(runId);
-  if (!nextRunId) return false;
+  // Every run-identity transition funnels through this CAS boundary. A stale
+  // sessions.list row must not be able to resurrect a run that already
+  // reached a terminal state, even when the adoption came from a reconnect
+  // probe instead of a live event.
+  if (!nextRunId || isRunTombstoned(sessionKey, nextRunId)) return false;
 
   const trackedStream = streamEventBus.getTrackedStream(sessionKey);
   const trackedRunId = normalizedRunId(trackedStream?.runId) || null;
@@ -783,6 +1737,13 @@ function adoptActiveRun(
   clearPendingCodexIdleTimeout(sessionKey);
   resetRunStreamState(sessionKey);
   activeRunIds.set(sessionKey, nextRunId);
+  const priorOrigin = runOriginUserBySession.get(sessionKey);
+  if (priorOrigin?.runId === previousRunId) {
+    runOriginUserBySession.set(sessionKey, { ...priorOrigin, runId: nextRunId });
+  }
+  if (ambiguousRunReservationsBySession.get(sessionKey) === previousRunId) {
+    ambiguousRunReservationsBySession.delete(sessionKey);
+  }
   const pendingToolRun = pendingToolRunsBySession.get(sessionKey);
   if (pendingToolRun) pendingToolRun.runId = nextRunId;
   if (publishResume) {
@@ -801,6 +1762,8 @@ function cleanupCompletedRun(sessionKey: string, runId?: string): void {
   if (!streamEventBus.softClearStream(sessionKey, completedRunId)) return;
   tombstoneRun(sessionKey, completedRunId);
   if (activeRunIds.get(sessionKey) === completedRunId) activeRunIds.delete(sessionKey);
+  clearReconnectRunRecovery(sessionKey);
+  ambiguousRunReservationsBySession.delete(sessionKey);
   pendingToolRunsBySession.delete(sessionKey);
   resetRunStreamState(sessionKey);
 }
@@ -887,6 +1850,8 @@ function publishFatalRunError(sessionKey: string, content: string, runId?: strin
   if (!streamEventBus.clearStream(sessionKey, failedRunId)) return;
   tombstoneRun(sessionKey, failedRunId);
   if (activeRunIds.get(sessionKey) === failedRunId) activeRunIds.delete(sessionKey);
+  clearReconnectRunRecovery(sessionKey);
+  ambiguousRunReservationsBySession.delete(sessionKey);
   pendingToolRunsBySession.delete(sessionKey);
   resetRunStreamState(sessionKey);
 }
@@ -935,6 +1900,17 @@ function scheduleEmptyFinal(sessionKey: string, runId?: string, model?: string |
   }, 2500);
   timer.unref?.();
   pendingEmptyFinalBySession.set(sessionKey, { runId: pendingRunId, model, timer });
+}
+
+function buildApprovalWaitStatusEvent(runId: string): StreamEvent {
+  // Approval request bodies can contain host commands. They travel only on
+  // the separately role-gated approval channel; the ordinary session stream
+  // receives a body-free status rail update.
+  return {
+    type: 'status',
+    content: '⏳ Waiting for command approval…',
+    runId,
+  };
 }
 
 function getReconnectDelay(): number {
@@ -1113,7 +2089,7 @@ function mergePreambleProgress(
 
   let state = preambleProgressBySession.get(sessionKey);
   if (!state || (state.runId && state.runId !== runId)) {
-    state = { runId, order: [], textByItem: new Map() };
+    state = { runId, order: [], textByItem: new Map(), textChars: 0 };
     preambleProgressBySession.set(sessionKey, state);
   } else if (!state.runId) {
     state.runId = runId;
@@ -1124,7 +2100,37 @@ function mergePreambleProgress(
     ? rawItemId.trim()
     : '__current__';
   if (!state.textByItem.has(itemId)) state.order.push(itemId);
+  state.textChars -= state.textByItem.get(itemId)?.length || 0;
   state.textByItem.set(itemId, progressText);
+  state.textChars += progressText.length;
+
+  const evictOldestItem = (): boolean => {
+    const oldestId = state!.order.shift();
+    if (!oldestId) return false;
+    const oldestText = state!.textByItem.get(oldestId) || '';
+    state!.textByItem.delete(oldestId);
+    state!.textChars -= oldestText.length;
+    return true;
+  };
+  const joinedLength = (): number => (
+    state!.textChars + Math.max(0, state!.order.length - 1) * 2
+  );
+
+  while (state.order.length > MAX_PREAMBLE_PROGRESS_ITEMS) evictOldestItem();
+  while (state.order.length > 1 && joinedLength() > MAX_PREAMBLE_PROGRESS_CHARS) {
+    evictOldestItem();
+  }
+  if (state.order.length === 1 && joinedLength() > MAX_PREAMBLE_PROGRESS_CHARS) {
+    const remainingId = state.order[0];
+    const remainingText = state.textByItem.get(remainingId) || '';
+    const suffixLength = Math.max(
+      0,
+      MAX_PREAMBLE_PROGRESS_CHARS - PREAMBLE_PROGRESS_TRUNCATION_MARKER.length,
+    );
+    const boundedText = `${PREAMBLE_PROGRESS_TRUNCATION_MARKER}${remainingText.slice(-suffixLength)}`;
+    state.textByItem.set(remainingId, boundedText);
+    state.textChars = boundedText.length;
+  }
 
   return state.order
     .map((id) => state!.textByItem.get(id) || '')
@@ -1182,6 +2188,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
 
   const sessionKey = resolveSessionKeyForGatewayPayload(payload);
   if (!sessionKey) {
+    if (quarantineUnresolvedRunFrame('agent', payload.runId, payload)) return;
     debugLog(`Ignoring agent event without resolvable sessionKey: stream=${String(payload.stream || '')} runId=${String(payload.runId || '')}`);
     return;
   }
@@ -1243,8 +2250,12 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   // Queue even when the Gateway happens to reuse our reservation id.
   if (queuePendingRunFrame(sessionKey, 'agent', runId, payload)) return;
   if (expectedRunId && runId && runId !== expectedRunId) {
-    debugLog(`Ignoring agent event for stale runId=${runId} (expected ${expectedRunId})`);
-    return;
+    if (tryAdoptReconnectRunFromTrustedEvent(sessionKey, expectedRunId, runId)) {
+      expectedRunId = runId;
+    } else {
+      debugLog(`Ignoring agent event for stale runId=${runId} (expected ${expectedRunId})`);
+      return;
+    }
   }
 
   const isLateTerminalError = streamEventBus.wasRecentlyDone(sessionKey, 10000)
@@ -1538,24 +2549,126 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
   }
 }
 
+function sessionUserMessageIdentity(payload: Record<string, unknown>, message: any, text: string): string {
+  const portalClientMessageId = portalClientMessageIdFromIdempotencyKey(message?.idempotencyKey);
+  if (portalClientMessageId) return portalClientMessageId;
+  const candidates = [
+    message?.id,
+    message?.messageId,
+    payload.messageId,
+    payload.id,
+    message?.idempotencyKey,
+    message?.__openclaw?.mirrorIdentity,
+    message?.metadata?.__openclaw?.mirrorIdentity,
+  ];
+  const stable = candidates.find((value) => typeof value === 'string' && value.trim());
+  if (typeof stable === 'string') {
+    let normalized = stable.trim();
+    if (normalized.endsWith(':user')) normalized = normalized.slice(0, -':user'.length);
+    return normalized.slice(0, 512);
+  }
+  const timestamp = Number(message?.timestamp ?? payload.timestamp ?? payload.ts);
+  const digest = createHash('sha256').update(text).digest('hex').slice(0, 24);
+  return `fallback:${Number.isFinite(timestamp) ? timestamp : Date.now()}:${digest}`;
+}
+
+function markUserMessageSeen(sessionKey: string, messageId: string): boolean {
+  const now = Date.now();
+  const seen = seenUserMessageIdsBySession.get(sessionKey) || new Map<string, number>();
+  for (const [id, seenAt] of seen) {
+    if (now - seenAt > SEEN_USER_MESSAGE_TTL_MS) seen.delete(id);
+  }
+  if (seen.has(messageId)) return false;
+  seen.set(messageId, now);
+  while (seen.size > MAX_SEEN_USER_MESSAGE_IDS) {
+    const oldest = seen.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    seen.delete(oldest);
+  }
+  seenUserMessageIdsBySession.set(sessionKey, seen);
+  return true;
+}
+
+function publishSessionUserMessage(
+  sessionKey: string,
+  payload: Record<string, unknown>,
+  message: any,
+  text: string,
+  currentRunId?: string,
+  sourceRunId?: string,
+): void {
+  const messageId = sessionUserMessageIdentity(payload, message, text);
+  if (!markUserMessageSeen(sessionKey, messageId)) return;
+  const rawTimestamp = Number(message?.timestamp ?? payload.timestamp ?? payload.ts);
+  const sourceChannel = typeof message?.sourceChannel === 'string' && message.sourceChannel.trim()
+    ? message.sourceChannel.trim().slice(0, 64)
+    : undefined;
+  streamEventBus.publish(sessionKey, {
+    type: 'user_message',
+    content: text.slice(0, 100_000),
+    messageId,
+    messageTimestamp: Number.isFinite(rawTimestamp) && rawTimestamp > 0 ? rawTimestamp : Date.now(),
+    ...(sourceChannel ? { sourceChannel } : {}),
+    ...(currentRunId ? { runId: currentRunId } : {}),
+    ...(sourceRunId && sourceRunId !== currentRunId ? { sourceRunId } : {}),
+  });
+}
+
 function handleSessionMessageEvent(payload: Record<string, unknown> | undefined): void {
   if (!payload) return;
   const sessionKey = resolveSessionKeyForGatewayPayload(payload);
   if (!sessionKey) return;
-  if (failedRunReservationsBySession.has(sessionKey)) return;
-
   const message = payload.message && typeof payload.message === 'object' ? payload.message as any : null;
   if (!message) return;
 
+  const snapshotActiveRunIds = Array.isArray(payload.activeRunIds)
+    ? [...new Set(payload.activeRunIds.map(normalizedRunId).filter(Boolean))] as string[]
+    : Array.isArray((payload.session as any)?.activeRunIds)
+      ? [...new Set((payload.session as any).activeRunIds.map(normalizedRunId).filter(Boolean))] as string[]
+      : null;
+  const snapshotRunId = snapshotActiveRunIds?.length === 1 ? snapshotActiveRunIds[0] : undefined;
   const messageRunId = [
     payload.runId,
     message.runId,
     message.__openclaw?.runId,
     message.metadata?.runId,
     message.metadata?.__openclaw?.runId,
+    snapshotRunId,
   ].find((value) => typeof value === 'string' && value.trim()) as string | undefined;
   const normalizedMessageRunId = messageRunId?.trim();
-  const activeRunId = activeRunIds.get(sessionKey);
+  const correlationRole = typeof message.role === 'string'
+    ? message.role.trim().toLowerCase()
+    : (typeof message.type === 'string' ? message.type.trim().toLowerCase() : '');
+  if (correlationRole === 'user' && normalizedMessageRunId) {
+    rememberRunOriginUser(sessionKey, normalizedMessageRunId, message.idempotencyKey);
+    correlateAmbiguousDispatchFromUserMessage(sessionKey, message, normalizedMessageRunId);
+  }
+  let activeRunId = activeRunIds.get(sessionKey);
+  const meta = (message.__openclaw && typeof message.__openclaw === 'object' ? message.__openclaw : null)
+    || (message.metadata?.__openclaw && typeof message.metadata.__openclaw === 'object' ? message.metadata.__openclaw : null);
+  const text = extractTextFromContent(message.content ?? message.text ?? '');
+  const role = typeof message.role === 'string' ? message.role : (typeof message.type === 'string' ? message.type : '');
+  const normalizedRole = role.trim().toLowerCase();
+  const willPublishTrustedUserOrigin = normalizedRole === 'user'
+    && Boolean(text)
+    && !isControlOnlyAssistantText(text);
+  if (failedRunReservationsBySession.has(sessionKey)) {
+    const failed = failedRunReservationDetailsBySession.get(sessionKey);
+    const observedKey = normalizedUserIdempotencyKey(message.idempotencyKey);
+    const isNewTrustedUserOrigin = normalizedRole === 'user'
+      && Boolean(normalizedMessageRunId)
+      && normalizedMessageRunId !== failed?.reservationRunId
+      && (!failed?.userIdempotencyKey || observedKey !== failed.userIdempotencyKey)
+      && Boolean(text)
+      && !isControlOnlyAssistantText(text);
+    if (!isNewTrustedUserOrigin) return;
+
+    // A definitive failed Portal reservation fences only its own late frames.
+    // An exact newer user origin from OpenClaw (Discord/Web UI/etc.) starts a
+    // different run and is allowed to heal the session-wide live lane.
+    failedRunReservationsBySession.delete(sessionKey);
+    failedRunReservationDetailsBySession.delete(sessionKey);
+  }
   if (normalizedMessageRunId) {
     if (queuePendingRunFrame(
       sessionKey,
@@ -1572,24 +2685,56 @@ function handleSessionMessageEvent(payload: Record<string, unknown> | undefined)
       return;
     }
   }
-  if (
-    normalizedMessageRunId
-    && (
-      isRunTombstoned(sessionKey, normalizedMessageRunId)
-      || (activeRunId && normalizedMessageRunId !== activeRunId)
-    )
-  ) {
-    debugLog(`Ignoring stale session.message for ${sessionKey} runId=${normalizedMessageRunId} expected=${activeRunId || '-'}`);
+  if (normalizedMessageRunId && isRunTombstoned(sessionKey, normalizedMessageRunId)) return;
+  if (normalizedRole === 'user' && normalizedMessageRunId && !activeRunId) {
+    const tracked = streamEventBus.getTrackedStream(sessionKey);
+    const predecessorRunId = normalizedRunId(tracked?.runId) || null;
+    const registered = tracked
+      ? registerRun(sessionKey, normalizedMessageRunId, predecessorRunId)
+      : registerRun(sessionKey, normalizedMessageRunId);
+    if (registered) {
+      activeRunId = normalizedMessageRunId;
+      streamEventBus.publish(sessionKey, {
+        type: 'run_resumed',
+        content: '',
+        runId: normalizedMessageRunId,
+      });
+    }
+  }
+  if (normalizedMessageRunId && activeRunId && normalizedMessageRunId !== activeRunId) {
+    if (tryAdoptReconnectRunFromTrustedEvent(
+      sessionKey,
+      activeRunId,
+      normalizedMessageRunId,
+      !willPublishTrustedUserOrigin,
+    )) {
+      activeRunId = normalizedMessageRunId;
+    } else {
+      debugLog(`Ignoring stale session.message for ${sessionKey} runId=${normalizedMessageRunId} expected=${activeRunId || '-'}`);
+      if (normalizedRole === 'user' && text && !isControlOnlyAssistantText(text)) {
+        publishSessionUserMessage(sessionKey, payload, message, text, activeRunId, normalizedMessageRunId);
+      }
+      return;
+    }
+  }
+
+  debugLog(`session.message event: session=${sessionKey} role=${role || '-'} textLen=${text.length} keys=${Object.keys(message).join(',')}`);
+
+  if (willPublishTrustedUserOrigin) {
+    publishSessionUserMessage(
+      sessionKey,
+      payload,
+      message,
+      text,
+      activeRunId === normalizedMessageRunId ? activeRunId : undefined,
+      normalizedMessageRunId,
+    );
+    if (normalizedMessageRunId && activeRunId === normalizedMessageRunId) {
+      replayQuarantinedRunFrames(sessionKey, normalizedMessageRunId);
+    }
     return;
   }
 
-  const meta = (message.__openclaw && typeof message.__openclaw === 'object' ? message.__openclaw : null)
-    || (message.metadata?.__openclaw && typeof message.metadata.__openclaw === 'object' ? message.metadata.__openclaw : null);
-  const text = extractTextFromContent(message.content ?? message.text ?? '');
-  const role = typeof message.role === 'string' ? message.role : (typeof message.type === 'string' ? message.type : '');
-  debugLog(`session.message event: session=${sessionKey} role=${role || '-'} textLen=${text.length} keys=${Object.keys(message).join(',')}`);
-
-  const normalizedRole = role.trim().toLowerCase();
   const reasoningMirrorText = normalizedRole === 'assistant' ? extractReasoningMirrorText(message) : '';
   if (reasoningMirrorText && !isControlOnlyAssistantText(reasoningMirrorText)) {
     // Codex/app-server stores visible reasoning as a delivery-mirror assistant
@@ -1755,6 +2900,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
 
   const sessionKey = resolveSessionKeyForGatewayPayload(payload);
   if (!sessionKey) {
+    if (quarantineUnresolvedRunFrame('chat', payload.runId, payload)) return;
     debugLog(`Ignoring chat event without resolvable sessionKey: state=${String(payload.state || '')} runId=${String(payload.runId || '')}`);
     return;
   }
@@ -1799,8 +2945,12 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
   // chooses the reservation id itself as the upstream run id.
   if (queuePendingRunFrame(sessionKey, 'chat', runId, payload)) return;
   if (expectedRunId && runId && runId !== expectedRunId) {
-    debugLog(`Ignoring chat event state=${state} for stale runId=${runId} (expected ${expectedRunId})`);
-    return;
+    if (tryAdoptReconnectRunFromTrustedEvent(sessionKey, expectedRunId, runId)) {
+      expectedRunId = runId;
+    } else {
+      debugLog(`Ignoring chat event state=${state} for stale runId=${runId} (expected ${expectedRunId})`);
+      return;
+    }
   }
 
   if (!expectedRunId && runId && state === 'error' && streamEventBus.wasRecentlyDone(sessionKey, 10000)) {
@@ -2124,6 +3274,8 @@ function connect(): void {
               debugLog(`Skipped stale reconnect snapshot for ${sessionKey} runId=${runId}`);
             } else {
               activeRunIds.set(sessionKey, runId);
+              armReconnectRunRecoveryAfterAuthentication(sessionKey);
+              scheduleReconnectRunProbe(sessionKey);
             }
           }
           // Clear the snapshot
@@ -2186,12 +3338,10 @@ function connect(): void {
         ? activeRunIds.get(approval.request.sessionKey)
         : undefined;
       if (approval.request?.sessionKey && approvalRunId && streamEventBus.hasSubscribers(approval.request.sessionKey)) {
-        streamEventBus.publish(approval.request.sessionKey, {
-          type: 'status',
-          content: '⏳ Waiting for command approval…',
-          approval,
-          runId: approvalRunId,
-        } as any);
+        streamEventBus.publish(
+          approval.request.sessionKey,
+          buildApprovalWaitStatusEvent(approvalRunId),
+        );
       }
       return;
     }
@@ -2262,6 +3412,15 @@ function connect(): void {
     // to re-seed StreamEventBus if the gateway still has active sessions.
     const activeSessionsSnapshot = new Map(activeRunIds);
 
+    for (const [sessionKey, runId] of activeSessionsSnapshot) {
+      beginReconnectRunRecovery(sessionKey, runId);
+      streamEventBus.publish(sessionKey, {
+        type: 'status',
+        content: 'Reconnecting to stream…',
+        runId,
+      });
+    }
+
     singletonWs = null;
     isConnecting = false;
     isAuthenticated = false;
@@ -2291,6 +3450,21 @@ async function subscribeGatewaySessionMessageNow(sessionKey: string): Promise<vo
     activeSessionMessageSubscriptions.add(canonicalKey);
     if (canonicalKey !== key) activeSessionMessageSubscriptions.add(key);
     debugLog(`Subscribed to OpenClaw session messages: ${canonicalKey}`);
+    await reconcileSubscribedSessionLiveRun(canonicalKey);
+    // The subscription is live-only. A prompt sent through Discord or another
+    // client while this upstream socket was down cannot be replayed here, so
+    // tell the browser to perform one durable history merge after every
+    // successful subscription/resubscription.
+    const now = Date.now();
+    const lastChangedAt = lastHistoryChangedAtBySession.get(canonicalKey) || 0;
+    if (now - lastChangedAt >= HISTORY_CHANGED_MIN_INTERVAL_MS) {
+      lastHistoryChangedAtBySession.set(canonicalKey, now);
+      streamEventBus.publish(canonicalKey, {
+        type: 'history_changed',
+        content: '',
+        reason: 'gateway-session-resubscribed',
+      });
+    }
   } catch (err: any) {
     debugLog(`sessions.messages.subscribe failed for ${key}: ${err?.message || err}`);
   }
@@ -2383,6 +3557,8 @@ export function reserveLogicalRun(sessionKey: string, reservationRunId: string):
   if (!accepted) return false;
 
   failedRunReservationsBySession.delete(key);
+  failedRunReservationDetailsBySession.delete(key);
+  ambiguousRunReservationsBySession.delete(key);
   const existing = pendingRunReservationsBySession.get(key);
   if (!existing || existing.reservationRunId !== reservation) {
     pendingRunReservationsBySession.set(key, {
@@ -2406,12 +3582,17 @@ export function acknowledgeRunReservation(
     return false;
   }
 
+  rememberRunOriginUser(sessionKey, upstreamRunId, pending.userIdempotencyKey);
   pendingRunReservationsBySession.delete(sessionKey);
+  ambiguousRunReservationsBySession.delete(sessionKey);
   if (upstreamRunId !== reservationRunId) {
     streamEventBus.publish(sessionKey, { type: 'run_resumed', content: '', runId: upstreamRunId });
   }
-  for (const frame of pending.frames) {
-    if (frame.runId !== upstreamRunId) continue;
+  const replayFrames: Array<PendingRunFrame | QuarantinedRunFrame> = [
+    ...pending.frames.filter((frame) => frame.runId === upstreamRunId),
+    ...takeQuarantinedRunFrames(sessionKey, upstreamRunId),
+  ].sort((left, right) => left.sequence - right.sequence);
+  for (const frame of replayFrames) {
     if (frame.kind === 'agent') handleAgentEvent(frame.payload);
     else if (frame.kind === 'chat') handleChatEvent(frame.payload);
     else handleSessionMessageEvent(frame.payload);
@@ -2462,12 +3643,25 @@ export async function callGatewayRpc(method: string, params: Record<string, any>
   if (runReservation && !reserveLogicalRun(rpcSessionKey, runReservation)) {
     throw new Error(`A different run is already active for ${rpcSessionKey}`);
   }
+  if (runReservation) setPendingRunUserIdempotency(rpcSessionKey, runReservation, params.idempotencyKey);
 
   return new Promise((resolve, reject) => {
     const timeoutTimer = setTimeout(() => {
       pendingResponses.delete(requestId);
-      if (runReservation) failPendingRunReservation(rpcSessionKey, runReservation);
-      reject(new Error(`${method} RPC timeout`));
+      if (runReservation) {
+        parkAmbiguousRunDispatch(rpcSessionKey, runReservation, {
+          expectedUserIdempotencyKey: typeof params.idempotencyKey === 'string' ? params.idempotencyKey : '',
+          accept: async (runId: string) => {
+            if (!acknowledgeRunReservation(rpcSessionKey, runReservation, runId)) {
+              throw new Error(`Stale recovered chat.send response ignored for ${rpcSessionKey}`);
+            }
+            resolve({ runId, recoveredAfterDisconnect: true });
+          },
+          reject,
+        });
+      } else {
+        reject(new Error(`${method} RPC timeout`));
+      }
     }, timeoutMs);
 
     pendingResponses.set(requestId, {
@@ -2485,7 +3679,23 @@ export async function callGatewayRpc(method: string, params: Record<string, any>
       },
       reject: (err: Error) => {
         clearTimeout(timeoutTimer);
-        if (runReservation) failPendingRunReservation(rpcSessionKey, runReservation);
+        if (runReservation) {
+          if (/WebSocket connection closed|RPC timeout/i.test(err.message)) {
+            parkAmbiguousRunDispatch(rpcSessionKey, runReservation, {
+              expectedUserIdempotencyKey: typeof params.idempotencyKey === 'string' ? params.idempotencyKey : '',
+              accept: async (runId: string) => {
+                if (!acknowledgeRunReservation(rpcSessionKey, runReservation, runId)) {
+                  throw new Error(`Stale recovered chat.send response ignored for ${rpcSessionKey}`);
+                }
+                resolve({ runId, recoveredAfterDisconnect: true });
+              },
+              reject,
+            });
+            return;
+          } else {
+            failPendingRunReservation(rpcSessionKey, runReservation);
+          }
+        }
         reject(err);
       },
     });
@@ -2981,6 +4191,7 @@ export async function sendChatMessage(
   if (!reserveLogicalRun(sessionKey, reservationRunId)) {
     throw new Error(`A different run is already active for ${sessionKey}`);
   }
+  setPendingRunUserIdempotency(sessionKey, reservationRunId, idempotencyKey);
 
   // Register this session's run expectation BEFORE sending (prevents race with
   // stale replayed events that arrive between send and response).
@@ -2989,8 +4200,19 @@ export async function sendChatMessage(
   return new Promise((resolve, reject) => {
     const timeoutTimer = setTimeout(() => {
       pendingResponses.delete(requestId);
-      failPendingRunReservation(sessionKey, reservationRunId);
-      reject(new Error('chat.send RPC timeout'));
+      parkAmbiguousRunDispatch(sessionKey, reservationRunId, {
+        expectedUserIdempotencyKey: idempotencyKey,
+        accept: async (runId: string) => {
+          await persistDispatchThenAcknowledgeRunReservation(
+            sessionKey,
+            reservationRunId,
+            runId,
+            onProviderDispatchAccepted,
+          );
+          resolve({ runId });
+        },
+        reject,
+      });
     }, 30000);
 
     pendingResponses.set(requestId, {
@@ -2998,8 +4220,19 @@ export async function sendChatMessage(
         clearTimeout(timeoutTimer);
         const runId = normalizedRunId(payload?.runId);
         if (!runId) {
-          failPendingRunReservation(sessionKey, reservationRunId);
-          reject(new Error(`chat.send response omitted its upstream run identity for ${sessionKey}`));
+          parkAmbiguousRunDispatch(sessionKey, reservationRunId, {
+            expectedUserIdempotencyKey: idempotencyKey,
+            accept: async (recoveredRunId: string) => {
+              await persistDispatchThenAcknowledgeRunReservation(
+                sessionKey,
+                reservationRunId,
+                recoveredRunId,
+                onProviderDispatchAccepted,
+              );
+              resolve({ runId: recoveredRunId });
+            },
+            reject,
+          });
           return;
         }
         void persistDispatchThenAcknowledgeRunReservation(
@@ -3016,7 +4249,24 @@ export async function sendChatMessage(
       },
       reject: (err: Error) => {
         clearTimeout(timeoutTimer);
-        failPendingRunReservation(sessionKey, reservationRunId);
+        if (/WebSocket connection closed|RPC timeout/i.test(err.message)) {
+          parkAmbiguousRunDispatch(sessionKey, reservationRunId, {
+            expectedUserIdempotencyKey: idempotencyKey,
+            accept: async (runId: string) => {
+              await persistDispatchThenAcknowledgeRunReservation(
+                sessionKey,
+                reservationRunId,
+                runId,
+                onProviderDispatchAccepted,
+              );
+              resolve({ runId });
+            },
+            reject,
+          });
+          return;
+        } else {
+          failPendingRunReservation(sessionKey, reservationRunId);
+        }
         reject(err);
       },
     });
@@ -3203,6 +4453,11 @@ export function registerRun(
   const key = String(sessionKey || '').trim();
   if (!key) return false;
   const nextRunId = normalizedRunId(runId);
+  // A terminal run ID is never valid authority for a new live lane. Keep this
+  // guard at the registration boundary so delayed sessions.list responses,
+  // stale RPC acknowledgements, and route-level recovery helpers cannot
+  // accidentally resurrect a completed run.
+  if (nextRunId && isRunTombstoned(key, nextRunId)) return false;
   desiredSessionMessageSubscriptions.add(key);
   const trackedRunId = normalizedRunId(streamEventBus.getTrackedStream(key)?.runId) || null;
   const currentRunId = activeRunIds.get(key) || trackedRunId;
@@ -3238,9 +4493,16 @@ export function registerRun(
  * Clear the active run for a session.
  */
 export function clearRun(sessionKey: string): void {
+  rejectAmbiguousRunDispatch(
+    sessionKey,
+    new Error('OpenClaw confirmed the ambiguous chat dispatch is not active.'),
+  );
   clearPendingRunReservation(sessionKey);
   tombstoneRun(sessionKey, activeRunIds.get(sessionKey));
   activeRunIds.delete(sessionKey);
+  clearReconnectRunRecovery(sessionKey);
+  ambiguousRunReservationsBySession.delete(sessionKey);
+  runOriginUserBySession.delete(sessionKey);
   pendingToolRunsBySession.delete(sessionKey);
   clearTextArbitration(sessionKey);
 }
@@ -3257,23 +4519,76 @@ export const __persistentGatewayWsTest = {
   handleAgentEvent,
   handleChatEvent,
   handleSessionMessageEvent,
+  beginReconnectRunRecovery,
+  liveRunIdsFromSessionList,
+  reconcileAuthoritativeLiveRun,
+  armReconnectRunRecoveryAfterAuthentication,
+  rememberRunOriginUser,
+  markAmbiguousRunReservation,
+  parkAmbiguousRunDispatch,
+  finalizeAmbiguousRunDispatch,
+  async reconcileInactiveReconnectHistoryPayload(sessionKey: string, payload: any): Promise<boolean> {
+    const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+    return recovery ? await reconcileInactiveReconnectHistory(sessionKey, recovery, payload) : false;
+  },
+  async settleReconnectRunRecovery(
+    sessionKey: string,
+    historyReader?: ReconnectHistoryReader,
+  ): Promise<void> {
+    const recovery = reconnectRunRecoveryBySession.get(sessionKey);
+    if (recovery) await settleExpiredReconnectRunRecovery(sessionKey, recovery, historyReader);
+  },
+  reconnectInactiveHistoryLimit: RECONNECT_INACTIVE_HISTORY_LIMIT,
+  reconnectInactiveHistoryMaxAttempts: RECONNECT_INACTIVE_HISTORY_MAX_ATTEMPTS,
+  runFrameQuarantineLimits: {
+    ttlMs: RUN_FRAME_QUARANTINE_TTL_MS,
+    maxFramesPerRun: MAX_QUARANTINED_FRAMES_PER_RUN,
+    maxBytesPerRun: MAX_QUARANTINED_BYTES_PER_RUN,
+    maxRuns: MAX_QUARANTINED_RUNS,
+    maxFramesTotal: MAX_QUARANTINED_FRAMES_TOTAL,
+    maxBytesTotal: MAX_QUARANTINED_BYTES_TOTAL,
+  },
+  quarantinedRunFrameCount(runId: string): number {
+    pruneQuarantinedRunFrames();
+    return quarantinedRunFramesByRunId.get(runId)?.frames.length || 0;
+  },
+  preambleProgressLimits: {
+    maxItems: MAX_PREAMBLE_PROGRESS_ITEMS,
+    maxChars: MAX_PREAMBLE_PROGRESS_CHARS,
+    truncationMarker: PREAMBLE_PROGRESS_TRUNCATION_MARKER,
+  },
+  buildApprovalWaitStatusEvent,
+  reconcileReconnectRunProbeResult,
   reserveLogicalRun,
+  setPendingRunUserIdempotency,
   acknowledgeRunReservation,
+  failPendingRunReservation,
   persistDispatchThenAcknowledgeRunReservation,
   registerRun,
   shouldProcessTrackedSessionEvent,
   resetSession(sessionKey: string): void {
     clearPendingRunReservation(sessionKey);
     failedRunReservationsBySession.delete(sessionKey);
+    failedRunReservationDetailsBySession.delete(sessionKey);
     clearPendingEmptyFinal(sessionKey);
     clearPendingCodexIdleTimeout(sessionKey);
     pendingToolRunsBySession.delete(sessionKey);
     streamEventBus.clearStream(sessionKey);
     activeRunIds.delete(sessionKey);
+    clearReconnectRunRecovery(sessionKey);
+    ambiguousRunReservationsBySession.delete(sessionKey);
+    ambiguousRunDispatchesBySession.delete(sessionKey);
+    runOriginUserBySession.delete(sessionKey);
     desiredSessionMessageSubscriptions.delete(sessionKey);
     activeSessionMessageSubscriptions.delete(sessionKey);
     clearTextArbitration(sessionKey);
     messageToolReplyBySession.delete(sessionKey);
     runTombstonesBySession.delete(sessionKey);
+    seenUserMessageIdsBySession.delete(sessionKey);
+    lastHistoryChangedAtBySession.delete(sessionKey);
+    for (const runId of [...quarantinedRunFramesByRunId.keys()]) {
+      dropQuarantinedRunFrames(runId);
+    }
+    bufferedRunFrameSequence = 0;
   },
 };

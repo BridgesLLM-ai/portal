@@ -34,6 +34,13 @@ export async function readExistingProjectChatBinding(input: {
   executionContext: ProjectSandboxExecutionContext;
   requireActive?: boolean;
   requireProviderSession?: boolean;
+  /**
+   * Read-only transcript/status callers may need to present recovery UI after
+   * an installer or policy update changes the immutable sandbox context.  This
+   * never authorizes use of the old provider session: stale session identities
+   * are withheld and mutating/active-session reads still fail closed.
+   */
+  allowStaleContext?: boolean;
 }, dependencies: {
   database?: BindingReadDatabase;
   loadSession?: typeof loadNativeSession;
@@ -60,6 +67,8 @@ export async function readExistingProjectChatBinding(input: {
   if (!binding) {
     return {
       binding: null,
+      staleBinding: null,
+      staleReason: null,
       portalSession,
       providerSessionKey: null,
       nativeSession: null as NativeSessionData | null,
@@ -69,10 +78,28 @@ export async function readExistingProjectChatBinding(input: {
     binding.userId !== input.actorUserId
     || binding.projectId !== input.executionContext.projectId
     || binding.provider !== input.provider
-    || binding.runtime !== expectedRuntime(input.provider)
+  ) {
+    throw new ProjectChatBindingReadError('The Project provider binding no longer matches its immutable identity.');
+  }
+  if (
+    binding.runtime !== expectedRuntime(input.provider)
     || binding.sandboxRoot !== input.executionContext.canonicalRoot
     || binding.policyFingerprint !== input.executionContext.policyFingerprint
   ) {
+    if (
+      input.allowStaleContext
+      && !input.requireActive
+      && !input.requireProviderSession
+    ) {
+      return {
+        binding: null,
+        staleBinding: binding,
+        staleReason: 'CONTEXT_DRIFT' as const,
+        portalSession,
+        providerSessionKey: null,
+        nativeSession: null as NativeSessionData | null,
+      };
+    }
     throw new ProjectChatBindingReadError('The Project provider binding no longer matches its immutable sandbox context.');
   }
   if (input.requireActive && binding.status !== 'active') {
@@ -167,5 +194,12 @@ export async function readExistingProjectChatBinding(input: {
     }
   }
 
-  return { binding, portalSession, providerSessionKey, nativeSession };
+  return {
+    binding,
+    staleBinding: null,
+    staleReason: null,
+    portalSession,
+    providerSessionKey,
+    nativeSession,
+  };
 }

@@ -9,9 +9,10 @@ import fs from 'fs';
 import http from 'http';
 import net from 'net';
 import path from 'path';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../config/database';
 import {
   bridgeContainerLoopbackPort,
+  assertProjectRuntimeImageAvailable,
   inspectProjectAppContainer,
   projectAppContainerName,
   readProjectAppLogs,
@@ -22,8 +23,7 @@ import {
 } from './project-lifecycle.service';
 import type { PortalProjectWorkloadPlan } from './projectWorkloadRuntime';
 import { PROJECT_METADATA_MAX_BYTES, readProjectTextFile } from './projectSurfacePolicy';
-
-const prisma = new PrismaClient();
+import { projectRuntimeManagement } from './projectRuntimeManagement';
 
 // Port range for full-stack apps: 5001-5099
 const PORT_RANGE_START = 5001;
@@ -56,6 +56,21 @@ interface ManagedApp {
   startupDeadlineAt: number;
   startupTimer?: NodeJS.Timeout;
   operationId: string;
+  persistenceGeneration: string;
+  statusPersistenceRevision: number;
+  runtimePersistenceRevision: number;
+  lastPersistedStatus?: AppProcessStatus;
+  lastPersistedRuntimeFingerprint?: string;
+  pendingStatusPersistence?: {
+    revision: number;
+    status: AppProcessStatus;
+    promise: Promise<void>;
+  };
+  pendingRuntimePersistence?: {
+    revision: number;
+    fingerprint: string;
+    promise: Promise<void>;
+  };
   runtimeIdentity: ProjectAppRuntimeIdentity;
   runtimePlan: PortalProjectWorkloadPlan;
 }
@@ -92,12 +107,37 @@ interface PersistedAppState {
   workloadId: string;
 }
 
+interface PersistedAppStateRecord {
+  value: string;
+  state: PersistedAppState | null;
+}
+
+interface ExpectedPersistedAppRuntime {
+  appId: string;
+  deployId: string;
+  actorId: string;
+  projectId: string;
+  deployPath: string;
+  port: number | null;
+}
+
+export class ProjectRuntimeStateAttestationError extends Error {
+  readonly code = 'PROJECT_RUNTIME_STATE_ATTESTATION_FAILED';
+  readonly retryable = false;
+
+  constructor() {
+    super('Portal found runtime recovery state that does not match this Project App. Cleanup stopped without deleting the recovery evidence.');
+    this.name = 'ProjectRuntimeStateAttestationError';
+  }
+}
+
 // In-memory registry of running app processes
 const runningApps: Map<string, ManagedApp> = new Map();
 const portLeases = new Map<number, PortLease>();
 const deployOperations = new Map<string, Promise<void>>();
 const appStatusWrites = new Map<string, Promise<void>>();
 const appStateWrites = new Map<string, Promise<void>>();
+const activeAppPersistenceGenerations = new Map<string, string>();
 let portAllocationQueue: Promise<void> = Promise.resolve();
 let startupPromise: Promise<void> | null = null;
 let shutdownPromise: Promise<void> | null = null;
@@ -158,9 +198,12 @@ async function waitForRuntimeReadiness(app: ManagedApp): Promise<void> {
       );
     }
     if (await readinessProbe(app.networkAddress, app.port)) {
+      if (!managedPersistenceGenerationIsActive(app) || app.desiredStatus !== 'running') {
+        throw new Error('App startup was superseded before readiness');
+      }
       app.status = 'running';
       app.lastError = undefined;
-      await updateAppStatus(app.appId, 'running');
+      await persistManagedStatus(app);
       await persistManagedApp(app);
       return;
     }
@@ -281,9 +324,27 @@ function serializePortAllocation<T>(work: () => Promise<T>): Promise<T> {
   return result;
 }
 
+function assertRuntimeMutationAdmissionOpen(): void {
+  if (shuttingDown) {
+    const error = new Error('App process runtime is shutting down') as Error & { code?: string };
+    error.code = 'APP_PROCESS_RUNTIME_SHUTTING_DOWN';
+    throw error;
+  }
+}
+
 function withDeployLock<T>(deployId: string, work: () => Promise<T>): Promise<T> {
+  // Admission and shutdown execute on the same event loop. Check before
+  // publishing a tail so shutdownAll() can take a complete, immutable snapshot
+  // of every operation that was admitted before it closed the lane.
+  assertRuntimeMutationAdmissionOpen();
   const previous = deployOperations.get(deployId) || Promise.resolve();
-  const result = previous.catch(() => undefined).then(work);
+  const result = previous.catch(() => undefined).then(() => {
+    // A mutation can have queued behind an earlier operation before shutdown.
+    // Refuse it when it reaches the head instead of mutating durable intent
+    // after shutdown has snapshotted the queue.
+    assertRuntimeMutationAdmissionOpen();
+    return work();
+  });
   const tail = result.then(() => undefined, () => undefined);
   deployOperations.set(deployId, tail);
   return result.finally(() => {
@@ -450,41 +511,133 @@ function persistedStateFromManaged(app: ManagedApp): PersistedAppState {
   };
 }
 
-async function persistManagedApp(app: ManagedApp): Promise<void> {
-  await persistAppState(persistedStateFromManaged(app));
+function persistedRuntimeFingerprint(state: PersistedAppState): string {
+  return JSON.stringify({
+    version: state.version,
+    appId: state.appId,
+    deployId: state.deployId,
+    port: state.port,
+    containerName: state.containerName,
+    containerId: state.containerId,
+    deployPath: state.deployPath,
+    status: state.status,
+    desiredStatus: state.desiredStatus,
+    restartCount: state.restartCount,
+    containerRestartCount: state.containerRestartCount,
+    lastError: state.lastError,
+    actorId: state.actorId,
+    projectId: state.projectId,
+    workloadId: state.workloadId,
+  });
 }
 
-async function persistAppState(state: PersistedAppState): Promise<void> {
+function managedPersistenceGenerationIsActive(app: ManagedApp): boolean {
+  return runningApps.get(app.deployId) === app
+    && activeAppPersistenceGenerations.get(app.appId) === app.persistenceGeneration;
+}
+
+async function serializeAppStateWrite(
+  appId: string,
+  work: () => Promise<void>,
+): Promise<void> {
+  const previous = appStateWrites.get(appId) || Promise.resolve();
+  const result = previous.catch(() => undefined).then(work);
+  const tail = result.then(() => undefined, () => undefined);
+  appStateWrites.set(appId, tail);
+  try {
+    await result;
+  } finally {
+    if (appStateWrites.get(appId) === tail) appStateWrites.delete(appId);
+  }
+}
+
+function persistManagedStatus(app: ManagedApp): Promise<void> {
+  if (!managedPersistenceGenerationIsActive(app)) return Promise.resolve();
+  const status = app.status;
+  const pending = app.pendingStatusPersistence;
+  if (pending?.status === status) return pending.promise;
+  if (!pending && app.lastPersistedStatus === status) return Promise.resolve();
+
+  const revision = ++app.statusPersistenceRevision;
+  const promise = updateAppStatus(app.appId, status, app.persistenceGeneration)
+    .then((persisted) => {
+      if (persisted && managedPersistenceGenerationIsActive(app)) {
+        app.lastPersistedStatus = status;
+      }
+    })
+    .finally(() => {
+      if (app.pendingStatusPersistence?.revision === revision) {
+        app.pendingStatusPersistence = undefined;
+      }
+    });
+  app.pendingStatusPersistence = { revision, status, promise };
+  return promise;
+}
+
+function persistManagedApp(app: ManagedApp): Promise<void> {
+  if (!managedPersistenceGenerationIsActive(app)) return Promise.resolve();
+  const state = persistedStateFromManaged(app);
+  const fingerprint = persistedRuntimeFingerprint(state);
+  const pending = app.pendingRuntimePersistence;
+  if (pending?.fingerprint === fingerprint) return pending.promise;
+  if (!pending && app.lastPersistedRuntimeFingerprint === fingerprint) return Promise.resolve();
+
+  const revision = ++app.runtimePersistenceRevision;
+  const promise = persistAppState(state, app.persistenceGeneration)
+    .then(() => {
+      if (managedPersistenceGenerationIsActive(app)) {
+        app.lastPersistedRuntimeFingerprint = fingerprint;
+      }
+    })
+    .finally(() => {
+      if (app.pendingRuntimePersistence?.revision === revision) {
+        app.pendingRuntimePersistence = undefined;
+      }
+    });
+  app.pendingRuntimePersistence = { revision, fingerprint, promise };
+  return promise;
+}
+
+async function persistAppState(
+  state: PersistedAppState,
+  persistenceGeneration?: string,
+): Promise<void> {
   const value = JSON.stringify(state);
-  const previous = appStateWrites.get(state.appId) || Promise.resolve();
-  const result = previous.catch(() => undefined).then(async () => {
+  await serializeAppStateWrite(state.appId, async () => {
+    if (
+      persistenceGeneration
+      && activeAppPersistenceGenerations.get(state.appId) !== persistenceGeneration
+    ) return;
     await prisma.systemSetting.upsert({
       where: { key: appStateKey(state.appId) },
       create: { key: appStateKey(state.appId), value },
       update: { value },
     });
   });
-  const tail = result.then(() => undefined, () => undefined);
-  appStateWrites.set(state.appId, tail);
-  try {
-    await result;
-  } finally {
-    if (appStateWrites.get(state.appId) === tail) appStateWrites.delete(state.appId);
-  }
 }
 
-async function loadAppState(appId: string): Promise<PersistedAppState | null> {
-  const record = await prisma.systemSetting.findUnique({ where: { key: appStateKey(appId) } }).catch(() => null);
-  if (!record) return null;
+function parsePersistedAppState(value: string, appId: string): PersistedAppState | null {
+  if (Buffer.byteLength(value, 'utf8') > 64 * 1024) return null;
   try {
-    const state = JSON.parse(record.value) as PersistedAppState;
+    const state = JSON.parse(value) as PersistedAppState;
     if (
       state?.version !== 2
       || state.appId !== appId
       || typeof state.deployId !== 'string'
       || !Number.isInteger(state.port)
       || typeof state.containerName !== 'string'
+      || !state.containerName
+      || typeof state.containerId !== 'string'
+      || !state.containerId
       || typeof state.deployPath !== 'string'
+      || !state.deployPath
+      || !['starting', 'running', 'stopped', 'error'].includes(state.status)
+      || !['running', 'stopped', 'error'].includes(state.desiredStatus)
+      || !Number.isInteger(state.restartCount)
+      || state.restartCount < 0
+      || !Number.isInteger(state.containerRestartCount)
+      || state.containerRestartCount < 0
+      || typeof state.updatedAt !== 'string'
       || typeof state.actorId !== 'string'
       || typeof state.projectId !== 'string'
       || state.workloadId !== appId
@@ -495,13 +648,93 @@ async function loadAppState(appId: string): Promise<PersistedAppState | null> {
   }
 }
 
+async function readPersistedAppStateRecord(appId: string): Promise<PersistedAppStateRecord | null> {
+  const record = await prisma.systemSetting.findUnique({ where: { key: appStateKey(appId) } });
+  if (!record) return null;
+  return {
+    value: record.value,
+    state: parsePersistedAppState(record.value, appId),
+  };
+}
+
+async function loadAppState(appId: string): Promise<PersistedAppState | null> {
+  const record = await readPersistedAppStateRecord(appId).catch(() => null);
+  return record?.state || null;
+}
+
+function attestPersistedAppState(
+  record: PersistedAppStateRecord,
+  expected: ExpectedPersistedAppRuntime,
+): PersistedAppState {
+  const state = record.state;
+  const runtimeIdentity = {
+    actorId: expected.actorId,
+    projectId: expected.projectId,
+    workloadId: expected.appId,
+  };
+  if (
+    !state
+    || state.appId !== expected.appId
+    || state.deployId !== expected.deployId
+    || state.actorId !== expected.actorId
+    || state.projectId !== expected.projectId
+    || state.workloadId !== expected.appId
+    || state.containerName !== projectAppContainerName(runtimeIdentity)
+    || state.deployPath !== expected.deployPath
+    || state.port !== expected.port
+  ) {
+    throw new ProjectRuntimeStateAttestationError();
+  }
+  return state;
+}
+
+function attestManagedApp(
+  managed: ManagedApp,
+  expected: ExpectedPersistedAppRuntime,
+  persisted?: PersistedAppState,
+): void {
+  if (
+    managed.appId !== expected.appId
+    || managed.deployId !== expected.deployId
+    || managed.runtimeIdentity.actorId !== expected.actorId
+    || managed.runtimeIdentity.projectId !== expected.projectId
+    || managed.runtimeIdentity.workloadId !== expected.appId
+    || managed.containerName !== projectAppContainerName(managed.runtimeIdentity)
+    || managed.deployPath !== expected.deployPath
+    || managed.port !== expected.port
+    || (persisted && (
+      persisted.containerId !== managed.containerId
+      || persisted.containerName !== managed.containerName
+    ))
+  ) {
+    throw new ProjectRuntimeStateAttestationError();
+  }
+}
+
 function clearStartupTimer(app: ManagedApp): void {
   if (!app.startupTimer) return;
   clearTimeout(app.startupTimer);
   app.startupTimer = undefined;
 }
 
+function retireManagedApp(
+  app: ManagedApp,
+  desiredStatus?: 'stopped' | 'error',
+): void {
+  clearStartupTimer(app);
+  app.operationId = crypto.randomUUID();
+  if (desiredStatus) {
+    app.status = desiredStatus;
+    app.desiredStatus = desiredStatus;
+  }
+  if (runningApps.get(app.deployId) === app) runningApps.delete(app.deployId);
+  if (activeAppPersistenceGenerations.get(app.appId) === app.persistenceGeneration) {
+    activeAppPersistenceGenerations.delete(app.appId);
+  }
+}
+
 function reconcileManagedApp(app: ManagedApp, persist = true): AppProcessStatus {
+  if (!managedPersistenceGenerationIsActive(app)) return app.status;
   const state = inspectProjectAppContainer(app.containerName);
   if (!state) {
     app.status = app.desiredStatus === 'running' ? 'error' : 'stopped';
@@ -528,7 +761,10 @@ function reconcileManagedApp(app: ManagedApp, persist = true): AppProcessStatus 
   }
 
   if (persist) {
-    void updateAppStatus(app.appId, app.status);
+    // Status and hosted-target reads are observation paths. Preserve durable
+    // recovery evidence without churning updatedAt on unchanged reads. Failed
+    // writes remain dirty and are retried only by a later observation.
+    void persistManagedStatus(app);
     void persistManagedApp(app).catch((error: any) => {
       console.error(`[AppProcess] Failed to persist runtime state for ${app.deployId}:`, error?.message || error);
     });
@@ -554,22 +790,22 @@ function scheduleStartupProbe(app: ManagedApp): void {
 
 async function stopAppUnlocked(
   deployId: string,
-  options: { updateDatabase?: boolean; desiredStatus?: 'stopped' | 'error' } = {},
+  options: {
+    updateDatabase?: boolean;
+    persistState?: boolean;
+    desiredStatus?: 'stopped' | 'error';
+  } = {},
 ): Promise<void> {
   const app = runningApps.get(deployId);
   if (app) {
-    clearStartupTimer(app);
-    app.operationId = crypto.randomUUID();
-    app.status = options.desiredStatus || 'stopped';
-    app.desiredStatus = options.desiredStatus || 'stopped';
+    retireManagedApp(app, options.desiredStatus || 'stopped');
   }
 
   console.log(`[AppProcess] Stopping sandboxed ${deployId}...`);
   if (app) await stopProjectAppContainer(app.runtimePlan);
-  if (runningApps.get(deployId) === app) runningApps.delete(deployId);
 
   if (app) {
-    await persistManagedApp(app);
+    if (options.persistState !== false) await persistAppState(persistedStateFromManaged(app));
     if (options.updateDatabase !== false) {
       await updateAppStatus(app.appId, app.status);
     }
@@ -585,6 +821,10 @@ async function startAppUnlocked(
   restartCount = 0,
 ): Promise<ManagedApp> {
   if (shuttingDown) throw new Error('App process runtime is shutting down');
+  // Never retire a healthy manager before proving its replacement image is
+  // locally available. This keeps Start/Restart recovery replayable when an
+  // unsafe host prune removed the immutable pin.
+  await assertProjectRuntimeImageAvailable();
   await stopAppUnlocked(deployId);
 
   const lease = await claimPortLease(port, appId, deployId);
@@ -608,6 +848,7 @@ async function startAppUnlocked(
       } catch (e: any) {
         console.error(`[AppProcess] npm install failed for ${deployId}:`, e.message);
         await updateAppStatus(appId, 'error');
+        if (e?.code === 'PROJECT_RUNTIME_IMAGE_UNAVAILABLE') throw e;
         throw new Error(`Dependency install failed: ${e.message}`);
       }
     }
@@ -641,11 +882,15 @@ async function startAppUnlocked(
       desiredStatus: 'running',
       startupDeadlineAt: Date.now() + STARTUP_TIMEOUT_MS,
       operationId: crypto.randomUUID(),
+      persistenceGeneration: crypto.randomUUID(),
+      statusPersistenceRevision: 0,
+      runtimePersistenceRevision: 0,
       runtimeIdentity,
       runtimePlan: container.plan,
     };
+    activeAppPersistenceGenerations.set(appId, managed.persistenceGeneration);
     runningApps.set(deployId, managed);
-    await updateAppStatus(appId, 'starting');
+    await persistManagedStatus(managed);
     await persistManagedApp(managed);
     await waitForRuntimeReadiness(managed);
     scheduleStartupProbe(managed);
@@ -653,8 +898,7 @@ async function startAppUnlocked(
   } catch (error) {
     const current = runningApps.get(deployId);
     if (current?.appId === appId) {
-      clearStartupTimer(current);
-      runningApps.delete(deployId);
+      retireManagedApp(current, 'error');
     }
     await stopProjectAppContainer(runtimeIdentity);
     await updateAppStatus(appId, 'error');
@@ -689,10 +933,9 @@ export async function restartApp(
   identity: { actorId: string; projectId: string },
 ): Promise<ManagedApp> {
   const runtimeIdentity = { ...identity, workloadId: appId };
-  return withDeployLock(deployId, async () => {
-    await stopAppUnlocked(deployId);
-    return startAppUnlocked(appId, deployId, deployPath, port, runtimeIdentity, 0);
-  });
+  return withDeployLock(deployId, () => (
+    startAppUnlocked(appId, deployId, deployPath, port, runtimeIdentity, 0)
+  ));
 }
 
 /**
@@ -709,17 +952,89 @@ export async function stopApp(deployId: string): Promise<void> {
 export async function forgetAppRuntime(
   appId: string,
   deployId: string,
-  identity: { actorId: string; projectId: string },
+  identity: {
+    actorId: string;
+    projectId: string;
+    deployPath: string;
+    port: number | null;
+  },
+  options: {
+    settleStatus?: 'stopped';
+  } = {},
 ): Promise<void> {
   await withDeployLock(deployId, async () => {
-    await stopAppUnlocked(deployId);
+    const expected: ExpectedPersistedAppRuntime = {
+      appId,
+      deployId,
+      actorId: identity.actorId,
+      projectId: identity.projectId,
+      deployPath: identity.deployPath,
+      port: identity.port,
+    };
+    const initialDurableRecord = await readPersistedAppStateRecord(appId);
+    const persisted = initialDurableRecord
+      ? attestPersistedAppState(initialDurableRecord, expected)
+      : undefined;
+    const managed = runningApps.get(deployId);
+    if (managed) attestManagedApp(managed, expected, persisted);
+
+    // Close every path that can admit a new status/state writer before the
+    // first awaited container mutation. Previously, hosted traffic and status
+    // reads could keep discovering this lane during Docker removal and enqueue
+    // a late "running" write after Stop had returned.
+    if (managed) retireManagedApp(managed, 'stopped');
+    if (managed) await stopProjectAppContainer(managed.runtimePlan);
     await stopProjectAppContainer({
       actorId: identity.actorId,
       projectId: identity.projectId,
       workloadId: appId,
     });
-    await prisma.systemSetting.deleteMany({
-      where: { key: appStateKey(appId) },
+
+    // A writer admitted before retirement may already be inside Prisma. Drain
+    // both per-App queues until their maps are stable, then serialize the final
+    // read/attestation/CAS deletion behind that boundary. No retired manager
+    // generation is allowed to enqueue or execute another write.
+    await drainAppPersistenceWrites(appId);
+    await serializeAppStateWrite(appId, async () => {
+      await serializeAppStatusWrite(appId, async () => {
+        await prisma.$transaction(async (transaction) => {
+          const stored = await transaction.systemSetting.findUnique({
+            where: { key: appStateKey(appId) },
+          });
+          const finalDurableRecord: PersistedAppStateRecord | null = stored
+            ? {
+              value: stored.value,
+              state: parsePersistedAppState(stored.value, appId),
+            }
+            : null;
+          if (finalDurableRecord) attestPersistedAppState(finalDurableRecord, expected);
+
+          // Commit the exact stopped intent and removal of its recovery record
+          // atomically. A changed App association or failed state CAS rolls
+          // both changes back, preserving the evidence and prior DB intent.
+          if (options.settleStatus === 'stopped') {
+            const settled = await transaction.app.updateMany({
+              where: {
+                id: appId,
+                projectIdentityId: expected.projectId,
+                userId: expected.actorId,
+                deployType: 'fullstack',
+                zipPath: expected.deployPath,
+                port: expected.port,
+              },
+              data: { processStatus: 'stopped' },
+            });
+            if (settled.count !== 1) throw new ProjectRuntimeStateAttestationError();
+          }
+
+          if (finalDurableRecord) {
+            const removed = await transaction.systemSetting.deleteMany({
+              where: { key: appStateKey(appId), value: finalDurableRecord.value },
+            });
+            if (removed.count !== 1) throw new ProjectRuntimeStateAttestationError();
+          }
+        }, { isolationLevel: 'Serializable' });
+      });
     });
   });
 }
@@ -765,24 +1080,60 @@ export function getAppTarget(deployId: string): string | null {
   return `http://${app.networkAddress}:${app.port}`;
 }
 
-async function updateAppStatus(appId: string, status: string): Promise<void> {
+async function serializeAppStatusWrite(
+  appId: string,
+  work: () => Promise<void>,
+): Promise<void> {
   const previous = appStatusWrites.get(appId) || Promise.resolve();
-  const result = previous.catch(() => undefined).then(async () => {
-    try {
-      await prisma.app.update({
-        where: { id: appId },
-        data: { processStatus: status },
-      });
-    } catch (e: any) {
-      console.error(`[AppProcess] Failed to update DB status for ${appId}:`, e.message);
-    }
-  });
+  const result = previous.catch(() => undefined).then(work);
   const tail = result.then(() => undefined, () => undefined);
   appStatusWrites.set(appId, tail);
   try {
     await result;
   } finally {
     if (appStatusWrites.get(appId) === tail) appStatusWrites.delete(appId);
+  }
+}
+
+async function updateAppStatus(
+  appId: string,
+  status: string,
+  persistenceGeneration?: string,
+): Promise<boolean> {
+  let persisted = false;
+  await serializeAppStatusWrite(appId, async () => {
+    if (
+      persistenceGeneration
+      && activeAppPersistenceGenerations.get(appId) !== persistenceGeneration
+    ) return;
+    try {
+      // App.updatedAt is the conservative recovery-replay revision. Routine
+      // status reconciliation must not advance it when the persisted value is
+      // already identical; real status transitions still do.
+      await prisma.app.updateMany({
+        where: { id: appId, processStatus: { not: status } },
+        data: { processStatus: status },
+      });
+      persisted = true;
+    } catch (e: any) {
+      console.error(`[AppProcess] Failed to update DB status for ${appId}:`, e.message);
+    }
+  });
+  return persisted;
+}
+
+async function drainAppPersistenceWrites(appId: string): Promise<void> {
+  while (true) {
+    const stateWrite = appStateWrites.get(appId);
+    const statusWrite = appStatusWrites.get(appId);
+    if (!stateWrite && !statusWrite) return;
+    await Promise.allSettled([
+      ...(stateWrite ? [stateWrite] : []),
+      ...(statusWrite ? [statusWrite] : []),
+    ]);
+    // Let the async wrappers run their finally blocks before re-reading the
+    // queue maps. A newly admitted tail is observed by the next iteration.
+    await Promise.resolve();
   }
 }
 
@@ -794,12 +1145,24 @@ export async function restoreRunningApps(): Promise<void> {
     where: { deployType: 'fullstack' },
   });
 
+  const runtimeManagementByAppId = new Map(
+    apps.map((app) => [app.id, projectRuntimeManagement(app)] as const),
+  );
+  const nonPortalRuntimeAppIds = new Set(
+    apps.filter((app) => (
+      runtimeManagementByAppId.get(app.id) === 'external-loopback'
+      || runtimeManagementByAppId.get(app.id) === 'invalid-external-binding'
+    )).map((app) => app.id),
+  );
+
   // Resolve every persisted running intent before mutating any App status or
   // container. If continuity enrollment did not produce an exact immutable
   // Project association, startup must fail so the installer can roll back;
   // converting that intent to "error" would destroy the evidence needed to
   // retry the upgrade safely.
   const runtimeIdentities = new Map<string, ProjectAppRuntimeIdentity | null>();
+  const exactRuntimeIdentities = new Map<string, ProjectAppRuntimeIdentity>();
+  const interruptedLifecycleIdentities = new Map<string, ProjectAppRuntimeIdentity>();
   for (const app of apps) {
     // The immutable foreign key is the only authority to enter a Project
     // runtime. An owner/name coincidence may describe a standalone App and
@@ -815,29 +1178,144 @@ export async function restoreRunningApps(): Promise<void> {
         },
       }).catch(() => null)
       : null;
-    const runtimeIdentity: ProjectAppRuntimeIdentity | null = (
-      projectIdentity?.lifecycleStatus === 'ACTIVE'
+    const exactRuntimeIdentity: ProjectAppRuntimeIdentity | null = (
+      projectIdentity
       && projectIdentity.workspaceOwnerId === app.userId
       && projectIdentity.projectName === app.name
     )
       ? { actorId: app.userId, projectId: projectIdentity.id, workloadId: app.id }
       : null;
+    const runtimeIdentity = projectIdentity?.lifecycleStatus === 'ACTIVE'
+      ? exactRuntimeIdentity
+      : null;
+    const interruptedLifecycleIdentity = (
+      exactRuntimeIdentity
+      && (projectIdentity?.lifecycleStatus === 'RENAMING'
+        || projectIdentity?.lifecycleStatus === 'DELETING')
+    )
+      ? exactRuntimeIdentity
+      : null;
     if (
+      !nonPortalRuntimeAppIds.has(app.id)
+      &&
       (app.processStatus === 'running' || app.processStatus === 'starting')
       && !runtimeIdentity
+      && !interruptedLifecycleIdentity
     ) {
       throw new Error(
         'A persisted running full-stack App did not have an exact immutable Project association',
       );
     }
     runtimeIdentities.set(app.id, runtimeIdentity);
+    if (exactRuntimeIdentity) exactRuntimeIdentities.set(app.id, exactRuntimeIdentity);
+    if (!nonPortalRuntimeAppIds.has(app.id) && interruptedLifecycleIdentity) {
+      interruptedLifecycleIdentities.set(app.id, interruptedLifecycleIdentity);
+    }
   }
 
   for (const app of apps) {
     const deployId = `${app.userId}-${app.name}`;
-    const persisted = await loadAppState(app.id);
+    const runtimeManagement = runtimeManagementByAppId.get(app.id);
+    const strictRuntimeRecord = nonPortalRuntimeAppIds.has(app.id)
+      ? await readPersistedAppStateRecord(app.id)
+      : null;
+    const persisted = nonPortalRuntimeAppIds.has(app.id)
+      ? strictRuntimeRecord?.state || null
+      : await loadAppState(app.id);
     const runtimeIdentity = runtimeIdentities.get(app.id) || null;
+    const exactRuntimeIdentity = exactRuntimeIdentities.get(app.id) || null;
+    const interruptedLifecycleIdentity = interruptedLifecycleIdentities.get(app.id) || null;
     const restartCount = persisted?.deployId === deployId ? Math.max(0, persisted.restartCount || 0) : 0;
+
+    if (runtimeManagement === 'external-loopback') {
+      // A valid operator binding takes durable ownership away from Portal.
+      // Settle the exact App intent to stopped while removing its attested
+      // recovery record, so removing the binding later cannot silently
+      // resurrect a shadow container beside the external service.
+      const managed = runningApps.get(deployId);
+      if (!managed && !strictRuntimeRecord && !exactRuntimeIdentity) continue;
+      if (!exactRuntimeIdentity) {
+        throw new ProjectRuntimeStateAttestationError();
+      }
+      await forgetAppRuntime(app.id, deployId, {
+        actorId: exactRuntimeIdentity.actorId,
+        projectId: exactRuntimeIdentity.projectId,
+        deployPath: app.zipPath,
+        port: app.port,
+      }, { settleStatus: 'stopped' });
+      continue;
+    }
+
+    if (runtimeManagement === 'invalid-external-binding') {
+      // APP_API_TARGET_<APP_ID> is an explicit operator-owned process
+      // boundary. Never resurrect a Portal container beside it. Remove only
+      // an exactly attested Portal shadow. Preserve the invalid binding's
+      // durable record for operator repair rather than interpreting it as a
+      // valid ownership handoff.
+      const managed = runningApps.get(deployId);
+      // A standalone App can be routed to an operator-owned loopback service
+      // without ever having had a Portal container. Only that no-lane,
+      // no-record, no-Project-identity case has no shadow state to attest. A
+      // current Project identity is sufficient to remove its exact labeled
+      // container even when no durable manager record exists.
+      if (!managed && !strictRuntimeRecord && !exactRuntimeIdentity) continue;
+      if (!app.projectIdentityId) throw new ProjectRuntimeStateAttestationError();
+      const expected: ExpectedPersistedAppRuntime = {
+        appId: app.id,
+        deployId,
+        actorId: app.userId,
+        projectId: app.projectIdentityId,
+        deployPath: app.zipPath,
+        port: app.port,
+      };
+      const attestedPersisted = strictRuntimeRecord
+        ? attestPersistedAppState(strictRuntimeRecord, expected)
+        : undefined;
+      if (managed) attestManagedApp(managed, expected, attestedPersisted);
+      const persistedRuntimeIdentity: ProjectAppRuntimeIdentity | null = attestedPersisted
+        ? {
+          actorId: attestedPersisted.actorId,
+          projectId: attestedPersisted.projectId,
+          workloadId: attestedPersisted.workloadId,
+        }
+        : null;
+      const cleanupIdentity = exactRuntimeIdentity
+        || persistedRuntimeIdentity
+        || managed?.runtimeIdentity
+        || null;
+      if (!cleanupIdentity) {
+        throw Object.assign(
+          new Error('An externally managed Project App had unverified Portal runtime state; startup stopped before changing it.'),
+          { code: 'PROJECT_EXTERNAL_RUNTIME_CLEANUP_UNATTESTED' },
+        );
+      }
+      if (managed) {
+        retireManagedApp(managed);
+        await stopProjectAppContainer(managed.runtimePlan);
+      }
+      // removePortalProjectWorkloadByIdentity verifies the deterministic name
+      // and immutable workload labels before deletion. Only after that proof
+      // succeeds may the durable manager record be removed.
+      await stopProjectAppContainer(cleanupIdentity);
+      continue;
+    }
+
+    if (interruptedLifecycleIdentity) {
+      // A crash can land after Project rename/deletion has durably closed the
+      // identity but before its normal cleanup reaches the App runtime. Never
+      // resurrect that container, and do not abort Portal startup before the
+      // lifecycle recovery route can load. The same exact identity/state CAS
+      // used by explicit Stop settles the saved intent and removes only its
+      // attested Portal workload. Unexpected lifecycle states still fail in
+      // the preflight above without any mutation.
+      await forgetAppRuntime(app.id, deployId, {
+        actorId: interruptedLifecycleIdentity.actorId,
+        projectId: interruptedLifecycleIdentity.projectId,
+        deployPath: app.zipPath,
+        port: app.port,
+      }, { settleStatus: 'stopped' });
+      continue;
+    }
 
     if (app.processStatus !== 'running' && app.processStatus !== 'starting') {
       // DB intent is authoritative for stopped/error apps. Remove any stale
@@ -957,19 +1435,21 @@ export function shutdownAll(): Promise<void> {
         reconcileManagedApp(app, false);
         app.desiredStatus = app.status === 'error' ? 'error' : 'running';
         if (app.desiredStatus === 'running') app.status = 'stopped';
-        await persistManagedApp(app);
+        const shutdownState = persistedStateFromManaged(app);
+        retireManagedApp(app);
+        await persistAppState(shutdownState);
       } catch (e: any) {
         console.error(`[AppProcess] Failed to persist shutdown state for ${deployId}:`, e.message);
       }
       try {
         await stopProjectAppContainer(app.runtimePlan);
-        if (runningApps.get(deployId) === app) runningApps.delete(deployId);
         console.log(`[AppProcess] Stopped sandboxed ${deployId}`);
       } catch (e: any) {
         console.error(`[AppProcess] Failed to stop ${deployId}:`, e.message);
       }
     }
     runningApps.clear();
+    activeAppPersistenceGenerations.clear();
 
     const leases = Array.from(portLeases.values());
     portLeases.clear();
@@ -994,6 +1474,7 @@ export const __appProcessTest = {
   resetRuntimeState(): void {
     for (const app of runningApps.values()) clearStartupTimer(app);
     runningApps.clear();
+    activeAppPersistenceGenerations.clear();
     portLeases.clear();
     deployOperations.clear();
     appStatusWrites.clear();

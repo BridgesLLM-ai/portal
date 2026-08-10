@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import { execFile } from 'child_process';
 import type { AgentProviderName } from './AgentProvider.interface';
 import { getAgentZeroAuthReadinessSnapshot } from './providers/agentZero/AgentZeroAuthSession';
@@ -55,6 +56,15 @@ function directoryHasEntries(targetPath: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The Antigravity CLI's whole state directory. Credential attestation
+ * deliberately covers only specific files inside it, so "does the CLI have
+ * any local state at all" needs its own anchor.
+ */
+function antigravityStateDir(): string {
+  return path.join(String(process.env.HOME || '/root'), '.gemini', 'antigravity-cli');
 }
 
 function hasEnvValue(name: string): boolean {
@@ -114,8 +124,7 @@ function classifyGeminiAuthProbe(
     }, 5_000, expectedEpoch);
   }
 
-  const [antigravityConfigDir] = resolveNativeCliCredentialPaths('GEMINI');
-  if (directoryHasEntries(antigravityConfigDir)) {
+  if (directoryHasEntries(antigravityStateDir())) {
     return cacheGeminiAuthStatus({
       provider: 'GEMINI',
       status: 'unknown',
@@ -328,8 +337,7 @@ function detectGeminiAuth(): NativeCliAuthStatus {
     }, 60_000);
   }
 
-  const [antigravityConfigDir] = resolveNativeCliCredentialPaths('GEMINI');
-  if (directoryHasEntries(antigravityConfigDir)) {
+  if (directoryHasEntries(antigravityStateDir())) {
     return {
       provider: 'GEMINI',
       status: 'unknown',

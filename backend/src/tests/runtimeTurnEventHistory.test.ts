@@ -80,4 +80,39 @@ describe('runtime turn event history bounds', () => {
     expect(replayed.some((event) => event.runId === 'run-two' && event.text === 'new run text')).toBe(true);
     expect(replayed.at(-1)?.runId).toBe('run-two');
   });
+
+  test('persists raw reasoning and attested preamble replacement lanes independently', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-reasoning-lanes-'));
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = dir;
+    const sessionKey = 'agent:main:durable-reasoning-lanes';
+    const runId = 'run-reasoning-lanes';
+
+    recordRuntimeTurnEvent(sessionKey, {
+      ...runtimeEvent(sessionKey, runId, 1, 'assistant_reasoning', 'Private reasoning snapshot'),
+      replace: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'thinking' },
+    });
+    recordRuntimeTurnEvent(sessionKey, {
+      ...runtimeEvent(sessionKey, runId, 2, 'assistant_reasoning', 'Inspecting the affected files'),
+      replace: true,
+      source: {
+        transport: 'portal-stream-event-bus',
+        eventType: 'status',
+        preambleProgress: true,
+      },
+    });
+
+    expect(readRuntimeTurnEvents(sessionKey, 100)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant_reasoning',
+        text: 'Private reasoning snapshot',
+        source: expect.objectContaining({ eventType: 'thinking' }),
+      }),
+      expect.objectContaining({
+        type: 'assistant_reasoning',
+        text: 'Inspecting the affected files',
+        source: expect.objectContaining({ preambleProgress: true }),
+      }),
+    ]));
+  });
 });

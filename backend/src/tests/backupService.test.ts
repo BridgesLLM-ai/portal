@@ -155,19 +155,19 @@ describe('persistent backup runner', () => {
     fs.writeFileSync(path.join(fakeBin, 'pg_dump'), [
       '#!/bin/sh',
       'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then printf "%s\\n" "pg_dump (PostgreSQL) 16.14"; exit 0; fi',
-      'case " $* " in *"--dbname=postgresql://test%3Aowner@[fe80::1%25eth0]:6543/test%2Ddb?sslmode=verify-full&sslrootcert=%2Fetc%2Fportal%20tls%2Froot.pem&options=-c%20statement_timeout%3D5000"*) ;; *) exit 91 ;; esac',
+      'case " $* " in *"--dbname=postgresql://test%3Aowner@db.example.test:6543/test%2Ddb?sslmode=verify-full&sslrootcert=%2Fetc%2Fportal%20tls%2Froot.pem&options=-c%20statement_timeout%3D5000"*) ;; *) exit 91 ;; esac',
       '[ -z "${DATABASE_URL:-}" ] || exit 92',
       '[ -z "${PGDATABASE:-}" ] || exit 97',
       '[ -n "${PGPASSFILE:-}" ] && [ -r "${PGPASSFILE}" ] || exit 93',
       '[ "$(stat -Lc %a "${PGPASSFILE}")" = "600" ] || exit 94',
-      "grep -Fx 'fe80\\:\\:1%eth0:6543:test-db:test\\:owner:p@ss\\:word\\\\tail' \"${PGPASSFILE}\" >/dev/null || exit 95",
+      "grep -Fx 'db.example.test:6543:test-db:test\\:owner:p@ss\\:word\\\\tail' \"${PGPASSFILE}\" >/dev/null || exit 95",
       "! env | grep '^PG' | grep -v '^PGPASSFILE=' >/dev/null || exit 96",
       'printf "%s\\n" "PGDMPBRIDGESLLM-TEST-V1"',
       '',
     ].join('\n'), { mode: 0o700 });
     fs.writeFileSync(
       path.join(portalRoot, 'backend', '.env.production'),
-      'DATABASE_URL=postgresql://test%3Aowner:p%40ss%3Aword%5Ctail@[fe80::1%25eth0]:6543/test%2Ddb?schema=tenant&sslmode=verify-full&sslrootcert=%2Fetc%2Fportal%20tls%2Froot.pem&options=-c%20statement_timeout%3D5000\n',
+      'DATABASE_URL=postgresql://test%3Aowner:p%40ss%3Aword%5Ctail@db.example.test:6543/test%2Ddb?schema=tenant&sslmode=verify-full&sslrootcert=%2Fetc%2Fportal%20tls%2Froot.pem&options=-c%20statement_timeout%3D5000\n',
       { mode: 0o600 },
     );
     fs.writeFileSync(path.join(portalRoot, 'marker.txt'), 'portal data', { mode: 0o600 });

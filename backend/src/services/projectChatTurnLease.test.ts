@@ -28,6 +28,7 @@ import {
   reconcileLegacyProjectChatTerminalHandoff,
   readProjectChatCoordinationState,
   readProjectChatTurnReplay,
+  recoverExpiredProjectChatOperationAfterNativeQuiescence,
   recoverExpiredProjectChatTurnAfterProviderTerminal,
   requestProjectChatTurnAbort,
   switchProjectChatProvider,
@@ -371,6 +372,61 @@ test('rejects Project runtime admission while a durable authorization transition
     httpStatus: 503,
   });
   expect(create).not.toHaveBeenCalled();
+});
+
+test('persists the exact stop-only recovery context in the runtime admission row', async () => {
+  const context = Object.freeze({
+    scope: 'PROJECT_SANDBOX' as const,
+    source: 'PORTAL_SERVER' as const,
+    userId: ACTOR,
+    projectId: PROJECT,
+    workspaceOwnerId: 'workspace-owner',
+    projectName: 'demo',
+    canonicalRoot: '/portal/projects/workspace-owner/demo',
+    rootDevice: '1',
+    rootInode: '2',
+    rootBirthtimeNs: '3',
+    runtimePolicyVersion: 'portal-project-sandbox-v2',
+    egressPolicyVersion: 'portal-project-egress-v1',
+    runtimeImageDigest: `sha256:${'9'.repeat(64)}`,
+    policyFingerprint: 'a'.repeat(64),
+  });
+  const createdTurn = turn({
+    requestId: `${PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX}qualify-codex:uuid`,
+  });
+  const createTurn = jest.fn().mockResolvedValue(createdTurn);
+  const findState = jest.fn()
+    .mockResolvedValueOnce(state())
+    .mockResolvedValueOnce(state({ version: 8, activeTurnId: createdTurn.id }));
+  const db = database({
+    projectIdentity: { findUnique: jest.fn().mockResolvedValue({ lifecycleStatus: 'ACTIVE' }) },
+    projectChatState: {
+      findUnique: findState,
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
+    projectChatTurn: { findUnique: jest.fn().mockResolvedValue(null), create: createTurn },
+  });
+
+  await expect(acquireProjectChatRuntimeAdmission({
+    actorUserId: ACTOR,
+    actorAuthorizationVersion: AUTHORIZATION_VERSION,
+    projectIdentityId: PROJECT,
+    provider: 'CODEX',
+    runtime: 'codex-project-adapter',
+    operation: 'qualify-codex',
+    leaseOwner: 'portal-process-a',
+    expectedVersion: 7,
+    recoveryExecutionContext: context,
+    now: NOW,
+  }, db)).resolves.toMatchObject({ operation: 'qualify-codex' });
+  expect(createTurn).toHaveBeenCalledWith(expect.objectContaining({
+    data: expect.objectContaining({
+      resultMetadata: {
+        runtimeAdmissionMetadataVersion: 1,
+        recoveryExecutionContext: context,
+      },
+    }),
+  }));
 });
 
 test('rejects provider mismatch before creating a turn', async () => {
@@ -1284,6 +1340,210 @@ test('restart recovery keeps an expired turn quarantined when the provider bindi
   }, db)).rejects.toMatchObject({ code: 'STATE_CORRUPT', httpStatus: 500 });
   expect(finalize).not.toHaveBeenCalled();
   expect(detach).not.toHaveBeenCalled();
+});
+
+test('native restart recovery expires an exact quiescent turn and releases its CAS row', async () => {
+  const interrupted = turn({
+    provider: AgentProviderType.CODEX,
+    runtime: 'codex-project-adapter',
+    providerSessionId: 'codex-native-session',
+    startedAt: new Date(NOW.getTime() - 180_000),
+    leaseExpiresAt: new Date(NOW.getTime() - 60_000),
+    resultMetadata: {
+      providerDispatchStage: PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED,
+      dispatchMetadataVersion: 1,
+    },
+  });
+  const recovered = turn({
+    ...interrupted,
+    status: ProjectChatTurnStatus.EXPIRED,
+    activeProjectKey: null,
+    completedAt: NOW,
+    errorCode: 'PORTAL_RESTART_NATIVE_TURN_QUIESCENT',
+  });
+  const finalize = jest.fn().mockResolvedValue({ count: 1 });
+  const detach = jest.fn().mockResolvedValue({ count: 1 });
+  const db = database({
+    projectChatState: {
+      findUnique: jest.fn().mockResolvedValue(state({ activeTurnId: interrupted.id })),
+      updateMany: detach,
+    },
+    projectChatTurn: {
+      findUnique: jest.fn()
+        .mockResolvedValueOnce(interrupted)
+        .mockResolvedValueOnce(recovered),
+      updateMany: finalize,
+    },
+    projectChatProviderBinding: {
+      findUnique: jest.fn().mockResolvedValue({
+        userId: ACTOR,
+        projectId: PROJECT,
+        provider: AgentProviderType.CODEX,
+        runtime: interrupted.runtime,
+        sessionKey: interrupted.providerSessionId,
+        externalSessionId: interrupted.providerSessionId,
+        status: 'active',
+      }),
+    },
+  });
+
+  await expect(recoverExpiredProjectChatOperationAfterNativeQuiescence({
+    actorUserId: ACTOR,
+    projectIdentityId: PROJECT,
+    turnId: interrupted.id,
+    expectedSelectedProvider: 'CODEX',
+    expectedRuntime: interrupted.runtime,
+    expectedLeaseOwner: interrupted.leaseOwner,
+    quiescedProvider: 'CODEX',
+    quiescenceBoundary: 'container-stopped',
+    quiescenceEvidence: 'a'.repeat(64),
+    providerSessionId: interrupted.providerSessionId,
+    now: NOW,
+  }, db)).resolves.toMatchObject({
+    status: 'EXPIRED',
+    errorCode: 'PORTAL_RESTART_NATIVE_TURN_QUIESCENT',
+  });
+  expect(finalize).toHaveBeenCalledWith(expect.objectContaining({
+    where: expect.objectContaining({
+      id: interrupted.id,
+      provider: 'CODEX',
+      runtime: interrupted.runtime,
+      providerSessionId: interrupted.providerSessionId,
+      leaseExpiresAt: { lte: NOW },
+    }),
+    data: expect.objectContaining({
+      status: 'EXPIRED',
+      activeProjectKey: null,
+      resultMetadata: expect.objectContaining({
+        providerDispatchStage: PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED,
+        restartRecoveryVersion: 2,
+        restartRecoveryProvider: 'CODEX',
+        restartRecoveryBoundary: 'container-stopped',
+        restartRecoveryEvidence: 'a'.repeat(64),
+      }),
+    }),
+  }));
+  expect(detach).toHaveBeenCalledWith(expect.objectContaining({
+    where: expect.objectContaining({ activeTurnId: interrupted.id, selectedProvider: 'CODEX' }),
+  }));
+});
+
+test('native restart recovery releases a provider-targeted runtime admission only after quiescence', async () => {
+  const admission = turn({
+    provider: AgentProviderType.OPENCLAW,
+    runtime: 'claude-code-project-adapter',
+    requestId: `${PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX}qualify-claude:uuid`,
+    providerSessionId: null,
+    leaseExpiresAt: new Date(NOW.getTime() - 60_000),
+  });
+  const recovered = turn({
+    ...admission,
+    status: ProjectChatTurnStatus.ERROR,
+    activeProjectKey: null,
+    completedAt: NOW,
+    errorCode: 'PORTAL_RESTART_NATIVE_RUNTIME_ADMISSION',
+  });
+  const finalize = jest.fn().mockResolvedValue({ count: 1 });
+  const detach = jest.fn().mockResolvedValue({ count: 1 });
+  const bindingRead = jest.fn();
+  const db = database({
+    projectChatState: {
+      findUnique: jest.fn().mockResolvedValue(state({
+        activeTurnId: admission.id,
+        selectedProvider: AgentProviderType.OPENCLAW,
+      })),
+      updateMany: detach,
+    },
+    projectChatTurn: {
+      findUnique: jest.fn()
+        .mockResolvedValueOnce(admission)
+        .mockResolvedValueOnce(recovered),
+      updateMany: finalize,
+    },
+    projectChatProviderBinding: { findUnique: bindingRead },
+  });
+
+  await expect(recoverExpiredProjectChatOperationAfterNativeQuiescence({
+    actorUserId: ACTOR,
+    projectIdentityId: PROJECT,
+    turnId: admission.id,
+    expectedSelectedProvider: 'OPENCLAW',
+    expectedRuntime: admission.runtime,
+    expectedLeaseOwner: admission.leaseOwner,
+    quiescedProvider: 'CLAUDE_CODE',
+    quiescenceBoundary: 'runtime-absent',
+    quiescenceEvidence: 'b'.repeat(64),
+    now: NOW,
+  }, db)).resolves.toMatchObject({
+    status: 'ERROR',
+    errorCode: 'PORTAL_RESTART_NATIVE_RUNTIME_ADMISSION',
+  });
+  expect(bindingRead).not.toHaveBeenCalled();
+  expect(finalize).toHaveBeenCalledWith(expect.objectContaining({
+    where: expect.objectContaining({
+      provider: 'OPENCLAW',
+      runtime: admission.runtime,
+      requestId: { startsWith: PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX },
+    }),
+    data: expect.objectContaining({
+      status: 'ERROR',
+      errorCode: 'PORTAL_RESTART_NATIVE_RUNTIME_ADMISSION',
+      resultMetadata: expect.objectContaining({
+        restartRecoveryKind: 'runtime-admission',
+        restartRecoveryProvider: 'CLAUDE_CODE',
+        restartRecoveryBoundary: 'runtime-absent',
+      }),
+    }),
+  }));
+});
+
+test('native restart recovery rejects admission evidence from a provider that does not own the runtime', async () => {
+  const db = database({});
+
+  await expect(recoverExpiredProjectChatOperationAfterNativeQuiescence({
+    actorUserId: ACTOR,
+    projectIdentityId: PROJECT,
+    turnId: 'admission-turn',
+    expectedSelectedProvider: 'OPENCLAW',
+    expectedRuntime: 'claude-code-project-adapter',
+    expectedLeaseOwner: 'portal-process-a',
+    quiescedProvider: 'CODEX',
+    quiescenceBoundary: 'runtime-absent',
+    quiescenceEvidence: 'b'.repeat(64),
+    now: NOW,
+  }, db)).rejects.toMatchObject({ code: 'PROVIDER_MISMATCH' });
+  expect(db.$transaction).not.toHaveBeenCalled();
+});
+
+test('native restart recovery refuses a user turn attested for another provider', async () => {
+  const interrupted = turn({
+    provider: AgentProviderType.CODEX,
+    runtime: 'codex-project-adapter',
+    providerSessionId: 'codex-native-session',
+    leaseExpiresAt: new Date(NOW.getTime() - 60_000),
+  });
+  const finalize = jest.fn();
+  const db = database({
+    projectChatTurn: {
+      findUnique: jest.fn().mockResolvedValue(interrupted),
+      updateMany: finalize,
+    },
+  });
+
+  await expect(recoverExpiredProjectChatOperationAfterNativeQuiescence({
+    actorUserId: ACTOR,
+    projectIdentityId: PROJECT,
+    turnId: interrupted.id,
+    expectedSelectedProvider: 'CODEX',
+    expectedRuntime: interrupted.runtime,
+    expectedLeaseOwner: interrupted.leaseOwner,
+    quiescedProvider: 'GEMINI',
+    quiescenceBoundary: 'container-stopped',
+    quiescenceEvidence: 'c'.repeat(64),
+    providerSessionId: interrupted.providerSessionId,
+    now: NOW,
+  }, db)).rejects.toMatchObject({ code: 'PROVIDER_MISMATCH' });
+  expect(finalize).not.toHaveBeenCalled();
 });
 
 test('completion is monotonic and a repeated callback returns the durable terminal row', async () => {

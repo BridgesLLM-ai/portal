@@ -79,6 +79,15 @@ describe('gatewayAPI.patchSessionModel', () => {
     expect(mocks.get).toHaveBeenLastCalledWith('/gateway/models', {
       params: { provider: 'CODEX' },
     });
+
+    await gatewayAPI.models('CODEX', { silent: true });
+    expect(mocks.get).toHaveBeenLastCalledWith(
+      '/gateway/models',
+      expect.objectContaining({
+        params: { provider: 'CODEX' },
+        _silent: true,
+      }),
+    );
   });
 
   it('keeps expected cross-tab ask-user settlement races out of the global error panel', async () => {

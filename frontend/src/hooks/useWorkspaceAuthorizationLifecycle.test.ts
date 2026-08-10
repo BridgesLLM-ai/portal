@@ -56,6 +56,7 @@ vi.mock('socket.io-client', () => ({ io: socketHarness.io }));
 import {
   hideWorkspacePrivacyCurtain,
   quarantineWorkspaceAuthorization,
+  showWorkspacePrivacyCurtain,
   useWorkspaceAuthorizationLifecycle,
 } from './useWorkspaceAuthorizationLifecycle';
 
@@ -112,6 +113,8 @@ describe('workspace authorization quarantine', () => {
     expect(document.getElementById('root')?.getAttribute('aria-hidden')).toBe('true');
     expect(document.getElementById('portal-workspace-authorization-curtain')?.textContent)
       .toContain('Refreshing workspace access');
+    expect(document.querySelector<HTMLElement>('[data-portal-curtain-layer="mark"]')?.style.backgroundImage)
+      .toContain('/logo-display.png');
     expect(localStorage.getItem('projects-last-selected')).toBeNull();
     expect(localStorage.getItem('theme')).toBe('dark');
     expect(sessionStorage.getItem('portal:terminal-state:v1')).toBeNull();
@@ -122,12 +125,12 @@ describe('workspace authorization quarantine', () => {
   });
 
   it('covers the first frame with an opaque branded composition that remains motion-safe', () => {
-    const favicon = document.createElement('link');
-    favicon.dataset.portalFavicon = 'true';
-    favicon.href = '/static-assets/branding/customer-mark.png';
-    document.head.appendChild(favicon);
-
-    quarantineWorkspaceAuthorization('user-1', 2, vi.fn());
+    quarantineWorkspaceAuthorization(
+      'user-1',
+      2,
+      vi.fn(),
+      '/static-assets/branding/customer-mark.png',
+    );
 
     const curtain = document.getElementById('portal-workspace-authorization-curtain');
     const mark = curtain?.querySelector<HTMLElement>('[data-portal-curtain-layer="mark"]');
@@ -138,8 +141,15 @@ describe('workspace authorization quarantine', () => {
     expect(mark?.style.backgroundImage).toContain('/static-assets/branding/customer-mark.png');
     expect(status?.textContent).toContain('Verifying your permissions');
     expect(styles?.textContent).toContain('@media (prefers-reduced-motion: reduce)');
+  });
 
-    favicon.remove();
+  it('quotes an owner-provided curtain logo URL before assigning it to CSS', () => {
+    showWorkspacePrivacyCurtain('/branding/customer"\\mark.png');
+
+    const mark = document.querySelector<HTMLElement>('[data-portal-curtain-layer="mark"]');
+    expect(mark?.style.backgroundImage).toContain('customer');
+    expect(mark?.style.backgroundImage).toContain('mark.png');
+    expect(mark?.style.opacity).toBe('0.04');
   });
 
   it('keeps the shell curtained until a matching socket snapshot arrives', () => {

@@ -11,7 +11,7 @@ import { recordRuntimeTurnEvent } from './RuntimeTurnEventHistory';
 import { sanitizeThinkingSubject } from '../utils/thinkingSubject';
 
 export interface StreamEvent {
-  type: 'text' | 'thinking' | 'tool_start' | 'tool_update' | 'tool_end' | 'tool_used' | 'status' | 'done' | 'error' | 'exec_approval' | 'segment_break' | 'compaction_start' | 'compaction_end' | 'run_resumed';
+  type: 'text' | 'thinking' | 'tool_start' | 'tool_update' | 'tool_end' | 'tool_used' | 'status' | 'done' | 'error' | 'exec_approval' | 'segment_break' | 'compaction_start' | 'compaction_end' | 'run_resumed' | 'user_message' | 'history_changed';
   /**
    * Set on events the project run broker republishes for browser relays.
    * Provider subscribers must ignore these: consuming a broker envelope
@@ -103,7 +103,9 @@ function normalizedRunId(value: unknown): string | null {
 }
 
 function isSessionLevelEvent(event: StreamEvent): boolean {
-  return event.type === 'compaction_start'
+  return event.type === 'user_message'
+    || event.type === 'history_changed'
+    || event.type === 'compaction_start'
     || event.type === 'compaction_end'
     || (event.type === 'status' && event.maintenanceKind === 'maintenance');
 }
@@ -435,9 +437,12 @@ export class StreamEventBus {
       this.turnEventSeq.set(sessionKey, nextTurnSeq);
       const recent = this.recentTurnEvents.get(sessionKey) || [];
       const previous = recent[recent.length - 1];
+      const sameReasoningLane = Boolean(turnEvent.source?.preambleProgress)
+        === Boolean(previous?.source?.preambleProgress);
       const replacesSameLiveThought = turnEvent.type === 'assistant_reasoning'
         && turnEvent.replace === true
         && previous?.type === 'assistant_reasoning'
+        && sameReasoningLane
         && (previous.runId || '') === (turnEvent.runId || '');
       const replacesSameLiveStatus = turnEvent.type === 'assistant_status'
         && turnEvent.replace === true

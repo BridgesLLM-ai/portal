@@ -70,6 +70,7 @@ function renderMenu(overrides: Partial<ComponentProps<typeof ProjectProviderMenu
     qualificationPending: false,
     onSelect: vi.fn(),
     onQualify: vi.fn(),
+    onReviewAgentZero: vi.fn(),
     agentZeroModel: '',
     agentZeroModels: [
       { value: 'codex_oauth/gpt-5.5', label: 'OpenAI Codex · GPT-5.5' },
@@ -115,6 +116,10 @@ describe('ProjectProviderMenu', () => {
     }
     expect(screen.getByText('Selected')).toBeVisible();
     expect(screen.queryByText('Active')).not.toBeInTheDocument();
+    expect(screen.getByText(
+      'Choose Prepare provider to verify an isolated runtime before using it.',
+    )).toBeVisible();
+    expect(screen.queryByText(/prepares.*automatically/i)).not.toBeInTheDocument();
   });
 
   it('never labels a waiting provider "Preparing" and keeps the last preparation failure visible', async () => {
@@ -135,8 +140,8 @@ describe('ProjectProviderMenu', () => {
         AGENT_ZERO: {
           message: 'Agent Zero is not signed in on this server. Complete its CLI login on the host, then select the provider again.',
           code: 'PROJECT_PROVIDER_AUTH_REQUIRED',
-          retryable: true,
-          recovery: null,
+          retryable: false,
+          recovery: 'AI_SETTINGS',
           retryAt: null,
         },
       },
@@ -153,6 +158,49 @@ describe('ProjectProviderMenu', () => {
     // The remembered failure explains what the operator must actually do.
     await user.click(screen.getByRole('menuitem', { name: 'Review Agent Zero' }));
     expect(screen.getByText(/not signed in on this server/)).toBeVisible();
+    expect(screen.getByText('Contact an Owner or Sub Admin to reconnect this provider.')).toBeVisible();
+    expect(screen.queryByRole('menuitem', { name: 'Reconnect in AI Settings' })).not.toBeInTheDocument();
+    expect(screen.getByRole('menuitem', {
+      name: 'Recheck Agent Zero after reconnecting',
+    })).toBeEnabled();
+  });
+
+  it('routes an operator from a provider-auth failure to AI Settings and then exposes a real recheck', async () => {
+    const user = userEvent.setup();
+    const onQualify = vi.fn();
+    renderMenu({
+      providers: [openClaw, { ...codex, selectable: false, executionScope: null }],
+      qualifications: {
+        CODEX: {
+          ...agentZeroQualification,
+          provider: 'CODEX',
+          reason: 'Codex authentication must be renewed.',
+        },
+      },
+      qualificationFailures: {
+        CODEX: {
+          message: 'Codex must be reconnected in AI Settings before it can be prepared for this project.',
+          code: 'PROJECT_PROVIDER_AUTH_REQUIRED',
+          retryable: false,
+          recovery: 'AI_SETTINGS',
+          retryAt: null,
+        },
+      },
+      hostRecoveryRole: 'OWNER',
+      onQualify,
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Review Codex' }));
+
+    expect(screen.getByRole('menuitem', { name: 'Reconnect in AI Settings' })).toHaveAttribute(
+      'href',
+      '/settings?tab=ai-providers',
+    );
+    await user.click(screen.getByRole('menuitem', {
+      name: 'Recheck Codex after reconnecting',
+    }));
+    expect(onQualify).toHaveBeenCalledWith('CODEX');
   });
 
   it('blocks repeated preparation for host-maintenance failures and exposes only the hardcoded recovery route', async () => {
@@ -385,11 +433,17 @@ describe('ProjectProviderMenu', () => {
   it('qualifies Agent Zero only with an exact connected model', async () => {
     const user = userEvent.setup();
     const onQualify = vi.fn();
+    const onReviewAgentZero = vi.fn();
     const onAgentZeroModelChange = vi.fn();
-    const { rerender, props } = renderMenu({ onQualify, onAgentZeroModelChange });
+    const { rerender, props } = renderMenu({
+      onQualify,
+      onReviewAgentZero,
+      onAgentZeroModelChange,
+    });
 
     await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review Agent Zero' }));
+    expect(onReviewAgentZero).toHaveBeenCalledTimes(1);
     await user.selectOptions(
       screen.getByRole('combobox', { name: 'Agent Zero qualification model' }),
       'codex_oauth/gpt-5.5',
