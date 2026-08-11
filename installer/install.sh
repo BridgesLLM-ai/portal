@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="4.0.15"
+readonly VERSION="4.0.16"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -11014,6 +11014,12 @@ PORTAL_BACKUP_HELPER_RELEASES = {
     (248156, "5b42a047fa07e3b5af2752b85f6d3e22e5944778c660799cf2eaade18f868143"),
     (263283, "337d15eb7289a63f77429aee7677ebb8c1aa4a037698111c591565a3496a1a85"),
     (268494, "384e21ade857380bdced2855671184f0a624338dcc20da3f21bea09cdc6178c9"),
+    # 4.0.15 shipped a rewritten helper (degraded-backup preservation) without
+    # adding it here, so 4.0.15's own guard rejected the helper 4.0.15 installs
+    # and every host that reached 4.0.15 was blocked from updating again.
+    # scripts/validation/backup-helper-allowlist-static.py now fails the build
+    # when this set does not cover the helper the release actually ships.
+    (271864, "c68881be5af61d0ba778b37fbea65068f650b74ab96703f15cafe73420b34f6c"),
 }
 PORTAL_RUNTIME_REPAIR_LAUNCHER = (
     "/opt/bridgesllm/portal/installer/"

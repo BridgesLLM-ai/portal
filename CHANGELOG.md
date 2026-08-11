@@ -2,6 +2,28 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.16] - 2026-08-11
+
+### Fixed
+- **Servers running 4.0.15 can update again.** The update path attests the
+  scheduled Portal backup helper (`backup-full.sh`) against a list of helpers
+  that shipped in a signed release, and refuses to continue when it finds one
+  it cannot vouch for. 4.0.15 shipped a rewritten helper — the degraded-backup
+  work — without adding it to that list, so 4.0.15's own guard rejected the
+  helper 4.0.15 installs. Every server that reached 4.0.15 was blocked from
+  updating with `Unsafe Docker prune guard: scheduled Portal backup helper does
+  not match a known shipped BridgesLLM release`. The helper is now attested and
+  the update proceeds normally. No action is required beyond updating; the
+  guard itself was working correctly and is unchanged.
+
+### Changed
+- **A release can no longer ship a backup helper its own installer would
+  reject.** The guard reads the helper that is already installed, before the
+  update replaces it, so changing the helper passes every gate on the release
+  that introduces it and only fails on the *next* update. The release build now
+  hashes the helper it is about to ship and fails closed unless the installer
+  attests those exact bytes.
+
 ## [4.0.15] - 2026-08-10
 
 ### Fixed

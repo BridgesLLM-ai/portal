@@ -1,13 +1,10 @@
 {
   "schema": 1,
-  "version": "4.0.15",
-  "releasedAt": "2026-08-10",
+  "version": "4.0.16",
+  "releasedAt": "2026-08-11",
   "releaseClass": "hotfix",
   "highlights": [
-    "Fresh and expired sessions return to an enabled sign-in form instead of remaining locked on Signing in.",
-    "Long Codex and OpenClaw runs keep reasoning and tools interleaved across return, reconnect, and refresh.",
-    "Anthropic Agent Chat shows honest token progress and keeps accepted messages visible during history lag.",
-    "Project Chat applies the same reasoning reconstruction and discloses retained-activity truncation.",
-    "Degraded comprehensive backups preserve sealed recovery evidence without displacing complete backups."
+    "Updating works again on servers running 4.0.15, which refused to update because it did not recognize its own scheduled backup helper.",
+    "The release build now fails if a release ships a backup helper its own installer would reject, so this cannot recur silently."
   ]
 }
