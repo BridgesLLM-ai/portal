@@ -9,6 +9,7 @@ import {
   isAgentChatStreamingAssistant,
   isAssistantContentRepresentedByTimeline,
 } from './ChatInterface';
+import { parseHistoryMessages } from '../../contexts/ChatStateProvider';
 
 vi.mock('./MarkdownRenderer', () => ({
   default: ({ content }: { content: string }) => <span>{content}</span>,
@@ -124,6 +125,79 @@ describe('Agent Chat thinking subject presentation', () => {
       'middle',
       'tool-two',
       'final',
+    ]);
+  });
+
+  it('restores every long-run reasoning phase around its tool after a background history reload', () => {
+    const phaseCount = 96;
+    const segments = Array.from({ length: phaseCount }, (_, index) => ({
+      // Model cumulative/sliding provider snapshots: adjacent phases overlap,
+      // but a tool boundary makes each one a distinct visible thought.
+      text: index === 0
+        ? 'Inspecting phase 0'
+        : `Inspecting phase ${index - 1} and phase ${index}`,
+      subject: 'Long-running audit',
+      kind: 'thinking' as const,
+      position: 'before' as const,
+      order: index * 2,
+      // Deliberately reverse provider clocks. Durable order must remain the
+      // background/reload authority instead of timestamps or array grouping.
+      ts: 500_000 - index,
+    }));
+    const toolCalls = Array.from({ length: phaseCount }, (_, index) => ({
+      id: `tool-${index}`,
+      name: 'exec',
+      arguments: { command: `check-${index}` },
+      result: `ok-${index}`,
+      startedAt: 100_000 + index,
+      endedAt: 100_500 + index,
+      status: 'done' as const,
+      order: index * 2 + 1,
+    }));
+
+    const [restored] = parseHistoryMessages([{
+      id: 'restored-long-run',
+      role: 'assistant',
+      content: 'Long run complete.',
+      timestamp: '2026-08-10T17:59:53.286Z',
+      segments,
+      toolCalls,
+    }]);
+
+    expect(restored.segments).toHaveLength(phaseCount);
+    expect(restored.toolCalls).toHaveLength(phaseCount);
+    expect(restored.thinkingContent).toBeUndefined();
+
+    const restoredTimeline = [
+      ...(restored.segments || []).map((segment, index) => ({
+        id: `reasoning-${index}`,
+        kind: 'reasoning',
+        order: segment.order ?? null,
+        ts: segment.ts ?? 0,
+        fallbackOrder: index * 2,
+      })),
+      ...(restored.toolCalls || []).map((tool, index) => ({
+        id: tool.id,
+        kind: 'tool',
+        order: tool.order ?? null,
+        ts: tool.startedAt,
+        fallbackOrder: index * 2 + 1,
+      })),
+    ].sort(compareActivityTimelineItems);
+
+    expect(restoredTimeline).toHaveLength(phaseCount * 2);
+    expect(restoredTimeline.map(({ kind }) => kind)).toEqual(
+      Array.from({ length: phaseCount }, () => ['reasoning', 'tool']).flat(),
+    );
+    expect(restoredTimeline.slice(0, 4).map(({ id }) => id)).toEqual([
+      'reasoning-0',
+      'tool-0',
+      'reasoning-1',
+      'tool-1',
+    ]);
+    expect(restoredTimeline.slice(-2).map(({ id }) => id)).toEqual([
+      `reasoning-${phaseCount - 1}`,
+      `tool-${phaseCount - 1}`,
     ]);
   });
 

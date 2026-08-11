@@ -424,6 +424,8 @@ RUN_PHASE_LABEL=""
 RUN_PHASE_INDEX=""
 RUN_PHASE_TOTAL=""
 RUN_ERROR_DETAIL=""
+RUN_DEGRADED=false
+RUN_DEGRADED_COMPONENTS=()
 STAGING_DIR=""
 PARTIAL_ARCHIVE=""
 RECOVERY_COMPONENTS_FILE=""
@@ -4108,6 +4110,7 @@ import fnmatch
 import hashlib
 import os
 import pathlib
+import posixpath
 import stat
 import struct
 import sys
@@ -4118,6 +4121,7 @@ digest_path = pathlib.Path(sys.argv[3])
 raw_options = sys.argv[4:]
 patterns = []
 allow_external_hardlinks = False
+allowed_absolute_symlink_roots = []
 overlay_root_raw = None
 overlay_relatives = []
 for option in raw_options:
@@ -4133,6 +4137,19 @@ for option in raw_options:
         if len(option) <= len("--overlay-relative="):
             raise SystemExit("empty recovery archive overlay path")
         overlay_relatives.append(option.removeprefix("--overlay-relative="))
+        continue
+    if option.startswith("--allow-absolute-symlink-root="):
+        raw_root = option.removeprefix("--allow-absolute-symlink-root=")
+        if (
+            not raw_root
+            or not raw_root.startswith("/")
+            or os.path.normpath(raw_root) != raw_root
+            or len(raw_root.encode("utf-8")) >= 4096
+            or any(ord(char) < 32 or ord(char) == 127 for char in raw_root)
+            or raw_root in allowed_absolute_symlink_roots
+        ):
+            raise SystemExit("invalid allowed recovery symbolic-link root")
+        allowed_absolute_symlink_roots.append(raw_root)
         continue
     if (
         not option.startswith("--exclude=")
@@ -4407,6 +4424,29 @@ def inspect_entry(path, relative, *, apply_exclusions=True, expected_device=None
         target_bytes = valid_text(target, 4096)
         if target_bytes is None:
             raise SystemExit("recovery source contains an unsafe symbolic link")
+        if target.startswith("/"):
+            resolved_target = posixpath.normpath(target)
+            admitted_roots = [str(source), *allowed_absolute_symlink_roots]
+            if not any(
+                resolved_target == root
+                or resolved_target.startswith(root + "/")
+                for root in admitted_roots
+            ):
+                raise SystemExit(
+                    "recovery source symbolic link escapes its admitted roots"
+                )
+        else:
+            resolved_target = posixpath.normpath(
+                posixpath.join(posixpath.dirname(archive_name), target)
+            )
+            if (
+                resolved_target in {"", ".", ".."}
+                or resolved_target.startswith("../")
+                or resolved_target.split("/", 1)[0] != source.name
+            ):
+                raise SystemExit(
+                    "recovery source symbolic link escapes its component"
+                )
         add_field(target_bytes)
     else:
         target_bytes = b""
@@ -4946,7 +4986,10 @@ archive_required_component() {
   local target="$3"
   shift 3
   if ! archive_dir "$source_dir" "$target" "$@"; then
-    die "Required recovery source is missing or could not be archived: ${component_id} (${source_dir})"
+    record_degraded_component \
+      "$component_id" required "$source_dir" \
+      "Required recovery source was missing or could not be archived"
+    return 0
   fi
   local capture_method="live-filesystem-tar"
   [[ "${RUN_TYPE:-}" == "comprehensive" ]] && capture_method="service-quiesced-tar"
@@ -4965,7 +5008,10 @@ archive_required_component_with_retries() {
     || die "Archive retry count must be a positive integer: ${component_id}"
   while ! archive_dir "$source_dir" "$target" "$@"; do
     if (( attempt >= max_attempts )); then
-      die "Required recovery source is missing or could not be archived after ${max_attempts} attempts: ${component_id} (${source_dir})"
+      record_degraded_component \
+        "$component_id" required "$source_dir" \
+        "Required recovery source could not be archived after ${max_attempts} attempts"
+      return 0
     fi
     log "Recovery source changed during capture; retrying ${component_id} ($(( attempt + 1 ))/${max_attempts})"
     (( attempt += 1 ))
@@ -5113,22 +5159,10 @@ try:
         or source_identity(before) != source_identity(os.fstat(source_descriptor))
     ):
         raise ValueError("SQLite source identity changed")
-    sidecars_after = {
-        suffix
-        for suffix in sidecar_suffixes
-        if os.path.lexists(pathlib.Path(str(source) + suffix))
-    }
-    if sidecars_after != set(sidecars_before):
-        raise ValueError("SQLite sidecar set changed")
-    for index, suffix in enumerate(sidecars_before, start=1):
-        candidate = pathlib.Path(str(source) + suffix)
-        after_sidecar = os.lstat(candidate)
-        held_sidecar = os.fstat(held_descriptors[index])
-        if (
-            source_identity(sidecars_before[suffix]) != source_identity(after_sidecar)
-            or source_identity(sidecars_before[suffix]) != source_identity(held_sidecar)
-        ):
-            raise ValueError("SQLite sidecar identity changed")
+    # sqlite3_backup produces a transactionally consistent image across
+    # concurrent writers and restarts itself internally when the source is
+    # written. Sidecar existence is connection-lifetime state, not archive
+    # validity, so only the main database inode remains identity-bound here.
     os.chmod(target, 0o600)
     final = os.lstat(target)
     if (
@@ -5336,7 +5370,10 @@ archive_openclaw_state_component() {
     fi
     rm -f -- "$target"
     if (( attempt >= max_attempts )); then
-      die "Required recovery source or SQLite snapshot could not be archived after ${max_attempts} attempts: ${component_id} (${source_dir})"
+      record_degraded_component \
+        "$component_id" required "$source_dir" \
+        "Required recovery source or SQLite snapshot could not be archived after ${max_attempts} attempts"
+      return 0
     fi
     log "Recovery source or SQLite snapshot changed during capture; retrying ${component_id} ($(( attempt + 1 ))/${max_attempts})"
     (( attempt += 1 ))
@@ -5346,6 +5383,18 @@ archive_openclaw_state_component() {
   [[ "${RUN_TYPE:-}" == "comprehensive" ]] && capture_method="service-quiesced-tar"
   record_recovery_component \
     "$component_id" required captured "$(basename "$target")" "$source_dir" "$capture_method"
+}
+
+record_degraded_component() {
+  local component_id="$1"
+  local requirement="$2"
+  local source="$3"
+  local reason="$4"
+  record_recovery_component \
+    "$component_id" "$requirement" degraded "" "$source" "" "$reason"
+  RUN_DEGRADED=true
+  RUN_DEGRADED_COMPONENTS+=("$component_id")
+  log "WARNING: recovery component is degraded: ${component_id} (${reason})"
 }
 
 record_absent_component() {
@@ -5366,7 +5415,10 @@ archive_optional_component() {
   shift 4
   if [[ -d "$source_dir" && ! -L "$source_dir" ]]; then
     if ! archive_dir "$source_dir" "$target" "$@"; then
-      die "Optional recovery source was present but could not be archived: ${component_id} (${source_dir})"
+      record_degraded_component \
+        "$component_id" optional "$source_dir" \
+        "Optional recovery source was present but could not be archived"
+      return 0
     fi
     local capture_method="live-filesystem-tar"
     [[ "${RUN_TYPE:-}" == "comprehensive" ]] && capture_method="service-quiesced-tar"
@@ -5544,8 +5596,11 @@ prune_backups() {
 
 verify_recovery_contract() {
   local directory="$1"
+  local allow_degraded="${2:-false}"
+  [[ "$allow_degraded" == "true" || "$allow_degraded" == "false" ]] || return 1
   python3 - "$directory" "${BACKUP_PG_RESTORE_BIN}" \
-    "${BACKUP_POSTGRESQL_CLIENT_MAJOR}" "${PORTAL_APP_SOURCES_DIR}" <<'PY'
+    "${BACKUP_POSTGRESQL_CLIENT_MAJOR}" "${PORTAL_APP_SOURCES_DIR}" \
+    "$allow_degraded" <<'PY'
 import decimal
 import json
 import os
@@ -5562,6 +5617,7 @@ root = pathlib.Path(sys.argv[1])
 pg_restore = pathlib.Path(sys.argv[2])
 postgres_major = int(sys.argv[3])
 portal_app_sources = pathlib.Path(sys.argv[4])
+allow_degraded = sys.argv[5] == "true"
 manifest_path = root / "RECOVERY-MANIFEST.json"
 core_payloads = {
     "database": "database.dump",
@@ -5688,7 +5744,10 @@ def member_xattr_bytes(member):
         "SCHILY.acl.access" in member.pax_headers
         and b"system.posix_acl_access" not in names
     ) or (
-        "SCHILY.acl.default" in member.pax_headers
+        # GNU tar emits an empty SCHILY.acl.default marker for an
+        # access-ACL-bearing directory that has no default ACL. Only a
+        # non-empty default ACL has an authoritative binary xattr.
+        bool(member.pax_headers.get("SCHILY.acl.default"))
         and b"system.posix_acl_default" not in names
     ):
         fail("nested recovery ACL lacks its authoritative binary xattr")
@@ -5990,12 +6049,16 @@ try:
 
         requirement = entry.get("requirement")
         status = entry.get("status")
-        if requirement not in {"required", "optional"} or status not in {"captured", "not-configured"}:
+        if requirement not in {"required", "optional"} or status not in {"captured", "not-configured", "degraded"}:
             fail("invalid recovery component state")
-        if requirement == "required" and status != "captured":
+        if status == "degraded" and not allow_degraded:
+            fail("degraded recovery component is not a complete backup")
+        if requirement == "required" and status != "captured" and not (
+            allow_degraded and status == "degraded"
+        ):
             fail("required recovery component was not captured")
         if component_id == "openclaw-state" or component_id.startswith("stalwart-"):
-            expected_requirement = "required" if status == "captured" else "optional"
+            expected_requirement = "optional" if status == "not-configured" else "required"
             if requirement != expected_requirement:
                 fail("installed optional feature must be recovery-required")
         logical_bytes = entry.get("logicalBytes")
@@ -6186,7 +6249,7 @@ try:
                 fail("absent recovery component claims a payload")
             reason = entry.get("reason")
             if not isinstance(reason, str) or not reason.strip() or len(reason) > 512:
-                fail("optional absence lacks bounded evidence")
+                fail("uncaptured recovery component lacks bounded evidence")
 
         source = entry.get("source")
         if source is not None and (
@@ -6199,7 +6262,11 @@ try:
 
     for component_id, expected_payload in core_payloads.items():
         entry = by_id.get(component_id)
-        if not entry or entry.get("requirement") != "required" or entry.get("status") != "captured":
+        if not entry or entry.get("requirement") != "required":
+            fail(f"required core recovery component is missing: {component_id}")
+        if entry.get("status") == "degraded" and allow_degraded:
+            continue
+        if entry.get("status") != "captured":
             fail(f"required core recovery component is missing: {component_id}")
         if entry.get("payload") != expected_payload:
             fail(f"required core recovery payload is wrong: {component_id}")
@@ -6289,6 +6356,7 @@ PY
 
 verify_staging_manifest() {
   local directory="$1"
+  local allow_degraded="${2:-false}"
   assert_backup_archive_trust || return 1
   python3 - "${directory}" "${BACKUP_HMAC_KEY}" <<'PY' || return 1
 import hashlib
@@ -6413,11 +6481,12 @@ PY
     && ! -L "${directory}/database.dump" ]] || return 1
   [[ -f "${directory}/RECOVERY-MANIFEST.json" \
     && ! -L "${directory}/RECOVERY-MANIFEST.json" ]] || return 1
-  verify_recovery_contract "$directory"
+  verify_recovery_contract "$directory" "$allow_degraded"
 }
 
 verify_archive() {
   local archive="$1"
+  local allow_degraded="${2:-false}"
   local expanded_bytes="" reserve_bytes="${BACKUP_RECOVERY_RESERVE_BYTES:-536870912}"
   [[ -f "$archive" && ! -L "$archive" ]] || return 1
   assert_backup_archive_trust || return 1
@@ -6664,7 +6733,7 @@ PY
   local status=0
   if ! tar --no-same-owner --no-same-permissions -xzf "$archive" -C "$verify_dir"; then
     status=1
-  elif ! verify_staging_manifest "$verify_dir"; then
+  elif ! verify_staging_manifest "$verify_dir" "$allow_degraded"; then
     status=1
   fi
   rm -rf -- "$verify_dir"
@@ -6810,7 +6879,9 @@ create_backup() {
     portal-backend-state "$PORTAL_BACKEND_STATE_DIR" "${staging}/portal-backend-state.tar.gz" \
     --exclude='backups/status.json' \
     --exclude='backups/current.log' \
-    --exclude='backups/backup.lock'
+    --exclude='backups/backup.lock' \
+    --exclude='runtime-turn-events/*' \
+    --exclude='maintenance-history/*'
   archive_required_component portal-state "$PORTAL_STATE_DIR" "${staging}/portal-state.tar.gz"
   archive_required_component portal-assets "$PORTAL_ASSETS_DIR" "${staging}/portal-assets.tar.gz"
   if [[ "$RUNTIME_ROOT" != "$PROJECTS_DIR" ]]; then
@@ -6898,7 +6969,10 @@ create_backup() {
       || die "Stalwart is configured but no configured mail data root exists; set STALWART_DIR or STALWART_INSTALL_DIR"
     archive_configured_feature_component \
       stalwart-data "$STALWART_DIR" "${staging}/stalwart-data.tar.gz" \
-      "Stalwart was configured but this data root did not exist at backup time"
+      "Stalwart was configured but this data root did not exist at backup time" \
+      --exclude='logs/*' \
+      --exclude='data/LOG' \
+      --exclude='data/LOG.old*'
     archive_configured_feature_component \
       stalwart-mail-data "$STALWART_MAIL_DIR" "${staging}/stalwart-mail-data.tar.gz" \
       "Stalwart was configured but this alternate data root did not exist at backup time"
@@ -6981,6 +7055,7 @@ create_backup() {
     archive_openclaw_state_component \
       openclaw-state "$OPENCLAW_DIR" "${staging}/openclaw-state.tar.gz" 3 \
       --allow-external-hardlinks \
+      --allow-absolute-symlink-root=/usr/lib/node_modules/openclaw \
       --exclude='npm/*' \
       --exclude='logs/*' \
       --exclude='*/agent/codex-home/tmp' \
@@ -7075,7 +7150,8 @@ create_backup() {
     || die "Backup MAC record was not committed durably"
   fsync_directory "$staging" \
     || die "Authenticated backup staging directory was not committed durably"
-  verify_staging_manifest "$staging" || die "Backup manifest checksum generation failed"
+  verify_staging_manifest "$staging" "$RUN_DEGRADED" \
+    || die "Backup manifest checksum generation failed"
 
   if [[ "$type" == "comprehensive" ]]; then
     set_backup_phase creating-archive "Creating backup archive" 10 \
@@ -7098,7 +7174,7 @@ create_backup() {
     set_backup_phase verifying-archive "Verifying and publishing archive" 8 \
       || die "Backup progress state could not be updated"
   fi
-  if ! verify_archive "$PARTIAL_ARCHIVE"; then
+  if ! verify_archive "$PARTIAL_ARCHIVE" "$RUN_DEGRADED"; then
     die "Published archive would not satisfy the recovery manifest contract"
   fi
 
@@ -7124,11 +7200,18 @@ create_backup() {
   fi
   PARTIAL_ARCHIVE=""
 
-  prune_backups "$type"
-
   local size
   size="$(du -h "$archive_path" | awk '{print $1}')"
   RUN_ARCHIVE_PATH="$archive_path"
+  if $RUN_DEGRADED; then
+    local degraded_list
+    degraded_list="$(IFS=,; printf '%s' "${RUN_DEGRADED_COMPONENTS[*]}")"
+    RUN_ERROR_DETAIL="Backup archive was published in degraded state; unavailable components: ${degraded_list}"
+    log "WARNING: ${RUN_ERROR_DETAIL}: ${archive_path} (${size}, ${file_count} entries)"
+    return 1
+  fi
+
+  prune_backups "$type"
   log "${type} backup complete: ${archive_path} (${size}, ${file_count} entries)"
 }
 

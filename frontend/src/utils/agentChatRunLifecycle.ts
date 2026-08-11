@@ -153,17 +153,33 @@ export function resolveToolCompletionStatus(event: unknown): 'done' | 'error' {
 export function selectSnapshotReasoningEvents<T extends {
   type?: unknown;
   text?: unknown;
+  subject?: unknown;
   runId?: unknown;
   seq?: unknown;
+  visible?: unknown;
+  source?: { eventType?: unknown };
 }>(turnEvents: T[], snapshotRunId: unknown): T[] {
   const expectedRunId = typeof snapshotRunId === 'string' ? snapshotRunId.trim() : '';
   if (!expectedRunId) return [];
 
   return turnEvents
     .filter((event) => (
-      event?.type === 'assistant_reasoning'
-      && typeof event?.text === 'string'
-      && event.text.trim()
+      (
+        event?.type === 'assistant_reasoning'
+        || (
+          event?.type === 'assistant_status'
+          && event?.visible === true
+          && event?.source?.eventType === 'status'
+        )
+      )
+      && (
+        (typeof event?.text === 'string' && event.text.trim())
+        || (
+          event?.type === 'assistant_reasoning'
+          && typeof event?.subject === 'string'
+          && event.subject.trim()
+        )
+      )
       && typeof event?.runId === 'string'
       && event.runId.trim() === expectedRunId
     ))

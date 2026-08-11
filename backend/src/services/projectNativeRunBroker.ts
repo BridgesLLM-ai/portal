@@ -158,11 +158,76 @@ function boundedStructuredValue(value: unknown, depth = 0, seen = new WeakSet<ob
   return output;
 }
 
+function attestedPreambleReasoning(event: StreamEvent): Record<string, unknown> | null {
+  const turnEvent = event.turnEvent;
+  if (
+    !turnEvent
+    || turnEvent.schema !== 'bridgesllm.runtime-turn-event.v1'
+    || turnEvent.type !== 'assistant_reasoning'
+    || turnEvent.source?.transport !== 'portal-stream-event-bus'
+    || turnEvent.source?.eventType !== 'status'
+    || turnEvent.source?.preambleProgress !== true
+  ) return null;
+  return turnEvent as unknown as Record<string, unknown>;
+}
+
+function isGenericAssistantStatusText(value: unknown): boolean {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  if (!normalized) return true;
+  if (/^(thinking|working|reasoning|processing|responding|running|typing)\s*(…|\.{1,3})?$/i.test(normalized)) {
+    return true;
+  }
+  return /\b(?:compacting context|context compacted|context maintenance|memory flush|heartbeat check)\b/i.test(normalized);
+}
+
+function attestedVisibleAssistantStatus(event: StreamEvent): Record<string, unknown> | null {
+  const turnEvent = event.turnEvent;
+  if (
+    event.type !== 'status'
+    || event.transient === true
+    || !turnEvent
+    || turnEvent.schema !== 'bridgesllm.runtime-turn-event.v1'
+    || turnEvent.type !== 'assistant_status'
+    || turnEvent.visible !== true
+    || turnEvent.source?.transport !== 'portal-stream-event-bus'
+    || turnEvent.source?.eventType !== 'status'
+    || turnEvent.source?.preambleProgress === true
+    || isGenericAssistantStatusText(turnEvent.text)
+  ) return null;
+  return turnEvent as unknown as Record<string, unknown>;
+}
+
+function boundedPreambleItemId(
+  event: StreamEvent,
+  turnEvent: Record<string, unknown> | null,
+): string {
+  const source = turnEvent?.source && typeof turnEvent.source === 'object' && !Array.isArray(turnEvent.source)
+    ? turnEvent.source as Record<string, unknown>
+    : null;
+  const candidate = source?.preambleItemId
+    ?? source?.itemId
+    ?? event.preambleItemId
+    ?? event.itemId;
+  return typeof candidate === 'string' ? boundedText(candidate.trim()).slice(0, 256) : '';
+}
+
 function sanitizeEvent(event: StreamEvent): StreamEvent {
-  const type = SAFE_EVENT_TYPES.has(event.type) ? event.type : 'status';
+  // item.preamble arrives from OpenClaw as a compatibility-shaped status
+  // envelope. Only the StreamEventBus-attested turn event may promote it to
+  // Project reasoning; a raw provider flag on its own is not sufficient.
+  const preambleTurnEvent = attestedPreambleReasoning(event);
+  const statusTurnEvent = preambleTurnEvent ? null : attestedVisibleAssistantStatus(event);
+  const type = preambleTurnEvent
+    ? 'thinking'
+    : (SAFE_EVENT_TYPES.has(event.type) ? event.type : 'status');
   const sanitized: StreamEvent = { type };
-  if (event.content != null) sanitized.content = boundedText(event.content);
-  const subject = sanitizeThinkingSubject(event.subject);
+  const attestedText = typeof preambleTurnEvent?.text === 'string'
+    ? preambleTurnEvent.text
+    : typeof statusTurnEvent?.text === 'string'
+      ? statusTurnEvent.text
+      : event.content;
+  if (attestedText != null) sanitized.content = boundedText(attestedText);
+  const subject = sanitizeThinkingSubject(preambleTurnEvent?.subject ?? event.subject);
   if (subject) sanitized.subject = subject;
   if (typeof event.toolName === 'string') sanitized.toolName = boundedText(event.toolName).slice(0, 512);
   if (event.toolArgs !== undefined) sanitized.toolArgs = boundedStructuredValue(event.toolArgs);
@@ -178,7 +243,22 @@ function sanitizeEvent(event: StreamEvent): StreamEvent {
   if (event.maintenanceKind === 'compaction' || event.maintenanceKind === 'maintenance') {
     sanitized.maintenanceKind = event.maintenanceKind;
   }
-  if (typeof event.replace === 'boolean') sanitized.replace = event.replace;
+  if (event.transient === true) sanitized.transient = true;
+  if (statusTurnEvent) sanitized.assistantStatus = true;
+  if (preambleTurnEvent) {
+    sanitized.preambleProgress = true;
+    const preambleItemId = boundedPreambleItemId(event, preambleTurnEvent);
+    if (preambleItemId) sanitized.preambleItemId = preambleItemId;
+  } else if (event.type === 'thinking' && event.preambleProgress === true) {
+    // Native Project adapters may already emit a reasoning-shaped preamble.
+    sanitized.preambleProgress = true;
+    const preambleItemId = boundedPreambleItemId(event, null);
+    if (preambleItemId) sanitized.preambleItemId = preambleItemId;
+  }
+  const replace = preambleTurnEvent?.replace === true
+    || statusTurnEvent?.replace === true
+    || event.replace === true;
+  if (replace) sanitized.replace = true;
   if (typeof event.exitCode === 'number' && Number.isFinite(event.exitCode)) sanitized.exitCode = event.exitCode;
   return sanitized;
 }

@@ -19,13 +19,18 @@ import type { GatewayPendingQuestion } from '../api/endpoints';
 import { authAPI } from '../api/auth';
 import { useAuthStore } from './AuthContext';
 import {
+  createGraduatedThinkingSnapshotTracker,
   extractThinkingChunk,
   isControlOnlyAssistantContent,
+  markThinkingSnapshotGraduated,
   mergeAssistantStream,
   mergeThinkingStream,
+  projectThinkingChunkAfterGraduation,
   reconcileCumulativeFinalTail,
+  resetGraduatedThinkingSnapshotTracker,
   sanitizeAssistantContent,
   sanitizeAssistantChunk,
+  seedGraduatedThinkingSnapshot,
   stripOpenClawReplyTags,
 } from '../utils/chatStream';
 import {
@@ -147,7 +152,7 @@ interface StreamSegment {
   ts: number;
   kind: 'text' | 'thinking';
   order: number;
-  lane?: 'raw' | 'preamble';
+  lane?: 'raw' | 'preamble' | 'status';
 }
 
 type ChatStreamTransport = 'portal' | 'direct' | 'sse';
@@ -202,8 +207,14 @@ export interface ChatMessage {
   toolName?: string;
   /** Text segments with their position relative to tool calls (for history reconstruction) */
   segments?: TextSegment[];
+  /** Server presentation caps omitted older activity from this single turn. */
+  presentationTruncated?: boolean;
   /** Exact active run carried only by Portal runtime-history overlays. */
   runtimeRunId?: string;
+  /** Highest normalized runtime event already represented by this overlay. */
+  runtimeLastEventSeq?: number;
+  /** Provider cumulative cursors represented by the graduated overlay. */
+  runtimeThinkingCursors?: Partial<Record<'raw' | 'preamble' | 'status', string>>;
 }
 
 export interface MessageQueueItem {
@@ -708,6 +719,25 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     runtimeRunId: m?.__portal?.kind === 'runtime-turn-event-history'
       ? normalizeRunId(m?.__portal?.runId) || undefined
       : undefined,
+    runtimeLastEventSeq: m?.__portal?.kind === 'runtime-turn-event-history'
+      && Number.isSafeInteger(m?.__portal?.lastEventSeq)
+      ? m.__portal.lastEventSeq
+      : undefined,
+    runtimeThinkingCursors: m?.__portal?.kind === 'runtime-turn-event-history'
+      && m?.__portal?.thinkingCursors
+      && typeof m.__portal.thinkingCursors === 'object'
+      ? {
+          ...(typeof m.__portal.thinkingCursors.raw === 'string'
+            ? { raw: sanitizeAssistantContent(m.__portal.thinkingCursors.raw) }
+            : {}),
+          ...(typeof m.__portal.thinkingCursors.status === 'string'
+            ? { status: sanitizeAssistantContent(m.__portal.thinkingCursors.status) }
+            : {}),
+          ...(typeof m.__portal.thinkingCursors.preamble === 'string'
+            ? { preamble: sanitizeAssistantContent(m.__portal.thinkingCursors.preamble) }
+            : {}),
+        }
+      : undefined,
   };
   if (m.toolCalls) {
     msg.toolCalls = normalizeToolCalls(m.toolCalls, 'done');
@@ -925,6 +955,53 @@ function normalizeRunId(rawRunId: unknown): string | null {
   return runId || null;
 }
 
+function resolveCompatibilityToolReplayIdentity(
+  payload: any,
+  fallbackSessionKey?: string | null,
+): string {
+  const explicitId = typeof payload?.toolCallId === 'string' && payload.toolCallId.trim()
+    ? payload.toolCallId.trim()
+    : typeof payload?.id === 'string' && payload.id.trim()
+      ? payload.id.trim()
+      : typeof payload?.turnEvent?.tool?.id === 'string' && payload.turnEvent.tool.id.trim()
+        ? payload.turnEvent.tool.id.trim()
+        : '';
+  if (explicitId) return explicitId;
+
+  const runId = normalizeRunId(payload?.runId || payload?.turnEvent?.runId);
+  const rawSequence = payload?.seq ?? payload?.turnEvent?.seq;
+  const sequence = typeof rawSequence === 'number'
+    ? rawSequence
+    : typeof rawSequence === 'string' && rawSequence.trim()
+      ? Number(rawSequence)
+      : Number.NaN;
+  if (!runId || !Number.isSafeInteger(sequence) || sequence < 0) return '';
+
+  const sessionKey = String(
+    payload?.sessionKey
+    || payload?.turnEvent?.sessionKey
+    || fallbackSessionKey
+    || 'unknown-session',
+  ).trim() || 'unknown-session';
+  return `compat-tool:${encodeURIComponent(sessionKey)}:${encodeURIComponent(runId)}:${sequence}`;
+}
+
+function normalizeThinkingProgressTokens(rawProgressTokens: unknown): number | null {
+  if (
+    typeof rawProgressTokens !== 'number'
+    || !Number.isFinite(rawProgressTokens)
+    || rawProgressTokens <= 0
+  ) return null;
+  return Math.floor(rawProgressTokens);
+}
+
+function formatThinkingProgressStatus(rawProgressTokens: unknown): string | null {
+  const progressTokens = normalizeThinkingProgressTokens(rawProgressTokens);
+  return progressTokens === null
+    ? null
+    : `Thinking… (~${progressTokens.toLocaleString('en-US')} tokens)`;
+}
+
 function isVerifiedDirectContinuationFrame(evt: GatewayEvent): boolean {
   const payload = evt.payload as any;
   if (evt.event === 'chat') {
@@ -942,7 +1019,10 @@ function isVerifiedDirectContinuationFrame(evt: GatewayEvent): boolean {
   const hasContent = [data.text, data.delta, data.content, data.progressText]
     .some((value) => typeof value === 'string' && value.trim());
 
-  if (stream === 'assistant' || stream === 'thinking') return hasContent;
+  if (stream === 'assistant') return hasContent;
+  if (stream === 'thinking') {
+    return hasContent || normalizeThinkingProgressTokens(data.progressTokens) !== null;
+  }
   if (stream === 'lifecycle') return phase === 'start' || phase === 'started' || phase === 'running';
   if (stream === 'tool') return phase === 'start';
   if (stream === 'item') {
@@ -1007,6 +1087,25 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
     thinkingContent: thinking,
     runtimeRunId: (msg as any)?.__portal?.kind === 'runtime-turn-event-history'
       ? normalizeRunId((msg as any)?.__portal?.runId) || undefined
+      : undefined,
+    runtimeLastEventSeq: (msg as any)?.__portal?.kind === 'runtime-turn-event-history'
+      && Number.isSafeInteger((msg as any)?.__portal?.lastEventSeq)
+      ? (msg as any).__portal.lastEventSeq
+      : undefined,
+    runtimeThinkingCursors: (msg as any)?.__portal?.kind === 'runtime-turn-event-history'
+      && (msg as any)?.__portal?.thinkingCursors
+      && typeof (msg as any).__portal.thinkingCursors === 'object'
+      ? {
+          ...(typeof (msg as any).__portal.thinkingCursors.raw === 'string'
+            ? { raw: sanitizeAssistantContent((msg as any).__portal.thinkingCursors.raw) }
+            : {}),
+          ...(typeof (msg as any).__portal.thinkingCursors.status === 'string'
+            ? { status: sanitizeAssistantContent((msg as any).__portal.thinkingCursors.status) }
+            : {}),
+          ...(typeof (msg as any).__portal.thinkingCursors.preamble === 'string'
+            ? { preamble: sanitizeAssistantContent((msg as any).__portal.thinkingCursors.preamble) }
+            : {}),
+        }
       : undefined,
   };
 }
@@ -1532,6 +1631,13 @@ function isLikelyCommittedPendingUser(localMessage: ChatMessage, committedMessag
   const committedTs = committedMessage.createdAt instanceof Date ? committedMessage.createdAt.getTime() : NaN;
   if (!Number.isFinite(localTs) || !Number.isFinite(committedTs)) return false;
 
+  // A matching upstream echo gives local Agent Chat rows a server timestamp.
+  // Use that narrow authority so an older identical prompt cannot consume the
+  // newly accepted row while its own durable projection is still lagging.
+  if (localMessage.provenance === 'live-local-user') {
+    return committedTs >= localTs && committedTs <= localTs + 10_000;
+  }
+
   const earliestExpectedCommitTs = localTs - 10_000;
   const latestExpectedCommitTs = localTs + LOCAL_PENDING_ACK_WINDOW_MS;
   return committedTs >= earliestExpectedCommitTs && committedTs <= latestExpectedCommitTs;
@@ -1877,7 +1983,10 @@ function mergeLoadedHistoryWithLocalMessages(
     if (message.queued) return true;
     if (message.role === 'system' && message.provenance === 'live-steer') return true;
     if (message.role === 'user' && message.pendingAck) return true;
-    if (message.role === 'user' && message.provenance === 'live-foreign-user') return true;
+    if (
+      message.role === 'user'
+      && (message.provenance === 'live-foreign-user' || message.provenance === 'live-local-user')
+    ) return true;
     if (preserveActiveAssistant && message.id === activeAssistantId) return true;
     if (isRecentOptimisticAssistant(message)) return true;
     return false;
@@ -2056,7 +2165,11 @@ function mergeLoadedHistoryWithLocalMessages(
       if (existing.id && candidate.id && existing.id === candidate.id) {
         if (
           candidate.role === 'user'
-          && (candidate.pendingAck || candidate.provenance === 'live-foreign-user')
+          && (
+            candidate.pendingAck
+            || candidate.provenance === 'live-foreign-user'
+            || candidate.provenance === 'live-local-user'
+          )
         ) {
           consumedCommittedUserMatches.add(existing);
         }
@@ -2064,7 +2177,11 @@ function mergeLoadedHistoryWithLocalMessages(
       }
       if (
         candidate.role === 'user'
-        && (candidate.pendingAck || candidate.provenance === 'live-foreign-user')
+        && (
+          candidate.pendingAck
+          || candidate.provenance === 'live-foreign-user'
+          || candidate.provenance === 'live-local-user'
+        )
       ) {
         if (consumedCommittedUserMatches.has(existing)) return false;
         if (isLikelyCommittedPendingUser(candidate, existing)) {
@@ -2823,7 +2940,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (matchingLocal.pendingAck) {
         setMessages((previous) => {
           const next = previous.map((message) => message.id === rawId
-            ? { ...message, pendingAck: false }
+            ? {
+                ...message,
+                pendingAck: false,
+                createdAt: new Date(timestampMs),
+                // The upstream echo proves acceptance, not immediate history
+                // durability. Preserve this exact optimistic row across a
+                // forced history read until the committed transcript catches up.
+                provenance: 'live-local-user',
+              }
             : message);
           messagesRef.current = next;
           return next;
@@ -2864,7 +2989,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
   const thinkingContentRef = useRef('');
-  const reasoningLaneRef = useRef<'raw' | 'preamble' | null>(null);
+  const reasoningLaneRef = useRef<'raw' | 'preamble' | 'status' | null>(null);
+  const thinkingSnapshotTrackerRef = useRef(createGraduatedThinkingSnapshotTracker());
   useEffect(() => { thinkingContentRef.current = thinkingContent; }, [thinkingContent]);
   const [thinkingSubject, setThinkingSubject] = useState<string>('');
   const thinkingSubjectRef = useRef('');
@@ -2964,6 +3090,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const retiredRunIdsRef = useRef<RetiredRunEpoch[]>([]);
   const streamingAssistantIdRef = useRef<string | null>(null);
   const activeStreamToolCallsRef = useRef<ToolCall[]>([]);
+  const compatibilityToolReplayIdsRef = useRef<Set<string>>(new Set());
   const activeToolNameRef = useRef<string | null>(null);
   const assembledRef = useRef('');
   const lastSegmentStartRef = useRef(0);
@@ -3000,6 +3127,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     runId: null,
     seq: null,
   });
+  const runtimeReplaySequenceRef = useRef<{ runId: string | null; seq: number | null }>({
+    runId: null,
+    seq: null,
+  });
   const runtimeOverlayOrderOffsetRef = useRef<{ runId: string; offset: number } | null>(null);
 
   // React state setters are asynchronous. Recovery frames can arrive
@@ -3009,8 +3140,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     thinkingContentRef.current = '';
     thinkingSubjectRef.current = '';
     reasoningLaneRef.current = null;
+    resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
     streamSegmentsRef.current = [];
     runtimeOverlayOrderOffsetRef.current = null;
+    compatibilityToolReplayIdsRef.current.clear();
     setThinkingContent('');
     setThinkingSubject('');
     setStreamSegments([]);
@@ -3129,7 +3262,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                   ts: segment.ts,
                   order: segment.order,
                   ...(segment.kind === 'thinking'
-                    ? { source: segment.lane === 'preamble' ? 'preamble' as const : 'reasoning' as const }
+                    ? {
+                        source: segment.lane === 'preamble'
+                          ? 'preamble' as const
+                          : segment.lane === 'status'
+                            ? 'status' as const
+                            : 'reasoning' as const,
+                      }
                     : { source: 'text' as const }),
                 }))
               : message.segments,
@@ -3863,6 +4002,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       prepareVerifiedContinuationAdoptionRef.current();
     }
     if (result.state.currentRunId !== previousRunId) {
+      compatibilityToolReplayIdsRef.current.clear();
       pendingQuestionPollGenerationRef.current += 1;
       pendingUserQuestionsReadyRef.current = false;
       pendingQuestionComposerAnswerRef.current = null;
@@ -3874,12 +4014,29 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   const recordReasoningTurnSequence = useCallback((payload: any) => {
     const turnEvent = payload?.turnEvent;
-    if (turnEvent?.type !== 'assistant_reasoning') return;
+    const isVisibleReasoningStatus = turnEvent?.type === 'assistant_status'
+      && turnEvent?.visible === true
+      && turnEvent?.source?.eventType === 'status';
+    if (turnEvent?.type !== 'assistant_reasoning' && !isVisibleReasoningStatus) return;
     const runId = normalizeRunId(turnEvent.runId || payload?.runId);
     const seq = Number(turnEvent.seq);
     if (!runId || !Number.isFinite(seq) || seq < 0) return;
     const current = reasoningSequenceRef.current;
     reasoningSequenceRef.current = {
+      runId,
+      seq: current.runId === runId && current.seq !== null
+        ? Math.max(current.seq, seq)
+        : seq,
+    };
+  }, []);
+
+  const recordRuntimeReplaySequence = useCallback((payload: any) => {
+    const turnEvent = payload?.turnEvent;
+    const runId = normalizeRunId(turnEvent?.runId || payload?.runId);
+    const seq = Number(turnEvent?.seq);
+    if (!runId || !Number.isFinite(seq) || seq < 0) return;
+    const current = runtimeReplaySequenceRef.current;
+    runtimeReplaySequenceRef.current = {
       runId,
       seq: current.runId === runId && current.seq !== null
         ? Math.max(current.seq, seq)
@@ -4083,10 +4240,21 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return true;
   }, [appendStreamSegment, clearPendingTextRender]);
 
+  const graduateDirectLiveTextSegment = useCallback((assistantId?: string | null) => {
+    if (!assembledRef.current.trim()) return false;
+    directSnapshotCursorRef.current = beginCumulativeSnapshotSegment(directSnapshotCursorRef.current);
+    lastSegmentStartRef.current = directSnapshotCursorRef.current.segmentBaseline.length;
+    return graduateLiveTextSegment(assistantId);
+  }, [graduateLiveTextSegment]);
+
   const graduateLiveThinkingSegment = useCallback(() => {
     const currentThinking = thinkingContentRef.current;
     const currentSubject = thinkingSubjectRef.current;
     if (!currentThinking.trim() && !currentSubject) return false;
+    markThinkingSnapshotGraduated(
+      thinkingSnapshotTrackerRef.current,
+      reasoningLaneRef.current,
+    );
     appendStreamSegment(
       'thinking',
       currentThinking,
@@ -4123,7 +4291,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         ts: seg.ts,
         order: seg.order,
         ...(seg.kind === 'thinking'
-          ? { source: seg.lane === 'preamble' ? 'preamble' as const : 'reasoning' as const }
+          ? {
+              source: seg.lane === 'preamble'
+                ? 'preamble' as const
+                : seg.lane === 'status'
+                  ? 'status' as const
+                  : 'reasoning' as const,
+            }
           : { source: 'text' as const }),
       });
     }
@@ -4146,7 +4320,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const appendThinkingChunk = useCallback((
     _assistantId: string | null,
     chunk: string,
-    opts?: { replace?: boolean; lane?: 'raw' | 'preamble' },
+    opts?: { replace?: boolean; lane?: 'raw' | 'preamble' | 'status' },
   ) => {
     if (!chunk) return;
     const nextLane = opts?.lane || 'raw';
@@ -4158,7 +4332,21 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       graduateLiveThinkingSegment();
     }
     reasoningLaneRef.current = nextLane;
-    const nextThinking = mergeThinkingStream(thinkingContentRef.current, chunk, opts);
+    const projectedChunk = projectThinkingChunkAfterGraduation(
+      thinkingSnapshotTrackerRef.current,
+      nextLane,
+      chunk,
+      opts?.replace === true,
+    );
+    // A delayed cumulative snapshot can equal the prefix already graduated at
+    // a tool boundary. It carries no new visible reasoning and must not clear
+    // a newer append-style delta already on screen.
+    if (!projectedChunk) return;
+    const nextThinking = mergeThinkingStream(
+      thinkingContentRef.current,
+      projectedChunk,
+      opts,
+    );
     thinkingContentRef.current = nextThinking;
     setThinkingContent(nextThinking);
   }, [graduateLiveThinkingSegment]);
@@ -4285,7 +4473,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                   ts: segment.ts,
                   order: segment.order,
                   ...(segment.kind === 'thinking'
-                    ? { source: segment.lane === 'preamble' ? 'preamble' as const : 'reasoning' as const }
+                    ? {
+                        source: segment.lane === 'preamble'
+                          ? 'preamble' as const
+                          : segment.lane === 'status'
+                            ? 'status' as const
+                            : 'reasoning' as const,
+                      }
                     : { source: 'text' as const }),
                 }))
               : message.segments,
@@ -4364,12 +4558,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       : '';
     const snapshotToolCalls = normalizeToolCalls(snapshot.toolCalls, 'running') || [];
     const preservedToolCalls = activeStreamToolCallsRef.current;
-    const effectiveToolCalls = snapshotToolCalls.length > 0
+    let effectiveToolCalls = snapshotToolCalls.length > 0
       ? (mergeToolCallSnapshots(preservedToolCalls, snapshotToolCalls) || [])
       : preservedToolCalls;
-    const runningToolCall = effectiveToolCalls.find((toolCall) => toolCall.status === 'running') || effectiveToolCalls[effectiveToolCalls.length - 1];
-    const toolNameCandidate = snapshot.toolName || snapshot.name || runningToolCall?.name || activeToolNameRef.current;
-    const snapshotToolName = typeof toolNameCandidate === 'string' && toolNameCandidate.trim()
+    let runningToolCall = effectiveToolCalls.find((toolCall) => toolCall.status === 'running');
+    let toolNameCandidate = snapshot.toolName || snapshot.name || runningToolCall?.name || activeToolNameRef.current;
+    let snapshotToolName = typeof toolNameCandidate === 'string' && toolNameCandidate.trim()
       ? resolveToolName(toolNameCandidate)
       : null;
     const rawStatusText = getRailSafeStatusText(typeof snapshot.statusText === 'string' ? snapshot.statusText.trim() : '');
@@ -4412,29 +4606,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (snapshotRunId) {
       snapshotEpochDecision = reconcileIncomingRunEpoch(snapshotRunId, { continuationVerified: true });
       if (snapshotEpochDecision === 'reject') return false;
+      if (snapshotEpochDecision === 'adopt') {
+        resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+      }
     }
-    // Verified replacement adoption may have just graduated and cleared the
-    // predecessor's cumulative text. Compare the snapshot against that
-    // post-adoption state, not against the stale R1 buffer captured beforehand.
-    const currentStreamText = assembledRef.current;
-    const normalizedSnapshotContent = normalizeHistoryReplayContent(snapshotContent);
-    const snapshotDuplicatesGraduatedText = Boolean(normalizedSnapshotContent)
-      && !currentStreamText.trim()
-      && streamSegmentsRef.current.some((segment) => (
-        segment.kind === 'text'
-        && normalizeHistoryReplayContent(segment.text) === normalizedSnapshotContent
-      ));
-    const effectiveSnapshotContent = snapshotDuplicatesGraduatedText ? '' : snapshotContent;
-    const shouldReplaceSnapshotText = Boolean(effectiveSnapshotContent)
-      && (!currentStreamText || effectiveSnapshotContent.length >= currentStreamText.length || effectiveSnapshotContent.includes(currentStreamText));
     if (providerRef.current === 'OPENCLAW') {
       directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
     }
 
-    // Resume snapshots carry recent normalized turn events. When local thinking
-    // state was lost (reconnect, fuse clear), replay assistant_reasoning events
-    // through the same merge as the live path so thought bubbles reappear
-    // without requiring a manual page refresh.
+    // Resume snapshots carry a bounded normalized event tail. Durable runtime
+    // overlays attest the exact sequence they already represent; seed provider
+    // cumulative cursors from that prefix, then replay only the newer tail in
+    // event order. This prevents both failure modes seen after a long hidden
+    // tab: dropping genuinely new thoughts and replaying the whole run as one
+    // enormous cumulative bubble.
     const snapshotTurnEvents: any[] = Array.isArray(snapshot.turnEvents) ? snapshot.turnEvents : [];
     const hasLocalThinking = Boolean(thinkingContentRef.current.trim())
       || Boolean(thinkingSubjectRef.current)
@@ -4443,31 +4628,197 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         && (Boolean(segment.text.trim()) || Boolean(segment.subject))
       ));
     if (snapshotTurnEvents.length > 0) {
-      const knownReasoningSequence = reasoningSequenceRef.current.runId === snapshotRunId
-        ? reasoningSequenceRef.current.seq
-        : null;
-      const reasoningEvents = selectSnapshotReasoningEvents(snapshotTurnEvents, snapshotRunId)
-        .filter((event) => {
-          if (snapshotEpochDecision === 'adopt' || !hasLocalThinking) return true;
-          const seq = Number(event?.seq);
-          return knownReasoningSequence !== null
-            && Number.isFinite(seq)
-            && seq > knownReasoningSequence;
+      const knownReplaySequence = runtimeReplaySequenceRef.current.runId === snapshotRunId
+        ? runtimeReplaySequenceRef.current.seq
+        : reasoningSequenceRef.current.runId === snapshotRunId
+          ? reasoningSequenceRef.current.seq
+          : null;
+      const sortedSnapshotEvents = [...snapshotTurnEvents]
+        .filter((event) => !snapshotRunId || !normalizeRunId(event?.runId) || normalizeRunId(event?.runId) === snapshotRunId)
+        .sort((left, right) => (Number(left?.seq) || 0) - (Number(right?.seq) || 0));
+      const allReasoningEvents = selectSnapshotReasoningEvents(snapshotTurnEvents, snapshotRunId);
+      const shouldReplayWholeSnapshot = snapshotEpochDecision === 'adopt'
+        || (!hasLocalThinking && knownReplaySequence === null);
+      const replayAfterSequence = shouldReplayWholeSnapshot
+        ? Number.NEGATIVE_INFINITY
+        : (knownReplaySequence ?? Number.POSITIVE_INFINITY);
+
+      // Legacy/local recovery can have thought bubbles but no durable cursor.
+      // In that unknowable case preserve the visible timeline and only seed the
+      // newest cumulative baseline. New builds always carry lastEventSeq.
+      const representedReasoning = shouldReplayWholeSnapshot
+        ? []
+        : allReasoningEvents.filter((event) => Number(event?.seq) <= replayAfterSequence);
+      const representedCursors: Partial<Record<'raw' | 'preamble' | 'status', string>> = {};
+      for (const event of representedReasoning) {
+        const lane = event?.source?.preambleProgress === true
+          ? 'preamble'
+          : event.type === 'assistant_status'
+            ? 'status'
+            : 'raw';
+        const eventType = event.type === 'assistant_status' ? 'status' : 'thinking';
+        const chunk = extractThinkingChunk(eventType, event.text, false);
+        if (!chunk) continue;
+        representedCursors[lane] = event.replace === true
+          ? chunk
+          : `${representedCursors[lane] || ''}${chunk}`;
+      }
+      for (const lane of ['raw', 'preamble', 'status'] as const) {
+        const cursor = representedCursors[lane];
+        if (cursor && !thinkingSnapshotTrackerRef.current.latest[lane]) {
+          seedGraduatedThinkingSnapshot(thinkingSnapshotTrackerRef.current, lane, cursor);
+        }
+      }
+
+      const replayReasoningSequences = new Set(allReasoningEvents
+        .filter((event) => Number(event?.seq) > replayAfterSequence)
+        .map((event) => Number(event?.seq)));
+      const preservedToolIds = new Set(preservedToolCalls.map((tool) => tool.id));
+      const replayedToolIds = new Set<string>();
+      const findLastSnapshotToolIndex = (predicate: (tool: ToolCall) => boolean) => {
+        for (let index = effectiveToolCalls.length - 1; index >= 0; index -= 1) {
+          if (predicate(effectiveToolCalls[index])) return index;
+        }
+        return -1;
+      };
+      const upsertSnapshotToolEvent = (event: any) => {
+        const rawName = typeof event?.tool?.name === 'string' ? event.tool.name.trim() : '';
+        if (!rawName) return;
+        const name = resolveToolName(rawName);
+        if (!name || isMessageToolName(name)) return;
+        const eventSeq = Number(event?.seq);
+        const eventTs = Number(event?.ts);
+        const id = typeof event?.tool?.id === 'string' && event.tool.id.trim()
+          ? event.tool.id.trim()
+          : `snapshot-tool-${snapshotRunId || 'run'}-${Number.isFinite(eventSeq) ? eventSeq : effectiveToolCalls.length}`;
+        let index = effectiveToolCalls.findIndex((tool) => tool.id === id);
+        if (index < 0 && event.type === 'tool_output') {
+          index = findLastSnapshotToolIndex((tool) => (
+            resolveToolName(tool.name) === name
+            && (tool.status === 'running' || (!preservedToolIds.has(tool.id) && tool.order === undefined))
+          ));
+        }
+        if (index < 0 && event.type === 'tool_started') {
+          index = findLastSnapshotToolIndex((tool) => (
+            resolveToolName(tool.name) === name
+            && !preservedToolIds.has(tool.id)
+            && !replayedToolIds.has(tool.id)
+          ));
+        }
+        const existing = index >= 0 ? effectiveToolCalls[index] : null;
+        const startedAt = existing?.startedAt
+          ?? (Number.isFinite(eventTs) ? eventTs : Date.now());
+        const isOutput = event.type === 'tool_output';
+        const status: ToolCall['status'] = event?.tool?.status === 'error'
+          ? 'error'
+          : isOutput && event?.tool?.status !== 'running'
+            ? 'done'
+            : 'running';
+        const needsTimelineOrder = !existing
+          || (!preservedToolIds.has(existing.id) && !replayedToolIds.has(existing.id));
+        const nextTool: ToolCall = {
+          ...(existing || {} as ToolCall),
+          id: existing?.id || id,
+          name,
+          arguments: existing?.arguments ?? event?.tool?.arguments,
+          startedAt,
+          ...(isOutput ? { endedAt: Number.isFinite(eventTs) ? eventTs : Date.now() } : {}),
+          ...(typeof event?.tool?.result === 'string' ? { result: event.tool.result } : {}),
+          status: existing?.status === 'error' || existing?.status === 'done'
+            ? existing.status
+            : status,
+          order: needsTimelineOrder ? streamActivityOrderRef.current++ : existing?.order,
+        };
+        if (index >= 0) {
+          effectiveToolCalls = effectiveToolCalls.map((tool, toolIndex) => toolIndex === index ? nextTool : tool);
+        } else {
+          effectiveToolCalls = [...effectiveToolCalls, nextTool];
+        }
+        replayedToolIds.add(nextTool.id);
+      };
+
+      for (const event of sortedSnapshotEvents) {
+        const eventSeq = Number(event?.seq);
+        if (!Number.isFinite(eventSeq) || eventSeq <= replayAfterSequence) continue;
+        if (replayReasoningSequences.has(eventSeq)) {
+          if (assembledRef.current.trim()) {
+            graduateLiveTextSegment(streamingAssistantIdRef.current);
+          }
+          applyThinkingSubject(null, event.subject);
+          const eventType = event.type === 'assistant_status' ? 'status' : 'thinking';
+          appendThinkingChunk(
+            null,
+            extractThinkingChunk(eventType, event.text, false),
+            {
+              replace: event.replace === true,
+              lane: event?.source?.preambleProgress === true
+                ? 'preamble'
+                : event.type === 'assistant_status'
+                  ? 'status'
+                  : 'raw',
+            },
+          );
+          recordReasoningTurnSequence({ turnEvent: event, runId: snapshotRunId });
+          continue;
+        }
+        if (event.type === 'assistant_delta' || event.type === 'source_reply') {
+          graduateLiveThinkingSegment();
+          const replayText = typeof event.text === 'string'
+            ? (event.replace === true ? sanitizeAssistantContent(event.text) : sanitizeAssistantChunk(event.text))
+            : '';
+          if (replayText && !isControlOrMaintenanceAssistantContent(replayText)) {
+            mergeStreamText(replayText, { replace: event.replace === true });
+          }
+          continue;
+        }
+        if (event.type === 'tool_started' || event.type === 'tool_output') {
+          const rawToolName = typeof event?.tool?.name === 'string' ? event.tool.name.trim() : '';
+          const visibleToolName = rawToolName ? resolveToolName(rawToolName) : '';
+          if (visibleToolName && isMessageToolName(visibleToolName)) continue;
+          graduateLiveThinkingSegment();
+          if (visibleToolName && assembledRef.current.trim()) {
+            graduateLiveTextSegment(streamingAssistantIdRef.current);
+          }
+          if (visibleToolName) upsertSnapshotToolEvent(event);
+        }
+      }
+      const newestSnapshotSequence = sortedSnapshotEvents.reduce((latest, event) => {
+        const seq = Number(event?.seq);
+        return Number.isFinite(seq) ? Math.max(latest, seq) : latest;
+      }, -1);
+      if (snapshotRunId && newestSnapshotSequence >= 0) {
+        recordRuntimeReplaySequence({
+          runId: snapshotRunId,
+          turnEvent: { runId: snapshotRunId, seq: newestSnapshotSequence },
         });
-      for (const event of reasoningEvents) {
-        applyThinkingSubject(null, event.subject);
-        appendThinkingChunk(
-          null,
-          extractThinkingChunk('thinking', event.text, Boolean(assembledRef.current)),
-          {
-            replace: event.replace === true,
-            lane: event?.source?.preambleProgress === true ? 'preamble' : 'raw',
-          },
-        );
-        recordReasoningTurnSequence({ turnEvent: event, runId: snapshotRunId });
       }
     }
+    runningToolCall = effectiveToolCalls.find((toolCall) => toolCall.status === 'running');
+    toolNameCandidate = snapshot.toolName || snapshot.name || runningToolCall?.name || activeToolNameRef.current;
+    snapshotToolName = typeof toolNameCandidate === 'string' && toolNameCandidate.trim()
+      ? resolveToolName(toolNameCandidate)
+      : null;
+    // The active snapshot content can be cumulative across text already
+    // graduated around replayed tools. Keep only the unrepresented tail.
+    const snapshotTextTail = reconcileCumulativeFinalTail(
+      streamSegmentsRef.current
+        .filter((segment) => segment.kind === 'text')
+        .map((segment) => segment.text),
+      snapshotContent,
+    );
+    const currentStreamText = assembledRef.current;
+    const normalizedSnapshotContent = normalizeHistoryReplayContent(snapshotTextTail);
+    const snapshotDuplicatesGraduatedText = Boolean(normalizedSnapshotContent)
+      && !currentStreamText.trim()
+      && streamSegmentsRef.current.some((segment) => (
+        segment.kind === 'text'
+        && normalizeHistoryReplayContent(segment.text) === normalizedSnapshotContent
+      ));
+    const effectiveSnapshotContent = snapshotDuplicatesGraduatedText ? '' : snapshotTextTail;
+    const shouldReplaceSnapshotText = Boolean(effectiveSnapshotContent)
+      && (!currentStreamText || effectiveSnapshotContent.length >= currentStreamText.length || effectiveSnapshotContent.includes(currentStreamText));
     shouldMaterializeBubble = shouldMaterializeBubble
+      || effectiveToolCalls.length > 0
       || Boolean(thinkingContentRef.current.trim())
       || Boolean(thinkingSubjectRef.current)
       || streamSegmentsRef.current.some((segment) => (
@@ -4536,7 +4887,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     resetStreamWatchdog({ visible: Boolean(effectiveSnapshotContent) });
     return true;
-  }, [appendThinkingChunk, applyCompactionSnapshotState, applyThinkingSubject, ensureStreamingAssistantBubble, mergeStreamText, reconcileIncomingRunEpoch, recordReasoningTurnSequence, resetStreamWatchdog]);
+  }, [appendThinkingChunk, applyCompactionSnapshotState, applyThinkingSubject, ensureStreamingAssistantBubble, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, reconcileIncomingRunEpoch, recordReasoningTurnSequence, recordRuntimeReplaySequence, resetStreamWatchdog]);
   applyOpenClawActiveStreamSnapshotRef.current = applyOpenClawActiveStreamSnapshot;
 
   const hydrateActiveStream = useCallback(async (
@@ -4870,6 +5221,40 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               message.role !== 'assistant' || message.runtimeRunId !== exactActiveRunId
             ));
           } else {
+            const overlayLastEventSeq = activeRuntimeOverlays.reduce((latest, message) => (
+              Number.isSafeInteger(message.runtimeLastEventSeq)
+                ? Math.max(latest, message.runtimeLastEventSeq as number)
+                : latest
+            ), -1);
+            if (overlayLastEventSeq >= 0) {
+              const currentReplayCursor = reasoningSequenceRef.current;
+              reasoningSequenceRef.current = {
+                runId: exactActiveRunId,
+                seq: currentReplayCursor.runId === exactActiveRunId && currentReplayCursor.seq !== null
+                  ? Math.max(currentReplayCursor.seq, overlayLastEventSeq)
+                  : overlayLastEventSeq,
+              };
+              const currentRuntimeReplayCursor = runtimeReplaySequenceRef.current;
+              runtimeReplaySequenceRef.current = {
+                runId: exactActiveRunId,
+                seq: currentRuntimeReplayCursor.runId === exactActiveRunId
+                  && currentRuntimeReplayCursor.seq !== null
+                  ? Math.max(currentRuntimeReplayCursor.seq, overlayLastEventSeq)
+                  : overlayLastEventSeq,
+              };
+            }
+            if (epochDecision === 'adopt') {
+              resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+            }
+            for (const lane of ['raw', 'preamble', 'status'] as const) {
+              const cursor = [...activeRuntimeOverlays]
+                .reverse()
+                .map((message) => message.runtimeThinkingCursors?.[lane])
+                .find((value): value is string => typeof value === 'string' && Boolean(value));
+              if (cursor) {
+                seedGraduatedThinkingSnapshot(thinkingSnapshotTrackerRef.current, lane, cursor);
+              }
+            }
             const rawOverlaySegments = activeRuntimeOverlays.flatMap((message) => message.segments || []);
             const rawOverlayToolCalls = activeRuntimeOverlays.reduce<ToolCall[]>((calls, message) => (
               mergeToolCallSnapshots(calls, message.toolCalls || []) || calls
@@ -4910,8 +5295,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                 : streamActivityOrderRef.current++,
               ...(segment.kind === 'thinking' && segment.source === 'preamble'
                 ? { lane: 'preamble' as const }
+                : segment.kind === 'thinking' && segment.source === 'status'
+                  ? { lane: 'status' as const }
                 : segment.kind === 'thinking'
-                    && (segment.source === 'reasoning' || segment.source === 'status')
+                    && segment.source === 'reasoning'
                   ? { lane: 'raw' as const }
                   : {}),
             }));
@@ -4922,8 +5309,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                 : {}),
             }));
             const mergedSegments = [...streamSegmentsRef.current];
+            const segmentReplayIdentity = (segment: StreamSegment) => (
+              `${segment.order}|${segment.kind}|${segment.lane || ''}|${segment.subject || ''}|${normalizeHistoryReplayContent(segment.text)}`
+            );
             const representedSegments = new Set(mergedSegments.map((segment) => (
-              `${segment.kind}|${segment.lane || ''}|${segment.subject || ''}|${normalizeHistoryReplayContent(segment.text)}`
+              segmentReplayIdentity(segment)
             )));
             let lastOverlayThinkingIndex = -1;
             for (let index = overlaySegments.length - 1; index >= 0; index -= 1) {
@@ -4951,7 +5341,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
                   continue;
                 }
               }
-              const key = `${segment.kind}|${segment.lane || ''}|${segment.subject || ''}|${segmentText}`;
+              const key = segmentReplayIdentity(segment);
               if (representedSegments.has(key)) continue;
               representedSegments.add(key);
               mergedSegments.push(segment);
@@ -5315,33 +5705,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
   }, [session, provider, loadHistoryInternal]);
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-
-    const reconcileForegroundState = () => {
-      const currentSession = sessionRef.current;
-      const currentProvider = providerRef.current;
-      if (currentProvider !== 'OPENCLAW' || !currentSession) return;
-      const now = Date.now();
-      if (now - lastForegroundReconcileAtRef.current < 1500) return;
-      lastForegroundReconcileAtRef.current = now;
-      void loadHistoryInternalRef.current?.(currentSession, currentProvider, { force: true, refreshActiveSnapshot: true });
-    };
-
-    const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        reconcileForegroundState();
-      }
-    };
-
-    window.addEventListener('focus', reconcileForegroundState);
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    return () => {
-      window.removeEventListener('focus', reconcileForegroundState);
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-    };
-  }, []);
-
   const handleActiveTurnConflict = useCallback((data: any) => {
     const clientMessageId = typeof data?.clientMessageId === 'string'
       ? data.clientMessageId.trim()
@@ -5549,6 +5912,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         });
         return;
       }
+      recordRuntimeReplaySequence(data);
       recordReasoningTurnSequence(data);
     } else if (data?.type === 'stream_resume' && Array.isArray(data.turnEvents)) {
       const resumeSequence = latestTurnSequence(data.turnEvents);
@@ -5646,9 +6010,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         // combinations do not expose private reasoning deltas, so the status event
         // is the only honest in-turn signal before tools begin.
         const runningToolName = getRunningToolName();
+        if (data.transient === true && !maintenanceRail.isMaintenanceStatus) {
+          setLiveRunPhase('thinking', typeof data.content === 'string' ? data.content : null);
+          resetStreamWatchdog({ visible: true });
+          break;
+        }
         if (!maintenanceRail.isMaintenanceStatus && !runningToolName && data.preambleProgress !== true) {
-          const statusThinkingChunk = extractThinkingChunk('status', data.content, assembledRef.current.length > 0);
-          appendThinkingChunk(assistantId, statusThinkingChunk, { lane: 'raw' });
+          const statusThinkingChunk = extractThinkingChunk(
+            'status',
+            data.content,
+            data?.turnEvent?.visible === true ? false : assembledRef.current.length > 0,
+          );
+          if (statusThinkingChunk && assembledRef.current.trim()) {
+            graduateLiveTextSegment(assistantId);
+          }
+          appendThinkingChunk(assistantId, statusThinkingChunk, {
+            replace: data.replace === true,
+            lane: 'status',
+          });
           if (statusThinkingChunk) resetStreamWatchdog({ visible: true });
         }
         if (data.preambleProgress === true && !runningToolName) {
@@ -5662,6 +6041,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             data.content,
             assembledRef.current.length > 0,
           );
+          if (preambleThinking && assembledRef.current.trim()) {
+            graduateLiveTextSegment(assistantId);
+          }
           appendThinkingChunk(assistantId, preambleThinking, {
             replace: data.replace === true,
             lane: 'preamble',
@@ -5681,6 +6063,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         const thinkingChunk = extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0);
         const isPreambleThinking = data.preambleProgress === true
           || data?.turnEvent?.source?.preambleProgress === true;
+        if (thinkingChunk && assembledRef.current.trim()) {
+          graduateLiveTextSegment(assistantId);
+        }
         appendThinkingChunk(assistantId, thinkingChunk, {
           replace: data.replace === true,
           lane: isPreambleThinking ? 'preamble' : 'raw',
@@ -5791,13 +6176,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (hasRealToolEventsRef.current) break;
         const tn = resolveToolName(data.toolName, data.name, data.content, 'tool');
         if (isMessageToolName(tn)) break;
+        const stableToolCallId = resolveCompatibilityToolReplayIdentity(
+          data,
+          resolvedPortalSession || sessionRef.current,
+        );
+        if (
+          stableToolCallId
+          && (
+            compatibilityToolReplayIdsRef.current.has(stableToolCallId)
+            || activeStreamToolCallsRef.current.some((tool) => tool.id === stableToolCallId)
+          )
+        ) break;
+        if (stableToolCallId) compatibilityToolReplayIdsRef.current.add(stableToolCallId);
         graduateLiveThinkingSegment();
         if (assembledRef.current && assembledRef.current.trim().length > 0) {
           graduateLiveTextSegment(assistantId);
         }
         const toolOrder = streamActivityOrderRef.current++;
         setMessages(prev => {
-          const tid = 'tool-' + (++toolCounterRef.current);
+          const tid = stableToolCallId || 'tool-' + (++toolCounterRef.current);
           const now = Date.now();
           const projection = appendCompletedToolCallIfMissing(prev, assistantId, {
             ...buildCompletedToolCall({
@@ -5807,7 +6204,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               endedAt: now,
             }),
             order: toolOrder,
-          }, { now });
+          }, {
+            now,
+            ...(stableToolCallId ? { stableToolCallId } : {}),
+          });
           if (projection.changed) activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
           return projection.messages as ChatMessage[];
         });
@@ -6063,7 +6463,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       case 'keepalive':
         break;
     }
-  }, [appendLiveUserMessage, applyOpenClawActiveStreamSnapshot, preserveLiveTurnThenClear, clearPendingTextRender, clearPostTurnHistorySync, clearStreamRecoveryTimer, ensureStreamingAssistantBubble, getCurrentToolStatusText, handleActiveTurnConflict, markStreamRecovery, normalizeAgentError, observeSessionActivityTitle, reconcileIncomingRunEpoch, recordReasoningTurnSequence, resetLiveThinkingTimeline, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyThinkingSubject, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, resolveOpenClawSessionKey, schedulePendingTextRender, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, scheduleStreamContinuityRepair, setLiveRunPhase, settleCancelledTurn]);
+  }, [appendLiveUserMessage, applyOpenClawActiveStreamSnapshot, preserveLiveTurnThenClear, clearPendingTextRender, clearPostTurnHistorySync, clearStreamRecoveryTimer, ensureStreamingAssistantBubble, getCurrentToolStatusText, handleActiveTurnConflict, markStreamRecovery, normalizeAgentError, observeSessionActivityTitle, reconcileIncomingRunEpoch, recordReasoningTurnSequence, recordRuntimeReplaySequence, resetLiveThinkingTimeline, resetStreamWatchdog, clearStreamWatchdog, appendThinkingChunk, applyThinkingSubject, applyCompactionState, buildGraduatedSegments, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, mergeStreamText, resolveOpenClawSessionKey, schedulePendingTextRender, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, scheduleStreamContinuityRepair, setLiveRunPhase, settleCancelledTurn]);
 
   // Keep handleWsEvent in a ref so the WS handler always calls the latest version
   const handleWsEventRef = useRef(handleWsEvent);
@@ -6396,9 +6796,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           }
 
           if (thinkingText) {
+            const thinkingChunk = extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0);
+            if (thinkingChunk && assembledRef.current.trim()) {
+              graduateDirectLiveTextSegment(assistantId);
+            }
             appendThinkingChunk(
               assistantId,
-              extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0),
+              thinkingChunk,
               { lane: 'raw' },
             );
             if (!assembledRef.current && assistantId) setStreamingPhase('thinking');
@@ -6530,10 +6934,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setSessionAvailability('present');
         directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
         if (!runningToolName) {
+          const statusThinkingChunk = extractThinkingChunk('status', codexProgressStatus, false);
+          if (statusThinkingChunk && assembledRef.current.trim()) {
+            graduateDirectLiveTextSegment(assistantId);
+          }
           appendThinkingChunk(
             assistantId,
-            extractThinkingChunk('status', codexProgressStatus, assembledRef.current.length > 0),
-            { lane: 'raw' },
+            statusThinkingChunk,
+            { lane: 'status' },
           );
         }
         setLiveRunPhase('thinking', codexProgressStatus);
@@ -6616,6 +7024,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           cumulativePreamble,
           assembledRef.current.length > 0,
         );
+        if (preambleThinking && assembledRef.current.trim()) {
+          graduateDirectLiveTextSegment(assistantId);
+        }
         appendThinkingChunk(assistantId, preambleThinking, { replace: true, lane: 'preamble' });
         setStatusText(sanitizeThinkingSubject(cumulativePreamble) || null);
         setStreamingPhase('thinking');
@@ -6641,7 +7052,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               ? rawData.delta
               : (typeof rawData?.content === 'string' ? rawData.content : ''));
         const thinkingChunk = extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0);
-        if (!thinkingChunk) return;
+        const progressStatus = formatThinkingProgressStatus(rawData?.progressTokens);
+        if (!thinkingChunk && !progressStatus) return;
 
         let assistantId = streamingAssistantIdRef.current;
         if (!assistantId) {
@@ -6652,7 +7064,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         setIsRunning(true);
         setSessionAvailability('present');
         directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+        if (progressStatus && !thinkingChunk) {
+          setLiveRunPhase('thinking', progressStatus);
+          resetStreamWatchdog({ visible: true });
+          return;
+        }
         applyThinkingSubject(assistantId, rawData?.subject);
+        if (thinkingChunk && assembledRef.current.trim()) {
+          graduateDirectLiveTextSegment(assistantId);
+        }
         appendThinkingChunk(assistantId, thinkingChunk, { lane: 'raw' });
         setLiveRunPhase('thinking', null);
         resetStreamWatchdog({ visible: true });
@@ -6671,9 +7091,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           setIsRunning(true);
           setSessionAvailability('present');
           directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
+          const thinkingChunk = extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0);
+          if (thinkingChunk && assembledRef.current.trim()) {
+            graduateDirectLiveTextSegment(assistantId);
+          }
           appendThinkingChunk(
             assistantId,
-            extractThinkingChunk('thinking', thinkingText, assembledRef.current.length > 0),
+            thinkingChunk,
             { lane: 'raw' },
           );
           setLiveRunPhase('thinking', null);
@@ -6871,7 +7295,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [appendLiveUserMessage, clearDirectPendingEmptyFinal, clearStreamRecoveryTimer, completeDirectAssistantTurn, ensureStreamingAssistantBubble, getCurrentToolStatusText, isAbortTerminalError, normalizeAgentError, reconcileIncomingRunEpoch, resetLiveThinkingTimeline, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, appendThinkingChunk, applyThinkingSubject, applyCompactionState, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePendingTextRender, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase, settleCancelledTurn]);
+  }, [appendLiveUserMessage, clearDirectPendingEmptyFinal, clearStreamRecoveryTimer, completeDirectAssistantTurn, ensureStreamingAssistantBubble, getCurrentToolStatusText, isAbortTerminalError, normalizeAgentError, reconcileIncomingRunEpoch, resetLiveThinkingTimeline, resetStreamWatchdog, clearStreamWatchdog, clearPendingTextRender, mergeStreamText, appendThinkingChunk, applyThinkingSubject, applyCompactionState, getRunningToolName, graduateDirectLiveTextSegment, graduateLiveTextSegment, graduateLiveThinkingSegment, resolveCurrentStreamModel, schedulePendingTextRender, schedulePostTurnHistorySync, scheduleSessionTelemetryRefresh, resolveOpenClawSessionKey, setLiveRunPhase, settleCancelledTurn]);
 
   // The direct gateway connection can remain open for hours. Keep the callback
   // identity passed to it stable, while dispatching each frame through the
@@ -7127,6 +7551,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const handleVisibilityChange = async () => {
       if (document.visibilityState !== 'visible') return;
 
+      const now = Date.now();
+      if (now - lastForegroundReconcileAtRef.current < 1500) return;
+      lastForegroundReconcileAtRef.current = now;
+
       const manager = wsManagerRef.current;
       const directClient = directClientRef.current;
       const currentSession = resolveOpenClawSessionKey(sessionRef.current);
@@ -7177,8 +7605,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
     };
 
+    window.addEventListener('focus', handleVisibilityChange);
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
+      window.removeEventListener('focus', handleVisibilityChange);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [loadHistoryInternal, markStreamRecovery, resetStreamWatchdog, resolveOpenClawSessionKey, useDirectGateway]);
@@ -7525,6 +7955,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     portalTurnSequenceRef.current = null;
     portalTurnSequenceScopeRef.current = `${providerRef.current}:${sessionRef.current || 'main'}`;
     reasoningSequenceRef.current = { runId: null, seq: null };
+    runtimeReplaySequenceRef.current = { runId: null, seq: null };
 
     // Add user message to UI
     const userMsg: ChatMessage = {
@@ -7869,6 +8300,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             });
             if (epochDecision === 'reject') continue;
           }
+          recordRuntimeReplaySequence(evt);
           recordReasoningTurnSequence(evt);
           if (SSE_LIVE_EVENT_TYPES.has(evt.type)) {
             const visibleSseActivity = (
@@ -7912,8 +8344,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             const maintenanceRail = resolveMaintenanceRailStatus(evt);
             if (maintenanceRail.update) applyCompactionState(maintenanceRail.update);
             const runningToolName = getRunningToolName();
-            if (!maintenanceRail.isMaintenanceStatus && !runningToolName && evt.preambleProgress === true) {
+            if (evt.transient === true && !maintenanceRail.isMaintenanceStatus) {
+              setLiveRunPhase('thinking', typeof evt.content === 'string' ? evt.content : null);
+              resetStreamWatchdog({ visible: true });
+            } else if (!maintenanceRail.isMaintenanceStatus && !runningToolName && evt.preambleProgress === true) {
               const preambleThinking = extractThinkingChunk('thinking', evt.content, assembled.length > 0);
+              if (preambleThinking && assembledRef.current.trim()) {
+                graduateLiveTextSegment(assistantId);
+                assembled = '';
+              }
               appendThinkingChunk(assistantId, preambleThinking, {
                 replace: evt.replace === true,
                 lane: 'preamble',
@@ -7922,16 +8361,28 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               setStatusText(sanitizeThinkingSubject(evt.content) || null);
               setStreamingPhase('thinking');
             } else if (!maintenanceRail.isMaintenanceStatus && !runningToolName) {
-              const thinkingChunk = extractThinkingChunk('status', evt.content, assembled.length > 0);
-              appendThinkingChunk(assistantId, thinkingChunk, { lane: 'raw' });
+              const thinkingChunk = extractThinkingChunk(
+                'status',
+                evt.content,
+                evt?.turnEvent?.visible === true ? false : assembled.length > 0,
+              );
+              if (thinkingChunk && assembledRef.current.trim()) {
+                graduateLiveTextSegment(assistantId);
+                assembled = '';
+              }
+              appendThinkingChunk(assistantId, thinkingChunk, { replace: evt.replace === true, lane: 'status' });
               if (thinkingChunk) resetStreamWatchdog({ visible: true });
             }
-            if (!assembled || runningToolName) {
+            if (evt.transient !== true && (!assembled || runningToolName)) {
               setLiveRunPhase('thinking', maintenanceRail.displayStatusText);
             }
           } else if (evt.type === 'thinking') {
             applyThinkingSubject(assistantId, evt.subject);
             const thinkingChunk = extractThinkingChunk('thinking', evt.content, assembled.length > 0);
+            if (thinkingChunk && assembledRef.current.trim()) {
+              graduateLiveTextSegment(assistantId);
+              assembled = '';
+            }
             appendThinkingChunk(assistantId, thinkingChunk, { replace: evt.replace === true, lane: 'raw' });
             if (!assembled || getRunningToolName()) {
               setLiveRunPhase('thinking', null);
@@ -7997,32 +8448,48 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             }));
           } else if (evt.type === 'tool_used') {
             const toolName = resolveToolName(evt.toolName, evt.content, 'tool');
-            if (!hasRealToolEventsRef.current) {
-              const toolId = typeof evt.toolCallId === 'string' && evt.toolCallId.trim()
-                ? evt.toolCallId.trim()
-                : 'tool-' + (++toolCounterRef.current);
+            if (!hasRealToolEventsRef.current && !isMessageToolName(toolName)) {
+              const stableToolCallId = resolveCompatibilityToolReplayIdentity(
+                evt,
+                sessionRef.current,
+              );
+              if (
+                stableToolCallId
+                && (
+                  compatibilityToolReplayIdsRef.current.has(stableToolCallId)
+                  || activeStreamToolCallsRef.current.some((tool) => tool.id === stableToolCallId)
+                )
+              ) continue;
+              if (stableToolCallId) compatibilityToolReplayIdsRef.current.add(stableToolCallId);
+              graduateLiveThinkingSegment();
+              if (assembled && assembled.trim().length > 0) {
+                graduateLiveTextSegment(assistantId);
+                assembled = '';
+                assembledRef.current = '';
+              }
               const now = Date.now();
               const toolOrder = streamActivityOrderRef.current++;
-              setMessages(prev => prev.map(m => {
-                if (m.id !== assistantId) return m;
-                const nextToolCalls = [
-                  ...(m.toolCalls || []),
-                  {
+              setMessages(prev => {
+                const toolId = stableToolCallId || 'tool-' + (++toolCounterRef.current);
+                const projection = appendCompletedToolCallIfMissing(prev, assistantId, {
+                  ...buildCompletedToolCall({
                     id: toolId,
                     name: toolName,
                     startedAt: now - 1000,
                     endedAt: now,
-                    status: 'done' as const,
-                    order: toolOrder,
-                  },
-                ];
-                activeStreamToolCallsRef.current = nextToolCalls;
-                return { ...m, toolCalls: nextToolCalls };
-              }));
+                  }),
+                  order: toolOrder,
+                }, {
+                  now,
+                  ...(stableToolCallId ? { stableToolCallId } : {}),
+                });
+                if (projection.changed) activeStreamToolCallsRef.current = projection.toolCalls as ToolCall[];
+                return projection.messages as ChatMessage[];
+              });
+              setStreamingPhase(assembled ? 'streaming' : 'thinking');
+              setActiveToolName(null);
+              setStatusText(null);
             }
-            setStreamingPhase('tool');
-            setActiveToolName(toolName);
-            setStatusText(getCurrentToolStatusText(toolName));
           } else if (evt.type === 'tool_update') {
             const toolResult = typeof (evt as any).toolResult === 'string'
               ? (evt as any).toolResult
@@ -8180,7 +8647,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       activeSse.resolveSettled();
     }
-  }, [appendThinkingChunk, applyThinkingSubject, applyCompactionState, applyOpenClawActiveStreamSnapshot, buildGraduatedSegments, clearPendingTextRender, clearStreamWatchdog, ensureStreamingAssistantBubble, getCurrentToolStatusText, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, handleActiveTurnConflict, normalizeAgentError, preserveLiveTurnThenClear, reconcileIncomingRunEpoch, recordReasoningTurnSequence, resetLiveThinkingTimeline, resetStreamWatchdog, resolveOpenClawSessionKey, schedulePostTurnHistorySync, setLiveRunPhase, settleCancelledTurn]);
+  }, [appendThinkingChunk, applyThinkingSubject, applyCompactionState, applyOpenClawActiveStreamSnapshot, buildGraduatedSegments, clearPendingTextRender, clearStreamWatchdog, ensureStreamingAssistantBubble, getCurrentToolStatusText, getRunningToolName, graduateLiveTextSegment, graduateLiveThinkingSegment, handleActiveTurnConflict, normalizeAgentError, preserveLiveTurnThenClear, reconcileIncomingRunEpoch, recordReasoningTurnSequence, recordRuntimeReplaySequence, resetLiveThinkingTimeline, resetStreamWatchdog, resolveOpenClawSessionKey, schedulePostTurnHistorySync, setLiveRunPhase, settleCancelledTurn]);
   sendViaSSERef.current = sendViaSSE;
 
   stopActiveSseTransportRef.current = async (reason) => {

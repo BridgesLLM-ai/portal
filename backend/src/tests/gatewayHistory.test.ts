@@ -113,6 +113,87 @@ describe('gateway history readers', () => {
     expect(__gatewayHistoryTest.parseHistoryLimit('500')).toBe(100);
   });
 
+  test('enhanced OpenClaw pagination uses pre-hydration source completeness for tool-heavy tails', async () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-source-completeness-'));
+    const sessionKey = 'agent:main:tool-pair-pagination';
+    const filePath = path.join(sessionsDir, `${sessionKey}.jsonl`);
+    const epoch = Date.parse('2026-08-10T10:00:00.000Z');
+    const lines: string[] = [];
+
+    try {
+      for (let index = 0; index < 40; index += 1) {
+        lines.push(JSON.stringify({
+          id: `older-user-${index}`,
+          type: 'message',
+          timestamp: new Date(epoch + index * 2000).toISOString(),
+          message: { role: 'user', content: `older prompt ${index}` },
+        }));
+        lines.push(JSON.stringify({
+          id: `older-assistant-${index}`,
+          type: 'message',
+          timestamp: new Date(epoch + index * 2000 + 1000).toISOString(),
+          message: { role: 'assistant', content: `older answer ${index}` },
+        }));
+      }
+
+      const longTurnTs = epoch + 100_000;
+      lines.push(JSON.stringify({
+        id: 'long-user',
+        type: 'message',
+        timestamp: new Date(longTurnTs).toISOString(),
+        message: { role: 'user', content: 'run four hundred tools' },
+      }));
+      for (let index = 0; index < 400; index += 1) {
+        lines.push(JSON.stringify({
+          id: `long-tool-call-${index}`,
+          type: 'message',
+          timestamp: new Date(longTurnTs + index * 10 + 1).toISOString(),
+          message: {
+            role: 'assistant',
+            content: [{ type: 'toolCall', id: `long-tool-${index}`, name: 'exec', arguments: { index } }],
+          },
+        }));
+        lines.push(JSON.stringify({
+          id: `long-tool-result-${index}`,
+          type: 'message',
+          timestamp: new Date(longTurnTs + index * 10 + 2).toISOString(),
+          message: {
+            role: 'toolResult',
+            toolCallId: `long-tool-${index}`,
+            toolName: 'exec',
+            content: 'ok',
+          },
+        }));
+      }
+      lines.push(JSON.stringify({
+        id: 'long-final',
+        type: 'message',
+        timestamp: new Date(longTurnTs + 5000).toISOString(),
+        message: { role: 'assistant', content: 'all four hundred tools finished' },
+      }));
+      fs.writeFileSync(filePath, lines.join('\n'));
+
+      const scope = __gatewayHistoryTest.historyCursorScope('actor-a', 'OPENCLAW', sessionKey);
+      const page = await __gatewayHistoryTest.readOpenClawHistoryPage({
+        sessionKey,
+        sessionId: sessionKey,
+        sessionsDir,
+        enhanced: true,
+        limit: 20,
+        scope,
+      });
+
+      expect(page.messages).toHaveLength(20);
+      expect(page.hasMoreBefore).toBe(true);
+      expect(page.beforeCursor).toEqual(expect.any(String));
+      expect(page.messages.some((message: any) => message.content === 'run four hundred tools')).toBe(true);
+      const final = page.messages.find((message: any) => message.id === 'long-final');
+      expect(final?.toolCalls).toHaveLength(400);
+    } finally {
+      fs.rmSync(sessionsDir, { recursive: true, force: true });
+    }
+  });
+
   test('trajectory recovery reads only bounded complete tail records', () => {
     const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-trajectory-tail-'));
     const trajectory = path.join(sessionsDir, 'active.trajectory.jsonl');
@@ -489,6 +570,64 @@ describe('gateway history readers', () => {
       'family-assistant-1',
       'family-user-2',
     ]);
+  });
+
+  test('usage-family pagination does not report completion when the merged files exceed the read window', async () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-usage-family-pagination-'));
+    const sessionKey = 'agent:main:usage-family-pagination';
+    const firstSessionId = 'usage-family-page-first';
+    const currentSessionId = 'usage-family-page-current';
+    const epoch = Date.parse('2026-08-10T08:00:00.000Z');
+    const rows = (start: number, count: number) => Array.from({ length: count }, (_, offset) => {
+      const index = start + offset;
+      return JSON.stringify({
+        id: `family-page-${index}`,
+        type: 'message',
+        timestamp: new Date(epoch + index * 1000).toISOString(),
+        message: {
+          role: index % 2 === 0 ? 'user' : 'assistant',
+          content: `usage family message ${index}`,
+        },
+      });
+    }).join('\n') + '\n';
+
+    try {
+      fs.writeFileSync(path.join(sessionsDir, 'sessions.json'), JSON.stringify({
+        [sessionKey]: {
+          sessionId: currentSessionId,
+          usageFamilySessionIds: [firstSessionId, currentSessionId],
+        },
+      }));
+      fs.writeFileSync(path.join(sessionsDir, `${firstSessionId}.jsonl`), rows(0, 150));
+      fs.writeFileSync(path.join(sessionsDir, `${currentSessionId}.jsonl`), rows(150, 150));
+
+      const scope = __gatewayHistoryTest.historyCursorScope('actor-a', 'OPENCLAW', sessionKey);
+      const readPage = (beforeCursor?: string | null) => __gatewayHistoryTest.readOpenClawHistoryPage({
+        sessionKey,
+        sessionId: currentSessionId,
+        sessionsDir,
+        enhanced: true,
+        limit: 100,
+        scope,
+        ...(beforeCursor ? { beforeCursor } : {}),
+      });
+
+      const newest = await readPage();
+      const middle = await readPage(newest.beforeCursor);
+      const oldest = await readPage(middle.beforeCursor);
+
+      expect(newest.messages[0].id).toBe('family-page-200');
+      expect(newest.messages.at(-1).id).toBe('family-page-299');
+      expect(newest.hasMoreBefore).toBe(true);
+      expect(middle.messages[0].id).toBe('family-page-100');
+      expect(middle.messages.at(-1).id).toBe('family-page-199');
+      expect(middle.hasMoreBefore).toBe(true);
+      expect(oldest.messages[0].id).toBe('family-page-0');
+      expect(oldest.messages.at(-1).id).toBe('family-page-99');
+      expect(oldest.hasMoreBefore).toBe(false);
+    } finally {
+      fs.rmSync(sessionsDir, { recursive: true, force: true });
+    }
   });
 
   test('best OpenClaw history filters stale trajectory snapshots around canonical transcript span', () => {
@@ -899,12 +1038,27 @@ describe('gateway history readers', () => {
 
       for (let index = 0; index < toolOnlyCount; index += 1) {
         lines.push(JSON.stringify({
-          id: `tool-only-${index}`,
+          id: `tool-call-${index}`,
           type: 'message',
           timestamp: new Date(toolBaseTs + index * 1000).toISOString(),
           message: {
             role: 'assistant',
             content: [{ type: 'toolCall', id: `tool-${index}`, name: 'apply_patch', arguments: { index } }],
+          },
+        }));
+        // Hydration folds each result into its preceding toolCall. The raw
+        // source therefore has twice as many rows as the hydrated projection;
+        // source exhaustion must come from the pre-hydration tail reader, not
+        // `hydrated.length < requestedLimit`.
+        lines.push(JSON.stringify({
+          id: `tool-result-${index}`,
+          type: 'message',
+          timestamp: new Date(toolBaseTs + index * 1000 + 500).toISOString(),
+          message: {
+            role: 'toolResult',
+            toolCallId: `tool-${index}`,
+            toolName: 'apply_patch',
+            content: 'ok',
           },
         }));
       }
@@ -957,6 +1111,8 @@ describe('gateway history readers', () => {
       expect(roles).toContain('user');
       expect(messages.some((message: any) => message.content === 'make the animation better')).toBe(true);
       expect(final).toBeTruthy();
+      expect(messages.filter((message: any) => message.content === 'Finished the upgrade.')).toHaveLength(1);
+      expect(runtimeOverlay?.content).toBe('');
       expect(new Set(retainedTools.map((tool: any) => tool.id)).size).toBe(toolOnlyCount);
       expect(runtimeOverlay?.segments.map((segment: any) => segment.text))
         .toContain('I will inspect and improve the existing file.');
@@ -969,6 +1125,402 @@ describe('gateway history readers', () => {
     } finally {
       if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
       else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+    }
+  });
+
+  test('terminal contentless runtime history reconciles a fragmented canonical tool timeline exactly once', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-contentless-runtime-'));
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-contentless-events-'));
+    const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = eventDir;
+
+    try {
+      const sessionKey = 'agent:main:contentless-fragmented-runtime-test';
+      const runId = 'run-contentless-fragmented';
+      const heartbeatRunId = 'run-contentless-heartbeat';
+      const filePath = path.join(sessionsDir, `${sessionKey}.jsonl`);
+      const baseTs = Date.parse('2026-08-10T21:59:10.000Z');
+      const toolIds = Array.from({ length: 11 }, (_, index) => `stable-call-${index + 1}`);
+      const lines: string[] = [
+        JSON.stringify({
+          id: 'prior-user',
+          type: 'message',
+          timestamp: new Date(baseTs - 2_000).toISOString(),
+          message: { role: 'user', content: 'prior prompt' },
+        }),
+        JSON.stringify({
+          id: 'prior-assistant',
+          type: 'message',
+          timestamp: new Date(baseTs - 1_000).toISOString(),
+          message: { role: 'assistant', content: 'prior answer' },
+        }),
+        JSON.stringify({
+          id: 'smoke-user',
+          type: 'message',
+          timestamp: new Date(baseTs).toISOString(),
+          message: { role: 'user', content: 'run the chronology smoke test' },
+        }),
+      ];
+      const runtimeEvents: RuntimeTurnEvent[] = [];
+      let seq = 1;
+      const runtimeEvent = (
+        type: RuntimeTurnEvent['type'],
+        ts: number,
+        extra: Partial<RuntimeTurnEvent> = {},
+      ): RuntimeTurnEvent => ({
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type,
+        sessionKey,
+        runId,
+        seq: seq++,
+        ts,
+        visible: true,
+        source: {
+          transport: 'portal-stream-event-bus',
+          eventType: type === 'assistant_reasoning'
+            ? 'thinking'
+            : type === 'assistant_delta'
+              ? 'text'
+              : type === 'tool_started'
+                ? 'tool_start'
+                : type === 'tool_output'
+                  ? 'tool_end'
+                  : 'done',
+        },
+        ...extra,
+      });
+
+      for (let index = 0; index < toolIds.length; index += 1) {
+        const assistantTs = baseTs + 1_000 + index * 1_000;
+        const reasoning = `Reasoning phase ${index + 1}.`;
+        const text = index === 1 ? 'Visible phase-two check.' : '';
+        const toolName = index === 5 || index === 6 ? 'process' : 'exec';
+        lines.push(JSON.stringify({
+          id: `fragment-${index + 1}`,
+          type: 'message',
+          timestamp: new Date(assistantTs).toISOString(),
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: reasoning },
+              ...(text ? [{ type: 'text', text }] : []),
+              { type: 'toolCall', id: toolIds[index], name: toolName, arguments: { index } },
+            ],
+          },
+        }));
+        lines.push(JSON.stringify({
+          id: `tool-result-${index + 1}`,
+          type: 'message',
+          timestamp: new Date(assistantTs + 200).toISOString(),
+          message: {
+            role: 'toolResult',
+            toolCallId: toolIds[index],
+            toolName,
+            content: [{ type: 'text', text: index === 5 ? 'sessionId is required' : `phase-${index + 1}` }],
+          },
+        }));
+        runtimeEvents.push(runtimeEvent('assistant_reasoning', assistantTs + 10, { text: reasoning }));
+        if (text) runtimeEvents.push(runtimeEvent('assistant_delta', assistantTs + 20, { text }));
+        runtimeEvents.push(runtimeEvent('tool_started', assistantTs + 30, {
+          tool: { id: toolIds[index], name: toolName, status: 'running' },
+        }));
+        runtimeEvents.push(runtimeEvent('tool_output', assistantTs + 150, {
+          tool: {
+            id: toolIds[index],
+            name: toolName,
+            status: index === 5 ? 'error' : 'done',
+          },
+        }));
+      }
+
+      const finalReasoning = 'All chronology phases are complete.';
+      lines.push(JSON.stringify({
+        id: 'final-reasoning-fragment',
+        type: 'message',
+        timestamp: new Date(baseTs + 12_100).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'thinking', thinking: finalReasoning }] },
+      }));
+      runtimeEvents.push(runtimeEvent('assistant_reasoning', baseTs + 12_110, { text: finalReasoning }));
+      runtimeEvents.push(runtimeEvent('turn_done', baseTs + 12_200, { terminal: true, visible: false }));
+      lines.push(JSON.stringify({
+        id: 'canonical-final',
+        type: 'message',
+        timestamp: new Date(baseTs + 12_300).toISOString(),
+        message: { role: 'assistant', content: 'UI_TIMELINE_SMOKE_COMPLETE' },
+      }));
+      lines.push(JSON.stringify({
+        id: 'heartbeat-user',
+        type: 'message',
+        timestamp: new Date(baseTs + 13_000).toISOString(),
+        message: { role: 'user', content: '[OpenClaw heartbeat poll]' },
+      }));
+      lines.push(JSON.stringify({
+        id: 'heartbeat-assistant',
+        type: 'message',
+        timestamp: new Date(baseTs + 14_000).toISOString(),
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'Heartbeat reasoning remains in its own turn.' },
+            { type: 'text', text: 'HEARTBEAT_OK' },
+          ],
+        },
+      }));
+      fs.writeFileSync(filePath, lines.join('\n'));
+      runtimeEvents.push({
+        ...runtimeEvent('assistant_reasoning', baseTs + 14_010, {
+          text: 'Heartbeat reasoning remains in its own turn.',
+        }),
+        runId: heartbeatRunId,
+        seq: 1,
+      });
+      runtimeEvents.push({
+        ...runtimeEvent('assistant_delta', baseTs + 14_020, { text: 'HEARTBEAT_OK' }),
+        runId: heartbeatRunId,
+        seq: 2,
+      });
+      runtimeEvents.push({
+        ...runtimeEvent('turn_done', baseTs + 14_100, { terminal: true, visible: false }),
+        runId: heartbeatRunId,
+        seq: 3,
+      });
+      for (const event of runtimeEvents) recordRuntimeTurnEvent(sessionKey, event);
+
+      const messages = __gatewayHistoryTest.readSessionMessagesEnhancedForSessionKey(
+        sessionKey,
+        100,
+        sessionsDir,
+      );
+      const smokeTools = messages.flatMap((message: any) => (
+        Array.isArray(message?.toolCalls)
+          ? message.toolCalls.filter((tool: any) => toolIds.includes(tool.id))
+          : []
+      ));
+
+      expect(smokeTools).toHaveLength(11);
+      expect(smokeTools.map((tool: any) => tool.id)).toEqual(toolIds);
+      expect(smokeTools.find((tool: any) => tool.id === toolIds[5])).toEqual(expect.objectContaining({
+        status: 'error',
+        result: 'sessionId is required',
+      }));
+      expect(messages.find((message: any) => message.id === 'smoke-user')?.content)
+        .toBe('run the chronology smoke test');
+      expect(messages.find((message: any) => message.id === 'canonical-final')?.content)
+        .toBe('UI_TIMELINE_SMOKE_COMPLETE');
+      expect(messages.find((message: any) => message.id === 'prior-assistant')?.content)
+        .toBe('prior answer');
+      expect(messages.find((message: any) => message.id === 'heartbeat-user')?.content)
+        .toBe('[OpenClaw heartbeat poll]');
+      expect(messages.find((message: any) => message.id === 'heartbeat-assistant')).toEqual(
+        expect.objectContaining({
+          thinkingContent: 'Heartbeat reasoning remains in its own turn.',
+        }),
+      );
+      expect(messages.some((message: any) => (
+        message?.__portal?.kind === 'runtime-turn-event-history'
+        && message?.__portal?.runId === runId
+      ))).toBe(false);
+      expect(messages.filter((message: any) => message.content === 'HEARTBEAT_OK')).toHaveLength(1);
+    } finally {
+      if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+      else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+      fs.rmSync(sessionsDir, { recursive: true, force: true });
+      fs.rmSync(eventDir, { recursive: true, force: true });
+    }
+  });
+
+  test('contentless runtime history stays fail-closed without a complete run boundary', () => {
+    const baseTs = Date.parse('2026-08-10T23:00:00.000Z');
+    const canonical = [
+      { id: 'u1', role: 'user', content: 'keep both lanes', timestamp: new Date(baseTs).toISOString() },
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: '',
+        thinkingContent: 'Still running.',
+        timestamp: new Date(baseTs + 1_000).toISOString(),
+        toolCalls: [{ id: 'stable-live-tool', name: 'exec', status: 'done', startedAt: baseTs + 1_200 }],
+      },
+    ];
+    const events: RuntimeTurnEvent[] = [
+      {
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type: 'assistant_reasoning',
+        sessionKey: 'agent:main:incomplete-contentless',
+        runId: 'run-incomplete-contentless',
+        seq: 400,
+        ts: baseTs + 1_010,
+        text: 'Still running.',
+        visible: true,
+        source: { transport: 'portal-stream-event-bus', eventType: 'thinking' },
+      },
+      {
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type: 'tool_started',
+        sessionKey: 'agent:main:incomplete-contentless',
+        runId: 'run-incomplete-contentless',
+        seq: 401,
+        ts: baseTs + 1_200,
+        visible: true,
+        tool: { id: 'stable-live-tool', name: 'exec', status: 'running' },
+        source: { transport: 'portal-stream-event-bus', eventType: 'tool_start' },
+      },
+      {
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type: 'turn_done',
+        sessionKey: 'agent:main:incomplete-contentless',
+        runId: 'run-incomplete-contentless',
+        seq: 402,
+        ts: baseTs + 1_300,
+        terminal: true,
+        visible: false,
+        source: { transport: 'portal-stream-event-bus', eventType: 'done' },
+      },
+    ];
+    const runtime = __gatewayHistoryTest.buildRuntimeHistoryMessages(events, {
+      leadingRunComplete: false,
+    });
+    const messages = __gatewayHistoryTest.mergeRuntimeHistoryMessages(canonical, runtime, 20);
+
+    expect(runtime[0].__portal).toEqual(expect.objectContaining({ terminal: true, complete: false }));
+    expect(messages.flatMap((message: any) => message.toolCalls || [])).toHaveLength(2);
+    expect(messages.some((message: any) => message?.__portal?.kind === 'runtime-turn-event-history'))
+      .toBe(true);
+  });
+
+  test('a later match-budget failure restores the original contentless overlay', () => {
+    const baseTs = Date.parse('2026-08-10T23:30:00.000Z');
+    const canonical = [
+      { id: 'u1', role: 'user', content: 'first turn', timestamp: new Date(baseTs).toISOString() },
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: '',
+        thinkingContent: 'First thought.',
+        timestamp: new Date(baseTs + 1_000).toISOString(),
+        toolCalls: [{ id: 'stable-first-tool', name: 'exec', status: 'done', startedAt: baseTs + 1_200 }],
+      },
+      { id: 'u2', role: 'user', content: '[OpenClaw heartbeat poll]', timestamp: new Date(baseTs + 2_000).toISOString() },
+      { id: 'a2', role: 'assistant', content: 'HEARTBEAT_OK', timestamp: new Date(baseTs + 3_000).toISOString() },
+    ];
+    const contentless = {
+      id: 'runtime-first',
+      role: 'assistant',
+      content: '',
+      timestamp: new Date(baseTs + 1_500).toISOString(),
+      segments: [{
+        kind: 'thinking',
+        source: 'reasoning',
+        position: 'before',
+        text: 'First thought.',
+        ts: baseTs + 1_010,
+      }],
+      toolCalls: [{
+        id: 'stable-first-tool',
+        identity: 'provider',
+        name: 'exec',
+        status: 'done',
+        startedAt: baseTs + 1_100,
+        endedAt: baseTs + 1_300,
+      }],
+      __portal: {
+        kind: 'runtime-turn-event-history',
+        runId: 'run-first',
+        terminal: true,
+        complete: true,
+      },
+    };
+    const heartbeat = {
+      id: 'runtime-heartbeat',
+      role: 'assistant',
+      content: 'HEARTBEAT_OK',
+      timestamp: new Date(baseTs + 3_010).toISOString(),
+      __portal: {
+        kind: 'runtime-turn-event-history',
+        runId: 'run-heartbeat',
+        terminal: true,
+        complete: true,
+      },
+    };
+
+    const messages = __gatewayHistoryTest.mergeRuntimeHistoryMessages(
+      canonical,
+      [contentless, heartbeat],
+      20,
+      { match: 0 },
+    );
+
+    expect(messages.flatMap((message: any) => message.toolCalls || [])).toHaveLength(2);
+    expect(messages.some((message: any) => message.id === 'runtime-first')).toBe(true);
+    expect(messages.some((message: any) => message.id === 'a1')).toBe(true);
+    expect(messages.some((message: any) => message.id === 'u2')).toBe(true);
+  });
+
+  test.each([
+    { label: 'active', terminal: false },
+    { label: 'completed', terminal: true },
+  ])('runtime history scans to the real run boundary for a >320-event $label turn', ({ terminal }) => {
+    const eventDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-run-boundary-'));
+    const previousEventDir = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = eventDir;
+
+    try {
+      const sessionKey = `agent:main:runtime-run-boundary-${terminal ? 'completed' : 'active'}`;
+      const runId = `run-boundary-${terminal ? 'completed' : 'active'}`;
+      const baseTs = Date.parse('2026-08-10T15:00:00.000Z');
+      const event = (
+        type: RuntimeTurnEvent['type'],
+        seq: number,
+        extra: Partial<RuntimeTurnEvent> = {},
+      ): RuntimeTurnEvent => ({
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type,
+        sessionKey,
+        runId,
+        seq,
+        ts: baseTs + seq * 10,
+        visible: true,
+        source: {
+          transport: 'portal-stream-event-bus',
+          eventType: type === 'assistant_reasoning' ? 'thinking' : (type === 'tool_started' ? 'tool_start' : 'done'),
+        },
+        ...extra,
+      });
+
+      recordRuntimeTurnEvent(sessionKey, event('assistant_reasoning', 0, {
+        text: 'The first reasoning phase must survive a bounded tail read.',
+        replace: true,
+      }));
+      for (let index = 0; index < 420; index += 1) {
+        recordRuntimeTurnEvent(sessionKey, event('tool_started', index + 1, {
+          tool: { id: `boundary-tool-${index}`, name: 'exec', status: 'running', arguments: { index } },
+        }));
+      }
+      if (terminal) {
+        recordRuntimeTurnEvent(sessionKey, event('assistant_final', 421, {
+          text: 'Boundary scan complete.',
+          terminal: true,
+        }));
+      }
+
+      // No canonical timestamp fence is available. The scanner must still read
+      // past its initial limit*4 tail until it proves the leading run boundary.
+      const messages = __gatewayHistoryTest.mergeRuntimeTurnEventHistory(sessionKey, [], 20);
+      const overlay = messages.find((message: any) => (
+        message?.__portal?.kind === 'runtime-turn-event-history'
+      ));
+
+      expect(overlay?.segments.map((segment: any) => segment.text)).toContain(
+        'The first reasoning phase must survive a bounded tail read.',
+      );
+      expect(overlay?.toolCalls).toHaveLength(420);
+      expect(overlay?.toolCalls[0].id).toBe('boundary-tool-0');
+      expect(overlay?.toolCalls.at(-1).id).toBe('boundary-tool-419');
+      expect(overlay?.content).toBe(terminal ? 'Boundary scan complete.' : '');
+    } finally {
+      if (previousEventDir === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+      else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previousEventDir;
+      fs.rmSync(eventDir, { recursive: true, force: true });
     }
   });
 
@@ -1191,6 +1743,213 @@ describe('gateway history readers', () => {
         source: 'preamble',
         text: 'Inspecting the affected files and tests',
       }),
+    ]);
+  });
+
+  test('runtime history projects strict and sliding cumulative preambles across tool boundaries', () => {
+    const baseTs = Date.parse('2026-08-10T13:00:00.000Z');
+    const sessionKey = 'agent:main:sliding-preamble-history';
+    const runId = 'run-sliding-preamble-history';
+    const preamble = (seq: number, text: string): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_reasoning',
+      sessionKey,
+      runId,
+      seq,
+      ts: baseTs + seq * 100,
+      text,
+      replace: true,
+      visible: true,
+      source: {
+        transport: 'portal-stream-event-bus',
+        eventType: 'status',
+        preambleProgress: true,
+      },
+    });
+    const tool = (seq: number, id: string): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'tool_started',
+      sessionKey,
+      runId,
+      seq,
+      ts: baseTs + seq * 100,
+      visible: true,
+      tool: { id, name: 'exec', status: 'running' },
+      source: { transport: 'portal-stream-event-bus', eventType: 'tool_start' },
+    });
+    const phaseA = `Phase A ${'a'.repeat(120)}`;
+    const phaseB = `Phase B ${'b'.repeat(360)}`;
+    const phaseC = `Phase C ${'c'.repeat(120)}`;
+    const reset = `Independent provider reset ${'z'.repeat(180)}`;
+
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      preamble(1, phaseA),
+      tool(2, 'tool-a'),
+      preamble(3, `${phaseA}\n\n${phaseB}`),
+      tool(4, 'tool-b'),
+      // OpenClaw evicted A from its bounded accumulator. This is a sliding
+      // B+C window, not a provider reset and not a fresh B thought.
+      preamble(5, `${phaseB}\n\n${phaseC}`),
+      tool(6, 'tool-c'),
+      // Low-overlap rewrites remain authoritative and are never suppressed.
+      preamble(7, reset),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].segments.map((segment: any) => segment.text)).toEqual([
+      phaseA,
+      phaseB,
+      phaseC,
+      reset,
+    ]);
+    expect(messages[0].segments.map((segment: any) => segment.order)).toEqual([0, 2, 4, 6]);
+    expect(messages[0].toolCalls.map((toolCall: any) => [toolCall.id, toolCall.order])).toEqual([
+      ['tool-a', 1],
+      ['tool-b', 3],
+      ['tool-c', 5],
+    ]);
+  });
+
+  test('runtime history projects cumulative assistant statuses across tool boundaries', () => {
+    const baseTs = Date.parse('2026-08-10T13:30:00.000Z');
+    const sessionKey = 'agent:main:cumulative-status-history';
+    const runId = 'run-cumulative-status-history';
+    const status = (seq: number, text: string): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_status',
+      sessionKey,
+      runId,
+      seq,
+      ts: baseTs + seq * 100,
+      text,
+      replace: true,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'status' },
+    });
+    const tool = (seq: number, id: string): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'tool_started',
+      sessionKey,
+      runId,
+      seq,
+      ts: baseTs + seq * 100,
+      visible: true,
+      tool: { id, name: 'exec', status: 'running' },
+      source: { transport: 'portal-stream-event-bus', eventType: 'tool_start' },
+    });
+    const phaseA = `Status A ${'a'.repeat(140)}`;
+    const phaseB = `Status B ${'b'.repeat(140)}`;
+    const phaseC = `Status C ${'c'.repeat(140)}`;
+
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      status(1, phaseA),
+      tool(2, 'status-tool-a'),
+      status(3, `${phaseA}\n\n${phaseB}`),
+      tool(4, 'status-tool-b'),
+      status(5, `${phaseA}\n\n${phaseB}\n\n${phaseC}`),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].segments.map((segment: any) => segment.text)).toEqual([
+      phaseA,
+      phaseB,
+      phaseC,
+    ]);
+    expect(messages[0].segments.map((segment: any) => segment.order)).toEqual([0, 2, 4]);
+    expect(messages[0].toolCalls.map((toolCall: any) => [toolCall.id, toolCall.order])).toEqual([
+      ['status-tool-a', 1],
+      ['status-tool-b', 3],
+    ]);
+    expect(messages[0].__portal).toEqual(expect.objectContaining({
+      kind: 'runtime-turn-event-history',
+      runId,
+      lastEventSeq: 5,
+      thinkingCursors: { status: `${phaseA}\n\n${phaseB}\n\n${phaseC}` },
+    }));
+  });
+
+  test('runtime history ignores a delayed graduated baseline without rolling back later status text', () => {
+    const baseTs = Date.parse('2026-08-10T13:45:00.000Z');
+    const baseline = `Baseline ${'a'.repeat(140)}`;
+    const extension = `Extension ${'b'.repeat(140)}`;
+    const tail = `Tail ${'c'.repeat(140)}`;
+    const event = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_status',
+      sessionKey: 'agent:main:delayed-status-baseline',
+      runId: 'run-delayed-status-baseline',
+      seq,
+      ts: baseTs + seq * 100,
+      replace: true,
+      visible: true,
+      source: { transport: 'portal-stream-event-bus', eventType: 'status' },
+      ...extra,
+    });
+
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      event(1, { text: baseline }),
+      event(2, {
+        type: 'tool_started',
+        tool: { id: 'delayed-tool-a', name: 'exec', status: 'running' },
+        source: { transport: 'portal-stream-event-bus', eventType: 'tool_start' },
+      }),
+      event(3, { text: `${baseline}\n\n${extension}` }),
+      // A late copy of the old baseline must not replace the newer latest
+      // snapshot that the following tool boundary will graduate.
+      event(4, { text: baseline }),
+      event(5, {
+        type: 'tool_started',
+        tool: { id: 'delayed-tool-b', name: 'exec', status: 'running' },
+        source: { transport: 'portal-stream-event-bus', eventType: 'tool_start' },
+      }),
+      event(6, { text: `${baseline}\n\n${extension}\n\n${tail}` }),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].segments.map((segment: any) => segment.text)).toEqual([
+      baseline,
+      extension,
+      tail,
+    ]);
+  });
+
+  test('runtime history projects the new tail after the 64-item preamble window evicts its oldest item', () => {
+    const items = Array.from({ length: 65 }, (_, index) => (
+      `item-${String(index).padStart(2, '0')}:${String.fromCharCode(65 + (index % 26)).repeat(96)}`
+    ));
+    const firstWindow = items.slice(0, 64).join('\n\n');
+    const shiftedWindow = items.slice(1, 65).join('\n\n');
+    const base = (seq: number, extra: Partial<RuntimeTurnEvent>): RuntimeTurnEvent => ({
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_reasoning',
+      sessionKey: 'agent:main:bounded-preamble-window',
+      runId: 'run-bounded-preamble-window',
+      seq,
+      ts: Date.parse('2026-08-10T14:00:00.000Z') + seq * 100,
+      replace: true,
+      visible: true,
+      source: {
+        transport: 'portal-stream-event-bus',
+        eventType: 'status',
+        preambleProgress: true,
+      },
+      ...extra,
+    });
+
+    const messages = __gatewayHistoryTest.buildRuntimeHistoryMessages([
+      base(1, { text: firstWindow }),
+      base(2, {
+        type: 'tool_started',
+        tool: { id: 'window-tool', name: 'exec', status: 'running' },
+        source: { transport: 'portal-stream-event-bus', eventType: 'tool_start' },
+      }),
+      base(3, { text: shiftedWindow }),
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].segments.map((segment: any) => segment.text)).toEqual([
+      firstWindow,
+      items[64],
     ]);
   });
 

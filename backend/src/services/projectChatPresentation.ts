@@ -9,6 +9,9 @@ const MAX_SEGMENT_CHARS = 24_000;
 const MAX_TOOL_NAME_CHARS = 512;
 const MAX_TOOL_RESULT_CHARS = 16_000;
 const MAX_TOOL_ARGUMENT_CHARS = 12_000;
+const MAX_THINKING_SNAPSHOT_OVERLAP_CHARS = 64 * 1024;
+const MIN_THINKING_SNAPSHOT_OVERLAP_CHARS = 128;
+const MIN_THINKING_SNAPSHOT_OVERLAP_RATIO = 0.6;
 
 export type ProjectChatPresentationTerminalStatus =
   | 'running'
@@ -87,30 +90,148 @@ export function retainNewestProjectChatPresentationEvents<T>(
   };
 }
 
-function boundedString(value: unknown, limit: number): string {
+function boundedString(value: unknown, limit: number, onTruncated?: () => void): string {
   const text = typeof value === 'string' ? value : value == null ? '' : String(value);
-  return text.length > limit ? `${text.slice(0, Math.max(0, limit - 12))}…[truncated]` : text;
+  if (text.length <= limit) return text;
+  onTruncated?.();
+  return `${text.slice(0, Math.max(0, limit - 12))}…[truncated]`;
 }
 
-function boundedJsonValue(value: unknown): unknown {
+function boundedJsonValue(value: unknown, onTruncated?: () => void): unknown {
   if (value === undefined) return undefined;
   try {
     const serialized = JSON.stringify(value);
     if (serialized.length <= MAX_TOOL_ARGUMENT_CHARS) return JSON.parse(serialized);
+    onTruncated?.();
     return `${serialized.slice(0, MAX_TOOL_ARGUMENT_CHARS - 12)}…[truncated]`;
   } catch {
+    onTruncated?.();
     return '[unavailable]';
   }
 }
 
-function mergeStreamText(current: string, incoming: unknown, replace = false): string {
-  const chunk = boundedString(incoming, MAX_SEGMENT_CHARS);
+function mergeStreamText(
+  current: string,
+  incoming: unknown,
+  replace = false,
+  onTruncated?: () => void,
+): string {
+  const chunk = boundedString(incoming, MAX_SEGMENT_CHARS, onTruncated);
   if (!chunk) return current;
   if (replace) return chunk;
-  if (!current) return chunk;
-  if (chunk.startsWith(current)) return chunk.slice(0, MAX_SEGMENT_CHARS);
-  if (current.endsWith(chunk)) return current;
-  return `${current}${chunk}`.slice(0, MAX_SEGMENT_CHARS);
+  const combined = `${current}${chunk}`;
+  if (combined.length > MAX_SEGMENT_CHARS) onTruncated?.();
+  return combined.slice(0, MAX_SEGMENT_CHARS);
+}
+
+type ReasoningSnapshotLane = 'raw' | 'preamble' | 'status';
+
+interface ReasoningSnapshotTracker {
+  latest: Partial<Record<ReasoningSnapshotLane, string>>;
+  graduated: Partial<Record<ReasoningSnapshotLane, string>>;
+}
+
+function longestSuffixPrefixOverlap(left: string, right: string): number {
+  const candidateLength = Math.min(
+    left.length,
+    right.length,
+    MAX_THINKING_SNAPSHOT_OVERLAP_CHARS,
+  );
+  if (!candidateLength) return 0;
+
+  const pattern = right.slice(0, candidateLength);
+  const searchableTail = left.slice(-candidateLength);
+  const fallback = new Array<number>(pattern.length).fill(0);
+  for (let index = 1, matched = 0; index < pattern.length; index += 1) {
+    while (matched > 0 && pattern[index] !== pattern[matched]) matched = fallback[matched - 1];
+    if (pattern[index] === pattern[matched]) matched += 1;
+    fallback[index] = matched;
+  }
+
+  let matched = 0;
+  for (let index = 0; index < searchableTail.length; index += 1) {
+    const character = searchableTail[index];
+    while (matched > 0 && character !== pattern[matched]) matched = fallback[matched - 1];
+    if (character === pattern[matched]) matched += 1;
+    if (matched === pattern.length && index < searchableTail.length - 1) {
+      matched = fallback[matched - 1];
+    }
+  }
+  return matched;
+}
+
+function highConfidenceSlidingSnapshotOverlap(baseline: string, incoming: string): number {
+  const overlap = longestSuffixPrefixOverlap(baseline, incoming);
+  const comparableLength = Math.min(
+    baseline.length,
+    incoming.length,
+    MAX_THINKING_SNAPSHOT_OVERLAP_CHARS,
+  );
+  if (
+    overlap < MIN_THINKING_SNAPSHOT_OVERLAP_CHARS
+    || comparableLength === 0
+    || overlap / comparableLength < MIN_THINKING_SNAPSHOT_OVERLAP_RATIO
+  ) return 0;
+  return overlap;
+}
+
+/**
+ * Provider replace frames can be run-wide cumulative snapshots in either the
+ * raw-thinking or preamble lane. Once a boundary graduates a visible bubble,
+ * project only the new suffix while keeping both lanes independent.
+ */
+function projectReasoningChunkAfterGraduation(
+  tracker: ReasoningSnapshotTracker,
+  lane: ReasoningSnapshotLane,
+  incoming: string,
+  replace: boolean,
+): string {
+  if (!incoming) return '';
+
+  if (!replace) {
+    tracker.latest[lane] = `${tracker.latest[lane] || ''}${incoming}`;
+    return incoming;
+  }
+
+  const previousLatest = tracker.latest[lane] || '';
+  const graduated = tracker.graduated[lane] || '';
+  if (!graduated) {
+    tracker.latest[lane] = incoming;
+    return incoming;
+  }
+  if (incoming === graduated) {
+    // A delayed baseline must not roll back append-style reasoning that
+    // already arrived after that baseline.
+    if (!(previousLatest.startsWith(incoming) && previousLatest.length > incoming.length)) {
+      tracker.latest[lane] = incoming;
+    }
+    return '';
+  }
+  if (incoming.startsWith(graduated)) {
+    tracker.latest[lane] = incoming;
+    return incoming.slice(graduated.length).trimStart();
+  }
+
+  const slidingOverlap = highConfidenceSlidingSnapshotOverlap(graduated, incoming);
+  if (slidingOverlap > 0) {
+    tracker.latest[lane] = incoming;
+    return incoming.slice(slidingOverlap).trimStart();
+  }
+
+  // A non-overlapping frame is a provider reset, not evidence that any of its
+  // text was already represented. Preserve the new authoritative frame.
+  tracker.latest[lane] = incoming;
+  tracker.graduated[lane] = '';
+  return incoming;
+}
+
+function markReasoningSnapshotGraduated(
+  tracker: ReasoningSnapshotTracker,
+  lane: ReasoningSnapshotLane | null,
+): void {
+  if (!lane) return;
+  const latest = tracker.latest[lane];
+  if (typeof latest === 'string') tracker.graduated[lane] = latest;
 }
 
 function safeTimestamp(value: unknown, fallback: number): number {
@@ -140,22 +261,26 @@ function appendTool(
   tools: PersistedProjectChatToolCall[],
   event: ProjectNativeRunEvent,
   status: 'running' | 'done' | 'error',
+  onTruncated?: () => void,
 ): PersistedProjectChatToolCall {
   const startedAt = safeTimestamp(event.ts, Date.now());
   const tool: PersistedProjectChatToolCall = {
-    id: boundedString(event.toolCallId || `project-tool-${event.seq}`, 256),
-    name: boundedString(event.toolName || 'tool', MAX_TOOL_NAME_CHARS) || 'tool',
+    id: boundedString(event.toolCallId || `project-tool-${event.seq}`, 256, onTruncated),
+    name: boundedString(event.toolName || 'tool', MAX_TOOL_NAME_CHARS, onTruncated) || 'tool',
     startedAt,
     status,
     order: event.seq,
   };
-  const args = boundedJsonValue(event.toolArgs);
+  const args = boundedJsonValue(event.toolArgs, onTruncated);
   if (args !== undefined) tool.arguments = args;
-  const result = boundedString(event.toolResult ?? event.content, MAX_TOOL_RESULT_CHARS);
+  const result = boundedString(event.toolResult ?? event.content, MAX_TOOL_RESULT_CHARS, onTruncated);
   if (result) tool.result = result;
   if (status !== 'running') tool.endedAt = startedAt;
   tools.push(tool);
-  if (tools.length > MAX_TOOL_CALLS) tools.splice(0, tools.length - MAX_TOOL_CALLS);
+  if (tools.length > MAX_TOOL_CALLS) {
+    tools.splice(0, tools.length - MAX_TOOL_CALLS);
+    onTruncated?.();
+  }
   return tool;
 }
 
@@ -223,14 +348,18 @@ export function buildProjectChatMessagePresentation(
 ): ProjectChatMessagePresentation | null {
   const toolCalls: PersistedProjectChatToolCall[] = [];
   const segments: PersistedProjectChatSegment[] = [];
+  let truncated = options.sourceTruncated === true;
   let currentKind: 'text' | 'thinking' | null = null;
+  let currentReasoningLane: ReasoningSnapshotLane | null = null;
   let currentText = '';
   let currentSubject = '';
   let currentTs = 0;
   let currentOrder = 0;
+  const reasoningSnapshots: ReasoningSnapshotTracker = { latest: {}, graduated: {} };
+  const markTruncated = () => { truncated = true; };
 
   const flushSegment = () => {
-    const text = boundedString(currentText, MAX_SEGMENT_CHARS);
+    const text = boundedString(currentText, MAX_SEGMENT_CHARS, markTruncated);
     if (currentKind && (text || currentSubject)) {
       segments.push({
         text,
@@ -240,9 +369,16 @@ export function buildProjectChatMessagePresentation(
         ts: currentTs || Date.now(),
         order: currentOrder,
       });
-      if (segments.length > MAX_SEGMENTS) segments.splice(0, segments.length - MAX_SEGMENTS);
+      if (segments.length > MAX_SEGMENTS) {
+        segments.splice(0, segments.length - MAX_SEGMENTS);
+        markTruncated();
+      }
+    }
+    if (currentKind === 'thinking') {
+      markReasoningSnapshotGraduated(reasoningSnapshots, currentReasoningLane);
     }
     currentKind = null;
+    currentReasoningLane = null;
     currentText = '';
     currentSubject = '';
     currentTs = 0;
@@ -250,28 +386,66 @@ export function buildProjectChatMessagePresentation(
   };
 
   const mergeSegment = (event: ProjectNativeRunEvent, kind: 'text' | 'thinking') => {
-    if (currentKind && currentKind !== kind) flushSegment();
+    const reasoningLane: ReasoningSnapshotLane | null = kind === 'thinking'
+      ? (
+          event.preambleProgress === true
+            ? 'preamble'
+            : event.assistantStatus === true
+              ? 'status'
+              : 'raw'
+        )
+      : null;
     const subject = kind === 'thinking' ? sanitizeThinkingSubject(event.subject) : '';
-    if (
+    const changedKind = Boolean(currentKind && currentKind !== kind);
+    const changedReasoningLane = Boolean(
+      currentKind === 'thinking' && currentReasoningLane !== reasoningLane,
+    );
+    const changedSubject = Boolean(
       subject
       && currentKind === 'thinking'
       && (currentText || currentSubject)
-      && currentSubject !== subject
-    ) {
-      flushSegment();
-    }
+      && currentSubject !== subject,
+    );
+    if (changedKind || changedReasoningLane || changedSubject) flushSegment();
+
+    const rawContent = typeof event.content === 'string'
+      ? event.content
+      : event.content == null ? '' : String(event.content);
+    const content = reasoningLane
+      ? projectReasoningChunkAfterGraduation(
+          reasoningSnapshots,
+          reasoningLane,
+          rawContent,
+          event.replace === true,
+        )
+      : rawContent;
+    if (!content && !subject) return;
+
     if (!currentKind) {
       currentKind = kind;
+      currentReasoningLane = reasoningLane;
       currentTs = safeTimestamp(event.ts, Date.now());
       currentOrder = event.seq;
     }
     if (subject) currentSubject = subject;
-    currentText = mergeStreamText(currentText, event.content, event.replace === true);
+    currentText = mergeStreamText(
+      currentText,
+      content,
+      event.replace === true,
+      markTruncated,
+    );
   };
 
   for (const event of events) {
     if (!event || typeof event !== 'object') continue;
-    if (event.type === 'thinking') {
+    if (event.transient === true) continue;
+    if (
+      event.type === 'thinking'
+      || (
+        event.type === 'status'
+        && (event.preambleProgress === true || event.assistantStatus === true)
+      )
+    ) {
       mergeSegment(event, 'thinking');
       continue;
     }
@@ -283,32 +457,55 @@ export function buildProjectChatMessagePresentation(
       flushSegment();
       continue;
     }
+    if (event.type === 'compaction_start' || event.type === 'compaction_end') {
+      flushSegment();
+      reasoningSnapshots.latest = {};
+      reasoningSnapshots.graduated = {};
+      continue;
+    }
     if (event.type === 'tool_start') {
       flushSegment();
-      appendTool(toolCalls, event, 'running');
+      appendTool(toolCalls, event, 'running', markTruncated);
       continue;
     }
     if (event.type === 'tool_update') {
       const index = findToolIndex(toolCalls, event);
-      const tool = index >= 0 ? toolCalls[index] : appendTool(toolCalls, event, 'running');
-      if (event.toolArgs !== undefined) tool.arguments = boundedJsonValue(event.toolArgs);
-      const update = boundedString(event.toolResult ?? event.content, MAX_TOOL_RESULT_CHARS);
+      const tool = index >= 0
+        ? toolCalls[index]
+        : appendTool(toolCalls, event, 'running', markTruncated);
+      if (event.toolArgs !== undefined) tool.arguments = boundedJsonValue(event.toolArgs, markTruncated);
+      const update = boundedString(
+        event.toolResult ?? event.content,
+        MAX_TOOL_RESULT_CHARS,
+        markTruncated,
+      );
       if (update) tool.result = update;
       continue;
     }
     if (event.type === 'tool_end') {
       const status = normalizeToolStatus(event.status, event.exitCode);
       const index = findToolIndex(toolCalls, event);
-      const tool = index >= 0 ? toolCalls[index] : appendTool(toolCalls, event, status);
+      const tool = index >= 0
+        ? toolCalls[index]
+        : appendTool(toolCalls, event, status, markTruncated);
       tool.status = status;
       tool.endedAt = safeTimestamp(event.ts, tool.startedAt);
-      const result = boundedString(event.toolResult ?? event.content, MAX_TOOL_RESULT_CHARS);
+      const result = boundedString(
+        event.toolResult ?? event.content,
+        MAX_TOOL_RESULT_CHARS,
+        markTruncated,
+      );
       if (result) tool.result = result;
       continue;
     }
     if (event.type === 'tool_used') {
       flushSegment();
-      appendTool(toolCalls, event, normalizeToolStatus(event.status, event.exitCode));
+      appendTool(
+        toolCalls,
+        event,
+        normalizeToolStatus(event.status, event.exitCode),
+        markTruncated,
+      );
     }
   }
   flushSegment();
@@ -338,7 +535,7 @@ export function buildProjectChatMessagePresentation(
     version: PRESENTATION_VERSION,
     ...(segments.length > 0 ? { segments } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    ...(options.sourceTruncated ? { truncated: true } : {}),
+    ...(truncated ? { truncated: true } : {}),
   });
 }
 
@@ -347,34 +544,40 @@ export function parseProjectChatMessagePresentation(value: unknown): ProjectChat
   const raw = value as Record<string, unknown>;
   if (raw.version !== 1 && raw.version !== PRESENTATION_VERSION) return null;
 
-  const rawTools = Array.isArray(raw.toolCalls) ? raw.toolCalls.slice(-MAX_TOOL_CALLS) : [];
+  let truncated = raw.truncated === true;
+  const markTruncated = () => { truncated = true; };
+  const allRawTools = Array.isArray(raw.toolCalls) ? raw.toolCalls : [];
+  if (allRawTools.length > MAX_TOOL_CALLS) markTruncated();
+  const rawTools = allRawTools.slice(-MAX_TOOL_CALLS);
   const toolCalls = rawTools.flatMap((entry, index): PersistedProjectChatToolCall[] => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
     const tool = entry as Record<string, unknown>;
-    const name = boundedString(tool.name, MAX_TOOL_NAME_CHARS);
+    const name = boundedString(tool.name, MAX_TOOL_NAME_CHARS, markTruncated);
     if (!name) return [];
     const startedAt = safeTimestamp(tool.startedAt, Date.now() + index);
     const status = tool.status === 'running' || tool.status === 'error' ? tool.status : 'done';
     const parsed: PersistedProjectChatToolCall = {
-      id: boundedString(tool.id || `project-tool-${index}`, 256),
+      id: boundedString(tool.id || `project-tool-${index}`, 256, markTruncated),
       name,
       startedAt,
       status,
       order: typeof tool.order === 'number' && Number.isSafeInteger(tool.order) ? tool.order : index,
     };
-    const args = boundedJsonValue(tool.arguments);
+    const args = boundedJsonValue(tool.arguments, markTruncated);
     if (args !== undefined) parsed.arguments = args;
-    const result = boundedString(tool.result, MAX_TOOL_RESULT_CHARS);
+    const result = boundedString(tool.result, MAX_TOOL_RESULT_CHARS, markTruncated);
     if (result) parsed.result = result;
     if (status !== 'running') parsed.endedAt = safeTimestamp(tool.endedAt, startedAt);
     return [parsed];
   });
 
-  const rawSegments = Array.isArray(raw.segments) ? raw.segments.slice(-MAX_SEGMENTS) : [];
+  const allRawSegments = Array.isArray(raw.segments) ? raw.segments : [];
+  if (allRawSegments.length > MAX_SEGMENTS) markTruncated();
+  const rawSegments = allRawSegments.slice(-MAX_SEGMENTS);
   const segments = rawSegments.flatMap((entry, index): PersistedProjectChatSegment[] => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
     const segment = entry as Record<string, unknown>;
-    const text = boundedString(segment.text, MAX_SEGMENT_CHARS);
+    const text = boundedString(segment.text, MAX_SEGMENT_CHARS, markTruncated);
     const kind = segment.kind === 'thinking' ? 'thinking' : 'text';
     const subject = kind === 'thinking' ? sanitizeThinkingSubject(segment.subject) : '';
     if (!text && !subject) return [];
@@ -390,13 +593,15 @@ export function parseProjectChatMessagePresentation(value: unknown): ProjectChat
 
   // Read legacy v1 aggregate reasoning without making it part of the v2
   // persistence contract, preserving compatibility across an in-place upgrade.
-  const legacyThinking = raw.version === 1 ? boundedString(raw.thinkingContent, MAX_SEGMENT_CHARS) : '';
+  const legacyThinking = raw.version === 1
+    ? boundedString(raw.thinkingContent, MAX_SEGMENT_CHARS, markTruncated)
+    : '';
   if (!legacyThinking && segments.length === 0 && toolCalls.length === 0) return null;
   return enforceAggregateBudget({
     version: PRESENTATION_VERSION,
     ...(legacyThinking ? { thinkingContent: legacyThinking } : {}),
     ...(segments.length > 0 ? { segments } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    ...(raw.truncated === true ? { truncated: true } : {}),
+    ...(truncated ? { truncated: true } : {}),
   });
 }

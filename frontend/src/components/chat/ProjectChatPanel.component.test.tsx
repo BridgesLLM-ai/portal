@@ -3752,6 +3752,389 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(screen.queryByText('Before the tool. After the tool.')).not.toBeInTheDocument();
   });
 
+  it('keeps replayed live reasoning interleaved with tools when a background tab catches up instantly', async () => {
+    const fixedNow = vi.spyOn(Date, 'now').mockReturnValue(25_000);
+    try {
+      projectMocks.projectChatProviders.mockResolvedValue(capabilities({
+        id: 'turn-background-replay',
+        provider: 'OPENCLAW',
+        status: 'RUNNING',
+        requestId: 'request-background-replay',
+        leaseExpiresAt: '2026-08-10T20:00:00.000Z',
+      }));
+      projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+        runId: 'turn-background-replay',
+        lineCount: 7,
+        events: [
+          {
+            seq: 1,
+            type: 'thinking',
+            content: 'Inspecting the workspace',
+            subject: 'Long-running audit',
+            replace: true,
+          },
+          {
+            seq: 2,
+            type: 'tool_start',
+            toolCallId: 'tool-first-check',
+            toolName: 'exec',
+            toolArgs: { command: 'first-check' },
+          },
+          {
+            seq: 3,
+            type: 'tool_end',
+            toolCallId: 'tool-first-check',
+            toolName: 'exec',
+            toolResult: 'first-ok',
+            status: 'done',
+          },
+          {
+            seq: 4,
+            type: 'thinking',
+            content: 'Inspecting the workspace and tests',
+            subject: 'Long-running audit',
+            replace: true,
+          },
+          {
+            seq: 5,
+            type: 'tool_start',
+            toolCallId: 'tool-second-check',
+            toolName: 'exec',
+            toolArgs: { command: 'second-check' },
+          },
+          {
+            seq: 6,
+            type: 'tool_end',
+            toolCallId: 'tool-second-check',
+            toolName: 'exec',
+            toolResult: 'second-ok',
+            status: 'done',
+          },
+          {
+            seq: 7,
+            type: 'thinking',
+            content: 'Running final checks',
+            subject: 'Long-running audit',
+            replace: true,
+          },
+        ],
+        active: true,
+        isProcessing: true,
+        complete: false,
+        status: 'running',
+      }));
+
+      const view = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+      await screen.findByText('Inspecting the workspace');
+      // The provider frame is cumulative. Project Chat should render only the
+      // newly visible suffix after the first tool boundary.
+      await screen.findByText('and tests');
+      await screen.findByText('Running final checks');
+      await screen.findByText('Run first-check');
+      await screen.findByText('Run second-check');
+
+      const rendered = view.container.textContent || '';
+      expect(rendered.indexOf('Inspecting the workspace')).toBeLessThan(rendered.indexOf('Run first-check'));
+      expect(rendered.indexOf('Run first-check')).toBeLessThan(rendered.indexOf('and tests'));
+      expect(rendered.indexOf('and tests')).toBeLessThan(rendered.indexOf('Run second-check'));
+      expect(rendered.indexOf('Run second-check')).toBeLessThan(rendered.indexOf('Running final checks'));
+    } finally {
+      fixedNow.mockRestore();
+    }
+  });
+
+  it('graduates live text at every tool and reasoning boundary so mixed activity stays chronological', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities({
+      id: 'turn-mixed-live-order',
+      provider: 'OPENCLAW',
+      status: 'RUNNING',
+      requestId: 'request-mixed-live-order',
+      leaseExpiresAt: '2026-08-10T20:00:00.000Z',
+    }));
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      runId: 'turn-mixed-live-order',
+      lineCount: 6,
+      events: [
+        { seq: 1, type: 'text', content: 'Draft before the tool.' },
+        {
+          seq: 2,
+          type: 'tool_start',
+          toolCallId: 'mixed-tool',
+          toolName: 'exec',
+          toolArgs: { command: 'chronology-check' },
+        },
+        {
+          seq: 3,
+          type: 'tool_end',
+          toolCallId: 'mixed-tool',
+          toolName: 'exec',
+          toolResult: 'ok',
+          status: 'done',
+        },
+        { seq: 4, type: 'thinking', content: 'Checking the tool result.' },
+        { seq: 5, type: 'text', content: 'Interim answer.' },
+        { seq: 6, type: 'thinking', content: 'Final verification.' },
+      ],
+      active: true,
+      isProcessing: true,
+      complete: false,
+      status: 'running',
+    }));
+
+    const view = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    await screen.findByText('Draft before the tool.');
+    await screen.findByText('Run chronology-check');
+    await screen.findByText('Checking the tool result.');
+    await screen.findByText('Interim answer.');
+    await screen.findByText('Final verification.');
+
+    const rendered = view.container.textContent || '';
+    expect(rendered.indexOf('Draft before the tool.')).toBeLessThan(rendered.indexOf('Run chronology-check'));
+    expect(rendered.indexOf('Run chronology-check')).toBeLessThan(rendered.indexOf('Checking the tool result.'));
+    expect(rendered.indexOf('Checking the tool result.')).toBeLessThan(rendered.indexOf('Interim answer.'));
+    expect(rendered.indexOf('Interim answer.')).toBeLessThan(rendered.indexOf('Final verification.'));
+  });
+
+  it.each([
+    {
+      label: 'transient status followed by reasoning',
+      events: [
+        {
+          seq: 2,
+          type: 'status',
+          content: 'Thinking… (~2,048 tokens)',
+          transient: true,
+          replace: true,
+        },
+        { seq: 3, type: 'thinking', content: 'Reasoning after transient progress.' },
+      ],
+      laterText: 'Reasoning after transient progress.',
+    },
+    {
+      label: 'reasoning',
+      events: [
+        { seq: 2, type: 'thinking', content: 'Reasoning after reconnect.' },
+      ],
+      laterText: 'Reasoning after reconnect.',
+    },
+    {
+      label: 'tool start',
+      events: [
+        {
+          seq: 2,
+          type: 'tool_start',
+          toolCallId: 'reconnect-tool',
+          toolName: 'exec',
+          toolArgs: { command: 'reconnect-check' },
+        },
+      ],
+      laterText: 'Run reconnect-check',
+    },
+  ])('preserves reconnect snapshot text when the next catch-up boundary is $label', async ({ events, laterText }) => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities({
+      id: 'turn-reconnect-seed',
+      provider: 'OPENCLAW',
+      status: 'RUNNING',
+      requestId: 'request-reconnect-seed',
+      leaseExpiresAt: '2026-08-10T20:00:00.000Z',
+    }));
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      runId: 'turn-reconnect-seed',
+      lineCount: events.at(-1)?.seq || 1,
+      events: [
+        {
+          seq: 1,
+          type: 'stream_status',
+          runId: 'turn-reconnect-seed',
+          active: true,
+          phase: 'streaming',
+          content: 'Draft before reconnect boundary.',
+        },
+        ...events,
+      ],
+      active: true,
+      isProcessing: true,
+      complete: false,
+      status: 'running',
+    }));
+
+    const view = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    await screen.findByText('Draft before reconnect boundary.');
+    await screen.findByText(laterText);
+    const rendered = view.container.textContent || '';
+    expect(rendered.indexOf('Draft before reconnect boundary.')).toBeLessThan(rendered.indexOf(laterText));
+  });
+
+  it('orders subject-only encrypted reasoning on both sides of a replayed tool', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities({
+      id: 'turn-subject-only-order',
+      provider: 'OPENCLAW',
+      status: 'RUNNING',
+      requestId: 'request-subject-only-order',
+      leaseExpiresAt: '2026-08-10T20:00:00.000Z',
+    }));
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      runId: 'turn-subject-only-order',
+      lineCount: 4,
+      events: [
+        { seq: 1, type: 'thinking', content: '', subject: 'Decrypting response' },
+        {
+          seq: 2,
+          type: 'tool_start',
+          toolCallId: 'subject-tool',
+          toolName: 'exec',
+          toolArgs: { command: 'subject-check' },
+        },
+        {
+          seq: 3,
+          type: 'tool_end',
+          toolCallId: 'subject-tool',
+          toolName: 'exec',
+          status: 'done',
+        },
+        { seq: 4, type: 'thinking', content: '', subject: 'Validating response' },
+      ],
+      active: true,
+      isProcessing: true,
+      complete: false,
+      status: 'running',
+    }));
+
+    const view = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    await screen.findByText('thinking · Decrypting response');
+    await screen.findByText('Run subject-check');
+    await screen.findByText('thinking · Validating response');
+
+    const rendered = view.container.textContent || '';
+    expect(rendered.indexOf('thinking · Decrypting response')).toBeLessThan(rendered.indexOf('Run subject-check'));
+    expect(rendered.indexOf('Run subject-check')).toBeLessThan(rendered.indexOf('thinking · Validating response'));
+  });
+
+  it('renders compatibility tool_used events completed and preserves distinct same-name sequence events', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities({
+      id: 'turn-compat-tools',
+      provider: 'OPENCLAW',
+      status: 'RUNNING',
+      requestId: 'request-compat-tools',
+      leaseExpiresAt: '2026-08-10T20:00:00.000Z',
+    }));
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      runId: 'turn-compat-tools',
+      lineCount: 5,
+      events: [
+        { seq: 1, type: 'text', content: 'Before compatibility tools.' },
+        { seq: 2, type: 'thinking', content: 'Calling the compatibility path.' },
+        { seq: 3, type: 'tool_used', toolName: 'exec' },
+        { seq: 4, type: 'tool_used', toolName: 'exec' },
+        { seq: 4, type: 'tool_used', toolName: 'exec' },
+      ],
+      active: true,
+      isProcessing: true,
+      complete: false,
+      status: 'running',
+    }));
+
+    const view = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    await screen.findByText('Before compatibility tools.');
+    await screen.findByText('Calling the compatibility path.');
+    await waitFor(() => expect(screen.getAllByText('Run command')).toHaveLength(2));
+    expect(screen.queryByLabelText('Tool turn running')).not.toBeInTheDocument();
+
+    const rendered = view.container.textContent || '';
+    expect(rendered.indexOf('Before compatibility tools.')).toBeLessThan(rendered.indexOf('Calling the compatibility path.'));
+    expect(rendered.indexOf('Calling the compatibility path.')).toBeLessThan(rendered.indexOf('Run command'));
+  });
+
+  it('keeps attested visible status thoughts ordered across tools', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities({
+      id: 'turn-status-order',
+      provider: 'OPENCLAW',
+      status: 'RUNNING',
+      requestId: 'request-status-order',
+      leaseExpiresAt: '2026-08-10T20:00:00.000Z',
+    }));
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      runId: 'turn-status-order',
+      lineCount: 4,
+      events: [
+        {
+          seq: 1,
+          type: 'status',
+          content: 'Reviewing the first result.',
+          replace: true,
+          assistantStatus: true,
+        },
+        {
+          seq: 2,
+          type: 'tool_start',
+          toolCallId: 'status-tool',
+          toolName: 'exec',
+          toolArgs: { command: 'status-check' },
+        },
+        {
+          seq: 3,
+          type: 'tool_end',
+          toolCallId: 'status-tool',
+          toolName: 'exec',
+          status: 'done',
+        },
+        {
+          seq: 4,
+          type: 'status',
+          content: 'Reviewing the first result. Checking the second result.',
+          replace: true,
+          assistantStatus: true,
+        },
+      ],
+      active: true,
+      isProcessing: true,
+      complete: false,
+      status: 'running',
+    }));
+
+    const view = render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    await screen.findByText('Reviewing the first result.');
+    await screen.findByText('Run status-check');
+    await screen.findByText('Checking the second result.');
+
+    const rendered = view.container.textContent || '';
+    expect(rendered.indexOf('Reviewing the first result.')).toBeLessThan(rendered.indexOf('Run status-check'));
+    expect(rendered.indexOf('Run status-check')).toBeLessThan(rendered.indexOf('Checking the second result.'));
+  });
+
+  it('renders an explicit marker when saved Project activity was truncated', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.chatHistory.mockResolvedValue({
+      messages: [{
+        id: 'assistant-truncated-presentation',
+        role: 'assistant',
+        content: 'The retained final answer.',
+        timestamp: new Date().toISOString(),
+        provider: 'OPENCLAW',
+        turnId: 'turn-truncated-presentation',
+        presentationTruncated: true,
+        segments: [{
+          text: 'Newest retained reasoning phase.',
+          kind: 'thinking',
+          position: 'after',
+          ts: 9_000,
+          order: 99,
+        }],
+      }],
+    });
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('Newest retained reasoning phase.')).toBeVisible();
+    expect(await screen.findByText(/earlier activity.*omitted/i)).toBeVisible();
+  });
+
   it('renders a thinking subject above its body and reconciles a prefix-lagging final exactly once', async () => {
     projectMocks.projectChatProviders.mockResolvedValue(capabilities());
     projectMocks.chatHistory.mockResolvedValue({

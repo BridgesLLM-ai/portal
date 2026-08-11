@@ -28,6 +28,8 @@ export interface StreamEvent {
   completed?: boolean;
   willRetry?: boolean;
   maintenanceKind?: 'compaction' | 'maintenance';
+  /** Live-only rail status that must not become durable transcript content. */
+  transient?: boolean;
   /** Stable BridgesLLM turn-event contract used by Agent Chat. */
   turnEvent?: RuntimeTurnEvent;
   [key: string]: unknown;
@@ -110,7 +112,7 @@ function isSessionLevelEvent(event: StreamEvent): boolean {
     || (event.type === 'status' && event.maintenanceKind === 'maintenance');
 }
 
-const RAIL_SAFE_STATUS_RE = /^(?:thinking[.…]*|connecting directly to openclaw[.…]*|reconnecting to stream[.…]*|resuming stream[.…]*|still responding[.…]*|still working[.…]*|starting codex runtime[.…]*|codex session ready\.?|starting codex turn[.…]*|codex accepted the turn\.?|codex is writing[.…]*|codex is working[.…]*|codex turn completion is delayed; waiting for the final response[.…]*|running tool[.…]*|preparing execution hooks[.…]*|execution hooks ready\.?|waiting for command approval[.…]*|command denied|command approved|approval did not complete|approval failed(?::.*)?|compacting context[.…]*|context compacted\.?|context maintenance (?:in progress|finished|complete(?:d)?)[.…]*|preparing context maintenance[.…]*|memory flush (?:about to start|starting|started|queued|pending|complete(?:d)?)[.…]*|heartbeat check (?:started|starting|running|queued|pending|complete(?:d)?)[.…]*|heartbeat_ok)$/i;
+const RAIL_SAFE_STATUS_RE = /^(?:thinking[.…]*(?:\s+\(~[0-9][0-9,]*\s+tokens\))?|connecting directly to openclaw[.…]*|reconnecting to stream[.…]*|resuming stream[.…]*|still responding[.…]*|still working[.…]*|starting codex runtime[.…]*|codex session ready\.?|starting codex turn[.…]*|codex accepted the turn\.?|codex is writing[.…]*|codex is working[.…]*|codex turn completion is delayed; waiting for the final response[.…]*|running tool[.…]*|preparing execution hooks[.…]*|execution hooks ready\.?|waiting for command approval[.…]*|command denied|command approved|approval did not complete|approval failed(?::.*)?|compacting context[.…]*|context compacted\.?|context maintenance (?:in progress|finished|complete(?:d)?)[.…]*|preparing context maintenance[.…]*|memory flush (?:about to start|starting|started|queued|pending|complete(?:d)?)[.…]*|heartbeat check (?:started|starting|running|queued|pending|complete(?:d)?)[.…]*|heartbeat_ok)$/i;
 const RAIL_SAFE_MAINTENANCE_RE = /\b(preparing (?:for )?(?:a )?memory flush|preparing context maintenance|preparing compaction|pre-compaction|memory flush(?:ing)?|flush in progress|flushing memory|storing durable memor(?:y|ies)|writing durable memor(?:y|ies)|context maintenance|refreshing (?:context|memory)|summariz(?:ing|ation) (?:context|conversation|history)|trimming context|durable memor(?:y|ies) (?:stored|written)|context refreshed)\b/i;
 
 function normalizeRailStatusText(text?: unknown): string | undefined {

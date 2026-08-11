@@ -138,6 +138,9 @@ export function normalizeRuntimeTurnEvent(params: {
     }
 
     case 'status': {
+      // Provider progress counters keep an in-flight turn visibly alive, but
+      // are not model-authored reasoning and must not enter durable history.
+      if (event.transient === true) return null;
       // Opus can expose its only readable live reasoning as an attested
       // item.preamble progress frame. It remains a status-shaped transport
       // event for compatibility, but its durable/runtime projection must be

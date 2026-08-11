@@ -3482,6 +3482,7 @@ type RuntimeHistorySegment = {
 type RuntimeHistoryToolCall = {
   id: string;
   name: string;
+  identity?: 'provider' | 'fallback';
   arguments?: unknown;
   result?: string;
   startedAt: number;
@@ -3489,6 +3490,115 @@ type RuntimeHistoryToolCall = {
   status: 'running' | 'done' | 'error';
   order: number;
 };
+
+type RuntimeReasoningSnapshotLane = 'reasoning' | 'preamble' | 'status';
+
+type RuntimeReasoningSnapshotTracker = {
+  latest: Partial<Record<RuntimeReasoningSnapshotLane, string>>;
+  graduated: Partial<Record<RuntimeReasoningSnapshotLane, string>>;
+};
+
+const RUNTIME_REASONING_OVERLAP_MIN_CHARS = 128;
+const RUNTIME_REASONING_OVERLAP_MIN_RATIO = 0.6;
+const RUNTIME_REASONING_OVERLAP_MAX_SCAN_CHARS = 64 * 1024;
+
+/**
+ * Return the longest suffix of `previous` that is also a prefix of `incoming`.
+ *
+ * OpenClaw bounds its cumulative preamble accumulator by evicting old items.
+ * Once that bound is crossed, the next snapshot is a sliding window rather
+ * than a strict extension: `A + B` becomes `B + C`. A prefix-only projection
+ * therefore mistakes the whole `B + C` window for a fresh thought. KMP keeps
+ * this recovery linear and the explicit scan bound prevents adversarial
+ * history text from turning replay into unbounded work.
+ */
+function longestRuntimeReasoningSuffixPrefixOverlap(previous: string, incoming: string): number {
+  const scanLength = Math.min(
+    previous.length,
+    incoming.length,
+    RUNTIME_REASONING_OVERLAP_MAX_SCAN_CHARS,
+  );
+  if (scanLength <= 0) return 0;
+
+  const pattern = incoming.slice(0, scanLength);
+  const haystack = previous.slice(-scanLength);
+  const prefix = new Uint32Array(pattern.length);
+  for (let index = 1; index < pattern.length; index += 1) {
+    let matched = prefix[index - 1];
+    while (matched > 0 && pattern[index] !== pattern[matched]) matched = prefix[matched - 1];
+    if (pattern[index] === pattern[matched]) matched += 1;
+    prefix[index] = matched;
+  }
+
+  let matched = 0;
+  for (let index = 0; index < haystack.length; index += 1) {
+    while (matched > 0 && haystack[index] !== pattern[matched]) matched = prefix[matched - 1];
+    if (haystack[index] === pattern[matched]) matched += 1;
+    if (matched === pattern.length && index < haystack.length - 1) matched = prefix[matched - 1];
+  }
+  return matched;
+}
+
+function projectRuntimeReasoningSnapshot(
+  tracker: RuntimeReasoningSnapshotTracker,
+  lane: RuntimeReasoningSnapshotLane,
+  incoming: string,
+  replace = false,
+): string {
+  if (!incoming) return '';
+  if (!replace) {
+    tracker.latest[lane] = `${tracker.latest[lane] || ''}${incoming}`;
+    return incoming;
+  }
+
+  const previousLatest = tracker.latest[lane] || '';
+  const graduated = tracker.graduated[lane] || '';
+  if (!graduated) {
+    tracker.latest[lane] = incoming;
+    return incoming;
+  }
+  if (incoming === graduated) {
+    // A delayed baseline frame must not roll back a longer append-style
+    // snapshot already observed after that baseline. Otherwise the next tool
+    // boundary graduates the stale value and old thought text is replayed.
+    if (!(previousLatest.startsWith(incoming) && previousLatest.length > incoming.length)) {
+      tracker.latest[lane] = incoming;
+    }
+    return '';
+  }
+  if (incoming.startsWith(graduated)) {
+    tracker.latest[lane] = incoming;
+    return incoming.slice(graduated.length).trimStart();
+  }
+
+  const overlap = longestRuntimeReasoningSuffixPrefixOverlap(graduated, incoming);
+  const comparableLength = Math.min(
+    graduated.length,
+    incoming.length,
+    RUNTIME_REASONING_OVERLAP_MAX_SCAN_CHARS,
+  );
+  const highConfidenceSlidingWindow = overlap >= RUNTIME_REASONING_OVERLAP_MIN_CHARS
+    && overlap >= comparableLength * RUNTIME_REASONING_OVERLAP_MIN_RATIO;
+  if (highConfidenceSlidingWindow) {
+    tracker.latest[lane] = incoming;
+    return incoming.slice(overlap).trimStart();
+  }
+
+  // A low-overlap rewrite is an authoritative provider reset/correction, not a
+  // cumulative continuation. Do not suppress any of the replacement text.
+  tracker.latest[lane] = incoming;
+  tracker.graduated[lane] = '';
+  return incoming;
+}
+
+function graduateRuntimeReasoningSnapshot(
+  tracker: RuntimeReasoningSnapshotTracker,
+  lane: RuntimeReasoningSnapshotLane | null,
+): void {
+  if (!lane) return;
+  const latest = tracker.latest[lane];
+  if (typeof latest === 'string') tracker.graduated[lane] = latest;
+}
 
 // Rail placeholders ("Thinking…") and maintenance notices are transient status
 // strip material; persisted status events replaying them as durable thought
@@ -3506,7 +3616,10 @@ function runtimeTurnEventGroupKey(event: RuntimeTurnEvent, fallbackIndex: number
   return `runtime-${Math.floor((event.ts || Date.now()) / 300000)}-${fallbackIndex}`;
 }
 
-function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
+function buildRuntimeHistoryMessages(
+  events: RuntimeTurnEvent[],
+  options: { leadingRunComplete?: boolean } = {},
+): any[] {
   if (!Array.isArray(events) || events.length === 0) return [];
 
   const groups: Array<{ key: string; events: RuntimeTurnEvent[]; terminal: boolean }> = [];
@@ -3523,13 +3636,23 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
     if (event.terminal) current.terminal = true;
   }
 
-  return groups.flatMap((group) => {
+  return groups.flatMap((group, groupIndex) => {
     const timeline: Array<{ kind: 'segment'; segment: RuntimeHistorySegment } | { kind: 'tool'; tool: RuntimeHistoryToolCall }> = [];
     const toolsByKey = new Map<string, RuntimeHistoryToolCall>();
     let finalText = '';
     let model: string | undefined;
     let provenance: string | undefined;
     let lastTs = 0;
+    const reasoningSnapshots: RuntimeReasoningSnapshotTracker = { latest: {}, graduated: {} };
+
+    const graduateActiveReasoning = () => {
+      // A tool/text/terminal boundary settles every reasoning lane observed in
+      // this phase, even when raw reasoning and attested preamble frames were
+      // interleaved immediately before it.
+      graduateRuntimeReasoningSnapshot(reasoningSnapshots, 'reasoning');
+      graduateRuntimeReasoningSnapshot(reasoningSnapshots, 'preamble');
+      graduateRuntimeReasoningSnapshot(reasoningSnapshots, 'status');
+    };
 
     const appendSegment = (
       kind: 'thinking' | 'text',
@@ -3620,6 +3743,7 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
           if (rawId && open.id !== rawId) {
             toolsByKey.delete(open.id);
             open.id = rawId;
+            open.identity = 'provider';
             toolsByKey.set(rawId, open);
           }
           return;
@@ -3628,6 +3752,7 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
       const tool: RuntimeHistoryToolCall = {
         id: key,
         name: rawName,
+        identity: rawId ? 'provider' : 'fallback',
         arguments: event.tool?.arguments,
         result: typeof event.tool?.result === 'string' ? event.tool.result : undefined,
         startedAt: event.ts,
@@ -3646,24 +3771,42 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
 
       if (event.type === 'assistant_status') {
         if (event.visible && event.text && !isGenericStatusPlaceholderText(event.text)) {
-          appendSegment('thinking', event.text, event.ts, event.replace === true, 'status');
+          const projectedStatus = projectRuntimeReasoningSnapshot(
+            reasoningSnapshots,
+            'status',
+            sanitizeHistoryText(event.text),
+            event.replace === true,
+          );
+          appendSegment('thinking', projectedStatus, event.ts, event.replace === true, 'status');
         }
       } else if (event.type === 'assistant_reasoning') {
+        const lane: RuntimeReasoningSnapshotLane = event.source?.preambleProgress === true
+          ? 'preamble'
+          : 'reasoning';
+        const projectedReasoning = projectRuntimeReasoningSnapshot(
+          reasoningSnapshots,
+          lane,
+          sanitizeHistoryText(event.text || ''),
+          event.replace === true,
+        );
         appendSegment(
           'thinking',
-          event.text || '',
+          projectedReasoning,
           event.ts,
           event.replace === true,
-          event.source?.preambleProgress === true ? 'preamble' : 'reasoning',
+          lane,
           event.subject,
         );
       } else if (event.type === 'tool_started' || event.type === 'tool_output') {
+        graduateActiveReasoning();
         flushPendingTextBeforeTool(event.ts);
         upsertTool(event);
       } else if (event.type === 'assistant_delta') {
+        graduateActiveReasoning();
         finalText = mergeRuntimeText(finalText, event.text || '', event.replace === true);
         pendingTextTs = event.ts;
       } else if (event.type === 'assistant_final') {
+        graduateActiveReasoning();
         const representedText = timeline
           .filter((item): item is { kind: 'segment'; segment: RuntimeHistorySegment } => (
             item.kind === 'segment'
@@ -3691,8 +3834,9 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
         } else {
           finalText = mergeRuntimeText(finalText, terminalTail, event.replace === true);
         }
-      } else if (event.type === 'turn_error' && !finalText) {
-        finalText = sanitizeHistoryText(event.text || '');
+      } else if (event.type === 'turn_error') {
+        graduateActiveReasoning();
+        if (!finalText) finalText = sanitizeHistoryText(event.text || '');
       }
     }
 
@@ -3710,6 +3854,12 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
 
     const timestamp = new Date(lastTs || Date.now()).toISOString();
     const id = `runtime-turn-${createHash('sha256').update(`${group.key}:${timestamp}:${content}`).digest('hex').slice(0, 24)}`;
+    const lastEventSeq = group.events.reduce((latest, event) => (
+      Number.isSafeInteger(event.seq) ? Math.max(latest, event.seq) : latest
+    ), -1);
+    const rawThinkingCursor = reasoningSnapshots.latest.reasoning;
+    const statusThinkingCursor = reasoningSnapshots.latest.status;
+    const preambleThinkingCursor = reasoningSnapshots.latest.preamble;
     return [{
       id,
       role: 'assistant',
@@ -3719,7 +3869,22 @@ function buildRuntimeHistoryMessages(events: RuntimeTurnEvent[]): any[] {
       provenance: provenance || 'runtime-turn-event-history',
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       segments: segments.length > 0 ? segments : undefined,
-      __portal: { kind: 'runtime-turn-event-history', runId: group.key },
+      __portal: {
+        kind: 'runtime-turn-event-history',
+        runId: group.key,
+        terminal: group.terminal,
+        complete: group.terminal && (groupIndex > 0 || options.leadingRunComplete !== false),
+        ...(lastEventSeq >= 0 ? { lastEventSeq } : {}),
+        ...(rawThinkingCursor || statusThinkingCursor || preambleThinkingCursor
+          ? {
+              thinkingCursors: {
+                ...(rawThinkingCursor ? { raw: rawThinkingCursor } : {}),
+                ...(statusThinkingCursor ? { status: statusThinkingCursor } : {}),
+                ...(preambleThinkingCursor ? { preamble: preambleThinkingCursor } : {}),
+              },
+            }
+          : {}),
+      },
     }];
   });
 }
@@ -4109,6 +4274,208 @@ function hasUniqueRuntimeHistoryToolOwner(
   ));
 }
 
+function findUniqueExactRuntimeHistoryToolOwner(
+  runtimeMessage: any,
+  runtimeTool: any,
+  turnIndex: RuntimeHistoryTurnIndex,
+  ownership: RuntimeHistoryOwnershipIndex,
+  allowedIndexes: ReadonlySet<number>,
+  budget: RuntimeHistoryWorkBudget,
+): number {
+  const id = typeof runtimeTool?.id === 'string' ? runtimeTool.id.trim() : '';
+  // Runtime fallback ids are derived from name/order and are not durable
+  // identity. Only a provider-stable id can authorize suppressing an overlay
+  // tool in favor of its canonical transcript owner.
+  if (!id || runtimeTool?.identity === 'fallback') return -1;
+  const startedAt = finiteRuntimeHistoryTimestamp(runtimeTool?.startedAt);
+  if (startedAt === null || !isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage, startedAt)) return -1;
+  const rawEndedAt = runtimeTool?.endedAt;
+  const endedAt = rawEndedAt === undefined
+    ? null
+    : finiteRuntimeHistoryTimestamp(rawEndedAt);
+  if (
+    rawEndedAt !== undefined
+    && (
+      endedAt === null
+      || endedAt < startedAt
+      || !isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage, endedAt)
+    )
+  ) return -1;
+  const turn = resolveRuntimeHistoryTurnAt(turnIndex, startedAt);
+  if (turn === null) return -1;
+  const key = JSON.stringify([turn, JSON.stringify(['id', id])]);
+  const owners = new Set<number>();
+  for (const entry of ownership.tools.get(key) || []) {
+    if (!consumeRuntimeHistoryWork(budget)) return -1;
+    if (
+      !allowedIndexes.has(entry.ownerIndex)
+      || !isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage, entry.timestamp)
+      || Math.min(
+        Math.abs(entry.timestamp - startedAt),
+        endedAt === null ? Number.POSITIVE_INFINITY : Math.abs(entry.timestamp - endedAt),
+      ) > RUNTIME_HISTORY_MATCH_WINDOW_MS
+    ) continue;
+    owners.add(entry.ownerIndex);
+    if (owners.size > 1) return -1;
+  }
+  return owners.size === 1 ? [...owners][0] : -1;
+}
+
+function mergeExactRuntimeHistoryToolIntoOwner(message: any, runtimeTool: any): any {
+  const id = typeof runtimeTool?.id === 'string' ? runtimeTool.id.trim() : '';
+  if (!id || !Array.isArray(message?.toolCalls)) return message;
+  let changed = false;
+  const toolCalls = message.toolCalls.map((tool: any) => {
+    const durableId = typeof tool?.id === 'string' ? tool.id.trim() : '';
+    if (durableId !== id) return tool;
+    changed = true;
+    const runtimeName = typeof runtimeTool?.name === 'string' && runtimeTool.name.trim()
+      ? runtimeTool.name.trim()
+      : undefined;
+    const runtimeStatus = runtimeTool?.status === 'done' || runtimeTool?.status === 'error'
+      ? runtimeTool.status
+      : undefined;
+    return {
+      ...tool,
+      ...(!tool?.name && runtimeName ? { name: runtimeName } : {}),
+      arguments: tool?.arguments ?? runtimeTool?.arguments,
+      result: tool?.result ?? runtimeTool?.result,
+      startedAt: finiteRuntimeHistoryTimestamp(tool?.startedAt)
+        ?? finiteRuntimeHistoryTimestamp(runtimeTool?.startedAt)
+        ?? tool?.startedAt,
+      endedAt: finiteRuntimeHistoryTimestamp(tool?.endedAt)
+        ?? finiteRuntimeHistoryTimestamp(runtimeTool?.endedAt)
+        ?? tool?.endedAt,
+      // Canonical transcript hydration treats every toolResult row as done;
+      // the exact stable-id runtime terminal is the only source that can
+      // attest an error. Never let a runtime "done" erase a durable error.
+      ...(runtimeStatus === 'error'
+        ? { status: 'error' }
+        : (!tool?.status && runtimeStatus ? { status: runtimeStatus } : {})),
+      ...(!Number.isFinite(tool?.order) && Number.isFinite(runtimeTool?.order)
+        ? { order: runtimeTool.order }
+        : {}),
+    };
+  });
+  return changed ? { ...message, toolCalls } : message;
+}
+
+function isCompleteContentlessRuntimeHistoryMessage(message: any): boolean {
+  return message?.__portal?.kind === 'runtime-turn-event-history'
+    && message?.__portal?.terminal === true
+    && message?.__portal?.complete === true
+    && message?.__portal?.truncated !== true
+    && !normalizeRuntimeHistoryMatchText(message?.content)
+    && (
+      (Array.isArray(message?.segments) && message.segments.length > 0)
+      || (Array.isArray(message?.toolCalls) && message.toolCalls.length > 0)
+    );
+}
+
+function reconcileCompleteContentlessRuntimeHistory(
+  messages: any[],
+  runtimeMessages: any[],
+  turnIndex: RuntimeHistoryTurnIndex,
+  ownership: RuntimeHistoryOwnershipIndex,
+  retainedSourceIndexes: ReadonlySet<number>,
+  budget: RuntimeHistoryWorkBudget,
+): { messages: any[]; runtimeMessages: any[]; changed: boolean } | null {
+  if (!runtimeMessages.some(isCompleteContentlessRuntimeHistoryMessage)) {
+    return { messages, runtimeMessages, changed: false };
+  }
+  const allSourceIndexes = new Set(messages.map((_message, index) => index));
+  const staged = messages.map((message) => ({ ...message }));
+  const residualRuntimeMessages: any[] = [];
+  let changed = false;
+
+  for (const runtimeMessage of runtimeMessages) {
+    if (!consumeRuntimeHistoryWork(budget)) return null;
+    if (!isCompleteContentlessRuntimeHistoryMessage(runtimeMessage)) {
+      residualRuntimeMessages.push(runtimeMessage);
+      continue;
+    }
+    const terminalTimestamp = finiteRuntimeHistoryTimestamp(runtimeMessage?.timestamp);
+    const runtimeTurn = terminalTimestamp === null
+      ? null
+      : resolveRuntimeHistoryTurnAt(turnIndex, terminalTimestamp);
+    if (runtimeTurn === null) {
+      residualRuntimeMessages.push(runtimeMessage);
+      continue;
+    }
+
+    const remainingSegments: any[] = [];
+    for (const segment of Array.isArray(runtimeMessage?.segments) ? runtimeMessage.segments : []) {
+      const segmentTimestamp = finiteRuntimeHistoryTimestamp(segment?.ts);
+      if (
+        segmentTimestamp === null
+        || resolveRuntimeHistoryTurnAt(turnIndex, segmentTimestamp) !== runtimeTurn
+      ) {
+        remainingSegments.push(segment);
+        continue;
+      }
+      const ownerIndex = findUniqueRuntimeHistorySegmentOwner(
+        runtimeMessage,
+        segment,
+        turnIndex,
+        ownership,
+        allSourceIndexes,
+        -1,
+        budget,
+      );
+      if (ownerIndex < 0 || !retainedSourceIndexes.has(ownerIndex)) {
+        remainingSegments.push(segment);
+      } else {
+        changed = true;
+      }
+    }
+
+    const remainingTools: any[] = [];
+    for (const tool of Array.isArray(runtimeMessage?.toolCalls) ? runtimeMessage.toolCalls : []) {
+      const toolTimestamp = finiteRuntimeHistoryTimestamp(tool?.startedAt);
+      if (
+        toolTimestamp === null
+        || resolveRuntimeHistoryTurnAt(turnIndex, toolTimestamp) !== runtimeTurn
+      ) {
+        remainingTools.push(tool);
+        continue;
+      }
+      const ownerIndex = findUniqueExactRuntimeHistoryToolOwner(
+        runtimeMessage,
+        tool,
+        turnIndex,
+        ownership,
+        allSourceIndexes,
+        budget,
+      );
+      if (ownerIndex < 0 || !retainedSourceIndexes.has(ownerIndex)) {
+        remainingTools.push(tool);
+      } else {
+        staged[ownerIndex] = mergeExactRuntimeHistoryToolIntoOwner(staged[ownerIndex], tool);
+        changed = true;
+      }
+    }
+    if (budget.exhausted) return null;
+
+    const residual = {
+      ...runtimeMessage,
+      timestamp: residualRuntimeHistoryTimestamp(runtimeMessage, remainingSegments, remainingTools),
+      segments: remainingSegments.length > 0 ? remainingSegments : undefined,
+      toolCalls: remainingTools.length > 0 ? remainingTools : undefined,
+    };
+    const hasResidual = remainingSegments.length > 0
+      || remainingTools.length > 0
+      || (typeof residual.thinkingContent === 'string' && residual.thinkingContent.trim())
+      || normalizeRuntimeHistoryMatchText(residual.content);
+    if (hasResidual) residualRuntimeMessages.push(residual);
+  }
+
+  return {
+    messages: changed ? staged : messages,
+    runtimeMessages: changed ? residualRuntimeMessages : runtimeMessages,
+    changed,
+  };
+}
+
 function reconcileMergedRuntimeHistoryContent(
   existing: any,
   runtimeMessage: any,
@@ -4274,32 +4641,84 @@ function mergeRuntimeHistoryMessages(
   workLimits: RuntimeHistoryWorkLimits = {},
 ): any[] {
   if (runtimeMessages.length === 0) return messages;
-  const combined = messages
+  let pendingRuntimeMessages = runtimeMessages;
+  let combined = messages
     .map((message) => ({ ...message }))
     .sort((left, right) => toHistoryTimestampMs(left?.timestamp) - toHistoryTimestampMs(right?.timestamp));
+  const originalCombined = combined;
+  const failClosedOriginalRuntimeHistory = () => failClosedRuntimeHistory(
+    originalCombined,
+    runtimeMessages,
+    limit,
+  );
   const turnIndexBudget: RuntimeHistoryWorkBudget = {
     remaining: runtimeHistoryWorkLimit(workLimits.turnIndex),
   };
-  const turnIndex = buildRuntimeHistoryTurnIndex(
+  let turnIndex = buildRuntimeHistoryTurnIndex(
     combined,
     turnIndexBudget,
   );
-  if (!turnIndex) return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+  if (!turnIndex) return failClosedOriginalRuntimeHistory();
   const ownershipBudget: RuntimeHistoryWorkBudget = {
     remaining: runtimeHistoryWorkLimit(workLimits.ownership),
   };
-  const ownership = buildRuntimeHistoryOwnershipIndex(
+  let ownership = buildRuntimeHistoryOwnershipIndex(
     combined,
     turnIndex,
     ownershipBudget,
   );
-  if (!ownership) return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+  if (!ownership) return failClosedOriginalRuntimeHistory();
+
+  if (pendingRuntimeMessages.some(isCompleteContentlessRuntimeHistoryMessage)) {
+    const contentlessBudget: RuntimeHistoryWorkBudget = {
+      remaining: runtimeHistoryWorkLimit(workLimits.prune),
+    };
+    // Including every overlay in this preview is conservative: suppressing a
+    // fully represented overlay can only pull more canonical rows into the
+    // retained tail, never evict an owner we relied on.
+    const preview = getRuntimeHistoryPreviewRetainedSourceIndexes(
+      combined,
+      pendingRuntimeMessages,
+      limit,
+      contentlessBudget,
+    );
+    if (!preview) return failClosedOriginalRuntimeHistory();
+    const reconciled = reconcileCompleteContentlessRuntimeHistory(
+      combined,
+      pendingRuntimeMessages,
+      turnIndex,
+      ownership,
+      preview.sourceIndexes,
+      contentlessBudget,
+    );
+    if (!reconciled || contentlessBudget.exhausted) {
+      return failClosedOriginalRuntimeHistory();
+    }
+    if (reconciled.changed) {
+      combined = reconciled.messages;
+      pendingRuntimeMessages = reconciled.runtimeMessages;
+      const reconciledTurnIndexBudget: RuntimeHistoryWorkBudget = {
+        remaining: runtimeHistoryWorkLimit(workLimits.turnIndex),
+      };
+      turnIndex = buildRuntimeHistoryTurnIndex(combined, reconciledTurnIndexBudget);
+      if (!turnIndex) return failClosedOriginalRuntimeHistory();
+      const reconciledOwnershipBudget: RuntimeHistoryWorkBudget = {
+        remaining: runtimeHistoryWorkLimit(workLimits.ownership),
+      };
+      ownership = buildRuntimeHistoryOwnershipIndex(
+        combined,
+        turnIndex,
+        reconciledOwnershipBudget,
+      );
+      if (!ownership) return failClosedOriginalRuntimeHistory();
+    }
+  }
   const matchBudget: RuntimeHistoryWorkBudget = {
     remaining: runtimeHistoryWorkLimit(workLimits.match),
   };
   const allSourceIndexes = new Set(combined.map((_message, index) => index));
   const availableIndexes = new Set(allSourceIndexes);
-  const matches: RuntimeHistoryMatch[] = runtimeMessages.map((runtimeMessage) => {
+  const matches: RuntimeHistoryMatch[] = pendingRuntimeMessages.map((runtimeMessage) => {
     const match = findRuntimeHistoryTerminalMatch(
       combined,
       runtimeMessage,
@@ -4312,7 +4731,7 @@ function mergeRuntimeHistoryMessages(
     if (match.matchIndex >= 0) availableIndexes.delete(match.matchIndex);
     return { runtimeMessage, ...match };
   });
-  if (matchBudget.exhausted) return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+  if (matchBudget.exhausted) return failClosedOriginalRuntimeHistory();
 
   const unmatchedRuntimeIndexes = new Set<number>();
   matches.forEach((entry, index) => {
@@ -4330,7 +4749,7 @@ function mergeRuntimeHistoryMessages(
     limit,
     pruneBudget,
   );
-  if (!initialRetainedIndexes) return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+  if (!initialRetainedIndexes) return failClosedOriginalRuntimeHistory();
   let retainedIndexes: ReadonlySet<number> = initialRetainedIndexes.sourceIndexes;
   while (!plannedCombined) {
     let changed = false;
@@ -4389,7 +4808,7 @@ function mergeRuntimeHistoryMessages(
         )) remainingTools.push(tool);
       }
       if (pruneBudget.exhausted) {
-        return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+        return failClosedOriginalRuntimeHistory();
       }
       const runtimeText = normalizeRuntimeHistoryMatchText(entry.runtimeMessage?.content);
       const exactContent = normalizeRuntimeHistoryMatchText(existing?.content) === runtimeText;
@@ -4451,7 +4870,7 @@ function mergeRuntimeHistoryMessages(
       pruneBudget,
     );
     if (!actualRetainedIndexes || pruneBudget.exhausted) {
-      return failClosedRuntimeHistory(combined, runtimeMessages, limit);
+      return failClosedOriginalRuntimeHistory();
     }
     const unretainedResidualRuntimeIndexes = stagedResidualRuntimeIndexes.filter((_, index) => (
       !actualRetainedIndexes.overlayIndexes.has(stagedUnmatchedRuntimeMessages.length + index)
@@ -4489,6 +4908,22 @@ function mergeRuntimeHistoryMessages(
     .slice(-Math.max(limit, 1));
 }
 
+function runtimeTurnEventsShareGroup(previous: RuntimeTurnEvent, next: RuntimeTurnEvent): boolean {
+  if (previous.terminal) return false;
+  const previousRunId = typeof previous.runId === 'string' ? previous.runId.trim() : '';
+  const nextRunId = typeof next.runId === 'string' ? next.runId.trim() : '';
+  return Boolean(previousRunId && nextRunId && previousRunId === nextRunId);
+}
+
+function runtimeTurnEventsHaveExplicitLeadingBoundary(events: RuntimeTurnEvent[]): boolean {
+  const first = events[0];
+  if (!first) return true;
+  // run_resumed is also emitted for mid-run recovery, so its label alone is
+  // not a start proof. Sequence 0/1 is the bounded durable evidence that the
+  // event tail includes the beginning of this logical run.
+  return Number.isSafeInteger(first.seq) && first.seq >= 0 && first.seq <= 1;
+}
+
 function mergeRuntimeTurnEventHistory(sessionKey: string, messages: any[], limit = 200): any[] {
   const earliestMessageTs = messages.reduce((earliest, message) => {
     const ts = toHistoryTimestampMs(message?.timestamp);
@@ -4496,21 +4931,44 @@ function mergeRuntimeTurnEventHistory(sessionKey: string, messages: any[], limit
   }, Number.POSITIVE_INFINITY);
   let eventLimit = Math.min(Math.max(limit * 4, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
   let runtimeEvents: RuntimeTurnEvent[] = [];
+  let leadingRunComplete = false;
 
   while (true) {
-    runtimeEvents = readRuntimeTurnEvents(sessionKey, eventLimit);
+    // Read one predecessor beyond the candidate window. A timestamp crossing
+    // the oldest canonical row is not proof that the leading runtime run is
+    // complete: on a long/active turn that row can itself be hundreds of tool
+    // events into the run. Keep widening until the predecessor is a different
+    // run (or follows a terminal event), so materialization always starts at a
+    // real run boundary rather than an arbitrary `limit * 4` tail cutoff.
+    const requestedLimit = Math.min(eventLimit + 1, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+    const scannedEvents = readRuntimeTurnEvents(sessionKey, requestedLimit);
+    const exhaustedSource = scannedEvents.length < requestedLimit;
+    const candidateStart = Math.max(scannedEvents.length - eventLimit, 0);
+    const predecessor = candidateStart > 0 ? scannedEvents[candidateStart - 1] : null;
+    runtimeEvents = scannedEvents.slice(candidateStart);
     const oldestEventTs = runtimeEvents[0]?.ts;
     const reachedRelevantBoundary = !Number.isFinite(earliestMessageTs)
       || !oldestEventTs
       || oldestEventTs <= earliestMessageTs;
-    const exhaustedSource = runtimeEvents.length < eventLimit;
-    if (reachedRelevantBoundary || exhaustedSource || eventLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES) break;
+    // A short read is not proof of EOF: the bounded JSONL reader may have hit
+    // its byte ceiling. With no predecessor, require an explicit run-start
+    // marker/sequence before declaring this leading group complete.
+    const startsAtRunBoundary = !runtimeEvents[0]
+      || (predecessor
+        ? !runtimeTurnEventsShareGroup(predecessor, runtimeEvents[0])
+        : runtimeTurnEventsHaveExplicitLeadingBoundary(runtimeEvents));
+    leadingRunComplete = startsAtRunBoundary;
+    if (
+      exhaustedSource
+      || (reachedRelevantBoundary && startsAtRunBoundary)
+      || eventLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
+    ) break;
     eventLimit = Math.min(eventLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
   }
 
   return mergeRuntimeHistoryMessages(
     messages,
-    buildRuntimeHistoryMessages(runtimeEvents),
+    buildRuntimeHistoryMessages(runtimeEvents, { leadingRunComplete }),
     limit,
   );
 }
@@ -4732,14 +5190,25 @@ function collapseFragmentedToolOnlyAssistantHistory(messages: any[]): any[] {
 }
 
 function finalizeEnhancedHistoryMessages(sessionKey: string, messages: any[], limit = 200): any[] {
+  // Collapse canonical toolCall/toolResult plumbing before runtime
+  // reconciliation. Otherwise hundreds of one-tool assistant rows consume the
+  // retained-message preview, push the early residual activity overlay outside
+  // `limit`, and force fail-closed reconciliation to repeat the terminal answer.
+  const collapsedCanonical = collapseFragmentedToolOnlyAssistantHistory(
+    mergeMaintenanceHistoryMarkers(sessionKey, messages, Math.max(limit * 2, 200)),
+  );
   return collapseFragmentedToolOnlyAssistantHistory(mergeRuntimeTurnEventHistory(
     sessionKey,
-    mergeMaintenanceHistoryMarkers(sessionKey, messages, Math.max(limit * 2, 200)),
+    collapsedCanonical,
     limit,
   ));
 }
 
-function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+function readSessionMessagesEnhancedForSessionKeyWithMetadata(
+  sessionKey: string,
+  limit = 200,
+  sessionsDir = SESSIONS_DIR,
+): RecentSessionMessagesRead<any> {
   // Transcript rows are sparse among tool plumbing and control artifacts, so
   // start with a modest enrichment window and let the lower-level tail reader
   // grow only when filtering proves that more raw lines are actually needed.
@@ -4749,7 +5218,12 @@ function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 20
   let readLimit = Math.min(Math.max(limit * 3, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
 
   while (true) {
-    const localMessages = readBestOpenClawSessionMessagesForSessionKey(sessionKey, readLimit, sessionsDir);
+    const localRead = readBestOpenClawSessionMessagesForSessionKeyWithMetadata(
+      sessionKey,
+      readLimit,
+      sessionsDir,
+    );
+    const localMessages = localRead.messages;
     const importedMessages = geminiCliSessionIds
       .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, readLimit))
       .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
@@ -4775,16 +5249,21 @@ function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 20
       combined.slice(-Math.max(readLimit, 1)),
       limit,
     );
-    const sourceFilledWindow = localMessages.length >= readLimit || importedMessages.length >= readLimit;
+    const importedSourceComplete = importedMessages.length < readLimit;
+    const sourceComplete = localRead.sourceComplete && importedSourceComplete;
     if (
       finalized.length >= limit
-      || !sourceFilledWindow
+      || sourceComplete
       || readLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
     ) {
-      return finalized;
+      return { messages: finalized, sourceComplete };
     }
     readLimit = Math.min(readLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
   }
+}
+
+function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+  return readSessionMessagesEnhancedForSessionKeyWithMetadata(sessionKey, limit, sessionsDir).messages;
 }
 
 async function recoverRecentOpenClawAssistantReply(
@@ -5032,14 +5511,19 @@ function readLastJsonlLines(filePath: string, maxLines: number): { lines: string
   return { lines: lines.slice(-maxLines), hitStart };
 }
 
-function readRecentSessionMessages<T>(params: {
+type RecentSessionMessagesRead<T> = {
+  messages: T[];
+  sourceComplete: boolean;
+};
+
+function readRecentSessionMessagesWithMetadata<T>(params: {
   sessionId: string;
   limit: number;
   sessionsDir?: string;
   parseLine: (line: string) => T | null;
   minRawLineWindow?: number;
   growthFactor?: number;
-}): T[] {
+}): RecentSessionMessagesRead<T> {
   const {
     sessionId,
     limit,
@@ -5050,7 +5534,7 @@ function readRecentSessionMessages<T>(params: {
   } = params;
 
   const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
-  if (!existsSync(filePath) || limit <= 0) return [];
+  if (!existsSync(filePath) || limit <= 0) return { messages: [], sourceComplete: true };
 
   const rawWindowFloor = Math.max(limit, minRawLineWindow);
   let rawLineWindow = Math.max(rawWindowFloor, limit * growthFactor);
@@ -5067,11 +5551,31 @@ function readRecentSessionMessages<T>(params: {
     }
 
     if (parsed.length >= limit || hitStart) {
-      return parsed.slice(-limit);
+      return {
+        messages: parsed.slice(-limit),
+        // `parsed` is intentionally richer than the final hydrated projection:
+        // toolCall/toolResult pairs can collapse two source rows into one. Keep
+        // the raw tail reader's real boundary signal instead of guessing source
+        // exhaustion later from the smaller post-hydration array. Hitting byte
+        // zero is complete only when the parsed limit did not still slice older
+        // accepted rows away.
+        sourceComplete: hitStart && parsed.length <= limit,
+      };
     }
 
     rawLineWindow *= 2;
   }
+}
+
+function readRecentSessionMessages<T>(params: {
+  sessionId: string;
+  limit: number;
+  sessionsDir?: string;
+  parseLine: (line: string) => T | null;
+  minRawLineWindow?: number;
+  growthFactor?: number;
+}): T[] {
+  return readRecentSessionMessagesWithMetadata(params).messages;
 }
 
 /** Legacy text-only history reader (kept for backward compat) */
@@ -5123,6 +5627,7 @@ export const __gatewayHistoryTest = {
   parseHistoryLimit,
   readNativeHistoryPage,
   readAgentZeroHistoryPage,
+  readOpenClawHistoryPage,
   readBoundedJsonlTailText,
   mergeHistorySegments,
   mergeHistoryToolCalls,
@@ -5131,6 +5636,7 @@ export const __gatewayHistoryTest = {
   getOpenClawRuntimeActiveStreamSnapshot,
   getOpenClawActiveStreamSnapshot,
   buildRuntimeHistoryMessages,
+  mergeRuntimeTurnEventHistory,
   mergeRuntimeHistoryMessages,
   mergeRuntimeText,
   reconcileRuntimeCumulativeFinalTail,
@@ -5142,8 +5648,12 @@ export const __gatewayHistoryTest = {
 /**
  * Enhanced history reader — includes tool calls and tool results from JSONL.
  */
-function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
-  const messages = readRecentSessionMessages({
+function readSessionMessagesEnhancedWithMetadata(
+  sessionId: string,
+  limit = 200,
+  sessionsDir = SESSIONS_DIR,
+): RecentSessionMessagesRead<any> {
+  const read = readRecentSessionMessagesWithMetadata({
     sessionId,
     limit,
     sessionsDir,
@@ -5330,7 +5840,14 @@ function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir
     },
   });
 
-  return stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(messages));
+  return {
+    messages: stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(read.messages)),
+    sourceComplete: read.sourceComplete,
+  };
+}
+
+function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+  return readSessionMessagesEnhancedWithMetadata(sessionId, limit, sessionsDir).messages;
 }
 
 function toHistoryTimestampMs(value: unknown): number {
@@ -5893,11 +6410,16 @@ function filterTrajectoryMessagesNearCanonicalMessages(trajectoryMessages: any[]
   });
 }
 
-function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+function readBestOpenClawSessionMessagesForSessionKeyWithMetadata(
+  sessionKey: string,
+  limit = 200,
+  sessionsDir = SESSIONS_DIR,
+): RecentSessionMessagesRead<any> {
   const candidates = findSessionFileIdsForSessionKey(sessionKey, sessionsDir);
   const seen = new Set<string>();
   const combined: any[] = [];
   const canonicalMessages: any[] = [];
+  let sourceComplete = true;
 
   const normalizedDuplicateSignature = (message: any) => {
     const toolNames = Array.isArray(message?.toolCalls) ? message.toolCalls.map((tool: any) => tool?.name || '').join(',') : '';
@@ -5927,8 +6449,9 @@ function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit 
   };
 
   for (const sessionId of candidates) {
-    const messages = readSessionMessagesEnhanced(sessionId, limit, sessionsDir);
-    for (const message of messages) {
+    const read = readSessionMessagesEnhancedWithMetadata(sessionId, limit, sessionsDir);
+    sourceComplete = sourceComplete && read.sourceComplete;
+    for (const message of read.messages) {
       canonicalMessages.push(message);
       pushMessage(message);
     }
@@ -5944,7 +6467,19 @@ function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit 
   }
 
   combined.sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
-  return stripMessageDeliveryArtifactsFromHistory(combined).slice(-Math.max(limit, 1));
+  const stripped = stripMessageDeliveryArtifactsFromHistory(combined);
+  return {
+    messages: stripped.slice(-Math.max(limit, 1)),
+    // Every candidate file can be individually exhausted while their merged
+    // usage-family history still exceeds this read window. Preserve that
+    // cross-file truncation signal so a restart boundary cannot terminate
+    // cursor pagination early.
+    sourceComplete: sourceComplete && stripped.length <= Math.max(limit, 1),
+  };
+}
+
+function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+  return readBestOpenClawSessionMessagesForSessionKeyWithMetadata(sessionKey, limit, sessionsDir).messages;
 }
 
 async function readOpenClawHistoryPage(params: {
@@ -5964,10 +6499,20 @@ async function readOpenClawHistoryPage(params: {
     : params.limit + 1;
 
   while (true) {
-    const messages = params.enhanced
-      ? readSessionMessagesEnhancedForSessionKey(params.sessionKey, scanLimit, params.sessionsDir)
-      : await readSessionMessages(params.sessionId, scanLimit, params.sessionsDir);
-    const sourceComplete = messages.length < scanLimit;
+    let messages: any[];
+    let sourceComplete: boolean;
+    if (params.enhanced) {
+      const read = readSessionMessagesEnhancedForSessionKeyWithMetadata(
+        params.sessionKey,
+        scanLimit,
+        params.sessionsDir,
+      );
+      messages = read.messages;
+      sourceComplete = read.sourceComplete;
+    } else {
+      messages = await readSessionMessages(params.sessionId, scanLimit, params.sessionsDir);
+      sourceComplete = messages.length < scanLimit;
+    }
 
     if (!anchor) {
       return buildHistoryPage(messages, params.limit, params.scope, undefined, sourceComplete);

@@ -87,11 +87,28 @@ describe('Agent Chat run lifecycle helpers', () => {
     const events = [
       { type: 'assistant_reasoning', text: 'newer', runId: 'run-2', seq: 4 },
       { type: 'assistant_reasoning', text: 'stale', runId: 'run-1', seq: 1 },
+      { type: 'assistant_reasoning', subject: 'Encrypted reasoning subject', runId: 'run-2', seq: 1 },
       { type: 'assistant_reasoning', text: 'older', runId: 'run-2', seq: 2 },
+      {
+        type: 'assistant_status',
+        text: 'codex cumulative summary',
+        runId: 'run-2',
+        seq: 3,
+        visible: true,
+        source: { eventType: 'status' },
+      },
+      {
+        type: 'assistant_status',
+        text: 'compaction complete',
+        runId: 'run-2',
+        seq: 3.5,
+        visible: true,
+        source: { eventType: 'compaction_end' },
+      },
       { type: 'assistant_message', text: 'answer', runId: 'run-2', seq: 3 },
     ];
-    expect(selectSnapshotReasoningEvents(events, 'run-2').map((event) => event.text))
-      .toEqual(['older', 'newer']);
+    expect(selectSnapshotReasoningEvents(events, 'run-2').map((event) => event.text || event.subject))
+      .toEqual(['Encrypted reasoning subject', 'older', 'codex cumulative summary', 'newer']);
     expect(selectSnapshotReasoningEvents(events, null)).toEqual([]);
   });
 

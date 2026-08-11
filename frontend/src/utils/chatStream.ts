@@ -93,6 +93,146 @@ export function mergeThinkingStream(
   return current + chunk;
 }
 
+export type ThinkingSnapshotLane = 'raw' | 'preamble' | 'status';
+
+export interface GraduatedThinkingSnapshotTracker {
+  latest: Partial<Record<ThinkingSnapshotLane, string>>;
+  graduated: Partial<Record<ThinkingSnapshotLane, string>>;
+}
+
+export function createGraduatedThinkingSnapshotTracker(): GraduatedThinkingSnapshotTracker {
+  return { latest: {}, graduated: {} };
+}
+
+export function resetGraduatedThinkingSnapshotTracker(
+  tracker: GraduatedThinkingSnapshotTracker,
+): void {
+  tracker.latest = {};
+  tracker.graduated = {};
+}
+
+const MAX_THINKING_SNAPSHOT_OVERLAP_CHARS = 64 * 1024;
+const MIN_THINKING_SNAPSHOT_OVERLAP_CHARS = 128;
+const MIN_THINKING_SNAPSHOT_OVERLAP_RATIO = 0.6;
+
+function longestSuffixPrefixOverlap(left: string, right: string): number {
+  const candidateLength = Math.min(
+    left.length,
+    right.length,
+    MAX_THINKING_SNAPSHOT_OVERLAP_CHARS,
+  );
+  if (!candidateLength) return 0;
+
+  const pattern = right.slice(0, candidateLength);
+  const searchableTail = left.slice(-candidateLength);
+  const fallback = new Array<number>(pattern.length).fill(0);
+  for (let index = 1, matched = 0; index < pattern.length; index += 1) {
+    while (matched > 0 && pattern[index] !== pattern[matched]) matched = fallback[matched - 1];
+    if (pattern[index] === pattern[matched]) matched += 1;
+    fallback[index] = matched;
+  }
+
+  let matched = 0;
+  for (let index = 0; index < searchableTail.length; index += 1) {
+    const character = searchableTail[index];
+    while (matched > 0 && character !== pattern[matched]) matched = fallback[matched - 1];
+    if (character === pattern[matched]) matched += 1;
+    if (matched === pattern.length && index < searchableTail.length - 1) {
+      matched = fallback[matched - 1];
+    }
+  }
+  return matched;
+}
+
+function highConfidenceSlidingSnapshotOverlap(baseline: string, incoming: string): number {
+  const overlap = longestSuffixPrefixOverlap(baseline, incoming);
+  const comparableLength = Math.min(
+    baseline.length,
+    incoming.length,
+    MAX_THINKING_SNAPSHOT_OVERLAP_CHARS,
+  );
+  if (
+    overlap < MIN_THINKING_SNAPSHOT_OVERLAP_CHARS
+    || comparableLength === 0
+    || overlap / comparableLength < MIN_THINKING_SNAPSHOT_OVERLAP_RATIO
+  ) return 0;
+  return overlap;
+}
+
+/**
+ * Provider `replace` reasoning frames are often cumulative for the entire run,
+ * not merely for the bubble currently on screen. Once a tool/text boundary has
+ * graduated the visible prefix, a later cumulative frame must project only the
+ * new suffix or every old thought is repeated in the next bubble.
+ */
+export function projectThinkingChunkAfterGraduation(
+  tracker: GraduatedThinkingSnapshotTracker,
+  lane: ThinkingSnapshotLane,
+  incoming: string,
+  replace = false,
+): string {
+  if (!incoming) return '';
+
+  if (!replace) {
+    tracker.latest[lane] = `${tracker.latest[lane] || ''}${incoming}`;
+    return incoming;
+  }
+
+  const previousLatest = tracker.latest[lane] || '';
+  const graduated = tracker.graduated[lane] || '';
+  if (!graduated) {
+    tracker.latest[lane] = incoming;
+    return incoming;
+  }
+  if (incoming === graduated) {
+    // A delayed baseline snapshot must not roll back append-style reasoning
+    // that already arrived after that baseline.
+    if (!(previousLatest.startsWith(incoming) && previousLatest.length > incoming.length)) {
+      tracker.latest[lane] = incoming;
+    }
+    return '';
+  }
+  if (incoming.startsWith(graduated)) {
+    tracker.latest[lane] = incoming;
+    return incoming.slice(graduated.length).trimStart();
+  }
+
+  // OpenClaw bounds long preamble histories by evicting their oldest items.
+  // The next replace frame is then a sliding cumulative window rather than a
+  // strict prefix extension. A large suffix/prefix overlap is the only safe
+  // evidence that the overlapping text was already graduated.
+  const slidingOverlap = highConfidenceSlidingSnapshotOverlap(graduated, incoming);
+  if (slidingOverlap > 0) {
+    tracker.latest[lane] = incoming;
+    return incoming.slice(slidingOverlap).trimStart();
+  }
+
+  // The provider reset/corrected its snapshot instead of extending it. The new
+  // value is authoritative, and the old run prefix must not suppress it.
+  tracker.latest[lane] = incoming;
+  tracker.graduated[lane] = '';
+  return incoming;
+}
+
+export function markThinkingSnapshotGraduated(
+  tracker: GraduatedThinkingSnapshotTracker,
+  lane: ThinkingSnapshotLane | null,
+): void {
+  if (!lane) return;
+  const latest = tracker.latest[lane];
+  if (typeof latest === 'string') tracker.graduated[lane] = latest;
+}
+
+export function seedGraduatedThinkingSnapshot(
+  tracker: GraduatedThinkingSnapshotTracker,
+  lane: ThinkingSnapshotLane,
+  snapshot: string,
+): void {
+  if (!snapshot) return;
+  tracker.latest[lane] = snapshot;
+  tracker.graduated[lane] = snapshot;
+}
+
 /**
  * Remove text already represented by graduated pre/tool/post segments from a
  * cumulative provider final. Returns only the genuinely new terminal tail.

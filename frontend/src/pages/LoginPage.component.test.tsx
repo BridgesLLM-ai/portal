@@ -113,6 +113,17 @@ describe('public login shell', () => {
       .toHaveAttribute('src', '/logo-display.png');
   });
 
+  it('keeps sign-in enabled after an unauthenticated session restore settles', () => {
+    testState.auth.isLoading = false;
+
+    render(<MemoryRouter><LoginPage /></MemoryRouter>);
+
+    const submit = screen.getByRole('button', { name: 'Sign In' });
+    expect(submit).toBeEnabled();
+    expect(submit).toHaveAttribute('aria-busy', 'false');
+    expect(screen.queryByRole('button', { name: 'Signing in…' })).not.toBeInTheDocument();
+  });
+
   it('labels approval-mode registration as an access request', async () => {
     testState.settings.registrationMode = 'approval';
     render(<MemoryRouter><LoginPage /></MemoryRouter>);

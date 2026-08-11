@@ -67,6 +67,7 @@ describe('runtimeTurnEvents tool identity', () => {
       });
 
       expect(normalized.type).toBe(eventType);
+      expect(normalized.seq).toBe(1);
     },
   );
 });

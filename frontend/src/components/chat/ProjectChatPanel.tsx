@@ -27,11 +27,15 @@ import type {
 } from '../../api/endpoints';
 import { useIsMobile } from '../../hooks/useIsMobile';
 import {
+  createGraduatedThinkingSnapshotTracker,
   extractThinkingChunk,
   isControlOnlyAssistantContent,
+  markThinkingSnapshotGraduated,
   mergeAssistantStream,
   mergeThinkingStream,
+  projectThinkingChunkAfterGraduation,
   reconcileCumulativeFinalTail,
+  resetGraduatedThinkingSnapshotTracker,
   sanitizeAssistantContent,
   sanitizeAssistantChunk,
   stripOpenClawReplyTags,
@@ -1013,6 +1017,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     model: typeof m.model === 'string' ? m.model : undefined,
     thinkingContent: rawThinkingContent || undefined,
     thinkingSubject: rawThinkingSubject || undefined,
+    presentationTruncated: m.presentationTruncated === true,
   };
   if (m.toolCalls) {
     msg.toolCalls = m.toolCalls.map((tc: any) => ({
@@ -1858,6 +1863,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   }>({ hasMore: false, nextCursor: null });
   const [streamingPhase, setStreamingPhase] = useState<StreamingPhase>('idle');
   const [activeToolName, setActiveToolName] = useState<string | null>(null);
+  const activeToolNameRef = useRef<string | null>(null);
   const [statusText, setStatusText] = useState<string | null>(null);
   const [pendingSend, setPendingSend] = useState<PendingProjectChatSend | null>(null);
   const [queuedComposerMessage, setQueuedComposerMessage] = useState<string | null>(null);
@@ -1869,6 +1875,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   const [pendingSendStorageError, setPendingSendStorageError] = useState<string | null>(null);
   const [thinkingContent, setThinkingContent] = useState<string>('');
   const thinkingContentRef = useRef('');
+  const reasoningLaneRef = useRef<'raw' | 'preamble' | 'status' | null>(null);
+  const thinkingSnapshotTrackerRef = useRef(createGraduatedThinkingSnapshotTracker());
+  const thinkingSnapshotRunRef = useRef<string | null>(null);
+  const liveActivityOrderRef = useRef(0);
+  const thinkingActivityOrderRef = useRef<number | null>(null);
+  const textActivityOrderRef = useRef<number | null>(null);
   const [thinkingSubject, setThinkingSubject] = useState<string>('');
   const thinkingSubjectRef = useRef('');
   const [pendingApprovals, setPendingApprovals] = useState<ExecApprovalRequest[]>([]);
@@ -2528,6 +2540,10 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     : null;
 
   useEffect(() => {
+    activeToolNameRef.current = activeToolName;
+  }, [activeToolName]);
+
+  useEffect(() => {
     const activeAssistantId = streamingAssistantIdRef.current;
     if (!activeAssistantId || streamingPhase !== 'tool') return;
     const activeMessage = messages.find((message) => message.id === activeAssistantId);
@@ -3143,6 +3159,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           startedAt: typeof toolCall.startedAt === 'number' ? toolCall.startedAt : Date.now(),
           endedAt: typeof toolCall.endedAt === 'number' ? toolCall.endedAt : undefined,
           status: toolCall.status === 'running' || toolCall.status === 'error' ? toolCall.status : 'done',
+          order: Number.isSafeInteger(toolCall.order) ? toolCall.order : undefined,
         }))
       : [];
     const runningToolCall = getLastRunningToolCall(snapshotToolCalls);
@@ -3173,6 +3190,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     suppressLiveBubbleContentRef.current = true;
     setIsRunning(true);
     setStreamingPhase(resumePhase);
+    activeToolNameRef.current = snapshotToolName || null;
     setActiveToolName(snapshotToolName || null);
     const liveStatusText = isMaintenanceStatusOnly ? '' : (rawStatusText || '');
     const compactionStatusText = hasLiveSnapshotSignal && snapshot.compactionPhase === 'compacting'
@@ -3381,18 +3399,13 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     loadOlderHistoryRef.current = () => { void loadOlderHistory(); };
   }, [loadOlderHistory]);
 
-  const clearResumeSeededContent = useCallback((assistantId?: string | null) => {
+  const acceptResumeSeededContent = useCallback(() => {
     if (!resumeSeededContentRef.current) return;
-    flushPendingLiveRenders();
+    // A reconnect snapshot is an authoritative prefix of the active turn.
+    // A later non-text event establishes its boundary; it must not erase the
+    // prefix before the normal text-graduation path can place it chronologically.
     resumeSeededContentRef.current = false;
-    assembledRef.current = '';
-    lastSegmentStartRef.current = 0;
-    lastRawTextLenRef.current = 0;
-    const cid = assistantId || streamingAssistantIdRef.current;
-    if (cid) {
-      setMessages(prev => prev.map(m => m.id === cid ? { ...m, content: '' } : m));
-    }
-  }, [flushPendingLiveRenders]);
+  }, []);
 
   const finalizeStreamingAssistant = useCallback(() => {
     flushPendingLiveRenders();
@@ -3407,6 +3420,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     }
     setStatusText(null);
     setStreamingPhase('idle');
+    activeToolNameRef.current = null;
     setActiveToolName(null);
     setIsRunning(false);
     if (compactionPhaseRef.current === 'compacting') {
@@ -3419,6 +3433,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     }
     isStreamActiveRef.current = false;
     thinkingContentRef.current = '';
+    reasoningLaneRef.current = null;
+    resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+    thinkingSnapshotRunRef.current = null;
+    thinkingActivityOrderRef.current = null;
+    textActivityOrderRef.current = null;
+    liveActivityOrderRef.current = 0;
     setThinkingContent('');
     thinkingSubjectRef.current = '';
     setThinkingSubject('');
@@ -3427,9 +3447,76 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     streamingAssistantIdRef.current = null;
   }, [flushPendingLiveRenders]);
 
-  const appendThinkingChunk = useCallback((assistantId: string | null, chunk: string, opts?: { replace?: boolean }) => {
+  const graduateLiveThinkingPhaseRef = useRef<(assistantId?: string | null) => boolean>(() => false);
+  const graduateLiveTextPhaseRef = useRef<(assistantId?: string | null) => boolean>(() => false);
+
+  const graduateLiveTextPhase = useCallback((assistantId?: string | null) => {
+    flushPendingLiveRenders();
+    const start = Math.min(lastSegmentStartRef.current, assembledRef.current.length);
+    const text = assembledRef.current.substring(start);
+    if (!text.trim()) {
+      lastSegmentStartRef.current = lastRawTextLenRef.current;
+      textActivityOrderRef.current = null;
+      return false;
+    }
+    const targetId = assistantId || streamingAssistantIdRef.current;
+    if (targetId) {
+      const order = textActivityOrderRef.current;
+      const ts = Date.now();
+      setMessages((previous) => previous.map((message) => (
+        message.id === targetId
+          ? {
+              ...message,
+              content: '',
+              segments: [
+                ...(message.segments || []),
+                {
+                  text,
+                  kind: 'text',
+                  position: 'after',
+                  ts,
+                  ...(order !== null ? { order } : {}),
+                  source: 'text',
+                },
+              ],
+            }
+          : message
+      )));
+    }
+    lastSegmentStartRef.current = lastRawTextLenRef.current;
+    textActivityOrderRef.current = null;
+    return true;
+  }, [flushPendingLiveRenders]);
+  graduateLiveTextPhaseRef.current = graduateLiveTextPhase;
+
+  const appendThinkingChunk = useCallback((
+    assistantId: string | null,
+    chunk: string,
+    opts?: { replace?: boolean; lane?: 'raw' | 'preamble' | 'status'; order?: number },
+  ) => {
+    if (!chunk && !thinkingSubjectRef.current) return;
+    graduateLiveTextPhaseRef.current(assistantId);
+    const nextLane = opts?.lane || 'raw';
+    if (
+      reasoningLaneRef.current
+      && reasoningLaneRef.current !== nextLane
+      && (thinkingContentRef.current.trim() || thinkingSubjectRef.current)
+    ) {
+      graduateLiveThinkingPhaseRef.current(assistantId);
+    }
+    reasoningLaneRef.current = nextLane;
+    if (thinkingActivityOrderRef.current === null && Number.isSafeInteger(opts?.order)) {
+      thinkingActivityOrderRef.current = Number(opts?.order);
+    }
     if (!chunk) return;
-    const nextThinking = mergeThinkingStream(thinkingContentRef.current, chunk, opts);
+    const projectedChunk = projectThinkingChunkAfterGraduation(
+      thinkingSnapshotTrackerRef.current,
+      nextLane,
+      chunk,
+      opts?.replace === true,
+    );
+    if (!projectedChunk) return;
+    const nextThinking = mergeThinkingStream(thinkingContentRef.current, projectedChunk, opts);
     thinkingContentRef.current = nextThinking;
     scheduleThinkingRender(assistantId, nextThinking);
   }, [scheduleThinkingRender]);
@@ -3439,6 +3526,16 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     const text = thinkingContentRef.current;
     const subject = thinkingSubjectRef.current;
     if (!text.trim() && !subject) return false;
+    markThinkingSnapshotGraduated(
+      thinkingSnapshotTrackerRef.current,
+      reasoningLaneRef.current,
+    );
+    const phaseOrder = thinkingActivityOrderRef.current;
+    const phaseSource = reasoningLaneRef.current === 'preamble'
+      ? 'preamble'
+      : reasoningLaneRef.current === 'status'
+        ? 'status'
+        : 'reasoning';
     const targetId = assistantId || streamingAssistantIdRef.current;
     if (targetId) {
       const ts = Date.now();
@@ -3454,6 +3551,10 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                   kind: 'thinking',
                   position: 'after',
                   ts,
+                  ...(phaseOrder !== null
+                    ? { order: phaseOrder }
+                    : {}),
+                  source: phaseSource,
                 },
               ],
             }
@@ -3461,15 +3562,29 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       )));
     }
     thinkingContentRef.current = '';
+    reasoningLaneRef.current = null;
+    thinkingActivityOrderRef.current = null;
     setThinkingContent('');
     thinkingSubjectRef.current = '';
     setThinkingSubject('');
     return true;
   }, [flushPendingLiveRenders]);
+  graduateLiveThinkingPhaseRef.current = graduateLiveThinkingPhase;
+
+  const resolveLiveActivityOrder = useCallback((rawOrder: unknown): number => {
+    const order = Number(rawOrder);
+    if (Number.isSafeInteger(order) && order >= 0) {
+      liveActivityOrderRef.current = Math.max(liveActivityOrderRef.current, order);
+      return order;
+    }
+    liveActivityOrderRef.current += 1;
+    return liveActivityOrderRef.current;
+  }, []);
 
   const applyLiveThinkingSubject = useCallback((
     assistantId: string | null,
     rawSubject: unknown,
+    opts?: { lane?: 'raw' | 'preamble' | 'status'; order?: number },
   ) => {
     const subject = sanitizeThinkingSubject(rawSubject);
     if (!subject) return '';
@@ -3478,6 +3593,10 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       && (thinkingContentRef.current.trim() || thinkingSubjectRef.current)
     ) {
       graduateLiveThinkingPhase(assistantId);
+    }
+    reasoningLaneRef.current = opts?.lane || reasoningLaneRef.current || 'raw';
+    if (thinkingActivityOrderRef.current === null && Number.isSafeInteger(opts?.order)) {
+      thinkingActivityOrderRef.current = Number(opts?.order);
     }
     thinkingSubjectRef.current = subject;
     setThinkingSubject(subject);
@@ -3536,6 +3655,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   // ── Durable replay event handler ──
   const handleReplayEvent = useCallback((rawData: any) => {
     const data = normalizePortalStreamEventFromTurnEvent(rawData);
+    const eventRunId = typeof data?.runId === 'string' && data.runId.trim()
+      ? data.runId.trim()
+      : (typeof data?.turnEvent?.runId === 'string' ? data.turnEvent.runId.trim() : '');
+    if (eventRunId && eventRunId !== thinkingSnapshotRunRef.current) {
+      resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+      reasoningLaneRef.current = null;
+      thinkingActivityOrderRef.current = null;
+      textActivityOrderRef.current = null;
+      liveActivityOrderRef.current = 0;
+      thinkingSnapshotRunRef.current = eventRunId;
+    }
     setTransportConnected(true);
     setConnectionNotice(null);
     const passthrough = ['connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_status', 'stream_ended', 'run_resumed', 'exec_approval', 'exec_approval_resolved'];
@@ -3583,20 +3713,53 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         }
 
         if (!assistantId && !isStreamActiveRef.current) break;
-        clearResumeSeededContent(assistantId);
+        acceptResumeSeededContent();
+        const runningToolName = activeToolNameRef.current;
+        if (
+          data.transient !== true
+          && data.assistantStatus === true
+          && !maintenanceRail.isMaintenanceStatus
+          && !runningToolName
+        ) {
+          const isPreambleThinking = data.preambleProgress === true
+            || data?.turnEvent?.source?.preambleProgress === true;
+          const statusThinking = extractThinkingChunk(
+            isPreambleThinking ? 'thinking' : 'status',
+            data.content,
+            assembledRef.current.length > 0,
+          );
+          appendThinkingChunk(assistantId, statusThinking, {
+            replace: data.replace === true,
+            lane: isPreambleThinking ? 'preamble' : 'status',
+            order: resolveLiveActivityOrder(data.seq),
+          });
+        }
         setStatusText(maintenanceRail.displayStatusText);
-        if (activeToolName) setStreamingPhase('tool');
+        if (runningToolName) setStreamingPhase('tool');
         else if (!assembledRef.current) setStreamingPhase('thinking');
         break;
       }
       case 'thinking': {
         if (!assistantId && !isStreamActiveRef.current) break;
-        clearResumeSeededContent(assistantId);
-        applyLiveThinkingSubject(assistantId, data.subject);
+        acceptResumeSeededContent();
+        const thinkingLane = data.preambleProgress === true
+          || data?.turnEvent?.source?.preambleProgress === true
+          ? 'preamble'
+          : 'raw';
+        const thinkingOrder = resolveLiveActivityOrder(data.seq);
+        graduateLiveTextPhase(assistantId);
+        applyLiveThinkingSubject(assistantId, data.subject, {
+          lane: thinkingLane,
+          order: thinkingOrder,
+        });
         appendThinkingChunk(
           assistantId,
           extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0),
-          { replace: data.replace === true },
+          {
+            replace: data.replace === true,
+            lane: thinkingLane,
+            order: thinkingOrder,
+          },
         );
         if (!assembledRef.current) setStreamingPhase('thinking');
         break;
@@ -3633,25 +3796,28 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         break;
       }
       case 'tool_start': {
-        clearResumeSeededContent(assistantId);
+        acceptResumeSeededContent();
         hasRealToolEventsRef.current = true;
         graduateLiveThinkingPhase(assistantId);
+        graduateLiveTextPhase(assistantId);
         const toolName = resolveToolName(data.toolName, data.name, data.content, 'tool');
-        if (assembledRef.current && assembledRef.current.trim().length > 0) {
-          lastSegmentStartRef.current = lastRawTextLenRef.current;
-        }
         setStatusText(getToolStatusText(toolName));
         setStreamingPhase('tool');
+        activeToolNameRef.current = toolName;
         setActiveToolName(toolName);
         const toolId = typeof data.toolCallId === 'string' && data.toolCallId.trim()
           ? data.toolCallId.trim()
           : `tool-${String(data.runId || activeReplayTurnIdRef.current || 'run')}-${String(data.seq || ++toolCounterRef.current)}`;
         const toolArgs = data.toolArgs || undefined;
-        setMessages(prev => appendToolCallToMessage(prev, assistantId, buildRunningToolCall({
+        const toolCall = buildRunningToolCall({
           id: toolId,
           name: toolName,
           arguments: toolArgs,
-        })).messages as ChatMessage[]);
+        });
+        setMessages(prev => appendToolCallToMessage(prev, assistantId, {
+          ...toolCall,
+          order: resolveLiveActivityOrder(data.seq),
+        }).messages as ChatMessage[]);
         break;
       }
       case 'tool_update': {
@@ -3659,6 +3825,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         const toolResult = data.toolResult || data.content || '';
         hasRealToolEventsRef.current = true;
         setStreamingPhase('tool');
+        activeToolNameRef.current = toolName;
         setActiveToolName(toolName);
         setStatusText(getToolStatusText(toolName));
         setMessages(prev => updateRunningToolCallInMessage(prev, assistantId, {
@@ -3684,11 +3851,13 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         });
         if (nextRunningToolName) {
           setStreamingPhase('tool');
+          activeToolNameRef.current = nextRunningToolName;
           setActiveToolName(nextRunningToolName);
           setStatusText(getToolStatusText(nextRunningToolName));
         } else {
           setStreamingPhase(assembledRef.current ? 'streaming' : 'thinking');
           setStatusText(null);
+          activeToolNameRef.current = null;
           setActiveToolName(null);
         }
         break;
@@ -3696,33 +3865,58 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       case 'tool_used': {
         if (hasRealToolEventsRef.current) break;
         const tn = resolveToolName(data.toolName, data.name, data.content, 'tool');
+        graduateLiveThinkingPhase(assistantId);
+        graduateLiveTextPhase(assistantId);
+        const stableToolCallId = typeof data.toolCallId === 'string' && data.toolCallId.trim()
+          ? data.toolCallId.trim()
+          : typeof data.id === 'string' && data.id.trim()
+            ? data.id.trim()
+            : '';
+        const stableOrder = Number.isSafeInteger(Number(data.seq)) && Number(data.seq) >= 0
+          ? Number(data.seq)
+          : undefined;
+        const toolOrder = resolveLiveActivityOrder(data.seq);
         setMessages(prev => {
-          const tid = 'tool-' + (++toolCounterRef.current);
+          const tid = stableToolCallId || 'tool-' + (++toolCounterRef.current);
           const now = Date.now();
-          return appendCompletedToolCallIfMissing(prev, assistantId, buildCompletedToolCall({
-            id: tid,
-            name: tn,
-            startedAt: now - 1000,
-            endedAt: now,
-          }), { now }).messages as ChatMessage[];
+          return appendCompletedToolCallIfMissing(prev, assistantId, {
+            ...buildCompletedToolCall({
+              id: tid,
+              name: tn,
+              startedAt: now - 1000,
+              endedAt: now,
+            }),
+            order: toolOrder,
+          }, {
+            now,
+            ...(stableToolCallId ? { stableToolCallId } : {}),
+            ...(stableOrder !== undefined ? { stableOrder } : {}),
+          }).messages as ChatMessage[];
         });
-        setStreamingPhase('tool');
-        setActiveToolName(tn);
-        setStatusText(getToolStatusText(tn));
+        setStreamingPhase('thinking');
+        activeToolNameRef.current = null;
+        setActiveToolName(null);
+        setStatusText(null);
         break;
       }
       case 'toolCall': {
-        clearResumeSeededContent(assistantId);
+        acceptResumeSeededContent();
         const tid = 'tool-' + (++toolCounterRef.current);
+        graduateLiveThinkingPhase(assistantId);
+        graduateLiveTextPhase(assistantId);
         setStreamingPhase('tool');
         const toolName = resolveToolName(data.toolName, data.name, 'tool');
+        activeToolNameRef.current = toolName;
         setActiveToolName(toolName);
         setStatusText(getToolStatusText(toolName));
-        setMessages(prev => appendToolCallToMessage(prev, assistantId, buildRunningToolCall({
-          id: data.id || tid,
-          name: toolName,
-          arguments: data.arguments,
-        })).messages as ChatMessage[]);
+        setMessages(prev => appendToolCallToMessage(prev, assistantId, {
+          ...buildRunningToolCall({
+            id: data.id || tid,
+            name: toolName,
+            arguments: data.arguments,
+          }),
+          order: resolveLiveActivityOrder(data.seq),
+        }).messages as ChatMessage[]);
         break;
       }
       case 'toolResult': {
@@ -3741,16 +3935,19 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         });
         if (nextRunningToolName) {
           setStreamingPhase('tool');
+          activeToolNameRef.current = nextRunningToolName;
           setActiveToolName(nextRunningToolName);
           setStatusText(getToolStatusText(nextRunningToolName));
         } else {
           setStreamingPhase(assembledRef.current ? 'streaming' : 'thinking');
           setStatusText(null);
+          activeToolNameRef.current = null;
           setActiveToolName(null);
         }
         break;
       }
       case 'segment_break': {
+        graduateLiveThinkingPhase(assistantId);
         flushPendingLiveRenders();
         const ct = assembledRef.current.substring(lastSegmentStartRef.current);
         if (ct.trim()) {
@@ -3767,10 +3964,18 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         if (rawChunk && isControlOrMaintenanceAssistantContent(rawChunk)) {
           break;
         }
+        graduateLiveThinkingPhase(assistantId);
         const safeChunk = typeof data.content === 'string'
           ? (data.replace === true ? sanitizeAssistantContent(data.content) : sanitizeAssistantChunk(data.content))
           : '';
-        const fullText = mergeAssistantStream(assembledRef.current, safeChunk, { replace: data.replace === true });
+        const phaseStart = Math.min(lastSegmentStartRef.current, assembledRef.current.length);
+        const graduatedPrefix = assembledRef.current.substring(0, phaseStart);
+        const currentPhaseText = assembledRef.current.substring(phaseStart);
+        const nextPhaseText = mergeAssistantStream(currentPhaseText, safeChunk, { replace: data.replace === true });
+        const fullText = `${graduatedPrefix}${nextPhaseText}`;
+        if (textActivityOrderRef.current === null && safeChunk) {
+          textActivityOrderRef.current = resolveLiveActivityOrder(data.seq);
+        }
         lastRawTextLenRef.current = fullText.length;
         const st = fullText.substring(lastSegmentStartRef.current);
 
@@ -3779,6 +3984,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         assembledRef.current = fullText;
         setStatusText(null);
         setStreamingPhase('streaming');
+        activeToolNameRef.current = null;
         setActiveToolName(null);
         const cid = streamingAssistantIdRef.current;
         scheduleTextRender(cid, st);
@@ -3805,12 +4011,19 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           && !hadLiveThinking;
         setStatusText(null);
         setStreamingPhase('idle');
+        activeToolNameRef.current = null;
         setIsRunning(false);
         // Execution is terminal, but the durable assistant row may still be
         // committing. Keep a separate hydration retry alive after the live
         // poll state becomes idle.
         setTerminalHistoryPending(true);
         thinkingContentRef.current = '';
+        reasoningLaneRef.current = null;
+        resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+        thinkingSnapshotRunRef.current = null;
+        thinkingActivityOrderRef.current = null;
+        textActivityOrderRef.current = null;
+        liveActivityOrderRef.current = 0;
         setThinkingContent('');
         thinkingSubjectRef.current = '';
         setThinkingSubject('');
@@ -3845,7 +4058,14 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         }
         setStatusText(null);
         setStreamingPhase('idle');
+        activeToolNameRef.current = null;
         thinkingContentRef.current = '';
+        reasoningLaneRef.current = null;
+        resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+        thinkingSnapshotRunRef.current = null;
+        thinkingActivityOrderRef.current = null;
+        textActivityOrderRef.current = null;
+        liveActivityOrderRef.current = 0;
         setThinkingContent('');
         thinkingSubjectRef.current = '';
         setThinkingSubject('');
@@ -3893,6 +4113,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         isStreamActiveRef.current = true;
         setIsRunning(true);
         setStreamingPhase(resumePhase);
+        activeToolNameRef.current = resumeToolName || null;
         setActiveToolName(resumeToolName || null);
         setStatusText(resumeToolName ? getToolStatusText(resumeToolName) : null);
         if (resumePhase === 'streaming' && typeof data.content === 'string' && !isControlOrMaintenanceAssistantContent(data.content)) {
@@ -3919,8 +4140,8 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         }
         isStreamActiveRef.current = true;
         setIsRunning(true);
-        setStreamingPhase(activeToolName ? 'tool' : 'thinking');
-        setStatusText(activeToolName ? getToolStatusText(activeToolName) : '🧠 Agent is thinking…');
+        setStreamingPhase(activeToolNameRef.current ? 'tool' : 'thinking');
+        setStatusText(activeToolNameRef.current ? getToolStatusText(activeToolNameRef.current) : '🧠 Agent is thinking…');
         resetWatchdog();
         break;
       }
@@ -3941,10 +4162,17 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
           setStreamingPhase('idle');
           setStatusText(null);
           thinkingContentRef.current = '';
+          reasoningLaneRef.current = null;
+          resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+          thinkingSnapshotRunRef.current = null;
+          thinkingActivityOrderRef.current = null;
+          textActivityOrderRef.current = null;
+          liveActivityOrderRef.current = 0;
           setThinkingContent('');
           thinkingSubjectRef.current = '';
           setThinkingSubject('');
           setPendingApprovals([]);
+          activeToolNameRef.current = null;
           setActiveToolName(null);
           streamingAssistantIdRef.current = null;
           resumeSeededContentRef.current = false;
@@ -3954,7 +4182,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       case 'keepalive':
         break;
     }
-  }, [activeToolName, appendSystemNotice, applyActiveStreamSnapshot, applyLiveThinkingSubject, applyMaintenanceState, clearResumeSeededContent, resetWatchdog, clearWatchdog, appendThinkingChunk, ensureStreamingAssistant, finalizeStreamingAssistant, flushPendingLiveRenders, graduateLiveThinkingPhase, scheduleTextRender]);
+  }, [acceptResumeSeededContent, appendSystemNotice, applyActiveStreamSnapshot, applyLiveThinkingSubject, applyMaintenanceState, resetWatchdog, clearWatchdog, appendThinkingChunk, ensureStreamingAssistant, finalizeStreamingAssistant, flushPendingLiveRenders, graduateLiveTextPhase, graduateLiveThinkingPhase, resolveLiveActivityOrder, scheduleTextRender]);
 
   const handleReplayEventRef = useRef(handleReplayEvent);
   useEffect(() => { handleReplayEventRef.current = handleReplayEvent; }, [handleReplayEvent]);
@@ -3964,6 +4192,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     let cancelled = false;
     clearPendingLiveRenders();
     thinkingContentRef.current = '';
+    reasoningLaneRef.current = null;
+    resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+    thinkingSnapshotRunRef.current = null;
+    thinkingActivityOrderRef.current = null;
+    textActivityOrderRef.current = null;
+    liveActivityOrderRef.current = 0;
     setThinkingContent('');
     const myGen = ++historyGenRef.current;
     olderHistoryLoadInFlightRef.current = false;
@@ -4828,6 +5062,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     suppressLiveBubbleContentRef.current = false;
     clearPendingLiveRenders();
     thinkingContentRef.current = '';
+    reasoningLaneRef.current = null;
+    resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+    thinkingSnapshotRunRef.current = null;
+    thinkingActivityOrderRef.current = null;
+    textActivityOrderRef.current = null;
+    liveActivityOrderRef.current = 0;
     setThinkingContent('');
     thinkingSubjectRef.current = '';
     setThinkingSubject('');
@@ -5247,6 +5487,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       setMessages([]);
       setStatusText(null);
       thinkingContentRef.current = '';
+      reasoningLaneRef.current = null;
+      resetGraduatedThinkingSnapshotTracker(thinkingSnapshotTrackerRef.current);
+      thinkingSnapshotRunRef.current = null;
+      thinkingActivityOrderRef.current = null;
+      textActivityOrderRef.current = null;
+      liveActivityOrderRef.current = 0;
       setThinkingContent('');
       thinkingSubjectRef.current = '';
       setThinkingSubject('');
@@ -7458,6 +7704,16 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
 
                 return (
                   <div key={msg.id} className="px-3 py-1.5 group">
+
+                    {msg.presentationTruncated ? (
+                      <div
+                        role="status"
+                        data-testid="project-activity-truncated"
+                        className="mx-3 mb-1 rounded-lg border border-amber-400/20 bg-amber-500/[0.08] px-2.5 py-1.5 text-[10px] text-amber-200/80"
+                      >
+                        Earlier activity from this long turn was omitted from the saved presentation.
+                      </div>
+                    ) : null}
 
                     {hasOrderedTimeline ? (
                       <ProjectActivityTimeline

@@ -35,6 +35,23 @@ function invalidateSessionRestoreAttempts(): void {
   sessionRestoreInFlight = null;
 }
 
+/**
+ * A superseded restore attempt must not write auth state — but it still owns
+ * the `isLoading` flag it set on entry. Returning without clearing it strands
+ * the whole shell: every auth button renders disabled as "Signing in…" forever.
+ *
+ * That is exactly what happens on a first visit with no session. `/auth/me`
+ * 401s, the client's recovery path calls `/auth/refresh`, that 401s too, and
+ * `silentLogout()` bumps the generation *before* the rejection reaches this
+ * catch — so the only attempt in existence sees itself as stale and bails with
+ * `isLoading` stuck true. Clear it unless a newer attempt is genuinely running,
+ * in which case that attempt owns the flag and will clear it itself.
+ */
+function abandonSupersededRestore(): false {
+  if (!sessionRestoreInFlight) useAuthStore.setState({ isLoading: false });
+  return false;
+}
+
 /** Zustand persist key; also cleared explicitly when abandoning a session. */
 const AUTH_PERSIST_KEY = 'bridgesllm-auth';
 const ABANDON_SESSION_LOGOUT_TIMEOUT_MS = 2000;
@@ -422,12 +439,12 @@ export const useAuthStore = create<AuthState>()(
             // or httpOnly cookie (sent automatically with withCredentials: true).
             // This handles both normal login (localStorage) and setup wizard (cookie-only).
             const user = await authAPI.me({ allowSessionRecovery: true });
-            if (generation !== sessionRestoreGeneration) return false;
+            if (generation !== sessionRestoreGeneration) return abandonSupersededRestore();
             set({ isAuthenticated: true, user, isLoading: false, lastSessionRestoreAt: Date.now(), sessionRestoreError: false, sessionRestoreRetryable: false });
             startSessionHeartbeat();
             return true;
           } catch (error: any) {
-            if (generation !== sessionRestoreGeneration) return false;
+            if (generation !== sessionRestoreGeneration) return abandonSupersededRestore();
             // Only clear auth on definitive auth failures (401/403)
             // Don't clear on network errors — session might still be valid
             const status = error.response?.status;

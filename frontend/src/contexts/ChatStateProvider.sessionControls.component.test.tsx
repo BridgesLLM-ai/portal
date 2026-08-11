@@ -266,6 +266,30 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(chatMocks.patchSession).not.toHaveBeenCalled();
   });
 
+  it('coalesces visibility and focus into one foreground history reconciliation', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    try {
+      await renderReadyHarness();
+      const historyReadsBeforeReturn = chatMocks.clientGet.mock.calls.filter(
+        ([url]) => url === '/gateway/history',
+      ).length;
+
+      act(() => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        window.dispatchEvent(new Event('focus'));
+      });
+
+      await waitFor(() => {
+        const historyReads = chatMocks.clientGet.mock.calls.filter(
+          ([url]) => url === '/gateway/history',
+        ).length;
+        expect(historyReads).toBe(historyReadsBeforeReturn + 1);
+      });
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
   it('does not create a session merely because an existing synthetic-key session is opened', async () => {
     localStorage.setItem('agent-chat-session', 'agent:main:new-existing-session');
     localStorage.setItem('agent-chat-session:OPENCLAW', 'agent:main:new-existing-session');
@@ -735,6 +759,88 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(screen.getByTestId('is-running')).toHaveTextContent('running');
   });
 
+  it('shows token-only Claude progress as a replaceable transient rail status', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+      socket.emit({
+        type: 'run_resumed',
+        sessionKey: 'agent:main:first',
+        runId: 'claude-token-progress',
+      });
+      socket.emit({
+        type: 'status',
+        sessionKey: 'agent:main:first',
+        runId: 'claude-token-progress',
+        content: 'Thinking… (~37 tokens)',
+        replace: true,
+        transient: true,
+      });
+    });
+
+    await waitFor(() => expect(screen.getByTestId('status-text')).toHaveTextContent(
+      'Thinking… (~37 tokens)',
+    ));
+    expect(screen.getByTestId('thinking')).not.toHaveTextContent('37 tokens');
+
+    act(() => {
+      socket.emit({
+        type: 'status',
+        sessionKey: 'agent:main:first',
+        runId: 'claude-token-progress',
+        content: 'Thinking… (~128 tokens)',
+        replace: true,
+        transient: true,
+      });
+    });
+    await waitFor(() => expect(screen.getByTestId('status-text')).toHaveTextContent(
+      'Thinking… (~128 tokens)',
+    ));
+    expect(screen.getByTestId('status-text')).not.toHaveTextContent('37 tokens');
+    expect(screen.getByTestId('thinking')).not.toHaveTextContent('128 tokens');
+
+    act(() => {
+      socket.emit({
+        type: 'done',
+        sessionKey: 'agent:main:first',
+        runId: 'claude-token-progress',
+        content: 'Claude finished after encrypted reasoning.',
+      });
+    });
+    await waitFor(() => expect(screen.getByTestId('messages')).toHaveTextContent(
+      'Claude finished after encrypted reasoning.',
+    ));
+    expect(screen.getByTestId('messages')).not.toHaveTextContent('128 tokens');
+  });
+
+  it('restores token-only Claude progress as rail status after reconnect', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+      socket.emit({
+        type: 'stream_resume',
+        sessionKey: 'agent:main:first',
+        runId: 'claude-token-progress-reconnect',
+        phase: 'thinking',
+        statusText: 'Thinking… (~512 tokens)',
+        startedAt: Date.now(),
+        turnEvents: [],
+      });
+    });
+
+    await waitFor(() => expect(screen.getByTestId('status-text')).toHaveTextContent(
+      'Thinking… (~512 tokens)',
+    ));
+    expect(screen.getByTestId('thinking')).not.toHaveTextContent('512 tokens');
+    expect(screen.getByTestId('is-running')).toHaveTextContent('running');
+  });
+
   it('promotes trusted cumulative preamble progress into persistent thinking before a tool call', async () => {
     await renderReadyHarness();
     const socket = PendingWebSocket.instances[0];
@@ -840,6 +946,85 @@ describe('ChatStateProvider session-control ownership', () => {
       'Raw Opus reasoning survives the preamble transition',
     );
     expect(screen.getByTestId('messages')).toHaveTextContent('opus-read-1');
+  });
+
+  it('keeps cumulative Codex reasoning as distinct phases around tool boundaries', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    const runId = 'codex-cumulative-tool-phases';
+
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+      socket.emit({
+        type: 'thinking',
+        sessionKey: 'agent:main:first',
+        runId,
+        seq: 1,
+        content: 'Inspecting the workspace',
+        replace: true,
+      });
+      socket.emit({
+        type: 'tool_start',
+        sessionKey: 'agent:main:first',
+        runId,
+        seq: 2,
+        toolCallId: 'codex-tool-one',
+        toolName: 'Read',
+      });
+      socket.emit({
+        type: 'tool_end',
+        sessionKey: 'agent:main:first',
+        runId,
+        seq: 3,
+        toolCallId: 'codex-tool-one',
+        toolName: 'Read',
+        toolResult: 'done',
+      });
+      socket.emit({
+        type: 'thinking',
+        sessionKey: 'agent:main:first',
+        runId,
+        seq: 4,
+        content: 'Inspecting the workspace\n\nRunning the focused tests',
+        replace: true,
+      });
+      socket.emit({
+        type: 'tool_start',
+        sessionKey: 'agent:main:first',
+        runId,
+        seq: 5,
+        toolCallId: 'codex-tool-two',
+        toolName: 'exec',
+      });
+      socket.emit({
+        type: 'tool_end',
+        sessionKey: 'agent:main:first',
+        runId,
+        seq: 6,
+        toolCallId: 'codex-tool-two',
+        toolName: 'exec',
+        toolResult: 'passed',
+      });
+      socket.emit({
+        type: 'thinking',
+        sessionKey: 'agent:main:first',
+        runId,
+        seq: 7,
+        content: 'Inspecting the workspace\n\nRunning the focused tests\n\nReviewing the result',
+        replace: true,
+      });
+    });
+
+    const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
+    expect(thinking.segments.map((segment: { text: string }) => segment.text)).toEqual([
+      'Inspecting the workspace',
+      'Running the focused tests',
+    ]);
+    expect(thinking.content).toBe('Reviewing the result');
+    expect(JSON.stringify(thinking)).not.toContain(
+      'Inspecting the workspace\\n\\nRunning the focused tests',
+    );
   });
 
   it('does not leak a completed run thinking timeline into the next done-only foreign run', async () => {
@@ -975,6 +1160,369 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(screen.getByTestId('messages')).toHaveTextContent('opus-reconnect-tool');
   });
 
+  it('replays only the post-overlay snapshot tail across text and output-only tool boundaries', async () => {
+    const phaseA = 'Inspecting the existing implementation';
+    const phaseB = 'Checking the restored browser state';
+    const phaseC = 'Verifying the chronology after the legacy tool output';
+    const betweenText = 'A visible progress note between reasoning phases.';
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        return {
+          data: {
+            activeStream: {
+              active: true,
+              runId: 'snapshot-tail-run',
+              phase: 'thinking',
+              content: betweenText,
+              turnEvents: [
+                {
+                  type: 'assistant_reasoning', runId: 'snapshot-tail-run', seq: 1,
+                  text: phaseA, replace: true, visible: true,
+                  source: { eventType: 'thinking' },
+                },
+                {
+                  type: 'assistant_delta', runId: 'snapshot-tail-run', seq: 2,
+                  text: betweenText, visible: true,
+                  source: { eventType: 'text' },
+                },
+                {
+                  type: 'assistant_status', runId: 'snapshot-tail-run', seq: 3,
+                  text: `${phaseA}\n\n${phaseB}`, replace: true, visible: true,
+                  source: { eventType: 'status' },
+                },
+                {
+                  type: 'tool_output', runId: 'snapshot-tail-run', seq: 4, ts: 4_000,
+                  tool: { id: 'legacy-output-only', name: 'exec', result: 'ok', status: 'done' },
+                },
+                {
+                  type: 'assistant_status', runId: 'snapshot-tail-run', seq: 5,
+                  text: `${phaseA}\n\n${phaseB}\n\n${phaseC}`, replace: true, visible: true,
+                  source: { eventType: 'status' },
+                },
+              ],
+              toolCalls: [{
+                id: 'legacy-output-only',
+                name: 'exec',
+                result: 'ok',
+                status: 'done',
+                startedAt: 4_000,
+                endedAt: 4_000,
+              }],
+            },
+            messages: [{
+              id: 'snapshot-tail-overlay',
+              role: 'assistant',
+              content: '',
+              timestamp: '2026-08-10T16:00:00.000Z',
+              provenance: 'runtime-turn-event-history',
+              segments: [{
+                kind: 'thinking',
+                source: 'status',
+                text: phaseA,
+                order: 0,
+                ts: 1_000,
+              }],
+              __portal: {
+                kind: 'runtime-turn-event-history',
+                runId: 'snapshot-tail-run',
+                lastEventSeq: 1,
+                thinkingCursors: { status: phaseA },
+              },
+            }],
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+
+    await renderReadyHarness();
+    await waitFor(() => expect(screen.getByTestId('thinking')).toHaveTextContent(phaseC));
+
+    const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
+    expect(thinking.segments.map((segment: { text: string; order: number }) => ({
+      text: segment.text,
+      order: segment.order,
+    }))).toEqual([
+      { text: phaseA, order: 0 },
+      { text: betweenText, order: 1 },
+      { text: phaseB, order: 2 },
+    ]);
+    expect(thinking.content).toBe(phaseC);
+
+    const activeAssistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { id: string }) => message.id === 'snapshot-tail-overlay');
+    expect(activeAssistant.toolCalls).toEqual([
+      expect.objectContaining({ id: 'legacy-output-only', order: 3, status: 'done' }),
+    ]);
+    expect(JSON.stringify(thinking)).not.toContain(`${phaseA}\\n\\n${phaseB}`);
+  });
+
+  it('does not replay the represented prefix of a text-and-tool-only runtime overlay', async () => {
+    const restoredText = 'Text already restored before the tool.';
+    const newTail = 'New text after the restored tool.';
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        return {
+          data: {
+            activeStream: {
+              active: true,
+              runId: 'text-tool-overlay-run',
+              phase: 'streaming',
+              content: `${restoredText}${newTail}`,
+              turnEvents: [
+                { type: 'assistant_delta', runId: 'text-tool-overlay-run', seq: 1, text: restoredText },
+                {
+                  type: 'tool_started', runId: 'text-tool-overlay-run', seq: 2, ts: 2_000,
+                  tool: { id: 'restored-tool', name: 'read', status: 'running' },
+                },
+                {
+                  type: 'tool_output', runId: 'text-tool-overlay-run', seq: 3, ts: 3_000,
+                  tool: { id: 'restored-tool', name: 'read', status: 'done', result: 'ok' },
+                },
+                { type: 'assistant_delta', runId: 'text-tool-overlay-run', seq: 4, text: newTail },
+              ],
+              toolCalls: [{
+                id: 'restored-tool', name: 'read', status: 'done', result: 'ok',
+                startedAt: 2_000, endedAt: 3_000, order: 1,
+              }],
+            },
+            messages: [{
+              id: 'text-tool-overlay',
+              role: 'assistant',
+              content: '',
+              timestamp: '2026-08-10T16:30:00.000Z',
+              provenance: 'runtime-turn-event-history',
+              segments: [{ kind: 'text', source: 'text', text: restoredText, order: 0, ts: 1_000 }],
+              toolCalls: [{
+                id: 'restored-tool', name: 'read', status: 'done', result: 'ok',
+                startedAt: 2_000, endedAt: 3_000, order: 1,
+              }],
+              __portal: {
+                kind: 'runtime-turn-event-history',
+                runId: 'text-tool-overlay-run',
+                lastEventSeq: 3,
+              },
+            }],
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+
+    await renderReadyHarness();
+    await waitFor(() => expect(screen.getByTestId('messages')).toHaveTextContent(newTail));
+
+    const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
+    expect(thinking.segments).toEqual([
+      expect.objectContaining({ kind: 'text', text: restoredText, order: 0 }),
+    ]);
+    const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { id: string }) => message.id === 'text-tool-overlay');
+    expect(assistant.content).toBe(newTail);
+    expect(assistant.toolCalls).toEqual([
+      expect.objectContaining({ id: 'restored-tool', order: 1, status: 'done' }),
+    ]);
+  });
+
+  it('keeps raw and status cumulative cursors independent across a restored snapshot', async () => {
+    const rawPhaseA = 'Raw reasoning before the status update';
+    const statusSignal = 'Waiting for the next provider phase';
+    const rawPhaseB = 'Raw reasoning after the status update';
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        return {
+          data: {
+            activeStream: {
+              active: true,
+              runId: 'independent-lanes-run',
+              phase: 'thinking',
+              turnEvents: [
+                {
+                  type: 'assistant_reasoning', runId: 'independent-lanes-run', seq: 1,
+                  text: rawPhaseA, replace: true, visible: true,
+                  source: { eventType: 'thinking' },
+                },
+                {
+                  type: 'assistant_status', runId: 'independent-lanes-run', seq: 2,
+                  text: statusSignal, replace: true, visible: true,
+                  source: { eventType: 'status' },
+                },
+                {
+                  type: 'assistant_reasoning', runId: 'independent-lanes-run', seq: 3,
+                  text: `${rawPhaseA}\n\n${rawPhaseB}`, replace: true, visible: true,
+                  source: { eventType: 'thinking' },
+                },
+              ],
+            },
+            messages: [{
+              id: 'independent-lanes-overlay',
+              role: 'assistant',
+              content: '',
+              timestamp: '2026-08-10T17:00:00.000Z',
+              provenance: 'runtime-turn-event-history',
+              segments: [
+                { kind: 'thinking', source: 'reasoning', text: rawPhaseA, order: 0, ts: 1_000 },
+                { kind: 'thinking', source: 'status', text: statusSignal, order: 1, ts: 2_000 },
+              ],
+              __portal: {
+                kind: 'runtime-turn-event-history',
+                runId: 'independent-lanes-run',
+                lastEventSeq: 2,
+                thinkingCursors: { raw: rawPhaseA, status: statusSignal },
+              },
+            }],
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+
+    await renderReadyHarness();
+    await waitFor(() => expect(screen.getByTestId('thinking')).toHaveTextContent(rawPhaseB));
+
+    const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
+    expect(thinking.segments).toEqual([
+      expect.objectContaining({ text: rawPhaseA, lane: 'raw', order: 0 }),
+      expect.objectContaining({ text: statusSignal, lane: 'status', order: 1 }),
+    ]);
+    expect(thinking.content).toBe(rawPhaseB);
+    expect(thinking.content).not.toContain(rawPhaseA);
+  });
+
+  it('restores subject-only encrypted reasoning from an active snapshot', async () => {
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        return {
+          data: {
+            activeStream: {
+              active: true,
+              runId: 'subject-only-snapshot-run',
+              phase: 'tool',
+              turnEvents: [
+                {
+                  type: 'assistant_reasoning',
+                  runId: 'subject-only-snapshot-run',
+                  seq: 1,
+                  subject: 'Inspecting encrypted provider reasoning',
+                  visible: true,
+                  source: { eventType: 'thinking' },
+                },
+                {
+                  type: 'tool_started',
+                  runId: 'subject-only-snapshot-run',
+                  seq: 2,
+                  ts: 2_000,
+                  tool: { id: 'subject-only-tool', name: 'read', status: 'running' },
+                },
+              ],
+            },
+            messages: [],
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+
+    await renderReadyHarness();
+    await waitFor(() => expect(screen.getByTestId('thinking')).toHaveTextContent(
+      'Inspecting encrypted provider reasoning',
+    ));
+
+    const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
+    expect(thinking.segments).toEqual([
+      expect.objectContaining({
+        kind: 'thinking',
+        subject: 'Inspecting encrypted provider reasoning',
+        text: '',
+        order: 0,
+      }),
+    ]);
+    const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { role: string }) => message.role === 'assistant');
+    expect(assistant.toolCalls).toEqual([
+      expect.objectContaining({ id: 'subject-only-tool', order: 1, status: 'running' }),
+    ]);
+  });
+
+  it('preserves identical ordered thoughts across a tool while deduping overlay replay', async () => {
+    let historyReads = 0;
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        historyReads += 1;
+        return {
+          data: {
+            activeStream: {
+              active: true,
+              runId: 'identical-thought-overlay-run',
+              phase: 'thinking',
+              turnEvents: [],
+            },
+            messages: [{
+              id: 'identical-thought-overlay',
+              role: 'assistant',
+              content: '',
+              timestamp: '2026-08-10T18:00:00.000Z',
+              provenance: 'runtime-turn-event-history',
+              segments: [
+                { kind: 'thinking', source: 'reasoning', text: 'Checking', order: 1, ts: 1_000 },
+                { kind: 'thinking', source: 'reasoning', text: 'Checking', order: 3, ts: 3_000 },
+              ],
+              toolCalls: [{
+                id: 'checking-tool', name: 'read', status: 'done', result: 'ok',
+                startedAt: 2_000, endedAt: 2_500, order: 2,
+              }],
+              __portal: {
+                kind: 'runtime-turn-event-history',
+                runId: 'identical-thought-overlay-run',
+                lastEventSeq: 3,
+              },
+            }],
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+
+    await renderReadyHarness();
+    const assertTimeline = () => {
+      const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
+      const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+        .find((message: { id: string }) => message.id === 'identical-thought-overlay');
+      expect([
+        ...thinking.segments.map((segment: { text: string; order: number }) => ({
+          kind: 'thinking', text: segment.text, order: segment.order,
+        })),
+        ...assistant.toolCalls.map((tool: { name: string; order: number }) => ({
+          kind: 'tool', text: tool.name, order: tool.order,
+        })),
+      ].sort((left, right) => left.order - right.order)).toEqual([
+        { kind: 'thinking', text: 'Checking', order: 1 },
+        { kind: 'tool', text: 'read', order: 2 },
+        { kind: 'thinking', text: 'Checking', order: 3 },
+      ]);
+    };
+
+    await waitFor(assertTimeline);
+    const socket = PendingWebSocket.instances[0];
+    act(() => socket.emit({
+      type: 'history_changed',
+      sessionKey: 'agent:main:first',
+      reason: 'identical-thought-overlay-replay',
+    }));
+    await waitFor(() => expect(historyReads).toBeGreaterThan(1));
+    await waitFor(assertTimeline);
+  });
+
   it('preserves visible WebSocket reasoning when inactive reconciliation replaces a missed terminal', async () => {
     await renderReadyHarness();
     const socket = PendingWebSocket.instances[0];
@@ -1106,6 +1654,181 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(screen.getByTestId('messages')).toHaveTextContent('Raw SSE reasoning before the preamble');
     expect(screen.getByTestId('messages')).not.toHaveTextContent('live view detached');
     expect(screen.getByTestId('messages')).not.toHaveTextContent('may still be working');
+  });
+
+  it('keeps token-only Claude progress transient through the SSE fallback', async () => {
+    const encoder = new TextEncoder();
+    const releaseFinal = deferred<void>();
+    let readCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi.fn(async () => {
+            readCount += 1;
+            if (readCount === 1) {
+              const progressFrames = [
+                { type: 'session', sessionId: 'agent:main:first' },
+                {
+                  type: 'status',
+                  sessionKey: 'agent:main:first',
+                  runId: 'sse-claude-token-progress',
+                  content: 'Thinking… (~37 tokens)',
+                  replace: true,
+                  transient: true,
+                },
+                {
+                  type: 'status',
+                  sessionKey: 'agent:main:first',
+                  runId: 'sse-claude-token-progress',
+                  content: 'Thinking… (~128 tokens)',
+                  replace: true,
+                  transient: true,
+                },
+              ].map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('');
+              return { done: false, value: encoder.encode(progressFrames) };
+            }
+            if (readCount === 2) {
+              await releaseFinal.promise;
+              return {
+                done: false,
+                value: encoder.encode(`data: ${JSON.stringify({
+                  type: 'done',
+                  sessionKey: 'agent:main:first',
+                  runId: 'sse-claude-token-progress',
+                  content: 'SSE Claude turn finished.',
+                })}\n\n`),
+              };
+            }
+            return { done: true, value: undefined };
+          }),
+          cancel: vi.fn(async () => undefined),
+        }),
+      },
+    } as unknown as Response)));
+    const user = userEvent.setup();
+    await renderReadyHarness();
+
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+    await waitFor(() => expect(screen.getByTestId('status-text')).toHaveTextContent(
+      'Thinking… (~128 tokens)',
+    ));
+    expect(screen.getByTestId('status-text')).not.toHaveTextContent('37 tokens');
+    expect(screen.getByTestId('thinking')).not.toHaveTextContent('tokens');
+
+    await act(async () => {
+      releaseFinal.resolve();
+      await releaseFinal.promise;
+    });
+    await waitFor(() => expect(screen.getByTestId('messages')).toHaveTextContent(
+      'SSE Claude turn finished.',
+    ));
+    expect(screen.getByTestId('messages')).not.toHaveTextContent('128 tokens');
+  });
+
+  it('keeps SSE compatibility tools chronological, completed, and replay-safe', async () => {
+    const encoder = new TextEncoder();
+    const releaseFinal = deferred<void>();
+    let readCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: vi.fn(async () => {
+            readCount += 1;
+            if (readCount === 1) {
+              const replayedIdlessTool = {
+                type: 'tool_used',
+                sessionKey: 'agent:main:first',
+                runId: 'r',
+                seq: 10,
+                toolName: 'exec',
+              };
+              const frames = [
+                { type: 'session', sessionId: 'agent:main:first' },
+                {
+                  type: 'thinking',
+                  sessionKey: 'agent:main:first',
+                  runId: 'r',
+                  content: 'SSE thinking before first compatibility tool',
+                },
+                replayedIdlessTool,
+                { ...replayedIdlessTool },
+                {
+                  type: 'text',
+                  sessionKey: 'agent:main:first',
+                  runId: 'r',
+                  content: 'SSE text before second compatibility tool',
+                },
+                {
+                  type: 'tool_used',
+                  sessionKey: 'agent:main:first',
+                  runId: 'r',
+                  seq: 11,
+                  toolName: 'exec',
+                },
+              ].map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('');
+              return { done: false, value: encoder.encode(frames) };
+            }
+            if (readCount === 2) {
+              await releaseFinal.promise;
+              return {
+                done: false,
+                value: encoder.encode(`data: ${JSON.stringify({
+                  type: 'done',
+                  sessionKey: 'agent:main:first',
+                  runId: 'r',
+                  content: 'SSE compatibility tools complete.',
+                })}\n\n`),
+              };
+            }
+            return { done: true, value: undefined };
+          }),
+          cancel: vi.fn(async () => undefined),
+        }),
+      },
+    } as unknown as Response)));
+    const user = userEvent.setup();
+    await renderReadyHarness();
+
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+    await waitFor(() => {
+      const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+        .filter((message: { role: string }) => message.role === 'assistant')
+        .at(-1);
+      expect(assistant.toolCalls).toHaveLength(2);
+    });
+
+    const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
+    expect(thinking.content).toBe('');
+    expect(thinking.segments).toEqual([
+      expect.objectContaining({
+        kind: 'thinking', text: 'SSE thinking before first compatibility tool', order: 0,
+      }),
+      expect.objectContaining({
+        kind: 'text', text: 'SSE text before second compatibility tool', order: 2,
+      }),
+    ]);
+    const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .filter((message: { role: string }) => message.role === 'assistant')
+      .at(-1);
+    expect(assistant.toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'compat-tool:agent%3Amain%3Afirst:r:10', order: 1, status: 'done',
+      }),
+      expect.objectContaining({
+        id: 'compat-tool:agent%3Amain%3Afirst:r:11', order: 3, status: 'done',
+      }),
+    ]);
+    expect(screen.getByTestId('status-text')).toHaveTextContent('');
+
+    await act(async () => {
+      releaseFinal.resolve();
+      await releaseFinal.promise;
+    });
+    await waitFor(() => expect(screen.getByTestId('messages')).toHaveTextContent(
+      'SSE compatibility tools complete.',
+    ));
   });
 
   it('preserves a live foreign prompt while history lags, then dedupes it when durable history catches up', async () => {
@@ -2624,7 +3347,7 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(liveThinking.segments.filter((segment: { text: string }) => (
       segment.text === 'Exact status reasoning before tool'
     ))).toEqual([
-      expect.objectContaining({ lane: 'raw' }),
+      expect.objectContaining({ lane: 'status' }),
     ]);
     overlayReady = true;
     act(() => {
@@ -2688,6 +3411,26 @@ describe('ChatStateProvider session-control ownership', () => {
   });
 
   it('acknowledges an echoed optimistic user message without duplicating it', async () => {
+    let durableReady = false;
+    let echoTimestamp = 0;
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        return {
+          data: {
+            activeStream: { active: false },
+            messages: durableReady ? [{
+              id: 'durable-local-yes',
+              role: 'user',
+              content: 'Yes',
+              timestamp: new Date(echoTimestamp).toISOString(),
+            }] : [],
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
     const user = userEvent.setup();
     await renderReadyHarness();
     const socket = PendingWebSocket.instances[0];
@@ -2701,13 +3444,14 @@ describe('ChatStateProvider session-control ownership', () => {
     const sendFrame = socket.sent.find((frame) => frame.type === 'send');
     const clientMessageId = String(sendFrame?.clientMessageId || '');
 
+    echoTimestamp = Date.now();
     act(() => {
       socket.emit({
         type: 'user_message',
         sessionKey: 'agent:main:first',
         runId: 'echo-run',
         messageId: clientMessageId,
-        messageTimestamp: Date.now(),
+        messageTimestamp: echoTimestamp,
         content: 'Yes',
       });
     });
@@ -2717,6 +3461,102 @@ describe('ChatStateProvider session-control ownership', () => {
       message.role === 'user' && message.content === 'Yes'
     ))).toHaveLength(1);
     expect(parsed.find((message: { id: string }) => message.id === clientMessageId)?.pendingAck).toBe(false);
+
+    // Acceptance can beat the enhanced-history projection. A forced refresh in
+    // that gap must not erase the acknowledged local row.
+    await user.click(screen.getByRole('button', { name: 'Retry history' }));
+    await waitFor(() => {
+      const afterLaggingRefresh = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+      expect(afterLaggingRefresh.filter((message: { role: string; content: string }) => (
+        message.role === 'user' && message.content === 'Yes'
+      ))).toHaveLength(1);
+    });
+
+    durableReady = true;
+    await user.click(screen.getByRole('button', { name: 'Retry history' }));
+    await waitFor(() => {
+      const afterCatchUp = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+      const matching = afterCatchUp.filter((message: { role: string; content: string }) => (
+        message.role === 'user' && message.content === 'Yes'
+      ));
+      expect(matching).toHaveLength(1);
+      expect(matching[0]?.id).toBe('durable-local-yes');
+    });
+  });
+
+  it('does not let an older identical durable prompt consume a newly echoed local message', async () => {
+    const echoTimestamp = Date.now();
+    let newDurableReady = false;
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') {
+        return {
+          data: {
+            activeStream: { active: false },
+            messages: [
+              {
+                id: 'older-durable-yes',
+                role: 'user',
+                content: 'Yes',
+                timestamp: new Date(echoTimestamp - 100).toISOString(),
+              },
+              ...(newDurableReady ? [{
+                id: 'new-durable-yes',
+                role: 'user',
+                content: 'Yes',
+                timestamp: new Date(echoTimestamp).toISOString(),
+              }] : []),
+            ],
+            pagination: { beforeCursor: null, hasMoreBefore: false },
+          },
+        };
+      }
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+    await waitFor(() => expect(socket.sent.some((frame) => frame.type === 'send')).toBe(true));
+    const sendFrame = socket.sent.find((frame) => frame.type === 'send');
+    const clientMessageId = String(sendFrame?.clientMessageId || '');
+    act(() => {
+      socket.emit({
+        type: 'user_message',
+        sessionKey: 'agent:main:first',
+        runId: 'second-identical-local-run',
+        messageId: clientMessageId,
+        messageTimestamp: echoTimestamp,
+        content: 'Yes',
+      });
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Retry history' }));
+    await waitFor(() => {
+      const lagging = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+      expect(lagging.filter((message: { role: string; content: string }) => (
+        message.role === 'user' && message.content === 'Yes'
+      ))).toHaveLength(2);
+      expect(lagging.find((message: { id: string }) => message.id === clientMessageId)).toBeDefined();
+    });
+
+    newDurableReady = true;
+    await user.click(screen.getByRole('button', { name: 'Retry history' }));
+    await waitFor(() => {
+      const caughtUp = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+      const matching = caughtUp.filter((message: { role: string; content: string }) => (
+        message.role === 'user' && message.content === 'Yes'
+      ));
+      expect(matching.map((message: { id: string }) => message.id)).toEqual([
+        'older-durable-yes',
+        'new-durable-yes',
+      ]);
+    });
   });
 
   it('queues a duplicate send attempt and reattaches when the backend reports an active turn', async () => {
@@ -3075,6 +3915,98 @@ describe('ChatStateProvider session-control ownership', () => {
     }))).toEqual([
       { id: 'tool-one', order: 1 },
       { id: 'tool-two', order: 3 },
+    ]);
+  });
+
+  it('graduates live text before visible status and raw reasoning phases', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    const emit = (payload: Record<string, unknown>) => act(() => socket.emit({
+      sessionKey: 'agent:main:first',
+      runId: 'text-thinking-order-run',
+      ...payload,
+    }));
+
+    emit({ type: 'text', content: 'Visible text before status.' });
+    emit({
+      type: 'status',
+      content: 'Visible provider status after text',
+      turnEvent: {
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type: 'assistant_status',
+        sessionKey: 'agent:main:first',
+        runId: 'text-thinking-order-run',
+        seq: 1,
+        text: 'Visible provider status after text',
+        replace: true,
+        visible: true,
+        source: { eventType: 'status' },
+      },
+    });
+    emit({ type: 'tool_start', toolCallId: 'status-boundary-tool', toolName: 'read' });
+    emit({ type: 'tool_end', toolCallId: 'status-boundary-tool', toolName: 'read', toolResult: 'ok' });
+    emit({ type: 'text', content: 'Visible text before raw reasoning.' });
+    emit({ type: 'thinking', content: 'Raw reasoning after text', replace: true });
+
+    const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
+    expect(thinking.segments).toEqual([
+      expect.objectContaining({ kind: 'text', text: 'Visible text before status.', order: 0 }),
+      expect.objectContaining({ kind: 'thinking', lane: 'status', text: 'Visible provider status after text', order: 1 }),
+      expect.objectContaining({ kind: 'text', text: 'Visible text before raw reasoning.', order: 3 }),
+    ]);
+    expect(thinking.content).toBe('Raw reasoning after text');
+    const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { role: string }) => message.role === 'assistant');
+    expect(assistant.toolCalls).toEqual([
+      expect.objectContaining({ id: 'status-boundary-tool', order: 2, status: 'done' }),
+    ]);
+  });
+
+  it('preserves distinct same-name compatibility tools while deduping an identical replay', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    const emit = (payload: Record<string, unknown>) => act(() => socket.emit({
+      type: 'tool_used',
+      sessionKey: 'agent:main:first',
+      runId: 'compat-tool-identity-run',
+      toolName: 'exec',
+      ...payload,
+    }));
+
+    emit({ seq: 1, toolCallId: 'compat-exec-first' });
+    emit({ seq: 2, toolCallId: 'compat-exec-second' });
+    emit({ seq: 2, toolCallId: 'compat-exec-second' });
+
+    const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { role: string }) => message.role === 'assistant');
+    expect(assistant.toolCalls).toEqual([
+      expect.objectContaining({ id: 'compat-exec-first', name: 'exec', order: 0, status: 'done' }),
+      expect.objectContaining({ id: 'compat-exec-second', name: 'exec', order: 1, status: 'done' }),
+    ]);
+  });
+
+  it('dedupes ID-less WebSocket compatibility replay by run sequence, not display order', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    const replayed = { runId: 'r', seq: 10, toolName: 'exec' };
+
+    act(() => {
+      socket.emit({ type: 'tool_used', sessionKey: 'agent:main:first', ...replayed });
+      socket.emit({ type: 'tool_used', sessionKey: 'agent:main:first', ...replayed });
+      socket.emit({
+        type: 'tool_used', sessionKey: 'agent:main:first', runId: 'r', seq: 11, toolName: 'exec',
+      });
+    });
+
+    const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { role: string }) => message.role === 'assistant');
+    expect(assistant.toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'compat-tool:agent%3Amain%3Afirst:r:10', name: 'exec', order: 0, status: 'done',
+      }),
+      expect.objectContaining({
+        id: 'compat-tool:agent%3Amain%3Afirst:r:11', name: 'exec', order: 1, status: 'done',
+      }),
     ]);
   });
 

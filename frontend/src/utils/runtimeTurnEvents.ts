@@ -43,6 +43,7 @@ export interface RuntimeTurnEvent {
 
 export interface PortalStreamEventFromTurnEvent {
   type?: string;
+  seq?: number;
   content?: string;
   subject?: string;
   runId?: string;
@@ -123,6 +124,7 @@ export function normalizePortalStreamEventFromTurnEvent<T extends Record<string,
   return {
     ...payload,
     type: mappedType,
+    ...(Number.isSafeInteger(turnEvent.seq) ? { seq: turnEvent.seq } : {}),
     content: text || payload?.content || '',
     subject: subject || payload?.subject,
     runId: turnEvent.runId || payload?.runId,

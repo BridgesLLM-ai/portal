@@ -1791,7 +1791,8 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
         stream: 'thinking',
         data: { text: 'Second thought', delta: 'Second thought', isReasoningSnapshot: true },
       });
-      // progressTokens-only events carry no text and must not publish.
+      // Claude CLI can expose encrypted reasoning only as a cumulative token
+      // count. Keep that activity visible without pretending it is thought text.
       __persistentGatewayWsTest.handleAgentEvent({
         sessionKey,
         runId: 'run-thinking-snapshot',
@@ -1807,6 +1808,20 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
       ]);
       expect(thinkingEvents[0].replace).toBeUndefined();
       expect(thinkingEvents[2].replace).toBeUndefined();
+      const progressStatusEvents = events.filter((event) => event.type === 'status');
+      expect(progressStatusEvents).toEqual([
+        expect.objectContaining({
+          content: 'Thinking… (~128 tokens)',
+          replace: true,
+          transient: true,
+          runId: 'run-thinking-snapshot',
+        }),
+      ]);
+      expect(progressStatusEvents[0].turnEvent).toBeUndefined();
+      expect(streamEventBus.getTrackedStream(sessionKey)).toMatchObject({
+        phase: 'thinking',
+        statusText: 'Thinking… (~128 tokens)',
+      });
     } finally {
       unsubscribe();
       __persistentGatewayWsTest.resetSession(sessionKey);

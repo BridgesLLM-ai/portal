@@ -233,6 +233,156 @@ test('uses the same bounded durable broker for an OpenClaw Project turn', async 
   });
 });
 
+test('preserves attested OpenClaw preamble reasoning and transient rail semantics', async () => {
+  const onEvent = jest.fn();
+  startProjectNativeRun({
+    userId: USER_ID,
+    projectId: PROJECT_ID,
+    provider: 'OPENCLAW',
+    runtime: 'openclaw-project-sandbox',
+    sessionId: 'agent:portal-project-a:project-a',
+    message: 'Keep the Project reasoning timeline faithful',
+    onEvent,
+  });
+
+  // A raw compatibility flag is not enough to promote arbitrary status text
+  // into persisted model reasoning.
+  onStatus?.({
+    type: 'status',
+    content: 'unattested preamble text',
+    preambleProgress: true,
+    replace: true,
+  });
+  onStatus?.({
+    type: 'status',
+    content: 'wrong transport source',
+    replace: true,
+    turnEvent: {
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_reasoning',
+      text: 'must not be promoted',
+      replace: true,
+      source: {
+        transport: 'portal-stream-event-bus',
+        eventType: 'text',
+        preambleProgress: true,
+      },
+    },
+  });
+  onStatus?.({
+    type: 'status',
+    content: 'Planning the safe change.',
+    preambleProgress: true,
+    replace: true,
+    turnEvent: {
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_reasoning',
+      text: 'Planning the safe change.',
+      replace: true,
+      source: {
+        transport: 'portal-stream-event-bus',
+        eventType: 'status',
+        preambleProgress: true,
+        preambleItemId: 'preamble-item-1',
+      },
+    },
+  });
+  onStatus?.({
+    type: 'status',
+    content: 'Thinking… (~1,234 tokens)',
+    replace: true,
+    transient: true,
+  });
+  onStatus?.({
+    type: 'status',
+    content: 'untrusted wrapper text',
+    turnEvent: {
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_status',
+      text: 'Reviewing the verified test output.',
+      replace: true,
+      visible: true,
+      sessionKey: 'agent:portal-project-a:project-a',
+      seq: 10,
+      ts: 10,
+      source: {
+        transport: 'portal-stream-event-bus',
+        eventType: 'status',
+      },
+    },
+  });
+  onStatus?.({
+    type: 'status',
+    content: 'Thinking…',
+    turnEvent: {
+      schema: 'bridgesllm.runtime-turn-event.v1',
+      type: 'assistant_status',
+      text: 'Thinking…',
+      replace: true,
+      visible: true,
+      sessionKey: 'agent:portal-project-a:project-a',
+      seq: 11,
+      ts: 11,
+      source: {
+        transport: 'portal-stream-event-bus',
+        eventType: 'status',
+      },
+    },
+  });
+
+  const snapshot = getProjectNativeRunSnapshot({
+    userId: USER_ID,
+    projectId: PROJECT_ID,
+    provider: 'OPENCLAW',
+  });
+  expect(snapshot?.events).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      type: 'status',
+      content: 'unattested preamble text',
+      replace: true,
+    }),
+    expect.objectContaining({
+      type: 'status',
+      content: 'wrong transport source',
+      replace: true,
+    }),
+    expect.objectContaining({
+      type: 'thinking',
+      content: 'Planning the safe change.',
+      replace: true,
+      preambleProgress: true,
+      preambleItemId: 'preamble-item-1',
+    }),
+    expect.objectContaining({
+      type: 'status',
+      content: 'Thinking… (~1,234 tokens)',
+      replace: true,
+      transient: true,
+    }),
+    expect.objectContaining({
+      type: 'status',
+      content: 'Reviewing the verified test output.',
+      replace: true,
+      assistantStatus: true,
+    }),
+  ]));
+  expect(snapshot?.events.find((event) => event.content === 'unattested preamble text'))
+    .not.toHaveProperty('preambleProgress');
+  expect(snapshot?.events.find((event) => event.content === 'wrong transport source'))
+    .not.toHaveProperty('preambleProgress');
+  expect(snapshot?.events.find((event) => event.content === 'Thinking…'))
+    .not.toHaveProperty('assistantStatus');
+  expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+    type: 'thinking',
+    preambleProgress: true,
+    preambleItemId: 'preamble-item-1',
+  }));
+
+  resolveSend({ fullText: 'Done.' });
+  await flushPromises();
+  await flushPromises();
+});
+
 test('passes bounded provider fullText to settlement when no text chunks were emitted', async () => {
   const onSettled = jest.fn().mockResolvedValue(undefined);
   startProjectNativeRun({

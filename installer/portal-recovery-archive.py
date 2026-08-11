@@ -260,7 +260,10 @@ def member_xattrs(member: tarfile.TarInfo) -> tuple[tuple[bytes, bytes], ...]:
         "SCHILY.acl.access" in member.pax_headers
         and b"system.posix_acl_access" not in names
     ) or (
-        "SCHILY.acl.default" in member.pax_headers
+        # GNU tar emits an empty SCHILY.acl.default marker for an
+        # access-ACL-bearing directory that has no default ACL. Only a
+        # non-empty default ACL has an authoritative binary xattr.
+        bool(member.pax_headers.get("SCHILY.acl.default"))
         and b"system.posix_acl_default" not in names
     ):
         fail("archive member ACL metadata lacks its authoritative binary xattr")

@@ -112,18 +112,39 @@ export function finishMatchingToolCall<TToolCall extends LiveTurnToolCall>(
 export function hasRecentCompletedTool<TMessage extends LiveTurnMessage>(
   messages: TMessage[],
   toolName: string,
-  params: { now?: number; windowMs?: number } = {},
+  params: {
+    now?: number;
+    windowMs?: number;
+    stableToolCallId?: string;
+    stableOrder?: number;
+    assistantId?: string | null;
+  } = {},
 ): boolean {
   const now = params.now ?? Date.now();
   const windowMs = params.windowMs ?? 5000;
+  const stableToolCallId = typeof params.stableToolCallId === 'string'
+    ? params.stableToolCallId.trim()
+    : '';
+  const stableOrder = Number.isSafeInteger(params.stableOrder)
+    ? Number(params.stableOrder)
+    : null;
   return messages.some((message) => (
-    message.role === 'assistant'
+    (!params.assistantId || message.id === params.assistantId)
+    && message.role === 'assistant'
     && Array.isArray(message.toolCalls)
     && message.toolCalls.some((toolCall) => (
       toolCall.status !== 'running'
       && toolCall.name === toolName
-      && typeof toolCall.endedAt === 'number'
-      && now - toolCall.endedAt < windowMs
+      && (
+        stableToolCallId
+          ? toolCall.id === stableToolCallId
+          : stableOrder !== null
+            ? toolCall.order === stableOrder
+            : (
+                typeof toolCall.endedAt === 'number'
+                && now - toolCall.endedAt < windowMs
+              )
+      )
     ))
   ));
 }
@@ -239,9 +260,17 @@ export function appendCompletedToolCallIfMissing<TMessage extends LiveTurnMessag
   messages: TMessage[],
   assistantId: string | null | undefined,
   toolCall: LiveTurnToolCall,
-  params: { now?: number; windowMs?: number } = {},
+  params: {
+    now?: number;
+    windowMs?: number;
+    stableToolCallId?: string;
+    stableOrder?: number;
+  } = {},
 ): LiveTurnToolProjection<TMessage> {
-  if (hasRecentCompletedTool(messages, toolCall.name, params)) {
+  if (hasRecentCompletedTool(messages, toolCall.name, {
+    ...params,
+    assistantId: assistantId || null,
+  })) {
     return { messages, toolCalls: [], nextRunningToolName: null, changed: false };
   }
   return appendToolCallToMessage(messages, assistantId, toolCall);

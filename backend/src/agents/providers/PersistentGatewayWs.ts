@@ -2359,11 +2359,36 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
     // for both the claude-cli thinking lane (isReasoningSnapshot) and the
     // embedded runtime. Publishing the snapshot as an append chunk duplicates
     // the whole thought on every event, so diff against the last snapshot and
-    // emit only new text. Events with only progressTokens carry no text.
+    // emit only new text. Claude CLI can keep private reasoning encrypted and
+    // expose only a cumulative progress-token count; publish that count as an
+    // honest replaceable status instead of making the live turn look dead.
     const snapshotText = typeof data.text === 'string' ? data.text : '';
     const chunkText = typeof data.delta === 'string'
       ? data.delta
       : (typeof data.content === 'string' ? data.content : '');
+    const progressTokens = typeof data.progressTokens === 'number'
+      && Number.isFinite(data.progressTokens)
+      && data.progressTokens > 0
+      ? Math.floor(data.progressTokens)
+      : null;
+    if (!snapshotText && !chunkText && progressTokens !== null) {
+      const progressStatus = `Thinking… (~${progressTokens.toLocaleString('en-US')} tokens)`;
+      if (!hasRunningToolCall(sessionKey)) {
+        streamEventBus.updateStreamPhase(sessionKey, {
+          phase: 'thinking',
+          runId: effectiveRunId,
+          statusText: progressStatus,
+        });
+        streamEventBus.publish(sessionKey, {
+          type: 'status',
+          content: progressStatus,
+          runId: effectiveRunId,
+          replace: true,
+          transient: true,
+        });
+      }
+      return;
+    }
     let thinkingContent = '';
     let thinkingReplace = false;
     if (snapshotText) {

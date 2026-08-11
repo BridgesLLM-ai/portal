@@ -16,7 +16,8 @@ import {
 } from './backupRunnerFixture';
 
 const repositoryRoot = path.resolve(__dirname, '../../..');
-const backupScript = path.join(repositoryRoot, 'backup-full.sh');
+const backupScript = process.env.BACKUP_SCRIPT_UNDER_TEST
+  || path.join(repositoryRoot, 'backup-full.sh');
 const tempRoots: string[] = [];
 
 describe('backup status contract', () => {
@@ -38,6 +39,89 @@ describe('backup status contract', () => {
     expect(parseBackupStatus(JSON.stringify({ ...status, failureDetail: '🧰'.repeat(250) }))).not.toBeNull();
     expect(parseBackupStatus(JSON.stringify({ ...status, failureDetail: '🧰'.repeat(251) }))).toBeNull();
   });
+});
+
+describe('SQLite online snapshot concurrency', () => {
+  it('survives a WAL sidecar appearing after admission while a writer stays connected', async () => {
+    const testRoot = makeTempRoot('backup-sqlite-sidecar-transition');
+    const sourceDir = path.join(testRoot, 'source');
+    const targetDir = path.join(testRoot, 'target');
+    fs.mkdirSync(sourceDir, { mode: 0o700 });
+    fs.mkdirSync(targetDir, { mode: 0o700 });
+    const sourcePath = path.join(sourceDir, 'live.sqlite');
+    const targetPath = path.join(targetDir, 'snapshot.sqlite');
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    const setupDatabase = new DatabaseSync(sourcePath);
+    setupDatabase.prepare('PRAGMA journal_mode=WAL').get();
+    setupDatabase.exec('PRAGMA wal_autocheckpoint=0; CREATE TABLE payload (value BLOB NOT NULL); BEGIN');
+    const insertPayload = setupDatabase.prepare('INSERT INTO payload (value) VALUES (?)');
+    const payload = Buffer.alloc(4096, 0x5a);
+    for (let index = 0; index < 32_768; index += 1) insertPayload.run(payload);
+    setupDatabase.exec('COMMIT; PRAGMA wal_checkpoint(TRUNCATE)');
+    setupDatabase.close();
+    fs.chmodSync(sourcePath, 0o600);
+    expect(fs.existsSync(`${sourcePath}-wal`)).toBe(false);
+    expect(fs.existsSync(`${sourcePath}-shm`)).toBe(false);
+
+    const script = fs.readFileSync(backupScript, 'utf8');
+    const functionStart = script.indexOf('snapshot_sqlite_database() {');
+    const functionEnd = script.indexOf('\nmaterialize_openclaw_codex_database_list() {', functionStart);
+    expect(functionStart).toBeGreaterThanOrEqual(0);
+    expect(functionEnd).toBeGreaterThan(functionStart);
+    const harnessPath = path.join(testRoot, 'snapshot-harness.sh');
+    fs.writeFileSync(
+      harnessPath,
+      `set -euo pipefail\n${script.slice(functionStart, functionEnd)}\nsnapshot_sqlite_database "$1" "$2"\n`,
+      { mode: 0o700 },
+    );
+
+    const snapshot = spawn('bash', [harnessPath, sourcePath, targetPath], {
+      cwd: repositoryRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const snapshotCompletion = new Promise<{ code: number | null; stderr: string }>((resolve) => {
+      let stderr = '';
+      snapshot.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+      snapshot.on('close', (code) => resolve({ code, stderr }));
+    });
+    await waitUntil(() => fs.existsSync(targetPath), 10_000);
+
+    const writer = spawn('python3', ['-c', [
+      'import sqlite3, sys, time',
+      'connection = sqlite3.connect(sys.argv[1], timeout=30)',
+      'connection.execute("PRAGMA journal_mode=WAL")',
+      'connection.execute("INSERT INTO payload (value) VALUES (randomblob(4096))")',
+      'connection.commit()',
+      'print("writer-ready", flush=True)',
+      'time.sleep(30)',
+    ].join('; '), sourcePath], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+      await waitUntil(() => fs.existsSync(`${sourcePath}-wal`) && fs.existsSync(`${sourcePath}-shm`), 10_000);
+      const snapshotResult = await snapshotCompletion;
+      expect(snapshotResult).toEqual({ code: 0, stderr: '' });
+    } finally {
+      writer.kill('SIGTERM');
+      await new Promise<void>((resolve) => writer.once('close', () => resolve()));
+    }
+
+    const restoredDatabase = new DatabaseSync(targetPath, { readOnly: true });
+    try {
+      expect(restoredDatabase.prepare('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
+      const row = restoredDatabase.prepare('SELECT COUNT(*) AS count FROM payload').get() as { count: number };
+      expect(row.count).toBeGreaterThanOrEqual(32_768);
+      expect(row.count).toBeLessThanOrEqual(32_769);
+    } finally {
+      restoredDatabase.close();
+    }
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      expect(fs.existsSync(`${targetPath}${suffix}`)).toBe(false);
+    }
+  }, 45_000);
 });
 
 function makeTempRoot(prefix: string): string {
@@ -548,6 +632,52 @@ describe('persistent backup runner', () => {
       expect(`${result.stdout}\n${result.stderr}`).toContain(
         'Required recovery source or SQLite snapshot could not be archived',
       );
+      const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
+      expect(status).toMatchObject({
+        type: 'daily',
+        status: 'failed',
+      });
+      expect(status.exitCode).not.toBe(0);
+      expect(status.failureDetail).toContain('published in degraded state');
+      expect(status.archivePath).toMatch(
+        new RegExp(`^${backupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/daily/portal-daily-`),
+      );
+      expect(fs.statSync(status.archivePath).mode & 0o777).toBe(0o600);
+
+      const recoveryManifest = JSON.parse(
+        spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], {
+          encoding: 'utf8',
+        }).stdout,
+      );
+      expect(
+        recoveryManifest.components.find((entry: any) => entry.id === 'openclaw-state'),
+      ).toMatchObject({
+        requirement: 'required',
+        status: 'degraded',
+        payload: null,
+        captureMethod: null,
+        reason: 'Required recovery source or SQLite snapshot could not be archived after 3 attempts',
+      });
+
+      const strictVerification = spawnSync(
+        'bash',
+        [backupScript, '--verify-archive', status.archivePath],
+        {
+          cwd: repositoryRoot,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ...fixture.env,
+            OPENCLAW_BACKUP_POLICY: 'required',
+            OPENCLAW_DIR: openclawRoot,
+          },
+          timeout: 30_000,
+        },
+      );
+      expect(strictVerification.status).not.toBe(0);
+      expect(`${strictVerification.stdout}\n${strictVerification.stderr}`).toContain(
+        'degraded recovery component is not a complete backup',
+      );
     },
     40_000,
   );
@@ -723,7 +853,7 @@ describe('persistent backup runner', () => {
     expect(fs.readdirSync(path.join(backupRoot, 'daily')).filter((name) => name.endsWith('.tar.gz'))).toEqual([]);
   });
 
-  it('fails closed when a required recovery source is missing', () => {
+  it('publishes an honest degraded archive when a required recovery source is missing', () => {
     const testRoot = makeTempRoot('backup-missing-source');
     const portalRoot = path.join(testRoot, 'portal');
     const stateDir = path.join(portalRoot, 'backend', '.data', 'backups');
@@ -735,7 +865,17 @@ describe('persistent backup runner', () => {
     });
     const requiredSources = fixture.requiredSources;
     fs.rmSync(requiredSources.APPS_ROOT, { recursive: true });
+    fs.symlinkSync(
+      '/usr/bin/python3',
+      path.join(requiredSources.PROJECTS_ROOT, 'escaping-python'),
+    );
     fs.writeFileSync(path.join(stateDir, 'backup-base-path'), `${backupRoot}\n`, { mode: 0o600 });
+    const priorCompleteArchive = path.join(
+      backupRoot,
+      'daily',
+      'portal-daily-20200102-000000.tar.gz',
+    );
+    fs.writeFileSync(priorCompleteArchive, 'prior complete archive sentinel', { mode: 0o600 });
     fs.writeFileSync(path.join(portalRoot, 'backend', '.env.production'), [
       'DATABASE_URL=postgresql://test:test@127.0.0.1/test',
       'INSTALL_PROFILE=custom',
@@ -757,23 +897,83 @@ describe('persistent backup runner', () => {
         STALWART_MAIL_DIR: path.join(testRoot, 'missing-stalwart-mail'),
         STALWART_INSTALL_DIR: path.join(testRoot, 'missing-stalwart-install'),
         SYSTEMD_DIR: path.join(testRoot, 'missing-systemd'),
+        DAILY_KEEP: '1',
         ...fixture.env,
       },
       timeout: 30_000,
     });
 
     expect(result.status).not.toBe(0);
-    expect(`${result.stdout}\n${result.stderr}`).toContain('Required recovery source is missing');
-    expect(JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'))).toMatchObject({
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      'recovery component is degraded: hosted-apps',
+    );
+    const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
+    expect(status).toMatchObject({
       type: 'daily',
       status: 'failed',
-      phase: 'portal-data',
-      phaseLabel: 'Archiving Portal data',
-      phaseIndex: 3,
+      phase: 'verifying-archive',
+      phaseLabel: 'Verifying and publishing archive',
+      phaseIndex: 8,
       phaseTotal: 8,
-      failureDetail: expect.stringContaining('Required recovery source is missing'),
+      failureDetail: expect.stringContaining('published in degraded state'),
     });
-    expect(fs.readdirSync(path.join(backupRoot, 'daily')).filter((name) => name.endsWith('.tar.gz'))).toEqual([]);
+    expect(status.exitCode).not.toBe(0);
+    expect(fs.existsSync(status.archivePath)).toBe(true);
+    expect(fs.existsSync(priorCompleteArchive)).toBe(true);
+
+    const recoveryManifest = JSON.parse(
+      spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], {
+        encoding: 'utf8',
+      }).stdout,
+    );
+    const components = new Map(recoveryManifest.components.map((entry: any) => [entry.id, entry]));
+    expect(components.get('hosted-apps')).toMatchObject({
+      requirement: 'required',
+      status: 'degraded',
+      payload: null,
+      captureMethod: null,
+      reason: 'Required recovery source was missing or could not be archived',
+    });
+    expect(components.get('projects')).toMatchObject({
+      requirement: 'required',
+      status: 'degraded',
+      payload: null,
+      captureMethod: null,
+      reason: 'Required recovery source was missing or could not be archived',
+    });
+    for (const laterComponent of [
+      'portal-files',
+      'upload-storage',
+      'portal-backend-state',
+      'portal-state',
+      'portal-assets',
+      'portal-install',
+      'portal-environment',
+    ]) {
+      expect(components.get(laterComponent)).toMatchObject({
+        requirement: 'required',
+        status: 'captured',
+      });
+    }
+
+    const strictVerification = spawnSync(
+      'bash',
+      [backupScript, '--verify-archive', status.archivePath],
+      {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ...requiredSources,
+          ...fixture.env,
+        },
+        timeout: 30_000,
+      },
+    );
+    expect(strictVerification.status).not.toBe(0);
+    expect(`${strictVerification.stdout}\n${strictVerification.stderr}`).toContain(
+      'degraded recovery component is not a complete backup',
+    );
   });
 
   it('rejects an archive whose payload no longer matches its manifest', () => {

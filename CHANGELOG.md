@@ -2,6 +2,21 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.15] - 2026-08-10
+
+### Fixed
+- **Fresh and expired sessions can sign in again.** A missing or expired session could make its own recovery attempt look stale, leave the login form permanently disabled, and display “Signing in…” even though no request was still running. Superseded recovery now releases the loading state without allowing an older response to overwrite a genuinely newer session. A regression test drives the real `/auth/me` 401 → `/auth/refresh` 401 → local logout path that caused the lockout rather than simulating an unrelated external generation change.
+
+  **Locked out on 4.0.14?** The Dashboard update button is unreachable from the disabled login screen. Connect to the VPS over SSH and run the signed terminal updater (omit `sudo` only when already logged in as root):
+
+  ```bash
+  curl -fsSL https://bridgesllm.ai/install.sh | sudo bash -s -- --update
+  ```
+
+- **Long Agent Chat runs remain a readable timeline after the browser has been away.** OpenClaw's cumulative and bounded sliding reasoning snapshots are projected into only the new thought at each tool or text boundary, while history scans continue to the real run boundary instead of stopping at an arbitrary page timestamp. Tool-heavy and multi-file session pagination no longer drops the initiating prompt or duplicates the final answer, one foreground reconciliation replaces two racing reloads, accepted user messages remain visible during durable-history lag, and encrypted Anthropic reasoning reports honest transient token progress without inventing hidden chain-of-thought.
+- **Project Chat preserves the same reasoning/tool chronology.** Attested OpenClaw preambles and raw reasoning use independent cumulative-snapshot lanes in both live replay and durable history, replay sequence wins over skewed timestamps, text and segment boundaries graduate the active thought, and transient token counters stay out of saved reasoning. If a safety cap genuinely omits earlier activity, the saved presentation is marked and the UI says so instead of silently pretending the turn is complete.
+- **A comprehensive backup can publish an honest degraded archive instead of destroying all recovery evidence.** Component capture records exact complete, degraded, and failed outcomes; a nonzero degraded run keeps its sealed archive and manifest, refuses strict restore verification, and cannot rotate away older complete backups. The runner snapshots mutable SQLite state online, excludes volatile sidecars, and verifies restore fixtures under active-host failure rather than treating an idle daily run as evidence.
+
 ## [4.0.14] - 2026-08-10
 
 ### Added
