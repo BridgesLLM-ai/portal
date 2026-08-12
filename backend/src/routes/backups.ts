@@ -7,13 +7,19 @@ import {
   BACKUP_TYPES,
   BackupFile,
   BackupType,
+  deleteBackupFile,
+  expectedBackupOwnerIdentity,
   findBackupFile,
   getConfiguredBackupRoot,
+  isBackupReferencedByLiveDependencyRepair,
+  isRepairOwnedBackupLockMarker,
   listBackupFiles,
   readBackupSchedules,
   readBackupStatus,
   readLegacyBackupCron,
+  assertBackupMutationLockLease,
   startBackupUnit,
+  withBackupMutationLock,
 } from '../services/backup.service';
 
 const router = Router();
@@ -31,7 +37,7 @@ function humanSize(bytes: number): string {
   return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-function publicBackup(file: BackupFile) {
+export function publicBackup(file: BackupFile) {
   return {
     filename: file.filename,
     size: file.size,
@@ -39,6 +45,35 @@ function publicBackup(file: BackupFile) {
     created: new Date(file.mtimeMs).toISOString(),
     type: file.type,
     locked: file.locked,
+    completeness: file.completeness,
+    degradedComponents: file.degradedComponents,
+    classificationAuthenticated: file.classificationAuthenticated,
+  };
+}
+
+export function buildBackupListResponse(root: string, files: BackupFile[]) {
+  const backups = files
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .map(publicBackup);
+  const totalSize = backups.reduce((sum, backup) => sum + backup.size, 0);
+  const completeBackups = backups.filter((backup) => backup.completeness === 'complete');
+  const degradedBackups = backups.filter((backup) => backup.completeness === 'degraded');
+  const unknownBackups = backups.filter((backup) => backup.completeness === 'unknown');
+
+  return {
+    backups,
+    root,
+    summary: {
+      total: backups.length,
+      totalSize,
+      totalSizeHuman: humanSize(totalSize),
+      oldest: backups.length ? backups[backups.length - 1].created : null,
+      newest: backups.length ? backups[0].created : null,
+      complete: completeBackups.length,
+      degraded: degradedBackups.length,
+      unknown: unknownBackups.length,
+      newestComplete: completeBackups.length ? completeBackups[0].created : null,
+    },
   };
 }
 
@@ -51,7 +86,7 @@ function sameFile(left: BackupFile, right: BackupFile): boolean {
   return left.dev === right.dev
     && left.ino === right.ino
     && left.size === right.size
-    && Math.trunc(left.mtimeMs) === Math.trunc(right.mtimeMs);
+    && left.mtimeNs === right.mtimeNs;
 }
 
 function streamFile(req: Request, res: Response, file: BackupFile): void {
@@ -79,6 +114,34 @@ function streamFile(req: Request, res: Response, file: BackupFile): void {
     res.setHeader('Content-Range', `bytes ${start}-${end}/${file.size}`);
   }
 
+  let descriptor: number | null = null;
+  try {
+    descriptor = fs.openSync(file.fullPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const stat = fs.fstatSync(descriptor, { bigint: true });
+    const expectedOwner = expectedBackupOwnerIdentity();
+    if (!stat.isFile() || stat.isSymbolicLink()
+      || stat.dev.toString() !== file.dev
+      || stat.ino.toString() !== file.ino
+      || stat.size !== BigInt(file.size)
+      || stat.mtimeNs.toString() !== file.mtimeNs
+      || stat.uid !== BigInt(expectedOwner.uid)
+      || stat.gid !== BigInt(expectedOwner.gid)
+      || stat.nlink !== 1n
+      || (stat.mode & 0o022n) !== 0n) {
+      fs.closeSync(descriptor);
+      descriptor = null;
+      res.status(409).json({ error: 'Backup changed before download' });
+      return;
+    }
+  } catch {
+    if (descriptor !== null) {
+      try { fs.closeSync(descriptor); } catch {}
+      descriptor = null;
+    }
+    res.status(409).json({ error: 'Backup changed before download' });
+    return;
+  }
+
   res.status(statusCode);
   res.setHeader('Content-Type', 'application/gzip');
   res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
@@ -87,7 +150,8 @@ function streamFile(req: Request, res: Response, file: BackupFile): void {
   res.setHeader('Cache-Control', 'private, no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
 
-  const stream = fs.createReadStream(file.fullPath, { start, end });
+  const stream = fs.createReadStream(file.fullPath, { fd: descriptor, autoClose: true, start, end });
+  descriptor = null; // createReadStream owns and closes the descriptor now.
   const close = () => stream.destroy();
   req.once('aborted', close);
   res.once('close', close);
@@ -102,22 +166,7 @@ function streamFile(req: Request, res: Response, file: BackupFile): void {
 router.get('/list', async (_req: Request, res: Response) => {
   try {
     const root = await getConfiguredBackupRoot();
-    const backups = listBackupFiles(root)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .map(publicBackup);
-    const totalSize = backups.reduce((sum, backup) => sum + backup.size, 0);
-
-    res.json({
-      backups,
-      root,
-      summary: {
-        total: backups.length,
-        totalSize,
-        totalSizeHuman: humanSize(totalSize),
-        oldest: backups.length ? backups[backups.length - 1].created : null,
-        newest: backups.length ? backups[0].created : null,
-      },
-    });
+    res.json(buildBackupListResponse(root, listBackupFiles(root)));
   } catch (error) {
     console.error('Backup list error:', error);
     res.status(500).json({ error: 'Backup storage is unavailable or insecurely configured' });
@@ -146,21 +195,32 @@ router.post('/lock/:filename', async (req: Request, res: Response) => {
   }
   activeBackupMutations.add(mutationKey);
   try {
-    const found = await resolveBackup(req.params.filename);
-    if (!found) {
-      res.status(404).json({ error: 'Backup not found' });
-      return;
-    }
-
-    const lockPath = `${found.fullPath}.locked`;
-    if (found.locked) {
-      const stat = fs.lstatSync(lockPath);
-      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('Invalid backup lock file');
-      fs.unlinkSync(lockPath);
-    } else {
-      fs.writeFileSync(lockPath, `${new Date().toISOString()}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    }
-    res.json({ filename: found.filename, locked: !found.locked });
+    await withBackupMutationLock(async (lease) => {
+      const found = await resolveBackup(req.params.filename);
+      if (!found) {
+        res.status(404).json({ error: 'Backup not found' });
+        return;
+      }
+      if (isRepairOwnedBackupLockMarker(found)
+        || await isBackupReferencedByLiveDependencyRepair(found)) {
+        res.status(409).json({
+          error: 'This backup is pinned by an active Project dependency repair and cannot be unlocked.',
+          code: 'BACKUP_PINNED_BY_DEPENDENCY_REPAIR',
+        });
+        return;
+      }
+      const lockPath = `${found.fullPath}.locked`;
+      if (found.locked) {
+        const stat = fs.lstatSync(lockPath);
+        if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('Invalid backup lock file');
+        assertBackupMutationLockLease(lease);
+        fs.unlinkSync(lockPath);
+      } else {
+        assertBackupMutationLockLease(lease);
+        fs.writeFileSync(lockPath, `${new Date().toISOString()}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      }
+      res.json({ filename: found.filename, locked: !found.locked });
+    });
   } catch (error) {
     console.error('Backup lock error:', error);
     res.status(500).json({ error: 'Failed to toggle backup lock' });
@@ -177,35 +237,45 @@ router.delete('/:filename', async (req: Request, res: Response) => {
   }
   activeBackupMutations.add(mutationKey);
   try {
-    const root = await getConfiguredBackupRoot();
-    const found = findBackupFile(root, req.params.filename);
-    if (!found) {
-      res.status(404).json({ error: 'Backup not found' });
-      return;
-    }
-    if (found.locked) {
-      res.status(400).json({ error: 'Cannot delete locked backup. Unlock it first.' });
-      return;
-    }
+    await withBackupMutationLock(async (lease) => {
+      const root = await getConfiguredBackupRoot();
+      const found = findBackupFile(root, req.params.filename);
+      if (!found) {
+        res.status(404).json({ error: 'Backup not found' });
+        return;
+      }
+      if (await isBackupReferencedByLiveDependencyRepair(found)) {
+        res.status(409).json({
+          error: 'This backup is pinned by an active Project dependency repair and cannot be deleted.',
+          code: 'BACKUP_PINNED_BY_DEPENDENCY_REPAIR',
+        });
+        return;
+      }
+      if (found.locked) {
+        res.status(400).json({ error: 'Cannot delete locked backup. Unlock it first.' });
+        return;
+      }
 
-    const revalidated = findBackupFile(root, found.filename);
-    if (!revalidated || !sameFile(found, revalidated)) {
-      res.status(409).json({ error: 'Backup changed while the delete was being prepared' });
-      return;
-    }
-    fs.unlinkSync(found.fullPath);
+      const revalidated = findBackupFile(root, found.filename);
+      if (!revalidated || !sameFile(found, revalidated)) {
+        res.status(409).json({ error: 'Backup changed while the delete was being prepared' });
+        return;
+      }
+      assertBackupMutationLockLease(lease);
+      deleteBackupFile(found, lease);
 
-    await prisma.activityLog.create({
-      data: {
-        userId: req.user!.userId,
-        action: 'BACKUP_DELETE',
-        resource: 'backup',
-        resourceId: found.filename,
-        severity: 'INFO',
-        metadata: { type: found.type, filename: found.filename },
-      },
-    }).catch((error) => console.error('Failed to record backup deletion activity:', error));
-    res.json({ success: true, filename: found.filename });
+      await prisma.activityLog.create({
+        data: {
+          userId: req.user!.userId,
+          action: 'BACKUP_DELETE',
+          resource: 'backup',
+          resourceId: found.filename,
+          severity: 'INFO',
+          metadata: { type: found.type, filename: found.filename },
+        },
+      }).catch((error) => console.error('Failed to record backup deletion activity:', error));
+      res.json({ success: true, filename: found.filename });
+    });
   } catch (error) {
     console.error('Backup delete error:', error);
     res.status(500).json({ error: 'Failed to delete backup' });
@@ -341,6 +411,9 @@ router.get('/download-info/:filename', async (req: Request, res: Response) => {
       sizeHuman: humanSize(found.size),
       chunkSize: CHUNK_SIZE,
       totalChunks: Math.ceil(found.size / CHUNK_SIZE),
+      completeness: found.completeness,
+      degradedComponents: found.degradedComponents,
+      classificationAuthenticated: found.classificationAuthenticated,
     });
   } catch (error) {
     console.error('Download info error:', error);

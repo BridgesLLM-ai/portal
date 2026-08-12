@@ -10,7 +10,13 @@ import { prisma } from '../config/database';
 import { startAgentJob } from '../services/agentJobs';
 import { isOwnerRole } from '../utils/authz';
 import { isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
-import { getConfiguredBackupRoot, listBackupFiles } from '../services/backup.service';
+import {
+  type BackupFile,
+  getConfiguredBackupRoot,
+  expectedBackupOwnerIdentity,
+  listBackupFiles,
+  reauthenticateBackupClassification,
+} from '../services/backup.service';
 import {
   getOpenClawSetupReadiness,
   type OpenClawSetupReadiness,
@@ -122,21 +128,34 @@ type MaintenanceAdmissionOptions = {
   staleMs?: number;
 };
 
-type MaintenanceBackupCandidate = {
-  filename: string;
-  fullPath: string;
-  size: number;
-  mtimeMs: number;
-  dev: number;
-  ino: number;
-};
+export type MaintenanceBackupCandidate = Pick<BackupFile,
+  'filename' | 'fullPath' | 'size' | 'mtimeMs' | 'mtimeNs' | 'dev' | 'ino'
+  | 'type' | 'completeness' | 'degradedComponents' | 'classificationAuthenticated'>;
 
-type VerifiedMaintenanceBackup = {
+export type VerifiedMaintenanceBackup = {
   path: string;
   filename: string;
   createdAt: string;
   ageHours: number;
   size: number;
+  device: string;
+  inode: string;
+  mtimeNs: string;
+  receiptDigest: string;
+  fingerprintDigest: string;
+};
+
+export type MaintenanceBackupRejection =
+  | 'NO_COMPREHENSIVE_CANDIDATE'
+  | 'AUTHENTICATED_DEGRADED_ARCHIVE'
+  | 'UNCLASSIFIED_ARCHIVE'
+  | 'NO_FRESH_COMPLETE_COMPREHENSIVE_ARCHIVE'
+  | 'STRICT_VERIFICATION_FAILED_OR_TIMED_OUT';
+
+export type MaintenanceBackupAdmissionResult = {
+  backup: VerifiedMaintenanceBackup | null;
+  backupRejection: MaintenanceBackupRejection | null;
+  degradedComponents: string[];
 };
 
 const router = Router();
@@ -169,7 +188,28 @@ const CHECKED_SERVICES: CheckedService[] = [
 export const MAINTENANCE_BACKUP_MAX_AGE_HOURS = 24;
 const MAINTENANCE_BACKUP_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
 const MAINTENANCE_ADMISSION_STALE_MS = 10 * 60 * 1000;
+const MAINTENANCE_BACKUP_VERIFY_TIMEOUT_MS = 15 * 60_000;
+const MAX_MAINTENANCE_BACKUP_CANDIDATES = 4;
 const MAINTENANCE_TOOL_ID = 'system-maintenance';
+
+function secureArchiveStat(stat: fs.BigIntStats): boolean {
+  const expectedOwner = expectedBackupOwnerIdentity();
+  return stat.isFile() && !stat.isSymbolicLink()
+    && stat.uid === BigInt(expectedOwner.uid)
+    && stat.gid === BigInt(expectedOwner.gid)
+    && stat.nlink === 1n
+    && (stat.mode & 0o022n) === 0n;
+}
+
+function secureReceiptStat(stat: fs.BigIntStats): boolean {
+  const expectedOwner = expectedBackupOwnerIdentity();
+  return stat.isFile() && !stat.isSymbolicLink()
+    && stat.uid === BigInt(expectedOwner.uid)
+    && stat.gid === BigInt(expectedOwner.gid)
+    && stat.nlink === 1n
+    && (stat.mode & 0o777n) === 0o600n
+    && stat.size > 0n && stat.size <= 16_384n;
+}
 
 const PROTECTED_PACKAGE_REGEX = /^(?:bridgesllm(?:-.+)?|openclaw(?:-.+)?|stalwart(?:-.+)?|stalwart-mail|caddy)$/i;
 
@@ -418,19 +458,19 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     id: 'create-maintenance-backup',
     label: 'Create Maintenance Backup',
     title: 'Create maintenance backup',
-    description: 'Creates a daily Portal backup before maintenance work.',
-    risk: 'safe',
-    downtimeExpected: false,
+    description: 'Creates and verifies a comprehensive recovery backup before maintenance work.',
+    risk: 'scheduled',
+    downtimeExpected: true,
     requiresOwner: true,
     changesSystem: true,
     destructive: false,
     requiresBackup: false,
-    requiresMaintenanceWindow: false,
-    automationLevel: 'safe',
-    impact: 'Creates a Portal backup archive. It writes backup files but should not change running services.',
-    recovery: 'Delete the failed or unwanted backup archive if storage cleanup is needed.',
+    requiresMaintenanceWindow: true,
+    automationLevel: 'guarded',
+    impact: 'Temporarily pauses Portal and agent services while it fences all required recovery data, then publishes only an authenticated complete archive.',
+    recovery: 'If capture fails, services are recovered from the quiescence journal and any degraded salvage archive remains outside restore admission.',
     confirmationPhrase: 'CREATE MAINTENANCE BACKUP',
-    command: 'set -euo pipefail\nsystemctl start bridgesllm-backup@daily.service',
+    command: 'set -euo pipefail\nsystemctl start bridgesllm-backup@comprehensive.service',
   },
 };
 
@@ -772,19 +812,28 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
   };
 }
 
-async function latestBackup(): Promise<{ path: string; createdAt: string; ageHours: number } | null> {
+async function latestBackup(): Promise<{
+  filename: string;
+  createdAt: string;
+  ageHours: number;
+  admissionStatus: 'candidate-awaiting-strict-verification';
+} | null> {
   let latest: { fullPath: string; mtimeMs: number } | null = null;
   try {
     const root = await getConfiguredBackupRoot();
-    latest = listBackupFiles(root).sort((a, b) => b.mtimeMs - a.mtimeMs)[0] || null;
+    latest = listBackupFiles(root)
+      .filter((candidate) => candidate.type === 'comprehensive')
+      .filter((candidate) => candidate.completeness === 'complete' && candidate.classificationAuthenticated)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)[0] || null;
   } catch {
     return null;
   }
   if (!latest) return null;
   return {
-    path: latest.fullPath,
+    filename: path.basename(latest.fullPath),
     createdAt: new Date(latest.mtimeMs).toISOString(),
     ageHours: ageHoursSince(latest.mtimeMs),
+    admissionStatus: 'candidate-awaiting-strict-verification',
   };
 }
 
@@ -972,23 +1021,37 @@ export async function acquireMaintenanceActionAdmission(
   );
 }
 
-export async function verifyMaintenanceBackupArchive(candidate: MaintenanceBackupCandidate): Promise<boolean> {
-  if (candidate.size <= 0) return false;
-  const backupScript = process.env.BACKUP_SCRIPT_PATH
-    || path.join(portalRoot(), 'backup-full.sh');
-  const verification = await runShell(
-    `/bin/bash ${shellQuote(backupScript)} --verify-archive ${shellQuote(candidate.fullPath)}`,
-    120_000,
+export async function verifyMaintenanceBackupArchive(
+  candidate: MaintenanceBackupCandidate,
+  dependencies: {
+    runShellImpl?: (command: string, timeoutMs?: number) => Promise<CommandResult>;
+    restoreScriptPath?: string;
+    timeoutMs?: number;
+  } = {},
+): Promise<boolean> {
+  if (candidate.size <= 0
+    || candidate.type !== 'comprehensive'
+    || candidate.completeness !== 'complete'
+    || !candidate.classificationAuthenticated) return false;
+  const restoreScript = dependencies.restoreScriptPath
+    || process.env.RESTORE_SCRIPT_PATH
+    || path.join(portalRoot(), 'restore-full.sh');
+  const timeoutMs = Number.isFinite(dependencies.timeoutMs)
+    ? Math.max(1, Math.min(MAINTENANCE_BACKUP_VERIFY_TIMEOUT_MS, Math.trunc(dependencies.timeoutMs!)))
+    : MAINTENANCE_BACKUP_VERIFY_TIMEOUT_MS;
+  const verification = await (dependencies.runShellImpl || runShell)(
+    `/bin/bash ${shellQuote(restoreScript)} --verify-archive ${shellQuote(candidate.fullPath)}`,
+    timeoutMs,
   );
   if (!verification.ok) return false;
   try {
-    const stat = fs.lstatSync(candidate.fullPath);
+    const stat = fs.lstatSync(candidate.fullPath, { bigint: true });
     return stat.isFile()
       && !stat.isSymbolicLink()
-      && stat.dev === candidate.dev
-      && stat.ino === candidate.ino
-      && stat.size === candidate.size
-      && stat.mtimeMs === candidate.mtimeMs;
+      && stat.dev.toString() === candidate.dev
+      && stat.ino.toString() === candidate.ino
+      && stat.size === BigInt(candidate.size)
+      && stat.mtimeNs.toString() === candidate.mtimeNs;
   } catch {
     return false;
   }
@@ -996,9 +1059,24 @@ export async function verifyMaintenanceBackupArchive(candidate: MaintenanceBacku
 
 export async function findFreshVerifiedMaintenanceBackup(options: {
   nowMs?: number;
+  createdAfterMs?: number;
   candidates?: MaintenanceBackupCandidate[];
-  verifyArchive?: (candidate: MaintenanceBackupCandidate) => Promise<boolean>;
+  verifyArchive?: (candidate: MaintenanceBackupCandidate, timeoutMs?: number) => Promise<boolean>;
+  clock?: () => number;
+  totalTimeoutMs?: number;
 } = {}): Promise<VerifiedMaintenanceBackup | null> {
+  return (await inspectMaintenanceBackupAdmission(options)).backup;
+}
+
+export async function inspectMaintenanceBackupAdmission(options: {
+  nowMs?: number;
+  /** Require an archive written strictly after this durable recovery boundary. */
+  createdAfterMs?: number;
+  candidates?: MaintenanceBackupCandidate[];
+  verifyArchive?: (candidate: MaintenanceBackupCandidate, timeoutMs?: number) => Promise<boolean>;
+  clock?: () => number;
+  totalTimeoutMs?: number;
+} = {}): Promise<MaintenanceBackupAdmissionResult> {
   const nowMs = options.nowMs ?? Date.now();
   let candidates = options.candidates;
   if (!candidates) {
@@ -1006,28 +1084,206 @@ export async function findFreshVerifiedMaintenanceBackup(options: {
       const root = await getConfiguredBackupRoot();
       candidates = listBackupFiles(root);
     } catch {
-      return null;
+      return {
+        backup: null,
+        backupRejection: 'NO_COMPREHENSIVE_CANDIDATE',
+        degradedComponents: [],
+      };
     }
   }
-  const verifyArchive = options.verifyArchive || verifyMaintenanceBackupArchive;
+  const verifyArchive = options.verifyArchive || ((candidate, timeoutMs) => (
+    verifyMaintenanceBackupArchive(candidate, { timeoutMs })
+  ));
   const maxAgeMs = MAINTENANCE_BACKUP_MAX_AGE_HOURS * 3_600_000;
+  const comprehensive = candidates.filter((candidate) => candidate.type === 'comprehensive');
   const eligible = candidates
     .filter((candidate) => candidate.size > 0)
+    .filter((candidate) => candidate.type === 'comprehensive')
+    .filter((candidate) => candidate.completeness === 'complete' && candidate.classificationAuthenticated)
+    .filter((candidate) => options.createdAfterMs == null || candidate.mtimeMs > options.createdAfterMs)
     .filter((candidate) => nowMs - candidate.mtimeMs <= maxAgeMs)
     .filter((candidate) => candidate.mtimeMs - nowMs <= MAINTENANCE_BACKUP_MAX_FUTURE_SKEW_MS)
-    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .slice(0, MAX_MAINTENANCE_BACKUP_CANDIDATES);
 
-  for (const candidate of eligible) {
-    if (!await verifyArchive(candidate)) continue;
+  if (eligible.length === 0) {
+    const degradedComponents = Array.from(new Set(comprehensive
+      .filter((candidate) => candidate.completeness === 'degraded' && candidate.classificationAuthenticated)
+      .flatMap((candidate) => candidate.degradedComponents)))
+      .filter((component) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(component))
+      .sort()
+      .slice(0, 128);
+    if (degradedComponents.length > 0) {
+      return {
+        backup: null,
+        backupRejection: 'AUTHENTICATED_DEGRADED_ARCHIVE',
+        degradedComponents,
+      };
+    }
+    if (comprehensive.some((candidate) => !candidate.classificationAuthenticated
+      || candidate.completeness === 'unknown')) {
+      return { backup: null, backupRejection: 'UNCLASSIFIED_ARCHIVE', degradedComponents: [] };
+    }
     return {
-      path: candidate.fullPath,
-      filename: candidate.filename,
-      createdAt: new Date(candidate.mtimeMs).toISOString(),
-      ageHours: Math.round(((nowMs - candidate.mtimeMs) / 3_600_000) * 10) / 10,
-      size: candidate.size,
+      backup: null,
+      backupRejection: comprehensive.length > 0
+        ? 'NO_FRESH_COMPLETE_COMPREHENSIVE_ARCHIVE'
+        : 'NO_COMPREHENSIVE_CANDIDATE',
+      degradedComponents: [],
     };
   }
-  return null;
+
+  const clock = options.clock || Date.now;
+  const totalTimeoutMs = Number.isFinite(options.totalTimeoutMs)
+    ? Math.max(1, Math.min(MAINTENANCE_BACKUP_VERIFY_TIMEOUT_MS, Math.trunc(options.totalTimeoutMs!)))
+    : MAINTENANCE_BACKUP_VERIFY_TIMEOUT_MS;
+  const deadline = clock() + totalTimeoutMs;
+
+  for (const candidate of eligible) {
+    const remainingMs = Math.trunc(deadline - clock());
+    if (remainingMs <= 0) break;
+    let archiveBefore: fs.BigIntStats;
+    let receiptBefore: fs.BigIntStats;
+    let receiptBeforeBytes: Buffer;
+    try {
+      archiveBefore = fs.lstatSync(candidate.fullPath, { bigint: true });
+      const receiptPath = `${candidate.fullPath}.receipt.json`;
+      receiptBefore = fs.lstatSync(receiptPath, { bigint: true });
+      if (!secureArchiveStat(archiveBefore)
+        || archiveBefore.dev.toString() !== candidate.dev
+        || archiveBefore.ino.toString() !== candidate.ino
+        || archiveBefore.size !== BigInt(candidate.size)
+        || archiveBefore.mtimeNs.toString() !== candidate.mtimeNs
+        || !secureReceiptStat(receiptBefore)) continue;
+      receiptBeforeBytes = fs.readFileSync(receiptPath);
+      const receiptReadback = fs.lstatSync(receiptPath, { bigint: true });
+      if (receiptReadback.dev !== receiptBefore.dev
+        || receiptReadback.ino !== receiptBefore.ino
+        || receiptReadback.size !== receiptBefore.size
+        || receiptReadback.mtimeNs !== receiptBefore.mtimeNs) continue;
+    } catch {
+      continue;
+    }
+    const authenticatedBefore = reauthenticateBackupClassification(
+      candidate.fullPath,
+      candidate.type,
+      candidate.completeness as 'complete',
+    );
+    if (!authenticatedBefore.classificationAuthenticated
+      || authenticatedBefore.completeness !== 'complete') continue;
+    if (!await verifyArchive(candidate, Math.min(MAINTENANCE_BACKUP_VERIFY_TIMEOUT_MS, remainingMs))) continue;
+    let stat: fs.BigIntStats;
+    let receiptAfter: fs.BigIntStats;
+    let receiptAfterBytes: Buffer;
+    try {
+      stat = fs.lstatSync(candidate.fullPath, { bigint: true });
+      const receiptPath = `${candidate.fullPath}.receipt.json`;
+      receiptAfter = fs.lstatSync(receiptPath, { bigint: true });
+      receiptAfterBytes = fs.readFileSync(receiptPath);
+      const receiptReadback = fs.lstatSync(receiptPath, { bigint: true });
+      if (stat.dev !== archiveBefore.dev
+        || stat.ino !== archiveBefore.ino
+        || stat.size !== archiveBefore.size
+        || stat.mtimeNs !== archiveBefore.mtimeNs
+        || !secureArchiveStat(stat)
+        || !secureReceiptStat(receiptAfter)
+        || receiptAfter.dev !== receiptBefore.dev
+        || receiptAfter.ino !== receiptBefore.ino
+        || receiptAfter.size !== receiptBefore.size
+        || receiptAfter.mtimeNs !== receiptBefore.mtimeNs
+        || receiptReadback.dev !== receiptAfter.dev
+        || receiptReadback.ino !== receiptAfter.ino
+        || receiptReadback.size !== receiptAfter.size
+        || receiptReadback.mtimeNs !== receiptAfter.mtimeNs
+        || !receiptBeforeBytes.equals(receiptAfterBytes)) continue;
+    } catch {
+      continue;
+    }
+    const authenticatedAfter = reauthenticateBackupClassification(
+      candidate.fullPath,
+      candidate.type,
+      candidate.completeness as 'complete',
+    );
+    if (!authenticatedAfter.classificationAuthenticated
+      || authenticatedAfter.completeness !== 'complete') continue;
+    try {
+      const archiveFinal = fs.lstatSync(candidate.fullPath, { bigint: true });
+      const receiptFinal = fs.lstatSync(`${candidate.fullPath}.receipt.json`, { bigint: true });
+      const receiptFinalBytes = fs.readFileSync(`${candidate.fullPath}.receipt.json`);
+      if (archiveFinal.dev !== stat.dev
+        || archiveFinal.ino !== stat.ino
+        || archiveFinal.size !== stat.size
+        || archiveFinal.mtimeNs !== stat.mtimeNs
+        || !secureArchiveStat(archiveFinal)
+        || !secureReceiptStat(receiptFinal)
+        || receiptFinal.dev !== receiptAfter.dev
+        || receiptFinal.ino !== receiptAfter.ino
+        || receiptFinal.size !== receiptAfter.size
+        || receiptFinal.mtimeNs !== receiptAfter.mtimeNs
+        || !receiptFinalBytes.equals(receiptAfterBytes)) continue;
+    } catch {
+      continue;
+    }
+    const receiptDigest = crypto.createHash('sha256').update(receiptAfterBytes).digest('hex');
+    const fingerprint = {
+      path: candidate.fullPath,
+      filename: candidate.filename,
+      device: stat.dev.toString(),
+      inode: stat.ino.toString(),
+      size: stat.size.toString(),
+      mtimeNs: stat.mtimeNs.toString(),
+      receiptDigest,
+    };
+    return {
+      backup: {
+        path: candidate.fullPath,
+        filename: candidate.filename,
+        createdAt: new Date(Number(stat.mtimeNs / 1_000_000n)).toISOString(),
+        ageHours: Math.round(((nowMs - Number(stat.mtimeNs / 1_000_000n)) / 3_600_000) * 10) / 10,
+        size: Number(stat.size),
+        device: fingerprint.device,
+        inode: fingerprint.inode,
+        mtimeNs: fingerprint.mtimeNs,
+        receiptDigest,
+        fingerprintDigest: crypto.createHash('sha256')
+          .update(JSON.stringify(fingerprint), 'utf8')
+          .digest('hex'),
+      },
+      backupRejection: null,
+      degradedComponents: [],
+    };
+  }
+  return {
+    backup: null,
+    backupRejection: 'STRICT_VERIFICATION_FAILED_OR_TIMED_OUT',
+    degradedComponents: [],
+  };
+}
+
+export function maintenanceBackupRejectionPayload(
+  admission: MaintenanceBackupAdmissionResult,
+): {
+  error: string;
+  code: 'FRESH_VERIFIED_BACKUP_REQUIRED';
+  backupRejection: MaintenanceBackupRejection;
+  degradedComponents: string[];
+  maxBackupAgeHours: number;
+} {
+  const rejection = admission.backupRejection || 'STRICT_VERIFICATION_FAILED_OR_TIMED_OUT';
+  const detail: Record<MaintenanceBackupRejection, string> = {
+    NO_COMPREHENSIVE_CANDIDATE: 'No comprehensive recovery archive is available.',
+    AUTHENTICATED_DEGRADED_ARCHIVE: 'The newest authenticated comprehensive result is salvage-only because required recovery components were omitted.',
+    UNCLASSIFIED_ARCHIVE: 'A comprehensive archive exists, but Portal cannot authenticate its completeness classification.',
+    NO_FRESH_COMPLETE_COMPREHENSIVE_ARCHIVE: `No authenticated complete comprehensive archive is within the ${MAINTENANCE_BACKUP_MAX_AGE_HOURS}-hour maintenance window.`,
+    STRICT_VERIFICATION_FAILED_OR_TIMED_OUT: 'Fresh candidates did not pass the bounded strict restore verifier before admission.',
+  };
+  return {
+    error: `${detail[rejection]} Create a comprehensive maintenance backup in an approved window and wait for it to complete.`,
+    code: 'FRESH_VERIFIED_BACKUP_REQUIRED',
+    backupRejection: rejection,
+    degradedComponents: admission.degradedComponents.slice(0, 128),
+    maxBackupAgeHours: MAINTENANCE_BACKUP_MAX_AGE_HOURS,
+  };
 }
 
 async function getRootDisk() {
@@ -1253,22 +1509,22 @@ async function collectMaintenanceStatus() {
   if (!backup) {
     issues.push({
       id: 'backup-missing',
-      title: 'No Portal backup found',
-      detail: 'No backup archive was found in the configured backup storage.',
+      title: 'No complete comprehensive backup candidate',
+      detail: 'No authenticated complete comprehensive archive is available. Degraded or unclassified files are not maintenance-ready.',
       severity: 'warning',
       category: 'backups',
-      recommendation: 'Create a backup before maintenance.',
+      recommendation: 'Create a comprehensive backup before maintenance; strict restore verification runs again at action admission.',
       actionId: 'create-maintenance-backup',
       automationSafe: true,
     });
   } else if (backup.ageHours > MAINTENANCE_BACKUP_MAX_AGE_HOURS) {
     issues.push({
       id: 'backup-stale',
-      title: 'Latest backup is stale',
-      detail: `Latest backup is about ${backup.ageHours} hours old.`,
+      title: 'Latest complete backup candidate is stale',
+      detail: `The latest authenticated complete comprehensive candidate is about ${backup.ageHours} hours old and still awaits strict verification at action admission.`,
       severity: backup.ageHours > 72 ? 'warning' : 'info',
       category: 'backups',
-      recommendation: `Create a verified backup no more than ${MAINTENANCE_BACKUP_MAX_AGE_HOURS} hours before guarded maintenance.`,
+      recommendation: `Create a complete comprehensive backup no more than ${MAINTENANCE_BACKUP_MAX_AGE_HOURS} hours before guarded maintenance; action admission will run the strict verifier.`,
       actionId: 'create-maintenance-backup',
       automationSafe: true,
     });
@@ -1563,15 +1819,12 @@ router.post('/actions/:actionId', async (req: Request, res: Response) => {
         }
       }
 
-      const verifiedBackup = action.requiresBackup
-        ? await findFreshVerifiedMaintenanceBackup()
+      const backupAdmission = action.requiresBackup
+        ? await inspectMaintenanceBackupAdmission()
         : null;
-      if (action.requiresBackup && !verifiedBackup) {
-        res.status(409).json({
-          error: `A verified Portal backup no older than ${MAINTENANCE_BACKUP_MAX_AGE_HOURS} hours is required before this action. Create a maintenance backup and wait for it to complete.`,
-          code: 'FRESH_VERIFIED_BACKUP_REQUIRED',
-          maxBackupAgeHours: MAINTENANCE_BACKUP_MAX_AGE_HOURS,
-        });
+      const verifiedBackup = backupAdmission?.backup || null;
+      if (action.requiresBackup && backupAdmission && !verifiedBackup) {
+        res.status(409).json(maintenanceBackupRejectionPayload(backupAdmission));
         return;
       }
 

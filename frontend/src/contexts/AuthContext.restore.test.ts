@@ -201,13 +201,18 @@ describe('session restore fail-closed contract', () => {
     }
   });
 
-  it('clears cached auth on a definitive authorization failure', async () => {
+  it('clears cached auth when reload reports that the durable session was revoked', async () => {
     const fileUrl = buildFileDeepLink('restore-file', 'owner/restore.txt', {
       actorUserId: 'user-1',
       authorizationVersion: 1,
     });
     sessionStorage.setItem('portal-module-reload:FilesPage', '1');
-    mocks.me.mockRejectedValueOnce({ response: { status: 401 } });
+    mocks.me.mockRejectedValueOnce({
+      response: {
+        status: 401,
+        data: { code: 'AUTH_SESSION_REVOKED' },
+      },
+    });
 
     await expect(useAuthStore.getState().restoreSession()).resolves.toBe(false);
     expect(useAuthStore.getState()).toMatchObject({

@@ -360,6 +360,10 @@ function createWsManager(url: string): WsManager {
           })
           .catch((err) => {
             console.warn('[ws-manager] Token refresh failed, stopping reconnect:', err);
+            const status = Number(err?.response?.status || 0);
+            if (status === 401 || status === 403) {
+              useAuthStore.getState().silentLogout();
+            }
             intentionallyClosed = true; // Give up — user will need to re-login
             for (const cb of disconnectCallbacks) {
               try { cb(); } catch (e) { console.error('[ws-manager] disconnect callback error:', e); }
@@ -2902,6 +2906,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const pendingActiveSteerRef = useRef<{
     requestId: string;
     sessionKey: string;
+    expectedRunId: string;
     text: string;
     inFlight: boolean;
   } | null>(null);
@@ -7741,10 +7746,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (!normalized) return;
 
     let shouldAnswerPendingQuestion = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current;
+    let expectedActiveRunId = shouldAnswerPendingQuestion
+      ? normalizeRunId(currentRunIdRef.current)
+      : null;
 
     // Local stream recovery can briefly lag the server. Probe before a normal
     // send so text can never interrupt a run that is still waiting on input.
-    if (providerRef.current === 'OPENCLAW' && !shouldAnswerPendingQuestion) {
+    if (
+      providerRef.current === 'OPENCLAW'
+      && (!shouldAnswerPendingQuestion || !expectedActiveRunId)
+    ) {
       try {
         const probeSession = resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main';
         const { data } = await client.get('/gateway/stream-status', {
@@ -7755,6 +7766,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         if (data?.active) {
           debugLog('[ChatState] Pre-send probe: session still has an active turn');
           shouldAnswerPendingQuestion = true;
+          expectedActiveRunId = normalizeRunId(data?.runId);
         }
       } catch {
         // Best-effort probe; a normal send proceeds when it cannot answer.
@@ -7787,9 +7799,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           setStatusText('The previous steering message has an unknown outcome. Retry it unchanged.');
           return;
         }
+        if (!existingSteer && !expectedActiveRunId) {
+          setStatusText('Portal could not identify the exact active run. Retry in a moment.');
+          return;
+        }
         const steer = existingSteer || {
           requestId: nextId(),
           sessionKey: currentSession,
+          expectedRunId: expectedActiveRunId!,
           text: normalized,
           inFlight: false,
         };
@@ -7798,6 +7815,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         try {
           const { data } = await client.post('/gateway/session-steer', {
             session: currentSession,
+            expectedRunId: steer.expectedRunId,
             message: normalized,
             requestId: steer.requestId,
           });
@@ -7805,6 +7823,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             data?.ok !== true
             || data?.sessionKey !== currentSession
             || data?.requestId !== steer.requestId
+            || data?.runId !== steer.expectedRunId
             || data?.interruptedActiveRun !== false
           ) {
             throw new Error('Portal did not confirm steering for this exact active run.');

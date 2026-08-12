@@ -92,6 +92,19 @@ Projects preserved from 3.x remain visible with their files and any exactly asso
 
 For Projects created or safely admitted under the 4.0 identity boundary, lifecycle states converge automatically: a Project stuck in RENAMING or DELETING after an interrupted operation is rolled forward or back by expired-lease recovery on a later touching request. Re-read the Project list before attempting manual repair.
 
+An interrupted dependency promotion can leave one Project intentionally
+quarantined while the rest of Portal remains available. Everyone may see the
+warning; only an authenticated Owner may open **Repair dependency update**. The
+repair requires a freshly created, authenticated **Complete** comprehensive
+backup newer than the quarantine, exact Project/generation and promotion
+binding, and the displayed typed confirmation. It only force-forwards the exact
+staged generation already authorized. Never delete or edit the promotion
+journal, repair journal, staging tree, displaced evidence, pinned backup, lock
+file, or database receipt. If the whole Portal instead serves the status-only
+`PROJECT_DEPENDENCY_PROMOTION_QUARANTINED` response, application routes are
+closed; follow `docs/BACKUP_AND_RECOVERY.md` rather than attempting the Project
+card workflow.
+
 ## Git, dependencies, and deployment
 
 Networked Git and dependency installation run in attested Portal workload containers with brokered public egress. Local-only Git uses no network.

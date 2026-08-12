@@ -11,6 +11,7 @@ jest.mock('../config/database', () => ({
 }));
 
 jest.mock('../utils/authz', () => ({
+  canAccessPortal: jest.fn(() => true),
   canUseInteractivePortal: jest.fn(() => true),
   isElevatedRole: jest.fn(() => true),
 }));
@@ -48,6 +49,7 @@ import {
   acquireGlobalWorkspaceAuthorizationMutationLease,
   subscribeToGlobalWorkspaceAuthorizationFence,
 } from '../services/workspaceAuthorizationBarrier';
+import { publishSessionRevoked } from '../services/sessionRevocationBus';
 import { verifyAccessToken } from '../utils/jwt';
 
 const USER_ID = 'terminal-owner';
@@ -222,6 +224,10 @@ describe('privileged terminal systemd-scope authorization boundary', () => {
 
     (verifyAccessToken as jest.Mock).mockReturnValue({
       userId: USER_ID,
+      sessionId: 'terminal-session',
+      email: 'owner@example.test',
+      role: 'OWNER',
+      accountStatus: 'ACTIVE',
       authorizationVersion: 7,
     });
     (prisma.user.findUnique as jest.Mock).mockResolvedValue({
@@ -231,6 +237,10 @@ describe('privileged terminal systemd-scope authorization boundary', () => {
       accountStatus: 'ACTIVE',
       isActive: true,
       authorizationVersion: 7,
+      sessions: [{
+        id: 'terminal-session',
+        expiresAt: new Date(Date.now() + 60_000),
+      }],
     });
     (subscribeToGlobalWorkspaceAuthorizationFence as jest.Mock)
       .mockImplementation((listener: () => void) => {
@@ -350,6 +360,34 @@ describe('privileged terminal systemd-scope authorization boundary', () => {
     activated.resolve();
     await flushPromises();
     socket.trigger('input', 'must-not-run');
+    expect(session.pty.write).not.toHaveBeenCalled();
+    expect(releaseLease).toHaveBeenCalledTimes(1);
+  });
+
+  test('exact Session logout stops the established systemd scope while it is activating', async () => {
+    const activated = deferred<void>();
+    const stopped = deferred<any>();
+    const session = createSession({
+      activate: () => activated.promise,
+      stop: () => stopped.promise,
+    });
+    (prepareTerminalSystemdScope as jest.Mock).mockResolvedValue(session);
+
+    const socket = await authorizeAndConnect();
+    expect(session.activate).toHaveBeenCalledTimes(1);
+    publishSessionRevoked({
+      userId: USER_ID,
+      sessionId: 'terminal-session',
+      reason: 'logout',
+    });
+    await flushPromises();
+
+    expect(socket.disconnected).toBe(true);
+    expect(session.stop).toHaveBeenCalledTimes(1);
+    stopped.resolve({ cgroupEmpty: true });
+    activated.resolve();
+    await flushPromises();
+    socket.trigger('input', 'must-not-run-after-logout');
     expect(session.pty.write).not.toHaveBeenCalled();
     expect(releaseLease).toHaveBeenCalledTimes(1);
   });

@@ -2,16 +2,19 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
-import { execFileSync, spawnSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import {
   acquireMaintenanceActionAdmission,
   MaintenanceAdmissionError,
   verifyMaintenanceBackupArchive,
 } from '../routes/system-maintenance';
-import {
-  createAttestedBackupRoot,
-  createBackupRunnerFixture,
-} from './backupRunnerFixture';
+
+jest.mock('../config/database', () => ({
+  prisma: {
+    agentJob: { findFirst: jest.fn() },
+    systemSetting: { findUnique: jest.fn() },
+  },
+}));
 
 const repositoryRoot = path.resolve(__dirname, '../../..');
 
@@ -104,67 +107,44 @@ describe('system maintenance admission gate', () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  test('verifies gzip integrity and required recovery evidence without a TOCTOU swap', async () => {
-    const { cleanupRoot, fixtureRoot } = createAttestedBackupRoot(
-      'maintenance-archive',
-    );
-    try {
-      const fixture = createBackupRunnerFixture(fixtureRoot);
-      const backup = spawnSync('bash', [
-        path.join(repositoryRoot, 'backup-full.sh'),
-        'daily',
-      ], {
-        cwd: repositoryRoot,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ...fixture.env,
-        },
-        timeout: 30_000,
-      });
-      if (backup.status !== 0) {
-        throw new Error(
-          `fixture backup failed (${backup.status})\n`
-          + `stdout:\n${backup.stdout}\nstderr:\n${backup.stderr}`,
-        );
-      }
-      const backupStatus = JSON.parse(
-        fs.readFileSync(path.join(fixture.stateDir, 'status.json'), 'utf8'),
-      );
-      const archivePath = backupStatus.archivePath as string;
-      const stat = fs.lstatSync(archivePath);
-      const candidate = {
-        filename: path.basename(archivePath),
-        fullPath: archivePath,
-        size: stat.size,
-        mtimeMs: stat.mtimeMs,
-        dev: stat.dev,
-        ino: stat.ino,
-      };
+  test('uses the recovery verifier and rejects an archive changed during verification', async () => {
+    const archivePath = path.join(tempRoot, 'portal-comprehensive-test.tar.gz');
+    fs.writeFileSync(archivePath, 'fixture recovery archive');
+    const stat = fs.lstatSync(archivePath);
+    const statNs = fs.lstatSync(archivePath, { bigint: true });
+    const candidate = {
+      filename: path.basename(archivePath),
+      fullPath: archivePath,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      mtimeNs: statNs.mtimeNs.toString(),
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      type: 'comprehensive' as const,
+      completeness: 'complete' as const,
+      degradedComponents: [],
+      classificationAuthenticated: true,
+    };
+    const runShellImpl = jest.fn().mockResolvedValue({ ok: true, stdout: '', stderr: '' });
 
-      const overrides = {
-        ...fixture.env,
-        BACKUP_SCRIPT_PATH: path.join(repositoryRoot, 'backup-full.sh'),
-      };
-      const previous = new Map<string, string | undefined>();
-      for (const [key, value] of Object.entries(overrides)) {
-        previous.set(key, process.env[key]);
-        process.env[key] = value;
-      }
-      try {
-        await expect(verifyMaintenanceBackupArchive(candidate)).resolves.toBe(true);
-        fs.appendFileSync(archivePath, 'tamper');
-        await expect(verifyMaintenanceBackupArchive(candidate)).resolves.toBe(false);
-      } finally {
-        for (const [key, value] of previous) {
-          if (value === undefined) delete process.env[key];
-          else process.env[key] = value;
-        }
-      }
-    } finally {
-      fs.rmSync(cleanupRoot, { recursive: true, force: true });
-    }
-  }, 40_000);
+    await expect(verifyMaintenanceBackupArchive(candidate, {
+      runShellImpl,
+      restoreScriptPath: '/opt/bridgesllm/portal/restore-full.sh',
+    })).resolves.toBe(true);
+    expect(runShellImpl).toHaveBeenCalledWith(
+      "/bin/bash '/opt/bridgesllm/portal/restore-full.sh' --verify-archive '" + archivePath + "'",
+      900_000,
+    );
+
+    const mutatingVerifier = jest.fn().mockImplementation(async () => {
+      fs.appendFileSync(archivePath, 'tamper');
+      return { ok: true, stdout: '', stderr: '' };
+    });
+    await expect(verifyMaintenanceBackupArchive(candidate, {
+      runShellImpl: mutatingVerifier,
+      restoreScriptPath: '/opt/bridgesllm/portal/restore-full.sh',
+    })).resolves.toBe(false);
+  });
 
   test('rejects a checksum-valid database-only archive as incomplete recovery evidence', async () => {
     const staging = path.join(tempRoot, 'database-only-staging');
@@ -176,25 +156,57 @@ describe('system maintenance admission gate', () => {
       path.join(staging, 'MANIFEST.txt'),
       `BridgesLLM Portal Backup\n\nChecksums:\n${databaseHash}  ./database.sql\n`,
     );
-    const archivePath = path.join(tempRoot, 'portal-daily-database-only.tar.gz');
+    const archivePath = path.join(tempRoot, 'portal-comprehensive-database-only.tar.gz');
     execFileSync('tar', ['czf', archivePath, '-C', staging, '.']);
     const stat = fs.lstatSync(archivePath);
+    const statNs = fs.lstatSync(archivePath, { bigint: true });
     const candidate = {
       filename: path.basename(archivePath),
       fullPath: archivePath,
       size: stat.size,
       mtimeMs: stat.mtimeMs,
-      dev: stat.dev,
-      ino: stat.ino,
+      mtimeNs: statNs.mtimeNs.toString(),
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      type: 'comprehensive' as const,
+      completeness: 'complete' as const,
+      degradedComponents: [],
+      classificationAuthenticated: true,
     };
 
-    const previousBackupScriptPath = process.env.BACKUP_SCRIPT_PATH;
-    process.env.BACKUP_SCRIPT_PATH = path.join(repositoryRoot, 'backup-full.sh');
+    const previousRestoreScriptPath = process.env.RESTORE_SCRIPT_PATH;
+    process.env.RESTORE_SCRIPT_PATH = path.join(repositoryRoot, 'restore-full.sh');
     try {
       await expect(verifyMaintenanceBackupArchive(candidate)).resolves.toBe(false);
     } finally {
-      if (previousBackupScriptPath === undefined) delete process.env.BACKUP_SCRIPT_PATH;
-      else process.env.BACKUP_SCRIPT_PATH = previousBackupScriptPath;
+      if (previousRestoreScriptPath === undefined) delete process.env.RESTORE_SCRIPT_PATH;
+      else process.env.RESTORE_SCRIPT_PATH = previousRestoreScriptPath;
     }
+  });
+
+  test('rejects daily, degraded, and unauthenticated candidates before invoking a verifier', async () => {
+    const archivePath = path.join(tempRoot, 'portal-comprehensive-classification.tar.gz');
+    fs.writeFileSync(archivePath, 'fixture');
+    const stat = fs.lstatSync(archivePath);
+    const statNs = fs.lstatSync(archivePath, { bigint: true });
+    const base = {
+      filename: path.basename(archivePath),
+      fullPath: archivePath,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      mtimeNs: statNs.mtimeNs.toString(),
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      type: 'comprehensive' as const,
+      completeness: 'complete' as const,
+      degradedComponents: [],
+      classificationAuthenticated: true,
+    };
+    const runShellImpl = jest.fn().mockResolvedValue({ ok: true, stdout: '', stderr: '' });
+
+    await expect(verifyMaintenanceBackupArchive({ ...base, type: 'daily' }, { runShellImpl })).resolves.toBe(false);
+    await expect(verifyMaintenanceBackupArchive({ ...base, completeness: 'degraded' }, { runShellImpl })).resolves.toBe(false);
+    await expect(verifyMaintenanceBackupArchive({ ...base, classificationAuthenticated: false }, { runShellImpl })).resolves.toBe(false);
+    expect(runShellImpl).not.toHaveBeenCalled();
   });
 });

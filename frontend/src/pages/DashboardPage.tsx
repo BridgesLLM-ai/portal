@@ -1087,6 +1087,7 @@ export default function DashboardPage() {
   const updateBackup = updateStatus?.preparation?.backup;
   const updateBackupDescription = useMemo(() => describeUpdateBackup(updateBackup), [updateBackup]);
   const updateBackupRunning = updateBackup?.state === 'running';
+  const updateBackupCanUseCurrent = updateBackup?.state === 'candidate' || updateBackup?.state === 'fresh';
   const updateProgressActive = portalUpdateProgressIsActive(updateProgress);
   const updateProgressTerminal = portalUpdateProgressIsTerminal(updateProgress);
   const updateRetryBlocked = updateProgressAmbiguous || portalUpdateProgressBlocksRetry(updateProgress);
@@ -1094,6 +1095,9 @@ export default function DashboardPage() {
   const updateProgressDanger = ['failed', 'recovery_required'].includes(updateProgressStatus);
   const updateProgressAttention = ['rolled_back', 'updated_with_errors'].includes(updateProgressStatus);
   const updateProgressRetryable = ['failed', 'rolled_back'].includes(updateProgressStatus);
+  const updateAttentionRunbook = 'docs/PORTAL_UPDATE_ATTENTION_RECOVERY.md';
+  const updateAttentionRunbookHref = 'https://github.com/BridgesLLM-ai/portal/blob/main/docs/PORTAL_UPDATE_ATTENTION_RECOVERY.md';
+  const updateInstalledVersion = updateStatus?.current || updateProgress?.previousVersion || null;
   const showUpdateReviewControls = !updateInProgress && !updateRetryBlocked;
   const updateTargetVersion = updateProgress?.expectedVersion || updateStatus?.latest || null;
   const updateSourceVersion = updateProgress?.previousVersion || updateStatus?.current || null;
@@ -1320,8 +1324,8 @@ export default function DashboardPage() {
 
       if (updatePlan === 'create-backup') {
         await createFreshBackupForUpdate({
-          startDailyBackup: async () => {
-            const { data } = await client.post('/backups/create', { type: 'daily' });
+          startComprehensiveBackup: async () => {
+            const { data } = await client.post('/backups/create', { type: 'comprehensive' });
             return data;
           },
           getBackupStatus: async () => {
@@ -1743,7 +1747,7 @@ export default function DashboardPage() {
                   <button
                     onClick={() => {
                       if (!updateProgress && !updateProgressAmbiguous) {
-                        setUpdatePlan(updateBackup?.state === 'fresh' ? 'use-current' : 'create-backup');
+                        setUpdatePlan(updateBackupCanUseCurrent ? 'use-current' : 'create-backup');
                         setUpdateMessage(null);
                       }
                       setUpdateDialogOpen(true);
@@ -2343,6 +2347,50 @@ export default function DashboardPage() {
                   <div>
                     <p className="text-sm font-semibold">{updateProgress.label}</p>
                     <p className="mt-1 text-xs leading-5 opacity-90">{updateProgress.detail}</p>
+                    {['updated_with_errors', 'recovery_required'].includes(updateProgressStatus) && (
+                      <div className="mt-2 text-xs leading-5 opacity-95">
+                        {updateProgressStatus === 'updated_with_errors' ? (
+                          <p className="font-medium">
+                            The new Portal committed and is serving, but ancillary host work failed.
+                          </p>
+                        ) : (
+                          <p className="font-medium">
+                            Automatic recovery did not reach a fully attested terminal state.
+                          </p>
+                        )}
+                        <dl aria-label="Update attention details" className="mt-2 grid grid-cols-[auto_1fr] gap-x-2 gap-y-1">
+                          <dt className="font-semibold">Failed phase</dt>
+                          <dd><code>{updateProgress.phase}</code></dd>
+                          <dt className="font-semibold">Operation ID</dt>
+                          <dd className="break-all"><code>{updateProgress.operationId || 'unavailable'}</code></dd>
+                          <dt className="font-semibold">Installed / expected</dt>
+                          <dd>
+                            <code>{updateInstalledVersion ? `v${updateInstalledVersion}` : 'unavailable'}</code>
+                            {' / '}
+                            <code>{updateProgress.expectedVersion ? `v${updateProgress.expectedVersion}` : 'unavailable'}</code>
+                          </dd>
+                          <dt className="font-semibold">Recovery runbook</dt>
+                          <dd className="break-all"><code>{updateAttentionRunbook}</code></dd>
+                        </dl>
+                        <p className="mt-2 font-semibold">Read-only checks before root resolution</p>
+                        <ul aria-label="Read-only update recovery checks" className="mt-1 list-disc space-y-1 pl-5">
+                          <li>
+                            Confirm <code>bridgesllm-portal-self-update.service</code> is no longer active.
+                          </li>
+                          <li>
+                            Confirm both <code>active-update.json</code> and <code>cutover-update.json</code> are absent; do not delete them to make the check pass.
+                          </li>
+                        </ul>
+                        <a
+                          href={updateAttentionRunbookHref}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-2 inline-flex font-semibold underline underline-offset-2"
+                        >
+                          Open root recovery procedure
+                        </a>
+                      </div>
+                    )}
                     {updateProgressRetryable && (
                       <p className="mt-2 text-xs leading-5 opacity-90">
                         The updater recorded a safe terminal state. Review the recovery plan below before retrying.
@@ -2413,7 +2461,7 @@ export default function DashboardPage() {
 
                 <fieldset className="space-y-2">
                   <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-theme-text-muted">Recovery plan</legend>
-                  {updateBackup?.state === 'fresh' && (
+                  {updateBackupCanUseCurrent && (
                     <label aria-label="Use the recent backup" htmlFor="portal-update-use-current" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
                       updatePlan === 'use-current'
                         ? 'accent-active'
@@ -2430,8 +2478,8 @@ export default function DashboardPage() {
                         style={{ accentColor: 'var(--accent, #6366f1)' }}
                       />
                       <span>
-                        <span className="block text-sm font-semibold text-theme-text">Use the recent backup</span>
-                        <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Fastest path; the server will recheck freshness before the updater starts.</span>
+                        <span className="block text-sm font-semibold text-theme-text">Use the recent backup candidate</span>
+                        <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Fastest path; the server will run strict restore verification before the updater starts.</span>
                       </span>
                     </label>
                   )}
@@ -2455,7 +2503,7 @@ export default function DashboardPage() {
                       <span className="mt-0.5 block text-xs leading-5 text-theme-text-muted">Recommended. Portal waits for the archive to finish before starting the signed updater.</span>
                     </span>
                   </label>
-                  {updateBackup?.state !== 'fresh' && (
+                  {!updateBackupCanUseCurrent && (
                     <label aria-label="Continue without a fresh backup" htmlFor="portal-update-skip-backup" className={`flex cursor-pointer gap-3 rounded-xl border p-3 transition ${
                       updatePlan === 'skip-backup'
                         ? 'accent-active'

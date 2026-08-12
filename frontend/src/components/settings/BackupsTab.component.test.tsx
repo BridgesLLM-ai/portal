@@ -28,6 +28,9 @@ const backup = {
   created: '2026-07-21T00:00:00.000Z',
   type: 'daily',
   locked: false,
+  completeness: 'complete',
+  degradedComponents: [],
+  classificationAuthenticated: true,
 };
 
 function deferred<T>() {
@@ -76,6 +79,10 @@ describe('BackupsTab mutation admission', () => {
               totalSizeHuman: backup.sizeHuman,
               oldest: backup.created,
               newest: backup.created,
+              complete: 1,
+              degraded: 0,
+              unknown: 0,
+              newestComplete: backup.created,
             },
           },
         });
@@ -173,7 +180,7 @@ describe('BackupsTab mutation admission', () => {
 
     await waitFor(() => expect(screen.getByRole('button', { name: 'Leave Settings' })).toBeEnabled());
     expect(screen.getByRole('button', { name: 'Creating Backup...' })).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByText(/standard backups run in the background/i)).toBeVisible();
+    expect(screen.getByText(/standard backups are authenticated online data snapshots/i)).toBeVisible();
     expect(mocks.get.mock.calls.some(([url]) => url === '/backups/status')).toBe(true);
     unmount();
   });
@@ -236,7 +243,7 @@ describe('BackupsTab mutation admission', () => {
           data: {
             id: 'failed-job',
             type: 'comprehensive',
-            status: 'failed',
+            status: 'degraded',
             error: 'Backup process exited with code 1',
             failureDetail: 'Container database PGDATA is not on persistent writable storage',
           },
@@ -248,5 +255,104 @@ describe('BackupsTab mutation admission', () => {
 
     expect(await screen.findByText('Container database PGDATA is not on persistent writable storage')).toBeVisible();
     expect(screen.queryByText('Backup process exited with code 1')).not.toBeInTheDocument();
+  });
+
+  it('labels incomplete classifications and requires confirmation before degraded or unknown downloads', async () => {
+    const user = userEvent.setup();
+    const degraded = {
+      ...backup,
+      filename: 'portal-daily-degraded.tar.gz',
+      completeness: 'degraded',
+      degradedComponents: ['hosted-apps', 'projects'],
+    };
+    const unknown = {
+      ...backup,
+      filename: 'portal-daily-legacy.tar.gz',
+      completeness: 'unknown',
+      degradedComponents: [],
+      classificationAuthenticated: false,
+    };
+    mocks.get.mockImplementation((url: string) => {
+      if (url === '/backups/list') {
+        return Promise.resolve({
+          data: {
+            backups: [degraded, unknown],
+            summary: {
+              total: 2,
+              totalSize: 2048,
+              totalSizeHuman: '2 KB',
+              oldest: backup.created,
+              newest: backup.created,
+              complete: 0,
+              degraded: 1,
+              unknown: 1,
+              newestComplete: null,
+            },
+          },
+        });
+      }
+      if (url === '/backups/cron-info') return Promise.resolve({ data: { schedules: [], active: [], disabled: [] } });
+      if (url === '/backups/status') return Promise.resolve({ data: { status: 'idle' } });
+      if (url.startsWith('/backups/download-info/')) return Promise.resolve({ data: { ok: true } });
+      return Promise.reject(new Error(`Unexpected backup GET: ${url}`));
+    });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    render(<BackupsTab />);
+
+    expect(await screen.findByText('Salvage only')).toBeVisible();
+    expect(screen.getByText('Unclassified')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: `Download ${degraded.filename}` }));
+    const degradedDialog = screen.getByRole('alertdialog', { name: 'Download incomplete backup?' });
+    expect(within(degradedDialog).getByText(/omitted required recovery components/i)).toBeVisible();
+    expect(within(degradedDialog).getByText('Unavailable: hosted-apps, projects')).toBeVisible();
+    expect(mocks.get.mock.calls.some(([url]) => String(url).startsWith('/backups/download-info/'))).toBe(false);
+    await user.click(within(degradedDialog).getByRole('button', { name: 'Download anyway' }));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledWith(`/backups/download-info/${encodeURIComponent(degraded.filename)}`));
+
+    await user.click(screen.getByRole('button', { name: `Download ${unknown.filename}` }));
+    const unknownDialog = screen.getByRole('alertdialog', { name: 'Download unclassified backup?' });
+    expect(within(unknownDialog).getByText(/cannot authenticate this legacy archive/i)).toBeVisible();
+    await user.click(within(unknownDialog).getByRole('button', { name: 'Download anyway' }));
+    await waitFor(() => expect(mocks.get).toHaveBeenCalledWith(`/backups/download-info/${encodeURIComponent(unknown.filename)}`));
+    expect(click).toHaveBeenCalledTimes(2);
+    click.mockRestore();
+  });
+
+  it('surfaces repeated scheduled backup failures prominently', async () => {
+    mocks.get.mockImplementation((url: string) => {
+      if (url === '/backups/list') {
+        return Promise.resolve({
+          data: {
+            backups: [],
+            summary: {
+              total: 0,
+              totalSize: 0,
+              totalSizeHuman: '0 B',
+              oldest: null,
+              newest: null,
+              complete: 0,
+              degraded: 0,
+              unknown: 0,
+              newestComplete: null,
+            },
+          },
+        });
+      }
+      if (url === '/backups/cron-info') return Promise.resolve({ data: { schedules: [], active: [], disabled: [] } });
+      if (url === '/backups/status') {
+        return Promise.resolve({
+          data: {
+            status: 'degraded',
+            consecutiveFailures: 3,
+            failureDetail: 'Projects changed during capture',
+          },
+        });
+      }
+      return Promise.reject(new Error(`Unexpected backup GET: ${url}`));
+    });
+    render(<BackupsTab />);
+
+    expect(await screen.findByText('Backups have been incomplete 3 times in a row')).toBeVisible();
+    expect(screen.getByText('Projects changed during capture')).toBeVisible();
   });
 });

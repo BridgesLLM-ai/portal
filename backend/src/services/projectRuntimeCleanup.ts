@@ -210,7 +210,8 @@ export interface ProjectRuntimeCleanupRepository {
   finishTurnAbort(
     turn: ProjectRuntimeCleanupTurn,
     evidence: string,
-    lifecycleReason: 'delete' | 'rename' | 'authorization_change',
+    lifecycleReason: 'delete' | 'rename' | 'authorization_change'
+      | 'dependency_promotion' | 'dependency_repair',
   ): Promise<void>;
   markBindingsCleanupComplete(projectIdentityId: string, bindingIds: readonly string[]): Promise<void>;
 }
@@ -259,7 +260,8 @@ export interface ProjectRuntimeCleanupInput {
    * must discover provider state that never reached a binding/session row.
    */
   candidateActorIds?: readonly string[];
-  lifecycleReason?: 'delete' | 'rename' | 'authorization_change';
+  lifecycleReason?: 'delete' | 'rename' | 'authorization_change'
+    | 'dependency_promotion' | 'dependency_repair';
 }
 
 export interface ProjectRuntimeCleanupOptions {
@@ -777,11 +779,15 @@ const defaultRepository: ProjectRuntimeCleanupRepository = {
             ? 'PROJECT_RENAMED'
             : lifecycleReason === 'authorization_change'
               ? 'PROJECT_AUTHORIZATION_CHANGED'
+              : lifecycleReason === 'dependency_promotion'
+                ? 'PROJECT_DEPENDENCY_PROMOTION_RECOVERY'
               : 'PROJECT_DELETED',
           errorMessage: lifecycleReason === 'rename'
             ? `Project runtime quiesced before rename (${sanitizedEvidence.slice(0, 384)})`
             : lifecycleReason === 'authorization_change'
               ? `Project runtime quiesced before authorization change (${sanitizedEvidence.slice(0, 384)})`
+              : lifecycleReason === 'dependency_promotion'
+                ? `Project runtime quiesced before dependency promotion recovery (${sanitizedEvidence.slice(0, 384)})`
               : `Project runtime quiesced before deletion (${sanitizedEvidence.slice(0, 384)})`,
         },
       });

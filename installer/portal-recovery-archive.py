@@ -378,6 +378,23 @@ def resolve_hardlink_target(
             fail("archive hard link escapes its captured component")
 
 
+def admitted_absolute_symlink(
+    resolved: str,
+    roots: tuple[str, ...],
+    *,
+    allow_project_interpreter_symlinks: bool = False,
+) -> bool:
+    if any(resolved == root or resolved.startswith(root + "/") for root in roots):
+        return True
+    return bool(
+        allow_project_interpreter_symlinks
+        and re.fullmatch(
+            r"/(?:usr/bin|usr/local/bin)/python3(?:\.[0-9]+)?",
+            resolved,
+        )
+    )
+
+
 def validate_members(
     members: list[tarfile.TarInfo],
     *,
@@ -385,6 +402,7 @@ def validate_members(
     allow_relative_symlinks: bool = False,
     allow_hardlinks: bool = False,
     absolute_symlink_roots: tuple[str, ...] = (),
+    allow_project_interpreter_symlinks: bool = False,
     expected_top_level: str | None = None,
     extraction_root: pathlib.Path | None = None,
     require_exact_metadata: bool = False,
@@ -441,9 +459,10 @@ def validate_members(
                 fail("archive contains an unsafe symbolic-link target")
             if link.startswith("/"):
                 resolved = posixpath.normpath(link)
-                if not any(
-                    resolved == root or resolved.startswith(root + "/")
-                    for root in absolute_symlink_roots
+                if not admitted_absolute_symlink(
+                    resolved,
+                    absolute_symlink_roots,
+                    allow_project_interpreter_symlinks=allow_project_interpreter_symlinks,
                 ):
                     fail("archive symbolic link escapes its admitted absolute roots")
             else:
@@ -495,6 +514,7 @@ def validate_nested_stream(
     handle: tarfile.TarFile,
     *,
     absolute_symlink_roots: tuple[str, ...],
+    allow_project_interpreter_symlinks: bool,
     expected_top_level: str,
     extraction_roots: tuple[pathlib.Path, ...],
     reject_privileged_metadata: bool = False,
@@ -556,9 +576,10 @@ def validate_nested_stream(
                 fail("archive contains an unsafe symbolic-link target")
             if link.startswith("/"):
                 resolved = posixpath.normpath(link)
-                if not any(
-                    resolved == root or resolved.startswith(root + "/")
-                    for root in absolute_symlink_roots
+                if not admitted_absolute_symlink(
+                    resolved,
+                    absolute_symlink_roots,
+                    allow_project_interpreter_symlinks=allow_project_interpreter_symlinks,
                 ):
                     fail("archive symbolic link escapes its admitted absolute roots")
             else:
@@ -1455,6 +1476,7 @@ def nested_size(
     absolute_symlink_roots: tuple[str, ...],
     expected_top_level: str,
     extraction_roots: tuple[pathlib.Path, ...],
+    allow_project_interpreter_symlinks: bool = False,
     reject_privileged_metadata: bool = False,
 ) -> tuple[int, int]:
     stream = handle.extractfile(member)
@@ -1468,6 +1490,7 @@ def nested_size(
             total, count = validate_nested_stream(
                 nested,
                 absolute_symlink_roots=absolute_symlink_roots,
+                allow_project_interpreter_symlinks=allow_project_interpreter_symlinks,
                 expected_top_level=expected_top_level,
                 extraction_roots=extraction_roots,
                 reject_privileged_metadata=reject_privileged_metadata,
@@ -1870,6 +1893,7 @@ def inspect_archive(
                         transaction_dir / "components" / component_id,
                         target.parent,
                     ),
+                    allow_project_interpreter_symlinks=component_id == "projects",
                     reject_privileged_metadata=component_id == "portal-install",
                 )
                 if component_id == "portal-install":
@@ -2075,6 +2099,7 @@ def safe_extract(
     allow_relative_symlinks: bool = False,
     allow_hardlinks: bool = False,
     absolute_symlink_roots: tuple[str, ...] = (),
+    allow_project_interpreter_symlinks: bool = False,
     expected_top_level: str | None = None,
     preserve_exact_metadata: bool = False,
     reject_privileged_metadata: bool = False,
@@ -2095,6 +2120,7 @@ def safe_extract(
             allow_relative_symlinks=allow_relative_symlinks,
             allow_hardlinks=allow_hardlinks,
             absolute_symlink_roots=absolute_symlink_roots,
+            allow_project_interpreter_symlinks=allow_project_interpreter_symlinks,
             expected_top_level=expected_top_level,
             extraction_root=destination,
             require_exact_metadata=preserve_exact_metadata,
@@ -2363,6 +2389,7 @@ def main() -> int:
                 if args.component == "openclaw-state"
                 else (str(target),)
             ),
+            allow_project_interpreter_symlinks=args.component == "projects",
             expected_top_level=target.name,
             preserve_exact_metadata=True,
             reject_privileged_metadata=args.component == "portal-install",

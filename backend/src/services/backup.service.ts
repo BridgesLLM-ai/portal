@@ -1,12 +1,13 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { prisma } from '../config/database';
 
 export const BACKUP_TYPES = ['daily', 'weekly', 'monthly', 'comprehensive'] as const;
 export type BackupType = typeof BACKUP_TYPES[number];
+export type BackupCompleteness = 'complete' | 'degraded' | 'unknown';
 
 export interface BackupFile {
   filename: string;
@@ -14,15 +15,19 @@ export interface BackupFile {
   type: BackupType;
   size: number;
   mtimeMs: number;
-  dev: number;
-  ino: number;
+  mtimeNs: string;
+  dev: string;
+  ino: string;
   locked: boolean;
+  completeness: BackupCompleteness;
+  degradedComponents: string[];
+  classificationAuthenticated: boolean;
 }
 
 export interface BackupStatus {
   id: string;
   type: BackupType;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'completed' | 'degraded' | 'failed';
   startedAt: string;
   completedAt?: string;
   pid?: number;
@@ -35,6 +40,7 @@ export interface BackupStatus {
   phaseIndex?: number;
   phaseTotal?: number;
   output?: string;
+  consecutiveFailures?: number;
 }
 
 export interface BackupSchedule {
@@ -62,6 +68,8 @@ const BACKUP_OUTPUT_FILE = path.join(BACKUP_STATE_DIR, 'current.log');
 const MAX_STATUS_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 16 * 1024;
 const MAX_PATH_BYTES = 1024;
+const MAX_RECEIPT_BYTES = 16 * 1024;
+const BACKUP_RECEIPT_SCHEMA = 'bridgesllm.backup-publication.v1';
 
 const TIMER_UNITS: Array<{
   type: Exclude<BackupType, 'weekly'>;
@@ -88,7 +96,437 @@ function expectedOwnerUid(): number {
   return typeof process.getuid === 'function' ? process.getuid() : 0;
 }
 
-function assertSecureDirectoryChain(directory: string, expectedUid = expectedOwnerUid()): void {
+function expectedOwnerGid(): number {
+  return typeof process.getgid === 'function' ? process.getgid() : 0;
+}
+
+export function expectedBackupOwnerIdentity(): { uid: number; gid: number } {
+  return { uid: expectedOwnerUid(), gid: expectedOwnerGid() };
+}
+
+/**
+ * Hold the same kernel flock used by backup-full.sh. This coordinates Portal
+ * backup mutations with shell rotation/pruning and intentionally accepts an
+ * already-open descriptor in the child so a pathname swap cannot redirect the
+ * lock after validation.
+ */
+interface BackupMutationLeaseState {
+  child: ReturnType<typeof spawn>;
+  descriptors: number[];
+  live: boolean;
+  releasing: boolean;
+}
+
+const activeBackupMutationLeases = new WeakMap<object, BackupMutationLeaseState>();
+export interface BackupMutationLockLease { readonly kind: 'backup-mutation-lock'; }
+
+export function assertBackupMutationLockLease(lease: BackupMutationLockLease): void {
+  const state = lease ? activeBackupMutationLeases.get(lease) : undefined;
+  if (!state || !state.live || state.releasing
+    || state.child.exitCode !== null || state.child.signalCode !== null) {
+    throw new Error('Backup mutation lock lease is not held');
+  }
+}
+
+export interface BackupMutationLockOptions {
+  operationLockPath?: string;
+  stateDirectory?: string;
+  timeoutSeconds?: number;
+}
+
+export class BackupMutationLockContentionError extends Error {
+  readonly code = 'BACKUP_MUTATION_LOCK_CONTENDED';
+
+  constructor(public readonly lockExitCode: 71 | 72) {
+    super('Backup mutation lock remains owned by another operation');
+    this.name = 'BackupMutationLockContentionError';
+  }
+}
+
+export async function acquireBackupMutationLock(options: BackupMutationLockOptions = {}): Promise<{
+  lease: BackupMutationLockLease;
+  release(): Promise<void>;
+}> {
+  const stateDirectory = path.resolve(options.stateDirectory || BACKUP_STATE_DIR);
+  fs.mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
+  const stateStat = fs.lstatSync(stateDirectory);
+  if (!stateStat.isDirectory() || stateStat.isSymbolicLink()
+    || stateStat.uid !== expectedOwnerUid() || stateStat.gid !== expectedOwnerGid()
+    || (stateStat.mode & 0o077) !== 0) {
+    throw new Error('Backup state directory is unsafe');
+  }
+  const lockPaths = [
+    path.resolve(options.operationLockPath
+      || process.env.PORTAL_OPERATION_LOCK_FILE
+      || '/run/lock/bridgesllm-portal-installer.lock'),
+    path.join(stateDirectory, 'backup.lock'),
+  ];
+  const descriptors: number[] = [];
+  let descriptorsTransferred = false;
+  try {
+    for (const lockPath of lockPaths) {
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o755 });
+      const descriptor = fs.openSync(
+        lockPath,
+        fs.constants.O_RDWR | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW || 0),
+        0o600,
+      );
+      descriptors.push(descriptor);
+      fs.fchmodSync(descriptor, 0o600);
+      const stat = fs.fstatSync(descriptor);
+      if (!stat.isFile() || stat.nlink !== 1
+        || stat.uid !== expectedOwnerUid() || stat.gid !== expectedOwnerGid()
+        || (stat.mode & 0o077) !== 0) {
+        throw new Error('Backup mutation lock is unsafe');
+      }
+    }
+    const acquired = await new Promise<{
+      lease: BackupMutationLockLease;
+      child: ReturnType<typeof spawn>;
+    }>((resolve, reject) => {
+      const timeoutSeconds = Math.max(1, Math.min(300, Number(options.timeoutSeconds ?? 60)));
+      const child = spawn(
+        '/bin/sh',
+        [
+          '-c',
+          '/usr/bin/flock --exclusive --timeout "$1" 3 || exit 71; '
+            + '/usr/bin/flock --exclusive --timeout "$1" 4 || exit 72; '
+            + 'printf "LOCKED\\n"; IFS= read -r _',
+          'bridgesllm-backup-mutation-lock',
+          String(timeoutSeconds),
+        ],
+        { stdio: ['pipe', 'pipe', 'pipe', ...descriptors], detached: true },
+      );
+      let settled = false;
+      let ready = false;
+      let stdout = '';
+      let stderr = '';
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        child.stdin?.destroy();
+        reject(error);
+      };
+      child.stderr!.setEncoding('utf8');
+      child.stderr!.on('data', (chunk) => { stderr += chunk; });
+      child.on('error', fail);
+      child.on('exit', (code) => {
+        if (!settled && !ready) {
+          fail(code === 71 || code === 72
+            ? new BackupMutationLockContentionError(code)
+            : new Error(`Backup mutation lock failed (${code ?? 'signal'}): ${stderr.trim()}`));
+        }
+      });
+      child.stdout!.setEncoding('utf8');
+      child.stdout!.on('data', (chunk) => {
+        if (settled || ready) return;
+        stdout += chunk;
+        if (!stdout.includes('\n')) return;
+        if (stdout.trim() !== 'LOCKED') {
+          fail(new Error('Backup mutation lock returned an invalid handshake'));
+          return;
+        }
+        ready = true;
+        const lease: BackupMutationLockLease = Object.freeze({ kind: 'backup-mutation-lock' });
+        const state: BackupMutationLeaseState = {
+          child,
+          // flock(2) locks the inherited open-file descriptions. Retaining
+          // the parent's descriptors preserves kernel exclusion even if the
+          // helper dies before Node can process its exit event. Explicit
+          // release below is the sole lock-release point.
+          descriptors,
+          live: true,
+          releasing: false,
+        };
+        activeBackupMutationLeases.set(lease, state);
+        child.once('exit', () => {
+          state.live = false;
+          activeBackupMutationLeases.delete(lease);
+        });
+        descriptorsTransferred = true;
+        settled = true;
+        resolve({ lease, child });
+      });
+    });
+    let released = false;
+    return {
+      lease: acquired.lease,
+      release: async () => {
+        if (released) return;
+        released = true;
+        const state = activeBackupMutationLeases.get(acquired.lease);
+        if (state) state.releasing = true;
+        activeBackupMutationLeases.delete(acquired.lease);
+        await new Promise<void>((resolve) => {
+          if (acquired.child.exitCode !== null || acquired.child.signalCode !== null) return resolve();
+          acquired.child.once('exit', () => resolve());
+          if (state?.live) {
+            acquired.child.stdin?.once('error', () => undefined);
+            acquired.child.stdin?.end('\n');
+          }
+        });
+        for (const descriptor of state?.descriptors || descriptors) {
+          try { fs.closeSync(descriptor); } catch {}
+        }
+      },
+    };
+  } finally {
+    if (!descriptorsTransferred) {
+      for (const descriptor of descriptors) fs.closeSync(descriptor);
+    }
+  }
+}
+
+export const __backupMutationLockTest = {
+  terminateHolderExternally(lease: BackupMutationLockLease): void {
+    const state = activeBackupMutationLeases.get(lease);
+    if (!state) throw new Error('Backup mutation holder is unavailable');
+    if (state.child.pid) process.kill(-state.child.pid, 'SIGKILL');
+  },
+};
+
+export async function withBackupMutationLock<T>(
+  callback: (lease: BackupMutationLockLease) => Promise<T>,
+  options: BackupMutationLockOptions = {},
+): Promise<T> {
+  const acquired = await acquireBackupMutationLock(options);
+  try {
+    assertBackupMutationLockLease(acquired.lease);
+    const result = await callback(acquired.lease);
+    assertBackupMutationLockLease(acquired.lease);
+    return result;
+  } finally {
+    await acquired.release();
+  }
+}
+
+export async function isBackupReferencedByLiveDependencyRepair(file: Pick<BackupFile,
+  'fullPath' | 'dev' | 'ino' | 'size' | 'mtimeNs'>): Promise<boolean> {
+  const rows = await prisma.$queryRaw<Array<{ exists: boolean }>>`
+    SELECT EXISTS (
+      SELECT 1 FROM "ProjectDependencyRepairOperation"
+      WHERE "status" = 'PROMOTING'
+        AND "backupPath" = ${file.fullPath}
+        AND "backupDevice" = ${file.dev}
+        AND "backupInode" = ${file.ino}
+        AND "backupSize" = ${BigInt(file.size)}
+        AND "backupMtimeNs" = ${file.mtimeNs}
+    ) AS "exists"
+  `;
+  return rows[0]?.exists === true;
+}
+
+export interface RepairOwnedBackupLockMarker {
+  schemaVersion: 1;
+  kind: 'bridgesllm.project-dependency-repair-backup-pin';
+  repairId: string;
+  backupFingerprintDigest: string;
+  projectIdentityId: string;
+  projectIdentityGeneration: number;
+  workspaceOwnerId: string;
+  projectName: string;
+  promotionOperationId: string;
+  manifestDigest: string;
+}
+
+export function readRepairOwnedBackupLockMarker(
+  file: Pick<BackupFile, 'fullPath'>,
+): RepairOwnedBackupLockMarker | null {
+  const marker = `${file.fullPath}.locked`;
+  try {
+    const stat = fs.lstatSync(marker);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
+      || stat.uid !== expectedOwnerUid() || stat.gid !== expectedOwnerGid()
+      || (stat.mode & 0o777) !== 0o600 || stat.size <= 0 || stat.size > 16_384) return null;
+    const parsed = JSON.parse(fs.readFileSync(marker, 'utf8'));
+    const after = fs.lstatSync(marker);
+    const valid = after.dev === stat.dev && after.ino === stat.ino && after.size === stat.size
+      && after.mtimeMs === stat.mtimeMs && after.nlink === 1
+      && parsed?.schemaVersion === 1
+      && parsed?.kind === 'bridgesllm.project-dependency-repair-backup-pin'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+        String(parsed?.repairId || ''),
+      )
+      && /^[a-f0-9]{64}$/.test(String(parsed?.backupFingerprintDigest || ''))
+      && typeof parsed?.projectIdentityId === 'string' && parsed.projectIdentityId.length > 0
+      && Number.isInteger(parsed?.projectIdentityGeneration) && parsed.projectIdentityGeneration > 0
+      && typeof parsed?.workspaceOwnerId === 'string' && parsed.workspaceOwnerId.length > 0
+      && typeof parsed?.projectName === 'string' && parsed.projectName.length > 0
+      && !parsed.projectName.includes('/') && !parsed.projectName.includes('\\')
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+        String(parsed?.promotionOperationId || ''),
+      )
+      && /^[a-f0-9]{64}$/.test(String(parsed?.manifestDigest || ''));
+    return valid ? parsed as RepairOwnedBackupLockMarker : null;
+  } catch { return null; }
+}
+
+export function isRepairOwnedBackupLockMarker(file: Pick<BackupFile, 'fullPath'>): boolean {
+  return readRepairOwnedBackupLockMarker(file) !== null;
+}
+
+export function removeExactRepairOwnedBackupLockMarker(input: {
+  file: Pick<BackupFile, 'fullPath'>;
+  expected: RepairOwnedBackupLockMarker;
+  lease: BackupMutationLockLease;
+}): void {
+  assertBackupMutationLockLease(input.lease);
+  const current = readRepairOwnedBackupLockMarker(input.file);
+  if (!current || JSON.stringify(current) !== JSON.stringify(input.expected)) {
+    throw new Error('Repair-owned backup pin changed before retirement');
+  }
+  const marker = `${input.file.fullPath}.locked`;
+  assertBackupMutationLockLease(input.lease);
+  fs.unlinkSync(marker);
+  const parent = fs.openSync(
+    path.dirname(marker),
+    fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0),
+  );
+  try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+}
+
+export function backupReceiptSigningPayload(input: {
+  archive: string;
+  backupType: BackupType;
+  completeness: Exclude<BackupCompleteness, 'unknown'>;
+  archiveSize: number;
+  archiveMtimeNs: string;
+  manifestHmac: string;
+  degradedComponents: string[];
+}): Buffer {
+  const fields = [
+    BACKUP_RECEIPT_SCHEMA,
+    input.archive,
+    input.backupType,
+    input.completeness,
+    String(input.archiveSize),
+    input.archiveMtimeNs,
+    input.manifestHmac,
+    String(input.degradedComponents.length),
+    ...input.degradedComponents,
+  ];
+  return Buffer.from(`${fields.join('\0')}\0`, 'utf8');
+}
+
+function readBackupTrustKey(): Buffer {
+  const rawRoot = process.env.BRIDGESLLM_BACKUP_TRUST_ROOT || '/var/lib/bridgesllm/backup-trust';
+  if (!path.isAbsolute(rawRoot) || path.resolve(rawRoot) !== rawRoot) {
+    throw new Error('Backup trust root is not canonical');
+  }
+  const rootStat = fs.lstatSync(rawRoot);
+  if (rootStat.isSymbolicLink()
+    || !rootStat.isDirectory()
+    || rootStat.uid !== expectedOwnerUid()
+    || rootStat.gid !== expectedOwnerGid()
+    || (rootStat.mode & 0o077) !== 0
+    || fs.realpathSync(rawRoot) !== rawRoot) {
+    throw new Error('Backup trust root is unsafe');
+  }
+  const keyPath = path.join(rawRoot, 'archive-hmac.key');
+  const keyStat = fs.lstatSync(keyPath);
+  if (keyStat.isSymbolicLink()
+    || !keyStat.isFile()
+    || keyStat.uid !== expectedOwnerUid()
+    || keyStat.gid !== expectedOwnerGid()
+    || keyStat.nlink !== 1
+    || (keyStat.mode & 0o777) !== 0o600
+    || keyStat.size !== 32) {
+    throw new Error('Backup trust key is unsafe');
+  }
+  const key = fs.readFileSync(keyPath);
+  if (key.length !== 32) throw new Error('Backup trust key length changed');
+  return key;
+}
+
+function authenticatedBackupClassification(
+  fullPath: string,
+  type: BackupType,
+  expected: Exclude<BackupCompleteness, 'unknown'>,
+): Pick<BackupFile, 'completeness' | 'degradedComponents' | 'classificationAuthenticated'> {
+  const unknown = {
+    completeness: 'unknown' as const,
+    degradedComponents: [],
+    classificationAuthenticated: false,
+  };
+  try {
+    const receiptPath = `${fullPath}.receipt.json`;
+    const receiptStat = fs.lstatSync(receiptPath);
+    if (receiptStat.isSymbolicLink()
+      || !receiptStat.isFile()
+      || receiptStat.uid !== expectedOwnerUid()
+      || receiptStat.gid !== expectedOwnerGid()
+      || receiptStat.nlink !== 1
+      || (receiptStat.mode & 0o777) !== 0o600
+      || receiptStat.size <= 0
+      || receiptStat.size > MAX_RECEIPT_BYTES) return unknown;
+    const parsed = JSON.parse(fs.readFileSync(receiptPath, 'utf8')) as Record<string, unknown>;
+    const keys = Object.keys(parsed).sort();
+    const expectedKeys = [
+      'archive', 'archiveMtimeNs', 'archiveSize', 'backupType', 'completeness',
+      'degradedComponents', 'manifestHmac', 'schema', 'signature',
+    ].sort();
+    if (keys.length !== expectedKeys.length
+      || keys.some((key, index) => key !== expectedKeys[index])) return unknown;
+    const archiveStat = fs.lstatSync(fullPath, { bigint: true });
+    const completeness = parsed.completeness;
+    const degradedComponents = parsed.degradedComponents;
+    if (parsed.schema !== BACKUP_RECEIPT_SCHEMA
+      || parsed.archive !== path.basename(fullPath)
+      || parsed.backupType !== type
+      || completeness !== expected
+      || (completeness !== 'complete' && completeness !== 'degraded')
+      || !Number.isSafeInteger(parsed.archiveSize)
+      || BigInt(parsed.archiveSize as number) !== archiveStat.size
+      || typeof parsed.archiveMtimeNs !== 'string'
+      || !/^\d{1,32}$/.test(parsed.archiveMtimeNs)
+      || BigInt(parsed.archiveMtimeNs) !== archiveStat.mtimeNs
+      || typeof parsed.manifestHmac !== 'string'
+      || !/^[0-9a-f]{64}$/.test(parsed.manifestHmac)
+      || !Array.isArray(degradedComponents)
+      || degradedComponents.length > 128
+      || degradedComponents.some((entry) => typeof entry !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(entry))
+      || degradedComponents.some((entry, index) => index > 0 && entry <= degradedComponents[index - 1])
+      || (completeness === 'complete' && degradedComponents.length !== 0)
+      || (completeness === 'degraded' && degradedComponents.length === 0)
+      || typeof parsed.signature !== 'string'
+      || !/^[0-9a-f]{64}$/.test(parsed.signature)) return unknown;
+    const signed = backupReceiptSigningPayload({
+      archive: parsed.archive as string,
+      backupType: type,
+      completeness,
+      archiveSize: parsed.archiveSize as number,
+      archiveMtimeNs: parsed.archiveMtimeNs,
+      manifestHmac: parsed.manifestHmac,
+      degradedComponents: degradedComponents as string[],
+    });
+    const expectedSignature = crypto.createHmac('sha256', readBackupTrustKey()).update(signed).digest();
+    const actualSignature = Buffer.from(parsed.signature, 'hex');
+    if (actualSignature.length !== expectedSignature.length
+      || !crypto.timingSafeEqual(actualSignature, expectedSignature)) return unknown;
+    return {
+      completeness,
+      degradedComponents: degradedComponents as string[],
+      classificationAuthenticated: true,
+    };
+  } catch {
+    return unknown;
+  }
+}
+
+/** Re-run the signed publication receipt against the archive's current bytes. */
+export function reauthenticateBackupClassification(
+  fullPath: string,
+  type: BackupType,
+  expected: Exclude<BackupCompleteness, 'unknown'>,
+): Pick<BackupFile, 'completeness' | 'degradedComponents' | 'classificationAuthenticated'> {
+  return authenticatedBackupClassification(fullPath, type, expected);
+}
+
+function assertSecureDirectoryChain(
+  directory: string,
+  expectedUid = expectedOwnerUid(),
+  expectedGid = expectedOwnerGid(),
+): void {
   const parsed = path.parse(directory);
   let current = parsed.root;
   const segments = directory.slice(parsed.root.length).split(path.sep).filter(Boolean);
@@ -99,11 +537,16 @@ function assertSecureDirectoryChain(directory: string, expectedUid = expectedOwn
     if (stat.isSymbolicLink()) throw new Error(`Backup path cannot contain symbolic links: ${current}`);
     if (!stat.isDirectory()) throw new Error(`Backup path component is not a directory: ${current}`);
     if (stat.uid !== expectedUid) throw new Error(`Backup path must be owned by uid ${expectedUid}: ${current}`);
+    if (stat.gid !== expectedGid) throw new Error(`Backup path must be owned by gid ${expectedGid}: ${current}`);
     if ((stat.mode & 0o022) !== 0) throw new Error(`Backup path cannot be group/world writable: ${current}`);
   }
 }
 
-function assertSecureExistingPrefix(directory: string, expectedUid = expectedOwnerUid()): void {
+function assertSecureExistingPrefix(
+  directory: string,
+  expectedUid = expectedOwnerUid(),
+  expectedGid = expectedOwnerGid(),
+): void {
   const parsed = path.parse(directory);
   let current = parsed.root;
   const segments = directory.slice(parsed.root.length).split(path.sep).filter(Boolean);
@@ -119,6 +562,7 @@ function assertSecureExistingPrefix(directory: string, expectedUid = expectedOwn
     if (stat.isSymbolicLink()) throw new Error(`Backup path cannot contain symbolic links: ${current}`);
     if (!stat.isDirectory()) throw new Error(`Backup path component is not a directory: ${current}`);
     if (stat.uid !== expectedUid) throw new Error(`Backup path must be owned by uid ${expectedUid}: ${current}`);
+    if (stat.gid !== expectedGid) throw new Error(`Backup path must be owned by gid ${expectedGid}: ${current}`);
     if ((stat.mode & 0o022) !== 0) throw new Error(`Backup path cannot be group/world writable: ${current}`);
   }
 }
@@ -166,12 +610,24 @@ export function ensureBackupLayout(input: string, portalRoot = PORTAL_ROOT): str
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   assertSecureDirectoryChain(root);
 
-  for (const name of [...BACKUP_TYPES, 'logs'] as const) {
+  for (const name of [...BACKUP_TYPES, 'logs', 'degraded'] as const) {
     const directory = path.join(root, name);
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const stat = fs.lstatSync(directory);
-    if (stat.isSymbolicLink() || !stat.isDirectory() || stat.uid !== expectedOwnerUid() || (stat.mode & 0o022) !== 0) {
+    if (stat.isSymbolicLink() || !stat.isDirectory()
+      || stat.uid !== expectedOwnerUid() || stat.gid !== expectedOwnerGid()
+      || (stat.mode & 0o022) !== 0) {
       throw new Error(`Backup directory is not securely owned: ${directory}`);
+    }
+  }
+  for (const type of BACKUP_TYPES) {
+    const directory = path.join(root, 'degraded', type);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const stat = fs.lstatSync(directory);
+    if (stat.isSymbolicLink() || !stat.isDirectory()
+      || stat.uid !== expectedOwnerUid() || stat.gid !== expectedOwnerGid()
+      || (stat.mode & 0o022) !== 0) {
+      throw new Error(`Degraded backup directory is not securely owned: ${directory}`);
     }
   }
   return root;
@@ -222,6 +678,14 @@ export async function getConfiguredBackupRoot(options: { syncFile?: boolean } = 
   return root;
 }
 
+/** Resolve the configured root without creating, chmodding, or syncing paths. */
+export function getConfiguredBackupRootReadOnly(databaseValue?: string | null): string {
+  const configured = databaseValue
+    || readSmallFile(BACKUP_CONFIG_FILE, MAX_PATH_BYTES + 2)?.trim()
+    || DEFAULT_BACKUP_ROOT;
+  return normalizeBackupRoot(configured);
+}
+
 export async function initializeBackupConfiguration(): Promise<void> {
   await getConfiguredBackupRoot({ syncFile: true });
 }
@@ -231,38 +695,71 @@ function backupFilenameMatches(filename: string, type: BackupType): boolean {
   return new RegExp(`^portal-${escapedType}-[A-Za-z0-9._-]+\\.tar\\.gz$`).test(filename);
 }
 
-export function listBackupFiles(root: string): BackupFile[] {
-  const validatedRoot = ensureBackupLayout(root);
+export function listBackupFiles(root: string, options: { readOnly?: boolean } = {}): BackupFile[] {
+  const validatedRoot = options.readOnly ? normalizeBackupRoot(root) : ensureBackupLayout(root);
+  if (options.readOnly) {
+    assertSecureDirectoryChain(validatedRoot);
+    const rootStat = fs.lstatSync(validatedRoot);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()
+      || fs.realpathSync.native(validatedRoot) !== validatedRoot) {
+      throw new Error('Backup root is unsafe');
+    }
+  }
   const files: BackupFile[] = [];
 
   for (const type of BACKUP_TYPES) {
-    const directory = path.join(validatedRoot, type);
-    const realDirectory = fs.realpathSync(directory);
-    for (const filename of fs.readdirSync(directory)) {
-      if (!backupFilenameMatches(filename, type)) continue;
-      const fullPath = path.join(directory, filename);
+    const locations: Array<{
+      directory: string;
+      expected: Exclude<BackupCompleteness, 'unknown'>;
+    }> = [
+      { directory: path.join(validatedRoot, type), expected: 'complete' },
+      { directory: path.join(validatedRoot, 'degraded', type), expected: 'degraded' },
+    ];
+    for (const { directory, expected } of locations) {
+      let realDirectory: string;
       try {
-        const stat = fs.lstatSync(fullPath);
-        if (stat.isSymbolicLink() || !stat.isFile() || stat.uid !== expectedOwnerUid()) continue;
-        const realPath = fs.realpathSync(fullPath);
-        if (!isWithin(realPath, realDirectory)) continue;
-        const lockPath = `${fullPath}.locked`;
-        let locked = false;
+        const directoryStat = fs.lstatSync(directory);
+        if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()
+          || directoryStat.uid !== expectedOwnerUid() || directoryStat.gid !== expectedOwnerGid()
+          || (directoryStat.mode & 0o022) !== 0) throw new Error('Backup directory is unsafe');
+        realDirectory = fs.realpathSync(directory);
+        if (realDirectory !== directory) throw new Error('Backup directory is not canonical');
+      } catch (error: any) {
+        if (options.readOnly && error?.code === 'ENOENT') continue;
+        throw error;
+      }
+      for (const filename of fs.readdirSync(directory)) {
+        if (!backupFilenameMatches(filename, type)) continue;
+        const fullPath = path.join(directory, filename);
         try {
-          const lockStat = fs.lstatSync(lockPath);
-          locked = lockStat.isFile() && !lockStat.isSymbolicLink() && lockStat.uid === expectedOwnerUid();
+          const stat = fs.lstatSync(fullPath, { bigint: true });
+          if (stat.isSymbolicLink() || !stat.isFile()
+            || stat.uid !== BigInt(expectedOwnerUid()) || stat.gid !== BigInt(expectedOwnerGid())
+            || stat.nlink !== 1n || (stat.mode & 0o022n) !== 0n) continue;
+          const realPath = fs.realpathSync(fullPath);
+          if (!isWithin(realPath, realDirectory)) continue;
+          const lockPath = `${fullPath}.locked`;
+          let locked = false;
+          try {
+            const lockStat = fs.lstatSync(lockPath);
+            locked = lockStat.isFile() && !lockStat.isSymbolicLink()
+              && lockStat.uid === expectedOwnerUid() && lockStat.gid === expectedOwnerGid()
+              && lockStat.nlink === 1 && (lockStat.mode & 0o077) === 0;
+          } catch {}
+          files.push({
+            filename,
+            fullPath,
+            type,
+            size: Number(stat.size),
+            mtimeMs: Number(stat.mtimeNs) / 1_000_000,
+            mtimeNs: stat.mtimeNs.toString(),
+            dev: stat.dev.toString(),
+            ino: stat.ino.toString(),
+            locked,
+            ...authenticatedBackupClassification(fullPath, type, expected),
+          });
         } catch {}
-        files.push({
-          filename,
-          fullPath,
-          type,
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-          dev: stat.dev,
-          ino: stat.ino,
-          locked,
-        });
-      } catch {}
+      }
     }
   }
   return files;
@@ -270,7 +767,59 @@ export function listBackupFiles(root: string): BackupFile[] {
 
 export function findBackupFile(root: string, filename: string): BackupFile | null {
   if (!filename || filename.length > 255 || filename !== path.basename(filename)) return null;
-  return listBackupFiles(root).find((file) => file.filename === filename) || null;
+  const matches = listBackupFiles(root).filter((file) => file.filename === filename);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+export function deleteBackupFile(file: BackupFile, lease?: BackupMutationLockLease): void {
+  if (lease) assertBackupMutationLockLease(lease);
+  const archiveStat = fs.lstatSync(file.fullPath, { bigint: true });
+  if (archiveStat.isSymbolicLink()
+    || !archiveStat.isFile()
+    || archiveStat.uid !== BigInt(expectedOwnerUid())
+    || archiveStat.gid !== BigInt(expectedOwnerGid())
+    || archiveStat.nlink !== 1n
+    || (archiveStat.mode & 0o022n) !== 0n
+    || archiveStat.dev.toString() !== file.dev
+    || archiveStat.ino.toString() !== file.ino
+    || archiveStat.size !== BigInt(file.size)
+    || archiveStat.mtimeNs.toString() !== file.mtimeNs) {
+    throw new Error('Backup changed before deletion');
+  }
+  const receiptPath = `${file.fullPath}.receipt.json`;
+  try {
+    const receiptStat = fs.lstatSync(receiptPath);
+    if (receiptStat.isSymbolicLink()
+      || !receiptStat.isFile()
+      || receiptStat.uid !== expectedOwnerUid()
+      || receiptStat.gid !== expectedOwnerGid()
+      || receiptStat.nlink !== 1
+      || (receiptStat.mode & 0o077) !== 0) {
+      throw new Error('Backup receipt is unsafe to delete');
+    }
+    // Remove authentication metadata first. A crash can leave an explicitly
+    // unclassified archive, but never a stale authenticated receipt that can
+    // bind to a later file with the same name.
+    if (lease) assertBackupMutationLockLease(lease);
+    fs.unlinkSync(receiptPath);
+    const directoryFd = fs.openSync(path.dirname(file.fullPath), 'r');
+    try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  const current = fs.lstatSync(file.fullPath, { bigint: true });
+  if (current.isSymbolicLink()
+    || !current.isFile()
+    || current.dev !== archiveStat.dev
+    || current.ino !== archiveStat.ino
+    || current.size !== archiveStat.size
+    || current.mtimeNs !== archiveStat.mtimeNs) {
+    throw new Error('Backup changed while deletion was prepared');
+  }
+  if (lease) assertBackupMutationLockLease(lease);
+  fs.unlinkSync(file.fullPath);
+  const directoryFd = fs.openSync(path.dirname(file.fullPath), 'r');
+  try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
 }
 
 function isBackupProcess(status: BackupStatus): boolean {
@@ -306,7 +855,7 @@ export function parseBackupStatus(raw: string): BackupStatus | null {
     const parsed = JSON.parse(raw) as Partial<BackupStatus>;
     if (!parsed || typeof parsed.id !== 'string' || parsed.id.length > 128) return null;
     if (!BACKUP_TYPES.includes(parsed.type as BackupType)) return null;
-    if (!['queued', 'running', 'completed', 'failed'].includes(String(parsed.status))) return null;
+    if (!['queued', 'running', 'completed', 'degraded', 'failed'].includes(String(parsed.status))) return null;
     if (typeof parsed.startedAt !== 'string' || !Number.isFinite(Date.parse(parsed.startedAt))) return null;
     const boundedText = (value: unknown, maximum: number): value is string => (
       typeof value === 'string'
@@ -315,6 +864,11 @@ export function parseBackupStatus(raw: string): BackupStatus | null {
     );
     if (parsed.error !== undefined && !boundedText(parsed.error, 1000)) return null;
     if (parsed.failureDetail !== undefined && !boundedText(parsed.failureDetail, 1000)) return null;
+    if (parsed.consecutiveFailures !== undefined && (
+      !Number.isSafeInteger(parsed.consecutiveFailures)
+      || (parsed.consecutiveFailures as number) < 0
+      || (parsed.consecutiveFailures as number) > 100_000
+    )) return null;
     const progressFields = [parsed.phase, parsed.phaseLabel, parsed.phaseIndex, parsed.phaseTotal];
     const hasProgress = progressFields.some((value) => value !== undefined);
     if (hasProgress && (

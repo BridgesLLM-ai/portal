@@ -3,9 +3,8 @@ import type { IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
 import fs from 'fs';
 import { authenticateToken } from '../middleware/auth';
-import { canAccessPortal, isElevatedRole } from '../utils/authz';
+import { isElevatedRole } from '../utils/authz';
 import { verifyAccessToken, type JwtPayload } from '../utils/jwt';
-import { prisma } from '../config/database';
 import { isAllowedWebSocketOrigin } from '../utils/websocketOrigin';
 import WebSocket, { WebSocketServer } from 'ws';
 import { parseSafeCookieHeader } from '../utils/safeCookies';
@@ -15,8 +14,10 @@ import {
   isExactWebSocketPath,
   validateSharedBrowserUrl,
 } from '../services/remoteDesktopPolicy';
-import { subscribeToAuthorizationChanges } from '../services/authorizationChangeBus';
-import { subscribeToGlobalWorkspaceAuthorizationFence } from '../services/workspaceAuthorizationBarrier';
+import {
+  authorizeAgentBrowserWebSocketTransport,
+  completeAuthorizedWebSocketUpgrade,
+} from '../services/portalTransportAuthorization';
 
 const router = Router();
 
@@ -170,44 +171,6 @@ async function captureScreenshotFromTarget(target: CdpTarget): Promise<Buffer> {
       }
     });
   });
-}
-
-async function getAuthorizedAdminFromUpgrade(
-  req: IncomingMessage,
-  verifiedUser?: JwtPayload,
-): Promise<JwtPayload | null> {
-  const cookies = parseSafeCookieHeader(req.headers.cookie);
-  const token = cookies.accessToken;
-  const user = verifiedUser || (token ? verifyAccessToken(token) : null);
-  if (!user) return null;
-  const dbUser = await prisma.user.findUnique({
-    where: { id: user.userId },
-    select: {
-      id: true,
-      email: true,
-      role: true,
-      accountStatus: true,
-      isActive: true,
-      sandboxEnabled: true,
-      authorizationVersion: true,
-    },
-  } as any);
-
-  if (!dbUser
-    || !canAccessPortal((dbUser as any).accountStatus, dbUser.isActive)
-    || !isElevatedRole(dbUser.role)
-    || (user.authorizationVersion ?? 1) !== Number((dbUser as any).authorizationVersion ?? 1)) {
-    return null;
-  }
-
-  return {
-    userId: dbUser.id,
-    email: dbUser.email,
-    role: dbUser.role,
-    accountStatus: (dbUser as any).accountStatus,
-    sandboxEnabled: !!(dbUser as any).sandboxEnabled,
-    authorizationVersion: Number((dbUser as any).authorizationVersion ?? 1),
-  } satisfies JwtPayload;
 }
 
 router.use(authenticateToken);
@@ -405,58 +368,15 @@ export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
       socket.destroy();
       return;
     }
-    let authorizationRevoked = false;
-    let unsubscribed = false;
-    let globalSubscriptionReady = false;
-    const revokeForGlobalFence = () => {
-      authorizationRevoked = true;
-      if (globalSubscriptionReady) socket.destroy();
-    };
-    let unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
-      revokeForGlobalFence,
-    );
-    globalSubscriptionReady = true;
-    if (authorizationRevoked) {
-      unsubscribeGlobalFence();
-      socket.write('HTTP/1.1 409 Conflict\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-    const unsubscribeAuthorization = subscribeToAuthorizationChanges(tokenUser.userId, () => {
-      authorizationRevoked = true;
-      socket.destroy();
-    });
-    const cleanupAuthorization = () => {
-      if (unsubscribed) return;
-      unsubscribed = true;
-      socket.removeListener('close', cleanupAuthorization);
-      unsubscribeGlobalFence();
-      unsubscribeGlobalFence = () => {};
-      unsubscribeAuthorization();
-    };
-    socket.once('close', cleanupAuthorization);
-
-    void getAuthorizedAdminFromUpgrade(req, tokenUser).then((user) => {
-      if (authorizationRevoked || socket.destroyed || !user) {
-        cleanupAuthorization();
-        if (!socket.destroyed) socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-
-      (req as any).__portalUser = user;
-      try {
+    completeAuthorizedWebSocketUpgrade({
+      socket,
+      authorize: (onRevoke) => authorizeAgentBrowserWebSocketTransport(tokenUser, onRevoke),
+      onAuthorized: (result) => {
+        (req as any).__portalUser = result.identity;
         wss.handleUpgrade(req, socket, head, (ws) => {
           wss.emit('connection', ws, req);
         });
-      } catch {
-        cleanupAuthorization();
-        socket.destroy();
-      }
-    }).catch(() => {
-      cleanupAuthorization();
-      if (!socket.destroyed) socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-      socket.destroy();
+      },
     });
   });
 

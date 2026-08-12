@@ -1,10 +1,13 @@
 {
   "schema": 1,
-  "version": "4.0.16",
-  "releasedAt": "2026-08-11",
+  "version": "4.0.17",
+  "releasedAt": "2026-08-12",
   "releaseClass": "hotfix",
   "highlights": [
-    "Updating works again on servers running 4.0.15, which refused to update because it did not recognize its own scheduled backup helper.",
-    "The release build now fails if a release ships a backup helper its own installer would reject, so this cannot recur silently."
+    "Sign-in converges across tabs; revoked sessions stay revoked, and dependency installs use an exact durable promotion boundary with crash recovery.",
+    "Agent Chat steering is bound to the exact active OpenClaw run, including Anthropic-backed turns, and retries cannot enqueue duplicate text.",
+    "Updates prove rebootability before downtime and, once 4.0.17 is installed, authenticate the exact Dashboard installer bytes before execution.",
+    "Project adoption is crash-safe while preserving Apps and share links; contained dependency updates have an exact Owner repair path backed by a freshly verified comprehensive backup.",
+    "Password-protected shares work without JavaScript, and shared App API failures remain truthful only after complete JSON validation."
   ]
 }

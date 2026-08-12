@@ -4512,6 +4512,7 @@ describe('ChatStateProvider session-control ownership', () => {
           ok: true,
           sessionKey: 'agent:main:first',
           requestId: body?.requestId,
+          runId: body?.expectedRunId,
           interruptedActiveRun: false,
         },
       };
@@ -4530,8 +4531,94 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(steeringBodies[1].requestId).toBe(steeringBodies[0].requestId);
     expect(steeringBodies[1]).toMatchObject({
       session: 'agent:main:first',
+      expectedRunId: 'run-steer',
       message: 'Yes',
     });
+  });
+
+  it('does not accept a replacement-run success for an R1 steering request', async () => {
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    await waitFor(() => expect(chatMocks.pendingQuestions).toHaveBeenCalledWith('agent:main:first'));
+    const socket = PendingWebSocket.instances[0];
+    act(() => {
+      socket.emit({
+        type: 'text',
+        sessionKey: 'agent:main:first',
+        runId: 'run-r1',
+        content: 'Working on R1',
+      });
+    });
+    chatMocks.clientPost.mockImplementation(async (url: string, body?: Record<string, unknown>) => {
+      if (url !== '/gateway/session-steer') return { data: { ok: true } };
+      return {
+        data: {
+          ok: true,
+          sessionKey: 'agent:main:first',
+          requestId: body?.requestId,
+          runId: 'run-r2',
+          interruptedActiveRun: false,
+        },
+      };
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+
+    expect(await screen.findByTestId('status-text')).toHaveTextContent(
+      'Portal did not confirm steering for this exact active run.',
+    );
+    const steeringBody = chatMocks.clientPost.mock.calls
+      .find(([url]) => url === '/gateway/session-steer')?.[1] as Record<string, unknown>;
+    expect(steeringBody).toMatchObject({
+      session: 'agent:main:first',
+      expectedRunId: 'run-r1',
+      message: 'Yes',
+    });
+    const messages = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+    expect(messages).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'user', content: 'Yes' }),
+    ]));
+  });
+
+  it('probes the exact run identity before steering when local active state lacks one', async () => {
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    await waitFor(() => expect(chatMocks.pendingQuestions).toHaveBeenCalledWith('agent:main:first'));
+    const socket = PendingWebSocket.instances[0];
+    act(() => {
+      socket.emit({
+        type: 'text',
+        sessionKey: 'agent:main:first',
+        content: 'Working before the run identity arrives',
+      });
+    });
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/stream-status') {
+        return { data: { active: true, runId: 'run-from-probe' } };
+      }
+      return { data: {} };
+    });
+    chatMocks.clientPost.mockImplementation(async (url: string, body?: Record<string, unknown>) => ({
+      data: url === '/gateway/session-steer'
+        ? {
+            ok: true,
+            sessionKey: 'agent:main:first',
+            requestId: body?.requestId,
+            runId: body?.expectedRunId,
+            interruptedActiveRun: false,
+          }
+        : { ok: true },
+    }));
+
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+
+    await waitFor(() => expect(chatMocks.clientPost).toHaveBeenCalledWith(
+      '/gateway/session-steer',
+      expect.objectContaining({
+        expectedRunId: 'run-from-probe',
+        message: 'Yes',
+      }),
+    ));
   });
 
   it('ignores a delayed inactive R1 history snapshot after a new local R2 turn starts', async () => {

@@ -40,7 +40,7 @@ Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · r
 - **Updates you can watch and undo.** One button in the Dashboard: signed release notes, backup check, migrations, health checks, automatic rollback if the new build won't come up healthy.
 - **Everything else got a pass.** Setup, Files, Mail, Terminal, Remote Desktop, Apps, Tasks, Skills, Settings, Admin, light mode, and accessibility all got reliability and clarity work.
 
-Read the complete [4.0.16 changelog](CHANGELOG.md#4016---2026-08-11) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
+Read the complete [4.0.17 changelog](CHANGELOG.md#4017---2026-08-12) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
 
 ## What you get
 
@@ -58,7 +58,7 @@ Read the complete [4.0.16 changelog](CHANGELOG.md#4016---2026-08-11) and [releas
 
 **Terminal, tasks, and skills** — A browser terminal on the host, scheduled recurring agent work, background jobs you can inspect, and skills from [ClawHub](https://clawhub.ai).
 
-**Setup and admin** — Setup creates a secure Owner first, then walks optional domain/TLS, mail, providers, local models, and Remote Desktop. Admin covers accounts, storage, alerts, backups, maintenance, and updates.
+**Setup and admin** — Setup creates a secure Owner first, then walks optional domain/TLS, mail, providers, local models, and Remote Desktop. Admin covers accounts, storage, alerts, backups, maintenance, and updates. The [backup and recovery guide](docs/BACKUP_AND_RECOVERY.md) explains complete, salvage-only, and cross-host recovery requirements.
 
 ## Architecture
 

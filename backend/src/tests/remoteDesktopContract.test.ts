@@ -131,7 +131,10 @@ describe('Remote Desktop release contract', () => {
 
   test('the shared browser stream is account-gated, bounded, and exact-path only', () => {
     const route = readRepo('backend/src/routes/agentBrowser.ts');
-    expect(route).toContain('canAccessPortal((dbUser as any).accountStatus, dbUser.isActive)');
+    const transportAuthorization = readRepo('backend/src/services/portalTransportAuthorization.ts');
+    expect(route).toContain('authorizeAgentBrowserWebSocketTransport(tokenUser, onRevoke)');
+    expect(transportAuthorization).toContain('canUseInteractivePortal(');
+    expect(transportAuthorization).toContain('isElevatedRole(identity.role)');
     expect(route).toContain("isExactWebSocketPath(url, '/api/agent-browser/stream')");
     expect(route).toContain('MAX_AGENT_BROWSER_BUFFERED_BYTES');
     expect(route).toContain('validateSharedBrowserUrl(req.body?.url)');

@@ -403,6 +403,7 @@ DAILY_KEEP="${DAILY_KEEP:-7}"
 WEEKLY_KEEP="${WEEKLY_KEEP:-4}"
 MONTHLY_KEEP="${MONTHLY_KEEP:-3}"
 COMPREHENSIVE_KEEP="${COMPREHENSIVE_KEEP:-4}"
+DEGRADED_KEEP="${DEGRADED_KEEP:-2}"
 
 STATUS_FILE="${BACKUP_STATE_DIR}/status.json"
 OUTPUT_FILE="${BACKUP_STATE_DIR}/current.log"
@@ -426,6 +427,8 @@ RUN_PHASE_TOTAL=""
 RUN_ERROR_DETAIL=""
 RUN_DEGRADED=false
 RUN_DEGRADED_COMPONENTS=()
+ARCHIVE_FAILURE_DETAIL=""
+RUN_CONSECUTIVE_FAILURES=0
 STAGING_DIR=""
 PARTIAL_ARCHIVE=""
 RECOVERY_COMPONENTS_FILE=""
@@ -1134,7 +1137,7 @@ for segment in root.strip(os.path.sep).split(os.path.sep):
     if info.st_uid != expected_uid or info.st_mode & 0o022:
         raise SystemExit("Backup path must be owner-controlled and not group/world writable")
 
-for name in ("daily", "weekly", "monthly", "comprehensive", "logs"):
+for name in ("daily", "weekly", "monthly", "comprehensive", "logs", "degraded"):
     child = os.path.join(root, name)
     if not os.path.lexists(child):
         os.mkdir(child, mode=0o700)
@@ -1142,6 +1145,16 @@ for name in ("daily", "weekly", "monthly", "comprehensive", "logs"):
     info = os.lstat(child)
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != expected_uid or info.st_mode & 0o022:
         raise SystemExit("Backup subdirectory is not securely owned")
+
+degraded = os.path.join(root, "degraded")
+for name in ("daily", "weekly", "monthly", "comprehensive"):
+    child = os.path.join(degraded, name)
+    if not os.path.lexists(child):
+        os.mkdir(child, mode=0o700)
+        created.append(child)
+    info = os.lstat(child)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != expected_uid or info.st_mode & 0o022:
+        raise SystemExit("Degraded backup subdirectory is not securely owned")
 
 def fsync_directory(path):
     descriptor = os.open(
@@ -1253,6 +1266,7 @@ write_status() {
   STATUS_EXIT_CODE="$exit_code" \
   STATUS_ARCHIVE_PATH="$RUN_ARCHIVE_PATH" \
   STATUS_ERROR="$error_message" \
+  STATUS_CONSECUTIVE_FAILURES="$RUN_CONSECUTIVE_FAILURES" \
   STATUS_PHASE="$RUN_PHASE" \
   STATUS_PHASE_LABEL="$RUN_PHASE_LABEL" \
   STATUS_PHASE_INDEX="$RUN_PHASE_INDEX" \
@@ -1277,6 +1291,7 @@ payload = {
     "status": os.environ["STATUS_VALUE"],
     "startedAt": os.environ["STATUS_STARTED_AT"],
     "pid": int(os.environ["STATUS_PID"]),
+    "consecutiveFailures": int(os.environ["STATUS_CONSECUTIVE_FAILURES"]),
 }
 if os.environ.get("STATUS_COMPLETED_AT"):
     payload["completedAt"] = os.environ["STATUS_COMPLETED_AT"]
@@ -1313,6 +1328,43 @@ finally:
         os.unlink(temporary)
     except FileNotFoundError:
         pass
+PY
+}
+
+previous_backup_failure_streak() {
+  python3 - "$STATUS_FILE" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or info.st_mode & 0o022
+        or info.st_size <= 0
+        or info.st_size > 64 * 1024
+    ):
+        raise SystemExit(1)
+    payload = json.loads(open(path, "r", encoding="utf-8").read())
+except FileNotFoundError:
+    print(0)
+    raise SystemExit(0)
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if payload.get("status") not in {"failed", "degraded"}:
+    print(0)
+    raise SystemExit(0)
+value = payload.get("consecutiveFailures", 1)
+if not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > 100000:
+    raise SystemExit(1)
+print(value)
 PY
 }
 
@@ -1355,9 +1407,11 @@ def safe_root_owned(path: pathlib.Path, expect_directory: bool) -> bool:
         info = os.lstat(path)
     except FileNotFoundError:
         return False
-    if stat.S_ISLNK(info.st_mode) or info.st_uid != 0:
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_mode & 0o022:
         return False
-    return stat.S_ISDIR(info.st_mode) if expect_directory else stat.S_ISREG(info.st_mode)
+    if expect_directory:
+        return stat.S_ISDIR(info.st_mode)
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
 
 def contains_mount(path: pathlib.Path) -> bool:
     root = str(path)
@@ -1385,18 +1439,34 @@ for candidate in tmp.iterdir():
             raise SystemExit("unsafe stale backup helper artifact")
         candidate.unlink()
 
-for kind in ("daily", "weekly", "monthly", "comprehensive"):
-    directory = backup_root / kind
-    if not directory.is_dir() or directory.is_symlink():
-        continue
-    for candidate in directory.iterdir():
-        if ".partial-" not in candidate.name:
+for parent in (backup_root, backup_root / "degraded"):
+    for kind in ("daily", "weekly", "monthly", "comprehensive"):
+        directory = parent / kind
+        if not directory.is_dir() or directory.is_symlink():
             continue
-        if not re.fullmatch(r"portal-[A-Za-z0-9.-]+\.tar\.gz\.partial-[A-Za-z0-9._-]{1,128}", candidate.name):
-            continue
-        if not safe_root_owned(candidate, False):
-            raise SystemExit("unsafe stale partial backup archive")
-        candidate.unlink()
+        for candidate in directory.iterdir():
+            if candidate.name.endswith(".tar.gz.receipt.json"):
+                archive = directory / candidate.name.removesuffix(".receipt.json")
+                if not archive.exists() and not archive.is_symlink():
+                    if not safe_root_owned(candidate, False):
+                        raise SystemExit("unsafe orphaned backup receipt")
+                    candidate.unlink()
+                continue
+            if re.fullmatch(
+                r"portal-[A-Za-z0-9.-]+\.tar\.gz\.receipt\.json\.tmp-[A-Za-z0-9._-]+",
+                candidate.name,
+            ):
+                if not safe_root_owned(candidate, False):
+                    raise SystemExit("unsafe stale backup receipt temporary")
+                candidate.unlink()
+                continue
+            if ".partial-" not in candidate.name:
+                continue
+            if not re.fullmatch(r"portal-[A-Za-z0-9.-]+\.tar\.gz\.partial-[A-Za-z0-9._-]{1,128}", candidate.name):
+                continue
+            if not safe_root_owned(candidate, False):
+                raise SystemExit("unsafe stale partial backup archive")
+            candidate.unlink()
 PY
 }
 
@@ -2478,6 +2548,7 @@ PY
 
 finish_run() {
   local exit_code="$?"
+  local published_degraded=false
   local failed_phase="${RUN_PHASE}"
   local failed_phase_label="${RUN_PHASE_LABEL}"
   local failed_phase_index="${RUN_PHASE_INDEX}"
@@ -2485,6 +2556,9 @@ finish_run() {
   trap - EXIT HUP INT TERM ERR
   if (( exit_code != 0 )) && [[ -z "${RUN_ERROR_DETAIL}" ]]; then
     RUN_ERROR_DETAIL="Backup process exited unexpectedly with code ${exit_code} during ${RUN_PHASE_LABEL:-backup processing}"
+  fi
+  if (( exit_code != 0 )) && $RUN_DEGRADED && [[ -n "${RUN_ARCHIVE_PATH}" ]]; then
+    published_degraded=true
   fi
   if $RUN_ACTIVE && [[ "${RUN_TYPE}" == "comprehensive" ]] \
     && { $BACKUP_QUIESCE_ACTIVE \
@@ -2503,6 +2577,7 @@ finish_run() {
       RUN_ERROR_DETAIL="One or more services, managed Project containers, or the database fence did not return to their pre-backup state"
     fi
     exit_code=1
+    published_degraded=false
   elif $recovery_attempted && (( exit_code != 0 )); then
     RUN_PHASE="${failed_phase}"
     RUN_PHASE_LABEL="${failed_phase_label}"
@@ -2516,11 +2591,17 @@ finish_run() {
   fi
   if $RUN_ACTIVE; then
     if (( exit_code == 0 )); then
+      RUN_CONSECUTIVE_FAILURES=0
       RUN_PHASE="completed"
       RUN_PHASE_LABEL="Backup completed"
       RUN_PHASE_INDEX="${RUN_PHASE_TOTAL}"
       write_status completed "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "0" ""
+    elif $published_degraded; then
+      (( RUN_CONSECUTIVE_FAILURES += 1 ))
+      write_status degraded "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$exit_code" \
+        "${RUN_ERROR_DETAIL:-Backup archive was published in degraded state}"
     else
+      (( RUN_CONSECUTIVE_FAILURES += 1 ))
       write_status failed "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$exit_code" \
         "${RUN_ERROR_DETAIL:-Backup process exited with code ${exit_code}}"
     fi
@@ -2528,6 +2609,7 @@ finish_run() {
   if ! release_backup_lock_guard; then
     exit_code=1
     if $RUN_ACTIVE; then
+      (( RUN_CONSECUTIVE_FAILURES > 0 )) || RUN_CONSECUTIVE_FAILURES=1
       RUN_ERROR_DETAIL="Backup lock guard did not release cleanly"
       write_status failed "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$exit_code" \
         "${RUN_ERROR_DETAIL}"
@@ -2893,6 +2975,8 @@ begin_run() {
   RUN_ID="${BACKUP_JOB_ID:-$(date -u '+%Y%m%dT%H%M%S')-$$}"
   [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "Invalid backup job id"
   RUN_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  RUN_CONSECUTIVE_FAILURES="$(previous_backup_failure_streak)" \
+    || die "Previous backup failure streak could not be read safely"
   if [[ "${RUN_TYPE}" == "comprehensive" ]]; then
     RUN_PHASE_TOTAL=12
   else
@@ -4111,6 +4195,7 @@ import hashlib
 import os
 import pathlib
 import posixpath
+import re
 import stat
 import struct
 import sys
@@ -4121,12 +4206,18 @@ digest_path = pathlib.Path(sys.argv[3])
 raw_options = sys.argv[4:]
 patterns = []
 allow_external_hardlinks = False
+allow_project_interpreter_symlinks = False
 allowed_absolute_symlink_roots = []
 overlay_root_raw = None
 overlay_relatives = []
 for option in raw_options:
     if option == "--allow-external-hardlinks":
         allow_external_hardlinks = True
+        continue
+    if option == "--allow-project-interpreter-symlinks":
+        if allow_project_interpreter_symlinks:
+            raise SystemExit("duplicate Project interpreter symbolic-link policy")
+        allow_project_interpreter_symlinks = True
         continue
     if option.startswith("--overlay-root="):
         if overlay_root_raw is not None or len(option) <= len("--overlay-root="):
@@ -4427,7 +4518,14 @@ def inspect_entry(path, relative, *, apply_exclusions=True, expected_device=None
         if target.startswith("/"):
             resolved_target = posixpath.normpath(target)
             admitted_roots = [str(source), *allowed_absolute_symlink_roots]
-            if not any(
+            admitted_interpreter = (
+                allow_project_interpreter_symlinks
+                and re.fullmatch(
+                    r"/(?:usr/bin|usr/local/bin)/python3(?:\.[0-9]+)?",
+                    resolved_target,
+                ) is not None
+            )
+            if not admitted_interpreter and not any(
                 resolved_target == root
                 or resolved_target.startswith(root + "/")
                 for root in admitted_roots
@@ -4797,6 +4895,52 @@ finally:
 PY
 }
 
+record_archive_failure() {
+  local summary="$1"
+  local diagnostics="${2:-}"
+  local excerpt=""
+  if [[ -n "${diagnostics}" && -f "${diagnostics}" && ! -L "${diagnostics}" ]]; then
+    excerpt="$(python3 - "${diagnostics}" <<'PY' 2>/dev/null || true
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+info = os.lstat(path)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != 0
+    or info.st_gid != 0
+    or info.st_nlink != 1
+    or info.st_mode & 0o022
+):
+    raise SystemExit(1)
+descriptor = os.open(
+    path,
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    payload = os.read(descriptor, 4097)
+finally:
+    os.close(descriptor)
+payload = payload[:4096]
+text = payload.decode("utf-8", errors="replace")
+text = " ".join(text.split())
+if text:
+    print(text)
+PY
+)"
+  fi
+  ARCHIVE_FAILURE_DETAIL="${summary}"
+  [[ -z "${excerpt}" ]] || ARCHIVE_FAILURE_DETAIL="${ARCHIVE_FAILURE_DETAIL}: ${excerpt}"
+  ARCHIVE_FAILURE_DETAIL="$(
+    printf '%s' "${ARCHIVE_FAILURE_DETAIL}" | sanitize_status_detail 2>/dev/null \
+      || printf '%s' 'Recovery component archive failed without a diagnostic detail'
+  )"
+  log "WARNING: ${ARCHIVE_FAILURE_DETAIL}"
+}
+
 archive_dir() {
   local source_dir="$1"
   local target="$2"
@@ -4807,6 +4951,7 @@ archive_dir() {
   local after_digest="${target}.source-after.sha256"
   local source_only_list="${target}.source-only"
   shift 2
+  ARCHIVE_FAILURE_DETAIL=""
   # `--check-links` makes tar fail when it cannot archive every link of an
   # inode. For a component that deliberately shares inodes with another
   # backed-up tree, that is the normal state, not a fault. The options here
@@ -4822,28 +4967,40 @@ archive_dir() {
       --overlay-relative=*) overlay_relatives+=("${option#--overlay-relative=}") ;;
     esac
   done
-  [[ -z "${overlay_root}" && "${#overlay_relatives[@]}" -eq 0 \
-    || ( -n "${overlay_root}" && "${#overlay_relatives[@]}" -gt 0 ) ]] || return 1
+  if ! { [[ -z "${overlay_root}" && "${#overlay_relatives[@]}" -eq 0 ]] \
+    || [[ -n "${overlay_root}" && "${#overlay_relatives[@]}" -gt 0 ]]; }; then
+    record_archive_failure "Recovery archive overlay authority was incomplete"
+    return 1
+  fi
   for option in "${overlay_relatives[@]}"; do
     overlay_members+=("$(basename "$source_dir")/${option}")
   done
-  [[ "$source_dir" == /* && -d "$source_dir" && ! -L "$source_dir" ]] || return 1
-  [[ ! -e "$target" && ! -L "$target" \
+  if [[ "$source_dir" != /* || ! -d "$source_dir" || -L "$source_dir" ]]; then
+    record_archive_failure "Recovery source is missing, linked, or not an absolute directory"
+    return 1
+  fi
+  if ! [[ ! -e "$target" && ! -L "$target" \
     && ! -e "$diagnostics" && ! -L "$diagnostics" \
     && ! -e "$before_list" && ! -L "$before_list" \
     && ! -e "$before_digest" && ! -L "$before_digest" \
     && ! -e "$after_list" && ! -L "$after_list" \
     && ! -e "$after_digest" && ! -L "$after_digest" \
-    && ! -e "$source_only_list" && ! -L "$source_only_list" ]] || return 1
+    && ! -e "$source_only_list" && ! -L "$source_only_list" ]]; then
+    record_archive_failure "Recovery archive staging paths were not empty"
+    return 1
+  fi
   if ! materialize_archive_source_inventory \
-      "$source_dir" "$before_list" "$before_digest" "$@"; then
-    rm -f -- "$before_list" "$before_digest"
+      "$source_dir" "$before_list" "$before_digest" "$@" \
+      2>"$diagnostics"; then
+    record_archive_failure "Recovery source inventory was rejected" "$diagnostics"
+    rm -f -- "$diagnostics" "$before_list" "$before_digest"
     return 1
   fi
   local archive_list="$before_list"
   if [[ -n "${overlay_root}" ]]; then
     if ! materialize_archive_list_without_overlay \
         "$before_list" "$source_only_list" "${overlay_members[@]}"; then
+      record_archive_failure "Recovery archive overlay inventory was rejected"
       rm -f -- "$before_list" "$before_digest" "$source_only_list"
       return 1
     fi
@@ -4867,11 +5024,13 @@ archive_dir() {
         2>"${diagnostics}" || tar_status=$?
   fi
   if (( tar_status != 0 )); then
+    record_archive_failure "Tar could not capture the recovery source" "$diagnostics"
     rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
       "$source_only_list"
     return 1
   fi
   if [[ -s "$diagnostics" ]]; then
+    record_archive_failure "Tar reported an incomplete recovery capture" "$diagnostics"
     rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
       "$source_only_list"
     return 1
@@ -4882,6 +5041,7 @@ archive_dir() {
       --atime-preserve=system --no-recursion --null --verbatim-files-from \
       -zf "$target" -C "$(dirname "$source_dir")" -T "$archive_list" \
       >"$diagnostics" 2>&1; then
+    record_archive_failure "Captured recovery archive did not compare with its source" "$diagnostics"
     rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
       "$source_only_list"
     return 1
@@ -4893,11 +5053,13 @@ archive_dir() {
       -zf "$target" -C "$(dirname "$overlay_root")" \
       "${overlay_members[@]}" \
       >>"$diagnostics" 2>&1; then
+    record_archive_failure "Captured recovery overlay did not compare with its snapshot" "$diagnostics"
     rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
       "$source_only_list"
     return 1
   fi
   if [[ -s "$diagnostics" ]]; then
+    record_archive_failure "Captured recovery archive comparison produced diagnostics" "$diagnostics"
     rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
       "$source_only_list"
     return 1
@@ -4905,16 +5067,28 @@ archive_dir() {
   rm -f -- "$diagnostics"
   if ! materialize_archive_source_inventory \
       "$source_dir" "$after_list" "$after_digest" "$@" \
-    || ! cmp -s -- "$before_list" "$after_list" \
-    || ! cmp -s -- "$before_digest" "$after_digest" \
-    || ! assert_archive_matches_source_inventory \
-      "$target" "$before_list" "$before_digest"; then
+      2>"$diagnostics"; then
+    record_archive_failure "Post-capture recovery source inventory was rejected" "$diagnostics"
+    rm -f -- "$target" "$diagnostics" "$before_list" "$before_digest" \
+      "$after_list" "$after_digest" "$source_only_list"
+    return 1
+  fi
+  if ! cmp -s -- "$before_list" "$after_list" \
+    || ! cmp -s -- "$before_digest" "$after_digest"; then
+    record_archive_failure "Recovery source changed during capture"
     rm -f -- "$target" "$before_list" "$before_digest" \
       "$after_list" "$after_digest" "$source_only_list"
     return 1
   fi
-  rm -f -- "$before_list" "$before_digest" "$after_list" "$after_digest" \
-    "$source_only_list"
+  if ! assert_archive_matches_source_inventory \
+      "$target" "$before_list" "$before_digest" 2>"$diagnostics"; then
+    record_archive_failure "Captured archive inventory did not match its admitted source" "$diagnostics"
+    rm -f -- "$target" "$before_list" "$before_digest" \
+      "$after_list" "$after_digest" "$source_only_list" "$diagnostics"
+    return 1
+  fi
+  rm -f -- "$diagnostics" "$before_list" "$before_digest" "$after_list" \
+    "$after_digest" "$source_only_list"
   [[ -s "$target" && -f "$target" && ! -L "$target" ]]
 }
 
@@ -4988,7 +5162,7 @@ archive_required_component() {
   if ! archive_dir "$source_dir" "$target" "$@"; then
     record_degraded_component \
       "$component_id" required "$source_dir" \
-      "Required recovery source was missing or could not be archived"
+      "${ARCHIVE_FAILURE_DETAIL:-Required recovery source was missing or could not be archived}"
     return 0
   fi
   local capture_method="live-filesystem-tar"
@@ -5010,10 +5184,10 @@ archive_required_component_with_retries() {
     if (( attempt >= max_attempts )); then
       record_degraded_component \
         "$component_id" required "$source_dir" \
-        "Required recovery source could not be archived after ${max_attempts} attempts"
+        "${ARCHIVE_FAILURE_DETAIL:-Required recovery source could not be archived after ${max_attempts} attempts}"
       return 0
     fi
-    log "Recovery source changed during capture; retrying ${component_id} ($(( attempt + 1 ))/${max_attempts})"
+    log "${ARCHIVE_FAILURE_DETAIL:-Recovery source could not be archived}; retrying ${component_id} ($(( attempt + 1 ))/${max_attempts})"
     (( attempt += 1 ))
     sleep 1
   done
@@ -5208,7 +5382,7 @@ finally:
 PY
 }
 
-materialize_openclaw_codex_database_list() {
+materialize_openclaw_snapshot_database_list() {
   local source_dir="$1"
   local target="$2"
   python3 - "${source_dir}" "${target}" <<'PY'
@@ -5229,7 +5403,9 @@ if (
     or os.path.lexists(target)
 ):
     raise SystemExit(1)
-pattern = re.compile(r"^(goals|memories)_[0-9]+\.sqlite(?:(-wal|-shm|-journal))?$")
+codex_pattern = re.compile(r"^(goals|memories)_[0-9]+\.sqlite(?:(-wal|-shm|-journal))?$")
+agent_pattern = re.compile(r"^openclaw-agent\.sqlite(?:(-wal|-shm|-journal))?$")
+safe_agent_id = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 bases = set()
 sidecar_bases = set()
 for current_raw, directory_names, file_names in os.walk(source, followlinks=False):
@@ -5240,7 +5416,15 @@ for current_raw, directory_names, file_names in os.walk(source, followlinks=Fals
         name for name in directory_names
         if name not in {".tmp", "tmp", "cache", "sessions", "shell_snapshots", "node_modules", ".git"}
     ]
-    if current.name != "codex-home" or current.parent.name != "agent":
+    relative_parts = current.relative_to(source).parts
+    is_codex_home = current.name == "codex-home" and current.parent.name == "agent"
+    is_agent_home = (
+        len(relative_parts) == 3
+        and relative_parts[0] == "agents"
+        and safe_agent_id.fullmatch(relative_parts[1]) is not None
+        and relative_parts[2] == "agent"
+    )
+    if not is_codex_home and not is_agent_home:
         continue
     info = os.lstat(current)
     if (
@@ -5252,12 +5436,17 @@ for current_raw, directory_names, file_names in os.walk(source, followlinks=Fals
     ):
         raise SystemExit(1)
     for name in file_names:
-        match = pattern.fullmatch(name)
+        match = (
+            codex_pattern.fullmatch(name)
+            if is_codex_home
+            else agent_pattern.fullmatch(name)
+        )
         if match is None:
             continue
         relative = (current / name).relative_to(source).as_posix()
-        base = relative.removesuffix(match.group(2) or "")
-        if match.group(2):
+        suffix = match.group(2) if is_codex_home else match.group(1)
+        base = relative.removesuffix(suffix or "")
+        if suffix:
             sidecar_bases.add(base)
         else:
             bases.add(base)
@@ -5319,7 +5508,7 @@ archive_openclaw_state_component() {
 
     local codex_snapshots_ok=true
     local -a codex_databases=()
-    if ! materialize_openclaw_codex_database_list \
+    if ! materialize_openclaw_snapshot_database_list \
         "${source_dir}" "${database_list_before}"; then
       codex_snapshots_ok=false
     elif [[ -s "${database_list_before}" ]]; then
@@ -5347,10 +5536,11 @@ archive_openclaw_state_component() {
           --exclude='state/openclaw.sqlite-wal' \
           --exclude='state/openclaw.sqlite-shm' \
           --exclude='state/openclaw.sqlite-journal' \
+          --exclude='agents/*/agent/openclaw-agent.sqlite*' \
           --exclude='*/agent/codex-home/goals_*.sqlite*' \
           --exclude='*/agent/codex-home/memories_*.sqlite*' \
           "$@" "${overlay_options[@]}"; then
-        if materialize_openclaw_codex_database_list \
+        if materialize_openclaw_snapshot_database_list \
             "${source_dir}" "${database_list_after}" \
           && cmp -s -- "${database_list_before}" "${database_list_after}" \
           && { $snapshot_present \
@@ -5558,6 +5748,130 @@ backup_name_for_type() {
   esac
 }
 
+write_backup_publication_receipt() {
+  local archive="$1"
+  local backup_type="$2"
+  local completeness="$3"
+  local manifest_record="$4"
+  shift 4
+  python3 - "$archive" "$BACKUP_HMAC_KEY" "$backup_type" \
+    "$completeness" "$manifest_record" "$@" <<'PY'
+import hashlib
+import hmac
+import json
+import os
+import pathlib
+import re
+import stat
+import tempfile
+import sys
+
+archive_raw, key_raw, backup_type, completeness, manifest_raw, *components = sys.argv[1:]
+archive = pathlib.Path(archive_raw)
+key_path = pathlib.Path(key_raw)
+manifest_path = pathlib.Path(manifest_raw)
+receipt = pathlib.Path(str(archive) + ".receipt.json")
+schema = "bridgesllm.backup-publication.v1"
+
+def safe_regular(path, *, mode=None, maximum=None):
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or info.st_mode & 0o022
+        or (mode is not None and stat.S_IMODE(info.st_mode) != mode)
+        or (maximum is not None and info.st_size > maximum)
+    ):
+        raise SystemExit(1)
+    return info
+
+if (
+    not archive.is_absolute()
+    or os.path.normpath(archive_raw) != archive_raw
+    or not re.fullmatch(r"portal-(daily|weekly|monthly|comprehensive)-[A-Za-z0-9._-]+\.tar\.gz", archive.name)
+    or backup_type not in {"daily", "weekly", "monthly", "comprehensive"}
+    or completeness not in {"complete", "degraded"}
+    or len(components) != len(set(components))
+    or components != sorted(components)
+    or any(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", value) is None for value in components)
+    or (completeness == "complete" and components)
+    or (completeness == "degraded" and not components)
+    or os.path.lexists(receipt)
+):
+    raise SystemExit(1)
+
+archive_info = safe_regular(archive)
+key_info = safe_regular(key_path, mode=0o600, maximum=32)
+manifest_info = safe_regular(manifest_path, mode=0o600, maximum=16 * 1024)
+if archive_info.st_size <= 0 or key_info.st_size != 32 or manifest_info.st_size <= 0:
+    raise SystemExit(1)
+key = key_path.read_bytes()
+if len(key) != 32:
+    raise SystemExit(1)
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+manifest_hmac = manifest.get("manifestHmac")
+if not isinstance(manifest_hmac, str) or re.fullmatch(r"[0-9a-f]{64}", manifest_hmac) is None:
+    raise SystemExit(1)
+
+fields = [
+    schema,
+    archive.name,
+    backup_type,
+    completeness,
+    str(archive_info.st_size),
+    str(archive_info.st_mtime_ns),
+    manifest_hmac,
+    str(len(components)),
+    *components,
+]
+signed_payload = ("\0".join(fields) + "\0").encode("utf-8")
+payload = {
+    "schema": schema,
+    "archive": archive.name,
+    "backupType": backup_type,
+    "completeness": completeness,
+    "archiveSize": archive_info.st_size,
+    "archiveMtimeNs": str(archive_info.st_mtime_ns),
+    "manifestHmac": manifest_hmac,
+    "degradedComponents": components,
+    "signature": hmac.new(key, signed_payload, hashlib.sha256).hexdigest(),
+}
+descriptor, temporary_raw = tempfile.mkstemp(
+    prefix=receipt.name + ".tmp-",
+    dir=receipt.parent,
+    text=True,
+)
+temporary = pathlib.Path(temporary_raw)
+try:
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.link(temporary, receipt, follow_symlinks=False)
+    directory_descriptor = os.open(
+        receipt.parent,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+finally:
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+PY
+}
+
 keep_count_for_type() {
   case "$1" in
     daily) printf '%s\n' "$DAILY_KEEP" ;;
@@ -5566,6 +5880,76 @@ keep_count_for_type() {
     comprehensive) printf '%s\n' "$COMPREHENSIVE_KEEP" ;;
     *) die "Unknown backup type: $1" ;;
   esac
+}
+
+remove_backup_with_receipt() {
+  local archive="$1"
+  python3 - "$archive" <<'PY'
+import os
+import pathlib
+import re
+import stat
+import sys
+
+archive = pathlib.Path(sys.argv[1])
+receipt = pathlib.Path(str(archive) + ".receipt.json")
+if (
+    not archive.is_absolute()
+    or os.path.normpath(str(archive)) != str(archive)
+    or re.fullmatch(
+        r"portal-(?:daily|weekly|monthly|comprehensive)-[A-Za-z0-9._-]+\.tar\.gz",
+        archive.name,
+    ) is None
+):
+    raise SystemExit(1)
+parent = archive.parent
+parent_info = os.lstat(parent)
+if (
+    not stat.S_ISDIR(parent_info.st_mode)
+    or stat.S_ISLNK(parent_info.st_mode)
+    or parent_info.st_uid != 0
+    or parent_info.st_gid != 0
+    or parent_info.st_mode & 0o022
+):
+    raise SystemExit(1)
+
+def admitted_file(path):
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or info.st_mode & 0o022
+    ):
+        raise SystemExit(1)
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+archive_identity = admitted_file(archive)
+if os.path.lexists(receipt):
+    admitted_file(receipt)
+    os.unlink(receipt)
+    directory_descriptor = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+if admitted_file(archive) != archive_identity:
+    raise SystemExit(1)
+os.unlink(archive)
+directory_descriptor = os.open(
+    parent,
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+)
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+PY
 }
 
 prune_backups() {
@@ -5588,7 +5972,32 @@ prune_backups() {
     ((unlocked_seen += 1))
     if (( unlocked_seen > keep )); then
       log "Pruning old backup: ${old_backup}"
-      rm -f -- "$old_backup"
+      remove_backup_with_receipt "$old_backup"
+    fi
+  done
+  fsync_directory "$dir"
+}
+
+prune_degraded_backups() {
+  local type="$1"
+  local dir="${BACKUP_BASE}/degraded/${type}"
+  [[ "${DEGRADED_KEEP}" =~ ^[0-9]+$ && "${DEGRADED_KEEP}" -le 100 ]] \
+    || die "DEGRADED_KEEP must be an integer between 0 and 100"
+  [[ -d "$dir" ]] || return 0
+  local -a candidates=()
+  mapfile -t candidates < <(
+    find "$dir" -maxdepth 1 -type f -name 'portal-*.tar.gz' -printf '%T@ %p\n' \
+      | sort -nr \
+      | cut -d' ' -f2-
+  )
+  local unlocked_seen=0
+  local old_backup
+  for old_backup in "${candidates[@]}"; do
+    [[ -e "${old_backup}.locked" ]] && continue
+    ((unlocked_seen += 1))
+    if (( unlocked_seen > DEGRADED_KEEP )); then
+      log "Pruning old degraded backup: ${old_backup}"
+      remove_backup_with_receipt "$old_backup"
     fi
   done
   fsync_directory "$dir"
@@ -6176,16 +6585,26 @@ try:
                                 if component_id == "openclaw-state":
                                     allowed_roots.append("/usr/lib/node_modules/openclaw")
                                 resolved_link = posixpath.normpath(link)
+                                admitted_project_interpreter = (
+                                    component_id == "projects"
+                                    and re.fullmatch(
+                                        r"/(?:usr/bin|usr/local/bin)/python3(?:\.[0-9]+)?",
+                                        resolved_link,
+                                    ) is not None
+                                )
                                 if (
                                     not isinstance(source_root, str)
                                     or not source_root.startswith("/")
-                                    or not any(
-                                        isinstance(root, str)
-                                        and (
-                                            resolved_link == root
-                                            or resolved_link.startswith(root + "/")
+                                    or (
+                                        not admitted_project_interpreter
+                                        and not any(
+                                            isinstance(root, str)
+                                            and (
+                                                resolved_link == root
+                                                or resolved_link.startswith(root + "/")
+                                            )
+                                            for root in allowed_roots
                                         )
-                                        for root in allowed_roots
                                     )
                                 ):
                                     fail("nested recovery symbolic link escapes its admitted roots")
@@ -6753,7 +7172,9 @@ create_backup() {
   assert_backup_disk_admission \
     || die "Backup disk admission failed before any source was quiesced"
 
-  local backup_dir="${BACKUP_BASE}/${type}"
+  local complete_backup_dir="${BACKUP_BASE}/${type}"
+  local degraded_backup_dir="${BACKUP_BASE}/degraded/${type}"
+  local backup_dir="${complete_backup_dir}"
   local staging
   staging="$(mktemp -d "/tmp/bridgesllm-backup-${type}-XXXXXX")"
   STAGING_DIR="$staging"
@@ -6768,13 +7189,18 @@ create_backup() {
   select_backup_postgresql_toolchain_for_authority \
     "${BACKUP_AUTHORITY_ENV_FILE}" \
     || die "Sealed PostgreSQL authority or trusted client toolchain changed"
-  local archive_path
-  archive_path="${backup_dir}/$(backup_name_for_type "$type")"
+  local archive_name archive_path
+  archive_name="$(backup_name_for_type "$type")"
+  archive_path="${backup_dir}/${archive_name}"
   PARTIAL_ARCHIVE="${archive_path}.partial-${RUN_ID}"
 
-  mkdir -p "$backup_dir" "${BACKUP_BASE}/logs"
-  fsync_directory "$backup_dir" \
-    || die "Backup type directory could not be made durable"
+  mkdir -p "$complete_backup_dir" "$degraded_backup_dir" "${BACKUP_BASE}/logs"
+  fsync_directory "$complete_backup_dir" \
+    || die "Complete backup type directory could not be made durable"
+  fsync_directory "$degraded_backup_dir" \
+    || die "Degraded backup type directory could not be made durable"
+  fsync_directory "${BACKUP_BASE}/degraded" \
+    || die "Degraded backup directory could not be made durable"
   fsync_directory "$BACKUP_BASE" \
     || die "Backup base directory could not be made durable"
 
@@ -6874,7 +7300,9 @@ create_backup() {
       legacy-portal-files "$LEGACY_PORTAL_FILES_DIR" "${staging}/legacy-portal-files.tar.gz" \
       "Legacy Portal file root is not present for this installation profile"
   fi
-  archive_required_component projects "$PROJECTS_DIR" "${staging}/projects.tar.gz"
+  archive_required_component_with_retries \
+    projects "$PROJECTS_DIR" "${staging}/projects.tar.gz" 3 \
+    --allow-project-interpreter-symlinks
   archive_required_component \
     portal-backend-state "$PORTAL_BACKEND_STATE_DIR" "${staging}/portal-backend-state.tar.gz" \
     --exclude='backups/status.json' \
@@ -7070,7 +7498,8 @@ create_backup() {
       --exclude='*/agent/codex-home/shell_snapshots/*' \
       --exclude='*/agent/codex-home/models_cache.json' \
       --exclude='*/agent/codex-home/state_*.sqlite*' \
-      --exclude='*/agent/codex-home/logs_*.sqlite*'
+      --exclude='*/agent/codex-home/logs_*.sqlite*' \
+      --exclude='workspace-*/state/job-watchdog.json'
   else
     record_absent_component \
       openclaw-state "$OPENCLAW_DIR" \
@@ -7153,6 +7582,12 @@ create_backup() {
   verify_staging_manifest "$staging" "$RUN_DEGRADED" \
     || die "Backup manifest checksum generation failed"
 
+  if $RUN_DEGRADED; then
+    backup_dir="${degraded_backup_dir}"
+    archive_path="${backup_dir}/${archive_name}"
+    PARTIAL_ARCHIVE="${archive_path}.partial-${RUN_ID}"
+  fi
+
   if [[ "$type" == "comprehensive" ]]; then
     set_backup_phase creating-archive "Creating backup archive" 10 \
       || die "Backup progress state could not be updated"
@@ -7202,12 +7637,26 @@ create_backup() {
 
   local size
   size="$(du -h "$archive_path" | awk '{print $1}')"
+  local completeness="complete"
+  local -a receipt_components=()
+  if $RUN_DEGRADED; then
+    completeness="degraded"
+    mapfile -t receipt_components < <(printf '%s\n' "${RUN_DEGRADED_COMPONENTS[@]}" | sort -u)
+  fi
+  if ! write_backup_publication_receipt \
+      "$archive_path" "$type" "$completeness" \
+      "${staging}/ARCHIVE-MAC.json" "${receipt_components[@]}"; then
+    remove_backup_with_receipt "$archive_path"
+    fsync_directory "$backup_dir" || true
+    die "Backup publication receipt could not be authenticated and committed"
+  fi
   RUN_ARCHIVE_PATH="$archive_path"
   if $RUN_DEGRADED; then
     local degraded_list
     degraded_list="$(IFS=,; printf '%s' "${RUN_DEGRADED_COMPONENTS[*]}")"
     RUN_ERROR_DETAIL="Backup archive was published in degraded state; unavailable components: ${degraded_list}"
     log "WARNING: ${RUN_ERROR_DETAIL}: ${archive_path} (${size}, ${file_count} entries)"
+    prune_degraded_backups "$type"
     return 1
   fi
 
@@ -7221,6 +7670,13 @@ list_backups() {
     printf '\n== %s ==\n' "$type"
     if [[ -d "$dir" ]]; then
       find "$dir" -maxdepth 1 -type f -name 'portal-*.tar.gz' -printf '%TY-%Tm-%Td %TH:%TM %10s %p\n' | sort -r || true
+    else
+      printf '(none)\n'
+    fi
+    local degraded_dir="${BACKUP_BASE}/degraded/${type}"
+    printf '%s\n' '-- degraded salvage --'
+    if [[ -d "$degraded_dir" ]]; then
+      find "$degraded_dir" -maxdepth 1 -type f -name 'portal-*.tar.gz' -printf '%TY-%Tm-%Td %TH:%TM %10s %p\n' | sort -r || true
     else
       printf '(none)\n'
     fi

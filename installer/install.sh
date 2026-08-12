@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="4.0.16"
+readonly VERSION="4.0.17"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -227,6 +227,7 @@ OPENCLAW_ASK_USER_TRANSACTION_COMMITTED=false
 OPENCLAW_ASK_USER_TRANSACTION_DIR=""
 OPENCLAW_ASK_USER_STATE_DIR=""
 OPENCLAW_ASK_USER_GATEWAY_WAS_ACTIVE=false
+OPENCLAW_ASK_USER_BASE_ATTESTED=false
 OPENCLAW_ASK_USER_LIVE_ATTESTED=false
 OPENCLAW_COMPAT_HOTFIX_PID=""
 OPENCLAW_TESTED_PAIR_COMMIT_RECORD="/root/.openclaw/.bridgesllm-tested-pair-commit-v3.json"
@@ -309,6 +310,7 @@ DASHBOARD_UPDATE_PROGRESS_PERCENT=5
 DASHBOARD_UPDATE_PROGRESS_PHASE="installer-download"
 DASHBOARD_UPDATE_PORTAL_COMMITTED=false
 DASHBOARD_UPDATE_FAILURE_MESSAGE=""
+DASHBOARD_UPDATE_FAILURE_PHASE=""
 UNINSTALL_TRANSACTION_ID=""
 UNINSTALL_RECOVERED_THIS_RUN=false
 
@@ -435,6 +437,7 @@ fail() {
   fi
   FAIL_TERMINAL_IN_PROGRESS=true
   DASHBOARD_UPDATE_FAILURE_MESSAGE="$1"
+  DASHBOARD_UPDATE_FAILURE_PHASE="${DASHBOARD_UPDATE_PROGRESS_PHASE:-failure}"
   # fail() never returns; from here on nothing may re-trigger ERR handling.
   trap - ERR
   trap '' SIGINT TERM HUP
@@ -448,7 +451,7 @@ fail() {
   fi
   if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     dashboard_update_progress updated_with_errors \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
       "Portal updated; follow-up work failed" "$1"
   elif [[ "${UPDATE_RECOVERY_ARMED:-false}" == "true" ]]; then
     dashboard_update_progress recovering \
@@ -484,7 +487,7 @@ fail() {
   if [[ "${database_operation_settled}" != "true" ]]; then
     warn "The active database operation could not be proven stopped. Recovery was not started; the Portal remains boot-fenced."
     dashboard_update_progress recovery_required \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
       "Automatic recovery needs attention" \
       "The active database operation could not be proven stopped. Do not start another update."
     exit 1
@@ -552,7 +555,7 @@ fail() {
   fi
   if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     dashboard_update_progress updated_with_errors \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
       "Portal updated; follow-up work failed" \
       "${DASHBOARD_UPDATE_FAILURE_MESSAGE}"
   elif [[ "${update_recovery_attempted}" == "true" \
@@ -563,7 +566,7 @@ fail() {
       "The update failed, and the previous Portal was restored and verified. ${DASHBOARD_UPDATE_FAILURE_MESSAGE}"
   elif [[ "${update_recovery_attempted}" == "true" ]]; then
     dashboard_update_progress recovery_required \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
       "Automatic recovery needs attention" \
       "Recovery did not complete. Do not start another update; review the root-only transaction journal and installer log."
   fi
@@ -8513,12 +8516,13 @@ recover_update_after_signal() {
 
 handle_installer_signal() {
   local exit_code="$1" message="$2"
+  local interrupted_phase="${DASHBOARD_UPDATE_PROGRESS_PHASE:-failure}"
   trap '' SIGINT TERM HUP
   trap - ERR
   set +e
   if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     dashboard_update_progress updated_with_errors \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
       "Portal updated; follow-up work was interrupted" "${message}"
   elif [[ "${UPDATE_RECOVERY_ARMED:-false}" == "true" ]]; then
     dashboard_update_progress recovering \
@@ -8536,7 +8540,7 @@ handle_installer_signal() {
     warn "The OpenClaw compatibility patch process could not be proven stopped. Recovery was not started."
     [[ "${UPDATE_RECOVERY_ARMED:-false}" != "true" ]] \
       || dashboard_update_progress recovery_required \
-        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+        "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
         "Automatic recovery needs attention" \
         "A compatibility process could not be proven stopped. Do not start another update."
     exit "${exit_code}"
@@ -8545,7 +8549,7 @@ handle_installer_signal() {
     && ! settle_active_update_database_operation; then
     warn "The active database operation could not be proven stopped. Recovery was not started; the Portal remains boot-fenced."
     dashboard_update_progress recovery_required \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
       "Automatic recovery needs attention" \
       "The database operation could not be proven stopped. Do not start another update."
     exit "${exit_code}"
@@ -8553,7 +8557,7 @@ handle_installer_signal() {
   if ! recover_update_after_signal; then
     warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved."
     dashboard_update_progress recovery_required \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
       "Automatic recovery needs attention" \
       "Recovery after interruption did not complete. Do not start another update."
   elif [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
@@ -8562,7 +8566,7 @@ handle_installer_signal() {
     # exact outcome instead of letting the outer nonzero exit look like an
     # ordinary pre-commit failure.
     dashboard_update_progress updated_with_errors \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
       "Portal updated; follow-up work was interrupted" "${message}"
   fi
   exit "${exit_code}"
@@ -8588,6 +8592,7 @@ handle_err() {
 
 handle_update_transaction_err() {
   local exit_code="${1:-1}"
+  local failed_phase="${DASHBOARD_UPDATE_PROGRESS_PHASE:-failure}"
   [[ "${exit_code}" =~ ^[1-9][0-9]*$ ]] || exit_code=1
   trap - ERR
   trap '' SIGINT TERM HUP
@@ -8599,7 +8604,7 @@ handle_update_transaction_err() {
   if ! settle_openclaw_compatibility_hotfix_process; then
     warn "The OpenClaw compatibility patch process could not be proven stopped. Recovery was not started."
     dashboard_update_progress recovery_required \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
       "Automatic recovery needs attention" \
       "A compatibility process could not be proven stopped. Do not start another update."
     exit "${exit_code}"
@@ -8608,7 +8613,7 @@ handle_update_transaction_err() {
     && ! settle_active_update_database_operation; then
     warn "The active database operation could not be proven stopped. Recovery was not started; the Portal remains boot-fenced."
     dashboard_update_progress recovery_required \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
       "Automatic recovery needs attention" \
       "The database operation could not be proven stopped. Do not start another update."
     exit "${exit_code}"
@@ -8616,12 +8621,12 @@ handle_update_transaction_err() {
   if ! recover_pending_update_transaction; then
     warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved."
     dashboard_update_progress recovery_required \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery-required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
       "Automatic recovery needs attention" \
       "The transaction stopped without a verified terminal state. Do not start another update."
   elif [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     dashboard_update_progress updated_with_errors \
-      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" updated-with-errors \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
       "Portal updated; follow-up work failed" \
       "The cutover recovered forward, but the installer exited before completing host integration."
   fi
@@ -9104,6 +9109,8 @@ required_current_migrations = {
     "portal/backend/prisma/migrations/20260729_project_authorization_transition/migration.sql",
     "portal/backend/prisma/migrations/20260808_share_link_rate_limits/migration.sql",
     "portal/backend/prisma/migrations/20260809_project_runtime_recovery_replay/migration.sql",
+    "portal/backend/prisma/migrations/20260812_project_dependency_promotion_decision/migration.sql",
+    "portal/backend/prisma/migrations/20260812_project_dependency_repair_force_forward/migration.sql",
 }
 required_current_skill = {
     "portal/skills/bridgesllm-portal/SKILL.md",
@@ -9145,9 +9152,19 @@ required_baseline_members = {
     "portal/backend/dist/routes/projects.js",
     "portal/backend/dist/server.js",
     "portal/backend/dist/services/app-process.service.js",
+    "portal/backend/dist/services/accessTokenAuthorization.js",
     "portal/backend/dist/services/openclawProjectSandbox.js",
     "portal/backend/dist/services/openclawProjectQualification.js",
+    "portal/backend/dist/services/portalTransportAuthorization.js",
     "portal/backend/dist/services/projectChatTurnLease.js",
+    "portal/backend/dist/services/projectDeletionLock.js",
+    "portal/backend/dist/services/projectDependencyInstall.js",
+    "portal/backend/dist/services/projectDependencyPromotionWriterFence.js",
+    "portal/backend/dist/services/projectDependencyPromotionDecision.js",
+    "portal/backend/dist/services/projectDependencyPromotionManifest.js",
+    "portal/backend/dist/services/projectDependencyPromotionStartupRecovery.js",
+    "portal/backend/dist/services/projectDependencyRepair.js",
+    "portal/backend/dist/services/projectChatDependencyPromotionQuiescence.js",
     "portal/backend/dist/services/projectEgressCleanupAdapter.js",
     "portal/backend/dist/services/projectEgressCredentials.js",
     "portal/backend/dist/services/projectEgressPlane.js",
@@ -9161,8 +9178,11 @@ required_baseline_members = {
     "portal/backend/dist/services/projectRuntimeCleanup.js",
     "portal/backend/dist/services/projectRuntimeCleanupAdapters.js",
     "portal/backend/dist/services/projectRuntimeConfinement.js",
+    "portal/backend/dist/services/projectStoragePaths.js",
     "portal/backend/dist/services/projectWorkloadRuntime.js",
     "portal/backend/dist/services/releaseUpdateDetails.js",
+    "portal/backend/dist/services/sessionRevocationBus.js",
+    "portal/backend/dist/services/startupStatusServer.js",
     "portal/backend/dist/version.js",
     "portal/backend/package-lock.json",
     "portal/backend/package.json",
@@ -11002,10 +11022,13 @@ HELPER_CANDIDATE_FILE_LIMIT = 256
 HELPER_CANDIDATE_TOTAL_LIMIT = 4 * 1024 * 1024
 HELPER_CANDIDATE_LINE_LIMIT = 65536
 PORTAL_AUDITED_HELPER_LIMIT = 512 * 1024
-# Exact backup-full.sh payloads from installable Portal 4.0 releases through
-# 4.0.13. The backup service legitimately schedules this larger audited
-# entrypoint. Keep arbitrary operator helpers on the generic 128 KiB per-file,
-# 96-file, 1 MiB aggregate, and 16,384 executable-line work bounds.
+# Exact backup-full.sh payloads retained from installable Portal 4.0 releases.
+# installer/backup-helper-identities.tsv is the append-only, version-labelled
+# source ledger; the release gate validates every historical Git blob and
+# requires this set to match that ledger exactly. The backup service
+# legitimately schedules this larger audited entrypoint. Keep arbitrary
+# operator helpers on the generic 128 KiB per-file, 96-file, 1 MiB aggregate,
+# and 16,384 executable-line work bounds.
 PORTAL_BACKUP_HELPER_RELEASES = {
     (223518, "4988ba5be75e7e78e9c0f0981684c0a9203c7175f353eb07f890d337df8e1b1b"),
     (224956, "fc6751d6844589e081911e425c551afb317a3ded4b9d465b754dc7113c3c9454"),
@@ -11020,6 +11043,7 @@ PORTAL_BACKUP_HELPER_RELEASES = {
     # scripts/validation/backup-helper-allowlist-static.py now fails the build
     # when this set does not cover the helper the release actually ships.
     (271864, "c68881be5af61d0ba778b37fbea65068f650b74ab96703f15cafe73420b34f6c"),
+    (288193, "04309ddec3ab7f2ae5c18d68a6e07b09809924f94a3f77b9694da90aa8c48305"),
 }
 PORTAL_RUNTIME_REPAIR_LAUNCHER = (
     "/opt/bridgesllm/portal/installer/"
@@ -16986,6 +17010,53 @@ try {
       [proxy, runtime].filter((candidate) => candidate?.running),
     );
 
+    // A proxy that never started (or exited before Docker materialized its
+    // endpoints) can leave the exact managed container and its empty network
+    // pair behind. Treat only that fully detached, stopped shape as reclaimable
+    // debris. A running proxy, any runtime peer, or any network-side member
+    // remains an authoritative topology failure.
+    const exitedDetachedProxy = proxy.running === false
+      && runtime === null
+      && Object.keys(internal.members).length === 0
+      && Object.keys(publicNetwork.members).length === 0;
+    const exitedDetachedProxyDebris = exitedDetachedProxy
+      && reportedInternalId === ''
+      && reportedPublicId === ''
+      && String(internalAttachment.EndpointID || '') === ''
+      && String(publicAttachment.EndpointID || '') === ''
+      && String(internalAttachment.IPAddress || '') === ''
+      && String(publicAttachment.IPAddress || '') === ''
+      && String(internalAttachment.GlobalIPv6Address || '') === ''
+      && String(publicAttachment.GlobalIPv6Address || '') === ''
+      && String(internalAttachment.IPAMConfig?.IPv6Address || '') === ''
+      && String(publicAttachment.IPAMConfig?.IPv6Address || '') === '';
+    if (exitedDetachedProxyDebris) {
+      const orphanTopology = canonical({
+        identity,
+        proxy: {
+          id: proxy.id,
+          name: proxy.name,
+          image: proxy.image,
+          configuredImage: proxy.configuredImage,
+          labels: proxy.labels,
+          networkMode: proxy.networkMode,
+          networks: proxy.networks,
+          running: proxy.running,
+        },
+        internal,
+        publicNetwork,
+        runtime: null,
+      });
+      topologyRecords.push(
+        `orphan-container|${proxy.id}|/${proxy.name}|${proxy.image}`,
+        `orphan-network|${internal.id}|${internal.name}|internal`,
+        `orphan-network|${publicNetwork.id}|${publicNetwork.name}|proxy-public`,
+        `orphan-plane|${identity.identityFingerprint}|${sha256(JSON.stringify(orphanTopology))}|`,
+      );
+      continue;
+    }
+    if (exitedDetachedProxy) fail();
+
     const topology = canonical({
       identity,
       proxy: {
@@ -17057,10 +17128,12 @@ discover_unique_managed_project_egress_proxy_image_id() {
   # Two complete immutable snapshots make image selection a CAS boundary.
   # Any create/remove/relabel between them is a race, not a generation the
   # updater may guess through.
-  local first_inventory="" second_inventory="" barrier_inventory=""
-  local first_status=0 second_status=0 barrier_status=0
+  local first_inventory="" second_inventory="" barrier_inventory="" removal_inventory=""
+  local first_status=0 second_status=0 barrier_status=0 removal_status=0
   local row kind resource_id name detail selected_image_id="" index
   local cleanup_attempted=false resource_summary="" separator=""
+  local -a orphan_container_ids=()
+  local -a orphan_container_names=()
   local -a orphan_network_ids=()
   local -a orphan_network_names=()
 
@@ -17068,6 +17141,8 @@ discover_unique_managed_project_egress_proxy_image_id() {
     first_inventory=""
     second_inventory=""
     selected_image_id=""
+    orphan_container_ids=()
+    orphan_container_names=()
     orphan_network_ids=()
     orphan_network_names=()
     if first_inventory="$(capture_managed_project_egress_inventory)"; then
@@ -17123,6 +17198,14 @@ discover_unique_managed_project_egress_proxy_image_id() {
           orphan_network_ids+=("${resource_id}")
           orphan_network_names+=("${name}")
           ;;
+        orphan-container)
+          [[ "${resource_id}" =~ ^[a-f0-9]{64}$ \
+            && "${name}" =~ ^/p4e-proxy-[a-f0-9]{20}$ ]] \
+            || return 3
+          valid_docker_image_id "${detail}" || return 3
+          orphan_container_ids+=("${resource_id}")
+          orphan_container_names+=("${name#/}")
+          ;;
         *) return 3 ;;
       esac
     done <<<"${first_inventory}"
@@ -17141,19 +17224,50 @@ discover_unique_managed_project_egress_proxy_image_id() {
         || "${barrier_inventory}" != "${first_inventory}" ]]; then
         return 5
       fi
+      # One final complete discovery immediately before the first exact-ID
+      # removal closes the gap between the cleanup barrier and mutation. A
+      # stopped proxy that is reattached or otherwise changes remains intact.
+      removal_inventory=""
+      if removal_inventory="$(capture_managed_project_egress_inventory)"; then
+        removal_status=0
+      else
+        removal_status=$?
+      fi
+      if [[ "${removal_status}" != "0" \
+        || "${removal_inventory}" != "${first_inventory}" ]]; then
+        return 5
+      fi
       resource_summary=""
       separator=""
+      for ((index = 0; index < ${#orphan_container_ids[@]}; index++)); do
+        resource_summary+="${separator}${orphan_container_names[index]} (${orphan_container_ids[index]})"
+        separator=", "
+      done
       for ((index = 0; index < ${#orphan_network_ids[@]}; index++)); do
         resource_summary+="${separator}${orphan_network_names[index]} (${orphan_network_ids[index]})"
         separator=", "
       done
       printf '%s\n' \
-        "Reclaiming empty parentless Project egress networks: ${resource_summary}." >&2
+        "Reclaiming exact stopped, detached Project egress debris: ${resource_summary}." >&2
+      for ((index = 0; index < ${#orphan_container_ids[@]}; index++)); do
+        if ! docker container rm "${orphan_container_ids[index]}" \
+          >> "${LOG_FILE}" 2>&1; then
+          printf '%s\n' \
+            "Could not reclaim Project egress debris ${resource_summary}. Remediation: docker container inspect ${orphan_container_ids[*]}; docker network inspect ${orphan_network_ids[*]}; verify the proxy is stopped and every network endpoint is gone, then retry the Portal update." >&2
+          return 3
+        fi
+        if docker container inspect "${orphan_container_ids[index]}" \
+          >/dev/null 2>&1; then
+          printf '%s\n' \
+            "Project egress proxy ${orphan_container_names[index]} (${orphan_container_ids[index]}) remained after exact removal. Remediation: docker container inspect ${orphan_container_ids[index]}; retry only after the proxy is stopped and detached." >&2
+          return 3
+        fi
+      done
       for ((index = 0; index < ${#orphan_network_ids[@]}; index++)); do
         if ! docker network rm "${orphan_network_ids[index]}" \
           >> "${LOG_FILE}" 2>&1; then
           printf '%s\n' \
-            "Could not reclaim Project egress networks ${resource_summary}. Remediation: docker network inspect ${orphan_network_ids[*]}; stop attached Project runtimes, then retry the Portal update. Do not remove a network that still has endpoints." >&2
+            "Could not reclaim Project egress debris ${resource_summary}. Remediation: docker network inspect ${orphan_network_ids[*]}; stop attached Project runtimes, then retry the Portal update. Do not remove a network that still has endpoints." >&2
           return 3
         fi
         if docker network inspect "${orphan_network_ids[index]}" \
@@ -20063,6 +20177,55 @@ prepare_update_project_runtimes() {
     || fail "Prepared Project runtime identities failed validation."
 }
 
+run_staged_portal_rebootability_preflight() {
+  local staged_portal="$1" source_env="$2" plan_file="${3:-}"
+  local backend_dir="${staged_portal}/backend"
+  local preflight="${backend_dir}/dist/cli/portalRebootabilityPreflight.js"
+  local -a arguments=(--env-file "${source_env}")
+  if [[ -n "${plan_file}" ]]; then
+    [[ "${plan_file}" == /* && ! -e "${plan_file}" && ! -L "${plan_file}" ]] \
+      || return 1
+    arguments+=(--plan-file "${plan_file}")
+  fi
+  [[ -d "${backend_dir}" && ! -L "${backend_dir}" \
+    && -f "${preflight}" && ! -L "${preflight}" \
+    && -f "${source_env}" && ! -L "${source_env}" ]] \
+    || return 1
+  [[ "$(stat -c '%u:%g:%h' "${preflight}")" == "0:0:1" \
+    && "$(stat -c '%u:%g:%h' "${source_env}")" == "0:0:1" \
+    && $((8#$(stat -c '%a' "${preflight}") & 0022)) -eq 0 \
+    && $((8#$(stat -c '%a' "${source_env}") & 0022)) -eq 0 ]] \
+    || return 1
+  (
+    cd "${backend_dir}"
+    /usr/bin/node "${preflight}" "${arguments[@]}"
+  ) >> "${LOG_FILE}" 2>&1
+}
+
+run_staged_portal_continuity_repair() {
+  local staged_portal="$1" source_env="$2" plan_file="$3"
+  local backend_dir="${staged_portal}/backend"
+  local repair="${backend_dir}/dist/cli/portalContinuityRepair.js"
+  [[ -d "${backend_dir}" && ! -L "${backend_dir}" \
+    && -f "${repair}" && ! -L "${repair}" \
+    && -f "${source_env}" && ! -L "${source_env}" \
+    && -f "${plan_file}" && ! -L "${plan_file}" ]] \
+    || return 1
+  [[ "$(stat -c '%u:%g:%h' "${repair}")" == "0:0:1" \
+    && "$(stat -c '%u:%g:%h' "${source_env}")" == "0:0:1" \
+    && "$(stat -c '%u:%g:%h' "${plan_file}")" == "0:0:1" \
+    && $((8#$(stat -c '%a' "${repair}") & 0022)) -eq 0 \
+    && $((8#$(stat -c '%a' "${source_env}") & 0022)) -eq 0 \
+    && $((8#$(stat -c '%a' "${plan_file}") & 0077)) -eq 0 ]] \
+    || return 1
+  (
+    cd "${backend_dir}"
+    /usr/bin/node "${repair}" \
+      --env-file "${source_env}" \
+      --plan-file "${plan_file}"
+  ) >> "${LOG_FILE}" 2>&1
+}
+
 reattest_quiesced_update_project_egress_generation() {
   # Preparation happens while the old Portal is serving requests. After its
   # service is proven stopped, close that admission window by comparing the
@@ -21710,8 +21873,8 @@ auto_apply_openclaw_compatibility_hotfix() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
   fi
-  if ! $OPENCLAW_ASK_USER_LIVE_ATTESTED; then
-    fail "Refusing to disable native Claude questions before the replacement ask-user tool and all settlement methods pass live semantic probes."
+  if ! $OPENCLAW_ASK_USER_BASE_ATTESTED; then
+    fail "Native Claude questions may only be suppressed after the replacement ask-user tool and all settlement methods pass live base probes."
   fi
 
   local hotfix_script="${PORTAL_DIR}/scripts/patch-openclaw-long-run-relay-hotfix.sh"
@@ -22664,7 +22827,12 @@ PY
 
 verify_bridgesllm_ask_user_gateway_method() {
   local output_path="$1"
+  local mode="${2:-full}"
   local nonce session_key run_id request_id method params probe_kind
+  case "${mode}" in
+    full|bootstrap) ;;
+    *) return 1 ;;
+  esac
   nonce="$(rand_hex 12)" || return 1
   session_key="agent:main:bridgesllm-install-probe-${nonce}"
   run_id="bridgesllm-install-probe-${nonce}"
@@ -22699,7 +22867,8 @@ verify_bridgesllm_ask_user_gateway_method() {
         --params "${params}" > "${output_path}" 2>> "${LOG_FILE}"; then
       return 1
     fi
-    if ! python3 - "${output_path}" "${probe_kind}" "${request_id}" <<'PY'
+    if ! python3 - \
+      "${output_path}" "${probe_kind}" "${request_id}" "${mode}" <<'PY'
 import json
 import pathlib
 import sys
@@ -22710,17 +22879,31 @@ except (OSError, UnicodeError, json.JSONDecodeError):
     raise SystemExit(1)
 kind = sys.argv[2]
 request_id = sys.argv[3]
+mode = sys.argv[4]
+if mode not in {"full", "bootstrap"}:
+    raise SystemExit(1)
 if not isinstance(response, dict):
     raise SystemExit(1)
 if kind == "probe":
-    valid = (
+    full_valid = (
         response.get("ok") is True
         and response.get("code") == "SEMANTIC_PROBE_OK"
         and response.get("toolName") == "ask_user_question"
         and response.get("answer") is True
         and response.get("dismiss") is True
         and response.get("steer") is True
+        and response.get("activeRunSteer") is True
     )
+    bootstrap_valid = (
+        response.get("ok") is False
+        and response.get("code") == "SEMANTIC_PROBE_FAILED"
+        and response.get("toolName") == "ask_user_question"
+        and response.get("answer") is True
+        and response.get("dismiss") is True
+        and response.get("steer") is True
+        and response.get("activeRunSteer") is False
+    )
+    valid = full_valid or (mode == "bootstrap" and bootstrap_valid)
 elif kind == "pending":
     valid = (
         response.get("pending") is False
@@ -22743,6 +22926,7 @@ PY
 
 verify_bridgesllm_ask_user_tested_pair() {
   local openclaw_state_dir="${1:-/root/.openclaw}"
+  local mode="${2:-full}"
   local target_dir="${openclaw_state_dir}/extensions/bridgesllm-ask-user"
   local config_path="${openclaw_state_dir}/openclaw.json"
   local output_path status=0
@@ -22752,7 +22936,7 @@ verify_bridgesllm_ask_user_tested_pair() {
   verify_bridgesllm_ask_user_plugin_config "${config_path}" \
     && verify_bridgesllm_ask_user_plugin_runtime \
       "${target_dir}" "${output_path}" \
-    && verify_bridgesllm_ask_user_gateway_method "${output_path}" \
+    && verify_bridgesllm_ask_user_gateway_method "${output_path}" "${mode}" \
     || status=$?
   rm -f -- "${output_path}"
   return "${status}"
@@ -23041,6 +23225,7 @@ PY
   OPENCLAW_ASK_USER_TRANSACTION_DIR=""
   OPENCLAW_ASK_USER_STATE_DIR=""
   OPENCLAW_ASK_USER_GATEWAY_WAS_ACTIVE=false
+  OPENCLAW_ASK_USER_BASE_ATTESTED=false
   OPENCLAW_ASK_USER_LIVE_ATTESTED=false
 }
 
@@ -23234,6 +23419,7 @@ install_bridgesllm_ask_user_plugin() {
       OPENCLAW_ASK_USER_TRANSACTION_DIR="${transaction_dir}"
       OPENCLAW_ASK_USER_STATE_DIR="${openclaw_state_dir}"
       OPENCLAW_ASK_USER_GATEWAY_WAS_ACTIVE="${gateway_was_active}"
+      OPENCLAW_ASK_USER_BASE_ATTESTED=false
       OPENCLAW_ASK_USER_LIVE_ATTESTED=false
     fi
   fi
@@ -23274,7 +23460,8 @@ install_bridgesllm_ask_user_plugin() {
     elif ! verify_openclaw_gateway_stable \
       "${PIN_OPENCLAW_RUNTIME_VERSION}" 18; then
       failure_reason="the OpenClaw gateway was not stable after plugin activation"
-    elif ! verify_bridgesllm_ask_user_gateway_method "${rpc_output}"; then
+    elif ! verify_bridgesllm_ask_user_gateway_method \
+      "${rpc_output}" bootstrap; then
       failure_reason="the running OpenClaw gateway failed ask-user execute and settlement semantics"
     fi
   fi
@@ -23294,7 +23481,7 @@ install_bridgesllm_ask_user_plugin() {
     return 1
   fi
 
-  $gateway_was_active && OPENCLAW_ASK_USER_LIVE_ATTESTED=true
+  $gateway_was_active && OPENCLAW_ASK_USER_BASE_ATTESTED=true
   ok "Ask-question answer channel installed and verified; tested-pair rollback remains armed"
 }
 
@@ -23563,7 +23750,7 @@ prepare_openclaw_runtime_for_portal() {
   fi
   # Publish the replacement tool/config under the same durable rollback
   # decision as the core and native bundle patches. Native AskUserQuestion is
-  # still available throughout this first boot and live semantic attestation.
+  # still available throughout this first boot and live base attestation.
   if ! install_bridgesllm_ask_user_plugin; then
     fail "OpenClaw is healthy, but the Portal ask-question answer channel could not be installed and verified. The previous plugin/config were restored when possible."
   fi
@@ -23573,16 +23760,17 @@ prepare_openclaw_runtime_for_portal() {
   if ! ensure_openclaw_gateway_matches_cli; then
     fail "OpenClaw gateway version/RPC readiness could not be verified. The updater will restore the previous OpenClaw runtime when applicable. Check: systemctl status openclaw-gateway"
   fi
-  if ! verify_bridgesllm_ask_user_tested_pair; then
-    fail "The replacement ask-user tool or one of its live settlement methods failed semantic attestation before native Claude question routing could be changed."
+  if ! verify_bridgesllm_ask_user_tested_pair /root/.openclaw bootstrap; then
+    fail "The replacement ask-user tool or one of its live settlement methods failed base semantic attestation before native Claude question routing could be changed."
   fi
-  OPENCLAW_ASK_USER_LIVE_ATTESTED=true
+  OPENCLAW_ASK_USER_BASE_ATTESTED=true
   auto_apply_openclaw_compatibility_hotfix
   if ! ensure_openclaw_gateway_boots_cleanly \
     || ! ensure_openclaw_gateway_matches_cli \
     || ! verify_bridgesllm_ask_user_tested_pair; then
     fail "OpenClaw did not retain the complete ask-user bridge after compatibility activation. The tested-pair rollback remains armed."
   fi
+  OPENCLAW_ASK_USER_LIVE_ATTESTED=true
   if $OPENCLAW_PACKAGE_UPDATED || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; then
     local expected_gateway_version
     expected_gateway_version="$(openclaw_cli_version)"
@@ -28396,7 +28584,7 @@ do_update() {
     || fail "The existing Portal runtime or configuration is incomplete, linked, writable by another account, or version-inconsistent. Repair it explicitly before updating."
 
   node_version_meets_minimum \
-    || fail "The running Portal uses a Node.js release outside ${OPENCLAW_NODE_ENGINE_RANGE}. Update Node.js on this host first; the Portal updater will not replace a shared runtime without a rollback boundary."
+    || fail "The running Portal uses a Node.js release outside ${OPENCLAW_NODE_ENGINE_RANGE}. Update the shared Node runtime first (Node 22 must be >=22.22.3 and <23), then retry. The updater refused before its boot fence and will not replace Node without a rollback boundary. See docs/PORTAL_NODE_RUNTIME_REMEDIATION.md."
 
   dashboard_update_progress running 16 portal-preflight \
     "Validating current Portal and recovery prerequisites" \
@@ -28516,6 +28704,20 @@ do_update() {
     || fail "Candidate runtime dependencies could not be prepared and verified before downtime."
   prepare_update_project_runtimes \
     "${staged_update_dir}" "${env_file}" "${UPDATE_TRANSACTION_ID}"
+  if [[ "${previous_portal_version}" != 3.* ]]; then
+    local continuity_repair_plan="${UPDATE_RELEASE_STAGE_DIR}/portal-continuity-repair-plan.json"
+    run_staged_portal_rebootability_preflight \
+      "${staged_update_dir}" "${env_file}" "${continuity_repair_plan}" \
+      || fail "The signed candidate could not classify persisted App/Project continuity safely. No database mutation, transaction, or downtime was started; repair the reported ambiguity and retry. Details: ${LOG_FILE}."
+    run_staged_portal_continuity_repair \
+      "${staged_update_dir}" "${env_file}" "${continuity_repair_plan}" \
+      || fail "The signed candidate could not apply its exact serializable App continuity repair while the existing Portal was online. No update transaction or downtime was started; the repair refused a race or ambiguous row. Details: ${LOG_FILE}."
+    run_staged_portal_rebootability_preflight \
+      "${staged_update_dir}" "${env_file}" \
+      || fail "The signed candidate could not reattest a clean, rebootable App/Project state after continuity repair. The existing Portal remains online and no update transaction or downtime was started. Details: ${LOG_FILE}."
+  else
+    info "Legacy 3.x source detected; the 4.x App identity preflight will run after continuity enrollment."
+  fi
   disk_admission_status=0
   assert_update_transaction_disk_admission \
     "${PORTAL_DIR}" "${existing_db_url}" "${staged_update_dir}" \

@@ -1,10 +1,15 @@
-import { createServer } from 'http';
+import { createServer, Server } from 'http';
 import type { AddressInfo } from 'net';
 import {
   startStartupStatusServer,
   stopStartupStatusServer,
   setStartupPhase,
   getStartupPhase,
+  holdStartupStatusServerForProjectDependencyPromotionQuarantine,
+  stopStartupStatusServerForShutdown,
+  StartupStatusServerFailureHoldError,
+  PROJECT_DEPENDENCY_PROMOTION_QUARANTINE_CODE,
+  PROJECT_DEPENDENCY_PROMOTION_RECOVERY_PHASE,
 } from '../services/startupStatusServer';
 import { PORTAL_VERSION } from '../version';
 
@@ -25,15 +30,21 @@ async function request(
   port: number,
   path: string,
   method = 'GET'
-): Promise<{ status: number; body: any }> {
+): Promise<{ status: number; body: any; headers: Headers }> {
   const res = await fetch(`http://${HOST}:${port}${path}`, { method });
   const text = await res.text();
-  return { status: res.status, body: text ? JSON.parse(text) : null };
+  return { status: res.status, body: text ? JSON.parse(text) : null, headers: res.headers };
 }
 
 describe('startupStatusServer', () => {
   afterEach(async () => {
-    await stopStartupStatusServer();
+    try {
+      await stopStartupStatusServer();
+    } catch (error) {
+      if (!(error instanceof StartupStatusServerFailureHoldError)) throw error;
+      await stopStartupStatusServerForShutdown();
+    }
+    jest.restoreAllMocks();
     setStartupPhase('initializing');
   });
 
@@ -101,5 +112,47 @@ describe('startupStatusServer', () => {
     await stopStartupStatusServer();
     await expect(stopStartupStatusServer()).resolves.toBeUndefined();
     expect(getStartupPhase()).toBeDefined();
+  });
+
+  it('irreversibly holds every route on a sanitized Project promotion quarantine', async () => {
+    const ref = jest.spyOn(Server.prototype, 'ref');
+    const port = await freePort();
+    await startStartupStatusServer(port, HOST);
+    setStartupPhase('/private/owner/project/path');
+
+    holdStartupStatusServerForProjectDependencyPromotionQuarantine();
+    holdStartupStatusServerForProjectDependencyPromotionQuarantine();
+    setStartupPhase('finalizing');
+
+    expect(ref).toHaveBeenCalled();
+    expect(getStartupPhase()).toBe(PROJECT_DEPENDENCY_PROMOTION_RECOVERY_PHASE);
+    for (const [method, path] of [
+      ['GET', '/health'],
+      ['GET', '/health/update-ready?owner=private'],
+      ['POST', '/health'],
+      ['GET', '/api/auth/login'],
+      ['DELETE', '/private/owner/project/path'],
+      ['GET', '/'],
+    ] as const) {
+      const res = await request(port, path, method);
+      expect(res.status).toBe(503);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+      expect(res.headers.get('retry-after')).toBe('60');
+      expect(res.body).toMatchObject({
+        status: 'unavailable',
+        code: PROJECT_DEPENDENCY_PROMOTION_QUARANTINE_CODE,
+        phase: PROJECT_DEPENDENCY_PROMOTION_RECOVERY_PHASE,
+      });
+      expect(Object.keys(res.body).sort()).toEqual([
+        'code', 'phase', 'startedAt', 'status', 'timestamp', 'version',
+      ]);
+      expect(JSON.stringify(res.body)).not.toContain('/private/owner/project/path');
+      expect(JSON.stringify(res.body)).not.toContain('owner=private');
+    }
+
+    await expect(stopStartupStatusServer()).rejects.toBeInstanceOf(
+      StartupStatusServerFailureHoldError,
+    );
   });
 });

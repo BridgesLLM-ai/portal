@@ -12,6 +12,9 @@ interface Backup {
   created: string;
   type: string;
   locked: boolean;
+  completeness: 'complete' | 'degraded' | 'unknown';
+  degradedComponents: string[];
+  classificationAuthenticated: boolean;
 }
 
 interface Summary {
@@ -20,6 +23,10 @@ interface Summary {
   totalSizeHuman: string;
   oldest: string | null;
   newest: string | null;
+  complete: number;
+  degraded: number;
+  unknown: number;
+  newestComplete: string | null;
 }
 
 interface CronInfo {
@@ -42,7 +49,7 @@ interface CronInfo {
 interface BackupRunStatus {
   id?: string;
   type?: string;
-  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'degraded' | 'failed';
   startedAt?: string;
   completedAt?: string;
   archivePath?: string;
@@ -53,6 +60,7 @@ interface BackupRunStatus {
   phaseIndex?: number;
   phaseTotal?: number;
   output?: string;
+  consecutiveFailures?: number;
 }
 
 const typeBadgeColors: Record<string, string> = {
@@ -128,6 +136,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('all');
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmDownload, setConfirmDownload] = useState<Backup | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -220,13 +229,19 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
           await fetchBackups();
           return;
         }
-        if (status.status === 'failed') {
+        if (status.status === 'degraded' || status.status === 'failed') {
           setCreating(false);
           operationAdmissionRef.current = null;
           const settingsOwner = settingsMutationOwnerRef.current;
           if (settingsOwner?.startsWith('settings:backups:create:')) releaseSettingsMutation(settingsOwner);
           sounds.error();
-          showCreateStatus({ type: 'error', message: status.failureDetail || status.error || 'Backup failed' });
+          showCreateStatus({
+            type: 'error',
+            message: status.failureDetail || status.error || (status.status === 'degraded'
+              ? 'Backup completed with a salvage-only archive.'
+              : 'Backup failed'),
+          });
+          if (status.archivePath) await fetchBackups();
           return;
         }
         pollTimerRef.current = window.setTimeout(poll, 3000);
@@ -300,8 +315,13 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
     }
   };
 
-  const handleDownload = async (filename: string) => {
+  const handleDownload = async (filename: string, classificationConfirmed = false) => {
     if (operationAdmissionRef.current) return;
+    const backup = backups.find((entry) => entry.filename === filename);
+    if (!classificationConfirmed && backup && backup.completeness !== 'complete') {
+      setConfirmDownload(backup);
+      return;
+    }
     operationAdmissionRef.current = `download:${filename}`;
     const baseUrl = import.meta.env.VITE_API_URL || '/api';
     setActionLoading(filename);
@@ -401,6 +421,16 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
         </div>
       )}
 
+      {(lastRun?.status === 'failed' || lastRun?.status === 'degraded') && (lastRun.consecutiveFailures || 0) >= 2 && (
+        <div role="alert" className="rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+          <p className="font-semibold">Backups have been incomplete {lastRun.consecutiveFailures} times in a row</p>
+          <p className="mt-1 text-xs leading-relaxed text-red-200/80">
+            The installed schedule is still present, but it has not produced a complete recovery archive. Review the failure
+            detail below and create a verified backup before maintenance or an update.
+          </p>
+        </div>
+      )}
+
       <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 px-4 py-3 text-sm text-blue-200">
         <div className="flex items-start gap-2">
           <Shield size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
@@ -471,7 +501,8 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
             </div>
           ) : (
             <p className="text-xs leading-relaxed text-slate-500">
-              Standard backups run in the background. You can navigate away safely and return here to reattach to the current run.
+              Standard backups are authenticated online data snapshots. They run in the background, but only a comprehensive,
+              quiesced archive is accepted by the supported full-restore workflow.
             </p>
           )}
           
@@ -580,10 +611,10 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
       {summary && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
           {[
-            { icon: Archive, label: 'Total Backups', value: summary.total, color: 'text-blue-400' },
+            { icon: CheckCircle, label: 'Complete', value: summary.complete, color: 'text-emerald-400' },
+            { icon: AlertCircle, label: 'Incomplete', value: summary.degraded, color: 'text-red-400' },
             { icon: HardDrive, label: 'Storage Used', value: summary.totalSizeHuman, color: 'text-emerald-400' },
-            { icon: Calendar, label: 'Newest', value: summary.newest ? formatDate(summary.newest) : 'N/A', color: 'text-purple-400' },
-            { icon: Shield, label: 'Locked', value: backups.filter(b => b.locked).length, color: 'text-amber-400' },
+            { icon: Calendar, label: 'Newest Complete', value: summary.newestComplete ? formatDate(summary.newestComplete) : 'N/A', color: 'text-purple-400' },
           ].map(({ icon: Icon, label, value, color }) => (
             <div key={label} className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-4">
               <div className="flex items-center gap-2 mb-1">
@@ -719,16 +750,33 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
                   </td>
                   <td className="px-4 py-3 text-xs text-slate-400">{formatDate(b.created)}</td>
                   <td className="px-4 py-3 text-center">
-                    {b.locked ? (
-                      <Lock size={14} className="inline text-amber-400" />
-                    ) : (
-                      <Unlock size={14} className="inline text-slate-600" />
-                    )}
+                    <div className="flex items-center justify-center gap-2">
+                      <span className={`rounded-md border px-2 py-0.5 text-[10px] font-medium ${
+                        b.completeness === 'complete'
+                          ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300'
+                          : b.completeness === 'degraded'
+                            ? 'border-red-500/20 bg-red-500/10 text-red-300'
+                            : 'border-amber-500/20 bg-amber-500/10 text-amber-300'
+                      }`} title={
+                        b.completeness === 'degraded'
+                          ? `Salvage only; unavailable: ${b.degradedComponents.join(', ')}`
+                          : b.completeness === 'unknown'
+                            ? 'Legacy or unauthenticated classification; verify before relying on this archive.'
+                            : 'Authenticated complete publication'
+                      }>
+                        {b.completeness === 'complete' ? 'Complete' : b.completeness === 'degraded' ? 'Salvage only' : 'Unclassified'}
+                      </span>
+                      {b.locked ? (
+                        <Lock size={14} className="text-amber-400" aria-label="Retention locked" />
+                      ) : (
+                        <Unlock size={14} className="text-slate-600" aria-label="Retention unlocked" />
+                      )}
+                    </div>
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center justify-end gap-1">
                       <button
-                        onClick={() => handleDownload(b.filename)}
+                        onClick={() => void handleDownload(b.filename)}
                         disabled={Boolean(actionLoading) || creating}
                         className="p-1.5 rounded-lg text-emerald-400 hover:bg-emerald-500/10 transition-all"
                         title="Download"
@@ -766,6 +814,26 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
           </table>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={Boolean(confirmDownload)}
+        title={confirmDownload?.completeness === 'degraded' ? 'Download incomplete backup?' : 'Download unclassified backup?'}
+        message={confirmDownload?.completeness === 'degraded'
+          ? 'This authenticated archive omitted required recovery components and is salvage only. It cannot satisfy strict restore admission.'
+          : 'Portal cannot authenticate this legacy archive’s completeness. Verify it independently before relying on it.'}
+        detail={confirmDownload?.completeness === 'degraded'
+          ? `Unavailable: ${confirmDownload.degradedComponents.join(', ')}`
+          : confirmDownload?.filename}
+        confirmLabel="Download anyway"
+        variant="warning"
+        icon="warning"
+        onCancel={() => setConfirmDownload(null)}
+        onConfirm={() => {
+          const pending = confirmDownload;
+          setConfirmDownload(null);
+          if (pending) void handleDownload(pending.filename, true);
+        }}
+      />
 
       <ConfirmDialog
         open={Boolean(confirmDelete)}

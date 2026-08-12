@@ -3745,6 +3745,10 @@ export const PENDING_USER_INPUT_READ_GATEWAY_METHOD = 'bridgesllm.ask_user.pendi
 export const PENDING_USER_INPUT_GATEWAY_METHOD = 'bridgesllm.ask_user.answer';
 export const PENDING_USER_INPUT_DISMISS_GATEWAY_METHOD = 'bridgesllm.ask_user.dismiss';
 export const ACTIVE_RUN_STEER_GATEWAY_METHOD = 'bridgesllm.ask_user.steer';
+// The pinned OpenClaw adapter cancels an uncommitted steer after 10 seconds.
+// Keep the Portal transport deadline above that cancellation/response window so
+// ordinary delivery failure is observed instead of becoming an ambiguous RPC.
+export const ACTIVE_RUN_STEER_RPC_TIMEOUT_MS = 15_000;
 
 export interface PendingUserInputQuestion {
   id: string;
@@ -4116,7 +4120,7 @@ export async function steerActiveRunWithRpc(
     expectedRunId: normalizedRunId,
     requestId: normalizedRequestId,
     text: normalizedText,
-  }, 10_000);
+  }, ACTIVE_RUN_STEER_RPC_TIMEOUT_MS);
   if (payload?.accepted !== true) rejectedPendingInputResponse(payload);
   if (
     payload.requestId !== normalizedRequestId
@@ -4366,17 +4370,15 @@ export async function injectChatMessage(sessionKey: string, text: string): Promi
 
 export async function steerSessionMessage(
   sessionKey: string,
+  expectedRunId: unknown,
   text: string,
   requestId = `legacy-steer-${nextId()}`,
-): Promise<{ interruptedActiveRun: false; replayed: boolean; requestId: string }> {
-  const expectedRunId = activeRunIds.get(sessionKey);
-  if (!expectedRunId) {
-    throw new PendingUserInputAnswerError(
-      'NO_ACTIVE_RUN',
-      'That OpenClaw run is no longer waiting for input.',
-      404,
-    );
-  }
+): Promise<{ interruptedActiveRun: false; replayed: boolean; requestId: string; runId: string }> {
+  // The browser observed this run before issuing the request. Never replace
+  // that identity with whichever run happens to be active when HTTP/RPC
+  // processing reaches this point: a delayed R1 request must not steer R2.
+  // The exact-run gateway method also uses this identity for safe receipt
+  // replay after R1 has settled.
   const result = await steerActiveRun(
     sessionKey,
     expectedRunId,
@@ -4387,6 +4389,7 @@ export async function steerSessionMessage(
     interruptedActiveRun: false,
     replayed: result.replayed,
     requestId: result.requestId,
+    runId: result.runId,
   };
 }
 

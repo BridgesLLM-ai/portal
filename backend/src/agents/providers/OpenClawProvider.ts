@@ -362,7 +362,7 @@ function sendMessageViaPersistentWs(
           fail(new Error(evt.content || 'Agent error'));
           break;
       }
-    });
+    }, { role: 'provider-waiter' });
 
     sendChatMessage(
       sessionId,

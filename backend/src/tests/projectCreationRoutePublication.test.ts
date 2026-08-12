@@ -44,6 +44,7 @@ const mockProjectIdentity = {
 
 const mockRemovePortalProjectWorkloadsForProject = jest.fn(async () => undefined);
 const mockPrisma = {
+  $queryRaw: jest.fn(async () => []),
   projectIdentity: mockProjectIdentity,
   activityLog: { create: jest.fn(async () => ({})) },
 };

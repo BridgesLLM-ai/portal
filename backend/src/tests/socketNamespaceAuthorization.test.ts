@@ -5,6 +5,14 @@ const serverSource = fs.readFileSync(path.resolve(__dirname, '../server.ts'), 'u
 const terminalSource = fs.readFileSync(path.resolve(__dirname, '../routes/exec.ts'), 'utf8');
 const gatewaySource = fs.readFileSync(path.resolve(__dirname, '../routes/gateway.ts'), 'utf8');
 const agentBrowserSource = fs.readFileSync(path.resolve(__dirname, '../routes/agentBrowser.ts'), 'utf8');
+const accessAuthorizationSource = fs.readFileSync(
+  path.resolve(__dirname, '../services/accessTokenAuthorization.ts'),
+  'utf8',
+);
+const transportAuthorizationSource = fs.readFileSync(
+  path.resolve(__dirname, '../services/portalTransportAuthorization.ts'),
+  'utf8',
+);
 
 function namespaceBlock(namespace: string, nextNamespace: string): string {
   const start = serverSource.indexOf(`const ${namespace} =`);
@@ -69,40 +77,28 @@ describe('operator Socket.IO namespace authorization', () => {
     expect(block).toContain('relay(latest)');
     expect(block.indexOf('if (pendingEvents?.length)'))
       .toBeLessThan(block.indexOf("socket.emit('authorization_snapshot'"));
-    const middlewareStart = serverSource.indexOf('const socketAuthMiddleware');
-    const middlewareEnd = serverSource.indexOf('const socketElevatedRoleMiddleware', middlewareStart);
-    const middleware = serverSource.slice(middlewareStart, middlewareEnd);
-    expect(middleware).toContain("socket.nsp?.name === '/authorization'");
-    expect(middleware).toContain('subscribeToAuthorizationChanges(payload.userId');
-    expect(middleware.indexOf('subscribeToAuthorizationChanges(payload.userId'))
-      .toBeLessThan(middleware.indexOf('prisma.user.findUnique'));
+    expect(serverSource).toContain('createSocketAccessAuthorizationMiddleware()');
+    expect(transportAuthorizationSource).toContain("socket.nsp?.name === '/authorization'");
+    expect(transportAuthorizationSource).toContain('authorizationPendingEvents');
+    expect(accessAuthorizationSource.indexOf('subscribeAuthorization(input.payload.userId'))
+      .toBeLessThan(accessAuthorizationSource.indexOf('authorizeAccessTokenPayload(input.payload'));
+    expect(accessAuthorizationSource.indexOf('subscribeSession('))
+      .toBeLessThan(accessAuthorizationSource.indexOf('authorizeAccessTokenPayload(input.payload'));
   });
 
   it('rejects socket handshakes from an older durable authorization generation', () => {
-    const start = serverSource.indexOf('const socketAuthMiddleware');
-    const end = serverSource.indexOf('const socketElevatedRoleMiddleware', start);
-    const middleware = serverSource.slice(start, end);
-    expect(middleware).toContain('authorizationVersion: true');
-    expect(middleware).toContain('(payload.authorizationVersion ?? 1) !== authorizationVersion');
-    expect(middleware).toContain('Authorization changed; sign in again');
+    expect(accessAuthorizationSource).toContain('authorizationVersion: true');
+    expect(accessAuthorizationSource).toContain('(payload.authorizationVersion ?? 1) !== authorizationVersion');
+    expect(transportAuthorizationSource).toContain('Authorization changed; sign in again');
   });
 
   it('server-revokes every already-open privileged transport after authorization changes', () => {
-    const sharedStart = serverSource.indexOf('const socketAuthMiddleware');
-    const sharedEnd = serverSource.indexOf('const socketElevatedRoleMiddleware', sharedStart);
-    const shared = serverSource.slice(sharedStart, sharedEnd);
-    expect(shared).toContain("socket.nsp?.name === '/authorization'");
-    expect(shared).toContain('subscribeToAuthorizationChanges(payload.userId');
-    expect(shared).toContain('subscribeToGlobalWorkspaceAuthorizationFence(');
-    expect(shared).toContain('if (!authorizationNamespace)');
-    expect(shared.indexOf('subscribeToGlobalWorkspaceAuthorizationFence('))
-      .toBeLessThan(shared.indexOf('prisma.user.findUnique'));
-    expect(shared).toContain('socket.disconnect(true)');
+    expect(accessAuthorizationSource).toContain('subscribeGlobalFence(() => revoke');
+    expect(accessAuthorizationSource).toContain('subscribeAuthorization(input.payload.userId');
+    expect(accessAuthorizationSource).toContain('subscribeSession(');
+    expect(transportAuthorizationSource).toContain('socket.disconnect(true)');
 
-    expect(terminalSource).toContain('subscribeToAuthorizationChanges(');
-    expect(terminalSource).toContain('subscribeToGlobalWorkspaceAuthorizationFence(');
-    expect(terminalSource.indexOf('subscribeToGlobalWorkspaceAuthorizationFence('))
-      .toBeLessThan(terminalSource.indexOf('prisma.user.findUnique'));
+    expect(terminalSource).toContain('establishLongLivedAccessAuthorization({');
     expect(terminalSource).toContain('authorizationControl.revoked = true');
     expect(terminalSource).toContain('authorizationControl.requestTermination?.()');
     expect(terminalSource).toContain('acquireGlobalWorkspaceAuthorizationMutationLease()');
@@ -110,54 +106,32 @@ describe('operator Socket.IO namespace authorization', () => {
     expect(terminalSource).not.toContain('pty.kill(');
     expect(terminalSource).toContain('socket.disconnect(true)');
 
-    for (const path of ['/novnc/websockify', '/novnc/audio']) {
-      const start = serverSource.indexOf(`isExactWebSocketPath(req.url, '${path}')`);
-      expect(start).toBeGreaterThanOrEqual(0);
-      const nextBranch = serverSource.indexOf('} else if (isExactWebSocketPath', start + 1);
-      const end = nextBranch >= 0 ? nextBranch : serverSource.indexOf('// Legacy Guacamole', start);
-      const block = serverSource.slice(start, end);
-      expect(block).toContain('subscribeToAuthorizationChanges(payload.userId');
-      expect(block).toContain('subscribeToGlobalWorkspaceAuthorizationFence(');
-      expect(block.indexOf('subscribeToAuthorizationChanges(payload.userId'))
-        .toBeLessThan(block.indexOf('prisma.user.findUnique'));
-      expect(block.indexOf('subscribeToGlobalWorkspaceAuthorizationFence('))
-        .toBeLessThan(block.indexOf('prisma.user.findUnique'));
-      expect(block).toContain('unsubscribeGlobalFence()');
-      expect(block).toContain('socket.destroy()');
-    }
+    expect(serverSource).toContain("isExactWebSocketPath(req.url, '/novnc/websockify')");
+    expect(serverSource).toContain("isExactWebSocketPath(req.url, '/novnc/audio')");
+    expect(serverSource).toContain('handleRemoteDesktopWebSocketUpgrade(req, socket, head, novncWsProxy');
+    expect(serverSource).toContain('handleRemoteDesktopWebSocketUpgrade(req, socket, head, audioWsProxy');
+    expect(serverSource).toContain('authorizeRemoteDesktopWebSocketTransport(payload, onRevoke)');
+    expect(serverSource).toContain('completeAuthorizedWebSocketUpgrade({');
   });
 
   it('generation-binds and actively revokes gateway and agent-browser WebSockets', () => {
-    expect(gatewaySource).toContain('(user.authorizationVersion ?? 1) !== Number((dbUser as any).authorizationVersion ?? 1)');
     const gatewayUpgrade = gatewaySource.slice(gatewaySource.indexOf("httpServer.on('upgrade'"));
-    expect(gatewayUpgrade).toContain('subscribeToAuthorizationChanges(user.userId');
-    expect(gatewayUpgrade).toContain('subscribeToGlobalWorkspaceAuthorizationFence(');
-    expect(gatewayUpgrade.indexOf('subscribeToAuthorizationChanges(user.userId'))
-      .toBeLessThan(gatewayUpgrade.indexOf('prisma.user.findUnique'));
-    expect(gatewayUpgrade.indexOf('subscribeToGlobalWorkspaceAuthorizationFence('))
-      .toBeLessThan(gatewayUpgrade.indexOf('prisma.user.findUnique'));
-    expect(gatewayUpgrade).toContain("socket.write('HTTP/1.1 409 Conflict");
-    expect(gatewayUpgrade).toContain('unsubscribeGlobalFence()');
-    expect(gatewayUpgrade).toContain('socket.destroy()');
+    expect(gatewayUpgrade).toContain('completeAuthorizedWebSocketUpgrade({');
+    expect(gatewayUpgrade).toContain('authorizeGatewayWebSocketTransport(');
+    expect(gatewayUpgrade).toContain('authorizationBinding.revoked = true');
 
-    expect(agentBrowserSource).toContain('(user.authorizationVersion ?? 1) !== Number((dbUser as any).authorizationVersion ?? 1)');
     const browserUpgrade = agentBrowserSource.slice(agentBrowserSource.indexOf("httpServer.on('upgrade'"));
-    expect(browserUpgrade).toContain('subscribeToAuthorizationChanges(tokenUser.userId');
-    expect(browserUpgrade).toContain('subscribeToGlobalWorkspaceAuthorizationFence(');
-    expect(browserUpgrade.indexOf('subscribeToAuthorizationChanges(tokenUser.userId'))
-      .toBeLessThan(browserUpgrade.indexOf('getAuthorizedAdminFromUpgrade(req, tokenUser)'));
-    expect(browserUpgrade.indexOf('subscribeToGlobalWorkspaceAuthorizationFence('))
-      .toBeLessThan(browserUpgrade.indexOf('getAuthorizedAdminFromUpgrade(req, tokenUser)'));
-    expect(browserUpgrade).toContain("socket.write('HTTP/1.1 409 Conflict");
-    expect(browserUpgrade).toContain('unsubscribeGlobalFence()');
-    expect(browserUpgrade).toContain('socket.destroy()');
+    expect(browserUpgrade).toContain('completeAuthorizedWebSocketUpgrade({');
+    expect(browserUpgrade).toContain('authorizeAgentBrowserWebSocketTransport(tokenUser, onRevoke)');
+    expect(transportAuthorizationSource).toContain('socket.once(\'close\', result.dispose)');
   });
 
   it('tears down long-lived Agent Chat and approval SSE streams on revocation', () => {
     const sendStart = gatewaySource.indexOf("router.post('/send'");
     const sendEnd = gatewaySource.indexOf("router.post('/abort'", sendStart);
     const send = gatewaySource.slice(sendStart, sendEnd);
-    expect(send).toContain('subscribeToAuthorizationChanges(req.user!.userId');
+    expect(send).toContain('establishLongLivedAccessAuthorization({');
+    expect(send).toContain('disposeStreamAuthority()');
     expect(send).toContain('provider.abortActiveRun?.(sessionId, routeRunId)');
     expect(send).toContain('finishSse()');
     expect(send).toContain("'private, no-store, no-transform, max-age=0'");
@@ -165,7 +139,8 @@ describe('operator Socket.IO namespace authorization', () => {
     const approvalsStart = gatewaySource.indexOf("router.get('/approvals/stream'");
     const approvalsEnd = gatewaySource.indexOf('/* ═', approvalsStart);
     const approvals = gatewaySource.slice(approvalsStart, approvalsEnd);
-    expect(approvals).toContain('subscribeToAuthorizationChanges(req.user!.userId');
+    expect(approvals).toContain('establishLongLivedAccessAuthorization({');
+    expect(approvals).toContain('disposeStreamAuthority()');
     expect(approvals).toContain('res.destroy()');
     expect(approvals).toContain("'private, no-store, no-transform, max-age=0'");
   });

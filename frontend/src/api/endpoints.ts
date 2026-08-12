@@ -4,6 +4,7 @@ import {
   captureWorkspaceAuthorizationRequestContext,
   workspaceAuthorizedFetch,
 } from '../utils/workspaceAuthorizedFetch';
+import { refreshAuthSessionWithFetch } from '../utils/authRefreshConvergence';
 
 export type ShareRateLimitWindowSeconds = 60 | 300 | 3600;
 
@@ -433,6 +434,72 @@ export interface ProjectIdentityProof {
   generation: number;
 }
 
+export type ProjectDependencyRepairState =
+  | 'QUARANTINED'
+  | 'PROMOTING'
+  | 'COMPLETE'
+  | 'NOT_QUARANTINED'
+  | 'UNAVAILABLE';
+
+export type ProjectDependencyRepairPhase =
+  | 'GO_BIT'
+  | 'ALL_NEW'
+  | 'APPLIED'
+  | 'EVIDENCE_CLEAN'
+  | 'COMPLETE';
+
+export interface ProjectDependencyRepairStatus {
+  state: ProjectDependencyRepairState;
+  ownerOnly: true;
+  action: 'FORCE_FORWARD_STAGED';
+  confirmationPhrase: string;
+  project: Readonly<{
+    id: string;
+    name: string;
+    generation: number;
+  }> | null;
+  promotion: Readonly<{
+    operationId: string;
+    manifestDigest: string;
+    status: string;
+  }> | null;
+  repair: Readonly<{
+    repairId: string;
+    status: 'PROMOTING' | 'APPLIED';
+    phase: ProjectDependencyRepairPhase;
+    startedAt: string;
+    completedAt: string | null;
+  }> | null;
+  backup: Readonly<{
+    requiredAfter: string | null;
+    eligible: boolean;
+    pinned: boolean;
+    filename?: string;
+    createdAt?: string;
+  }>;
+  /** A new force-forward POST may be admitted for this exact status. */
+  retryable: boolean;
+  /** Read-only status reconciliation should continue. */
+  statusRetryable: boolean;
+  /** The durable repair requires Portal startup recovery to continue. */
+  restartRequired: boolean;
+}
+
+export interface ProjectDependencyRepairDiscovery {
+  repairs: readonly ProjectDependencyRepairStatus[];
+  count: number;
+  unavailable: boolean;
+}
+
+export interface ProjectDependencyRepairRequest {
+  repairId: string;
+  expectedProjectIdentityId: string;
+  expectedProjectIdentityGeneration: number;
+  expectedPromotionOperationId: string;
+  expectedManifestDigest: string;
+  confirmation: string;
+}
+
 export type ProjectRuntimeRecoveryReplayProof = Readonly<{
   proof: string;
   action: 'deploy' | 'start' | 'restart';
@@ -558,7 +625,8 @@ export interface ProjectAvailability {
   available: false;
   code: 'PROJECT_IDENTITY_RECONCILIATION_REQUIRED'
     | 'PROJECT_LIFECYCLE_RECONCILIATION_REQUIRED'
-    | 'PROJECT_LIFECYCLE_RECOVERY_PENDING';
+    | 'PROJECT_LIFECYCLE_RECOVERY_PENDING'
+    | 'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED';
   message: string;
   action: 'RECONCILE_PROJECT_IDENTITY' | 'RECONCILE_PROJECT_LIFECYCLE' | 'RETRY';
   retryable: boolean;
@@ -781,6 +849,242 @@ export function validateProjectIdentityProof(value: unknown): ProjectIdentityPro
   return { id: record.id, generation: record.generation as number };
 }
 
+const projectDependencyRepairStates = new Set<ProjectDependencyRepairState>([
+  'QUARANTINED',
+  'PROMOTING',
+  'COMPLETE',
+  'NOT_QUARANTINED',
+  'UNAVAILABLE',
+]);
+const projectDependencyRepairPhases = new Set<ProjectDependencyRepairPhase>([
+  'GO_BIT',
+  'ALL_NEW',
+  'APPLIED',
+  'EVIDENCE_CLEAN',
+  'COMPLETE',
+]);
+const projectDependencyRepairUuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const projectDependencyRepairDigest = /^[0-9a-f]{64}$/;
+
+function validProjectDependencyRepairTimestamp(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 64
+    && Number.isFinite(Date.parse(value));
+}
+
+export function validateProjectDependencyRepairStatus(
+  value: unknown,
+): ProjectDependencyRepairStatus {
+  const record = requireRecord(value, 'Project dependency repair status');
+  const project = record.project === null
+    ? null
+    : requireRecord(record.project, 'Project dependency repair identity');
+  const promotion = record.promotion === null
+    ? null
+    : requireRecord(record.promotion, 'Project dependency promotion');
+  const repair = record.repair === null
+    ? null
+    : requireRecord(record.repair, 'Project dependency repair operation');
+  const backup = requireRecord(record.backup, 'Project dependency repair backup');
+  const state = record.state as ProjectDependencyRepairState;
+  const phase = repair?.phase as ProjectDependencyRepairPhase | undefined;
+  const confirmationPhrase = project === null
+    ? null
+    : `FORCE FORWARD ${String(project.name || '')}`;
+  const hasBackupMetadata = backup.filename !== undefined || backup.createdAt !== undefined;
+  const backupMetadataIsCoherent = !hasBackupMetadata || (
+    typeof backup.filename === 'string'
+    && backup.filename.length > 0
+    && backup.filename.length <= 255
+    && validProjectDependencyRepairTimestamp(backup.createdAt)
+    && validProjectDependencyRepairTimestamp(backup.requiredAfter)
+    && Date.parse(backup.createdAt) > Date.parse(backup.requiredAfter)
+  );
+  const activeRepairStateIsCoherent = !['PROMOTING', 'COMPLETE'].includes(state)
+    || (promotion !== null && repair !== null);
+  const completedRepairStateIsCoherent = state !== 'COMPLETE' || (
+    repair?.status === 'APPLIED'
+    && repair.phase === 'COMPLETE'
+    && validProjectDependencyRepairTimestamp(repair.completedAt)
+    && promotion?.status === 'APPLIED'
+  );
+  const repairPhaseIsCoherent = repair === null || (
+    repair.status === 'PROMOTING'
+      ? ['GO_BIT', 'ALL_NEW', 'APPLIED', 'EVIDENCE_CLEAN'].includes(repair.phase as string)
+      : repair.phase === 'COMPLETE'
+  );
+  const restartRequired = record.restartRequired === true;
+  const expectedRetryable = state === 'QUARANTINED' && !restartRequired;
+  const expectedStatusRetryable = ['PROMOTING', 'UNAVAILABLE'].includes(state)
+    && !restartRequired;
+  const stateIsCoherent = state === 'UNAVAILABLE'
+    ? project === null && promotion === null && repair === null
+      && backup.requiredAfter === null && backup.eligible === false && backup.pinned === false
+      && !hasBackupMetadata
+      && record.retryable === false && record.statusRetryable === true && record.restartRequired === false
+    : state === 'NOT_QUARANTINED'
+      ? promotion === null && repair === null
+        && backup.requiredAfter === null && backup.eligible === false && backup.pinned === false
+        && !hasBackupMetadata
+        && record.retryable === false && record.statusRetryable === false && record.restartRequired === false
+      : state === 'QUARANTINED'
+        ? project !== null && promotion !== null && repair === null
+          && backup.pinned === false && hasBackupMetadata === backup.eligible
+          && (restartRequired ? backup.eligible === false : true)
+          && record.retryable === expectedRetryable
+          && record.statusRetryable === false
+        : state === 'PROMOTING'
+          ? project !== null && promotion !== null && repair !== null
+            && repair.status === 'PROMOTING' && repair.phase !== 'COMPLETE'
+            && repair.completedAt === null && backup.eligible === false
+            && record.retryable === false
+            && record.statusRetryable === expectedStatusRetryable
+          : state === 'COMPLETE'
+            ? project !== null && promotion !== null && repair !== null
+              && repair.status === 'APPLIED' && repair.phase === 'COMPLETE'
+              && backup.eligible === false && record.retryable === false
+              && record.statusRetryable === false && record.restartRequired === false
+            : false;
+  if (
+    !projectDependencyRepairStates.has(state)
+    || record.ownerOnly !== true
+    || record.action !== 'FORCE_FORWARD_STAGED'
+    || typeof record.confirmationPhrase !== 'string'
+    || !record.confirmationPhrase
+    || (confirmationPhrase !== null && record.confirmationPhrase !== confirmationPhrase)
+    || record.confirmationPhrase.length > 512
+    || (project === null
+      ? !['NOT_QUARANTINED', 'UNAVAILABLE'].includes(state)
+      : typeof project.id !== 'string'
+        || !project.id
+        || project.id.length > 128
+        || typeof project.name !== 'string'
+        || !project.name
+        || project.name.length > 255
+        || !Number.isSafeInteger(project.generation)
+        || Number(project.generation) < 1)
+    || (promotion !== null && (
+      typeof promotion.operationId !== 'string'
+      || !projectDependencyRepairUuidV4.test(promotion.operationId)
+      || typeof promotion.manifestDigest !== 'string'
+      || !projectDependencyRepairDigest.test(promotion.manifestDigest)
+      || typeof promotion.status !== 'string'
+      || !promotion.status
+      || promotion.status.length > 64
+    ))
+    || (repair !== null && (
+      typeof repair.repairId !== 'string'
+      || !projectDependencyRepairUuidV4.test(repair.repairId)
+      || !['PROMOTING', 'APPLIED'].includes(String(repair.status))
+      || !projectDependencyRepairPhases.has(phase as ProjectDependencyRepairPhase)
+      || !validProjectDependencyRepairTimestamp(repair.startedAt)
+      || (repair.completedAt !== null && !validProjectDependencyRepairTimestamp(repair.completedAt))
+    ))
+    || (backup.requiredAfter === null
+      ? !['NOT_QUARANTINED', 'UNAVAILABLE'].includes(state)
+      : !validProjectDependencyRepairTimestamp(backup.requiredAfter))
+    || typeof backup.eligible !== 'boolean'
+    || typeof backup.pinned !== 'boolean'
+    || (backup.eligible === true && backup.pinned === true)
+    || !backupMetadataIsCoherent
+    || ((repair !== null || backup.eligible === true || backup.pinned === true) && !hasBackupMetadata)
+    || typeof record.retryable !== 'boolean'
+    || typeof record.statusRetryable !== 'boolean'
+    || typeof record.restartRequired !== 'boolean'
+    || record.retryable !== expectedRetryable
+    || record.statusRetryable !== expectedStatusRetryable
+    || (restartRequired && !['QUARANTINED', 'PROMOTING'].includes(state))
+    || (state === 'PROMOTING' && backup.eligible !== false)
+    || (['QUARANTINED', 'PROMOTING', 'COMPLETE'].includes(state) && promotion === null)
+    || !activeRepairStateIsCoherent
+    || !completedRepairStateIsCoherent
+    || !repairPhaseIsCoherent
+    || !stateIsCoherent
+  ) {
+    throw new Error('Project dependency repair status is malformed');
+  }
+  return Object.freeze({
+    state,
+    ownerOnly: true,
+    action: 'FORCE_FORWARD_STAGED',
+    confirmationPhrase: record.confirmationPhrase,
+    project: project === null ? null : Object.freeze({
+      id: project.id as string,
+      name: project.name as string,
+      generation: project.generation as number,
+    }),
+    promotion: promotion === null ? null : Object.freeze({
+      operationId: promotion.operationId as string,
+      manifestDigest: promotion.manifestDigest as string,
+      status: promotion.status as string,
+    }),
+    repair: repair === null ? null : Object.freeze({
+      repairId: repair.repairId as string,
+      status: repair.status as 'PROMOTING' | 'APPLIED',
+      phase: repair.phase as ProjectDependencyRepairPhase,
+      startedAt: repair.startedAt as string,
+      completedAt: repair.completedAt as string | null,
+    }),
+    backup: Object.freeze({
+      requiredAfter: backup.requiredAfter as string | null,
+      eligible: backup.eligible as boolean,
+      pinned: backup.pinned as boolean,
+      ...(backup.filename === undefined ? {} : { filename: backup.filename as string }),
+      ...(backup.createdAt === undefined ? {} : { createdAt: backup.createdAt as string }),
+    }),
+    retryable: record.retryable as boolean,
+    statusRetryable: record.statusRetryable as boolean,
+    restartRequired: record.restartRequired as boolean,
+  });
+}
+
+export function validateProjectDependencyRepairDiscovery(
+  value: unknown,
+): ProjectDependencyRepairDiscovery {
+  const record = requireRecord(value, 'Active Project dependency repair discovery');
+  if (!Array.isArray(record.repairs)
+    || record.repairs.length > 20
+    || !Number.isSafeInteger(record.count)
+    || Number(record.count) !== record.repairs.length
+    || typeof record.unavailable !== 'boolean'
+    || (record.unavailable === true && record.repairs.length !== 0)) {
+    throw new Error('Active Project dependency repair discovery is malformed');
+  }
+  const repairs = record.repairs.map(validateProjectDependencyRepairStatus);
+  const repairIds = new Set<string>();
+  const projectGenerations = new Set<string>();
+  const projectNames = new Set<string>();
+  const promotionOperations = new Set<string>();
+  for (const status of repairs) {
+    if (status.state !== 'PROMOTING'
+      || status.project === null
+      || status.promotion === null
+      || status.repair === null
+      || status.retryable
+      || status.statusRetryable === status.restartRequired
+      || status.backup.eligible) {
+      throw new Error('Active Project dependency repair discovery is malformed');
+    }
+    const projectGeneration = `${status.project.id}\0${status.project.generation}`;
+    if (repairIds.has(status.repair.repairId)
+      || projectGenerations.has(projectGeneration)
+      || projectNames.has(status.project.name)
+      || promotionOperations.has(status.promotion.operationId)) {
+      throw new Error('Active Project dependency repair discovery is malformed');
+    }
+    repairIds.add(status.repair.repairId);
+    projectGenerations.add(projectGeneration);
+    projectNames.add(status.project.name);
+    promotionOperations.add(status.promotion.operationId);
+  }
+  return Object.freeze({
+    repairs: Object.freeze(repairs),
+    count: record.count as number,
+    unavailable: record.unavailable as boolean,
+  });
+}
+
 function validateProjectSummary(value: unknown): ProjectSummary {
   const record = requireRecord(value, 'Project inventory entry');
   const destructiveActions = requireRecord(
@@ -797,6 +1101,7 @@ function validateProjectSummary(value: unknown): ProjectSummary {
     'PROJECT_IDENTITY_RECONCILIATION_REQUIRED',
     'PROJECT_LIFECYCLE_RECONCILIATION_REQUIRED',
     'PROJECT_LIFECYCLE_RECOVERY_PENDING',
+    'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED',
   ]);
   const availabilityActions = new Set([
     'RECONCILE_PROJECT_IDENTITY',
@@ -1165,6 +1470,46 @@ export const projectsAPI = {
   list: async () => {
     const { data } = await client.get('/projects', { _silent: true } as any);
     return validateProjectListResponse(data);
+  },
+  activeDependencyRepairs: async (): Promise<ProjectDependencyRepairDiscovery> => {
+    const { data } = await client.get(
+      '/projects/dependency-repair/active',
+      { _silent: true, _skipNetworkRetry: true } as any,
+    );
+    return validateProjectDependencyRepairDiscovery(data);
+  },
+  dependencyRepairStatus: async (name: string): Promise<ProjectDependencyRepairStatus> => {
+    const { data } = await client.get(
+      `/projects/${projectSegment(name)}/dependency-repair/status`,
+      { _silent: true, _skipNetworkRetry: true } as any,
+    );
+    return validateProjectDependencyRepairStatus(data);
+  },
+  forceForwardDependencyRepair: async (
+    name: string,
+    request: ProjectDependencyRepairRequest,
+  ): Promise<ProjectDependencyRepairStatus> => {
+    if (
+      !projectDependencyRepairUuidV4.test(request.repairId)
+      || typeof request.expectedProjectIdentityId !== 'string'
+      || !request.expectedProjectIdentityId
+      || request.expectedProjectIdentityId.length > 128
+      || !Number.isSafeInteger(request.expectedProjectIdentityGeneration)
+      || request.expectedProjectIdentityGeneration < 1
+      || !projectDependencyRepairUuidV4.test(request.expectedPromotionOperationId)
+      || !projectDependencyRepairDigest.test(request.expectedManifestDigest)
+      || typeof request.confirmation !== 'string'
+      || request.confirmation !== `FORCE FORWARD ${name}`
+      || request.confirmation.length > 512
+    ) {
+      throw new Error('Project dependency repair request is malformed');
+    }
+    const { data } = await client.post(
+      `/projects/${projectSegment(name)}/dependency-repair/force-forward`,
+      request,
+      { _skipNetworkRetry: true } as any,
+    );
+    return validateProjectDependencyRepairStatus(data);
   },
   search: async (query: string, limit = 24, signal?: AbortSignal): Promise<ProjectSearchResponse> => {
     const { data } = await client.get('/projects/search', { params: { q: query, limit }, signal });
@@ -1790,17 +2135,7 @@ export const gatewayAPI = {
       }, authorizationContext);
       // Auto-refresh on 401/403
       if ((response.status === 401 || response.status === 403) && !controller.signal.aborted) {
-        try {
-          const refreshResp = await fetch(`${apiUrl}/auth/refresh`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({}),
-          });
-          if (refreshResp.ok) {
-            return doFetch();
-          }
-        } catch {}
+        if (await refreshAuthSessionWithFetch(apiUrl)) return doFetch();
       }
       return response;
     };

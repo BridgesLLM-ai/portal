@@ -1540,19 +1540,22 @@ export interface AgentJobAuthorizationQuiescence {
   persistedRuntimeSignalCount: number;
 }
 
+type AgentJobQuiescenceReason = 'authorization_transition' | 'project_dependency_promotion';
+
 /**
  * Authorization transitions call this only while the global workspace
  * admission fence is closed. It converges both this process's runtime objects
  * and restart-surviving process groups identified by durable PID/start-time
  * metadata, then proves no selected row is still RUNNING.
  */
-export async function quiesceAgentJobsForAuthorizationTransition(
-  userIds: readonly string[],
-): Promise<AgentJobAuthorizationQuiescence> {
-  const selectedUserIds = Array.from(new Set(
-    userIds.map((value) => String(value || '').trim()).filter(Boolean),
+async function quiesceAgentJobs(input: {
+  userIds?: readonly string[];
+  reason: AgentJobQuiescenceReason;
+}): Promise<AgentJobAuthorizationQuiescence> {
+  const selectedUserIds = input.userIds === undefined ? null : Array.from(new Set(
+    input.userIds.map((value) => String(value || '').trim()).filter(Boolean),
   )).sort();
-  if (selectedUserIds.length === 0) {
+  if (selectedUserIds?.length === 0) {
     return { jobCount: 0, liveRuntimeCount: 0, persistedRuntimeSignalCount: 0 };
   }
 
@@ -1561,7 +1564,7 @@ export async function quiesceAgentJobsForAuthorizationTransition(
   const jobs = await prisma.agentJob.findMany({
     where: {
       status: 'running',
-      userId: { in: selectedUserIds },
+      ...(selectedUserIds ? { userId: { in: selectedUserIds } } : {}),
     },
     select: {
       id: true,
@@ -1587,7 +1590,9 @@ export async function quiesceAgentJobsForAuthorizationTransition(
       await terminateRuntime(
         runtime,
         'killed',
-        'Job cancelled before its owner authorization generation changed.',
+        input.reason === 'authorization_transition'
+          ? 'Job cancelled before its owner authorization generation changed.'
+          : 'Job cancelled before a Project dependency generation was promoted.',
       );
       continue;
     }
@@ -1602,7 +1607,9 @@ export async function quiesceAgentJobsForAuthorizationTransition(
       // DB status alone.
       appendStandaloneEntry(job.transcriptPath, {
         type: 'system',
-        text: 'A retained host process could not be proven terminated; the authorization transition is refused.',
+        text: input.reason === 'authorization_transition'
+          ? 'A retained host process could not be proven terminated; the authorization transition is refused.'
+          : 'A retained host process could not be proven terminated; dependency promotion is refused.',
         timestamp: finishedAt.toISOString(),
       });
       continue;
@@ -1610,7 +1617,9 @@ export async function quiesceAgentJobsForAuthorizationTransition(
     if (outcome.signaled) persistedRuntimeSignalCount += 1;
     appendStandaloneEntry(job.transcriptPath, {
       type: 'system',
-      text: 'A retained host process was cancelled before its owner authorization generation changed.',
+      text: input.reason === 'authorization_transition'
+        ? 'A retained host process was cancelled before its owner authorization generation changed.'
+        : 'A retained host process was cancelled before a Project dependency generation was promoted.',
       timestamp: finishedAt.toISOString(),
     });
     await prisma.agentJob.updateMany({
@@ -1625,7 +1634,9 @@ export async function quiesceAgentJobsForAuthorizationTransition(
         finishedAt,
         metadata: {
           ...metadata,
-          authorizationTransition: {
+          [input.reason === 'authorization_transition'
+            ? 'authorizationTransition'
+            : 'projectDependencyPromotion']: {
             portalInstanceId,
             quiescedAt: finishedAt.toISOString(),
             persistedRuntimeSignaled: outcome.signaled,
@@ -1638,18 +1649,31 @@ export async function quiesceAgentJobsForAuthorizationTransition(
   const residual = await prisma.agentJob.findFirst({
     where: {
       status: 'running',
-      userId: { in: selectedUserIds },
+      ...(selectedUserIds ? { userId: { in: selectedUserIds } } : {}),
     },
     select: { id: true },
   });
   if (residual) {
-    throw new Error('A host job remained active after authorization cleanup');
+    throw new Error(input.reason === 'authorization_transition'
+      ? 'A host job remained active after authorization cleanup'
+      : 'A host job remained active before dependency promotion');
   }
   return {
     jobCount: jobs.length,
     liveRuntimeCount,
     persistedRuntimeSignalCount,
   };
+}
+
+export function quiesceAgentJobsForAuthorizationTransition(
+  userIds: readonly string[],
+): Promise<AgentJobAuthorizationQuiescence> {
+  return quiesceAgentJobs({ userIds, reason: 'authorization_transition' });
+}
+
+export function quiesceAgentJobsForProjectDependencyPromotion(
+): Promise<AgentJobAuthorizationQuiescence> {
+  return quiesceAgentJobs({ reason: 'project_dependency_promotion' });
 }
 
 function readBoundedTranscriptFile(transcriptPath: string, maxReadBytes = AGENT_JOB_LIMITS.maxTranscriptReadBytes): { text: string; truncated: boolean } {

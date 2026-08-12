@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '../contexts/AuthContext';
+import { AUTH_REFRESH_CONFLICT_MAX_WAIT_MS } from './authRefreshConvergence';
 import {
   PORTAL_AUTHORIZATION_VERSION_HEADER,
   StaleWorkspaceAuthorizationResponseError,
@@ -46,6 +47,11 @@ describe('workspaceAuthorizedFetch', () => {
     });
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
   it('stamps the admitted actor generation and accepts a matching response', async () => {
     fetchMock.mockResolvedValue(response(3));
 
@@ -71,6 +77,36 @@ describe('workspaceAuthorizedFetch', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('/api/gateway/sessions');
     expect(fetchMock.mock.calls[1][0]).toBe('/api/auth/refresh');
     expect(fetchMock.mock.calls[2][0]).toBe('/api/gateway/sessions');
+  });
+
+  it('clears local auth when the bounded fetch refresh retry also conflicts', async () => {
+    vi.useFakeTimers();
+    const conflict = () => new Response(JSON.stringify({
+      code: 'AUTH_REFRESH_ROTATION_CONFLICT',
+      retryable: true,
+    }), {
+      status: 409,
+      headers: {
+        'content-type': 'application/json',
+        'retry-after': '5',
+      },
+    });
+    fetchMock
+      .mockResolvedValueOnce({ ...response(3), ok: false, status: 401 })
+      .mockImplementationOnce(async () => conflict())
+      .mockImplementationOnce(async () => conflict());
+
+    const request = workspaceAuthorizedFetch('/api/gateway/sessions');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(AUTH_REFRESH_CONFLICT_MAX_WAIT_MS);
+
+    await expect(request).resolves.toMatchObject({ status: 401 });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(useAuthStore.getState()).toMatchObject({
+      user: null,
+      isAuthenticated: false,
+    });
   });
 
   it('rejects a delayed response after the signed-in actor changes', async () => {

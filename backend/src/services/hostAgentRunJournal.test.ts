@@ -655,6 +655,26 @@ describe('host-native systemd scope journal', () => {
     expect(mockRows.get(run.id)?.status).toBe('RECOVERED');
   });
 
+  test('global dependency-promotion quiescence retires late settlement and quarantine callbacks', async () => {
+    const run = handle('dependency-promotion-quiescence');
+    await journal.beginHostAgentRun(run);
+    const { launch } = await reserveAndSpawn(run);
+    await journal.activateGatedHostAgentRunAttempt(run, launch);
+
+    await expect(journal.quiesceHostAgentRunsForProjectDependencyPromotion())
+      .resolves.toMatchObject({
+        runCount: 1,
+        persistedRuntimeSignalCount: 1,
+        recoveredCount: 1,
+      });
+    expect(mockRows.get(run.id)?.status).toBe('RECOVERED');
+
+    await expect(journal.settleHostAgentRun(run, 'COMPLETED')).resolves.toBeUndefined();
+    await expect(journal.quarantineHostAgentRun(run, 'late provider failure'))
+      .resolves.toBeUndefined();
+    expect(mockRows.get(run.id)?.status).toBe('RECOVERED');
+  });
+
   test('production runtime identity is fixed and ignores environment overrides', () => {
     process.env.PORTAL_HOST_AGENT_RUN_ROOT = '/tmp/unsafe-test-override';
     expect(journal.__hostAgentRunJournalTest.runtimeRoot).toBe(

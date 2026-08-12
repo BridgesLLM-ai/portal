@@ -34,8 +34,12 @@ describe('Project Chat workspace ownership preparation contract', () => {
 
   test('assigns runtime ownership at exact Project mutation boundaries', () => {
     expect(routeSource).toContain('writeProjectRuntimeOwnedFileAtomic(projectDir, filePath, content');
-    expect(routeSource).toContain('ensureProjectRuntimeOwnedDirectory(projectDir, attachmentSubdirectory)');
-    expect(routeSource).toContain("assignProjectRuntimeOwnership(projectDir, destination, 'file')");
+    expect(routeSource).toContain(
+      'ensureProjectRuntimeOwnedDirectory(\n        lockedWorkspace.projectDir,\n        attachmentSubdirectory',
+    );
+    expect(routeSource).toContain(
+      "assignProjectRuntimeOwnership(lockedWorkspace.projectDir, destination, 'file')",
+    );
     expect(routeSource).toContain("assignProjectRuntimeOwnership(projectDir, resolvedDest, 'file')");
     expect(routeSource).toContain("writeProjectRuntimeTextFile(projectDir, '.deps-installed'");
     expect(filesRouteSource).toContain('ensureProjectRuntimeOwnedDirectory(projectDir, relativeDestDir)');

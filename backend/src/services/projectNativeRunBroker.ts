@@ -78,6 +78,8 @@ export interface ProjectNativeRunSnapshot {
 
 interface ProjectNativeRunState extends ProjectNativeRunSnapshot {
   key: string;
+  userId: string;
+  projectId: string;
   initialSessionId: string;
   textTruncated: boolean;
 }
@@ -346,6 +348,8 @@ export function startProjectNativeRun(input: StartProjectNativeRunInput): Projec
   const now = Date.now();
   const state: ProjectNativeRunState = {
     key,
+    userId: input.userId,
+    projectId: input.projectId,
     runId: String(input.runId || '').trim() || crypto.randomUUID(),
     provider: input.provider,
     runtime: input.runtime,
@@ -673,6 +677,45 @@ export async function quiesceProjectNativeRunForDestructiveReset(input: {
     ),
     runId,
   };
+}
+
+export async function quiesceProjectNativeRunsForProjectDependencyPromotion(
+): Promise<{ runCount: number }> {
+  const active = [...states.values()]
+    .filter((state) => state.active)
+    .map((state) => ({
+      userId: state.userId,
+      projectId: state.projectId,
+      provider: state.provider as DurableProjectProvider,
+      runId: state.runId,
+    }));
+  const settled = await Promise.allSettled(active.map(async (run) => ({
+    run,
+    result: await quiesceProjectNativeRunForDestructiveReset({
+      userId: run.userId,
+      projectId: run.projectId,
+      provider: run.provider,
+    }),
+  })));
+  if (settled.some((outcome) => outcome.status === 'rejected')) {
+    throw new Error('A Project Chat provider run could not be quiesced before dependency promotion');
+  }
+  const outcomes = settled.map((outcome) => (
+    outcome as PromiseFulfilledResult<{
+      run: typeof active[number];
+      result: { quiescent: boolean; runId: string | null };
+    }>
+  ).value);
+  if (outcomes.some(({ run, result }) => (
+    !result.quiescent || (run.runId && result.runId !== run.runId)
+  ))) {
+    throw new Error('A Project Chat provider run remained active before dependency promotion');
+  }
+  const residual = [...states.values()].find((state) => state.active);
+  if (residual) {
+    throw new Error('A Project Chat provider run escaped dependency-promotion quiescence');
+  }
+  return { runCount: active.length };
 }
 
 export function clearProjectNativeRun(input: {

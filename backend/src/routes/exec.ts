@@ -1,13 +1,11 @@
 import { Server as SocketIOServer } from 'socket.io';
 import { verifyAccessToken } from '../utils/jwt';
-import { prisma } from '../config/database';
 import { canUseInteractivePortal, isElevatedRole } from '../utils/authz';
 import { parseSafeCookieHeader } from '../utils/safeCookies';
-import { subscribeToAuthorizationChanges } from '../services/authorizationChangeBus';
 import {
   acquireGlobalWorkspaceAuthorizationMutationLease,
-  subscribeToGlobalWorkspaceAuthorizationFence,
 } from '../services/workspaceAuthorizationBarrier';
+import { establishLongLivedAccessAuthorization } from '../services/accessTokenAuthorization';
 import {
   prepareTerminalSystemdScope,
   TerminalSystemdScopeError,
@@ -68,7 +66,6 @@ export function setupTerminalNamespace(io: SocketIOServer) {
       revoked: false,
     };
     (socket as any).terminalAuthorizationControl = authorizationControl;
-    let unsubscribed = false;
     const revokeInteractiveAuthority = () => {
       authorizationControl.revoked = true;
       authorizationControl.requestTermination?.();
@@ -78,59 +75,32 @@ export function setupTerminalNamespace(io: SocketIOServer) {
         // The post-query check below still rejects a handshake being torn down.
       }
     };
-    let unsubscribeGlobalFence = () => {};
-    let unsubscribeAuthorization = () => {};
-    unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
-      revokeInteractiveAuthority,
-    );
-    if (authorizationControl.revoked) {
-      unsubscribeGlobalFence();
-      return next(new Error('Workspace authorization is changing'));
-    }
-    unsubscribeAuthorization = subscribeToAuthorizationChanges(
-      payload.userId,
-      revokeInteractiveAuthority,
-    );
-    const cleanupAuthorization = () => {
-      if (unsubscribed) return;
-      unsubscribed = true;
-      socket.conn?.removeListener?.('close', cleanupAuthorization);
-      unsubscribeGlobalFence();
-      unsubscribeAuthorization();
-    };
-    (socket as any).authorizationUnsubscribe = cleanupAuthorization;
-    socket.conn?.once?.('close', cleanupAuthorization);
-
-    prisma.user.findUnique({
-      where: { id: payload.userId },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        accountStatus: true,
-        isActive: true,
-        authorizationVersion: true,
-      },
-    } as any).then((user) => {
-      if (!user || !canUseInteractivePortal(user.role, (user as any).accountStatus, user.isActive) || !isElevatedRole(user.role)) {
-        cleanupAuthorization();
-        return next(new Error('Account is not permitted for terminal access'));
+    void establishLongLivedAccessAuthorization({
+      payload,
+      authorize: (identity) => canUseInteractivePortal(
+        identity.role,
+        identity.accountStatus,
+        true,
+      ) && isElevatedRole(identity.role),
+      onRevoke: revokeInteractiveAuthority,
+    }).then((result) => {
+      if (!result.ok) {
+        next(new Error(result.reason === 'session_revoked'
+          ? 'This sign-in session is no longer active'
+          : 'Account is not permitted for terminal access'));
+        return;
       }
-      if ((payload.authorizationVersion ?? 1) !== Number((user as any).authorizationVersion ?? 1)) {
-        cleanupAuthorization();
-        return next(new Error('Authorization changed; sign in again'));
-      }
-      if (authorizationControl.revoked) {
-        cleanupAuthorization();
-        return next(new Error('Authorization changed during connection'));
+      if (authorizationControl.revoked || socket.disconnected) {
+        result.dispose();
+        next(new Error('Authorization changed during connection'));
+        return;
       }
 
-      (socket as any).user = { userId: user.id, email: user.email, role: user.role };
+      (socket as any).user = result.identity;
+      (socket as any).authorizationUnsubscribe = result.dispose;
+      socket.conn?.once?.('close', result.dispose);
       next();
-    }).catch((err) => {
-      cleanupAuthorization();
-      next(err);
-    });
+    }).catch((err) => next(err));
   });
 
   terminal.on('connection', (socket) => {

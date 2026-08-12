@@ -12,7 +12,12 @@ import {
   configuredAppApiTargetBinding,
   invalidAppApiTargetResponse,
 } from './utils/appApiProxyAuth';
-import { createAppApiAbortContext, serializeAppApiRequestBody, streamAppApiResponse } from './utils/appApiProxy';
+import {
+  appApiUpstreamFailureResponse,
+  createAppApiAbortContext,
+  serializeAppApiRequestBody,
+  streamAppApiResponse,
+} from './utils/appApiProxy';
 import helmet from 'helmet';
 import path from 'path';
 import fs from 'fs';
@@ -35,8 +40,15 @@ import activityRoutes from './routes/activity';
 import chunkedUploadRoutes, { initializeChunkedUploadRuntime, shutdownChunkedUploadRuntime } from './routes/chunked-upload';
 import projectsRoutes, {
   initializeProjectStorage,
+  PROJECTS_DIR,
   recoverInterruptedCurrentProjectCreations,
 } from './routes/projects';
+import {
+  runProjectDependencyPromotionStartupRecovery,
+} from './services/projectDependencyPromotionStartupRecovery';
+import {
+  retireConvergedProjectDependencyRepairBackupPins,
+} from './services/projectDependencyRepair';
 import aiRoutes from './routes/ai';
 import terminalRoutes from './routes/terminal';
 // Legacy Guacamole routes removed — noVNC/Xtigervnc is the active remote desktop stack.
@@ -109,7 +121,7 @@ import { ollamaPullManager } from './services/ollamaPullManager';
 import { setupLocalOllamaPullManager } from './services/setupLocalOllamaPullManager';
 import { initPersistentGatewayWs, shutdownPersistentGatewayWs } from './agents/providers/PersistentGatewayWs';
 import { stopDefaultAgentZeroHostGateway } from './agents/providers/agentZero/AgentZeroHostGateway';
-import { canAccessPortal, canUseInteractivePortal, isElevatedRole } from './utils/authz';
+import { canAccessPortal, isElevatedRole } from './utils/authz';
 import { isAllowedWebSocketOrigin } from './utils/websocketOrigin';
 import { startTelemetryService, stopTelemetryService } from './services/telemetryService';
 import { startAudioProxy, stopAudioProxy } from './services/audioProxy';
@@ -153,12 +165,13 @@ import {
   admitWorkspaceAuthorizationRead,
   settleWorkspaceAuthorizationRequest,
   settleWorkspaceAuthorizationRequestIfResponseEnded,
-  subscribeToGlobalWorkspaceAuthorizationFence,
 } from './services/workspaceAuthorizationBarrier';
+import type { AuthorizationChangedEvent } from './services/authorizationChangeBus';
 import {
-  subscribeToAuthorizationChanges,
-  type AuthorizationChangedEvent,
-} from './services/authorizationChangeBus';
+  authorizeRemoteDesktopWebSocketTransport,
+  completeAuthorizedWebSocketUpgrade,
+  createSocketAccessAuthorizationMiddleware,
+} from './services/portalTransportAuthorization';
 import {
   beginLegacyOpenClawProjectMigration,
   legacyOpenClawProjectMigrationRetryDelayMs,
@@ -166,8 +179,10 @@ import {
   shouldRetryLegacyOpenClawProjectMigration,
 } from './services/legacyOpenClawProjectRetirement';
 import {
+  holdStartupStatusServerForProjectDependencyPromotionQuarantine,
   startStartupStatusServer,
   stopStartupStatusServer,
+  stopStartupStatusServerForShutdown,
   setStartupPhase,
 } from './services/startupStatusServer';
 import {
@@ -218,110 +233,9 @@ app.set('io', io);
 // Setup terminal namespace
 setupTerminalNamespace(io);
 
-// Shared Socket.IO auth middleware — same pattern as /terminal namespace
-const socketAuthMiddleware = (socket: any, next: (err?: any) => void) => {
-  let token = socket.handshake.auth?.token;
-
-  if (!token || typeof token !== 'string') {
-    const cookieHeader = socket.handshake.headers?.cookie || '';
-    const cookies = parseSafeCookieHeader(cookieHeader);
-    token = cookies.accessToken;
-  }
-
-  if (!token || typeof token !== 'string') return next(new Error('Auth required'));
-  const payload = verifyAccessToken(token);
-  if (!payload) return next(new Error('Invalid or expired token'));
-  const authorizationNamespace = socket.nsp?.name === '/authorization';
-  const pendingEvents: AuthorizationChangedEvent[] = [];
-  let authorizationRevoked = false;
-  let unsubscribed = false;
-  const revokeInteractiveAuthority = () => {
-    authorizationRevoked = true;
-    try {
-      socket.disconnect(true);
-    } catch {
-      // The post-query check still rejects a handshake already being torn down.
-    }
-  };
-  let unsubscribeGlobalFence = () => {};
-  let unsubscribeAuthorization = () => {};
-  // Keep only the non-privileged revocation relay alive long enough to deliver
-  // the committed generation. Every namespace with read or execution
-  // authority is synchronously disconnected by the global fence.
-  if (!authorizationNamespace) {
-    unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
-      revokeInteractiveAuthority,
-    );
-    if (authorizationRevoked) {
-      unsubscribeGlobalFence();
-      return next(new Error('Workspace authorization is changing'));
-    }
-  }
-  unsubscribeAuthorization = subscribeToAuthorizationChanges(payload.userId, (event) => {
-    authorizationRevoked = true;
-    if (authorizationNamespace) {
-      const relay = socket.data.authorizationChangeRelay as
-        | ((changed: AuthorizationChangedEvent) => void)
-        | null
-        | undefined;
-      if (relay) relay(event);
-      else pendingEvents.push(event);
-      return;
-    }
-    socket.disconnect(true);
-  });
-  const cleanupAuthorization = () => {
-    if (unsubscribed) return;
-    unsubscribed = true;
-    socket.conn?.removeListener?.('close', cleanupAuthorization);
-    unsubscribeGlobalFence();
-    unsubscribeAuthorization();
-  };
-  socket.data.authorizationPendingEvents = pendingEvents;
-  socket.data.authorizationChangeRelay = null;
-  socket.data.authorizationUnsubscribe = cleanupAuthorization;
-  socket.conn?.once?.('close', cleanupAuthorization);
-
-  prisma.user.findUnique({
-    where: { id: payload.userId },
-    select: {
-      id: true,
-      email: true,
-      role: true,
-      accountStatus: true,
-      isActive: true,
-      authorizationVersion: true,
-    },
-  } as any).then((user) => {
-    if (!user || !canUseInteractivePortal(user.role, (user as any).accountStatus, user.isActive)) {
-      cleanupAuthorization();
-      return next(new Error('Account is not permitted for interactive access'));
-    }
-    const authorizationVersion = Number((user as any).authorizationVersion ?? 1);
-    if ((payload.authorizationVersion ?? 1) !== authorizationVersion) {
-      cleanupAuthorization();
-      return next(new Error('Authorization changed; sign in again'));
-    }
-    // Subscription deliberately precedes the database lookup. A commit in the
-    // query-to-subscribe gap would otherwise be lost and admit a stale socket.
-    if (authorizationRevoked) {
-      cleanupAuthorization();
-      return next(new Error('Authorization changed during connection'));
-    }
-    socket.data.user = {
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-      accountStatus: (user as any).accountStatus,
-      authorizationVersion,
-    };
-    socket.once('disconnect', cleanupAuthorization);
-    next();
-  }).catch((err) => {
-    cleanupAuthorization();
-    next(err);
-  });
-};
+// Shared Socket.IO admission binds every namespace to the exact durable browser
+// Session as well as the user's authorization generation.
+const socketAuthMiddleware = createSocketAccessAuthorizationMiddleware();
 
 // Namespace middleware runs in registration order, so this executes only
 // after socketAuthMiddleware has reloaded the current user from the database.
@@ -566,6 +480,37 @@ const audioWsProxy = createProxyMiddleware({
     },
   },
 } as any);
+
+function handleRemoteDesktopWebSocketUpgrade(
+  req: any,
+  socket: any,
+  head: Buffer,
+  proxy: { upgrade(request: any, transport: any, upgradeHead: Buffer): void },
+): void {
+  const origin = req.headers.origin;
+  if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const cookies = parseSafeCookieHeader(req.headers.cookie);
+  const token = cookies.accessToken;
+  const payload = token ? verifyAccessToken(token) : null;
+  if (!payload) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  completeAuthorizedWebSocketUpgrade({
+    socket,
+    authorize: (onRevoke) => authorizeRemoteDesktopWebSocketTransport(payload, onRevoke),
+    onAuthorized: () => {
+      proxy.upgrade(req, socket, head);
+    },
+  });
+}
 
 // Cookie parsing — must be before any auth middleware that reads req.cookies
 app.use(cookieParser());
@@ -982,6 +927,7 @@ app.use('/hosted/:deployId/api/*', requireHostedAppAccess, async (req: any, res:
   const deployId = String(req.params.deployId || '');
   const configuredBinding = configuredAppApiTargetBinding(hostedApp.id);
   if (configuredBinding.status === 'invalid') {
+    res.setHeader('Cache-Control', 'no-store');
     res.status(503).json(invalidAppApiTargetResponse());
     settleWorkspaceAuthorizationRequest(req);
     return;
@@ -1046,7 +992,9 @@ app.use('/hosted/:deployId/api/*', requireHostedAppAccess, async (req: any, res:
   } catch (err: any) {
     console.error('[Hosted API Proxy] Error:', err.message);
     if (!res.headersSent) {
-      res.status(abortContext.didTimeout() ? 504 : 502).json({ error: abortContext.didTimeout() ? 'Backend timeout' : 'Backend unavailable' });
+      const failure = appApiUpstreamFailureResponse(abortContext.didTimeout(), err);
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(failure.status).json(failure.body);
     } else if (!res.writableEnded) {
       res.end();
     }
@@ -1712,7 +1660,31 @@ app.use(errorHandler);
 // Metrics collection interval (every 30s)
 let metricsInterval: NodeJS.Timeout;
 let legacyOpenClawMigrationRetryTimer: NodeJS.Timeout | null = null;
+let projectDependencyRepairPinRetryTimer: NodeJS.Timeout | null = null;
+let projectDependencyRepairPinRetirementStopped = false;
+
+function scheduleProjectDependencyRepairPinRetirement(delayMs = 1_000): void {
+  if (projectDependencyRepairPinRetirementStopped || projectDependencyRepairPinRetryTimer) return;
+  projectDependencyRepairPinRetryTimer = setTimeout(() => {
+    projectDependencyRepairPinRetryTimer = null;
+    void retireConvergedProjectDependencyRepairBackupPins().then((result) => {
+      if (result.retired > 0 || result.retained > 0) {
+        console.log('[Project Dependencies] Backup pin reconciliation:', result);
+      }
+      // Retained exact markers may be waiting on durable startup/manual
+      // convergence. Keep a bounded low-frequency retry without holding the
+      // event loop open or delaying readiness.
+      if (result.retained > 0) scheduleProjectDependencyRepairPinRetirement(60_000);
+    }).catch((error) => {
+      console.warn('[Project Dependencies] Backup pin reconciliation deferred:',
+        (error as Error)?.message || 'unknown error');
+      scheduleProjectDependencyRepairPinRetirement(15_000);
+    });
+  }, Math.max(1_000, Math.min(60_000, delayMs)));
+  projectDependencyRepairPinRetryTimer.unref?.();
+}
 let legacyOpenClawMigrationCoordinatorStopped = false;
+let projectDependencyPromotionFailureHold = false;
 let legacyOpenClawMigrationCoordinatorRunning = false;
 let legacyOpenClawMigrationFailureCount = 0;
 let claimedLegacyOpenClawMigrationCoordinator: Awaited<ReturnType<
@@ -1771,6 +1743,17 @@ async function runLegacyOpenClawProjectMigrationCoordinator(): Promise<void> {
 // Graceful shutdown
 const shutdownHandler = async (signal: string) => {
   console.log(`\n${signal} received, shutting down gracefully...`);
+  if (projectDependencyPromotionFailureHold) {
+    try {
+      await stopStartupStatusServerForShutdown();
+      await prisma.$disconnect();
+      console.log('Promotion-quarantine database connection closed');
+      return process.exit(0);
+    } catch (error) {
+      console.error('Error during promotion-quarantine shutdown:', error);
+      return process.exit(1);
+    }
+  }
   if (PORTAL_UPDATE_VALIDATION_MODE) {
     try {
       await stopStartupStatusServer();
@@ -1787,6 +1770,9 @@ const shutdownHandler = async (signal: string) => {
   legacyOpenClawMigrationCoordinatorStopped = true;
   if (legacyOpenClawMigrationRetryTimer) clearTimeout(legacyOpenClawMigrationRetryTimer);
   legacyOpenClawMigrationRetryTimer = null;
+  projectDependencyRepairPinRetirementStopped = true;
+  if (projectDependencyRepairPinRetryTimer) clearTimeout(projectDependencyRepairPinRetryTimer);
+  projectDependencyRepairPinRetryTimer = null;
   clearInterval(metricsInterval);
   stopLogWatcher();
   stopStatusWatcher();
@@ -1873,6 +1859,50 @@ export const startServer = async () => {
     // before accepting work. The corresponding module imports stay read-only.
     initializeAppsStorage();
     initializeProjectStorage();
+    // Promotion recovery is the union of durable database decisions and
+    // filesystem evidence. Prove DB readiness before making either side
+    // authoritative; the real Portal listener remains closed throughout.
+    // The coordinator closes global Project mutation admission, inventories
+    // before mutation, drains every tracked writer, verifies an unchanged
+    // snapshot, and only then invokes filesystem recovery.
+    setStartupPhase('database-connection');
+    await prisma.$queryRaw`SELECT 1`;
+    console.log('✅ Database connection successful');
+    setStartupPhase('project-dependency-promotion-recovery');
+    let dependencyPromotionRecovery;
+    try {
+      dependencyPromotionRecovery = await runProjectDependencyPromotionStartupRecovery(
+        PROJECTS_DIR,
+      );
+    } catch (error: any) {
+      // This bounded phase is the only place where database decisions and
+      // filesystem evidence are reconciled. Any uncertainty keeps the already
+      // bound bootstrap listener alive in an irreversible, status-only hold;
+      // the real Express/WS listener never opens.
+      projectDependencyPromotionFailureHold = true;
+      holdStartupStatusServerForProjectDependencyPromotionQuarantine();
+      const localCode = String(error?.code || error?.name || 'UnknownError')
+        .replace(/[^A-Za-z0-9_-]/g, '')
+        .slice(0, 64);
+      const localMessage = String(error?.message || 'Promotion recovery failed')
+        .replace(/[\u0000-\u001f\u007f]/g, ' ')
+        .slice(0, 1024);
+      console.error(
+        `[Project Dependencies] Startup quarantined (${localCode}): ${localMessage}`,
+      );
+      return;
+    }
+    if (
+      dependencyPromotionRecovery.recovery.rolledBack > 0
+      || dependencyPromotionRecovery.recovery.committed > 0
+      || dependencyPromotionRecovery.recovery.quarantined > 0
+      || dependencyPromotionRecovery.recovery.discarded > 0
+    ) {
+      console.warn(
+        '[Project Dependencies] Recovered interrupted artifact promotion:',
+        dependencyPromotionRecovery.recovery,
+      );
+    }
     initializeFileStorage();
     initializeImageAssetStorage();
     initializeAgentJobsStorage();
@@ -1890,9 +1920,6 @@ export const startServer = async () => {
     }
     ensureRuntimeDirectory(HOSTED_APPS_DIR, { mode: 0o755 });
 
-    setStartupPhase('database-connection');
-    await prisma.$queryRaw`SELECT 1`;
-    console.log('✅ Database connection successful');
     await initializeEmbedSecurityPolicy();
 
     const terminalScopeRecovery = await initializeTerminalSystemdScopeRuntime();
@@ -1937,6 +1964,7 @@ export const startServer = async () => {
     if (
       projectContinuity.identitiesEnrolled > 0
       || projectContinuity.appsBackfilled > 0
+      || projectContinuity.appsQuarantined > 0
       || projectContinuity.preservedUnownedDirectories > 0
     ) {
       console.warn('[Project Continuity] Reconciled pre-4.0 filesystem/App ownership:', projectContinuity);
@@ -2016,153 +2044,11 @@ export const startServer = async () => {
     // Attach WebSocket upgrade handlers to HTTP server
     httpServer.on('upgrade', (req, socket, head) => {
       if (isExactWebSocketPath(req.url, '/novnc/websockify')) {
-        const origin = req.headers.origin;
-        if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {
-          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-
-        // Verify JWT from accessToken cookie before allowing WebSocket upgrade
-        const cookies = parseSafeCookieHeader(req.headers.cookie);
-        const token = cookies.accessToken;
-        if (!token) {
-          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-        const payload = verifyAccessToken(token);
-        if (!payload) {
-          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-        let authorizationRevoked = false;
-        let unsubscribed = false;
-        const revokeInteractiveAuthority = () => {
-          authorizationRevoked = true;
-          socket.destroy();
-        };
-        let unsubscribeGlobalFence = () => {};
-        let unsubscribeAuthorization = () => {};
-        unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
-          revokeInteractiveAuthority,
-        );
-        if (authorizationRevoked || socket.destroyed) {
-          unsubscribeGlobalFence();
-          socket.destroy();
-          return;
-        }
-        unsubscribeAuthorization = subscribeToAuthorizationChanges(payload.userId, revokeInteractiveAuthority);
-        const cleanupAuthorization = () => {
-          if (unsubscribed) return;
-          unsubscribed = true;
-          socket.removeListener('close', cleanupAuthorization);
-          unsubscribeGlobalFence();
-          unsubscribeAuthorization();
-        };
-        socket.once('close', cleanupAuthorization);
-        prisma.user.findUnique({
-          where: { id: payload.userId },
-          select: {
-            id: true,
-            role: true,
-            accountStatus: true,
-            isActive: true,
-            authorizationVersion: true,
-          },
-        } as any).then((user) => {
-          if (authorizationRevoked
-            || socket.destroyed
-            || !user
-            || !canAccessPortal((user as any).accountStatus, user.isActive)
-            || !isElevatedRole(user.role)
-            || (payload.authorizationVersion ?? 1) !== Number((user as any).authorizationVersion ?? 1)) {
-            cleanupAuthorization();
-            if (!socket.destroyed) socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-            socket.destroy();
-            return;
-          }
-          // noVNC WebSocket upgrade — only /novnc/websockify goes to websockify
-          (novncWsProxy as any).upgrade(req, socket, head);
-        }).catch(() => {
-          cleanupAuthorization();
-          if (!socket.destroyed) socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-          socket.destroy();
-        });
+        // noVNC WebSocket upgrade — only /novnc/websockify goes to websockify.
+        handleRemoteDesktopWebSocketUpgrade(req, socket, head, novncWsProxy as any);
       } else if (isExactWebSocketPath(req.url, '/novnc/audio')) {
-        // Audio WebSocket upgrade — same auth as VNC
-        const origin = req.headers.origin;
-        if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {
-          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-        const cookies = parseSafeCookieHeader(req.headers.cookie);
-        const token = cookies.accessToken;
-        if (!token) {
-          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-        const payload = verifyAccessToken(token);
-        if (!payload) {
-          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-        let authorizationRevoked = false;
-        let unsubscribed = false;
-        const revokeInteractiveAuthority = () => {
-          authorizationRevoked = true;
-          socket.destroy();
-        };
-        let unsubscribeGlobalFence = () => {};
-        let unsubscribeAuthorization = () => {};
-        unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
-          revokeInteractiveAuthority,
-        );
-        if (authorizationRevoked || socket.destroyed) {
-          unsubscribeGlobalFence();
-          socket.destroy();
-          return;
-        }
-        unsubscribeAuthorization = subscribeToAuthorizationChanges(payload.userId, revokeInteractiveAuthority);
-        const cleanupAuthorization = () => {
-          if (unsubscribed) return;
-          unsubscribed = true;
-          socket.removeListener('close', cleanupAuthorization);
-          unsubscribeGlobalFence();
-          unsubscribeAuthorization();
-        };
-        socket.once('close', cleanupAuthorization);
-        prisma.user.findUnique({
-          where: { id: payload.userId },
-          select: {
-            id: true,
-            role: true,
-            accountStatus: true,
-            isActive: true,
-            authorizationVersion: true,
-          },
-        } as any).then((user) => {
-          if (authorizationRevoked
-            || socket.destroyed
-            || !user
-            || !canAccessPortal((user as any).accountStatus, user.isActive)
-            || !isElevatedRole(user.role)
-            || (payload.authorizationVersion ?? 1) !== Number((user as any).authorizationVersion ?? 1)) {
-            cleanupAuthorization();
-            if (!socket.destroyed) socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-            socket.destroy();
-            return;
-          }
-          (audioWsProxy as any).upgrade(req, socket, head);
-        }).catch(() => {
-          cleanupAuthorization();
-          if (!socket.destroyed) socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-          socket.destroy();
-        });
+        // Audio WebSocket upgrade — same durable-session contract as VNC.
+        handleRemoteDesktopWebSocketUpgrade(req, socket, head, audioWsProxy as any);
       }
       // Legacy Guacamole upgrade path removed; noVNC websocket handling is active above.
     });
@@ -2197,6 +2083,11 @@ export const startServer = async () => {
       void retireInternalProjectIdentityDebris().catch((error) => {
         console.warn('[project-identity] internal-directory debris sweep failed:', (error as Error)?.message);
       });
+      // The updater deliberately retains its host-operation flock through
+      // restart and health verification. Run repair-pin retirement only after
+      // the real listener is healthy; the asynchronous worker then joins that
+      // canonical operation -> backup lock order without delaying readiness.
+      scheduleProjectDependencyRepairPinRetirement();
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error);

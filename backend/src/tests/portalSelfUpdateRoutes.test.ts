@@ -138,7 +138,7 @@ const operationId = '0123456789abcdef0123456789abcdef';
 const preparation = {
   confirmationPhrase: 'UPDATE PORTAL',
   backup: {
-    state: 'fresh',
+    state: 'candidate',
     maxAgeHours: 24,
     newestCreatedAt: '2026-08-10T05:00:00.000Z',
     ageHours: 1,
@@ -213,12 +213,31 @@ describe('Portal self-update admin routes', () => {
     });
   });
 
+  test('labels normal update status as an authenticated candidate awaiting strict admission verification', async () => {
+    const { capture, next } = await invokeHandler('/update-status', 'get', {});
+
+    expect(next).not.toHaveBeenCalled();
+    expect(mockGetPortalUpdatePreparation).toHaveBeenCalledWith();
+    expect(capture.headers['Cache-Control']).toBe('private, no-store');
+    expect(capture.body).toEqual({ ...updateStatus, preparation });
+    expect((capture.body as any).preparation.backup.state).toBe('candidate');
+  });
+
   test('returns a durable 202 receipt and forwards only the admitted update inputs', async () => {
+    const requestBody = { confirmation: 'UPDATE PORTAL', expectedVersion: '4.0.14' };
     const { capture, next } = await invokeHandler('/self-update', 'post', {
-      body: { confirmation: 'UPDATE PORTAL', expectedVersion: '4.0.14' },
+      body: requestBody,
     });
 
     expect(next).not.toHaveBeenCalled();
+    expect(mockGetPortalUpdatePreparation.mock.calls).toEqual([
+      [],
+      [expect.any(Number), { verifyFreshArchive: true }],
+    ]);
+    expect(mockAdmitPortalUpdate.mock.calls).toEqual([
+      [preparation, requestBody, { allowAuthenticatedCandidate: true }],
+      [preparation, requestBody],
+    ]);
     expect(mockLaunchPortalSelfUpdate).toHaveBeenCalledWith({
       originMode: 'tailnet',
       domain: '',

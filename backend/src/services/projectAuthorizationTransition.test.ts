@@ -312,6 +312,7 @@ class FakeDatabase {
 function harness(database = new FakeDatabase().initialize()) {
   const events: string[] = [];
   const published: any[] = [];
+  const publishedSessions: any[] = [];
   let gatewayActive = true;
   let failGatewayStart = false;
   let failCleanup = false;
@@ -454,6 +455,10 @@ function harness(database = new FakeDatabase().initialize()) {
       events.push(`published:${event.userId}`);
       published.push(event);
     },
+    publishSessions: (event) => {
+      events.push(`sessions-published:${event.userId}`);
+      publishedSessions.push(event);
+    },
     now: () => new Date(NOW),
     randomUUID: () => `uuid-${++uuid}`,
     randomBytes: () => Buffer.alloc(32, 7),
@@ -464,6 +469,7 @@ function harness(database = new FakeDatabase().initialize()) {
     database,
     events,
     published,
+    publishedSessions,
     setFailGatewayStart(value: boolean) {
       failGatewayStart = value;
     },
@@ -544,6 +550,7 @@ describe('durable Project authorization transitions', () => {
       authorizationVersion: 2,
       reasons: ['role'],
     })]);
+    expect(test.publishedSessions).toEqual([]);
   });
 
   test('durably quiesces provider authority before emergency credential recovery', async () => {
@@ -630,6 +637,10 @@ describe('durable Project authorization transitions', () => {
       authorizationVersion: 8,
       reasons: ['credential_recovery'],
     }]);
+    expect(test.publishedSessions).toEqual([{
+      userId: 'target',
+      reason: 'credential_recovery',
+    }]);
   });
 
   test('atomically revokes every stale authentication artifact when an inaccessible account becomes accessible', async () => {
@@ -688,6 +699,10 @@ describe('durable Project authorization transitions', () => {
       { id: 'target-reset', userId: 'target', usedAt: NOW },
       { id: 'third-reset', userId: 'third', usedAt: null },
     ]);
+    expect(test.publishedSessions).toEqual([{
+      userId: 'target',
+      reason: 'authorization_transition',
+    }]);
   });
 
   test('preserves authentication artifacts for an active-to-active authorization update', async () => {

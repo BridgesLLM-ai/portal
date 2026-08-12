@@ -107,7 +107,7 @@ import {
   stripEnvelope,
   stripOpenClawReplyTags,
 } from '../utils/chatText';
-import { canUseDirectGateway, canUseInteractivePortal, isElevatedRole, isOwnerRole } from '../utils/authz';
+import { canUseInteractivePortal, isElevatedRole, isOwnerRole } from '../utils/authz';
 import {
   openClawSessionActorId,
   isOpenClawSessionActorScopedTo,
@@ -124,13 +124,16 @@ import { config } from '../config/env';
 import { PRIVILEGED_CONFIRMATION, isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
 import { parseSafeCookieHeader } from '../utils/safeCookies';
 import { sanitizeThinkingSubject } from '../utils/thinkingSubject';
-import { subscribeToAuthorizationChanges } from '../services/authorizationChangeBus';
 import {
   acquireWorkspaceAuthorizationMutationLease,
   settleWorkspaceAuthorizationRequest,
-  subscribeToGlobalWorkspaceAuthorizationFence,
 } from '../services/workspaceAuthorizationBarrier';
 import { OPENCLAW_CODEX_PLUGIN_VERSION } from '../services/openclawConfigManager';
+import {
+  authorizeGatewayWebSocketTransport,
+  completeAuthorizedWebSocketUpgrade,
+} from '../services/portalTransportAuthorization';
+import { establishLongLivedAccessAuthorization } from '../services/accessTokenAuthorization';
 import {
   getOpenClawSetupReadiness,
   TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
@@ -1171,6 +1174,7 @@ interface OpenClawAskUserRuntimeReadiness {
   ready: boolean;
   pluginLoaded: boolean;
   toolExecutionCallable: boolean;
+  activeRunSteerCallable: boolean;
   pendingMethodCallable: boolean;
   answerMethodCallable: boolean;
   dismissMethodCallable: boolean;
@@ -1263,6 +1267,7 @@ async function getOpenClawAskUserRuntimeReadiness(
       ready: false,
       pluginLoaded: false,
       toolExecutionCallable: false,
+      activeRunSteerCallable: false,
       pendingMethodCallable: false,
       answerMethodCallable: false,
       dismissMethodCallable: false,
@@ -1292,6 +1297,7 @@ async function getOpenClawAskUserRuntimeReadiness(
       ready: false,
       pluginLoaded: false,
       toolExecutionCallable: false,
+      activeRunSteerCallable: false,
       pendingMethodCallable: false,
       answerMethodCallable: false,
       dismissMethodCallable: false,
@@ -1316,6 +1322,8 @@ async function getOpenClawAskUserRuntimeReadiness(
     && semanticProbe.data?.answer === true
     && semanticProbe.data?.dismiss === true
     && semanticProbe.data?.steer === true;
+  const activeRunSteerCallable = toolExecutionCallable
+    && semanticProbe.data?.activeRunSteer === true;
 
   const pendingProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.pending', {
     sessionKey,
@@ -1357,12 +1365,15 @@ async function getOpenClawAskUserRuntimeReadiness(
     && steerProbe.data?.code === 'NO_ACTIVE_RUN'
     && steerProbe.data?.requestId === requestId;
   const ready = toolExecutionCallable
+    && activeRunSteerCallable
     && pendingMethodCallable
     && answerMethodCallable
     && dismissMethodCallable
     && steerMethodCallable;
   const failedProbe = !toolExecutionCallable
     ? ['tool execution', semanticProbe]
+    : !activeRunSteerCallable
+      ? ['active-run steering', semanticProbe]
     : !pendingMethodCallable
       ? ['pending', pendingProbe]
       : !answerMethodCallable
@@ -1376,6 +1387,7 @@ async function getOpenClawAskUserRuntimeReadiness(
     ready,
     pluginLoaded: true,
     toolExecutionCallable,
+    activeRunSteerCallable,
     pendingMethodCallable,
     answerMethodCallable,
     dismissMethodCallable,
@@ -8632,6 +8644,33 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     }
 
     if (wantStream) {
+      const routeRunId = randomUUID();
+      let handleStreamAuthorityRevocation = () => {};
+      const streamAuthority = await establishLongLivedAccessAuthorization({
+        payload: req.user!,
+        authorize: (identity) => canUseInteractivePortal(
+          identity.role,
+          identity.accountStatus,
+          true,
+        ) && isElevatedRole(identity.role),
+        onRevoke: () => handleStreamAuthorityRevocation(),
+      });
+      if (!streamAuthority.ok) {
+        const status = streamAuthority.reason === 'session_revoked'
+          ? 401
+          : streamAuthority.reason === 'workspace_fenced'
+            || streamAuthority.reason === 'authorization_changed'
+            ? 409
+            : 403;
+        res.status(status).json({ error: status === 401
+          ? 'This sign-in session is no longer active.'
+          : status === 409
+            ? 'Authorization changed before the stream could start.'
+            : 'Account is not permitted for Agent Chat.' });
+        return;
+      }
+      req.user = streamAuthority.identity;
+
       res.socket?.setNoDelay?.(true);
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'private, no-store, no-transform, max-age=0');
@@ -8652,14 +8691,14 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       let streamUnsub: (() => void) | null = null;
       let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
       let unregisterSseDelivery = () => {};
-      let unsubscribeAuthorization = () => {};
+      let disposeStreamAuthority = streamAuthority.dispose;
       const keepaliveTimer = setInterval(() => { if (sseAlive) try { sseWrite(': keepalive\n\n'); } catch { sseAlive = false; } }, 15000);
       const finishSse = () => {
         if (sseFinished) return;
         sseFinished = true;
         sseAlive = false;
-        unsubscribeAuthorization();
-        unsubscribeAuthorization = () => {};
+        disposeStreamAuthority();
+        disposeStreamAuthority = () => {};
         unregisterSseDelivery();
         if (fallbackTimer) {
           clearTimeout(fallbackTimer);
@@ -8675,8 +8714,8 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       };
       req.on('close', () => {
         sseAlive = false;
-        unsubscribeAuthorization();
-        unsubscribeAuthorization = () => {};
+        disposeStreamAuthority();
+        disposeStreamAuthority = () => {};
         unregisterSseDelivery();
         if (fallbackTimer) {
           clearTimeout(fallbackTimer);
@@ -8703,11 +8742,10 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         if (!gotRealStatus && sseAlive) try { sseWrite(`data: ${JSON.stringify({ type: 'status', content: `${provider.displayName} is thinking…` })}\n\n`); } catch { sseAlive = false; }
       }, 2000);
 
-      const routeRunId = randomUUID();
-      unsubscribeAuthorization = subscribeToAuthorizationChanges(req.user!.userId, () => {
+      handleStreamAuthorityRevocation = () => {
         void provider.abortActiveRun?.(sessionId, routeRunId).catch(() => false);
         finishSse();
-      });
+      };
       const streamStartedAtMs = Date.now();
       const requestedStreamModel = normalizeGatewayModelId(
         typeof requestedModel === 'string' ? requestedModel : '',
@@ -8822,7 +8860,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
             return;
           }
           sawTerminalEvent = true;
-        });
+        }, { role: 'route-terminal' });
         const deniedApprovalIds = new Set<string>();
         streamUnsub = streamEventBus.subscribe(sessionId, (evt: StreamEvent) => {
           if (!runMatcher.matches(evt)) return;
@@ -8874,7 +8912,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
             sawTerminalEvent = true;
             finishSse();
           }
-        });
+        }, { role: 'browser-sse' });
 
         try {
           const result = await sendHostOperatorProviderMessage({
@@ -9156,7 +9194,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         if (event.type === 'done' || event.type === 'error') {
           sawNonStreamingTerminal = true;
         }
-      });
+      }, { role: 'route-terminal' });
     }
     try {
       const result = await sendHostOperatorProviderMessage({
@@ -9523,16 +9561,19 @@ router.post('/answer-user-input', authenticateToken, requireApproved, async (req
 });
 
 router.post('/session-steer', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
-  const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
   const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  const expectedRunId = typeof req.body?.expectedRunId === 'string'
+    ? req.body.expectedRunId.trim()
+    : '';
   const requestId = typeof req.body?.requestId === 'string' ? req.body.requestId.trim() : undefined;
-  if (!message) {
-    res.status(400).json({ error: 'message required' });
+  if (!message || !expectedRunId) {
+    res.status(400).json({ error: 'message and expectedRunId are required' });
     return;
   }
   try {
+    const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
     await assertGatewaySessionAccess(sessionKey, req.user!);
-    const result = await steerSessionMessage(sessionKey, message, requestId);
+    const result = await steerSessionMessage(sessionKey, expectedRunId, message, requestId);
     res.json({ ok: true, sessionKey, ...result });
   } catch (error) {
     pendingUserInputRouteError(res, error);
@@ -9583,6 +9624,32 @@ router.post('/exec-approval/resolve', authenticateToken, requireAdmin, async (re
 
 // GET /api/gateway/approvals/stream — SSE for exec approval events (kept as fallback)
 router.get('/approvals/stream', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  let handleApprovalAuthorityRevocation = () => {};
+  const streamAuthority = await establishLongLivedAccessAuthorization({
+    payload: req.user!,
+    authorize: (identity) => canUseInteractivePortal(
+      identity.role,
+      identity.accountStatus,
+      true,
+    ) && isElevatedRole(identity.role),
+    onRevoke: () => handleApprovalAuthorityRevocation(),
+  });
+  if (!streamAuthority.ok) {
+    const status = streamAuthority.reason === 'session_revoked'
+      ? 401
+      : streamAuthority.reason === 'workspace_fenced'
+        || streamAuthority.reason === 'authorization_changed'
+        ? 409
+        : 403;
+    res.status(status).json({ error: status === 401
+      ? 'This sign-in session is no longer active.'
+      : status === 409
+        ? 'Authorization changed before the approval stream could start.'
+        : 'Account is not permitted for approval access.' });
+    return;
+  }
+  req.user = streamAuthority.identity;
+
   res.socket?.setNoDelay?.(true);
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'private, no-store, no-transform, max-age=0');
@@ -9594,7 +9661,7 @@ router.get('/approvals/stream', authenticateToken, requireAdmin, async (req: Req
   let alive = true;
   let cleaned = false;
   let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
-  let unsubscribeAuthorization = () => {};
+  let disposeStreamAuthority = streamAuthority.dispose;
   let unsubReq = () => {};
   let unsubRes = () => {};
   let unsubNativeReq = () => {};
@@ -9603,8 +9670,8 @@ router.get('/approvals/stream', authenticateToken, requireAdmin, async (req: Req
     if (cleaned) return;
     cleaned = true;
     alive = false;
-    unsubscribeAuthorization();
-    unsubscribeAuthorization = () => {};
+    disposeStreamAuthority();
+    disposeStreamAuthority = () => {};
     if (keepaliveTimer) {
       clearInterval(keepaliveTimer);
       keepaliveTimer = undefined;
@@ -9622,6 +9689,8 @@ router.get('/approvals/stream', authenticateToken, requireAdmin, async (req: Req
     cleanup();
     if (!res.destroyed) res.destroy();
   };
+  handleApprovalAuthorityRevocation = terminateStream;
+  req.on('close', cleanup);
   const sseWrite = (data: string): boolean => {
     if (!alive) return false;
     try {
@@ -9638,10 +9707,15 @@ router.get('/approvals/stream', authenticateToken, requireAdmin, async (req: Req
   }
   // Replay any in-flight approval requests so a reconnecting / late SSE client still
   // renders the popup. The frontend upserts by id, so re-delivery is idempotent.
-  for (const approval of await pendingApprovalsForUser(req.user!)) {
-    if (!sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval })}\n\n`)) {
-      return;
+  try {
+    for (const approval of await pendingApprovalsForUser(req.user!)) {
+      if (!sseWrite(`data: ${JSON.stringify({ type: 'exec_approval_requested', approval })}\n\n`)) {
+        return;
+      }
     }
+  } catch {
+    terminateStream();
+    return;
   }
   keepaliveTimer = setInterval(() => {
     sseWrite(': keepalive\n\n');
@@ -9684,10 +9758,6 @@ router.get('/approvals/stream', authenticateToken, requireAdmin, async (req: Req
   unsubRes = onApprovalResolved(deliverApprovalResolved);
   unsubNativeReq = onNativeCliApprovalRequest(deliverApprovalRequest);
   unsubNativeRes = onNativeCliApprovalResolved(deliverApprovalResolved);
-  unsubscribeAuthorization = subscribeToAuthorizationChanges(req.user!.userId, () => {
-    terminateStream();
-  });
-  req.on('close', cleanup);
 });
 
 
@@ -9781,6 +9851,7 @@ function wsSend(ws: WebSocket, data: any) {
 
 interface GatewayWebSocketAuthorizationBinding {
   revoked: boolean;
+  dispose?: () => void;
 }
 
 async function assertGatewayActorIsCurrent(user: JwtPayload): Promise<void> {
@@ -9882,6 +9953,7 @@ function attachBrowserWsToSessionStream(params: {
   keepSubscriptionAfterDone?: boolean;
   acceptEvent?: (evt: StreamEvent) => boolean;
   onEvent?: (evt: StreamEvent) => void;
+  onCleanup?: () => void;
   shouldForwardEvent?: (evt: StreamEvent) => boolean;
 }): boolean {
   const {
@@ -9893,6 +9965,7 @@ function attachBrowserWsToSessionStream(params: {
     keepSubscriptionAfterDone = true,
     acceptEvent,
     onEvent,
+    onCleanup,
     shouldForwardEvent,
   } = params;
 
@@ -9937,7 +10010,7 @@ function attachBrowserWsToSessionStream(params: {
     if (evt.type === 'done' && !keepSubscriptionAfterDone) {
       queueMicrotask(() => runWsStreamCleanup(ws, sessionKey));
     }
-  });
+  }, { role: 'browser-ws' });
 
   const onClose = () => runWsStreamCleanup(ws, sessionKey);
   const cleanup = () => {
@@ -9945,6 +10018,7 @@ function attachBrowserWsToSessionStream(params: {
     unsubscribed = true;
     ws.removeListener('close', onClose);
     unsub();
+    onCleanup?.();
   };
 
   ws.once('close', onClose);
@@ -10036,7 +10110,7 @@ function attachSseToSessionStream(params: {
       return;
     }
     if (event.type === 'done' || event.type === 'error') finish();
-  });
+  }, { role: 'browser-sse' });
 
   const phase = status.phase || 'thinking';
   const snapshotContent = 'content' in status && typeof status.content === 'string'
@@ -10442,7 +10516,7 @@ async function handleWsSend(
           return;
         }
         if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
-      });
+      }, { role: 'route-terminal' });
       attachBrowserWsToSessionStream({
         ws,
         sessionKey: sessionId,
@@ -10484,6 +10558,12 @@ async function handleWsSend(
           // Hard error — clean up fully
           if (streamKeepalive) { clearInterval(streamKeepalive); streamKeepalive = null; }
         }
+        },
+        onCleanup: () => {
+          if (streamKeepalive) {
+            clearInterval(streamKeepalive);
+            streamKeepalive = null;
+          }
         },
         shouldForwardEvent: (evt: StreamEvent) => {
           const runtimeEvt = evt as any;
@@ -11958,74 +12038,21 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
 
     const authorizationBinding: GatewayWebSocketAuthorizationBinding = { revoked: false };
     (req as any).__portalAuthorizationBinding = authorizationBinding;
-    let unsubscribed = false;
-    let globalSubscriptionReady = false;
-    const revokeForGlobalFence = () => {
-      authorizationBinding.revoked = true;
-      if (globalSubscriptionReady) socket.destroy();
-    };
-    let unsubscribeGlobalFence = subscribeToGlobalWorkspaceAuthorizationFence(
-      revokeForGlobalFence,
-    );
-    globalSubscriptionReady = true;
-    if (authorizationBinding.revoked) {
-      unsubscribeGlobalFence();
-      socket.write('HTTP/1.1 409 Conflict\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-    const unsubscribeAuthorization = subscribeToAuthorizationChanges(user.userId, () => {
-      authorizationBinding.revoked = true;
-      socket.destroy();
-    });
-    const cleanupAuthorization = () => {
-      if (unsubscribed) return;
-      unsubscribed = true;
-      socket.removeListener('close', cleanupAuthorization);
-      unsubscribeGlobalFence();
-      unsubscribeGlobalFence = () => {};
-      unsubscribeAuthorization();
-    };
-    socket.once('close', cleanupAuthorization);
+    completeAuthorizedWebSocketUpgrade({
+      socket,
+      authorize: (onRevoke) => authorizeGatewayWebSocketTransport(
+        user,
+        isDirectProxy,
+        (reason) => {
+          authorizationBinding.revoked = true;
+          onRevoke(reason);
+        },
+      ),
+      onAuthorized: (result) => {
+        authorizationBinding.dispose = result.dispose;
+        (req as any).__portalUser = result.identity;
 
-    prisma.user.findUnique({
-      where: { id: user.userId },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        accountStatus: true,
-        isActive: true,
-        sandboxEnabled: true,
-        authorizationVersion: true,
-      },
-    } as any).then((dbUser) => {
-      const canUseRequestedTransport = dbUser && (
-        isDirectProxy
-          ? canUseDirectGateway(dbUser.role, (dbUser as any).accountStatus, dbUser.isActive)
-          : canUseInteractivePortal(dbUser.role, (dbUser as any).accountStatus, dbUser.isActive)
-      );
-      if (authorizationBinding.revoked
-        || socket.destroyed
-        || !canUseRequestedTransport
-        || (user.authorizationVersion ?? 1) !== Number((dbUser as any).authorizationVersion ?? 1)) {
-        cleanupAuthorization();
-        if (!socket.destroyed) socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-
-      (req as any).__portalUser = {
-        userId: dbUser.id,
-        email: dbUser.email,
-        role: dbUser.role,
-        accountStatus: (dbUser as any).accountStatus,
-        sandboxEnabled: !!(dbUser as any).sandboxEnabled,
-        authorizationVersion: Number((dbUser as any).authorizationVersion ?? 1),
-      };
-
-      // Route to the appropriate WebSocket server
-      try {
+        // Route to the appropriate WebSocket server.
         if (isDirectProxy) {
           directWss!.handleUpgrade(req, socket, head, (ws: any) => {
             directWss!.emit('connection', ws, req);
@@ -12035,14 +12062,7 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
             portalWss!.emit('connection', ws, req);
           });
         }
-      } catch {
-        cleanupAuthorization();
-        socket.destroy();
-      }
-    }).catch(() => {
-      cleanupAuthorization();
-      if (!socket.destroyed) socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-      socket.destroy();
+      },
     });
   });
 

@@ -1,4 +1,10 @@
-export type UpdateBackupState = 'fresh' | 'stale' | 'missing' | 'running' | 'unavailable';
+export type UpdateBackupState =
+  | 'candidate'
+  | 'fresh'
+  | 'stale'
+  | 'missing'
+  | 'running'
+  | 'unavailable';
 
 export type UpdateBackupReadiness = {
   state: UpdateBackupState;
@@ -14,12 +20,12 @@ export type PortalUpdatePreparation = {
 };
 
 type BackupRunStatus = {
-  status?: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  status?: 'idle' | 'queued' | 'running' | 'completed' | 'degraded' | 'failed';
   error?: string;
 };
 
 type FreshBackupApi = {
-  startDailyBackup: () => Promise<{ status?: string }>;
+  startComprehensiveBackup: () => Promise<{ status?: string }>;
   getBackupStatus: () => Promise<BackupRunStatus>;
   getBackupReadiness: () => Promise<UpdateBackupReadiness | null>;
 };
@@ -52,7 +58,7 @@ function isActiveBackupConflict(error: unknown): boolean {
 }
 
 function freshBackupWasCreatedSince(readiness: UpdateBackupReadiness | null, requestedAt: number): boolean {
-  if (readiness?.state !== 'fresh' || !readiness.newestCreatedAt) return false;
+  if (!['candidate', 'fresh'].includes(readiness?.state || '') || !readiness?.newestCreatedAt) return false;
   const createdAt = Date.parse(readiness.newestCreatedAt);
   return Number.isFinite(createdAt) && createdAt >= requestedAt - 60_000;
 }
@@ -69,9 +75,9 @@ export async function createFreshBackupForUpdate(
   const maxAttempts = options.maxAttempts ?? 450;
   const requestedAt = now();
 
-  options.onProgress?.('Starting a fresh Portal backup…');
+  options.onProgress?.('Starting a comprehensive recovery backup…');
   try {
-    const started = await api.startDailyBackup();
+    const started = await api.startComprehensiveBackup();
     if (started.status === 'failed') throw new Error('The backup service failed during startup.');
   } catch (error) {
     if (!isActiveBackupConflict(error)) throw error;
@@ -80,22 +86,37 @@ export async function createFreshBackupForUpdate(
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     await delay(pollIntervalMs);
-    const run = await api.getBackupStatus();
-    if (run.status === 'failed') {
+    let run: BackupRunStatus;
+    try {
+      run = await api.getBackupStatus();
+    } catch {
+      // Comprehensive backups intentionally stop the Portal while the recovery
+      // fence is held. Treat a bounded connection loss as expected downtime,
+      // then require the authenticated readiness endpoint after it returns.
+      options.onProgress?.('Portal is paused while the recovery backup is captured…');
+      continue;
+    }
+    if (run.status === 'degraded' || run.status === 'failed') {
       throw new Error(run.error || 'The fresh backup failed. The update was not started.');
     }
 
-    if (run.status === 'queued') options.onProgress?.('Fresh backup queued…');
-    if (run.status === 'running') options.onProgress?.('Creating and verifying the fresh backup…');
+    if (run.status === 'queued') options.onProgress?.('Comprehensive backup queued…');
+    if (run.status === 'running') options.onProgress?.('Creating and verifying the comprehensive recovery backup…');
 
     if (run.status === 'completed') {
-      const readiness = await api.getBackupReadiness();
+      let readiness: UpdateBackupReadiness | null;
+      try {
+        readiness = await api.getBackupReadiness();
+      } catch {
+        options.onProgress?.('Backup finished. Waiting for Portal readiness verification…');
+        continue;
+      }
       if (freshBackupWasCreatedSince(readiness, requestedAt)) return readiness!;
       options.onProgress?.('Backup finished. Confirming the new archive…');
     }
   }
 
-  throw new Error('The backup did not finish within 15 minutes. The update was not started.');
+  throw new Error('The comprehensive backup did not finish within 15 minutes. The update was not started.');
 }
 
 function portalHealthVersion(value: unknown): string | null {
@@ -151,7 +172,7 @@ export function describeUpdateBackup(readiness: UpdateBackupReadiness | null | u
     return {
       tone: 'warning',
       label: 'Backup status unavailable',
-      detail: 'Portal could not confirm the latest backup. Create a fresh backup before updating.',
+      detail: 'Portal could not identify an authenticated comprehensive backup candidate. Create one before updating.',
     };
   }
   if (readiness.state === 'running') {
@@ -165,19 +186,26 @@ export function describeUpdateBackup(readiness: UpdateBackupReadiness | null | u
     return {
       tone: 'warning',
       label: 'No backup found',
-      detail: 'Create a fresh Portal backup before installing the update.',
+      detail: 'Create a comprehensive recovery backup before installing the update.',
     };
   }
   if (readiness.state === 'stale') {
     return {
       tone: 'warning',
       label: 'Backup is stale',
-      detail: `The latest Portal backup is ${formatAge(readiness.ageHours)}. The update safety window is ${readiness.maxAgeHours} hours.`,
+      detail: `The newest authenticated comprehensive backup candidate is ${formatAge(readiness.ageHours)}. The update safety window is ${readiness.maxAgeHours} hours.`,
+    };
+  }
+  if (readiness.state === 'candidate') {
+    return {
+      tone: 'info',
+      label: 'Backup candidate found',
+      detail: `The newest authenticated comprehensive backup candidate is ${formatAge(readiness.ageHours)}. Strict restore verification will run before the update is admitted.`,
     };
   }
   return {
     tone: 'good',
-    label: 'Recent backup ready',
-    detail: `The latest Portal backup is ${formatAge(readiness.ageHours)} and within the ${readiness.maxAgeHours}-hour safety window.`,
+    label: 'Recovery backup strictly verified',
+    detail: `Strict restore verification succeeded for the comprehensive backup ${formatAge(readiness.ageHours)}.`,
   };
 }

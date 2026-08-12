@@ -344,6 +344,24 @@ describe('agentJobs lifecycle safety', () => {
     expect(jobRecords.get(job.id)).toEqual(expect.objectContaining({ status: 'killed' }));
   });
 
+  it('quiesces the global live-job inventory before dependency promotion', async () => {
+    const { job, child } = await startMockJob();
+    findManyMock.mockResolvedValueOnce([jobRecords.get(job.id)]);
+    const quiescence = agentJobs.quiesceAgentJobsForProjectDependencyPromotion();
+    const result = await completeTermination(quiescence);
+
+    expect(result).toEqual({
+      jobCount: 1,
+      liveRuntimeCount: 1,
+      persistedRuntimeSignalCount: 0,
+    });
+    expect(findManyMock.mock.calls.at(-1)?.[0]?.where).toEqual({ status: 'running' });
+    expect(scopeStopMock).toHaveBeenCalledWith(
+      expect.objectContaining({ invocationId: child.pid.toString(16).padStart(32, '0') }),
+    );
+    expect(jobRecords.get(job.id)).toEqual(expect.objectContaining({ status: 'killed' }));
+  });
+
   it('returns only the requested bounded tail of a retained transcript', async () => {
     const { job } = await startMockJob();
     const transcriptPath = job.transcriptPath as string;

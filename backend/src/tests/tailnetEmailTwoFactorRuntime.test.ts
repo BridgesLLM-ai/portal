@@ -445,7 +445,7 @@ describe('private-origin Email Code 2FA runtime contract', () => {
       expect(generateRefreshToken).not.toHaveBeenCalled();
     });
 
-    test('preserves invalid-token cookie clearing without opening admission', async () => {
+    test('rejects an invalid token without opening admission or deleting newer cookies', async () => {
       verifyRefreshToken.mockReturnValue(null);
 
       const response = await request(server, '/auth/refresh', {
@@ -454,10 +454,7 @@ describe('private-origin Email Code 2FA runtime contract', () => {
 
       expect(response.status).toBe(401);
       expect(transaction).not.toHaveBeenCalled();
-      expect(response.headers['set-cookie']).toEqual(expect.arrayContaining([
-        expect.stringMatching(/^accessToken=;/),
-        expect.stringMatching(/^refreshToken=;/),
-      ]));
+      expect(response.headers['set-cookie']).toBeUndefined();
       expect(generateAccessToken).not.toHaveBeenCalled();
       expect(generateRefreshToken).not.toHaveBeenCalled();
     });
@@ -494,9 +491,13 @@ describe('private-origin Email Code 2FA runtime contract', () => {
           expiresAt: { gt: expect.any(Date) },
         }),
       }));
-      expect(generateRefreshToken).toHaveBeenCalledWith({ userId: 'user-1' });
+      expect(generateRefreshToken).toHaveBeenCalledWith({
+        userId: 'user-1',
+        sessionId: 'session-1',
+      });
       expect(generateAccessToken).toHaveBeenCalledWith(expect.objectContaining({
         userId: 'user-1',
+        sessionId: 'session-1',
         role: 'SUB_ADMIN',
         accountStatus: 'ACTIVE',
         authorizationVersion: 8,
@@ -507,7 +508,7 @@ describe('private-origin Email Code 2FA runtime contract', () => {
       ]));
     });
 
-    test('commits expired-session deletion before preserving the existing cookie-clear response', async () => {
+    test('commits expired-session deletion without deleting newer browser cookies', async () => {
       verifyRefreshToken.mockReturnValue({ userId: 'user-1' });
       sessionFindUnique.mockResolvedValue({
         id: 'session-expired',
@@ -528,15 +529,12 @@ describe('private-origin Email Code 2FA runtime contract', () => {
           refreshTokenHash: expect.any(String),
         },
       });
-      expect(response.headers['set-cookie']).toEqual(expect.arrayContaining([
-        expect.stringMatching(/^accessToken=;/),
-        expect.stringMatching(/^refreshToken=;/),
-      ]));
+      expect(response.headers['set-cookie']).toBeUndefined();
       expect(generateAccessToken).not.toHaveBeenCalled();
       expect(generateRefreshToken).not.toHaveBeenCalled();
     });
 
-    test('commits blocked-session deletion before preserving the existing forbidden response', async () => {
+    test('commits blocked-session deletion without deleting newer browser cookies', async () => {
       verifyRefreshToken.mockReturnValue({ userId: 'user-1' });
       sessionFindUnique.mockResolvedValue({
         id: 'session-blocked',
@@ -561,15 +559,12 @@ describe('private-origin Email Code 2FA runtime contract', () => {
           refreshTokenHash: expect.any(String),
         },
       });
-      expect(response.headers['set-cookie']).toEqual(expect.arrayContaining([
-        expect.stringMatching(/^accessToken=;/),
-        expect.stringMatching(/^refreshToken=;/),
-      ]));
+      expect(response.headers['set-cookie']).toBeUndefined();
       expect(generateAccessToken).not.toHaveBeenCalled();
       expect(generateRefreshToken).not.toHaveBeenCalled();
     });
 
-    test('commits the admitted replay-race outcome before clearing the stale cookie', async () => {
+    test('rejects an admitted replay race without erasing a concurrent winner cookie', async () => {
       verifyRefreshToken.mockReturnValue({ userId: 'user-1' });
       sessionFindUnique.mockResolvedValue({
         id: 'session-raced',
@@ -583,11 +578,12 @@ describe('private-origin Email Code 2FA runtime contract', () => {
         refreshToken: existingRefreshToken,
       });
 
-      expect(response.status).toBe(401);
-      expect(response.headers['set-cookie']).toEqual(expect.arrayContaining([
-        expect.stringMatching(/^accessToken=;/),
-        expect.stringMatching(/^refreshToken=;/),
-      ]));
+      expect(response.status).toBe(409);
+      expect(response.body).toEqual(expect.objectContaining({
+        code: 'AUTH_REFRESH_ROTATION_CONFLICT',
+        retryable: true,
+      }));
+      expect(response.headers['set-cookie']).toBeUndefined();
       expect(generateRefreshToken).not.toHaveBeenCalled();
       expect(generateAccessToken).not.toHaveBeenCalled();
     });

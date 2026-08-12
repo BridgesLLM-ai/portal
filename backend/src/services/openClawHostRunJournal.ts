@@ -400,6 +400,7 @@ export function createOpenClawHostRunJournal(
     });
     if (updated.count === 1) return;
     const row = await readExact(handle);
+    if (row.status === 'QUIESCED') return;
     if (
       row.upstreamRunId === upstreamRunId
       && ['DISPATCHED', 'VISIBLE_DONE', 'QUARANTINED'].includes(row.status)
@@ -443,6 +444,7 @@ export function createOpenClawHostRunJournal(
     });
     if (updated.count === 1) return;
     const row = await readExact(handle);
+    if (row.status === 'QUIESCED') return;
     if (row.status === 'VISIBLE_DONE' && row.terminalReason === outcome) return;
     throw new OpenClawHostRunJournalError(
       'OpenClaw visible settlement could not be committed',
@@ -480,6 +482,7 @@ export function createOpenClawHostRunJournal(
     });
     if (updated.count === 1) return;
     const row = await readExact(handle);
+    if (row.status === 'QUIESCED') return;
     if (row.status === 'QUARANTINED') return;
     throw new OpenClawHostRunJournalError(
       'OpenClaw host run could not be quarantined',
@@ -555,8 +558,10 @@ export function createOpenClawHostRunJournal(
     });
   };
 
-  const quiesceForAuthorizationTransition = async (
+  const quiesce = async (
     rawActorUserIds: readonly string[],
+    reason: 'authorization_transition' | 'project_dependency_promotion' =
+      'authorization_transition',
   ): Promise<OpenClawHostRunQuiescence> => {
     const actorUserIds = canonicalActorIds(rawActorUserIds);
     const [rows, ownedSessions] = await Promise.all([
@@ -700,7 +705,7 @@ export function createOpenClawHostRunJournal(
             data: {
               status: 'QUIESCED',
               quiescedAt: dependencies.now(),
-              terminalReason: 'authorization_transition_session_reset',
+              terminalReason: `${reason}_session_reset`,
               evidence: committedProof,
             },
           });
@@ -726,7 +731,9 @@ export function createOpenClawHostRunJournal(
     });
     if (remaining !== 0) {
       throw new OpenClawHostRunJournalError(
-        'OpenClaw host runs remain after authorization quiescence',
+        reason === 'authorization_transition'
+          ? 'OpenClaw host runs remain after authorization quiescence'
+          : 'OpenClaw host runs remain before dependency promotion',
         503,
         'OPENCLAW_HOST_RUN_QUIESCENCE_UNPROVEN',
       );
@@ -739,6 +746,12 @@ export function createOpenClawHostRunJournal(
       sessions: Object.freeze(proofs) as OpenClawSessionResetProof[],
     });
   };
+
+  const quiesceForAuthorizationTransition = (
+    actorUserIds: readonly string[],
+  ): Promise<OpenClawHostRunQuiescence> => (
+    quiesce(actorUserIds, 'authorization_transition')
+  );
 
   const initialize = async (): Promise<{ unresolved: number }> => {
     const rows = await dependencies.database.openClawHostRun.findMany({
@@ -821,12 +834,34 @@ export function createOpenClawHostRunJournal(
     return { unresolved: rows.length };
   };
 
+  const quiesceForProjectDependencyPromotion = async (
+  ): Promise<OpenClawHostRunQuiescence> => {
+    const rows = await dependencies.database.openClawHostRun.findMany({
+      where: { status: { in: [...UNRESOLVED_STATUSES] } },
+      select: { actorUserId: true },
+    }) as Array<{ actorUserId: string }>;
+    const actorUserIds = [...new Set(rows.map((row) => (
+      exactIdentifier(row.actorUserId, 'actor identity', 255)
+    )))].sort();
+    if (actorUserIds.length === 0) {
+      return Object.freeze({
+        schemaVersion: 1,
+        actorUserIds: [],
+        rowCount: 0,
+        sessionCount: 0,
+        sessions: [] as OpenClawSessionResetProof[],
+      });
+    }
+    return quiesce(actorUserIds, 'project_dependency_promotion');
+  };
+
   return Object.freeze({
     begin,
     markDispatchAccepted,
     markVisibleSettled,
     quarantine,
     quiesceForAuthorizationTransition,
+    quiesceForProjectDependencyPromotion,
     initialize,
   });
 }
@@ -841,6 +876,8 @@ export const markOpenClawHostRunVisibleSettled =
 export const quarantineOpenClawHostRun = openClawHostRunJournal.quarantine;
 export const quiesceOpenClawHostRunsForAuthorizationTransition =
   openClawHostRunJournal.quiesceForAuthorizationTransition;
+export const quiesceOpenClawHostRunsForProjectDependencyPromotion =
+  openClawHostRunJournal.quiesceForProjectDependencyPromotion;
 export const initializeOpenClawHostRunJournal = openClawHostRunJournal.initialize;
 
 export const __openClawHostRunJournalTest = {

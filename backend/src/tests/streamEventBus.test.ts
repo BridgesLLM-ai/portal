@@ -1,6 +1,67 @@
 import { StreamEventBus } from '../services/StreamEventBus';
 
 describe('StreamEventBus', () => {
+  test('treats multiple browser tabs as fan-out while preserving exact role counts', () => {
+    const bus = new StreamEventBus();
+    const sessionKey = 'agent:main:two-browser-tabs';
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const unsubscribeProvider = bus.subscribe(sessionKey, () => undefined, { role: 'provider-waiter' });
+    const unsubscribeTerminal = bus.subscribe(sessionKey, () => undefined, { role: 'route-terminal' });
+    const unsubscribeFirstTab = bus.subscribe(sessionKey, () => undefined, { role: 'browser-ws' });
+    const unsubscribeSecondTab = bus.subscribe(sessionKey, () => undefined, { role: 'browser-ws' });
+
+    try {
+      expect(bus.getSubscriberDiagnostics(sessionKey)).toEqual({
+        total: 4,
+        roles: {
+          'provider-waiter': 1,
+          'route-terminal': 1,
+          'browser-ws': 2,
+          'browser-sse': 0,
+          internal: 0,
+          unspecified: 0,
+        },
+      });
+
+      bus.startStream(sessionKey, 'run-fanout');
+      bus.publish(sessionKey, { type: 'text', content: 'visible in both tabs', runId: 'run-fanout' });
+      expect(warn).not.toHaveBeenCalled();
+
+      unsubscribeFirstTab();
+      expect(bus.getSubscriberDiagnostics(sessionKey)).toMatchObject({
+        total: 3,
+        roles: { 'browser-ws': 1 },
+      });
+    } finally {
+      unsubscribeProvider();
+      unsubscribeTerminal();
+      unsubscribeFirstTab();
+      unsubscribeSecondTab();
+      warn.mockRestore();
+    }
+    expect(bus.getSubscriberDiagnostics(sessionKey).total).toBe(0);
+  });
+
+  test('warns on duplicated internal turn ownership instead of raw browser count', () => {
+    const bus = new StreamEventBus();
+    const sessionKey = 'agent:main:duplicated-provider-owner';
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const unsubscribeFirst = bus.subscribe(sessionKey, () => undefined, { role: 'provider-waiter' });
+    const unsubscribeSecond = bus.subscribe(sessionKey, () => undefined, { role: 'provider-waiter' });
+
+    try {
+      bus.startStream(sessionKey, 'run-duplicate');
+      bus.publish(sessionKey, { type: 'text', content: 'one turn', runId: 'run-duplicate' });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain('subscriber accumulation');
+      expect(warn.mock.calls[0][0]).toContain('provider-waiter=2');
+    } finally {
+      unsubscribeFirst();
+      unsubscribeSecond();
+      warn.mockRestore();
+    }
+  });
+
   test('notifies global reconnect listeners even while an internal session observer exists', () => {
     const bus = new StreamEventBus();
     const sessionKey = 'native:reconnect-during-internal-observer';

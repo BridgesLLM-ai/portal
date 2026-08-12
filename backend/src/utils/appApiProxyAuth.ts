@@ -1,5 +1,5 @@
 const APP_API_SECRET_PREFIX = 'APP_API_SECRET_';
-const APP_API_TARGET_PREFIX = 'APP_API_TARGET_';
+export const APP_API_TARGET_PREFIX = 'APP_API_TARGET_';
 
 export type ConfiguredAppApiTargetBinding =
   | Readonly<{ status: 'absent' }>
@@ -30,6 +30,18 @@ export function invalidAppApiTargetResponse() {
  */
 export function appApiBindingKey(appId: string): string {
   return String(appId || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '_');
+}
+
+/**
+ * Exact environment key selected by the current App proxy contract.
+ *
+ * Keep diagnostics and runtime lookup on this one constructor. In particular,
+ * an App name, deployment path, or API path must never substitute for the
+ * immutable App id here.
+ */
+export function appApiTargetEnvironmentKey(appId: string): string | undefined {
+  const normalized = appApiBindingKey(appId);
+  return normalized ? `${APP_API_TARGET_PREFIX}${normalized}` : undefined;
 }
 
 /**
@@ -88,10 +100,8 @@ export function configuredAppApiTargetBinding(
   appId: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): ConfiguredAppApiTargetBinding {
-  const normalized = appApiBindingKey(appId);
-  if (!normalized) return { status: 'absent' };
-
-  const key = `${APP_API_TARGET_PREFIX}${normalized}`;
+  const key = appApiTargetEnvironmentKey(appId);
+  if (!key) return { status: 'absent' };
   const configuredValue = environment[key];
   if (configuredValue === undefined) return { status: 'absent' };
   const raw = String(configuredValue).trim();

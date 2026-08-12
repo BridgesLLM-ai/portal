@@ -28,6 +28,10 @@ const shareEmailHandler = sourceBetween('const sendShareEmail = async (linkId: s
 const deleteShareHandler = sourceBetween('const deleteSharePermanently = async () => {', 'const makeSharePublic');
 const makePublicHandler = sourceBetween('const makeSharePublic = async () => {', 'const copyToClipboard');
 const shareConfirmationDialogs = sourceBetween('{/* Confirm Delete Share Link */}', '{/* Project Chat Panel */}');
+const dependencyRepairReconciliation = sourceBetween(
+  'const reconcileDependencyRepair = useCallback',
+  'const openDependencyRepair = useCallback',
+);
 
 describe('AppsPage action dialog ownership', () => {
   it('routes all three centered action dialogs through the body-owned modal foundation', () => {
@@ -175,6 +179,18 @@ describe('AppsPage action dialog ownership', () => {
     );
     expect(autosaveBarrier).toBeGreaterThan(-1);
     expect(postBarrierShareCheck).toBeGreaterThan(autosaveBarrier);
+  });
+
+  it('keeps long dependency-repair verification below the status rate limit', () => {
+    expect(appsSource).toContain('const DEPENDENCY_REPAIR_RECONCILIATION_ATTEMPTS = 180;');
+    expect(appsSource).toContain('return attempt < 5 ? 2_000 : 20_000;');
+    expect(dependencyRepairReconciliation).toContain(
+      'attempt < DEPENDENCY_REPAIR_RECONCILIATION_ATTEMPTS',
+    );
+    expect(dependencyRepairReconciliation).toContain(
+      'dependencyRepairReconciliationDelayMs(attempt)',
+    );
+    expect(dependencyRepairReconciliation).not.toContain('window.setTimeout(resolve, 2_000)');
   });
 
 });

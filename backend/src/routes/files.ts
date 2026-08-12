@@ -23,6 +23,7 @@ import {
   ensureProjectRuntimeOwnedDirectory,
   ProjectRuntimeOwnershipError,
 } from '../services/projectRuntimeOwnership';
+import { withProjectDeletionLock } from '../services/projectDeletionLock';
 import { generateBoundedThumbnail, ThumbnailError } from '../services/fileThumbnail';
 import { issueFileCapabilityToken, verifyFileCapabilityToken } from '../services/fileCapabilityToken';
 import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
@@ -924,7 +925,6 @@ router.patch('/:id/rename', authenticateToken, requireApproved, async (req: Requ
 
 // POST /:id/copy-to-project - Copy file to a project
 router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (req: Request, res: Response) => {
-  let copiedProjectDestination: string | null = null;
   try {
     const ownerId = await getScopedOwnerId(req);
     const { id } = req.params;
@@ -966,78 +966,100 @@ router.post('/:id/copy-to-project', authenticateToken, requireApproved, async (r
       return;
     }
 
-    let projectDir: string;
-    try {
-      projectDir = getContainedProjectPath(ownerId, projectName);
-    } catch {
-      res.status(403).json({ error: 'Path traversal detected' });
-      return;
-    }
-
-    // Verify project exists and user owns it
-    if (!fs.existsSync(projectDir)) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
-
-    // Determine destination path in project
-    const fileName = path.basename(file.originalName || file.path);
-    let destPath: string;
-    try {
-      destPath = getContainedProjectDestination(projectDir, destinationPath, fileName);
-    } catch {
-      res.status(403).json({ error: 'Path traversal detected' });
-      return;
-    }
-
-    // Ensure destination directory exists
-    const destDir = path.dirname(destPath);
-    const relativeDestDir = path.relative(projectDir, destDir).split(path.sep).join('/');
-    if (relativeDestDir) ensureProjectRuntimeOwnedDirectory(projectDir, relativeDestDir);
-
-    // Check if file already exists
-    if (fs.existsSync(destPath)) {
-      res.status(409).json({ error: 'File already exists in project' });
-      return;
-    }
-
-    fs.copyFileSync(sourcePath, destPath, fs.constants.COPYFILE_EXCL);
-    copiedProjectDestination = destPath;
-    assignProjectRuntimeOwnership(projectDir, destPath, 'file');
-
-    if (moveFile) {
-      const quarantined: QuarantinedFilePath[] = [];
+    await withProjectDeletionLock({
+      workspaceOwnerId: ownerId,
+      projectName,
+    }, async () => {
+      // Resolve the live owner/name only after the same lifecycle lock used by
+      // dependency installation, Project rename, and deletion is held.
+      let projectDir: string;
       try {
-        const canonical = quarantineRegularFile(sourcePath, 'Canonical file');
-        if (canonical) quarantined.push(canonical);
-        const mirror = quarantineToolMirror(ownerId, file.path);
-        if (mirror) quarantined.push(mirror);
-      } catch (error) {
-        restoreQuarantinedFiles(quarantined);
-        try { fs.unlinkSync(destPath); } catch {}
-        throw error;
+        projectDir = getContainedProjectPath(ownerId, projectName);
+      } catch {
+        res.status(403).json({ error: 'Path traversal detected' });
+        return;
       }
-      try {
-        await prisma.file.delete({ where: { id } });
-      } catch (error) {
-        restoreQuarantinedFiles(quarantined);
-        try { fs.unlinkSync(destPath); } catch {}
-        throw error;
-      }
-      purgeQuarantinedFiles(quarantined);
-    }
 
-    res.json({ 
-      success: true, 
-      action: moveFile ? 'moved' : 'copied',
-      destination: path.relative(projectDir, destPath),
+      // Verify project exists and user owns it
+      if (!fs.existsSync(projectDir)) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+
+      // Determine destination path in project
+      const fileName = path.basename(file.originalName || file.path);
+      let destPath: string;
+      try {
+        destPath = getContainedProjectDestination(projectDir, destinationPath, fileName);
+      } catch {
+        res.status(403).json({ error: 'Path traversal detected' });
+        return;
+      }
+
+      // Ensure destination directory exists
+      const destDir = path.dirname(destPath);
+      const relativeDestDir = path.relative(projectDir, destDir).split(path.sep).join('/');
+      if (relativeDestDir) ensureProjectRuntimeOwnedDirectory(projectDir, relativeDestDir);
+
+      // Check if file already exists
+      if (fs.existsSync(destPath)) {
+        res.status(409).json({ error: 'File already exists in project' });
+        return;
+      }
+
+      let copiedProjectDestination: string | null = null;
+      try {
+        fs.copyFileSync(sourcePath, destPath, fs.constants.COPYFILE_EXCL);
+        copiedProjectDestination = destPath;
+        assignProjectRuntimeOwnership(projectDir, destPath, 'file');
+
+        if (moveFile) {
+          const quarantined: QuarantinedFilePath[] = [];
+          try {
+            const canonical = quarantineRegularFile(sourcePath, 'Canonical file');
+            if (canonical) quarantined.push(canonical);
+            const mirror = quarantineToolMirror(ownerId, file.path);
+            if (mirror) quarantined.push(mirror);
+          } catch (error) {
+            restoreQuarantinedFiles(quarantined);
+            throw error;
+          }
+          try {
+            await prisma.file.delete({ where: { id } });
+          } catch (error) {
+            restoreQuarantinedFiles(quarantined);
+            throw error;
+          }
+          purgeQuarantinedFiles(quarantined);
+        }
+
+        res.json({
+          success: true,
+          action: moveFile ? 'moved' : 'copied',
+          destination: path.relative(projectDir, destPath),
+        });
+        copiedProjectDestination = null;
+      } finally {
+        if (copiedProjectDestination) {
+          try { fs.unlinkSync(copiedProjectDestination); } catch {}
+        }
+      }
     });
-    copiedProjectDestination = null;
   } catch (error) {
-    if (copiedProjectDestination) {
-      try { fs.unlinkSync(copiedProjectDestination); } catch {}
-    }
     console.error('Copy to project error:', error);
+    if (
+      error
+      && typeof error === 'object'
+      && (error as { code?: unknown }).code === 'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED'
+      && (error as { scope?: unknown }).scope === 'project'
+    ) {
+      res.status(409).json({
+        error: error instanceof Error ? error.message : 'Project lifecycle mutation is contained',
+        code: 'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED',
+        retryable: Boolean((error as { retryable?: unknown }).retryable),
+      });
+      return;
+    }
     if (error instanceof ProjectRuntimeOwnershipError) {
       res.status(503).json({
         error: 'Project storage is temporarily unavailable. Try again.',

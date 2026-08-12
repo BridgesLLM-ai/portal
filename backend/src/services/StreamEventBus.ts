@@ -66,6 +66,22 @@ type StreamCallback = (event: StreamEvent) => void;
 
 type GlobalCallback = (sessionKey: string, event: StreamEvent) => void;
 
+const STREAM_SUBSCRIBER_ROLES = [
+  'provider-waiter',
+  'route-terminal',
+  'browser-ws',
+  'browser-sse',
+  'internal',
+  'unspecified',
+] as const;
+
+export type StreamSubscriberRole = typeof STREAM_SUBSCRIBER_ROLES[number];
+
+export type StreamSubscriberDiagnostics = Readonly<{
+  total: number;
+  roles: Readonly<Record<StreamSubscriberRole, number>>;
+}>;
+
 function getLastRunningToolCall(toolCalls?: StreamToolCall[]): StreamToolCall | null {
   if (!Array.isArray(toolCalls)) return null;
   for (let i = toolCalls.length - 1; i >= 0; i--) {
@@ -129,6 +145,12 @@ export class StreamEventBus {
   /** sessionKey → set of subscriber callbacks */
   private listeners = new Map<string, Set<StreamCallback>>();
 
+  /** Callback roles keep legitimate multi-browser fan-out distinct from leaks. */
+  private listenerRoles = new Map<string, Map<StreamCallback, StreamSubscriberRole>>();
+
+  /** sessionKey → last role-aware accumulation warning timestamp */
+  private lastSubscriberWarningAt = new Map<string, number>();
+
   /** Global listeners (receive ALL events for ANY session — used for compaction forwarding) */
   private globalListeners = new Set<GlobalCallback>();
 
@@ -167,6 +189,8 @@ export class StreamEventBus {
           this.latestText.delete(sessionKey);
           this.turnEventSeq.delete(sessionKey);
           this.recentTurnEvents.delete(sessionKey);
+          this.listenerRoles.delete(sessionKey);
+          this.lastSubscriberWarningAt.delete(sessionKey);
         }
       }
     }, 15 * 60 * 1000);
@@ -178,21 +202,54 @@ export class StreamEventBus {
    * Subscribe to stream events for a specific session.
    * Returns an unsubscribe function.
    */
-  subscribe(sessionKey: string, callback: StreamCallback): () => void {
+  subscribe(
+    sessionKey: string,
+    callback: StreamCallback,
+    options: { role?: StreamSubscriberRole } = {},
+  ): () => void {
     let subs = this.listeners.get(sessionKey);
     if (!subs) {
       subs = new Set();
       this.listeners.set(sessionKey, subs);
     }
     subs.add(callback);
+    let roles = this.listenerRoles.get(sessionKey);
+    if (!roles) {
+      roles = new Map();
+      this.listenerRoles.set(sessionKey, roles);
+    }
+    roles.set(callback, options.role || 'unspecified');
 
     return () => {
       const s = this.listeners.get(sessionKey);
       if (s) {
         s.delete(callback);
-        if (s.size === 0) this.listeners.delete(sessionKey);
+        this.listenerRoles.get(sessionKey)?.delete(callback);
+        if (s.size === 0) {
+          this.listeners.delete(sessionKey);
+          this.listenerRoles.delete(sessionKey);
+          this.lastSubscriberWarningAt.delete(sessionKey);
+        }
       }
     };
+  }
+
+  /**
+   * Return counts only—never callbacks or browser identities—for tests and
+   * bounded operational diagnostics.
+   */
+  getSubscriberDiagnostics(sessionKey: string): StreamSubscriberDiagnostics {
+    const counts = Object.fromEntries(
+      STREAM_SUBSCRIBER_ROLES.map((role) => [role, 0]),
+    ) as Record<StreamSubscriberRole, number>;
+    const roles = this.listenerRoles.get(sessionKey);
+    if (roles) {
+      for (const role of roles.values()) counts[role] += 1;
+    }
+    return Object.freeze({
+      total: this.listeners.get(sessionKey)?.size || 0,
+      roles: Object.freeze(counts),
+    });
   }
 
   /**
@@ -406,16 +463,27 @@ export class StreamEventBus {
     }
 
     const subs = this.listeners.get(sessionKey);
-    if (subs && subs.size > 3 && event.type === 'text') {
-      // Three subscribers are normal during portal streaming: the provider
-      // waiter, a route-owned terminal observer that survives browser handoff,
-      // and the current browser forwarder. Warn above that baseline.
-      const now = Date.now();
-      const lastWarnKey = `__lastDupWarn_${sessionKey}`;
-      const lastWarn = (this as any)[lastWarnKey] || 0;
-      if (now - lastWarn > 10000) {
-        (this as any)[lastWarnKey] = now;
-        console.warn(`[StreamEventBus] ⚠️ EXTRA SUBS: ${subs.size} subscribers for ${sessionKey} on text event (expected <= 3). Check registerWsStreamCleanup / reconnect lifecycle.`);
+    if (subs && event.type === 'text') {
+      const diagnostics = this.getSubscriberDiagnostics(sessionKey);
+      // One provider waiter and one route terminal observer are the normal
+      // internal ownership shape. Browser WS/SSE listeners are fan-out, not a
+      // leak: two tabs legitimately make the old subscriber-count heuristic
+      // report four. Retain a cap only for unclassified future call sites,
+      // while warning precisely on duplicated internal owners today.
+      const duplicatedInternalOwner = diagnostics.roles['provider-waiter'] > 1
+        || diagnostics.roles['route-terminal'] > 1;
+      const unclassifiedExcess = diagnostics.roles.unspecified > 3;
+      if (duplicatedInternalOwner || unclassifiedExcess) {
+        const now = Date.now();
+        const lastWarn = this.lastSubscriberWarningAt.get(sessionKey) || 0;
+        if (now - lastWarn > 10000) {
+          this.lastSubscriberWarningAt.set(sessionKey, now);
+          const roleSummary = STREAM_SUBSCRIBER_ROLES
+            .filter((role) => diagnostics.roles[role] > 0)
+            .map((role) => `${role}=${diagnostics.roles[role]}`)
+            .join(',');
+          console.warn(`[StreamEventBus] subscriber accumulation for ${sessionKey}: total=${diagnostics.total} roles=${roleSummary}. Check route ownership and reconnect cleanup.`);
+        }
       }
     }
     const toolNormalizedEvent = resolvedToolCallId && !normalizedToolCallId(event)

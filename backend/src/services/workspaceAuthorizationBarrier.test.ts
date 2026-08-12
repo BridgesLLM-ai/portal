@@ -4,6 +4,7 @@ import {
   acquireWorkspaceAuthorizationMutationLease,
   admitWorkspaceAuthorizationRequest,
   closeGlobalWorkspaceAuthorizationAdmission,
+  closeGlobalWorkspaceAuthorizationAdmissionExcludingRequest,
   closeWorkspaceAuthorizationAdmission,
   settleWorkspaceAuthorizationRequest,
   settleWorkspaceAuthorizationRequestIfResponseEnded,
@@ -276,6 +277,50 @@ describe('workspace authorization barrier', () => {
     await fenced;
   });
 
+  test('keeps exact Owner dependency-repair discovery and controls reachable under the global fence', () => {
+    const fence = closeGlobalWorkspaceAuthorizationAdmission();
+    try {
+      for (const [method, pathname] of [
+        ['GET', '/api/projects/dependency-repair/active'],
+        ['GET', '/api/projects/dependency-repair/active/'],
+        ['GET', '/API/PROJECTS/DEPENDENCY-REPAIR/ACTIVE'],
+        ['GET', '/api/projects/Example/dependency-repair/status'],
+        ['GET', '/api/projects/Example/dependency-repair/status/'],
+        ['GET', '/API/PROJECTS/Example/DEPENDENCY-REPAIR/STATUS'],
+        ['POST', '/api/projects/Example/dependency-repair/force-forward'],
+        ['POST', '/api/projects/Example/dependency-repair/force-forward/'],
+        ['POST', '/API/PROJECTS/Example/DEPENDENCY-REPAIR/FORCE-FORWARD'],
+      ]) {
+        const res = response();
+        expect(admitWorkspaceAuthorizationRequest(
+          request(method, pathname),
+          res,
+          'repair-owner',
+        )).toBe(true);
+        expect(res.statusCode).toBe(200);
+      }
+      for (const [method, pathname] of [
+        ['GET', '/api/projects'],
+        ['POST', '/api/projects/dependency-repair/active'],
+        ['POST', '/api/projects/Example/dependency-repair/status'],
+        ['GET', '/api/projects/Example/dependency-repair/force-forward'],
+        ['GET', '/api/projects/dependency-repair/active/deeper'],
+        ['GET', '/api/projects/Example/dependency-repair/status/deeper'],
+        ['POST', '/api/projects/Example/dependency-repair/force-forward/deeper'],
+      ]) {
+        const blocked = response();
+        expect(admitWorkspaceAuthorizationRequest(
+          request(method, pathname),
+          blocked,
+          'repair-owner',
+        )).toBe(false);
+        expect(blocked.statusCode).toBe(409);
+      }
+    } finally {
+      fence.release();
+    }
+  });
+
   test('lets a durable global transition quiesce old work before awaiting drain', async () => {
     const releaseFirst = acquireWorkspaceAuthorizationMutationLease('global-first-user');
     const releaseSecond = acquireWorkspaceAuthorizationMutationLease('global-second-user');
@@ -310,6 +355,40 @@ describe('workspace authorization barrier', () => {
       'user-created-after-transition',
     )).toBe(true);
     admitted.emit('finish');
+  });
+
+  test('closes globally before excluding the exact promotion coordinator from its own drain', async () => {
+    const req = request('POST', '/api/projects/Example/install-deps');
+    const res = response();
+    expect(admitWorkspaceAuthorizationRequest(req, res, 'promotion-coordinator')).toBe(true);
+    const releaseOther = acquireWorkspaceAuthorizationMutationLease('other-writer');
+    const observedDuringClose: Array<{ mutations: number }> = [];
+    const unsubscribe = subscribeToGlobalWorkspaceAuthorizationFence(() => {
+      observedDuringClose.push(workspaceAuthorizationBarrierSnapshot('promotion-coordinator'));
+    });
+
+    const fence = closeGlobalWorkspaceAuthorizationAdmissionExcludingRequest(req);
+
+    expect(observedDuringClose).toEqual([expect.objectContaining({ mutations: 1 })]);
+    expect(workspaceAuthorizationBarrierSnapshot('promotion-coordinator')).toMatchObject({
+      mutations: 0,
+    });
+    let drained = false;
+    const wait = fence.waitForMutationDrain().then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    const blocked = response();
+    expect(admitWorkspaceAuthorizationRequest(
+      request('POST', '/api/projects/Other/install-deps'),
+      blocked,
+      'new-writer',
+    )).toBe(false);
+
+    releaseOther();
+    await wait;
+    expect(drained).toBe(true);
+    fence.release();
+    unsubscribe();
   });
 
   test('synchronously revokes subscribers that attach after the global fence closed', () => {

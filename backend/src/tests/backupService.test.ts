@@ -1,8 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { spawn, spawnSync } from 'child_process';
 import {
   ensureBackupLayout,
+  backupReceiptSigningPayload,
+  deleteBackupFile,
   findBackupFile,
   listBackupFiles,
   normalizeBackupRoot,
@@ -10,10 +13,18 @@ import {
   parseOnCalendar,
   parseSystemctlProperties,
 } from '../services/backup.service';
+import { buildBackupListResponse } from '../routes/backups';
 import {
   createAttestedBackupRoot,
   createBackupRunnerFixture,
 } from './backupRunnerFixture';
+
+jest.mock('../config/database', () => ({
+  prisma: {
+    activityLog: { create: jest.fn() },
+    systemSetting: { findUnique: jest.fn() },
+  },
+}));
 
 const repositoryRoot = path.resolve(__dirname, '../../..');
 const backupScript = process.env.BACKUP_SCRIPT_UNDER_TEST
@@ -31,13 +42,21 @@ describe('backup status contract', () => {
       phaseLabel: 'Capturing database snapshot',
       phaseIndex: 5,
       phaseTotal: 12,
+      consecutiveFailures: 2,
       failureDetail: 'Database fence was lost before the snapshot completed',
     };
     expect(parseBackupStatus(JSON.stringify(status))).toMatchObject(status);
+    expect(parseBackupStatus(JSON.stringify({
+      ...status,
+      status: 'degraded',
+      completedAt: '2026-08-04T12:10:00.000Z',
+      archivePath: '/root/backups/degraded/comprehensive/portal-comprehensive-test.tar.gz',
+    }))).toMatchObject({ status: 'degraded', consecutiveFailures: 2 });
     expect(parseBackupStatus(JSON.stringify({ ...status, phaseIndex: 13 }))).toBeNull();
     expect(parseBackupStatus(JSON.stringify({ ...status, phaseLabel: 'unsafe\u0000detail' }))).toBeNull();
     expect(parseBackupStatus(JSON.stringify({ ...status, failureDetail: '🧰'.repeat(250) }))).not.toBeNull();
     expect(parseBackupStatus(JSON.stringify({ ...status, failureDetail: '🧰'.repeat(251) }))).toBeNull();
+    expect(parseBackupStatus(JSON.stringify({ ...status, consecutiveFailures: -1 }))).toBeNull();
   });
 });
 
@@ -67,7 +86,7 @@ describe('SQLite online snapshot concurrency', () => {
 
     const script = fs.readFileSync(backupScript, 'utf8');
     const functionStart = script.indexOf('snapshot_sqlite_database() {');
-    const functionEnd = script.indexOf('\nmaterialize_openclaw_codex_database_list() {', functionStart);
+    const functionEnd = script.indexOf('\nmaterialize_openclaw_snapshot_database_list() {', functionStart);
     expect(functionStart).toBeGreaterThanOrEqual(0);
     expect(functionEnd).toBeGreaterThan(functionStart);
     const harnessPath = path.join(testRoot, 'snapshot-harness.sh');
@@ -193,8 +212,144 @@ describe('backup storage containment', () => {
 
     const files = listBackupFiles(root);
     expect(files).toHaveLength(1);
-    expect(files[0]).toMatchObject({ filename: path.basename(archive), type: 'daily', locked: true, size: 7 });
+    expect(files[0]).toMatchObject({
+      filename: path.basename(archive),
+      type: 'daily',
+      locked: true,
+      size: 7,
+      completeness: 'unknown',
+      classificationAuthenticated: false,
+    });
     expect(findBackupFile(root, '../portal-daily-20260718-120000.tar.gz')).toBeNull();
+  });
+
+  it('authenticates complete and degraded receipts and deletes receipt before archive', () => {
+    const fixtureRoot = makeTempRoot('backup-receipt');
+    const root = ensureBackupLayout(path.join(fixtureRoot, 'backups'));
+    const trustRoot = path.join(fixtureRoot, 'backup-trust');
+    fs.mkdirSync(trustRoot, { mode: 0o700 });
+    const key = crypto.randomBytes(32);
+    fs.writeFileSync(path.join(trustRoot, 'archive-hmac.key'), key, { mode: 0o600 });
+    const previousTrustRoot = process.env.BRIDGESLLM_BACKUP_TRUST_ROOT;
+    process.env.BRIDGESLLM_BACKUP_TRUST_ROOT = trustRoot;
+
+    const writeReceipt = (
+      archive: string,
+      backupType: 'daily',
+      completeness: 'complete' | 'degraded',
+      degradedComponents: string[],
+    ) => {
+      const stat = fs.lstatSync(archive, { bigint: true });
+      const input = {
+        archive: path.basename(archive),
+        backupType,
+        completeness,
+        archiveSize: Number(stat.size),
+        archiveMtimeNs: String(stat.mtimeNs),
+        manifestHmac: 'a'.repeat(64),
+        degradedComponents,
+      };
+      fs.writeFileSync(`${archive}.receipt.json`, `${JSON.stringify({
+        schema: 'bridgesllm.backup-publication.v1',
+        ...input,
+        signature: crypto.createHmac('sha256', key)
+          .update(backupReceiptSigningPayload(input))
+          .digest('hex'),
+      })}\n`, { mode: 0o600 });
+    };
+
+    try {
+      const complete = path.join(root, 'daily', 'portal-daily-20260718-120000.tar.gz');
+      const degraded = path.join(root, 'degraded', 'daily', 'portal-daily-20260718-130000.tar.gz');
+      fs.writeFileSync(complete, 'complete archive', { mode: 0o600 });
+      fs.writeFileSync(degraded, 'degraded archive', { mode: 0o600 });
+      writeReceipt(complete, 'daily', 'complete', []);
+      writeReceipt(degraded, 'daily', 'degraded', ['projects']);
+
+      const files = listBackupFiles(root);
+      expect(files.find((entry) => entry.fullPath === complete)).toMatchObject({
+        completeness: 'complete',
+        degradedComponents: [],
+        classificationAuthenticated: true,
+      });
+      expect(files.find((entry) => entry.fullPath === degraded)).toMatchObject({
+        completeness: 'degraded',
+        degradedComponents: ['projects'],
+        classificationAuthenticated: true,
+      });
+      const apiResponse = buildBackupListResponse(root, [...files]);
+      expect(apiResponse.summary).toMatchObject({ complete: 1, degraded: 1, unknown: 0 });
+      expect(apiResponse.backups).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          filename: path.basename(complete),
+          completeness: 'complete',
+          classificationAuthenticated: true,
+        }),
+        expect.objectContaining({
+          filename: path.basename(degraded),
+          completeness: 'degraded',
+          degradedComponents: ['projects'],
+          classificationAuthenticated: true,
+        }),
+      ]));
+      expect(JSON.stringify(apiResponse.backups)).not.toContain(root);
+
+      const degradedFile = files.find((entry) => entry.fullPath === degraded)!;
+      deleteBackupFile(degradedFile);
+      expect(fs.existsSync(degraded)).toBe(false);
+      expect(fs.existsSync(`${degraded}.receipt.json`)).toBe(false);
+
+      const completeReceipt = JSON.parse(fs.readFileSync(`${complete}.receipt.json`, 'utf8'));
+      completeReceipt.signature = '0'.repeat(64);
+      fs.writeFileSync(`${complete}.receipt.json`, `${JSON.stringify(completeReceipt)}\n`, { mode: 0o600 });
+      expect(listBackupFiles(root).find((entry) => entry.fullPath === complete)).toMatchObject({
+        completeness: 'unknown',
+        classificationAuthenticated: false,
+      });
+      expect(buildBackupListResponse(root, listBackupFiles(root)).summary)
+        .toMatchObject({ complete: 0, degraded: 0, unknown: 1 });
+    } finally {
+      if (previousTrustRoot === undefined) delete process.env.BRIDGESLLM_BACKUP_TRUST_ROOT;
+      else process.env.BRIDGESLLM_BACKUP_TRUST_ROOT = previousTrustRoot;
+    }
+  });
+
+  it('refuses hardlinked deletion targets and revalidates after receipt-first removal', () => {
+    const root = ensureBackupLayout(path.join(makeTempRoot('backup-delete-race'), 'backups'));
+    const archive = path.join(root, 'daily', 'portal-daily-20260718-140000.tar.gz');
+    const receipt = `${archive}.receipt.json`;
+    fs.writeFileSync(archive, 'original archive', { mode: 0o600 });
+    fs.writeFileSync(receipt, '{}\n', { mode: 0o600 });
+    const listed = listBackupFiles(root)[0];
+    expect(listed).toBeDefined();
+
+    const receiptAlias = path.join(root, 'daily', 'receipt-hardlink');
+    fs.linkSync(receipt, receiptAlias);
+    expect(() => deleteBackupFile(listed)).toThrow(/receipt is unsafe/i);
+    expect(fs.existsSync(archive)).toBe(true);
+    expect(fs.existsSync(receipt)).toBe(true);
+    fs.unlinkSync(receiptAlias);
+
+    const archiveAlias = path.join(root, 'daily', 'archive-hardlink');
+    fs.linkSync(archive, archiveAlias);
+    expect(() => deleteBackupFile(listed)).toThrow(/changed before deletion/i);
+    expect(fs.existsSync(receipt)).toBe(true);
+    fs.unlinkSync(archiveAlias);
+
+    const replacement = path.join(root, 'daily', 'replacement.tmp');
+    fs.writeFileSync(replacement, 'replacement archive', { mode: 0o600 });
+    const realUnlink = fs.unlinkSync.bind(fs);
+    const unlink = jest.spyOn(fs, 'unlinkSync').mockImplementation(((target: fs.PathLike) => {
+      realUnlink(target);
+      if (String(target) === receipt) fs.renameSync(replacement, archive);
+    }) as typeof fs.unlinkSync);
+    try {
+      expect(() => deleteBackupFile(listed)).toThrow(/changed while deletion was prepared/i);
+    } finally {
+      unlink.mockRestore();
+    }
+    expect(fs.existsSync(receipt)).toBe(false);
+    expect(fs.readFileSync(archive, 'utf8')).toBe('replacement archive');
   });
 });
 
@@ -256,11 +411,21 @@ describe('persistent backup runner', () => {
     );
     fs.writeFileSync(path.join(portalRoot, 'marker.txt'), 'portal data', { mode: 0o600 });
     const requiredSources = fixture.requiredSources;
+    const venvBin = path.join(requiredSources.PROJECTS_ROOT, 'python-demo', '.venv', 'bin');
+    fs.mkdirSync(venvBin, { recursive: true, mode: 0o700 });
+    fs.symlinkSync('/usr/bin/python3', path.join(venvBin, 'python3'));
+    fs.symlinkSync('python3', path.join(venvBin, 'python'));
     const lockedArchive = path.join(backupRoot, 'daily', 'portal-daily-20200101-000000.tar.gz');
     const oldUnlockedArchive = path.join(backupRoot, 'daily', 'portal-daily-20200102-000000.tar.gz');
     fs.writeFileSync(lockedArchive, 'locked archive', { mode: 0o600 });
     fs.writeFileSync(`${lockedArchive}.locked`, 'locked', { mode: 0o600 });
     fs.writeFileSync(oldUnlockedArchive, 'old archive', { mode: 0o600 });
+    const orphanReceipt = path.join(
+      backupRoot,
+      'daily',
+      'portal-daily-20200103-000000.tar.gz.receipt.json',
+    );
+    fs.writeFileSync(orphanReceipt, '{}\n', { mode: 0o600 });
 
     const runnerEnv = {
       ...process.env,
@@ -305,11 +470,13 @@ describe('persistent backup runner', () => {
     });
     expect(status.archivePath).toMatch(new RegExp(`^${backupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/daily/portal-daily-`));
     expect(fs.statSync(status.archivePath).mode & 0o777).toBe(0o600);
+    expect(fs.existsSync(`${status.archivePath}.receipt.json`)).toBe(true);
     expect(fs.readFileSync(path.join(stateDir, 'current.log'), 'utf8').length).toBeLessThanOrEqual(65536);
     expect(fs.existsSync(path.join(backupRoot, 'daily'))).toBe(true);
     expect(fs.existsSync(lockedArchive)).toBe(true);
     expect(fs.existsSync(`${lockedArchive}.locked`)).toBe(true);
     expect(fs.existsSync(oldUnlockedArchive)).toBe(false);
+    expect(fs.existsSync(orphanReceipt)).toBe(false);
 
     const recoveryManifest = JSON.parse(
       spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], { encoding: 'utf8' }).stdout,
@@ -389,7 +556,7 @@ describe('persistent backup runner', () => {
     expect(verification.status).toBe(0);
   }, 35_000);
 
-  it('captures durable OpenClaw state without its reproducible npm runtime', () => {
+  it('captures primary, Codex, and per-agent SQLite state while watchdog runtime state churns', async () => {
     const testRoot = makeTempRoot('backup-openclaw-state');
     const portalRoot = path.join(testRoot, 'portal');
     const stateDir = path.join(portalRoot, 'backend', '.data', 'backups');
@@ -471,9 +638,39 @@ describe('persistent backup runner', () => {
       expect(fs.existsSync(`${databasePath}-wal`)).toBe(true);
       return database;
     });
+    const agentDatabasePath = path.join(openclawRoot, 'agents', 'main', 'agent', 'openclaw-agent.sqlite');
+    const liveAgentDatabase = new DatabaseSync(agentDatabasePath);
+    liveAgentDatabase.prepare('PRAGMA journal_mode=WAL').get();
+    liveAgentDatabase.exec('PRAGMA wal_autocheckpoint=0; CREATE TABLE durable_agent_record (value TEXT NOT NULL);');
+    liveAgentDatabase.prepare('INSERT INTO durable_agent_record (value) VALUES (?)')
+      .run('per-agent state committed in wal');
+    fs.chmodSync(agentDatabasePath, 0o600);
+    expect(fs.existsSync(`${agentDatabasePath}-wal`)).toBe(true);
+    const watchdogStateDir = path.join(openclawRoot, 'workspace-main', 'state');
+    const watchdogPath = path.join(watchdogStateDir, 'job-watchdog.json');
+    fs.mkdirSync(watchdogStateDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(watchdogPath, '{"counter":0}\n', { mode: 0o600 });
+    const initialWatchdogMtimeNs = fs.statSync(watchdogPath, { bigint: true }).mtimeNs;
+    const watchdog = spawn('python3', ['-c', [
+      'import json, pathlib, sys, time',
+      'path = pathlib.Path(sys.argv[1])',
+      'counter = 0',
+      'while True:',
+      ' counter += 1',
+      ' path.write_text(json.dumps({"counter": counter}) + "\\n", encoding="utf-8")',
+      ' time.sleep(0.005)',
+    ].join('\n'), watchdogPath], { stdio: 'ignore' });
+    const watchdogStartedBy = Date.now() + 2_000;
+    let watchdogMtimeBeforeBackup = initialWatchdogMtimeNs;
+    while (watchdogMtimeBeforeBackup === initialWatchdogMtimeNs && Date.now() < watchdogStartedBy) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      watchdogMtimeBeforeBackup = fs.statSync(watchdogPath, { bigint: true }).mtimeNs;
+    }
+    expect(watchdogMtimeBeforeBackup).toBeGreaterThan(initialWatchdogMtimeNs);
     fs.writeFileSync(path.join(openclawRoot, 'logs', 'gateway.log'), 'operational log\n', { mode: 0o600 });
 
     let result;
+    let watchdogMtimeAfterBackup = watchdogMtimeBeforeBackup;
     try {
       result = spawnSync('bash', [backupScript, 'daily'], {
         cwd: repositoryRoot,
@@ -486,13 +683,24 @@ describe('persistent backup runner', () => {
         },
         timeout: 30_000,
       });
+      // The watchdog file is deliberately excluded from recovery data because
+      // it is volatile and may be between truncate/write syscalls at any
+      // instant. Prove that it continued changing without parsing bytes after
+      // SIGTERM, which could itself interrupt the synthetic writer mid-write.
+      watchdogMtimeAfterBackup = fs.statSync(watchdogPath, { bigint: true }).mtimeNs;
     } finally {
       liveDatabase.close();
       for (const database of liveCodexDatabases) database.close();
+      liveAgentDatabase.close();
+      if (watchdog.exitCode === null && watchdog.signalCode === null) {
+        watchdog.kill('SIGTERM');
+        await new Promise<void>((resolve) => watchdog.once('close', () => resolve()));
+      }
     }
     if (result.status !== 0) {
       throw new Error(`OpenClaw-state backup failed (${result.status})\n${result.stdout}\n${result.stderr}`);
     }
+    expect(watchdogMtimeAfterBackup).toBeGreaterThan(watchdogMtimeBeforeBackup);
 
     const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
     const extractionRoot = path.join(testRoot, 'extracted');
@@ -516,12 +724,18 @@ describe('persistent backup runner', () => {
     expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/config.toml');
     expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/memories_1.sqlite');
     expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/goals_1.sqlite');
+    expect(listing.stdout).toContain('.openclaw/agents/main/agent/openclaw-agent.sqlite');
+    expect(listing.stdout).not.toContain('.openclaw/workspace-main/state/job-watchdog.json');
     const listingMembers = new Set(listing.stdout.trim().split('\n'));
     for (const database of ['memories_1.sqlite', 'goals_1.sqlite']) {
       expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}`)).toBe(true);
       expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-wal`)).toBe(false);
       expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-shm`)).toBe(false);
       expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-journal`)).toBe(false);
+    }
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const member = `.openclaw/agents/main/agent/openclaw-agent.sqlite${suffix}`;
+      expect(listingMembers.has(member)).toBe(suffix === '');
     }
     for (const excludedMember of [
       '.openclaw/agents/main/agent/codex-home/.tmp/plugin-cache',
@@ -551,6 +765,7 @@ describe('persistent backup runner', () => {
         '.openclaw/state/openclaw.sqlite',
         '.openclaw/agents/main/agent/codex-home/memories_1.sqlite',
         '.openclaw/agents/main/agent/codex-home/goals_1.sqlite',
+        '.openclaw/agents/main/agent/openclaw-agent.sqlite',
       ],
       { encoding: 'utf8' },
     );
@@ -579,6 +794,17 @@ describe('persistent backup runner', () => {
       } finally {
         restoredCodexDatabase.close();
       }
+    }
+    const restoredAgentDatabase = new DatabaseSync(
+      path.join(openclawExtractionRoot, '.openclaw', 'agents', 'main', 'agent', 'openclaw-agent.sqlite'),
+      { readOnly: true },
+    );
+    try {
+      expect(restoredAgentDatabase.prepare('SELECT value FROM durable_agent_record').get())
+        .toEqual({ value: 'per-agent state committed in wal' });
+      expect(restoredAgentDatabase.prepare('PRAGMA quick_check').get()).toEqual({ quick_check: 'ok' });
+    } finally {
+      restoredAgentDatabase.close();
     }
 
     const recoveryManifest = JSON.parse(
@@ -635,12 +861,12 @@ describe('persistent backup runner', () => {
       const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
       expect(status).toMatchObject({
         type: 'daily',
-        status: 'failed',
+        status: 'degraded',
       });
       expect(status.exitCode).not.toBe(0);
       expect(status.failureDetail).toContain('published in degraded state');
       expect(status.archivePath).toMatch(
-        new RegExp(`^${backupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/daily/portal-daily-`),
+        new RegExp(`^${backupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/degraded/daily/portal-daily-`),
       );
       expect(fs.statSync(status.archivePath).mode & 0o777).toBe(0o600);
 
@@ -870,12 +1096,29 @@ describe('persistent backup runner', () => {
       path.join(requiredSources.PROJECTS_ROOT, 'escaping-python'),
     );
     fs.writeFileSync(path.join(stateDir, 'backup-base-path'), `${backupRoot}\n`, { mode: 0o600 });
+    fs.writeFileSync(path.join(stateDir, 'status.json'), `${JSON.stringify({
+      id: 'daily-prior-degraded',
+      type: 'daily',
+      status: 'degraded',
+      startedAt: '2026-08-11T00:00:00.000Z',
+      completedAt: '2026-08-11T00:01:00.000Z',
+      exitCode: 1,
+      consecutiveFailures: 2,
+    })}\n`, { mode: 0o600 });
     const priorCompleteArchive = path.join(
       backupRoot,
       'daily',
       'portal-daily-20200102-000000.tar.gz',
     );
+    const priorDegradedArchive = path.join(
+      backupRoot,
+      'degraded',
+      'daily',
+      'portal-daily-20200103-000000.tar.gz',
+    );
+    fs.mkdirSync(path.dirname(priorDegradedArchive), { recursive: true, mode: 0o700 });
     fs.writeFileSync(priorCompleteArchive, 'prior complete archive sentinel', { mode: 0o600 });
+    fs.writeFileSync(priorDegradedArchive, 'prior degraded archive sentinel', { mode: 0o600 });
     fs.writeFileSync(path.join(portalRoot, 'backend', '.env.production'), [
       'DATABASE_URL=postgresql://test:test@127.0.0.1/test',
       'INSTALL_PROFILE=custom',
@@ -896,8 +1139,8 @@ describe('persistent backup runner', () => {
         STALWART_DIR: path.join(testRoot, 'missing-stalwart'),
         STALWART_MAIL_DIR: path.join(testRoot, 'missing-stalwart-mail'),
         STALWART_INSTALL_DIR: path.join(testRoot, 'missing-stalwart-install'),
-        SYSTEMD_DIR: path.join(testRoot, 'missing-systemd'),
         DAILY_KEEP: '1',
+        DEGRADED_KEEP: '1',
         ...fixture.env,
       },
       timeout: 30_000,
@@ -910,16 +1153,20 @@ describe('persistent backup runner', () => {
     const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
     expect(status).toMatchObject({
       type: 'daily',
-      status: 'failed',
+      status: 'degraded',
       phase: 'verifying-archive',
       phaseLabel: 'Verifying and publishing archive',
       phaseIndex: 8,
       phaseTotal: 8,
       failureDetail: expect.stringContaining('published in degraded state'),
+      consecutiveFailures: 3,
     });
     expect(status.exitCode).not.toBe(0);
     expect(fs.existsSync(status.archivePath)).toBe(true);
+    expect(status.archivePath).toContain(`${path.sep}degraded${path.sep}daily${path.sep}`);
+    expect(fs.existsSync(`${status.archivePath}.receipt.json`)).toBe(true);
     expect(fs.existsSync(priorCompleteArchive)).toBe(true);
+    expect(fs.existsSync(priorDegradedArchive)).toBe(false);
 
     const recoveryManifest = JSON.parse(
       spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], {
@@ -932,14 +1179,12 @@ describe('persistent backup runner', () => {
       status: 'degraded',
       payload: null,
       captureMethod: null,
-      reason: 'Required recovery source was missing or could not be archived',
+      reason: expect.stringContaining('Recovery source is missing'),
     });
     expect(components.get('projects')).toMatchObject({
       requirement: 'required',
-      status: 'degraded',
-      payload: null,
-      captureMethod: null,
-      reason: 'Required recovery source was missing or could not be archived',
+      status: 'captured',
+      payload: 'projects.tar.gz',
     });
     for (const laterComponent of [
       'portal-files',
@@ -975,6 +1220,51 @@ describe('persistent backup runner', () => {
       'degraded recovery component is not a complete backup',
     );
   });
+
+  it('rejects an unversioned absolute Project python symlink with a bounded durable diagnostic', () => {
+    const testRoot = makeTempRoot('backup-project-hostile-symlink');
+    const portalRoot = path.join(testRoot, 'portal');
+    const stateDir = path.join(portalRoot, 'backend', '.data', 'backups');
+    const backupRoot = path.join(testRoot, 'configured-backups');
+    const fixture = createBackupRunnerFixture(testRoot, { backupRoot, portalRoot, stateDir });
+    fs.symlinkSync('/usr/bin/python', path.join(fixture.requiredSources.PROJECTS_ROOT, 'host-escape'));
+
+    const result = spawnSync('bash', [backupScript, 'daily'], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ...fixture.env,
+        OPENCLAW_DIR: path.join(testRoot, 'missing-openclaw'),
+        STALWART_DIR: path.join(testRoot, 'missing-stalwart'),
+        STALWART_MAIL_DIR: path.join(testRoot, 'missing-stalwart-mail'),
+        STALWART_INSTALL_DIR: path.join(testRoot, 'missing-stalwart-install'),
+      },
+      timeout: 35_000,
+    });
+    expect(result.status).not.toBe(0);
+    if (!fs.existsSync(path.join(stateDir, 'status.json'))) {
+      throw new Error(
+        `hostile Project symlink backup failed before durable status (${result.status})\n`
+        + `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+    }
+    const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
+    expect(status).toMatchObject({ type: 'daily', status: 'degraded' });
+    expect(status.archivePath).toContain(`${path.sep}degraded${path.sep}daily${path.sep}`);
+    const currentLog = fs.readFileSync(path.join(stateDir, 'current.log'), 'utf8');
+    expect(currentLog).toContain('recovery source symbolic link escapes its admitted roots');
+    expect(currentLog.length).toBeLessThanOrEqual(65_536);
+    const manifest = JSON.parse(
+      spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], { encoding: 'utf8' }).stdout,
+    );
+    expect(manifest.components.find((entry: any) => entry.id === 'projects')).toMatchObject({
+      requirement: 'required',
+      status: 'degraded',
+      payload: null,
+      reason: expect.stringContaining('symbolic link escapes its admitted roots'),
+    });
+  }, 40_000);
 
   it('rejects an archive whose payload no longer matches its manifest', () => {
     const testRoot = makeTempRoot('backup-tamper');

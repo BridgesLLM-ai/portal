@@ -84,6 +84,7 @@ import {
 } from '../utils/portalFeatureCapabilities';
 import { assertNoProjectAuthorizationTransitionActive } from '../services/projectAuthorizationTransition';
 import { publishAuthorizationChanged } from '../services/authorizationChangeBus';
+import { publishAllSessionsRevoked } from '../services/sessionRevocationBus';
 import { invalidateEmailBrandingCache } from '../templates/baseTemplate';
 
 const router = Router();
@@ -801,6 +802,10 @@ router.post('/reinstall-reset', requireSetupToken, async (req: Request, res: Res
       userId: owner.id,
       authorizationVersion: Number((owner as any).authorizationVersion),
       reasons: ['credential_recovery'],
+    });
+    publishAllSessionsRevoked({
+      userId: owner.id,
+      reason: 'credential_recovery',
     });
     tokenRemoval.commit();
 
@@ -1691,8 +1696,9 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
     }
 
     const ownerId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
     const passwordHash = await hashPassword(body.password);
-    const refreshToken = generateRefreshToken({ userId: ownerId });
+    const refreshToken = generateRefreshToken({ userId: ownerId, sessionId });
     const refreshTokenHash = digestAuthToken('refresh', refreshToken);
 
     const nameParts = body.name.split(/\s+/);
@@ -1753,6 +1759,7 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
 
       await tx.session.create({
         data: {
+          id: sessionId,
           userId: createdUser.id,
           refreshTokenHash,
           ipAddress: req.ip || 'unknown',
@@ -1802,6 +1809,7 @@ router.post('/complete', requireSetupToken, async (req: Request, res: Response, 
 
     const accessToken = generateAccessToken({
       userId: user.id,
+      sessionId,
       email: user.email,
       role: user.role,
       authorizationVersion: Number((user as any).authorizationVersion ?? 1),

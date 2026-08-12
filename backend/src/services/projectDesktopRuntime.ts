@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 
 export const PROJECT_DESKTOP_RUNTIME_ROOT = '/var/lib/bridgesllm/desktop-projects';
 export const LEGACY_PROJECT_DESKTOP_RUNTIME_ROOT = '/home/bridgesrd/projects';
@@ -26,6 +27,175 @@ export interface ProjectDesktopRuntimeIdentity {
   processMarker: string;
   systemdUnit: string;
   windowTitle: string;
+}
+
+function processLookupReportedAbsent(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as { status?: unknown }).status === 1;
+}
+
+function projectDesktopRuntimeProcessIds(marker: string): number[] {
+  try {
+    execFileSync('id', ['-u', 'bridgesrd'], { timeout: 3_000, stdio: 'ignore' });
+  } catch (error) {
+    if (processLookupReportedAbsent(error)) return [];
+    throw error;
+  }
+  let output: string;
+  try {
+    output = execFileSync('pgrep', ['-u', 'bridgesrd'], {
+      timeout: 3_000,
+      encoding: 'utf8',
+    });
+  } catch (error) {
+    if (processLookupReportedAbsent(error)) return [];
+    throw error;
+  }
+  const ids = output.split(/\s+/).filter(Boolean);
+  if (ids.some((value) => !/^[1-9][0-9]*$/.test(value))) {
+    throw new Error('Project desktop runtime process discovery returned an invalid identity');
+  }
+  const shellPathToken = path.isAbsolute(marker)
+    ? `'${marker.replace(/'/g, `'\\''`)}'`
+    : null;
+  return ids.flatMap((value) => {
+    const processId = Number(value);
+    let raw: Buffer;
+    try {
+      raw = fs.readFileSync(`/proc/${processId}/cmdline`);
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') return [];
+      throw error;
+    }
+    const args = raw.toString('utf8').split('\0').filter(Boolean);
+    return args.some((argument) => (
+      argument === marker || Boolean(shellPathToken && argument.includes(shellPathToken))
+    )) ? [processId] : [];
+  });
+}
+
+function signalProjectDesktopRuntimeProcesses(
+  processIds: readonly number[],
+  signal: 'SIGTERM' | 'SIGKILL',
+): void {
+  for (const processId of processIds) {
+    try {
+      process.kill(processId, signal);
+    } catch (error: any) {
+      if (error?.code !== 'ESRCH') throw error;
+    }
+  }
+}
+
+function projectDesktopRuntimeUnitProperty(unitName: string, property: string): string {
+  return execFileSync('systemctl', [
+    'show',
+    unitName,
+    `--property=${property}`,
+    '--value',
+  ], {
+    encoding: 'utf8',
+    timeout: 5_000,
+  }).trim();
+}
+
+function projectDesktopRuntimeCgroupHasProcesses(controlGroup: string): boolean {
+  if (!controlGroup) return false;
+  if (!controlGroup.startsWith('/system.slice/') || controlGroup.includes('..')) {
+    throw new Error('Project desktop runtime cgroup identity is invalid');
+  }
+  const cgroupRoot = path.resolve('/sys/fs/cgroup', `.${controlGroup}`);
+  if (!cgroupRoot.startsWith('/sys/fs/cgroup/system.slice/')) {
+    throw new Error('Project desktop runtime cgroup escaped system.slice');
+  }
+  if (!fs.existsSync(cgroupRoot)) return false;
+  const pending = [cgroupRoot];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const processesPath = path.join(current, 'cgroup.procs');
+    if (fs.existsSync(processesPath) && fs.readFileSync(processesPath, 'utf8').trim()) return true;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory()) pending.push(path.join(current, entry.name));
+    }
+  }
+  return false;
+}
+
+export interface ProjectDesktopRuntimeQuiescenceDependencies {
+  processIds?: (marker: string) => number[];
+  signalProcesses?: (
+    processIds: readonly number[],
+    signal: 'SIGTERM' | 'SIGKILL',
+  ) => void;
+  unitProperty?: (unitName: string, property: string) => string;
+  stopUnit?: (unitName: string) => void;
+  resetFailedUnit?: (unitName: string) => void;
+  cgroupHasProcesses?: (controlGroup: string) => boolean;
+}
+
+/**
+ * Stop the immutable systemd/cmdline identities that can keep writing a
+ * copied Project desktop runtime across a Portal crash. Legacy recorded paths
+ * are accepted only when they remain inside one of the two managed runtime
+ * roots; an arbitrary persisted path is not process authority.
+ */
+export function quiesceProjectDesktopRuntimeForDependencyPromotion(input: {
+  projectIdentityId: string;
+  projectName: string;
+  recordedRuntimeDirectories?: readonly string[];
+}, dependencies: ProjectDesktopRuntimeQuiescenceDependencies = {}): {
+  systemdUnitStopped: boolean;
+  processCount: number;
+} {
+  const processIds = dependencies.processIds || projectDesktopRuntimeProcessIds;
+  const signalProcesses = dependencies.signalProcesses || signalProjectDesktopRuntimeProcesses;
+  const unitProperty = dependencies.unitProperty || projectDesktopRuntimeUnitProperty;
+  const stopUnit = dependencies.stopUnit || ((unitName: string) => {
+    execFileSync('systemctl', ['stop', unitName], { timeout: 20_000 });
+  });
+  const resetFailedUnit = dependencies.resetFailedUnit || ((unitName: string) => {
+    execFileSync('systemctl', ['reset-failed', unitName], { timeout: 5_000 });
+  });
+  const cgroupHasProcesses = dependencies.cgroupHasProcesses
+    || projectDesktopRuntimeCgroupHasProcesses;
+  const identity = buildProjectDesktopRuntimeIdentity(input.projectIdentityId, input.projectName);
+  const loadState = unitProperty(identity.systemdUnit, 'LoadState');
+  let systemdUnitStopped = false;
+  if (loadState !== 'not-found') {
+    stopUnit(identity.systemdUnit);
+    const activeState = unitProperty(identity.systemdUnit, 'ActiveState');
+    const controlGroup = unitProperty(identity.systemdUnit, 'ControlGroup');
+    if (
+      !['inactive', 'failed'].includes(activeState)
+      || cgroupHasProcesses(controlGroup)
+    ) {
+      throw new Error('Project desktop runtime remained active after its exact cgroup stop');
+    }
+    try {
+      resetFailedUnit(identity.systemdUnit);
+    } catch {
+      // A collected transient unit can disappear immediately after stop.
+    }
+    systemdUnitStopped = true;
+  }
+
+  const markers = new Set<string>([identity.processMarker]);
+  for (const recorded of input.recordedRuntimeDirectories || []) {
+    const managed = managedProjectDesktopRuntimeDirectory(recorded);
+    if (!managed) throw new Error('Recorded Project desktop runtime escaped its managed roots');
+    markers.add(managed);
+  }
+  let processCount = 0;
+  for (const marker of markers) {
+    const initial = processIds(marker);
+    processCount += initial.length;
+    signalProcesses(initial, 'SIGTERM');
+    const residual = processIds(marker);
+    signalProcesses(residual, 'SIGKILL');
+    if (processIds(marker).length > 0) {
+      throw new Error('Project desktop runtime remained after its exact process stop');
+    }
+  }
+  return Object.freeze({ systemdUnitStopped, processCount });
 }
 
 /**

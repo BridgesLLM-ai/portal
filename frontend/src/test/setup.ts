@@ -2,6 +2,12 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
 import { afterEach, vi } from 'vitest';
 
+// Capture jsdom's timer functions while the environment is live. Framer Motion
+// can schedule a final frame during component cleanup; resolving `window`
+// inside that delayed callback races Vitest tearing the environment down.
+const scheduleAnimationFrame = window.setTimeout.bind(window);
+const cancelScheduledAnimationFrame = window.clearTimeout.bind(window);
+
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
@@ -41,11 +47,11 @@ Object.defineProperty(globalThis, 'ResizeObserver', {
 
 Object.defineProperty(window, 'requestAnimationFrame', {
   configurable: true,
-  value: (callback: FrameRequestCallback) => window.setTimeout(() => callback(Date.now()), 0),
+  value: (callback: FrameRequestCallback) => scheduleAnimationFrame(() => callback(Date.now()), 0),
 });
 Object.defineProperty(window, 'cancelAnimationFrame', {
   configurable: true,
-  value: (handle: number) => window.clearTimeout(handle),
+  value: (handle: number) => cancelScheduledAnimationFrame(handle),
 });
 
 Object.defineProperty(HTMLElement.prototype, 'scrollTo', {

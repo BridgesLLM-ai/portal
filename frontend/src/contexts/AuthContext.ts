@@ -17,6 +17,7 @@ import {
 } from './RouteOperationContext';
 import { clearWorkspaceClientState } from '../utils/clearWorkspaceClientState';
 import { StaleWorkspaceAuthorizationResponseError } from '../utils/workspaceAuthorization';
+import { isDefinitiveAuthRefreshFailure } from '../utils/authRefreshConvergence';
 
 const DEBUG_AUTH = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -485,6 +486,9 @@ export const useAuthStore = create<AuthState>()(
           return true;
         } catch (error) {
           debugLog('[Auth] Manual refresh failed:', error);
+          if (isDefinitiveAuthRefreshFailure(error)) {
+            get().silentLogout();
+          }
           return false;
         }
       },

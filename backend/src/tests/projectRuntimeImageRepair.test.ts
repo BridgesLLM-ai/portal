@@ -3,6 +3,7 @@ process.env.DATABASE_URL ||= 'postgresql://test:test@127.0.0.1:5432/test';
 const { spawnSync } = require('child_process') as typeof import('child_process');
 const fs = require('fs') as typeof import('fs');
 const path = require('path') as typeof import('path');
+const { PORTAL_VERSION } = require('../version') as typeof import('../version');
 
 const {
   __projectRuntimeImageRepairTest,
@@ -63,7 +64,7 @@ describe('Project runtime image repair launcher', () => {
       '-I',
       '-S',
       '/opt/bridgesllm/portal/installer/project-runtime-image-repair-launcher.py',
-      '4.0.15',
+      PORTAL_VERSION,
       '/opt/bridgesllm/logs/project-runtime-image-repair-test.log',
     ]);
     expect(args).not.toContain('--collect');

@@ -2,6 +2,7 @@ import {
   __projectEgressPlaneTest,
   buildProjectEgressPlaneSpec,
   discoverProjectEgressPlaneResources,
+  teardownExactProjectEgressPlane,
   teardownProjectEgressPlaneResources,
   type ProjectEgressCommandExecutor,
   type ProjectEgressCommandResult,
@@ -50,6 +51,12 @@ interface FakeContainer {
   id: string;
   name: string;
   running: boolean;
+  omitAttachments: boolean;
+  attachmentsMaterialized: boolean;
+  runtimeEndpointsCleared: boolean;
+  attachmentDrifted: boolean;
+  globalIpv6Address: string;
+  configuredIpv6Address: string;
   labels: Record<string, string>;
   networks: string[];
 }
@@ -81,6 +88,8 @@ class StatefulCleanupExecutor implements ProjectEgressCommandExecutor {
   failNetworkRemovalOnce = false;
   proxyInspectCount = 0;
   mutateProxyIdOnInspect = 0;
+  mutateProxyAttachmentOnStop = false;
+  clearRuntimeEndpointsOnStop = false;
   ambiguousMissingContainer: string | null = null;
 
   install(input: ProjectEgressPlaneSpec): void {
@@ -88,6 +97,12 @@ class StatefulCleanupExecutor implements ProjectEgressCommandExecutor {
       id: 'c'.repeat(64),
       name: input.proxyContainerName,
       running: true,
+      omitAttachments: false,
+      attachmentsMaterialized: true,
+      runtimeEndpointsCleared: false,
+      attachmentDrifted: false,
+      globalIpv6Address: '',
+      configuredIpv6Address: '',
       labels: {
         ...labels(input, 'proxy'),
         [__projectEgressPlaneTest.labels.LABEL_TOKEN_HASH]: input.tokenHash,
@@ -149,9 +164,20 @@ class StatefulCleanupExecutor implements ProjectEgressCommandExecutor {
       State: { Running: container.running },
       HostConfig: { NetworkMode: container.networks.find((name) => !this.networks.get(name)?.internal) || '' },
       NetworkSettings: {
-        Networks: Object.fromEntries(container.networks.map((name) => [name, {
-          IPAddress: this.networks.get(name)?.internal ? '172.30.0.2' : '172.29.0.2',
-          GlobalIPv6Address: '',
+        Networks: container.omitAttachments ? {} : Object.fromEntries(container.networks.map((name) => [name, {
+          NetworkID: container.attachmentsMaterialized ? this.networks.get(name)?.id || '' : '',
+          EndpointID: container.attachmentsMaterialized && !container.runtimeEndpointsCleared
+            ? `${container.id}-${name}`
+            : '',
+          IPAddress: container.attachmentsMaterialized && !container.runtimeEndpointsCleared
+            ? container.attachmentDrifted
+              ? '192.0.2.99'
+              : this.networks.get(name)?.internal ? '172.30.0.2' : '172.29.0.2'
+            : '',
+          GlobalIPv6Address: container.runtimeEndpointsCleared ? '' : container.globalIpv6Address,
+          IPAMConfig: this.networks.get(name)?.internal
+            ? { IPv6Address: container.configuredIpv6Address }
+            : { IPv4Address: '172.29.0.2', IPv6Address: container.configuredIpv6Address },
           Aliases: this.networks.get(name)?.internal ? ['portal-project-egress'] : [],
         }])),
       },
@@ -216,6 +242,8 @@ class StatefulCleanupExecutor implements ProjectEgressCommandExecutor {
       const container = this.containerByReference(String(args.at(-1)));
       if (!container) return this.result('', 1, 'No such container');
       container.running = false;
+      if (this.clearRuntimeEndpointsOnStop) container.runtimeEndpointsCleared = true;
+      if (this.mutateProxyAttachmentOnStop) container.attachmentDrifted = true;
       return this.result(container.name);
     }
     if (command === 'docker' && args[0] === 'container' && args[1] === 'rm') {
@@ -455,6 +483,136 @@ describe('Project egress discovery and teardown', () => {
       expectedIdentities: [input.identity],
     }, executor)).resolves.toMatchObject({ alreadyAbsent: false });
     expect(executor.networks.size).toBe(0);
+  });
+
+  test('reclaims an exact exited proxy whose declared networks lost their endpoints', async () => {
+    const executor = new StatefulCleanupExecutor();
+    const input = plane();
+    executor.install(input);
+    executor.containers.get(input.proxyContainerName)!.running = false;
+    executor.containers.get(input.proxyContainerName)!.attachmentsMaterialized = false;
+    executor.networks.get(input.internalNetworkName)!.members = [];
+    executor.networks.get(input.publicNetworkName)!.members = [];
+
+    await expect(discoverProjectEgressPlaneResources(PROJECT_ID, {
+      expectedIdentities: [input.identity],
+    }, executor)).rejects.toMatchObject({ code: 'INTERNAL_PROXY_MEMBERSHIP' });
+
+    await expect(teardownExactProjectEgressPlane(input.identity, executor)).resolves.toMatchObject({
+      alreadyAbsent: false,
+      removedResourceCount: 5,
+    });
+    expect(executor.containers.size).toBe(0);
+    expect(executor.networks.size).toBe(0);
+  });
+
+  test('reclaims exact stopped debris after Docker drops the attachment map entirely', async () => {
+    const executor = new StatefulCleanupExecutor();
+    const input = plane();
+    executor.install(input);
+    const proxy = executor.containers.get(input.proxyContainerName)!;
+    proxy.running = false;
+    proxy.omitAttachments = true;
+    executor.networks.get(input.internalNetworkName)!.members = [];
+    executor.networks.get(input.publicNetworkName)!.members = [];
+
+    await expect(discoverProjectEgressPlaneResources(PROJECT_ID, {
+      expectedIdentities: [input.identity],
+    }, executor)).rejects.toMatchObject({ code: 'PROXY_NETWORK_IDENTITY' });
+
+    await expect(teardownExactProjectEgressPlane(input.identity, executor)).resolves.toMatchObject({
+      alreadyAbsent: false,
+      removedResourceCount: 5,
+    });
+    expect(executor.containers.size).toBe(0);
+    expect(executor.networks.size).toBe(0);
+  });
+
+  test('keeps a running detached proxy fail-closed without destructive calls', async () => {
+    const executor = new StatefulCleanupExecutor();
+    const input = plane();
+    executor.install(input);
+    executor.networks.get(input.internalNetworkName)!.members = [];
+    executor.networks.get(input.publicNetworkName)!.members = [];
+
+    await expect(teardownExactProjectEgressPlane(input.identity, executor)).rejects.toMatchObject({
+      code: 'INTERNAL_PROXY_MEMBERSHIP',
+    });
+    expect(executor.commands.some(({ args }) => args[1] === 'stop' || args[1] === 'rm')).toBe(false);
+    expect(executor.containers.has(input.proxyContainerName)).toBe(true);
+  });
+
+  test('keeps a stopped proxy with materialized endpoints fail-closed when memberships are empty', async () => {
+    const executor = new StatefulCleanupExecutor();
+    const input = plane();
+    executor.install(input);
+    executor.containers.get(input.proxyContainerName)!.running = false;
+    executor.networks.get(input.internalNetworkName)!.members = [];
+    executor.networks.get(input.publicNetworkName)!.members = [];
+
+    await expect(teardownExactProjectEgressPlane(input.identity, executor)).rejects.toMatchObject({
+      code: 'INTERNAL_PROXY_MEMBERSHIP',
+    });
+    expect(executor.commands.some(({ args }) => args[1] === 'stop' || args[1] === 'rm')).toBe(false);
+    expect(executor.containers.has(input.proxyContainerName)).toBe(true);
+  });
+
+  test('does not reclaim an otherwise unmaterialized proxy with residual IPv6 endpoint state', async () => {
+    const executor = new StatefulCleanupExecutor();
+    const input = plane();
+    executor.install(input);
+    const proxy = executor.containers.get(input.proxyContainerName)!;
+    proxy.running = false;
+    proxy.attachmentsMaterialized = false;
+    proxy.globalIpv6Address = '2001:db8::2';
+    executor.networks.get(input.internalNetworkName)!.members = [];
+    executor.networks.get(input.publicNetworkName)!.members = [];
+
+    await expect(teardownExactProjectEgressPlane(input.identity, executor)).rejects.toMatchObject({
+      code: 'INTERNAL_PROXY_MEMBERSHIP',
+    });
+    expect(executor.commands.some(({ args }) => args[1] === 'stop' || args[1] === 'rm')).toBe(false);
+  });
+
+  test('does not remove a proxy whose attachment changes after stop', async () => {
+    const executor = new StatefulCleanupExecutor();
+    const input = plane();
+    executor.install(input);
+    executor.mutateProxyAttachmentOnStop = true;
+
+    await expect(teardownExactProjectEgressPlane(input.identity, executor)).rejects.toMatchObject({
+      code: 'PROXY_REMOVAL_RACE',
+    });
+    expect(executor.commands.some(({ args }) => args[1] === 'rm')).toBe(false);
+    expect(executor.containers.has(input.proxyContainerName)).toBe(true);
+  });
+
+  test('accepts Docker clearing only runtime endpoint fields during a normal stop', async () => {
+    const executor = new StatefulCleanupExecutor();
+    const input = plane();
+    executor.install(input);
+    executor.clearRuntimeEndpointsOnStop = true;
+
+    await expect(teardownExactProjectEgressPlane(input.identity, executor)).resolves.toMatchObject({
+      alreadyAbsent: false,
+      removedResourceCount: 5,
+    });
+    expect(executor.containers.size).toBe(0);
+    expect(executor.networks.size).toBe(0);
+  });
+
+  test('does not reclaim exited proxy state while a runtime member remains', async () => {
+    const executor = new StatefulCleanupExecutor();
+    const input = plane();
+    executor.install(input);
+    executor.containers.get(input.proxyContainerName)!.running = false;
+    executor.networks.get(input.internalNetworkName)!.members = ['provider-runtime'];
+    executor.networks.get(input.publicNetworkName)!.members = [];
+
+    await expect(teardownExactProjectEgressPlane(input.identity, executor)).rejects.toMatchObject({
+      code: 'INTERNAL_PROXY_MEMBERSHIP',
+    });
+    expect(executor.commands.some(({ args }) => args[1] === 'stop' || args[1] === 'rm')).toBe(false);
   });
 
   test('recovers an empty deterministic firewall chain left between flush and delete', async () => {

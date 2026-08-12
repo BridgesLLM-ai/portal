@@ -32,6 +32,51 @@ export interface ProjectIdentityRecord {
   updatedAt: Date;
 }
 
+/**
+ * Exact column set backing ProjectIdentityRecord.
+ *
+ * Reads that can run against a database which has not yet applied this
+ * release's migrations must select these columns explicitly. An unqualified
+ * `findUnique`/`findFirst` asks Prisma for every scalar in the *candidate*
+ * schema, so a column introduced by this release makes the query fail with
+ * `The column (not available) does not exist in the current database` on every
+ * host still running the previous version. That is exactly how the 4.0.17
+ * rebootability preflight rejected its own upgrade: it queried ProjectIdentity
+ * before `20260812_project_dependency_repair_force_forward` had added
+ * `dependencyQuarantinedAt`.
+ *
+ * Keep this list in sync with ProjectIdentityRecord above, and deliberately do
+ * NOT add columns here that the record does not declare — the point is that a
+ * pre-migration read asks only for what the outgoing schema already has.
+ */
+export const PROJECT_IDENTITY_RECORD_SELECT = Object.freeze({
+  id: true,
+  workspaceOwnerId: true,
+  projectName: true,
+  canonicalRoot: true,
+  rootDevice: true,
+  rootInode: true,
+  rootBirthtimeNs: true,
+  generation: true,
+  lifecycleStatus: true,
+  legacyOpenClawMigrationStatus: true,
+  deletionStartedAt: true,
+  renameTargetName: true,
+  renameLeaseTokenHash: true,
+  renameLeaseExpiresAt: true,
+  renameStartedAt: true,
+  renameCleanupStartedAt: true,
+  renameRuntimeCleanedAt: true,
+  renameDeployPresent: true,
+  renameDeployDevice: true,
+  renameDeployInode: true,
+  renameDeployBirthtimeNs: true,
+  lastRenameSourceName: true,
+  lastRenameCompletedAt: true,
+  createdAt: true,
+  updatedAt: true,
+} as const);
+
 interface ProjectIdentityDelegate {
   findUnique(args: unknown): Promise<ProjectIdentityRecord | null>;
   findFirst(args: unknown): Promise<ProjectIdentityRecord | null>;
@@ -210,6 +255,12 @@ export function projectLifecycleBlockedMessage(identity: Pick<
   }
   if (status === 'DELETING') return 'Project deletion is already in progress';
   if (status === 'CREATING') return 'This project is still being created. Try again in a moment.';
+  if (status === 'DEPENDENCY_PROMOTING') {
+    return 'This Project is finishing an interrupted dependency update. Try again after recovery completes.';
+  }
+  if (status === 'DEPENDENCY_QUARANTINED') {
+    return 'This Project is quarantined after an interrupted dependency update and requires authenticated recovery.';
+  }
   return `Project lifecycle state ${status} is blocking this operation`;
 }
 
@@ -653,15 +704,25 @@ export async function createCurrentProjectIdentity(input: {
   workspaceOwnerId: string;
   projectName: string;
   projectRoot: string;
+  projectIdentityId?: string;
 }, database: ProjectIdentityDatabase = defaultDatabase): Promise<ProjectIdentityRecord> {
   const workspaceOwnerId = requireWorkspaceOwnerId(input.workspaceOwnerId);
   const projectName = requireProjectName(input.projectName);
   const root = attestProjectRoot(input.projectRoot);
+  const projectIdentityId = input.projectIdentityId === undefined
+    ? crypto.randomUUID()
+    : String(input.projectIdentityId);
+  const isOperationId = /^[a-f0-9]{32}$/i.test(projectIdentityId);
+  const isUuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
+    .test(projectIdentityId);
+  if (!isOperationId && !isUuid) {
+    throw new ProjectIdentityLifecycleError('Current Project creation identity is invalid');
+  }
 
   try {
     return await database.projectIdentity.create({
       data: {
-        id: crypto.randomUUID(),
+        id: projectIdentityId,
         workspaceOwnerId,
         projectName,
         canonicalRoot: root.canonicalRoot,

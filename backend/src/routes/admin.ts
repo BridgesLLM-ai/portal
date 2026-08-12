@@ -74,6 +74,7 @@ import {
   type ProjectAuthorizationUserUpdate,
 } from '../services/projectAuthorizationTransition';
 import { publishAuthorizationChanged } from '../services/authorizationChangeBus';
+import { publishAllSessionsRevoked } from '../services/sessionRevocationBus';
 import {
   OllamaAuthorityBarrierBusyError,
   withOllamaAuthorityMutationFence,
@@ -608,7 +609,12 @@ router.post('/self-update', requireOwner, async (req: Request, res: Response, ne
   try {
     const request = req.body || {};
     let preparation = await getPortalUpdatePreparation();
-    let admission = admitPortalUpdate(preparation, request);
+    // The normal status endpoint proves only an authenticated, recent
+    // candidate. Permit that candidate through request/release preflight, then
+    // require the strict recovery verifier below before final admission.
+    let admission = admitPortalUpdate(preparation, request, {
+      allowAuthenticatedCandidate: true,
+    });
     if (!admission.ok) {
       res.status(admission.status).json({
         error: admission.error,
@@ -900,6 +906,10 @@ router.post('/registration-requests/:id/approve', requireOwner, async (req: Requ
         userId: approvedUserId,
         authorizationVersion: reactivatedAuthorizationVersion,
         reasons: ['account_status', 'active_status'],
+      });
+      publishAllSessionsRevoked({
+        userId: approvedUserId,
+        reason: 'account_reactivation',
       });
     }
 

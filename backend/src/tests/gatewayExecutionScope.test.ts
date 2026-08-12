@@ -7,6 +7,10 @@ import * as openclawGatewayRpc from '../utils/openclawGatewayRpc';
 import * as openClawHostRunJournal from '../services/openClawHostRunJournal';
 import * as agentZeroOAuthModels from '../agents/providers/agentZero/AgentZeroOAuthModelCatalog';
 import {
+  publishSessionRevoked,
+  sessionRevocationSubscriberCount,
+} from '../services/sessionRevocationBus';
+import {
   AGENT_ZERO_OPENROUTER_FALLBACK_MESSAGE,
 } from '../agents/providers/agentZero/AgentZeroDiagnostics';
 import { prisma } from '../config/database';
@@ -65,6 +69,67 @@ function createOwnershipDatabase(
     } as any,
     claims,
     agentSession,
+  };
+}
+
+function mockDurableAccessIdentity(input: {
+  userId: string;
+  sessionId: string;
+  email?: string;
+  role?: string;
+  authorizationVersion?: number;
+}) {
+  const email = input.email || 'owner@example.com';
+  const role = input.role || 'OWNER';
+  const authorizationVersion = input.authorizationVersion ?? 1;
+  const sessionExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const payload = {
+    userId: input.userId,
+    sessionId: input.sessionId,
+    email,
+    role,
+    accountStatus: 'ACTIVE',
+    sandboxEnabled: true,
+    authorizationVersion,
+    exp: Math.floor((Date.now() + 30 * 60 * 1000) / 1000),
+  };
+  const userDelegate = prisma.user as any;
+  const findUnique = jest.spyOn(userDelegate, 'findUnique').mockImplementation(async (args: any) => {
+    if (args?.where?.id !== input.userId) return null;
+    const selectedSessionId = args?.select?.sessions?.where?.id;
+    return {
+      id: input.userId,
+      email,
+      role,
+      accountStatus: 'ACTIVE',
+      isActive: true,
+      sandboxEnabled: true,
+      authorizationVersion,
+      sessions: selectedSessionId === input.sessionId
+        ? [{ id: input.sessionId, expiresAt: sessionExpiresAt }]
+        : [],
+    } as any;
+  });
+
+  return {
+    payload,
+    expectDurableLookup: () => {
+      expect(findUnique).toHaveBeenCalledTimes(1);
+      expect(findUnique).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: input.userId },
+        select: expect.objectContaining({
+          authorizationVersion: true,
+          sessions: {
+            where: {
+              id: input.sessionId,
+              expiresAt: { gt: expect.any(Date) },
+            },
+            select: { id: true, expiresAt: true },
+            take: 1,
+          },
+        }),
+      }));
+    },
   };
 }
 
@@ -1243,10 +1308,12 @@ describe('Agent Chat execution boundary', () => {
     }
   });
 
-  test('WebSocket conflict recovery attaches the browser when provider state vanished locally', async () => {
+  test('WebSocket conflict recovery attaches the browser and retires its replaced keepalive', async () => {
     const userId = '44444444-4444-4444-8444-444444444444';
     const sessionKey = `agent:main:portal-${userId}-upstream-conflict`;
     const upstreamRunId = 'openclaw-upstream-only-run';
+    const setIntervalSpy = jest.spyOn(global, 'setInterval');
+    const clearIntervalSpy = jest.spyOn(global, 'clearInterval');
     jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun')
       .mockImplementation(async (handle) => handle);
     jest.spyOn(openClawHostRunJournal, 'quarantineOpenClawHostRun').mockResolvedValue();
@@ -1307,6 +1374,12 @@ describe('Agent Chat execution boundary', () => {
       }));
       expect(payloads.some((payload) => payload.type === 'error')).toBe(false);
 
+      const keepaliveHandles = setIntervalSpy.mock.calls.flatMap((args, index) => (
+        args[1] === 10_000 ? [setIntervalSpy.mock.results[index]?.value] : []
+      ));
+      expect(keepaliveHandles).toHaveLength(2);
+      expect(clearIntervalSpy).toHaveBeenCalledWith(keepaliveHandles[1]);
+
       __persistentGatewayWsTest.handleAgentEvent({
         sessionKey,
         runId: upstreamRunId,
@@ -1329,6 +1402,10 @@ describe('Agent Chat execution boundary', () => {
     const userId = '45454545-4545-4545-8545-454545454545';
     const sessionKey = `agent:main:portal-${userId}-upstream-sse-conflict`;
     const upstreamRunId = 'openclaw-upstream-sse-run';
+    const access = mockDurableAccessIdentity({
+      userId,
+      sessionId: 'durable-sse-conflict-session',
+    });
     jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun')
       .mockImplementation(async (handle) => handle);
     jest.spyOn(openClawHostRunJournal, 'quarantineOpenClawHostRun').mockResolvedValue();
@@ -1369,7 +1446,7 @@ describe('Agent Chat execution boundary', () => {
       },
       query: { stream: '1' },
       headers: { accept: 'text/event-stream' },
-      user: { userId, email: 'owner@example.com', role: 'OWNER', authorizationVersion: 1 },
+      user: access.payload,
     });
     const res = {
       socket: { setNoDelay: jest.fn() },
@@ -1417,6 +1494,7 @@ describe('Agent Chat execution boundary', () => {
         content: 'Visible on the SSE recovery lane',
         runId: upstreamRunId,
       }));
+      access.expectDurableLookup();
     } finally {
       req.emit('close');
       __persistentGatewayWsTest.resetSession(sessionKey);
@@ -1475,6 +1553,10 @@ describe('Agent Chat execution boundary', () => {
   });
 
   test('host-native CLI SSE does not republish callback copies into the bus', async () => {
+    const access = mockDurableAccessIdentity({
+      userId: 'owner-1',
+      sessionId: 'durable-codex-sse-session',
+    });
     const provider = {
       providerName: 'CODEX',
       displayName: 'Codex',
@@ -1503,7 +1585,7 @@ describe('Agent Chat execution boundary', () => {
       body: { message: 'hello', provider: 'CODEX', session: 'new-test' },
       query: { stream: '1' },
       headers: { accept: 'text/event-stream' },
-      user: { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' },
+      user: access.payload,
     });
     const res = {
       socket: { setNoDelay: jest.fn() },
@@ -1532,6 +1614,76 @@ describe('Agent Chat execution boundary', () => {
       requestId: payloads.find((payload) => payload.type === 'text')?.runId,
     });
     expect(res.end).toHaveBeenCalledTimes(1);
+    access.expectDurableLookup();
+  });
+
+  test('exact durable-session revocation retires an active Agent Chat SSE', async () => {
+    const userId = 'owner-revoked-sse';
+    const sessionId = 'revoked-route-sse-session';
+    const access = mockDurableAccessIdentity({
+      userId,
+      sessionId: 'durable-revoked-sse-session',
+    });
+    let signalProviderStarted!: () => void;
+    const providerStarted = new Promise<void>((resolve) => { signalProviderStarted = resolve; });
+    let settleProvider!: () => void;
+    const providerSettled = new Promise<{ fullText: string; metadata: Record<string, never> }>(
+      (resolve) => {
+        settleProvider = () => resolve({ fullText: 'late result', metadata: {} });
+      },
+    );
+    const provider = {
+      providerName: 'CODEX',
+      displayName: 'Codex',
+      startSession: jest.fn().mockResolvedValue(sessionId),
+      abortActiveRun: jest.fn().mockResolvedValue(true),
+      sendMessage: jest.fn(async () => {
+        signalProviderStarted();
+        return providerSettled;
+      }),
+    };
+    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+
+    const req = Object.assign(new EventEmitter(), {
+      body: { message: 'keep running', provider: 'CODEX', session: 'new-test' },
+      query: { stream: '1' },
+      headers: { accept: 'text/event-stream' },
+      user: access.payload,
+    });
+    const res = {
+      socket: { setNoDelay: jest.fn() },
+      setHeader: jest.fn(),
+      flushHeaders: jest.fn(),
+      write: jest.fn(),
+      end: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+
+    const route = sendRouteHandler()(req as any, res as any);
+    await providerStarted;
+    expect(sessionRevocationSubscriberCount(userId)).toBe(1);
+
+    publishSessionRevoked({
+      userId,
+      sessionId: 'durable-revoked-sse-session',
+      reason: 'logout',
+    });
+
+    expect(provider.abortActiveRun).toHaveBeenCalledWith(sessionId, expect.any(String));
+    expect(res.end).toHaveBeenCalledTimes(1);
+    expect(sessionRevocationSubscriberCount(userId)).toBe(0);
+
+    settleProvider();
+    await route;
+    const payloads = res.write.mock.calls
+      .map(([raw]) => String(raw))
+      .flatMap((raw) => raw.split('\n'))
+      .filter((line) => line.startsWith('data: {'))
+      .map((line) => JSON.parse(line.slice('data: '.length)));
+    expect(payloads.some((payload) => payload.type === 'done')).toBe(false);
+    access.expectDurableLookup();
+    streamEventBus.clearStream(sessionId);
   });
 
   test('route-owned Ollama WebSocket callbacks are mirrored once through the reconnect bus', async () => {
@@ -1670,9 +1822,35 @@ describe('Agent Chat execution boundary', () => {
     })).toBe(true);
     expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(firstSocket as any, sessionId)).toBe(true);
     expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(secondSocket as any, sessionId)).toBe(false);
+    expect(streamEventBus.getSubscriberDiagnostics(sessionId).roles['browser-ws']).toBe(1);
+
+    // Reattaching the same browser/socket must replace its prior direct
+    // delivery subscription rather than accumulating another listener.
+    expect(__gatewayExecutionScopeTest.attachBrowserWsToSessionStream({
+      ws: firstSocket as any,
+      sessionKey: sessionId,
+      providerName: 'GROK',
+      streamInfo: __gatewayExecutionScopeTest.getProviderOwnedBusStreamSnapshot(sessionId),
+    })).toBe(true);
+    expect(streamEventBus.getSubscriberDiagnostics(sessionId).roles['browser-ws']).toBe(1);
+
+    // A second browser tab is legitimate fan-out and should be counted as a
+    // distinct browser consumer, not diagnosed as an internal subscriber leak.
+    expect(__gatewayExecutionScopeTest.attachBrowserWsToSessionStream({
+      ws: secondSocket as any,
+      sessionKey: sessionId,
+      providerName: 'GROK',
+      streamInfo: __gatewayExecutionScopeTest.getProviderOwnedBusStreamSnapshot(sessionId),
+    })).toBe(true);
+    expect(streamEventBus.getSubscriberDiagnostics(sessionId).roles['browser-ws']).toBe(2);
 
     firstSocket.emit('close');
     expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(firstSocket as any, sessionId)).toBe(false);
+    expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(secondSocket as any, sessionId)).toBe(true);
+    expect(streamEventBus.getSubscriberDiagnostics(sessionId).roles['browser-ws']).toBe(1);
+
+    secondSocket.emit('close');
+    expect(streamEventBus.getSubscriberDiagnostics(sessionId).roles['browser-ws']).toBe(0);
   });
 
   test.each(['done', 'error'] as const)(
@@ -1757,6 +1935,10 @@ describe('Agent Chat execution boundary', () => {
   });
 
   test('route-owned Agent Zero SSE callbacks are mirrored once and sanitize terminal metadata', async () => {
+    const access = mockDurableAccessIdentity({
+      userId: 'owner-1',
+      sessionId: 'durable-agent-zero-sse-session',
+    });
     jest.spyOn(agentZeroOAuthModels, 'validateAgentZeroOAuthModelSelection').mockResolvedValue({
       id: 'codex_oauth/gpt-5.6-terra',
       providerId: 'codex_oauth',
@@ -1794,7 +1976,7 @@ describe('Agent Chat execution boundary', () => {
       },
       query: { stream: '1' },
       headers: { accept: 'text/event-stream' },
-      user: { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' },
+      user: access.payload,
     });
     const res = {
       socket: { setNoDelay: jest.fn() },
@@ -1828,9 +2010,16 @@ describe('Agent Chat execution boundary', () => {
       providerEventType: 'warning',
     }));
     expect(res.end).toHaveBeenCalledTimes(1);
+    access.expectDurableLookup();
   });
 
   test.each(['REST', 'SSE'])('%s preserves Agent Zero OAuth fallback guidance at the browser boundary', async (mode) => {
+    const access = mode === 'SSE'
+      ? mockDurableAccessIdentity({
+          userId: 'owner-1',
+          sessionId: 'durable-agent-zero-fallback-sse-session',
+        })
+      : null;
     jest.spyOn(agentZeroOAuthModels, 'validateAgentZeroOAuthModelSelection').mockResolvedValue({
       id: 'codex_oauth/gpt-5.6-terra',
       providerId: 'codex_oauth',
@@ -1858,7 +2047,7 @@ describe('Agent Chat execution boundary', () => {
       },
       query: mode === 'SSE' ? { stream: '1' } : {},
       headers: mode === 'SSE' ? { accept: 'text/event-stream' } : {},
-      user: { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' },
+      user: access?.payload || { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' },
     });
     const res = {
       socket: { setNoDelay: jest.fn() },
@@ -1888,6 +2077,7 @@ describe('Agent Chat execution boundary', () => {
       type: 'error',
       content: AGENT_ZERO_OPENROUTER_FALLBACK_MESSAGE,
     }));
+    access?.expectDurableLookup();
   });
 
   test('HTTP /gateway/send preserves MODEL_PROTOCOL_INCOMPATIBLE for a stale direct selection', async () => {

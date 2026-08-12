@@ -1,4 +1,5 @@
 import {
+  ACTIVE_RUN_STEER_RPC_TIMEOUT_MS,
   ACTIVE_RUN_STEER_GATEWAY_METHOD,
   answerPendingUserInputWithRpc,
   dismissPendingUserInputWithRpc,
@@ -183,8 +184,34 @@ describe('PersistentGatewayWs native pending-user-input RPC', () => {
       expectedRunId: runId,
       requestId: 'steer-1',
       text: 'Focus on the durable fix.',
-    }, 10_000);
+    }, ACTIVE_RUN_STEER_RPC_TIMEOUT_MS);
+    expect(ACTIVE_RUN_STEER_RPC_TIMEOUT_MS).toBe(15_000);
     expect(ACTIVE_RUN_STEER_GATEWAY_METHOD).not.toBe(PENDING_USER_INPUT_GATEWAY_METHOD);
+  });
+
+  test('rejects a steering success that echoes a replacement run', async () => {
+    const rpc = jest.fn(async () => ({
+      accepted: true,
+      replayed: false,
+      runId: 'run-2',
+      requestId: 'steer-r1',
+    }));
+    await expect(steerActiveRunWithRpc(
+      rpc,
+      sessionKey,
+      runId,
+      'steer-r1',
+      'This belongs to R1.',
+    )).rejects.toMatchObject({
+      code: 'INVALID_GATEWAY_RESPONSE',
+      statusCode: 502,
+    });
+    expect(rpc).toHaveBeenCalledWith(ACTIVE_RUN_STEER_GATEWAY_METHOD, {
+      sessionKey,
+      expectedRunId: runId,
+      requestId: 'steer-r1',
+      text: 'This belongs to R1.',
+    }, ACTIVE_RUN_STEER_RPC_TIMEOUT_MS);
   });
 
   test.each([

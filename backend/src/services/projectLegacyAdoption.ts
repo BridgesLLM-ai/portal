@@ -412,6 +412,48 @@ function manifestsMatch(
     && left.symlinkCount === right.symlinkCount;
 }
 
+export function verifyProjectLegacyAdoptionManifestSummary(
+  root: string,
+  expected: Pick<ProjectLegacyAdoptionManifest, 'fileCount' | 'totalBytes' | 'sha256'>,
+): ProjectLegacyAdoptionManifest {
+  const actual = buildProjectLegacyAdoptionManifest(root);
+  if (
+    actual.fileCount !== expected.fileCount
+    || actual.totalBytes !== expected.totalBytes
+    || actual.sha256 !== expected.sha256
+  ) throw migrationIntegrityFailure('The published Project copy changed after its durable migration receipt.');
+  return actual;
+}
+
+/**
+ * Resume the durable Project-copy staging phase without confusing a newly
+ * recreated empty directory for the copy recorded by the journal. When the
+ * exact staged copy survived, verify it in place. When it did not survive,
+ * rebuild it from the immutable source view and require that the rebuilt copy
+ * still matches the already-durable manifest before permitting publication.
+ */
+export function prepareProjectLegacyAdoptionStaging(input: {
+  sourceRoot: string;
+  stagingRoot: string;
+  stagedCopyExisted: boolean;
+  durableManifest?: Pick<ProjectLegacyAdoptionManifest, 'fileCount' | 'totalBytes' | 'sha256'> | null;
+}): ProjectLegacyAdoptionManifest {
+  if (input.stagedCopyExisted) {
+    if (!input.durableManifest) {
+      throw migrationIntegrityFailure('Project copy staging exists without a durable migration manifest.');
+    }
+    return verifyProjectLegacyAdoptionManifestSummary(input.stagingRoot, input.durableManifest);
+  }
+
+  const copied = copyLegacyProjectIntoCurrentStaging({
+    sourceRoot: input.sourceRoot,
+    stagingRoot: input.stagingRoot,
+  });
+  return input.durableManifest
+    ? verifyProjectLegacyAdoptionManifestSummary(input.stagingRoot, input.durableManifest)
+    : copied;
+}
+
 function manifestPathSegments(relative: string): string[] {
   if (
     !relative

@@ -54,6 +54,10 @@ model User {
   projectChatTurns                ProjectChatTurn[]                     @relation("ProjectChatTurnActor")
   projectChatResetJournals        ProjectChatDestructiveResetJournal[]  @relation("ProjectChatResetActor")
   ownedProjectIdentities          ProjectIdentity[]                     @relation("ProjectIdentityOwner")
+  dependencyPromotionDecisions      ProjectDependencyPromotionDecision[]  @relation("ProjectDependencyPromotionActor")
+  ownedDependencyPromotionDecisions ProjectDependencyPromotionDecision[]  @relation("ProjectDependencyPromotionOwner")
+  dependencyRepairOperations        ProjectDependencyRepairOperation[]     @relation("ProjectDependencyRepairActor")
+  ownedDependencyRepairOperations   ProjectDependencyRepairOperation[]     @relation("ProjectDependencyRepairOwner")
   legacyOpenClawImports           LegacyOpenClawProjectImport[]         @relation("LegacyOpenClawImportActor")
   legacyOpenClawQuarantines       LegacyOpenClawProjectQuarantine[]     @relation("LegacyOpenClawQuarantineActor")
   legacyOpenClawClearTombstones   LegacyOpenClawProjectClearTombstone[] @relation("LegacyOpenClawClearActor")
@@ -579,13 +583,19 @@ model ProjectIdentity {
   generation                    Int       @default(1)
   // CREATING is a hidden server-owned staging fence, CREATION_CLEANUP is its
   // crash-recoverable cleanup claim, and ACTIVE/RENAMING/DELETING are the
-  // published Project lifecycle states.
+  // published Project lifecycle states. DEPENDENCY_PROMOTING closes admission
+  // around an authorized artifact swap; DEPENDENCY_QUARANTINED contains an
+  // exact Project whose post-authorization filesystem topology is ambiguous.
   lifecycleStatus               String    @default("ACTIVE")
   // NONE is legacy eligibility unknown, PENDING/COMPLETE belong to the
   // reconciliation lifecycle, and CURRENT is reserved for authoritative
   // Portal 4 project creation. The database CHECK enforces this closed set.
   legacyOpenClawMigrationStatus String    @default("NONE")
   deletionStartedAt             DateTime?
+  // Dedicated containment timestamp. It survives the repair go-bit while the
+  // lifecycle moves back through DEPENDENCY_PROMOTING, so backup admission can
+  // prove the selected recovery archive was created after quarantine.
+  dependencyQuarantinedAt       DateTime?
   renameTargetName              String?
   renameLeaseTokenHash          String?
   renameLeaseExpiresAt          DateTime?
@@ -615,12 +625,114 @@ model ProjectIdentity {
   legacyOpenClawQuarantines     LegacyOpenClawProjectQuarantine[]     @relation("LegacyOpenClawQuarantineProject")
   legacyOpenClawClearTombstones LegacyOpenClawProjectClearTombstone[] @relation("LegacyOpenClawClearProject")
   deploymentLifecycleRevision   ProjectDeploymentLifecycleRevision?
+  dependencyPromotionDecisions ProjectDependencyPromotionDecision[]
+  dependencyRepairOperations   ProjectDependencyRepairOperation[]
 
   @@unique([workspaceOwnerId, projectName])
   @@unique([workspaceOwnerId, canonicalRoot])
   @@unique([workspaceOwnerId, renameTargetName])
   @@index([workspaceOwnerId])
   @@index([lifecycleStatus])
+}
+
+// Durable authorization boundary between dependency staging and the
+// same-filesystem artifact promotion. Actor/User and ProjectIdentity use
+// RESTRICT relations so live evidence blocks their deletion; Session remains
+// a scalar snapshot because logout must remain possible. The trigger validates
+// the live rows and permits only AUTHORIZED -> APPLIED.
+model ProjectDependencyPromotionDecision {
+  operationId                   String   @id @db.Uuid
+  actorUserId                   String
+  sessionId                     String
+  authorizationVersion          Int
+  projectIdentityId             String
+  projectIdentityGeneration     Int
+  workspaceOwnerId              String
+  projectName                   String
+  operationParentCanonicalRoot  String
+  operationParentDevice         String
+  operationParentInode          String
+  operationParentBirthtimeNs    String
+  operationParentMode           Int
+  operationParentUid            Int
+  operationParentGid            Int
+  destinationCanonicalRoot      String   @unique(map: "ProjectDependencyPromotionDecision_destination_key")
+  destinationRootDevice         String
+  destinationRootInode          String
+  destinationRootBirthtimeNs    String
+  manifestDigest                String   @db.VarChar(64)
+  // Canonical bounded recovery evidence. Keeping the complete manifest in the
+  // immutable row lets APPLIED recovery re-attest all-new after the filesystem
+  // journal has already been retired by a previous process.
+  manifest                      Json     @db.JsonB
+  status                        String   @default("AUTHORIZED") @db.VarChar(16)
+  authorizedAt                  DateTime @default(now())
+  appliedAt                     DateTime?
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @default(now()) @updatedAt
+
+  actorUser       User            @relation("ProjectDependencyPromotionActor", fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  workspaceOwner  User            @relation("ProjectDependencyPromotionOwner", fields: [workspaceOwnerId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  projectIdentity ProjectIdentity @relation(fields: [projectIdentityId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([workspaceOwnerId, projectName, status], map: "ProjectDependencyPromotionDecision_owner_project_status_idx")
+  @@index([projectIdentityId, projectIdentityGeneration], map: "ProjectDependencyPromotionDecision_identity_generation_idx")
+  @@index([status, appliedAt], map: "ProjectDependencyPromotionDecision_status_appliedAt_idx")
+}
+
+// Immutable Owner authorization plus a monotonic crash-recovery receipt for
+// force-forwarding one exact quarantined dependency generation. The original
+// promotion decision remains the generation authority until this row reaches
+// COMPLETE and the Project returns to ACTIVE.
+model ProjectDependencyRepairOperation {
+  repairId                     String   @id @db.Uuid
+  action                       String   @default("FORCE_FORWARD_STAGED") @db.VarChar(32)
+  promotionOperationId         String   @unique(map: "ProjectDependencyRepairOperation_promotionOperationId_key") @db.Uuid
+  manifestDigest               String   @db.VarChar(64)
+  actorUserId                  String
+  sessionId                    String
+  authorizationVersion         Int
+  projectIdentityId            String
+  projectIdentityGeneration    Int
+  workspaceOwnerId             String
+  projectName                  String
+  quarantinedAt                DateTime
+  repairJournalCanonicalPath   String
+  displacementCanonicalRoot    String
+  repairBindingDigest          String   @db.VarChar(64)
+  backupPath                   String
+  backupFilename               String
+  backupDevice                 String
+  backupInode                  String
+  backupSize                   BigInt
+  backupMtimeNs                String
+  backupReceiptDigest          String   @db.VarChar(64)
+  backupFingerprintDigest      String   @db.VarChar(64)
+  backupLockMarkerPath         String
+  backupLockMarkerDigest       String   @db.VarChar(64)
+  backupLockOwned              Boolean
+  movePlanDigest               String   @db.VarChar(64)
+  cleanupPlanDigest            String?  @db.VarChar(64)
+  status                       String   @default("PROMOTING") @db.VarChar(16)
+  phase                        String   @default("GO_BIT") @db.VarChar(24)
+  startedAt                    DateTime @default(now())
+  allNewAt                     DateTime?
+  appliedAt                    DateTime?
+  evidenceCleanedAt            DateTime?
+  completedAt                  DateTime?
+  createdAt                    DateTime @default(now())
+  updatedAt                    DateTime @default(now()) @updatedAt
+
+  actorUser       User            @relation("ProjectDependencyRepairActor", fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  workspaceOwner  User            @relation("ProjectDependencyRepairOwner", fields: [workspaceOwnerId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  // Live repair states hold lifecycle DEPENDENCY_PROMOTING and cannot enter a
+  // deletion transaction. A retained COMPLETE receipt may retire with the
+  // Project identity, avoiding a permanent post-repair deletion blocker.
+  projectIdentity ProjectIdentity @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+
+  @@index([projectIdentityId, projectIdentityGeneration, status], map: "ProjectDependencyRepairOperation_identity_generation_status_idx")
+  @@index([workspaceOwnerId, projectName, status], map: "ProjectDependencyRepairOperation_owner_project_status_idx")
+  @@index([status, updatedAt], map: "ProjectDependencyRepairOperation_status_updatedAt_idx")
 }
 
 // Project deployment intent has its own monotonic generation. Runtime status

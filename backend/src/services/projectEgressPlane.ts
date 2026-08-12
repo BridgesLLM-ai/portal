@@ -193,6 +193,7 @@ export interface DockerContainerInspect {
       GlobalIPv6Address?: string;
       Aliases?: string[] | null;
       NetworkID?: string;
+      EndpointID?: string;
       IPAMConfig?: { IPv4Address?: string; IPv6Address?: string } | null;
     }>;
   };
@@ -220,12 +221,19 @@ export interface ProjectEgressDiscoveredResource {
   sourceCidrs: readonly string[];
   chainDeclared: boolean;
   snapshotFingerprint: string;
+  transitionInvariantFingerprint: string | null;
 }
 
 export interface ProjectEgressDiscoveryOptions {
   expectedIdentities?: readonly ProjectEgressIdentity[];
   /** Teardown requires provider runtimes to be gone; read-only preflight does not. */
   requireNoRuntimeMembers?: boolean;
+  /**
+   * Exact teardown may recover a Docker-stopped proxy whose two declared
+   * network attachments no longer have endpoints. Ordinary discovery keeps
+   * this state fail-closed so it can never be mistaken for a live plane.
+   */
+  allowExitedDetachedProxyDebris?: boolean;
 }
 
 export interface ProjectEgressTeardownResult {
@@ -958,6 +966,7 @@ function baseDiscoveredResource(input: {
   sourceCidrs?: readonly string[];
   chainDeclared?: boolean;
   snapshot: unknown;
+  transitionInvariant?: unknown;
 }): ProjectEgressDiscoveredResource {
   return Object.freeze({
     kind: input.kind,
@@ -975,11 +984,73 @@ function baseDiscoveredResource(input: {
     sourceCidrs: Object.freeze([...(input.sourceCidrs || [])]),
     chainDeclared: input.chainDeclared === true,
     snapshotFingerprint: dockerResourceSnapshot(input.snapshot),
+    transitionInvariantFingerprint: input.transitionInvariant === undefined
+      ? null
+      : dockerResourceSnapshot(input.transitionInvariant),
   });
 }
 
 function namesInNetwork(network: DockerNetworkInspect): string[] {
   return Object.values(network.Containers || {}).map((entry) => requireDockerName(entry.Name, 'network member')).sort();
+}
+
+function proxyDiscoverySnapshot(inspect: DockerContainerInspect) {
+  const attachments = inspect.NetworkSettings?.Networks || {};
+  return {
+    dockerId: requireDockerId(inspect.Id, 'Project egress proxy'),
+    labels: inspect.Config?.Labels,
+    attached: Object.keys(attachments).sort(),
+    attachments: Object.fromEntries(Object.entries(attachments)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, attachment]) => [name, {
+        networkId: attachment.NetworkID || '',
+        endpointId: attachment.EndpointID || '',
+        address: attachment.IPAddress || '',
+        globalIpv6Address: attachment.GlobalIPv6Address || '',
+        configuredIpv4Address: attachment.IPAMConfig?.IPv4Address || '',
+        configuredIpv6Address: attachment.IPAMConfig?.IPv6Address || '',
+        aliases: [...(attachment.Aliases || [])].sort(),
+      }])),
+    networkMode: inspect.HostConfig?.NetworkMode,
+    running: inspect.State?.Running,
+  };
+}
+
+function proxyStoppedTransitionInvariant(inspect: DockerContainerInspect) {
+  const snapshot = proxyDiscoverySnapshot(inspect);
+  return {
+    dockerId: snapshot.dockerId,
+    labels: snapshot.labels,
+    attached: snapshot.attached,
+    attachments: Object.fromEntries(Object.entries(snapshot.attachments).map(([name, attachment]) => [name, {
+      networkId: attachment.networkId,
+      configuredIpv4Address: attachment.configuredIpv4Address,
+      configuredIpv6Address: attachment.configuredIpv6Address,
+      aliases: attachment.aliases,
+    }])),
+    networkMode: snapshot.networkMode,
+  };
+}
+
+function proxyRuntimeEndpointsAreEmpty(inspect: DockerContainerInspect): boolean {
+  return Object.values(inspect.NetworkSettings?.Networks || {}).every((attachment) => (
+    String(attachment.EndpointID || '') === ''
+    && String(attachment.IPAddress || '') === ''
+    && String(attachment.GlobalIPv6Address || '') === ''
+  ));
+}
+
+function proxyAttachmentIsUnmaterialized(
+  attachment: NonNullable<NonNullable<DockerContainerInspect['NetworkSettings']>['Networks']>[string]
+    | undefined,
+): boolean {
+  return !attachment || (
+    String(attachment.NetworkID || '') === ''
+    && String(attachment.EndpointID || '') === ''
+    && String(attachment.IPAddress || '') === ''
+    && String(attachment.GlobalIPv6Address || '') === ''
+    && String(attachment.IPAMConfig?.IPv6Address || '') === ''
+  );
 }
 
 function assertPolicyConsistency(resources: readonly ProjectEgressDiscoveredResource[]): void {
@@ -1238,7 +1309,10 @@ export async function discoverProjectEgressPlaneResources(
     if (!/^[a-f0-9]{64}$/i.test(tokenHash)) fail('PROXY_TOKEN_LABEL', 'Project egress proxy token hash label is invalid');
     const attached = Object.keys(inspect.NetworkSettings?.Networks || {}).sort();
     const expectedAttached = [managed.scope.internalNetworkName, managed.scope.publicNetworkName].sort();
-    if (JSON.stringify(attached) !== JSON.stringify(expectedAttached)
+    const stoppedWithNoAttachments = options.allowExitedDetachedProxyDebris === true
+      && inspect.State?.Running === false
+      && attached.length === 0;
+    if ((!stoppedWithNoAttachments && JSON.stringify(attached) !== JSON.stringify(expectedAttached))
       || inspect.HostConfig?.NetworkMode === 'host') {
       fail('PROXY_NETWORK_IDENTITY', 'Project egress proxy network attachment did not match its identity');
     }
@@ -1250,12 +1324,8 @@ export async function discoverProjectEgressPlaneResources(
       scope: managed.scope,
       policyFingerprint: managed.policyFingerprint,
       dockerId,
-      snapshot: {
-        dockerId,
-        labels: inspect.Config?.Labels,
-        attached,
-        networkMode: inspect.HostConfig?.NetworkMode,
-      },
+      snapshot: proxyDiscoverySnapshot(inspect),
+      transitionInvariant: proxyStoppedTransitionInvariant(inspect),
     }));
   }
 
@@ -1293,22 +1363,40 @@ export async function discoverProjectEgressPlaneResources(
     }));
   }
 
+  const exitedDetachedProxyDebris = new Set<string>();
   for (const [identityFingerprint, proxy] of proxies) {
     if (!networks.has(`${identityFingerprint}:internal`) || !networks.has(`${identityFingerprint}:proxy-public`)) {
       fail('PROXY_NETWORK_MISSING', 'Project egress proxy references a missing managed network');
     }
-    const internalAlias = proxy.inspect.NetworkSettings?.Networks?.[proxy.scope.internalNetworkName]?.Aliases || [];
-    if (!internalAlias.includes(PROXY_ALIAS)) fail('PROXY_ALIAS', 'Project egress proxy internal alias is missing');
+    const internal = networks.get(`${identityFingerprint}:internal`)!;
+    const publicNetwork = networks.get(`${identityFingerprint}:proxy-public`)!;
+    const internalAttachment = proxy.inspect.NetworkSettings?.Networks?.[proxy.scope.internalNetworkName];
+    const publicAttachment = proxy.inspect.NetworkSettings?.Networks?.[proxy.scope.publicNetworkName];
+    if (
+      options.allowExitedDetachedProxyDebris === true
+      && proxy.inspect.State?.Running === false
+      && proxyAttachmentIsUnmaterialized(internalAttachment)
+      && proxyAttachmentIsUnmaterialized(publicAttachment)
+      && namesInNetwork(internal.inspect).length === 0
+      && namesInNetwork(publicNetwork.inspect).length === 0
+    ) {
+      exitedDetachedProxyDebris.add(identityFingerprint);
+    } else {
+      const internalAlias = internalAttachment?.Aliases || [];
+      if (!internalAlias.includes(PROXY_ALIAS)) fail('PROXY_ALIAS', 'Project egress proxy internal alias is missing');
+    }
   }
   for (const entry of networks.values()) {
     const proxy = proxies.get(entry.scope.identityFingerprint);
     const members = namesInNetwork(entry.inspect);
-    const expectedProxy = proxy ? [entry.scope.proxyContainerName] : [];
+    const expectedProxy = proxy && !exitedDetachedProxyDebris.has(entry.scope.identityFingerprint)
+      ? [entry.scope.proxyContainerName]
+      : [];
     if (entry.role === 'proxy-public' && JSON.stringify(members) !== JSON.stringify(expectedProxy)) {
       fail('PUBLIC_NETWORK_MEMBERSHIP', 'Project egress public network has unexpected members');
     }
     if (entry.role === 'internal') {
-      if (proxy && !members.includes(entry.scope.proxyContainerName)) {
+      if (proxy && expectedProxy.length > 0 && !members.includes(entry.scope.proxyContainerName)) {
         fail('INTERNAL_PROXY_MEMBERSHIP', 'Project egress internal network lost its proxy member');
       }
       if (options.requireNoRuntimeMembers
@@ -1337,6 +1425,7 @@ function resourcesOfKind(
 async function reattestProxyBeforeRemoval(
   executor: ProjectEgressCommandExecutor,
   resource: ProjectEgressDiscoveredResource,
+  state: 'unchanged' | 'stopped-transition' = 'unchanged',
 ): Promise<DockerContainerInspect> {
   const dockerId = requireDockerId(resource.dockerId, 'Project egress proxy');
   const inspect = await strictInspectOne<DockerContainerInspect>(executor, 'container', dockerId);
@@ -1349,6 +1438,22 @@ async function reattestProxyBeforeRemoval(
   if (managed.scope.identityFingerprint !== resource.identityFingerprint
     || managed.policyFingerprint !== resource.policyFingerprint) {
     fail('PROXY_REMOVAL_LABELS', 'Project egress proxy labels changed before removal');
+  }
+  const snapshot = proxyDiscoverySnapshot(inspect);
+  const unchanged = dockerResourceSnapshot(snapshot) === resource.snapshotFingerprint;
+  const stoppedTransition = state === 'stopped-transition'
+    && inspect.State?.Running === false
+    && (
+      dockerResourceSnapshot({ ...snapshot, running: true }) === resource.snapshotFingerprint
+      || (
+        proxyRuntimeEndpointsAreEmpty(inspect)
+        && resource.transitionInvariantFingerprint !== null
+        && dockerResourceSnapshot(proxyStoppedTransitionInvariant(inspect))
+          === resource.transitionInvariantFingerprint
+      )
+    );
+  if (!unchanged && !stoppedTransition) {
+    fail('PROXY_REMOVAL_RACE', 'Project egress proxy state changed before removal');
   }
   return inspect;
 }
@@ -1430,7 +1535,11 @@ export async function teardownProjectEgressPlaneResources(
   executor: ProjectEgressCommandExecutor = projectEgressCommandExecutor,
 ): Promise<ProjectEgressTeardownResult> {
   const projectId = requireOpaqueId(projectIdInput, 'projectId');
-  const strictOptions = { ...options, requireNoRuntimeMembers: true };
+  const strictOptions = {
+    ...options,
+    requireNoRuntimeMembers: true,
+    allowExitedDetachedProxyDebris: true,
+  };
   const initial = await discoverProjectEgressPlaneResources(projectId, strictOptions, executor);
   const secondAttestation = await discoverProjectEgressPlaneResources(projectId, strictOptions, executor);
   compareResourceSnapshots(initial, secondAttestation);
@@ -1439,7 +1548,7 @@ export async function teardownProjectEgressPlaneResources(
     const proxyId = requireDockerId(proxy.dockerId, 'Project egress proxy');
     await reattestProxyBeforeRemoval(executor, proxy);
     await executor.run('docker', ['container', 'stop', '--time', '10', proxyId]);
-    await reattestProxyBeforeRemoval(executor, proxy);
+    await reattestProxyBeforeRemoval(executor, proxy, 'stopped-transition');
     await executor.run('docker', ['container', 'rm', proxyId]);
     if (await strictInspectOne<DockerContainerInspect>(executor, 'container', proxyId)) {
       fail('PROXY_REMOVAL_VERIFY', 'Project egress proxy still exists after removal');
@@ -1496,7 +1605,10 @@ export async function teardownExactProjectEgressPlane(
   executor: ProjectEgressCommandExecutor = projectEgressCommandExecutor,
 ): Promise<ProjectEgressTeardownResult> {
   const scope = buildProjectEgressIdentityScope(identityInput);
-  const options: ProjectEgressDiscoveryOptions = { expectedIdentities: [scope.identity] };
+  const options: ProjectEgressDiscoveryOptions = {
+    expectedIdentities: [scope.identity],
+    allowExitedDetachedProxyDebris: true,
+  };
   const target = (resources: readonly ProjectEgressDiscoveredResource[]) => resources
     .filter((resource) => resource.identityFingerprint === scope.identityFingerprint);
 
@@ -1524,7 +1636,7 @@ export async function teardownExactProjectEgressPlane(
     const proxyId = requireDockerId(proxy.dockerId, 'Project egress proxy');
     await reattestProxyBeforeRemoval(executor, proxy);
     await executor.run('docker', ['container', 'stop', '--time', '10', proxyId], { allowExitCodes: [0, 1] });
-    await reattestProxyBeforeRemoval(executor, proxy);
+    await reattestProxyBeforeRemoval(executor, proxy, 'stopped-transition');
     await executor.run('docker', ['container', 'rm', proxyId]);
     if (await strictInspectOne<DockerContainerInspect>(executor, 'container', proxyId)) {
       fail('EXACT_PROXY_REMOVAL_VERIFY', 'The Portal workload egress proxy still exists after removal');

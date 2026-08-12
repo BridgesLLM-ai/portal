@@ -14,6 +14,7 @@ import {
   getProjectNativeRunSnapshot,
   PROJECT_NATIVE_MAX_RUN_TEXT,
   quiesceProjectNativeRunForDestructiveReset,
+  quiesceProjectNativeRunsForProjectDependencyPromotion,
   startProjectNativeRun,
   waitForProjectNativeRunSettlement,
 } from './projectNativeRunBroker';
@@ -914,6 +915,33 @@ test('destructive reset quiesces the exact callback boundary even after provider
 
   releaseSettlement();
   await expect(quiescence).resolves.toMatchObject({ quiescent: true });
+});
+
+test('dependency promotion globally waits through every tracked durable settlement callback', async () => {
+  let releaseSettlement!: () => void;
+  const settlementPending = new Promise<void>((resolve) => {
+    releaseSettlement = resolve;
+  });
+  startProjectNativeRun({
+    userId: USER_ID,
+    projectId: PROJECT_ID,
+    provider: 'CODEX',
+    runtime: 'codex-project-adapter',
+    sessionId: 'codex-global-promotion-fence',
+    message: 'Complete while the global fence waits',
+    onSettled: () => settlementPending,
+  });
+  resolveSend({ fullText: 'Terminal response pending global settlement' });
+  await flushPromises();
+
+  const quiescence = quiesceProjectNativeRunsForProjectDependencyPromotion();
+  let resolved = false;
+  void quiescence.then(() => { resolved = true; });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(resolved).toBe(false);
+
+  releaseSettlement();
+  await expect(quiescence).resolves.toEqual({ runCount: 1 });
 });
 
 test('bounds long-run text and redacts sensitive nested tool metadata', async () => {

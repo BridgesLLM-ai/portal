@@ -16,6 +16,31 @@ describe('Project Chat attachment boundary', () => {
     expect(route).toContain('requireSelectedProjectChatState({');
     expect(route).toContain('coordination.activeTurn');
     expect(route).toContain('scanFile(uploadedFile.path)');
+    const firstContext = route.indexOf('const { provider, executionContext, projectIdentity } = await resolveProjectChatOperationContext(');
+    const scan = route.indexOf('scanFile(uploadedFile.path)');
+    const lock = route.indexOf('await acquireProjectDeletionLock(', scan);
+    const lockedWorkspace = route.indexOf('const lockedWorkspace = resolveActorProjectChatWorkspace', lock);
+    const lockedContext = route.indexOf('const lockedContext = await resolveProjectChatOperationContext(', lockedWorkspace);
+    const generationAttestation = route.indexOf(
+      'lockedContext.projectIdentity.generation !== projectIdentity.generation',
+      lockedContext,
+    );
+    const coordinationAdmission = route.indexOf(
+      'const admittedCoordination = await requireSelectedProjectChatState({',
+      generationAttestation,
+    );
+    const materialize = route.indexOf("path.posix.join('.portal', 'attachments'", coordinationAdmission);
+    expect(firstContext).toBeGreaterThanOrEqual(0);
+    expect(firstContext).toBeLessThan(scan);
+    expect(route.slice(firstContext, scan)).toContain('{ readOnly: true }');
+    expect(lock).toBeGreaterThan(scan);
+    expect(lockedWorkspace).toBeGreaterThan(lock);
+    expect(lockedContext).toBeGreaterThan(lockedWorkspace);
+    expect(generationAttestation).toBeGreaterThan(lockedContext);
+    expect(coordinationAdmission).toBeGreaterThan(generationAttestation);
+    expect(materialize).toBeGreaterThan(coordinationAdmission);
+    expect(route.slice(lockedContext, generationAttestation)).not.toContain('{ readOnly: true }');
+    expect(route).toContain('releaseProjectNameLock?.()');
     expect(route).toContain("path.posix.join('.portal', 'attachments', crypto.randomUUID())");
     expect(route).toContain('resolveContainedPath(attachmentDir, safeOriginalName');
     expect(route).toContain('projectPath,');

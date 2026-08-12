@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import { createHash, createPublicKey } from 'crypto';
 import {
   __resetPortalSelfUpdateLaunchStateForTests,
   UPDATE_BACKUP_MAX_AGE_HOURS,
@@ -10,13 +11,25 @@ import {
   assessUpdateBackupReadiness,
   findFreshVerifiedUpdateBackup,
   launchPortalSelfUpdate,
+  PORTAL_INSTALLER_AUTHENTICATION_SCRIPT,
   unavailableUpdatePreparation,
   verifyUpdateBackupArchive,
   type PortalUpdatePreparation,
 } from '../services/updatePreparation';
 
+jest.mock('../config/database', () => ({
+  prisma: {
+    systemSetting: { findUnique: jest.fn() },
+  },
+}));
+
 const NOW = Date.parse('2026-07-20T20:00:00.000Z');
 const progressWriter = () => jest.fn().mockResolvedValue(undefined);
+const admittedBackup = {
+  type: 'comprehensive' as const,
+  completeness: 'complete' as const,
+  classificationAuthenticated: true,
+};
 
 function preparation(state: PortalUpdatePreparation['backup']['state']): PortalUpdatePreparation {
   return {
@@ -36,19 +49,22 @@ describe('Portal update backup readiness', () => {
     __resetPortalSelfUpdateLaunchStateForTests();
   });
 
-  test('reports fresh, stale, missing, and active backup states without exposing paths', () => {
+  test('reports candidate, strictly verified, stale, missing, and active states without exposing paths', () => {
     expect(assessUpdateBackupReadiness([
-      { mtimeMs: NOW - 2 * 3_600_000, size: 100 },
+      { ...admittedBackup, mtimeMs: NOW - 2 * 3_600_000, size: 100 },
     ], null, NOW)).toEqual({
-      state: 'fresh',
+      state: 'candidate',
       maxAgeHours: 24,
       newestCreatedAt: '2026-07-20T18:00:00.000Z',
       ageHours: 2,
       activeStatus: null,
     });
+    expect(assessUpdateBackupReadiness([
+      { ...admittedBackup, mtimeMs: NOW - 2 * 3_600_000, size: 100 },
+    ], null, NOW, { strictlyVerified: true }).state).toBe('fresh');
 
     expect(assessUpdateBackupReadiness([
-      { mtimeMs: NOW - 25 * 3_600_000, size: 100 },
+      { ...admittedBackup, mtimeMs: NOW - 25 * 3_600_000, size: 100 },
     ], null, NOW).state).toBe('stale');
     expect(assessUpdateBackupReadiness([], null, NOW).state).toBe('missing');
     expect(assessUpdateBackupReadiness([], { status: 'queued' }, NOW)).toMatchObject({
@@ -59,10 +75,10 @@ describe('Portal update backup readiness', () => {
 
   test('does not trust empty archives or timestamps far in the future', () => {
     expect(assessUpdateBackupReadiness([
-      { mtimeMs: NOW, size: 0 },
+      { ...admittedBackup, mtimeMs: NOW, size: 0 },
     ], null, NOW).state).toBe('missing');
     expect(assessUpdateBackupReadiness([
-      { mtimeMs: NOW + 10 * 60_000, size: 100 },
+      { ...admittedBackup, mtimeMs: NOW + 10 * 60_000, size: 100 },
     ], null, NOW)).toMatchObject({ state: 'unavailable', ageHours: null });
   });
 
@@ -86,6 +102,18 @@ describe('Portal update backup readiness', () => {
       confirmation: 'UPDATE PORTAL',
       backupDecision: 'use-current',
     })).toEqual({ ok: true, backupDecision: 'use-current' });
+
+    expect(admitPortalUpdate(preparation('candidate'), {
+      confirmation: 'UPDATE PORTAL',
+      backupDecision: 'use-current',
+    })).toMatchObject({ ok: false, code: 'FRESH_BACKUP_REQUIRED' });
+    expect(admitPortalUpdate(preparation('candidate'), {
+      confirmation: 'UPDATE PORTAL',
+      backupDecision: 'use-current',
+    }, { allowAuthenticatedCandidate: true })).toEqual({
+      ok: true,
+      backupDecision: 'use-current',
+    });
   });
 
   test('never permits an update while a backup is still running', () => {
@@ -123,65 +151,109 @@ describe('Portal update backup readiness', () => {
 
   test('uses the recovery archive verifier and rejects an archive changed during verification', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-update-backup-'));
-    const fullPath = path.join(directory, 'portal-daily-test.tar.gz');
+    const fullPath = path.join(directory, 'portal-comprehensive-test.tar.gz');
     fs.writeFileSync(fullPath, 'verified backup bytes');
-    const initial = fs.lstatSync(fullPath);
+    const initial = fs.lstatSync(fullPath, { bigint: true });
     const candidate = {
       filename: path.basename(fullPath),
       fullPath,
-      mtimeMs: initial.mtimeMs,
-      size: initial.size,
-      dev: initial.dev,
-      ino: initial.ino,
+      mtimeMs: Number(initial.mtimeMs),
+      mtimeNs: initial.mtimeNs.toString(),
+      size: Number(initial.size),
+      dev: initial.dev.toString(),
+      ino: initial.ino.toString(),
+      ...admittedBackup,
     };
 
     try {
       const execFileImpl = jest.fn().mockResolvedValue(undefined);
       await expect(verifyUpdateBackupArchive(candidate, {
         execFileImpl,
-        backupScriptPath: '/opt/bridgesllm/portal/backup-full.sh',
+        restoreScriptPath: '/opt/bridgesllm/portal/restore-full.sh',
       })).resolves.toBe(true);
       expect(execFileImpl).toHaveBeenCalledWith('/bin/bash', [
-        '/opt/bridgesllm/portal/backup-full.sh',
+        '/opt/bridgesllm/portal/restore-full.sh',
         '--verify-archive',
         fullPath,
-      ], expect.objectContaining({ timeout: 120_000, maxBuffer: 64 * 1024 }));
+      ], expect.objectContaining({ timeout: 900_000, maxBuffer: 64 * 1024 }));
 
       const mutatingVerifier = jest.fn().mockImplementation(async () => {
         fs.appendFileSync(fullPath, 'tampered');
       });
       await expect(verifyUpdateBackupArchive(candidate, {
         execFileImpl: mutatingVerifier,
-        backupScriptPath: '/opt/bridgesllm/portal/backup-full.sh',
+        restoreScriptPath: '/opt/bridgesllm/portal/restore-full.sh',
       })).resolves.toBe(false);
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  test('verifies only the newest eligible archive within one bounded request', async () => {
+  test('checks a bounded newest-first set and accepts the next restore-admitted archive', async () => {
     const newest = {
-      filename: 'portal-daily-new.tar.gz',
-      fullPath: '/backups/daily/portal-daily-new.tar.gz',
+      filename: 'portal-comprehensive-new.tar.gz',
+      fullPath: '/backups/comprehensive/portal-comprehensive-new.tar.gz',
       mtimeMs: NOW - 60_000,
+      mtimeNs: String(BigInt(NOW - 60_000) * 1_000_000n),
       size: 200,
-      dev: 1,
-      ino: 2,
+      dev: '1',
+      ino: '2',
+      ...admittedBackup,
     };
     const older = {
-      filename: 'portal-daily-old.tar.gz',
-      fullPath: '/backups/daily/portal-daily-old.tar.gz',
+      filename: 'portal-comprehensive-old.tar.gz',
+      fullPath: '/backups/comprehensive/portal-comprehensive-old.tar.gz',
       mtimeMs: NOW - 2 * 3_600_000,
+      mtimeNs: String(BigInt(NOW - 2 * 3_600_000) * 1_000_000n),
       size: 100,
-      dev: 1,
-      ino: 1,
+      dev: '1',
+      ino: '1',
+      ...admittedBackup,
     };
-    const verifyArchive = jest.fn(async (_candidate: typeof newest) => false);
+    const verifyArchive = jest.fn(async (candidate: { filename: string }) => candidate.filename === older.filename);
 
     await expect(findFreshVerifiedUpdateBackup([older, newest], NOW, verifyArchive))
-      .resolves.toBeNull();
+      .resolves.toEqual(older);
     expect(verifyArchive.mock.calls.map(([candidate]) => candidate.filename))
-      .toEqual([newest.filename]);
+      .toEqual([newest.filename, older.filename]);
+  });
+
+  test('shares one verification deadline across candidates instead of multiplying timeouts', async () => {
+    let clockMs = 1_000;
+    const candidates = [0, 1, 2].map((offset) => ({
+      filename: `portal-comprehensive-${offset}.tar.gz`,
+      fullPath: `/backups/comprehensive/portal-comprehensive-${offset}.tar.gz`,
+      mtimeMs: NOW - offset * 1_000,
+      mtimeNs: String(BigInt(NOW - offset * 1_000) * 1_000_000n),
+      size: 100,
+      dev: '1',
+      ino: String(offset + 1),
+      ...admittedBackup,
+    }));
+    const observedTimeouts: number[] = [];
+    const verifyArchive = jest.fn(async (_candidate: { filename: string }, timeoutMs = 0) => {
+      observedTimeouts.push(timeoutMs);
+      clockMs += timeoutMs;
+      return false;
+    });
+
+    await expect(findFreshVerifiedUpdateBackup(candidates, NOW, verifyArchive, {
+      clock: () => clockMs,
+      totalTimeoutMs: 5_000,
+    })).resolves.toBeNull();
+    expect(observedTimeouts).toEqual([5_000]);
+  });
+
+  test('ignores daily, degraded, and unauthenticated archives even when newer', () => {
+    expect(assessUpdateBackupReadiness([
+      { ...admittedBackup, mtimeMs: NOW - 3_600_000, size: 100 },
+      { ...admittedBackup, type: 'daily', mtimeMs: NOW - 1_000, size: 999 },
+      { ...admittedBackup, completeness: 'degraded', mtimeMs: NOW - 2_000, size: 999 },
+      { ...admittedBackup, classificationAuthenticated: false, mtimeMs: NOW - 3_000, size: 999 },
+    ], null, NOW)).toMatchObject({
+      state: 'candidate',
+      newestCreatedAt: '2026-07-20T19:00:00.000Z',
+    });
   });
 
   test('returns a bounded unavailable fallback when readiness cannot be read', () => {
@@ -236,13 +308,24 @@ describe('Portal update backup readiness', () => {
     expect(script).not.toContain('finish --operation-id');
     expect(script).toContain('/bin/sync -f "$2" || true');
     expect(script).toContain('https://bridgesllm.ai/releases/$3/install.sh');
+    expect(script).toContain('https://bridgesllm.ai/releases/$3/install.sh.sig');
+    expect(script).toContain('https://bridgesllm.ai/releases/$3/portal-release.manifest');
+    expect(script).toContain('https://bridgesllm.ai/releases/$3/portal-release.sig');
     expect(script).toContain('--connect-timeout 15 --max-time 120');
     expect(script).toContain('--retry 3 --retry-delay 2 --retry-max-time 300 --retry-all-errors');
     expect(script).toContain('--max-filesize 2097152 -o "$installer_file"');
+    expect(script).toContain('--max-filesize 64 -o "$installer_signature_file"');
     expect(script).toContain('/usr/bin/mktemp /var/lib/bridgesllm-installer/dashboard-update-installer.XXXXXX');
     expect(script).not.toContain('| /bin/bash');
     expect(script).not.toContain('http://127.0.0.1:4001/health');
-    expect(script).toContain('--domain "$1"');
+    expect(script).not.toContain('/bin/bash "$installer_file"');
+    expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toContain('/bin/bash "$installer_fd"');
+    expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toContain('--domain "$domain"');
+    expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toContain('pkeyutl -verify');
+    expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toContain('expected_version="$7"');
+    expect(spawnSync('/bin/bash', ['-n'], {
+      input: PORTAL_INSTALLER_AUTHENTICATION_SCRIPT,
+    }).status).toBe(0);
     expect(script).toContain('>> "$2" 2>&1');
     expect(script).not.toContain('portal.example.com');
     expect(script).not.toContain('/opt/bridgesllm/logs/self-update-test.log');
@@ -266,10 +349,132 @@ describe('Portal update backup readiness', () => {
       expect(args).toEqual(expect.arrayContaining([originMode]));
       expect(args).not.toContain('stale.example.com');
       const script = args[args.indexOf('-c') + 1];
-      // The domain branch is selected by the validated mode argument only.
-      expect(script).toContain('if [ "$4" = "domain" ]; then');
-      expect(script).toContain('--update --domain "$1"');
-      expect(script).toMatch(/else\n[^\n]*--update >> "\$2" 2>&1/);
+      // The authenticated executor selects the domain branch only after all
+      // release evidence and the exact installer inode have verified.
+      expect(script).toContain('/bin/bash -c "$8" portal-installer-auth');
+      expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toContain('if [ "$origin_mode" = "domain" ]; then');
+      expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toContain('--update --domain "$domain"');
+      expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toMatch(/else\n[^\n]*--update/);
+    }
+  });
+
+  test('authenticates exact version-bound installer bytes before bash and fails closed for bad evidence', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-installer-auth-'));
+    const privateKey = path.join(directory, 'release-private.pem');
+    const publicKey = path.join(directory, 'release-public.pem');
+    const installer = path.join(directory, 'install.sh');
+    const installerSignature = path.join(directory, 'install.sh.sig');
+    const manifest = path.join(directory, 'portal-release.manifest');
+    const manifestSignature = path.join(directory, 'portal-release.sig');
+    const marker = path.join(directory, 'executed');
+
+    const openssl = (...args: string[]) => {
+      const result = spawnSync('/usr/bin/openssl', args, { encoding: 'utf8' });
+      expect(result.status).toBe(0);
+    };
+    const sign = (source: string, destination: string) => {
+      openssl('pkeyutl', '-sign', '-inkey', privateKey, '-rawin', '-in', source, '-out', destination);
+      fs.chmodSync(destination, 0o600);
+      expect(fs.statSync(destination).size).toBe(64);
+    };
+    const writeFixture = (installerVersion = '4.1.0', manifestVersion = '4.1.0') => {
+      fs.writeFileSync(installer, [
+        '#!/usr/bin/env bash',
+        `readonly VERSION="${installerVersion}"`,
+        'printf "%s\\n" "$*" > "$BRIDGESLLM_AUTH_TEST_MARKER"',
+        '',
+      ].join('\n'), { mode: 0o600 });
+      fs.chmodSync(installer, 0o600);
+      fs.writeFileSync(manifest, [
+        'schema=2',
+        `version=${manifestVersion}`,
+        'artifact=portal.tar.gz',
+        'sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        'size=1',
+        'released=2026-08-11',
+        'release_class=hotfix',
+        'highlights=WyJ0ZXN0Il0',
+        '',
+      ].join('\n'), { mode: 0o600 });
+      fs.chmodSync(manifest, 0o600);
+      sign(installer, installerSignature);
+      sign(manifest, manifestSignature);
+      try { fs.unlinkSync(marker); } catch {}
+    };
+    const runAuthentication = () => spawnSync('/bin/bash', [
+      '-c', PORTAL_INSTALLER_AUTHENTICATION_SCRIPT, 'portal-installer-auth',
+      installer, installerSignature, manifest, manifestSignature,
+      publicKey,
+      createHash('sha256').update(createPublicKey(fs.readFileSync(publicKey)).export({
+        type: 'spki',
+        format: 'der',
+      })).digest('hex'),
+      '4.1.0', 'domain', 'portal.example.com',
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, BRIDGESLLM_AUTH_TEST_MARKER: marker },
+    });
+    const expectNoExecution = () => expect(fs.existsSync(marker)).toBe(false);
+
+    try {
+      openssl('genpkey', '-algorithm', 'ED25519', '-out', privateKey);
+      openssl('pkey', '-in', privateKey, '-pubout', '-out', publicKey);
+      fs.chmodSync(privateKey, 0o600);
+      fs.chmodSync(publicKey, 0o644);
+
+      writeFixture();
+      expect(runAuthentication().status).toBe(0);
+      expect(fs.readFileSync(marker, 'utf8').trim()).toBe('--update --domain portal.example.com');
+
+      writeFixture();
+      fs.appendFileSync(installer, '# tampered after signature\n');
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+
+      writeFixture();
+      fs.appendFileSync(manifest, 'tampered=true\n');
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+
+      writeFixture();
+      fs.unlinkSync(installerSignature);
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+
+      writeFixture('4.1.1');
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+
+      writeFixture('4.1.0', '4.1.1');
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+
+      writeFixture();
+      fs.appendFileSync(installer, 'readonly VERSION="4.1.0"\n');
+      sign(installer, installerSignature);
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+
+      writeFixture();
+      fs.writeFileSync(installerSignature, Buffer.alloc(64), { mode: 0o600 });
+      fs.chmodSync(installerSignature, 0o600);
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+
+      writeFixture();
+      fs.writeFileSync(manifestSignature, Buffer.alloc(65), { mode: 0o600 });
+      fs.chmodSync(manifestSignature, 0o600);
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+
+      writeFixture();
+      fs.writeFileSync(manifest, Buffer.alloc(16_385, 0x61), { mode: 0o600 });
+      fs.chmodSync(manifest, 0o600);
+      sign(manifest, manifestSignature);
+      expect(runAuthentication().status).not.toBe(0);
+      expectNoExecution();
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
     }
   });
 

@@ -7,7 +7,14 @@ import {
   configuredAppApiTargetBinding,
   invalidAppApiTargetResponse,
 } from '../utils/appApiProxyAuth';
-import { createAppApiAbortContext, serializeAppApiRequestBody, streamAppApiResponse } from '../utils/appApiProxy';
+import {
+  appApiBackendUnconfiguredResponse,
+  appApiRequestPathInvalidResponse,
+  appApiUpstreamFailureResponse,
+  createAppApiAbortContext,
+  serializeAppApiRequestBody,
+  streamAppApiResponse,
+} from '../utils/appApiProxy';
 import multer from 'multer';
 import path from 'path';
 import { getAppTarget } from '../services/app-process.service';
@@ -671,73 +678,20 @@ function preflightShareVisit(
   return true;
 }
 
-function renderPasswordLandingPage(token: string, projectName?: string): string {
+function renderPasswordLandingPage(token: string, projectName?: string, errorMessage?: string): string {
   const name = escapeHtml(projectName || 'Shared Project');
+  const formAction = escapeHtml(`/share/${encodeURIComponent(token)}/auth`);
+  const stylesheet = escapeHtml(`/share/${encodeURIComponent(token)}/password.css`);
+  const error = errorMessage
+    ? `<div class="error" role="alert">${escapeHtml(errorMessage)}</div>`
+    : '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Password Required - ${name}</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: #0A0E27;
-      color: #f0f4f8;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 1rem;
-    }
-    .card {
-      width: 100%;
-      max-width: 420px;
-      background: rgba(255,255,255,0.03);
-      backdrop-filter: blur(20px);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 1.25rem;
-      padding: 2.5rem;
-      box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
-    }
-    .lock-icon {
-      width: 48px; height: 48px; margin: 0 auto 1rem;
-      display: flex; align-items: center; justify-content: center;
-      background: rgba(16,185,129,0.1);
-      border-radius: 50%;
-    }
-    .lock-icon svg { width: 24px; height: 24px; color: #10b981; }
-    h1 { font-size: 1.5rem; font-weight: 700; text-align: center; margin-bottom: 0.5rem; }
-    .subtitle { color: #94a3b8; text-align: center; margin-bottom: 1.5rem; font-size: 0.9rem; }
-    .project-name { color: #818cf8; font-weight: 600; }
-    input[type="password"] {
-      width: 100%; padding: 0.85rem 1rem; border-radius: 0.75rem;
-      background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
-      color: white; font-size: 0.95rem; outline: none;
-      transition: border-color 0.2s;
-    }
-    input[type="password"]:focus { border-color: rgba(16,185,129,0.5); }
-    input[type="password"]::placeholder { color: #475569; }
-    .btn {
-      width: 100%; padding: 0.85rem; border-radius: 0.75rem;
-      background: #10b981; color: white; border: none;
-      font-size: 0.95rem; font-weight: 600; cursor: pointer;
-      margin-top: 1rem; transition: background 0.2s, opacity 0.2s;
-    }
-    .btn:hover { background: #059669; }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .error {
-      background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.15);
-      border-radius: 0.5rem; padding: 0.75rem; margin-top: 0.75rem;
-      color: #f87171; font-size: 0.85rem; display: none; text-align: center;
-    }
-    .error.show { display: block; }
-    .spinner { display: none; animation: spin 0.8s linear infinite; }
-    .btn.loading .spinner { display: inline-block; }
-    .btn.loading .btn-text { display: none; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-  </style>
+  <link rel="stylesheet" href="${stylesheet}">
 </head>
 <body>
   <div class="card">
@@ -748,52 +702,42 @@ function renderPasswordLandingPage(token: string, projectName?: string): string 
     </div>
     <h1>Password Required</h1>
     <p class="subtitle">Access <span class="project-name">${name}</span></p>
-    <form id="authForm">
-      <input type="password" id="password" placeholder="Enter password" autofocus autocomplete="off" />
-      <div class="error" id="error"></div>
-      <button type="submit" class="btn" id="submitBtn">
-        <span class="btn-text">Access Project</span>
-        <span class="spinner">⟳</span>
-      </button>
+    <form action="${formAction}" method="post">
+      <input type="password" name="password" placeholder="Enter password" autofocus autocomplete="current-password" maxlength="72" required />
+      ${error}
+      <button type="submit" class="btn">Access Project</button>
     </form>
   </div>
-  <script>
-    const form = document.getElementById('authForm');
-    const pw = document.getElementById('password');
-    const err = document.getElementById('error');
-    const btn = document.getElementById('submitBtn');
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      if (!pw.value) return;
-      btn.classList.add('loading');
-      btn.disabled = true;
-      err.classList.remove('show');
-      try {
-        const res = await fetch('/share/${token}/auth', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password: pw.value })
-        });
-        if (res.ok) {
-          window.location.reload();
-        } else {
-          const data = await res.json();
-          err.textContent = data.error || 'Authentication failed';
-          err.classList.add('show');
-          pw.value = '';
-          pw.focus();
-        }
-      } catch {
-        err.textContent = 'Connection error. Please try again.';
-        err.classList.add('show');
-      } finally {
-        btn.classList.remove('loading');
-        btn.disabled = false;
-      }
-    });
-  </script>
 </body>
 </html>`;
+}
+
+const SHARE_PASSWORD_STYLESHEET = `
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e27;color:#f0f4f8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}.card{width:100%;max-width:420px;background:rgba(255,255,255,.03);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.08);border-radius:1.25rem;padding:2.5rem;box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}.lock-icon{width:48px;height:48px;margin:0 auto 1rem;display:flex;align-items:center;justify-content:center;background:rgba(16,185,129,.1);border-radius:50%}.lock-icon svg{width:24px;height:24px;color:#10b981}h1{font-size:1.5rem;font-weight:700;text-align:center;margin-bottom:.5rem}.subtitle{color:#94a3b8;text-align:center;margin-bottom:1.5rem;font-size:.9rem}.project-name{color:#818cf8;font-weight:600}input[type=password]{width:100%;padding:.85rem 1rem;border-radius:.75rem;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:#fff;font-size:.95rem;outline:none;transition:border-color .2s}input[type=password]:focus{border-color:rgba(16,185,129,.5)}input[type=password]::placeholder{color:#475569}.btn{width:100%;padding:.85rem;border-radius:.75rem;background:#10b981;color:#fff;border:0;font-size:.95rem;font-weight:600;cursor:pointer;margin-top:1rem;transition:background .2s,opacity .2s}.btn:hover{background:#059669}.btn:disabled{opacity:.5;cursor:not-allowed}.error{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.15);border-radius:.5rem;padding:.75rem;margin-top:.75rem;color:#f87171;font-size:.85rem;text-align:center}
+`;
+
+function isNativeShareAuthForm(req: Request): boolean {
+  return String(req.headers['content-type'] || '')
+    .split(';', 1)[0]
+    .trim()
+    .toLowerCase() === 'application/x-www-form-urlencoded';
+}
+
+function sendShareAuthFailure(
+  req: Request,
+  res: Response,
+  status: number,
+  message: string,
+  code: string,
+  token: string,
+  projectName?: string,
+): void {
+  res.setHeader('Cache-Control', 'no-store');
+  if (isNativeShareAuthForm(req)) {
+    res.status(status).type('html').send(renderPasswordLandingPage(token, projectName, message));
+    return;
+  }
+  res.status(status).json({ error: message, code });
 }
 
 async function serveAppFile(app: { zipPath: string }, requestedPath: string, res: Response, token?: string): Promise<boolean> {
@@ -961,6 +905,7 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
     const deployId = `${link.userId}-${link.app.name}`;
     const configuredBinding = configuredAppApiTargetBinding(link.app.id);
     if (configuredBinding.status === 'invalid') {
+      res.setHeader('Cache-Control', 'no-store');
       res.status(503).json(invalidAppApiTargetResponse());
       return;
     }
@@ -970,9 +915,15 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
     const baseTarget = configuredBinding.status === 'configured'
       ? configuredBinding.target
       : registeredTarget || undefined;
-    const targetUrl = baseTarget ? buildAppApiTargetUrl(baseTarget, proxiedPath, query) : undefined;
+    if (!baseTarget) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(503).json(appApiBackendUnconfiguredResponse());
+      return;
+    }
+    const targetUrl = buildAppApiTargetUrl(baseTarget, proxiedPath, query);
     if (!targetUrl) {
-      res.status(502).json({ error: 'App API backend is not configured' });
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(400).json(appApiRequestPathInvalidResponse());
       return;
     }
 
@@ -1031,13 +982,27 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('[ShareAPI] proxy error:', error);
     if (!res.headersSent) {
-      res.status(proxyTimedOut ? 504 : 502).json({ error: proxyTimedOut ? 'Share API backend timeout' : 'Share API proxy error' });
+      const failure = appApiUpstreamFailureResponse(proxyTimedOut, error);
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(failure.status).json(failure.body);
     }
     else if (!res.writableEnded) res.end();
   }
 });
 
 // GET /share/:token/progress - Load saved progress
+shareRouter.get('/:token/password.css', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const shareLink = await findShareLink(req.params.token);
+  if (!shareLink) {
+    res.status(404).send('Not found');
+    return;
+  }
+  if (!(await enforceShareAccessWindow(shareLink, res))) return;
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  res.type('text/css').send(SHARE_PASSWORD_STYLESHEET);
+});
+
 shareRouter.get('/:token/progress', async (req: Request, res: Response) => {
   try {
     const { token } = req.params;
@@ -1108,48 +1073,89 @@ shareRouter.put('/:token/progress', async (req: Request, res: Response) => {
 
 // POST /share/:token/auth - Validate password
 shareRouter.post('/:token/auth', async (req: Request, res: Response) => {
+  const { token } = req.params;
+  let projectName: string | undefined;
   try {
-    const { token } = req.params;
-    const { password } = req.body;
+    const password = req.body?.password;
     const ip = String(req.ip || req.socket.remoteAddress || 'unknown').slice(0, 128);
 
     if (!isValidShareToken(token)) {
-      res.status(404).json({ error: 'Link not found' });
+      sendShareAuthFailure(req, res, 404, 'This shared link is unavailable.', 'SHARE_LINK_NOT_FOUND', token);
       return;
     }
 
     const link = await findShareLink(token);
     if (!link || !link.passwordHash) {
-      res.status(404).json({ error: 'Link not found' });
+      sendShareAuthFailure(req, res, 404, 'This shared link is unavailable.', 'SHARE_LINK_NOT_FOUND', token);
       return;
     }
-    if (!(await enforceShareAccessWindow(link, res))) return;
+    projectName = link.app.name;
+    if (!link.app.isActive || link.userId !== link.app.userId) {
+      sendShareAuthFailure(
+        req,
+        res,
+        404,
+        'This shared link is unavailable.',
+        'SHARE_LINK_NOT_FOUND',
+        token,
+        projectName,
+      );
+      return;
+    }
 
     if (typeof password !== 'string' || !password || Buffer.byteLength(password, 'utf8') > 72) {
-      res.status(400).json({ error: 'Password required' });
+      sendShareAuthFailure(req, res, 400, 'Enter the share password.', 'SHARE_PASSWORD_REQUIRED', token, projectName);
       return;
     }
 
     const rl = passwordAttemptLimiter.begin(ip, token);
     if (!rl.allowed) {
       res.setHeader('Retry-After', String(rl.retryAfter || 60));
-      res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      sendShareAuthFailure(
+        req,
+        res,
+        429,
+        'Too many attempts. Try again later.',
+        'SHARE_PASSWORD_RATE_LIMITED',
+        token,
+        projectName,
+      );
       return;
     }
 
     const valid = await bcrypt.compare(password, link.passwordHash);
     if (!valid) {
-      res.status(401).json({ error: 'Authentication failed' });
+      sendShareAuthFailure(
+        req,
+        res,
+        401,
+        'Authentication failed.',
+        'SHARE_PASSWORD_INVALID',
+        token,
+        projectName,
+      );
       return;
     }
 
     passwordAttemptLimiter.success(ip, token);
     if (!(await claimShareVisit(req, res, link))) return;
     grantShareAccess(req, res, link, 'password');
+    if (isNativeShareAuthForm(req)) {
+      res.redirect(303, `/share/${encodeURIComponent(link.token)}`);
+      return;
+    }
     res.json({ success: true });
   } catch (error) {
     console.error('Share auth error:', error);
-    res.status(500).json({ error: 'Server error' });
+    sendShareAuthFailure(
+      req,
+      res,
+      500,
+      'Authentication is temporarily unavailable. Try again.',
+      'SHARE_AUTH_UNAVAILABLE',
+      token,
+      projectName,
+    );
   }
 });
 

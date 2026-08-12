@@ -324,6 +324,30 @@ describe('OpenClaw host-run journal', () => {
     });
   });
 
+  test('global dependency-promotion quiescence discovers unresolved actors and retires late callbacks', async () => {
+    const test = dependencies();
+    await test.journal.begin(HANDLE);
+
+    await expect(test.journal.quiesceForProjectDependencyPromotion()).resolves.toMatchObject({
+      rowCount: 1,
+      sessionCount: 1,
+      actorUserIds: ['user-1'],
+    });
+    expect(test.rows[0]).toMatchObject({
+      status: 'QUIESCED',
+      terminalReason: 'project_dependency_promotion_session_reset',
+    });
+
+    await expect(test.journal.markDispatchAccepted(HANDLE, 'late-run')).resolves.toBeUndefined();
+    await expect(test.journal.markVisibleSettled(HANDLE, 'completed')).resolves.toBeUndefined();
+    await expect(test.journal.quarantine(HANDLE, new Error('late failure'))).resolves.toBeUndefined();
+    expect(test.rows[0]).toMatchObject({
+      status: 'QUIESCED',
+      upstreamRunId: null,
+      terminalReason: 'project_dependency_promotion_session_reset',
+    });
+  });
+
   test('allows an absent pre-dispatch session only when reset creates and reattests it', async () => {
     let calls = 0;
     const test = dependencies({

@@ -1,8 +1,12 @@
 import { Request, Response, NextFunction } from 'express';
 import { verifyAccessToken, JwtPayload } from '../utils/jwt';
-import { prisma } from '../config/database';
 import { blockedIPs, extractIP } from '../utils/auth-tracking';
-import { canAccessPortal, isElevatedRole } from '../utils/authz';
+import { isElevatedRole } from '../utils/authz';
+import { clearAuthCookies } from '../utils/authCookies';
+import {
+  authorizeAccessTokenPayload,
+  type AuthorizedAccessIdentity,
+} from '../services/accessTokenAuthorization';
 import {
   admitWorkspaceAuthorizationRequest,
   settleWorkspaceAuthorizationRequestIfResponseEnded,
@@ -11,7 +15,7 @@ import {
 declare global {
   namespace Express {
     interface Request {
-      user?: JwtPayload;
+      user?: AuthorizedAccessIdentity;
     }
   }
 }
@@ -19,6 +23,7 @@ declare global {
 const AUTH_LOG_DEDUPE_WINDOW_MS = 60_000;
 const authFailureLogState = new Map<string, { lastLoggedAt: number; suppressedCount: number }>();
 export const AUTHORIZATION_VERSION_HEADER = 'X-Portal-Authorization-Version';
+export const AUTH_SESSION_REVOKED_CODE = 'AUTH_SESSION_REVOKED';
 
 function logAuthFailure(kind: 'Missing token' | 'Invalid token', req: Request) {
   const ip = extractIP(req);
@@ -57,41 +62,21 @@ function getTokenFromRequest(req: Request): string | undefined {
   return undefined;
 }
 
-async function loadAuthorizedUser(payload: JwtPayload) {
-  const user = await prisma.user.findUnique({
-    where: { id: payload.userId },
-    select: {
-      id: true,
-      email: true,
-      role: true,
-      accountStatus: true,
-      isActive: true,
-      sandboxEnabled: true,
-      authorizationVersion: true,
-    },
-  } as any);
-
-  if (!user || !canAccessPortal((user as any).accountStatus, user.isActive)) {
-    return null;
+function clearRejectedCookieSession(req: Request, res: Response): void {
+  // Bearer callers may coexist with an unrelated, valid browser cookie jar.
+  // Delete cookies only when this request actually authenticated from them.
+  if (!getBearerToken(req) && typeof req.cookies?.accessToken === 'string') {
+    clearAuthCookies(req, res);
   }
+}
 
-  // Access tokens issued before this migration are generation 1. That keeps
-  // existing sessions alive until the first authorization-impacting change,
-  // while every later change fails closed immediately.
-  const tokenAuthorizationVersion = payload.authorizationVersion ?? 1;
-  const currentAuthorizationVersion = Number((user as any).authorizationVersion ?? 1);
-  if (tokenAuthorizationVersion !== currentAuthorizationVersion) {
-    return null;
-  }
-
-  return {
-    userId: user.id,
-    email: user.email,
-    role: user.role,
-    accountStatus: (user as any).accountStatus,
-    sandboxEnabled: user.sandboxEnabled,
-    authorizationVersion: currentAuthorizationVersion,
-  } satisfies JwtPayload;
+function respondRevokedSession(req: Request, res: Response): void {
+  clearRejectedCookieSession(req, res);
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  res.status(401).json({
+    error: 'This sign-in session is no longer active. Sign in again.',
+    code: AUTH_SESSION_REVOKED_CODE,
+  });
 }
 
 function applyAuthorizationResponsePolicy(res: Response, user: JwtPayload): void {
@@ -136,11 +121,16 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
   // with the barrier, allowing one old-generation request through after the
   // fence has already reopened.
   if (!admitWorkspaceAuthorizationRequest(req, res, payload.userId)) return;
-  const authorizedUser = await loadAuthorizedUser(payload);
-  if (!authorizedUser) {
+  const authorized = await authorizeAccessTokenPayload(payload);
+  if (!authorized.ok) {
+    if (authorized.reason === 'session_revoked') {
+      respondRevokedSession(req, res);
+      return;
+    }
     res.status(403).json({ error: 'Account is no longer authorized' });
     return;
   }
+  const authorizedUser = authorized.identity;
   if (settleWorkspaceAuthorizationRequestIfResponseEnded(req, res)) return;
 
   applyAuthorizationResponsePolicy(res, authorizedUser);
@@ -171,13 +161,15 @@ export async function browserAuthRedirect(req: Request, res: Response, next: Nex
     const payload = verifyAccessToken(token);
     if (payload) {
       if (!admitWorkspaceAuthorizationRequest(req, res, payload.userId)) return;
-      const authorizedUser = await loadAuthorizedUser(payload);
-      if (authorizedUser) {
+      const authorized = await authorizeAccessTokenPayload(payload);
+      if (authorized.ok) {
         if (settleWorkspaceAuthorizationRequestIfResponseEnded(req, res)) return;
+        const authorizedUser = authorized.identity;
         applyAuthorizationResponsePolicy(res, authorizedUser);
         req.user = authorizedUser;
         return next();
       }
+      if (authorized.reason === 'session_revoked') clearRejectedCookieSession(req, res);
     }
   }
 
@@ -215,11 +207,18 @@ export async function browserAssetAuth(req: Request, res: Response, next: NextFu
     return;
   }
 
-  const authorizedUser = await loadAuthorizedUser(payload);
-  if (!authorizedUser) {
+  const authorized = await authorizeAccessTokenPayload(payload);
+  if (!authorized.ok) {
+    if (authorized.reason === 'session_revoked') {
+      clearRejectedCookieSession(req, res);
+      res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+      res.status(401).send('Unauthorized');
+      return;
+    }
     res.status(403).send('Forbidden');
     return;
   }
+  const authorizedUser = authorized.identity;
 
   applyAuthorizationResponsePolicy(res, authorizedUser);
   req.user = authorizedUser;

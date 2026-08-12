@@ -20,14 +20,22 @@ const { createHash } = require('node:crypto');
 // OpenClaw core and the independently installed Codex provider ship separate
 // copies of the embedded run bundle. Keep their process-local bridges on
 // separate symbols: defining the same non-configurable Symbol API twice makes
-// the second bundle fail during module evaluation. The provider is preferred
-// because current installs execute Codex turns there; the core symbol remains
-// a compatibility fallback for older/runtime-native layouts.
+// the second bundle fail during module evaluation. Pending-input adapters must
+// run before the provider-neutral steer adapter so a question that opens after
+// Portal's probe cannot accidentally receive composer text as a steer.
+const ACTIVE_RUN_RUNTIME_SYMBOL = Symbol.for('bridgesllm.openclaw.active-run-steer.v1');
+const CODEX_PROVIDER_RUNTIME_SYMBOL = Symbol.for('bridgesllm.openclaw.pending-input.codex-plugin.v1');
+const CORE_RUNTIME_SYMBOL = Symbol.for('bridgesllm.openclaw.pending-input.v1');
 const RUNTIME_SYMBOLS = Object.freeze([
-  Symbol.for('bridgesllm.openclaw.pending-input.codex-plugin.v1'),
-  Symbol.for('bridgesllm.openclaw.pending-input.v1'),
+  CODEX_PROVIDER_RUNTIME_SYMBOL,
+  CORE_RUNTIME_SYMBOL,
+  // The pinned core patch owns this provider-neutral adapter. It resolves the
+  // exact active embedded handle, verifies the expected run id, and waits for
+  // both queue acceptance and transcript commitment before returning.
+  ACTIVE_RUN_RUNTIME_SYMBOL,
 ]);
-const RUNTIME_SYMBOL = RUNTIME_SYMBOLS[1];
+// Preserve the historical test/export alias for the core pending-input bridge.
+const RUNTIME_SYMBOL = CORE_RUNTIME_SYMBOL;
 const GATEWAY_METHODS = Object.freeze({
   probe: 'bridgesllm.ask_user.probe',
   pending: 'bridgesllm.ask_user.pending',
@@ -69,6 +77,9 @@ const RUNTIME_ADAPTER_MISS_CODES = new Set([
   'RUN_MISMATCH',
   'NO_PENDING_INPUT',
   'REQUEST_MISMATCH',
+  // Codex app-server turns use their native exact-turn adapter because their
+  // queue handle cannot attest the generic transcript-commit wait contract.
+  'TRANSCRIPT_COMMIT_UNSUPPORTED',
 ]);
 /**
  * Accepted receipts make an exact retry safe when OpenClaw consumed the
@@ -76,6 +87,14 @@ const RUNTIME_ADAPTER_MISS_CODES = new Set([
  * Store only a digest for answers so secret/free-text values are not retained.
  */
 const terminalReceipts = new Map();
+/**
+ * Operations that may already have crossed into an OpenClaw runtime but have
+ * not produced a terminal receipt yet. A retry with the same exact identity
+ * joins the original promise; it must never call the runtime a second time.
+ * Entries are removed on every terminal outcome. Combined capacity with the
+ * terminal receipt map bounds memory without evicting a live side effect.
+ */
+const inFlightReceipts = new Map();
 /**
  * `before_tool_call` is the host-authoritative source for runId. Tool factory
  * context intentionally does not expose it, so short-lived one-shot bindings
@@ -471,7 +490,7 @@ function replayOrConflict(respond, key, action, digest, requestId, runId) {
 }
 
 function reserveReceiptCapacity(respond, requestId, runId) {
-  if (terminalReceipts.size < MAX_TERMINAL_RECEIPTS) return true;
+  if (terminalReceipts.size + inFlightReceipts.size < MAX_TERMINAL_RECEIPTS) return true;
   nonAcceptance(respond, 'DEDUPE_CAPACITY', { requestId, runId });
   return false;
 }
@@ -483,6 +502,63 @@ function recordTerminalReceipt(key, action, digest, now) {
     acceptedAt: now,
     expiresAt: now + TERMINAL_RECEIPT_TTL_MS,
   });
+}
+
+function operationAcceptedCode(action) {
+  return action === 'answer' ? 'ANSWERED' : action === 'dismiss' ? 'DISMISSED' : 'STEERED';
+}
+
+async function runDeduplicatedOperation({
+  respond,
+  key,
+  action,
+  digest,
+  requestId,
+  runId,
+  execute,
+}) {
+  const now = Date.now();
+  pruneTerminalReceipts(now);
+  if (replayOrConflict(respond, key, action, digest, requestId, runId)) return;
+
+  const existing = inFlightReceipts.get(key);
+  if (existing) {
+    if (existing.action !== action || existing.digest !== digest) {
+      nonAcceptance(respond, 'REQUEST_CONFLICT', { requestId, runId });
+      return;
+    }
+    const outcome = await existing.promise;
+    respond(true, outcome.accepted === true
+      ? { ...outcome, replayed: true }
+      : outcome);
+    return;
+  }
+  if (!reserveReceiptCapacity(respond, requestId, runId)) return;
+
+  let settle;
+  const promise = new Promise((resolve) => {
+    settle = resolve;
+  });
+  const receipt = { action, digest, startedAt: now, promise };
+  inFlightReceipts.set(key, receipt);
+
+  let outcome;
+  try {
+    outcome = await execute();
+  } catch {
+    outcome = { accepted: false, code: 'HOTFIX_ERROR', requestId };
+  }
+  if (!outcome || typeof outcome !== 'object') {
+    outcome = { accepted: false, code: 'HOTFIX_ERROR', requestId };
+  }
+  if (inFlightReceipts.get(key) === receipt) inFlightReceipts.delete(key);
+  if (outcome.accepted === true) {
+    recordTerminalReceipt(key, action, digest, Date.now());
+  }
+  settle(outcome);
+  respond(true, outcome.accepted === true
+    ? { ...outcome, replayed: false }
+    : outcome);
 }
 
 const genericRuntimeApi = Object.freeze({
@@ -664,6 +740,42 @@ async function runAskUserSemanticProbe(rawNonce) {
   }
 }
 
+async function runActiveRunSteerSemanticProbe(rawNonce) {
+  const nonce = boundedIdentifier(rawNonce, 64);
+  if (!nonce) return false;
+  const runtime = globalThis[ACTIVE_RUN_RUNTIME_SYMBOL];
+  if (
+    !runtime
+    || runtime.version !== 1
+    || typeof runtime.read !== 'function'
+    || typeof runtime.answer !== 'function'
+    || typeof runtime.dismiss !== 'function'
+    || typeof runtime.steer !== 'function'
+  ) return false;
+
+  const sessionId = `bridgesllm-active-steer-probe-session-${nonce}`;
+  const runId = `bridgesllm-active-steer-probe-run-${nonce}`;
+  try {
+    if (await runtime.read(sessionId, runId) !== null) return false;
+    const answer = await runtime.answer(sessionId, runId, `probe-answer-${nonce}`, 'Probe.');
+    if (
+      answer?.ok !== false
+      || answer.code !== 'NO_PENDING_INPUT'
+      || answer.runId !== runId
+    ) return false;
+    const dismiss = await runtime.dismiss(sessionId, runId, `probe-dismiss-${nonce}`);
+    if (
+      dismiss?.ok !== false
+      || dismiss.code !== 'NO_PENDING_INPUT'
+      || dismiss.runId !== runId
+    ) return false;
+    const steer = await runtime.steer(sessionId, runId, 'BridgesLLM active-run readiness probe.');
+    return steer?.ok === false && steer.code === 'NO_ACTIVE_RUN';
+  } catch {
+    return false;
+  }
+}
+
 const ASK_USER_TOOL_PARAMETERS = Object.freeze({
   type: 'object',
   additionalProperties: false,
@@ -807,7 +919,7 @@ function createAskUserQuestionTool(toolContext) {
 function runtimeApis() {
   const runtimes = [];
   const seen = new Set();
-  for (const symbol of RUNTIME_SYMBOLS) {
+  const appendSymbolRuntime = (symbol) => {
     const candidate = globalThis[symbol];
     if (
       !candidate
@@ -817,11 +929,18 @@ function runtimeApis() {
       || typeof candidate.dismiss !== 'function'
       || typeof candidate.steer !== 'function'
       || seen.has(candidate)
-    ) continue;
+    ) return;
     seen.add(candidate);
     runtimes.push(candidate);
+  };
+  for (const symbol of [CODEX_PROVIDER_RUNTIME_SYMBOL, CORE_RUNTIME_SYMBOL]) {
+    appendSymbolRuntime(symbol);
   }
+  // The provider-neutral pending implementation owns Anthropic and other
+  // generic ask_user_question waits. It must reject PENDING_INPUT before the
+  // active-run adapter is allowed to queue anything.
   runtimes.push(genericRuntimeApi);
+  appendSymbolRuntime(ACTIVE_RUN_RUNTIME_SYMBOL);
   return runtimes;
 }
 
@@ -850,7 +969,15 @@ async function invokeExactRuntime(runtimes, method, args) {
   let runtimeThrew = false;
   for (const runtime of runtimes) {
     try {
-      const outcome = await runtime[method](...args);
+      // Do not introduce an `await` boundary after the synchronous generic
+      // pending-input guard. A provider can publish ask_user_question in that
+      // microtask gap; the exact active-run adapter must be invoked on the same
+      // JavaScript stack as the final NO_PENDING_INPUT observation so composer
+      // text cannot cross into a question that became pending first.
+      const result = runtime[method](...args);
+      const outcome = result && typeof result.then === 'function'
+        ? await result
+        : result;
       if (RUNTIME_ADAPTER_MISS_CODES.has(outcome?.code)) {
         adapterMiss = outcome;
         continue;
@@ -947,14 +1074,17 @@ function registerSemanticProbeMethod(api) {
       respondInvalid(respond, 'nonce must be a valid bounded string.');
       return;
     }
-    const ready = await runAskUserSemanticProbe(nonce);
+    const toolReady = await runAskUserSemanticProbe(nonce);
+    const activeRunSteer = await runActiveRunSteerSemanticProbe(nonce);
+    const ready = toolReady && activeRunSteer;
     respond(true, {
       ok: ready,
       code: ready ? 'SEMANTIC_PROBE_OK' : 'SEMANTIC_PROBE_FAILED',
       toolName: ASK_USER_TOOL_NAME,
-      answer: ready,
-      dismiss: ready,
-      steer: ready,
+      answer: toolReady,
+      dismiss: toolReady,
+      steer: toolReady,
+      activeRunSteer,
     });
   }, { scope: 'operator.write' });
 }
@@ -972,50 +1102,48 @@ function registerAnswerMethod(api) {
       );
       return;
     }
-    const now = Date.now();
-    pruneTerminalReceipts(now);
     const key = receiptKey(sessionKey, expectedRunId, requestId);
     const digest = answerDigest(answer);
-    if (replayOrConflict(respond, key, 'answer', digest, requestId, expectedRunId)) return;
-    if (!reserveReceiptCapacity(respond, requestId, expectedRunId)) return;
-    const target = resolveRuntimeTarget({ sessionKey, expectedRunId });
-    if (target.error) {
-      nonAcceptance(respond, target.error, { requestId });
-      return;
-    }
-    try {
-      const outcome = await invokeExactRuntime(target.runtimes, 'answer', [
-        target.sessionId,
-        target.expectedRunId,
-        requestId,
-        answer,
-      ]);
-      if (
-        outcome?.ok === true
-        && outcome.code === 'ANSWERED'
-        && outcome.requestId === requestId
-        && outcome.runId === target.expectedRunId
-      ) {
-        recordTerminalReceipt(key, 'answer', digest, now);
-        respond(true, {
-          accepted: true,
-          replayed: false,
-          code: 'ANSWERED',
+    await runDeduplicatedOperation({
+      respond,
+      key,
+      action: 'answer',
+      digest,
+      requestId,
+      runId: expectedRunId,
+      execute: async () => {
+        const target = resolveRuntimeTarget({ sessionKey, expectedRunId });
+        if (target.error) return { accepted: false, code: target.error, requestId };
+        const outcome = await invokeExactRuntime(target.runtimes, 'answer', [
+          target.sessionId,
+          target.expectedRunId,
           requestId,
-          runId: target.expectedRunId,
-        });
-        return;
-      }
-      const code = RUNTIME_REJECTION_CODES.has(outcome?.code)
-        ? outcome.code
-        : 'RUNTIME_REJECTED';
-      nonAcceptance(respond, code, {
-        requestId,
-        ...(outcome?.runId === target.expectedRunId ? { runId: target.expectedRunId } : {}),
-      });
-    } catch {
-      nonAcceptance(respond, 'HOTFIX_ERROR', { requestId });
-    }
+          answer,
+        ]);
+        if (
+          outcome?.ok === true
+          && outcome.code === operationAcceptedCode('answer')
+          && outcome.requestId === requestId
+          && outcome.runId === target.expectedRunId
+        ) {
+          return {
+            accepted: true,
+            code: operationAcceptedCode('answer'),
+            requestId,
+            runId: target.expectedRunId,
+          };
+        }
+        const code = RUNTIME_REJECTION_CODES.has(outcome?.code)
+          ? outcome.code
+          : 'RUNTIME_REJECTED';
+        return {
+          accepted: false,
+          code,
+          requestId,
+          ...(outcome?.runId === target.expectedRunId ? { runId: target.expectedRunId } : {}),
+        };
+      },
+    });
   }, { scope: 'operator.write' });
 }
 
@@ -1031,48 +1159,46 @@ function registerDismissMethod(api) {
       );
       return;
     }
-    const now = Date.now();
-    pruneTerminalReceipts(now);
     const key = receiptKey(sessionKey, expectedRunId, requestId);
-    if (replayOrConflict(respond, key, 'dismiss', '', requestId, expectedRunId)) return;
-    if (!reserveReceiptCapacity(respond, requestId, expectedRunId)) return;
-    const target = resolveRuntimeTarget({ sessionKey, expectedRunId });
-    if (target.error) {
-      nonAcceptance(respond, target.error, { requestId });
-      return;
-    }
-    try {
-      const outcome = await invokeExactRuntime(target.runtimes, 'dismiss', [
-        target.sessionId,
-        target.expectedRunId,
-        requestId,
-      ]);
-      if (
-        outcome?.ok === true
-        && outcome.code === 'DISMISSED'
-        && outcome.requestId === requestId
-        && outcome.runId === target.expectedRunId
-      ) {
-        recordTerminalReceipt(key, 'dismiss', '', now);
-        respond(true, {
-          accepted: true,
-          replayed: false,
-          code: 'DISMISSED',
+    await runDeduplicatedOperation({
+      respond,
+      key,
+      action: 'dismiss',
+      digest: '',
+      requestId,
+      runId: expectedRunId,
+      execute: async () => {
+        const target = resolveRuntimeTarget({ sessionKey, expectedRunId });
+        if (target.error) return { accepted: false, code: target.error, requestId };
+        const outcome = await invokeExactRuntime(target.runtimes, 'dismiss', [
+          target.sessionId,
+          target.expectedRunId,
           requestId,
-          runId: target.expectedRunId,
-        });
-        return;
-      }
-      const code = RUNTIME_REJECTION_CODES.has(outcome?.code)
-        ? outcome.code
-        : 'RUNTIME_REJECTED';
-      nonAcceptance(respond, code, {
-        requestId,
-        ...(outcome?.runId === target.expectedRunId ? { runId: target.expectedRunId } : {}),
-      });
-    } catch {
-      nonAcceptance(respond, 'HOTFIX_ERROR', { requestId });
-    }
+        ]);
+        if (
+          outcome?.ok === true
+          && outcome.code === operationAcceptedCode('dismiss')
+          && outcome.requestId === requestId
+          && outcome.runId === target.expectedRunId
+        ) {
+          return {
+            accepted: true,
+            code: operationAcceptedCode('dismiss'),
+            requestId,
+            runId: target.expectedRunId,
+          };
+        }
+        const code = RUNTIME_REJECTION_CODES.has(outcome?.code)
+          ? outcome.code
+          : 'RUNTIME_REJECTED';
+        return {
+          accepted: false,
+          code,
+          requestId,
+          ...(outcome?.runId === target.expectedRunId ? { runId: target.expectedRunId } : {}),
+        };
+      },
+    });
   }, { scope: 'operator.write' });
 }
 
@@ -1089,48 +1215,46 @@ function registerSteerMethod(api) {
       );
       return;
     }
-    const now = Date.now();
-    pruneTerminalReceipts(now);
     const key = receiptKey(sessionKey, expectedRunId, requestId);
     const digest = answerDigest(text);
-    if (replayOrConflict(respond, key, 'steer', digest, requestId, expectedRunId)) return;
-    if (!reserveReceiptCapacity(respond, requestId, expectedRunId)) return;
-    const target = resolveRuntimeTarget({ sessionKey, expectedRunId });
-    if (target.error) {
-      nonAcceptance(respond, target.error, { requestId });
-      return;
-    }
-    try {
-      const outcome = await invokeExactRuntime(target.runtimes, 'steer', [
-        target.sessionId,
-        target.expectedRunId,
-        text,
-      ]);
-      if (
-        outcome?.ok === true
-        && outcome.code === 'STEERED'
-        && outcome.runId === target.expectedRunId
-      ) {
-        recordTerminalReceipt(key, 'steer', digest, now);
-        respond(true, {
-          accepted: true,
-          replayed: false,
-          code: 'STEERED',
+    await runDeduplicatedOperation({
+      respond,
+      key,
+      action: 'steer',
+      digest,
+      requestId,
+      runId: expectedRunId,
+      execute: async () => {
+        const target = resolveRuntimeTarget({ sessionKey, expectedRunId });
+        if (target.error) return { accepted: false, code: target.error, requestId };
+        const outcome = await invokeExactRuntime(target.runtimes, 'steer', [
+          target.sessionId,
+          target.expectedRunId,
+          text,
+        ]);
+        if (
+          outcome?.ok === true
+          && outcome.code === operationAcceptedCode('steer')
+          && outcome.runId === target.expectedRunId
+        ) {
+          return {
+            accepted: true,
+            code: operationAcceptedCode('steer'),
+            requestId,
+            runId: target.expectedRunId,
+          };
+        }
+        const code = RUNTIME_REJECTION_CODES.has(outcome?.code)
+          ? outcome.code
+          : 'RUNTIME_REJECTED';
+        return {
+          accepted: false,
+          code,
           requestId,
-          runId: target.expectedRunId,
-        });
-        return;
-      }
-      const code = RUNTIME_REJECTION_CODES.has(outcome?.code)
-        ? outcome.code
-        : 'RUNTIME_REJECTED';
-      nonAcceptance(respond, code, {
-        requestId,
-        ...(outcome?.runId === target.expectedRunId ? { runId: target.expectedRunId } : {}),
-      });
-    } catch {
-      nonAcceptance(respond, 'HOTFIX_ERROR', { requestId });
-    }
+          ...(outcome?.runId === target.expectedRunId ? { runId: target.expectedRunId } : {}),
+        };
+      },
+    });
   }, { scope: 'operator.write' });
 }
 
@@ -1156,6 +1280,7 @@ module.exports = {
   },
   __test: {
     GATEWAY_METHODS,
+    ACTIVE_RUN_RUNTIME_SYMBOL,
     RUNTIME_SYMBOL,
     RUNTIME_SYMBOLS,
     ASK_USER_TOOL_NAME,
@@ -1163,8 +1288,15 @@ module.exports = {
     GENERIC_PENDING_TTL_MS,
     TERMINAL_RECEIPT_TTL_MS,
     MAX_TERMINAL_RECEIPTS,
+    dedupeCounts() {
+      return {
+        inFlight: inFlightReceipts.size,
+        terminal: terminalReceipts.size,
+      };
+    },
     reset() {
       terminalReceipts.clear();
+      inFlightReceipts.clear();
       toolCallBindings.clear();
       toolCallBindingLookup.clear();
       toolCallBindingCountsBySession.clear();

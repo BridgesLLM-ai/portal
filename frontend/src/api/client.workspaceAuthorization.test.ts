@@ -12,6 +12,10 @@ import {
   StaleWorkspaceAuthorizationResponseError,
   resetWorkspaceAuthorizationForTests,
 } from '../utils/workspaceAuthorization';
+import {
+  AUTH_REFRESH_CONFLICT_MAX_WAIT_MS,
+  publishAuthRefreshSuccess,
+} from '../utils/authRefreshConvergence';
 import client from './client';
 
 const originalAdapter = client.defaults.adapter;
@@ -183,6 +187,104 @@ describe('Axios workspace authorization request identity', () => {
 
     expect(useAuthStore.getState().isAuthenticated).toBe(false);
     expect(useAuthStore.getState().user).toBeNull();
+  });
+
+  it('waits once for a rotation winner and then replays the original request', async () => {
+    vi.spyOn(axios, 'post')
+      .mockRejectedValueOnce(new AxiosError(
+        'Refresh rotation conflict',
+        'ERR_BAD_REQUEST',
+        undefined,
+        undefined,
+        {
+          data: { code: 'AUTH_REFRESH_ROTATION_CONFLICT', retryable: true },
+          status: 409,
+          statusText: 'Conflict',
+          headers: { 'retry-after': '0.1' },
+          config: {} as InternalAxiosRequestConfig,
+        },
+      ))
+      .mockResolvedValueOnce({} as AxiosResponse);
+    let requestCount = 0;
+    client.defaults.adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        throw new AxiosError(
+          'Access token expired',
+          'ERR_BAD_REQUEST',
+          config,
+          undefined,
+          {
+            data: { error: 'expired' },
+            status: 401,
+            statusText: 'Unauthorized',
+            headers: {
+              [PORTAL_AUTHORIZATION_VERSION_HEADER.toLowerCase()]: '3',
+            },
+            config,
+          },
+        );
+      }
+      return axiosResponse(config, 3);
+    }) as AxiosAdapter;
+
+    const request = client.get('/files');
+    await vi.waitFor(() => expect(axios.post).toHaveBeenCalledTimes(1));
+    publishAuthRefreshSuccess();
+
+    await expect(request).resolves.toMatchObject({ data: { ok: true } });
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(requestCount).toBe(2);
+    expect(useAuthStore.getState().isAuthenticated).toBe(true);
+  });
+
+  it('clears local auth after the bounded rotation retry also conflicts', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(axios, 'post').mockRejectedValue(new AxiosError(
+      'Refresh rotation conflict',
+      'ERR_BAD_REQUEST',
+      undefined,
+      undefined,
+      {
+        data: { code: 'AUTH_REFRESH_ROTATION_CONFLICT', retryable: true },
+        status: 409,
+        statusText: 'Conflict',
+        headers: { 'retry-after': '5' },
+        config: {} as InternalAxiosRequestConfig,
+      },
+    ));
+    client.defaults.adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      throw new AxiosError(
+        'Access token expired',
+        'ERR_BAD_REQUEST',
+        config,
+        undefined,
+        {
+          data: { error: 'expired' },
+          status: 401,
+          statusText: 'Unauthorized',
+          headers: {
+            [PORTAL_AUTHORIZATION_VERSION_HEADER.toLowerCase()]: '3',
+          },
+          config,
+        },
+      );
+    }) as AxiosAdapter;
+
+    const request = client.get('/files');
+    const rejected = expect(request).rejects.toMatchObject({
+      response: { status: 401 },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(axios.post).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(AUTH_REFRESH_CONFLICT_MAX_WAIT_MS);
+
+    await rejected;
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(useAuthStore.getState()).toMatchObject({
+      user: null,
+      isAuthenticated: false,
+    });
   });
 
   it('does not create a critical activity error for a silent expected-failure probe', async () => {

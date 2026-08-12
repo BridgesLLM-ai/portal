@@ -632,7 +632,7 @@ describe('dashboard role-aware loading', () => {
     render(<DashboardPage />);
 
     await waitFor(() => expect(screen.getByText('Backup is stale')).toBeInTheDocument(), { timeout: 3000 });
-    expect(screen.getByText(/latest Portal backup is 3 days old/i)).toBeInTheDocument();
+    expect(screen.getByText(/newest authenticated comprehensive backup candidate is 3 days old/i)).toBeInTheDocument();
     const reviewButton = screen.getByRole('button', { name: 'Review & update' });
     fireEvent.click(reviewButton);
 
@@ -655,6 +655,30 @@ describe('dashboard role-aware loading', () => {
     });
     expect(mocks.clientPost.mock.calls.some(([url]) => url === '/backups/create')).toBe(false);
     expect(await screen.findByText('Updater intentionally not started in this test')).toBeInTheDocument();
+  });
+
+  it('labels a recent authenticated backup as a candidate awaiting strict update admission verification', async () => {
+    mockOwnerBackgroundChecks({
+      ...staleBackupUpdate,
+      preparation: {
+        ...staleBackupUpdate.preparation,
+        backup: {
+          state: 'candidate',
+          maxAgeHours: 24,
+          newestCreatedAt: '2026-07-20T19:00:00.000Z',
+          ageHours: 1,
+          activeStatus: null,
+        },
+      },
+    });
+    render(<DashboardPage />);
+
+    await waitFor(() => expect(screen.getByText('Backup candidate found')).toBeInTheDocument(), { timeout: 3000 });
+    expect(screen.getByText(/Strict restore verification will run before the update is admitted/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Review & update' }));
+    expect(screen.getByRole('radio', { name: 'Use the recent backup' })).toBeChecked();
+    expect(screen.getByText('Use the recent backup candidate')).toBeInTheDocument();
+    expect(screen.getByText(/server will run strict restore verification before the updater starts/i)).toBeInTheDocument();
   });
 
   it('keeps the signed updater submission single-flight while the server accepts it', async () => {
@@ -1097,6 +1121,21 @@ describe('dashboard role-aware loading', () => {
 
     expect(await screen.findByRole('dialog', { name: 'Portal update needs recovery' })).toBeVisible();
     expect(screen.getByText('Manual recovery required')).toBeVisible();
+    const attentionDetails = screen.getByLabelText('Update attention details');
+    expect(attentionDetails).toHaveTextContent(`Failed phase${recoveryProgress.phase}`);
+    expect(attentionDetails).toHaveTextContent(UPDATE_OPERATION_ID);
+    expect(attentionDetails).toHaveTextContent('v4.0.0 / v4.1.0');
+    expect(attentionDetails).toHaveTextContent('docs/PORTAL_UPDATE_ATTENTION_RECOVERY.md');
+    expect(screen.getByLabelText('Read-only update recovery checks')).toHaveTextContent(
+      'bridgesllm-portal-self-update.service',
+    );
+    expect(screen.getByLabelText('Read-only update recovery checks')).toHaveTextContent(
+      'active-update.json',
+    );
+    expect(screen.getByRole('link', { name: 'Open root recovery procedure' })).toHaveAttribute(
+      'href',
+      'https://github.com/BridgesLLM-ai/portal/blob/main/docs/PORTAL_UPDATE_ATTENTION_RECOVERY.md',
+    );
     expect(screen.getByText(/second update is disabled until this host state is reviewed/i)).toBeVisible();
     expect(screen.queryByRole('textbox', { name: /UPDATE PORTAL/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /install update|retry signed update|update without backup/i })).not.toBeInTheDocument();
@@ -1129,6 +1168,7 @@ describe('dashboard role-aware loading', () => {
     render(<DashboardPage />);
 
     expect(await screen.findByRole('dialog', { name: 'Portal updated with follow-up required' })).toBeVisible();
+    expect(screen.getByText(/new Portal committed and is serving, but ancillary host work failed/i)).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
 
     expect(screen.queryByRole('dialog', { name: 'Portal updated with follow-up required' })).not.toBeInTheDocument();
@@ -1230,7 +1270,7 @@ describe('dashboard role-aware loading', () => {
     expect(mocks.clientPost.mock.calls.filter(([url]) => url === '/admin/self-update')).toHaveLength(1);
   });
 
-  it('creates and verifies a fresh backup before asking the backend to admit the update', async () => {
+  it('creates a fresh authenticated backup candidate before asking the backend to strictly verify and admit it', async () => {
     mocks.authUser.current = { id: 'owner-1', role: 'OWNER', email: 'owner@example.com' };
     let backupStatusReads = 0;
     const freshBackupUpdate = {
@@ -1238,7 +1278,7 @@ describe('dashboard role-aware loading', () => {
       preparation: {
         ...staleBackupUpdate.preparation,
         backup: {
-          state: 'fresh',
+          state: 'candidate',
           maxAgeHours: 24,
           newestCreatedAt: new Date().toISOString(),
           ageHours: 0,
@@ -1285,7 +1325,7 @@ describe('dashboard role-aware loading', () => {
         expectedVersion: '4.1.0',
       });
     }, { timeout: 8000 });
-    expect(mocks.clientPost).toHaveBeenCalledWith('/backups/create', { type: 'daily' });
+    expect(mocks.clientPost).toHaveBeenCalledWith('/backups/create', { type: 'comprehensive' });
     expect(backupStatusReads).toBe(2);
     expect(mocks.clientGet).toHaveBeenCalledWith('/admin/update-status', { _silent: true });
     expect(await screen.findByText('Fresh backup accepted; updater intentionally not started in this test')).toBeInTheDocument();

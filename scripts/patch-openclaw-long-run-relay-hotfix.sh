@@ -61,6 +61,25 @@ GET_REPLY_FILE="$(resolve_optional_bundle get-reply- reply-)"
 CLAUDE_LIVE_SESSION="$(resolve_optional_bundle claude-live-session-)"
 EXECUTE_RUNTIME="$(resolve_optional_bundle execute.runtime-)"
 AGENT_RUNNER_RUNTIME="$(resolve_optional_bundle agent-runner.runtime-)"
+RUNS_BUNDLE="$(python3 - "$ROOT" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+for candidate in sorted(root.glob('runs-*.js'), key=lambda p: (p.stat().st_size, p.name), reverse=True):
+    try:
+        text = candidate.read_text()
+    except Exception:
+        continue
+    if (
+        'function queueEmbeddedAgentMessageWithOutcomeAsync(' in text
+        and 'function setActiveEmbeddedRun(' in text
+        and 'ACTIVE_EMBEDDED_RUNS.get(sessionId)' in text
+    ):
+        print(candidate)
+        break
+PY
+)"
 COMPACT_TOOLS_BUNDLE="$(python3 - "$ROOT" <<'PY'
 from pathlib import Path
 import sys
@@ -122,6 +141,7 @@ require_strict_bundle() {
 
 require_strict_bundle "compaction-tools" "${COMPACT_TOOLS_BUNDLE}"
 require_strict_bundle "agent-runner-runtime" "${AGENT_RUNNER_RUNTIME}"
+require_strict_bundle "embedded-runs" "${RUNS_BUNDLE}"
 require_strict_bundle "heartbeat-detector" "${HEARTBEAT_DETECTOR_FILE:-${HEARTBEAT_EVENTS_FILTER:-${HEARTBEAT_RUNNER}}}"
 require_strict_bundle "heartbeat-runner" "${HEARTBEAT_RUNNER}"
 require_strict_bundle "reply-routing" "${GET_REPLY_FILE}"
@@ -280,6 +300,178 @@ print(f"patched active steer transcript-commit wait: {p}")
 PY
 else
   echo "skipping active steer transcript-commit patch: agent runner runtime bundle not found under $ROOT"
+fi
+
+# Portal's exact-run steer RPC must work for every embedded provider, not only
+# the separately patched Codex app-server extension. The stock public SDK queue
+# API is deliberately insufficient: it is session-only, fire-and-forget, and
+# cannot attest asynchronous rejection. Install one process-local adapter next
+# to the authoritative active-run map instead. It verifies the expected run id
+# and resolves only after the embedded handle confirms queue acceptance and the
+# matching user message reaches the transcript.
+if [[ -n "$RUNS_BUNDLE" && -f "$RUNS_BUNDLE" ]]; then
+python3 - "$RUNS_BUNDLE" <<'PY' || FAILED_PATCHES+=("provider-neutral-exact-run-steer")
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+text = p.read_text()
+marker = 'bridgesllm-openclaw-provider-neutral-exact-run-steer-v1'
+symbol = 'bridgesllm.openclaw.active-run-steer.v1'
+anchor = 'function prepareEmbeddedAgentQueueMessage(sessionId, text, options) {'
+
+runtime = r'''// bridgesllm-openclaw-provider-neutral-exact-run-steer-v1
+const BRIDGESLLM_ACTIVE_RUN_STEER_SYMBOL = Symbol.for("bridgesllm.openclaw.active-run-steer.v1");
+function bridgesllmActiveRunSteerIdentity(value, maxLength) {
+	return typeof value === "string" && value.length > 0 && value.length <= maxLength && !/[\u0000-\u001F\u007F]/.test(value) ? value : void 0;
+}
+function bridgesllmActiveRunSteerText(value) {
+	return typeof value === "string" && value.length > 0 && value.length <= 32768 && !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value) ? value : void 0;
+}
+const bridgesllmActiveRunSteerApi = Object.freeze({
+	version: 1,
+	read() {
+		return null;
+	},
+	answer(sessionId, expectedRunId) {
+		return {
+			ok: false,
+			code: "NO_PENDING_INPUT",
+			...bridgesllmActiveRunSteerIdentity(expectedRunId, 512) ? { runId: expectedRunId } : {}
+		};
+	},
+	dismiss(sessionId, expectedRunId) {
+		return {
+			ok: false,
+			code: "NO_PENDING_INPUT",
+			...bridgesllmActiveRunSteerIdentity(expectedRunId, 512) ? { runId: expectedRunId } : {}
+		};
+	},
+	async steer(sessionId, expectedRunId, text) {
+		const safeSessionId = bridgesllmActiveRunSteerIdentity(sessionId, 512);
+		const safeRunId = bridgesllmActiveRunSteerIdentity(expectedRunId, 512);
+		const safeText = bridgesllmActiveRunSteerText(text);
+		if (!safeSessionId || !safeRunId || !safeText) return {
+			ok: false,
+			code: "INVALID_IDENTITY"
+		};
+		const handle = ACTIVE_EMBEDDED_RUNS.get(safeSessionId);
+		if (!handle) return {
+			ok: false,
+			code: "NO_ACTIVE_RUN"
+		};
+		if (handle.runId !== safeRunId) return {
+			ok: false,
+			code: "RUN_MISMATCH"
+		};
+		if (!isEmbeddedQueueHandleMessageInjectable(safeSessionId, handle)) return {
+			ok: false,
+			code: "NO_ACTIVE_RUN"
+		};
+		if (handle.isCompacting()) return {
+			ok: false,
+			code: "QUEUE_REJECTED",
+			runId: safeRunId
+		};
+		if (handle.supportsTranscriptCommitWait !== true) return {
+			ok: false,
+			code: "TRANSCRIPT_COMMIT_UNSUPPORTED",
+			runId: safeRunId
+		};
+		try {
+			// Dispatch through the one handle whose run id was attested above.
+			// Re-entering the session-only queue helper here would perform a second
+			// map lookup and could target a replacement run.
+			await handle.queueMessage(safeText, {
+				steeringMode: "all",
+				debounceMs: 0,
+				waitForTranscriptCommit: true,
+				// bridgesllm-openclaw-active-steer-delivery-timeout-v1
+				deliveryTimeoutMs: 10000
+			});
+			logMessageQueued({
+				sessionId: safeSessionId,
+				source: "bridgesllm-exact-run-steer"
+			});
+			return {
+				ok: true,
+				code: "STEERED",
+				runId: safeRunId
+			};
+		} catch {
+			return {
+				ok: false,
+				code: "QUEUE_REJECTED",
+				runId: safeRunId
+			};
+		}
+	}
+});
+if (globalThis[BRIDGESLLM_ACTIVE_RUN_STEER_SYMBOL] !== void 0) throw new Error("BridgesLLM active-run steering runtime symbol is already registered");
+Object.defineProperty(globalThis, BRIDGESLLM_ACTIVE_RUN_STEER_SYMBOL, {
+	value: bridgesllmActiveRunSteerApi,
+	writable: false,
+	configurable: false,
+	enumerable: false
+});
+'''
+
+marker_count = text.count(marker)
+if marker_count:
+    marker_start = text.index(f'// {marker}')
+    marker_end = text.find(anchor, marker_start)
+    if marker_end < 0:
+        raise SystemExit(f"provider-neutral exact-run steer patch has no closing anchor in {p}")
+    marker_block = text[marker_start:marker_end]
+    base_contract_invalid = (
+        marker_count != 1
+        or marker_block.count(f'Symbol.for("{symbol}")') != 1
+        or marker_block.count('waitForTranscriptCommit: true') != 1
+        or marker_block.count('handle.runId !== safeRunId') != 1
+        or marker_block.count('await handle.queueMessage(safeText, {') != 1
+    )
+    if base_contract_invalid:
+        raise SystemExit(f"provider-neutral exact-run steer patch is partial or duplicated in {p}")
+    delivery_marker = 'bridgesllm-openclaw-active-steer-delivery-timeout-v1'
+    delivery_line = '\t\t\t\tdeliveryTimeoutMs: 10000'
+    if delivery_marker not in marker_block:
+        old_wait_line = '\t\t\t\twaitForTranscriptCommit: true'
+        if (
+            marker_block.count(old_wait_line) != 1
+            or 'deliveryTimeoutMs:' in marker_block
+            or delivery_marker in text
+        ):
+            raise SystemExit(f"provider-neutral exact-run steer delivery timeout is partial or ambiguous in {p}")
+        replacement = (
+            old_wait_line + ',\n'
+            '\t\t\t\t// ' + delivery_marker + '\n'
+            + delivery_line
+        )
+        upgraded_block = marker_block.replace(old_wait_line, replacement, 1)
+        p.write_text(text[:marker_start] + upgraded_block + text[marker_end:])
+        print(f"upgraded provider-neutral exact-run steer delivery timeout: {p}")
+        raise SystemExit(0)
+    if (
+        marker_block.count(delivery_marker) != 1
+        or marker_block.count(delivery_line) != 1
+        or marker_block.count('deliveryTimeoutMs:') != 1
+    ):
+        raise SystemExit(f"provider-neutral exact-run steer delivery timeout is partial or ambiguous in {p}")
+    print(f"provider-neutral exact-run steer already patched: {p}")
+    raise SystemExit(0)
+
+if text.count(anchor) != 1:
+    raise SystemExit(f"provider-neutral exact-run steer anchor drifted in {p}")
+if text.count('const handle = ACTIVE_EMBEDDED_RUNS.get(sessionId);') < 1:
+    raise SystemExit(f"authoritative active-run lookup drifted in {p}")
+if text.count('function isEmbeddedQueueHandleMessageInjectable(') != 1:
+    raise SystemExit(f"captured-handle queue eligibility check drifted in {p}")
+
+p.write_text(text.replace(anchor, runtime + anchor, 1))
+print(f"patched provider-neutral exact-run steer runtime: {p}")
+PY
+else
+  echo "skipping provider-neutral exact-run steer patch: embedded runs bundle not found under $ROOT"
 fi
 
 if [[ -n "$HEARTBEAT_DETECTOR_FILE" ]]; then

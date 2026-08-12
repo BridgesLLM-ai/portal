@@ -1,4 +1,5 @@
 import { useAuthStore } from '../contexts/AuthContext';
+import { refreshAuthSessionWithFetch } from './authRefreshConvergence';
 import {
   PORTAL_AUTHORIZATION_VERSION_HEADER,
   StaleWorkspaceAuthorizationResponseError,
@@ -77,14 +78,9 @@ let workspaceRefreshPromise: Promise<boolean> | null = null;
 function refreshWorkspaceSession(): Promise<boolean> {
   if (workspaceRefreshPromise) return workspaceRefreshPromise;
   const apiUrl = import.meta.env.VITE_API_URL || '/api';
-  workspaceRefreshPromise = fetch(`${apiUrl}/auth/refresh`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({}),
+  workspaceRefreshPromise = refreshAuthSessionWithFetch(apiUrl, {
+    onDefinitiveFailure: () => useAuthStore.getState().silentLogout(),
   })
-    .then((response) => response.ok)
-    .catch(() => false)
     .finally(() => {
       workspaceRefreshPromise = null;
     });

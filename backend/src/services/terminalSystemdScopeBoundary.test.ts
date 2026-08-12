@@ -479,6 +479,35 @@ describe('terminal systemd scope recovery and shutdown', () => {
       activePreparations: 0,
     });
   });
+
+  test('dependency-promotion quiescence stops all tracked scopes without shutting runtime down', async () => {
+    const {
+      boundary,
+      systemctl,
+    } = await initializedFixture({
+      listOutputs: ['', ''],
+      shows: [
+        show(),
+        show(),
+        show({ loadState: 'not-found' }),
+      ],
+      cgroupEvents: [null],
+    });
+    await boundary.prepare(input());
+
+    await expect(boundary.quiesceForProjectDependencyPromotion()).resolves.toEqual({
+      preparationCount: 0,
+      sessionCount: 1,
+      recoveredCount: 0,
+    });
+
+    expect(systemctl).toHaveBeenCalledWith(['stop', UNIT]);
+    expect(boundary.snapshot()).toMatchObject({
+      shuttingDown: false,
+      activeSessions: 0,
+      activePreparations: 0,
+    });
+  });
 });
 
 test('parsers reject malformed inventories and persisted identities', () => {

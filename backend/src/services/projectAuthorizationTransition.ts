@@ -6,6 +6,7 @@ import {
   publishAuthorizationChanged,
   type AuthorizationChangeReason,
 } from './authorizationChangeBus';
+import { publishAllSessionsRevoked } from './sessionRevocationBus';
 import {
   quiesceAgentJobsForAuthorizationTransition,
   type AgentJobAuthorizationQuiescence,
@@ -272,6 +273,10 @@ interface TransitionDependencies {
     authorizationVersion: number;
     reasons: AuthorizationChangeReason[];
   }): void;
+  publishSessions(input: {
+    userId: string;
+    reason: 'credential_recovery' | 'authorization_transition';
+  }): void;
   now(): Date;
   randomUUID(): string;
   randomBytes(size: number): Buffer;
@@ -290,6 +295,7 @@ const defaultDependencies: TransitionDependencies = {
   assertProjectRoot: assertProjectIdentityRoot,
   gateway: openClawGatewayAuthorizationFence,
   publish: publishAuthorizationChanged,
+  publishSessions: publishAllSessionsRevoked,
   now: () => new Date(),
   randomUUID: () => crypto.randomUUID(),
   randomBytes: (size) => crypto.randomBytes(size),
@@ -2232,6 +2238,25 @@ export function createProjectAuthorizationTransitionCoordinator(
           authorizationVersion: userResult.user.authorizationVersion,
           reasons: userResult.authorizationReasons,
         });
+        const sessionsWereDeleted = userResult.authorizationReasons.includes('credential_recovery')
+          || (
+            !canAccessPortal(
+              userResult.existing.accountStatus,
+              userResult.existing.isActive,
+            )
+            && canAccessPortal(
+              userResult.user.accountStatus,
+              userResult.user.isActive,
+            )
+          );
+        if (sessionsWereDeleted) {
+          dependencies.publishSessions({
+            userId: userResult.user.id,
+            reason: userResult.authorizationReasons.includes('credential_recovery')
+              ? 'credential_recovery'
+              : 'authorization_transition',
+          });
+        }
       }
     } else {
       const ownershipResult = result as ProjectOwnershipTransferResult;

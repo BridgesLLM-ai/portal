@@ -57,6 +57,342 @@ describe('Projects API route contract', () => {
     );
   });
 
+  it('validates and binds Owner dependency repair to one exact promotion generation', async () => {
+    const status = {
+      state: 'QUARANTINED',
+      ownerOnly: true,
+      action: 'FORCE_FORWARD_STAGED',
+      confirmationPhrase: 'FORCE FORWARD Project name?#',
+      project: {
+        id: 'project-identity-1',
+        name: 'Project name?#',
+        generation: 4,
+      },
+      promotion: {
+        operationId: '11111111-1111-4111-8111-111111111111',
+        manifestDigest: 'a'.repeat(64),
+        status: 'AUTHORIZED',
+      },
+      repair: null,
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: true,
+        pinned: false,
+        filename: 'portal-backup.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+      retryable: true,
+      statusRetryable: false,
+      restartRequired: false,
+    };
+    const request = {
+      repairId: '22222222-2222-4222-8222-222222222222',
+      expectedProjectIdentityId: status.project.id,
+      expectedProjectIdentityGeneration: status.project.generation,
+      expectedPromotionOperationId: status.promotion.operationId,
+      expectedManifestDigest: status.promotion.manifestDigest,
+      confirmation: status.confirmationPhrase,
+    };
+    clientMocks.get.mockResolvedValueOnce({ data: status });
+    await expect(projectsAPI.dependencyRepairStatus('Project name?#')).resolves.toEqual(status);
+    expect(clientMocks.get).toHaveBeenLastCalledWith(
+      '/projects/Project%20name%3F%23/dependency-repair/status',
+      expect.objectContaining({ _silent: true, _skipNetworkRetry: true }),
+    );
+
+    clientMocks.post.mockResolvedValueOnce({
+      data: {
+        accepted: true,
+        completed: false,
+        ...status,
+        state: 'PROMOTING',
+        repair: {
+          repairId: request.repairId,
+          status: 'PROMOTING',
+          phase: 'GO_BIT',
+          startedAt: '2026-08-12T08:06:00.000Z',
+          completedAt: null,
+        },
+        backup: { ...status.backup, eligible: false, pinned: true },
+        retryable: false,
+        statusRetryable: true,
+      },
+    });
+    await projectsAPI.forceForwardDependencyRepair('Project name?#', request);
+    expect(clientMocks.post).toHaveBeenLastCalledWith(
+      '/projects/Project%20name%3F%23/dependency-repair/force-forward',
+      request,
+      expect.objectContaining({ _skipNetworkRetry: true }),
+    );
+  });
+
+  it.each([
+    ['mismatched typed phrase', { confirmationPhrase: 'FORCE FORWARD another-project' }],
+    ['unbound manifest', { promotion: { operationId: '11111111-1111-4111-8111-111111111111', manifestDigest: 'not-a-digest', status: 'AUTHORIZED' } }],
+    ['eligible backup without evidence metadata', { backup: { requiredAfter: '2026-08-12T08:00:00.000Z', eligible: true } }],
+    ['unpaired optional backup metadata', { backup: { requiredAfter: '2026-08-12T08:00:00.000Z', eligible: false, pinned: false, filename: 'orphan.tar.gz' } }],
+    ['promoting without a repair receipt', { state: 'PROMOTING', repair: null }],
+    ['promoting with a completed receipt', {
+      state: 'PROMOTING',
+      repair: {
+        repairId: '22222222-2222-4222-8222-222222222222',
+        status: 'APPLIED',
+        phase: 'COMPLETE',
+        startedAt: '2026-08-12T08:06:00.000Z',
+        completedAt: '2026-08-12T08:07:00.000Z',
+      },
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: false,
+        pinned: true,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+      retryable: false,
+      statusRetryable: true,
+    }],
+    ['startup-owned quarantine advertised as retryable', {
+      retryable: true,
+      statusRetryable: false,
+      restartRequired: true,
+    }],
+    ['startup-owned quarantine advertised a new eligible backup', {
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: true,
+        pinned: false,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+      retryable: false,
+      statusRetryable: false,
+      restartRequired: true,
+    }],
+  ])('rejects malformed dependency repair status: %s', async (_label, patch) => {
+    clientMocks.get.mockResolvedValueOnce({
+      data: {
+        state: 'QUARANTINED',
+        ownerOnly: true,
+        action: 'FORCE_FORWARD_STAGED',
+        confirmationPhrase: 'FORCE FORWARD alpha',
+        project: { id: 'project-alpha', name: 'alpha', generation: 3 },
+        promotion: {
+          operationId: '11111111-1111-4111-8111-111111111111',
+          manifestDigest: 'a'.repeat(64),
+          status: 'AUTHORIZED',
+        },
+        repair: null,
+        backup: { requiredAfter: '2026-08-12T08:00:00.000Z', eligible: false, pinned: false },
+        retryable: true,
+        statusRetryable: false,
+        restartRequired: false,
+        ...patch,
+      },
+    });
+    await expect(projectsAPI.dependencyRepairStatus('alpha')).rejects.toThrow(
+      /dependency repair status is malformed/i,
+    );
+  });
+
+  it('accepts an exact completed repair receipt after the original decision is retired', async () => {
+    clientMocks.get.mockResolvedValueOnce({
+      data: {
+        state: 'COMPLETE',
+        ownerOnly: true,
+        action: 'FORCE_FORWARD_STAGED',
+        confirmationPhrase: 'FORCE FORWARD alpha',
+        project: { id: 'project-alpha', name: 'alpha', generation: 3 },
+        promotion: {
+          operationId: '11111111-1111-4111-8111-111111111111',
+          manifestDigest: 'a'.repeat(64),
+          status: 'APPLIED',
+        },
+        repair: {
+          repairId: '22222222-2222-4222-8222-222222222222',
+          status: 'APPLIED',
+          phase: 'COMPLETE',
+          startedAt: '2026-08-12T08:06:00.000Z',
+          completedAt: '2026-08-12T08:07:00.000Z',
+        },
+        backup: {
+          requiredAfter: '2026-08-12T08:00:00.000Z',
+          eligible: false,
+          pinned: false,
+          filename: 'portal-complete.tar.gz',
+          createdAt: '2026-08-12T08:05:00.000Z',
+        },
+        retryable: false,
+        statusRetryable: false,
+        restartRequired: false,
+      },
+    });
+
+    await expect(projectsAPI.dependencyRepairStatus('alpha')).resolves.toMatchObject({
+      state: 'COMPLETE',
+      promotion: { status: 'APPLIED' },
+      repair: { phase: 'COMPLETE' },
+      backup: { eligible: false, pinned: false },
+    });
+  });
+
+  it('accepts a quarantined pre-go startup handoff without advertising another mutation or poll', async () => {
+    clientMocks.get.mockResolvedValueOnce({
+      data: {
+        state: 'QUARANTINED',
+        ownerOnly: true,
+        action: 'FORCE_FORWARD_STAGED',
+        confirmationPhrase: 'FORCE FORWARD alpha',
+        project: { id: 'project-alpha', name: 'alpha', generation: 3 },
+        promotion: {
+          operationId: '11111111-1111-4111-8111-111111111111',
+          manifestDigest: 'a'.repeat(64),
+          status: 'AUTHORIZED',
+        },
+        repair: null,
+        backup: {
+          requiredAfter: '2026-08-12T08:00:00.000Z',
+          eligible: false,
+          pinned: false,
+        },
+        retryable: false,
+        statusRetryable: false,
+        restartRequired: true,
+      },
+    });
+
+    await expect(projectsAPI.dependencyRepairStatus('alpha')).resolves.toMatchObject({
+      state: 'QUARANTINED',
+      repair: null,
+      retryable: false,
+      statusRetryable: false,
+      restartRequired: true,
+    });
+  });
+
+  it('accepts a project-neutral response after quarantine has already cleared', async () => {
+    clientMocks.get.mockResolvedValueOnce({
+      data: {
+        state: 'NOT_QUARANTINED',
+        ownerOnly: true,
+        action: 'FORCE_FORWARD_STAGED',
+        confirmationPhrase: 'FORCE FORWARD alpha',
+        project: null,
+        promotion: null,
+        repair: null,
+        backup: { requiredAfter: null, eligible: false, pinned: false },
+        retryable: false,
+        statusRetryable: false,
+        restartRequired: false,
+      },
+    });
+
+    await expect(projectsAPI.dependencyRepairStatus('alpha')).resolves.toMatchObject({
+      state: 'NOT_QUARANTINED',
+      project: null,
+      promotion: null,
+      repair: null,
+    });
+  });
+
+  it.each(['APPLIED', 'EVIDENCE_CLEAN'] as const)(
+    'accepts a still-promoting repair in durable %s phase',
+    async (phase) => {
+      clientMocks.get.mockResolvedValueOnce({
+        data: {
+          state: 'PROMOTING',
+          ownerOnly: true,
+          action: 'FORCE_FORWARD_STAGED',
+          confirmationPhrase: 'FORCE FORWARD alpha',
+          project: { id: 'project-alpha', name: 'alpha', generation: 3 },
+          promotion: {
+            operationId: '11111111-1111-4111-8111-111111111111',
+            manifestDigest: 'a'.repeat(64),
+            status: 'APPLIED',
+          },
+          repair: {
+            repairId: '22222222-2222-4222-8222-222222222222',
+            status: 'PROMOTING',
+            phase,
+            startedAt: '2026-08-12T08:06:00.000Z',
+            completedAt: null,
+          },
+          backup: {
+            requiredAfter: '2026-08-12T08:00:00.000Z',
+            eligible: false,
+            pinned: true,
+            filename: 'portal-complete.tar.gz',
+            createdAt: '2026-08-12T08:05:00.000Z',
+          },
+          retryable: false,
+          statusRetryable: true,
+          restartRequired: false,
+        },
+      });
+
+      await expect(projectsAPI.dependencyRepairStatus('alpha')).resolves.toMatchObject({
+        state: 'PROMOTING',
+        repair: { status: 'PROMOTING', phase },
+        backup: { eligible: false, pinned: true },
+        statusRetryable: true,
+      });
+    },
+  );
+
+  it('discovers one exact active repair without generic network retries', async () => {
+    const active = {
+      state: 'PROMOTING',
+      ownerOnly: true,
+      action: 'FORCE_FORWARD_STAGED',
+      confirmationPhrase: 'FORCE FORWARD alpha',
+      project: { id: 'project-alpha', name: 'alpha', generation: 3 },
+      promotion: {
+        operationId: '11111111-1111-4111-8111-111111111111',
+        manifestDigest: 'a'.repeat(64),
+        status: 'AUTHORIZED',
+      },
+      repair: {
+        repairId: '22222222-2222-4222-8222-222222222222',
+        status: 'PROMOTING',
+        phase: 'GO_BIT',
+        startedAt: '2026-08-12T08:06:00.000Z',
+        completedAt: null,
+      },
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: false,
+        pinned: true,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+      retryable: false,
+      statusRetryable: false,
+      restartRequired: true,
+    };
+    clientMocks.get.mockResolvedValueOnce({
+      data: { repairs: [active], count: 1, unavailable: false },
+    });
+
+    await expect(projectsAPI.activeDependencyRepairs()).resolves.toMatchObject({
+      repairs: [{ repair: { repairId: active.repair.repairId }, restartRequired: true }],
+      count: 1,
+      unavailable: false,
+    });
+    expect(clientMocks.get).toHaveBeenLastCalledWith(
+      '/projects/dependency-repair/active',
+      expect.objectContaining({ _silent: true, _skipNetworkRetry: true }),
+    );
+  });
+
+  it.each([
+    ['count mismatch', { repairs: [], count: 1, unavailable: false }],
+    ['unavailable with a receipt', { repairs: [{}], count: 1, unavailable: true }],
+  ])('rejects malformed active dependency repair discovery: %s', async (_label, data) => {
+    clientMocks.get.mockResolvedValueOnce({ data });
+    await expect(projectsAPI.activeDependencyRepairs()).rejects.toThrow(
+      /active project dependency repair discovery is malformed/i,
+    );
+  });
+
   it('passes visitor-slot and shared API throttle policy through project and app share creation', async () => {
     const policy = {
       maxUses: 10,

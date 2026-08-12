@@ -49,6 +49,7 @@ async function healthyGatewayRpc(method: string, params: Record<string, any>): P
         answer: true,
         dismiss: true,
         steer: true,
+        activeRunSteer: true,
       },
     };
   }
@@ -135,6 +136,7 @@ describe('compatibility hotfix ask-user runtime attestation', () => {
       ready: false,
       pluginLoaded: false,
       toolExecutionCallable: false,
+      activeRunSteerCallable: false,
       pendingMethodCallable: false,
     }));
     expect(dependencies.callGatewayRpc).not.toHaveBeenCalled();
@@ -156,6 +158,25 @@ describe('compatibility hotfix ask-user runtime attestation', () => {
       ready: false,
       pluginLoaded: true,
       toolExecutionCallable: false,
+      activeRunSteerCallable: false,
+    }));
+  });
+
+  it('rejects a plugin without provider-neutral active-run steering', async () => {
+    const dependencies = runtimeDependencies();
+    dependencies.callGatewayRpc.mockImplementation(async (method: string, params: any) => {
+      const result = await healthyGatewayRpc(method, params);
+      if (method === 'bridgesllm.ask_user.probe') {
+        result.data.activeRunSteer = false;
+      }
+      return result;
+    });
+    const readiness = await getOpenClawAskUserRuntimeReadiness(dependencies as any);
+    expect(readiness).toEqual(expect.objectContaining({
+      ready: false,
+      pluginLoaded: true,
+      toolExecutionCallable: true,
+      activeRunSteerCallable: false,
     }));
   });
 
@@ -181,6 +202,7 @@ describe('compatibility hotfix ask-user runtime attestation', () => {
       ready: true,
       pluginLoaded: true,
       toolExecutionCallable: true,
+      activeRunSteerCallable: true,
       pendingMethodCallable: true,
       answerMethodCallable: true,
       dismissMethodCallable: true,

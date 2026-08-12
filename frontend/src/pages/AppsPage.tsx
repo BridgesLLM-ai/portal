@@ -20,6 +20,7 @@ import {
   projectRuntimeRecoveryCompletion,
   type ProjectIdentityProof,
   type ProjectDeploymentProcessState,
+  type ProjectDependencyRepairStatus,
   type ProjectLifecycleAction,
   type ProjectRuntimeManagement,
   type ProjectRuntimeRecoveryReplayProof,
@@ -145,6 +146,23 @@ type RuntimeImageRepairRetryOwner = Readonly<{
   recoveryReplay: ProjectRuntimeRecoveryReplayProof;
 }>;
 
+type DependencyRepairDialog = Readonly<{
+  projectName: string;
+  projectIdentity: ProjectIdentityProof;
+  repairId: string;
+  status: ProjectDependencyRepairStatus;
+}>;
+
+type DependencyRepairPhase = 'idle' | 'loading' | 'submitting' | 'reconciling';
+
+const DEPENDENCY_REPAIR_RECONCILIATION_ATTEMPTS = 180;
+function dependencyRepairReconciliationDelayMs(attempt: number): number {
+  // Resolve a fast commit promptly, then stay comfortably below the backend's
+  // 240/hour status limit while allowing both bounded 15-minute archive
+  // verification passes to finish. The full window is just under one hour.
+  return attempt < 5 ? 2_000 : 20_000;
+}
+
 interface DeploymentControlFailure {
   message: string;
   detail?: string;
@@ -234,6 +252,33 @@ function projectRuntimeRecoveryTransportFailure(error: unknown): boolean {
     || record.request !== undefined
     || ['ERR_NETWORK', 'ECONNABORTED', 'ETIMEDOUT'].includes(String(record.code || ''))
   );
+}
+
+function dependencyRepairPostFailureIsDefinitive(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const response = (error as Record<string, unknown>).response;
+  if (!response || typeof response !== 'object') return false;
+  const responseRecord = response as Record<string, unknown>;
+  const data = responseRecord.data && typeof responseRecord.data === 'object'
+    ? responseRecord.data as Record<string, unknown>
+    : null;
+  const code = typeof data?.code === 'string' ? data.code : '';
+
+  // These responses explicitly say the server cannot prove whether the
+  // durable go-bit committed. Treat them like a lost response and reconcile
+  // the exact repairId through GET; never turn uncertainty into a second POST.
+  if (
+    code === 'PROJECT_DEPENDENCY_REPAIR_INDETERMINATE'
+    || code === 'PROJECT_DEPENDENCY_REPAIR_EVIDENCE_CONFLICT'
+  ) return false;
+
+  const status = Number(responseRecord.status);
+  if ([400, 401, 403, 409, 422, 429].includes(status)) return true;
+
+  // Any other server response (including an unclassified 5xx) is ambiguous:
+  // an upstream failure may have happened after the database commit. Reconcile
+  // the immutable receipt instead of trusting HTTP status as transaction truth.
+  return false;
 }
 
 function projectRuntimeRecoveryReplayFailureOutcome(
@@ -326,6 +371,27 @@ function projectLifecycleActionAllowed(
 ): boolean {
   if (!project?.deployment) return true;
   return project.deployment.supportedLifecycleActions.includes(action);
+}
+
+function dependencyRepairStatusMatchesProject(
+  status: ProjectDependencyRepairStatus,
+  project: Pick<Project, 'name' | 'identity'>,
+): boolean {
+  return status.project !== null
+    && status.project.name === project.name
+    && status.project.id === project.identity.id
+    && status.project.generation === project.identity.generation
+    && status.confirmationPhrase === `FORCE FORWARD ${project.name}`;
+}
+
+function dependencyRepairPromotionMatches(
+  current: ProjectDependencyRepairStatus,
+  expected: ProjectDependencyRepairStatus,
+): boolean {
+  return current.promotion !== null
+    && expected.promotion !== null
+    && current.promotion.operationId === expected.promotion.operationId
+    && current.promotion.manifestDigest === expected.promotion.manifestDigest;
 }
 
 function deploymentFailureText(error: DeploymentControlFailure | null): string | null {
@@ -1043,6 +1109,21 @@ export default function AppsPage() {
   const [runtimeImageRepairError, setRuntimeImageRepairError] = useState<string | null>(null);
   const runtimeImageRepairInFlightRef = useRef(false);
   const runtimeImageRepairReplayOutcomeRef = useRef<RuntimeImageRepairReplayOutcome>('stale');
+  const [dependencyRepairDialog, setDependencyRepairDialog] = useState<DependencyRepairDialog | null>(null);
+  const [dependencyRepairPhase, setDependencyRepairPhase] = useState<DependencyRepairPhase>('idle');
+  const [dependencyRepairError, setDependencyRepairError] = useState<string | null>(null);
+  const [dependencyRepairOpeningProject, setDependencyRepairOpeningProject] = useState<string | null>(null);
+  const dependencyRepairInFlightRef = useRef(false);
+  const dependencyRepairDialogRef = useRef<DependencyRepairDialog | null>(null);
+  const dependencyRepairDiscoveryReadRef = useRef<Readonly<{
+    key: string;
+    promise: ReturnType<typeof projectsAPI.activeDependencyRepairs>;
+  }> | null>(null);
+  const dependencyRepairDiscoveryCompletedKeyRef = useRef('');
+
+  useEffect(() => {
+    dependencyRepairDialogRef.current = dependencyRepairDialog;
+  }, [dependencyRepairDialog]);
   
   // Progress notification state for deploy/install flow
   const [progressNotification, setProgressNotification] = useState<ProgressNotificationProps | null>(null);
@@ -1623,6 +1704,402 @@ export default function AppsPage() {
       ) setLoading(false);
     }
   }, []);
+
+  const completeDependencyRepair = useCallback(async (
+    owner: DependencyRepairDialog,
+    status: ProjectDependencyRepairStatus,
+  ): Promise<void> => {
+    if (
+      status.state !== 'COMPLETE'
+      || status.repair?.repairId !== owner.repairId
+      || !dependencyRepairStatusMatchesProject(status, {
+        name: owner.projectName,
+        identity: owner.projectIdentity,
+      })
+      || !dependencyRepairPromotionMatches(status, owner.status)
+    ) {
+      throw new Error('Portal returned dependency repair completion for a different Project operation.');
+    }
+    if (!await loadProjects()) {
+      throw new Error('Dependency repair completed, but Portal could not reload the Project inventory.');
+    }
+    const current = projectsRef.current.find((project) => project.name === owner.projectName);
+    if (
+      !current
+      || current.identity.id !== owner.projectIdentity.id
+      || current.identity.generation !== owner.projectIdentity.generation
+      || current.availability?.available === false
+    ) {
+      throw new Error('Dependency repair completed, but the exact Project generation is not ACTIVE. Keep the recovery evidence and check again.');
+    }
+    setDependencyRepairDialog(null);
+    setDependencyRepairError(null);
+    setDependencyRepairPhase('idle');
+    showToast(`Dependency update repaired for ${owner.projectName}.`, 'success');
+  }, [loadProjects, showToast]);
+
+  const reconcileDependencyRepair = useCallback(async (
+    owner: DependencyRepairDialog,
+    submissionError: string | null = null,
+  ): Promise<void> => {
+    setDependencyRepairPhase('reconciling');
+    let transportFailures = 0;
+    let unchangedQuarantineReads = 0;
+    for (let attempt = 0; attempt < DEPENDENCY_REPAIR_RECONCILIATION_ATTEMPTS; attempt += 1) {
+      if (!mountedRef.current) return;
+      try {
+        const status = await projectsAPI.dependencyRepairStatus(owner.projectName);
+        if (status.state === 'UNAVAILABLE') {
+          if (!status.statusRetryable) {
+            throw new Error('Portal cannot prove the dependency repair state. The Project remains contained.');
+          }
+          transportFailures += 1;
+          if (transportFailures >= 20) {
+            throw new Error(submissionError || 'Portal stopped returning dependency repair status. The Project remains contained; check server health before retrying.');
+          }
+          await new Promise((resolve) => window.setTimeout(
+            resolve,
+            dependencyRepairReconciliationDelayMs(attempt),
+          ));
+          continue;
+        }
+        if (status.state === 'NOT_QUARANTINED') {
+          await loadProjects();
+          throw new Error('The dependency repair receipt is no longer active. Project inventory was refreshed without claiming repair completion.');
+        }
+        transportFailures = 0;
+        if (
+          !dependencyRepairStatusMatchesProject(status, {
+            name: owner.projectName,
+            identity: owner.projectIdentity,
+          })
+          || !dependencyRepairPromotionMatches(status, owner.status)
+        ) {
+          throw new Error('The dependency repair binding changed while Portal was reconciling it.');
+        }
+        if (status.repair !== null && status.repair.repairId !== owner.repairId) {
+          throw new Error('Another dependency repair receipt owns this Project operation.');
+        }
+        setDependencyRepairDialog({ ...owner, status });
+        if (status.restartRequired) {
+          // This process no longer owns enough exclusion proof to continue.
+          // Startup recovery is the only safe writer; stop polling this process.
+          return;
+        }
+        if (status.state === 'COMPLETE') {
+          await completeDependencyRepair(owner, status);
+          return;
+        }
+        if (status.state === 'PROMOTING') {
+          unchangedQuarantineReads = 0;
+        } else if (status.state === 'QUARANTINED') {
+          unchangedQuarantineReads += 1;
+          if (unchangedQuarantineReads >= 3) {
+            throw new Error(submissionError || 'Portal did not admit the dependency repair. Review the backup gate and retry the same repair receipt.');
+          }
+        } else {
+          throw new Error('Portal cannot prove the dependency repair state. The Project remains contained.');
+        }
+      } catch (error) {
+        if (!projectRuntimeRecoveryTransportFailure(error)) {
+          throw error;
+        }
+        transportFailures += 1;
+        if (transportFailures >= 20) {
+          throw new Error(submissionError || 'Portal stopped returning dependency repair status. The Project remains contained; check server health before retrying.');
+        }
+      }
+      await new Promise((resolve) => window.setTimeout(
+        resolve,
+        dependencyRepairReconciliationDelayMs(attempt),
+      ));
+    }
+    throw new Error('Dependency repair is still running. Check its durable status before taking another action.');
+  }, [completeDependencyRepair, loadProjects]);
+
+  const openDependencyRepair = useCallback(async (project: Project): Promise<void> => {
+    if (
+      !isOwner(user)
+      || project.availability?.code !== 'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED'
+      || dependencyRepairDialog !== null
+      || dependencyRepairInFlightRef.current
+    ) return;
+    setDependencyRepairOpeningProject(project.name);
+    setDependencyRepairError(null);
+    try {
+      const status = await projectsAPI.dependencyRepairStatus(project.name);
+      if (status.state === 'NOT_QUARANTINED') {
+        await loadProjects();
+        showToast('This Project is no longer quarantined. Its inventory was refreshed.', 'info');
+        return;
+      }
+      if (status.state === 'UNAVAILABLE') {
+        throw new Error('Portal cannot prove the quarantined dependency operation. No repair was started.');
+      }
+      if (!dependencyRepairStatusMatchesProject(status, project)) {
+        throw new Error('The dependency repair contract does not match this Project generation.');
+      }
+      if (status.promotion === null) {
+        throw new Error('Portal cannot prove the quarantined dependency operation. No repair was started.');
+      }
+      const repairId = status.repair?.repairId || globalThis.crypto.randomUUID();
+      const owner = Object.freeze({
+        projectName: project.name,
+        projectIdentity: Object.freeze({ ...project.identity }),
+        repairId,
+        status,
+      });
+      setDependencyRepairDialog(owner);
+      if (status.state === 'COMPLETE') {
+        await completeDependencyRepair(owner, status);
+      }
+    } catch (error) {
+      const message = extractError(error).message || 'Could not load the dependency repair contract.';
+      setDependencyRepairError(message);
+      showToast(message, 'error');
+    } finally {
+      setDependencyRepairOpeningProject(null);
+    }
+  }, [completeDependencyRepair, dependencyRepairDialog, loadProjects, showToast, user]);
+
+  const refreshDependencyRepair = useCallback(async (): Promise<void> => {
+    const owner = dependencyRepairDialog;
+    if (!owner || dependencyRepairInFlightRef.current || !isOwner(user)) return;
+    dependencyRepairInFlightRef.current = true;
+    setDependencyRepairPhase('loading');
+    setDependencyRepairError(null);
+    try {
+      const status = await projectsAPI.dependencyRepairStatus(owner.projectName);
+      if (status.state === 'UNAVAILABLE') {
+        if (!status.statusRetryable) {
+          throw new Error('Portal cannot prove the dependency repair state. The Project remains contained.');
+        }
+        await reconcileDependencyRepair(owner);
+        return;
+      }
+      if (status.state === 'NOT_QUARANTINED') {
+        await loadProjects();
+        setDependencyRepairDialog(null);
+        showToast('This Project is no longer quarantined. Its inventory was refreshed.', 'info');
+        return;
+      }
+      if (
+        !dependencyRepairStatusMatchesProject(status, {
+          name: owner.projectName,
+          identity: owner.projectIdentity,
+        })
+        || !dependencyRepairPromotionMatches(status, owner.status)
+        || (status.repair !== null && status.repair.repairId !== owner.repairId)
+      ) {
+        throw new Error('The dependency repair binding changed. Refresh Projects before continuing.');
+      }
+      setDependencyRepairDialog({ ...owner, status });
+      if (status.restartRequired) {
+        return;
+      }
+      if (status.state === 'COMPLETE') {
+        await completeDependencyRepair(owner, status);
+      } else if (status.state === 'PROMOTING') {
+        await reconcileDependencyRepair(owner);
+      } else if (status.state !== 'QUARANTINED') {
+        throw new Error('Portal cannot prove a repairable dependency state. The Project remains contained.');
+      }
+    } catch (error) {
+      setDependencyRepairError(extractError(error).message || 'Could not refresh dependency repair status.');
+    } finally {
+      dependencyRepairInFlightRef.current = false;
+      if (mountedRef.current) setDependencyRepairPhase('idle');
+    }
+  }, [completeDependencyRepair, dependencyRepairDialog, loadProjects, reconcileDependencyRepair, showToast, user]);
+
+  useEffect(() => {
+    if (!isOwner(user) || !user?.id) {
+      dependencyRepairDiscoveryReadRef.current = null;
+      dependencyRepairDiscoveryCompletedKeyRef.current = '';
+      return undefined;
+    }
+    const discoveryKey = `${user.id}:${Number(user.authorizationVersion || 1)}`;
+    if (dependencyRepairDiscoveryCompletedKeyRef.current === discoveryKey) return undefined;
+    let cancelled = false;
+    const readActiveDependencyRepairs = () => {
+      const shared = dependencyRepairDiscoveryReadRef.current;
+      if (shared?.key === discoveryKey) return shared.promise;
+      const promise = projectsAPI.activeDependencyRepairs();
+      dependencyRepairDiscoveryReadRef.current = Object.freeze({ key: discoveryKey, promise });
+      return promise;
+    };
+    void (async () => {
+      try {
+        let discovery: Awaited<ReturnType<typeof projectsAPI.activeDependencyRepairs>> | null = null;
+        let discoveryError: unknown = null;
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          if (cancelled) return;
+          try {
+            const candidate = await readActiveDependencyRepairs();
+            if (cancelled) return;
+            if (!candidate.unavailable) {
+              discovery = candidate;
+              break;
+            }
+            if (dependencyRepairDiscoveryReadRef.current?.promise) {
+              dependencyRepairDiscoveryReadRef.current = null;
+            }
+            discoveryError = new Error('Portal could not inspect active dependency repairs yet.');
+          } catch (error) {
+            if (!projectRuntimeRecoveryTransportFailure(error)) throw error;
+            dependencyRepairDiscoveryReadRef.current = null;
+            discoveryError = error;
+          }
+          if (attempt < 19) {
+            await new Promise((resolve) => window.setTimeout(
+              resolve,
+              dependencyRepairReconciliationDelayMs(attempt),
+            ));
+          }
+        }
+        if (!discovery) throw discoveryError || new Error('Portal could not inspect active dependency repairs.');
+        if (cancelled) return;
+        dependencyRepairDiscoveryCompletedKeyRef.current = discoveryKey;
+        if (discovery.repairs.length === 0) return;
+        if (discovery.repairs.length !== 1) {
+          const message = 'Portal found multiple active dependency repairs and will not guess which Project to reopen. The Projects remain contained.';
+          setProjectsError((current) => current || message);
+          showToast(message, 'error');
+          return;
+        }
+        if (dependencyRepairInFlightRef.current || dependencyRepairDialogRef.current !== null) return;
+        const status = discovery.repairs[0];
+        if (!status.project || !status.promotion || !status.repair) {
+          throw new Error('Portal returned an unbound active dependency repair receipt.');
+        }
+        const owner: DependencyRepairDialog = Object.freeze({
+          projectName: status.project.name,
+          projectIdentity: Object.freeze({
+            id: status.project.id,
+            generation: status.project.generation,
+          }),
+          repairId: status.repair.repairId,
+          status,
+        });
+        dependencyRepairInFlightRef.current = true;
+        setDependencyRepairDialog(owner);
+        setDependencyRepairError(null);
+        try {
+          if (!status.restartRequired) {
+            await reconcileDependencyRepair(owner);
+          }
+        } finally {
+          dependencyRepairInFlightRef.current = false;
+          if (mountedRef.current) setDependencyRepairPhase('idle');
+        }
+      } catch (error) {
+        if (cancelled) return;
+        const message = extractError(error).message || 'Could not recover the active dependency repair status.';
+        setProjectsError((current) => current || message);
+        showToast(message, 'error');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [reconcileDependencyRepair, showToast, user?.authorizationVersion, user?.id, user?.role]);
+
+  const runDependencyRepair = useCallback(async (confirmation: string): Promise<void> => {
+    const owner = dependencyRepairDialog;
+    if (!owner || dependencyRepairInFlightRef.current || !isOwner(user)) return;
+    dependencyRepairInFlightRef.current = true;
+    setDependencyRepairPhase('submitting');
+    setDependencyRepairError(null);
+    try {
+      const currentProject = projectsRef.current.find((project) => project.name === owner.projectName);
+      if (
+        !currentProject
+        || currentProject.availability?.code !== 'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED'
+        || currentProject.identity.id !== owner.projectIdentity.id
+        || currentProject.identity.generation !== owner.projectIdentity.generation
+      ) {
+        throw new Error('The quarantined Project generation changed. Refresh Projects before continuing.');
+      }
+      const fresh = await projectsAPI.dependencyRepairStatus(owner.projectName);
+      if (fresh.state === 'UNAVAILABLE') {
+        throw new Error('Portal cannot prove the dependency repair state. Nothing was started.');
+      }
+      if (fresh.state === 'NOT_QUARANTINED') {
+        await loadProjects();
+        setDependencyRepairDialog(null);
+        showToast('This Project is no longer quarantined. Its inventory was refreshed.', 'info');
+        return;
+      }
+      if (
+        !dependencyRepairStatusMatchesProject(fresh, currentProject)
+        || !dependencyRepairPromotionMatches(fresh, owner.status)
+        || (fresh.repair !== null && fresh.repair.repairId !== owner.repairId)
+      ) {
+        throw new Error('The dependency repair binding changed before submission. Nothing was started.');
+      }
+      setDependencyRepairDialog({ ...owner, status: fresh });
+      if (fresh.restartRequired) {
+        return;
+      }
+      if (fresh.state === 'COMPLETE') {
+        await completeDependencyRepair(owner, fresh);
+        return;
+      }
+      if (fresh.state === 'PROMOTING') {
+        await reconcileDependencyRepair(owner);
+        return;
+      }
+      if (fresh.state !== 'QUARANTINED' || fresh.promotion === null) {
+        throw new Error('Portal cannot prove a repairable dependency state. Nothing was started.');
+      }
+      if (!fresh.retryable) {
+        throw new Error('Portal has reserved this dependency operation for startup recovery. Nothing was started in this process.');
+      }
+      if (!fresh.backup.eligible) {
+        throw new Error('A fresh authenticated comprehensive backup is required after quarantine before repair can start.');
+      }
+
+      let submissionError: string | null = null;
+      try {
+        const accepted = await projectsAPI.forceForwardDependencyRepair(owner.projectName, {
+          repairId: owner.repairId,
+          expectedProjectIdentityId: owner.projectIdentity.id,
+          expectedProjectIdentityGeneration: owner.projectIdentity.generation,
+          expectedPromotionOperationId: fresh.promotion.operationId,
+          expectedManifestDigest: fresh.promotion.manifestDigest,
+          confirmation,
+        });
+        if (
+          !dependencyRepairStatusMatchesProject(accepted, currentProject)
+          || !dependencyRepairPromotionMatches(accepted, fresh)
+          || accepted.repair?.repairId !== owner.repairId
+        ) {
+          throw new Error('Portal acknowledged a different dependency repair operation.');
+        }
+        setDependencyRepairDialog({ ...owner, status: accepted });
+        if (accepted.restartRequired) {
+          return;
+        }
+        if (accepted.state === 'COMPLETE') {
+          await completeDependencyRepair(owner, accepted);
+          return;
+        }
+        if (accepted.state !== 'PROMOTING') {
+          throw new Error('Portal did not return a durable dependency repair receipt.');
+        }
+      } catch (error) {
+        // The request may have committed its durable go-bit before the browser
+        // lost the response. Never submit it again here; reconcile the exact
+        // repairId through the read-only status endpoint.
+        if (dependencyRepairPostFailureIsDefinitive(error)) throw error;
+        submissionError = extractError(error).message || 'Portal did not acknowledge the dependency repair request.';
+      }
+      await reconcileDependencyRepair(owner, submissionError);
+    } catch (error) {
+      setDependencyRepairError(extractError(error).message || 'Dependency repair failed.');
+    } finally {
+      dependencyRepairInFlightRef.current = false;
+      if (mountedRef.current) setDependencyRepairPhase('idle');
+    }
+  }, [completeDependencyRepair, dependencyRepairDialog, loadProjects, reconcileDependencyRepair, showToast, user]);
 
   useEffect(() => { loadProjects(); }, [loadProjects]);
 
@@ -5384,7 +5861,28 @@ export default function AppsPage() {
                                 <button type="button" onClick={() => { void loadProjects(); }} disabled={loading} className="mt-1 text-amber-300 underline-offset-2 hover:underline disabled:opacity-50">Check again</button>
                               )}
                               {!p.availability.retryable && (
-                                <p className="mt-1 font-medium text-amber-200">Administrator reconciliation is required.</p>
+                                <p className="mt-1 font-medium text-amber-200">
+                                  {p.availability.code === 'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED'
+                                    ? 'Do not edit or run this Project. An owner must complete authenticated dependency recovery.'
+                                    : 'Administrator reconciliation is required.'}
+                                </p>
+                              )}
+                              {p.availability.code === 'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED'
+                                && isOwner(user) && (
+                                <button
+                                  type="button"
+                                  onClick={() => { void openDependencyRepair(p); }}
+                                  disabled={dependencyRepairDialog !== null
+                                    || dependencyRepairOpeningProject !== null
+                                    || dependencyRepairInFlightRef.current}
+                                  aria-busy={dependencyRepairOpeningProject === p.name}
+                                  className="mt-2 inline-flex min-h-8 items-center gap-1.5 rounded-md border border-amber-300/25 bg-amber-300/10 px-2 py-1 text-[11px] font-medium text-amber-100 transition hover:bg-amber-300/20 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  {dependencyRepairOpeningProject === p.name
+                                    ? <Loader2 size={11} className="animate-spin" aria-hidden="true" />
+                                    : <RefreshCw size={11} aria-hidden="true" />}
+                                  Repair dependency update
+                                </button>
                               )}
                             </div>
                           )}
@@ -6975,6 +7473,118 @@ export default function AppsPage() {
           </form>
         )}
       </ViewportModal>
+
+      <TypedConfirmationDialog
+        open={!!dependencyRepairDialog}
+        title={`Repair dependency update${dependencyRepairDialog ? ` for ${dependencyRepairDialog.projectName}` : ''}?`}
+        description="Portal will only finish the exact staged dependency generation that was already authorized. It will not preserve, merge, or overwrite an unknown live generation."
+        confirmationPhrase={dependencyRepairDialog?.status.state === 'QUARANTINED'
+          && dependencyRepairDialog.status.retryable
+          ? dependencyRepairDialog.status.confirmationPhrase
+          : null}
+        confirmLabel="Force forward staged generation"
+        confirmDisabled={!isOwner(user) || !dependencyRepairDialog?.status.backup.eligible}
+        showConfirmAction={dependencyRepairDialog?.status.state === 'QUARANTINED'
+          && dependencyRepairDialog.status.retryable}
+        busy={dependencyRepairPhase !== 'idle'}
+        busyLabel={dependencyRepairPhase === 'submitting'
+          ? 'Committing durable repair receipt…'
+          : dependencyRepairPhase === 'reconciling'
+            ? 'Verifying staged generation and recovery evidence…'
+            : 'Checking dependency repair status…'}
+        busyStartedAt={dependencyRepairDialog?.status.repair?.startedAt || null}
+        busyPhaseLabel={dependencyRepairDialog?.status.repair
+          ? `Durable phase: ${dependencyRepairDialog.status.repair.phase.replace(/_/g, ' ')}`
+          : null}
+        busyPhaseDetail={dependencyRepairDialog?.status.state === 'PROMOTING'
+          ? dependencyRepairDialog.status.restartRequired
+            ? 'Live continuation is unavailable. Portal will hand this exact repair to startup recovery; the Project remains fenced while the browser reconnects.'
+            : 'The Project remains fenced until Portal proves the all-new generation, applies the original decision, and cleans retained evidence.'
+          : null}
+        tone="danger"
+        details={dependencyRepairDialog ? (
+          <div className="space-y-3 text-sm leading-6 text-theme-text-muted">
+            <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2">
+              <p className="font-medium text-amber-100">
+                State: {dependencyRepairDialog.status.state.replace(/_/g, ' ')}
+              </p>
+              <p className="mt-1 text-xs text-amber-100/75">
+                Project identity {dependencyRepairDialog.projectIdentity.id}, generation {dependencyRepairDialog.projectIdentity.generation}.
+              </p>
+              {dependencyRepairDialog.status.repair && (
+                <p className="mt-1 text-xs text-amber-100/75">
+                  Repair receipt {dependencyRepairDialog.status.repair.repairId} · {dependencyRepairDialog.status.repair.phase.replace(/_/g, ' ')}
+                </p>
+              )}
+            </div>
+            <div className={`rounded-xl border px-3 py-2 ${dependencyRepairDialog.status.backup.eligible
+              ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100'
+              : dependencyRepairDialog.status.backup.pinned
+                ? 'border-sky-500/25 bg-sky-500/10 text-sky-100'
+              : 'border-red-500/25 bg-red-500/10 text-red-100'}`}>
+              <p className="font-medium">
+                {dependencyRepairDialog.status.restartRequired
+                  ? 'Recovery assigned to Portal startup'
+                  : dependencyRepairDialog.status.backup.eligible
+                  ? 'Fresh comprehensive backup verified'
+                  : dependencyRepairDialog.status.backup.pinned
+                    ? 'Recovery backup pinned to this repair'
+                    : dependencyRepairDialog.status.state === 'PROMOTING'
+                      ? 'Recovery backup attestation unavailable'
+                  : 'Fresh comprehensive backup required'}
+              </p>
+              <p className="mt-1 text-xs opacity-75">
+                {dependencyRepairDialog.status.restartRequired
+                  ? dependencyRepairDialog.status.backup.pinned
+                    ? 'Portal retained the exact authenticated recovery archive for startup. Do not replace it or submit another repair.'
+                    : 'Portal retained the Project fence before a durable repair receipt was created. Startup will reconcile the pre-repair evidence; do not submit another repair.'
+                  : dependencyRepairDialog.status.backup.pinned
+                  ? 'Portal retained the exact authenticated recovery archive selected at admission and will reverify it before deleting displaced evidence.'
+                  : dependencyRepairDialog.status.state === 'PROMOTING'
+                    ? 'The durable repair is already admitted, so do not submit another request or replace its evidence. Portal will keep the Project contained for startup recovery.'
+                  : `The backup must be authenticated, complete, strictly restorable, and created after ${dependencyRepairDialog.status.backup.requiredAfter}.`}
+              </p>
+              {dependencyRepairDialog.status.backup.filename && (
+                <p className="mt-1 break-all text-xs opacity-75">
+                  {dependencyRepairDialog.status.backup.filename}
+                  {dependencyRepairDialog.status.backup.createdAt
+                    ? ` · ${dependencyRepairDialog.status.backup.createdAt}`
+                    : ''}
+                </p>
+              )}
+            </div>
+            {dependencyRepairDialog.status.restartRequired && (
+              <div className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-amber-100" role="status">
+                <p className="font-medium">Controlled Portal restart pending</p>
+                <p className="mt-1 text-xs opacity-75">
+                  Do not resubmit the repair. Portal retained the Project fence for startup reconciliation. After Portal restarts, reload Projects to rediscover the exact quarantined operation or durable receipt.
+                </p>
+              </div>
+            )}
+            {dependencyRepairError && (
+              <div role="alert" className="rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2 text-red-100">
+                {dependencyRepairError}
+              </div>
+            )}
+            {dependencyRepairPhase === 'idle' && !dependencyRepairDialog.status.restartRequired && (
+              <button
+                type="button"
+                onClick={() => { void refreshDependencyRepair(); }}
+                className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-theme-border bg-theme-bg px-3 py-1.5 text-xs font-medium text-theme-text transition hover:bg-theme-surface-hover"
+              >
+                <RefreshCw size={12} aria-hidden="true" /> Check repair status
+              </button>
+            )}
+          </div>
+        ) : null}
+        onConfirm={(confirmation) => { void runDependencyRepair(confirmation); }}
+        onCancel={() => {
+          if (dependencyRepairInFlightRef.current) return;
+          setDependencyRepairError(null);
+          setDependencyRepairDialog(null);
+          setDependencyRepairPhase('idle');
+        }}
+      />
 
       <TypedConfirmationDialog
         open={!!runtimeImageRepairDialog}

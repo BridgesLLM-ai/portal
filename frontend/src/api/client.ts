@@ -2,6 +2,7 @@ import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'ax
 import { useAuthStore } from '../contexts/AuthContext';
 import { captureError } from '../utils/errorHandler';
 import { diagnosticEndpoint } from '../utils/diagnosticEndpoint';
+import { withAuthRefreshConvergence } from '../utils/authRefreshConvergence';
 import {
   PORTAL_AUTHORIZATION_VERSION_HEADER,
   StaleWorkspaceAuthorizationResponseError,
@@ -147,16 +148,15 @@ async function refreshSession(): Promise<boolean> {
     return true;
   }
 
-  refreshPromise = (async () => {
-    const response = await axios.post(`${API_URL}/auth/refresh`, {}, { 
+  refreshPromise = withAuthRefreshConvergence(async () => {
+    await axios.post(`${API_URL}/auth/refresh`, {}, {
       withCredentials: true,
       timeout: 10000, // 10s timeout for refresh
     });
     // Reset network failure counter on success
     consecutiveNetworkFailures = 0;
     lastSuccessfulAuth = Date.now();
-    return response;
-  })().then(() => {}).finally(() => {
+  }).finally(() => {
     refreshPromise = null;
   });
 

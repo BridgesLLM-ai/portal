@@ -12,8 +12,22 @@ import { PORTAL_VERSION } from '../version';
 let statusServer: Server | null = null;
 let currentPhase = 'initializing';
 let startedAtIso = '';
+let failureHold = false;
+
+export const PROJECT_DEPENDENCY_PROMOTION_QUARANTINE_CODE =
+  'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED' as const;
+export const PROJECT_DEPENDENCY_PROMOTION_RECOVERY_PHASE =
+  'project-dependency-promotion-recovery' as const;
+
+export class StartupStatusServerFailureHoldError extends Error {
+  constructor() {
+    super('The startup status listener is held by an irreversible startup failure');
+    this.name = 'StartupStatusServerFailureHoldError';
+  }
+}
 
 export function setStartupPhase(phase: string): void {
+  if (failureHold) return;
   currentPhase = phase;
 }
 
@@ -21,11 +35,45 @@ export function getStartupPhase(): string {
   return currentPhase;
 }
 
+/**
+ * Permanently hold this process in a sanitized status-only quarantine. The
+ * state has no reset API: only explicit process shutdown may close the held
+ * listener. No caller-controlled detail is accepted or reflected.
+ */
+export function holdStartupStatusServerForProjectDependencyPromotionQuarantine(): void {
+  if (!failureHold) {
+    failureHold = true;
+    currentPhase = PROJECT_DEPENDENCY_PROMOTION_RECOVERY_PHASE;
+  }
+  // The bootstrap listener is normally unref'd so ordinary startup failures
+  // can exit. Quarantine is an intentional operator-visible hold and must keep
+  // the process alive until a shutdown signal arrives.
+  statusServer?.ref();
+}
+
 export async function startStartupStatusServer(port: number, host: string): Promise<void> {
   if (statusServer) return;
   startedAtIso = new Date().toISOString();
   const server = createServer((req, res) => {
     const url = (req.url || '').split('?')[0];
+    if (failureHold) {
+      res.writeHead(503, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        connection: 'close',
+        'retry-after': '60',
+      });
+      res.end(JSON.stringify({
+        status: 'unavailable',
+        code: PROJECT_DEPENDENCY_PROMOTION_QUARANTINE_CODE,
+        phase: PROJECT_DEPENDENCY_PROMOTION_RECOVERY_PHASE,
+        version: PORTAL_VERSION,
+        startedAt: startedAtIso,
+        timestamp: new Date().toISOString(),
+      }));
+      return;
+    }
     const payload = {
       status: 'starting',
       phase: currentPhase,
@@ -41,15 +89,27 @@ export async function startStartupStatusServer(port: number, host: string): Prom
     });
     res.end(JSON.stringify(payload));
   });
-  server.unref();
+  if (failureHold) server.ref();
+  else server.unref();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, host, () => resolve());
   });
   statusServer = server;
+  if (failureHold) server.ref();
 }
 
 export async function stopStartupStatusServer(): Promise<void> {
+  if (failureHold) throw new StartupStatusServerFailureHoldError();
+  await closeStartupStatusServer();
+}
+
+/** Process-shutdown-only close; deliberately does not clear the failure hold. */
+export async function stopStartupStatusServerForShutdown(): Promise<void> {
+  await closeStartupStatusServer();
+}
+
+async function closeStartupStatusServer(): Promise<void> {
   const server = statusServer;
   statusServer = null;
   if (!server) return;

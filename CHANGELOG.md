@@ -2,6 +2,88 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.17] - 2026-08-12
+
+### Fixed
+- **Sign-in remains stable across browser tabs, and revoked sessions stay
+  revoked.** Concurrent refresh requests now converge on the winning
+  credentials instead of deleting them from the shared browser cookie jar.
+  Deleted or expired durable sessions—including sessions revoked by a password
+  reset—fail closed, cannot return after a reload, and immediately retire their
+  live Portal transports. Project dependency installation re-attests the exact
+  durable sign-in at its promotion boundary: revocation that wins leaves the
+  live Project unchanged, while an already-authorized promotion converges to
+  one complete generation after interruption instead of stranding mixed
+  artifacts.
+
+- **Agent Chat steering now reaches the exact run shown in the browser.**
+  Steering works through Codex and provider-neutral OpenClaw runs, including
+  Anthropic-backed turns. Retries join the original in-flight delivery instead
+  of queuing duplicate text, a replacement run cannot receive a delayed steer,
+  and a pending clarification remains authoritative. Readiness now attests the
+  actual provider-neutral active-run bridge, and replaced stream subscriptions
+  retire their keepalives instead of leaking server timers.
+
+- **Updates stop before downtime when the candidate cannot restart cleanly.**
+  The signed candidate audits App and Project continuity, persisted App
+  runtimes, and App API bindings before opening the update transaction. Exactly
+  identified stale links can be quarantined and re-attested while the current
+  Portal remains online; ambiguous state and unsupported Node.js versions
+  produce actionable failures before the boot fence. An ordinary reboot now
+  contains one unsafe App instead of taking down the entire Portal, and
+  Dashboard attention states expose the failed phase, operation, versions, and
+  recovery procedure. Startup recovery now distinguishes stable promotion
+  evidence from timestamp-only Project-directory churn, so harmless namespace
+  metadata changes cannot quarantine an otherwise clean Portal. Once 4.0.17 is
+  installed, Dashboard updates authenticate
+  the exact installer bytes with a detached release signature before Bash can
+  execute them; the first 4.0.16-to-4.0.17 hop remains rooted in the existing
+  updater's pinned HTTPS origin because new code cannot retroactively change an
+  older launcher's trust boundary. OpenClaw question-bridge updates now attest
+  the replacement tool and settlement methods before activating compatibility,
+  then require the complete active-run bridge before committing, so an
+  unpatched 4.0.16 runtime cannot deadlock its own upgrade.
+
+- **Legacy Projects can enter Project Chat without losing their deployed App or
+  share URLs.** Adoption can rebind one eligible stopped App to the exact
+  current Project identity while retaining its App ID and existing share
+  tokens. Conflicting identities, ambiguous paths, or a running Portal-managed
+  App are refused instead of guessed through. The rebind now shares the Project
+  lifecycle lock and converges after interruption instead of stranding a copied
+  deployment or pairing a new database identity with an old live runtime.
+
+- **A contained Project dependency update has one supported Owner recovery
+  path.** Portal can force-forward only the exact staged generation recorded by
+  the original promotion decision, after a new authenticated Complete
+  comprehensive backup passes strict restore verification. The Project remains
+  fenced through writer shutdown, crash-resumable promotion, all-new
+  verification, backup revalidation, and evidence cleanup. Lost browser
+  responses and reloads rediscover and reconcile the same durable receipt. If
+  live continuation loses its exact exclusion proof or exhausts bounded
+  retries, Portal stops current-process polling and hands the exact operation
+  or committed receipt to controlled startup recovery instead of inviting a
+  second mutation. Conflicting identities, stale backups, mixed files, and
+  attempts to preserve or abandon the staged generation fail closed.
+
+- **Backups now distinguish recovery archives from salvage files.** Backup
+  Settings shows authenticated Complete, Salvage only, and Unclassified states,
+  names omitted components, warns after repeated incomplete runs, and confirms
+  before downloading an archive that is not restore-ready. When an operator
+  chooses an existing current backup for an update or guarded maintenance, it
+  must be fresh, comprehensive, and pass strict restore verification; the
+  existing explicit confirmation to proceed without a fresh backup remains
+  available. Project captures accept ordinary virtual-environment interpreter
+  links, live agent SQLite databases are snapshotted safely, and degraded
+  archives cannot rotate away complete recovery evidence.
+
+- **Shared App logins and API failures report what actually happened.**
+  Password-protected shares use a native form that works without JavaScript and
+  keeps authentication errors visible. App API responses preserve real upstream
+  authentication statuses only after complete JSON validation; truncated,
+  malformed, or JSON responses larger than 8 MiB return a truthful failure,
+  while missing configuration, timeout, and upstream outage remain distinct
+  cases.
+
 ## [4.0.16] - 2026-08-11
 
 ### Fixed

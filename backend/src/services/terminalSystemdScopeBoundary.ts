@@ -1579,6 +1579,41 @@ export function createTerminalSystemdScopeBoundary(
     await recover();
   };
 
+  const quiesceForProjectDependencyPromotion = async (): Promise<{
+    preparationCount: number;
+    sessionCount: number;
+    recoveredCount: number;
+  }> => {
+    if (shuttingDown) {
+      throw new TerminalSystemdScopeError(
+        'Terminal scope runtime is shutting down',
+        'TERMINAL_SCOPE_RUNTIME_UNAVAILABLE',
+        false,
+      );
+    }
+    await initialize();
+    const preparations = [...activePreparations];
+    await Promise.allSettled(preparations);
+    const sessions = [...activeSessions];
+    const settlements = await Promise.allSettled(sessions.map((session) => session.stop()));
+    if (settlements.some((result) => result.status === 'rejected')) {
+      throw settlementUnproven(
+        'One or more terminal systemd scopes did not settle before dependency promotion',
+      );
+    }
+    const recovered = await recover();
+    if (activePreparations.size !== 0 || activeSessions.size !== 0) {
+      throw settlementUnproven(
+        'A terminal systemd scope remained active before dependency promotion',
+      );
+    }
+    return {
+      preparationCount: preparations.length,
+      sessionCount: sessions.length,
+      recoveredCount: recovered.recovered,
+    };
+  };
+
   return Object.freeze({
     initialize,
     prepare,
@@ -1587,6 +1622,7 @@ export function createTerminalSystemdScopeBoundary(
     inspect,
     sameBoot,
     stopIdentity,
+    quiesceForProjectDependencyPromotion,
     snapshot: () => ({
       initialized,
       shuttingDown,
@@ -1619,6 +1655,12 @@ export const stopTerminalSystemdScopeIdentity = (
 ): Promise<TerminalSystemdScopeStopProof> => (
   terminalSystemdScopeBoundary.stopIdentity(identity)
 );
+
+export const quiesceTerminalSystemdScopesForProjectDependencyPromotion = (): Promise<{
+  preparationCount: number;
+  sessionCount: number;
+  recoveredCount: number;
+}> => terminalSystemdScopeBoundary.quiesceForProjectDependencyPromotion();
 
 export const shutdownTerminalSystemdScopeRuntime = (): Promise<void> => (
   terminalSystemdScopeBoundary.shutdown()

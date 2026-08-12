@@ -408,7 +408,7 @@ async function markQuarantined(
 
 async function recoverRow(
   row: HostAgentRunRow,
-  reason: 'startup' | 'authorization_transition' | 'shutdown',
+  reason: 'startup' | 'authorization_transition' | 'project_dependency_promotion' | 'shutdown',
 ): Promise<{ recovered: boolean; quarantined: boolean; signaled: boolean }> {
   try {
     const termination = await stopPersistedBoundary(row);
@@ -1078,7 +1078,7 @@ export function settleHostAgentRun(
     }
     if (
       current.status === status
-      || (current.status === 'RECOVERED' && status !== 'COMPLETED')
+      || current.status === 'RECOVERED'
     ) {
       return;
     }
@@ -1147,7 +1147,7 @@ export function settleHostAgentRun(
         && sameHandle(raced, handle)
         && (
           raced.status === status
-          || (raced.status === 'RECOVERED' && status !== 'COMPLETED')
+          || raced.status === 'RECOVERED'
         )
       ) {
         return;
@@ -1197,6 +1197,10 @@ export function quarantineHostAgentRun(
       },
     });
     if (updated.count !== 1) {
+      const current = await (prisma as any).hostAgentRun.findUnique({
+        where: { id: handle.id },
+      }) as HostAgentRunRow | null;
+      if (current && sameHandle(current, handle) && current.status === 'RECOVERED') return;
       throw new HostAgentRunJournalError(
         'Host agent quarantine state could not be committed',
         503,
@@ -1226,7 +1230,7 @@ export function registerHostAgentRunAbort(
 
 async function quiesceRows(
   rows: HostAgentRunRow[],
-  reason: 'authorization_transition' | 'shutdown',
+  reason: 'authorization_transition' | 'project_dependency_promotion' | 'shutdown',
 ): Promise<HostAgentRunQuiescence> {
   let inMemoryAbortCount = 0;
   let persistedRuntimeSignalCount = 0;
@@ -1300,6 +1304,29 @@ export async function quiesceHostAgentRunsForAuthorizationTransition(
   if (residual) {
     throw new HostAgentRunJournalError(
       'A host-native run remained unresolved after authorization cleanup',
+      503,
+      'HOST_RUN_QUIESCENCE_UNPROVEN',
+    );
+  }
+  return result;
+}
+
+export async function quiesceHostAgentRunsForProjectDependencyPromotion(
+): Promise<HostAgentRunQuiescence> {
+  await initializeHostAgentRunRuntime();
+  await Promise.allSettled([...activeOperations]);
+  const rows = await (prisma as any).hostAgentRun.findMany({
+    where: { status: { in: [...ACTIVE_HOST_RUN_STATUSES] } },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  }) as HostAgentRunRow[];
+  const result = await quiesceRows(rows, 'project_dependency_promotion');
+  const residual = await (prisma as any).hostAgentRun.findFirst({
+    where: { status: { in: [...ACTIVE_HOST_RUN_STATUSES] } },
+    select: { id: true },
+  });
+  if (residual) {
+    throw new HostAgentRunJournalError(
+      'A host-native run remained unresolved before dependency promotion',
       503,
       'HOST_RUN_QUIESCENCE_UNPROVEN',
     );

@@ -10,6 +10,7 @@ import {
   managedProjectDesktopRuntimeDirectory,
   projectDesktopRuntimeAppState,
   projectDesktopRuntimeCleanupDirectories,
+  quiesceProjectDesktopRuntimeForDependencyPromotion,
 } from './projectDesktopRuntime';
 
 describe('Project desktop runtime identity', () => {
@@ -109,5 +110,49 @@ describe('Project desktop runtime identity', () => {
   test('never reports a failed desktop launch as running', () => {
     expect(projectDesktopRuntimeAppState(null)).toEqual({ isActive: true, processStatus: 'running' });
     expect(projectDesktopRuntimeAppState('xterm failed')).toEqual({ isActive: false, processStatus: 'error' });
+  });
+
+  test('dependency recovery stops and verifies the exact desktop cgroup and process marker', () => {
+    const processIds = jest.fn()
+      .mockReturnValueOnce([101])
+      .mockReturnValueOnce([101])
+      .mockReturnValueOnce([]);
+    const signalProcesses = jest.fn();
+    const stopUnit = jest.fn();
+    const result = quiesceProjectDesktopRuntimeForDependencyPromotion({
+      projectIdentityId: '11111111-1111-4111-8111-111111111111',
+      projectName: 'Demo',
+    }, {
+      processIds,
+      signalProcesses,
+      unitProperty: jest.fn((_unit, property) => ({
+        LoadState: 'loaded',
+        ActiveState: 'inactive',
+        ControlGroup: '/system.slice/bridgesllm-project.service',
+      }[property] || '')),
+      stopUnit,
+      resetFailedUnit: jest.fn(),
+      cgroupHasProcesses: jest.fn(() => false),
+    });
+    expect(stopUnit).toHaveBeenCalledWith(
+      'bridgesllm-project-11111111-1111-4111-8111-111111111111.service',
+    );
+    expect(signalProcesses).toHaveBeenNthCalledWith(1, [101], 'SIGTERM');
+    expect(signalProcesses).toHaveBeenNthCalledWith(2, [101], 'SIGKILL');
+    expect(result).toEqual({ systemdUnitStopped: true, processCount: 1 });
+  });
+
+  test('dependency recovery fails closed when an exact desktop process remains', () => {
+    expect(() => quiesceProjectDesktopRuntimeForDependencyPromotion({
+      projectIdentityId: '11111111-1111-4111-8111-111111111111',
+      projectName: 'Demo',
+    }, {
+      processIds: jest.fn(() => [101]),
+      signalProcesses: jest.fn(),
+      unitProperty: jest.fn(() => 'not-found'),
+      stopUnit: jest.fn(),
+      resetFailedUnit: jest.fn(),
+      cgroupHasProcesses: jest.fn(() => false),
+    })).toThrow(/remained/i);
   });
 });

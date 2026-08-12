@@ -51,6 +51,24 @@ function workspaceAuthorizationOperationKind(
   req: Pick<Request, 'originalUrl' | 'path'> & { method?: string },
 ): 'read' | 'mutation' | null {
   const pathname = String(req.originalUrl || req.path || '').split('?')[0];
+  // Owner dependency-repair control is the only recovery surface that must
+  // remain reachable while the process-global workspace writer fence is held.
+  // It has its own exact Project lock, durable go-bit and Owner/session gate;
+  // admitting it here would either deadlock on itself or make a lost-response
+  // retry impossible while containment is doing its job.
+  // Mirror Express's default route equivalence exactly: literals are
+  // case-insensitive and one trailing slash is optional, while methods and
+  // deeper suffixes remain distinct. Any broader prefix exemption would let
+  // ordinary Project mutations bypass the global containment fence.
+  const method = String(req.method || '').toUpperCase();
+  if ((method === 'GET'
+      && /^\/api\/projects\/dependency-repair\/active\/?$/i.test(pathname))
+    || (method === 'GET'
+      && /^\/api\/projects\/[^/]+\/dependency-repair\/status\/?$/i.test(pathname))
+    || (method === 'POST'
+      && /^\/api\/projects\/[^/]+\/dependency-repair\/force-forward\/?$/i.test(pathname))) {
+    return null;
+  }
   if (pathname === '/api/gateway' || pathname.startsWith('/api/gateway/')) {
     // Default every non-read Gateway operation to mutation-capable so a newly
     // added session/runtime control cannot silently bypass an authorization
@@ -404,6 +422,37 @@ export function closeWorkspaceAuthorizationAdmission(
 export function closeGlobalWorkspaceAuthorizationAdmission(
 ): WorkspaceAuthorizationFenceController {
   return closeWorkspaceAuthorizationAdmission([GLOBAL_WORKSPACE_AUTHORIZATION_KEY]);
+}
+
+/**
+ * Close global admission and then remove one exact, already-admitted mutation
+ * from the drain set in the same synchronous JavaScript turn.
+ *
+ * Dependency installation is itself a `/api/projects` mutation. Once it has
+ * finished all expensive work in a private staging directory, it becomes the
+ * coordinator for a global promotion fence and must not wait for its own HTTP
+ * admission forever. Closing first is essential: settling first would leave an
+ * admission gap in which another root-capable writer could start. The caller
+ * must detach its own global-fence subscription before invoking this helper.
+ */
+export function closeGlobalWorkspaceAuthorizationAdmissionExcludingRequest(
+  req: Request,
+): WorkspaceAuthorizationFenceController {
+  const admission = requestAdmissions.get(req);
+  if (
+    !admission
+    || admission.released
+    || admission.kind !== 'mutation'
+    || !admission.stateKeys.includes(GLOBAL_WORKSPACE_AUTHORIZATION_KEY)
+  ) {
+    throw new AppError(
+      500,
+      'The promotion coordinator does not own an active workspace mutation admission.',
+    );
+  }
+  const controller = closeGlobalWorkspaceAuthorizationAdmission();
+  releaseAdmission(admission);
+  return controller;
 }
 
 export async function withWorkspaceAuthorizationFences<T>(

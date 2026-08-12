@@ -44,6 +44,9 @@ const mocks = vi.hoisted(() => ({
   ollamaStatus: vi.fn(),
   runtimeRepairStatus: vi.fn(),
   runtimeRepair: vi.fn(),
+  activeDependencyRepairs: vi.fn(),
+  dependencyRepairStatus: vi.fn(),
+  forceForwardDependencyRepair: vi.fn(),
 }));
 
 vi.mock('../api/endpoints', () => ({
@@ -62,6 +65,9 @@ vi.mock('../api/endpoints', () => ({
     undeploy: mocks.undeploy,
     appProcess: mocks.appProcess,
     checkDeps: mocks.checkDeps,
+    activeDependencyRepairs: mocks.activeDependencyRepairs,
+    dependencyRepairStatus: mocks.dependencyRepairStatus,
+    forceForwardDependencyRepair: mocks.forceForwardDependencyRepair,
     share: mocks.share,
     listShares: mocks.listShares,
     updateShare: mocks.updateShare,
@@ -407,6 +413,48 @@ const projects = [
   },
 ];
 
+const quarantinedAlpha = {
+  ...projects[0],
+  availability: {
+    available: false as const,
+    code: 'PROJECT_DEPENDENCY_PROMOTION_QUARANTINED' as const,
+    message: 'Portal contained an interrupted dependency promotion.',
+    action: 'RECONCILE_PROJECT_LIFECYCLE' as const,
+    retryable: false,
+  },
+  destructiveActions: {
+    allowed: false,
+    reason: 'Dependency promotion recovery is required.',
+  },
+};
+
+function dependencyRepairStatus(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    state: 'QUARANTINED',
+    ownerOnly: true,
+    action: 'FORCE_FORWARD_STAGED',
+    confirmationPhrase: 'FORCE FORWARD alpha',
+    project: { id: alphaIdentity.id, name: 'alpha', generation: alphaIdentity.generation },
+    promotion: {
+      operationId: '11111111-1111-4111-8111-111111111111',
+      manifestDigest: 'a'.repeat(64),
+      status: 'AUTHORIZED',
+    },
+    repair: null,
+    backup: {
+      requiredAfter: '2026-08-12T08:00:00.000Z',
+      eligible: false,
+      pinned: false,
+    },
+    retryable: true,
+    statusRetryable: false,
+    restartRequired: false,
+    ...overrides,
+  };
+}
+
 const PROJECT_RENAME_ATTEMPT_STORAGE_PREFIX = 'portal:project-rename-attempt:';
 
 function projectRenameAttemptStorageKeys(): string[] {
@@ -465,8 +513,9 @@ function opaqueProjectTestEntry(initialEntry: string): string {
 function renderApps(
   initialEntry = '/projects?project=alpha&file=one.ts',
   convertLegacyTarget = true,
+  strictMode = false,
 ) {
-  return render(
+  const app = (
     <MemoryRouter
       initialEntries={[convertLegacyTarget ? opaqueProjectTestEntry(initialEntry) : initialEntry]}
     >
@@ -475,8 +524,9 @@ function renderApps(
         <RouteOperationProbe />
         <AppsPage />
       </RouteOperationProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  return render(strictMode ? <React.StrictMode>{app}</React.StrictMode> : app);
 }
 
 async function waitForAlphaFile() {
@@ -581,6 +631,13 @@ describe('AppsPage share action ownership', () => {
       restartExpected: true,
     });
     mocks.runtimeRepair.mockReset().mockResolvedValue({ ok: true, state: 'running', started: true });
+    mocks.activeDependencyRepairs.mockReset().mockResolvedValue({
+      repairs: [],
+      count: 0,
+      unavailable: false,
+    });
+    mocks.dependencyRepairStatus.mockReset().mockResolvedValue(dependencyRepairStatus());
+    mocks.forceForwardDependencyRepair.mockReset();
   });
 
   it('scrubs mismatched and legacy project targets without resolving them', async () => {
@@ -2040,6 +2097,363 @@ describe('AppsPage share action ownership', () => {
     expect(screen.getByText('This project directory changed outside Portal.')).toBeVisible();
     expect(screen.getByText('Administrator reconciliation is required.')).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Open Project Chat' })).not.toBeInTheDocument();
+  });
+
+  it('shows dependency quarantine to everyone but exposes repair only to Owners', async () => {
+    mocks.userRole = 'MEMBER';
+    mocks.listProjects.mockResolvedValueOnce({ projects: [quarantinedAlpha] });
+
+    renderApps('/projects', false);
+
+    expect(await screen.findByText('Portal contained an interrupted dependency promotion.')).toBeVisible();
+    expect(screen.getByText(/Do not edit or run this Project/i)).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Repair dependency update' })).not.toBeInTheDocument();
+    expect(mocks.dependencyRepairStatus).not.toHaveBeenCalled();
+  });
+
+  it('shows the exact dependency repair contract and blocks submission without a fresh backup', async () => {
+    mocks.listProjects.mockResolvedValueOnce({ projects: [quarantinedAlpha] });
+    mocks.dependencyRepairStatus.mockResolvedValueOnce(dependencyRepairStatus());
+    const user = userEvent.setup();
+
+    renderApps('/projects', false);
+    await user.click(await screen.findByRole('button', { name: 'Repair dependency update' }));
+
+    const dialog = await screen.findByRole('dialog', { name: /Repair dependency update for alpha/i });
+    expect(within(dialog).getByText(/Project identity project-alpha-id, generation 3/i)).toBeVisible();
+    expect(within(dialog).getByText('Fresh comprehensive backup required')).toBeVisible();
+    expect(within(dialog).getByRole('button', { name: 'Force forward staged generation' })).toBeDisabled();
+    expect(mocks.forceForwardDependencyRepair).not.toHaveBeenCalled();
+  });
+
+  it('shows a pre-go startup handoff without offering another repair or current-process poll', async () => {
+    mocks.listProjects.mockResolvedValueOnce({ projects: [quarantinedAlpha] });
+    mocks.dependencyRepairStatus.mockResolvedValueOnce(dependencyRepairStatus({
+      retryable: false,
+      statusRetryable: false,
+      restartRequired: true,
+    }));
+    const user = userEvent.setup();
+
+    renderApps('/projects', false);
+    await user.click(await screen.findByRole('button', { name: 'Repair dependency update' }));
+
+    const dialog = await screen.findByRole('dialog', { name: /Repair dependency update for alpha/i });
+    expect(within(dialog).getByText('Recovery assigned to Portal startup')).toBeVisible();
+    expect(within(dialog).getByText('Controlled Portal restart pending')).toBeVisible();
+    expect(within(dialog).queryByRole('button', { name: 'Force forward staged generation' })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole('button', { name: 'Check repair status' })).not.toBeInTheDocument();
+    expect(mocks.dependencyRepairStatus).toHaveBeenCalledTimes(1);
+    expect(mocks.forceForwardDependencyRepair).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the repair contract names a different Project generation', async () => {
+    mocks.listProjects.mockResolvedValueOnce({ projects: [quarantinedAlpha] });
+    mocks.dependencyRepairStatus.mockResolvedValueOnce(dependencyRepairStatus({
+      project: { id: alphaIdentity.id, name: 'alpha', generation: alphaIdentity.generation + 1 },
+    }));
+    const user = userEvent.setup();
+
+    renderApps('/projects', false);
+    await user.click(await screen.findByRole('button', { name: 'Repair dependency update' }));
+
+    await waitFor(() => expect(mocks.dependencyRepairStatus).toHaveBeenCalledWith('alpha'));
+    expect(screen.queryByRole('dialog', { name: /Repair dependency update/i })).not.toBeInTheDocument();
+    expect(mocks.forceForwardDependencyRepair).not.toHaveBeenCalled();
+  });
+
+  it('refreshes inventory when the quarantine cleared before the Owner opened repair', async () => {
+    mocks.listProjects
+      .mockResolvedValueOnce({ projects: [quarantinedAlpha] })
+      .mockResolvedValueOnce({ projects });
+    mocks.dependencyRepairStatus.mockResolvedValueOnce(dependencyRepairStatus({
+      state: 'NOT_QUARANTINED',
+      project: null,
+      promotion: null,
+      repair: null,
+      backup: { requiredAfter: null, eligible: false, pinned: false },
+      retryable: false,
+      statusRetryable: false,
+      restartRequired: false,
+    }));
+    const user = userEvent.setup();
+
+    renderApps('/projects', false);
+    await user.click(await screen.findByRole('button', { name: 'Repair dependency update' }));
+
+    await waitFor(() => expect(mocks.listProjects).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole('dialog', { name: /Repair dependency update/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'alpha' })).toBeEnabled();
+    expect(mocks.forceForwardDependencyRepair).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a definitive backup-gate rejection without treating it as a lost response', async () => {
+    const eligible = dependencyRepairStatus({
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: true,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+    });
+    mocks.listProjects.mockResolvedValueOnce({ projects: [quarantinedAlpha] });
+    mocks.dependencyRepairStatus
+      .mockResolvedValueOnce(eligible)
+      .mockResolvedValueOnce(eligible);
+    mocks.forceForwardDependencyRepair.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: {
+          code: 'PROJECT_DEPENDENCY_REPAIR_BACKUP_REQUIRED',
+          error: 'The verified backup is no longer eligible.',
+        },
+      },
+    });
+    const user = userEvent.setup();
+
+    renderApps('/projects', false);
+    await user.click(await screen.findByRole('button', { name: 'Repair dependency update' }));
+    const dialog = await screen.findByRole('dialog', { name: /Repair dependency update for alpha/i });
+    await user.type(within(dialog).getByRole('textbox'), 'FORCE FORWARD alpha');
+    await user.click(within(dialog).getByRole('button', { name: 'Force forward staged generation' }));
+
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('verified backup is no longer eligible');
+    expect(mocks.dependencyRepairStatus).toHaveBeenCalledTimes(2);
+    expect(mocks.forceForwardDependencyRepair).toHaveBeenCalledTimes(1);
+  });
+
+  it('rediscovers one live repair after reload and resumes only read-only reconciliation', async () => {
+    const repairId = '22222222-2222-4222-8222-222222222222';
+    const active = dependencyRepairStatus({
+      state: 'PROMOTING',
+      repair: {
+        repairId,
+        status: 'PROMOTING',
+        phase: 'GO_BIT',
+        startedAt: '2026-08-12T08:06:00.000Z',
+        completedAt: null,
+      },
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: false,
+        pinned: true,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+      retryable: false,
+      statusRetryable: true,
+      restartRequired: false,
+    });
+    const statusRead = deferred<Record<string, unknown>>();
+    mocks.listProjects
+      .mockRejectedValueOnce(new Error('Project inventory is fenced during dependency repair.'))
+      .mockResolvedValueOnce({ projects });
+    mocks.activeDependencyRepairs.mockResolvedValueOnce({
+      repairs: [active],
+      count: 1,
+      unavailable: false,
+    });
+    mocks.dependencyRepairStatus.mockReturnValueOnce(statusRead.promise);
+
+    renderApps('/projects', false, true);
+
+    const dialog = await screen.findByRole('dialog', { name: /Repair dependency update for alpha/i });
+    expect(within(dialog).getByText('Recovery backup pinned to this repair')).toBeVisible();
+    expect(within(dialog).queryByText('Controlled Portal restart pending')).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole('button', { name: 'Force forward staged generation' })).not.toBeInTheDocument();
+    expect(mocks.forceForwardDependencyRepair).not.toHaveBeenCalled();
+
+    statusRead.resolve(dependencyRepairStatus({
+      state: 'COMPLETE',
+      repair: {
+        repairId,
+        status: 'APPLIED',
+        phase: 'COMPLETE',
+        startedAt: '2026-08-12T08:06:00.000Z',
+        completedAt: '2026-08-12T08:07:00.000Z',
+      },
+      promotion: {
+        operationId: '11111111-1111-4111-8111-111111111111',
+        manifestDigest: 'a'.repeat(64),
+        status: 'APPLIED',
+      },
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: false,
+        pinned: false,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+      retryable: false,
+      statusRetryable: false,
+      restartRequired: false,
+    }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /Repair dependency update/i })).not.toBeInTheDocument());
+    expect(mocks.activeDependencyRepairs).toHaveBeenCalledTimes(1);
+    expect(mocks.forceForwardDependencyRepair).not.toHaveBeenCalled();
+    expect(mocks.listProjects).toHaveBeenCalledTimes(3);
+  });
+
+  it('rediscovers a startup-owned repair after reload without polling the retired process', async () => {
+    const repairId = '22222222-2222-4222-8222-222222222222';
+    const active = dependencyRepairStatus({
+      state: 'PROMOTING',
+      repair: {
+        repairId,
+        status: 'PROMOTING',
+        phase: 'GO_BIT',
+        startedAt: '2026-08-12T08:06:00.000Z',
+        completedAt: null,
+      },
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: false,
+        pinned: true,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+      retryable: false,
+      statusRetryable: false,
+      restartRequired: true,
+    });
+    mocks.listProjects.mockRejectedValueOnce(new Error('Project inventory is fenced during dependency repair.'));
+    mocks.activeDependencyRepairs.mockResolvedValueOnce({
+      repairs: [active],
+      count: 1,
+      unavailable: false,
+    });
+
+    renderApps('/projects', false, true);
+
+    const dialog = await screen.findByRole('dialog', { name: /Repair dependency update for alpha/i });
+    expect(within(dialog).getByText('Recovery assigned to Portal startup')).toBeVisible();
+    expect(within(dialog).getByText('Controlled Portal restart pending')).toBeVisible();
+    expect(within(dialog).queryByRole('button', { name: 'Check repair status' })).not.toBeInTheDocument();
+    expect(mocks.dependencyRepairStatus).not.toHaveBeenCalled();
+    expect(mocks.forceForwardDependencyRepair).not.toHaveBeenCalled();
+  });
+
+  it('reconciles an indeterminate 503 without submitting the repair twice', async () => {
+    const eligible = dependencyRepairStatus({
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: true,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+    });
+    let submittedRepairId = '';
+    mocks.listProjects
+      .mockResolvedValueOnce({ projects: [quarantinedAlpha] })
+      .mockResolvedValueOnce({ projects });
+    mocks.dependencyRepairStatus
+      .mockResolvedValueOnce(eligible)
+      .mockResolvedValueOnce(eligible)
+      .mockImplementation(async () => dependencyRepairStatus({
+        state: 'COMPLETE',
+        repair: {
+          repairId: submittedRepairId,
+          status: 'APPLIED',
+          phase: 'COMPLETE',
+          startedAt: '2026-08-12T08:06:00.000Z',
+          completedAt: '2026-08-12T08:07:00.000Z',
+        },
+        backup: {
+          requiredAfter: '2026-08-12T08:00:00.000Z',
+          eligible: true,
+          filename: 'portal-complete.tar.gz',
+          createdAt: '2026-08-12T08:05:00.000Z',
+        },
+      }));
+    mocks.forceForwardDependencyRepair.mockImplementationOnce(async (
+      _projectName: string,
+      request: { repairId: string },
+    ) => {
+      submittedRepairId = request.repairId;
+      throw {
+        response: {
+          status: 503,
+          data: {
+            code: 'PROJECT_DEPENDENCY_REPAIR_INDETERMINATE',
+            error: 'Portal could not prove whether the repair go-bit committed.',
+          },
+        },
+      };
+    });
+    const user = userEvent.setup();
+
+    renderApps('/projects', false);
+    await user.click(await screen.findByRole('button', { name: 'Repair dependency update' }));
+    const dialog = await screen.findByRole('dialog', { name: /Repair dependency update for alpha/i });
+    await user.type(within(dialog).getByRole('textbox'), 'FORCE FORWARD alpha');
+    await user.click(within(dialog).getByRole('button', { name: 'Force forward staged generation' }));
+
+    await waitFor(() => expect(mocks.forceForwardDependencyRepair).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /Repair dependency update/i })).not.toBeInTheDocument());
+    expect(mocks.dependencyRepairStatus).toHaveBeenCalledTimes(3);
+    expect(mocks.listProjects).toHaveBeenCalledTimes(2);
+  });
+
+  it('reconciles a lost repair response by exact receipt before reporting the Project ACTIVE', async () => {
+    const eligible = dependencyRepairStatus({
+      backup: {
+        requiredAfter: '2026-08-12T08:00:00.000Z',
+        eligible: true,
+        filename: 'portal-complete.tar.gz',
+        createdAt: '2026-08-12T08:05:00.000Z',
+      },
+    });
+    let submittedRepairId = '';
+    mocks.listProjects
+      .mockResolvedValueOnce({ projects: [quarantinedAlpha] })
+      .mockResolvedValueOnce({ projects });
+    mocks.dependencyRepairStatus
+      .mockResolvedValueOnce(eligible)
+      .mockResolvedValueOnce(eligible)
+      .mockImplementation(async () => dependencyRepairStatus({
+        state: 'COMPLETE',
+        repair: {
+          repairId: submittedRepairId,
+          status: 'APPLIED',
+          phase: 'COMPLETE',
+          startedAt: '2026-08-12T08:06:00.000Z',
+          completedAt: '2026-08-12T08:07:00.000Z',
+        },
+        backup: {
+          requiredAfter: '2026-08-12T08:00:00.000Z',
+          eligible: true,
+          filename: 'portal-complete.tar.gz',
+          createdAt: '2026-08-12T08:05:00.000Z',
+        },
+      }));
+    mocks.forceForwardDependencyRepair.mockImplementation(async (
+      _projectName: string,
+      request: { repairId: string },
+    ) => {
+      submittedRepairId = request.repairId;
+      throw new Error('Project dependency repair status is malformed');
+    });
+    const user = userEvent.setup();
+
+    renderApps('/projects', false);
+    await user.click(await screen.findByRole('button', { name: 'Repair dependency update' }));
+    const dialog = await screen.findByRole('dialog', { name: /Repair dependency update for alpha/i });
+    await user.type(within(dialog).getByRole('textbox'), 'FORCE FORWARD alpha');
+    await user.click(within(dialog).getByRole('button', { name: 'Force forward staged generation' }));
+
+    await waitFor(() => expect(mocks.forceForwardDependencyRepair).toHaveBeenCalledTimes(1));
+    expect(mocks.forceForwardDependencyRepair).toHaveBeenCalledWith('alpha', {
+      repairId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
+      expectedProjectIdentityId: alphaIdentity.id,
+      expectedProjectIdentityGeneration: alphaIdentity.generation,
+      expectedPromotionOperationId: '11111111-1111-4111-8111-111111111111',
+      expectedManifestDigest: 'a'.repeat(64),
+      confirmation: 'FORCE FORWARD alpha',
+    });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /Repair dependency update/i })).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'alpha' })).toBeEnabled();
+    expect(mocks.listProjects).toHaveBeenCalledTimes(2);
   });
 
   it('refuses a blocked Project deep link without loading its file tree', async () => {

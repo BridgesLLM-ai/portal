@@ -85,6 +85,7 @@ class MockProjectRuntimeStateAttestationError extends Error {
 }
 
 const mockPrisma = {
+  $queryRaw: jest.fn(async () => []),
   projectIdentity: {
     findUnique: jest.fn(async () => mockIdentity),
     findFirst: jest.fn(async () => null),

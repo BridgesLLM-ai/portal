@@ -551,7 +551,10 @@ describe('password recovery and registration approval delivery truth', () => {
         passwordHash: 'stored-password-hash',
         authorizationVersion: 4,
       }),
-      data: { passwordHash: 'hash:NewPassword123!' },
+      data: {
+        passwordHash: 'hash:NewPassword123!',
+        authorizationVersion: { increment: 1 },
+      },
     });
     expect(sessionDeleteMany).toHaveBeenCalledWith({ where: { userId: 'recovery-user' } });
     expect(twoFactorChallengeDeleteMany).toHaveBeenCalledWith({

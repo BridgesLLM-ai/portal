@@ -99,6 +99,14 @@ project, and repeatedly verifies zero residual state. Cleanup is retryable
 across process restarts. A path cannot be safely reused while the old project
 identity still has live resources.
 
+The supported Portal deployment has exactly one serving backend process. The
+installer enforces a single `Type=simple` systemd service whose direct command
+is `node dist/server.js`. PM2, Node cluster mode, multiple service replicas, or
+a manually started second backend against the same database and Project roots
+are unsupported: Project lifecycle serialization is process-local. The update
+validator is a separate loopback-only, non-mutating preflight and is not a
+serving replica.
+
 ## Release qualification
 
 Unit tests and configuration inspection are necessary but insufficient. Every

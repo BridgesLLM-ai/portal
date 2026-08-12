@@ -109,6 +109,37 @@ describe('durable authorization version', () => {
     expect(res.headers.get('cache-control')).toBe('private, no-store, max-age=0');
   });
 
+  test('checks a session-bound access token inside the existing user lookup', async () => {
+    userFindUnique.mockResolvedValue({
+      ...dbUser(1),
+      sessions: [{ id: 'session-1', expiresAt: new Date(Date.now() + 60_000) }],
+    });
+    const token = generateAccessToken({
+      userId: 'user-1',
+      sessionId: 'session-1',
+      email: 'user@example.com',
+      role: 'SUB_ADMIN',
+      authorizationVersion: 1,
+    });
+    const req = request(token);
+    const res = response();
+    const next = jest.fn();
+
+    await authenticateToken(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(req.user).toMatchObject({ sessionId: 'session-1' });
+    expect(userFindUnique).toHaveBeenCalledTimes(1);
+    expect(userFindUnique).toHaveBeenCalledWith(expect.objectContaining({
+      select: expect.objectContaining({
+        sessions: expect.objectContaining({
+          where: expect.objectContaining({ id: 'session-1' }),
+          take: 1,
+        }),
+      }),
+    }));
+  });
+
   test('rejects the same old access token after an authorization generation change', async () => {
     userFindUnique.mockResolvedValue(dbUser(2));
     const token = generateAccessToken({

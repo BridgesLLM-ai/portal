@@ -1,5 +1,6 @@
 import client from './client';
 import { AuthResponse } from '../types';
+import { withAuthRefreshConvergence } from '../utils/authRefreshConvergence';
 
 export interface RegistrationPendingResponse {
   pending: true;
@@ -94,7 +95,11 @@ export const authAPI = {
   },
 
   refresh: async (): Promise<{ accessToken?: string }> => {
-    const { data } = await client.post('/auth/refresh', {});
+    const { data } = await withAuthRefreshConvergence(() => client.post(
+      '/auth/refresh',
+      {},
+      { _silent: true } as any,
+    ));
     return data;
   },
 

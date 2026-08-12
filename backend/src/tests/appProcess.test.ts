@@ -8,6 +8,8 @@ const appStatusStore = new Map<string, string>();
 const prismaMock = {
   $transaction: jest.fn(),
   app: {
+    count: jest.fn(),
+    findFirst: jest.fn(),
     findMany: jest.fn(),
     update: jest.fn(),
     updateMany: jest.fn(),
@@ -50,11 +52,18 @@ import {
   getAppTarget,
   getAppStatus,
   initializeAppProcessRuntime,
-  restartApp,
+  preflightAppProcessRuntimeRestoration,
+  restartApp as restartAppWithAdmission,
   shutdownAll,
-  startApp,
+  startApp as startAppWithAdmission,
   stopApp,
+  withProjectAppDeploymentLocks,
 } from '../services/app-process.service';
+import {
+  acquireProjectDeletionLockWithoutGuard,
+  projectDeletionLockKey,
+  type ProjectDeletionLockLease,
+} from '../services/projectDeletionLock';
 
 function makeDeployDir(withNodeModules = true): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'portal-app-process-test-'));
@@ -74,6 +83,36 @@ function runningContainer(restartCount = 0) {
 }
 
 const APP_IDENTITY = { actorId: 'user-1', projectId: 'project-identity-1' };
+const APP_PROJECT_NAME = 'demo';
+let appLifecycleLock: ProjectDeletionLockLease;
+
+function startApp(
+  appId: string,
+  deployId: string,
+  deployPath: string,
+  port: number,
+  identity: typeof APP_IDENTITY,
+) {
+  return startAppWithAdmission(appId, deployId, deployPath, port, {
+    ...identity,
+    projectGeneration: 1,
+    lifecycleLock: appLifecycleLock,
+  });
+}
+
+function restartApp(
+  appId: string,
+  deployId: string,
+  deployPath: string,
+  port: number,
+  identity: typeof APP_IDENTITY,
+) {
+  return restartAppWithAdmission(appId, deployId, deployPath, port, {
+    ...identity,
+    projectGeneration: 1,
+    lifecycleLock: appLifecycleLock,
+  });
+}
 
 async function flushAsyncWork(): Promise<void> {
   await Promise.resolve();
@@ -113,7 +152,7 @@ async function applyAppStatusUpdateMany({ where, data }: any) {
 }
 
 describe('app-process.service', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.useFakeTimers();
     jest.clearAllMocks();
     settingStore.clear();
@@ -141,6 +180,8 @@ describe('app-process.service', () => {
       return { id: where.id, ...data };
     });
     prismaMock.app.updateMany.mockImplementation(applyAppStatusUpdateMany);
+    prismaMock.app.count.mockResolvedValue(1);
+    prismaMock.app.findFirst.mockImplementation(async ({ where }: any) => ({ id: where.id }));
     prismaMock.app.findMany.mockResolvedValue([]);
     prismaMock.projectIdentity.findUnique.mockResolvedValue({ id: APP_IDENTITY.projectId, lifecycleStatus: 'ACTIVE' });
     prismaMock.systemSetting.create.mockImplementation(async ({ data }: any) => {
@@ -184,9 +225,13 @@ describe('app-process.service', () => {
     );
     lifecycleMock.readProjectAppLogs.mockReturnValue(['ready']);
     __appProcessTest.setReadinessProbe(async () => true);
+    appLifecycleLock = await acquireProjectDeletionLockWithoutGuard(
+      projectDeletionLockKey(APP_IDENTITY.actorId, APP_PROJECT_NAME),
+    );
   });
 
   afterEach(() => {
+    appLifecycleLock?.();
     __appProcessTest.resetRuntimeState();
     jest.useRealTimers();
   });
@@ -208,6 +253,28 @@ describe('app-process.service', () => {
         mode: 'app',
         workloadId: 'app-1',
         network: true,
+      });
+      expect(prismaMock.app.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: 'app-1',
+          userId: APP_IDENTITY.actorId,
+          name: APP_PROJECT_NAME,
+          zipPath: deployDir,
+          port: 5001,
+          deployType: 'fullstack',
+          isActive: true,
+          projectIdentityId: APP_IDENTITY.projectId,
+          projectIdentity: {
+            is: {
+              id: APP_IDENTITY.projectId,
+              workspaceOwnerId: APP_IDENTITY.actorId,
+              projectName: APP_PROJECT_NAME,
+              generation: 1,
+              lifecycleStatus: 'ACTIVE',
+            },
+          },
+        },
+        select: { id: true },
       });
       expect(lifecycleMock.runProjectLifecycleCommand).not.toHaveBeenCalled();
 
@@ -232,6 +299,102 @@ describe('app-process.service', () => {
         data: { processStatus: 'stopped' },
       });
     } finally {
+      rmSync(deployDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a stale Start queued behind the shared Project App deployment lane', async () => {
+    const deployDir = makeDeployDir();
+    const admittedRebind = deferred<void>();
+    const heldLane = withProjectAppDeploymentLocks(['user-1-demo'], async () => {
+      await admittedRebind.promise;
+    });
+    await flushAsyncWork();
+    prismaMock.app.findFirst.mockResolvedValueOnce(null);
+
+    try {
+      const queuedStart = startApp(
+        'app-stale',
+        'user-1-demo',
+        deployDir,
+        5001,
+        APP_IDENTITY,
+      );
+      admittedRebind.resolve();
+      await heldLane;
+      await expect(queuedStart).rejects.toMatchObject({
+        code: 'PROJECT_RUNTIME_STATE_ATTESTATION_FAILED',
+      });
+      expect(lifecycleMock.assertProjectRuntimeImageAvailable).not.toHaveBeenCalled();
+      expect(lifecycleMock.stopProjectAppContainer).not.toHaveBeenCalled();
+      expect(lifecycleMock.startProjectAppContainer).not.toHaveBeenCalled();
+    } finally {
+      admittedRebind.resolve();
+      rmSync(deployDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a queued Start whose exact Project lifecycle lease was released', async () => {
+    const deployDir = makeDeployDir();
+    const admitQueuedStart = deferred<void>();
+    const heldLane = withProjectAppDeploymentLocks(['deploy-released-lease'], async () => {
+      await admitQueuedStart.promise;
+    });
+    await flushAsyncWork();
+
+    try {
+      const queuedStart = startApp(
+        'app-released-lease',
+        'deploy-released-lease',
+        deployDir,
+        5001,
+        APP_IDENTITY,
+      );
+      appLifecycleLock();
+      admitQueuedStart.resolve();
+      await heldLane;
+      await expect(queuedStart).rejects.toThrow(/held exact Project lifecycle lock lease/i);
+      expect(prismaMock.app.findFirst).not.toHaveBeenCalled();
+      expect(lifecycleMock.assertProjectRuntimeImageAvailable).not.toHaveBeenCalled();
+      expect(lifecycleMock.startProjectAppContainer).not.toHaveBeenCalled();
+    } finally {
+      admitQueuedStart.resolve();
+      await heldLane.catch(() => undefined);
+      if (!appLifecycleLock.isHeld()) {
+        appLifecycleLock = await acquireProjectDeletionLockWithoutGuard(
+          projectDeletionLockKey(APP_IDENTITY.actorId, APP_PROJECT_NAME),
+        );
+      }
+      rmSync(deployDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects forged and wrong-Project lifecycle leases before App re-attestation', async () => {
+    const deployDir = makeDeployDir();
+    const forgedLifecycleLock = (() => undefined) as unknown as ProjectDeletionLockLease;
+    const wrongLifecycleLock = await acquireProjectDeletionLockWithoutGuard(
+      projectDeletionLockKey(APP_IDENTITY.actorId, 'different-project'),
+    );
+    try {
+      for (const lifecycleLock of [forgedLifecycleLock, wrongLifecycleLock]) {
+        await expect(startAppWithAdmission(
+          'app-invalid-lease',
+          'user-1-demo',
+          deployDir,
+          5001,
+          {
+            ...APP_IDENTITY,
+            projectGeneration: 1,
+            appName: APP_PROJECT_NAME,
+            lifecycleLock,
+          },
+        )).rejects.toThrow(/held exact Project lifecycle lock lease/i);
+      }
+      expect(prismaMock.app.findFirst).not.toHaveBeenCalled();
+      expect(lifecycleMock.assertProjectRuntimeImageAvailable).not.toHaveBeenCalled();
+      expect(lifecycleMock.startProjectAppContainer).not.toHaveBeenCalled();
+    } finally {
+      wrongLifecycleLock();
       rmSync(deployDir, { recursive: true, force: true });
     }
   });
@@ -916,6 +1079,77 @@ describe('app-process.service', () => {
     }
   });
 
+  it('contains one stopped App cleanup failure and continues reconciling other Apps', async () => {
+    const stoppedDir = makeDeployDir();
+    const runningDir = makeDeployDir();
+    const stoppedProjectId = 'project-stopped-cleanup-failure';
+    const runningProjectId = 'project-running-after-cleanup-failure';
+    prismaMock.app.findMany.mockResolvedValue([
+      {
+        id: 'app-stopped-cleanup-failure',
+        userId: 'user-stopped-cleanup-failure',
+        projectIdentityId: stoppedProjectId,
+        name: 'stopped-cleanup-failure',
+        zipPath: stoppedDir,
+        port: 5020,
+        deployType: 'fullstack',
+        processStatus: 'stopped',
+      },
+      {
+        id: 'app-running-after-cleanup-failure',
+        userId: 'user-running-after-cleanup-failure',
+        projectIdentityId: runningProjectId,
+        name: 'running-after-cleanup-failure',
+        zipPath: runningDir,
+        port: 5021,
+        deployType: 'fullstack',
+        processStatus: 'running',
+      },
+    ]);
+    prismaMock.projectIdentity.findUnique.mockImplementation(async ({ where }: any) => {
+      if (where.id === stoppedProjectId) {
+        return {
+          id: stoppedProjectId,
+          workspaceOwnerId: 'user-stopped-cleanup-failure',
+          projectName: 'stopped-cleanup-failure',
+          lifecycleStatus: 'ACTIVE',
+        };
+      }
+      return {
+        id: runningProjectId,
+        workspaceOwnerId: 'user-running-after-cleanup-failure',
+        projectName: 'running-after-cleanup-failure',
+        lifecycleStatus: 'ACTIVE',
+      };
+    });
+    lifecycleMock.stopProjectAppContainer.mockRejectedValueOnce(
+      new Error('exact stale container attestation failed'),
+    );
+    lifecycleMock.inspectProjectAppContainer.mockReturnValue(null);
+
+    try {
+      await expect(initializeAppProcessRuntime()).resolves.toBeUndefined();
+
+      expect(lifecycleMock.stopProjectAppContainer).toHaveBeenCalledWith({
+        actorId: 'user-stopped-cleanup-failure',
+        projectId: stoppedProjectId,
+        workloadId: 'app-stopped-cleanup-failure',
+      });
+      expect(prismaMock.app.updateMany).toHaveBeenCalledWith({
+        where: { id: 'app-stopped-cleanup-failure', processStatus: { not: 'error' } },
+        data: { processStatus: 'error' },
+      });
+      expect(lifecycleMock.startProjectAppContainer).toHaveBeenCalledWith(expect.objectContaining({
+        actorId: 'user-running-after-cleanup-failure',
+        projectId: runningProjectId,
+        workloadId: 'app-running-after-cleanup-failure',
+      }));
+    } finally {
+      rmSync(stoppedDir, { recursive: true, force: true });
+      rmSync(runningDir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['RENAMING', 'DELETING'] as const)(
     'settles an interrupted %s lifecycle runtime instead of blocking Portal startup',
     async (lifecycleStatus) => {
@@ -989,7 +1223,7 @@ describe('app-process.service', () => {
     },
   );
 
-  it('still fails startup without mutation for an unknown non-active Project lifecycle state', async () => {
+  it('contains an unknown non-active Project lifecycle state to the affected App', async () => {
     const deployDir = makeDeployDir();
     prismaMock.app.findMany.mockResolvedValue([{
       id: 'app-unknown-lifecycle',
@@ -1009,12 +1243,13 @@ describe('app-process.service', () => {
     });
 
     try {
-      await expect(initializeAppProcessRuntime()).rejects.toThrow(
-        'did not have an exact immutable Project association',
-      );
+      await expect(initializeAppProcessRuntime()).resolves.toBeUndefined();
       expect(lifecycleMock.startProjectAppContainer).not.toHaveBeenCalled();
       expect(lifecycleMock.stopProjectAppContainer).not.toHaveBeenCalled();
-      expect(prismaMock.app.updateMany).not.toHaveBeenCalled();
+      expect(prismaMock.app.updateMany).toHaveBeenCalledWith({
+        where: { id: 'app-unknown-lifecycle', processStatus: { not: 'error' } },
+        data: { processStatus: 'error' },
+      });
     } finally {
       rmSync(deployDir, { recursive: true, force: true });
     }
@@ -1693,7 +1928,7 @@ describe('app-process.service', () => {
     }
   });
 
-  it('does not authorize a running standalone App through an owner/name coincidence', async () => {
+  it('contains a running standalone App without authorizing an owner/name coincidence', async () => {
     const deployDir = makeDeployDir();
     prismaMock.app.findMany.mockResolvedValue([{
       id: 'app-standalone',
@@ -1713,19 +1948,21 @@ describe('app-process.service', () => {
     });
 
     try {
-      await expect(initializeAppProcessRuntime()).rejects.toThrow(
-        'did not have an exact immutable Project association',
-      );
+      await expect(initializeAppProcessRuntime()).resolves.toBeUndefined();
 
       expect(prismaMock.projectIdentity.findUnique).not.toHaveBeenCalled();
       expect(lifecycleMock.startProjectAppContainer).not.toHaveBeenCalled();
-      expect(prismaMock.app.update).not.toHaveBeenCalled();
+      expect(lifecycleMock.stopProjectAppContainer).not.toHaveBeenCalled();
+      expect(prismaMock.app.updateMany).toHaveBeenCalledWith({
+        where: { id: 'app-standalone', processStatus: { not: 'error' } },
+        data: { processStatus: 'error' },
+      });
     } finally {
       rmSync(deployDir, { recursive: true, force: true });
     }
   });
 
-  it('fails startup without mutation when a running App foreign key resolves to another Project', async () => {
+  it('rejects a stale App association in update preflight, then contains it on ordinary boot', async () => {
     const deployDir = makeDeployDir();
     prismaMock.app.findMany.mockResolvedValue([{
       id: 'app-wrong-project',
@@ -1745,14 +1982,23 @@ describe('app-process.service', () => {
     });
 
     try {
-      await expect(initializeAppProcessRuntime()).rejects.toThrow(
+      await expect(preflightAppProcessRuntimeRestoration({
+        rejectUnsafeRunningApps: true,
+      })).rejects.toThrow(
         'did not have an exact immutable Project association',
       );
+      expect(prismaMock.app.updateMany).not.toHaveBeenCalled();
+
+      await expect(initializeAppProcessRuntime()).resolves.toBeUndefined();
       expect(prismaMock.projectIdentity.findUnique).toHaveBeenCalledWith(expect.objectContaining({
         where: { id: 'wrong-project-id' },
       }));
       expect(lifecycleMock.startProjectAppContainer).not.toHaveBeenCalled();
-      expect(prismaMock.app.update).not.toHaveBeenCalled();
+      expect(lifecycleMock.stopProjectAppContainer).not.toHaveBeenCalled();
+      expect(prismaMock.app.updateMany).toHaveBeenCalledWith({
+        where: { id: 'app-wrong-project', processStatus: { not: 'error' } },
+        data: { processStatus: 'error' },
+      });
     } finally {
       rmSync(deployDir, { recursive: true, force: true });
     }
@@ -1770,6 +2016,7 @@ describe('app-process.service', () => {
 
     try {
       const starting = startApp('app-shutdown-race', 'deploy-shutdown-race', deployDir, 5007, APP_IDENTITY);
+      const startingRejected = expect(starting).rejects.toThrow('App process runtime is shutting down');
       for (let attempt = 0; attempt < 20 && !releaseLease; attempt += 1) {
         await flushAsyncWork();
       }
@@ -1777,7 +2024,7 @@ describe('app-process.service', () => {
       const shuttingDown = shutdownAll();
       releaseLease?.();
 
-      await expect(starting).rejects.toThrow('App process runtime is shutting down');
+      await startingRejected;
       await shuttingDown;
       expect(lifecycleMock.startProjectAppContainer).not.toHaveBeenCalled();
       expect(getAppStatus('deploy-shutdown-race')).toBeNull();

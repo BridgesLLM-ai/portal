@@ -8,7 +8,7 @@ import { hashPassword, comparePassword, validatePasswordStrength } from '../util
 import { normalizeRegistrationMode } from '../utils/registrationMode';
 import { buildPasswordResetPath } from '../utils/passwordResetLink';
 import { generateAccessToken, generateRefreshToken, verifyAccessToken, verifyRefreshToken } from '../utils/jwt';
-import { authenticateToken } from '../middleware/auth';
+import { authenticateToken, AUTH_SESSION_REVOKED_CODE } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
 import { ACTIVE_STATUS, canAccessPortal, describeBlockedAccountStatus } from '../utils/authz';
 import { sendNewUserAlert } from '../services/email';
@@ -50,6 +50,11 @@ import {
   projectAuthorizationTransitionCoordinator,
 } from '../services/projectAuthorizationTransition';
 import { effectiveRequestOrigin } from '../utils/appContentSecurity';
+import { publishAuthorizationChanged } from '../services/authorizationChangeBus';
+import {
+  publishAllSessionsRevoked,
+  publishSessionRevoked,
+} from '../services/sessionRevocationBus';
 
 // Shared plugins for TOTP operations (otplib v13 functional API)
 const otpCrypto = new NobleCryptoPlugin();
@@ -232,6 +237,21 @@ async function withAuthorizationArtifactAdmission<T>(
       return operation(tx);
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable })
   ));
+}
+
+async function revokeAllSessionsForLegacyLogout(userId: string): Promise<number> {
+  return withAuthorizationArtifactAdmission(async (tx) => {
+    // Keep the durable-access lock order User -> Session. Final filesystem
+    // mutations re-attest under the same order, so legacy logout cannot form a
+    // row-lock cycle while waiting for an in-flight mutation to settle.
+    const updated = await tx.user.update({
+      where: { id: userId },
+      data: { authorizationVersion: { increment: 1 } },
+      select: { authorizationVersion: true },
+    });
+    await tx.session.deleteMany({ where: { userId } });
+    return Number(updated.authorizationVersion ?? 1);
+  });
 }
 
 function isAuthorizationTransitionActiveError(error: unknown): boolean {
@@ -499,6 +519,39 @@ async function applyAuthCookies(req: Request, res: Response, accessToken: string
   setAuthCookies(req, res, accessToken, refreshToken, maxAge);
 }
 
+function respondRefreshRotationConflict(res: Response): void {
+  // A winning rotation may still be committing or its response may still be
+  // installing cookies in another browser tab. Give that winner enough time
+  // to publish its browser-wide generation before a loser retries.
+  res.setHeader('Retry-After', '5');
+  res.status(409).json({
+    error: 'Another request refreshed this session first. Retry with the current cookies.',
+    code: 'AUTH_REFRESH_ROTATION_CONFLICT',
+    retryable: true,
+  });
+}
+
+function respondRefreshSessionGone(
+  req: Request,
+  res: Response,
+  presentedRefreshToken: string,
+): void {
+  // A body-carried stale token may be tested while the browser holds an
+  // unrelated current cookie. Only delete the browser jar when this failed
+  // credential is the cookie the browser actually presented.
+  if (
+    typeof req.cookies?.refreshToken === 'string'
+    && req.cookies.refreshToken === presentedRefreshToken
+  ) {
+    clearAuthCookies(req, res);
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(401).json({
+    error: 'This sign-in session is no longer active. Sign in again.',
+    code: 'AUTH_REFRESH_SESSION_GONE',
+  });
+}
+
 
 async function getSettingValue(key: string): Promise<string | null> {
   const row = await prisma.systemSetting.findUnique({ where: { key } });
@@ -750,15 +803,19 @@ router.post('/login', authLimiter, async (req: Request, res: Response, next: Nex
       return;
     }
 
-    // Generate tokens
+    // Bind both tokens to the durable Session row. The stable identity survives
+    // refresh rotation and makes a deleted row distinguishable from a stale
+    // digest that another tab just rotated.
+    const sessionId = crypto.randomUUID();
     const accessToken = generateAccessToken({
       userId: user.id,
+      sessionId,
       email: user.email,
       role: user.role,
       accountStatus: (user as any).accountStatus,
       authorizationVersion: Number((user as any).authorizationVersion ?? 1),
     });
-    const refreshToken = generateRefreshToken({ userId: user.id });
+    const refreshToken = generateRefreshToken({ userId: user.id, sessionId });
     const refreshTokenHash = digestAuthToken('refresh', refreshToken);
     const sessionExpiresAt = new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000);
 
@@ -773,6 +830,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response, next: Nex
       }
       await tx.session.create({
         data: {
+          id: sessionId,
           userId: user.id,
           refreshTokenHash,
           ipAddress: meta.ip,
@@ -844,32 +902,58 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
     const { refreshToken: bodyRefreshToken } = refreshSchema.parse(req.body || {});
     const refreshToken = bodyRefreshToken || req.cookies?.refreshToken;
     if (!refreshToken) {
-      clearAuthCookies(req, res);
+      // Never emit deletion cookies from a refresh failure. A delayed failure
+      // response can arrive after a newer login/rotation and would erase the
+      // newer shared browser credentials. The 401 is the local sign-out signal.
       throw new AppError(401, 'Refresh token required');
     }
 
     const payload = verifyRefreshToken(refreshToken);
     if (!payload) {
-      clearAuthCookies(req, res);
       throw new AppError(401, 'Invalid refresh token');
     }
 
     const refreshTokenHash = digestAuthToken('refresh', refreshToken);
     const outcome = await withAuthorizationArtifactAdmission(async (tx) => {
+      const now = new Date();
       const session = await tx.session.findUnique({
         where: { refreshTokenHash },
         include: { user: true },
       });
       if (!session || session.userId !== payload.userId) {
-        return { state: 'missing' } as const;
+        // New tokens carry a stable Session id, so an old digest can be
+        // classified without weakening the exact-digest CAS. If the row still
+        // exists, another tab rotated it; if the row is gone, it was revoked.
+        if (payload.sessionId) {
+          const currentSession = await tx.session.findUnique({
+            where: { id: payload.sessionId },
+            select: { id: true, userId: true, expiresAt: true },
+          });
+          if (!currentSession || currentSession.userId !== payload.userId) {
+            return { state: 'revoked', sessionId: payload.sessionId } as const;
+          }
+          if (currentSession.expiresAt < now) {
+            await tx.session.deleteMany({
+              where: { id: currentSession.id, userId: payload.userId },
+            });
+            return { state: 'expired', sessionId: currentSession.id } as const;
+          }
+          return { state: 'raced' } as const;
+        }
+        // Legacy tokens have no stable id. Preserve the pre-4.0.17
+        // cookie-safe convergence behavior; /auth/me separately verifies their
+        // current refresh digest so a deleted legacy row cannot restore.
+        return { state: 'missingLegacy' } as const;
       }
 
-      const now = new Date();
+      if (payload.sessionId && payload.sessionId !== session.id) {
+        return { state: 'revoked', sessionId: payload.sessionId } as const;
+      }
       if (session.expiresAt < now) {
         await tx.session.deleteMany({
           where: { id: session.id, refreshTokenHash },
         });
-        return { state: 'expired' } as const;
+        return { state: 'expired', sessionId: session.id } as const;
       }
 
       const user = session.user;
@@ -879,6 +963,7 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
         });
         return {
           state: 'blocked',
+          sessionId: session.id,
           accountStatus: (user as any).accountStatus,
         } as const;
       }
@@ -902,7 +987,10 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
         return { state: 'raced' } as const;
       }
 
-      const newRefreshToken = generateRefreshToken({ userId: user.id });
+      const newRefreshToken = generateRefreshToken({
+        userId: user.id,
+        sessionId: session.id,
+      });
       const newRefreshTokenHash = digestAuthToken('refresh', newRefreshToken);
       const finalized = await tx.session.updateMany({
         where: {
@@ -921,6 +1009,7 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
         newRefreshToken,
         user: {
           id: user.id,
+          sessionId: session.id,
           email: user.email,
           role: user.role,
           accountStatus: (user as any).accountStatus,
@@ -929,25 +1018,56 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
       } as const;
     });
 
-    if (outcome.state === 'missing') {
-      clearAuthCookies(req, res);
-      throw new AppError(401, 'Session not found');
+    if (outcome.state === 'missingLegacy') {
+      // The JWT is valid but its old digest is no longer current. This can be a
+      // replay, revocation, or a second tab whose request reached PostgreSQL
+      // after the winner committed. Reject admission in every case, but never
+      // emit deletion cookies that can clobber a newer shared browser jar.
+      respondRefreshRotationConflict(res);
+      return;
+    }
+    if (outcome.state === 'revoked') {
+      if (outcome.sessionId) {
+        // The verified token carries a stable authority even if its digest was
+        // rebound or corrupted. Retire that exact in-process authority only
+        // after the admission transaction has settled.
+        publishSessionRevoked({
+          userId: payload.userId,
+          sessionId: outcome.sessionId,
+          reason: 'logout',
+        });
+      }
+      respondRefreshSessionGone(req, res, refreshToken);
+      return;
     }
     if (outcome.state === 'expired') {
-      clearAuthCookies(req, res);
+      publishSessionRevoked({
+        userId: payload.userId,
+        sessionId: outcome.sessionId,
+        reason: 'expired',
+      });
       throw new AppError(401, 'Refresh token expired');
     }
     if (outcome.state === 'blocked') {
-      clearAuthCookies(req, res);
+      publishSessionRevoked({
+        userId: payload.userId,
+        sessionId: outcome.sessionId,
+        reason: 'account_blocked',
+      });
       throw new AppError(403, describeBlockedAccountStatus(outcome.accountStatus));
     }
     if (outcome.state === 'raced') {
-      clearAuthCookies(req, res);
-      throw new AppError(401, 'Refresh token was already used');
+      // Another request won the exact old-token CAS. Reject this replay without
+      // mutating cookies: two tabs share one browser jar, so a late deletion
+      // response would otherwise erase the winner's newly rotated credentials.
+      // No token is minted here and the old digest remains unusable.
+      respondRefreshRotationConflict(res);
+      return;
     }
 
     const newAccessToken = generateAccessToken({
       userId: outcome.user.id,
+      sessionId: outcome.user.sessionId,
       email: outcome.user.email,
       role: outcome.user.role,
       accountStatus: outcome.user.accountStatus,
@@ -979,6 +1099,9 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
     const refreshPayload = refreshToken ? verifyRefreshToken(refreshToken) : null;
     const userId = accessPayload?.userId || refreshPayload?.userId || null;
 
+    let revokedSessionId: string | null = null;
+    let revokedAllSessions = false;
+    let logoutAuthorizationVersion: number | null = null;
     if (userId) {
       await prisma.activityLog.create({
         data: {
@@ -993,20 +1116,58 @@ router.post('/logout', async (req: Request, res: Response, next: NextFunction) =
         },
       }).catch(() => {});
 
-      if (refreshToken) {
-        const deleted = await prisma.session.deleteMany({
-          where: {
-            userId,
-            refreshTokenHash: digestAuthToken('refresh', refreshToken),
-          },
+      if (accessPayload?.sessionId) {
+        // A stable access-token claim is authoritative even when a shared cookie
+        // jar still carries a stale, rotated, or cross-identity refresh token.
+        revokedSessionId = accessPayload.sessionId;
+        await prisma.session.deleteMany({
+          where: { id: accessPayload.sessionId, userId: accessPayload.userId },
         });
-        if (deleted.count === 0 && accessPayload) {
-          // Preserve the old authenticated logout behavior as a fallback.
-          await prisma.session.deleteMany({ where: { userId } });
+      } else if (
+        accessPayload
+        && !accessPayload.sessionId
+      ) {
+        // A legacy access token cannot bind one live transport to one durable
+        // Session. Preserve the migration fallback as an explicit all-session
+        // logout and advance the generation so that old JWT cannot reconnect.
+        // The selected access identity remains authoritative even when a shared
+        // cookie jar carries an invalid or cross-identity refresh token.
+        logoutAuthorizationVersion = await revokeAllSessionsForLegacyLogout(accessPayload.userId);
+        revokedAllSessions = true;
+      } else if (
+        refreshToken
+        && refreshPayload
+        && refreshPayload.userId === userId
+      ) {
+        if (!refreshPayload.sessionId) {
+          logoutAuthorizationVersion = await revokeAllSessionsForLegacyLogout(userId);
+          revokedAllSessions = true;
+        } else {
+          // A verified stable refresh claim names the durable authority even if
+          // its row was already removed or its digest rotated in another tab.
+          revokedSessionId = refreshPayload.sessionId;
+          await prisma.session.deleteMany({
+            where: {
+              userId,
+              id: refreshPayload.sessionId,
+            },
+          });
         }
-      } else if (accessPayload) {
-        await prisma.session.deleteMany({ where: { userId } });
       }
+    }
+
+    if (userId && logoutAuthorizationVersion !== null) {
+      publishAuthorizationChanged({
+        type: 'authorization_changed',
+        userId,
+        authorizationVersion: logoutAuthorizationVersion,
+        reasons: ['credential_recovery'],
+      });
+    }
+    if (userId && revokedSessionId && !revokedAllSessions) {
+      publishSessionRevoked({ userId, sessionId: revokedSessionId, reason: 'logout' });
+    } else if (userId && revokedAllSessions) {
+      publishAllSessionsRevoked({ userId, reason: 'logout' });
     }
 
     clearAuthCookies(req, res);
@@ -1159,7 +1320,7 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
     }
 
     const newHash = await hashPassword(newPassword);
-    await withAuthorizationArtifactAdmission(async (tx) => {
+    const resetAuthorizationVersion = await withAuthorizationArtifactAdmission(async (tx) => {
       const consumed = await tx.passwordResetToken.updateMany({
         where: {
           id: matchedToken.id,
@@ -1178,7 +1339,10 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
           ...authorizationUserSnapshotCas(matchedToken.user),
           passwordHash: matchedToken.user.passwordHash,
         },
-        data: { passwordHash: newHash },
+        data: {
+          passwordHash: newHash,
+          authorizationVersion: { increment: 1 },
+        },
       });
       if (updated.count !== 1) {
         throw new AppError(409, 'Account or credential state changed. Request a new password reset.');
@@ -1190,6 +1354,18 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
         where: { userId: matchedToken.userId, usedAt: null },
         data: { usedAt: new Date() },
       });
+      return Number(matchedToken.user.authorizationVersion ?? 1) + 1;
+    });
+
+    publishAuthorizationChanged({
+      type: 'authorization_changed',
+      userId: matchedToken.userId,
+      authorizationVersion: resetAuthorizationVersion,
+      reasons: ['credential_recovery'],
+    });
+    publishAllSessionsRevoked({
+      userId: matchedToken.userId,
+      reason: 'credential_recovery',
     });
 
     // If the reset link is opened in a browser that still carries old auth
@@ -1323,14 +1499,16 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
       // Create user immediately with USER role
       const passwordHash = await hashPassword(password);
       const userId = crypto.randomUUID();
+      const sessionId = crypto.randomUUID();
       const accessToken = generateAccessToken({
         userId,
+        sessionId,
         email,
         role: 'USER',
         accountStatus: ACTIVE_STATUS,
         authorizationVersion: 1,
       });
-      const refreshToken = generateRefreshToken({ userId });
+      const refreshToken = generateRefreshToken({ userId, sessionId });
       const refreshTokenHash = digestAuthToken('refresh', refreshToken);
       const sandboxEnabled = await getSandboxDefaultEnabled();
       const expiresAt = new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000);
@@ -1352,6 +1530,7 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
           } as any);
           await tx.session.create({
             data: {
+              id: sessionId,
               userId: created.id,
               refreshTokenHash,
               ipAddress: req.ip || 'unknown',
@@ -1420,39 +1599,99 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
 
 // ── Profile ─────────────────────────────────────────────────────────────
 
+function rejectLegacySessionRestore(req: Request, res: Response): void {
+  // The normal Portal client authenticates /auth/me with the httpOnly access
+  // cookie. Do not let an unrelated bearer probe erase a newer browser jar.
+  if (!req.headers.authorization && typeof req.cookies?.accessToken === 'string') {
+    clearAuthCookies(req, res);
+  }
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  res.status(401).json({
+    error: 'This sign-in session is no longer active. Sign in again.',
+    code: AUTH_SESSION_REVOKED_CODE,
+  });
+}
+
+/**
+ * Access tokens issued before the stable Session claim cannot be checked by
+ * authenticateToken's existing user query. Restrict this compatibility lookup
+ * to the restore probe: a legacy browser remains signed in only while its exact
+ * refresh digest still names a live durable Session.
+ */
+async function requireDurableLegacySessionForRestore(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  if (req.user?.sessionId) {
+    next();
+    return;
+  }
+
+  const refreshToken = req.cookies?.refreshToken;
+  const refreshPayload = typeof refreshToken === 'string'
+    ? verifyRefreshToken(refreshToken)
+    : null;
+  if (!refreshPayload || refreshPayload.userId !== req.user?.userId) {
+    rejectLegacySessionRestore(req, res);
+    return;
+  }
+
+  const session = await prisma.session.findUnique({
+    where: { refreshTokenHash: digestAuthToken('refresh', refreshToken) },
+    select: { id: true, userId: true, expiresAt: true },
+  });
+  if (
+    !session
+    || session.userId !== req.user.userId
+    || session.expiresAt <= new Date()
+    || (refreshPayload.sessionId && refreshPayload.sessionId !== session.id)
+  ) {
+    rejectLegacySessionRestore(req, res);
+    return;
+  }
+
+  next();
+}
+
 /**
  * GET /api/auth/me
  * Get current user profile (includes role and sandboxEnabled)
  */
-router.get('/me', authenticateToken, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    if (!req.user) throw new AppError(401, 'Not authenticated');
+router.get(
+  '/me',
+  authenticateToken,
+  requireDurableLegacySessionForRestore,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (!req.user) throw new AppError(401, 'Not authenticated');
 
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.userId },
-      select: {
-        id: true,
-        email: true,
-        username: true,
-        firstName: true,
-        lastName: true,
-        role: true,
-        accountStatus: true,
-        sandboxEnabled: true,
-        authorizationVersion: true,
-        avatarPath: true,
-        createdAt: true,
-        lastLoginAt: true,
-      },
-    } as any);
+      const user = await prisma.user.findUnique({
+        where: { id: req.user.userId },
+        select: {
+          id: true,
+          email: true,
+          username: true,
+          firstName: true,
+          lastName: true,
+          role: true,
+          accountStatus: true,
+          sandboxEnabled: true,
+          authorizationVersion: true,
+          avatarPath: true,
+          createdAt: true,
+          lastLoginAt: true,
+        },
+      } as any);
 
-    if (!user) throw new AppError(404, 'Invalid request');
+      if (!user) throw new AppError(404, 'Invalid request');
 
-    res.json(user);
-  } catch (error) {
-    next(error);
-  }
-});
+      res.json(user);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 /**
  * GET /api/auth/registration-mode
@@ -1562,6 +1801,7 @@ router.put('/me', authenticateToken, async (req: Request, res: Response, next: N
         data: {
           ...data,
           ...(totpStep === null ? {} : { twoFactorLastUsedStep: totpStep }),
+          authorizationVersion: { increment: 1 },
         },
       });
       if (updated.count !== 1) {
@@ -1578,8 +1818,21 @@ router.put('/me', authenticateToken, async (req: Request, res: Response, next: N
           role: true,
           accountStatus: true,
           sandboxEnabled: true,
+          authorizationVersion: true,
         },
       } as any);
+    });
+
+    const profileAuthorizationVersion = Number((user as any).authorizationVersion ?? requestAuthorizationVersion + 1);
+    publishAuthorizationChanged({
+      type: 'authorization_changed',
+      userId: currentUser.id,
+      authorizationVersion: profileAuthorizationVersion,
+      reasons: ['credential_recovery'],
+    });
+    publishAllSessionsRevoked({
+      userId: currentUser.id,
+      reason: 'credential_change',
     });
 
     // Provision mailbox if username changed, but keep prior mailboxes accessible
@@ -1634,14 +1887,17 @@ router.post('/change-password', authenticateToken, async (req: Request, res: Res
     }
 
     const newHash = await hashPassword(newPassword);
-    await withAuthorizationArtifactAdmission(async (tx) => {
+    const changedAuthorizationVersion = await withAuthorizationArtifactAdmission(async (tx) => {
       const updated = await tx.user.updateMany({
         where: {
           ...authorizationUserSnapshotCas(user),
           authorizationVersion: requestAuthorizationVersion,
           passwordHash: user.passwordHash,
         },
-        data: { passwordHash: newHash },
+        data: {
+          passwordHash: newHash,
+          authorizationVersion: { increment: 1 },
+        },
       });
       if (updated.count !== 1) {
         throw new AppError(409, 'Password changed in another session; authenticate again');
@@ -1653,6 +1909,17 @@ router.post('/change-password', authenticateToken, async (req: Request, res: Res
         where: { userId: req.user!.userId, usedAt: null },
         data: { usedAt: new Date() },
       });
+      return requestAuthorizationVersion + 1;
+    });
+    publishAuthorizationChanged({
+      type: 'authorization_changed',
+      userId: req.user.userId,
+      authorizationVersion: changedAuthorizationVersion,
+      reasons: ['credential_recovery'],
+    });
+    publishAllSessionsRevoked({
+      userId: req.user.userId,
+      reason: 'credential_change',
     });
     clearAuthCookies(req, res);
 
@@ -2141,14 +2408,16 @@ router.post('/2fa/validate', twoFactorValidateLimiter, async (req: Request, res:
       }
     }
 
+    const sessionId = crypto.randomUUID();
     const accessToken = generateAccessToken({
       userId: user.id,
+      sessionId,
       email: user.email,
       role: user.role,
       accountStatus: (user as any).accountStatus,
       authorizationVersion: Number((user as any).authorizationVersion ?? 1),
     });
-    const refreshToken = generateRefreshToken({ userId: user.id });
+    const refreshToken = generateRefreshToken({ userId: user.id, sessionId });
     const refreshTokenHash = digestAuthToken('refresh', refreshToken);
     const sessionExpiresAt = new Date(Date.now() + (await getSessionDurationHours()) * 60 * 60 * 1000);
 
@@ -2208,6 +2477,7 @@ router.post('/2fa/validate', twoFactorValidateLimiter, async (req: Request, res:
 
       await tx.session.create({
         data: {
+          id: sessionId,
           userId: user.id,
           refreshTokenHash,
           ipAddress: meta.ip,
