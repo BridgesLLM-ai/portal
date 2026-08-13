@@ -300,10 +300,18 @@ describe('Portal update backup readiness', () => {
       '/opt/bridgesllm/logs/self-update-test.log',
       '4.1.0',
       'domain',
-      '4.0.13',
     ]));
+    // The launcher takes exactly nine positional arguments, and `previousVersion`
+    // is deliberately not among them: the script never read it, and carrying it
+    // pushed the release key fingerprint into `${10}` — which systemd expands to
+    // the empty string before bash ever sees the text.
+    expect(args).not.toContain('4.0.13');
+    expect(args.slice(args.indexOf('portal-self-update') + 1)).toHaveLength(9);
     const script = args[args.indexOf('-c') + 1];
     expect(spawnSync('/bin/bash', ['-n'], { input: script }).status).toBe(0);
+    // systemd rewrites `$$` and `${...}` in argv before bash parses it.
+    expect(script).not.toMatch(/\$\$/);
+    expect(script).not.toMatch(/\$\{/);
     expect(script).toContain('set -Eeuo pipefail');
     expect(script).not.toContain('finish --operation-id');
     expect(script).toContain('/bin/sync -f "$2" || true');
@@ -351,7 +359,7 @@ describe('Portal update backup readiness', () => {
       const script = args[args.indexOf('-c') + 1];
       // The authenticated executor selects the domain branch only after all
       // release evidence and the exact installer inode have verified.
-      expect(script).toContain('/bin/bash -c "$8" portal-installer-auth');
+      expect(script).toContain('/bin/bash -c "$7" portal-installer-auth');
       expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toContain('if [ "$origin_mode" = "domain" ]; then');
       expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toContain('--update --domain "$domain"');
       expect(PORTAL_INSTALLER_AUTHENTICATION_SCRIPT).toMatch(/else\n[^\n]*--update/);

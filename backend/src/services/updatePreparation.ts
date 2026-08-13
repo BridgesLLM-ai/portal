@@ -57,10 +57,16 @@ export const PORTAL_INSTALLER_AUTHENTICATION_SCRIPT = [
   '  [ "$candidate_identity" = "0:0:600:1" ] || exit 70',
   'done',
   'exec 3<"$installer_file" 4<"$installer_signature_file" 5<"$manifest_file" 6<"$manifest_signature_file"',
-  'installer_fd="/proc/$$/fd/3"',
-  'installer_signature_fd="/proc/$$/fd/4"',
-  'manifest_fd="/proc/$$/fd/5"',
-  'manifest_signature_fd="/proc/$$/fd/6"',
+  // `/dev/fd/N`, never `/proc/$$/fd/N`. This text is handed to `systemd-run`,
+  // and systemd consumes `$$` as its escape for a literal `$` before bash ever
+  // parses it, leaving `/proc/$/fd/3` — not a path. `/dev/fd` is `/proc/self/fd`,
+  // and these descriptors are inherited by the `stat`/`openssl`/`bash` children,
+  // so each still names the exact same open file and the fd-vs-path identity
+  // comparison below is unchanged.
+  'installer_fd="/dev/fd/3"',
+  'installer_signature_fd="/dev/fd/4"',
+  'manifest_fd="/dev/fd/5"',
+  'manifest_signature_fd="/dev/fd/6"',
   '[ "$(/usr/bin/stat -c "%d:%i:%s:%u:%g:%a:%h" "$installer_file")" = "$(/usr/bin/stat -Lc "%d:%i:%s:%u:%g:%a:%h" "$installer_fd")" ] || exit 70',
   '[ "$(/usr/bin/stat -c "%d:%i:%s:%u:%g:%a:%h" "$installer_signature_file")" = "$(/usr/bin/stat -Lc "%d:%i:%s:%u:%g:%a:%h" "$installer_signature_fd")" ] || exit 70',
   '[ "$(/usr/bin/stat -c "%d:%i:%s:%u:%g:%a:%h" "$manifest_file")" = "$(/usr/bin/stat -Lc "%d:%i:%s:%u:%g:%a:%h" "$manifest_fd")" ] || exit 70',
@@ -69,7 +75,10 @@ export const PORTAL_INSTALLER_AUTHENTICATION_SCRIPT = [
   '[ -f "$public_key" ] && [ ! -L "$public_key" ] || exit 71',
   'key_identity="$(/usr/bin/stat -c "%u:%g:%a:%h:%s" "$public_key")"',
   'case "$key_identity" in 0:0:600:1:*|0:0:644:1:*) ;; *) exit 71 ;; esac',
-  'key_size="${key_identity##*:}"',
+  // `${key_identity##*:}` would be eaten by systemd's `${...}` expansion and
+  // resolve to the empty string, failing the bounds check below on a key that
+  // is actually fine. No braces may appear anywhere in this script.
+  'key_size="$(printf %s "$key_identity" | /usr/bin/sed "s/.*://")"',
   '[ "$key_size" -ge 1 ] && [ "$key_size" -le 4096 ] || exit 71',
   'installer_size="$(/usr/bin/stat -Lc "%s" "$installer_fd")"',
   'manifest_size="$(/usr/bin/stat -Lc "%s" "$manifest_fd")"',
@@ -96,11 +105,13 @@ export const PORTAL_INSTALLER_AUTHENTICATION_SCRIPT = [
 // Domain-origin installs pass their attested domain through; Tailnet and
 // local origins launch a plain --update so the installer reloads only the
 // attested installed-origin state instead of being forced into domain mode.
-const PORTAL_SELF_UPDATE_SCRIPT = [
+// Exported so `systemdRunArgumentExpansion.test.ts` can assert the exact text
+// that reaches `systemd-run`, rather than a copy that can drift from it.
+export const PORTAL_SELF_UPDATE_SCRIPT = [
   'set -Eeuo pipefail',
   'umask 077',
   'export BRIDGESLLM_DASHBOARD_UPDATE_ID="$5"',
-  '/usr/bin/python3 "$7" update --operation-id "$5" --status running --percent 5 --phase installer-download --label "Downloading authenticated versioned installer" --detail "Step 1 of 13 · Fetching the signed release evidence and exact installer over pinned HTTPS."',
+  '/usr/bin/python3 "$6" update --operation-id "$5" --status running --percent 5 --phase installer-download --label "Downloading authenticated versioned installer" --detail "Step 1 of 13 · Fetching the signed release evidence and exact installer over pinned HTTPS."',
   'installer_file="$(/usr/bin/mktemp /var/lib/bridgesllm-installer/dashboard-update-installer.XXXXXX)"',
   'installer_signature_file="$(/usr/bin/mktemp /var/lib/bridgesllm-installer/dashboard-update-installer-signature.XXXXXX)"',
   'manifest_file="$(/usr/bin/mktemp /var/lib/bridgesllm-installer/dashboard-update-manifest.XXXXXX)"',
@@ -120,10 +131,10 @@ const PORTAL_SELF_UPDATE_SCRIPT = [
   'fi',
   'if [ "$update_rc" -eq 0 ]; then',
   '  /bin/chmod 0600 "$installer_file" "$installer_signature_file" "$manifest_file" "$manifest_signature_file"',
-  '  /bin/bash -c "$8" portal-installer-auth "$installer_file" "$installer_signature_file" "$manifest_file" "$manifest_signature_file" "$9" "${10}" "$3" "$4" "$1" >> "$2" 2>&1',
+  '  /bin/bash -c "$7" portal-installer-auth "$installer_file" "$installer_signature_file" "$manifest_file" "$manifest_signature_file" "$8" "$9" "$3" "$4" "$1" >> "$2" 2>&1',
   '  update_rc=$?',
   'else',
-  '  /usr/bin/python3 "$7" update --operation-id "$5" --status running --percent 5 --phase installer-download --label "Authenticated installer staging stopped" --detail "Step 1 of 13 · Required bounded release evidence was unavailable; no downloaded installer executed." || true',
+  '  /usr/bin/python3 "$6" update --operation-id "$5" --status running --percent 5 --phase installer-download --label "Authenticated installer staging stopped" --detail "Step 1 of 13 · Required bounded release evidence was unavailable; no downloaded installer executed." || true',
   'fi',
   // Terminal state is deliberately absent here. systemd invokes the stable
   // helper from ExecStopPost only after it has recorded how this main process
@@ -351,17 +362,21 @@ export async function launchPortalSelfUpdate(
       '/bin/bash',
       '-c',
       PORTAL_SELF_UPDATE_SCRIPT,
+      // Exactly nine positional arguments, and never more. `${10}` cannot be
+      // written without braces, and systemd expands `${...}` to the empty
+      // string before bash sees it — which silently blanked the release key
+      // fingerprint. `previousVersion` is deliberately absent: the script never
+      // read it, and carrying it pushed the fingerprint into tenth position.
       'portal-self-update',
-      input.originMode === 'domain' ? input.domain : '',
-      input.logFile,
-      input.expectedVersion,
-      input.originMode,
-      operationId,
-      input.previousVersion,
-      PORTAL_SELF_UPDATE_PROGRESS_STABLE_HELPER,
-      PORTAL_INSTALLER_AUTHENTICATION_SCRIPT,
-      PORTAL_RELEASE_PUBLIC_KEY,
-      PORTAL_RELEASE_PUBLIC_KEY_SHA256,
+      input.originMode === 'domain' ? input.domain : '', // $1
+      input.logFile, // $2
+      input.expectedVersion, // $3
+      input.originMode, // $4
+      operationId, // $5
+      PORTAL_SELF_UPDATE_PROGRESS_STABLE_HELPER, // $6
+      PORTAL_INSTALLER_AUTHENTICATION_SCRIPT, // $7
+      PORTAL_RELEASE_PUBLIC_KEY, // $8
+      PORTAL_RELEASE_PUBLIC_KEY_SHA256, // $9
     ], {
       timeout: 10_000,
       maxBuffer: 64 * 1024,

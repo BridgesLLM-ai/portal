@@ -2,6 +2,36 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.19] - 2026-08-12
+
+### Fixed
+- **The Dashboard update button works again.** 4.0.17 introduced an
+  authenticated update launcher that is handed to `systemd-run`, and systemd
+  rewrites its own escapes before Bash ever parses the text: `$$` becomes a
+  literal `$`, and `${...}` is replaced with the empty string. That silently
+  turned `/proc/$$/fd/3` into `/proc/$/fd/3`, which is not a path, and blanked
+  both the release key fingerprint and a size check. Every in-portal update
+  failed at step 1 with `stat: cannot statx '/proc/$/fd/3'` before downloading
+  anything. 4.0.18 inherited the same launcher.
+- The launcher no longer contains any construct systemd can rewrite. File
+  descriptors are named with `/dev/fd/N`, the argument list is capped at nine so
+  no `${10}` is needed, and the one parameter expansion has been replaced. All
+  of the authentication it performs is unchanged: fd-to-path identity, key
+  fingerprint, both signatures, manifest schema and version, and installer
+  version are still verified before any downloaded installer runs.
+
+### Upgrading
+- **Hosts on 4.0.17 or 4.0.18 cannot reach this release through the Dashboard**,
+  because the broken launcher is the very thing being replaced. Update once from
+  the command line:
+  `curl -fsSL https://bridgesllm.ai/install.sh | sudo bash -s -- --update`.
+  The in-portal update button works normally from 4.0.19 onward.
+
+### Testing
+- Added a regression suite asserting both launcher scripts are unchanged under
+  systemd argument expansion, so any future `$$` or `${...}` fails immediately.
+  The model of systemd is itself checked against the running `systemd-run`.
+
 ## [4.0.18] - 2026-08-12
 
 ### Fixed

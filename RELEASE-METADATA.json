@@ -1,11 +1,11 @@
 {
   "schema": 1,
-  "version": "4.0.18",
+  "version": "4.0.19",
   "releasedAt": "2026-08-12",
   "releaseClass": "hotfix",
   "highlights": [
-    "Signed-in workspaces load again. 4.0.17 refused every live connection during the handshake, holding users at Refreshing workspace access indefinitely.",
-    "Live alerts, metrics, OpenClaw status, and agent-job streams reconnect, since all five namespaces shared the same rejected admission path.",
-    "Revoked sessions, expired sessions, and superseded sign-ins are still refused exactly as before; only healthy handshakes were being turned away."
+    "The Dashboard update button works again. On 4.0.17 and 4.0.18 it failed immediately at step 1 and could never install anything, including this fix.",
+    "Hosts on 4.0.17 or 4.0.18 must update once from the command line to reach 4.0.19; the in-portal updater works normally from then on.",
+    "The signed release evidence, key fingerprint, and exact installer bytes are still authenticated before any downloaded installer executes."
   ]
 }
