@@ -2,6 +2,34 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [4.0.18] - 2026-08-12
+
+### Fixed
+- **Signed-in workspaces load again.** 4.0.17 added a post-authorization guard
+  to the shared Socket.IO namespace middleware that rejected admission whenever
+  `socket.disconnected` was set. Socket.IO assigns `connected` in `_onconnect()`,
+  which runs only *after* namespace middleware resolves, so that condition was
+  unconditionally true during the handshake and every connection was refused
+  with "Authorization changed during connection." The workspace privacy curtain
+  lifts only on an authorization snapshot whose generation matches the signed-in
+  one, and it has no timeout or fallback, so affected users were held at
+  "Refreshing workspace access…" indefinitely and could not reach the Portal.
+  Revocation that lands while the authorization read is in flight is now tracked
+  explicitly, and a closed engine connection is used as the transport-loss
+  signal.
+- **Live alerts, metrics, OpenClaw status, and agent-job streams reconnect.**
+  All five namespaces share the affected middleware, so the same defect silently
+  ended every live stream in the Portal, not only the workspace handshake.
+- Genuine mid-handshake revocation and transport loss are still refused, and
+  revoked sessions, expired sessions, and superseded authorization generations
+  continue to be rejected with their existing, distinct errors.
+
+### Testing
+- Added a Socket.IO admission suite that opens a real client against the real
+  middleware and asserts both admission and refusal outcomes. The existing
+  namespace suite asserts only on source text and could not observe this class
+  of failure.
+
 ## [4.0.17] - 2026-08-12
 
 ### Fixed

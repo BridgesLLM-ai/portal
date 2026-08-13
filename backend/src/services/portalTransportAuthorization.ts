@@ -161,7 +161,14 @@ export function createSocketAccessAuthorizationMiddleware(
     socket.data.authorizationPendingEvents = pendingEvents;
     socket.data.authorizationChangeRelay = null;
 
+    // Revocation that lands while the authorization read is in flight must be
+    // recorded explicitly. Socket.IO only sets `connected` in `_onconnect()`,
+    // which runs *after* this middleware resolves, so `socket.disconnected` is
+    // unconditionally true here and cannot be used to detect a torn-down
+    // handshake.
+    let revokedDuringHandshake = false;
     const disconnect = () => {
+      revokedDuringHandshake = true;
       try {
         socket.disconnect(true);
       } catch {
@@ -194,7 +201,7 @@ export function createSocketAccessAuthorizationMiddleware(
         next(socketAuthorizationError(result.reason));
         return;
       }
-      if (socket.disconnected) {
+      if (revokedDuringHandshake || socket.conn?.readyState === 'closed') {
         result.dispose();
         next(new Error('Authorization changed during connection'));
         return;

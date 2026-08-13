@@ -1,13 +1,11 @@
 {
   "schema": 1,
-  "version": "4.0.17",
+  "version": "4.0.18",
   "releasedAt": "2026-08-12",
   "releaseClass": "hotfix",
   "highlights": [
-    "Sign-in converges across tabs; revoked sessions stay revoked, and dependency installs use an exact durable promotion boundary with crash recovery.",
-    "Agent Chat steering is bound to the exact active OpenClaw run, including Anthropic-backed turns, and retries cannot enqueue duplicate text.",
-    "Updates prove rebootability before downtime and, once 4.0.17 is installed, authenticate the exact Dashboard installer bytes before execution.",
-    "Project adoption is crash-safe while preserving Apps and share links; contained dependency updates have an exact Owner repair path backed by a freshly verified comprehensive backup.",
-    "Password-protected shares work without JavaScript, and shared App API failures remain truthful only after complete JSON validation."
+    "Signed-in workspaces load again. 4.0.17 refused every live connection during the handshake, holding users at Refreshing workspace access indefinitely.",
+    "Live alerts, metrics, OpenClaw status, and agent-job streams reconnect, since all five namespaces shared the same rejected admission path.",
+    "Revoked sessions, expired sessions, and superseded sign-ins are still refused exactly as before; only healthy handshakes were being turned away."
   ]
 }
