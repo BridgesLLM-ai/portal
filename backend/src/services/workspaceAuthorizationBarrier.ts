@@ -1,4 +1,4 @@
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { AppError } from '../middleware/errorHandler';
 
 interface ActiveWorkspaceRequest {
@@ -69,6 +69,7 @@ function workspaceAuthorizationOperationKind(
       && /^\/api\/projects\/[^/]+\/dependency-repair\/force-forward\/?$/i.test(pathname))) {
     return null;
   }
+  const normalizedMethod = method || 'GET';
   if (pathname === '/api/gateway' || pathname.startsWith('/api/gateway/')) {
     // Default every non-read Gateway operation to mutation-capable so a newly
     // added session/runtime control cannot silently bypass an authorization
@@ -82,7 +83,7 @@ function workspaceAuthorizationOperationKind(
     ].includes(pathname)) {
       return 'mutation';
     }
-    return req.method === 'GET' || req.method === 'HEAD' ? 'read' : 'mutation';
+    return normalizedMethod === 'GET' || normalizedMethod === 'HEAD' ? 'read' : 'mutation';
   }
   if (pathname === '/api/ai/analyze' || pathname === '/api/ai/file-content') {
     return 'read';
@@ -99,7 +100,17 @@ function workspaceAuthorizationOperationKind(
     return 'mutation';
   }
   if (pathname === '/api/agent-jobs' || pathname.startsWith('/api/agent-jobs/')) {
-    return req.method === 'GET' || req.method === 'HEAD' ? 'read' : 'mutation';
+    return normalizedMethod === 'GET' || normalizedMethod === 'HEAD' ? 'read' : 'mutation';
+  }
+  if (
+    (normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
+    && [
+      '/api/auth/me',
+      '/api/auth/registration-mode',
+      '/api/auth/2fa/status',
+    ].includes(pathname)
+  ) {
+    return 'read';
   }
   if (pathname === '/hosted' || pathname.startsWith('/hosted/')) {
     return req.method === 'GET' || req.method === 'HEAD' ? 'read' : null;
@@ -112,12 +123,31 @@ function workspaceAuthorizationOperationKind(
     // as mutation-capable until those handlers are made side-effect-free.
     return 'mutation';
   }
+  if (pathname === '/api/mail' || pathname.startsWith('/api/mail/')) {
+    // Mailbox reads can migrate legacy credentials or auto-provision the
+    // caller's desired mailbox. Keep the whole surface mutation-capable so a
+    // nominal GET cannot create DB/external state across account retirement.
+    return 'mutation';
+  }
+  if (pathname === '/api/users/me/avatar') {
+    // The GET repairs a dangling avatarPath. Upload and DELETE also mutate the
+    // exact DB/filesystem inventory sealed by user retirement.
+    return 'mutation';
+  }
   const workspacePath = pathname === '/api/files'
     || pathname.startsWith('/api/files/')
     || pathname === '/api/upload'
     || pathname.startsWith('/api/upload/');
-  if (!workspacePath) return null;
-  return req.method === 'GET' || req.method === 'HEAD' ? 'read' : 'mutation';
+  if (workspacePath) {
+    return normalizedMethod === 'GET' || normalizedMethod === 'HEAD' ? 'read' : 'mutation';
+  }
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
+    // Authenticated API admission is mutation-default. A newly mounted user
+    // state writer cannot silently bypass retirement merely because its path
+    // was omitted from this table.
+    return 'mutation';
+  }
+  return null;
 }
 
 /**
@@ -128,7 +158,7 @@ function workspaceAuthorizationOperationKind(
 function admitWorkspaceAuthorizationOperation(
   req: Request,
   res: Response,
-  actorUserId: string,
+  actorUserId: string | null,
   kind: 'read' | 'mutation',
 ): boolean {
   if (admittedRequests.has(req)) return true;
@@ -140,8 +170,8 @@ function admitWorkspaceAuthorizationOperation(
     });
     return false;
   }
-  const state = stateFor(actorUserId);
-  if (state.fenced) {
+  const state = actorUserId === null ? null : stateFor(actorUserId);
+  if (state?.fenced) {
     if (!globalState.fenced && globalState.active.size === 0) {
       states.delete(GLOBAL_WORKSPACE_AUTHORIZATION_KEY);
     }
@@ -156,11 +186,13 @@ function admitWorkspaceAuthorizationOperation(
     kind,
     response: res,
     released: false,
-    stateKeys: [actorUserId, GLOBAL_WORKSPACE_AUTHORIZATION_KEY],
+    stateKeys: actorUserId === null
+      ? [GLOBAL_WORKSPACE_AUTHORIZATION_KEY]
+      : [actorUserId, GLOBAL_WORKSPACE_AUTHORIZATION_KEY],
   };
   admittedRequests.add(req);
   requestAdmissions.set(req, admission);
-  state.active.add(admission);
+  state?.active.add(admission);
   globalState.active.add(admission);
   const release = () => releaseAdmission(admission);
   res.once('finish', release);
@@ -201,6 +233,26 @@ export function admitWorkspaceAuthorizationRequest(
     actorUserId,
     kind,
   );
+}
+
+/** Admit an Auth mutation before credentials have resolved a user identity. */
+export function admitGlobalWorkspaceAuthorizationRequest(
+  req: Request,
+  res: Response,
+): boolean {
+  const kind = workspaceAuthorizationOperationKind(req);
+  if (!kind) return true;
+  return admitWorkspaceAuthorizationOperation(req, res, null, kind);
+}
+
+/** Express boundary used in front of every unauthenticated Auth route. */
+export function requireGlobalWorkspaceAuthorizationAdmission(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!admitGlobalWorkspaceAuthorizationRequest(req, res)) return;
+  next();
 }
 
 /** Admit a POST-style endpoint whose operation is semantically read-only. */
@@ -345,12 +397,25 @@ interface ClosedWorkspaceAuthorizationFences {
   drained: Promise<void>;
 }
 
+export const WORKSPACE_AUTHORIZATION_DRAIN_TIMEOUT_MS = 45_000;
+
+export class WorkspaceAuthorizationDrainTimeoutError extends Error {
+  constructor(public readonly timeoutMs: number) {
+    super(
+      'Timed out waiting for in-flight workspace mutations to settle. '
+      + 'No authorization change was applied. Retry once activity subsides.',
+    );
+    this.name = 'WorkspaceAuthorizationDrainTimeoutError';
+    Object.setPrototypeOf(this, WorkspaceAuthorizationDrainTimeoutError.prototype);
+  }
+}
+
 export interface WorkspaceAuthorizationFenceController {
   /**
    * Resolves only after every mutation admitted before the fence has reached
    * its authoritative settlement boundary.
    */
-  waitForMutationDrain(): Promise<void>;
+  waitForMutationDrain(timeoutMs?: number): Promise<void>;
   /**
    * Reopens admission. Callers must keep the fence closed through their
    * durable authorization commit (or rollback).
@@ -397,7 +462,34 @@ export function closeWorkspaceAuthorizationAdmission(
   const closed = closeFences(userIds);
   let released = false;
   return {
-    waitForMutationDrain: () => closed.drained,
+    waitForMutationDrain: (
+      timeoutMs: number = WORKSPACE_AUTHORIZATION_DRAIN_TIMEOUT_MS,
+    ) => {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return closed.drained;
+      return new Promise<void>((resolve, reject) => {
+        let finished = false;
+        const timer = setTimeout(() => {
+          if (finished) return;
+          finished = true;
+          reject(new WorkspaceAuthorizationDrainTimeoutError(timeoutMs));
+        }, timeoutMs);
+        if (typeof timer.unref === 'function') timer.unref();
+        closed.drained.then(
+          () => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            resolve();
+          },
+          (error) => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            reject(error);
+          },
+        );
+      });
+    },
     release: () => {
       if (released) return;
       released = true;

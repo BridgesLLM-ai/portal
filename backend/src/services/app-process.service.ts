@@ -14,8 +14,10 @@ import {
   bridgeContainerLoopbackPort,
   assertProjectRuntimeImageAvailable,
   inspectProjectAppContainer,
+  listInterruptedDeploymentPromotionTargets,
   projectAppContainerName,
   readProjectAppLogs,
+  recoverInterruptedDeploymentPromotions,
   runProjectLifecycleCommand,
   startProjectAppContainer,
   stopProjectAppContainer,
@@ -29,6 +31,8 @@ import {
   projectDeletionLockKey,
   type ProjectDeletionLockLease,
 } from './projectDeletionLock';
+import { acquireGlobalWorkspaceAuthorizationMutationLease } from './workspaceAuthorizationBarrier';
+import { findUnfinishedAdminUserRetirementTarget } from './adminUserRetirementParticipation';
 
 // Port range for full-stack apps: 5001-5099
 const PORT_RANGE_START = 5001;
@@ -754,11 +758,35 @@ async function persistAppState(
       persistenceGeneration
       && activeAppPersistenceGenerations.get(state.appId) !== persistenceGeneration
     ) return;
-    await prisma.systemSetting.upsert({
-      where: { key: appStateKey(state.appId) },
-      create: { key: appStateKey(state.appId), value },
-      update: { value },
-    });
+    let releaseAdmission: (() => void) | null = null;
+    try {
+      releaseAdmission = acquireGlobalWorkspaceAuthorizationMutationLease();
+    } catch {
+      // A background probe may finish after retirement closes admission.
+      // Never recreate persisted runtime identity behind that fence.
+      return;
+    }
+    try {
+      await prisma.$transaction(async (transaction) => {
+        const actor = await transaction.user.findUnique({
+          where: { id: state.actorId },
+          select: { id: true },
+        });
+        if (!actor) return;
+        const retirement = await findUnfinishedAdminUserRetirementTarget(
+          transaction,
+          [state.actorId],
+        );
+        if (retirement) return;
+        await transaction.systemSetting.upsert({
+          where: { key: appStateKey(state.appId) },
+          create: { key: appStateKey(state.appId), value },
+          update: { value },
+        });
+      }, { isolationLevel: 'Serializable' });
+    } finally {
+      releaseAdmission();
+    }
   });
 }
 
@@ -1183,6 +1211,28 @@ export async function stopApp(deployId: string): Promise<void> {
 }
 
 /**
+ * Quiesce a runtime for an in-progress deployment without changing its durable
+ * desired state. If Portal exits before the deployment transaction commits,
+ * startup recovery rolls the filesystem back and the existing running intent
+ * brings the prior release back online.
+ */
+export async function quiesceAppForDeployment(
+  deployId: string,
+  exactRuntimeIdentity?: ProjectAppRuntimeIdentity,
+): Promise<void> {
+  await withProjectAppDeploymentLocks([deployId], async () => {
+    await stopAppUnlocked(deployId, {
+      updateDatabase: false,
+      persistState: false,
+    });
+    // A durable App binding can outlive an in-memory manager after an abnormal
+    // reconciliation. Remove only that immutable labeled workload as a second,
+    // idempotent fence before the data snapshot.
+    if (exactRuntimeIdentity) await stopProjectAppContainer(exactRuntimeIdentity);
+  });
+}
+
+/**
  * Remove all process-manager state for one immutable Project App. Callers must
  * separately remove the attested deployment directory and App database row.
  */
@@ -1343,17 +1393,37 @@ async function updateAppStatus(
       persistenceGeneration
       && activeAppPersistenceGenerations.get(appId) !== persistenceGeneration
     ) return;
+    let releaseAdmission: (() => void) | null = null;
+    try {
+      releaseAdmission = acquireGlobalWorkspaceAuthorizationMutationLease();
+    } catch {
+      return;
+    }
     try {
       // App.updatedAt is the conservative recovery-replay revision. Routine
       // status reconciliation must not advance it when the persisted value is
       // already identical; real status transitions still do.
-      await prisma.app.updateMany({
-        where: { id: appId, processStatus: { not: status } },
-        data: { processStatus: status },
-      });
-      persisted = true;
+      persisted = await prisma.$transaction(async (transaction) => {
+        const app = await transaction.app.findUnique({
+          where: { id: appId },
+          select: { id: true, userId: true },
+        });
+        if (!app) return false;
+        const retirement = await findUnfinishedAdminUserRetirementTarget(
+          transaction,
+          [app.userId],
+        );
+        if (retirement) return false;
+        await transaction.app.updateMany({
+          where: { id: app.id, processStatus: { not: status } },
+          data: { processStatus: status },
+        });
+        return true;
+      }, { isolationLevel: 'Serializable' });
     } catch (e: any) {
       console.error(`[AppProcess] Failed to update DB status for ${appId}:`, e.message);
+    } finally {
+      releaseAdmission();
     }
   });
   return persisted;
@@ -1484,6 +1554,7 @@ export async function preflightAppProcessRuntimeRestoration(options: {
  * Restore running apps on server startup
  */
 export async function restoreRunningApps(): Promise<void> {
+  const preflight = await preflightAppProcessRuntimeRestoration();
   const {
     apps,
     runtimeManagementByAppId,
@@ -1493,7 +1564,39 @@ export async function restoreRunningApps(): Promise<void> {
     interruptedLifecycleIdentities,
     dependencyContainmentIdentities,
     unsafeRunningAppIds,
-  } = await preflightAppProcessRuntimeRestoration();
+  } = preflight;
+
+  // A process exit can interrupt the same-filesystem App release swap after a
+  // container has started but before COMMITTED is durable. Stop only the exact
+  // immutable Project workload bound to each journal target before deciding
+  // rollback/forward from the journal and inode topology. Static/initial
+  // deployments have no managed runtime to quiesce.
+  const deploymentRoot = process.env.NODE_ENV === 'test' && !process.env.APPS_ROOT
+    ? null
+    : path.resolve(process.env.APPS_ROOT || '/var/www/bridgesllm-apps');
+  if (deploymentRoot && fs.existsSync(deploymentRoot)) {
+    const interruptedTargets = listInterruptedDeploymentPromotionTargets(deploymentRoot);
+    for (const target of interruptedTargets) {
+      const matchingApps = apps.filter((app) => path.resolve(app.zipPath) === target);
+      if (matchingApps.length > 1) {
+        throw new ProjectRuntimeStateAttestationError();
+      }
+      const app = matchingApps[0];
+      if (!app) continue;
+      if (nonPortalRuntimeAppIds.has(app.id)) {
+        throw new ProjectRuntimeStateAttestationError();
+      }
+      const runtimeIdentity = exactRuntimeIdentities.get(app.id) || null;
+      if (!runtimeIdentity) {
+        throw new ProjectRuntimeStateAttestationError();
+      }
+      await stopProjectAppContainer(runtimeIdentity);
+    }
+    const recovered = recoverInterruptedDeploymentPromotions(deploymentRoot);
+    if (recovered.rolledBack > 0 || recovered.committed > 0) {
+      console.warn('[AppProcess] Recovered interrupted deployment promotion:', recovered);
+    }
+  }
 
   for (const app of apps) {
     const deployId = `${app.userId}-${app.name}`;
@@ -1777,10 +1880,16 @@ export function shutdownAll(): Promise<void> {
     // A start can be between dependency preparation and registry insertion.
     // Drain every already-admitted deploy operation after closing admission.
     await Promise.allSettled(Array.from(deployOperations.values()));
-    console.log(`[AppProcess] Shutting down ${runningApps.size} running app(s)...`);
+    const managedApps = Array.from(runningApps.entries());
+    console.log(`[AppProcess] Shutting down ${managedApps.length} running app(s)...`);
     // Keep running/starting DB intent intact so initializeAppProcessRuntime can
     // distinguish a graceful Portal restart from an admin stop.
-    for (const [deployId, app] of Array.from(runningApps.entries())) {
+    // Seal every App's restart intent before stopping any container. Container
+    // removal is comparatively slow (and independently identity-attested), so
+    // serialize neither it nor distinct per-App persistence behind the number
+    // of running Apps. Four healthy Apps previously consumed the updater's
+    // entire 45-second Portal shutdown window one Docker removal at a time.
+    await Promise.all(managedApps.map(async ([deployId, app]) => {
       try {
         clearStartupTimer(app);
         reconcileManagedApp(app, false);
@@ -1792,13 +1901,15 @@ export function shutdownAll(): Promise<void> {
       } catch (e: any) {
         console.error(`[AppProcess] Failed to persist shutdown state for ${deployId}:`, e.message);
       }
+    }));
+    await Promise.all(managedApps.map(async ([deployId, app]) => {
       try {
         await stopProjectAppContainer(app.runtimePlan);
         console.log(`[AppProcess] Stopped sandboxed ${deployId}`);
       } catch (e: any) {
         console.error(`[AppProcess] Failed to stop ${deployId}:`, e.message);
       }
-    }
+    }));
     runningApps.clear();
     activeAppPersistenceGenerations.clear();
 

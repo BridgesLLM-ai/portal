@@ -568,11 +568,22 @@ function parseManagedFirewallCleanupPlan(payload: string): ManagedFirewallCleanu
   }
 
   const hostRules = lines.filter((line) => line.startsWith(`-A ${P4E_HOST_CHAIN} `));
-  const hostPattern = new RegExp(
+  const hostRejectPattern = new RegExp(
     `^-A ${P4E_HOST_CHAIN} -s [0-9A-Fa-f:.]+/[0-9]{1,3} -m comment --comment p4e-v1:[a-f0-9]{64}:[a-f0-9]{64} -j REJECT$`,
   );
-  if (!hostRules.every((line) => hostPattern.test(line))) {
-    throw new ProjectRuntimeUninstallPreflightError('PROJECT_FIREWALL_AMBIGUOUS_CHAIN');
+  const hostReplyPattern = new RegExp(
+    `^-A ${P4E_HOST_CHAIN} -s ([0-9A-Fa-f:.]+/[0-9]{1,3}) -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment (p4e-v1:[a-f0-9]{64}:[a-f0-9]{64}) -j ACCEPT$`,
+  );
+  // The egress plane writes a narrow established-reply exception immediately
+  // before its matching deny. Recognize that exact owned pair, not arbitrary
+  // ACCEPT rules or an exception whose deny has disappeared.
+  for (let index = 0; index < hostRules.length; index += 1) {
+    if (hostRejectPattern.test(hostRules[index])) continue;
+    const reply = hostRules[index].match(hostReplyPattern);
+    if (!reply || hostRules[index + 1]
+      !== `-A ${P4E_HOST_CHAIN} -s ${reply[1]} -m comment --comment ${reply[2]} -j REJECT`) {
+      throw new ProjectRuntimeUninstallPreflightError('PROJECT_FIREWALL_AMBIGUOUS_CHAIN');
+    }
   }
   hostRules.forEach((line) => consumed.add(line));
 
@@ -766,9 +777,27 @@ export async function assertPortalServiceStopped(
   if (result.code === 0) {
     throw new ProjectRuntimeUninstallPreflightError('PORTAL_SERVICE_ACTIVE');
   }
-  if (result.code !== 3) {
-    throw new ProjectRuntimeUninstallPreflightError('PORTAL_SERVICE_STATE_UNKNOWN');
+  if (result.code === 3) return;
+  if (result.code === 4) {
+    // A partial first install can fail before the service is written. Do not
+    // confuse a proved absent unit with an unreadable systemd state.
+    const absent = await runner.run(SYSTEMCTL_BIN, [
+      'show', PORTAL_SERVICE, '-p', 'LoadState', '-p', 'ActiveState',
+      '-p', 'SubState', '-p', 'MainPID', '-p', 'ControlPID', '-p', 'FragmentPath',
+    ], COMMAND_TIMEOUT_MS);
+    const expected: Readonly<Record<string, string>> = {
+      LoadState: 'not-found', ActiveState: 'inactive', SubState: 'dead',
+      MainPID: '0', ControlPID: '0', FragmentPath: '',
+    };
+    const entries = absent.stdout.trim().split('\n').map((line) => {
+      const separator = line.indexOf('=');
+      return [line.slice(0, separator), line.slice(separator + 1)];
+    });
+    if (absent.code === 0 && entries.length === Object.keys(expected).length
+      && new Set(entries.map(([key]) => key)).size === entries.length
+      && entries.every(([key, value]) => Object.prototype.hasOwnProperty.call(expected, key) && expected[key] === value)) return;
   }
+  throw new ProjectRuntimeUninstallPreflightError('PORTAL_SERVICE_STATE_UNKNOWN');
 }
 
 function validateEnvironmentValues(values: Readonly<Record<string, string>>): void {

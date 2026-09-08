@@ -15,12 +15,15 @@ jest.mock('../services/mailboxReconciliation', () => ({
   enqueueMailboxReconciliation: mockEnqueueMailboxReconciliation,
 }));
 
+import { prisma } from '../config/database';
 import { decryptSecret } from '../utils/authSecrets';
-import { provisionUserMailbox } from '../services/userMailService';
+import { getUserMailAccounts, provisionUserMailbox } from '../services/userMailService';
 import { PortalFeatureUnavailableError } from '../utils/portalFeatureCapabilities';
 
 describe('user mailbox persistence invariants', () => {
   const originalStalwartUrl = process.env.STALWART_URL;
+  const originalStalwartAdminPass = process.env.STALWART_ADMIN_PASS;
+  const originalMailDomain = process.env.MAIL_DOMAIN;
   const originalEncryptionKey = process.env.PORTAL_ENCRYPTION_KEY;
   const originalOriginMode = process.env.ORIGIN_MODE;
   const originalInstallProfile = process.env.INSTALL_PROFILE;
@@ -32,6 +35,8 @@ describe('user mailbox persistence invariants', () => {
     mockEnqueueMailboxReconciliation.mockReset();
     mockEnqueueMailboxReconciliation.mockResolvedValue(undefined);
     process.env.STALWART_URL = 'http://stalwart.test';
+    process.env.STALWART_ADMIN_PASS = 'synthetic-mail-fixture-only';
+    process.env.MAIL_DOMAIN = 'mailbox.test';
     process.env.PORTAL_ENCRYPTION_KEY = 'mailbox-test-encryption-key';
     delete process.env.ORIGIN_MODE;
     process.env.INSTALL_PROFILE = 'server';
@@ -42,6 +47,10 @@ describe('user mailbox persistence invariants', () => {
   });
 
   afterAll(() => {
+    if (originalStalwartAdminPass === undefined) delete process.env.STALWART_ADMIN_PASS;
+    else process.env.STALWART_ADMIN_PASS = originalStalwartAdminPass;
+    if (originalMailDomain === undefined) delete process.env.MAIL_DOMAIN;
+    else process.env.MAIL_DOMAIN = originalMailDomain;
     if (originalStalwartUrl === undefined) delete process.env.STALWART_URL;
     else process.env.STALWART_URL = originalStalwartUrl;
     if (originalEncryptionKey === undefined) delete process.env.PORTAL_ENCRYPTION_KEY;
@@ -68,6 +77,29 @@ describe('user mailbox persistence invariants', () => {
     expect(mockEnqueueMailboxReconciliation).not.toHaveBeenCalled();
   });
 
+  test.each(['STALWART_ADMIN_PASS', 'MAIL_DOMAIN'] as const)(
+    'does not create mailbox state before optional Mail is configured (%s missing)',
+    async (missing) => {
+      delete process.env[missing];
+      await expect(provisionUserMailbox('alice', 'user-1')).rejects.toMatchObject({
+        statusCode: 409,
+        message: 'Set up Mail before creating mailboxes.',
+      });
+      expect(transaction).not.toHaveBeenCalled();
+      expect(mockRequireMailboxReconciled).not.toHaveBeenCalled();
+      expect(mockEnqueueMailboxReconciliation).not.toHaveBeenCalled();
+    },
+  );
+
+  test('unconfigured optional Mail returns an empty inbox without migrating or reconciling rows', async () => {
+    delete process.env.STALWART_ADMIN_PASS;
+    jest.mocked(prisma.user.findUnique).mockClear();
+    await expect(getUserMailAccounts('user-1')).resolves.toEqual([]);
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(transaction).not.toHaveBeenCalled();
+    expect(mockRequireMailboxReconciled).not.toHaveBeenCalled();
+  });
+
   test('serializes ownership, creates a primary, and stores only encrypted passwords', async () => {
     const tx = {
       $queryRaw: jest.fn().mockResolvedValue([]),
@@ -79,6 +111,9 @@ describe('user mailbox persistence invariants', () => {
       },
       user: {
         update: jest.fn().mockResolvedValue({ id: 'user-1' }),
+      },
+      adminUserRetirement: {
+        findFirst: jest.fn().mockResolvedValue(null),
       },
     };
     transaction.mockImplementation(async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx));
@@ -117,6 +152,9 @@ describe('user mailbox persistence invariants', () => {
         upsert: jest.fn().mockResolvedValue({ id: 'mailbox-1' }),
       },
       user: { update: jest.fn().mockResolvedValue({ id: 'user-1' }) },
+      adminUserRetirement: {
+        findFirst: jest.fn().mockResolvedValue(null),
+      },
     };
     transaction.mockImplementation(async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx));
     mockRequireMailboxReconciled.mockRejectedValue(new Error('Mailbox reconciliation is queued for retry'));

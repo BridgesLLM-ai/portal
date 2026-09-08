@@ -5,21 +5,20 @@ import * as os from 'os';
 import * as path from 'path';
 import * as pty from 'node-pty';
 import * as openclawConfigManager from '../services/openclawConfigManager';
-import * as providerLifecycleLedger from '../services/providerCredentialLifecycleLedger';
+import * as nativeCliAuth from '../agents/nativeCliAuth';
+import * as nativeProviderReadiness from '../agents/nativeProviderReadiness';
 import {
   __deleteOAuthSessionForTests,
   __resetCredentialLifecycleLeasesForTests,
   __resetCredentialLifecycleMemoryForTests,
   __setOAuthSessionForTests,
+  attachNativeCliInteractiveTerminal,
   authProfileStateFingerprint,
-  attestCodexCredentialFile,
   beginClaudeSetupTokenFinalization,
-  buildCodexOAuthEnvironment,
   buildOAuthFlowStatusPayload,
   buildOAuthLoginArgs,
   buildXaiOAuthProfileId,
   captureNativeCredentialSnapshot,
-  classifyCodexDeviceLoginError,
   cleanupStaleClaudeSetupTokenProcesses,
   ClaudeOrphanLifecycleError,
   cancelOAuthFlow,
@@ -29,12 +28,14 @@ import {
   completeOAuthFlow,
   completeClaudeSetupTokenProcessExit,
   commitClaudeSetupTokenCredential,
+  createOAuthSessionId,
   getOAuthFlowStatus,
   getClaudeSetupToken,
   getCredentialLifecycleNamespaceForNativeProvider,
   getCredentialLifecycleNamespaceForOpenClawProvider,
   isOAuthSessionCleanupPending,
   maybeCaptureClaudeSetupToken,
+  markOAuthFlowFinalized,
   pasteCodeToClaudeSession,
   readExpectedXaiOAuthProfile,
   readXaiOAuthPreflightState,
@@ -50,7 +51,6 @@ import {
   GROK_BUILD_DEVICE_LOGIN_ARGS,
   googleGeminiCliProfileHasUsableCredential,
   parseAntigravityReauthArgs,
-  probeCodexLoginStatus,
   normalizeTerminalScreenText,
   outputLooksLikeClaudeCliAuthImportSuccess,
   selectCompletedProviderProfileId,
@@ -65,7 +65,6 @@ import {
 } from '../services/oauthFlowManager';
 import {
   __readProviderCredentialLifecycleLedgerForTests,
-  bindProviderCredentialLifecycle,
   claimProviderCredentialLifecycle,
 } from '../services/providerCredentialLifecycleLedger';
 
@@ -83,32 +82,49 @@ function silentPty(onKill?: () => void) {
 }
 
 function controllablePty() {
-  let dataHandler: ((chunk: string) => void) | undefined;
-  let exitHandler: ((event: { exitCode: number; signal?: number }) => void) | undefined;
+  const dataHandlers = new Set<(chunk: string) => void>();
+  const exitHandlers = new Set<(event: { exitCode: number; signal?: number }) => void>();
   return {
     process: {
       pid: process.pid,
-      onData: jest.fn((handler: (chunk: string) => void) => { dataHandler = handler; }),
-      onExit: jest.fn((handler: (event: { exitCode: number; signal?: number }) => void) => { exitHandler = handler; }),
+      onData: jest.fn((handler: (chunk: string) => void) => {
+        dataHandlers.add(handler);
+        return { dispose: () => dataHandlers.delete(handler) };
+      }),
+      onExit: jest.fn((handler: (event: { exitCode: number; signal?: number }) => void) => {
+        exitHandlers.add(handler);
+        return { dispose: () => exitHandlers.delete(handler) };
+      }),
       write: jest.fn(),
+      resize: jest.fn(),
       kill: jest.fn(),
     } as any,
-    emitData: (chunk: string) => dataHandler?.(chunk),
-    emitExit: (exitCode: number) => exitHandler?.({ exitCode }),
+    emitData: (chunk: string) => {
+      for (const handler of [...dataHandlers]) handler(chunk);
+    },
+    emitExit: (exitCode: number) => {
+      for (const handler of [...exitHandlers]) handler({ exitCode });
+    },
   };
-}
-
-async function waitForPtyListener(listener: jest.Mock): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (listener.mock.calls.length > 0) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error('Timed out waiting for native CLI PTY listeners.');
 }
 
 describe('oauthFlowManager terminal parsing', () => {
   afterEach(() => {
     __resetCredentialLifecycleLeasesForTests();
+  });
+
+  test('creates bounded cryptographically random session ids without same-tick collisions', () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_777_777_777_777);
+    try {
+      const ids = Array.from({ length: 1_024 }, () => createOAuthSessionId());
+      expect(new Set(ids).size).toBe(ids.length);
+      for (const id of ids) {
+        expect(id).toMatch(/^oauth_[a-z0-9]+_[a-f0-9]{16}$/);
+        expect(id.length).toBeLessThanOrEqual(40);
+      }
+    } finally {
+      now.mockRestore();
+    }
   });
   test('attests a CLI state directory that contains a symlink', () => {
     // The Antigravity CLI rewrites ~/.gemini/antigravity-cli/cli.log as a
@@ -297,50 +313,22 @@ describe('oauthFlowManager terminal parsing', () => {
     expect(signalProcess).not.toHaveBeenCalled();
   });
 
-  test('checks durable Claude ownership before scanning an old live PTY as orphaned', async () => {
+  test('rejects host Claude setup-token before cleanup or PTY work', async () => {
     (pty.spawn as jest.Mock).mockClear();
-    const claim = claimProviderCredentialLifecycle(
-      'credential-domain:anthropic',
-      'user:durable-owner',
-      'existing-request',
-      { baselineFingerprint: 'combined-before', reviewAfterMs: 60_000 },
-    );
-    bindProviderCredentialLifecycle(claim, 'existing-session', {
-      binding: { kind: 'owned-child', processPid: process.pid },
-    });
     const cleanupOrphans = jest.fn().mockResolvedValue(0);
+    const readInventoryFingerprint = jest.fn().mockResolvedValue('combined-before');
 
     await expect(startClaudeSetupTokenFlow('user:new-owner', {
       cleanupOrphans,
-      readInventoryFingerprint: async () => 'combined-before',
+      readInventoryFingerprint,
     })).rejects.toMatchObject({
-      statusCode: 409,
-      code: 'PROVIDER_CREDENTIAL_LIFECYCLE_RECOVERY_REQUIRED',
+      statusCode: 503,
+      code: 'HOST_CREDENTIAL_FLOW_UNAVAILABLE',
+      retryable: false,
     });
     expect(cleanupOrphans).not.toHaveBeenCalled();
+    expect(readInventoryFingerprint).not.toHaveBeenCalled();
     expect(pty.spawn).not.toHaveBeenCalled();
-  });
-
-  test('durably quarantines a pre-ledger Claude orphan that leaves credentials behind', async () => {
-    const committed = new ClaudeOrphanLifecycleError(
-      'orphan committed credentials',
-      'committed',
-      false,
-    );
-    await expect(startClaudeSetupTokenFlow('user:orphan-owner', {
-      cleanupOrphans: jest.fn().mockRejectedValue(committed),
-      readInventoryFingerprint: async () => 'combined-current',
-    })).rejects.toBe(committed);
-    expect(__readProviderCredentialLifecycleLedgerForTests().records['credential-domain:anthropic'])
-      .toMatchObject({ state: 'committed', lifecycleKind: 'claude-setup-token-orphan' });
-
-    __resetCredentialLifecycleMemoryForTests();
-    const replacementCleanup = jest.fn().mockResolvedValue(0);
-    await expect(startClaudeSetupTokenFlow('user:orphan-owner', {
-      cleanupOrphans: replacementCleanup,
-      readInventoryFingerprint: async () => 'combined-current',
-    })).rejects.toMatchObject({ statusCode: 409 });
-    expect(replacementCleanup).not.toHaveBeenCalled();
   });
   test('squashes screen-control fragments that render prompts one glyph per line', () => {
     const raw = 'P\r[2m\na\r[2m\ns\r[2m\nt\r[2m\ne\r[2m\n';
@@ -419,397 +407,61 @@ describe('oauthFlowManager terminal parsing', () => {
     expect(getOpenClawOAuthProviderId('google-gemini-cli')).toBe('google-gemini-cli');
   });
 
-  test('classifies Codex device-login failures without reflecting terminal output', () => {
-    expect(classifyCodexDeviceLoginError('Error: device code login is not enabled token=must-not-leak'))
-      .toBe('Codex device login is disabled. Enable device code login in your personal ChatGPT Security settings or ask your workspace admin to enable it in Permissions, then try again.');
-    expect(classifyCodexDeviceLoginError('authorization was denied secret=must-not-leak'))
-      .toBe('OpenAI authorization was denied. Start a fresh Codex sign-in when you are ready to approve it.');
-    expect(classifyCodexDeviceLoginError('TLS handshake failed: unknown issuer'))
-      .toBe('Codex could not establish a trusted TLS connection to OpenAI. Check the server trust store or configure CODEX_CA_CERTIFICATE, then retry.');
-    expect(classifyCodexDeviceLoginError('unexpected provider response token=must-not-leak')).toBeNull();
-  });
+  test.each([
+    'openai-codex',
+    'codex',
+  ])(
+    'rejects native %s credential PTY before lifecycle admission or process work',
+    async (provider) => {
+      (pty.spawn as jest.Mock).mockClear();
+      const ledgerBefore = JSON.stringify(__readProviderCredentialLifecycleLedgerForTests());
 
-  test('classifies the read-only Codex login-status probe without exposing command output', () => {
-    const previousApiKey = process.env.OPENAI_API_KEY;
-    process.env.OPENAI_API_KEY = 'must-not-cross-the-status-probe';
-    const runner = jest.fn(() => ({
-      status: 0,
-      stdout: '',
-      stderr: 'Logged in using ChatGPT\n',
-    }));
-    try {
-      expect(probeCodexLoginStatus('/fixture/codex', runner)).toBe('authenticated');
-      expect(runner).toHaveBeenCalledWith(
-        '/fixture/codex',
-        ['login', '-c', 'cli_auth_credentials_store="file"', 'status'],
-        expect.objectContaining({
-          env: expect.not.objectContaining({ OPENAI_API_KEY: expect.anything() }),
-        }),
-      );
-      expect(probeCodexLoginStatus('/fixture/codex', jest.fn(() => ({
-        status: 1,
-        stdout: '',
-        stderr: 'Not logged in\n',
-      })))).toBe('signed_out');
-      expect(probeCodexLoginStatus('/fixture/codex', jest.fn(() => ({
-        status: 1,
-        stdout: '',
-        stderr: 'Error checking login status: keyring unavailable\n',
-      })))).toBe('indeterminate');
-      expect(probeCodexLoginStatus('/fixture/codex', jest.fn(() => ({
-        status: 2,
-        stdout: '',
-        stderr: 'unexpected failure\n',
-      })))).toBe('indeterminate');
-    } finally {
-      if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = previousApiKey;
-    }
-  });
+      await expect(startOAuthFlow(provider, { ownerId: 'user:oauth-codex-disabled' }))
+        .rejects.toMatchObject({
+          statusCode: 503,
+          code: 'HOST_CREDENTIAL_FLOW_UNAVAILABLE',
+          retryable: false,
+        });
 
-  test('passes only allowlisted Codex OAuth network and trust settings', () => {
-    const env = buildCodexOAuthEnvironment({
-      HOME: '/srv/portal',
-      PATH: '/usr/local/bin:/usr/bin',
-      CODEX_HOME: '/srv/portal/codex',
-      OPENAI_API_KEY: 'must-not-cross-oauth',
-      HTTPS_PROXY: 'http://proxy.example:8443',
-      no_proxy: '127.0.0.1,localhost',
-      SSL_CERT_FILE: '/etc/portal/custom-ca.pem',
-      CODEX_CA_CERTIFICATE: '/etc/portal/codex-ca.pem',
-      DATABASE_URL: 'postgres://must-not-cross',
-      PORTAL_JWT_SECRET: 'must-not-cross',
+      expect(pty.spawn).not.toHaveBeenCalled();
+      expect(JSON.stringify(__readProviderCredentialLifecycleLedgerForTests())).toBe(ledgerBefore);
+    },
+  );
+
+  test.each([
+    'google-gemini-cli',
+    'qwen-portal',
+    'xai',
+  ])(
+    'rejects OpenClaw %s OAuth mutation before lifecycle admission or PTY work',
+    async (provider) => {
+      (pty.spawn as jest.Mock).mockClear();
+      const ledgerBefore = JSON.stringify(__readProviderCredentialLifecycleLedgerForTests());
+
+      await expect(startOAuthFlow(provider, { ownerId: 'user:oauth-openclaw-disabled' }))
+        .rejects.toMatchObject({
+          statusCode: 503,
+          code: 'OPENCLAW_HOST_MUTATION_UNAVAILABLE',
+          retryable: false,
+        });
+
+      expect(pty.spawn).not.toHaveBeenCalled();
+      expect(JSON.stringify(__readProviderCredentialLifecycleLedgerForTests())).toBe(ledgerBefore);
+    },
+  );
+
+  test('rejects host Codex login before status probes, credential reads, or PTY work', async () => {
+    (pty.spawn as jest.Mock).mockClear();
+
+    await expect(startNativeCliFlow('codex', {
+      ownerId: 'user:codex-host-disabled',
+      forceReauth: true,
+    })).rejects.toMatchObject({
+      statusCode: 503,
+      code: 'HOST_CREDENTIAL_FLOW_UNAVAILABLE',
+      retryable: false,
     });
-
-    expect(env).toMatchObject({
-      HOME: '/srv/portal',
-      PATH: '/usr/local/bin:/usr/bin',
-      CODEX_HOME: '/srv/portal/codex',
-      HTTPS_PROXY: 'http://proxy.example:8443',
-      no_proxy: '127.0.0.1,localhost',
-      SSL_CERT_FILE: '/etc/portal/custom-ca.pem',
-      CODEX_CA_CERTIFICATE: '/etc/portal/codex-ca.pem',
-    });
-    expect(env.OPENAI_API_KEY).toBeUndefined();
-    expect(env.DATABASE_URL).toBeUndefined();
-    expect(env.PORTAL_JWT_SECRET).toBeUndefined();
-  });
-
-  test('treats only a missing Codex auth file as absent', () => {
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-file-attestation-'));
-    const authPath = path.join(codexHome, 'auth.json');
-    try {
-      expect(attestCodexCredentialFile(authPath)).toBe('absent');
-      fs.writeFileSync(authPath, '{not-json', { mode: 0o600 });
-      expect(attestCodexCredentialFile(authPath)).toBe('indeterminate');
-      fs.writeFileSync(authPath, '{}', { mode: 0o600 });
-      expect(attestCodexCredentialFile(authPath)).toBe('indeterminate');
-      fs.writeFileSync(authPath, JSON.stringify({
-        tokens: { access_token: 'fixture-access-token' },
-      }), { mode: 0o600 });
-      expect(attestCodexCredentialFile(authPath)).toBe('committed');
-    } finally {
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  test('reuses an attested existing Codex login without spawning destructive reauthentication', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-reuse-'));
-    process.env.CODEX_HOME = codexHome;
-    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-      tokens: { access_token: 'existing-access-token', refresh_token: 'existing-refresh-token' },
-    }), { mode: 0o600 });
-    (pty.spawn as jest.Mock).mockClear();
-    let sessionId: string | null = null;
-
-    try {
-      const result = await startNativeCliFlow('codex', {
-        ownerId: 'user:codex-reuse',
-        codexLoginStatusProbe: () => 'authenticated',
-      });
-      sessionId = result.sessionId;
-      expect(result).toMatchObject({
-        status: 'complete',
-        alreadyAuthenticated: true,
-        reauthSupported: true,
-      });
-      expect(getOAuthFlowStatus(sessionId, 'user:codex-reuse')).toMatchObject({
-        status: 'complete',
-        credentialState: 'committed',
-        cleanupPending: false,
-      });
-      expect(pty.spawn).not.toHaveBeenCalled();
-    } finally {
-      if (sessionId) __deleteOAuthSessionForTests(sessionId);
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  test('requires explicit replacement before touching an existing unconfirmed Codex credential', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-protected-'));
-    process.env.CODEX_HOME = codexHome;
-    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-      tokens: { access_token: 'protected-access-token', refresh_token: 'protected-refresh-token' },
-    }), { mode: 0o600 });
-    (pty.spawn as jest.Mock).mockClear();
-
-    try {
-      await expect(startNativeCliFlow('codex', {
-        ownerId: 'user:codex-protected',
-        codexLoginStatusProbe: () => 'signed_out',
-      })).rejects.toMatchObject({
-        code: 'CODEX_REAUTHENTICATION_REQUIRED',
-        statusCode: 409,
-        message: expect.stringMatching(/stopped before it could delete/i),
-      });
-      expect(pty.spawn).not.toHaveBeenCalled();
-    } finally {
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  test('requires explicit replacement when Codex login status is indeterminate', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-indeterminate-'));
-    process.env.CODEX_HOME = codexHome;
-    (pty.spawn as jest.Mock).mockClear();
-
-    try {
-      await expect(startNativeCliFlow('codex', {
-        ownerId: 'user:codex-indeterminate',
-        codexLoginStatusProbe: () => 'indeterminate',
-      })).rejects.toMatchObject({
-        code: 'CODEX_REAUTHENTICATION_REQUIRED',
-        statusCode: 409,
-        message: expect.stringMatching(/could not verify whether Codex is already signed in/i),
-      });
-      expect(pty.spawn).not.toHaveBeenCalled();
-    } finally {
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  test('blocks ordinary Codex setup when auth.json changes during the status probe', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-probe-race-'));
-    const authPath = path.join(codexHome, 'auth.json');
-    process.env.CODEX_HOME = codexHome;
-    fs.writeFileSync(authPath, JSON.stringify({
-      tokens: { access_token: 'before-probe-token' },
-    }), { mode: 0o600 });
-    (pty.spawn as jest.Mock).mockClear();
-
-    try {
-      await expect(startNativeCliFlow('codex', {
-        ownerId: 'user:codex-probe-race',
-        codexLoginStatusProbe: () => {
-          fs.writeFileSync(authPath, JSON.stringify({
-            tokens: { access_token: 'after-probe-token' },
-          }), { mode: 0o600 });
-          return 'authenticated';
-        },
-      })).rejects.toMatchObject({
-        code: 'CODEX_REAUTHENTICATION_REQUIRED',
-        statusCode: 409,
-      });
-      expect(pty.spawn).not.toHaveBeenCalled();
-    } finally {
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  test('keeps native Codex non-terminal until CODEX_HOME credential proof succeeds', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const previousApiKey = process.env.OPENAI_API_KEY;
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-home-'));
-    const ptyControl = controllablePty();
-    process.env.CODEX_HOME = codexHome;
-    process.env.OPENAI_API_KEY = 'must-not-cross-the-device-login';
-    (pty.spawn as jest.Mock).mockReturnValueOnce(ptyControl.process);
-    let sessionId: string | null = null;
-
-    try {
-      const pending = startNativeCliFlow('codex', {
-        ownerId: 'user:codex-home',
-        codexLoginStatusProbe: () => 'signed_out',
-      });
-      await waitForPtyListener(ptyControl.process.onData);
-      const [, args, spawnOptions] = (pty.spawn as jest.Mock).mock.calls.at(-1);
-      expect(args.slice(-4)).toEqual(['login', '-c', 'cli_auth_credentials_store="file"', '--device-auth']);
-      expect(spawnOptions.env.CODEX_HOME).toBe(codexHome);
-      expect(spawnOptions.env.OPENAI_API_KEY).toBeUndefined();
-      ptyControl.emitData('Open https://auth.openai.com/codex/device to continue.');
-      const started = await pending;
-      sessionId = started.sessionId;
-
-      ptyControl.emitData('Successfully logged in');
-      expect(getOAuthFlowStatus(sessionId, 'user:codex-home')).toMatchObject({
-        status: 'processing',
-        credentialState: null,
-        createdProfileId: null,
-      });
-
-      fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-        tokens: { access_token: 'test-access-token', refresh_token: 'test-refresh-token' },
-      }), { mode: 0o600 });
-      ptyControl.emitExit(0);
-
-      expect(getOAuthFlowStatus(sessionId, 'user:codex-home')).toMatchObject({
-        status: 'complete',
-        credentialState: 'committed',
-        cleanupPending: false,
-        createdProfileId: null,
-      });
-    } finally {
-      if (sessionId) __deleteOAuthSessionForTests(sessionId);
-      (pty.spawn as jest.Mock).mockReset();
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = previousApiKey;
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  test('overrides premature Codex success text when no usable file credential exists', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-empty-'));
-    const ptyControl = controllablePty();
-    process.env.CODEX_HOME = codexHome;
-    (pty.spawn as jest.Mock).mockReturnValueOnce(ptyControl.process);
-    let sessionId: string | null = null;
-
-    try {
-      const pending = startNativeCliFlow('codex', {
-        ownerId: 'user:codex-empty',
-        codexLoginStatusProbe: () => 'signed_out',
-      });
-      await waitForPtyListener(ptyControl.process.onData);
-      ptyControl.emitData('Open https://auth.openai.com/codex/device to continue.');
-      const started = await pending;
-      sessionId = started.sessionId;
-      ptyControl.emitData('Successfully logged in');
-      ptyControl.emitExit(0);
-
-      expect(getOAuthFlowStatus(sessionId, 'user:codex-empty')).toMatchObject({
-        status: 'error',
-        credentialState: 'absent',
-        cleanupPending: false,
-        createdProfileId: null,
-        error: expect.stringMatching(/file-backed credential/i),
-      });
-    } finally {
-      if (sessionId) __deleteOAuthSessionForTests(sessionId);
-      (pty.spawn as jest.Mock).mockReset();
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  test('does not mistake an unchanged preexisting Codex credential for a successful reauthentication', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-existing-'));
-    const ptyControl = controllablePty();
-    process.env.CODEX_HOME = codexHome;
-    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-      tokens: { access_token: 'existing-access-token', refresh_token: 'existing-refresh-token' },
-    }), { mode: 0o600 });
-    (pty.spawn as jest.Mock).mockReturnValueOnce(ptyControl.process);
-    let sessionId: string | null = null;
-
-    try {
-      const pending = startNativeCliFlow('codex', {
-        ownerId: 'user:codex-existing',
-        forceReauth: true,
-        codexLoginStatusProbe: () => 'signed_out',
-      });
-      await waitForPtyListener(ptyControl.process.onData);
-      ptyControl.emitData('Open https://auth.openai.com/codex/device to continue.');
-      const started = await pending;
-      sessionId = started.sessionId;
-      ptyControl.emitData('Successfully logged in');
-      ptyControl.emitExit(1);
-
-      expect(getOAuthFlowStatus(sessionId, 'user:codex-existing')).toMatchObject({
-        status: 'error',
-        credentialState: 'absent',
-        cleanupPending: false,
-        createdProfileId: null,
-        error: expect.stringMatching(/without committing a new usable file-backed credential/i),
-      });
-    } finally {
-      if (sessionId) __deleteOAuthSessionForTests(sessionId);
-      (pty.spawn as jest.Mock).mockReset();
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  test('records an unclean changed Codex credential for review without stranding the lifecycle lease', async () => {
-    const previousCodexHome = process.env.CODEX_HOME;
-    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-codex-oauth-unclean-'));
-    const firstPty = controllablePty();
-    const retryPty = controllablePty();
-    process.env.CODEX_HOME = codexHome;
-    (pty.spawn as jest.Mock)
-      .mockReturnValueOnce(firstPty.process)
-      .mockReturnValueOnce(retryPty.process);
-    let firstSessionId: string | null = null;
-    let retrySessionId: string | null = null;
-
-    try {
-      const firstPending = startNativeCliFlow('codex', {
-        ownerId: 'user:codex-unclean',
-        codexLoginStatusProbe: () => 'signed_out',
-      });
-      await waitForPtyListener(firstPty.process.onData);
-      firstPty.emitData('Open https://auth.openai.com/codex/device to continue.');
-      const first = await firstPending;
-      firstSessionId = first.sessionId;
-      fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-        tokens: { access_token: 'changed-access-token', refresh_token: 'changed-refresh-token' },
-      }), { mode: 0o600 });
-      firstPty.emitData('Successfully logged in');
-      firstPty.emitExit(1);
-
-      expect(getOAuthFlowStatus(firstSessionId, 'user:codex-unclean')).toMatchObject({
-        status: 'error',
-        credentialState: 'committed',
-        cleanupPending: false,
-        createdProfileId: null,
-        error: expect.stringMatching(/wrote a usable credential.*exited with code 1/i),
-      });
-
-      const retryPending = startNativeCliFlow('codex', {
-        ownerId: 'user:codex-unclean',
-        forceReauth: true,
-        codexLoginStatusProbe: () => 'signed_out',
-      });
-      await waitForPtyListener(retryPty.process.onData);
-      retryPty.emitData('Open https://auth.openai.com/codex/device to continue.');
-      const retry = await retryPending;
-      retrySessionId = retry.sessionId;
-      expect(retrySessionId).not.toBe(firstSessionId);
-    } finally {
-      if (firstSessionId) __deleteOAuthSessionForTests(firstSessionId);
-      if (retrySessionId) __deleteOAuthSessionForTests(retrySessionId);
-      (pty.spawn as jest.Mock).mockReset();
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
+    expect(pty.spawn).not.toHaveBeenCalled();
   });
 
   test('uses the exact audited xAI OAuth argv without changing the default model', () => {
@@ -1258,6 +910,8 @@ describe('oauthFlowManager terminal parsing', () => {
       scope: 'user:inference',
     }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
     const persistClaudeCredentials = jest.fn();
+    const authInvalidation = jest.spyOn(nativeCliAuth, 'invalidateNativeCliAuthStatus');
+    const readinessInvalidation = jest.spyOn(nativeProviderReadiness, 'invalidateNativeProviderReadiness');
     const session = {
       id: sessionId,
       provider: 'claude-code',
@@ -1292,6 +946,8 @@ describe('oauthFlowManager terminal parsing', () => {
       await jest.advanceTimersByTimeAsync(0);
       expect(fetchImpl).toHaveBeenCalledTimes(1);
       expect(persistClaudeCredentials).toHaveBeenCalledTimes(1);
+      expect(authInvalidation).toHaveBeenCalledWith('CLAUDE_CODE');
+      expect(readinessInvalidation).toHaveBeenCalledWith('CLAUDE_CODE');
 
       session.status = 'complete';
       await jest.advanceTimersByTimeAsync(250);
@@ -1302,6 +958,8 @@ describe('oauthFlowManager terminal parsing', () => {
       expect(fetchImpl).toHaveBeenCalledTimes(1);
       expect(persistClaudeCredentials).toHaveBeenCalledTimes(1);
     } finally {
+      authInvalidation.mockRestore();
+      readinessInvalidation.mockRestore();
       __deleteOAuthSessionForTests(sessionId);
       jest.useRealTimers();
     }
@@ -1769,170 +1427,18 @@ describe('oauthFlowManager terminal parsing', () => {
     }
   });
 
-  test.each([
-    ['OpenClaw OAuth', 'credential-domain:openai', () => startOAuthFlow('openai-codex', { ownerId: 'user:owner' }), 20_200],
-    ['device-code OAuth', 'credential-domain:openclaw:github-copilot', () => startDeviceCodeFlow('github-copilot', 'user:owner'), 20_200],
-    ['Claude setup-token', 'credential-domain:anthropic', () => startClaudeSetupTokenFlow('user:owner'), 30_200],
-    ['native Codex', 'credential-domain:openai', () => startNativeCliFlow('codex', {
-      ownerId: 'user:owner',
-      forceReauth: true,
-      codexLoginStatusProbe: () => 'signed_out',
-    }), 20_200],
-  ])('binds %s PTYs before the first await, then safely handles startup timeout', async (
-    _label,
-    namespace,
-    start,
-    timeoutMs,
-  ) => {
-    jest.useFakeTimers();
-    const originalHome = process.env.HOME;
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-oauth-start-'));
-    process.env.HOME = tempHome;
-    const processMock = silentPty();
-    processMock.pid = process.pid;
-    (pty.spawn as jest.Mock).mockReturnValueOnce(processMock);
+  test('rejects GitHub device-code start before lifecycle admission or PTY spawn', async () => {
+    const namespace = 'credential-domain:openclaw:github-copilot';
+    (pty.spawn as jest.Mock).mockClear();
 
-    try {
-      const settled = start().then(
-        () => ({ error: null as any }),
-        (error) => ({ error }),
-      );
-      await jest.advanceTimersByTimeAsync(0);
-      expect(__readProviderCredentialLifecycleLedgerForTests().records[namespace]).toMatchObject({
-        processPid: process.pid,
-        processStartTicks: expect.stringMatching(/^\d+$/),
-        state: 'active',
-      });
-      expect(processMock.write).toHaveBeenCalledWith('\n');
-      // Simulate backend memory loss while the PTY is still awaiting its first
-      // prompt. The durable PID/start-time proof must remain authoritative.
-      __resetCredentialLifecycleMemoryForTests();
-      await jest.advanceTimersByTimeAsync(timeoutMs);
-      // OpenClaw-backed flows perform a separate bounded, strict post-exit
-      // credential-store convergence window before classifying the timeout.
-      await jest.advanceTimersByTimeAsync(3_500);
-      const { error } = await settled;
+    await expect(startDeviceCodeFlow('github-copilot', 'user:owner')).rejects.toMatchObject({
+      statusCode: 503,
+      code: 'OPENCLAW_HOST_MUTATION_UNAVAILABLE',
+      retryable: false,
+    });
 
-      expect(error).toBeInstanceOf(Error);
-      expect(error.sessionId).toEqual(expect.stringMatching(/^oauth_/));
-      expect(error.oauthSessionId).toBe(error.sessionId);
-      expect(['absent', 'indeterminate']).toContain(error.credentialState);
-      expect(Boolean(error.cleanupPending)).toBe(error.credentialState === 'indeterminate');
-      expect(processMock.kill).toHaveBeenCalledTimes(1);
-      expect(getOAuthFlowStatus(error.sessionId, 'user:owner')).toMatchObject({
-        id: error.sessionId,
-        status: 'error',
-        cleanupPending: error.credentialState === 'indeterminate',
-        credentialState: error.credentialState,
-      });
-      expect(__readProviderCredentialLifecycleLedgerForTests().records[namespace]).toMatchObject({
-        processPid: process.pid,
-        processStartTicks: expect.stringMatching(/^\d+$/),
-      });
-      __deleteOAuthSessionForTests(error.sessionId);
-    } finally {
-      (pty.spawn as jest.Mock).mockReset();
-      process.env.HOME = originalHome;
-      fs.rmSync(tempHome, { recursive: true, force: true });
-      jest.useRealTimers();
-    }
-  });
-
-  test.each([
-    ['OpenClaw OAuth', () => startOAuthFlow('openai-codex', { ownerId: 'user:bind-failure' })],
-    ['native Codex', () => startNativeCliFlow('codex', {
-      ownerId: 'user:bind-failure',
-      forceReauth: true,
-      codexLoginStatusProbe: () => 'signed_out',
-    })],
-    ['Claude setup-token', () => startClaudeSetupTokenFlow('user:bind-failure')],
-  ])('stops and attests a newly spawned %s PTY when durable PID binding fails', async (_label, start) => {
-    const originalHome = process.env.HOME;
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-oauth-bind-failure-'));
-    process.env.HOME = tempHome;
-    const processMock = silentPty();
-    processMock.pid = process.pid;
-    (pty.spawn as jest.Mock).mockReturnValueOnce(processMock);
-    const bindFailure = jest.spyOn(providerLifecycleLedger, 'bindProviderCredentialLifecycle')
-      .mockImplementationOnce(() => { throw new Error('injected ledger bind/fsync failure'); });
-
-    try {
-      await expect(start()).rejects.toMatchObject({
-        sessionId: expect.stringMatching(/^oauth_/),
-        credentialState: expect.stringMatching(/^(absent|indeterminate|committed)$/),
-      });
-      expect(processMock.kill).toHaveBeenCalledTimes(1);
-      expect(processMock.write).not.toHaveBeenCalled();
-      for (const record of Object.values(__readProviderCredentialLifecycleLedgerForTests().records)) {
-        expect(record.state).not.toBe('active');
-      }
-    } finally {
-      bindFailure.mockRestore();
-      (pty.spawn as jest.Mock).mockReset();
-      process.env.HOME = originalHome;
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
-  });
-
-  test('joins an exact device-code start and rejects conflicting credential ownership before spawning', async () => {
-    let dataHandler: ((chunk: string) => void) | undefined;
-    const processMock = {
-      onData: jest.fn((handler) => { dataHandler = handler; }),
-      onExit: jest.fn(),
-      write: jest.fn(),
-      kill: jest.fn(),
-    } as any;
-    (pty.spawn as jest.Mock).mockReturnValueOnce(processMock);
-
-    try {
-      const first = startDeviceCodeFlow('github-copilot', 'user:start-owner');
-      const second = startDeviceCodeFlow('github-copilot', 'user:start-owner');
-      await expect(startDeviceCodeFlow('github-copilot', 'user:other-owner'))
-        .rejects.toMatchObject({ statusCode: 409 });
-
-      await new Promise((resolve) => setImmediate(resolve));
-      expect(pty.spawn).toHaveBeenCalledTimes(1);
-      dataHandler?.('Visit https://github.com/login/device and enter code ABCD-EFGH');
-      const [firstResult, secondResult] = await Promise.all([first, second]);
-      expect(firstResult.sessionId).toBe(secondResult.sessionId);
-      await expect(startDeviceCodeFlow('github-copilot', 'user:start-owner'))
-        .resolves.toMatchObject({ sessionId: firstResult.sessionId });
-      expect(pty.spawn).toHaveBeenCalledTimes(1);
-      __deleteOAuthSessionForTests(firstResult.sessionId);
-    } finally {
-      (pty.spawn as jest.Mock).mockReset();
-    }
-  });
-
-  test('restart-memory loss retains device admission and never spawns a duplicate upstream flow', async () => {
-    let dataHandler: ((chunk: string) => void) | undefined;
-    const processMock = {
-      onData: jest.fn((handler) => { dataHandler = handler; }),
-      onExit: jest.fn(),
-      write: jest.fn(),
-      kill: jest.fn(),
-    } as any;
-    (pty.spawn as jest.Mock).mockReturnValueOnce(processMock);
-
-    try {
-      const first = startDeviceCodeFlow('github-copilot', 'user:restart-owner');
-      await new Promise((resolve) => setImmediate(resolve));
-      dataHandler?.('Visit https://github.com/login/device and enter code ABCD-EFGH');
-      const firstResult = await first;
-      expect(__readProviderCredentialLifecycleLedgerForTests().records['credential-domain:openclaw:github-copilot'])
-        .toMatchObject({ state: 'active' });
-
-      __resetCredentialLifecycleMemoryForTests();
-      await expect(startDeviceCodeFlow('github-copilot', 'user:restart-owner'))
-        .rejects.toMatchObject({
-          statusCode: 409,
-          code: 'PROVIDER_CREDENTIAL_LIFECYCLE_RECOVERY_REQUIRED',
-        });
-      expect(pty.spawn).toHaveBeenCalledTimes(1);
-      __deleteOAuthSessionForTests(firstResult.sessionId);
-    } finally {
-      (pty.spawn as jest.Mock).mockReset();
-    }
+    expect(pty.spawn).not.toHaveBeenCalled();
+    expect(__readProviderCredentialLifecycleLedgerForTests().records[namespace]).toBeUndefined();
   });
 
   test('never saves a Claude setup token flushed after cancellation kills the PTY', () => {
@@ -2524,5 +2030,125 @@ describe('oauthFlowManager terminal parsing', () => {
     ].join('\n');
 
     expect(outputLooksLikeClaudeCliAuthImportSuccess(raw)).toBe(true);
+  });
+
+  test.each([
+    {
+      provider: 'hermes' as const,
+      providerName: 'HERMES' as const,
+      executable: 'hermes',
+      commandArgs: ['model'],
+      rootEnvironmentKey: 'PORTAL_HERMES_HOME' as const,
+      writeCredential(root: string) {
+        fs.writeFileSync(path.join(root, '.env'), 'TEST_PROVIDER_API_KEY=test-credential\n', { mode: 0o600 });
+      },
+    },
+    {
+      provider: 'opencode' as const,
+      providerName: 'OPENCODE' as const,
+      executable: 'opencode',
+      commandArgs: ['auth', 'login'],
+      rootEnvironmentKey: 'PORTAL_OPENCODE_HOME' as const,
+      writeCredential(root: string) {
+        const credentialDir = path.join(root, 'data', 'opencode');
+        fs.mkdirSync(credentialDir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(credentialDir, 'auth.json'), JSON.stringify({
+          testProvider: { accessToken: 'test-credential' },
+        }), { mode: 0o600 });
+      },
+    },
+  ])('starts only the fixed $provider Portal-profile wizard and binds its terminal to the exact owner', async ({
+    provider,
+    providerName,
+    executable,
+    commandArgs,
+    rootEnvironmentKey,
+    writeCredential,
+  }) => {
+    const previousRoot = process.env[rootEnvironmentKey];
+    const previousDatabaseUrl = process.env.DATABASE_URL;
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `portal-${provider}-setup-`));
+    const controlled = controllablePty();
+    process.env[rootEnvironmentKey] = root;
+    process.env.DATABASE_URL = 'postgresql://must-not-cross-the-harness-boundary';
+    process.env.OPENAI_API_KEY = 'must-not-cross-the-harness-boundary';
+    (pty.spawn as jest.Mock).mockReturnValue(controlled.process);
+    let sessionId: string | null = null;
+
+    try {
+      const started = await startNativeCliFlow(provider, { ownerId: 'user:portal-owner' });
+      sessionId = started.sessionId;
+      expect(started.status).toBe('starting');
+
+      const [spawnFile, spawnArgs, spawnOptions] = (pty.spawn as jest.Mock).mock.calls.at(-1)!;
+      expect(spawnFile).toBe('/bin/sh');
+      expect(spawnArgs.slice(0, 3)).toEqual([
+        '-c',
+        'IFS= read -r _portal_credential_gate || exit 125; exec "$@"',
+        'portal-credential-gate',
+      ]);
+      expect(path.basename(spawnArgs[3])).toBe(executable);
+      expect(spawnArgs.slice(4)).toEqual(commandArgs);
+      expect(spawnOptions.cwd).toBe(path.join(root, 'home'));
+      expect(spawnOptions.env).toMatchObject({
+        HOME: path.join(root, 'home'),
+        XDG_CONFIG_HOME: path.join(root, 'config'),
+        XDG_CACHE_HOME: path.join(root, 'cache'),
+        XDG_DATA_HOME: path.join(root, 'data'),
+        TERM: 'xterm-256color',
+        BROWSER: '/bin/false',
+        NO_BROWSER: 'true',
+      });
+      expect(spawnOptions.env.DATABASE_URL).toBeUndefined();
+      expect(spawnOptions.env.OPENAI_API_KEY).toBeUndefined();
+      expect(spawnOptions.env.PORTAL_CREDENTIAL_LIFECYCLE_MARKER).toMatch(/^[0-9a-f]{8}[0-9a-f-]{28}$/u);
+      if (providerName === 'HERMES') {
+        expect(spawnOptions.env.HERMES_HOME).toBe(root);
+      }
+
+      expect(attachNativeCliInteractiveTerminal(sessionId, 'user:different-owner')).toBeNull();
+      const terminal = attachNativeCliInteractiveTerminal(sessionId, 'user:portal-owner');
+      expect(terminal).not.toBeNull();
+      expect(terminal?.provider).toBe(provider);
+
+      const liveOutput = jest.fn();
+      const processExit = jest.fn();
+      const detachOutput = terminal!.onData(liveOutput);
+      const detachExit = terminal!.onExit(processExit);
+      terminal!.write('menu-choice\r');
+      terminal!.resize(132, 44);
+      expect(controlled.process.write).toHaveBeenLastCalledWith('menu-choice\r');
+      expect(controlled.process.resize).toHaveBeenCalledWith(132, 44);
+
+      controlled.emitData('provider prompt\r\n');
+      controlled.emitData('x'.repeat(600 * 1024));
+      expect(liveOutput).toHaveBeenCalledWith('provider prompt\r\n');
+      const reattached = attachNativeCliInteractiveTerminal(sessionId, 'user:portal-owner');
+      expect(Buffer.byteLength(reattached?.output || '', 'utf8')).toBeLessThanOrEqual(512 * 1024);
+
+      writeCredential(root);
+      controlled.emitExit(0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(processExit).toHaveBeenCalledWith({ exitCode: 0 });
+      expect(getOAuthFlowStatus(sessionId, 'user:portal-owner')).toMatchObject({
+        provider,
+        status: 'complete',
+        credentialState: 'committed',
+      });
+      expect(markOAuthFlowFinalized(sessionId, 'user:portal-owner')).toBe(true);
+      detachOutput();
+      detachExit();
+    } finally {
+      if (sessionId) __deleteOAuthSessionForTests(sessionId);
+      (pty.spawn as jest.Mock).mockReset();
+      if (previousRoot === undefined) delete process.env[rootEnvironmentKey];
+      else process.env[rootEnvironmentKey] = previousRoot;
+      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previousDatabaseUrl;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

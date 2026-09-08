@@ -44,6 +44,61 @@ const PROJECT_ID = 'immutable-project-uuid';
 const PROJECT_ROOT = '/srv/projects/demo';
 const CONTAINER_ID = 'a'.repeat(64);
 
+function persistedAgentEntries(agents: Record<string, any>[]) {
+  return Object.fromEntries(agents.map((agent) => {
+    const { id, ...entry } = agent;
+    return [id, entry];
+  }));
+}
+
+function oversizedOpenClawProjectAgent(agentId: string): Record<string, any> {
+  return {
+    id: agentId,
+    workspace: '/root/.openclaw/project-agents/test',
+    model: { fallbacks: [] },
+    models: Object.fromEntries(Array.from({ length: 12 }, (_, index) => [
+      `provider-${index}/*`,
+      { agentRuntime: { id: 'openclaw' } },
+    ])),
+    tools: {
+      allow: Array.from({ length: 20 }, (_, index) => `allowed-tool-${index}`),
+      deny: Array.from({ length: 35 }, (_, index) => `denied-tool-${index}`),
+    },
+    sandbox: {
+      mode: 'all',
+      browser: { enabled: false, allowHostControl: false, autoStart: false, binds: [] },
+      docker: {
+        image: `sha256:${'a'.repeat(64)}`,
+        containerPrefix: 'p4oc-test-',
+        workdir: '/workspace/project',
+        readOnlyRoot: true,
+        tmpfs: Array.from({ length: 12 }, (_, index) => `/tmp-${index}:rw,noexec,size=1048576`),
+        env: Object.fromEntries(Array.from({ length: 18 }, (_, index) => [
+          `SAFE_ENV_${index}`,
+          `value-${index}-${'x'.repeat(18)}`,
+        ])),
+        ulimits: { nofile: { soft: 1024, hard: 1024 }, nproc: { soft: 256, hard: 256 } },
+        binds: Array.from({ length: 8 }, (_, index) => `/safe/source-${index}:/safe/target-${index}:ro`),
+        network: 'project-internal',
+        user: '1000:1000',
+        capDrop: ['ALL'],
+      },
+    },
+  };
+}
+
+function applyMergePatch(base: unknown, patch: unknown): any {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return structuredClone(patch);
+  const result: Record<string, any> = base && typeof base === 'object' && !Array.isArray(base)
+    ? { ...(base as Record<string, any>) }
+    : {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete result[key];
+    else result[key] = applyMergePatch(result[key], value);
+  }
+  return result;
+}
+
 function scope(overrides: Partial<ProjectRuntimeCleanupScope> = {}): ProjectRuntimeCleanupScope {
   return {
     authenticatedActorId: ACTOR,
@@ -110,7 +165,7 @@ function container(labels: Record<string, string>): Record<string, any> {
   };
 }
 
-function nativeProjectSession(provider: 'CLAUDE_CODE' | 'GEMINI'): NativeSessionData {
+function nativeProjectSession(provider: 'CLAUDE_CODE' | 'CODEX' | 'GEMINI'): NativeSessionData {
   return {
     sessionId: `${provider.toLowerCase()}-session-1`,
     provider,
@@ -185,7 +240,10 @@ describe('concrete Project runtime cleanup adapters', () => {
     let sessionPresent = true;
     const rpc = jest.fn(async (method: string) => {
       if (method === 'config.get') {
-        return { ok: true, data: { config: { agents: { list: agentPresent ? [{ id: agentId }] : [] } } } };
+        return {
+          ok: true,
+          data: { config: { agents: { entries: agentPresent ? { [agentId]: {} } : {} } } },
+        };
       }
       if (method === 'sessions.list') {
         return { ok: true, data: { sessions: sessionPresent ? [{ key: sessionKey }] : [] } };
@@ -224,7 +282,10 @@ describe('concrete Project runtime cleanup adapters', () => {
     const sessionKey = deriveOpenClawProjectSessionKey({ userId: ownerId, projectId: PROJECT_ID });
     const rpc = jest.fn(async (method: string) => {
       if (method === 'config.get') {
-        return { ok: true, data: { config: { agents: { list: [{ id: agentId }] } } } };
+        return {
+          ok: true,
+          data: { config: { agents: { entries: { [agentId]: {} } } } },
+        };
       }
       if (method === 'sessions.list') {
         return { ok: true, data: { sessions: [{ key: sessionKey }] } };
@@ -258,43 +319,11 @@ describe('concrete Project runtime cleanup adapters', () => {
 
   test('OpenClaw safely stages deletion when a sandboxed Project agent owns most of the config file', async () => {
     const agentId = deriveOpenClawProjectAgentId({ userId: ACTOR, projectId: PROJECT_ID });
-    const projectAgent = {
-      id: agentId,
-      workspace: '/root/.openclaw/project-agents/test',
-      model: { fallbacks: [] },
-      models: Object.fromEntries(Array.from({ length: 12 }, (_, index) => [
-        `provider-${index}/*`,
-        { agentRuntime: { id: 'openclaw' } },
-      ])),
-      tools: {
-        allow: Array.from({ length: 20 }, (_, index) => `allowed-tool-${index}`),
-        deny: Array.from({ length: 35 }, (_, index) => `denied-tool-${index}`),
-      },
-      sandbox: {
-        mode: 'all',
-        browser: { enabled: false, allowHostControl: false, autoStart: false, binds: [] },
-        docker: {
-          image: `sha256:${'a'.repeat(64)}`,
-          containerPrefix: 'p4oc-test-',
-          workdir: '/workspace/project',
-          readOnlyRoot: true,
-          tmpfs: Array.from({ length: 12 }, (_, index) => `/tmp-${index}:rw,noexec,size=1048576`),
-          env: Object.fromEntries(Array.from({ length: 18 }, (_, index) => [
-            `SAFE_ENV_${index}`,
-            `value-${index}-${'x'.repeat(18)}`,
-          ])),
-          ulimits: { nofile: { soft: 1024, hard: 1024 }, nproc: { soft: 256, hard: 256 } },
-          binds: Array.from({ length: 8 }, (_, index) => `/safe/source-${index}:/safe/target-${index}:ro`),
-          network: 'project-internal',
-          user: '1000:1000',
-          capDrop: ['ALL'],
-        },
-      },
-    };
+    const projectAgent = oversizedOpenClawProjectAgent(agentId);
     let config: Record<string, any> = {
       meta: { lastTouchedVersion: '2026.7.1-2' },
       gateway: { mode: 'local' },
-      agents: { list: [projectAgent] },
+      agents: { entries: persistedAgentEntries([projectAgent]) },
     };
     let hashSequence = 1;
     const rpc = jest.fn(async (method: string, params: Record<string, any> = {}) => {
@@ -302,17 +331,82 @@ describe('concrete Project runtime cleanup adapters', () => {
         return { ok: true, data: { config: structuredClone(config), hash: `hash-${hashSequence}` } };
       }
       if (method === 'config.patch') {
-        config = {
-          ...config,
-          agents: { ...config.agents, list: JSON.parse(params.raw).agents.list },
-        };
+        config = applyMergePatch(config, JSON.parse(params.raw));
+        hashSequence += 1;
+        return { ok: true, data: { hash: `hash-${hashSequence}` } };
+      }
+      if (method === 'agents.delete') {
+        const entries = { ...config.agents.entries };
+        delete entries[params.agentId];
+        config = { ...config, agents: { ...config.agents, entries } };
+        return { ok: true, data: { deleted: true } };
+      }
+      throw new Error(`Unexpected RPC ${method}`);
+    });
+    const adapter = createOpenClawProjectRuntimeCleanupAdapter({
+      executor: new FakeDocker(null),
+      rpc,
+    });
+
+    await adapter.cleanup(scope(), [{
+      id: `openclaw-agent:${agentId}`,
+      kind: 'OPENCLAW_AGENT',
+      projectIdentityId: PROJECT_ID,
+      actorUserId: ACTOR,
+      provider: 'OPENCLAW',
+    }]);
+
+    expect(config.agents.entries).not.toHaveProperty(agentId);
+    expect(rpc.mock.calls.filter(([method]) => method === 'config.patch').length).toBeGreaterThan(1);
+    const patchCalls = rpc.mock.calls.filter(([method]) => method === 'config.patch') as Array<[
+      string,
+      Record<string, any>,
+    ]>;
+    const authorizedArrayPaths = new Set<string>();
+    for (const [, patchParams] of patchCalls) {
+      const raw = JSON.parse(patchParams.raw);
+      expect(raw.agents).not.toHaveProperty('list');
+      expect(raw.agents.entries[agentId]).not.toHaveProperty('id');
+      for (const path of patchParams.replacePaths) authorizedArrayPaths.add(path);
+    }
+    expect([...authorizedArrayPaths]).toEqual(expect.arrayContaining([
+      `agents.entries.${agentId}.tools.allow`,
+      `agents.entries.${agentId}.tools.deny`,
+    ]));
+    expect(rpc).toHaveBeenCalledWith('agents.delete', { agentId, deleteFiles: true }, 20_000);
+  });
+
+  test('OpenClaw 2026.7.1 stages an oversized list roster through whole-array replacement', async () => {
+    const agentId = deriveOpenClawProjectAgentId({ userId: ACTOR, projectId: PROJECT_ID });
+    const main = { id: 'main', default: true };
+    let config: Record<string, any> = {
+      meta: { lastTouchedVersion: '2026.7.1-2' },
+      gateway: { mode: 'local' },
+      agents: { list: [main, oversizedOpenClawProjectAgent(agentId)] },
+    };
+    let hashSequence = 1;
+    const rpc = jest.fn(async (method: string, params: Record<string, any> = {}) => {
+      if (method === 'config.get') {
+        return { ok: true, data: { config: structuredClone(config), hash: `hash-${hashSequence}` } };
+      }
+      if (method === 'config.patch') {
+        expect(params.replacePaths).toEqual(['agents.list']);
+        const raw = JSON.parse(params.raw);
+        expect(raw.agents).not.toHaveProperty('entries');
+        expect(Array.isArray(raw.agents.list)).toBe(true);
+        config = applyMergePatch(config, raw);
         hashSequence += 1;
         return { ok: true, data: { hash: `hash-${hashSequence}` } };
       }
       if (method === 'agents.delete') {
         config = {
           ...config,
-          agents: { ...config.agents, list: config.agents.list.filter((entry: any) => entry.id !== params.agentId) },
+          agents: {
+            ...config.agents,
+            list: config.agents.list.filter((entry: Record<string, any>) => (
+              entry.id !== params.agentId
+            )),
+          },
         };
         return { ok: true, data: { deleted: true } };
       }
@@ -331,7 +425,7 @@ describe('concrete Project runtime cleanup adapters', () => {
       provider: 'OPENCLAW',
     }]);
 
-    expect(config.agents.list).toEqual([]);
+    expect(config.agents.list).toEqual([main]);
     expect(rpc.mock.calls.filter(([method]) => method === 'config.patch').length).toBeGreaterThan(1);
     expect(rpc).toHaveBeenCalledWith('agents.delete', { agentId, deleteFiles: true }, 20_000);
   });
@@ -342,7 +436,7 @@ describe('concrete Project runtime cleanup adapters', () => {
     const deleteOpenClawSession = jest.fn();
     const rpc = jest.fn(async (method: string) => {
       if (method === 'config.get') {
-        return { ok: true, data: { config: { agents: { list: [] } } } };
+        return { ok: true, data: { config: { agents: { entries: {} } } } };
       }
       if (method === 'sessions.list') {
         return { ok: true, data: { sessions: sessionPresent ? [{ key: sessionKey }] : [] } };
@@ -379,7 +473,7 @@ describe('concrete Project runtime cleanup adapters', () => {
     }));
     const rpc = jest.fn(async (method: string) => {
       if (method === 'config.get') {
-        return { ok: true, data: { config: { agents: { list: [] } } } };
+        return { ok: true, data: { config: { agents: { entries: {} } } } };
       }
       if (method === 'sessions.list') {
         return { ok: true, data: { sessions: [{ key: sessionKey }] } };
@@ -405,15 +499,36 @@ describe('concrete Project runtime cleanup adapters', () => {
       [CODEX_PROJECT_RUNTIME_IDENTITY_LABEL]: hashCodexProjectRuntimeLabelIdentity(PROJECT_ID),
       [CODEX_PROJECT_RUNTIME_ACTOR_LABEL]: hashCodexProjectRuntimeLabelIdentity(ACTOR),
     }));
-    const adapter = createCodexProjectRuntimeCleanupAdapter({ executor: docker });
+    const session = nativeProjectSession('CODEX');
+    let sessionPresent = true;
+    const abortSession = jest.fn(async () => true);
+    const terminateSession = jest.fn(async () => { sessionPresent = false; });
+    const deleteSession = jest.fn(() => { sessionPresent = false; });
+    const adapter = createCodexProjectRuntimeCleanupAdapter({
+      executor: docker,
+      listSessions: () => (sessionPresent ? [session] : []),
+      abortSession,
+      terminateSession,
+      deleteSession,
+    });
     const resources = await adapter.enumerate(scope());
-    expect(resources).toEqual([expect.objectContaining({
-      kind: 'NATIVE_RUNTIME_CONTAINER',
-      actorUserId: ACTOR,
-      projectIdentityId: PROJECT_ID,
-    })]);
+    expect(resources).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'NATIVE_SESSION',
+        actorUserId: ACTOR,
+        projectIdentityId: PROJECT_ID,
+      }),
+      expect.objectContaining({
+        kind: 'NATIVE_RUNTIME_CONTAINER',
+        actorUserId: ACTOR,
+        projectIdentityId: PROJECT_ID,
+      }),
+    ]));
     await adapter.cleanup(scope(), resources);
     await expect(adapter.verifyClean(scope())).resolves.toEqual([]);
+    expect(abortSession).toHaveBeenCalledWith(session.sessionId);
+    expect(terminateSession).toHaveBeenCalledWith(session.sessionId);
+    expect(deleteSession).toHaveBeenCalledWith(session.sessionId);
   });
 
   test.each(['CLAUDE_CODE', 'GEMINI'] as const)(

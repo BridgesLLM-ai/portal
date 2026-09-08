@@ -184,7 +184,6 @@ describe('transient Portal update-validation server', () => {
       startAudioProxy: jest.fn(),
       attachPortalWebSocket: jest.fn(),
       attachAgentBrowserWebSocket: jest.fn(),
-      reconcilePortalManagedSkill: jest.fn(),
       reconcilePortalVisibleBrowserDefaults: jest.fn(),
       reconcileRemoteDesktopLauncherAssets: jest.fn(),
       provisionAgentZeroDesktopLauncherSecret: jest.fn(),
@@ -232,16 +231,20 @@ describe('transient Portal update-validation server', () => {
       '../routes/system-control',
       '../routes/settings-public',
       '../routes/agent-jobs',
-      '../routes/agent-tools',
       '../routes/agent-runtime',
       '../routes/ollama',
       '../routes/system-remediation',
       '../routes/mail',
       '../routes/automations',
-      '../routes/skills',
     ]) {
       mockDefaultRoute(modulePath);
     }
+    mockDefaultRoute('../routes/skills', {
+      mountHostExtensionMutationFence: jest.fn(),
+    });
+    mockDefaultRoute('../routes/agent-tools', {
+      mountHostNativeRuntimeMutationFence: jest.fn(),
+    });
     mockDefaultRoute('../routes/gateway', {
       attachPortalWebSocket: startup.attachPortalWebSocket,
     });
@@ -249,7 +252,6 @@ describe('transient Portal update-validation server', () => {
       attachAgentBrowserWebSocket: startup.attachAgentBrowserWebSocket,
     });
     mockDefaultRoute('../routes/remote-desktop', {
-      reconcilePortalManagedSkill: startup.reconcilePortalManagedSkill,
       reconcilePortalVisibleBrowserDefaults: startup.reconcilePortalVisibleBrowserDefaults,
       reconcileRemoteDesktopLauncherAssets: startup.reconcileRemoteDesktopLauncherAssets,
     });
@@ -263,6 +265,7 @@ describe('transient Portal update-validation server', () => {
     }));
     jest.doMock('../routes/exec', () => ({
       setupTerminalNamespace: jest.fn(),
+      setupHarnessSetupNamespace: jest.fn(),
     }));
     jest.doMock('../middleware/pathSandbox', () => ({
       projectPathSandbox: pass,

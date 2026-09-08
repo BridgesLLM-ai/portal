@@ -35,6 +35,7 @@ describe('Agent Chat provider catalog cache', () => {
     overrides: Partial<AgentChatProviderCatalogEntry> = {},
   ): AgentChatProviderCatalogEntry {
     return {
+      harnessId: name,
       name,
       displayName: name === 'OPENCLAW' ? 'OpenClaw' : 'Codex',
       installed: availabilityState === 'checking' ? null : true,
@@ -47,6 +48,90 @@ describe('Agent Chat provider catalog cache', () => {
       ...overrides,
     };
   }
+
+  it('prefers the harness catalog and normalizes its additive runtime metadata', async () => {
+    mocks.get.mockResolvedValueOnce({
+      data: {
+        harnesses: [{
+          id: 'DEEPSEEK_HARNESS',
+          displayName: 'DeepSeek Harness',
+          transport: 'json-rpc-stdio',
+          releaseStage: 'developer-preview',
+          selectable: false,
+          compatibilityProviderId: null,
+          implemented: false,
+          auth: {
+            owner: 'model-provider-account',
+            requiresSeparateLogin: true,
+            modelProviderIds: ['deepseek'],
+          },
+          models: {
+            catalogOwner: 'none',
+            catalogKind: 'none',
+            selectionMode: 'none',
+            canEnumerate: false,
+            supportsCustomInput: false,
+          },
+          capabilities: {
+            supportsCancellation: true,
+            cancellationMode: 'process-kill',
+          },
+        }],
+      },
+    });
+
+    await expect(loadAgentChatProviderCatalog()).resolves.toEqual([
+      expect.objectContaining({
+        harnessId: 'DEEPSEEK_HARNESS',
+        name: 'DEEPSEEK_HARNESS',
+        displayName: 'DeepSeek Harness',
+        transport: 'json-rpc-stdio',
+        releaseStage: 'developer-preview',
+        selectable: false,
+        auth: expect.objectContaining({ owner: 'model-provider-account' }),
+        models: expect.objectContaining({ selectionMode: 'none' }),
+        capabilities: expect.objectContaining({ cancellationMode: 'process-kill' }),
+      }),
+    ]);
+    expect(mocks.get).toHaveBeenCalledWith(
+      '/gateway/harnesses',
+      expect.objectContaining({ _silent: true }),
+    );
+  });
+
+  it('accepts the providers compatibility envelope from the harness endpoint', async () => {
+    mocks.get.mockResolvedValueOnce({
+      data: { providers: [provider('CODEX', 'ready')] },
+    });
+
+    await expect(loadAgentChatProviderCatalog()).resolves.toEqual([
+      provider('CODEX', 'ready'),
+    ]);
+    expect(mocks.get.mock.calls.map(([url]) => url)).toEqual(['/gateway/harnesses']);
+  });
+
+  it('falls back to the legacy providers endpoint only when harnesses is missing', async () => {
+    mocks.get
+      .mockRejectedValueOnce({ response: { status: 404 } })
+      .mockResolvedValueOnce({ data: { providers: [provider('CODEX', 'ready')] } });
+
+    await expect(loadAgentChatProviderCatalog()).resolves.toEqual([
+      provider('CODEX', 'ready'),
+    ]);
+    expect(mocks.get.mock.calls.map(([url]) => url)).toEqual([
+      '/gateway/harnesses',
+      '/gateway/providers',
+    ]);
+  });
+
+  it('does not mask a failing harness endpoint with the legacy provider authority', async () => {
+    mocks.get.mockRejectedValueOnce({ response: { status: 503 } });
+
+    await expect(loadAgentChatProviderCatalog()).rejects.toMatchObject({
+      code: 'REQUEST_FAILED',
+    });
+    expect(mocks.get.mock.calls.map(([url]) => url)).toEqual(['/gateway/harnesses']);
+  });
 
   it('polls a cold checking catalog until it becomes ready', async () => {
     vi.useFakeTimers();
@@ -100,13 +185,12 @@ describe('Agent Chat provider catalog cache', () => {
       pollIntervalMs: 20,
       onSnapshot: (snapshot) => snapshots.push(snapshot),
     });
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(snapshots[0]).toEqual([
-      provider('OPENCLAW', 'ready'),
-      provider('CODEX', 'checking'),
-    ]);
+    await vi.waitFor(() => {
+      expect(snapshots[0]).toEqual([
+        provider('OPENCLAW', 'ready'),
+        provider('CODEX', 'checking'),
+      ]);
+    });
     expect(assessAgentChatProviderAvailability('OPENCLAW', snapshots[0][0]).canSend).toBe(true);
     expect(assessAgentChatProviderAvailability('CODEX', snapshots[0][1]).canSend).toBe(false);
 
@@ -299,7 +383,7 @@ describe('Agent Chat provider catalog cache', () => {
       generation: 2,
       requestVersion: 0,
     });
-    expect(isAgentChatSelectedProviderRevalidationPending('OPENCLAW', state, 0)).toBe(false);
+    expect(isAgentChatSelectedProviderRevalidationPending('OPENCLAW', state, 0)).toBe(true);
 
     await vi.advanceTimersByTimeAsync(5_000);
     let resolveRevalidation!: (value: {
@@ -482,6 +566,46 @@ describe('Agent Chat provider catalog cache', () => {
     expect(assessment.retryable).toBe(true);
   });
 
+  it('fails closed when the OpenClaw catalog row is missing instead of assuming gateway readiness', () => {
+    expect(assessAgentChatProviderAvailability('OPENCLAW', undefined)).toEqual({
+      status: 'error',
+      canSend: false,
+      message: 'OPENCLAW availability is unknown. Retry the provider check before sending.',
+      retryable: true,
+    });
+  });
+
+  it('keeps OpenClaw revalidation pending until a fresh host-availability row settles', () => {
+    const state = reduceAgentChatSelectedProviderRevalidation(null, {
+      type: 'begin',
+      provider: 'OPENCLAW',
+      generation: 7,
+      requestVersion: 3,
+    });
+    expect(state?.pending).toBe(true);
+    expect(isAgentChatSelectedProviderRevalidationPending('OPENCLAW', state, 3)).toBe(true);
+
+    const settled = reduceAgentChatSelectedProviderRevalidation(state, {
+      type: 'snapshot',
+      provider: 'OPENCLAW',
+      generation: 7,
+      providers: [provider('OPENCLAW', 'ready', {
+        usable: false,
+        reason: 'OPENCLAW_RUNTIME_UNAVAILABLE: OpenClaw host Agent Chat is unavailable.',
+      })],
+      metadata: { source: 'network', fresh: true, fetchedAt: Date.now() },
+    });
+    expect(settled?.pending).toBe(false);
+    expect(isAgentChatSelectedProviderRevalidationPending('OPENCLAW', settled, 3)).toBe(false);
+    expect(assessAgentChatProviderAvailability(
+      'OPENCLAW',
+      provider('OPENCLAW', 'ready', {
+        usable: false,
+        reason: 'OPENCLAW_RUNTIME_UNAVAILABLE: OpenClaw host Agent Chat is unavailable.',
+      }),
+    )).toMatchObject({ status: 'unusable', canSend: false });
+  });
+
   it('keeps Send blocked with the separate-login explanation after a native auth rejection', () => {
     const assessment = assessAgentChatProviderAvailability(
       'CLAUDE_CODE',
@@ -498,6 +622,28 @@ describe('Agent Chat provider catalog cache', () => {
       canSend: false,
       message: 'Claude Code authentication was rejected. Reconnect it in AI Settings and retry.',
       retryable: true,
+    });
+  });
+
+  it('treats a catalog-visible preview harness as informative but non-retryable', () => {
+    const assessment = assessAgentChatProviderAvailability(
+      'DEEPSEEK_HARNESS',
+      provider('DEEPSEEK_HARNESS', 'ready', {
+        displayName: 'DeepSeek Harness',
+        installed: null,
+        implemented: false,
+        selectable: false,
+        usable: false,
+        releaseStage: 'developer-preview',
+        unavailableReason: 'Developer Preview: persistent Agent Chat parity is not available.',
+      }),
+    );
+
+    expect(assessment).toEqual({
+      status: 'unusable',
+      canSend: false,
+      message: 'Developer Preview: persistent Agent Chat parity is not available.',
+      retryable: false,
     });
   });
 

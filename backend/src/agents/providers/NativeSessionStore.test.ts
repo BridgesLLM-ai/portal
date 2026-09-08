@@ -95,6 +95,33 @@ describe('append-only native provider transcript storage', () => {
     expect(olderPositioned.messages.at(-1)?.id).toBe('message-9900');
   });
 
+  test('a first native chat provisions its private default workspace, not explicit paths', () => {
+    const originalHome = process.env.HOME;
+    const originalWorkspace = process.env.OPENCLAW_WORKSPACE;
+    const taskHome = path.join(sessionsDir, 'fresh-host');
+    process.env.HOME = taskHome;
+    delete process.env.OPENCLAW_WORKSPACE;
+    try {
+      const store = require('./NativeSessionStore') as typeof import('./NativeSessionStore');
+      const session = store.createNativeSession('CODEX', 'owner-1', {
+        executionContext: createHostOperatorExecutionContext('owner-1'),
+      });
+      expect(session.cwd).toBe(path.join(taskHome, '.openclaw', 'workspace-main'));
+      expect(fs.statSync(session.cwd).isDirectory()).toBe(true);
+      expect(fs.statSync(session.cwd).mode & 0o777).toBe(0o700);
+      const explicit = path.join(taskHome, 'missing-explicit-path');
+      store.createNativeSession('CODEX', 'owner-1', {
+        executionContext: createHostOperatorExecutionContext('owner-1'), metadata: { cwd: explicit },
+      });
+      expect(fs.existsSync(explicit)).toBe(false);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalWorkspace === undefined) delete process.env.OPENCLAW_WORKSPACE;
+      else process.env.OPENCLAW_WORKSPACE = originalWorkspace;
+    }
+  });
+
   test('reset and deletion retire both metadata and transcript sidecars', () => {
     const store = require('./NativeSessionStore') as typeof import('./NativeSessionStore');
     const session = store.createNativeSession('OLLAMA', 'owner-1', {
@@ -115,6 +142,61 @@ describe('append-only native provider transcript storage', () => {
     store.deleteNativeSession('OLLAMA', session.sessionId);
     const providerDirectory = path.join(sessionsDir, 'ollama');
     expect(fs.readdirSync(providerDirectory)).toEqual([]);
+  });
+
+  test('same-millisecond session creation produces distinct durable identities', () => {
+    const store = require('./NativeSessionStore') as typeof import('./NativeSessionStore');
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_777_777_777_777);
+    try {
+      const first = store.createNativeSession('CODEX', 'owner-1', {
+        executionContext: createHostOperatorExecutionContext('owner-1'),
+      });
+      const second = store.createNativeSession('CODEX', 'owner-1', {
+        executionContext: createHostOperatorExecutionContext('owner-1'),
+      });
+
+      expect(first.sessionId).not.toBe(second.sessionId);
+      expect(first.sessionId).toMatch(/^codex-owner-1-1777777777777-[0-9a-f-]{36}$/);
+      expect(second.sessionId).toMatch(/^codex-owner-1-1777777777777-[0-9a-f-]{36}$/);
+      expect(store.loadNativeSessionMetadata('CODEX', first.sessionId)?.sessionId).toBe(first.sessionId);
+      expect(store.loadNativeSessionMetadata('CODEX', second.sessionId)?.sessionId).toBe(second.sessionId);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  test.each(['HERMES', 'OPENCODE'] as const)('%s has an isolated persisted transcript namespace', (provider) => {
+    const store = require('./NativeSessionStore') as typeof import('./NativeSessionStore');
+    const session = store.createNativeSession(provider, 'owner-1', {
+      executionContext: createHostOperatorExecutionContext('owner-1'),
+      model: 'provider/model-a',
+    });
+    store.appendNativeMessage(session, {
+      id: `${provider.toLowerCase()}-one`,
+      role: 'user',
+      content: 'hello',
+      timestamp: '2026-08-20T00:00:00.000Z',
+    });
+
+    expect(store.loadNativeSession(provider, session.sessionId)).toMatchObject({
+      provider,
+      model: 'provider/model-a',
+    });
+    expect(store.readAllNativeSessionHistory(provider, session.sessionId)).toHaveLength(1);
+    store.updateNativeSessionMetadata(provider, session.sessionId, {
+      acpAvailableModels: [
+        { id: 'provider/model-a', name: 'Model A' },
+        { id: '--unsafe', name: 'Unsafe' },
+      ],
+    });
+    expect(store.readPersistedNativeAcpModelCatalog(provider)).toEqual([
+      { id: 'provider/model-a', name: 'Model A' },
+    ]);
+    expect(fs.existsSync(path.join(
+      sessionsDir,
+      provider.toLowerCase(),
+      `${session.sessionId}.history.jsonl`,
+    ))).toBe(true);
   });
 
   test('deletion durably retires transcript before identity and exposes no artifacts', () => {

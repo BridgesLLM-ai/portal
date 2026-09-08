@@ -10,7 +10,7 @@ import {
 } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Timer, BarChart3, Puzzle, ChevronDown, Check, Loader2, Layers, ListTodo, Wrench } from 'lucide-react';
+import { Timer, BarChart3, Puzzle, ChevronDown, Check, Loader2, Layers, ListTodo, Wrench, Compass } from 'lucide-react';
 import client from '../api/client';
 import { getShortModelLabel } from '../utils/modelId';
 import AnchoredPopover from '../components/AnchoredPopover';
@@ -23,11 +23,13 @@ const SkillsContent = lazy(() => import('./SkillsPage').then(m => ({ default: m.
 const TasksContent = lazy(() => import('./TasksPage').then(m => ({ default: m.TasksContent })));
 const ToolsContent = lazy(() => import('./ToolsPage').then(m => ({ default: m.ToolsContent })));
 
+const HarnessWorkspace = lazy(() => import('../components/HarnessWorkspace'));
+
 /* ─── Types ─────────────────────────────────────────────── */
 
-type TabKey = 'tools' | 'automations' | 'usage' | 'skills' | 'tasks';
+type TabKey = 'workspace' | 'tools' | 'automations' | 'usage' | 'skills' | 'tasks';
 
-const VALID_TABS: TabKey[] = ['tools', 'automations', 'usage', 'skills', 'tasks'];
+const VALID_TABS: TabKey[] = ['workspace', 'tools', 'automations', 'usage', 'skills', 'tasks'];
 
 interface OpenClawAgent {
   id: string;
@@ -46,6 +48,7 @@ interface TabDef {
 /* ─── Constants ─────────────────────────────────────────── */
 
 const TABS: TabDef[] = [
+  { key: 'workspace', label: 'Workspace', icon: Compass },
   { key: 'tools', label: 'Tools', icon: Wrench },
   { key: 'automations', label: 'Automations', icon: Timer },
   { key: 'usage', label: 'Usage', icon: BarChart3 },
@@ -73,7 +76,7 @@ function getAgentLabel(agent: OpenClawAgent, assistantName?: string): string {
 }
 
 function parseTab(tab: string | null): TabKey {
-  return VALID_TABS.includes(tab as TabKey) ? (tab as TabKey) : 'tools';
+  return VALID_TABS.includes(tab as TabKey) ? (tab as TabKey) : 'workspace';
 }
 
 function parseAgent(agent: string | null): string {
@@ -201,7 +204,7 @@ function AgentSelectorDropdown({ agents, selected, onSelect, loading, assistantN
               OpenClaw agent scope
             </div>
             <div className="mt-1 text-[10px] leading-4 text-slate-400">
-              Agent Tools is OpenClaw-scoped. Agent Chat providers are selected in Agent Chat.
+              These controls manage OpenClaw agents. Use Workspace for other harnesses and native tools.
             </div>
           </div>
 
@@ -261,6 +264,7 @@ export default function AgentToolsPage() {
   const [assistantName, setAssistantName] = useState<string>('');
 
   useEffect(() => {
+    if (activeTab === 'workspace') return;
     let cancelled = false;
 
     async function fetchAgents() {
@@ -286,7 +290,7 @@ export default function AgentToolsPage() {
 
     fetchAgents();
     return () => { cancelled = true; };
-  }, [requestedAgent]);
+  }, [requestedAgent, activeTab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -327,7 +331,7 @@ export default function AgentToolsPage() {
       changed = true;
     }
 
-    if (activeTab === 'tools' || activeTab === 'skills' || activeTab === 'tasks') {
+    if (activeTab === 'workspace' || activeTab === 'tools' || activeTab === 'skills' || activeTab === 'tasks') {
       if (params.has('agent')) {
         params.delete('agent');
         changed = true;
@@ -337,6 +341,11 @@ export default function AgentToolsPage() {
         params.set('agent', selectedAgentId);
         changed = true;
       }
+    }
+
+    if (activeTab !== 'workspace' && params.has('harness')) {
+      params.delete('harness');
+      changed = true;
     }
 
     if (changed) {
@@ -375,10 +384,10 @@ export default function AgentToolsPage() {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h1 className="text-xl sm:text-2xl font-bold text-white">Agent Tools</h1>
-              <p className="text-slate-400 text-sm mt-0.5">Host tools, automations, usage, extensions, and background work</p>
+              <p className="text-slate-400 text-sm mt-0.5">Your harnesses, native workspaces, and agent operations</p>
             </div>
 
-            {!isSharedScopeTab ? (
+            {activeTab === 'workspace' ? null : !isSharedScopeTab ? (
               <AgentSelectorDropdown
                 agents={agents}
                 selected={selectedAgent}
@@ -430,6 +439,7 @@ export default function AgentToolsPage() {
           className="h-full"
         >
           <Suspense fallback={<TabFallback />}>
+            {activeTab === 'workspace' && <HarnessWorkspace />}
             {activeTab === 'automations' && <AutomationsContent agentId={selectedAgentId} />}
             {activeTab === 'usage' && <UsageContent agentId={selectedAgentId} />}
             {activeTab === 'tools' && <ToolsContent />}

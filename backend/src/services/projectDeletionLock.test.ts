@@ -23,7 +23,7 @@ import {
   reacquireExpectedPreparedProjectPromotionLock,
   withProjectDeletionLock,
 } from './projectDeletionLock';
-import { writeProjectRuntimeOwnedFileAtomic } from './projectRuntimeOwnership';
+import { writeContainedFileAtomic } from './containedPath';
 
 describe('Project deletion serialization', () => {
   beforeEach(() => {
@@ -93,7 +93,7 @@ describe('Project deletion serialization', () => {
       let writeStarted = false;
       const queuedWrite = withProjectDeletionLock({ workspaceOwnerId, projectName }, async () => {
         writeStarted = true;
-        writeProjectRuntimeOwnedFileAtomic(
+        writeContainedFileAtomic(
           projectRoot,
           'package-lock.json',
           '{"lockfileVersion":3}',

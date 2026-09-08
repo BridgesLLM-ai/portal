@@ -552,7 +552,7 @@ export default function AgentZeroOAuthPanel({
             <KeyRound size={16} className="text-violet-300" /> Official Agent Zero model OAuth
           </h4>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-theme-text-subtle">
-            Connect Codex/ChatGPT, GitHub Copilot, Google Cloud Gemini, or xAI Grok through Agent Zero 2.5’s official OAuth plugin. Portal forwards only fixed setup operations; OAuth tokens stay in Agent Zero’s private data volume.
+            Connect Codex/ChatGPT, GitHub Copilot, Google Cloud Gemini, or xAI Grok through Agent Zero 2.10’s official OAuth plugin. Portal forwards only fixed setup operations; OAuth tokens stay in Agent Zero’s private data volume.
           </p>
         </div>
         <button type="button" onClick={() => { void load(); }} disabled={loading || callbackPending || Boolean(busyProvider || activeAttempt || modelsLoadingProvider)} className="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-lg border border-theme-border-strong bg-theme-surface px-3 py-2 text-xs font-medium text-theme-text transition hover:bg-theme-surface-hover disabled:opacity-50">

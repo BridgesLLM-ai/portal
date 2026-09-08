@@ -19,6 +19,7 @@ const twoFactorChallengeDeleteMany = jest.fn();
 const emailVerificationCodeDeleteMany = jest.fn();
 const activityLogCreate = jest.fn();
 const projectAuthorizationTransitionFindFirst = jest.fn();
+const adminUserRetirementFindFirst = jest.fn();
 const transaction = jest.fn();
 
 const hashPassword = jest.fn();
@@ -56,6 +57,9 @@ const transactionClient = {
   projectAuthorizationTransition: {
     findFirst: projectAuthorizationTransitionFindFirst,
   },
+  adminUserRetirement: {
+    findFirst: adminUserRetirementFindFirst,
+  },
 };
 
 jest.mock('../config/database', () => ({
@@ -92,6 +96,9 @@ jest.mock('../config/database', () => ({
     },
     activityLog: {
       create: activityLogCreate,
+    },
+    adminUserRetirement: {
+      findFirst: adminUserRetirementFindFirst,
     },
     $transaction: transaction,
   },
@@ -346,6 +353,7 @@ describe('password recovery and registration approval delivery truth', () => {
     twoFactorChallengeDeleteMany.mockResolvedValue({ count: 1 });
     emailVerificationCodeDeleteMany.mockResolvedValue({ count: 1 });
     projectAuthorizationTransitionFindFirst.mockResolvedValue(null);
+    adminUserRetirementFindFirst.mockResolvedValue(null);
     sendPasswordResetEmail.mockResolvedValue(undefined);
     sendPasswordChangedEmail.mockResolvedValue(undefined);
     provisionUserMailbox.mockResolvedValue(undefined);

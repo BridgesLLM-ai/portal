@@ -499,7 +499,6 @@ export default function DashboardPage() {
     }
   });
   const [reconnecting, setReconnecting] = useState(false);
-  const [restartingGateway, setRestartingGateway] = useState(false);
   const [showCharts, setShowCharts] = useState(false);
   // readiness + recentActivity sections removed per design cleanup
   const socketRef = useRef<Socket | null>(null);
@@ -1116,7 +1115,7 @@ export default function DashboardPage() {
       : updateProgressStatus === 'rolled_back'
         ? 'Portal update rolled back'
         : updateProgressStatus === 'updated_with_errors'
-          ? 'Portal updated with follow-up required'
+          ? 'Portal update needs attention'
           : updateProgressStatus === 'recovery_required'
             ? 'Portal update needs recovery'
             : updateProgressStatus === 'failed'
@@ -1150,31 +1149,6 @@ export default function DashboardPage() {
     } catch {}
     setMaintenanceDismissedSignature(maintenanceSignature);
   };
-
-  const restartOpenClawGateway = useCallback(async () => {
-    if (!canReconnectGateway || gatewayActionRef.current) return;
-    gatewayActionRef.current = 'restart';
-    setRestartingGateway(true);
-    try {
-      const { data } = await client.post('/gateway/restart');
-      const nextVersion = data?.after || data?.openclawVersion || null;
-      setOpenClawVersion(nextVersion);
-      if (data?.ok || (nextVersion && !nextVersion.restartRecommended)) {
-        setOpenClawStatus('connected');
-        setOpenClawIssues([]);
-      } else {
-        setOpenClawStatus('misconfigured');
-        setOpenClawIssues([data?.message || nextVersion?.reason || 'OpenClaw gateway restart did not clear the version warning.']);
-      }
-    } catch (err: any) {
-      setOpenClawStatus('misconfigured');
-      setOpenClawIssues([err?.response?.data?.message || err?.response?.data?.error || 'OpenClaw gateway restart request failed.']);
-    } finally {
-      gatewayActionRef.current = null;
-      setRestartingGateway(false);
-      fetchData();
-    }
-  }, [canReconnectGateway, fetchData]);
 
   const reconnectOpenClawGateway = useCallback(async () => {
     if (!canReconnectGateway || gatewayActionRef.current) return;
@@ -1271,7 +1245,8 @@ export default function DashboardPage() {
         rememberPortalUpdateCheckpoint(result.progress);
       }
       // Exact health is corroboration, not completion authority. A target
-      // version alone can appear while postflight host work is still running.
+      // version alone can appear before the updater publishes its final
+      // Portal-verification checkpoint (`postflight` on the compatibility wire).
       if (result.outcome === 'succeeded'
         && result.progress
         && String(result.progress.status) === 'succeeded') {
@@ -1625,14 +1600,10 @@ export default function DashboardPage() {
                   <div
                     role="progressbar"
                     aria-label="Portal update progress"
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={updateProgress.percent}
                     className="mt-2 h-1.5 w-full max-w-xl overflow-hidden rounded-full bg-theme-border/70"
                   >
                     <div
-                      className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400 transition-[width] duration-500 motion-reduce:transition-none"
-                      style={{ width: `${updateProgress.percent}%` }}
+                      className="typed-confirmation-progress-sweep h-full w-1/3 rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400"
                     />
                   </div>
                 ) : null}
@@ -1681,22 +1652,17 @@ export default function DashboardPage() {
                       <Loader2 size={16} className="mt-0.5 flex-none animate-spin motion-reduce:animate-none text-cyan-300" aria-hidden="true" />
                     )}
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-3">
+                      <div>
                         <p className="truncate text-xs font-semibold text-theme-text">{updateProgress?.label}</p>
-                        <span className="shrink-0 text-[11px] font-semibold text-cyan-200 tabular-nums">{updateProgress?.percent}%</span>
                       </div>
                       <p className="mt-0.5 text-xs leading-5 text-theme-text-muted">{updateProgress?.detail}</p>
                       <div
                         role="progressbar"
                         aria-label="Portal update progress"
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={updateProgress?.percent}
                         className="mt-2 h-1.5 overflow-hidden rounded-full bg-theme-border/70"
                       >
                         <div
-                          className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400 transition-[width] duration-500 motion-reduce:transition-none"
-                          style={{ width: `${updateProgress?.percent || 0}%` }}
+                          className="typed-confirmation-progress-sweep h-full w-1/3 rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400"
                         />
                       </div>
                     </div>
@@ -2034,21 +2000,9 @@ export default function DashboardPage() {
               {openClawVersion.installedVersion ? ` Installed: v${openClawVersion.installedVersion}.` : ''}
               {openClawVersion.runningVersion ? ` Running: v${openClawVersion.runningVersion}.` : ''}
             </span>
-            {canReconnectGateway ? (
-              <button
-                onClick={restartOpenClawGateway}
-                disabled={restartingGateway || reconnecting}
-                aria-busy={restartingGateway}
-                className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/30 bg-cyan-500/20 hover:bg-cyan-500/30 px-3 py-1 text-xs font-medium text-cyan-100 transition disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {restartingGateway ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-                {restartingGateway ? 'Restarting…' : 'Restart OpenClaw'}
-              </button>
-            ) : (
-              <span className="shrink-0 rounded-lg border border-cyan-300/20 bg-black/10 px-2.5 py-1 text-xs text-cyan-100/90">
-                Admin access required to restart OpenClaw.
-              </span>
-            )}
+            <span className="shrink-0 rounded-lg border border-cyan-300/20 bg-black/10 px-2.5 py-1 text-xs text-cyan-100/90">
+              Portal cannot restart OpenClaw in this release.
+            </span>
           </div>
         )}
         {(openClawStatus === 'offline' || openClawStatus === 'misconfigured') && openClawIssues.length > 0 && !openClawVersion?.restartRecommended && (
@@ -2057,7 +2011,7 @@ export default function DashboardPage() {
             {canReconnectGateway ? (
               <button
                 onClick={reconnectOpenClawGateway}
-                disabled={reconnecting || restartingGateway}
+                disabled={reconnecting}
                 aria-busy={reconnecting}
                 className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-amber-400/30 bg-amber-500/20 hover:bg-amber-500/30 px-3 py-1 text-xs font-medium text-amber-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
@@ -2260,7 +2214,7 @@ export default function DashboardPage() {
               : 'Install update'}
         busyLabel={updateProgress?.label || (updatePlan === 'create-backup' ? 'Backing up safely…' : 'Starting signed updater…')}
         busy={updateInProgress}
-        busyProgress={updateProgress ? updateProgress.percent / 100 : null}
+        busyProgress={null}
         busyStartedAt={updateProgress?.startedAt}
         busyUpdatedAt={updateProgress?.updatedAt}
         busyPhaseLabel={updateProgress?.label}
@@ -2351,7 +2305,7 @@ export default function DashboardPage() {
                       <div className="mt-2 text-xs leading-5 opacity-95">
                         {updateProgressStatus === 'updated_with_errors' ? (
                           <p className="font-medium">
-                            The new Portal committed and is serving, but ancillary host work failed.
+                            The new Portal is installed, but the updater did not finish cleanly. The recorded result below says whether final verification completed.
                           </p>
                         ) : (
                           <p className="font-medium">

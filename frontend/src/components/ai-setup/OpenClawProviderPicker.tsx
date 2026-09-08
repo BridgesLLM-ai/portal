@@ -9,7 +9,6 @@ interface OpenClawProviderPickerProps {
   statusMap: Map<string, ProviderStatus>;
   onSelect: (provider: ProviderUIConfig) => void;
   onRemove: (provider: ProviderUIConfig) => void;
-  onDeviceFlow: () => void;
   onClose: () => void;
 }
 
@@ -54,16 +53,12 @@ function groupProviders(providers: ProviderUIConfig[]) {
   return { subscription, apiKey, advanced };
 }
 
-export default function OpenClawProviderPicker({ providers, statusMap, onSelect, onRemove, onDeviceFlow, onClose }: OpenClawProviderPickerProps) {
+export default function OpenClawProviderPicker({ providers, statusMap, onSelect, onRemove, onClose }: OpenClawProviderPickerProps) {
   const { subscription, apiKey, advanced } = groupProviders(providers);
 
   const handleClick = (provider: ProviderUIConfig) => {
     if (provider.guidedSetup.status !== 'available') return;
-    if (provider.id === 'github-copilot') {
-      onDeviceFlow();
-    } else {
-      onSelect(provider);
-    }
+    onSelect(provider);
   };
 
   const renderRow = (provider: ProviderUIConfig) => {

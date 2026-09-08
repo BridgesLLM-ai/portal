@@ -1,10 +1,10 @@
 import type { AgentZeroSetupStatus } from '../../api/agentRuntime';
 
-export type AgentZeroNextAction = 'credentials' | 'reconcile' | 'verify' | 'unavailable' | 'ready';
+export type AgentZeroNextAction = 'credentials' | 'verify' | 'unavailable' | 'ready';
 
 export function nextAgentZeroSetupAction(status: AgentZeroSetupStatus): AgentZeroNextAction {
   if (!status.credentials.configured) return 'credentials';
-  if (!status.runtime.protocolReady || !status.hostGateway.installed) return 'reconcile';
+  if (!status.runtime.protocolReady || !status.hostGateway.installed) return 'unavailable';
   if (!status.authentication.authenticated) return 'verify';
   return status.mainAgentChat.providerEnabled ? 'ready' : 'unavailable';
 }

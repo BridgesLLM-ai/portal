@@ -9,10 +9,17 @@ const prismaMock = {
   $transaction: jest.fn(),
   app: {
     count: jest.fn(),
+    findUnique: jest.fn(),
     findFirst: jest.fn(),
     findMany: jest.fn(),
     update: jest.fn(),
     updateMany: jest.fn(),
+  },
+  user: {
+    findUnique: jest.fn(),
+  },
+  adminUserRetirement: {
+    findFirst: jest.fn(),
   },
   systemSetting: {
     create: jest.fn(),
@@ -115,11 +122,14 @@ function restartApp(
 }
 
 async function flushAsyncWork(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
+  // Runtime persistence now performs actor and retirement-CAS reads inside
+  // its serializable transaction before it reaches the original write. Drain
+  // the complete bounded promise chain rather than assuming two microtasks.
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
 }
 
 async function flushManagedPersistence(deployId: string): Promise<void> {
+  await flushAsyncWork();
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const managed = __appProcessTest.runningApps.get(deployId);
     if (!managed?.pendingStatusPersistence && !managed?.pendingRuntimePersistence) return;
@@ -160,17 +170,7 @@ describe('app-process.service', () => {
     __appProcessTest.resetRuntimeState();
 
     prismaMock.$transaction.mockImplementation(async (work: (transaction: typeof prismaMock) => Promise<unknown>) => {
-      const settingSnapshot = new Map(settingStore);
-      const statusSnapshot = new Map(appStatusStore);
-      try {
-        return await work(prismaMock);
-      } catch (error) {
-        settingStore.clear();
-        for (const [key, value] of settingSnapshot) settingStore.set(key, value);
-        appStatusStore.clear();
-        for (const [key, value] of statusSnapshot) appStatusStore.set(key, value);
-        throw error;
-      }
+      return work(prismaMock);
     });
 
     prismaMock.app.update.mockImplementation(async ({ where, data }: any) => {
@@ -182,7 +182,13 @@ describe('app-process.service', () => {
     prismaMock.app.updateMany.mockImplementation(applyAppStatusUpdateMany);
     prismaMock.app.count.mockResolvedValue(1);
     prismaMock.app.findFirst.mockImplementation(async ({ where }: any) => ({ id: where.id }));
+    prismaMock.app.findUnique.mockImplementation(async ({ where }: any) => ({
+      id: where.id,
+      userId: APP_IDENTITY.actorId,
+    }));
     prismaMock.app.findMany.mockResolvedValue([]);
+    prismaMock.user.findUnique.mockImplementation(async ({ where }: any) => ({ id: where.id }));
+    prismaMock.adminUserRetirement.findFirst.mockResolvedValue(null);
     prismaMock.projectIdentity.findUnique.mockResolvedValue({ id: APP_IDENTITY.projectId, lifecycleStatus: 'ACTIVE' });
     prismaMock.systemSetting.create.mockImplementation(async ({ data }: any) => {
       if (settingStore.has(data.key)) {
@@ -484,6 +490,7 @@ describe('app-process.service', () => {
     const consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     try {
       await startApp(appId, deployId, deployDir, 5013, APP_IDENTITY);
+      await flushManagedPersistence(deployId);
       prismaMock.app.updateMany.mockClear();
       prismaMock.systemSetting.upsert.mockClear();
       prismaMock.app.updateMany.mockRejectedValueOnce(new Error('transient status write failure'));
@@ -1559,10 +1566,23 @@ describe('app-process.service', () => {
       const originalState = settingStore.get(stateKey);
       expect(originalState).toBeDefined();
       prismaMock.app.updateMany.mockClear();
-      prismaMock.systemSetting.deleteMany.mockImplementationOnce(async ({ where }: any) => {
-        settingStore.set(where.key, `${where.value}\n`);
-        return { count: 0 };
+      // This one assertion depends on PostgreSQL rolling the earlier status
+      // write back when the later state-record CAS loses. Keep the suite's
+      // ordinary transaction mock direct, and model that atomic rollback only
+      // for this deliberately failed transaction.
+      prismaMock.$transaction.mockImplementationOnce(async (
+        work: (transaction: typeof prismaMock) => Promise<unknown>,
+      ) => {
+        const statusSnapshot = new Map(appStatusStore);
+        try {
+          return await work(prismaMock);
+        } catch (error) {
+          appStatusStore.clear();
+          for (const [key, value] of statusSnapshot) appStatusStore.set(key, value);
+          throw error;
+        }
       });
+      prismaMock.systemSetting.deleteMany.mockResolvedValueOnce({ count: 0 });
 
       await expect(forgetAppRuntime(appId, deployId, {
         ...APP_IDENTITY,
@@ -2030,6 +2050,55 @@ describe('app-process.service', () => {
       expect(getAppStatus('deploy-shutdown-race')).toBeNull();
     } finally {
       rmSync(deployDir, { recursive: true, force: true });
+    }
+  });
+
+  it('seals every restart intent before stopping running App containers concurrently', async () => {
+    const deployDirs = Array.from({ length: 4 }, () => makeDeployDir());
+    const releaseStops = deferred<void>();
+
+    try {
+      for (let index = 0; index < deployDirs.length; index += 1) {
+        await startApp(
+          `app-shutdown-${index}`,
+          `deploy-shutdown-${index}`,
+          deployDirs[index],
+          5010 + index,
+          APP_IDENTITY,
+        );
+      }
+      lifecycleMock.stopProjectAppContainer.mockReset();
+      lifecycleMock.stopProjectAppContainer.mockImplementation(() => releaseStops.promise);
+
+      const shuttingDown = shutdownAll();
+      for (
+        let attempt = 0;
+        attempt < 40 && lifecycleMock.stopProjectAppContainer.mock.calls.length < 4;
+        attempt += 1
+      ) {
+        await flushAsyncWork();
+      }
+
+      // A sequential loop cannot reach the second call while the first removal
+      // is held. Reaching all four proves shutdown time is bounded by the
+      // slowest removal rather than the sum of all removal timeouts.
+      expect(lifecycleMock.stopProjectAppContainer).toHaveBeenCalledTimes(4);
+      for (let index = 0; index < deployDirs.length; index += 1) {
+        expect(JSON.parse(
+          settingStore.get(
+            `${__appProcessTest.APP_STATE_PREFIX}app-shutdown-${index}`,
+          ) || '{}',
+        )).toEqual(expect.objectContaining({
+          status: 'stopped',
+          desiredStatus: 'running',
+        }));
+      }
+
+      releaseStops.resolve();
+      await shuttingDown;
+    } finally {
+      releaseStops.resolve();
+      for (const deployDir of deployDirs) rmSync(deployDir, { recursive: true, force: true });
     }
   });
 

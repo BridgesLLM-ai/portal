@@ -87,6 +87,25 @@ function createSession(): string {
   }).sessionId;
 }
 
+function projectExecutionContext(userId: string) {
+  return {
+    scope: 'PROJECT_SANDBOX' as const,
+    source: 'PORTAL_SERVER' as const,
+    userId,
+    projectId: 'project-ollama-boundary',
+    workspaceOwnerId: userId,
+    projectName: 'ollama-boundary',
+    canonicalRoot: '/var/lib/bridgesllm/projects/ollama-boundary',
+    rootDevice: '1',
+    rootInode: '2',
+    rootBirthtimeNs: '3',
+    runtimePolicyVersion: 'portal-project-sandbox-test',
+    egressPolicyVersion: 'portal-project-egress-test',
+    runtimeImageDigest: `sha256:${'a'.repeat(64)}`,
+    policyFingerprint: 'ollama-boundary-policy',
+  };
+}
+
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;
@@ -115,6 +134,29 @@ describe('Ollama host Agent Chat lifecycle', () => {
     if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
     else process.env.DATABASE_URL = previousDatabaseUrl;
     fs.rmSync(sessionsDir, { recursive: true, force: true });
+  });
+
+  test('keeps the host adapter fenced from dedicated Project sessions', async () => {
+    const provider = new OllamaProvider();
+    await expect(provider.startSession('owner-1', {
+      executionContext: projectExecutionContext('owner-1'),
+      model: 'qwen3.5:4b',
+    })).rejects.toThrow(/expected HOST_OPERATOR/i);
+    expect(authorityService.resolveOllamaBackendAuthority).not.toHaveBeenCalled();
+
+    const projectSession = sessionStore.createNativeSession('OLLAMA', 'owner-1', {
+      executionContext: projectExecutionContext('owner-1'),
+      model: 'qwen3.5:4b',
+      metadata: { projectRuntime: 'fixture-project-runtime' },
+    });
+    await expect(provider.listSessions('owner-1')).resolves.not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ sessionId: projectSession.sessionId })]),
+    );
+    await expect(provider.sendMessage(
+      projectSession.sessionId,
+      'must stay in the dedicated Project adapter',
+    )).rejects.toThrow(/expected HOST_OPERATOR/i);
+    expect(mockStreamResolvedOllama).not.toHaveBeenCalled();
   });
 
   test('refuses to create a remote Agent Chat session until a model is selected', async () => {

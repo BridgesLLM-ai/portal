@@ -10,7 +10,7 @@ const mockRows = new Map<string, Row>();
 const mockGates = new Map<string, {
   socketPath: string;
   ready: Promise<void>;
-  prepareTargetEnvironment: jest.Mock<void, [NodeJS.ProcessEnv]>;
+  prepareTarget: jest.Mock<void, [{ environment: NodeJS.ProcessEnv; stdinText?: string }]>;
   release: jest.Mock<Promise<void>, []>;
   abort: jest.Mock<Promise<void>, []>;
 }>();
@@ -81,6 +81,12 @@ const mockBoundary: any = {
     child: fakeChild(),
     identity: { ...persisted, invocationId: INVOCATION_ID },
   })),
+  attestActive: jest.fn(async () => ({
+    installed: true,
+    loadState: 'loaded',
+    activeState: 'active',
+    subState: 'running',
+  })),
   stop: jest.fn(async (identity: Record<string, string>) => ({
     scopeUnit: identity.scopeUnit,
     invocationId: identity.invocationId,
@@ -98,7 +104,7 @@ const mockCreateGate = jest.fn(async (scopeUnit: string) => {
   const gate = {
     socketPath,
     ready: mockNextGateReady || Promise.resolve(),
-    prepareTargetEnvironment: jest.fn(),
+    prepareTarget: jest.fn(),
     release: jest.fn(async () => undefined),
     abort: jest.fn(async () => undefined),
   };
@@ -278,6 +284,12 @@ beforeEach(() => {
     child: fakeChild(),
     identity: { ...persisted, invocationId: INVOCATION_ID },
   }));
+  mockBoundary.attestActive.mockResolvedValue({
+    installed: true,
+    loadState: 'loaded',
+    activeState: 'active',
+    subState: 'running',
+  });
   mockBoundary.stop.mockImplementation(async (identity) => ({
     scopeUnit: identity.scopeUnit,
     invocationId: identity.invocationId,
@@ -293,7 +305,7 @@ beforeEach(() => {
     const gate = {
       socketPath,
       ready: mockNextGateReady || Promise.resolve(),
-      prepareTargetEnvironment: jest.fn(),
+      prepareTarget: jest.fn(),
       release: jest.fn(async () => undefined),
       abort: jest.fn(async () => undefined),
     };
@@ -340,6 +352,7 @@ describe('host-native systemd scope journal', () => {
       reservation: reserved,
       command: '/usr/bin/test-cli',
       args: [],
+      stdinText: 'private-host-run-prompt',
       options: {
         cwd: '/tmp',
         env: { PATH: '/usr/bin', LD_PRELOAD: '/tmp/hostile.so' },
@@ -366,13 +379,116 @@ describe('host-native systemd scope journal', () => {
       cwd: '/tmp',
     });
     expect(mockBoundary.launch.mock.calls[0][0]).not.toHaveProperty('env');
-    expect(gate.prepareTargetEnvironment).toHaveBeenCalledWith({
-      PATH: '/usr/bin',
-      LD_PRELOAD: '/tmp/hostile.so',
+    expect(gate.prepareTarget).toHaveBeenCalledWith({
+      environment: {
+        PATH: '/usr/bin',
+        LD_PRELOAD: '/tmp/hostile.so',
+      },
+      stdinText: 'private-host-run-prompt',
     });
     expect(mockBoundary.launch.mock.calls[0][0].wrapperArgs.join(' ')).toContain(
       reserved.gatePath,
     );
+    expect(mockBoundary.launch.mock.calls[0][0].wrapperArgs.join(' ')).not.toContain(
+      'private-host-run-prompt',
+    );
+  });
+
+  test('attaches only to the exact current actor, authorization, run, session, and active scope identity', async () => {
+    const run = handle('attachable');
+    await journal.beginHostAgentRun(run);
+    const { launch } = await reserveAndSpawn(run);
+    await journal.activateGatedHostAgentRunAttempt(run, launch);
+
+    await expect(journal.assertHostAgentRunAttachable({
+      runId: run.id,
+      actorUserId: run.actorUserId,
+      actorAuthorizationVersion: run.actorAuthorizationVersion,
+      provider: run.provider,
+      sessionId: run.sessionId,
+    })).resolves.toEqual({
+      handle: run,
+      attempt: 1,
+      identity: expect.objectContaining({
+        scopeUnit: launch.identity.scopeUnit,
+        scopeTag: launch.identity.scopeTag,
+        bootId: BOOT_ID,
+        controlGroup: launch.identity.controlGroup,
+        invocationId: INVOCATION_ID,
+      }),
+    });
+    expect(mockBoundary.attestActive).toHaveBeenCalledTimes(2);
+    expect(mockBoundary.attestActive).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      scopeUnit: launch.identity.scopeUnit,
+      scopeTag: launch.identity.scopeTag,
+      invocationId: INVOCATION_ID,
+    }));
+  });
+
+  test('rejects stale attachment ownership before consulting systemd', async () => {
+    const run = handle('attach-owner-mismatch');
+    await journal.beginHostAgentRun(run);
+    const { launch } = await reserveAndSpawn(run);
+    await journal.activateGatedHostAgentRunAttempt(run, launch);
+
+    await expect(journal.assertHostAgentRunAttachable({
+      runId: run.id,
+      actorUserId: run.actorUserId,
+      actorAuthorizationVersion: run.actorAuthorizationVersion,
+      provider: 'CLAUDE_CODE',
+      sessionId: run.sessionId,
+    })).rejects.toMatchObject({ code: 'HOST_RUN_ATTACH_UNAVAILABLE' });
+    expect(mockBoundary.attestActive).not.toHaveBeenCalled();
+  });
+
+  test('rejects a revoked attachment generation and an inactive exact scope', async () => {
+    const run = handle('attach-revoked');
+    await journal.beginHostAgentRun(run);
+    const { launch } = await reserveAndSpawn(run);
+    await journal.activateGatedHostAgentRunAttempt(run, launch);
+
+    mockActor.authorizationVersion += 1;
+    await expect(journal.assertHostAgentRunAttachable({
+      runId: run.id,
+      actorUserId: run.actorUserId,
+      actorAuthorizationVersion: run.actorAuthorizationVersion,
+      provider: run.provider,
+      sessionId: run.sessionId,
+    })).rejects.toMatchObject({ code: 'AUTHORIZATION_CHANGED' });
+    expect(mockBoundary.attestActive).not.toHaveBeenCalled();
+
+    mockActor.authorizationVersion = run.actorAuthorizationVersion;
+    mockBoundary.attestActive.mockRejectedValueOnce(new Error('scope inactive'));
+    await expect(journal.assertHostAgentRunAttachable({
+      runId: run.id,
+      actorUserId: run.actorUserId,
+      actorAuthorizationVersion: run.actorAuthorizationVersion,
+      provider: run.provider,
+      sessionId: run.sessionId,
+    })).rejects.toThrow('scope inactive');
+  });
+
+  test('rejects durable settlement or identity drift during attachment attestation', async () => {
+    const run = handle('attach-race');
+    await journal.beginHostAgentRun(run);
+    const { launch } = await reserveAndSpawn(run);
+    await journal.activateGatedHostAgentRunAttempt(run, launch);
+    mockBoundary.attestActive.mockImplementationOnce(async () => {
+      Object.assign(mockRows.get(run.id)!, {
+        status: 'COMPLETED',
+        settledAt: new Date(),
+      });
+      return { installed: true, activeState: 'active', subState: 'running' };
+    });
+
+    await expect(journal.assertHostAgentRunAttachable({
+      runId: run.id,
+      actorUserId: run.actorUserId,
+      actorAuthorizationVersion: run.actorAuthorizationVersion,
+      provider: run.provider,
+      sessionId: run.sessionId,
+    })).rejects.toMatchObject({ code: 'HOST_RUN_ATTACH_UNAVAILABLE' });
+    expect(mockBoundary.attestActive).toHaveBeenCalledTimes(1);
   });
 
   test('fails closed when authorization changes between SPAWNED and dispatch', async () => {
@@ -635,7 +751,7 @@ describe('host-native systemd scope journal', () => {
     })).rejects.toMatchObject({ code: 'HOST_RUN_ENV_REQUIRED' });
     expect(mockBoundary.launch).not.toHaveBeenCalled();
     expect(
-      mockGates.get(reserved.gatePath)?.prepareTargetEnvironment,
+      mockGates.get(reserved.gatePath)?.prepareTarget,
     ).not.toHaveBeenCalled();
   });
 

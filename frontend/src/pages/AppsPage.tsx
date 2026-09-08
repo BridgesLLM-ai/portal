@@ -1,3 +1,5 @@
+import ProjectWorkHistory from '../components/projects/ProjectWorkHistory';
+import { projectWorkLink } from '../utils/projectWorkNavigation';
 import {
   Component,
   useState,
@@ -507,7 +509,7 @@ type ProjectRenameStorageBlock = Readonly<{
 }>;
 
 type ShareActionOwner = Readonly<{
-  kind: 'create' | 'email' | 'delete' | 'make-public' | 'toggle' | 'refresh';
+  kind: 'create' | 'email' | 'delete' | 'make-public' | 'toggle' | 'refresh' | 'policy';
   projectName: string;
   projectGeneration: number;
   linkId?: string;
@@ -516,6 +518,15 @@ type ShareActionOwner = Readonly<{
 
 
 type ShareLinkAvailability = 'active' | 'disabled' | 'expired' | 'exhausted';
+
+type SharePolicyDraft = {
+  expiresAt: string;
+  maxUses: string;
+  maxConcurrentVisitors: string;
+  rateLimitEnabled: boolean;
+  rateLimitMaxRequests: string;
+  rateLimitWindowSeconds: ShareRateLimitWindowSeconds;
+};
 
 const SHARE_VISITOR_PRESETS = [
   { value: '1', label: 'One', detail: '1' },
@@ -538,6 +549,13 @@ function shareRateLimitWindowLabel(seconds: number | null | undefined): string {
   if (seconds === 300) return '5 minutes';
   if (seconds === 3600) return 'hour';
   return 'configured window';
+}
+
+function sharePolicyLocalDateTime(value: string | null): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
 }
 
 function utf8ByteLength(value: string): number {
@@ -1063,6 +1081,13 @@ export default function AppsPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { user } = useAuthStore();
+  const userIsOwner = isOwner(user);
+  const openProjectWork = () => {
+    if (!user || !currentProject || !['OWNER', 'SUB_ADMIN'].includes(user.role)) return;
+    navigate(projectWorkLink({ projectIdentityId: currentProject.identity.id,
+      projectGeneration: currentProject.identity.generation }, { actorUserId: user.id,
+      authorizationVersion: user.authorizationVersion ?? 1 }));
+  };
   const { resolvedTheme } = useTheme();
   const projectNavigationBinding = useMemo(() => {
     const authorizationVersion = Number(user?.authorizationVersion ?? 1);
@@ -1232,16 +1257,26 @@ export default function AppsPage() {
   const [sharePasswordConfirm, setSharePasswordConfirm] = useState('');
   const [shareExpiresAt, setShareExpiresAt] = useState('');
   const [shareMaxUses, setShareMaxUses] = useState('');
+  const [shareMaxConcurrentVisitors, setShareMaxConcurrentVisitors] = useState('');
   const [shareRateLimitEnabled, setShareRateLimitEnabled] = useState(false);
   const [shareRateLimitMaxRequests, setShareRateLimitMaxRequests] = useState('');
   const [shareRateLimitWindowSeconds, setShareRateLimitWindowSeconds] = useState<ShareRateLimitWindowSeconds>(60);
   const [shareCreateError, setShareCreateError] = useState<string | null>(null);
+  const [sharePolicyEditId, setSharePolicyEditId] = useState<string | null>(null);
+  const [sharePolicyDraft, setSharePolicyDraft] = useState<SharePolicyDraft | null>(null);
+  const [sharePolicyEditError, setSharePolicyEditError] = useState<string | null>(null);
   const sharePasswordByteLength = utf8ByteLength(sharePassword);
   const shareMaxUsesNumber = Number(shareMaxUses);
   const shareMaxUsesInvalid = shareMaxUses !== '' && (
     !Number.isSafeInteger(shareMaxUsesNumber)
     || shareMaxUsesNumber < 1
     || shareMaxUsesNumber > 1_000_000
+  );
+  const shareMaxConcurrentVisitorsNumber = Number(shareMaxConcurrentVisitors);
+  const shareMaxConcurrentVisitorsInvalid = shareMaxConcurrentVisitors !== '' && (
+    !Number.isSafeInteger(shareMaxConcurrentVisitorsNumber)
+    || shareMaxConcurrentVisitorsNumber < 1
+    || shareMaxConcurrentVisitorsNumber > 10_000
   );
   const shareRateLimitMaxRequestsNumber = Number(shareRateLimitMaxRequests);
   const shareRateLimitMaxRequestsInvalid = shareRateLimitEnabled && (
@@ -1913,7 +1948,7 @@ export default function AppsPage() {
   }, [completeDependencyRepair, dependencyRepairDialog, loadProjects, reconcileDependencyRepair, showToast, user]);
 
   useEffect(() => {
-    if (!isOwner(user) || !user?.id) {
+    if (!userIsOwner || !user?.id) {
       dependencyRepairDiscoveryReadRef.current = null;
       dependencyRepairDiscoveryCompletedKeyRef.current = '';
       return undefined;
@@ -2000,7 +2035,7 @@ export default function AppsPage() {
       }
     })();
     return () => { cancelled = true; };
-  }, [reconcileDependencyRepair, showToast, user?.authorizationVersion, user?.id, user?.role]);
+  }, [reconcileDependencyRepair, showToast, user?.authorizationVersion, user?.id, userIsOwner]);
 
   const runDependencyRepair = useCallback(async (confirmation: string): Promise<void> => {
     const owner = dependencyRepairDialog;
@@ -2188,10 +2223,14 @@ export default function AppsPage() {
     setSharePasswordConfirm('');
     setShareExpiresAt('');
     setShareMaxUses('');
+    setShareMaxConcurrentVisitors('');
     setShareRateLimitEnabled(false);
     setShareRateLimitMaxRequests('');
     setShareRateLimitWindowSeconds(60);
     setShareCreateError(null);
+    setSharePolicyEditId(null);
+    setSharePolicyDraft(null);
+    setSharePolicyEditError(null);
     setEmailingLinkId(null);
     setShareEmailInput('');
     setShareEmailSuccess(null);
@@ -2399,9 +2438,45 @@ export default function AppsPage() {
       && shareLoadGenerationRef.current === loadGeneration
     );
     try {
-      const data = await projectsAPI.listShares(projectName);
+      const collected = [] as Awaited<ReturnType<typeof projectsAPI.listShares>>['shares'];
+      const seenIds = new Set<string>();
+      const seenCursors = new Set<string>();
+      let cursor: string | undefined;
+      let complete = false;
+      // The server retains at most 1,000 links per App and returns at most 100
+      // per page. Eleven iterations leave one explicit guard page for a broken
+      // or drifting cursor contract instead of silently displaying a prefix.
+      for (let page = 0; page < 11; page += 1) {
+        const data = cursor
+          ? await projectsAPI.listShares(projectName, { cursor })
+          : await projectsAPI.listShares(projectName);
+        if (!Array.isArray(data.shares)
+          || !data.pagination
+          || typeof data.pagination.hasMore !== 'boolean'
+          || (data.pagination.nextCursor !== null && typeof data.pagination.nextCursor !== 'string')) {
+          throw new Error('Share-link pagination response is invalid');
+        }
+        for (const share of data.shares) {
+          if (!share || typeof share.id !== 'string' || seenIds.has(share.id)) {
+            throw new Error('Share-link pagination returned a duplicate or invalid row');
+          }
+          seenIds.add(share.id);
+          collected.push(share);
+        }
+        if (!data.pagination.hasMore) {
+          complete = true;
+          break;
+        }
+        const nextCursor = data.pagination.nextCursor;
+        if (!nextCursor || seenCursors.has(nextCursor)) {
+          throw new Error('Share-link pagination did not advance');
+        }
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      }
+      if (!complete) throw new Error('Share-link history exceeded its retained pagination boundary');
       if (!ownsShareReadback()) return false;
-      setShares(data.shares || []);
+      setShares(collected);
       setShareRefreshError(null);
       return true;
     } catch (err) {
@@ -4450,6 +4525,7 @@ export default function AppsPage() {
       passwordConfirm: sharePasswordConfirm,
       expiresAtInput: shareExpiresAt,
       maxUsesInput: shareMaxUses,
+      maxConcurrentVisitorsInput: shareMaxConcurrentVisitors,
       rateLimitEnabled: shareRateLimitEnabled,
       rateLimitMaxRequestsInput: shareRateLimitMaxRequests,
       rateLimitWindowSeconds: shareRateLimitWindowSeconds,
@@ -4471,6 +4547,17 @@ export default function AppsPage() {
     const maxUses = request.maxUsesInput ? Number(request.maxUsesInput) : null;
     if (maxUses !== null && (!Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 1_000_000)) {
       rejectSharePolicy('Visitor slots must be a whole number from 1 to 1,000,000');
+      return;
+    }
+    const maxConcurrentVisitors = request.maxConcurrentVisitorsInput
+      ? Number(request.maxConcurrentVisitorsInput)
+      : null;
+    if (maxConcurrentVisitors !== null && (
+      !Number.isSafeInteger(maxConcurrentVisitors)
+      || maxConcurrentVisitors < 1
+      || maxConcurrentVisitors > 10_000
+    )) {
+      rejectSharePolicy('Concurrent visitors must be a whole number from 1 to 10,000');
       return;
     }
     const rateLimitMaxRequests = request.rateLimitEnabled
@@ -4510,6 +4597,7 @@ export default function AppsPage() {
         ...(request.isPublic ? {} : { password: request.password }),
         ...(expiresAt ? { expiresAt: expiresAt.toISOString() } : {}),
         ...(maxUses !== null ? { maxUses } : {}),
+        ...(maxConcurrentVisitors !== null ? { maxConcurrentVisitors } : {}),
         ...(rateLimitMaxRequests !== null ? {
           rateLimitMaxRequests,
           rateLimitWindowSeconds: request.rateLimitWindowSeconds,
@@ -4519,6 +4607,7 @@ export default function AppsPage() {
       setSharePasswordConfirm('');
       setShareExpiresAt('');
       setShareMaxUses('');
+      setShareMaxConcurrentVisitors('');
       setShareRateLimitEnabled(false);
       setShareRateLimitMaxRequests('');
       setShareRateLimitWindowSeconds(60);
@@ -4572,6 +4661,106 @@ export default function AppsPage() {
     finally {
       releaseShareAction(owner);
       shareMutationIdsRef.current.delete(linkId);
+      setShareMutationIds(new Set(shareMutationIdsRef.current));
+    }
+  };
+
+  const openSharePolicyEditor = (link: ShareLink) => {
+    if (isShareActionInFlight()) return;
+    if (sharePolicyEditId === link.id) {
+      setSharePolicyEditId(null);
+      setSharePolicyDraft(null);
+      setSharePolicyEditError(null);
+      return;
+    }
+    setSharePolicyEditId(link.id);
+    setSharePolicyDraft({
+      expiresAt: sharePolicyLocalDateTime(link.expiresAt),
+      maxUses: link.maxUses === null ? '' : String(link.maxUses),
+      maxConcurrentVisitors: link.maxConcurrentVisitors === null
+        ? ''
+        : String(link.maxConcurrentVisitors),
+      rateLimitEnabled: link.rateLimitMaxRequests !== null,
+      rateLimitMaxRequests: link.rateLimitMaxRequests === null
+        ? ''
+        : String(link.rateLimitMaxRequests),
+      rateLimitWindowSeconds: link.rateLimitWindowSeconds || 60,
+    });
+    setSharePolicyEditError(null);
+  };
+
+  const saveSharePolicy = async (link: ShareLink) => {
+    if (!selectedProject
+      || sharePolicyEditId !== link.id
+      || !sharePolicyDraft
+      || shareActionOwnerRef.current
+      || shareMutationIdsRef.current.has(link.id)) return;
+    const expiresAt = sharePolicyDraft.expiresAt ? new Date(sharePolicyDraft.expiresAt) : null;
+    if (expiresAt && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) {
+      setSharePolicyEditError('Expiration must be in the future');
+      return;
+    }
+    const maxUses = sharePolicyDraft.maxUses === '' ? null : Number(sharePolicyDraft.maxUses);
+    if (maxUses !== null && (!Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 1_000_000)) {
+      setSharePolicyEditError('Visitor slots must be a whole number from 1 to 1,000,000');
+      return;
+    }
+    const maxConcurrentVisitors = sharePolicyDraft.maxConcurrentVisitors === ''
+      ? null
+      : Number(sharePolicyDraft.maxConcurrentVisitors);
+    if (maxConcurrentVisitors !== null && (
+      !Number.isSafeInteger(maxConcurrentVisitors)
+      || maxConcurrentVisitors < 1
+      || maxConcurrentVisitors > 10_000
+    )) {
+      setSharePolicyEditError('Concurrent visitors must be a whole number from 1 to 10,000');
+      return;
+    }
+    const rateLimitMaxRequests = sharePolicyDraft.rateLimitEnabled
+      ? Number(sharePolicyDraft.rateLimitMaxRequests)
+      : null;
+    if (sharePolicyDraft.rateLimitEnabled && (
+      !Number.isSafeInteger(rateLimitMaxRequests)
+      || rateLimitMaxRequests! < 1
+      || rateLimitMaxRequests! > 1_000_000
+    )) {
+      setSharePolicyEditError('API request limit must be a whole number from 1 to 1,000,000');
+      return;
+    }
+
+    const owner = Object.freeze({
+      kind: 'policy' as const,
+      projectName: selectedProject,
+      projectGeneration: projectLoadGenerationRef.current,
+      linkId: link.id,
+      token: ++projectOperationTokenRef.current,
+    });
+    if (!claimShareAction(owner)) return;
+    shareMutationIdsRef.current.add(link.id);
+    setShareMutationIds(new Set(shareMutationIdsRef.current));
+    setSharePolicyEditError(null);
+    try {
+      await projectsAPI.updateShare(selectedProject, link.id, {
+        expiresAt: expiresAt ? expiresAt.toISOString() : null,
+        maxUses,
+        maxConcurrentVisitors,
+        rateLimitMaxRequests,
+        rateLimitWindowSeconds: sharePolicyDraft.rateLimitEnabled
+          ? sharePolicyDraft.rateLimitWindowSeconds
+          : null,
+      });
+      if (await loadShares(selectedProject)) {
+        setSharePolicyEditId(null);
+        setSharePolicyDraft(null);
+        showToast('Share limits updated');
+      }
+    } catch (error) {
+      const extracted = extractError(error, 'Updating share limits');
+      logError(error, 'Updating share limits');
+      setSharePolicyEditError(extracted.message);
+    } finally {
+      releaseShareAction(owner);
+      shareMutationIdsRef.current.delete(link.id);
       setShareMutationIds(new Set(shareMutationIdsRef.current));
     }
   };
@@ -5570,6 +5759,7 @@ export default function AppsPage() {
                   onClick: () => toggleActivePanel('deployment'),
                   active: activePanel === 'deployment',
                 }] : []),
+                ...(['OWNER', 'SUB_ADMIN'].includes(user?.role || '') ? [{ label: 'Work in Agent Chat', icon: <Bot size={16} />, onClick: openProjectWork, disabled: !currentProjectAvailable }] : []),
                 { label: 'Project Chat', icon: <Bot size={16} />, onClick: () => agentChatOpen ? closeAgentChat() : openAgentChat(), active: agentChatOpen, disabled: !currentProjectAvailable },
                 { label: 'Download (Full)', icon: <Download size={16} />, onClick: () => downloadProject('full') },
                 { label: 'Download (Clean)', icon: <Download size={16} />, onClick: () => downloadProject('clean') },
@@ -5610,6 +5800,7 @@ export default function AppsPage() {
               )}
               {selectedProject && (
                 <>
+                  {['OWNER', 'SUB_ADMIN'].includes(user?.role || '') && <button type="button" onClick={openProjectWork} disabled={!currentProjectAvailable} className="flex items-center gap-1.5 rounded-lg border border-cyan-300/20 bg-cyan-300/10 px-3 py-1.5 text-xs text-cyan-100 transition-colors hover:bg-cyan-300/20 disabled:opacity-40"><Bot size={12} /> Work in Agent Chat</button>}
                   {/* Preview button for static/fullstack, Check button for runtime */}
                   {isRuntimeProject ? (
                     <button onClick={checkProject} disabled={checkingProject}
@@ -6623,6 +6814,7 @@ export default function AppsPage() {
               mobileLabel="Project activity panel"
               onDismiss={() => setActivePanel(null)}
             >
+              {currentProject && <ProjectWorkHistory projectIdentityId={currentProject.identity.id} />}
               <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
                 <span className="text-xs font-medium flex items-center gap-1.5"><Activity size={13} className="text-cyan-400" /> Activity</span>
                 <div className="flex items-center gap-1">
@@ -6818,6 +7010,25 @@ export default function AppsPage() {
                         <p id="share-visitor-slots-hint" className="text-[9px] leading-relaxed text-slate-500">
                           Each slot grants one browser up to 30 days of access while the link remains active. Clearing cookies or switching browsers can use another slot.
                         </p>
+                        <label className="space-y-1 text-[10px] text-slate-500">
+                          <span>Concurrent visitors</span>
+                          <input
+                            aria-label="Share link concurrent visitor limit"
+                            aria-describedby={`share-concurrent-visitors-hint${shareCreateError ? ' share-create-error' : ''}`}
+                            aria-invalid={shareMaxConcurrentVisitorsInvalid}
+                            type="number"
+                            min={1}
+                            max={10_000}
+                            step={1}
+                            value={shareMaxConcurrentVisitors}
+                            onChange={event => { setShareMaxConcurrentVisitors(event.target.value); setShareCreateError(null); }}
+                            placeholder="Unlimited"
+                            className="w-full rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-[11px] text-white placeholder-slate-600 focus:border-violet-500/30 focus:outline-none"
+                          />
+                        </label>
+                        <p id="share-concurrent-visitors-hint" className="text-[9px] leading-relaxed text-slate-500">
+                          Counts distinct signed browsers with an in-flight share request. Parallel asset/API requests from one browser use one visitor place; crashed requests expire automatically.
+                        </p>
                       </div>
 
                       <div className="space-y-2 rounded-lg border border-white/[0.07] bg-black/10 p-2.5">
@@ -6958,6 +7169,12 @@ export default function AppsPage() {
                                     : `${link.currentUses} visitor slot${link.currentUses === 1 ? '' : 's'} used · unlimited`}</span>
                                 </div>
                                 <div className="flex items-center gap-1.5">
+                                  <Users size={9} className="flex-shrink-0 text-fuchsia-400/70" />
+                                  <span>{link.maxConcurrentVisitors
+                                    ? `${link.maxConcurrentVisitors} concurrent visitor${link.maxConcurrentVisitors === 1 ? '' : 's'}`
+                                    : 'Unlimited concurrent visitors'}</span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
                                   <Gauge size={9} className="flex-shrink-0 text-sky-400/70" />
                                   <span>{link.rateLimitMaxRequests && link.rateLimitWindowSeconds
                                     ? `${link.rateLimitMaxRequests} API requests / ${shareRateLimitWindowLabel(link.rateLimitWindowSeconds)} · shared`
@@ -6967,6 +7184,15 @@ export default function AppsPage() {
                               <div className="flex items-center justify-between text-[10px] text-slate-600">
                                 <span>{timeAgo(link.createdAt)}</span>
                                 <div className="flex items-center gap-3">
+                                  <button
+                                    type="button"
+                                    onClick={() => openSharePolicyEditor(link)}
+                                    disabled={shareActionActive}
+                                    aria-expanded={sharePolicyEditId === link.id}
+                                    className="text-fuchsia-400/60 hover:text-fuchsia-300 disabled:cursor-not-allowed disabled:opacity-40"
+                                  >
+                                    {sharePolicyEditId === link.id ? 'Close limits' : 'Edit limits'}
+                                  </button>
                                   {getShareLinkAvailability(link) === 'active' && !link.isPublic && (
                                     <button
                                       onClick={() => {
@@ -7003,6 +7229,132 @@ export default function AppsPage() {
                                 </div>
                               </div>
                             </div>
+
+                            {sharePolicyEditId === link.id && sharePolicyDraft && (
+                              <div className="space-y-2 border-t border-white/5 px-2.5 pb-2.5 pt-2">
+                                <p className="text-[10px] font-medium text-fuchsia-300">Edit audience and request limits</p>
+                                <label className="block space-y-1 text-[9px] text-slate-500">
+                                  <span>Expires</span>
+                                  <input
+                                    aria-label="Edit share expiration"
+                                    type="datetime-local"
+                                    value={sharePolicyDraft.expiresAt}
+                                    onChange={event => {
+                                      setSharePolicyDraft(current => current ? { ...current, expiresAt: event.target.value } : current);
+                                      setSharePolicyEditError(null);
+                                    }}
+                                    className="w-full rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-[10px] text-slate-300"
+                                  />
+                                </label>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <label className="space-y-1 text-[9px] text-slate-500">
+                                    <span>Total visitor slots</span>
+                                    <input
+                                      aria-label="Edit share visitor slots"
+                                      type="number"
+                                      min={1}
+                                      max={1_000_000}
+                                      placeholder="Unlimited"
+                                      value={sharePolicyDraft.maxUses}
+                                      onChange={event => {
+                                        setSharePolicyDraft(current => current ? { ...current, maxUses: event.target.value } : current);
+                                        setSharePolicyEditError(null);
+                                      }}
+                                      className="w-full rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-[10px] text-slate-300"
+                                    />
+                                  </label>
+                                  <label className="space-y-1 text-[9px] text-slate-500">
+                                    <span>Concurrent visitors</span>
+                                    <input
+                                      aria-label="Edit share concurrent visitor limit"
+                                      type="number"
+                                      min={1}
+                                      max={10_000}
+                                      placeholder="Unlimited"
+                                      value={sharePolicyDraft.maxConcurrentVisitors}
+                                      onChange={event => {
+                                        setSharePolicyDraft(current => current ? { ...current, maxConcurrentVisitors: event.target.value } : current);
+                                        setSharePolicyEditError(null);
+                                      }}
+                                      className="w-full rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-[10px] text-slate-300"
+                                    />
+                                  </label>
+                                </div>
+                                <label className="flex items-center justify-between text-[9px] text-slate-400">
+                                  <span>Limit dynamic API requests</span>
+                                  <input
+                                    aria-label="Edit share API request limit enabled"
+                                    type="checkbox"
+                                    checked={sharePolicyDraft.rateLimitEnabled}
+                                    onChange={event => {
+                                      setSharePolicyDraft(current => current ? {
+                                        ...current,
+                                        rateLimitEnabled: event.target.checked,
+                                        rateLimitMaxRequests: event.target.checked ? current.rateLimitMaxRequests : '',
+                                      } : current);
+                                      setSharePolicyEditError(null);
+                                    }}
+                                    className="size-4 accent-violet-500"
+                                  />
+                                </label>
+                                {sharePolicyDraft.rateLimitEnabled && (
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <input
+                                      aria-label="Edit share API request count"
+                                      type="number"
+                                      min={1}
+                                      max={1_000_000}
+                                      placeholder="Requests"
+                                      value={sharePolicyDraft.rateLimitMaxRequests}
+                                      onChange={event => {
+                                        setSharePolicyDraft(current => current ? { ...current, rateLimitMaxRequests: event.target.value } : current);
+                                        setSharePolicyEditError(null);
+                                      }}
+                                      className="rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-[10px] text-slate-300"
+                                    />
+                                    <select
+                                      aria-label="Edit share API request window"
+                                      value={sharePolicyDraft.rateLimitWindowSeconds}
+                                      onChange={event => {
+                                        setSharePolicyDraft(current => current ? {
+                                          ...current,
+                                          rateLimitWindowSeconds: Number(event.target.value) as ShareRateLimitWindowSeconds,
+                                        } : current);
+                                        setSharePolicyEditError(null);
+                                      }}
+                                      className="rounded-md border border-white/10 bg-[#10142d] px-2 py-1.5 text-[10px] text-slate-300"
+                                    >
+                                      {SHARE_RATE_LIMIT_WINDOWS.map(window => (
+                                        <option key={window.value} value={window.value}>{window.label}</option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                )}
+                                {sharePolicyEditError && (
+                                  <p role="alert" className="rounded-md border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-[9px] text-red-200">
+                                    {sharePolicyEditError}
+                                  </p>
+                                )}
+                                <div className="grid grid-cols-2 gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => void saveSharePolicy(link)}
+                                    disabled={shareActionActive}
+                                    className="rounded-md bg-fuchsia-500/15 px-2 py-1.5 text-[10px] font-medium text-fuchsia-200 disabled:opacity-40"
+                                  >
+                                    {shareMutationIds.has(link.id) ? 'Saving…' : 'Save limits'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => openSharePolicyEditor(link)}
+                                    disabled={shareActionActive}
+                                    className="rounded-md bg-white/5 px-2 py-1.5 text-[10px] text-slate-400 disabled:opacity-40"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            )}
 
                             {/* Email form — inline accordion */}
                             {emailingLinkId === link.id && (

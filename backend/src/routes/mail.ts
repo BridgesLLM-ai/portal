@@ -350,10 +350,12 @@ async function resolveAccount(req: Request): Promise<ResolvedAccount | null | 'n
   const isAdmin = isElevatedRole(req.user?.role);
 
   if (accountParam === 'support') {
-    return isAdmin ? { user: getStalwartSupportUser(), pass: getStalwartSupportPass(), email: `support@${getMailDomain()}` } : null;
+    if (!isAdmin) return null;
+    return getStalwartSupportPass() ? { user: getStalwartSupportUser(), pass: getStalwartSupportPass(), email: `support@${getMailDomain()}` } : 'no_mailbox';
   }
   if (accountParam === 'noreply') {
-    return isAdmin ? { user: getStalwartNoreplyUser(), pass: getStalwartNoreplyPass(), email: `noreply@${getMailDomain()}` } : null;
+    if (!isAdmin) return null;
+    return getStalwartNoreplyPass() ? { user: getStalwartNoreplyUser(), pass: getStalwartNoreplyPass(), email: `noreply@${getMailDomain()}` } : 'no_mailbox';
   }
   if (getExtraSharedMailAccountId() && accountParam === getExtraSharedMailAccountId()) {
     const extraSharedMailbox = readExtraSharedMailCredentials();
@@ -404,10 +406,12 @@ router.get('/accounts', async (req: Request, res: Response) => {
     
     if (isAdmin) {
       const extraSharedMailbox = readExtraSharedMailCredentials();
-      accounts.push(
-        { id: 'support', label: 'Shared Support', email: `support@${getMailDomain()}`, kind: 'shared' },
-        { id: 'noreply', label: 'Shared No-Reply', email: `noreply@${getMailDomain()}`, kind: 'shared' },
-      );
+      if (getStalwartSupportPass()) {
+        accounts.push({ id: 'support', label: 'Shared Support', email: `support@${getMailDomain()}`, kind: 'shared' });
+      }
+      if (getStalwartNoreplyPass()) {
+        accounts.push({ id: 'noreply', label: 'Shared No-Reply', email: `noreply@${getMailDomain()}`, kind: 'shared' });
+      }
       if (getExtraSharedMailAccountId() && extraSharedMailbox) {
         accounts.push({ id: getExtraSharedMailAccountId(), label: getExtraSharedMailLabel(), email: extraSharedMailbox.email, kind: 'shared' });
       }

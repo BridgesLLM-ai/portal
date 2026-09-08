@@ -1,6 +1,29 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+
+jest.mock('./projectRuntimeOwnership', () => {
+  const actual = jest.requireActual<typeof import('./projectRuntimeOwnership')>(
+    './projectRuntimeOwnership',
+  );
+  if (typeof process.getuid !== 'function' || process.getuid() === 0) return actual;
+  const { writeContainedFileAtomic } = jest.requireActual<typeof import('./containedPath')>(
+    './containedPath',
+  );
+  return {
+    ...actual,
+    // Ownership is covered by the root-only ownership suite. Keep this policy
+    // fixture writable on an ordinary CI uid while retaining the same bounded,
+    // no-follow atomic writer used by production.
+    writeProjectRuntimeOwnedFileAtomic: (
+      projectRoot: string,
+      relativePath: string,
+      content: string | Buffer,
+      options: { encoding?: BufferEncoding; exclusive?: boolean; maxBytes?: number } = {},
+    ) => writeContainedFileAtomic(projectRoot, relativePath, content, options),
+  };
+});
+
 import {
   PROJECT_MEMORY_FILE,
   PROJECT_MEMORY_MAX_BYTES,

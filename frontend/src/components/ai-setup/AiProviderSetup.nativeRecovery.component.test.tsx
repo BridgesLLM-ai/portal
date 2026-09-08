@@ -47,4 +47,21 @@ describe('AiProviderSetup exact native recovery handoff', () => {
     );
     expect(screen.getByRole('dialog', { name: 'Native recovery claude-code' })).toBeVisible();
   });
+
+  it('consumes an exact OpenCode Portal-harness handoff without opening the Zen account flow', () => {
+    const onConsumed = vi.fn();
+    render(
+      <AiProviderSetup
+        mode="settings"
+        apiBase="/ai-setup"
+        compact
+        initialNativeCliProvider="opencode"
+        onInitialNativeCliProviderConsumed={onConsumed}
+      />,
+    );
+
+    expect(screen.getByRole('dialog', { name: 'Native recovery opencode' })).toBeVisible();
+    expect(onConsumed).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/OpenCode Zen/i)).not.toBeInTheDocument();
+  });
 });

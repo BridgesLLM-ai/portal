@@ -27,10 +27,13 @@ import {
   Send, StopCircle, Pencil, Settings, X, ChevronDown,
   Check, RefreshCw, Wrench, Loader2, CheckCircle2, XCircle, ShieldAlert, Radio,
   Sparkles, Copy, RotateCcw, MessageSquare, Code2, Bug, ChevronRight, Clock,
-  Paperclip, Mic, PenSquare, Layers3, Settings2,
+  Paperclip, Mic, PenSquare, Layers3, Settings2, Activity,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import AgentSelector, { type AgentSelection } from './AgentSelector';
+import PortalGuideButton from './PortalGuideButton';
+import { useProjectWork, ProjectWorkComposer, ProjectWorkCard, ProjectWorkActivity, ProjectWorkAttention, ProjectWorkDock, mergeProjectWorkTimeline } from './ProjectWork';
+import ChatTasksButton from './ChatTasksButton';
 import ImagePickerCropper from '../ImagePickerCropper';
 import AnchoredPopover from '../AnchoredPopover';
 import ViewportModal from '../ViewportModal';
@@ -56,6 +59,7 @@ import {
   type LocalSlashCommandEvent,
 } from '../../utils/localSlashCommandClaim';
 import client from '../../api/client';
+import { Link } from 'react-router-dom';
 import sounds from '../../utils/sounds';
 import { usePublicSettings } from '../../hooks/usePublicSettings';
 import { useUserAvatarUrl } from '../../hooks/useUserAvatarUrl';
@@ -69,7 +73,6 @@ import {
   isKnownOpenClawCatalogModelId,
 } from '../../utils/modelId';
 import ComposerStatusBadge from './ComposerStatusBadge';
-import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
 import { getToolPresentation, getToolSummary, isAskQuestionTool, isCompactionNotice } from '../../utils/toolPresentation';
 import { anchoredScrollTop, selectNewestWindow } from '../../utils/timelineWindow';
@@ -100,10 +103,18 @@ import {
 } from '../../utils/agentChatProviderCatalog';
 import { isAgentChatLaunchBoundModelError } from '../../utils/agentChatModelSwitch';
 import { reconcileCumulativeFinalTail } from '../../utils/chatStream';
+import AgentChatDiagnosticsDrawer from './AgentChatDiagnosticsDrawer';
 
 const MESSAGE_WINDOW_SIZE = 80;
 const TOOL_WINDOW_SIZE = 40;
 const LazyAgentZeroSetupPanel = React.lazy(() => import('../settings/AgentZeroSetupPanel'));
+
+export function isAgentChatPositiveApprovalBlocked(approvalId: string): boolean {
+  const normalized = String(approvalId || '').trim().toLowerCase();
+  // Native approval identities are minted by the exact active provider turn;
+  // resolving one can only resume that already supervised continuation.
+  return !normalized.startsWith('native-');
+}
 
 function downloadChatMarkdown(messages: ChatMessage[]) {
   const markdown = messages
@@ -230,6 +241,36 @@ const AGENTS: AgentIdentity[] = [
     provenance: 'via Antigravity',
   },
   {
+    name: 'Hermes',
+    initials: 'HE',
+    providerName: 'HERMES',
+    color: 'text-amber-300',
+    bgLight: 'bg-amber-500/[0.06]',
+    borderColor: 'border-amber-500/15',
+    avatarBg: 'bg-amber-600/20',
+    avatarText: 'text-amber-200',
+    accentRing: 'focus:ring-amber-500/40 focus:border-amber-500/30',
+    sendBg: 'bg-amber-500',
+    sendHover: 'hover:bg-amber-600',
+    sendShadow: 'shadow-amber-500/20',
+    provenance: 'via Hermes',
+  },
+  {
+    name: 'OpenCode',
+    initials: 'OP',
+    providerName: 'OPENCODE',
+    color: 'text-indigo-300',
+    bgLight: 'bg-indigo-500/[0.06]',
+    borderColor: 'border-indigo-500/15',
+    avatarBg: 'bg-indigo-600/20',
+    avatarText: 'text-indigo-200',
+    accentRing: 'focus:ring-indigo-500/40 focus:border-indigo-500/30',
+    sendBg: 'bg-indigo-500',
+    sendHover: 'hover:bg-indigo-600',
+    sendShadow: 'shadow-indigo-500/20',
+    provenance: 'via OpenCode',
+  },
+  {
     name: 'Ollama',
     initials: 'OL',
     providerName: 'OLLAMA',
@@ -279,6 +320,7 @@ const OPENCLAW_MODEL_FALLBACK = [
   'openai/gpt-5.6-terra',
   'openai/gpt-5.6-luna',
   'openai/gpt-5.5',
+  'anthropic/claude-fable-5-1',
   'anthropic/claude-fable-5',
   'anthropic/claude-opus-5',
   'anthropic/claude-sonnet-4-6',
@@ -335,6 +377,21 @@ const providerCommandsCache = new Map<string, {
   capabilities?: ProviderCapabilities;
 }>();
 
+const PORTAL_NATIVE_RUNTIME_MUTATION_UNAVAILABLE_TOOL_IDS = new Set([
+  'agent-zero',
+  'antigravity',
+  'gemini',
+  'grok-build',
+  'hermes',
+  'opencode',
+]);
+const PORTAL_COMPATIBILITY_BUNDLE_TOOL_IDS = new Set([
+  'openclaw',
+  'codex',
+  'claude-code',
+  'clawhub',
+]);
+
 export function getAgentChatNativeRecoveryTarget(
   providerName: string,
   entry?: AgentChatProviderCatalogEntry,
@@ -354,9 +411,10 @@ export function getAgentChatNativeRecoveryTarget(
   ) return null;
   const targets: Partial<Record<string, NativeCliSetupProvider>> = {
     CLAUDE_CODE: 'claude-code',
-    CODEX: 'codex',
     GEMINI: 'gemini',
     GROK: 'grok',
+    HERMES: 'hermes',
+    OPENCODE: 'opencode',
   };
   return targets[providerName] || null;
 }
@@ -602,6 +660,9 @@ export function ModelPicker({
   if (models.length === 0 && !supportsCustomModelInput && !loading && !error && !required) return null;
 
   const emptySelectionLabel = required ? 'Select model' : 'Default model';
+  const includesAccountDependentAstra = models.some(
+    (model) => canonicalizePortalModelId(model) === 'openai/gpt-6-astra',
+  );
 
   return (
     <div className="relative">
@@ -622,13 +683,13 @@ export function ModelPicker({
         className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] transition-colors ${disabled ? 'bg-white/[0.03] border-white/[0.05] text-slate-500 cursor-not-allowed opacity-60' : 'bg-white/[0.06] hover:bg-white/[0.10] border-white/[0.08] text-slate-400 hover:text-slate-200'}`}
         title={disabled ? 'Finish or abort the current response before switching models' : (error || value || emptySelectionLabel)}
       >
-        {/* Icon-only on mobile, text on desktop */}
+        {/* Keep the selected model visible on narrow screens too. */}
         {loading
           ? <Loader2 size={13} className="sm:hidden flex-shrink-0 animate-spin" />
           : error
             ? <XCircle size={13} className="flex-shrink-0 text-red-300" />
             : <Code2 size={13} className="sm:hidden flex-shrink-0" />}
-        <div className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[220px]">
+        <div className="flex items-center gap-1.5 min-w-0 max-w-[110px] sm:max-w-[220px]">
           {loading ? <Loader2 size={12} className="flex-shrink-0 animate-spin text-violet-300" /> : null}
           {value ? <ModelMeta modelId={value} compact /> : <span className="truncate max-w-[120px]">{emptySelectionLabel}</span>}
         </div>
@@ -665,6 +726,11 @@ export function ModelPicker({
               {emptyMessage}
             </div>
           )}
+          {includesAccountDependentAstra && (
+            <div className="border-b border-amber-500/15 bg-amber-500/[0.06] px-3 py-2 text-[11px] leading-4 text-amber-100" role="status">
+              GPT-6 Astra availability depends on your OpenAI account. Its listing does not confirm access; Portal verifies access when an authenticated turn starts.
+            </div>
+          )}
           {allowDefaultModel && (
             <button
               type="button"
@@ -697,7 +763,7 @@ export function ModelPicker({
                 {unavailableModelIds.length} model{unavailableModelIds.length === 1 ? '' : 's'} hidden
                 because their provider is not connected
                 {unavailableModelIds.length <= 4 ? ` — ${unavailableModelIds.join(', ')}` : ''}.
-                Connect it in Settings → AI Providers.
+                Connect it in Settings → Model Providers.
               </p>
             </div>
           )}
@@ -742,12 +808,12 @@ export function AgentZeroRecoveryCard({
   message,
   retrying = false,
   onRetry,
-  onRepair,
+  onOpenSettings,
 }: {
   message: string;
   retrying?: boolean;
   onRetry: () => void;
-  onRepair?: () => void;
+  onOpenSettings?: () => void;
 }) {
   return (
     <div
@@ -769,14 +835,14 @@ export function AgentZeroRecoveryCard({
               <RefreshCw size={13} className={retrying ? 'animate-spin' : ''} />
               {retrying ? 'Retrying…' : 'Retry Agent Zero'}
             </button>
-            {onRepair ? (
+            {onOpenSettings ? (
               <button
                 type="button"
-                onClick={onRepair}
+                onClick={onOpenSettings}
                 disabled={retrying}
                 className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-white/[0.10] bg-white/[0.05] px-3 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.09] disabled:cursor-wait disabled:opacity-60"
               >
-                <Wrench size={13} /> Repair managed runtime
+                <Settings size={13} /> View runtime status
               </button>
             ) : null}
           </div>
@@ -1080,7 +1146,7 @@ export function SessionControls({
   compatibilityHotfixApplying = false,
   compatibilityHotfixMessage = null,
   onRefreshCompatibilityHotfix,
-  onApplyCompatibilityHotfix,
+  onApplyCompatibilityHotfix: _onApplyCompatibilityHotfix,
   onSetThinkingLevel,
   onSetReasoningVisibility,
   onToggleFastMode,
@@ -1462,7 +1528,7 @@ export function SessionControls({
                     <Wrench size={14} className={compatibilityHotfixStatus?.applied ? 'text-emerald-400' : 'text-amber-400'} />
                     <div className="min-w-0 flex-1">
                       <div className="text-xs font-medium text-white">Compatibility Hotfix</div>
-                      <div className="text-[10px] text-slate-500">Installer/update usually auto-applies the OpenClaw relay, Gemini, and Claude ask-question compatibility patch. Use this fallback after a separate OpenClaw upgrade or if the expected markers are missing. Applying it restarts the gateway.</div>
+                      <div className="text-[10px] text-slate-500">Read-only here. Owner applies the exact OpenClaw and native-tool bundle under Admin &gt; Maintenance.</div>
                     </div>
                   </div>
                   <div className={`rounded border px-2 py-1 text-[10px] leading-relaxed ${compatibilityHotfixStatus?.applied ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/20 bg-amber-500/10 text-amber-200'}`}>
@@ -1487,16 +1553,9 @@ export function SessionControls({
                     >
                       <RefreshCw size={11} /> Refresh
                     </button>
-                    <button
-                      onClick={() => {
-                        setIsOpen(false);
-                        onApplyCompatibilityHotfix?.();
-                      }}
-                      disabled={disabled || controlsBusy || compatibilityHotfixApplying || compatibilityHotfixLoading || !compatibilityHotfixStatus?.supported || !onApplyCompatibilityHotfix}
-                      className="inline-flex min-h-[32px] items-center justify-center rounded-md border border-amber-200/70 bg-gradient-to-r from-amber-300 via-amber-400 to-amber-500 px-2.5 py-1 text-[10px] font-semibold text-slate-950 shadow-[0_8px_20px_rgba(245,158,11,0.24)] transition-all hover:-translate-y-0.5 hover:from-amber-200 hover:via-amber-300 hover:to-amber-400 hover:shadow-[0_12px_24px_rgba(245,158,11,0.3)] disabled:translate-y-0 disabled:cursor-not-allowed disabled:border-white/[0.08] disabled:bg-white/[0.08] disabled:bg-none disabled:text-slate-200 disabled:shadow-none"
-                    >
-                      {compatibilityHotfixApplying ? 'Applying…' : compatibilityHotfixStatus?.applied ? 'Reapply + restart' : 'Apply + restart'}
-                    </button>
+                    <span className="inline-flex min-h-[32px] items-center justify-center rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-[10px] text-amber-200">
+                      Update via Admin &gt; Maintenance
+                    </span>
                   </div>
                 </div>
               )}
@@ -1514,84 +1573,6 @@ export function SessionControls({
           </div>
       </AnchoredPopover>
     </div>
-  );
-}
-
-export function CompatibilityHotfixConfirmationDialog({
-  open,
-  status,
-  onClose,
-  onVerified,
-  onBusyChange,
-}: {
-  open: boolean;
-  status: CompatibilityHotfixStatus | null;
-  onClose: () => void;
-  onVerified: (status: CompatibilityHotfixStatus, message: string) => void;
-  onBusyChange?: (busy: boolean) => void;
-}) {
-  const [applying, setApplying] = useState(false);
-  const [applyError, setApplyError] = useState<string | null>(null);
-  const attemptRef = useRef<Readonly<{ confirmation: string }> | null>(null);
-
-  useEffect(() => {
-    if (open) setApplyError(null);
-  }, [open]);
-
-  const setBusy = useCallback((busy: boolean) => {
-    setApplying(busy);
-    onBusyChange?.(busy);
-  }, [onBusyChange]);
-
-  const apply = useCallback(async (confirmation: string) => {
-    if (attemptRef.current) return;
-    const snapshot = Object.freeze({ confirmation: String(confirmation || '').trim() });
-    attemptRef.current = snapshot;
-    setApplyError(null);
-    setBusy(true);
-    try {
-      const result = await gatewayAPI.applyCompatibilityHotfix(snapshot.confirmation);
-      if (attemptRef.current !== snapshot) return;
-      if (result?.ok !== true || result?.status?.applied !== true) {
-        throw new Error(result?.message || 'The gateway restart completed without verifying the compatibility hotfix.');
-      }
-      onVerified(result.status, result.message || 'Compatibility hotfix applied.');
-      onClose();
-    } catch (error: any) {
-      if (attemptRef.current !== snapshot) return;
-      const detail = error?.response?.data?.detail
-        || error?.response?.data?.error
-        || error?.message
-        || 'Failed to apply compatibility hotfix.';
-      setApplyError(String(detail));
-    } finally {
-      if (attemptRef.current === snapshot) {
-        attemptRef.current = null;
-        setBusy(false);
-      }
-    }
-  }, [onClose, onVerified, setBusy]);
-
-  return (
-    <TypedConfirmationDialog
-      open={open}
-      title="Apply OpenClaw compatibility hotfix?"
-      description="This updates the installed OpenClaw compatibility bundle and restarts the gateway. Active agent turns may be interrupted."
-      confirmationPhrase={status?.confirmationPhrase || null}
-      confirmLabel="Apply hotfix + restart"
-      busyLabel="Applying hotfix + restarting…"
-      busy={applying}
-      tone="warning"
-      details={applyError ? (
-        <div role="alert" className="rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
-          {applyError}
-        </div>
-      ) : null}
-      onCancel={() => {
-        if (!attemptRef.current) onClose();
-      }}
-      onConfirm={(confirmation) => { void apply(confirmation); }}
-    />
   );
 }
 
@@ -1628,6 +1609,17 @@ export function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete, 
   }, [open, loadTools]);
 
   const handleInstall = async (tool: AgentTool, confirmation: string) => {
+    const packageChangesUnavailable = tool.id === 'codex'
+      || tool.id === 'claude-code'
+      || tool.managedInstall === 'npm-cli'
+      || PORTAL_NATIVE_RUNTIME_MUTATION_UNAVAILABLE_TOOL_IDS.has(tool.id);
+    if (packageChangesUnavailable || tool.status?.installAvailable !== true) {
+      setPendingToolInstall(null);
+      setToolInstallError(PORTAL_COMPATIBILITY_BUNDLE_TOOL_IDS.has(tool.id)
+        ? 'Per-tool changes are disabled. Owner can run Admin > Maintenance > Update Compatible AI Tools to update the exact bundle safely.'
+        : 'Per-tool package changes are disabled; use this runtime\'s dedicated Portal setup or maintenance path.');
+      return;
+    }
     if (!isAdmin || installAdmissionRef.current) return;
     const toolId = tool.id;
     const admission = { toolId };
@@ -1737,18 +1729,23 @@ export function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete, 
                       {tools.map((tool) => {
                         const installed = tool.status?.installed;
                         const status = installStatus[tool.id];
+                        const packageChangesUnavailable = tool.id === 'codex'
+                          || tool.id === 'claude-code'
+                          || tool.managedInstall === 'npm-cli'
+                          || PORTAL_NATIVE_RUNTIME_MUTATION_UNAVAILABLE_TOOL_IDS.has(tool.id);
                         return (
                           <div key={tool.id} className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-1.5">
                                 <span className="truncate text-xs font-medium text-white">{tool.name}</span>
-                                {installed ? <CheckCircle2 size={10} className="shrink-0 text-emerald-400" /> : null}
+                                {installed && !packageChangesUnavailable ? <CheckCircle2 size={10} className="shrink-0 text-emerald-400" /> : null}
                               </div>
                               {installed && tool.status.version && <div className="mt-0.5 font-mono text-[10px] text-slate-500">v{tool.status.version}</div>}
+                              {packageChangesUnavailable ? <div className="mt-0.5 text-[10px] text-amber-300">{installed ? 'Package detected for Agent Chat' : `Package status: ${tool.status?.state || 'unavailable'}`} · {PORTAL_COMPATIBILITY_BUNDLE_TOOL_IDS.has(tool.id) ? 'Owner updates the exact bundle in Admin > Maintenance' : 'use this runtime\'s dedicated setup'}</div> : null}
                               {status === 'success' && <div role="status" className="mt-0.5 text-[10px] text-emerald-400">Install verified</div>}
                               {status === 'error' && <div role="alert" className="mt-0.5 text-[10px] text-red-400">Install failed — inspect Tasks</div>}
                             </div>
-                            {isAdmin && tool.install.length > 0 && (
+                            {isAdmin && !packageChangesUnavailable && tool.status?.installAvailable === true && tool.install.length > 0 && (
                               <button
                                 type="button"
                                 aria-label={`${installed ? 'Update' : 'Install'} ${tool.name}`}
@@ -2863,6 +2860,18 @@ interface ChatInterfaceProps {
   defaultProvider?: string;
 }
 
+export function shouldRefreshAcpCatalogAfterRun(
+  previousProvider: string,
+  previousRunning: boolean,
+  provider: string,
+  isRunning: boolean,
+): boolean {
+  return previousProvider === provider
+    && previousRunning
+    && !isRunning
+    && (provider === 'HERMES' || provider === 'OPENCODE');
+}
+
 interface SlashCommandOption {
   value: string;
   description?: string;
@@ -2912,11 +2921,21 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     agent: agentId || 'main',
   }), [agentId]);
   const session = chatState.session;
+  const projectWork = useProjectWork(provider, session, chatState.selectedModel);
   const selectedModel = chatState.selectedModel;
   const setSelectedModel = chatState.setSelectedModel;
   const switchModel = chatState.switchModel;
   const refreshChat = chatState.refreshChat;
   const historyError = chatState.historyError;
+  const [openConversationsRequest, setOpenConversationsRequest] = useState(0);
+  const historyErrorRetryable = chatState.historyErrorRetryable !== false;
+  const recoverHistory = () => historyErrorRetryable
+    ? void refreshChat()
+    : setOpenConversationsRequest((value) => value + 1);
+  const operationalBanner = chatState.operationalBanner;
+  const providerSignInError = operationalBanner?.source === 'runtime'
+    && /(?:missing.*bearer|invalid[_ ]api[_ ]key|not (?:logged|signed) in|not authenticated|api\.(?:openai|anthropic)\.com.*(?:401|unauthorized)|(?:401|unauthorized).*api\.(?:openai|anthropic)\.com)/i.test(operationalBanner.message);
+  const dismissOperationalBanner = chatState.dismissOperationalBanner;
   const hasOlderHistory = chatState.hasOlderHistory;
   const isLoadingOlderHistory = chatState.isLoadingOlderHistory;
   const olderHistoryError = chatState.olderHistoryError;
@@ -2946,6 +2965,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const sessionTelemetry = chatState.sessionTelemetry;
   const sessionAvailability = chatState.sessionAvailability;
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [providerRecoveryTarget, setProviderRecoveryTarget] = useState<NativeCliSetupProvider | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [agentZeroRecoveryPending, setAgentZeroRecoveryPending] = useState(false);
@@ -3007,9 +3027,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   const isAdmin = isElevated(user);
   const [compatibilityHotfixStatus, setCompatibilityHotfixStatus] = useState<CompatibilityHotfixStatus | null>(null);
   const [compatibilityHotfixLoading, setCompatibilityHotfixLoading] = useState(false);
-  const [compatibilityHotfixApplying, setCompatibilityHotfixApplying] = useState(false);
   const [compatibilityHotfixMessage, setCompatibilityHotfixMessage] = useState<string | null>(null);
-  const [compatibilityHotfixConfirmationOpen, setCompatibilityHotfixConfirmationOpen] = useState(false);
   const [sessionControlsLoading, setSessionControlsLoading] = useState(false);
 
   useEffect(() => {
@@ -3024,9 +3042,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         requestVersion: providerCatalogRefreshNonce,
       },
     ));
-    if (provider === 'OPENCLAW') {
-      return;
-    }
     const controller = new AbortController();
     let cancelled = false;
     const force = providerCatalogRefreshNonce > lastProviderCatalogRetryRef.current;
@@ -3101,7 +3116,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
   const showHeartbeatModel = provider === 'OPENCLAW' && isAdmin && (!agentId || agentId === 'main');
   const showCompatibilityHotfix = provider === 'OPENCLAW' && isAdmin;
-  const canApplyCompatibilityHotfix = provider === 'OPENCLAW' && isOwner(user);
   const {
     heartbeatModel,
     heartbeatModelLoading,
@@ -3157,7 +3171,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     if (!showCompatibilityHotfix) {
       setCompatibilityHotfixStatus(null);
       setCompatibilityHotfixLoading(false);
-      setCompatibilityHotfixApplying(false);
       setCompatibilityHotfixMessage(null);
     }
   }, [showCompatibilityHotfix]);
@@ -3474,7 +3487,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       : currentProviderModelsLoading || modelSwitching
         ? 'Agent Zero is loading and applying a connected model. Wait a moment before sending.'
         : availableModels.length === 0
-          ? 'Connect an Agent Zero model account in AI Providers before sending.'
+          ? 'Connect an Agent Zero model account in Model Providers before sending.'
           : 'Choose one of Agent Zero’s connected models before sending.';
   const providerAvailabilityBlockedReason = currentProviderAvailability.canSend
     ? null
@@ -3752,6 +3765,25 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     onSessionResolved: handleSessionResolved,
   });
 
+  const acpCatalogRunStateRef = useRef({ provider, wasRunning: isRunning });
+  useEffect(() => {
+    const previous = acpCatalogRunStateRef.current;
+    acpCatalogRunStateRef.current = { provider, wasRunning: isRunning };
+
+    // Hermes and OpenCode may not advertise an authenticated model catalog
+    // until ACP session/new succeeds. If the picker cached that legitimate
+    // pre-session empty result, replace it with the harness-attested catalog
+    // after the first terminal transition (and after later account changes).
+    if (shouldRefreshAcpCatalogAfterRun(
+      previous.provider,
+      previous.wasRunning,
+      provider,
+      isRunning,
+    )) {
+      void ensureProviderModelsLoaded(provider, { force: true }).catch(() => undefined);
+    }
+  }, [ensureProviderModelsLoaded, isRunning, provider]);
+
   const [revealedEarlierMessages, setRevealedEarlierMessages] = useState(0);
   const messageWindow = useMemo(
     () => selectNewestWindow(messages, MESSAGE_WINDOW_SIZE, revealedEarlierMessages),
@@ -3908,7 +3940,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       // Use requestAnimationFrame to scroll after DOM update
       requestAnimationFrame(() => scrollToBottom(true));
     }
-  }, [messages, scrollToBottom]);
+  }, [messages, projectWork.replays, scrollToBottom]);
 
   // Also scroll to bottom when streaming starts
   useEffect(() => {
@@ -4021,6 +4053,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   }, []);
 
   const startNewSession = useCallback(async (): Promise<boolean> => {
+    if (!currentProviderAvailability.canSend) {
+      setModelSelectionError(currentProviderAvailability.message || 'This provider cannot start a new chat right now.');
+      return false;
+    }
     if (blockForChatContextMutation('starting a new chat')) return false;
     if (newSessionLeaseRef.current) return false;
     const snapshot = Object.freeze({
@@ -4068,7 +4104,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         setNewSessionPending(false);
       }
     }
-  }, [blockForChatContextMutation, buildNewSessionKey, chatState]);
+  }, [blockForChatContextMutation, buildNewSessionKey, chatState, currentProviderAvailability.canSend, currentProviderAvailability.message]);
 
   // Model change handler — context handles localStorage persistence. Return a
   // success bit so both the picker and `/model` command use the same rollback,
@@ -4076,6 +4112,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
   // success message.
   const handleModelChange = useCallback(
     async (model: string): Promise<boolean> => {
+      if (!currentProviderAvailability.canSend) {
+        setModelSelectionError(currentProviderAvailability.message || 'Model changes are unavailable for this provider.');
+        return false;
+      }
       if (blockForChatContextMutation('changing models')) return false;
       if (isAgentZeroDefaultModelAlias(provider, model)) {
         setModelSelectionNotice(null);
@@ -4126,7 +4166,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         }
       }
     },
-    [blockForChatContextMutation, provider, providerLabel, selectedModel, session, setSelectedModel, startNewSession, switchModel],
+    [blockForChatContextMutation, currentProviderAvailability.canSend, currentProviderAvailability.message, provider, providerLabel, selectedModel, session, setSelectedModel, startNewSession, switchModel],
   );
 
   const handleNativeSetupModelSelected = useCallback(async (nativeProvider: 'GEMINI', model: string): Promise<boolean> => {
@@ -4377,10 +4417,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         {/* ── Main Chat Area ───────────────────────────────────────── */}
         <div className="flex-1 flex flex-col min-w-0">
           {/* Header */}
-          <div className="flex items-center gap-2 sm:gap-3 px-2 sm:px-4 py-2 sm:py-2.5 border-b border-white/[0.06] bg-[#0D1130]/40 backdrop-blur-sm flex-shrink-0 relative z-20">
-            <div className="flex items-center gap-2.5 flex-1 min-w-0">
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3 px-3 sm:px-4 py-2 sm:py-2.5 border-b border-white/[0.06] bg-[#0D1130]/40 backdrop-blur-sm flex-shrink-0 relative z-20">
+            <div className="flex items-center gap-2.5 w-full sm:w-auto sm:flex-1 min-w-0">
               <div
-                className={`w-9 h-9 rounded-full ${agent.avatarBg} flex items-center justify-center text-xs font-bold ${agent.avatarText} overflow-hidden relative group`}
+                className={`hidden sm:flex shrink-0 w-9 h-9 rounded-full ${agent.avatarBg} items-center justify-center text-xs font-bold ${agent.avatarText} overflow-hidden relative group`}
               >
                 {agentAvatars[agent.providerName] ? (
                   <img src={agentAvatars[agent.providerName]} alt={agent.name} className="w-full h-full object-cover" />
@@ -4403,6 +4443,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 disabled={modelSwitching || sessionSettingNavigationBusy || newSessionPending}
                 onChange={handleSelectAgent}
                 onViewSession={handleViewGatewaySession}
+                openConversationsRequest={openConversationsRequest}
                 currentSessionKey={session}
                 currentSessionActive={isRunning}
                 activityTitles={activityTitles}
@@ -4413,7 +4454,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               />
             </div>
 
-            <div className="flex items-center gap-1 sm:gap-2 ml-auto">
+            <div className="flex flex-wrap sm:flex-nowrap items-center justify-between sm:justify-end gap-1 sm:gap-2 w-full sm:w-auto sm:ml-auto shrink-0">
               {(canSelectModel || provider === 'AGENT_ZERO' || currentProviderModelsLoading || Boolean(currentProviderModelsError)) && (
                 <ModelPicker
                   value={provider === 'AGENT_ZERO' && !agentZeroSelectedModelVerified ? '' : selectedModel}
@@ -4423,10 +4464,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   error={modelSelectionError || currentProviderModelsError}
                   supportsCustomModelInput={provider === 'AGENT_ZERO' ? false : supportsCustomModelInput}
                   modelCatalogKind={provider === 'AGENT_ZERO' ? 'dynamic' : modelCatalogKind}
-                  disabled={isRunning || modelSwitching || sessionSettingNavigationBusy || newSessionPending}
+                  disabled={!currentProviderAvailability.canSend || isRunning || modelSwitching || sessionSettingNavigationBusy || newSessionPending}
                   allowDefaultModel={provider !== 'AGENT_ZERO'}
                   required={provider === 'AGENT_ZERO'}
-                  emptyMessage="Connect an Agent Zero OAuth account in AI Providers to load selectable models."
+                  emptyMessage="Connect an Agent Zero OAuth account in Model Providers to load selectable models."
                   unavailableModelIds={providerUnavailableModels[provider] || []}
                   onOpen={() => { void ensureProviderModelsLoaded(provider).catch(() => undefined); }}
                   onRetry={currentProviderModelsError
@@ -4443,15 +4484,15 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 compactionModelOverride={compactionModelOverride}
                 heartbeatModel={heartbeatModel}
                 heartbeatModelLoading={heartbeatModelLoading}
-                heartbeatModelError={heartbeatModelError}
+                heartbeatModelError={heartbeatModelError || (!currentProviderAvailability.canSend ? currentProviderAvailability.message : null)}
                 showHeartbeatModel={showHeartbeatModel}
                 showCompatibilityHotfix={showCompatibilityHotfix}
                 compatibilityHotfixStatus={compatibilityHotfixStatus}
                 compatibilityHotfixLoading={compatibilityHotfixLoading}
-                compatibilityHotfixApplying={compatibilityHotfixApplying}
+                compatibilityHotfixApplying={false}
                 compatibilityHotfixMessage={compatibilityHotfixMessage}
                 onRefreshCompatibilityHotfix={() => { void loadCompatibilityHotfixStatus(); }}
-                onApplyCompatibilityHotfix={canApplyCompatibilityHotfix ? () => setCompatibilityHotfixConfirmationOpen(true) : undefined}
+                onApplyCompatibilityHotfix={undefined}
                 onSetThinkingLevel={(level) => {
                   if (newSessionLeaseRef.current) return setModelSelectionError('Wait for the new chat to finish starting before changing session settings.');
                   void setThinkingLevel(level);
@@ -4469,6 +4510,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   void setCompactionModelOverride(model);
                 }}
                 onSetHeartbeatModel={(model) => {
+                  if (!currentProviderAvailability.canSend) return setModelSelectionError(currentProviderAvailability.message || 'Heartbeat model changes are unavailable.');
                   if (newSessionLeaseRef.current) return setModelSelectionError('Wait for the new chat to finish starting before changing session settings.');
                   void handleHeartbeatModelChange(model);
                 }}
@@ -4488,13 +4530,13 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   void loadHeartbeatModel();
                   void loadCompatibilityHotfixStatus();
                 }}
-                disabled={newSessionPending || modelSwitching || isRunning}
+                disabled={!currentProviderAvailability.canSend || newSessionPending || modelSwitching || isRunning}
                 currentModel={selectedModel}
                 sessionKey={session}
               />
               <button
                 onClick={handleNewChat}
-                disabled={sessionSettingNavigationBusy || newSessionPending}
+                disabled={!currentProviderAvailability.canSend || sessionSettingNavigationBusy || newSessionPending}
                 aria-busy={newSessionPending}
                 aria-label={newSessionPending ? 'Starting new chat' : 'New chat'}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/[0.08] transition-colors disabled:cursor-wait disabled:opacity-40"
@@ -4502,10 +4544,20 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               >
                 {newSessionPending ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <PenSquare size={16} />}
               </button>
+              {isAdmin && <ChatTasksButton projectWork={projectWork.cards} provider={provider} session={session} messages={messages} isRunning={isRunning || Boolean(projectWork.activity)} />}
               <StreamReconnectButton
                 visible={showConnectionLost}
                 onReconnect={reconnectSocket}
               />
+              <button
+                type="button"
+                onClick={() => setDiagnosticsOpen(true)}
+                aria-label="Open session events"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-cyan-500/[0.08] transition-colors"
+                title="Session events — maintenance and runtime diagnostics"
+              >
+                <Activity size={16} aria-hidden="true" />
+              </button>
               <button
                 onClick={async () => {
                   if (isRefreshing) return;
@@ -4530,6 +4582,22 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             </div>
           </div>
 
+              {isAdmin && currentProviderAvailability.canSend && <PortalGuideButton
+                suggestionKey={`${user?.id}:${provider}`}
+                scopeKey={`${user?.id}:${provider}:${session}`}
+                disabled={newSessionPending || modelSwitching || sessionSettingNavigationBusy}
+                onInsert={(guide) => {
+                  const textarea = composerInputRef.current;
+                  if (!textarea) return;
+                  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                  if (!setter) return;
+                  // Read the latest draft only after the fetch finishes. Never
+                  // submit, overwrite a newer draft, or move it to another session.
+                  if (!textarea.value.includes(guide)) setter.call(textarea, guide + textarea.value);
+                  textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                  textarea.focus();
+                }}
+              />}
           <ProviderAvailabilityBarrier
             assessment={currentProviderAvailability}
             loading={providerCatalogLoading}
@@ -4544,6 +4612,41 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               : undefined}
             onRetry={() => setProviderCatalogRefreshNonce((nonce) => nonce + 1)}
           />
+
+          {operationalBanner && (
+            <div
+              className={`flex items-center gap-2 border-b px-3 py-2 text-xs ${
+                operationalBanner.severity === 'error'
+                  ? 'border-red-500/15 bg-red-500/[0.07] text-red-100'
+                  : 'border-amber-500/15 bg-amber-500/[0.07] text-amber-100'
+              }`}
+              role="alert"
+              aria-live="assertive"
+            >
+              <ShieldAlert size={14} className="shrink-0" aria-hidden="true" />
+              <div className="min-w-0 flex-1">
+                {providerSignInError ? (
+                  <>
+                    <p className="font-medium">Connect your model-provider account to continue.</p>
+                    <p className="mt-1 text-red-100/80">The provider rejected this request because its sign-in is missing or expired. Your conversation is saved.</p>
+                    <Link to="/settings?tab=ai-providers" className="mt-2 inline-flex min-h-[36px] items-center rounded-lg border border-red-300/20 px-3 font-medium hover:bg-red-500/10">Open Model Providers</Link>
+                    <details className="mt-2 text-[11px] text-red-100/70">
+                      <summary className="cursor-pointer">Technical details</summary>
+                      <p className="mt-1 break-words">{operationalBanner.message}</p>
+                    </details>
+                  </>
+                ) : operationalBanner.message}
+              </div>
+              <button
+                type="button"
+                onClick={dismissOperationalBanner}
+                className="flex min-h-[32px] min-w-[32px] items-center justify-center rounded-lg hover:bg-white/[0.06]"
+                aria-label="Dismiss operational alert"
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
+            </div>
+          )}
 
           {modelSelectionError && provider !== 'AGENT_ZERO' && (
             <div className="flex items-center gap-2 border-b border-red-500/15 bg-red-500/[0.07] px-3 py-2 text-xs text-red-200" role="alert" aria-live="assertive">
@@ -4587,6 +4690,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             </AnimatePresence>
 
 
+            <ProjectWorkDock work={projectWork} />
+
             {/* Message list — rendered directly from messages state */}
             <div
               ref={scrollRef}
@@ -4594,17 +4699,17 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               className="flex-1 overflow-y-auto"
               onScroll={handleChatScroll}
             >
-              {isLoadingHistory && messages.length === 0 ? (
+              {isLoadingHistory && messages.length === 0 && projectWork.cards.length === 0 ? (
                 /* Initial loading skeleton */
                 <LoadingSkeletonList />
-              ) : (historyError || agentZeroRecoveryError) && messages.length === 0 && !isSwitchingSession ? (
+              ) : (historyError || agentZeroRecoveryError) && messages.length === 0 && projectWork.cards.length === 0 && !isSwitchingSession ? (
                 <div className="flex h-full items-center justify-center px-5 py-12">
                   {provider === 'AGENT_ZERO' && agentZeroRecoveryError ? (
                     <AgentZeroRecoveryCard
                       message={agentZeroRecoveryError}
                       retrying={agentZeroRecoveryPending}
                       onRetry={() => { void retryAgentZeroRecovery(); }}
-                      onRepair={isOwner(user) ? () => setSettingsOpen(true) : undefined}
+                      onOpenSettings={isOwner(user) ? () => setSettingsOpen(true) : undefined}
                     />
                   ) : (
                     <div role="alert" className="w-full max-w-lg rounded-2xl border border-amber-400/20 bg-amber-500/[0.08] px-4 py-4 text-left">
@@ -4612,15 +4717,16 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                       <div className="mt-1 text-xs leading-5 text-amber-100/80">{historyError}</div>
                       <button
                         type="button"
-                        onClick={() => { void refreshChat(); }}
+                        onClick={recoverHistory}
                         className="mt-3 inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-amber-300/25 bg-amber-400/10 px-3 text-xs font-medium text-amber-50 hover:bg-amber-400/20"
                       >
-                        <RefreshCw size={13} /> Retry chat history
+                        {historyErrorRetryable ? <RefreshCw size={13} /> : <MessageSquare size={13} />}
+                        {historyErrorRetryable ? 'Retry chat history' : 'Choose conversation'}
                       </button>
                     </div>
                   )}
                 </div>
-              ) : messages.length === 0 && !isSwitchingSession ? (
+              ) : messages.length === 0 && projectWork.cards.length === 0 && !isSwitchingSession ? (
                 /* Empty state */
                 <div className="flex flex-col items-center justify-center h-full text-center px-8 py-16">
                   <div
@@ -4687,14 +4793,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                         message={agentZeroRecoveryError}
                         retrying={agentZeroRecoveryPending}
                         onRetry={() => { void retryAgentZeroRecovery(); }}
-                        onRepair={isOwner(user) ? () => setSettingsOpen(true) : undefined}
+                        onOpenSettings={isOwner(user) ? () => setSettingsOpen(true) : undefined}
                       />
                     </div>
                   )}
                   {provider !== 'AGENT_ZERO' && historyError && (
                     <div role="alert" className="mx-auto mt-4 flex w-[calc(100%-2rem)] max-w-xl items-center gap-3 rounded-xl border border-amber-400/20 bg-amber-500/[0.08] px-3 py-2 text-xs text-amber-100">
                       <span className="min-w-0 flex-1">{historyError}</span>
-                      <button type="button" onClick={() => { void refreshChat(); }} className="min-h-[34px] rounded-lg border border-amber-300/20 px-2.5 font-medium">Retry</button>
+                      <button type="button" onClick={recoverHistory} className="min-h-[34px] rounded-lg border border-amber-300/20 px-2.5 font-medium">{historyErrorRetryable ? 'Retry' : 'Choose conversation'}</button>
                     </div>
                   )}
                   {/* Direct message rendering — no counters, fully reactive */}
@@ -4736,8 +4842,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                       <span className="text-[10px] uppercase tracking-[0.18em] text-slate-600">Beginning of chat</span>
                     )}
                   </div>
-                  {messageWindow.items.map((msg, visibleIdx) => {
-                    const idx = visibleMessageStartIndex + visibleIdx;
+                  {mergeProjectWorkTimeline(messageWindow.items, projectWork.cards, projectWork.replays).map((item, visibleIdx) => {
+                    if (item.kind === 'work') return <ProjectWorkCard key={`work-${item.card.id}`} card={item.card} work={projectWork} />;
+                    if (item.kind === 'work-activity') return <ProjectWorkActivity key={`work-${item.card.id}-${item.activity.id}`} card={item.card} activity={item.activity} active={Boolean(projectWork.replays[item.card.id]?.active)} />;
+                    const msg = item.message;
+                    const idx = messages.indexOf(msg);
                     const prevMsg = idx > 0 ? messages[idx - 1] : null;
                     const showDate =
                       visibleIdx === 0 || !prevMsg ||
@@ -4974,9 +5083,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                             })()}
                           </>
 ) : msg.role === 'system' ? (
-                          isCompactionNotice(msg.content) ? (
-                            <CompactionNoticeBlock key={msg.id} content={msg.content} size="default" />
-                          ) : (
+                          isCompactionNotice(msg.content) ? null : (
                             <div className="flex justify-center px-4 py-2 max-w-3xl mx-auto w-full">
                               <div className="max-w-xl rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-[12px] text-slate-300 whitespace-pre-wrap">
                                 {msg.content}
@@ -5021,11 +5128,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             {/* Compaction indicator */}
             <div className={provider === 'OPENCLAW' ? 'min-h-[40px]' : undefined}>
               <AnimatePresence initial={false}>
-                {(provider === 'OPENCLAW' || showConnectionLost || compactionPhase !== 'idle' || isRunning || queueCount > 0 || Boolean(contextSummary)) && (
+                {(provider === 'OPENCLAW' || showConnectionLost || compactionPhase !== 'idle' || isRunning || projectWork.activity || queueCount > 0 || Boolean(contextSummary)) && (
                   <ComposerStatusBadge
-                    phase={isRunning ? streamingPhase : 'idle'}
-                    toolName={activeToolName}
-                    statusText={statusText || idleConnectionStatus}
+                    phase={isRunning ? streamingPhase : projectWork.activity?.phase || 'idle'}
+                    toolName={isRunning ? activeToolName : projectWork.activity?.toolName || null}
+                    statusText={isRunning ? statusText : projectWork.activity?.statusText || statusText || idleConnectionStatus}
                     showConnectionLost={showConnectionLost}
                     compactionPhase={compactionPhase}
                     queueCount={queueCount}
@@ -5038,19 +5145,29 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
             {/* Composer */}
             <div className={`border-t transition-colors duration-300 ${
-              isRunning
+              isRunning || projectWork.activity
                 ? 'border-amber-500/20 bg-[#0D1130]/50'
                 : 'border-white/[0.06] bg-[#0D1130]/30'
             } backdrop-blur-sm`}>
               <div className="px-2 sm:px-4 pt-2 pb-3 pb-safe max-w-3xl mx-auto">
+                {projectWork.activeCards.map(card => <ProjectWorkAttention key={card.id} card={card} active={true} />)}
                 {pendingUserQuestions.map((request) => (
                   <AskUserQuestionCard
                     key={request.id}
                     request={request}
                     onSettled={settlePendingUserQuestion}
+                    responseDisabled={isAskUserResponseDisabled(
+                      request.surface,
+                      currentProviderAvailability.canSend,
+                    )}
+                    disabledReason={request.surface === 'agent-chat'
+                      ? AGENT_CHAT_ASK_USER_SUPERVISOR_REASON
+                      : currentProviderAvailability.message || undefined}
                   />
                 ))}
 
+                <ProjectWorkComposer work={projectWork} />
+                {!projectWork.selected && <>
                 {/* Fix #4: Attachment chips row */}
                 {pendingAttachments.length > 0 && (
                   <div className="flex flex-wrap gap-2 mb-2">
@@ -5066,15 +5183,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
                 {/* Composer row: [paperclip] [textarea] [mic] [send] */}
                 <div className={`mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] ${isRunning ? 'text-violet-300/80' : 'text-slate-500'}`}>
-                  <span className="inline-flex items-center gap-1"><kbd className="px-1 py-0.5 rounded bg-white/[0.05] text-[10px] font-mono text-slate-400">/</kbd> {providerCommandStatus}</span>
-                  <span>{provider === 'AGENT_ZERO' ? 'Connected model required' : (canSelectModel ? 'Model switching available' : 'Fixed provider defaults')}</span>
-                  <span>{modelCatalogKind === 'none' ? 'Manual model ids may be required' : `Model catalog: ${availableModels.length || 'live'}`}</span>
-                  <span className="text-slate-600">Try <span className="font-mono text-slate-400">/help</span> or <span className="font-mono text-slate-400">/status</span></span>
-                  {provider !== 'OPENCLAW' && (
-                    <span className={currentProviderAvailability.canSend ? 'text-emerald-300/80' : 'font-medium text-amber-200'}>
-                      Provider availability: {currentProviderAvailability.status}
-                    </span>
-                  )}
+                  <span className="inline-flex items-center gap-1" title={providerCommandStatus}><kbd className="px-1 py-0.5 rounded bg-white/[0.05] text-[10px] font-mono text-slate-400">/</kbd> for commands</span>
+                  <span className="ml-auto hidden sm:inline">Enter to send · Shift + Enter for a new line</span>
                   {currentProviderAvailability.canSend && agentZeroModelBlockedReason && (
                     <span id="agent-zero-model-requirement" role="status" className="basis-full font-medium text-amber-200">
                       {agentZeroModelBlockedReason}
@@ -5295,6 +5405,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     </button>
                   )}
                 </ComposerPrimitive.Root>
+                </>}
               </div>
             </div>
           </ThreadPrimitive.Root>
@@ -5318,17 +5429,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
           />
         )}
 
-        <CompatibilityHotfixConfirmationDialog
-          open={compatibilityHotfixConfirmationOpen}
-          status={compatibilityHotfixStatus}
-          onClose={() => setCompatibilityHotfixConfirmationOpen(false)}
-          onBusyChange={setCompatibilityHotfixApplying}
-          onVerified={(verifiedStatus, message) => {
-            setCompatibilityHotfixStatus(verifiedStatus);
-            setCompatibilityHotfixMessage(message);
-          }}
-        />
-
         <AgentSettingsDrawer
           open={settingsOpen}
           onClose={() => {
@@ -5340,6 +5440,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
           initialNativeCliProvider={providerRecoveryTarget}
         />
 
+        <AgentChatDiagnosticsDrawer
+          open={diagnosticsOpen}
+          onDismiss={() => setDiagnosticsOpen(false)}
+          session={session}
+          provider={provider}
+          harnessName={currentProviderCatalogEntry?.displayName || providerLabel}
+        />
+
         {/* Exec Approval Modal — keyed per approval so isResolving/isClosing
             state can never leak from one queued approval into the next. */}
         {pendingApproval && (
@@ -5349,10 +5457,21 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             queueCount={pendingApprovals.length}
             onResolve={resolveApproval}
             onDismiss={dismissApproval}
+            allowDisabled={isAgentChatPositiveApprovalBlocked(pendingApproval.id)}
+            allowDisabledReason="Positive approvals for unsupervised OpenClaw runs remain unavailable; supervised native-run approvals stay bound to their active run."
           />
         )}
       </div>
     </AssistantRuntimeProvider>
     </AskQuestionAnswerProvider>
   );
+}
+export const AGENT_CHAT_ASK_USER_SUPERVISOR_REASON =
+  'Agent Chat question responses remain unavailable because this question channel is not bound to a supervised native provider run.';
+
+export function isAskUserResponseDisabled(
+  surface: string | undefined,
+  currentProviderCanSend: boolean,
+): boolean {
+  return surface === 'agent-chat' || !currentProviderCanSend;
 }

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Download, Lock, Unlock, Trash2, RefreshCw, HardDrive, Archive, Calendar, Shield, Plus, Clock, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { Download, Lock, Unlock, Trash2, RefreshCw, HardDrive, Archive, RotateCcw, X, Calendar, Shield, Plus, Clock, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
 import client from '../../api/client';
 import sounds from '../../utils/sounds';
 import ConfirmDialog from '../ConfirmDialog';
@@ -15,6 +15,7 @@ interface Backup {
   completeness: 'complete' | 'degraded' | 'unknown';
   degradedComponents: string[];
   classificationAuthenticated: boolean;
+  format?: 'portal-data' | 'legacy';
 }
 
 interface Summary {
@@ -135,6 +136,8 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
   const [summary, setSummary] = useState<Summary | null>(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('all');
+  const [storageRoot, setStorageRoot] = useState('/root/backups');
+  const [restoreHelp, setRestoreHelp] = useState<Backup | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [confirmDownload, setConfirmDownload] = useState<Backup | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -173,6 +176,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
       const { data } = await client.get('/backups/list');
       setBackups(data.backups);
       setSummary(data.summary);
+      setStorageRoot(data.root);
       setListError('');
     } catch (e: any) {
       console.error('Failed to fetch backups', e);
@@ -435,11 +439,11 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
         <div className="flex items-start gap-2">
           <Shield size={16} className="mt-0.5 shrink-0" aria-hidden="true" />
           <div>
-            <p className="font-medium">Recovery is an offline operation</p>
+            <p className="font-medium">Projects and settings, without rebuilding your server</p>
             <p className="mt-1 text-xs leading-relaxed text-blue-200/80">
-              Download and retain an encrypted, access-controlled off-server copy: archives contain user data and service
-              credentials. Portal intentionally does not restore a live archive while its database, mail, app, and OpenClaw
-              services are running; recovery must quiesce those services and include a rollback plan.
+              Backups save Portal’s database, settings, projects, uploads, and app files. They do not copy the
+              operating system, installed runtimes, mail, or model downloads. Keep a private off-server copy;
+              use your VPS provider’s snapshots for whole-server recovery.
             </p>
           </div>
         </div>
@@ -493,19 +497,11 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
             <Plus size={16} className="text-emerald-400" />
             <h3 className="text-sm font-semibold text-white">Create Manual Backup</h3>
           </div>
-          {backupType === 'comprehensive' ? (
-            <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-200">
-              A comprehensive backup temporarily takes Portal and agent services offline while it fences recovery data.
-              Live progress pauses during that window and reconnects when services return. Start it only when you are ready
-              to wait for the Portal to come back.
-            </div>
-          ) : (
-            <p className="text-xs leading-relaxed text-slate-500">
-              Standard backups are authenticated online data snapshots. They run in the background, but only a comprehensive,
-              quiesced archive is accepted by the supported full-restore workflow.
-            </p>
-          )}
-          
+          <p className="text-xs leading-relaxed text-slate-400">
+            Portal stays online during backup. Pause project edits for a consistent file checkpoint.
+            {backupType === 'comprehensive' && ' Agent context adds available personality files and Portal native chat history as a reference export. It excludes provider logins and upstream runtime databases; unavailable context does not fail your project backup.'}
+          </p>
+
           {/* Backup Type Selector */}
           <div className="flex gap-3">
             <label className="flex items-center gap-2 cursor-pointer group">
@@ -519,7 +515,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
                 className="w-4 h-4 text-emerald-500 bg-slate-800 border-slate-600 focus:ring-emerald-500 focus:ring-2"
               />
               <span className="text-sm text-slate-300 group-hover:text-white transition-colors">
-                Standard <span className="text-xs text-slate-500">(all data + compact Portal install)</span>
+                Standard <span className="text-xs text-slate-500">(projects + settings)</span>
               </span>
             </label>
             <label className="flex items-center gap-2 cursor-pointer group">
@@ -533,7 +529,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
                 className="w-4 h-4 text-emerald-500 bg-slate-800 border-slate-600 focus:ring-emerald-500 focus:ring-2"
               />
               <span className="text-sm text-slate-300 group-hover:text-white transition-colors">
-                Comprehensive <span className="text-xs text-slate-500">(all data + full Portal install)</span>
+                Comprehensive <span className="text-xs text-slate-500">(plus available agent context)</span>
               </span>
             </label>
           </div>
@@ -739,6 +735,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
                 <tr key={b.filename} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
                   <td className="px-4 py-3">
                     <span className="text-slate-200 font-mono text-xs">{b.filename}</span>
+                    <p className="mt-1 text-[10px] text-slate-500">{b.format === 'portal-data' ? 'Projects & settings' : 'Legacy server archive'}</p>
                   </td>
                   <td className="px-4 py-3">
                     <span className={`px-2 py-0.5 rounded-md text-xs font-medium border ${typeBadgeColors[b.type] || 'text-slate-400'}`}>
@@ -775,6 +772,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center justify-end gap-1">
+                      <button type="button" onClick={() => setRestoreHelp(b)} aria-label={`Restore instructions for ${b.filename}`} title="Restore instructions" className="rounded-lg p-1.5 text-sky-300 hover:bg-sky-500/10"><RotateCcw size={14} /></button>
                       <button
                         onClick={() => void handleDownload(b.filename)}
                         disabled={Boolean(actionLoading) || creating}
@@ -814,6 +812,16 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
           </table>
         </div>
       </div>
+
+      {restoreHelp && <section role="region" aria-label="Restore instructions" className="rounded-xl border border-sky-400/20 bg-sky-400/5 p-4">
+        <div className="flex items-center justify-between"><h3 className="text-sm font-semibold text-white">Restore {restoreHelp.format === 'portal-data' ? 'projects and settings' : 'a legacy backup'}</h3>
+          <button type="button" aria-label="Close restore instructions" onClick={() => setRestoreHelp(null)}><X size={16} /></button></div>
+        <p className="mt-2 text-xs leading-relaxed text-slate-400">Save your current work first. Restore replaces Portal data and briefly stops Portal and its agents. Run this from your VPS terminal, or ask your agent to help. The previous data is retained for recovery.</p>
+        <pre className="my-3 overflow-x-auto rounded-lg bg-black/20 p-3 text-xs text-slate-200"><code>{restoreHelp.format === 'portal-data'
+          ? 'sudo python3 /opt/bridgesllm/portal/backup-data.py restore ' + "'" + (storageRoot + '/' + restoreHelp.type + '/' + restoreHelp.filename).replace(/'/g, "'\\''") + "' --confirm"
+          : 'sudo bash /opt/bridgesllm/portal/restore-full.sh --help'}</code></pre>
+        {restoreHelp.format === 'portal-data' && <p className="text-xs text-slate-500">Restore into the same Portal version and data layout. Agent context is a separate reference export, never a replacement for a running harness.</p>}
+      </section>}
 
       <ConfirmDialog
         open={Boolean(confirmDownload)}

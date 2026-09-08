@@ -22,6 +22,7 @@ const emailCodeUpdateMany = jest.fn();
 const emailCodeDeleteMany = jest.fn();
 const passwordResetCreate = jest.fn();
 const passwordResetUpdateMany = jest.fn();
+const adminUserRetirementFindFirst = jest.fn();
 const transaction = jest.fn();
 
 const comparePassword = jest.fn();
@@ -63,6 +64,7 @@ const transactionClient = {
     updateMany: passwordResetUpdateMany,
   },
   activityLog: { create: activityLogCreate },
+  adminUserRetirement: { findFirst: adminUserRetirementFindFirst },
 };
 
 jest.mock('../config/database', () => ({
@@ -98,6 +100,7 @@ jest.mock('../config/database', () => ({
       create: passwordResetCreate,
       updateMany: passwordResetUpdateMany,
     },
+    adminUserRetirement: { findFirst: adminUserRetirementFindFirst },
     $transaction: transaction,
   },
 }));
@@ -364,6 +367,7 @@ describe('private-origin Email Code 2FA runtime contract', () => {
     emailCodeDeleteMany.mockResolvedValue({ count: 0 });
     passwordResetCreate.mockResolvedValue({ id: 'password-reset-new' });
     passwordResetUpdateMany.mockResolvedValue({ count: 0 });
+    adminUserRetirementFindFirst.mockResolvedValue(null);
     comparePassword.mockImplementation(async (value: string, hash: string) => (
       hash === baseUser.passwordHash
         ? value === 'CurrentPassword123!'
@@ -1346,10 +1350,10 @@ describe('private-origin Email Code 2FA runtime contract', () => {
     });
 
     test.each([
-      ['totp method', { twoFactorMethod: 'totp', twoFactorBackupCodes: null }],
-      ['disabled 2FA', { twoFactorEnabled: false, twoFactorBackupCodes: null }],
-      ['inactive account', { isActive: false, twoFactorBackupCodes: null }],
-    ])('rejects ineligible account state: %s', async (_label, overrides) => {
+      ['totp method', { twoFactorMethod: 'totp', twoFactorBackupCodes: null }, 0],
+      ['disabled 2FA', { twoFactorEnabled: false, twoFactorBackupCodes: null }, 0],
+      ['inactive account', { isActive: false, twoFactorBackupCodes: null }, 1],
+    ])('rejects ineligible account state: %s', async (_label, overrides, retirementChecks) => {
       const headers = localOriginHeaders();
       configurePending({ ...baseUser, ...overrides });
 
@@ -1357,7 +1361,7 @@ describe('private-origin Email Code 2FA runtime contract', () => {
 
       expect(response.status).toBe(401);
       expect(comparePassword).not.toHaveBeenCalled();
-      expect(transaction).not.toHaveBeenCalled();
+      expect(transaction).toHaveBeenCalledTimes(retirementChecks);
     });
 
     test.each([

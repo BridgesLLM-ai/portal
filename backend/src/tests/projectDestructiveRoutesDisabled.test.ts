@@ -168,8 +168,11 @@ describe('Portal 4.0 bounded destructive Project admission', () => {
     expect(update).toContain('const prospectiveCredentialState = {');
     expect(update).toContain('shareCredentialStateIsValid(prospectiveCredentialState)');
     expect(update).toContain('SHARE_CREDENTIAL_STATE_INVALID');
-    expect(update.indexOf('shareCredentialStateIsValid(prospectiveCredentialState)'))
-      .toBeLessThan(update.indexOf('prisma.appShareLink.update({'));
+    const credentialValidation = update.indexOf('shareCredentialStateIsValid(prospectiveCredentialState)');
+    const credentialMutation = update.indexOf('tx.appShareLink.update({');
+    expect(credentialValidation).toBeGreaterThan(-1);
+    expect(credentialMutation).toBeGreaterThan(-1);
+    expect(credentialValidation).toBeLessThan(credentialMutation);
   });
 
   test('/:name/deploy preserves Remote Desktop runtimes and gates hosted deployment before mutation', () => {

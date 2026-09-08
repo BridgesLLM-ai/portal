@@ -8,6 +8,7 @@ jest.mock('../services/ollamaBackendAuthority', () => ({
 
 import {
   filterOpenClawSessionModelCatalog,
+  filterOpenClawModelsForRuntime,
   GROK_BUILD_MODEL_ARGS,
   listProviderModels,
   mapAgentZeroOAuthModels,
@@ -61,6 +62,7 @@ describe('provider model catalog curation', () => {
   test('OpenClaw Agent Chat catalog hides models that sessions.patch cannot select', () => {
     const models = parseOpenClawModelsListPayload({
       models: [
+        { key: 'openai/gpt-6-astra', name: 'GPT-6 Astra', available: true },
         { key: 'codex/gpt-5.5', name: 'GPT-5.5', available: true },
         { key: 'openai/gpt-5.4-mini', name: 'GPT-5.4 Mini', available: true },
         { key: 'openai/gpt-5.5', name: 'GPT-5.5 OpenAI', available: true },
@@ -72,6 +74,7 @@ describe('provider model catalog curation', () => {
     });
 
     expect(filterOpenClawSessionModelCatalog(models).map((entry) => entry.id)).toEqual([
+      'openai/gpt-6-astra',
       'openai/gpt-5.5',
       'openai/gpt-5.4-mini',
       'anthropic/claude-haiku-4-5',
@@ -79,6 +82,23 @@ describe('provider model catalog curation', () => {
       'google/gemini-3-flash-preview',
       'xai/grok-4.3',
     ]);
+  });
+
+  test.each([
+    [null, false],
+    [{ testedPairReady: true, testedRuntimeFamily: 'legacy-2026.7.1' as const }, false],
+    [{ testedPairReady: false, testedRuntimeFamily: 'current-2026.9.1' as const }, false],
+    [{ testedPairReady: true, testedRuntimeFamily: 'current-2026.9.1' as const }, true],
+  ])('enforces runtime compatibility even for a cached live catalog: %j', (readiness, expected) => {
+    const models = parseOpenClawModelsListPayload({ models: [
+      { key: 'anthropic/claude-fable-5-1', available: true },
+      { key: 'openai/gpt-6-astra', available: true },
+      { key: 'anthropic/claude-fable-5', available: true },
+    ] });
+    const ids = filterOpenClawModelsForRuntime(models, readiness).map(model => model.id);
+    expect(ids.includes('anthropic/claude-fable-5-1')).toBe(expected);
+    expect(ids.includes('openai/gpt-6-astra')).toBe(expected);
+    expect(ids).toContain('anthropic/claude-fable-5');
   });
 
   test('Grok Build model parser accepts only the native CLI catalog grammar', () => {
@@ -114,10 +134,11 @@ describe('provider model catalog curation', () => {
     }]);
   });
 
-  test('Codex Project Chat uses the centralized subscription catalog and preserves GPT-5.5', async () => {
+  test('Codex Project Chat exposes Astra as an account-dependent candidate and preserves GPT-5.5', async () => {
     const models = await listProviderModels('CODEX');
 
     expect(models).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'openai/gpt-6-astra', displayName: 'GPT-6 Astra', provider: 'codex' }),
       expect.objectContaining({ id: 'openai/gpt-5.6-sol', displayName: 'GPT-5.6 Sol', provider: 'codex' }),
       expect.objectContaining({ id: 'openai/gpt-5.6-terra', provider: 'codex' }),
       expect.objectContaining({ id: 'openai/gpt-5.6-luna', provider: 'codex' }),
@@ -130,6 +151,11 @@ describe('provider model catalog curation', () => {
     const models = await listProviderModels('CLAUDE_CODE');
 
     expect(models).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'anthropic/claude-fable-5-1',
+        displayName: 'Claude Fable 5.1',
+        provider: 'claude-code',
+      }),
       expect.objectContaining({
         id: 'anthropic/claude-fable-5',
         displayName: 'Claude Fable 5',

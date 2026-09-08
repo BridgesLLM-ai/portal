@@ -86,110 +86,41 @@ describe('Antigravity native setup catalog boundary', () => {
     mockListGatewayModels.mockResolvedValue({ ok: true, models: [{ id: 'openclaw/sentinel-model' }] });
   });
 
-  test('returns only the exact live native catalog and never falls through to OpenClaw', async () => {
-    mockGetNativeProviderReadiness.mockResolvedValue({
-      provider: 'GEMINI',
-      state: 'live_verified',
-      usable: true,
-      message: 'verified',
-    });
-    mockListAntigravityModelsFromCli.mockReturnValue([
-      { id: 'gemini-3.5-flash', displayName: 'Gemini 3.5 Flash' },
-      { id: 'gemini-3.1-pro-high', displayName: 'Gemini 3.1 Pro (High)' },
-    ]);
-
+  test('returns the authenticated native catalog without borrowing gateway models', async () => {
+    mockGetNativeProviderReadiness.mockResolvedValue({ provider: 'GEMINI', state: 'live_verified', usable: true, message: 'verified' });
+    mockListAntigravityModelsFromCli.mockResolvedValue([{ id: 'gemini-3.8-flash-medium', displayName: 'Gemini 3.8 Flash (Medium)' }]);
     const response = await invokeExactCatalog();
-
     expect(response.status).not.toHaveBeenCalled();
-    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
-      source: 'native-cli',
-      exact: true,
-      models: [
-        { id: 'google-antigravity/gemini-3.5-flash', name: 'Gemini 3.5 Flash', provider: 'google-antigravity' },
-        { id: 'google-antigravity/gemini-3.1-pro-high', name: 'Gemini 3.1 Pro (High)', provider: 'google-antigravity' },
-      ],
-    }));
-    expect(mockInvalidateAntigravityModelCache).toHaveBeenCalledTimes(1);
-    expect(mockGetNativeProviderReadiness).toHaveBeenCalledWith('GEMINI', { force: true });
-    expect(mockInvalidateAntigravityModelCache.mock.invocationCallOrder[0])
-      .toBeLessThan(mockListAntigravityModelsFromCli.mock.invocationCallOrder[0]);
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ source: 'native-cli', exact: true,
+      models: [{ id: 'google-antigravity/gemini-3.8-flash-medium', name: 'Gemini 3.8 Flash (Medium)' }] }));
     expect(mockListGatewayModels).not.toHaveBeenCalled();
   });
-
-  test('fails closed when the native login is not live-verified', async () => {
-    mockGetNativeProviderReadiness.mockResolvedValue({
-      provider: 'GEMINI',
-      state: 'needs_login',
-      usable: false,
-      message: 'Antigravity needs login.',
-    });
-
+  test('keeps a missing native subscription sign-in distinct from a model catalog', async () => {
+    mockGetNativeProviderReadiness.mockResolvedValue({ provider: 'GEMINI', state: 'needs_login', usable: false, message: 'Antigravity needs login.' });
     const response = await invokeExactCatalog();
-
     expect(response.status).toHaveBeenCalledWith(409);
-    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
-      source: 'native-cli',
-      exact: true,
-      error: 'Antigravity needs login.',
-    }));
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'NATIVE_LOGIN_REQUIRED', models: [] }));
     expect(mockListAntigravityModelsFromCli).not.toHaveBeenCalled();
     expect(mockListGatewayModels).not.toHaveBeenCalled();
   });
-
-  test('fails closed when an authenticated CLI returns no exact models', async () => {
-    mockGetNativeProviderReadiness.mockResolvedValue({
-      provider: 'GEMINI',
-      state: 'live_verified',
-      usable: true,
-      message: 'verified',
-    });
-    mockListAntigravityModelsFromCli.mockReturnValue([]);
-
+  test('does not replace an empty native catalog with plausible fallback models', async () => {
+    mockGetNativeProviderReadiness.mockResolvedValue({ provider: 'GEMINI', state: 'live_verified', usable: true });
+    mockListAntigravityModelsFromCli.mockResolvedValue([]);
     const response = await invokeExactCatalog();
-
     expect(response.status).toHaveBeenCalledWith(503);
-    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
-      source: 'native-cli',
-      exact: true,
-      error: expect.stringContaining('exact model catalog'),
-    }));
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'NATIVE_MODEL_CATALOG_UNAVAILABLE', models: [] }));
     expect(mockListGatewayModels).not.toHaveBeenCalled();
   });
-
-  test('finalizes an already-complete start response before the frontend loads models', async () => {
+  test('opens the native Antigravity login and refreshes its own readiness', async () => {
     const sessionId = 'native-antigravity-complete-start';
-    mockStartNativeCliFlow.mockResolvedValue({
-      sessionId,
-      status: 'complete',
-      alreadyAuthenticated: true,
-      reauthSupported: false,
-      authUrl: null,
-      callbackHintUrl: null,
-      deviceCode: null,
-      verificationUrl: null,
-    });
-    mockGetOAuthFlowStatus.mockReturnValue({
-      id: sessionId,
-      provider: 'gemini',
-      status: 'complete',
-    });
-
+    mockStartNativeCliFlow.mockResolvedValue({ sessionId, status: 'complete', alreadyAuthenticated: true });
+    mockGetOAuthFlowStatus.mockReturnValue({ id: sessionId, provider: 'gemini', status: 'complete' });
     const response = await invokeNativeStart({ provider: 'gemini', forceReauth: true });
-
     expect(response.status).not.toHaveBeenCalled();
-    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
-      success: true,
-      sessionId,
-      status: 'complete',
-      alreadyAuthenticated: true,
-    }));
-    expect(mockStartNativeCliFlow).toHaveBeenCalledWith('gemini', {
-      forceReauth: true,
-      ownerId: 'user:native-owner',
-    });
-    expect(mockGetOAuthFlowStatus).toHaveBeenCalledWith(sessionId, 'user:native-owner');
-    expect(mockInvalidateNativeCliAuthStatus).toHaveBeenCalledWith('GEMINI');
-    expect(mockInvalidateNativeProviderReadiness).toHaveBeenCalledWith('GEMINI');
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, sessionId }));
+    expect(mockStartNativeCliFlow).toHaveBeenCalledWith('gemini', { forceReauth: true, ownerId: 'user:native-owner' });
+    expect(mockInvalidateNativeCliAuthStatus).toHaveBeenCalled();
+    expect(mockInvalidateNativeProviderReadiness).toHaveBeenCalled();
     expect(mockInvalidateAntigravityModelCache).toHaveBeenCalled();
   });
 

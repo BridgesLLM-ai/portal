@@ -2,7 +2,6 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { ProjectSandboxExecutionContext, SenderIdentity } from '../agents/AgentProvider.interface';
-import { AgentRegistry } from '../agents';
 import {
   attestOnlyAgentZeroProjectIdentityRuntime,
   convergeAgentZeroProjectSandboxRuntime,
@@ -20,7 +19,7 @@ import { normalizePortalModelId } from '../utils/openclawCli';
 import {
   attestOnlyOpenClawProjectIdentityRuntime,
   attestOpenClawProjectContainer,
-  buildOpenClawProjectSandboxPlan,
+  buildOpenClawProjectSandboxPlanForRuntime,
   deriveOpenClawProjectAgentId,
   deriveOpenClawProjectSessionKey,
   ensureOpenClawProjectSandbox,
@@ -98,6 +97,7 @@ import {
   OLLAMA_PROJECT_MODEL_BRIDGE_POLICY_VERSION,
 } from '../agents/providers/ollama/OllamaProjectModelBridge';
 import { withOllamaAuthorityRunLease } from './ollamaAuthorityBarrier';
+import { assertCachedOpenClawExecutionAdmitted } from './openClawExecutionAdmission';
 
 export const OPENCLAW_PROJECT_QUALIFICATION_VERSION = 'portal-openclaw-project-qualification-v2';
 export const CODEX_PROJECT_QUALIFICATION_VERSION = 'portal-codex-project-qualification-v1';
@@ -1971,6 +1971,10 @@ async function runDefaultModelProbe(input: {
   if (!pinnedModel || !isOpenClawProjectEmbeddedModel(pinnedModel)) {
     fail('MODEL_RUNTIME_UNSAFE', 'OpenClaw qualification requires an explicit embedded-runtime model selection');
   }
+  // Qualification may spend minutes attesting the sandbox before it reaches
+  // Gateway mutation. Refuse a model patch if maintenance armed after the
+  // route-level admission.
+  assertCachedOpenClawExecutionAdmitted();
   const pinned = await patchSessionModel(input.sessionKey, pinnedModel);
   if (!pinned.ok) {
     fail('MODEL_RUNTIME_UNSAFE', `OpenClaw did not accept the qualification model ${pinnedModel}: ${String(pinned.error || 'session model patch failed')}`);
@@ -1984,6 +1988,10 @@ async function runDefaultModelProbe(input: {
   }
   const command = [
     'set -eu',
+    // The 9.2 workspace-qualified runtime starts in /workspace; the project
+    // mount is proven by the attested binds, so enter it explicitly before the
+    // cwd check rather than trusting the model to pass a workdir.
+    'cd /workspace/project',
     'test "$(pwd -P)" = "/workspace/project"',
     'test "$(id -u)" = "1000"',
     'test "$(id -g)" = "1000"',
@@ -2006,7 +2014,7 @@ async function runDefaultModelProbe(input: {
     `Only after it succeeds, reply with exactly ${expected} and no other text.`,
   ].join('\n');
   const events: OpenClawQualificationToolEvent[] = [];
-  const provider = AgentRegistry.get('OPENCLAW');
+  const provider = getProjectChatProviderAdapter('OPENCLAW');
   let timeout: ReturnType<typeof setTimeout> | null = null;
   try {
     runtimeMarkerStageAttempted = true;
@@ -2017,6 +2025,10 @@ async function runDefaultModelProbe(input: {
       nonce: input.nonce,
       marker: runtimeMarker,
     });
+    // Mandatory final fence immediately before the live OpenClaw turn. The
+    // runtime marker staging above is deliberately outside the provider call,
+    // and an installer transaction can arm during that awaited boundary.
+    assertCachedOpenClawExecutionAdmitted();
     const result = await Promise.race([
       provider.sendMessage(
         input.sessionKey,
@@ -2219,7 +2231,7 @@ async function runDefaultNativeCliModelProbe(input: {
     fail('MODEL_PROBE_RUNTIME', `${descriptor.displayName} qualification runtime identity did not match`);
   }
   const expected = `PORTAL_${input.provider}_PROJECT_QUALIFICATION_${input.nonce}`;
-  const provider = AgentRegistry.get(input.provider);
+  const provider = getProjectChatProviderAdapter(input.provider);
   let sessionId: string | null = null;
   let timeout: ReturnType<typeof setTimeout> | null = null;
   let attemptedTool = false;
@@ -2403,7 +2415,8 @@ async function attestOpenClawQualificationRuntime(input: {
       no_proxy: '',
     }),
   };
-  const plan = buildOpenClawProjectSandboxPlan({
+  const plan = buildOpenClawProjectSandboxPlanForRuntime({
+    runtime: sandbox,
     context: input.context,
     agentId,
     sessionKey,
@@ -3336,7 +3349,8 @@ async function attestFinalEvidenceRuntime(input: {
       const agentId = deriveOpenClawProjectAgentId(input.context);
       const sessionKey = deriveOpenClawProjectSessionKey(input.context);
       const proxyUrl = `http://portal:${encodeURIComponent(spec.token)}@${spec.proxyAlias}:${spec.proxyPort}`;
-      const plan = buildOpenClawProjectSandboxPlan({
+      const plan = buildOpenClawProjectSandboxPlanForRuntime({
+        runtime: input.bundle.sandbox,
         context: input.context,
         agentId,
         sessionKey,

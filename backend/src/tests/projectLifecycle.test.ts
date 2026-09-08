@@ -21,7 +21,18 @@ jest.mock('../services/projectWorkloadRuntime', () => ({
   startPreparedPortalProjectWorkloadContainer: jest.fn(),
 }));
 
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
 import os from 'os';
 import path from 'path';
 import {
@@ -32,6 +43,7 @@ import {
   copyStaticDeploymentTree,
   prepareFullstackDeploymentTree,
   ProjectDeploymentReplayStaleError,
+  recoverInterruptedDeploymentPromotions,
   PROJECT_RUNTIME_GID,
   PROJECT_RUNTIME_IMAGE,
   PROJECT_RUNTIME_UID,
@@ -278,6 +290,32 @@ describe('project lifecycle sandbox', () => {
     }
   });
 
+  it('preserves managed static deployment data while still deleting stale assets', () => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-static-data-parent-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'index.html'), 'first');
+      mkdirSync(path.join(workspace, 'data'));
+      writeFileSync(path.join(workspace, 'data', 'state.json'), 'seed');
+      copyStaticDeploymentTree(workspace, destination);
+      writeFileSync(path.join(destination, 'data', 'state.json'), 'runtime');
+      writeFileSync(path.join(destination, 'stale.js'), 'stale');
+      writeFileSync(path.join(workspace, 'index.html'), 'second');
+      writeFileSync(path.join(workspace, 'data', 'state.json'), 'replacement seed');
+
+      copyStaticDeploymentTree(workspace, destination);
+
+      expect(readFileSync(path.join(destination, 'index.html'), 'utf8')).toBe('second');
+      expect(readFileSync(path.join(destination, 'data', 'state.json'), 'utf8')).toBe('runtime');
+      expect(() => readFileSync(path.join(destination, 'stale.js'), 'utf8')).toThrow();
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
   it('atomically replaces fullstack deployments while preserving runtime configuration', () => {
     const workspace = makeWorkspace();
     const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-fullstack-parent-'));
@@ -293,6 +331,243 @@ describe('project lifecycle sandbox', () => {
       expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('updated');
       expect(() => readFileSync(path.join(destination, 'stale.txt'), 'utf8')).toThrow();
       promotion.finalize();
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves only the exact managed data root while replacing stale deployed code', () => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-persistent-deploy-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'server.js'), 'old');
+      mkdirSync(path.join(workspace, 'data'));
+      writeFileSync(path.join(workspace, 'data', 'league.json'), 'seed');
+      copyFullstackDeploymentTree(workspace, destination).finalize();
+
+      writeFileSync(path.join(destination, 'data', 'league.json'), 'runtime-v45');
+      chmodSync(path.join(destination, 'data'), 0o750);
+      chmodSync(path.join(destination, 'data', 'league.json'), 0o640);
+      const priorDataStat = statSync(path.join(destination, 'data'));
+      const priorFileStat = statSync(path.join(destination, 'data', 'league.json'));
+      writeFileSync(path.join(destination, 'stale-server.js'), 'must disappear');
+      mkdirSync(path.join(destination, 'uploads'));
+      writeFileSync(path.join(destination, 'uploads', 'runtime-only.bin'), 'not managed');
+      writeFileSync(path.join(workspace, 'server.js'), 'new');
+      writeFileSync(path.join(workspace, 'data', 'league.json'), 'new seed must not win');
+
+      const promotion = copyFullstackDeploymentTree(workspace, destination);
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('new');
+      expect(readFileSync(path.join(destination, 'data', 'league.json'), 'utf8')).toBe('runtime-v45');
+      expect(statSync(path.join(destination, 'data')).mode & 0o777).toBe(0o750);
+      expect(statSync(path.join(destination, 'data', 'league.json')).mode & 0o777).toBe(0o640);
+      expect(statSync(path.join(destination, 'data')).uid).toBe(priorDataStat.uid);
+      expect(statSync(path.join(destination, 'data')).gid).toBe(priorDataStat.gid);
+      expect(statSync(path.join(destination, 'data', 'league.json')).uid).toBe(priorFileStat.uid);
+      expect(statSync(path.join(destination, 'data', 'league.json')).gid).toBe(priorFileStat.gid);
+      expect(() => readFileSync(path.join(destination, 'stale-server.js'), 'utf8')).toThrow();
+      expect(() => readFileSync(path.join(destination, 'uploads', 'runtime-only.bin'), 'utf8')).toThrow();
+      promotion.finalize();
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
+  it('restores the prior code and persistent data snapshot after replacement rollback', () => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-persistent-rollback-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'server.js'), 'old');
+      mkdirSync(path.join(workspace, 'data'));
+      writeFileSync(path.join(workspace, 'data', 'league.json'), 'seed');
+      copyFullstackDeploymentTree(workspace, destination).finalize();
+      writeFileSync(path.join(destination, 'data', 'league.json'), 'runtime-before-deploy');
+      writeFileSync(path.join(workspace, 'server.js'), 'replacement');
+
+      const promotion = copyFullstackDeploymentTree(workspace, destination);
+      writeFileSync(path.join(destination, 'data', 'league.json'), 'failed-generation-write');
+      promotion.rollback();
+
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('old');
+      expect(readFileSync(path.join(destination, 'data', 'league.json'), 'utf8'))
+        .toBe('runtime-before-deploy');
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    'after-persistent-data-stage',
+    'after-previous-deployment-move',
+    'after-deployment-promote',
+  ] as const)('rolls back a fault at %s without losing persistent data', (checkpoint) => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-persistent-fault-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'server.js'), 'old');
+      mkdirSync(path.join(workspace, 'data'));
+      writeFileSync(path.join(workspace, 'data', 'state.json'), 'durable');
+      copyFullstackDeploymentTree(workspace, destination).finalize();
+      writeFileSync(path.join(workspace, 'server.js'), 'replacement');
+
+      const promotion = prepareFullstackDeploymentTree(
+        workspace,
+        destination,
+        undefined,
+        undefined,
+        (observed) => {
+          if (observed === checkpoint) throw new Error(`fault:${checkpoint}`);
+        },
+      );
+      expect(() => promotion.promote()).toThrow(`fault:${checkpoint}`);
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('old');
+      expect(readFileSync(path.join(destination, 'data', 'state.json'), 'utf8')).toBe('durable');
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers an interrupted journaled preparation before any live mutation', () => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-persistent-recovery-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'server.js'), 'old');
+      mkdirSync(path.join(workspace, 'data'));
+      writeFileSync(path.join(workspace, 'data', 'state.json'), 'durable');
+      copyFullstackDeploymentTree(workspace, destination).finalize();
+      writeFileSync(path.join(workspace, 'server.js'), 'replacement');
+
+      expect(() => prepareFullstackDeploymentTree(
+        workspace,
+        destination,
+        undefined,
+        undefined,
+        (checkpoint) => {
+          if (checkpoint === 'after-deployment-journal-create') throw new Error('simulated process exit');
+        },
+      )).toThrow('simulated process exit');
+
+      expect(recoverInterruptedDeploymentPromotions(destinationParent)).toEqual({
+        rolledBack: 1,
+        committed: 0,
+      });
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('old');
+      expect(readFileSync(path.join(destination, 'data', 'state.json'), 'utf8')).toBe('durable');
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
+  it('converges a durably committed promotion forward after cleanup interruption', () => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-persistent-commit-recovery-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'server.js'), 'old');
+      mkdirSync(path.join(workspace, 'data'));
+      writeFileSync(path.join(workspace, 'data', 'state.json'), 'seed');
+      copyFullstackDeploymentTree(workspace, destination).finalize();
+      writeFileSync(path.join(destination, 'data', 'state.json'), 'durable');
+      writeFileSync(path.join(workspace, 'server.js'), 'replacement');
+
+      const promotion = prepareFullstackDeploymentTree(
+        workspace,
+        destination,
+        undefined,
+        undefined,
+        (checkpoint) => {
+          if (checkpoint === 'after-deployment-commit') throw new Error('simulated cleanup interruption');
+        },
+      );
+      promotion.promote();
+      expect(() => promotion.finalize()).toThrow('simulated cleanup interruption');
+      expect(recoverInterruptedDeploymentPromotions(destinationParent)).toEqual({
+        rolledBack: 0,
+        committed: 1,
+      });
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('replacement');
+      expect(readFileSync(path.join(destination, 'data', 'state.json'), 'utf8')).toBe('durable');
+      expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(destinationParent, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds pre-journal staging leftovers and refuses a substituted staging symlink', () => {
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-persistent-orphan-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    const orphan = path.join(destinationParent, '.deployed-app.deploy-123-0123456789abcdef');
+    const unpublishedJournal = path.join(
+      destinationParent,
+      '.deployed-app.deployment-123-0123456789abcdef.json.tmp-123-fedcba9876543210',
+    );
+    const outside = mkdtempSync(path.join(os.tmpdir(), 'portal-persistent-outside-'));
+    try {
+      mkdirSync(orphan, { mode: 0o700 });
+      writeFileSync(unpublishedJournal, 'private temporary journal');
+      chmodSync(unpublishedJournal, 0o600);
+      expect(recoverInterruptedDeploymentPromotions(destinationParent)).toEqual({
+        rolledBack: 0,
+        committed: 0,
+      });
+      expect(readdirSync(destinationParent)).not.toContain(path.basename(orphan));
+      expect(readdirSync(destinationParent)).not.toContain(path.basename(unpublishedJournal));
+
+      writeFileSync(path.join(outside, 'must-survive'), 'outside');
+      symlinkSync(outside, orphan);
+      expect(() => recoverInterruptedDeploymentPromotions(destinationParent)).toThrow(/not private server-owned/i);
+      expect(readFileSync(path.join(outside, 'must-survive'), 'utf8')).toBe('outside');
+      rmSync(orphan, { force: true });
+      expect(readdirSync(destinationParent)).not.toContain(path.basename(destination));
+    } finally {
+      rmSync(destinationParent, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed on symlinked, hard-linked, or type-conflicting managed data', () => {
+    const workspace = makeWorkspace();
+    const destinationParent = mkdtempSync(path.join(os.tmpdir(), 'portal-persistent-invalid-'));
+    const destination = path.join(destinationParent, 'deployed-app');
+    try {
+      writeFileSync(path.join(workspace, 'server.js'), 'old');
+      mkdirSync(path.join(workspace, 'data'));
+      writeFileSync(path.join(workspace, 'data', 'state.json'), 'durable');
+      copyFullstackDeploymentTree(workspace, destination).finalize();
+
+      symlinkSync('/etc/passwd', path.join(destination, 'data', 'escape'));
+      writeFileSync(path.join(workspace, 'server.js'), 'replacement');
+      expect(() => copyFullstackDeploymentTree(workspace, destination)).toThrow(/real directory|unsupported|symbolic|escaped/i);
+      expect(readFileSync(path.join(destination, 'server.js'), 'utf8')).toBe('old');
+      rmSync(path.join(destination, 'data', 'escape'));
+
+      linkSync(
+        path.join(destination, 'data', 'state.json'),
+        path.join(destination, 'data', 'hard-link'),
+      );
+      expect(() => copyFullstackDeploymentTree(workspace, destination)).toThrow(/hard-linked/i);
+      expect(readFileSync(path.join(destination, 'data', 'state.json'), 'utf8')).toBe('durable');
+      rmSync(path.join(destination, 'data', 'hard-link'));
+
+      rmSync(path.join(workspace, 'data'), { recursive: true, force: true });
+      writeFileSync(path.join(workspace, 'data'), 'conflict');
+      expect(() => copyFullstackDeploymentTree(workspace, destination)).toThrow(/conflicts with managed persistent path/i);
+      expect(readFileSync(path.join(destination, 'data', 'state.json'), 'utf8')).toBe('durable');
       expect(readdirSync(destinationParent).filter((entry) => entry.startsWith('.deployed-app.'))).toEqual([]);
     } finally {
       rmSync(workspace, { recursive: true, force: true });

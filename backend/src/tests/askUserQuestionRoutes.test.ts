@@ -63,7 +63,7 @@ function dependencies(
       runId: record.runId,
       toolCallId: record.toolCallId,
       actorUserId: record.ownerUserId,
-      answers: Object.assign(Object.create(null), { database: 'PostgreSQL' }),
+      answers: Object.assign(Object.create(null), { database: ['PostgreSQL'] }),
       text: 'PostgreSQL',
     })),
     reserveDelivery: jest.fn(() => ({
@@ -200,6 +200,7 @@ describe('native ask-user route channel', () => {
       record.runId,
       record.toolCallId,
       'PostgreSQL',
+      Object.assign(Object.create(null), { database: ['PostgreSQL'] }),
     );
     expect(deps.commitAnswer).not.toHaveBeenCalled();
     accept({

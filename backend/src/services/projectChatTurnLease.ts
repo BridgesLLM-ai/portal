@@ -15,10 +15,13 @@ import {
   getProjectChatProviderRuntimeDescriptor,
   type NativeProjectProvider,
 } from './projectChatProviderRegistry';
+import { deriveOpenClawProjectSessionKey } from './openclawProjectSandbox';
 
 export const PROJECT_CHAT_DEFAULT_LEASE_MS = 2 * 60_000;
 export const PROJECT_CHAT_MIN_LEASE_MS = 15_000;
 export const PROJECT_CHAT_MAX_LEASE_MS = 15 * 60_000;
+export const PROJECT_CHAT_ACTIVE_RUN_LEASE_MS = 5 * 60_000;
+export const PROJECT_CHAT_ACTIVE_RUN_RENEW_INTERVAL_MS = 30_000;
 export const PROJECT_CHAT_MAX_REPLAY_PAYLOAD_BYTES = 128 * 1024;
 export const PROJECT_CHAT_RUNTIME_ADMISSION_REQUEST_PREFIX = 'portal-runtime-admission:';
 export const PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED = 'DISPATCH_UNCONFIRMED';
@@ -67,6 +70,7 @@ type LeaseTransaction = Pick<
   | 'projectChatTurn'
   | 'projectChatTurnEvent'
   | 'projectChatProviderBinding'
+  | 'projectChatSession'
   | 'projectChatMessage'
   | 'projectAuthorizationTransition'
   | 'user'
@@ -375,6 +379,24 @@ export interface ProjectChatTurnLeaseGrant {
   turn: ProjectChatTurn;
   leaseToken: string;
   idempotentReplay: boolean;
+}
+
+export interface ProjectChatOpenClawRestartRuntimeEvidence {
+  kind: 'pending-question' | 'active-run' | 'terminal-run' | 'terminal-session';
+  runId: string;
+  requestId?: string;
+  providerStatus?: string;
+  providerStartedAt?: Date;
+  providerEndedAt?: Date;
+}
+
+export interface ProjectChatOpenClawRestartLeaseGrant extends ProjectChatTurnLeaseGrant {
+  expectedHandoffCursor: number;
+  expectedHandoffVersion: number;
+}
+
+export function createProjectChatProcessLeaseOwner(): string {
+  return `${process.env.HOSTNAME || 'portal'}:${process.pid}:${crypto.randomUUID()}`;
 }
 
 export function projectChatTurnDispatchStage(
@@ -1058,6 +1080,272 @@ export async function renewProjectChatTurnLease(input: StateKey & {
       throw new ProjectChatLeaseError('VERSION_CONFLICT', 'Project Chat lease changed concurrently');
     }
     return transaction.projectChatTurn.findUnique({ where: { id: turnId } }) as Promise<ProjectChatTurn>;
+  });
+}
+
+/**
+ * Rotate an expired OpenClaw Project turn lease only when the replacement
+ * Portal process has already observed the exact upstream run through a native
+ * pending question, an authoritative active-run snapshot, or its terminal run
+ * receipt. The runtime read is intentionally outside this transaction; every
+ * durable identity it supplied is repeated in the compare-and-swap below so a
+ * stale or cross-project proof cannot widen an arbitrary expired lease.
+ */
+export async function reattachExpiredOpenClawProjectChatTurnAfterRestart(input: StateKey & {
+  actorAuthorizationVersion: number;
+  turnId: string;
+  expectedRuntime: string;
+  expectedLeaseOwner: string;
+  newLeaseOwner: string;
+  providerSessionId: string;
+  runtimeEvidence: ProjectChatOpenClawRestartRuntimeEvidence;
+  leaseDurationMs?: number;
+  now?: Date;
+}, database: ProjectChatLeaseDatabase = defaultDatabase): Promise<ProjectChatOpenClawRestartLeaseGrant> {
+  const key = normalizeStateKey(input);
+  const actorAuthorizationVersion = positiveAuthorizationVersion(input.actorAuthorizationVersion);
+  const turnId = requiredIdentifier(input.turnId, 'turn ID');
+  const expectedRuntime = requiredIdentifier(input.expectedRuntime, 'Project runtime');
+  const expectedLeaseOwner = requiredIdentifier(input.expectedLeaseOwner, 'prior lease owner');
+  const newLeaseOwner = requiredIdentifier(input.newLeaseOwner, 'replacement lease owner');
+  const providerSessionId = requiredIdentifier(input.providerSessionId, 'provider session ID');
+  const evidenceKind = String(input.runtimeEvidence?.kind || '').trim();
+  if (!['pending-question', 'active-run', 'terminal-run', 'terminal-session'].includes(evidenceKind)) {
+    throw new ProjectChatLeaseError('INVALID_INPUT', 'Invalid OpenClaw restart evidence kind', 400);
+  }
+  const expectedRunId = requiredIdentifier(input.runtimeEvidence.runId, 'provider run ID');
+  const pendingRequestId = evidenceKind === 'pending-question'
+    ? requiredIdentifier(input.runtimeEvidence.requestId, 'pending question request ID')
+    : null;
+  const providerStatus = input.runtimeEvidence.providerStatus == null
+    ? null
+    : requiredIdentifier(input.runtimeEvidence.providerStatus, 'provider run status').toLowerCase();
+  const providerStartedAt = input.runtimeEvidence.providerStartedAt;
+  const providerEndedAt = input.runtimeEvidence.providerEndedAt;
+  if (
+    (evidenceKind === 'terminal-run' || evidenceKind === 'terminal-session')
+    && (
+      !providerStatus
+      || !(providerStartedAt instanceof Date)
+      || !Number.isFinite(providerStartedAt.getTime())
+      || !(providerEndedAt instanceof Date)
+      || !Number.isFinite(providerEndedAt.getTime())
+      || providerStartedAt.getTime() > providerEndedAt.getTime()
+    )
+  ) {
+    throw new ProjectChatLeaseError('INVALID_INPUT', 'Invalid terminal OpenClaw run evidence', 400);
+  }
+  const leaseDurationMs = boundedLeaseDuration(input.leaseDurationMs);
+  const now = input.now || new Date();
+  if (expectedLeaseOwner === newLeaseOwner) {
+    throw new ProjectChatLeaseError(
+      'LEASE_REJECTED',
+      'Restart reattachment must rotate the Project Chat lease owner',
+      403,
+    );
+  }
+  if (expectedRunId !== `portal-${turnId}`) {
+    throw new ProjectChatLeaseError(
+      'PROVIDER_MISMATCH',
+      'OpenClaw restart run identity does not match the Project Chat turn',
+    );
+  }
+  if (expectedRuntime !== getProjectChatProviderRuntimeDescriptor('OPENCLAW').runtime) {
+    throw new ProjectChatLeaseError(
+      'PROVIDER_MISMATCH',
+      'Pending question recovery requires the registered OpenClaw Project runtime',
+    );
+  }
+
+  const leaseToken = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = leaseDigest(leaseToken);
+  const expiresAt = new Date(now.getTime() + leaseDurationMs);
+  return serializable(database, async (transaction) => {
+    const turn = await transaction.projectChatTurn.findUnique({ where: { id: turnId } });
+    if (!turn || turn.actorUserId !== key.actorUserId || turn.projectIdentityId !== key.projectIdentityId) {
+      throw new ProjectChatLeaseError('TURN_NOT_FOUND', 'Project Chat turn was not found', 404);
+    }
+    if (
+      turn.status !== ProjectChatTurnStatus.RUNNING
+      || isProjectChatRuntimeAdmissionTurn(turn)
+      || turn.provider !== AgentProviderType.OPENCLAW
+      || turn.runtime !== expectedRuntime
+      || turn.leaseOwner !== expectedLeaseOwner
+      || turn.providerSessionId !== providerSessionId
+      || turn.activeProjectKey !== key.projectIdentityId
+      || turn.leaseExpiresAt.getTime() > now.getTime()
+      || projectChatTurnDispatchStage(turn) !== PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED
+      || (
+        (evidenceKind === 'terminal-run' || evidenceKind === 'terminal-session')
+        && (
+          providerStartedAt!.getTime() < turn.startedAt.getTime()
+          || providerStartedAt!.getTime() > turn.leaseExpiresAt.getTime()
+          || providerEndedAt!.getTime() > now.getTime()
+        )
+      )
+    ) {
+      throw new ProjectChatLeaseError(
+        'TURN_NOT_ACTIVE',
+        'Restart evidence does not match an expired dispatched OpenClaw Project turn',
+      );
+    }
+    if (Number((turn as any).actorAuthorizationVersion) !== actorAuthorizationVersion) {
+      throw new ProjectChatLeaseError(
+        'AUTHORIZATION_CHANGED',
+        'Project Chat restart evidence belongs to another authorization generation',
+      );
+    }
+    await assertDurableActorAuthorization(
+      transaction,
+      key.actorUserId,
+      actorAuthorizationVersion,
+    );
+
+    const [state, projectIdentity, binding, session] = await Promise.all([
+      transaction.projectChatState.findUnique({
+        where: { actorUserId_projectIdentityId: key },
+      }),
+      transaction.projectIdentity.findUnique({
+        where: { id: key.projectIdentityId },
+        select: { lifecycleStatus: true, legacyOpenClawMigrationStatus: true },
+      }),
+      transaction.projectChatProviderBinding.findUnique({
+        where: {
+          userId_projectId_provider: {
+            userId: key.actorUserId,
+            projectId: key.projectIdentityId,
+            provider: AgentProviderType.OPENCLAW,
+          },
+        },
+      }),
+      transaction.projectChatSession.findUnique({ where: { sessionKey: providerSessionId } }),
+    ]);
+    if (
+      deriveOpenClawProjectSessionKey({
+        userId: key.actorUserId,
+        projectId: key.projectIdentityId,
+      }) !== providerSessionId
+      || !state
+      || state.activeTurnId !== turnId
+      || state.selectedProvider !== AgentProviderType.OPENCLAW
+    ) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'Expired OpenClaw Project turn is detached from its actor/project state',
+        500,
+      );
+    }
+    if (
+      !projectIdentity
+      || projectIdentity.lifecycleStatus !== 'ACTIVE'
+      || projectIdentity.legacyOpenClawMigrationStatus === 'PENDING'
+    ) {
+      throw new ProjectChatLeaseError(
+        'PROJECT_CLOSED',
+        'Project Chat restart recovery is closed during Project lifecycle reconciliation',
+      );
+    }
+    if (
+      !binding
+      || binding.userId !== key.actorUserId
+      || binding.projectId !== key.projectIdentityId
+      || binding.provider !== AgentProviderType.OPENCLAW
+      || binding.status !== 'active'
+      || binding.runtime !== expectedRuntime
+      || binding.sessionKey !== providerSessionId
+      || binding.externalSessionId !== providerSessionId
+    ) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'Expired OpenClaw Project turn no longer matches its provider binding',
+        500,
+      );
+    }
+    if (
+      !session
+      || session.userId !== key.actorUserId
+      || session.projectId !== key.projectIdentityId
+      || session.sessionKey !== providerSessionId
+      || session.status !== 'active'
+      || session.activeProvider !== AgentProviderType.OPENCLAW
+      || session.runtime !== expectedRuntime
+    ) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'Expired OpenClaw Project turn no longer matches its active Portal session',
+        500,
+      );
+    }
+
+    const existingMetadata = turn.resultMetadata
+      && typeof turn.resultMetadata === 'object'
+      && !Array.isArray(turn.resultMetadata)
+      ? turn.resultMetadata as Record<string, unknown>
+      : {};
+    const rotated = await transaction.projectChatTurn.updateMany({
+      where: {
+        id: turnId,
+        actorUserId: key.actorUserId,
+        actorAuthorizationVersion,
+        projectIdentityId: key.projectIdentityId,
+        activeProjectKey: key.projectIdentityId,
+        provider: AgentProviderType.OPENCLAW,
+        runtime: expectedRuntime,
+        status: ProjectChatTurnStatus.RUNNING,
+        leaseTokenHash: turn.leaseTokenHash,
+        leaseOwner: expectedLeaseOwner,
+        leaseExpiresAt: { lte: now },
+        providerSessionId,
+      },
+      data: {
+        leaseTokenHash: tokenHash,
+        leaseOwner: newLeaseOwner,
+        heartbeatAt: now,
+        leaseExpiresAt: expiresAt,
+        resultMetadata: {
+          ...existingMetadata,
+          openClawRestartReattachment: {
+            version: 1,
+            kind: evidenceKind,
+            runId: expectedRunId,
+            ...(pendingRequestId ? { requestId: pendingRequestId } : {}),
+            ...(providerStatus ? { providerStatus } : {}),
+            ...(providerStartedAt ? { providerStartedAt: providerStartedAt.toISOString() } : {}),
+            ...(providerEndedAt ? { providerEndedAt: providerEndedAt.toISOString() } : {}),
+            providerSessionId,
+            previousLeaseOwner: expectedLeaseOwner,
+            reattachedAt: now.toISOString(),
+          },
+        } as Prisma.InputJsonValue,
+      },
+    });
+    if (rotated.count !== 1) {
+      throw new ProjectChatLeaseError(
+        'VERSION_CONFLICT',
+        'Project Chat turn changed during restart reattachment',
+      );
+    }
+    const persisted = await transaction.projectChatTurn.findUnique({ where: { id: turnId } });
+    if (
+      !persisted
+      || persisted.leaseTokenHash !== tokenHash
+      || persisted.leaseOwner !== newLeaseOwner
+      || persisted.leaseExpiresAt.getTime() !== expiresAt.getTime()
+    ) {
+      throw new ProjectChatLeaseError(
+        'STATE_CORRUPT',
+        'Project Chat restart lease rotation was not durable',
+        500,
+      );
+    }
+    return {
+      state,
+      turn: persisted,
+      leaseToken,
+      idempotentReplay: false,
+      expectedHandoffCursor: binding.handoffCursor,
+      expectedHandoffVersion: binding.handoffVersion,
+    };
   });
 }
 

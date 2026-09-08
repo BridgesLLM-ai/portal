@@ -1,17 +1,18 @@
 import crypto from 'crypto';
 
 /**
- * Owner-scoped presentation cache for ask-user requests. Native Codex
- * `requestUserInput` and the provider-neutral OpenClaw `ask_user_question`
- * tool both arrive through the exact-run plugin RPC. OpenClaw remains the
- * authority for whether a run/request is pending; Portal re-attests and
- * reconciles this bounded cache before every read or settlement.
+ * Owner-scoped presentation cache for version-attested OpenClaw questions.
+ * On 9.1, `question.list` / `question.get` / `question.resolve` are the sole
+ * authority and the 4.0 BridgesLLM plugin is reserved for exact active-run
+ * steering. Retained 7.1 hosts keep their exact installed 3.3 or 3.4 bridge;
+ * only 3.4 adds Portal-owned guarded cron mutations.
+ * Portal never promotes this bounded display cache into settlement authority.
  */
 
-/** Hard ceiling, matching OpenClaw's documented per-hook budget. */
-export const ASK_USER_MAX_WAIT_MS = 600_000;
-/** Used when the caller does not ask for a specific budget. */
-export const ASK_USER_DEFAULT_WAIT_MS = 300_000;
+/** Hard ceiling, matching OpenClaw 2026.9.1's native question lifetime. */
+export const ASK_USER_MAX_WAIT_MS = 3_600_000;
+/** Used when the caller does not ask for a specific budget (15 minutes). */
+export const ASK_USER_DEFAULT_WAIT_MS = 900_000;
 /** How long an answered/expired record stays queryable for late arrivals. */
 const SETTLED_RETENTION_MS = 60_000;
 /** Refuse to hold more than this many open questions across all sessions. */
@@ -27,8 +28,7 @@ export interface AskUserQuestion {
   id: string;
   question: string;
   header?: string;
-  /** The exact-run settlement protocol currently carries one answer per question. */
-  multiSelect: false;
+  multiSelect: boolean;
   isOther?: boolean;
   isSecret?: boolean;
   options: AskUserQuestionOption[];
@@ -48,7 +48,7 @@ export interface AskUserQuestionRecord {
   createdAt: number;
   expiresAt: number;
   state: 'pending' | 'answered' | 'expired' | 'cancelled';
-  answers: Record<string, string> | null;
+  answers: Record<string, string[]> | null;
   answeredAt: number | null;
 }
 
@@ -121,7 +121,7 @@ export function normalizeAskUserQuestions(input: unknown): AskUserQuestion[] {
       id,
       question,
       ...(header ? { header } : {}),
-      multiSelect: false,
+      multiSelect: (entry as any).multiSelect === true,
       ...((entry as any).isOther === true ? { isOther: true } : {}),
       ...((entry as any).isSecret === true ? { isSecret: true } : {}),
       options,
@@ -208,22 +208,6 @@ export function registerAskUserQuestion(input: {
     throw new AskUserQuestionError('ASK_USER_SESSION_REQUIRED', 'A session key is required.');
   }
   const questions = normalizeAskUserQuestions(input.questions);
-  const rawQuestions = Array.isArray(input.questions)
-    ? input.questions
-    : Array.isArray((input.questions as any)?.questions)
-      ? (input.questions as any).questions
-      : [];
-  if (rawQuestions.some((question: any) => (
-    question
-    && typeof question === 'object'
-    && Object.prototype.hasOwnProperty.call(question, 'multiSelect')
-    && question.multiSelect !== false
-  ))) {
-    throw new AskUserQuestionError(
-      'ASK_USER_MULTISELECT_UNSUPPORTED',
-      'Ask-user questions do not support multi-select answers.',
-    );
-  }
   if (questions.length === 0) {
     throw new AskUserQuestionError('ASK_USER_QUESTIONS_INVALID', 'No answerable question was supplied.');
   }
@@ -395,7 +379,7 @@ export interface PreparedAskUserQuestionAnswer {
   readonly runId: string;
   readonly toolCallId: string;
   readonly actorUserId: string;
-  readonly answers: Record<string, string>;
+  readonly answers: Record<string, string[]>;
   readonly text: string;
 }
 
@@ -445,7 +429,7 @@ export function prepareAskUserQuestionAnswer(input: {
   const suppliedAnswers = input.answers && typeof input.answers === 'object'
     ? input.answers
     : {};
-  const answers = Object.create(null) as Record<string, string>;
+  const answers = Object.create(null) as Record<string, string[]>;
   for (const question of record.questions) {
     if (!Object.prototype.hasOwnProperty.call(suppliedAnswers, question.id)) {
       throw new AskUserQuestionError(
@@ -454,29 +438,49 @@ export function prepareAskUserQuestionAnswer(input: {
       );
     }
     const supplied = suppliedAnswers[question.id];
-    let value = boundedText(supplied, 4_000);
-    if (!value) {
+    const rawValues = Array.isArray(supplied) ? supplied : [supplied];
+    if (
+      rawValues.length < 1
+      || rawValues.length > 8
+      || (!question.multiSelect && rawValues.length !== 1)
+    ) {
+      throw new AskUserQuestionError(
+        'ASK_USER_ANSWER_INVALID',
+        question.multiSelect
+          ? 'A multi-select answer must contain between one and eight values.'
+          : 'A single-select question requires exactly one answer.',
+      );
+    }
+    const values: string[] = [];
+    for (const rawValue of rawValues) {
+      let value = boundedText(rawValue, 4_000);
+      if (!value) {
+        throw new AskUserQuestionError('ASK_USER_ANSWER_EMPTY', 'An answer is required.');
+      }
+      if (question.options.length > 0) {
+        const numericIndex = /^\d+$/.test(value) ? Number(value) - 1 : -1;
+        const indexedOption = numericIndex >= 0 && numericIndex < question.options.length
+          ? question.options[numericIndex]
+          : undefined;
+        const labelledOption = question.options.find((option) => (
+          option.label.toLowerCase() === value.toLowerCase()
+        ));
+        const matchedOption = indexedOption || labelledOption;
+        if (matchedOption) {
+          value = matchedOption.label;
+        } else if (question.isOther !== true) {
+          throw new AskUserQuestionError(
+            'ASK_USER_ANSWER_INVALID',
+            'Every answer must match one of the available options.',
+          );
+        }
+      }
+      if (!values.includes(value)) values.push(value);
+    }
+    if (!values.length) {
       throw new AskUserQuestionError('ASK_USER_ANSWER_EMPTY', 'An answer is required.');
     }
-    if (question.options.length > 0) {
-      const numericIndex = /^\d+$/.test(value) ? Number(value) - 1 : -1;
-      const indexedOption = numericIndex >= 0 && numericIndex < question.options.length
-        ? question.options[numericIndex]
-        : undefined;
-      const labelledOption = question.options.find((option) => (
-        option.label.toLowerCase() === value.toLowerCase()
-      ));
-      const matchedOption = indexedOption || labelledOption;
-      if (matchedOption) {
-        value = matchedOption.label;
-      } else if (question.isOther !== true) {
-        throw new AskUserQuestionError(
-          'ASK_USER_ANSWER_INVALID',
-          'The answer must match one of the available options.',
-        );
-      }
-    }
-    answers[question.id] = value;
+    answers[question.id] = values;
   }
   const suppliedKeys = Object.keys(suppliedAnswers);
   if (suppliedKeys.some((key) => !record.questions.some((question) => question.id === key))) {
@@ -486,10 +490,10 @@ export function prepareAskUserQuestionAnswer(input: {
     );
   }
   const text = record.questions.length === 1
-    ? answers[record.questions[0].id]
+    ? answers[record.questions[0].id].join(', ')
     // The runtime protocol uses numeric ordinal keys for multiple answers.
     // Model-supplied IDs containing `-`, `:` or `=` are not safe line keys.
-    : record.questions.map((question, index) => `${index + 1}: ${answers[question.id]}`).join('\n');
+    : record.questions.map((question, index) => `${index + 1}: ${answers[question.id].join(', ')}`).join('\n');
   return {
     recordId: record.id,
     sessionKey: record.sessionKey,
@@ -663,14 +667,14 @@ export function formatAskUserAnswerForModel(record: AskUserQuestionRecord): stri
   if (record.state === 'answered' && record.answers) {
     if (record.questions.length === 1) {
       const answer = record.answers[record.questions[0].id];
-      if (answer) return answer;
+      if (answer?.length) return answer.join(', ');
     }
     const lines = record.questions
       .map((question, index) => {
         const answer = Object.prototype.hasOwnProperty.call(record.answers, question.id)
           ? record.answers?.[question.id]
           : undefined;
-        return answer ? `${index + 1}: ${answer}` : null;
+        return answer?.length ? `${index + 1}: ${answer.join(', ')}` : null;
       })
       .filter((line): line is string => Boolean(line));
     if (lines.length > 0) return lines.join('\n');

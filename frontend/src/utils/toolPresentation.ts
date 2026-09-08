@@ -265,7 +265,14 @@ export function getToolPresentation(name: string): ToolPresentation {
     || canonical === 'enter_plan_mode'
     || canonical === 'exit_plan_mode'
   ) return TOOL_PRESENTATIONS.memory;
-  if (canonical === 'message' || canonical === 'send_message' || canonical === 'push_notification' || canonical === 'ask_user_question') return TOOL_PRESENTATIONS.message;
+  if (
+    canonical === 'message'
+    || canonical === 'send_message'
+    || canonical === 'push_notification'
+    || canonical === 'ask_user_question'
+    || canonical === 'ask_user'
+    || canonical === 'request_user_input'
+  ) return TOOL_PRESENTATIONS.message;
   if (canonical === 'image' || canonical === 'image_generate' || canonical === 'video_generate' || canonical === 'music_generate' || canonical === 'pdf' || canonical === 'view_image') return TOOL_PRESENTATIONS.media;
   if (canonical === 'tts' || canonical === 'voice_call') return TOOL_PRESENTATIONS.voice;
   if (
@@ -451,7 +458,11 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
   if (canonical === 'enter_plan_mode') return 'Start planning';
   if (canonical === 'exit_plan_mode') return 'Present plan';
   if (canonical === 'save_memory') return 'Save memory';
-  if (canonical === 'ask_user_question') return 'Ask a question';
+  if (
+    canonical === 'ask_user_question'
+    || canonical === 'ask_user'
+    || canonical === 'request_user_input'
+  ) return 'Ask a question';
   if (canonical === 'send_message') return 'Message agent';
   if (canonical === 'push_notification') return 'Send notification';
   if (canonical === 'view_image') return 'View image';
@@ -549,5 +560,8 @@ export function isCompactionNotice(content: string): boolean {
  */
 export function isAskQuestionTool(toolName: unknown): boolean {
   if (typeof toolName !== 'string') return false;
-  return canonicalToolName(toolName) === 'ask_user_question';
+  const canonical = canonicalToolName(toolName);
+  return canonical === 'ask_user_question'
+    || canonical === 'ask_user'
+    || canonical === 'request_user_input';
 }

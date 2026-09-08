@@ -22,6 +22,7 @@ const emailCodeFindFirst = jest.fn();
 const emailCodeUpdateMany = jest.fn();
 const activityCreate = jest.fn();
 const projectAuthorizationTransitionFindFirst = jest.fn();
+const adminUserRetirementFindFirst = jest.fn();
 const transaction = jest.fn();
 
 jest.mock('../config/database', () => ({
@@ -49,6 +50,7 @@ jest.mock('../config/database', () => ({
       updateMany: emailCodeUpdateMany,
     },
     activityLog: { create: activityCreate },
+    adminUserRetirement: { findFirst: adminUserRetirementFindFirst },
     $transaction: transaction,
   },
 }));
@@ -242,6 +244,7 @@ describe('auth one-time proof replay guards', () => {
     systemSettingFindUnique.mockResolvedValue(null);
     activityCreate.mockResolvedValue({});
     projectAuthorizationTransitionFindFirst.mockResolvedValue(null);
+    adminUserRetirementFindFirst.mockResolvedValue(null);
     sessionFindMany.mockResolvedValue([]);
     sessionDeleteMany.mockResolvedValue({ count: 0 });
     userFindUnique.mockResolvedValue(null);
@@ -253,6 +256,9 @@ describe('auth one-time proof replay guards', () => {
     transaction.mockImplementation(async (callback) => callback({
       projectAuthorizationTransition: {
         findFirst: projectAuthorizationTransitionFindFirst,
+      },
+      adminUserRetirement: {
+        findFirst: adminUserRetirementFindFirst,
       },
       session: {
         findUnique: sessionFindUnique,
@@ -360,6 +366,9 @@ describe('auth one-time proof replay guards', () => {
     transaction.mockImplementation(async (callback) => callback({
       projectAuthorizationTransition: {
         findFirst: projectAuthorizationTransitionFindFirst,
+      },
+      adminUserRetirement: {
+        findFirst: adminUserRetirementFindFirst,
       },
       session: { deleteMany: sessionDeleteMany },
       user: { update: updateAuthorizationVersion },
@@ -705,6 +714,9 @@ describe('auth one-time proof replay guards', () => {
       projectAuthorizationTransition: {
         findFirst: projectAuthorizationTransitionFindFirst,
       },
+      adminUserRetirement: {
+        findFirst: adminUserRetirementFindFirst,
+      },
       passwordResetToken: { updateMany: resetUpdateMany },
       user: { updateMany: userUpdateMany },
       session: { deleteMany: sessionDeleteMany },
@@ -783,6 +795,9 @@ describe('auth one-time proof replay guards', () => {
     transaction.mockImplementation(async (callback) => callback({
       projectAuthorizationTransition: {
         findFirst: projectAuthorizationTransitionFindFirst,
+      },
+      adminUserRetirement: {
+        findFirst: adminUserRetirementFindFirst,
       },
       passwordResetToken: { updateMany: resetUpdateMany },
       user: { updateMany: userUpdateMany },
@@ -880,6 +895,7 @@ describe('auth one-time proof replay guards', () => {
     });
     transaction.mockImplementation(async (callback) => callback({
       projectAuthorizationTransition: { findFirst: projectAuthorizationTransitionFindFirst },
+      adminUserRetirement: { findFirst: adminUserRetirementFindFirst },
       twoFactorChallenge: { updateMany: challengeUpdateMany },
       emailVerificationCode: { updateMany: emailCodeUpdateMany },
       user: { updateMany: userUpdateMany },

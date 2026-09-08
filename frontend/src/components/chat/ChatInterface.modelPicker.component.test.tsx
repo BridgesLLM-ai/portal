@@ -10,14 +10,25 @@ import {
   ProviderAvailabilityBarrier,
   getAgentChatNativeRecoveryTarget,
   planAgentChatSelection,
+  shouldRefreshAcpCatalogAfterRun,
 } from './ChatInterface';
 
 const originalInnerWidth = window.innerWidth;
 
 describe('Agent Chat provider navigation', () => {
+  it.each(['HERMES', 'OPENCODE'])('refreshes %s models after its first terminal ACP transition', (provider) => {
+    expect(shouldRefreshAcpCatalogAfterRun(provider, true, provider, false)).toBe(true);
+    expect(shouldRefreshAcpCatalogAfterRun(provider, false, provider, false)).toBe(false);
+    expect(shouldRefreshAcpCatalogAfterRun('OPENCLAW', true, provider, false)).toBe(false);
+  });
+
+  it('does not add post-turn catalog probes to non-ACP harnesses', () => {
+    expect(shouldRefreshAcpCatalogAfterRun('OPENCLAW', true, 'OPENCLAW', false)).toBe(false);
+    expect(shouldRefreshAcpCatalogAfterRun('CODEX', true, 'CODEX', false)).toBe(false);
+  });
+
   it.each([
     ['CLAUDE_CODE', 'claude-code'],
-    ['CODEX', 'codex'],
     ['GEMINI', 'gemini'],
     ['GROK', 'grok'],
   ] as const)('routes a needs-login %s row to its exact native setup flow', (provider, target) => {
@@ -54,6 +65,11 @@ describe('Agent Chat provider navigation', () => {
       nativeAuthStatus: 'needs_login' as const,
     };
     expect(getAgentChatNativeRecoveryTarget('OPENCLAW', readyNeedsLogin)).toBeNull();
+    expect(getAgentChatNativeRecoveryTarget('CODEX', {
+      ...readyNeedsLogin,
+      name: 'CODEX',
+      displayName: 'Codex',
+    })).toBeNull();
     expect(getAgentChatNativeRecoveryTarget('AGENT_ZERO', {
       ...readyNeedsLogin,
       name: 'AGENT_ZERO',
@@ -130,7 +146,22 @@ describe('Agent Chat model picker', () => {
     await user.click(screen.getByRole('button', { name: 'Chat model' }));
     const note = await screen.findByText(/2 models hidden/i);
     expect(note).toHaveTextContent('openai/gpt-5.6-sol');
-    expect(note).toHaveTextContent('Settings → AI Providers');
+    expect(note).toHaveTextContent('Settings → Model Providers');
+  });
+
+  it('labels Astra as account-dependent instead of treating catalog presence as entitlement', async () => {
+    const user = userEvent.setup();
+    render(
+      <ModelPicker
+        value=""
+        onChange={vi.fn()}
+        models={['openai/gpt-6-astra', 'openai/gpt-5.6-sol']}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Chat model' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('availability depends on your OpenAI account');
+    expect(screen.getByRole('status')).toHaveTextContent('listing does not confirm access');
   });
 
   it('submits a custom provider model once instead of switching on every keystroke', async () => {
@@ -245,23 +276,24 @@ describe('Agent Chat model picker', () => {
     expect(trigger).not.toHaveTextContent('gpt-5.6-sol');
   });
 
-  it('offers bounded Agent Zero recovery through Retry and managed runtime Repair', async () => {
+  it('offers bounded Agent Zero retry and truthful runtime-status navigation', async () => {
     const retry = vi.fn();
-    const repair = vi.fn();
+    const openSettings = vi.fn();
     const user = userEvent.setup();
     render(
       <AgentZeroRecoveryCard
         message="Agent Zero’s connected model catalog could not be loaded."
         onRetry={retry}
-        onRepair={repair}
+        onOpenSettings={openSettings}
       />,
     );
 
     expect(screen.getByRole('alert')).toHaveTextContent('Agent Zero needs attention');
     await user.click(screen.getByRole('button', { name: 'Retry Agent Zero' }));
-    await user.click(screen.getByRole('button', { name: 'Repair managed runtime' }));
+    expect(screen.queryByRole('button', { name: /Repair/i })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'View runtime status' }));
     expect(retry).toHaveBeenCalledTimes(1);
-    expect(repair).toHaveBeenCalledTimes(1);
+    expect(openSettings).toHaveBeenCalledTimes(1);
   });
 
   it('keeps required model selection visible when no connected models exist', async () => {

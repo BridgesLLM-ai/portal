@@ -103,9 +103,9 @@ describe('ProjectProviderMenu', () => {
       })),
     });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
 
-    const menu = screen.getByRole('menu', { name: 'Project chat providers' });
+    const menu = screen.getByRole('menu', { name: 'Project chat harnesses' });
     const popoverRoot = menu.closest<HTMLElement>('[data-anchored-popover-root="true"]');
     expect(popoverRoot?.parentElement).toBe(document.body);
     expect(popoverRoot).toHaveStyle({ zIndex: String(VIEWPORT_TRANSIENT_Z_INDEX) });
@@ -117,7 +117,7 @@ describe('ProjectProviderMenu', () => {
     expect(screen.getByText('Selected')).toBeVisible();
     expect(screen.queryByText('Active')).not.toBeInTheDocument();
     expect(screen.getByText(
-      'Choose Prepare provider to verify an isolated runtime before using it.',
+      'Choose Prepare harness to verify an isolated runtime before using it.',
     )).toBeVisible();
     expect(screen.queryByText(/prepares.*automatically/i)).not.toBeInTheDocument();
   });
@@ -147,7 +147,7 @@ describe('ProjectProviderMenu', () => {
       },
     });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
 
     // "Preparing" is reserved for a running preparation; idle states must be
     // actionable words instead.
@@ -190,7 +190,7 @@ describe('ProjectProviderMenu', () => {
       onQualify,
     });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review Codex' }));
 
     expect(screen.getByRole('menuitem', { name: 'Reconnect in AI Settings' })).toHaveAttribute(
@@ -238,7 +238,7 @@ describe('ProjectProviderMenu', () => {
       onQualify,
     });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review OpenClaw' }));
 
     expect(screen.getByText(failure.message)).toBeVisible();
@@ -269,7 +269,7 @@ describe('ProjectProviderMenu', () => {
       hostRecoveryRole: 'SUB_ADMIN',
       onQualify,
     });
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review OpenClaw' }));
     expect(screen.getByText(/config\.patch rejected the agents\.list replacement/)).toBeVisible();
     expect(screen.getByRole('menuitem', {
@@ -288,7 +288,7 @@ describe('ProjectProviderMenu', () => {
       hostRecoveryRole: 'USER',
       onQualify,
     });
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review OpenClaw' }));
     expect(screen.queryByText(/config\.patch rejected the agents\.list replacement/)).not.toBeInTheDocument();
     expect(screen.queryByRole('menuitem', { name: 'Open Dashboard for signed update' })).not.toBeInTheDocument();
@@ -330,7 +330,7 @@ describe('ProjectProviderMenu', () => {
       onQualify,
     });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review OpenClaw' }));
     expect(screen.getByRole('status')).toHaveTextContent(/Try again after/);
     expect(screen.getByRole('status').querySelector('time')).toHaveAttribute('datetime', retryAt);
@@ -374,7 +374,7 @@ describe('ProjectProviderMenu', () => {
       onQualify,
     });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Prepare OpenClaw' }));
     expect(screen.queryByText(/Try again after/)).not.toBeInTheDocument();
     expect(onQualify).toHaveBeenCalledWith('OPENCLAW');
@@ -387,7 +387,7 @@ describe('ProjectProviderMenu', () => {
     expect(screen.queryByText(agentZeroQualification.reason)).not.toBeInTheDocument();
     expect(screen.queryByRole('combobox', { name: 'Agent Zero qualification model' })).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     expect(screen.getByText('Choose an agent harness')).toBeVisible();
     expect(screen.getByRole('menuitem', { name: 'Use Codex' })).toBeVisible();
     expect(screen.getByRole('menuitem', { name: 'Review Agent Zero' })).toBeVisible();
@@ -404,18 +404,18 @@ describe('ProjectProviderMenu', () => {
     const onSelect = vi.fn();
     renderMenu({ onSelect });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Use Codex' }));
 
     expect(onSelect).toHaveBeenCalledWith('CODEX');
-    expect(screen.queryByRole('menu', { name: 'Project chat providers' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('menu', { name: 'Project chat harnesses' })).not.toBeInTheDocument();
   });
 
   it('opens on the active provider, supports arrow navigation, and returns focus on Escape', async () => {
     const user = userEvent.setup();
     renderMenu();
 
-    const trigger = screen.getByRole('button', { name: 'Project chat provider' });
+    const trigger = screen.getByRole('button', { name: 'Project chat harness' });
     await user.click(trigger);
 
     const openClawItem = screen.getByRole('menuitem', { name: 'Use OpenClaw' });
@@ -426,7 +426,7 @@ describe('ProjectProviderMenu', () => {
     expect(codexItem).toHaveFocus();
 
     await user.keyboard('{Escape}');
-    expect(screen.queryByRole('menu', { name: 'Project chat providers' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('menu', { name: 'Project chat harnesses' })).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
   });
 
@@ -441,7 +441,7 @@ describe('ProjectProviderMenu', () => {
       onAgentZeroModelChange,
     });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review Agent Zero' }));
     expect(onReviewAgentZero).toHaveBeenCalledTimes(1);
     await user.selectOptions(
@@ -490,7 +490,7 @@ describe('ProjectProviderMenu', () => {
       onQualify,
     });
 
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Review Antigravity' }));
 
     expect(screen.getByText(unavailableQualification.reason)).toBeVisible();
@@ -503,8 +503,8 @@ describe('ProjectProviderMenu', () => {
     const onSelect = vi.fn();
     renderMenu({ disabled: true, onSelect });
 
-    expect(screen.getByRole('button', { name: 'Project chat provider' })).toBeDisabled();
-    expect(screen.queryByRole('menu', { name: 'Project chat providers' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Project chat harness' })).toBeDisabled();
+    expect(screen.queryByRole('menu', { name: 'Project chat harnesses' })).not.toBeInTheDocument();
     expect(onSelect).not.toHaveBeenCalled();
   });
 });

@@ -14,8 +14,10 @@ describe('Agent Chat provider-scoped model selection', () => {
 
   it('keeps OpenClaw ids qualified but converts native CLI catalogs to runtime ids', () => {
     expect(normalizeAgentChatModelId('OPENCLAW', 'codex/gpt-5.5')).toBe('openai/gpt-5.5');
+    expect(normalizeAgentChatModelId('OPENCLAW', 'openai-codex/gpt-6-astra')).toBe('openai/gpt-6-astra');
     expect(normalizeAgentChatModelId('CLAUDE_CODE', 'anthropic/claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
     expect(normalizeAgentChatModelId('CODEX', 'openai/gpt-5.5')).toBe('gpt-5.5');
+    expect(normalizeAgentChatModelId('CODEX', 'openai/gpt-6-astra')).toBe('gpt-6-astra');
     expect(normalizeAgentChatModelId('GROK', 'xai/grok-4')).toBe('grok-4');
     expect(normalizeAgentChatModelId('GEMINI', 'google-antigravity/gemini-3.5-flash')).toBe('gemini-3.5-flash');
   });

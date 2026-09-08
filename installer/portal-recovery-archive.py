@@ -38,6 +38,60 @@ PAX_TIME_PATTERN = re.compile(r"-?[0-9]{1,12}(?:\.[0-9]{1,9})?")
 METADATA_PROFILE = "linux-pax-mtime-xattrs-sparse-v1"
 MAC_RECORD_NAME = "ARCHIVE-MAC.json"
 MANIFEST_NAME = "MANIFEST.txt"
+RECOVERY_SCHEMA_V2 = "bridgesllm.portal-recovery.v2"
+RECOVERY_SCHEMA_V3 = "bridgesllm.portal-recovery.v3"
+RECOVERY_SCHEMA_V4 = "bridgesllm.portal-recovery.v4"
+SUPPORTED_RECOVERY_SCHEMAS = frozenset({
+    RECOVERY_SCHEMA_V2,
+    RECOVERY_SCHEMA_V3,
+    RECOVERY_SCHEMA_V4,
+})
+RECOVERY_MANIFEST_FIELDS = frozenset({
+    "schema",
+    "backupType",
+    "createdAt",
+    "portalVersion",
+    "installationProfile",
+    "directoryConsistency",
+    "metadataProfile",
+    "databaseIdentity",
+    "components",
+})
+
+CORE_RECOVERY_COMPONENTS = frozenset({
+    "database",
+    "portal-install",
+    "portal-environment",
+    "hosted-apps",
+    "portal-app-sources",
+    "portal-files",
+    "upload-storage",
+    "projects",
+    "portal-backend-state",
+    "portal-state",
+    "portal-assets",
+})
+
+RECOVERY_COMPONENT_PAYLOADS = {
+    "database": "database.dump",
+    "portal-install": "portal-install.tar.gz",
+    "portal-environment": "configs/portal-backend.env.production",
+    "hosted-apps": "apps.tar.gz",
+    "portal-app-sources": "portal-app-sources.tar.gz",
+    "legacy-hosted-apps": "legacy-apps.tar.gz",
+    "portal-files": "portal-files.tar.gz",
+    "upload-storage": "uploads.tar.gz",
+    "legacy-portal-files": "legacy-portal-files.tar.gz",
+    "projects": "projects.tar.gz",
+    "portal-backend-state": "portal-backend-state.tar.gz",
+    "portal-state": "portal-state.tar.gz",
+    "portal-assets": "portal-assets.tar.gz",
+    "legacy-portal-runtime": "legacy-portal-runtime.tar.gz",
+    "openclaw-state": "openclaw-state.tar.gz",
+    "stalwart-data": "stalwart-data.tar.gz",
+    "stalwart-mail-data": "stalwart-mail-data.tar.gz",
+    "stalwart-install": "stalwart-install.tar.gz",
+}
 
 
 class RecoveryArchiveError(ValueError):
@@ -1159,20 +1213,256 @@ def parse_environment(payload: bytes) -> dict[str, str]:
     return values
 
 
-def current_environment(path: pathlib.Path) -> tuple[bytes, dict[str, str]]:
-    info = os.lstat(path)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or stat.S_ISLNK(info.st_mode)
-        or info.st_uid != 0
-        or info.st_nlink != 1
-        or info.st_mode & 0o022
-        or info.st_size <= 0
-        or info.st_size > MAX_MANIFEST_BYTES
+def is_openclaw_environment_name(name: str) -> bool:
+    upper_name = name.upper()
+    return "OPENCLAW" in upper_name or "CLAWDBOT" in upper_name
+
+
+def environment_assignment_lines(payload: bytes) -> list[tuple[str, str]]:
+    parse_environment(payload)
+    text = payload.decode("utf-8")
+    result = []
+    for raw in text.split("\n"):
+        match = ENV_ASSIGNMENT.fullmatch(raw)
+        if match is not None:
+            result.append((match.group(1), raw))
+    return result
+
+
+def filtered_v3_environment(payload: bytes) -> bytes:
+    lines = [
+        raw
+        for name, raw in environment_assignment_lines(payload)
+        if not is_openclaw_environment_name(name)
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def validate_v3_environment(payload: bytes) -> dict[str, str]:
+    values = parse_environment(payload)
+    forbidden = sorted(name for name in values if is_openclaw_environment_name(name))
+    if forbidden:
+        fail("v3 Portal environment contains OpenClaw authority")
+    if payload != filtered_v3_environment(payload):
+        fail("v3 Portal environment is not canonical assignment-only data")
+    return values
+
+
+def merge_v3_environment(archived_payload: bytes, current_payload: bytes) -> bytes:
+    archived_values = validate_v3_environment(archived_payload)
+    current_values = parse_environment(current_payload)
+    current_openclaw_lines = [
+        (name, raw)
+        for name, raw in environment_assignment_lines(current_payload)
+        if is_openclaw_environment_name(name)
+    ]
+    current_openclaw_names = {name for name, _ in current_openclaw_lines}
+    merged_lines = [
+        raw for _, raw in environment_assignment_lines(archived_payload)
+    ] + [raw for _, raw in current_openclaw_lines]
+    merged = ("\n".join(merged_lines) + "\n").encode("utf-8")
+    if len(merged) > MAX_MANIFEST_BYTES:
+        fail("merged Portal environment is oversized")
+    verified_values = parse_environment(merged)
+    if any(
+        verified_values.get(name) != value
+        for name, value in archived_values.items()
+    ) or any(
+        verified_values.get(name) != current_values[name]
+        for name in current_openclaw_names
     ):
-        fail("installed Portal environment is unsafe")
-    payload = path.read_bytes()
+        fail("merged Portal environment changed recovery authority")
+    return merged
+
+
+def read_safe_regular_payload(
+    path: pathlib.Path,
+    *,
+    label: str,
+    maximum: int,
+    exact_mode: int | None = None,
+) -> bytes:
+    """Read one immutable-looking root authority through its opened descriptor."""
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise RecoveryArchiveError(f"{label} is unavailable") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or before.st_mode & 0o022
+            or (
+                exact_mode is not None
+                and stat.S_IMODE(before.st_mode) != exact_mode
+            )
+            or before.st_size <= 0
+            or before.st_size > maximum
+        ):
+            fail(f"{label} is unsafe")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                fail(f"{label} ended unexpectedly")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            fail(f"{label} grew during inspection")
+        after = os.fstat(descriptor)
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in (
+                "st_dev", "st_ino", "st_mode", "st_uid", "st_gid",
+                "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns",
+            )
+        ):
+            fail(f"{label} changed during inspection")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def current_environment(path: pathlib.Path) -> tuple[bytes, dict[str, str]]:
+    payload = read_safe_regular_payload(
+        path,
+        label="sealed current Portal environment",
+        maximum=MAX_MANIFEST_BYTES,
+        exact_mode=0o600,
+    )
     return payload, parse_environment(payload)
+
+
+def write_private_payload(path: pathlib.Path, payload: bytes) -> None:
+    if (
+        not path.is_absolute()
+        or os.path.normpath(str(path)) != str(path)
+        or os.path.lexists(path)
+        or not payload
+        or len(payload) > MAX_MANIFEST_BYTES
+    ):
+        fail("private recovery payload target is unsafe")
+    parent_info = os.lstat(path.parent)
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_gid != 0
+        or parent_info.st_mode & 0o022
+    ):
+        fail("private recovery payload directory is unsafe")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_nlink != 1
+        ):
+            fail("private recovery payload inode is unsafe")
+        os.fchmod(descriptor, 0o600)
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("short private recovery payload write")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_descriptor = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def assert_environment_authority(
+    admission_path: pathlib.Path,
+    sealed_current_path: pathlib.Path,
+    staged_path: pathlib.Path,
+    merged_path: pathlib.Path,
+    live_path: pathlib.Path,
+    phase: str,
+) -> None:
+    admission_raw = read_safe_regular_payload(
+        admission_path,
+        label="restore admission",
+        maximum=MAX_MANIFEST_BYTES,
+        exact_mode=0o600,
+    )
+    try:
+        document = json.loads(admission_raw)
+    except json.JSONDecodeError as error:
+        raise RecoveryArchiveError("restore admission is invalid JSON") from error
+    authority = document.get("environmentAuthority")
+    recovery_schema = document.get("recoverySchema")
+    expected_policy = {
+        RECOVERY_SCHEMA_V2: "exact-v2",
+        RECOVERY_SCHEMA_V3: "portal-only-preserve-openclaw-v3",
+        RECOVERY_SCHEMA_V4: "exact-full-v4",
+    }.get(recovery_schema)
+    digest_names = ("archivedSha256", "currentSha256", "mergedSha256")
+    if (
+        document.get("schema") != "bridgesllm.restore-admission.v2"
+        or not isinstance(authority, dict)
+        or set(authority) != {
+            "schema", "policy", *digest_names,
+        }
+        or authority.get("schema")
+            != "bridgesllm.portal-environment-authority.v1"
+        or expected_policy is None
+        or authority.get("policy") != expected_policy
+        or any(
+            re.fullmatch(r"[a-f0-9]{64}", str(authority.get(name, ""))) is None
+            for name in digest_names
+        )
+        or phase not in {"pre-files", "files-restored", "rollback", "commit"}
+    ):
+        fail("Portal environment authority is invalid")
+
+    sealed_raw, _ = current_environment(sealed_current_path)
+    if hashlib.sha256(sealed_raw).hexdigest() != authority["currentSha256"]:
+        fail("sealed current Portal environment changed")
+    staged_raw, _ = current_environment(staged_path)
+    if hashlib.sha256(staged_raw).hexdigest() != authority["archivedSha256"]:
+        fail("staged archived Portal environment changed")
+    merged_raw, _ = current_environment(merged_path)
+    if hashlib.sha256(merged_raw).hexdigest() != authority["mergedSha256"]:
+        fail("prepared merged Portal environment changed")
+
+    if phase == "pre-files":
+        live_raw, _ = current_environment(live_path)
+        expected = ((live_raw, authority["currentSha256"]),)
+    elif phase in {"files-restored", "commit"}:
+        live_raw, _ = current_environment(live_path)
+        expected = ((live_raw, authority["mergedSha256"]),)
+    else:
+        live_raw, _ = current_environment(live_path)
+        expected = ((live_raw, authority["currentSha256"]),)
+    if any(
+        hashlib.sha256(payload).hexdigest() != digest
+        for payload, digest in expected
+    ):
+        fail(f"Portal environment changed during {phase}")
 
 
 def component_map(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1194,6 +1484,126 @@ def component_map(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
             fail("recovery component status is invalid")
         result[component_id] = entry
     return result
+
+
+def recovery_manifest_schema(document: Any) -> str:
+    if not isinstance(document, dict) or set(document) != RECOVERY_MANIFEST_FIELDS:
+        fail("recovery manifest schema is unsupported")
+    recovery_schema = document.get("schema")
+    if recovery_schema not in SUPPORTED_RECOVERY_SCHEMAS:
+        fail("recovery manifest schema is unsupported")
+    return recovery_schema
+
+
+def expected_recovery_component_ids(
+    recovery_schema: str,
+    targets: dict[str, pathlib.Path],
+) -> frozenset[str]:
+    if recovery_schema not in SUPPORTED_RECOVERY_SCHEMAS:
+        fail("recovery manifest schema is unsupported")
+    expected = set(CORE_RECOVERY_COMPONENTS)
+    expected.update({
+        "stalwart-data",
+        "stalwart-mail-data",
+        "stalwart-install",
+    })
+    # V2 is the read-only legacy full-host contract. V4 is its explicit
+    # successor for the live-member reconciliation writer and also carries
+    # whole-OpenClaw restore authority. V3 is the distinct Portal-only contract
+    # and deliberately never mutates /root/.openclaw.
+    if recovery_schema in {RECOVERY_SCHEMA_V2, RECOVERY_SCHEMA_V4}:
+        expected.add("openclaw-state")
+    if targets["legacy-hosted-apps"] != targets["hosted-apps"]:
+        expected.add("legacy-hosted-apps")
+    if targets["legacy-portal-files"] not in {
+        targets["portal-files"],
+        targets["upload-storage"],
+    }:
+        expected.add("legacy-portal-files")
+    if targets["legacy-portal-runtime"] != targets["projects"]:
+        expected.add("legacy-portal-runtime")
+    return frozenset(expected)
+
+
+def validate_v3_systemd_metadata(
+    members: dict[str, tarfile.TarInfo],
+) -> None:
+    for name, member in members.items():
+        if name == "systemd":
+            if not member.isdir():
+                fail("v3 recovery archive systemd root is not a directory")
+            continue
+        if not name.startswith("systemd/"):
+            continue
+        fail("v3 recovery archive contains unsupported systemd metadata")
+    if {
+        name for name in members if name.startswith("configs/")
+    } != {"configs/portal-backend.env.production"}:
+        fail("v3 recovery archive configuration inventory is not minimal")
+
+
+def v3_portal_member_mentions_environment(
+    normalized: str,
+    member: tarfile.TarInfo,
+) -> bool:
+    """Reject every embedded environment member and every link alias to one."""
+    names = [normalized]
+    if member.issym() or member.islnk():
+        names.append(member.linkname)
+    for name in names:
+        try:
+            parts = pathlib.PurePosixPath(name).parts
+        except (TypeError, ValueError):
+            return True
+        if any(part.casefold().startswith(".env") for part in parts):
+            return True
+    return False
+
+
+def validate_recovery_component_inventory(
+    recovery_schema: str,
+    components: dict[str, dict[str, Any]],
+    targets: dict[str, pathlib.Path],
+) -> frozenset[str]:
+    expected = expected_recovery_component_ids(recovery_schema, targets)
+    if recovery_schema == RECOVERY_SCHEMA_V3 and any(
+        "openclaw" in component_id for component_id in components
+    ):
+        fail("v3 recovery archive contains an OpenClaw component")
+    if set(components) != expected:
+        fail("recovery archive component inventory is incomplete or contradictory")
+    return expected
+
+
+def validate_comprehensive_component_capture(
+    recovery_schema: str,
+    component_id: str,
+    entry: dict[str, Any],
+) -> None:
+    """Bind every restorable component to the quiesced schema contract."""
+    if recovery_schema not in SUPPORTED_RECOVERY_SCHEMAS:
+        fail("recovery manifest schema is unsupported")
+    if "liveReconciliation" in entry:
+        fail("comprehensive recovery component contains live reconciliation evidence")
+    status = entry.get("status")
+    if status == "not-configured":
+        if entry.get("captureMethod") is not None:
+            fail("absent recovery component contract is invalid")
+        return
+    if status != "captured":
+        fail("recovery component state is invalid")
+    if component_id == "database":
+        expected_method = "pg-dump-custom"
+    elif component_id == "portal-environment":
+        expected_method = (
+            "v3-sanitized-environment"
+            if recovery_schema == RECOVERY_SCHEMA_V3
+            else "file-copy"
+        )
+    else:
+        expected_method = "service-quiesced-tar"
+    if entry.get("captureMethod") != expected_method:
+        fail("recovery component capture method conflicts with its schema")
 
 
 def validate_database_identity(
@@ -1352,7 +1762,7 @@ def environment_target_map(
     ):
         if paths_overlap(portal_app_sources, protected):
             fail("standalone App source target overlaps another recovery domain")
-    return {
+    result = {
         "portal-install": portal_root,
         "portal-environment": portal_root / "backend" / ".env.production",
         "hosted-apps": apps,
@@ -1371,6 +1781,28 @@ def environment_target_map(
         "legacy-portal-files": fixed_root / "portal/files",
         "legacy-portal-runtime": legacy_runtime,
     }
+    openclaw_root = result["openclaw-state"]
+    for component_id, target in result.items():
+        if component_id != "openclaw-state" and paths_overlap(
+            target,
+            openclaw_root,
+        ):
+            fail(
+                "Portal recovery target overlaps the preserved OpenClaw root"
+            )
+    return result
+
+
+def validate_environment_target_equivalence(
+    archived_values: dict[str, str],
+    current_values: dict[str, str],
+    test_root: pathlib.Path | None,
+) -> dict[str, pathlib.Path]:
+    current_targets = environment_target_map(current_values, test_root)
+    archived_targets = environment_target_map(archived_values, test_root)
+    if archived_targets != current_targets:
+        fail("recovery environment redirects a Portal recovery target")
+    return current_targets
 
 
 def paths_overlap(left: pathlib.Path, right: pathlib.Path) -> bool:
@@ -1505,14 +1937,17 @@ def validate_recovery_authority(
     member: tarfile.TarInfo,
     expected_top_level: str,
     portal_root: pathlib.Path,
+    recovery_schema: str,
+    current_environment_payload: bytes,
 ) -> dict[str, str]:
-    relative_paths = (
+    relative_paths = [
         "restore-full.sh",
         "backup-full.sh",
-        "backend/.env.production",
         "installer/install.sh",
         "installer/portal-recovery-archive.py",
-    )
+    ]
+    if recovery_schema not in SUPPORTED_RECOVERY_SCHEMAS:
+        fail("recovery manifest schema is unsupported")
     expected: dict[str, tuple[str, int, int, int]] = {}
     for relative in relative_paths:
         source = portal_root / relative
@@ -1537,6 +1972,13 @@ def validate_recovery_authority(
             info.st_uid,
             info.st_gid,
         )
+    if recovery_schema in {RECOVERY_SCHEMA_V2, RECOVERY_SCHEMA_V4}:
+        expected[f"{expected_top_level}/backend/.env.production"] = (
+            hashlib.sha256(current_environment_payload).hexdigest(),
+            0o600,
+            0,
+            0,
+        )
 
     stream = handle.extractfile(member)
     if stream is None:
@@ -1546,6 +1988,11 @@ def validate_recovery_authority(
         with tarfile.open(fileobj=stream, mode="r|gz") as nested:
             for item in nested:
                 normalized = normalized_member(item)
+                if (
+                    recovery_schema == RECOVERY_SCHEMA_V3
+                    and v3_portal_member_mentions_environment(normalized, item)
+                ):
+                    fail("v3 Portal archive contains embedded environment metadata")
                 authority = expected.get(normalized)
                 if authority is None:
                     continue
@@ -1604,7 +2051,8 @@ def inspect_archive(
     pg_restore: pathlib.Path,
     postgres_major: int,
     expected_version: str,
-    current_env_path: pathlib.Path,
+    current_env_authority_path: pathlib.Path,
+    current_env_target_path: pathlib.Path,
     transaction_dir: pathlib.Path,
     test_root: pathlib.Path | None = None,
     protected_control_paths: tuple[pathlib.Path, ...] = (),
@@ -1620,7 +2068,9 @@ def inspect_archive(
         or archive_info.st_size <= 0
     ):
         fail("recovery archive is unsafe")
-    current_raw, current_values = current_environment(current_env_path)
+    current_raw, current_values = current_environment(
+        current_env_authority_path
+    )
     key = read_hmac_key(hmac_key_path)
     try:
         with tarfile.open(archive, mode="r:gz") as handle:
@@ -1663,23 +2113,33 @@ def inspect_archive(
                 document = json.loads(recovery_raw)
             except json.JSONDecodeError as error:
                 raise RecoveryArchiveError("recovery manifest is invalid JSON") from error
-            archived_values = parse_environment(archived_env_raw)
-            if (
-                set(document) != {
-                    "schema",
-                    "backupType",
-                    "createdAt",
-                    "portalVersion",
-                    "installationProfile",
-                    "directoryConsistency",
-                    "metadataProfile",
-                    "databaseIdentity",
-                    "components",
-                }
-                or document.get("schema")
-                != "bridgesllm.portal-recovery.v2"
-            ):
+            recovery_schema = recovery_manifest_schema(document)
+            archived_values = (
+                validate_v3_environment(archived_env_raw)
+                if recovery_schema == RECOVERY_SCHEMA_V3
+                else parse_environment(archived_env_raw)
+            )
+            merged_env_raw = (
+                merge_v3_environment(archived_env_raw, current_raw)
+                if recovery_schema == RECOVERY_SCHEMA_V3
+                else archived_env_raw
+            )
+            environment_policy = {
+                RECOVERY_SCHEMA_V2: "exact-v2",
+                RECOVERY_SCHEMA_V3: "portal-only-preserve-openclaw-v3",
+                RECOVERY_SCHEMA_V4: "exact-full-v4",
+            }.get(recovery_schema)
+            if environment_policy is None:
                 fail("recovery manifest schema is unsupported")
+            environment_authority = {
+                "schema": "bridgesllm.portal-environment-authority.v1",
+                "policy": environment_policy,
+                "archivedSha256": hashlib.sha256(archived_env_raw).hexdigest(),
+                "currentSha256": hashlib.sha256(current_raw).hexdigest(),
+                "mergedSha256": hashlib.sha256(merged_env_raw).hexdigest(),
+            }
+            if recovery_schema == RECOVERY_SCHEMA_V3:
+                validate_v3_systemd_metadata(members)
             source_database_identity = validate_database_identity(
                 document.get("databaseIdentity"),
                 postgres_major,
@@ -1706,10 +2166,14 @@ def inspect_archive(
                 fail("recovery archive database authority does not match the installed target")
             if not current_values.get("DATABASE_URL"):
                 fail("installed database authority is missing")
-            # The environment itself is a recovery payload. Requiring exact
-            # bytes prevents a restore from silently rotating secrets or
-            # origin identity before the operator deliberately migrates them.
-            if current_raw != archived_env_raw:
+            # V2 and V4 restore their whole OpenClaw authority and therefore
+            # require exact environment bytes. V3 archives only Portal-owned
+            # assignments; current OpenClaw authority is merged into the staged
+            # environment after authenticated extraction.
+            if (
+                recovery_schema in {RECOVERY_SCHEMA_V2, RECOVERY_SCHEMA_V4}
+                and current_raw != archived_env_raw
+            ):
                 fail("recovery archive environment differs from the installed target")
             archived_env = members["configs/portal-backend.env.production"]
             if (
@@ -1721,63 +2185,34 @@ def inspect_archive(
                 fail("recovery archive environment metadata is not exact")
 
             components = component_map(document)
-            targets = environment_target_map(current_values, test_root)
+            targets = validate_environment_target_equivalence(
+                archived_values,
+                current_values,
+                test_root,
+            )
+            if current_env_target_path != targets["portal-environment"]:
+                fail(
+                    "supplied current Portal environment target differs from its map"
+                )
             if test_root is not None:
                 for target in targets.values():
                     if target != test_root and not target.is_relative_to(test_root):
                         fail("restore test target escaped its fixture root")
-            required_ids = {
-                "database",
-                "portal-install",
-                "portal-environment",
-                "hosted-apps",
-                "portal-app-sources",
-                "portal-files",
-                "upload-storage",
-                "projects",
-                "portal-backend-state",
-                "portal-state",
-                "portal-assets",
-            }
+            required_ids = set(CORE_RECOVERY_COMPONENTS)
             if not required_ids.issubset(components):
                 fail("recovery archive lacks required core components")
-            expected_payloads = {
-                "database": "database.dump",
-                "portal-install": "portal-install.tar.gz",
-                "portal-environment": "configs/portal-backend.env.production",
-                "hosted-apps": "apps.tar.gz",
-                "portal-app-sources": "portal-app-sources.tar.gz",
-                "legacy-hosted-apps": "legacy-apps.tar.gz",
-                "portal-files": "portal-files.tar.gz",
-                "upload-storage": "uploads.tar.gz",
-                "legacy-portal-files": "legacy-portal-files.tar.gz",
-                "projects": "projects.tar.gz",
-                "portal-backend-state": "portal-backend-state.tar.gz",
-                "portal-state": "portal-state.tar.gz",
-                "portal-assets": "portal-assets.tar.gz",
-                "legacy-portal-runtime": "legacy-portal-runtime.tar.gz",
-                "openclaw-state": "openclaw-state.tar.gz",
-                "stalwart-data": "stalwart-data.tar.gz",
-                "stalwart-mail-data": "stalwart-mail-data.tar.gz",
-                "stalwart-install": "stalwart-install.tar.gz",
-            }
-            expected_ids = required_ids | {
-                "openclaw-state",
-                "stalwart-data",
-                "stalwart-mail-data",
-                "stalwart-install",
-            }
-            if targets["legacy-hosted-apps"] != targets["hosted-apps"]:
-                expected_ids.add("legacy-hosted-apps")
-            if targets["legacy-portal-files"] not in {
-                targets["portal-files"],
-                targets["upload-storage"],
-            }:
-                expected_ids.add("legacy-portal-files")
-            if targets["legacy-portal-runtime"] != targets["projects"]:
-                expected_ids.add("legacy-portal-runtime")
-            if set(components) != expected_ids:
-                fail("recovery archive component inventory is incomplete or contradictory")
+            expected_payloads = RECOVERY_COMPONENT_PAYLOADS
+            validate_recovery_component_inventory(
+                recovery_schema,
+                components,
+                targets,
+            )
+            for component_id, entry in components.items():
+                validate_comprehensive_component_capture(
+                    recovery_schema,
+                    component_id,
+                    entry,
+                )
             unsupported = set(components) - set(expected_payloads)
             if unsupported:
                 fail("recovery archive contains an unsupported component")
@@ -1815,6 +2250,7 @@ def inspect_archive(
                 if component_id != "database" and (
                     entry.get("logicalBytes") is not None
                     or entry.get("relationCount") is not None
+                    or entry.get("databaseContractVariant") is not None
                 ):
                     fail("non-database recovery component claims database storage metadata")
             admitted: list[dict[str, Any]] = []
@@ -1860,6 +2296,15 @@ def inspect_archive(
                 if component_id == "portal-environment":
                     if payload != "configs/portal-backend.env.production":
                         fail("Portal environment recovery payload is invalid")
+                    expected_method = (
+                        "v3-sanitized-environment"
+                        if recovery_schema == RECOVERY_SCHEMA_V3
+                        else "file-copy"
+                    )
+                    if entry.get("captureMethod") != expected_method:
+                        fail("Portal environment capture method is invalid")
+                    if entry.get("source") != str(targets[component_id]):
+                        fail("Portal environment source authority does not match target")
                     admitted.append({
                         "id": component_id,
                         "payload": payload,
@@ -1901,7 +2346,9 @@ def inspect_archive(
                         handle,
                         members[payload],
                         target.name,
-                        current_env_path.parent.parent,
+                        current_env_target_path.parent.parent,
+                        recovery_schema,
+                        current_raw,
                     )
                 nested_bytes += component_bytes
                 nested_inodes += component_inodes
@@ -1931,6 +2378,8 @@ def inspect_archive(
                 fail("sealed recovery authority is outside the portal target")
             return {
                 "schema": "bridgesllm.restore-admission.v2",
+                "recoverySchema": recovery_schema,
+                "environmentAuthority": environment_authority,
                 "archive": str(archive),
                 "archiveSha256": sha256_file(archive),
                 "portalVersion": portal_version,
@@ -2311,6 +2760,7 @@ def main() -> int:
     inspect_parser.add_argument("--postgres-major", required=True, type=int)
     inspect_parser.add_argument("--expected-version", required=True)
     inspect_parser.add_argument("--current-env", required=True)
+    inspect_parser.add_argument("--current-env-target", required=True)
     inspect_parser.add_argument("--output", required=True)
     inspect_parser.add_argument("--test-root")
     inspect_parser.add_argument(
@@ -2327,6 +2777,24 @@ def main() -> int:
     extract_parser.add_argument("--archive", required=True)
     extract_parser.add_argument("--hmac-key", required=True)
     extract_parser.add_argument("--destination", required=True)
+    merge_environment_parser = subparsers.add_parser("merge-environment")
+    merge_environment_parser.add_argument("--archived", required=True)
+    merge_environment_parser.add_argument("--current", required=True)
+    merge_environment_parser.add_argument("--output", required=True)
+    merge_environment_parser.add_argument("--expected-archived-sha256", required=True)
+    merge_environment_parser.add_argument("--expected-current-sha256", required=True)
+    merge_environment_parser.add_argument("--expected-output-sha256", required=True)
+    assert_environment_parser = subparsers.add_parser("assert-environment")
+    assert_environment_parser.add_argument("--admission", required=True)
+    assert_environment_parser.add_argument("--sealed-current", required=True)
+    assert_environment_parser.add_argument("--staged", required=True)
+    assert_environment_parser.add_argument("--merged", required=True)
+    assert_environment_parser.add_argument("--live", required=True)
+    assert_environment_parser.add_argument(
+        "--phase",
+        required=True,
+        choices=("pre-files", "files-restored", "rollback", "commit"),
+    )
     component_parser = subparsers.add_parser("extract-component")
     component_parser.add_argument("--archive", required=True)
     component_parser.add_argument("--destination", required=True)
@@ -2353,6 +2821,10 @@ def main() -> int:
             args.postgres_major,
             expected_version,
             canonical_absolute(args.current_env, label="current environment"),
+            canonical_absolute(
+                args.current_env_target,
+                label="current environment target",
+            ),
             output.parent,
             validated_test_root(args.test_root),
             tuple(
@@ -2373,6 +2845,46 @@ def main() -> int:
         safe_extract(
             archive,
             canonical_absolute(args.destination, label="destination"),
+        )
+        return 0
+    if args.command == "merge-environment":
+        archived_raw, _ = current_environment(
+            canonical_absolute(args.archived, label="archived Portal environment")
+        )
+        current_raw, _ = current_environment(
+            canonical_absolute(args.current, label="current Portal environment")
+        )
+        expected_digests = (
+            args.expected_archived_sha256,
+            args.expected_current_sha256,
+            args.expected_output_sha256,
+        )
+        if any(re.fullmatch(r"[a-f0-9]{64}", value) is None for value in expected_digests):
+            fail("Portal environment digest authority is invalid")
+        merged = merge_v3_environment(archived_raw, current_raw)
+        observed_digests = (
+            hashlib.sha256(archived_raw).hexdigest(),
+            hashlib.sha256(current_raw).hexdigest(),
+            hashlib.sha256(merged).hexdigest(),
+        )
+        if observed_digests != expected_digests:
+            fail("Portal environment digest authority changed")
+        write_private_payload(
+            canonical_absolute(args.output, label="merged Portal environment"),
+            merged,
+        )
+        return 0
+    if args.command == "assert-environment":
+        assert_environment_authority(
+            canonical_absolute(args.admission, label="restore admission"),
+            canonical_absolute(
+                args.sealed_current,
+                label="sealed current Portal environment",
+            ),
+            canonical_absolute(args.staged, label="staged Portal environment"),
+            canonical_absolute(args.merged, label="merged Portal environment"),
+            canonical_absolute(args.live, label="live Portal environment"),
+            args.phase,
         )
         return 0
     if args.command == "extract-component":

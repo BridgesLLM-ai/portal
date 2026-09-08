@@ -1,8 +1,12 @@
 import {
+  __openClawSetupReadinessTest,
   getOpenClawSetupReadiness,
   invalidateOpenClawSetupReadinessCache,
   type OpenClawSetupReadinessDependencies,
 } from '../services/openclawSetupReadiness';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 type CliResponse = { ok: boolean; stdout: string; stderr: string };
 
@@ -27,14 +31,14 @@ function makeDependencies(options: {
   gatewayToken?: string | null;
   credentialStoreWritable?: boolean;
 } = {}): OpenClawSetupReadinessDependencies {
-  const corePackageVersion = options.corePackageVersion === undefined ? '2026.7.1-2' : options.corePackageVersion;
-  const cliVersion = options.cliVersion || '2026.7.1';
-  const gatewayRunningVersion = options.gatewayRunningVersion || '2026.7.1';
+  const corePackageVersion = options.corePackageVersion === undefined ? '2026.9.1' : options.corePackageVersion;
+  const cliVersion = options.cliVersion || '2026.9.1';
+  const gatewayRunningVersion = options.gatewayRunningVersion || '2026.9.1';
   const gatewayProbeOk = options.gatewayProbeOk !== false;
-  const pluginVersion = options.pluginVersion || '2026.7.1-1';
-  const pluginSpec = options.pluginSpec || '@openclaw/codex@2026.7.1-1';
+  const pluginVersion = options.pluginVersion || '2026.9.1';
+  const pluginSpec = options.pluginSpec || '@openclaw/codex@2026.9.1';
   const pluginSource = options.pluginSource || 'npm';
-  const pluginRecordedVersion = options.pluginRecordedVersion || '2026.7.1-1';
+  const pluginRecordedVersion = options.pluginRecordedVersion || '2026.9.1';
 
   return {
     runOpenClawCli: async (args) => {
@@ -89,6 +93,17 @@ function makeDependencies(options: {
 describe('OpenClaw setup readiness', () => {
   afterEach(() => invalidateOpenClawSetupReadinessCache());
 
+  it('accepts a writable regular config file with a writable parent directory', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-readiness-file-'));
+    try {
+      const configPath = path.join(root, 'openclaw.json');
+      fs.writeFileSync(configPath, '{}\n', { mode: 0o600 });
+      expect(__openClawSetupReadinessTest.existingPathChainIsSafeAndWritable(configPath)).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('allows provider setup only for the exact authenticated and writable tested pair', async () => {
     const status = await getOpenClawSetupReadiness(makeDependencies());
 
@@ -98,7 +113,95 @@ describe('OpenClaw setup readiness', () => {
     expect(status.gatewayProbeOk).toBe(true);
     expect(status.gatewayProbeError).toBeNull();
     expect(status.credentialStoreReady).toBe(true);
+    expect(status.testedRuntimeFamily).toBe('current-2026.9.1');
     expect(status.blockers).toEqual([]);
+  });
+
+  it.each([
+    ['2026.9.2', '2026.9.2', true],
+    ['2026.9.2', '2026.9.1', false],
+    ['2026.9.3', '2026.9.3', false],
+  ])('checks the native patch tuple core=%s plugin=%s', async (core, plugin, expected) => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({
+      corePackageVersion: core, cliVersion: core, gatewayRunningVersion: core,
+      pluginVersion: plugin, pluginSpec: `@openclaw/codex@${plugin}`, pluginRecordedVersion: plugin,
+    }));
+    expect(status.ready).toBe(expected);
+    if (expected) {
+      expect(status.testedRuntimeFamily).toBe('current-2026.9.1');
+      expect(status.testedCorePackageVersion).toBe('2026.9.2');
+      expect(status.testedCodexPluginVersion).toBe('2026.9.2');
+      expect(status.blockers).toEqual([]);
+    }
+  });
+
+  it('retains the exact Portal-only-update 2026.7.1 package/runtime/plugin tuple', async () => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({
+      corePackageVersion: '2026.7.1-2',
+      cliVersion: '2026.7.1',
+      gatewayRunningVersion: '2026.7.1',
+      pluginVersion: '2026.7.1-1',
+      pluginSpec: '@openclaw/codex@2026.7.1-1',
+      pluginRecordedVersion: '2026.7.1-1',
+    }));
+
+    expect(status.ready).toBe(true);
+    expect(status.testedPairReady).toBe(true);
+    expect(status.testedRuntimeFamily).toBe('legacy-2026.7.1');
+    expect(status.testedCorePackageVersion).toBe('2026.7.1-2');
+    expect(status.testedRuntimeVersion).toBe('2026.7.1');
+    expect(status.testedCodexPluginVersion).toBe('2026.7.1-1');
+    expect(status.blockers).toEqual([]);
+  });
+
+  it('accepts the exact legacy package banner without accepting arbitrary suffixes', async () => {
+    const legacyPackageBanner = await getOpenClawSetupReadiness(makeDependencies({
+      corePackageVersion: '2026.7.1-2',
+      cliVersion: '2026.7.1-2',
+      gatewayRunningVersion: '2026.7.1-2',
+      pluginVersion: '2026.7.1-1',
+      pluginSpec: '@openclaw/codex@2026.7.1-1',
+      pluginRecordedVersion: '2026.7.1-1',
+    }));
+    expect(legacyPackageBanner.testedPairReady).toBe(true);
+
+    const inventedSuffix = await getOpenClawSetupReadiness(makeDependencies({
+      corePackageVersion: '2026.9.1',
+      cliVersion: '2026.9.1-1',
+      gatewayRunningVersion: '2026.9.1-1',
+    }));
+    expect(inventedSuffix.testedPairReady).toBe(false);
+    expect(inventedSuffix.blockers.map((blocker) => blocker.code)).toEqual(expect.arrayContaining([
+      'cli-runtime-mismatch',
+      'gateway-runtime-mismatch',
+    ]));
+  });
+
+  it('rejects mixed core, runtime, gateway, and Codex plugin families', async () => {
+    const mixedRuntime = await getOpenClawSetupReadiness(makeDependencies({
+      corePackageVersion: '2026.7.1-2',
+      cliVersion: '2026.9.1',
+      gatewayRunningVersion: '2026.9.1',
+      pluginVersion: '2026.7.1-1',
+      pluginSpec: '@openclaw/codex@2026.7.1-1',
+      pluginRecordedVersion: '2026.7.1-1',
+    }));
+    expect(mixedRuntime.testedPairReady).toBe(false);
+    expect(mixedRuntime.blockers.map((blocker) => blocker.code)).toEqual(expect.arrayContaining([
+      'cli-runtime-mismatch',
+      'gateway-runtime-mismatch',
+    ]));
+
+    const mixedPlugin = await getOpenClawSetupReadiness(makeDependencies({
+      corePackageVersion: '2026.7.1-2',
+      cliVersion: '2026.7.1',
+      gatewayRunningVersion: '2026.7.1',
+      pluginVersion: '2026.9.1',
+      pluginSpec: '@openclaw/codex@2026.9.1',
+      pluginRecordedVersion: '2026.9.1',
+    }));
+    expect(mixedPlugin.testedPairReady).toBe(false);
+    expect(mixedPlugin.blockers).toContainEqual(expect.objectContaining({ code: 'codex-plugin-mismatch' }));
   });
 
   it('reads the running gateway version from status when the probe lacks operator scope', async () => {
@@ -107,25 +210,25 @@ describe('OpenClaw setup readiness', () => {
     // then reported "detected unknown" on a healthy, correctly versioned host.
     const status = await getOpenClawSetupReadiness(makeDependencies({
       gatewayProbeSelfVersion: null,
-      gatewayStatusVersion: '2026.7.1-2',
+      gatewayStatusVersion: '2026.9.1',
     }));
 
-    expect(status.runningVersion).toBe('2026.7.1-2');
+    expect(status.runningVersion).toBe('2026.9.1');
     expect(status.blockers.map((blocker) => blocker.code)).not.toContain('gateway-runtime-mismatch');
   });
 
   it('accepts the resolved Codex install identity rather than the requested spec', async () => {
     // the CLI records spec "@openclaw/codex" for an install that
-    // resolved to "@openclaw/codex@2026.7.1-1". Comparing the requested spec
+    // resolved to "@openclaw/codex@2026.9.1". Comparing the requested spec
     // rejected a correctly pinned, integrity-verified official install.
     const status = await getOpenClawSetupReadiness(makeDependencies({
       pluginSpec: '@openclaw/codex',
-      pluginResolvedSpec: '@openclaw/codex@2026.7.1-1',
-      pluginResolvedVersion: '2026.7.1-1',
+      pluginResolvedSpec: '@openclaw/codex@2026.9.1',
+      pluginResolvedVersion: '2026.9.1',
     }));
 
     expect(status.blockers.map((blocker) => blocker.code)).not.toContain('codex-plugin-mismatch');
-    expect(status.codexPluginInstallSpec).toBe('@openclaw/codex@2026.7.1-1');
+    expect(status.codexPluginInstallSpec).toBe('@openclaw/codex@2026.9.1');
   });
 
   it('still rejects a Codex install that resolved to another version', async () => {
@@ -224,6 +327,18 @@ describe('OpenClaw setup readiness', () => {
     const status = await getOpenClawSetupReadiness(makeDependencies({ corePackageVersion: '2026.7.1' }));
 
     expect(status.ready).toBe(false);
+    expect(status.blockers).toContainEqual(expect.objectContaining({ code: 'core-package-mismatch' }));
+  });
+
+  it('rejects an unqualified package suffix instead of treating it as the release family', async () => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({
+      corePackageVersion: '2026.9.1-1',
+      cliVersion: '2026.9.1-1',
+      gatewayRunningVersion: '2026.9.1-1',
+    }));
+
+    expect(status.ready).toBe(false);
+    expect(status.testedPairReady).toBe(false);
     expect(status.blockers).toContainEqual(expect.objectContaining({ code: 'core-package-mismatch' }));
   });
 

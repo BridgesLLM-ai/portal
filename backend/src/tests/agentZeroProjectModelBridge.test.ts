@@ -19,6 +19,7 @@ import {
 const PROJECT_KEY = 'a'.repeat(64);
 const UPSTREAM_TOKEN = 'U'.repeat(43);
 const NOW = Date.parse('2026-07-20T04:00:00.000Z');
+const TEST_OWNER_UID = typeof process.getuid === 'function' ? process.getuid() : 0;
 
 let root: string;
 let server: http.Server;
@@ -96,6 +97,7 @@ beforeEach(async () => {
     now: () => NOW,
     tokenFactory: () => 'T'.repeat(43),
     generationFactory: () => '22222222-2222-4222-8222-222222222222',
+    expectedOwnerUid: TEST_OWNER_UID,
   }).token;
   logs = [];
   upstreamRequests = [];
@@ -112,6 +114,7 @@ beforeEach(async () => {
     upstreamToken: UPSTREAM_TOKEN,
     credentialRoot: root,
     now: () => NOW + 1,
+    expectedOwnerUid: TEST_OWNER_UID,
     logger: (event) => logs.push(event),
     rateLimit: 10,
   }, { request: fakeRequestFactory });

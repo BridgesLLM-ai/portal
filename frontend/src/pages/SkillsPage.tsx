@@ -2,11 +2,9 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Puzzle, Search, RefreshCw, CheckCircle, AlertCircle, XCircle,
-  ChevronDown, ChevronUp, Loader2, Package, Folder, Box, Download, Plug, Store, Wrench, Trash2, TrendingUp, Clock, Star
+  ChevronDown, ChevronUp, Loader2, Package, Folder, Box, Plug, Store, Wrench, TrendingUp, Clock, Star
 } from 'lucide-react';
 import { skillsAPI } from '../api/endpoints';
-import { agentJobsAPI } from '../api/agentJobs';
-import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 
 /* ─── Types ─────────────────────────────────────────────── */
 
@@ -41,6 +39,11 @@ interface MarketplaceResult {
   updatedAt?: string;
 }
 
+interface MarketplaceUnavailable {
+  reason: string;
+  remediation: string;
+}
+
 interface PluginEntry {
   id?: string;
   name?: string;
@@ -54,36 +57,6 @@ interface PluginEntry {
 
 type FilterTab = 'all' | 'eligible' | 'installed' | 'missing';
 type MarketSort = 'trending' | 'newest' | 'downloads';
-
-type PendingExtensionMutation = {
-  kind: 'skill-install' | 'skill-uninstall' | 'plugin-install';
-  target: string;
-  confirmationPhrase: string;
-};
-
-type ExtensionMutationOwner = Readonly<{
-  mutation: Readonly<PendingExtensionMutation>;
-  confirmation: string;
-}>;
-
-type ExtensionMutationProof = Readonly<{
-  mutationKey: string;
-  jobId: string;
-  completed: boolean;
-}>;
-
-type ExtensionNavigationGuard = {
-  url: string;
-  state: unknown;
-  owner: ExtensionMutationOwner;
-};
-
-const JOB_STATUS_REQUEST_TIMEOUT_MS = 8_000;
-const JOB_POLL_TIMEOUT_MS = 5 * 60_000;
-const JOB_POLL_INTERVAL_MS = 2_000;
-const INVENTORY_READBACK_TIMEOUT_MS = 15_000;
-
-class ExtensionJobTerminalError extends Error {}
 
 /* ─── Animation Variants ────────────────────────────────── */
 
@@ -126,68 +99,31 @@ function getMissingItems(missing?: SkillMissing): string[] {
   return items;
 }
 
-function mutationKey(mutation: PendingExtensionMutation): string {
-  return `${mutation.kind}:${mutation.target}`;
-}
-
-function withoutPackageVersion(value: string): string {
-  if (value.startsWith('@')) {
-    const slashIndex = value.indexOf('/');
-    const versionIndex = value.lastIndexOf('@');
-    return slashIndex >= 0 && versionIndex > slashIndex ? value.slice(0, versionIndex) : value;
-  }
-  const versionIndex = value.lastIndexOf('@');
-  return versionIndex > 0 ? value.slice(0, versionIndex) : value;
-}
-
-function pluginIdentityCandidates(spec: string): Set<string> {
-  const normalized = spec.trim().toLowerCase();
-  const withoutScheme = normalized.replace(/^(?:npm|clawhub):/, '');
-  return new Set([
-    normalized,
-    withoutScheme,
-    withoutPackageVersion(withoutScheme),
-  ].filter(Boolean));
-}
-
-function pluginMatchesSpec(plugin: PluginEntry, spec: string): boolean {
-  const candidates = pluginIdentityCandidates(spec);
-  const exactFields = [plugin.id, plugin.name, plugin.origin, plugin.source]
-    .filter((value): value is string => typeof value === 'string')
-    .map((value) => value.trim().toLowerCase());
-  if (exactFields.some((value) => candidates.has(value))) return true;
-
-  const source = typeof plugin.source === 'string'
-    ? plugin.source.replace(/\\/g, '/').toLowerCase()
-    : '';
-  return [...candidates].some((candidate) => (
-    candidate.includes('/')
-    && (source.includes(`/node_modules/${candidate}/`) || source.endsWith(`/node_modules/${candidate}`))
-  ));
-}
-
-async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
-  let timeoutId: number | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timeoutId = window.setTimeout(() => reject(new Error(timeoutMessage)), Math.max(1, timeoutMs));
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
-  }
+function marketplaceUnavailableFromError(error: unknown): MarketplaceUnavailable | null {
+  if (!error || typeof error !== 'object' || !('response' in error)) return null;
+  const response = (error as { response?: { status?: unknown; data?: unknown } }).response;
+  if (response?.status !== 503 || !response.data || typeof response.data !== 'object') return null;
+  const payload = response.data as Record<string, unknown>;
+  if (
+    payload.state !== 'unavailable'
+    || typeof payload.reason !== 'string'
+    || !payload.reason.trim()
+    || typeof payload.remediation !== 'string'
+    || !payload.remediation.trim()
+  ) return null;
+  return {
+    reason: payload.reason,
+    remediation: payload.remediation,
+  };
 }
 
 /* ─── Skill Card Component ──────────────────────────────── */
 
 interface SkillCardProps {
   skill: Skill;
-  installedNames: Set<string>;
-  onUninstall?: (name: string) => void;
-  disabled?: boolean;
 }
 
-function SkillCard({ skill, installedNames: _installedNames, onUninstall, disabled = false }: SkillCardProps) {
+function SkillCard({ skill }: SkillCardProps) {
   const [expanded, setExpanded] = useState(false);
   const sourceInfo = getSourceLabel(skill);
   const statusInfo = getStatusInfo(skill);
@@ -291,15 +227,9 @@ function SkillCard({ skill, installedNames: _installedNames, onUninstall, disabl
                 )}
               </div>
 
-              {isManaged && onUninstall && (
-                <div className="mt-3 pt-3 border-t border-white/[0.06]">
-                  <button
-                    onClick={(e) => { e.stopPropagation(); onUninstall(skill.name); }}
-                    disabled={disabled}
-                    className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/20 transition-all disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <Trash2 size={12} /> Uninstall
-                  </button>
+              {isManaged && (
+                <div className="mt-3 border-t border-white/[0.06] pt-3 text-xs text-amber-200">
+                  Skill changes are paused until transactional maintenance is available.
                 </div>
               )}
             </div>
@@ -330,20 +260,13 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketSort, setMarketSort] = useState<MarketSort>('trending');
   const [marketMode, setMarketMode] = useState<'explore' | 'search'>('explore');
-  const [pluginSpec, setPluginSpec] = useState('');
+  const [marketUnavailable, setMarketUnavailable] = useState<MarketplaceUnavailable | null>(null);
   const [activityMessage, setActivityMessage] = useState<string | null>(null);
   const [activityError, setActivityError] = useState(false);
   const [activeTab, setActiveTab] = useState<FilterTab>('all');
-  const [pendingMutation, setPendingMutation] = useState<PendingExtensionMutation | null>(null);
-  const [mutationBusy, setMutationBusy] = useState(false);
-  const [mutationError, setMutationError] = useState<string | null>(null);
-  const [mutationProof, setMutationProof] = useState<ExtensionMutationProof | null>(null);
   const mountedRef = useRef(true);
   const listingRequestRef = useRef(0);
   const marketRequestRef = useRef(0);
-  const mutationOwnerRef = useRef<ExtensionMutationOwner | null>(null);
-  const mutationProofRef = useRef<ExtensionMutationProof | null>(null);
-  const mutationNavigationGuardRef = useRef<ExtensionNavigationGuard | null>(null);
 
   const installedNames = useMemo(() => new Set(skills.map(s => s.name)), [skills]);
 
@@ -383,14 +306,24 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
       const data = await skillsAPI.explore(sort, 25);
       if (mountedRef.current && requestId === marketRequestRef.current) {
         setMarketResults(Array.isArray(data.results) ? data.results : []);
+        setMarketUnavailable(null);
         setActivityMessage(null);
         setActivityError(false);
       }
     } catch (err) {
+      const unavailable = marketplaceUnavailableFromError(err);
       const message = err instanceof Error ? err.message : 'Failed to load marketplace';
       if (mountedRef.current && requestId === marketRequestRef.current) {
-        setActivityError(true);
-        setActivityMessage(message);
+        if (unavailable) {
+          setMarketResults([]);
+          setMarketUnavailable(unavailable);
+          setActivityError(false);
+          setActivityMessage(null);
+        } else {
+          setMarketUnavailable(null);
+          setActivityError(true);
+          setActivityMessage(message);
+        }
       }
     } finally {
       if (mountedRef.current && requestId === marketRequestRef.current) setMarketLoading(false);
@@ -411,227 +344,29 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
       const data = await skillsAPI.search(trimmed);
       if (mountedRef.current && requestId === marketRequestRef.current) {
         setMarketResults(Array.isArray(data.results) ? data.results : []);
+        setMarketUnavailable(null);
         setActivityMessage(null);
         setActivityError(false);
       }
     } catch (err) {
+      const unavailable = marketplaceUnavailableFromError(err);
       const message = err instanceof Error ? err.message : 'Marketplace search failed';
       if (mountedRef.current && requestId === marketRequestRef.current) {
-        setActivityError(true);
-        setActivityMessage(message);
+        if (unavailable) {
+          setMarketResults([]);
+          setMarketUnavailable(unavailable);
+          setActivityError(false);
+          setActivityMessage(null);
+        } else {
+          setMarketUnavailable(null);
+          setActivityError(true);
+          setActivityMessage(message);
+        }
       }
     } finally {
       if (mountedRef.current && requestId === marketRequestRef.current) setMarketLoading(false);
     }
   };
-
-  const installSkill = (name: string) => {
-    if (mutationOwnerRef.current) return;
-    setMutationError(null);
-    mutationProofRef.current = null;
-    setMutationProof(null);
-    setPendingMutation({
-      kind: 'skill-install',
-      target: name,
-      confirmationPhrase: `INSTALL SKILL ${name}`,
-    });
-  };
-
-  const uninstallSkill = (name: string) => {
-    if (mutationOwnerRef.current) return;
-    setMutationError(null);
-    mutationProofRef.current = null;
-    setMutationProof(null);
-    setPendingMutation({
-      kind: 'skill-uninstall',
-      target: name,
-      confirmationPhrase: `UNINSTALL SKILL ${name}`,
-    });
-  };
-
-  const installPlugin = () => {
-    if (mutationOwnerRef.current) return;
-    const spec = pluginSpec.trim();
-    if (!spec) return;
-    setMutationError(null);
-    mutationProofRef.current = null;
-    setMutationProof(null);
-    setPendingMutation({
-      kind: 'plugin-install',
-      target: spec,
-      confirmationPhrase: `INSTALL PLUGIN ${spec}`,
-    });
-  };
-
-  const waitForMutationJob = async (jobId: string) => {
-    const deadline = Date.now() + JOB_POLL_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      if (!mountedRef.current) throw new Error('Extension status polling cancelled');
-      const remainingMs = deadline - Date.now();
-      const requestTimeoutMs = Math.max(1, Math.min(JOB_STATUS_REQUEST_TIMEOUT_MS, remainingMs));
-      const job = await withDeadline(
-        agentJobsAPI.status(jobId, { timeoutMs: requestTimeoutMs }),
-        requestTimeoutMs,
-        `Background job ${jobId} did not answer a bounded status request. Retry verification or inspect its retained transcript in Tasks.`,
-      );
-      if (job.status === 'completed') return;
-      if (job.status === 'error' || job.status === 'killed') {
-        throw new ExtensionJobTerminalError(`Background extension job ${job.status}. Open Tasks for its retained transcript before retrying.`);
-      }
-      const delayMs = Math.min(JOB_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()));
-      if (delayMs > 0) await new Promise((resolve) => window.setTimeout(resolve, delayMs));
-    }
-    throw new Error(`Background job ${jobId} did not finish within five minutes. Retry verification or continue tracking it in Tasks.`);
-  };
-
-  const verifyFreshMutationInventory = async (owner: ExtensionMutationOwner, jobId: string) => {
-    if (owner.mutation.kind === 'plugin-install') {
-      let data: { plugins?: unknown };
-      try {
-        data = await withDeadline(
-          skillsAPI.listPlugins(true),
-          INVENTORY_READBACK_TIMEOUT_MS,
-          'the inventory request timed out',
-        );
-      } catch (inventoryError) {
-        const reason = inventoryError instanceof Error ? inventoryError.message : 'the inventory request failed';
-        throw new Error(`Background job ${jobId} completed, but fresh plugin inventory is unavailable: ${reason}. Retry verification or inspect Tasks before starting another install.`);
-      }
-      const nextPlugins = Array.isArray(data?.plugins) ? data.plugins as PluginEntry[] : null;
-      if (!nextPlugins) {
-        throw new Error(`Background job ${jobId} completed, but Portal returned a malformed plugin inventory. Retry verification or inspect Tasks.`);
-      }
-      if (!nextPlugins.some((plugin) => pluginMatchesSpec(plugin, owner.mutation.target))) {
-        throw new Error(`Background job ${jobId} completed, but the fresh plugin inventory does not prove ${owner.mutation.target} is installed. Retry verification or inspect Tasks before starting another install.`);
-      }
-      if (mutationOwnerRef.current === owner) {
-        listingRequestRef.current += 1;
-        setPlugins(nextPlugins);
-        setLoading(false);
-      }
-      return;
-    }
-
-    let data: { skills?: unknown };
-    try {
-      data = await withDeadline(
-        skillsAPI.list(true),
-        INVENTORY_READBACK_TIMEOUT_MS,
-        'the inventory request timed out',
-      );
-    } catch (inventoryError) {
-      const reason = inventoryError instanceof Error ? inventoryError.message : 'the inventory request failed';
-      throw new Error(`Background job ${jobId} completed, but fresh skill inventory is unavailable: ${reason}. Retry verification or inspect Tasks before starting another mutation.`);
-    }
-    const nextSkills = Array.isArray(data?.skills) ? data.skills as Skill[] : null;
-    if (!nextSkills) {
-      throw new Error(`Background job ${jobId} completed, but Portal returned a malformed skill inventory. Retry verification or inspect Tasks.`);
-    }
-    const targetPresent = nextSkills.some((skill) => skill.name === owner.mutation.target);
-    const expectedPresent = owner.mutation.kind === 'skill-install';
-    if (targetPresent !== expectedPresent) {
-      throw new Error(
-        `Background job ${jobId} completed, but the fresh skill inventory does not prove ${owner.mutation.target} was ${expectedPresent ? 'installed' : 'removed'}. Retry verification or inspect Tasks before starting another mutation.`,
-      );
-    }
-    if (mutationOwnerRef.current === owner) {
-      listingRequestRef.current += 1;
-      setSkills(nextSkills);
-      setLoading(false);
-    }
-  };
-
-  const confirmMutation = async (confirmation: string) => {
-    const mutation = pendingMutation;
-    if (!mutation || mutationOwnerRef.current) return;
-    const owner = Object.freeze({
-      mutation: Object.freeze({ ...mutation }),
-      confirmation,
-    });
-
-    mutationNavigationGuardRef.current = {
-      url: window.location.href,
-      state: window.history.state,
-      owner,
-    };
-    mutationOwnerRef.current = owner;
-    setMutationBusy(true);
-    setMutationError(null);
-    setActivityMessage(null);
-    setActivityError(false);
-    try {
-      const ownerKey = mutationKey(owner.mutation);
-      let proof = mutationProofRef.current?.mutationKey === ownerKey
-        ? mutationProofRef.current
-        : null;
-      if (!proof) {
-        const result = owner.mutation.kind === 'skill-install'
-          ? await skillsAPI.install(owner.mutation.target, owner.confirmation)
-          : owner.mutation.kind === 'skill-uninstall'
-            ? await skillsAPI.uninstall(owner.mutation.target, owner.confirmation)
-            : await skillsAPI.installPlugin(owner.mutation.target, owner.confirmation);
-        const jobId = String(result?.jobId || '');
-        if (!jobId) throw new Error('Extension mutation did not return a background job');
-        proof = Object.freeze({ mutationKey: ownerKey, jobId, completed: false });
-        mutationProofRef.current = proof;
-        setMutationProof(proof);
-      }
-      if (!proof.completed) {
-        await waitForMutationJob(proof.jobId);
-        proof = Object.freeze({ ...proof, completed: true });
-        mutationProofRef.current = proof;
-        setMutationProof(proof);
-      }
-      await verifyFreshMutationInventory(owner, proof.jobId);
-      mutationProofRef.current = null;
-      setMutationProof(null);
-      if (owner.mutation.kind === 'plugin-install') setPluginSpec('');
-      if (!mountedRef.current || mutationOwnerRef.current !== owner) return;
-      setPendingMutation(null);
-      setActivityMessage(`${owner.mutation.kind === 'skill-uninstall' ? 'Removed' : 'Installed'} ${owner.mutation.target}.`);
-    } catch (err) {
-      if (mountedRef.current && mutationOwnerRef.current === owner) {
-        if (err instanceof ExtensionJobTerminalError) {
-          mutationProofRef.current = null;
-          setMutationProof(null);
-        }
-        setMutationError(err instanceof Error ? err.message : `Failed to update ${owner.mutation.target}`);
-      }
-    } finally {
-      if (mutationOwnerRef.current === owner) {
-        if (mutationNavigationGuardRef.current?.owner === owner) {
-          mutationNavigationGuardRef.current = null;
-        }
-        mutationOwnerRef.current = null;
-      }
-      if (mountedRef.current) {
-        setMutationBusy(false);
-      }
-    }
-  };
-
-  useEffect(() => {
-    const blockUnload = (event: BeforeUnloadEvent) => {
-      if (!mutationOwnerRef.current) return;
-      event.preventDefault();
-      event.returnValue = '';
-    };
-
-    const blockHistoryBack = (event: PopStateEvent) => {
-      const guard = mutationNavigationGuardRef.current;
-      if (!guard) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      window.history.pushState(guard.state, '', guard.url);
-    };
-
-    window.addEventListener('beforeunload', blockUnload);
-    window.addEventListener('popstate', blockHistoryBack, true);
-    return () => {
-      window.removeEventListener('beforeunload', blockUnload);
-      window.removeEventListener('popstate', blockHistoryBack, true);
-    };
-  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -704,7 +439,7 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
               </div>
               <div>
                 <h1 className="text-xl font-bold text-white">Extensions</h1>
-                <p className="text-sm text-slate-400">Skills, marketplace installs, and plugins</p>
+                <p className="text-sm text-slate-400">Skills, marketplace availability, and plugin status</p>
               </div>
             </div>
 
@@ -771,6 +506,16 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
           </div>
         )}
 
+        <div role="status" className="flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <Wrench className="mt-0.5 shrink-0 text-amber-300" size={16} />
+          <div>
+            <p className="font-medium">Extension changes paused</p>
+            <p className="mt-0.5 text-amber-100/80">
+              Installed skill and plugin status remain available. Marketplace browsing and search require a ClawHub host package that passes Portal execution admission. Portal will re-enable install, update, and removal after durable, provenance-verified extension transactions are available.
+            </p>
+          </div>
+        </div>
+
         {warning && (
           <div role="status" className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
             Some extension sources are unavailable: {warning}
@@ -783,7 +528,7 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
           </div>
         )}
 
-        {/* Marketplace + Plugin Install */}
+        {/* Marketplace + Plugin Inventory */}
         <div className="grid grid-cols-1 xl:grid-cols-[1.3fr_0.7fr] gap-4">
           {/* Marketplace Panel */}
           <div className="rounded-2xl border border-white/[0.06] bg-white/[0.03] p-5 space-y-4">
@@ -794,7 +539,11 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
               <div>
                 <h2 className="text-white font-semibold">Skill Marketplace</h2>
                 <p className="text-sm text-slate-400">
-                  {marketMode === 'search' ? 'Search results from ClawHub' : 'Browse trending skills from ClawHub'}
+                  {marketUnavailable
+                    ? 'ClawHub marketplace unavailable'
+                    : marketMode === 'search'
+                      ? 'Search results from ClawHub'
+                      : 'Browse trending skills from ClawHub'}
                 </p>
               </div>
             </div>
@@ -808,14 +557,15 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                   value={marketQuery}
                   onChange={(e) => setMarketQuery(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') runMarketSearch(); }}
-                  placeholder="Search marketplace skills..."
+                  placeholder={marketUnavailable ? 'Marketplace unavailable' : 'Search marketplace skills...'}
                   aria-label="Search marketplace skills"
-                  className="w-full pl-9 pr-4 py-2 bg-black/20 border border-white/[0.08] rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/40"
+                  disabled={marketLoading || Boolean(marketUnavailable)}
+                  className="w-full pl-9 pr-4 py-2 bg-black/20 border border-white/[0.08] rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/40 disabled:cursor-not-allowed disabled:opacity-60"
                 />
               </div>
               <button
                 onClick={() => runMarketSearch()}
-                disabled={marketLoading}
+                disabled={marketLoading || Boolean(marketUnavailable)}
                 aria-label="Search marketplace skills"
                 className="px-4 py-2 rounded-xl bg-violet-500/15 text-violet-300 border border-violet-500/20 hover:bg-violet-500/20 disabled:opacity-50"
               >
@@ -832,11 +582,12 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                     <button
                       key={opt.key}
                       onClick={() => { setMarketSort(opt.key); loadExplore(opt.key); }}
+                      disabled={marketLoading || Boolean(marketUnavailable)}
                       className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
                         marketSort === opt.key
                           ? 'bg-violet-500/20 text-violet-300 border border-violet-500/30'
                           : 'text-slate-400 hover:text-white hover:bg-white/[0.05]'
-                      }`}
+                      } disabled:cursor-not-allowed disabled:opacity-50`}
                     >
                       <Icon size={12} /> {opt.label}
                     </button>
@@ -853,7 +604,7 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
               </div>
             )}
 
-            {marketMode === 'search' && (
+            {marketMode === 'search' && !marketUnavailable && (
               <div className="flex items-center gap-2">
                 <span className="text-xs text-slate-500">
                   {marketResults.length} result{marketResults.length !== 1 ? 's' : ''} for "{marketQuery}"
@@ -869,7 +620,27 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
 
             {/* Results */}
             <div className="space-y-2 max-h-[22rem] overflow-y-auto pr-1">
-              {marketResults.length === 0 ? (
+              {marketUnavailable ? (
+                <div role="alert" className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-4 text-sm text-red-100">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="mt-0.5 shrink-0 text-red-300" size={17} />
+                    <div>
+                      <p className="font-medium">ClawHub marketplace unavailable</p>
+                      <p className="mt-1 text-red-100/80">{marketUnavailable.reason}</p>
+                      <p className="mt-2 text-xs text-red-100/70">{marketUnavailable.remediation}</p>
+                      <button
+                        type="button"
+                        onClick={() => loadExplore(marketSort)}
+                        disabled={marketLoading}
+                        className="mt-3 inline-flex items-center gap-2 rounded-lg border border-red-400/20 bg-red-400/10 px-3 py-1.5 text-xs font-medium text-red-100 hover:bg-red-400/15 disabled:opacity-50"
+                      >
+                        <RefreshCw size={12} className={marketLoading ? 'animate-spin' : ''} />
+                        Retry marketplace check
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : marketResults.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-white/[0.08] px-4 py-6 text-sm text-slate-500 text-center">
                   {marketLoading ? 'Loading...' : 'No marketplace results.'}
                 </div>
@@ -894,22 +665,17 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
                         {typeof item.score === 'number' && <span>relevance: {item.score.toFixed(2)}</span>}
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => installSkill(target)}
-                      disabled={!target || mutationBusy || isInstalled}
-                      className={`shrink-0 inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm transition-all disabled:opacity-50 ${
+                    <span
+                      aria-label={isInstalled ? `${target} is installed` : `${target} cannot be installed while extension changes are paused`}
+                      className={`shrink-0 inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm ${
                         isInstalled
-                          ? 'border-emerald-500/20 bg-emerald-500/5 text-emerald-400 cursor-default'
-                          : 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
+                          ? 'border-emerald-500/20 bg-emerald-500/5 text-emerald-400'
+                          : 'border-amber-500/20 bg-amber-500/10 text-amber-200'
                       }`}
                     >
-                      {isInstalled
-                          ? <CheckCircle size={14} />
-                          : <Download size={14} />
-                      }
-                      {isInstalled ? 'Installed' : 'Install'}
-                    </button>
+                      {isInstalled ? <CheckCircle size={14} /> : <Wrench size={14} />}
+                      {isInstalled ? 'Installed' : 'Changes paused'}
+                    </span>
                   </div>
                 );
               })}
@@ -924,28 +690,8 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
               </div>
               <div>
                 <h2 className="text-white font-semibold">Plugins</h2>
-                <p className="text-sm text-slate-400">Install plugin specs: npm, path, clawhub:package</p>
+                <p className="text-sm text-slate-400">Installed OpenClaw plugin inventory</p>
               </div>
-            </div>
-            <div className="space-y-2">
-              <input
-                type="text"
-                value={pluginSpec}
-                onChange={(e) => setPluginSpec(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter' && !mutationBusy) installPlugin(); }}
-                disabled={mutationBusy}
-                placeholder="clawhub:my-plugin or npm:@scope/plugin"
-                aria-label="Plugin package specification"
-                className="w-full px-4 py-2 bg-black/20 border border-white/[0.08] rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500/40"
-              />
-              <button
-                onClick={installPlugin}
-                disabled={mutationBusy || !pluginSpec.trim()}
-                className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-blue-500/20 bg-blue-500/10 px-4 py-2 text-sm text-blue-300 hover:bg-blue-500/20 disabled:opacity-50"
-              >
-                <Wrench size={14} />
-                Install Plugin
-              </button>
             </div>
             <div className="space-y-2 max-h-[22rem] overflow-y-auto pr-1">
               {plugins.length === 0 ? (
@@ -1025,54 +771,11 @@ export function SkillsContent({ showHeader = false }: SkillsContentProps) {
               <SkillCard
                 key={skill.name}
                 skill={skill}
-                installedNames={installedNames}
-                onUninstall={uninstallSkill}
-                disabled={mutationBusy}
               />
             ))}
           </motion.div>
         )}
       </div>
-      <TypedConfirmationDialog
-        open={Boolean(pendingMutation)}
-        title={pendingMutation?.kind === 'skill-uninstall' ? 'Remove host extension' : 'Install host extension'}
-        description="This changes executable code available to OpenClaw on the server. The operation runs as a serialized background job and keeps its output in Tasks."
-        confirmationPhrase={pendingMutation?.confirmationPhrase}
-        confirmLabel={mutationProof ? 'Retry verification' : pendingMutation?.kind === 'skill-uninstall' ? 'Remove extension' : 'Install extension'}
-        busyLabel={mutationProof?.completed ? 'Verifying inventory…' : mutationProof ? 'Checking background job…' : pendingMutation?.kind === 'skill-uninstall' ? 'Removing extension…' : 'Installing extension…'}
-        busy={mutationBusy}
-        tone={pendingMutation?.kind === 'skill-uninstall' ? 'danger' : 'warning'}
-        details={pendingMutation && (
-          <div className="space-y-3">
-            <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-slate-300">
-              Target: <code className="break-all font-mono text-white">{pendingMutation.target}</code>
-            </div>
-            {mutationProof ? (
-              <div role="status" className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-                Background job <code className="break-all font-mono text-white">{mutationProof.jobId}</code> is retained in Tasks. Retrying here verifies that same job and its fresh inventory; it does not start another mutation.
-              </div>
-            ) : null}
-            {mutationError ? (
-              <div role="alert" className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">
-                {mutationError}
-              </div>
-            ) : null}
-          </div>
-        )}
-        onCancel={() => {
-          if (mutationOwnerRef.current) return;
-          const proof = mutationProofRef.current;
-          if (proof) {
-            setActivityError(true);
-            setActivityMessage(`Verification for background job ${proof.jobId} was left incomplete. Inspect Tasks before starting another extension mutation.`);
-          }
-          mutationProofRef.current = null;
-          setMutationProof(null);
-          setMutationError(null);
-          setPendingMutation(null);
-        }}
-        onConfirm={confirmMutation}
-      />
     </div>
   );
 }

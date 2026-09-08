@@ -204,6 +204,9 @@ describe('Project dependency promotion startup recovery coordinator', () => {
 
     expect(result.releaseState).toBe('CLEAN');
     expect(result.recovery.rolledBack).toBe(1);
+    expect(result.writerQuiescence).toBe('drained');
+    expect(result.preDrainTargets?.phase).toBe('pre_drain');
+    expect(result.postDrainTargets?.phase).toBe('post_drain');
     expect(events).toEqual([
       'close-writer-fence',
       'close-global-admission',
@@ -221,6 +224,76 @@ describe('Project dependency promotion startup recovery coordinator', () => {
       'inspect-4',
       'fence-release-end',
     ]);
+  });
+
+  test('an ordinary restart with no promotion or repair evidence releases without draining provider writers', async () => {
+    // Regression: TEST 2026-09-07 19:14:01 UTC — an ordinary Portal restart
+    // with an empty promotion inventory still drained the writer fence, which
+    // issued OpenClaw sessions.reset for every session with an unresolved
+    // provider-authority row (OpenClawHostRun terminalReason
+    // project_dependency_promotion_session_reset) and hid the owner's visible
+    // conversation history. With nothing to recover, nothing may be reset.
+    const events: string[] = [];
+    const clean = inspection({ hash: '3' });
+    const { fence, release } = fenceFixture(events);
+    const quiesceTargets = jest.fn(async (targets: readonly unknown[], phase: 'pre_drain' | 'post_drain') => (
+      targetQuiescence(phase, targets.length)
+    ));
+    const recover = jest.fn(async () => ({ rolledBack: 0, committed: 0, quarantined: 0, discarded: 0 }));
+    const result = await runProjectDependencyPromotionStartupRecovery('/srv/projects', {
+      ...emptyRepairDependencies(events),
+      closeAdmission: jest.fn(() => {
+        events.push('close-global-admission');
+        return {} as any;
+      }),
+      closeWriterFence: jest.fn((input) => {
+        events.push('close-writer-fence');
+        input.closeAdmissionAndSettleInstaller();
+        input.releaseProjectLease();
+        return fence;
+      }),
+      inspect: jest.fn(async () => {
+        events.push('inspect');
+        return clean;
+      }),
+      quiesceTargets,
+      recover,
+      attestQuarantine: jest.fn(),
+    });
+
+    expect(result.writerQuiescence).toBe('not_required');
+    expect(result.preDrainTargets).toBeNull();
+    expect(result.postDrainTargets).toBeNull();
+    expect(result.releaseState).toBe('CLEAN');
+    expect(fence.proveQuiescent).not.toHaveBeenCalled();
+    expect(quiesceTargets).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+    // Admission is still closed for the whole inventory and released only
+    // through the attested safe-state path.
+    expect(events).toEqual([
+      'close-writer-fence',
+      'close-global-admission',
+      'inspect',
+      'inspect',
+      'recover-repairs',
+      'inspect',
+      'fence-release-begin',
+      'attest-completed-repairs',
+      'inspect',
+      'fence-release-end',
+    ]);
+    expect(events).not.toContain('writer-pre-drain-post');
+  });
+
+  test('startup writer quiescence is required for any non-empty inventory', () => {
+    const { startupWriterQuiescenceRequired } = __projectDependencyPromotionStartupRecoveryTest;
+    const clean = inspection({ hash: '4' });
+    expect(startupWriterQuiescenceRequired(clean, EMPTY_REPAIR_INSPECTION, [])).toBe(false);
+    expect(startupWriterQuiescenceRequired(inspection({ hash: '5', targets: [TARGET] }), EMPTY_REPAIR_INSPECTION, [TARGET])).toBe(true);
+    expect(startupWriterQuiescenceRequired(inspection({ hash: '6', contained: [TARGET] }), EMPTY_REPAIR_INSPECTION, [])).toBe(true);
+    expect(startupWriterQuiescenceRequired(inspection({ hash: '7', uncertain: true }), EMPTY_REPAIR_INSPECTION, [])).toBe(true);
+    expect(startupWriterQuiescenceRequired(clean, { ...EMPTY_REPAIR_INSPECTION, hasEvidence: true }, [])).toBe(true);
+    expect(startupWriterQuiescenceRequired(clean, { ...EMPTY_REPAIR_INSPECTION, operationIds: ['op'] }, [])).toBe(true);
   });
 
   test('touching an empty storage root during quiescence still releases CLEAN', async () => {
@@ -541,5 +614,8 @@ describe('Project dependency promotion startup recovery coordinator', () => {
     expect(coordinator).toBeLessThan(serverSource.indexOf('await initializeAppProcessRuntime();'));
     expect(coordinator).toBeLessThan(serverSource.indexOf('httpServer.listen(config.port', coordinator));
     expect(serverSource).not.toContain('await recoverInterruptedProjectLifecycleArtifactPromotions(');
+    expect(serverSource).toContain('describeProjectDependencyPromotionStartupFailure(error)');
+    expect(serverSource).toContain("action: 'PROJECT_DEPENDENCY_PROMOTION_STARTUP_QUARANTINE'");
+    expect(serverSource).toContain('metadata: { ...diagnostic }');
   });
 });

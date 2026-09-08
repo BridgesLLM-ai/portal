@@ -45,7 +45,10 @@ import {
   buildExactNativeCliProjectInvocation,
 } from './NativeCliProjectRunControl';
 
-export type NativeCliProjectRuntimeProvider = Extract<AgentProviderName, 'CLAUDE_CODE' | 'GEMINI'>;
+export type NativeCliProjectRuntimeProvider = Extract<
+  AgentProviderName,
+  'CLAUDE_CODE' | 'GEMINI'
+>;
 
 export const NATIVE_CLI_PROJECT_CONTAINER_USER = PROJECT_RUNTIME_USER;
 export const NATIVE_CLI_PROJECT_CONTAINER_UID = PROJECT_RUNTIME_UID;
@@ -319,10 +322,11 @@ function assertHistoricalProjectContext(
 ): void {
   assertProfile(profile);
   assertExecutionContextBinding(context, context.userId, 'PROJECT_SANDBOX');
-  const expectedPolicyPrefix = profile.provider === 'CLAUDE_CODE'
-    ? 'portal-claude-code-project-sandbox-v'
-    : 'portal-antigravity-project-sandbox-v';
-  if (!new RegExp(`^${expectedPolicyPrefix}[1-9][0-9]*$`).test(context.runtimePolicyVersion)) {
+  const expectedPolicyPrefix: Record<NativeCliProjectRuntimeProvider, string> = {
+    CLAUDE_CODE: 'portal-claude-code-project-sandbox-v',
+    GEMINI: 'portal-antigravity-project-sandbox-v',
+  };
+  if (!new RegExp(`^${expectedPolicyPrefix[profile.provider]}[1-9][0-9]*$`).test(context.runtimePolicyVersion)) {
     fail('RUNTIME_POLICY', `${profile.displayName} historical runtime policy version is invalid`);
   }
   if (!/^portal-project-egress-v[1-9][0-9]*$/.test(context.egressPolicyVersion)) {
@@ -1997,6 +2001,7 @@ export function buildNativeCliProjectInvocation(input: {
   command: string;
   args: readonly string[];
   turnId: string;
+  interactiveStdio?: boolean;
   executor?: ProjectEgressCommandExecutor;
 }): NativeCliInvocation {
   assertRuntimeInvocation(input);
@@ -2008,6 +2013,7 @@ export function buildNativeCliProjectInvocation(input: {
     command: input.command,
     args: input.args,
     runId: input.turnId,
+    interactiveStdio: input.interactiveStdio,
     executor: input.executor || nativeCliProjectEgressCommandExecutor,
     hostEnvironment: nativeCliProjectDockerHostEnvironment(),
   });

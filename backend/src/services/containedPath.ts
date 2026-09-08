@@ -68,6 +68,54 @@ export function isPathContained(baseDir: string, candidatePath: string): boolean
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
+/**
+ * Linux openat-equivalent walk through private directory descriptors. Each
+ * user-controlled component is opened with O_NOFOLLOW while its parent stays
+ * pinned. Renaming a parent or replacing its old name cannot redirect the walk.
+ * The only magic links we follow are our own, still-open /proc/self/fd handles;
+ * no user path is ever resolved below a mutable absolute pathname or reopened.
+ */
+export function openContainedRegularFile(
+  baseDir: string,
+  requestedPath: unknown,
+): { fd: number; stat: fs.Stats } {
+  const relative = assertSafeRelativePath(requestedPath);
+  if (process.platform !== 'linux' || !fs.constants.O_DIRECTORY || !fs.constants.O_NOFOLLOW) {
+    throw new ContainedPathError('Descriptor-contained file reads require Linux');
+  }
+  // Node does not expose O_PATH. This is the Linux UAPI value. It lets us check
+  // the final inode without opening a FIFO/device, then open that same inode.
+  const O_PATH = 0x200000;
+  const directoryFlags = O_PATH | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+  const descriptors: number[] = [];
+  let readable: number | undefined;
+  try {
+    let parent = fs.openSync('/', directoryFlags);
+    descriptors.push(parent);
+    const rootParts = path.resolve(baseDir).split('/').filter(Boolean);
+    const fileParts = relative.split('/');
+    for (const part of [...rootParts, ...fileParts.slice(0, -1)]) {
+      parent = fs.openSync(`/proc/self/fd/${parent}/${part}`, directoryFlags);
+      descriptors.push(parent);
+    }
+    const inode = fs.openSync(`/proc/self/fd/${parent}/${fileParts[fileParts.length - 1]}`, O_PATH | fs.constants.O_NOFOLLOW);
+    descriptors.push(inode);
+    const pinned = fs.fstatSync(inode);
+    if (!pinned.isFile()) throw new ContainedPathError('Path is not a regular file');
+    readable = fs.openSync(`/proc/self/fd/${inode}`, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(readable);
+    if (!stat.isFile() || stat.dev !== pinned.dev || stat.ino !== pinned.ino) {
+      throw new ContainedPathError('File descriptor identity changed');
+    }
+    const result = { fd: readable, stat };
+    readable = undefined;
+    return result;
+  } finally {
+    if (readable !== undefined) fs.closeSync(readable);
+    for (const descriptor of descriptors.reverse()) fs.closeSync(descriptor);
+  }
+}
+
 function assertEntryKind(entryPath: string, kind: ContainedPathKind): void {
   if (kind === 'any') return;
   const stat = fs.lstatSync(entryPath);

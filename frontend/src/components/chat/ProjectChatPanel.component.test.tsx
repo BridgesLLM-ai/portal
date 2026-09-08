@@ -5,7 +5,10 @@ import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ProjectChatPanel, {
+  collectBoundedProjectChatExport,
+  filterProjectChatRoutineMaintenanceMessages,
   reconcileProjectPresentationSegments,
+  resolveProjectChatMaintenanceStateAtPageStart,
   resolveVerifiedProjectModelResponse,
   type ProjectChatActivity,
 } from './ProjectChatPanel';
@@ -515,6 +518,378 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(await screen.findByText('OpenClaw Project agent verified and ready')).toBeVisible();
     await waitFor(() => expect(projectMocks.agentPoll).toHaveBeenCalled());
     expect(projectMocks.chatHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps routine maintenance and compaction artifacts out of saved Project Chat history', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.chatHistory.mockResolvedValue({
+      messages: [
+        {
+          id: 'visible-project-user',
+          role: 'user',
+          content: 'Keep this Project request.',
+          timestamp: '2026-08-20T10:00:00.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'visible-project-assistant',
+          role: 'assistant',
+          content: 'Keep this Project answer.',
+          timestamp: '2026-08-20T10:00:01.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'project-flush-prompt',
+          role: 'user',
+          provenance: { kind: 'internal_system' },
+          content: 'Pre-compaction memory flush.',
+          timestamp: '2026-08-20T10:00:02.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'project-flush-result',
+          role: 'assistant',
+          content: 'NO_REPLY',
+          thinkingContent: 'Writing internal memory.',
+          toolCalls: [{ id: 'project-flush-tool', name: 'apply_patch', status: 'done' }],
+          timestamp: '2026-08-20T10:00:03.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'project-flush-fragment',
+          role: 'assistant',
+          content: 'Memory updated.',
+          thinkingContent: 'Internal follow-up fragment.',
+          timestamp: '2026-08-20T10:00:03.500Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'project-compaction-marker',
+          role: 'system',
+          content: 'Context maintenance finished.',
+          provenance: 'hidden-history-artifact',
+          timestamp: '2026-08-20T10:00:04.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'project-task-completion-injection',
+          role: 'user',
+          content: '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n[Internal task completion event]\nsource: subagent\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>',
+          timestamp: '2026-08-20T10:00:05.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'project-async-injection',
+          role: 'user',
+          content: 'An async command you ran earlier has completed. Handle the result internally.',
+          timestamp: '2026-08-20T10:00:06.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+      ],
+      pagination: { hasMore: false, nextCursor: null, limit: 100 },
+    });
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('Keep this Project request.')).toBeVisible();
+    expect(await screen.findByText('Keep this Project answer.')).toBeVisible();
+    expect(screen.queryByText('Pre-compaction memory flush.')).not.toBeInTheDocument();
+    expect(screen.queryByText('NO_REPLY')).not.toBeInTheDocument();
+    expect(screen.queryByText('Writing internal memory.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Memory updated.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Internal follow-up fragment.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Context maintenance finished.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Delegated task completed')).not.toBeInTheDocument();
+    expect(screen.queryByText('Earlier async command completed')).not.toBeInTheDocument();
+    expect(screen.queryByText('Run apply_patch')).not.toBeInTheDocument();
+  });
+
+  it('keeps a legacy maintenance turn hidden when its prompt is on the older history page', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.chatHistory.mockImplementation(async (
+      _name: string,
+      _provider: string,
+      page?: { before?: string },
+    ) => page?.before
+      ? {
+          messages: [
+            {
+              id: 'split-visible-old-user',
+              role: 'user',
+              content: 'Older Project request stays visible.',
+              timestamp: '2026-08-20T10:10:00.000Z',
+              provider: 'OPENCLAW',
+              runtime: 'openclaw-dedicated-project-agent',
+            },
+            {
+              id: 'split-visible-old-assistant',
+              role: 'assistant',
+              content: 'Older Project answer stays visible.',
+              timestamp: '2026-08-20T10:10:01.000Z',
+              provider: 'OPENCLAW',
+              runtime: 'openclaw-dedicated-project-agent',
+            },
+            {
+              id: 'split-flush-prompt',
+              role: 'user',
+              provenance: { kind: 'internal_system' },
+              content: 'Pre-compaction memory flush.',
+              timestamp: '2026-08-20T10:10:02.000Z',
+              provider: 'OPENCLAW',
+              runtime: 'openclaw-dedicated-project-agent',
+            },
+          ],
+          pagination: { hasMore: false, nextCursor: null, limit: 100 },
+        }
+      : {
+          messages: [
+            {
+              id: 'split-flush-fragment-1',
+              role: 'assistant',
+              content: 'Legacy maintenance fragment must stay hidden.',
+              thinkingContent: 'Legacy maintenance reasoning must stay hidden.',
+              toolCalls: [{ id: 'split-flush-tool', name: 'exec', status: 'done' }],
+              timestamp: '2026-08-20T10:10:03.000Z',
+              provider: 'OPENCLAW',
+              runtime: 'openclaw-dedicated-project-agent',
+            },
+            {
+              id: 'split-task-completion-injection',
+              role: 'user',
+        provenance: { kind: 'internal_system' },
+              content: '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n[Internal task completion event]\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>',
+              timestamp: '2026-08-20T10:10:03.500Z',
+              provider: 'OPENCLAW',
+              runtime: 'openclaw-dedicated-project-agent',
+            },
+            {
+              id: 'split-flush-fragment-2',
+              role: 'assistant',
+              content: 'Another legacy maintenance fragment.',
+              timestamp: '2026-08-20T10:10:04.000Z',
+              provider: 'OPENCLAW',
+              runtime: 'openclaw-dedicated-project-agent',
+            },
+            {
+              id: 'split-visible-new-user',
+              role: 'user',
+              content: 'New Project request stays visible.',
+              timestamp: '2026-08-20T10:10:05.000Z',
+              provider: 'OPENCLAW',
+              runtime: 'openclaw-dedicated-project-agent',
+            },
+            {
+              id: 'split-visible-new-assistant',
+              role: 'assistant',
+              content: 'New Project answer stays visible.',
+              timestamp: '2026-08-20T10:10:06.000Z',
+              provider: 'OPENCLAW',
+              runtime: 'openclaw-dedicated-project-agent',
+            },
+          ],
+          pagination: { hasMore: true, nextCursor: 'split-cursor', limit: 100 },
+        });
+
+    const user = userEvent.setup();
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText('New Project request stays visible.')).toBeVisible();
+    expect(screen.getByText('New Project answer stays visible.')).toBeVisible();
+    expect(projectMocks.chatHistory).toHaveBeenCalledWith(
+      'alpha',
+      'OPENCLAW',
+      { limit: 100, before: 'split-cursor' },
+    );
+    expect(screen.queryByText('Legacy maintenance fragment must stay hidden.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Legacy maintenance reasoning must stay hidden.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Another legacy maintenance fragment.')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Internal task completion event/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('Run exec')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Load earlier messages' }));
+    expect(await screen.findByText('Older Project request stays visible.')).toBeVisible();
+    expect(screen.getByText('Older Project answer stays visible.')).toBeVisible();
+    expect(screen.queryByText('Pre-compaction memory flush.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Legacy maintenance fragment must stay hidden.')).not.toBeInTheDocument();
+  });
+
+  it.each(['Pre-compaction memory flush.', '[OpenClaw heartbeat poll]', 'HEARTBEAT_OK', 'Pre-compaction memory flush. Explain what this phrase means.'])('preserves authored Project text without runtime provenance: %s', async (authoredText) => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    projectMocks.chatHistory.mockResolvedValue({
+      messages: [
+        {
+          id: 'authored-maintenance-prefix',
+          role: 'user',
+          content: authoredText,
+          timestamp: '2026-08-20T10:20:00.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'authored-maintenance-answer',
+          role: 'assistant',
+          content: 'It is an internal lifecycle phrase.',
+          timestamp: '2026-08-20T10:20:01.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'authored-internal-marker-quote',
+          role: 'user',
+          content: [
+            'Explain this quoted marker:',
+            '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>',
+            'OpenClaw runtime context (internal):',
+            'quoted example only',
+            '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>',
+          ].join('\n'),
+          timestamp: '2026-08-20T10:20:02.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'authored-internal-marker-answer',
+          role: 'assistant',
+          content: 'The quoted marker is authored conversation text.',
+          timestamp: '2026-08-20T10:20:03.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+        {
+          id: 'authored-metadata-envelope-quote',
+          role: 'user',
+          content: [
+            'Explain this quoted wrapper:',
+            'Sender (untrusted metadata):',
+            '```json',
+            '{"name":"quoted-example"}',
+            '```',
+            '[Thu 2026-08-20 10:20 EDT] quoted body',
+          ].join('\n'),
+          timestamp: '2026-08-20T10:20:04.000Z',
+          provider: 'OPENCLAW',
+          runtime: 'openclaw-dedicated-project-agent',
+        },
+      ],
+      pagination: { hasMore: false, nextCursor: null, limit: 100 },
+    });
+
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    expect(await screen.findByText(authoredText)).toBeVisible();
+    expect(screen.getByText('It is an internal lifecycle phrase.')).toBeVisible();
+    expect(screen.getByText(/Explain this quoted marker:/)).toBeVisible();
+    expect(screen.getByText('The quoted marker is authored conversation text.')).toBeVisible();
+    expect(screen.getByText(/Explain this quoted wrapper:/)).toBeVisible();
+  });
+
+  it('bounds empty compatibility pages and filters hidden artifacts from Project export projection', async () => {
+    let page = 0;
+    const readOlderPage = vi.fn(async () => {
+      page += 1;
+      return {
+        messages: [],
+        pagination: { hasMore: true, nextCursor: `empty-${page}`, limit: 100 },
+      } as any;
+    });
+
+    await expect(resolveProjectChatMaintenanceStateAtPageStart({
+      messages: [{ id: 'fragment', role: 'assistant', content: 'ambiguous', provider: 'OPENCLAW' }],
+      pagination: { hasMore: true, nextCursor: 'empty-0', limit: 100 },
+      provider: 'OPENCLAW',
+      readOlderPage,
+    })).resolves.toBe(true);
+    expect(readOlderPage).toHaveBeenCalledTimes(64);
+
+    let active = true;
+    await expect(resolveProjectChatMaintenanceStateAtPageStart({
+      messages: [{ id: 'fragment', role: 'assistant', content: 'ambiguous', provider: 'OPENCLAW' }],
+      pagination: { hasMore: true, nextCursor: 'cancel-0', limit: 100 },
+      provider: 'OPENCLAW',
+      readOlderPage: async () => {
+        active = false;
+        return {
+          messages: [],
+          pagination: { hasMore: true, nextCursor: 'cancel-1', limit: 100 },
+        } as any;
+      },
+      shouldContinue: () => active,
+    })).rejects.toThrow('Project Chat changed while maintenance context was being resolved.');
+
+    const exported = filterProjectChatRoutineMaintenanceMessages([
+      { id: 'visible-user', role: 'user', content: 'Visible request.', provider: 'OPENCLAW' },
+      {
+        id: 'task-injection',
+        role: 'user',
+        provenance: { kind: 'internal_system' },
+        content: '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n[Internal task completion event]\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>',
+        provider: 'OPENCLAW',
+      },
+      { id: 'no-reply', role: 'assistant', content: 'NO_REPLY', provider: 'OPENCLAW' },
+      { id: 'visible-answer', role: 'assistant', content: 'Visible answer.', provider: 'OPENCLAW' },
+    ], false, 'OPENCLAW');
+    expect(exported.map((message) => message.id)).toEqual(['visible-user', 'visible-answer']);
+  });
+
+  it('bounds Project export pages and rows and cancels a stale generation', async () => {
+    let emptyPage = 0;
+    const freshEmptyPages = vi.fn(async () => {
+      emptyPage += 1;
+      return {
+        messages: [],
+        pagination: { hasMore: true, nextCursor: `export-empty-${emptyPage}`, limit: 100 },
+      } as any;
+    });
+    await expect(collectBoundedProjectChatExport({
+      readPage: freshEmptyPages,
+      shouldContinue: () => true,
+      maxPages: 3,
+    })).rejects.toThrow('bounded page limit');
+    expect(freshEmptyPages).toHaveBeenCalledTimes(3);
+
+    await expect(collectBoundedProjectChatExport({
+      readPage: async () => ({
+        messages: [
+          { id: 'export-1', role: 'user', content: 'one' },
+          { id: 'export-2', role: 'assistant', content: 'two' },
+          { id: 'export-3', role: 'assistant', content: 'three' },
+        ],
+        pagination: { hasMore: false, nextCursor: null, limit: 100 },
+      } as any),
+      shouldContinue: () => true,
+      maxRows: 2,
+    })).rejects.toThrow('bounded row limit');
+
+    await expect(collectBoundedProjectChatExport({
+      readPage: async () => ({
+        messages: [{ id: 'export-large', role: 'assistant', content: 'x'.repeat(256) }],
+        pagination: { hasMore: false, nextCursor: null, limit: 100 },
+      } as any),
+      shouldContinue: () => true,
+      maxBytes: 64,
+    })).rejects.toThrow('bounded byte limit');
+
+    let active = true;
+    const staleRead = vi.fn(async () => {
+      active = false;
+      return {
+        messages: [],
+        pagination: { hasMore: true, nextCursor: 'stale-export-next', limit: 100 },
+      } as any;
+    });
+    await expect(collectBoundedProjectChatExport({
+      readPage: staleRead,
+      shouldContinue: () => active,
+    })).rejects.toThrow('changed while the transcript was being exported');
+    expect(staleRead).toHaveBeenCalledTimes(1);
   });
 
   it('surfaces and retries a failed cold-open transcript without preparing an unqualified provider', async () => {
@@ -1059,8 +1434,8 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(document.querySelector('[data-viewport-overlay-root="true"]')).not.toBeNull();
     expect(document.body.style.overflow).toBe('hidden');
 
-    await user.click(await screen.findByRole('button', { name: 'Project chat provider' }));
-    expect(await screen.findByRole('menu', { name: 'Project chat providers' })).toBeVisible();
+    await user.click(await screen.findByRole('button', { name: 'Project chat harness' }));
+    expect(await screen.findByRole('menu', { name: 'Project chat harnesses' })).toBeVisible();
     const overlayRoots = Array.from(document.querySelectorAll<HTMLElement>('[data-viewport-overlay-root="true"]'));
     expect(overlayRoots).toHaveLength(2);
     expect(overlayRoots[0]).toHaveAttribute('inert');
@@ -1068,7 +1443,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(Number(overlayRoots[1].style.zIndex)).toBeGreaterThan(Number(overlayRoots[0].style.zIndex));
 
     await user.keyboard('{Escape}');
-    expect(screen.queryByRole('menu', { name: 'Project chat providers' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('menu', { name: 'Project chat harnesses' })).not.toBeInTheDocument();
     expect(onClose).not.toHaveBeenCalled();
 
     await user.keyboard('{Escape}');
@@ -1370,7 +1745,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     // sending stays fail-closed, but choosing a different provider is
     // the recovery action and has to remain reachable. Every selection is
     // re-qualified server-side, so this picker is not the isolation boundary.
-    expect(screen.getByRole('button', { name: 'Project chat provider' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Project chat harness' })).toBeEnabled();
     expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Send message to project agent' })).toBeDisabled();
     expect(screen.getAllByRole('alert')).toHaveLength(1);
@@ -1772,7 +2147,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
         onActivityChange={onActivityChange}
       />,
     );
-    const providerMenu = await screen.findByRole('button', { name: 'Project chat provider' });
+    const providerMenu = await screen.findByRole('button', { name: 'Project chat harness' });
     expect(await screen.findByText('Historical transcript remains readable before preparation.')).toBeVisible();
     expect(projectMocks.chatHistory).toHaveBeenCalledWith('alpha', 'OPENCLAW', { limit: 100 });
     expect(screen.getByRole('textbox', { name: 'Message project agent' })).toBeEnabled();
@@ -1872,7 +2247,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
 
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
 
-    const picker = await screen.findByRole('button', { name: 'Project chat provider' });
+    const picker = await screen.findByRole('button', { name: 'Project chat harness' });
     expect(picker).toHaveTextContent('OpenClaw');
     await user.click(picker);
     await user.click(await screen.findByRole('menuitem', { name: 'Prepare Codex' }));
@@ -1881,7 +2256,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
       'alpha',
       'CODEX',
     ));
-    const reopenedMenu = await screen.findByRole('menu', { name: 'Project chat providers' });
+    const reopenedMenu = await screen.findByRole('menu', { name: 'Project chat harnesses' });
     expect(within(reopenedMenu).getByText(
       'Codex must be reconnected in AI Settings before it can be prepared for this project.',
     )).toBeVisible();
@@ -2842,7 +3217,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     const user = userEvent.setup();
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
 
-    const providerMenu = await screen.findByRole('button', { name: 'Project chat provider' });
+    const providerMenu = await screen.findByRole('button', { name: 'Project chat harness' });
     await waitFor(() => expect(screen.getByText(
       'OpenClaw Project agent verified and ready',
     )).toBeVisible());
@@ -2876,7 +3251,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(projectMocks.agentZeroProjectModels).not.toHaveBeenCalled();
     await user.click(review);
 
-    expect(await screen.findByRole('menu', { name: 'Project chat providers' })).toBeVisible();
+    expect(await screen.findByRole('menu', { name: 'Project chat harnesses' })).toBeVisible();
     expect(await screen.findByRole('combobox', { name: 'Agent Zero qualification model' })).toBeVisible();
     await waitFor(() => expect(projectMocks.agentZeroProjectModels).toHaveBeenCalledTimes(1));
     expect(screen.queryByText('Select a model from a currently connected Agent Zero OAuth provider before qualification.')).not.toBeInTheDocument();
@@ -2913,7 +3288,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
       '[ProjectChat] Project replay poll failed:',
       expect.objectContaining({ message: 'temporary replay outage' }),
     );
-    const providerSelect = screen.getByRole('button', { name: 'Project chat provider' });
+    const providerSelect = screen.getByRole('button', { name: 'Project chat harness' });
     expect(providerSelect).toBeDisabled();
     // Provider switching stays blocked for the whole turn, but the composer
     // stays open so the running turn can be steered on its exact run.
@@ -2933,6 +3308,92 @@ describe('ProjectChatPanel rendered provider contract', () => {
     const reveal = screen.getByRole('button', { name: /Show earlier messages · \d+ loaded/i });
     await user.click(reveal);
     expect(screen.getByText('historical message 1')).toBeVisible();
+  });
+
+  it('clears the running Project turn only after the abort response confirms the exact turn', async () => {
+    const activeTurn = {
+      id: 'turn-confirmed-abort',
+      provider: 'OPENCLAW' as const,
+      status: 'running',
+      requestId: 'request-confirmed-abort',
+      leaseExpiresAt: '2026-07-19T09:00:00.000Z',
+    };
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities(activeTurn));
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      active: true,
+      isProcessing: true,
+      runId: activeTurn.id,
+    }));
+    projectMocks.agentAbort.mockResolvedValue({
+      aborted: true,
+      provider: 'OPENCLAW',
+      runtime: 'openclaw-dedicated-project-agent',
+      turnId: activeTurn.id,
+      stateVersion: 2,
+    });
+
+    const user = userEvent.setup();
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    const stop = await screen.findByRole('button', { name: 'Stop project agent response' });
+    await user.click(stop);
+
+    await waitFor(() => expect(projectMocks.agentAbort).toHaveBeenCalledWith(
+      'alpha',
+      'OPENCLAW',
+      1,
+    ));
+    await waitFor(() => expect(screen.queryByRole('button', {
+      name: 'Stop project agent response',
+    })).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Send message to project agent' })).toBeVisible();
+  });
+
+  it('retains the running Project turn when the abort response does not confirm cancellation', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const activeTurn = {
+      id: 'turn-unconfirmed-abort',
+      provider: 'OPENCLAW' as const,
+      status: 'running',
+      requestId: 'request-unconfirmed-abort',
+      leaseExpiresAt: '2026-07-19T09:00:00.000Z',
+    };
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities(activeTurn));
+    projectMocks.agentPoll.mockResolvedValue(replaySnapshot({
+      active: true,
+      isProcessing: true,
+      runId: activeTurn.id,
+    }));
+    projectMocks.agentAbort.mockRejectedValue({
+      response: {
+        status: 409,
+        data: {
+          code: 'PROJECT_CHAT_TURN_ACTIVE',
+          error: 'The provider process could not confirm cancellation.',
+        },
+      },
+    });
+
+    const user = userEvent.setup();
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Stop project agent response' }));
+
+    await waitFor(() => expect(projectMocks.agentAbort).toHaveBeenCalledWith(
+      'alpha',
+      'OPENCLAW',
+      1,
+    ));
+    expect(screen.getByRole('button', { name: 'Stop project agent response' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Send message to project agent' })).not.toBeInTheDocument();
+    expect((await screen.findAllByText(
+      'Stop was not confirmed; the response remains active.',
+    )).length).toBeGreaterThan(0);
+    expect(warn).toHaveBeenCalledWith(
+      '[ProjectChat] Project turn abort failed:',
+      expect.objectContaining({ response: expect.objectContaining({ status: 409 }) }),
+    );
+    warn.mockRestore();
   });
 
   it('loads the next Project Chat history page on demand and exposes the older rows', async () => {
@@ -3052,8 +3513,8 @@ describe('ProjectChatPanel rendered provider contract', () => {
       />,
     );
 
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Project chat provider' })).toBeEnabled());
-    const providerSelect = screen.getByRole('button', { name: 'Project chat provider' });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Project chat harness' })).toBeEnabled());
+    const providerSelect = screen.getByRole('button', { name: 'Project chat harness' });
     await user.click(providerSelect);
     await user.click(screen.getByRole('menuitem', { name: 'Use Codex' }));
 
@@ -3135,7 +3596,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     );
 
     expect(await screen.findByText('OpenClaw Project agent verified and ready')).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Project chat provider' }));
+    await user.click(screen.getByRole('button', { name: 'Project chat harness' }));
     await user.click(screen.getByRole('menuitem', { name: 'Use Codex' }));
     await user.click(await screen.findByRole('button', { name: 'Switch provider' }));
 
@@ -4050,7 +4511,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
     expect(rendered.indexOf('Calling the compatibility path.')).toBeLessThan(rendered.indexOf('Run command'));
   });
 
-  it('keeps attested visible status thoughts ordered across tools', async () => {
+  it('keeps provider-attested preamble thoughts ordered across tools', async () => {
     projectMocks.projectChatProviders.mockResolvedValue(capabilities({
       id: 'turn-status-order',
       provider: 'OPENCLAW',
@@ -4068,6 +4529,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
           content: 'Reviewing the first result.',
           replace: true,
           assistantStatus: true,
+          preambleProgress: true,
         },
         {
           seq: 2,
@@ -4089,6 +4551,7 @@ describe('ProjectChatPanel rendered provider contract', () => {
           content: 'Reviewing the first result. Checking the second result.',
           replace: true,
           assistantStatus: true,
+          preambleProgress: true,
         },
       ],
       active: true,

@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertCircle, Copy, ExternalLink, Globe, Loader2, PackageOpen, Plus, Share2, Trash2, Upload } from 'lucide-react';
-import { appsAPI } from '../api/endpoints';
+import {
+  appsAPI,
+  type ShareLinkPagination,
+  type ShareRateLimitWindowSeconds,
+} from '../api/endpoints';
 
 interface AppShareLink {
   id: string;
@@ -9,6 +13,9 @@ interface AppShareLink {
   isPublic?: boolean;
   currentUses?: number;
   maxUses?: number | null;
+  maxConcurrentVisitors?: number | null;
+  rateLimitMaxRequests?: number | null;
+  rateLimitWindowSeconds?: ShareRateLimitWindowSeconds | null;
   expiresAt?: string | null;
   createdAt: string;
 }
@@ -20,9 +27,26 @@ interface PortalApp {
   createdAt: string;
   updatedAt: string;
   shareLinks?: AppShareLink[];
+  shareLinksPagination?: ShareLinkPagination;
 }
 
 type AppShareAvailability = 'active' | 'disabled' | 'expired' | 'exhausted';
+
+interface AppSharePolicyDraft {
+  expiresAt: string;
+  maxUses: string;
+  maxConcurrentVisitors: string;
+  rateLimitEnabled: boolean;
+  rateLimitMaxRequests: string;
+  rateLimitWindowSeconds: ShareRateLimitWindowSeconds;
+}
+
+function localDateTime(value?: string | null): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+}
 
 function appShareAvailability(link: AppShareLink, now = Date.now()): AppShareAvailability {
   if (link.expiresAt) {
@@ -69,6 +93,10 @@ export default function AppsLibraryPage() {
   const [file, setFile] = useState<File | null>(null);
   const [shareExpiresAt, setShareExpiresAt] = useState('');
   const [shareMaxUses, setShareMaxUses] = useState('');
+  const [shareMaxConcurrentVisitors, setShareMaxConcurrentVisitors] = useState('');
+  const [editingShareId, setEditingShareId] = useState<string | null>(null);
+  const [sharePolicyDraft, setSharePolicyDraft] = useState<AppSharePolicyDraft | null>(null);
+  const [loadingOlderAppId, setLoadingOlderAppId] = useState<string | null>(null);
 
   const loadApps = useCallback(async () => {
     setLoading(true);
@@ -155,6 +183,15 @@ export default function AppsLibraryPage() {
       setError('Share visit limit must be a whole number from 1 to 1,000,000');
       return;
     }
+    const maxConcurrentVisitors = shareMaxConcurrentVisitors ? Number(shareMaxConcurrentVisitors) : null;
+    if (maxConcurrentVisitors !== null && (
+      !Number.isSafeInteger(maxConcurrentVisitors)
+      || maxConcurrentVisitors < 1
+      || maxConcurrentVisitors > 10_000
+    )) {
+      setError('Concurrent visitors must be a whole number from 1 to 10,000');
+      return;
+    }
     setWorkingAppId(app.id);
     setError('');
     setNotice('');
@@ -162,11 +199,13 @@ export default function AppsLibraryPage() {
       const data = await appsAPI.createShareLink(app.id, {
         ...(expiresAt ? { expiresAt: expiresAt.toISOString() } : {}),
         ...(maxUses !== null ? { maxUses } : {}),
+        ...(maxConcurrentVisitors !== null ? { maxConcurrentVisitors } : {}),
       });
       const fullUrl = `${window.location.origin}${data.url}`;
       await loadApps();
       setShareExpiresAt('');
       setShareMaxUses('');
+      setShareMaxConcurrentVisitors('');
       try {
         await navigator.clipboard.writeText(fullUrl);
         setNotice(`Share link created and copied for ${app.name}`);
@@ -175,6 +214,82 @@ export default function AppsLibraryPage() {
       }
     } catch (err: any) {
       setError(err?.response?.data?.error || 'Failed to create share link');
+    } finally {
+      setWorkingAppId(null);
+    }
+  };
+
+  const openSharePolicyEditor = (link: AppShareLink) => {
+    if (editingShareId === link.id) {
+      setEditingShareId(null);
+      setSharePolicyDraft(null);
+      return;
+    }
+    setEditingShareId(link.id);
+    setSharePolicyDraft({
+      expiresAt: localDateTime(link.expiresAt),
+      maxUses: link.maxUses == null ? '' : String(link.maxUses),
+      maxConcurrentVisitors: link.maxConcurrentVisitors == null ? '' : String(link.maxConcurrentVisitors),
+      rateLimitEnabled: link.rateLimitMaxRequests != null,
+      rateLimitMaxRequests: link.rateLimitMaxRequests == null ? '' : String(link.rateLimitMaxRequests),
+      rateLimitWindowSeconds: link.rateLimitWindowSeconds || 60,
+    });
+    setError('');
+  };
+
+  const saveSharePolicy = async (app: PortalApp, link: AppShareLink) => {
+    if (!sharePolicyDraft || editingShareId !== link.id) return;
+    const expiresAt = sharePolicyDraft.expiresAt ? new Date(sharePolicyDraft.expiresAt) : null;
+    const maxUses = sharePolicyDraft.maxUses === '' ? null : Number(sharePolicyDraft.maxUses);
+    const maxConcurrentVisitors = sharePolicyDraft.maxConcurrentVisitors === ''
+      ? null
+      : Number(sharePolicyDraft.maxConcurrentVisitors);
+    const rateLimitMaxRequests = sharePolicyDraft.rateLimitEnabled
+      ? Number(sharePolicyDraft.rateLimitMaxRequests)
+      : null;
+    if (expiresAt && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) {
+      setError('Share expiration must be in the future');
+      return;
+    }
+    if (maxUses !== null && (!Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 1_000_000)) {
+      setError('Share visit limit must be a whole number from 1 to 1,000,000');
+      return;
+    }
+    if (maxConcurrentVisitors !== null && (
+      !Number.isSafeInteger(maxConcurrentVisitors)
+      || maxConcurrentVisitors < 1
+      || maxConcurrentVisitors > 10_000
+    )) {
+      setError('Concurrent visitors must be a whole number from 1 to 10,000');
+      return;
+    }
+    if (sharePolicyDraft.rateLimitEnabled && (
+      !Number.isSafeInteger(rateLimitMaxRequests)
+      || rateLimitMaxRequests! < 1
+      || rateLimitMaxRequests! > 1_000_000
+    )) {
+      setError('API request limit must be a whole number from 1 to 1,000,000');
+      return;
+    }
+    setWorkingAppId(app.id);
+    setError('');
+    setNotice('');
+    try {
+      await appsAPI.updateShareLink(app.id, link.id, {
+        expiresAt: expiresAt ? expiresAt.toISOString() : null,
+        maxUses,
+        maxConcurrentVisitors,
+        rateLimitMaxRequests,
+        rateLimitWindowSeconds: sharePolicyDraft.rateLimitEnabled
+          ? sharePolicyDraft.rateLimitWindowSeconds
+          : null,
+      });
+      setEditingShareId(null);
+      setSharePolicyDraft(null);
+      setNotice('Share limits updated');
+      await loadApps();
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Failed to update share limits');
     } finally {
       setWorkingAppId(null);
     }
@@ -228,6 +343,36 @@ export default function AppsLibraryPage() {
     }
   };
 
+  const handleLoadOlderShares = async (app: PortalApp) => {
+    const cursor = app.shareLinksPagination?.nextCursor;
+    if (!app.shareLinksPagination?.hasMore || !cursor || loadingOlderAppId) return;
+    setLoadingOlderAppId(app.id);
+    setError('');
+    try {
+      const data = await appsAPI.getShareLinks(app.id, { cursor });
+      if (!Array.isArray(data.shareLinks)
+        || !data.pagination
+        || typeof data.pagination.hasMore !== 'boolean'
+        || (data.pagination.nextCursor !== null && typeof data.pagination.nextCursor !== 'string')
+        || (data.pagination.hasMore && (!data.pagination.nextCursor || data.pagination.nextCursor === cursor))) {
+        throw new Error('Share-link pagination response is invalid');
+      }
+      const existingIds = new Set((app.shareLinks || []).map(link => link.id));
+      if (data.shareLinks.some((link: AppShareLink) => !link?.id || existingIds.has(link.id))) {
+        throw new Error('Share-link pagination returned a duplicate or invalid row');
+      }
+      setApps(current => current.map(candidate => candidate.id === app.id ? {
+        ...candidate,
+        shareLinks: [...(candidate.shareLinks || []), ...data.shareLinks],
+        shareLinksPagination: data.pagination,
+      } : candidate));
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || 'Failed to load older share links');
+    } finally {
+      setLoadingOlderAppId(null);
+    }
+  };
+
   return (
     <div className="h-full overflow-y-auto p-4 md:p-6 lg:p-8 bg-theme-bg text-white">
       <div className="max-w-6xl mx-auto space-y-6">
@@ -270,7 +415,7 @@ export default function AppsLibraryPage() {
                 {sortedApps.length} {sortedApps.length === 1 ? 'app' : 'apps'}
               </div>
             </div>
-            <div className="grid gap-3 border-b border-white/10 bg-black/10 px-5 py-4 sm:grid-cols-2">
+            <div className="grid gap-3 border-b border-white/10 bg-black/10 px-5 py-4 sm:grid-cols-3">
               <label className="space-y-1.5 text-xs text-slate-400">
                 <span>New-link expiration (optional)</span>
                 <input
@@ -295,8 +440,22 @@ export default function AppsLibraryPage() {
                   className="min-h-[44px] w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                 />
               </label>
-              <p className="text-xs text-slate-500 sm:col-span-2">
-                These controls apply to the next link you create. Visit limits count granted browser visits, not page views.
+              <label className="space-y-1.5 text-xs text-slate-400">
+                <span>Concurrent visitors (optional)</span>
+                <input
+                  aria-label="New app share concurrent visitor limit"
+                  type="number"
+                  min={1}
+                  max={10_000}
+                  step={1}
+                  value={shareMaxConcurrentVisitors}
+                  onChange={(event) => setShareMaxConcurrentVisitors(event.target.value)}
+                  placeholder="Unlimited"
+                  className="min-h-[44px] w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                />
+              </label>
+              <p className="text-xs text-slate-500 sm:col-span-3">
+                These controls apply to the next link. Visitor slots last for the signed browser grant; concurrent visitors count distinct browsers with an in-flight share request.
               </p>
             </div>
 
@@ -338,7 +497,10 @@ export default function AppsLibraryPage() {
                             <span>Updated {timeAgo(app.updatedAt)}</span>
                             <span>Created {new Date(app.createdAt).toLocaleDateString()}</span>
                             {app.shareLinks?.length ? (
-                              <span>{usableShares.length} usable / {app.shareLinks.length} total share link{app.shareLinks.length === 1 ? '' : 's'}</span>
+                              <span>
+                                {usableShares.length} usable / {app.shareLinks.length}
+                                {app.shareLinksPagination?.hasMore ? ' shown' : ' total'} share link{app.shareLinks.length === 1 ? '' : 's'}
+                              </span>
                             ) : null}
                           </div>
                           {app.shareLinks?.length ? (
@@ -376,9 +538,19 @@ export default function AppsLibraryPage() {
                                     <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
                                       <span>
                                         {link.currentUses || 0} visits{link.maxUses ? ` / ${link.maxUses} max` : ''}
+                                        {link.maxConcurrentVisitors ? ` • ${link.maxConcurrentVisitors} concurrent` : ' • unlimited concurrent'}
                                         {link.expiresAt ? ` • expires ${new Date(link.expiresAt).toLocaleString()}` : ''}
                                       </span>
                                       <span className="flex items-center gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => openSharePolicyEditor(link)}
+                                          disabled={working}
+                                          aria-expanded={editingShareId === link.id}
+                                          className="min-h-[36px] rounded-lg border border-fuchsia-500/20 px-2.5 text-fuchsia-200 hover:bg-fuchsia-500/10 disabled:opacity-40"
+                                        >
+                                          {editingShareId === link.id ? 'Close limits' : 'Edit limits'}
+                                        </button>
                                         <button
                                           type="button"
                                           onClick={() => handleToggleShare(app, link)}
@@ -397,9 +569,101 @@ export default function AppsLibraryPage() {
                                         </button>
                                       </span>
                                     </div>
+                                    {editingShareId === link.id && sharePolicyDraft && (
+                                      <div className="mt-3 space-y-2 border-t border-white/10 pt-3">
+                                        <div className="grid gap-2 sm:grid-cols-3">
+                                          <input
+                                            aria-label="Edit app share expiration"
+                                            type="datetime-local"
+                                            value={sharePolicyDraft.expiresAt}
+                                            onChange={event => setSharePolicyDraft(current => current ? { ...current, expiresAt: event.target.value } : current)}
+                                            className="min-h-[40px] rounded-lg border border-white/10 bg-black/20 px-2 text-xs text-white"
+                                          />
+                                          <input
+                                            aria-label="Edit app share visit limit"
+                                            type="number"
+                                            min={1}
+                                            max={1_000_000}
+                                            placeholder="Unlimited visits"
+                                            value={sharePolicyDraft.maxUses}
+                                            onChange={event => setSharePolicyDraft(current => current ? { ...current, maxUses: event.target.value } : current)}
+                                            className="min-h-[40px] rounded-lg border border-white/10 bg-black/20 px-2 text-xs text-white"
+                                          />
+                                          <input
+                                            aria-label="Edit app share concurrent visitor limit"
+                                            type="number"
+                                            min={1}
+                                            max={10_000}
+                                            placeholder="Unlimited concurrent"
+                                            value={sharePolicyDraft.maxConcurrentVisitors}
+                                            onChange={event => setSharePolicyDraft(current => current ? { ...current, maxConcurrentVisitors: event.target.value } : current)}
+                                            className="min-h-[40px] rounded-lg border border-white/10 bg-black/20 px-2 text-xs text-white"
+                                          />
+                                        </div>
+                                        <label className="flex items-center gap-2 text-[11px] text-slate-400">
+                                          <input
+                                            aria-label="Edit app share API request limit enabled"
+                                            type="checkbox"
+                                            checked={sharePolicyDraft.rateLimitEnabled}
+                                            onChange={event => setSharePolicyDraft(current => current ? {
+                                              ...current,
+                                              rateLimitEnabled: event.target.checked,
+                                              rateLimitMaxRequests: event.target.checked ? current.rateLimitMaxRequests : '',
+                                            } : current)}
+                                            className="size-4 accent-emerald-500"
+                                          />
+                                          Limit dynamic API requests
+                                        </label>
+                                        {sharePolicyDraft.rateLimitEnabled && (
+                                          <div className="grid grid-cols-2 gap-2">
+                                            <input
+                                              aria-label="Edit app share API request count"
+                                              type="number"
+                                              min={1}
+                                              max={1_000_000}
+                                              placeholder="Requests"
+                                              value={sharePolicyDraft.rateLimitMaxRequests}
+                                              onChange={event => setSharePolicyDraft(current => current ? { ...current, rateLimitMaxRequests: event.target.value } : current)}
+                                              className="min-h-[40px] rounded-lg border border-white/10 bg-black/20 px-2 text-xs text-white"
+                                            />
+                                            <select
+                                              aria-label="Edit app share API request window"
+                                              value={sharePolicyDraft.rateLimitWindowSeconds}
+                                              onChange={event => setSharePolicyDraft(current => current ? {
+                                                ...current,
+                                                rateLimitWindowSeconds: Number(event.target.value) as ShareRateLimitWindowSeconds,
+                                              } : current)}
+                                              className="min-h-[40px] rounded-lg border border-white/10 bg-[#10142d] px-2 text-xs text-white"
+                                            >
+                                              <option value={60}>per minute</option>
+                                              <option value={300}>per 5 minutes</option>
+                                              <option value={3600}>per hour</option>
+                                            </select>
+                                          </div>
+                                        )}
+                                        <button
+                                          type="button"
+                                          onClick={() => void saveSharePolicy(app, link)}
+                                          disabled={working}
+                                          className="min-h-[40px] w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 text-xs font-medium text-emerald-100 disabled:opacity-40"
+                                        >
+                                          {working ? 'Saving…' : 'Save limits'}
+                                        </button>
+                                      </div>
+                                    )}
                                   </div>
                                 );
                               })}
+                              {app.shareLinksPagination?.hasMore && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleLoadOlderShares(app)}
+                                  disabled={loadingOlderAppId !== null || !app.shareLinksPagination.nextCursor}
+                                  className="min-h-[40px] w-full rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 text-xs text-amber-100 hover:bg-amber-500/10 disabled:opacity-40"
+                                >
+                                  {loadingOlderAppId === app.id ? 'Loading older links…' : 'Load older share links'}
+                                </button>
+                              )}
                             </div>
                           ) : null}
                         </div>

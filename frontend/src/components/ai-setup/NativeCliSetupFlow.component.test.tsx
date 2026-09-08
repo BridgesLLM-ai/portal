@@ -17,12 +17,65 @@ vi.mock('../../api/client', () => ({
   },
 }));
 
+vi.mock('./HarnessNativeCliTerminal', () => ({
+  default: ({ provider, sessionId }: { provider: string; sessionId: string }) => (
+    <div role="application" aria-label={`${provider} Portal setup terminal`}>
+      Fixed terminal {sessionId}
+    </div>
+  ),
+}));
+
 describe('NativeCliSetupFlow Antigravity model handoff', () => {
   beforeEach(() => {
     mocks.clientGet.mockReset();
     mocks.clientPost.mockReset();
     window.localStorage.clear();
     invalidateAgentChatProviderModelsCache();
+  });
+
+  it('fails closed for a stale direct Codex setup entry without posting a host start', () => {
+    render(
+      <NativeCliSetupFlow
+        provider="codex"
+        apiBase="/ai-setup"
+        onComplete={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/Interactive host Codex login is unavailable.*Supervised Agent Chat can use an existing attested host credential/i);
+    expect(screen.queryByRole('button', { name: /Start Codex|Replace existing Codex/i })).not.toBeInTheDocument();
+    expect(mocks.clientPost).not.toHaveBeenCalled();
+  });
+
+  it('labels Claude as a process-free Project Sandbox authorization', async () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    mocks.clientPost.mockResolvedValueOnce({
+      data: {
+        success: true,
+        sessionId: 'native-claude-project',
+        status: 'awaiting_callback',
+        authUrl: 'https://claude.ai/oauth/authorize?state=project-test',
+        alreadyAuthenticated: false,
+        reauthSupported: true,
+      },
+    });
+
+    render(
+      <NativeCliSetupFlow
+        provider="claude-code"
+        apiBase="/ai-setup"
+        onComplete={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/process-free credential flow/i)).toBeVisible();
+    expect(screen.getByText(/will not launch Claude Code on the host/i)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Authorize Claude Project Sandbox' }));
+    expect(await screen.findByRole('link', { name: /Open Claude Project Sandbox login/i })).toBeVisible();
+    expect(mocks.clientPost).toHaveBeenCalledWith('/ai-setup/native-cli/start', { provider: 'claude-code' });
+    open.mockRestore();
   });
 
   it('continues an already-authenticated unsupported re-auth into an exact native model choice', async () => {
@@ -87,6 +140,40 @@ describe('NativeCliSetupFlow Antigravity model handoff', () => {
     expect(onComplete).toHaveBeenCalledTimes(1);
     expect(mocks.clientPost.mock.calls.some(([url]) => String(url).includes('set-default-model'))).toBe(false);
     open.mockRestore();
+  });
+
+  it.each([
+    { provider: 'hermes' as const, name: 'Hermes', sessionId: 'oauth_hermes_ab12cd' },
+    { provider: 'opencode' as const, name: 'OpenCode', sessionId: 'oauth_opencode_ab12cd' },
+  ])('opens the fixed $name Portal-profile terminal rather than a credential paste form', async ({
+    provider,
+    name,
+    sessionId,
+  }) => {
+    mocks.clientPost.mockResolvedValueOnce({
+      data: {
+        success: true,
+        sessionId,
+        status: 'starting',
+        alreadyAuthenticated: false,
+        reauthSupported: true,
+      },
+    });
+
+    render(
+      <NativeCliSetupFlow
+        provider={provider}
+        apiBase="/ai-setup"
+        onComplete={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/separate from OpenClaw and Remote Desktop auth/i)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: `Configure Portal ${name}` }));
+    expect(await screen.findByRole('application', { name: `${provider} Portal setup terminal` })).toHaveTextContent(sessionId);
+    expect(mocks.clientPost).toHaveBeenCalledWith('/ai-setup/native-cli/start', { provider });
+    expect(screen.queryByLabelText('Authorization code')).not.toBeInTheDocument();
   });
 
   it('rejects a fallback/default catalog instead of pretending it came from Antigravity', async () => {

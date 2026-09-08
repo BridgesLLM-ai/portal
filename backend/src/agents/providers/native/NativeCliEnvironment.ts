@@ -23,7 +23,11 @@ const PROVIDER_ENV_KEYS: Partial<Record<AgentProviderName, readonly string[]>> =
   CODEX: ['OPENAI_API_KEY', 'CODEX_HOME'],
   GEMINI: ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_APPLICATION_CREDENTIALS'],
   GROK: ['XAI_API_KEY', 'GROK_CODE_XAI_API_KEY', 'GROK_DEPLOYMENT_KEY', 'GROK_AUTH', 'GROK_AUTH_PATH', 'GROK_HOME'],
+  HERMES: ['PORTAL_HERMES_HOME'],
+  OPENCODE: ['PORTAL_OPENCODE_HOME'],
 };
+
+export const ADMITTED_HOST_NATIVE_CLI_PATH = '/usr/bin:/bin';
 
 export function resolveNativeCliCredentialPaths(
   providerName: AgentProviderName,
@@ -62,6 +66,20 @@ export function resolveNativeCliCredentialPaths(
     const grokHome = String(source.GROK_HOME || '').trim() || path.join(home, '.grok');
     return [path.join(grokHome, 'auth.json')];
   }
+  if (providerName === 'HERMES') {
+    const hermesHome = String(source.PORTAL_HERMES_HOME || '').trim()
+      || '/var/lib/bridgesllm/hermes';
+    return [
+      path.join(hermesHome, 'auth.json'),
+      path.join(hermesHome, '.env'),
+      path.join(hermesHome, 'config.yaml'),
+    ];
+  }
+  if (providerName === 'OPENCODE') {
+    const openCodeRoot = String(source.PORTAL_OPENCODE_HOME || '').trim()
+      || '/var/lib/bridgesllm/opencode';
+    return [path.join(openCodeRoot, 'data', 'opencode', 'auth.json')];
+  }
   return [];
 }
 
@@ -90,17 +108,28 @@ export function buildNativeCliEnvironment(
     if (typeof value === 'string' && value.length > 0) env[key] = value;
   }
 
-  env.PATH ||= '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+  if (providerName === 'CODEX' || providerName === 'CLAUDE_CODE') {
+    // Codex is a catalogued JS launcher. Never let /usr/bin/env resolve its
+    // Node interpreter from an ambient or /usr/local path outside admission.
+    env.PATH = ADMITTED_HOST_NATIVE_CLI_PATH;
+  } else {
+    env.PATH ||= '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+  }
   env.HOME ||= '/root';
   env.NO_COLOR = '1';
 
-  if (providerName === 'CLAUDE_CODE' && localClaudeOauthPresent(source)) {
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_AUTH_TOKEN;
+  if (providerName === 'CLAUDE_CODE') {
+    // Portal pins and qualifies an exact Claude Code release. Do not let a
+    // session replace that executable behind the installer's attestation.
+    env.DISABLE_AUTOUPDATER = '1';
+    if (localClaudeOauthPresent(source)) {
+      delete env.ANTHROPIC_API_KEY;
+      delete env.ANTHROPIC_AUTH_TOKEN;
+    }
   }
   if (providerName === 'GROK') env.GROK_DISABLE_AUTOUPDATER = '1';
   if (providerName === 'GEMINI') {
-    env.AGY_CLI_DISABLE_AUTO_UPDATE = '1';
+    env.AGY_CLI_DISABLE_AUTO_UPDATE = 'true';
     env.SSH_CONNECTION = source.SSH_CONNECTION || 'portal-native-check 127.0.0.1 127.0.0.1 0';
   }
   return env;

@@ -21,7 +21,6 @@ import {
   RemoteDesktopMutationBusyError,
   type RemoteDesktopMutationLease,
 } from '../services/remoteDesktopMutationLock';
-import { assertOpenClawGatewayAuthorizationFenceReleased } from '../services/openClawGatewayAuthorizationFence';
 import {
   openRemoteDesktopPath,
   RemoteDesktopOpenPathError,
@@ -43,10 +42,6 @@ type RemoteDesktopStatus = 'ready' | 'degraded' | 'unavailable';
 
 const RD_DEFAULT_URL = '/novnc/vnc_portal.html?reconnect=1&resize=smart';
 const PORTAL_VISIBLE_AGENT_ID = 'main';
-const PORTAL_VISIBLE_AGENT_NAME = 'Assistant';
-const PORTAL_VISIBLE_AGENT_EMOJI = '🖥️';
-const OPENCLAW_WORKSPACE = process.env.OPENCLAW_WORKSPACE || '/root/.openclaw/workspace-main';
-const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH || path.join(process.env.HOME || '/root', '.openclaw/openclaw.json');
 const PORTAL_STATIC_DIR = path.resolve(process.cwd(), '../static');
 const PORTAL_STATIC_NOVNC_DIR = path.resolve(process.cwd(), '../static/novnc');
 const SYSTEM_NOVNC_DIR = '/usr/share/novnc';
@@ -184,37 +179,6 @@ function clearRemoteDesktopAutomaticRecoveryLimits(): { ok: boolean; note: strin
   }
 }
 
-function hashDirectoryContents(root: string): string | null {
-  try {
-    if (!fs.existsSync(root)) return null;
-    const hash = createHash('sha256');
-
-    const walk = (dir: string, relative = '') => {
-      const entries = fs.readdirSync(dir, { withFileTypes: true })
-        .sort((a, b) => a.name.localeCompare(b.name));
-
-      for (const entry of entries) {
-        const relPath = relative ? `${relative}/${entry.name}` : entry.name;
-        const fullPath = path.join(dir, entry.name);
-        hash.update(relPath);
-        hash.update(entry.isDirectory() ? 'dir' : entry.isSymbolicLink() ? 'link' : 'file');
-        if (entry.isDirectory()) {
-          walk(fullPath, relPath);
-        } else if (entry.isFile()) {
-          hash.update(fs.readFileSync(fullPath));
-        } else if (entry.isSymbolicLink()) {
-          hash.update(fs.readlinkSync(fullPath));
-        }
-      }
-    };
-
-    walk(root);
-    return hash.digest('hex');
-  } catch {
-    return null;
-  }
-}
-
 function normalizeRemoteDesktopUrl(raw: string): string {
   const value = (raw || '').trim();
   if (!value) return '';
@@ -274,29 +238,6 @@ function runShell(cmd: string, timeoutMs = 60000): Promise<{ ok: boolean; stdout
     });
   });
 }
-
-async function restartOpenClawGatewaySystemUnit(timeoutMs = 60000): Promise<void> {
-  await assertOpenClawGatewayAuthorizationFenceReleased();
-  if (!fs.existsSync('/run/systemd/system') || !fs.existsSync('/usr/bin/systemctl')) {
-    throw new Error('OpenClaw gateway restart requires the installed systemd system service.');
-  }
-  await new Promise<void>((resolve, reject) => {
-    execFile(
-      '/usr/bin/systemctl',
-      ['restart', 'openclaw-gateway.service'],
-      { timeout: timeoutMs, encoding: 'utf8' },
-      (error, _stdout, stderr) => {
-        if (!error) {
-          resolve();
-          return;
-        }
-        const detail = (stderr || error.message || '').trim();
-        reject(new Error(`OpenClaw gateway system service restart failed${detail ? `: ${detail}` : '.'}`));
-      },
-    );
-  });
-}
-
 
 type DesktopClipboardSelection = 'clipboard' | 'primary';
 type DesktopClipboardTool = { name: 'xclip' | 'xsel'; path: string };
@@ -533,7 +474,8 @@ After=bridges-rd-xtigervnc.service bridges-rd-websockify.service
 Type=oneshot
 User=root
 ExecStart=${REMOTE_DESKTOP_HEALTHCHECK}
-TimeoutStartSec=150
+# Includes VNC stop/start and bounded pre/post semantic checks.
+TimeoutStartSec=420
 UMask=0077
 `;
 }
@@ -780,169 +722,6 @@ function ensureNovncStaticBundle(): { changed: boolean; ok: boolean; note: strin
   }
 }
 
-function ensurePortalSkillInstalled(): { changed: boolean; note: string } {
-  try {
-    const portalSkillSrc = path.resolve(__dirname, '../../..', 'skills/bridgesllm-portal');
-    const skillDest = path.join(OPENCLAW_WORKSPACE, 'skills/bridgesllm-portal');
-    if (!fs.existsSync(path.join(portalSkillSrc, 'SKILL.md'))) {
-      return { changed: false, note: `Skill source not found at ${portalSkillSrc}` };
-    }
-
-    const oldSkill = path.join(OPENCLAW_WORKSPACE, 'skills/shared-browser');
-    const oldSkillExists = fs.existsSync(oldSkill);
-    const sourceHash = hashDirectoryContents(portalSkillSrc);
-    const destHash = hashDirectoryContents(skillDest);
-
-    if (sourceHash && destHash && sourceHash === destHash && !oldSkillExists) {
-      return { changed: false, note: `Managed skill already current at ${skillDest}` };
-    }
-
-    const needsCopy = !fs.existsSync(path.join(skillDest, 'SKILL.md'));
-    fs.mkdirSync(path.dirname(skillDest), { recursive: true });
-    fs.rmSync(skillDest, { recursive: true, force: true });
-    fs.cpSync(portalSkillSrc, skillDest, { recursive: true, force: true });
-    if (oldSkillExists) fs.rmSync(oldSkill, { recursive: true, force: true });
-    return { changed: true, note: needsCopy ? `Installed managed skill to ${skillDest}` : `Refreshed managed skill at ${skillDest}` };
-  } catch (err: any) {
-    return { changed: false, note: `Failed to install managed skill: ${err?.message || 'unknown error'}` };
-  }
-}
-
-function ensurePortalVisibleBrowserAgentConfig(): { changed: boolean; created: boolean; note: string } {
-  try {
-    if (!fs.existsSync(OPENCLAW_CONFIG_PATH)) {
-      return { changed: false, created: false, note: `OpenClaw config not found at ${OPENCLAW_CONFIG_PATH}` };
-    }
-    const raw = fs.readFileSync(OPENCLAW_CONFIG_PATH, 'utf8');
-    const config = JSON.parse(raw || '{}');
-    if (!config.agents || typeof config.agents !== 'object') config.agents = {};
-    if (!Array.isArray(config.agents.list)) config.agents.list = [];
-
-    const desiredTools = {
-      deny: ['browser'],
-      exec: { security: 'full' },
-    };
-
-    const managedAgents = [
-      {
-        id: PORTAL_VISIBLE_AGENT_ID,
-        name: PORTAL_VISIBLE_AGENT_NAME,
-        workspace: OPENCLAW_WORKSPACE,
-        identity: { emoji: PORTAL_VISIBLE_AGENT_EMOJI },
-        tools: desiredTools,
-      },
-    ];
-
-    let created = false;
-    let changed = false;
-    const notes: string[] = [];
-
-    for (const desiredAgent of managedAgents) {
-      const idx = config.agents.list.findIndex((agent: any) => String(agent?.id || '') === desiredAgent.id);
-      if (idx === -1) {
-        config.agents.list.push(desiredAgent);
-        created = true;
-        changed = true;
-        notes.push(`created ${desiredAgent.id}`);
-        continue;
-      }
-
-      const existing = config.agents.list[idx] || {};
-      const next = { ...existing };
-      if (!next.name && desiredAgent.name) { next.name = desiredAgent.name; changed = true; }
-      if (!next.workspace) { next.workspace = desiredAgent.workspace; changed = true; }
-      if (!next.identity || typeof next.identity !== 'object') {
-        next.identity = { ...desiredAgent.identity };
-        changed = true;
-      } else if (!next.identity.emoji) {
-        next.identity.emoji = desiredAgent.identity.emoji;
-        changed = true;
-      }
-      if (!next.tools || typeof next.tools !== 'object') {
-        next.tools = { ...desiredTools };
-        changed = true;
-      } else {
-        const deny = Array.isArray(next.tools.deny) ? [...next.tools.deny] : [];
-        if (!deny.includes('browser')) {
-          deny.push('browser');
-          next.tools.deny = deny;
-          changed = true;
-        }
-        if (!next.tools.exec || typeof next.tools.exec !== 'object') {
-          next.tools.exec = { security: 'full' };
-          changed = true;
-        } else if (!next.tools.exec.security) {
-          next.tools.exec.security = 'full';
-          changed = true;
-        }
-      }
-      config.agents.list[idx] = next;
-      if (changed) notes.push(`reconciled ${desiredAgent.id}`);
-    }
-
-    if (!changed) {
-      return { changed: false, created: false, note: `${PORTAL_VISIBLE_AGENT_ID} agent already configured` };
-    }
-
-    fs.writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', 'utf8');
-    return {
-      changed: true,
-      created,
-      note: `Managed OpenClaw browser policy agents updated (${notes.join(', ')}) — hidden browser denied`,
-    };
-  } catch (err: any) {
-    return { changed: false, created: false, note: `Failed to reconcile OpenClaw agent: ${err?.message || 'unknown error'}` };
-  }
-}
-
-async function ensurePortalVisibleBrowserDefaults(): Promise<{ changed: boolean; note: string }> {
-  const agentResult = ensurePortalVisibleBrowserAgentConfig();
-  const notes: string[] = [];
-  if (agentResult.note) notes.push(agentResult.note);
-  let dbChanged = false;
-  try {
-    const keys = ['agent.defaultOpenClawAgentId', 'agent.visibleBrowserOpenClawAgentId'];
-    const existing = await prisma.systemSetting.findMany({ where: { key: { in: keys } } });
-    const map = new Map(existing.map((row) => [row.key, row.value] as const));
-
-    if (map.get('agent.defaultOpenClawAgentId') !== 'main') {
-      await prisma.systemSetting.upsert({
-        where: { key: 'agent.defaultOpenClawAgentId' },
-        update: { value: 'main' },
-        create: { key: 'agent.defaultOpenClawAgentId', value: 'main' },
-      });
-      dbChanged = true;
-    }
-    if (map.get('agent.visibleBrowserOpenClawAgentId') !== 'main') {
-      await prisma.systemSetting.upsert({
-        where: { key: 'agent.visibleBrowserOpenClawAgentId' },
-        update: { value: 'main' },
-        create: { key: 'agent.visibleBrowserOpenClawAgentId', value: 'main' },
-      });
-      dbChanged = true;
-    }
-  } catch {}
-
-  const changed = agentResult.changed || dbChanged;
-  notes.push(dbChanged ? 'DB defaults updated' : 'DB defaults already current');
-  return { changed, note: notes.join('; ') };
-}
-
-// The managed skill is part of every signed Portal bundle, not a Remote
-// Desktop setup artifact. Converge it on every normal backend start so an
-// update refreshes the active OpenClaw copy even when Desktop was never set up
-// or its settings are currently empty. OpenClaw snapshots skills per session;
-// its default watcher refreshes an existing snapshot on the next turn, and a
-// new session always reads the current files. No Gateway restart is required.
-export function reconcilePortalManagedSkill(): void {
-  const result = ensurePortalSkillInstalled();
-  if (result.changed) {
-    console.log(`[managed-skill] ${result.note}`);
-  } else if (/^(?:Failed|Skill source not found)/.test(result.note)) {
-    console.warn(`[managed-skill] ${result.note}`);
-  }
-}
-
 export async function reconcileRemoteDesktopLauncherAssets(): Promise<void> {
   try {
     const result = await ensureRemoteDesktopLauncherAssets({ reloadDesktop: true });
@@ -966,13 +745,9 @@ export async function reconcilePortalVisibleBrowserDefaults(): Promise<void> {
       || map.get('agent.defaultOpenClawAgentId') === PORTAL_VISIBLE_AGENT_ID
       || map.get('agent.visibleBrowserOpenClawAgentId') === PORTAL_VISIBLE_AGENT_ID;
     if (!wantsVisibleAgent) return;
-    const result = await ensurePortalVisibleBrowserDefaults();
-    if (result.changed) {
-      await restartOpenClawGatewaySystemUnit(20000);
-      console.log('[remote-desktop] Reconciled visible-browser agent defaults and restarted gateway');
-    }
+    console.warn('[remote-desktop] Visible-browser OpenClaw agent/default reconciliation is unavailable in this release until a separately supported maintenance operation ships; startup made no OpenClaw configuration changes.');
   } catch (err: any) {
-    console.warn('[remote-desktop] best-effort reconcile failed:', err?.message || err);
+    console.warn('[remote-desktop] read-only visible-browser default check failed:', err?.message || err);
   }
 }
 
@@ -1075,7 +850,7 @@ async function attemptSelfHeal(reason: string, allowRestart = false): Promise<Re
     const inPlaceRepair = await repairDesktopSessionPolicy();
     if (bundledStaticFileIsCurrent('installer/scripts/bridges-rd-healthcheck.sh', REMOTE_DESKTOP_HEALTHCHECK)
       && await checkSystemdUnitActive(REMOTE_DESKTOP_HEALTHCHECK_TIMER)) {
-      await runShell(`systemctl start ${REMOTE_DESKTOP_HEALTHCHECK_SERVICE}`, 150000);
+      await runShell(`systemctl start ${REMOTE_DESKTOP_HEALTHCHECK_SERVICE}`, 450000);
     }
     const inPlaceRuntime = await attestRuntime();
     if (inPlaceRepair.ok && inPlaceRuntime.ok) {
@@ -1127,7 +902,7 @@ async function attemptSelfHeal(reason: string, allowRestart = false): Promise<Re
       : { ok: false, stdout: '', stderr: 'Signed Remote Desktop launcher assets are unavailable' };
     const vncRestart = assets.ok
       && resetFailed.ok
-      ? await runShell('systemctl restart bridges-rd-xtigervnc.service', 140000)
+      ? await runShell('systemctl restart bridges-rd-xtigervnc.service', 360000)
       : { ok: false, stdout: '', stderr: 'Signed Remote Desktop launcher assets are unavailable; services were not restarted' };
     const websockifyRestart = vncRestart.ok
       ? await runShell('systemctl restart bridges-rd-websockify.service', 20000)
@@ -1139,7 +914,7 @@ async function attemptSelfHeal(reason: string, allowRestart = false): Promise<Re
       ? await runShell(`systemctl start ${REMOTE_DESKTOP_HEALTHCHECK_TIMER}`, 10000)
       : { ok: false, stdout: '', stderr: 'automatic recovery state could not be reset; timer was not started' };
     const healthcheckSeed = healthcheckTimerStarted.ok
-      ? await runShell(`systemctl start ${REMOTE_DESKTOP_HEALTHCHECK_SERVICE}`, 150000)
+      ? await runShell(`systemctl start ${REMOTE_DESKTOP_HEALTHCHECK_SERVICE}`, 450000)
       : { ok: false, stdout: '', stderr: 'automatic recovery timer failed; healthcheck was not seeded' };
     const restartedRuntime = vncRestart.ok && websockifyRestart.ok && recoveryLimits.ok
       && healthcheckSeed.ok && healthcheckTimerStarted.ok
@@ -1268,7 +1043,7 @@ async function checkLoopbackOnlyListeningPort(port: number): Promise<boolean> {
 }
 
 async function inspectVncProcessPolicy(): Promise<{ command: string; hardened: boolean }> {
-  const result = await runShell("ps -eo args= | grep '[X]tigervnc :1' | head -n 1", 2500);
+  const result = await runShell("ps -eww -o args= | grep '[X]tigervnc :1' | head -n 1", 2500);
   const command = result.ok ? result.stdout : '';
   const hardened = Boolean(command)
     && /(?:^|\s)-localhost=1(?:\s|$)/.test(command)
@@ -1279,7 +1054,7 @@ async function inspectVncProcessPolicy(): Promise<{ command: string; hardened: b
 
 async function inspectWebsockifyProcessPolicy(): Promise<{ command: string; hardened: boolean }> {
   const result = await runShell(
-    "ps -eo user:64=,args= | awk '$1 == \"bridgesrd\" && $0 ~ /[w]ebsockify 127.0.0.1:6080 127.0.0.1:5901/ { $1=\"\"; sub(/^ +/, \"\"); print; exit }'",
+    "ps -eww -o user:64=,args= | awk '$1 == \"bridgesrd\" && $0 ~ /[w]ebsockify 127.0.0.1:6080 127.0.0.1:5901/ { $1=\"\"; sub(/^ +/, \"\"); print; exit }'",
     2500,
   );
   const command = result.ok ? result.stdout : '';
@@ -1412,6 +1187,8 @@ router.get('/status', async (_req: Request, res: Response) => {
     const windowFitLauncherCurrent = bundledStaticFileIsCurrent('installer/scripts/bridges-rd-window-fit.sh', windowFitLauncher);
 
     const hasConfiguredUrl = configuredUrl.length > 0;
+    // Report desktop health independently of optional OpenClaw configuration.
+    // Status is read-only; it never installs skills or changes agent defaults.
     const portalManagedUrl = configuredUrl.startsWith('/') && !configuredUrl.startsWith('//');
     let externalUrlSafe = true;
     if (hasConfiguredUrl && !portalManagedUrl) {
@@ -1587,7 +1364,7 @@ router.get('/status', async (_req: Request, res: Response) => {
         message = `The graphical desktop is available, but integrated features need attention: ${integratedReasons}.`;
       } else {
         status = 'ready';
-        message = 'Remote Desktop is ready, including Shared Browser and OpenClaw Web UI launchers.';
+        message = 'Remote Desktop is ready, including Shared Browser, audio, and clipboard.';
       }
     } else if (hasConfiguredUrl && novncPortOpen && vncPortOpen
       && (!desktopSessionPolicy.healthy || !sessionGuardSupervised)) {
@@ -1903,7 +1680,14 @@ async function retireLegacyRemoteDesktopRcLocal(): Promise<{ ok: boolean; change
  * Core auto-setup logic — extracted so it can be called from both
  * the admin route (authenticated) and the setup wizard route (setup-token).
  */
-export async function runRemoteDesktopAutoSetup(): Promise<{ ok: boolean; steps: Array<{ step: string; ok: boolean; message: string }>; message: string }> {
+export async function runRemoteDesktopAutoSetup(): Promise<{
+  ok: boolean;
+  steps: Array<{ step: string; ok: boolean; message: string }>;
+  message: string;
+  maintenanceRequired?: boolean;
+  code?: 'HOST_TOOL_SUPERVISOR_UNAVAILABLE';
+  retryable?: false;
+}> {
   const steps: Array<{ step: string; ok: boolean; message: string }> = [];
   let lease: RemoteDesktopMutationLease;
 
@@ -2160,7 +1944,8 @@ ExecStopPost=-/bin/bash -c 'pkill -f "Xtigervnc :1" 2>/dev/null || true'
 Restart=on-failure
 RestartSec=3
 WatchdogSec=45
-TimeoutStartSec=120
+# Cold, loaded hosts must finish the full semantic READY gate before timeout.
+TimeoutStartSec=300
 TimeoutStopSec=20
 KillMode=control-group
 Environment=HOME=/root
@@ -2268,7 +2053,7 @@ done`, 30000);
     const resetFailed = await runShell('systemctl reset-failed bridges-rd-xtigervnc.service bridges-rd-websockify.service', 5000);
     steps.push({ step: 'Reset Remote Desktop start limits', ok: resetFailed.ok, message: resetFailed.ok ? 'Reset' : resetFailed.stderr.slice(0, 200) });
     const restartVnc = resetFailed.ok
-      ? await runShell('systemctl restart bridges-rd-xtigervnc.service', 140000)
+      ? await runShell('systemctl restart bridges-rd-xtigervnc.service', 360000)
       : { ok: false, stdout: '', stderr: 'Systemd start limit could not be reset' };
     steps.push({ step: 'Start VNC service', ok: restartVnc.ok, message: restartVnc.ok ? 'Started' : restartVnc.stderr.slice(0, 200) });
 
@@ -2294,7 +2079,7 @@ done`, 30000);
       message: startHealthTimer.ok ? 'Active' : startHealthTimer.stderr.slice(0, 200),
     });
     const seedHealthState = startHealthTimer.ok
-      ? await runShell(`systemctl start ${REMOTE_DESKTOP_HEALTHCHECK_SERVICE}`, 150000)
+      ? await runShell(`systemctl start ${REMOTE_DESKTOP_HEALTHCHECK_SERVICE}`, 450000)
       : { ok: false, stdout: '', stderr: 'automatic recovery timer failed; healthcheck was not seeded' };
     steps.push({
       step: 'Seed automatic health state',
@@ -2331,49 +2116,8 @@ done`, 30000);
       steps.push({ step: 'Set allowed path prefixes', ok: true, message: 'Already configured: ' + currentPrefixes });
     }
 
-    // Step 8: Install bridgesllm-portal skill into OpenClaw workspace
-    try {
-      const portalSkillSrc = path.resolve(__dirname, '../../..', 'skills/bridgesllm-portal');
-      const openclawWorkspace = process.env.OPENCLAW_WORKSPACE || '/root/.openclaw/workspace-main';
-      const skillDest = path.join(openclawWorkspace, 'skills/bridgesllm-portal');
-
-      if (fs.existsSync(path.join(portalSkillSrc, 'SKILL.md'))) {
-        // Copy full skill directory (SKILL.md + scripts + references) to OpenClaw workspace
-        await runShell(`mkdir -p "${skillDest}" && cp -r "${portalSkillSrc}/"* "${skillDest}/" && chmod +x "${skillDest}/scripts/"*.sh "${skillDest}/scripts/"*.mjs 2>/dev/null || true`, 10000);
-        // Remove old shared-browser skill if it exists (superseded)
-        const oldSkill = path.join(openclawWorkspace, 'skills/shared-browser');
-        if (fs.existsSync(oldSkill)) {
-          await runShell(`rm -rf "${oldSkill}"`, 5000);
-        }
-        steps.push({ step: 'Install bridgesllm-portal skill', ok: true, message: `Installed to ${skillDest}` });
-      } else {
-        steps.push({ step: 'Install bridgesllm-portal skill', ok: false, message: `Skill source not found at ${portalSkillSrc}` });
-      }
-    } catch (err: any) {
-      steps.push({ step: 'Install bridgesllm-portal skill', ok: false, message: `Non-fatal: ${err?.message?.slice(0, 200)}` });
-    }
-
-    // Step 9: Reconcile dedicated visible-browser OpenClaw agent and portal defaults
-    let gatewayRestartNeeded = false;
-    try {
-      const reconcile = await ensurePortalVisibleBrowserDefaults();
-      gatewayRestartNeeded = reconcile.changed;
-      steps.push({ step: 'Reconcile visible-browser OpenClaw agent', ok: true, message: reconcile.note });
-    } catch (err: any) {
-      steps.push({ step: 'Reconcile visible-browser OpenClaw agent', ok: false, message: `Non-fatal: ${err?.message?.slice(0, 200)}` });
-    }
-
-    // Step 10: Restart OpenClaw gateway if needed so the managed skill/agent are loaded for new sessions
-    if (gatewayRestartNeeded) {
-      await restartOpenClawGatewaySystemUnit(30000);
-      steps.push({
-        step: 'Restart OpenClaw gateway',
-        ok: true,
-        message: 'Restarted so managed skill/agent defaults are live for new sessions',
-      });
-    } else {
-      steps.push({ step: 'Restart OpenClaw gateway', ok: true, message: 'Not needed — managed skill/agent already current' });
-    }
+    // Desktop setup owns only the desktop. No OpenClaw workspace skill,
+    // agent configuration, or Portal agent defaults are changed here.
 
     // Step 11: Verify core ports and Shared Chrome contract
     await new Promise((r) => setTimeout(r, 3000));
@@ -2516,7 +2260,9 @@ done`, 30000);
     return {
       ok: allOk,
       steps,
-      message: allOk ? 'Remote Desktop setup complete and verified.' : 'Setup completed with warnings — review steps above.',
+      message: allOk
+        ? 'Remote Desktop setup complete and verified.'
+        : 'Setup completed with warnings — review steps above.',
     };
   } catch (error: any) {
     steps.push({ step: 'Unexpected error', ok: false, message: error?.message || 'Unknown error' });
@@ -2538,7 +2284,7 @@ router.post('/auto-setup', async (req: Request, res: Response) => {
   }
   const result = await runRemoteDesktopAutoSetup();
   const busy = result.steps.some((step) => step.step === 'Remote Desktop operation busy');
-  res.status(result.ok ? 200 : busy ? 409 : 500).json(result);
+  res.status(result.ok ? 200 : busy ? 409 : result.maintenanceRequired ? 503 : 500).json(result);
 });
 
 export default router;

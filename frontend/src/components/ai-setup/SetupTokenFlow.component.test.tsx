@@ -44,7 +44,7 @@ const anthropicProvider = {
 };
 
 async function openManualTokenAndEnter(user: ReturnType<typeof userEvent.setup>, token: string) {
-  await user.click(screen.getByRole('button', { name: 'Paste a setup-token manually' }));
+  await user.click(screen.getByRole('button', { name: 'Paste an existing setup-token' }));
   await user.type(await screen.findByRole('textbox', { name: 'Claude setup token' }), token);
 }
 
@@ -58,7 +58,7 @@ describe('SetupTokenFlow Anthropic guidance', () => {
     mocks.clientGet.mockResolvedValue({ data: { defaultModel: 'anthropic/claude-fable-5' } });
   });
 
-  it('shows neutral Claude CLI guidance without stale Extra Usage warnings', async () => {
+  it('shows an existing-credential boundary without offering host Claude execution', async () => {
     render(
       <SetupTokenFlow
         provider={anthropicProvider}
@@ -69,8 +69,11 @@ describe('SetupTokenFlow Anthropic guidance', () => {
     );
 
     expect(screen.getByRole('dialog', { name: 'Set up Claude' })).toHaveAttribute('aria-modal', 'true');
-    expect(screen.getByText('How the connection works')).toBeInTheDocument();
-    expect(screen.getByText(/Fable 5 is supported through the Claude CLI path/i)).toBeInTheDocument();
+    expect(screen.getByText('Credential boundary')).toBeInTheDocument();
+    expect(screen.getByText(/does not launch, probe, or reuse Claude Code on the host/i)).toBeInTheDocument();
+    expect(screen.getByText(/Project Sandbox authorization remains available through its separate process-free PKCE flow/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Paste an existing setup-token' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Connect Claude' })).not.toBeInTheDocument();
     expect(screen.queryByText(/extra usage/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/check your Claude account/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Anthropic can change those terms/i)).not.toBeInTheDocument();
@@ -99,9 +102,9 @@ describe('SetupTokenFlow Anthropic guidance', () => {
     const opener = screen.getByRole('button', { name: 'Open Claude setup' });
     await user.click(opener);
     const dialog = screen.getByRole('dialog', { name: 'Set up Claude' });
-    const primary = screen.getByRole('button', { name: 'Connect Claude' });
+    const primary = screen.getByRole('button', { name: 'Paste an existing setup-token' });
     const close = screen.getByRole('button', { name: 'Close Claude setup' });
-    const last = screen.getByRole('button', { name: 'Paste a setup-token manually' });
+    const last = primary;
 
     await waitFor(() => expect(primary).toHaveFocus());
     last.focus();
@@ -116,9 +119,7 @@ describe('SetupTokenFlow Anthropic guidance', () => {
     await waitFor(() => expect(opener).toHaveFocus());
   });
 
-  it('moves focus to each async step and announces progress without visual guesswork', async () => {
-    let resolveStart!: (value: unknown) => void;
-    mocks.clientPost.mockReturnValueOnce(new Promise((resolve) => { resolveStart = resolve; }));
+  it('moves to existing-token entry without calling the disabled host start route', async () => {
     const user = userEvent.setup();
     render(
       <SetupTokenFlow
@@ -129,21 +130,15 @@ describe('SetupTokenFlow Anthropic guidance', () => {
       />,
     );
 
-    await user.click(screen.getByRole('button', { name: 'Connect Claude' }));
+    await user.click(screen.getByRole('button', { name: 'Paste an existing setup-token' }));
     const step = screen.getByTestId('claude-setup-step');
     await waitFor(() => expect(step).toHaveFocus());
-    expect(step).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByRole('status')).toHaveTextContent('Starting Claude sign-in.');
-
-    resolveStart({ data: { success: true, sessionId: 'session-1', authUrl: null } });
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(
-      'Claude sign-in is waiting for browser authorization.',
-    ));
-    expect(step).toHaveFocus();
-    await waitFor(() => expect(step).toHaveAttribute('aria-busy', 'false'));
+    expect(screen.getByRole('status')).toHaveTextContent('Paste a Claude setup token manually.');
+    expect(screen.getByRole('textbox', { name: 'Claude setup token' })).toBeInTheDocument();
+    expect(mocks.clientPost).not.toHaveBeenCalled();
   });
 
-  it('announces setup failures assertively and keeps focus inside the failed step', async () => {
+  it('announces existing-token save failures assertively and keeps focus inside the failed step', async () => {
     mocks.clientPost.mockRejectedValueOnce(new Error('Claude CLI unavailable'));
     const user = userEvent.setup();
     render(
@@ -155,11 +150,12 @@ describe('SetupTokenFlow Anthropic guidance', () => {
       />,
     );
 
-    await user.click(screen.getByRole('button', { name: 'Connect Claude' }));
+    await openManualTokenAndEnter(user, 'test-existing-token');
+    await user.click(screen.getByRole('button', { name: 'Save Token' }));
     const step = screen.getByTestId('claude-setup-step');
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Claude setup needs attention.'));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Claude CLI unavailable'));
     expect(screen.getByRole('alert')).toHaveTextContent('Claude CLI unavailable');
-    expect(step).toHaveFocus();
+    expect(step).toContainElement(document.activeElement as HTMLElement);
   });
 
   it('recovers the manual-token UUID after a lost response and closed tab without persisting the token', async () => {

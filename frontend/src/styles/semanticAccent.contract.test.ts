@@ -257,7 +257,7 @@ describe('semantic accent selection contract', () => {
     expect(sources.dashboard).toContain("updateBackupDescription.tone === 'good'");
     expect(sources.dashboard).toContain("? 'border-emerald-400/25'");
     expect(sources.dashboard).toContain('className="mt-0.5 flex-none text-amber-300"');
-    expect(sources.settings).toContain("runtimeStatus?.gateway.connected ? 'bg-emerald-500/10 text-emerald-400'");
+    expect(sources.settings).toContain("harnessCatalog.find((entry) => entry.harnessId === 'OPENCLAW')?.usable ? 'bg-emerald-500/10 text-emerald-400'");
     expect(sources.setupWizard).toContain("complete ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'");
     expect(sources.terminal).toContain("state?.connected ? 'bg-emerald-400' : 'bg-slate-500'");
   });

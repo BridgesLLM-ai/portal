@@ -6,6 +6,8 @@ const PORTAL_STREAM_BUS_PROVIDERS = new Set([
   'AGENT_ZERO',
   'GEMINI',
   'OLLAMA',
+  'HERMES',
+  'OPENCODE',
 ]);
 
 export function providerUsesPortalStreamBus(provider: unknown): boolean {

@@ -7,6 +7,8 @@ import {
   type RegistrationApprovalResponse,
   type AdminUser,
   type RegistrationRequest,
+  type LegacyOpenClawAgentInventory,
+  type LegacyOpenClawAgentRegistration,
 } from '../api/admin';
 import { agentJobsAPI, type AgentJob } from '../api/agentJobs';
 import {
@@ -43,6 +45,7 @@ type AdminMutationKind =
   | 'status'
   | 'workspace'
   | 'promote'
+  | 'delete'
   | 'transfer'
   | 'approve-registration'
   | 'deny-registration';
@@ -270,6 +273,7 @@ function adminMutationWorkingLabel(action: AdminMutationSnapshot): string {
     case 'status': return 'Updating account status…';
     case 'workspace': return 'Updating project workspace…';
     case 'promote': return 'Granting server access…';
+    case 'delete': return 'Retiring user identity…';
     case 'transfer': return 'Transferring ownership…';
     case 'approve-registration': return 'Approving…';
     case 'deny-registration': return 'Denying…';
@@ -277,7 +281,7 @@ function adminMutationWorkingLabel(action: AdminMutationSnapshot): string {
 }
 
 function adminMutationUsesConfirmationDialog(action: AdminMutationSnapshot): boolean {
-  return action.kind === 'promote' || action.kind === 'transfer';
+  return action.kind === 'promote' || action.kind === 'delete' || action.kind === 'transfer';
 }
 
 export default function AdminPage() {
@@ -431,6 +435,148 @@ type MaintenanceActionProgress = {
   jobId: string | null;
   detail: string;
 };
+
+function legacyAgentStateLabel(state: LegacyOpenClawAgentRegistration['state']): string {
+  switch (state) {
+    case 'STALE_BINDLESS': return 'stale';
+    case 'BOUND': return 'bound';
+    case 'DUPLICATE': return 'duplicate';
+    case 'AMBIGUOUS': return 'manual review';
+  }
+}
+
+function LegacyOpenClawAgentsCard() {
+  const [inventory, setInventory] = useState<LegacyOpenClawAgentInventory | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<LegacyOpenClawAgentRegistration | null>(null);
+  const [detaching, setDetaching] = useState(false);
+  const [receipt, setReceipt] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      setInventory(await adminAPI.listLegacyOpenClawAgents());
+      setError(null);
+    } catch (requestError: any) {
+      setError(boundedAdminError(requestError, 'Failed to inspect stale OpenClaw Project agents.'));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const detach = useCallback(async (confirmation: string) => {
+    if (!pending || detaching) return;
+    setDetaching(true);
+    setError(null);
+    try {
+      const result = await adminAPI.detachLegacyOpenClawAgent(
+        pending.agentId,
+        pending.fingerprint,
+        confirmation,
+      );
+      setReceipt(result.receiptId);
+      setPending(null);
+      await refresh();
+    } catch (requestError: any) {
+      setError(boundedAdminError(requestError, 'Failed to detach the stale OpenClaw Project agent.'));
+    } finally {
+      setDetaching(false);
+    }
+  }, [detaching, pending, refresh]);
+
+  const agents = inventory?.agents || [];
+  const staleCount = agents.filter((agent) => agent.detachable).length;
+  return (
+    <section className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <HardDrive size={17} className="text-violet-300" aria-hidden="true" />
+            <h2 className="text-sm font-semibold text-white">Preserved OpenClaw 3.x agents</h2>
+          </div>
+          <p className="mt-2 max-w-3xl text-xs leading-5 text-slate-400">
+            Inspect retired <code>portal-*</code> Project registrations. Detach is offered only for exact, bind-less legacy entries and removes only the OpenClaw config registration. Transcripts, sandbox workspaces, and Project files remain on disk.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => { void refresh(); }}
+          disabled={loading || detaching}
+          className="inline-flex min-h-[44px] shrink-0 items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-100 transition hover:bg-white/10 disabled:opacity-60"
+        >
+          <RefreshCw size={14} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
+          Refresh inventory
+        </button>
+      </div>
+
+      {error && <div role="alert" className="mt-3 rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs text-red-100">{error}</div>}
+      {receipt && (
+        <div role="status" aria-live="polite" className="mt-3 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-xs leading-5 text-emerald-100">
+          Registration detached. No files were deleted. Encrypted rollback receipt: <code className="break-all">{receipt}</code>
+        </div>
+      )}
+      {!loading && agents.length === 0 && !error && (
+        <p className="mt-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-100">
+          No retired portal-* agent registrations are present.
+        </p>
+      )}
+      {agents.length > 0 && (
+        <div className="mt-3 space-y-2">
+          <p className="text-[11px] text-slate-500">{agents.length} preserved registration{agents.length === 1 ? '' : 's'} · {staleCount} safely detachable</p>
+          {agents.map((agent) => (
+            <div key={`${agent.agentId}:${agent.fingerprint}`} className="rounded-lg border border-white/8 bg-black/15 p-3">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <code className="break-all text-xs text-white">{agent.agentId}</code>
+                    <span className={`rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase ${agent.detachable ? 'bg-amber-500/15 text-amber-100' : 'bg-slate-500/15 text-slate-200'}`}>
+                      {legacyAgentStateLabel(agent.state)}
+                    </span>
+                    <span className="rounded-md bg-slate-700/40 px-2 py-0.5 text-[10px] text-slate-300">
+                      {agent.bindCount === null ? 'invalid bind field' : `${agent.bindCount} Project bind${agent.bindCount === 1 ? '' : 's'}`}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-5 text-slate-400">{agent.reason}</p>
+                </div>
+                {agent.detachable && (
+                  <button
+                    type="button"
+                    onClick={() => { setReceipt(null); setError(null); setPending(agent); }}
+                    disabled={detaching}
+                    className="inline-flex min-h-[44px] shrink-0 items-center justify-center rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-100 transition hover:bg-amber-500/20 disabled:opacity-50"
+                  >
+                    Detach registration
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <TypedConfirmationDialog
+        open={Boolean(pending)}
+        title="Detach stale OpenClaw registration"
+        description={pending ? `Detach ${pending.agentId} from OpenClaw configuration without deleting its stored transcript or workspace directories.` : ''}
+        confirmationPhrase={pending ? `DETACH ${pending.agentId}` : undefined}
+        confirmLabel="Detach registration"
+        busyLabel="Detaching…"
+        busy={detaching}
+        tone="warning"
+        onCancel={() => { if (!detaching) setPending(null); }}
+        onConfirm={(confirmation) => { void detach(confirmation); }}
+        details={(
+          <div className="rounded-xl border border-emerald-400/20 bg-emerald-500/5 p-3 text-xs leading-5 text-emerald-100">
+            This does not call OpenClaw&apos;s agent deletion API. Transcript, agent, workspace, and Project directories remain untouched; an encrypted rollback receipt is written before the config update.
+          </div>
+        )}
+      />
+    </section>
+  );
+}
 
 function MaintenanceTab({ owner }: { owner: boolean }) {
   const [status, setStatus] = useState<MaintenanceStatus | null>(null);
@@ -878,6 +1024,8 @@ function MaintenanceTab({ owner }: { owner: boolean }) {
         </div>
       </section>
 
+      {owner && <LegacyOpenClawAgentsCard />}
+
       <section className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
@@ -977,7 +1125,7 @@ function MaintenanceTab({ owner }: { owner: boolean }) {
 }
 
 type PendingUserAction = {
-  kind: 'promote' | 'transfer';
+  kind: 'promote' | 'delete' | 'transfer';
   user: AdminUser;
   confirmationPhrase: string;
   title: string;
@@ -1126,14 +1274,28 @@ function UsersTab({
         setFeedback({ type: 'success', message: `${action.user.username || action.user.email} now has SUB_ADMIN host-operator access.` });
         return;
       }
+      if (lease.action.kind === 'delete') {
+        await adminAPI.deleteUser(lease.action.targetId, lease.action.targetValue || '');
+        sounds.delete();
+        setUsers(prev => prev.filter(user => user.id !== lease.action.targetId));
+        setTotal(prev => Math.max(0, prev - 1));
+        setPendingUserAction(null);
+        setFeedback({
+          type: 'success',
+          message: 'User identity and every attested Portal resource were retired.',
+        });
+        return;
+      }
       await adminAPI.transferOwnership(lease.action.targetId, lease.action.targetValue || '');
       mutationAdmission.finish(lease);
       window.location.reload();
     } catch (err: any) {
       sounds.error();
-      const fallback = action.kind === 'transfer'
-        ? 'Failed to transfer ownership'
-        : 'Failed to update user authority';
+      const fallback = action.kind === 'delete'
+        ? 'Failed to retire user'
+        : action.kind === 'transfer'
+          ? 'Failed to transfer ownership'
+          : 'Failed to update user authority';
       setUserActionDialogError(boundedAdminError(err, fallback));
     } finally {
       mutationAdmission.finish(lease);
@@ -1191,18 +1353,6 @@ function UsersTab({
         >
           <span className="font-semibold">Authorization changes are temporarily unavailable.</span>{' '}
           {authorizationSafety.message} Fixed-generation Project Chat remains available.
-        </div>
-      )}
-
-      {ownerAccess && (
-        <div
-          id="admin-user-deletion-retirement-note"
-          role="note"
-          aria-label="User deletion unavailable"
-          className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs leading-5 text-amber-100"
-        >
-          <span className="font-semibold">User deletion is temporarily unavailable.</span>{' '}
-          Portal 4 identity-aware project and OpenClaw cleanup is retirement-pending. No deletion request is sent.
         </div>
       )}
 
@@ -1362,11 +1512,18 @@ function UsersTab({
                         )}
                         <button
                           type="button"
-                          disabled
-                          aria-describedby="admin-user-deletion-retirement-note"
-                          className="min-h-[44px] min-w-[44px] cursor-not-allowed rounded-lg p-2 text-slate-600 opacity-60"
-                          aria-label={`Delete ${u.email} unavailable`}
-                          title="User deletion unavailable while identity-aware cleanup is retirement-pending"
+                          disabled={actionBusy || !authorizationChangesAllowed}
+                          aria-describedby={!authorizationChangesAllowed ? 'admin-authorization-transition-note' : undefined}
+                          onClick={() => requestUserAction({
+                            kind: 'delete',
+                            user: u,
+                            confirmationPhrase: `DELETE ${u.email.trim().toLowerCase()}`,
+                            title: `Delete ${u.username || u.email}?`,
+                            description: 'Portal closes this account’s authorization first, then retires its exact Project, app, file, agent, mailbox, and provider identities through a crash-resumable journal. This cannot be undone from Admin.',
+                          })}
+                          className="min-h-[44px] min-w-[44px] rounded-lg p-2 text-slate-500 transition hover:bg-red-500/10 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+                          aria-label={`Delete ${u.email}`}
+                          title="Retire and delete user"
                         >
                           <Trash2 size={15} className="mx-auto" />
                         </button>
@@ -1396,8 +1553,14 @@ function UsersTab({
         title={pendingUserAction?.title || 'Confirm user change'}
         description={pendingUserAction?.description || ''}
         confirmationPhrase={pendingUserAction?.confirmationPhrase}
-        confirmLabel={pendingUserAction?.kind === 'transfer' ? 'Transfer ownership' : 'Grant server access'}
-        tone={pendingUserAction?.kind === 'transfer' ? 'danger' : 'warning'}
+        confirmLabel={
+          pendingUserAction?.kind === 'delete'
+            ? 'Delete user'
+            : pendingUserAction?.kind === 'transfer'
+              ? 'Transfer ownership'
+              : 'Grant server access'
+        }
+        tone={pendingUserAction?.kind === 'delete' || pendingUserAction?.kind === 'transfer' ? 'danger' : 'warning'}
         busy={actionBusy}
         busyLabel={pendingUserAction ? adminMutationWorkingLabel({ kind: pendingUserAction.kind, targetId: pendingUserAction.user.id }) : undefined}
         onCancel={cancelPendingUserAction}

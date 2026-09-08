@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Managed Agent Zero runtime contract for Portal 4.0.
+# Managed Agent Zero runtime contract for Portal 4.1.
 #
 # This script deliberately does not enable the Portal provider. It owns the
 # pinned container lifecycle so later setup/streaming work cannot inherit an
 # unpinned, unauthenticated, publicly-bound Docker deployment.
 
-readonly A0_VERSION="2.5"
+readonly A0_VERSION="2.10"
 readonly A0_IMAGE_REPOSITORY="agent0ai/agent-zero"
-readonly A0_AMD64_DIGEST="sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb"
-readonly A0_ARM64_DIGEST="sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c"
+readonly A0_AMD64_DIGEST="sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0"
+readonly A0_ARM64_DIGEST="sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8"
 readonly A0_CONTAINER="bridgesllm-agent-zero"
 readonly A0_ROLLBACK_CONTAINER="bridgesllm-agent-zero-rollback"
 readonly A0_VOLUME="bridgesllm-agent-zero-usr"
@@ -24,26 +24,26 @@ readonly A0_LATEST_BACKUP_FILE="${A0_STATE_DIR}/latest-backup"
 readonly A0_CAPABILITIES_PATH="/api/plugins/_a0_connector/v1/capabilities"
 readonly A0_CONNECTOR_VERSION="0.1.0"
 # Agent Zero's Codex OAuth model catalog calls the OpenAI Codex upstream
-# directly. The v2.5 image does not include the Codex CLI, so its automatic
+# directly. The managed image does not expose a compatible Codex CLI version
 # version probe resolves to an empty string and the upstream rejects model
 # discovery for omitting client_version. Keep this aligned with Portal's tested
 # Codex CLI compatibility pin and converge it into the persistent _oauth plugin
 # configuration without installing another mutable CLI inside the container.
-readonly A0_CODEX_CLIENT_VERSION="0.145.0"
+readonly A0_CODEX_CLIENT_VERSION="0.153.2"
 
-# Official Agent Zero A0 CLI v2.5 host-gateway component. The release has no
+# Official Agent Zero A0 CLI v2.10 host-gateway component. The release has no
 # uploaded binary assets, so Portal installs the official source archive into a
 # dedicated venv only after verifying the archive and both official hashed
 # dependency locks. The provider then verifies this provenance again at runtime.
-readonly A0_CLI_VERSION="2.5"
-readonly A0_CLI_TAG="v2.5"
-readonly A0_CLI_COMMIT="db0e53eba65326ee0792cbb007abfda31114b3f2"
-readonly A0_CLI_ARCHIVE_URL="https://github.com/agent0ai/a0-connector/archive/refs/tags/v2.5.tar.gz"
-readonly A0_CLI_ARCHIVE_SHA256="97cc0396b55e517775a0790d974d4c81c6534926fead01b02d150807180521b6"
-readonly A0_CLI_RUNTIME_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/refs/tags/v2.5/constraints/a0-runtime.txt"
-readonly A0_CLI_RUNTIME_CONSTRAINTS_SHA256="bfe27824fca3f23ffc4a1b06b8b2194d59db48ebaeb05c09ca1e46332075a327"
-readonly A0_CLI_BUILD_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/refs/tags/v2.5/constraints/a0-build.txt"
-readonly A0_CLI_BUILD_CONSTRAINTS_SHA256="7ded8dd591c408dfbe552eeffacb5e75dcddb02cd3072c8cec3653494a37aa19"
+readonly A0_CLI_VERSION="2.10"
+readonly A0_CLI_TAG="v2.10"
+readonly A0_CLI_COMMIT="42fb7fcde3f7f5ca70d3cf02f972f3854e403442"
+readonly A0_CLI_ARCHIVE_URL="https://github.com/agent0ai/a0-connector/archive/refs/tags/v2.10.tar.gz"
+readonly A0_CLI_ARCHIVE_SHA256="403d7b453983caf67a8a0976f9842f23bac4697f7a7756c39870d467793c1c40"
+readonly A0_CLI_RUNTIME_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/refs/tags/v2.10/constraints/a0-runtime.txt"
+readonly A0_CLI_RUNTIME_CONSTRAINTS_SHA256="e19e4907251ef75d7cca3f500a9f0ba476bcb4d20451751e2ebed8c08a3ccc71"
+readonly A0_CLI_BUILD_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/refs/tags/v2.10/constraints/a0-build.txt"
+readonly A0_CLI_BUILD_CONSTRAINTS_SHA256="701698e7490e500313195ea676b2c1925117709541a0ee4913636405a932371d"
 readonly A0_CLI_ROOT="${A0_STATE_DIR}/a0-cli"
 readonly A0_CLI_ROLLBACK_ROOT="${A0_STATE_DIR}/a0-cli-rollback"
 readonly A0_CLI_BINARY="${A0_CLI_ROOT}/bin/a0"
@@ -196,7 +196,7 @@ EOF
 
 download_verified_host_bridge_sources() {
   local work_dir="$1" archive runtime_constraints build_constraints
-  archive="${work_dir}/a0-v2.5.tar.gz"
+  archive="${work_dir}/a0-${A0_CLI_TAG}.tar.gz"
   runtime_constraints="${work_dir}/a0-runtime.txt"
   build_constraints="${work_dir}/a0-build.txt"
 
@@ -208,11 +208,11 @@ download_verified_host_bridge_sources() {
     --proto '=https' --tlsv1.2 "$A0_CLI_BUILD_CONSTRAINTS_URL" --output "$build_constraints"
 
   printf '%s  %s\n' "$A0_CLI_ARCHIVE_SHA256" "$archive" | sha256sum --check --status \
-    || die 'Official A0 CLI v2.5 source archive failed its immutable digest check.'
+    || die "Official A0 CLI ${A0_CLI_TAG} source archive failed its immutable digest check."
   printf '%s  %s\n' "$A0_CLI_RUNTIME_CONSTRAINTS_SHA256" "$runtime_constraints" | sha256sum --check --status \
-    || die 'Official A0 CLI v2.5 runtime lock failed its immutable digest check.'
+    || die "Official A0 CLI ${A0_CLI_TAG} runtime lock failed its immutable digest check."
   printf '%s  %s\n' "$A0_CLI_BUILD_CONSTRAINTS_SHA256" "$build_constraints" | sha256sum --check --status \
-    || die 'Official A0 CLI v2.5 build lock failed its immutable digest check.'
+    || die "Official A0 CLI ${A0_CLI_TAG} build lock failed its immutable digest check."
 }
 
 build_host_bridge_candidate() {
@@ -221,12 +221,12 @@ build_host_bridge_candidate() {
   # the final managed path after moving the previous install to rollback;
   # moving a completed candidate venv would make its `a0` entry point invalid.
   candidate="$A0_CLI_ROOT"
-  archive="${work_dir}/a0-v2.5.tar.gz"
+  archive="${work_dir}/a0-${A0_CLI_TAG}.tar.gz"
   runtime_constraints="${work_dir}/a0-runtime.txt"
   build_constraints="${work_dir}/a0-build.txt"
 
   python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
-    || die 'The official A0 CLI v2.5 host gateway requires Python 3.10 or newer.'
+    || die "The official A0 CLI ${A0_CLI_TAG} host gateway requires Python 3.10 or newer."
   # Boxes installed before python3-venv joined the base package set cannot
   # create a venv with pip (ensurepip is missing). Self-heal instead of dying
   # with an opaque build failure.
@@ -248,7 +248,7 @@ build_host_bridge_candidate() {
     --disable-pip-version-check --no-input --no-deps --no-build-isolation \
     "$archive" >/dev/null
   [[ "$("$candidate/bin/a0" --version 2>/dev/null | tr -d '[:space:]' | sed 's/^v//')" == "$A0_CLI_VERSION" ]] \
-    || die 'Built A0 CLI host-gateway candidate did not report exact version 2.5.'
+    || die "Built A0 CLI host-gateway candidate did not report exact version ${A0_CLI_VERSION}."
   write_host_bridge_provenance "$candidate/PROVENANCE"
   chown -R root:root "$candidate"
   chmod -R go-w "$candidate"
@@ -273,7 +273,7 @@ install_or_update_host_bridge() {
     download_verified_host_bridge_sources "$work_dir"
   ); then
     rm -rf -- "$work_dir"
-    die 'Could not download and verify the pinned official A0 CLI v2.5 host gateway.'
+    die "Could not download and verify the pinned official A0 CLI ${A0_CLI_TAG} host gateway."
   fi
 
   if [[ -e "$A0_CLI_ROLLBACK_ROOT" ]]; then
@@ -315,7 +315,7 @@ install_or_update_host_bridge() {
 status_host_bridge() {
   require_command timeout
   host_bridge_contract_ok \
-    || die 'Managed official A0 CLI v2.5 host gateway is not installed or violates its immutable contract.'
+    || die "Managed official A0 CLI ${A0_CLI_TAG} host gateway is not installed or violates its immutable contract."
   printf 'Official A0 CLI %s host gateway is provenance-verified for supervised HOST_OPERATOR use\n' "$A0_CLI_VERSION"
 }
 
@@ -374,7 +374,7 @@ version = str(value.get("agent_zero_version") or "").strip().removeprefix("v")
 ok = (
     value.get("protocol") == "a0-connector.v1"
     and str(value.get("version") or "").strip().removeprefix("v") == sys.argv[1]
-    and version == "2.5"
+    and version == sys.argv[2]
     and value.get("auth_required") is True
     and value.get("auth") == ["session"]
     and "http" in (value.get("transports") or [])
@@ -386,7 +386,7 @@ ok = (
     and "connector_login" not in (value.get("features") or [])
 )
 raise SystemExit(0 if ok else 1)
-' "$A0_CONNECTOR_VERSION" <<<"$payload"
+' "$A0_CONNECTOR_VERSION" "$A0_VERSION" <<<"$payload"
 }
 
 wait_until_ready() {
@@ -480,7 +480,7 @@ status_runtime() {
   validate_auth_file
   container_exists "$A0_CONTAINER" || die 'Managed Agent Zero container is not installed.'
   container_contract_ok || die 'Managed container exists but violates the pinned runtime contract.'
-  connector_protocol_ready "$A0_PORT" || die 'Agent Zero connector protocol is not ready or outside the tested v2.5 contract.'
+  connector_protocol_ready "$A0_PORT" || die "Agent Zero connector protocol is not ready or outside the tested v${A0_VERSION} contract."
   agent_zero_codex_client_version_ok \
     || die 'Agent Zero Codex OAuth model discovery is missing the tested client-version contract.'
   status_host_bridge
@@ -1058,8 +1058,8 @@ Commands:
   resume                Start the attested primary container if it is stopped
   uninstall             Remove only the attested managed runtime and all data
   credentials-reload    Reload an atomically replaced protected auth file
-  host-bridge-status     Verify the immutable official A0 CLI v2.5 bridge
-  host-bridge-reconcile  Install/update only the immutable A0 CLI v2.5 bridge
+  host-bridge-status     Verify the immutable official A0 CLI v2.10 bridge
+  host-bridge-reconcile  Install/update only the immutable A0 CLI v2.10 bridge
   host-bridge-rollback   Restore the previous A0 CLI host-bridge installation
 
 Before reconcile, create /etc/bridgesllm/agent-zero.env as root with mode 600

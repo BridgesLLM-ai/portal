@@ -1,13 +1,28 @@
+function isCanonicalUntrustedMetadataPrefix(value: string): boolean {
+  let remaining = String(value || '').trim();
+  let matched = false;
+  while (remaining) {
+    const block = remaining.match(/^(?:Conversation info|Sender) \(untrusted metadata\):\s*```json\s*\n?([\s\S]*?)\n?```\s*/i);
+    if (!block) return false;
+    try {
+      const parsed = JSON.parse(block[1]);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    } catch {
+      return false;
+    }
+    matched = true;
+    remaining = remaining.slice(block[0].length).trim();
+  }
+  return matched;
+}
+
 export function stripEnvelope(text: string): string {
   if (!text) return text;
   const timestampPattern = /\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\s+[A-Z]{2,4}\]\s*/;
   const match = text.match(timestampPattern);
   if (match && match.index !== undefined) {
     const beforeTimestamp = text.substring(0, match.index);
-    if (
-      beforeTimestamp.includes('Conversation info (untrusted metadata)') ||
-      beforeTimestamp.includes('Sender (untrusted metadata)')
-    ) {
+    if (isCanonicalUntrustedMetadataPrefix(beforeTimestamp)) {
       return text.substring(match.index + match[0].length).trim();
     }
   }

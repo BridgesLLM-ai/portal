@@ -3,10 +3,20 @@ import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
 import { gatewayRpcCall } from '../utils/openclawGatewayRpc';
+import {
+  assertOpenClawExecutionAdmitted,
+  OpenClawExecutionAdmissionError,
+} from '../services/openClawExecutionAdmission';
 
 const router = Router();
 
 router.use(authenticateToken, requireApproved, requireAdmin);
+
+function sendHostAutomationFence(res: Response, error: unknown): boolean {
+  if (!(error instanceof OpenClawExecutionAdmissionError)) return false;
+  res.status(error.statusCode).json({ error: error.message, code: error.code, retryable: error.retryable });
+  return true;
+}
 
 const AUTOMATIONS_LIST_CACHE_TTL_MS = 5000;
 let automationsListCache: { at: number; jobs: any[] } | null = null;
@@ -450,14 +460,16 @@ router.get('/status', async (_req: Request, res: Response) => {
 });
 
 router.post('/', async (req: Request, res: Response) => {
-  const input = req.body as AutomationInput;
-  const validationError = validateAutomationInput(input, 'create');
-  if (validationError) {
-    res.status(400).json({ error: validationError });
-    return;
-  }
+  try {
+    const input = req.body as AutomationInput;
+    const validationError = validateAutomationInput(input, 'create');
+    if (validationError) {
+      res.status(400).json({ error: validationError });
+      return;
+    }
+    if (input.disabled !== true) await assertOpenClawExecutionAdmitted();
 
-  const { name, message, agent, model, thinking, disabled } = input;
+    const { name, message, agent, model, thinking, disabled } = input;
   const schedule = buildSchedule(input);
   if (!schedule) {
     res.status(400).json({ error: 'invalid schedule' });
@@ -485,16 +497,21 @@ router.post('/', async (req: Request, res: Response) => {
   };
   if (agent) jobCreate.agentId = String(agent).trim();
 
-  const result = await runCron('cron.add', jobCreate, 45000);
+    const result = await runCron('cron.add', jobCreate, 45000);
   if (!result.ok) {
     sendCronFailure(res, result, 'Failed to create cron job');
     return;
   }
   invalidateAutomationsListCache();
-  res.json({ ok: true, result: result.data });
+    res.json({ ok: true, result: result.data });
+  } catch (error) {
+    if (sendHostAutomationFence(res, error)) return;
+    throw error;
+  }
 });
 
 router.put('/:id', async (req: Request, res: Response) => {
+  try {
   const { id } = req.params;
   if (!isValidAutomationId(id)) {
     res.status(400).json({ error: 'invalid automation id' });
@@ -510,7 +527,16 @@ router.put('/:id', async (req: Request, res: Response) => {
   // The Portal editor only understands isolated agentTurn jobs. Refuse to
   // rewrite OpenClaw command/system jobs (or the main session) into a
   // different payload shape when a caller bypasses the disabled UI control.
-  if (!(await requirePortalEditableAgentJob(id, res))) return;
+  const currentJob = await requirePortalEditableAgentJob(id, res);
+  if (!currentJob) return;
+
+  // Editing an enabled job changes a future autonomous host turn. A disabled
+  // job remains inert and can be repaired during maintenance; explicitly
+  // disabling an enabled job is cleanup and must remain available too.
+  const resultingEnabled = input.disabled === undefined
+    ? currentJob.enabled !== false
+    : input.disabled === false;
+  if (resultingEnabled) await assertOpenClawExecutionAdmitted();
 
   const { name, message, agent, model, thinking } = input;
   const patch: Record<string, any> = {};
@@ -525,11 +551,18 @@ router.put('/:id', async (req: Request, res: Response) => {
   }
   if (name !== undefined) patch.name = String(name).trim();
   if (agent !== undefined) patch.agentId = String(agent).trim() || null;
+  if (input.disabled !== undefined) patch.enabled = !input.disabled;
 
   const payload: Record<string, any> = { kind: 'agentTurn' };
   if (message !== undefined) payload.message = String(message).trim();
-  if (model !== undefined) payload.model = model === null || !model.trim() ? null : model.trim();
-  if (thinking !== undefined) payload.thinking = thinking === null || !thinking.trim() || thinking.trim() === 'off' ? null : thinking.trim();
+  if (model !== undefined) {
+    const normalizedModel = typeof model === 'string' ? String(model).trim() : '';
+    payload.model = normalizedModel || null;
+  }
+  if (thinking !== undefined) {
+    const normalizedThinking = typeof thinking === 'string' ? String(thinking).trim() : '';
+    payload.thinking = normalizedThinking && normalizedThinking !== 'off' ? normalizedThinking : null;
+  }
   if (Object.keys(payload).length > 1) patch.payload = payload;
   // Normalize legacy announce delivery on edit: portal jobs have no delivery
   // target, and announce-with-no-target flags successful runs as errors.
@@ -542,11 +575,15 @@ router.put('/:id', async (req: Request, res: Response) => {
 
   const result = await runCron('cron.update', { id, patch }, 45000);
   if (!result.ok) {
-    sendCronFailure(res, result, 'Failed to update cron job');
+    sendCronFailure(res, result as Extract<CronRpcResult, { ok: false }>, 'Failed to update cron job');
     return;
   }
   invalidateAutomationsListCache();
   res.json({ ok: true, result: result.data });
+  } catch (error) {
+    if (sendHostAutomationFence(res, error)) return;
+    throw error;
+  }
 });
 
 router.post('/:id/toggle', async (req: Request, res: Response) => {
@@ -556,23 +593,30 @@ router.post('/:id/toggle', async (req: Request, res: Response) => {
     return;
   }
   const { enabled } = req.body || {};
+  if (typeof enabled !== 'boolean') {
+    res.status(400).json({ error: 'enabled must be a boolean' });
+    return;
+  }
+
+  if (enabled) {
+    try {
+      await assertOpenClawExecutionAdmitted();
+    } catch (error) {
+      if (sendHostAutomationFence(res, error)) return;
+      throw error;
+    }
+  }
+
   const current = await requirePortalEditableAgentJob(id, res);
   if (!current) return;
 
-  let targetEnabled: boolean | null = null;
-  if (typeof enabled === 'boolean') {
-    targetEnabled = enabled;
-  } else {
-    targetEnabled = current.enabled === false;
-  }
-
-  const result = await runCron('cron.update', { id, patch: { enabled: targetEnabled } });
+  const result = await runCron('cron.update', { id, patch: { enabled } });
   if (!result.ok) {
-    sendCronFailure(res, result, `Failed to ${targetEnabled ? 'enable' : 'disable'} cron job`);
+    sendCronFailure(res, result, `Failed to ${enabled ? 'enable' : 'disable'} cron job`);
     return;
   }
   invalidateAutomationsListCache();
-  res.json({ ok: true, enabled: targetEnabled });
+  res.json({ ok: true, enabled });
 });
 
 router.delete('/:id', async (req: Request, res: Response) => {
@@ -597,10 +641,16 @@ router.post('/:id/run', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'invalid automation id' });
     return;
   }
+  try {
+    await assertOpenClawExecutionAdmitted();
+  } catch (error) {
+    if (sendHostAutomationFence(res, error)) return;
+    throw error;
+  }
   if (!(await requirePortalEditableAgentJob(id, res))) return;
   const result = await runCron('cron.run', { id, mode: 'force' }, 20_000, 0);
   if (!result.ok) {
-    sendCronFailure(res, result, 'Failed to run cron job');
+    sendCronFailure(res, result as Extract<CronRpcResult, { ok: false }>, 'Failed to run cron job');
     return;
   }
   invalidateAutomationsListCache();

@@ -180,7 +180,7 @@ describe('BackupsTab mutation admission', () => {
 
     await waitFor(() => expect(screen.getByRole('button', { name: 'Leave Settings' })).toBeEnabled());
     expect(screen.getByRole('button', { name: 'Creating Backup...' })).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByText(/standard backups are authenticated online data snapshots/i)).toBeVisible();
+    expect(screen.getByText(/standard backups temporarily take Portal and agent services offline/i)).toBeVisible();
     expect(mocks.get.mock.calls.some(([url]) => url === '/backups/status')).toBe(true);
     unmount();
   });

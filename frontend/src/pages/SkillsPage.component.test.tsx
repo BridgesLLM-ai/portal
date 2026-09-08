@@ -1,20 +1,10 @@
 // @vitest-environment jsdom
 import '../test/setup';
 import React from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SkillsContent } from './SkillsPage';
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
 
 vi.mock('framer-motion', async () => {
   const ReactModule = await import('react');
@@ -46,7 +36,6 @@ const mocks = vi.hoisted(() => ({
   install: vi.fn(),
   uninstall: vi.fn(),
   installPlugin: vi.fn(),
-  jobStatus: vi.fn(),
 }));
 
 vi.mock('../api/endpoints', () => ({
@@ -61,11 +50,7 @@ vi.mock('../api/endpoints', () => ({
   },
 }));
 
-vi.mock('../api/agentJobs', () => ({
-  agentJobsAPI: { status: mocks.jobStatus },
-}));
-
-describe('Skills and plugins durable mutation flow', () => {
+describe('Skills and plugins read-only maintenance boundary', () => {
   const weatherSkill = {
     name: 'weather',
     description: 'Weather skill',
@@ -75,227 +60,168 @@ describe('Skills and plugins durable mutation flow', () => {
   };
 
   beforeEach(() => {
-    mocks.list.mockReset()
-      .mockResolvedValueOnce({ skills: [weatherSkill] })
-      .mockResolvedValue({ skills: [] });
-    mocks.listPlugins.mockReset().mockResolvedValue({ plugins: [] });
-    mocks.explore.mockReset().mockResolvedValue({ results: [] });
+    mocks.list.mockReset().mockResolvedValue({ skills: [weatherSkill] });
+    mocks.listPlugins.mockReset().mockResolvedValue({
+      plugins: [{
+        id: '@openclaw/example-plugin',
+        name: 'Example Plugin',
+        version: '1.2.3',
+        status: 'loaded',
+        enabled: true,
+      }],
+    });
+    mocks.explore.mockReset().mockResolvedValue({
+      results: [{
+        name: 'Friendly Skill Name',
+        slug: 'canonical-skill',
+        description: 'Marketplace result',
+      }],
+    });
     mocks.search.mockReset().mockResolvedValue({ results: [] });
-    mocks.install.mockReset().mockResolvedValue({ jobId: 'job-install' });
-    mocks.uninstall.mockReset().mockResolvedValue({ jobId: 'job-remove' });
-    mocks.installPlugin.mockReset().mockResolvedValue({ jobId: 'job-plugin' });
-    mocks.jobStatus.mockReset().mockResolvedValue({ status: 'completed' });
+    mocks.install.mockReset();
+    mocks.uninstall.mockReset();
+    mocks.installPlugin.mockReset();
   });
 
-  afterEach(() => vi.useRealTimers());
-
-  it('requires typed confirmation and tracks skill removal as a retained job', async () => {
+  it('preserves inventories while removing every positive extension mutation control', async () => {
     const user = userEvent.setup();
     render(<SkillsContent />);
 
-    await user.click(await screen.findByRole('button', { name: 'Show details for weather' }));
-    await user.click(screen.getByRole('button', { name: 'Uninstall' }));
+    expect(await screen.findByText('Extension changes paused')).toBeVisible();
+    expect(screen.getByText(/Installed skill and plugin status remain available/i)).toBeVisible();
+    expect(screen.getByText(/Marketplace browsing and search require a ClawHub host package that passes Portal execution admission/i)).toBeVisible();
+    expect(await screen.findByText('Weather skill')).toBeVisible();
+    expect(await screen.findByText('Example Plugin')).toBeVisible();
 
-    const confirmButton = screen.getByRole('button', { name: 'Remove extension' });
-    expect(confirmButton).toBeDisabled();
-    await user.type(screen.getByLabelText(/Type .*UNINSTALL SKILL weather.* to continue/i), 'UNINSTALL SKILL weather');
-    expect(confirmButton).toBeEnabled();
-    await user.click(confirmButton);
+    await user.click(screen.getByRole('button', { name: 'Show details for weather' }));
+    expect(screen.getByText('Skill changes are paused until transactional maintenance is available.')).toBeVisible();
 
-    await waitFor(() => {
-      expect(mocks.uninstall).toHaveBeenCalledWith('weather', 'UNINSTALL SKILL weather');
-      expect(mocks.jobStatus).toHaveBeenCalledWith('job-remove', { timeoutMs: 8000 });
-      expect(mocks.list).toHaveBeenLastCalledWith(true);
-    });
-    expect(await screen.findByRole('status')).toHaveTextContent('Removed weather.');
+    expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Uninstall' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Install Plugin' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Plugin package specification')).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: /host extension/i })).not.toBeInTheDocument();
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(mocks.uninstall).not.toHaveBeenCalled();
+    expect(mocks.installPlugin).not.toHaveBeenCalled();
   });
 
-  it('uses the server job contract for plugin installation', async () => {
+  it('keeps ClawHub browse and search read-only without submitting a marketplace install', async () => {
     const user = userEvent.setup();
-    mocks.listPlugins.mockReset()
-      .mockResolvedValueOnce({ plugins: [] })
-      .mockResolvedValue({ plugins: [{ id: '@example/plugin', source: '/opt/node_modules/@example/plugin/index.js' }] });
+    mocks.search.mockResolvedValue({
+      results: [{
+        name: 'Search Result',
+        slug: 'search-result',
+        description: 'Found without changing the host',
+      }],
+    });
     render(<SkillsContent />);
 
-    const spec = 'npm:@example/plugin';
-    await user.type(await screen.findByLabelText('Plugin package specification'), spec);
-    await user.click(screen.getByRole('button', { name: 'Install Plugin' }));
-    await user.type(screen.getByLabelText(/Type .*INSTALL PLUGIN npm:@example\/plugin.* to continue/i), `INSTALL PLUGIN ${spec}`);
-    await user.click(screen.getByRole('button', { name: 'Install extension' }));
+    expect(await screen.findByText('Friendly Skill Name')).toBeVisible();
+    expect(screen.getByLabelText('canonical-skill cannot be installed while extension changes are paused')).toHaveTextContent('Changes paused');
 
-    await waitFor(() => {
-      expect(mocks.installPlugin).toHaveBeenCalledWith(spec, `INSTALL PLUGIN ${spec}`);
-      expect(mocks.jobStatus).toHaveBeenCalledWith('job-plugin', { timeoutMs: 8000 });
-    });
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Install host extension' })).not.toBeInTheDocument());
+    await user.type(screen.getByRole('textbox', { name: 'Search marketplace skills' }), 'search');
+    await user.click(screen.getByRole('button', { name: 'Search marketplace skills' }));
+
+    expect(await screen.findByText('Search Result')).toBeVisible();
+    expect(mocks.search).toHaveBeenCalledWith('search');
+    expect(screen.getByLabelText('search-result cannot be installed while extension changes are paused')).toHaveTextContent('Changes paused');
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(mocks.uninstall).not.toHaveBeenCalled();
+    expect(mocks.installPlugin).not.toHaveBeenCalled();
   });
 
-  it('keeps the usable skill inventory visible when only plugin discovery fails', async () => {
+  it('renders an explicit unavailable marketplace without hiding installed inventories', async () => {
+    const user = userEvent.setup();
+    mocks.explore.mockRejectedValueOnce(Object.assign(
+      new Error('Request failed with status code 503'),
+      {
+        response: {
+          status: 503,
+          data: {
+            state: 'unavailable',
+            reason: 'ClawHub 0.23.1 is recognized for status only and cannot be executed by Portal.',
+            remediation: 'Portal does not currently provide ClawHub package maintenance. Marketplace browsing stays unavailable until a supported Host Tools Maintenance operation ships.',
+            results: [],
+          },
+        },
+      },
+    ));
+    render(<SkillsContent />);
+
+    expect(await screen.findByText('Weather skill')).toBeVisible();
+    expect(await screen.findByText('Example Plugin')).toBeVisible();
+    const unavailable = await screen.findByRole('alert');
+    expect(unavailable).toHaveTextContent('ClawHub marketplace unavailable');
+    expect(unavailable).toHaveTextContent('ClawHub 0.23.1 is recognized for status only');
+    expect(unavailable).toHaveTextContent('Portal does not currently provide ClawHub package maintenance');
+    expect(screen.getByRole('textbox', { name: 'Search marketplace skills' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Search marketplace skills' })).toBeDisabled();
+    expect(screen.queryByText('No marketplace results.')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Marketplace browsing and installed extension status remain available/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Retry marketplace check' }));
+
+    expect(await screen.findByText('Friendly Skill Name')).toBeVisible();
+    expect(screen.queryByText('ClawHub marketplace unavailable')).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Search marketplace skills' })).toBeEnabled();
+    expect(mocks.explore).toHaveBeenCalledTimes(2);
+  });
+
+  it('replaces stale search results with the unavailable state when search admission fails', async () => {
+    const user = userEvent.setup();
+    mocks.search.mockRejectedValueOnce(Object.assign(
+      new Error('Request failed with status code 503'),
+      {
+        response: {
+          status: 503,
+          data: {
+            state: 'unavailable',
+            reason: 'ClawHub package integrity admission failed.',
+            remediation: 'Portal does not currently provide ClawHub package maintenance. Marketplace browsing stays unavailable until a supported Host Tools Maintenance operation ships.',
+            results: [],
+          },
+        },
+      },
+    ));
+    render(<SkillsContent />);
+
+    expect(await screen.findByText('Friendly Skill Name')).toBeVisible();
+    await user.type(screen.getByRole('textbox', { name: 'Search marketplace skills' }), 'blocked');
+    await user.click(screen.getByRole('button', { name: 'Search marketplace skills' }));
+
+    const unavailable = await screen.findByRole('alert');
+    expect(unavailable).toHaveTextContent('ClawHub package integrity admission failed.');
+    expect(screen.queryByText('Friendly Skill Name')).not.toBeInTheDocument();
+    expect(screen.queryByText('0 results for "blocked"')).not.toBeInTheDocument();
+    expect(screen.queryByText('No marketplace results.')).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Search marketplace skills' })).toBeDisabled();
+  });
+
+  it('labels an already-installed marketplace skill without exposing another action', async () => {
+    mocks.explore.mockResolvedValue({
+      results: [{ name: 'Weather', slug: 'weather', description: 'Already present' }],
+    });
+    render(<SkillsContent />);
+
+    const installedStatus = await screen.findByLabelText('weather is installed');
+    expect(installedStatus).toHaveTextContent('Installed');
+    expect(installedStatus.tagName).toBe('SPAN');
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(mocks.uninstall).not.toHaveBeenCalled();
+    expect(mocks.installPlugin).not.toHaveBeenCalled();
+  });
+
+  it('keeps usable skill browsing visible when only plugin discovery fails', async () => {
     mocks.listPlugins.mockRejectedValueOnce(new Error('plugin registry unavailable'));
     render(<SkillsContent />);
 
     expect(await screen.findByText('Weather skill')).toBeVisible();
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Some extension sources are unavailable: plugin registry unavailable',
-    );
+    expect(screen.getByText(/Some extension sources are unavailable: plugin registry unavailable/i)).toBeVisible();
     expect(screen.queryByText('Failed to load extensions')).not.toBeInTheDocument();
-  });
-
-  it('installs the canonical marketplace slug instead of a display title', async () => {
-    const user = userEvent.setup();
-    mocks.list.mockReset()
-      .mockResolvedValueOnce({ skills: [] })
-      .mockResolvedValue({ skills: [{ ...weatherSkill, name: 'canonical-skill' }] });
-    mocks.explore.mockResolvedValue({
-      results: [{ name: 'Friendly Skill Name', slug: 'canonical-skill', description: 'Marketplace result' }],
-    });
-    mocks.install.mockResolvedValue({ jobId: 'job-install' });
-    render(<SkillsContent />);
-
-    await user.click(await screen.findByRole('button', { name: 'Install' }));
-    await user.type(
-      screen.getByLabelText(/Type .*INSTALL SKILL canonical-skill.* to continue/i),
-      'INSTALL SKILL canonical-skill',
-    );
-    await user.click(screen.getByRole('button', { name: 'Install extension' }));
-
-    await waitFor(() => {
-      expect(mocks.install).toHaveBeenCalledWith('canonical-skill', 'INSTALL SKILL canonical-skill');
-    });
-  });
-
-  it('admits only one immutable host mutation across same-frame confirmations and targets', async () => {
-    const user = userEvent.setup();
-    const installGate = deferred<{ jobId: string }>();
-    mocks.list.mockResolvedValue({ skills: [] });
-    mocks.explore.mockResolvedValue({
-      results: [{ name: 'Other Skill', slug: 'other-skill', description: 'Second mutation target' }],
-    });
-    mocks.installPlugin.mockReturnValueOnce(installGate.promise);
-    mocks.listPlugins.mockReset()
-      .mockResolvedValueOnce({ plugins: [] })
-      .mockResolvedValue({ plugins: [{ id: '@example/guarded-plugin' }] });
-    render(<SkillsContent />);
-
-    const marketplaceInstall = await screen.findByRole('button', { name: 'Install' });
-    const spec = 'npm:@example/guarded-plugin';
-    await user.type(screen.getByLabelText('Plugin package specification'), spec);
-    await user.click(screen.getByRole('button', { name: 'Install Plugin' }));
-    await user.type(
-      screen.getByLabelText(/Type .*INSTALL PLUGIN npm:@example\/guarded-plugin.* to continue/i),
-      `INSTALL PLUGIN ${spec}`,
-    );
-    const confirm = screen.getByRole('button', { name: 'Install extension' });
-
-    act(() => {
-      confirm.click();
-      confirm.click();
-      marketplaceInstall.click();
-    });
-
-    expect(mocks.installPlugin).toHaveBeenCalledTimes(1);
-    expect(mocks.installPlugin).toHaveBeenCalledWith(spec, `INSTALL PLUGIN ${spec}`);
+    await waitFor(() => expect(mocks.list).toHaveBeenCalledWith(false));
     expect(mocks.install).not.toHaveBeenCalled();
-    expect(await screen.findByRole('button', { name: 'Installing extension…' })).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByRole('button', { name: 'Close confirmation dialog' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
-
-    await user.keyboard('{Escape}');
-    expect(screen.getByRole('dialog', { name: 'Install host extension' })).toBeVisible();
-    expect(window.dispatchEvent(new Event('beforeunload', { cancelable: true }))).toBe(false);
-    const pushState = vi.spyOn(window.history, 'pushState');
-    act(() => {
-      window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
-    });
-    expect(pushState).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole('dialog', { name: 'Install host extension' })).toBeVisible();
-    pushState.mockRestore();
-
-    installGate.resolve({ jobId: 'job-plugin' });
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Install host extension' })).not.toBeInTheDocument());
-  });
-
-  it('retains a failed mutation on its initiating dialog and permits an explicit retry', async () => {
-    const user = userEvent.setup();
-    mocks.uninstall
-      .mockRejectedValueOnce(new Error('host extension service refused the request'))
-      .mockResolvedValueOnce({ jobId: 'job-remove' });
-    render(<SkillsContent />);
-
-    await user.click(await screen.findByRole('button', { name: 'Show details for weather' }));
-    await user.click(screen.getByRole('button', { name: 'Uninstall' }));
-    await user.type(screen.getByLabelText(/Type .*UNINSTALL SKILL weather.* to continue/i), 'UNINSTALL SKILL weather');
-    await user.click(screen.getByRole('button', { name: 'Remove extension' }));
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('host extension service refused the request');
-    expect(screen.getByRole('dialog', { name: 'Remove host extension' })).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Remove extension' }));
-
-    await waitFor(() => expect(mocks.uninstall).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove host extension' })).not.toBeInTheDocument());
-  });
-
-  it('bounds an unresolved status RPC and retries verification without starting a second job', async () => {
-    const user = userEvent.setup();
-    mocks.jobStatus.mockReturnValue(new Promise(() => undefined));
-    render(<SkillsContent />);
-
-    await user.click(await screen.findByRole('button', { name: 'Show details for weather' }));
-    await user.click(screen.getByRole('button', { name: 'Uninstall' }));
-    await user.type(screen.getByLabelText(/Type .*UNINSTALL SKILL weather.* to continue/i), 'UNINSTALL SKILL weather');
-
-    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
-    fireEvent.click(screen.getByRole('button', { name: 'Remove extension' }));
-    await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
-    vi.useRealTimers();
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('did not answer a bounded status request');
-    expect(screen.getByRole('dialog', { name: 'Remove host extension' })).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Retry verification' })).toBeEnabled();
-    expect(mocks.uninstall).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps stale inventory in the dialog and retries only fresh proof for the retained job', async () => {
-    const user = userEvent.setup();
-    mocks.list.mockReset()
-      .mockResolvedValueOnce({ skills: [weatherSkill] })
-      .mockResolvedValueOnce({ skills: [weatherSkill] })
-      .mockResolvedValue({ skills: [] });
-    render(<SkillsContent />);
-
-    await user.click(await screen.findByRole('button', { name: 'Show details for weather' }));
-    await user.click(screen.getByRole('button', { name: 'Uninstall' }));
-    await user.type(screen.getByLabelText(/Type .*UNINSTALL SKILL weather.* to continue/i), 'UNINSTALL SKILL weather');
-    await user.click(screen.getByRole('button', { name: 'Remove extension' }));
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('does not prove weather was removed');
-    expect(screen.getByRole('dialog', { name: 'Remove host extension' })).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Retry verification' }));
-
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove host extension' })).not.toBeInTheDocument());
-    expect(mocks.uninstall).toHaveBeenCalledTimes(1);
-    expect(mocks.jobStatus).toHaveBeenCalledTimes(1);
-    expect(mocks.list).toHaveBeenCalledTimes(3);
-  });
-
-  it('fails closed when fresh inventory rejects and preserves a safe readback retry', async () => {
-    const user = userEvent.setup();
-    mocks.list.mockReset()
-      .mockResolvedValueOnce({ skills: [weatherSkill] })
-      .mockRejectedValueOnce(new Error('fresh skill inventory unavailable'))
-      .mockResolvedValue({ skills: [] });
-    render(<SkillsContent />);
-
-    await user.click(await screen.findByRole('button', { name: 'Show details for weather' }));
-    await user.click(screen.getByRole('button', { name: 'Uninstall' }));
-    await user.type(screen.getByLabelText(/Type .*UNINSTALL SKILL weather.* to continue/i), 'UNINSTALL SKILL weather');
-    await user.click(screen.getByRole('button', { name: 'Remove extension' }));
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('fresh skill inventory unavailable');
-    expect(screen.getByRole('button', { name: 'Retry verification' })).toBeEnabled();
-    await user.click(screen.getByRole('button', { name: 'Retry verification' }));
-
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove host extension' })).not.toBeInTheDocument());
-    expect(mocks.uninstall).toHaveBeenCalledTimes(1);
+    expect(mocks.uninstall).not.toHaveBeenCalled();
+    expect(mocks.installPlugin).not.toHaveBeenCalled();
   });
 });

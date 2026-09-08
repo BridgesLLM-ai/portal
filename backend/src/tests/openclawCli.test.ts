@@ -18,9 +18,11 @@ describe('openclawCli helpers', () => {
     expect(canonicalizeProviderModelId('google-antigravity', 'gemini-3-flash')).toBe('google-antigravity/gemini-3.5-flash');
     expect(canonicalizeProviderModelId('openrouter', 'anthropic/claude-sonnet-4-6')).toBe('openrouter/anthropic/claude-sonnet-4-6');
     expect(canonicalizeProviderModelId('anthropic', 'claude-cli/claude-sonnet-4-6')).toBe('anthropic/claude-sonnet-4-6');
+    expect(canonicalizeProviderModelId('anthropic', 'claude-cli/claude-fable-5.1')).toBe('anthropic/claude-fable-5-1');
     expect(canonicalizeProviderModelId('openai-codex', 'gpt-5.5')).toBe('openai/gpt-5.5');
     expect(canonicalizeProviderModelId('openai-codex', 'openai/gpt-5.5')).toBe('openai/gpt-5.5');
     expect(canonicalizeProviderModelId('openai-codex', 'openai-codex/gpt-5.5')).toBe('openai/gpt-5.5');
+    expect(canonicalizeProviderModelId('openai-codex', 'gpt-6-astra')).toBe('openai/gpt-6-astra');
     expect(canonicalizeProviderModelId('google-gemini-cli', 'google/gemini-2.5-pro')).toBe('google/gemini-2.5-pro');
     expect(canonicalizeProviderModelId('google-antigravity', 'google-gemini-cli/gemini-3-flash')).toBe('google-antigravity/gemini-3.5-flash');
   });
@@ -46,6 +48,15 @@ describe('openclawCli helpers', () => {
     expect(normalizeOpenClawConfigModelId('gpt-5.6')).toBe('openai/gpt-5.6-sol');
     expect(normalizeOpenClawConfigModelId('openai/gpt-5.6-terra')).toBe('openai/gpt-5.6-terra');
     expect(normalizeOpenClawConfigModelId('openai/gpt-4.1')).toBe('openai/gpt-4.1');
+  });
+
+  test('canonicalizes only exact Astra aliases without inventing a generic GPT-6 alias', () => {
+    expect(normalizeOpenClawConfigModelId('gpt-6-astra')).toBe('openai/gpt-6-astra');
+    expect(normalizeOpenClawConfigModelId('openai/gpt-6-astra')).toBe('openai/gpt-6-astra');
+    expect(normalizeOpenClawConfigModelId('codex/gpt-6-astra')).toBe('openai/gpt-6-astra');
+    expect(normalizeOpenClawConfigModelId('openai-codex/gpt-6-astra')).toBe('openai/gpt-6-astra');
+    expect(normalizeOpenClawConfigModelId('gpt-6')).toBe('gpt-6');
+    expect(normalizeOpenClawConfigModelId('openai/gpt-6')).toBe('openai/gpt-6');
   });
 
   test('usesClaudeCliAuthProfile detects OpenClaw 2026.6 config auth metadata', () => {
@@ -86,6 +97,7 @@ describe('openclawCli helpers', () => {
         },
       },
       agents: {
+        entries: { main: {} },
         defaults: {
           model: {
             primary: 'anthropic/claude-sonnet-4-6',
@@ -132,6 +144,10 @@ describe('openclawCli helpers', () => {
   });
 
   test('modelForOpenClawSessionPatch maps OpenAI-family Codex aliases to current runtime ids', () => {
+    expect(modelForOpenClawSessionPatch(
+      { agentRuntime: { id: 'codex' }, modelProvider: 'openai', model: 'gpt-6-astra' },
+      'openai-codex/gpt-6-astra',
+    )).toBe('openai/gpt-6-astra');
     expect(modelForOpenClawSessionPatch(
       { agentRuntime: { id: 'codex' }, modelProvider: 'openai', model: 'gpt-5.5' },
       'openai/gpt-5.5',
@@ -204,6 +220,7 @@ describe('openclawCli model declaration self-heal', () => {
         order: { anthropic: ['anthropic:claude-cli'] },
       },
       agents: {
+        entries: { main: {} },
         defaults: {
           model: { primary: 'anthropic/claude-sonnet-4-6', fallbacks: [] },
           models: { 'anthropic/claude-sonnet-4-6': { agentRuntime: { id: 'claude-cli' } } },
@@ -223,6 +240,165 @@ describe('openclawCli model declaration self-heal', () => {
     expect(mod.ensureOpenClawModelDeclaration('anthropic/claude-fable-5')).toEqual({ changed: false, model: 'anthropic/claude-fable-5' });
   });
 
+  test('ensureOpenClawModelDeclaration pins Astra only for the 9.1 Codex OAuth profile', () => {
+    const home = setupHome({
+      auth: {
+        order: { openai: ['openai:default'] },
+      },
+      agents: {
+        entries: { main: {} },
+        defaults: {
+          model: { primary: 'openai/gpt-5.5', fallbacks: [] },
+          models: {},
+        },
+      },
+    });
+    const authProfilePath = path.join(home, 'agents', 'main', 'agent', 'auth-profiles.json');
+    fs.mkdirSync(path.dirname(authProfilePath), { recursive: true });
+    fs.writeFileSync(authProfilePath, JSON.stringify({
+      version: 1,
+      profiles: { 'openai:default': { provider: 'openai', type: 'oauth' } },
+    }, null, 2));
+    const mod = loadModule();
+
+    expect(mod.ensureOpenClawModelDeclaration('openai-codex/gpt-6-astra')).toEqual({
+      changed: true,
+      model: 'openai/gpt-6-astra',
+    });
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.defaults.models['openai/gpt-6-astra']).toEqual({
+      agentRuntime: { id: 'codex' },
+    });
+    expect(written.models.providers.openai.models).toContainEqual({ id: 'gpt-6-astra', name: 'GPT-6 Astra', api: 'openai-chatgpt-responses' });
+    expect(written.agents.defaults.model).toEqual({ primary: 'openai/gpt-5.5', fallbacks: [] });
+  });
+
+  test('ensureOpenClawModelDeclaration does not admit Astra on a retained 7.1 Codex route', () => {
+    const home = setupHome({
+      auth: { order: { openai: ['openai:codex-cli'] } },
+      agents: {
+        list: [{ id: 'main', default: true }],
+        defaults: {
+          model: { primary: 'openai/gpt-5.5', fallbacks: [] },
+          models: {},
+        },
+      },
+    });
+    const mod = loadModule();
+
+    expect(mod.ensureOpenClawModelDeclaration('gpt-6-astra')).toEqual({
+      changed: false,
+      model: 'openai/gpt-6-astra',
+    });
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.defaults.models['openai/gpt-6-astra']).toBeUndefined();
+    expect(written.agents.defaults.model).toEqual({ primary: 'openai/gpt-5.5', fallbacks: [] });
+  });
+
+  test('ensureOpenClawModelDeclaration does not treat a 9.1 catalog row as Codex entitlement', () => {
+    const home = setupHome({
+      auth: {
+        profiles: { 'openai:api': { provider: 'openai', mode: 'api_key' } },
+        order: { openai: ['openai:api'] },
+      },
+      agents: {
+        entries: { main: {} },
+        defaults: {
+          model: { primary: 'openai/gpt-5.5', fallbacks: [] },
+          models: {},
+        },
+      },
+    });
+    const mod = loadModule();
+
+    expect(mod.ensureOpenClawModelDeclaration('openai/gpt-6-astra')).toEqual({
+      changed: false,
+      model: 'openai/gpt-6-astra',
+    });
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.defaults.models['openai/gpt-6-astra']).toBeUndefined();
+  });
+
+  test('ensureOpenClawModelDeclaration leaves API-key OpenAI models on ordinary routing', () => {
+    const home = setupHome({
+      auth: {
+        profiles: { 'openai:api': { provider: 'openai', mode: 'api_key' } },
+        order: { openai: ['openai:api'] },
+      },
+      agents: {
+        defaults: {
+          model: { primary: 'openai/gpt-4.1', fallbacks: [] },
+          models: {
+            'openai/gpt-4.1': { agentRuntime: { id: 'openclaw' } },
+          },
+        },
+      },
+    });
+    const mod = loadModule();
+
+    expect(mod.ensureOpenClawModelDeclaration('openai/gpt-4.1-mini')).toEqual({
+      changed: true,
+      model: 'openai/gpt-4.1-mini',
+    });
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.defaults.models['openai/gpt-4.1-mini']).toEqual({});
+    expect(written.agents.defaults.models['openai/gpt-4.1']).toEqual({ agentRuntime: { id: 'openclaw' } });
+  });
+
+  test('ensureOpenClawModelDeclaration does not infer Codex from an ambiguous mixed OpenAI profile set', () => {
+    const home = setupHome({
+      auth: {
+        profiles: {
+          'openai:api': { provider: 'openai', mode: 'api_key' },
+          'openai:default': { provider: 'openai', mode: 'oauth' },
+        },
+        order: { openai: ['openai:api', 'openai:default'] },
+      },
+      agents: {
+        defaults: {
+          model: { primary: 'openai/gpt-4.1', fallbacks: [] },
+          models: {},
+        },
+      },
+    });
+    const mod = loadModule();
+
+    expect(mod.ensureOpenClawModelDeclaration('openai/gpt-4.1-mini')).toEqual({
+      changed: true,
+      model: 'openai/gpt-4.1-mini',
+    });
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.defaults.models['openai/gpt-4.1-mini']).toEqual({});
+  });
+
+  test('ensureOpenClawModelDeclaration honors an explicit empty OpenAI auth order over stale OAuth profiles', () => {
+    const home = setupHome({
+      auth: {
+        order: { openai: [] },
+      },
+      agents: {
+        defaults: {
+          model: { primary: 'openai/gpt-4.1', fallbacks: [] },
+          models: {},
+        },
+      },
+    });
+    const authProfilePath = path.join(home, 'agents', 'main', 'agent', 'auth-profiles.json');
+    fs.mkdirSync(path.dirname(authProfilePath), { recursive: true });
+    fs.writeFileSync(authProfilePath, JSON.stringify({
+      version: 1,
+      profiles: { 'openai:default': { provider: 'openai', type: 'oauth' } },
+    }, null, 2));
+    const mod = loadModule();
+
+    expect(mod.ensureOpenClawModelDeclaration('openai/gpt-4.1-mini')).toEqual({
+      changed: true,
+      model: 'openai/gpt-4.1-mini',
+    });
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.defaults.models['openai/gpt-4.1-mini']).toEqual({});
+  });
+
   test('repairClaudeSubscriptionConfig seeds recommended models for existing subscription auth', () => {
     const home = setupHome({
       auth: {
@@ -232,6 +408,7 @@ describe('openclawCli model declaration self-heal', () => {
         order: { anthropic: ['anthropic:claude-cli'], openai: ['openai:codex-cli'] },
       },
       agents: {
+        entries: { main: {} },
         defaults: {
           model: { primary: 'anthropic/claude-sonnet-4-6', fallbacks: ['openai/gpt-5.5'] },
           models: {
@@ -248,16 +425,107 @@ describe('openclawCli model declaration self-heal', () => {
 
     const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
     const models = written.agents.defaults.models;
+    expect(models['anthropic/claude-fable-5-1']).toEqual({ agentRuntime: { id: 'claude-cli' } });
     expect(models['anthropic/claude-fable-5']).toEqual({ agentRuntime: { id: 'claude-cli' } });
     // Sonnet 5 must NOT be seeded: its claude-cli thinking profile is off-only
     // and a sonnet-5 default poisons thinking patches portal-wide.
     expect(models['anthropic/claude-sonnet-5']).toBeUndefined();
-    expect(models['openai/gpt-5.6-sol']).toEqual({});
-    expect(models['openai/gpt-5.6-terra']).toEqual({});
-    expect(models['openai/gpt-5.6-luna']).toEqual({});
-    expect(models['openai/gpt-5.5']).toEqual({});
+    expect(models['openai/gpt-6-astra']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(models['openai/gpt-5.6-sol']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(models['openai/gpt-5.6-terra']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(models['openai/gpt-5.6-luna']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(models['openai/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
+    // A newly declared model is selectable, not an implicit routing migration.
+    expect(written.agents.defaults.model.primary).toBe('anthropic/claude-sonnet-4-6');
     // Seeding must not grow the fallback chain.
     expect(written.agents.defaults.model.fallbacks).toEqual(['openai/gpt-5.5']);
+  });
+
+  test('repairClaudeSubscriptionConfig moves only legacy Codex refs onto explicit Codex runtime policy', () => {
+    const home = setupHome({
+      auth: {
+        profiles: { 'openai:api': { provider: 'openai', mode: 'api_key' } },
+        order: { openai: ['openai:api'] },
+      },
+      agents: {
+        entries: { main: {} },
+        defaults: {
+          model: { primary: 'openai/gpt-4.1', fallbacks: ['codex/gpt-5.4'] },
+          models: {
+            'openai/gpt-4.1': {},
+            'codex/gpt-5.4': {
+              alias: 'Legacy subscription route',
+              agentRuntime: { id: 'codex-cli', fallback: 'none' },
+            },
+          },
+        },
+      },
+    });
+    const mod = loadModule();
+
+    expect(mod.repairClaudeSubscriptionConfig().changed).toBe(true);
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.defaults.models['openai/gpt-4.1']).toEqual({});
+    expect(written.agents.defaults.models['openai/gpt-5.4']).toEqual({
+      alias: 'Legacy subscription route',
+      agentRuntime: { id: 'codex', fallback: 'none' },
+    });
+    expect(written.agents.defaults.models['codex/gpt-5.4']).toBeUndefined();
+    expect(written.agents.defaults.model.fallbacks).toEqual(['openai/gpt-5.4']);
+  });
+
+  test('retained 2026.7.1 config removes 9.1-only Codex runtime pins', () => {
+    const home = setupHome({
+      auth: {
+        order: { openai: ['openai:codex-cli'] },
+      },
+      agents: {
+        list: [{ id: 'main', default: true }],
+        defaults: {
+          model: { primary: 'openai/gpt-5.5', fallbacks: [] },
+          models: {
+            'openai/gpt-5.5': { agentRuntime: { id: 'codex' } },
+          },
+        },
+      },
+    });
+    const mod = loadModule();
+
+    expect(mod.repairClaudeSubscriptionConfig().changed).toBe(true);
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.list).toEqual([{ id: 'main', default: true }]);
+    expect(written.agents.defaults.models['openai/gpt-5.5']).toEqual({});
+    expect(written.agents.defaults.models['openai/gpt-5.6-sol']).toEqual({});
+    expect(written.agents.defaults.models['openai/gpt-6-astra']).toBeUndefined();
+  });
+
+  test('retained 7.1 Claude subscription never seeds or admits Fable 5.1', () => {
+    const home = setupHome({
+      auth: { profiles: { 'anthropic:claude-cli': { provider: 'claude-cli', mode: 'oauth' } }, order: { anthropic: ['anthropic:claude-cli'] } },
+      agents: { list: [{ id: 'main' }], defaults: { model: { primary: 'anthropic/claude-fable-5' }, models: {} } },
+    });
+    const mod = loadModule();
+    mod.repairClaudeSubscriptionConfig();
+    expect(mod.ensureOpenClawModelDeclaration('anthropic/claude-fable-5-1').changed).toBe(false);
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.agents.defaults.models['anthropic/claude-fable-5-1']).toBeUndefined();
+    expect(written.agents.defaults.models['anthropic/claude-fable-5']).toBeDefined();
+  });
+
+  test('Codex declaration refuses a missing or mixed roster contract', () => {
+    for (const agents of [
+      { defaults: { models: {} } },
+      { list: [{ id: 'main' }], entries: { main: {} }, defaults: { models: {} } },
+    ]) {
+      setupHome({
+        auth: { order: { openai: ['openai:codex-cli'] } },
+        agents,
+      });
+      const mod = loadModule();
+      expect(() => mod.ensureOpenClawModelDeclaration('openai/gpt-5.5')).toThrow(/roster contract/i);
+      if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+      tempDir = null;
+    }
   });
 
   test('repairClaudeSubscriptionConfig demotes a claude-cli-unusable sonnet-5 default and strips its declarations', () => {

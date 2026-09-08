@@ -704,6 +704,38 @@ export function createSystemdHostRunBoundary(
 
     sameBoot,
 
+    async attestActive(
+      identity: SystemdHostRunScopeIdentity,
+    ): Promise<SystemdHostRunUnitSnapshot> {
+      assertIdentity(identity);
+      await assertSameBoot(identity.bootId);
+
+      const assertActiveSnapshot = (snapshot: SystemdHostRunUnitSnapshot): void => {
+        if (!snapshot.installed) {
+          throw identityMismatch('Host agent systemd scope is unavailable for attachment');
+        }
+        assertSnapshotMatchesIdentity(snapshot, identity);
+        if (snapshot.activeState !== 'active' || snapshot.subState !== 'running') {
+          throw identityMismatch('Host agent systemd scope is not active for attachment');
+        }
+      };
+
+      const before = await inspect(identity.scopeUnit);
+      assertActiveSnapshot(before);
+      const cgroup = await readCgroupState(identity.controlGroup);
+      if (cgroup.populated !== 1) {
+        throw identityMismatch('Host agent systemd cgroup is not populated for attachment');
+      }
+
+      // Re-read both boot and unit identity after cgroup inspection. A single
+      // in-memory or systemctl snapshot is not sufficient attachment authority
+      // when settlement can race browser reconnect.
+      await assertSameBoot(identity.bootId);
+      const after = await inspect(identity.scopeUnit);
+      assertActiveSnapshot(after);
+      return Object.freeze(after);
+    },
+
     async launch(
       input: SystemdHostRunScopeLaunchInput,
     ): Promise<LaunchedSystemdHostRunScope> {

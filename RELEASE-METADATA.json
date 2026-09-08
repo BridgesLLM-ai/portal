@@ -1,11 +1,13 @@
 {
   "schema": 1,
-  "version": "4.0.19",
-  "releasedAt": "2026-08-12",
-  "releaseClass": "hotfix",
+  "version": "5.0.0",
+  "releasedAt": "2026-09-08",
+  "releaseClass": "feature",
   "highlights": [
-    "The Dashboard update button works again. On 4.0.17 and 4.0.18 it failed immediately at step 1 and could never install anything, including this fix.",
-    "Hosts on 4.0.17 or 4.0.18 must update once from the command line to reach 4.0.19; the in-portal updater works normally from then on.",
-    "The signed release evidence, key fingerprint, and exact installer bytes are still authenticated before any downloaded installer executes."
+    "Keep project work conversational with live tools, a persistent workspace, and questions beside the composer.",
+    "Inspect file sizes, modification times and added/removed lines, preview media, and open exact files in Projects.",
+    "Back up projects and settings, with optional agent context as reference material.",
+    "Preserve conversations across ordinary restarts and support OpenClaw 9.2 isolated project identities.",
+    "Keep Portal updates separate from AI runtime maintenance, with verified installation and recovery paths."
   ]
 }

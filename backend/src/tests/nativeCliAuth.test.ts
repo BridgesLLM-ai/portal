@@ -40,13 +40,14 @@ describe('Grok Build native credential classification', () => {
     expect(classifyGrokAuthStore('not-an-object', now)).toBe('unknown');
   });
 
-  test('reports the update-suppressed native login command', () => {
+  test('recognizes a Grok API credential on the qualified host lane', () => {
     const previous = process.env.XAI_API_KEY;
     process.env.XAI_API_KEY = 'redacted-test-value';
     try {
       expect(getNativeCliAuthStatus('GROK')).toMatchObject({
         status: 'authenticated',
-        loginCommand: 'grok --no-auto-update login --device-auth',
+        requiresSeparateLogin: true,
+        message: expect.stringContaining('server-side xAI credential'),
       });
     } finally {
       if (previous === undefined) delete process.env.XAI_API_KEY;
@@ -103,10 +104,9 @@ describe('native CLI custom credential homes', () => {
     }), { mode: 0o600 });
     process.env.CODEX_HOME = codexHome;
     try {
-      expect(getNativeCliAuthStatus('CODEX')).toMatchObject({
-        status: 'authenticated',
-        loginCommand: 'codex login',
-      });
+      const status = getNativeCliAuthStatus('CODEX');
+      expect(status).toMatchObject({ status: 'authenticated' });
+      expect(status.loginCommand).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = previous;

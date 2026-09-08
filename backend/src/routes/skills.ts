@@ -1,20 +1,35 @@
-import { Router, Request, Response } from 'express';
+import { Router, type Application, type Request, type Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
+import { requireSetupComplete } from '../middleware/requireSetupComplete';
 import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { AgentJobRequestError, startAgentJob } from '../services/agentJobs';
+import { readPortalOperatingGuide } from '../services/portalOperatingGuide';
 import {
-  confirmationForPluginInstall,
-  confirmationForSkillInstall,
-  confirmationForSkillUninstall,
-  isTypedConfirmationMatch,
-} from '../utils/privilegedConfirmation';
+  attestNativeHostCli,
+  NativeHostCliAdmissionError,
+} from '../services/nativeHostCliAdmission';
 
 const router = Router();
-const EXTENSION_MUTATION_TIMEOUT = '15m';
+
+export const HOST_EXTENSION_MUTATION_UNAVAILABLE = Object.freeze({
+  status: 503,
+  code: 'HOST_EXTENSION_MUTATION_UNAVAILABLE',
+  error: 'Portal-managed skill and OpenClaw plugin changes are unavailable until the transactional extension manager ships.',
+  retryable: false,
+  remediation: 'Use read-only extension status in Portal. Extension changes remain unavailable until provenance-bound, crash-recoverable transactions ship.',
+} as const);
+
+export const CLAWHUB_MARKETPLACE_UNAVAILABLE = Object.freeze({
+  status: 503,
+  code: 'CLAWHUB_MARKETPLACE_UNAVAILABLE',
+  state: 'unavailable',
+  available: false,
+  retryable: false,
+  remediation: 'Portal does not currently provide ClawHub package maintenance. Marketplace browsing stays unavailable until a supported Host Tools Maintenance operation ships.',
+} as const);
 
 router.use(authenticateToken, requireApproved, requireAdmin);
 
@@ -23,15 +38,28 @@ router.use(authenticateToken, requireApproved, requireAdmin);
 // CLI calls run async so multi-second skills/plugins listings cannot block the
 // event loop (the old spawnSync version stalled every other request while a
 // listing ran).
-function runCli(command: string, args: string[], timeout = 15000): Promise<{ stdout: string; stderr: string }> {
+function runCli(
+  command: string,
+  args: string[],
+  timeout = 15000,
+  environmentOverrides: NodeJS.ProcessEnv = {},
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     execFile(command, args, {
       timeout,
       encoding: 'utf-8',
       maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      shell: false,
+      env: {
+        ...process.env,
+        ...environmentOverrides,
+        FORCE_COLOR: '0',
+        NO_COLOR: '1',
+      },
     }, (error, stdout, stderr) => {
-      if (error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (error && ['ENOENT', 'EACCES', 'ELOOP', 'ENOTDIR'].includes(
+        String((error as NodeJS.ErrnoException).code || ''),
+      )) {
         reject(error);
         return;
       }
@@ -54,19 +82,35 @@ async function runOpenClaw(args: string[], timeout = 15000): Promise<string> {
 }
 
 async function runClawHub(args: string[], timeout = 30000): Promise<string> {
-  const { stdout, stderr } = await runCli('clawhub', args, timeout);
-  return stdout || stderr;
+  const identity = await attestNativeHostCli('clawhub', '/usr/bin/clawhub');
+  try {
+    const { stdout, stderr } = await runCli(
+      '/usr/bin/clawhub',
+      args,
+      timeout,
+      { PATH: '/usr/bin:/bin' },
+    );
+    return stdout || stderr;
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error
+      ? String((error as { code?: unknown }).code || '')
+      : '';
+    if (['ENOENT', 'EACCES', 'ELOOP', 'ENOTDIR'].includes(code)) {
+      throw new NativeHostCliAdmissionError(
+        'RACE_DETECTED',
+        'The admitted ClawHub executable changed before Portal could run it.',
+        identity.version,
+        error,
+      );
+    }
+    throw error;
+  }
 }
 
-// Skills/plugins listings shell out to the OpenClaw CLI and take seconds; the
-// results only change when something is installed, so serve a short cache and
-// bust it on any mutation.
+// Skills/plugins listings shell out to the OpenClaw CLI and take seconds, so
+// serve a short cache. Portal mutation routes are fail-closed below.
 const SKILLS_CACHE_TTL_MS = 60_000;
 const skillsListCache = new Map<string, { at: number; payload: any }>();
-
-function bustSkillsCache(): void {
-  skillsListCache.clear();
-}
 
 async function cachedListing<T>(key: string, loader: () => Promise<T>, force = false): Promise<T> {
   const cached = skillsListCache.get(key);
@@ -74,10 +118,6 @@ async function cachedListing<T>(key: string, loader: () => Promise<T>, force = f
   const payload = await loader();
   skillsListCache.set(key, { at: Date.now(), payload });
   return payload;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function resolveOpenClawWorkspace(): string {
@@ -108,53 +148,27 @@ function isSafeSkillName(value: string): boolean {
     || /^@[a-z0-9][a-z0-9_-]{0,62}\/[a-z0-9][a-z0-9_-]{0,62}$/i.test(value);
 }
 
-function isSafeMutationValue(value: unknown, maxLength: number): value is string {
-  return typeof value === 'string'
-    && value.trim().length > 0
-    && value.trim().length <= maxLength
-    && !/[\u0000-\u001f\u007f]/.test(value);
+function isClawHubAdmissionError(error: unknown): error is NativeHostCliAdmissionError {
+  return error instanceof NativeHostCliAdmissionError;
 }
 
-async function startSkillsMutation(input: {
-  userId: string;
-  actorAuthorizationVersion: number;
-  toolId: string;
-  title: string;
-  executable: string;
-  args: string[];
-}) {
-  bustSkillsCache();
-  const operation = [input.executable, ...input.args].map(shellQuote).join(' ');
-  const script = ['set -euo pipefail', operation].join('\n');
-  const serializedCommand = [
-    'flock',
-    '--nonblock',
-    '/run/bridgesllm-agent-mutation.lock',
-    '--',
-    'timeout',
-    '--foreground',
-    '--kill-after=30s',
-    EXTENSION_MUTATION_TIMEOUT,
-    '/bin/bash',
-    '-lc',
-    script,
-  ];
-  return startAgentJob({
-    userId: input.userId,
-    actorAuthorizationVersion: input.actorAuthorizationVersion,
-    toolId: input.toolId,
-    title: input.title,
-    command: serializedCommand.map(shellQuote).join(' '),
-    cwd: resolveOpenClawWorkspace(),
+function sendClawHubAdmissionUnavailable(
+  res: Response,
+  error: unknown,
+  includeResults = false,
+): boolean {
+  if (!isClawHubAdmissionError(error)) return false;
+  res.status(CLAWHUB_MARKETPLACE_UNAVAILABLE.status).json({
+    code: CLAWHUB_MARKETPLACE_UNAVAILABLE.code,
+    state: CLAWHUB_MARKETPLACE_UNAVAILABLE.state,
+    available: CLAWHUB_MARKETPLACE_UNAVAILABLE.available,
+    retryable: CLAWHUB_MARKETPLACE_UNAVAILABLE.retryable,
+    reason: error.message,
+    reasonCode: error.code,
+    remediation: CLAWHUB_MARKETPLACE_UNAVAILABLE.remediation,
+    ...(includeResults ? { results: [] } : {}),
   });
-}
-
-function mutationErrorStatus(error: unknown): number {
-  return error instanceof AgentJobRequestError ? error.statusCode : 500;
-}
-
-function isMissingClawHubError(err: unknown): boolean {
-  return err instanceof Error && ((err as NodeJS.ErrnoException).code === 'ENOENT' || /spawnSync clawhub ENOENT/.test(err.message));
+  return true;
 }
 
 /** Extract the first JSON object or array from a string (handles ANSI/banner preamble). */
@@ -248,14 +262,59 @@ async function enrichMarketplaceResults(results: any[], inspectLimit = 8) {
         ...enriched,
         score: normalized.score ?? enriched.score,
       };
-    } catch {
+    } catch (error) {
+      if (isClawHubAdmissionError(error)) throw error;
       return normalized;
     }
   });
   return enrichedItems.filter(item => item.name);
 }
 
+export function sendHostExtensionMutationUnavailable(_req: Request, res: Response): void {
+  res.status(HOST_EXTENSION_MUTATION_UNAVAILABLE.status).json({
+    code: HOST_EXTENSION_MUTATION_UNAVAILABLE.code,
+    error: HOST_EXTENSION_MUTATION_UNAVAILABLE.error,
+    retryable: HOST_EXTENSION_MUTATION_UNAVAILABLE.retryable,
+    remediation: HOST_EXTENSION_MUTATION_UNAVAILABLE.remediation,
+  });
+}
+
+const HOST_EXTENSION_MUTATION_PATHS = Object.freeze([
+  '/api/skills/install',
+  '/api/skills/uninstall',
+  '/api/skills/plugins/install',
+] as const);
+
+/**
+ * Mount the disabled mutation surface before any request-body parser. This is
+ * intentionally separate from the read-only Skills router below: malformed or
+ * oversized caller data must not be parsed, logged, or echoed before the
+ * request has crossed the normal setup/auth/approval/admin boundary.
+ */
+export function mountHostExtensionMutationFence(app: Application): void {
+  for (const routePath of HOST_EXTENSION_MUTATION_PATHS) {
+    app.post(
+      routePath,
+      requireSetupComplete,
+      authenticateToken,
+      requireApproved,
+      requireAdmin,
+      sendHostExtensionMutationUnavailable,
+    );
+  }
+}
+
 /* ─── Routes ─────────────────────────────────────────────── */
+
+/** Read-only, portable skill from the signed Portal bundle. Harness-neutral. */
+router.get('/portal-guide', (_req: Request, res: Response) => {
+  try {
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(readPortalOperatingGuide());
+  } catch {
+    res.status(503).json({ error: 'The packaged Portal guide is unavailable. Check the installed release before using it.' });
+  }
+});
 
 /** GET /api/skills — list all locally available skills (openclaw skills list --json) */
 router.get('/', async (req: Request, res: Response) => {
@@ -298,10 +357,7 @@ router.get('/search', async (req: Request, res: Response) => {
     const results = await enrichMarketplaceResults(parseSearchOutput(raw), Math.min(limit, 10));
     res.json({ available: true, results });
   } catch (err) {
-    if (isMissingClawHubError(err)) {
-      res.json({ available: false, results: [], error: 'ClawHub CLI is not installed on this server.' });
-      return;
-    }
+    if (sendClawHubAdmissionUnavailable(res, err, true)) return;
     const message = err instanceof Error ? err.message : 'Marketplace search failed';
     res.status(500).json({ error: message });
   }
@@ -325,7 +381,8 @@ router.get('/explore', async (req: Request, res: Response) => {
       if (Array.isArray(items) && items.length > 0) {
         results = items;
       }
-    } catch {
+    } catch (error) {
+      if (isClawHubAdmissionError(error)) throw error;
       // explore failed (not logged in, etc.) — fall through to search fallback
     }
 
@@ -337,7 +394,8 @@ router.get('/explore', async (req: Request, res: Response) => {
         try {
           const raw = await runClawHub(['search', q, '--limit', '10']);
           return parseSearchOutput(raw);
-        } catch {
+        } catch (error) {
+          if (isClawHubAdmissionError(error)) throw error;
           return [];
         }
       });
@@ -355,6 +413,7 @@ router.get('/explore', async (req: Request, res: Response) => {
 
     res.json({ results: await enrichMarketplaceResults(results, Math.min(limit, 10)) });
   } catch (err) {
+    if (sendClawHubAdmissionUnavailable(res, err, true)) return;
     const message = err instanceof Error ? err.message : 'Marketplace explore failed';
     res.status(500).json({ error: message });
   }
@@ -373,83 +432,17 @@ router.get('/inspect/:slug', async (req: Request, res: Response) => {
     const parsed = parseJson(raw);
     res.json(parsed);
   } catch (err) {
+    if (sendClawHubAdmissionUnavailable(res, err)) return;
     const message = err instanceof Error ? err.message : 'Inspect failed';
     res.status(500).json({ error: message });
   }
 });
 
-/** POST /api/skills/install — install a skill from clawhub marketplace */
-router.post('/install', async (req: Request, res: Response) => {
-  try {
-    const { name } = req.body;
-    if (!isSafeMutationValue(name, 128)) {
-      res.status(400).json({ error: 'Skill name required' });
-      return;
-    }
+/** POST /api/skills/install — disabled until the transactional skill adapter ships. */
+router.post('/install', sendHostExtensionMutationUnavailable);
 
-    // Allow ClawHub's unscoped and @scope/name skill identifiers only.
-    if (!isSafeSkillName(name)) {
-      res.status(400).json({ error: 'Invalid skill name' });
-      return;
-    }
-    const confirmationPhrase = confirmationForSkillInstall(name);
-    if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
-      res.status(400).json({ error: `Type ${confirmationPhrase} to confirm this host-wide skill installation.`, confirmationPhrase });
-      return;
-    }
-    const job = await startSkillsMutation({
-      userId: req.user!.userId,
-      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
-      toolId: `_skill:install:${name}`,
-      title: `Install skill ${name}`,
-      executable: 'clawhub',
-      args: ['--no-input', '--workdir', resolveOpenClawWorkspace(), 'install', name],
-    });
-    res.status(202).json({ ok: true, jobId: job.id, room: `job:${job.id}` });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Install failed';
-    res.status(mutationErrorStatus(err)).json({ error: message });
-  }
-});
-
-/** POST /api/skills/uninstall — uninstall a clawhub skill */
-router.post('/uninstall', async (req: Request, res: Response) => {
-  try {
-    const { name } = req.body;
-    if (!isSafeMutationValue(name, 128)) {
-      res.status(400).json({ error: 'Skill name required' });
-      return;
-    }
-
-    if (!isSafeSkillName(name)) {
-      res.status(400).json({ error: 'Invalid skill name' });
-      return;
-    }
-    if (!readManagedSkillNames().has(name)) {
-      res.status(409).json({
-        error: 'Only skills tracked as ClawHub-managed can be removed here. Bundled and workspace skills are protected.',
-      });
-      return;
-    }
-    const confirmationPhrase = confirmationForSkillUninstall(name);
-    if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
-      res.status(400).json({ error: `Type ${confirmationPhrase} to confirm this host-wide skill removal.`, confirmationPhrase });
-      return;
-    }
-    const job = await startSkillsMutation({
-      userId: req.user!.userId,
-      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
-      toolId: `_skill:uninstall:${name}`,
-      title: `Uninstall skill ${name}`,
-      executable: 'clawhub',
-      args: ['--no-input', '--workdir', resolveOpenClawWorkspace(), 'uninstall', '--yes', name],
-    });
-    res.status(202).json({ ok: true, jobId: job.id, room: `job:${job.id}` });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Uninstall failed';
-    res.status(mutationErrorStatus(err)).json({ error: message });
-  }
-});
+/** POST /api/skills/uninstall — disabled until the transactional skill adapter ships. */
+router.post('/uninstall', sendHostExtensionMutationUnavailable);
 
 /** GET /api/skills/plugins — list installed plugins (openclaw plugins list --json) */
 router.get('/plugins', async (req: Request, res: Response) => {
@@ -468,36 +461,7 @@ router.get('/plugins', async (req: Request, res: Response) => {
   }
 });
 
-/** POST /api/skills/plugins/install — install a plugin spec (openclaw plugins install) */
-router.post('/plugins/install', async (req: Request, res: Response) => {
-  try {
-    const { spec } = req.body;
-    if (!isSafeMutationValue(spec, 512)) {
-      res.status(400).json({ error: 'Plugin spec required' });
-      return;
-    }
-    if (spec.trim().startsWith('-')) {
-      res.status(400).json({ error: 'Plugin specifications cannot begin with an option prefix' });
-      return;
-    }
-    const confirmationPhrase = confirmationForPluginInstall(spec);
-    if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
-      res.status(400).json({ error: `Type ${confirmationPhrase} to confirm this host-wide plugin installation.`, confirmationPhrase });
-      return;
-    }
-    const job = await startSkillsMutation({
-      userId: req.user!.userId,
-      actorAuthorizationVersion: Number(req.user!.authorizationVersion ?? 1),
-      toolId: '_plugin:install',
-      title: `Install OpenClaw plugin ${spec}`,
-      executable: 'openclaw',
-      args: ['--no-color', 'plugins', 'install', spec],
-    });
-    res.status(202).json({ ok: true, jobId: job.id, room: `job:${job.id}` });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Plugin install failed';
-    res.status(mutationErrorStatus(err)).json({ error: message });
-  }
-});
+/** POST /api/skills/plugins/install — disabled until the transactional plugin adapter ships. */
+router.post('/plugins/install', sendHostExtensionMutationUnavailable);
 
 export default router;

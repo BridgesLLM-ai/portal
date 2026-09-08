@@ -9,12 +9,18 @@ import { hashPassword } from '../utils/password';
 import { AppError } from '../middleware/errorHandler';
 import { sendEmail } from '../services/mailService';
 import { sendPasswordResetEmail } from '../services/notificationService';
-import { provisionUserMailbox, deleteUserMailbox, deleteUserMailboxByUserId, getProvisionedMailboxes } from '../services/userMailService';
+import { isMailProvisioningConfigured, provisionUserMailbox, deleteUserMailbox, deleteUserMailboxByUserId, getProvisionedMailboxes } from '../services/userMailService';
 import { enqueueMailboxReconciliation, drainMailboxReconciliation } from '../services/mailboxReconciliation';
 import {
-  ADMIN_USER_DELETION_RETIREMENT_CODE,
-  ADMIN_USER_DELETION_RETIREMENT_MESSAGE,
+  getAdminUserDeletionReadiness,
 } from '../services/adminUserDeletion.service';
+import {
+  emailDigestForAdminUserRetirement,
+  getAdminUserRetirementStartupRecoverySummary,
+  publicAdminUserRetirementFailure,
+  readAdminUserRetirement,
+  retireAdminUserAccount,
+} from '../services/adminUserRetirementRuntime';
 import path from 'path';
 import {
   AVATARS_DIR,
@@ -29,7 +35,8 @@ import {
 } from '../services/imageAssets';
 import { ACTIVE_STATUS, isOwnerRole } from '../utils/authz';
 import { buildPortalUrl } from '../utils/portalUrl';
-import { configureDomainAndHttps, getCodingToolsStatus, getPublicIp, installCodingTool, updateEnvFile } from '../utils/serverSetup';
+import { configureDomainAndHttps, getCodingToolsStatus, getPublicIp, updateEnvFile } from '../utils/serverSetup';
+import { sendHostNativeRuntimeMutationUnavailable } from './agent-tools';
 import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
 import dns from 'dns/promises';
 import fs from 'fs';
@@ -38,8 +45,8 @@ import { execSync } from 'child_process';
 import { recycleStalwartContainerPreservingData } from '../services/stalwartRecovery';
 import { ensureBackupLayout, getConfiguredBackupRoot, writeBackupConfiguration } from '../services/backup.service';
 import {
+  confirmationForUserDeletion,
   confirmationForMailboxDeletion,
-  confirmationForToolInstall,
   isTypedConfirmationMatch,
 } from '../utils/privilegedConfirmation';
 import {
@@ -96,12 +103,68 @@ import {
   invalidateEmailBrandingCache,
   isEmailBrandingSettingKey,
 } from '../templates/baseTemplate';
+import {
+  detachLegacyOpenClawAgentRegistration,
+  LegacyOpenClawAgentDetachError,
+  listLegacyOpenClawAgentRegistrations,
+} from '../services/legacyOpenClawAgentDetach';
+import {
+  acquireGlobalWorkspaceAuthorizationMutationLease,
+  settleWorkspaceAuthorizationRequest,
+} from '../services/workspaceAuthorizationBarrier';
 
 const router = Router();
 
 // All admin routes require authentication + admin role
 router.use(authenticateToken);
 router.use(requireAdmin);
+
+// Owner-only recovery for stale Portal 3.x OpenClaw registrations. This path
+// changes only agents.list; it deliberately never calls agents.delete and
+// never removes transcript, agent, sandbox-workspace, or Project directories.
+router.get('/legacy-openclaw-agents', requireOwner, async (_req: Request, res: Response) => {
+  try {
+    const result = await listLegacyOpenClawAgentRegistrations();
+    res.json({
+      ...result,
+      preservation: {
+        transcripts: true,
+        workspaces: true,
+        projectFiles: true,
+      },
+    });
+  } catch (error: any) {
+    if (error instanceof LegacyOpenClawAgentDetachError) {
+      res.status(error.status).json({ error: error.message, code: error.code, retryable: error.status >= 500 });
+      return;
+    }
+    console.error('[legacy-agent-detach] inventory failed:', error);
+    res.status(500).json({ error: 'Failed to inspect stale OpenClaw Project agents' });
+  }
+});
+
+router.post('/legacy-openclaw-agents/:agentId/detach', requireOwner, async (req: Request, res: Response) => {
+  try {
+    const result = await detachLegacyOpenClawAgentRegistration({
+      actorUserId: req.user!.userId,
+      agentId: req.params.agentId,
+      expectedFingerprint: typeof req.body?.expectedFingerprint === 'string'
+        ? req.body.expectedFingerprint.trim()
+        : '',
+      confirmation: typeof req.body?.confirmation === 'string' ? req.body.confirmation : '',
+      ipAddress: req.ip || null,
+      userAgent: req.get('user-agent') || null,
+    });
+    res.json(result);
+  } catch (error: any) {
+    if (error instanceof LegacyOpenClawAgentDetachError) {
+      res.status(error.status).json({ error: error.message, code: error.code, retryable: error.status >= 500 });
+      return;
+    }
+    console.error('[legacy-agent-detach] detach failed:', error);
+    res.status(500).json({ error: 'Failed to detach stale OpenClaw Project agent' });
+  }
+});
 
 async function getSandboxDefaultEnabled(): Promise<boolean> {
   const raw = await prisma.systemSetting.findUnique({ where: { key: 'security.sandboxDefaultEnabled' } });
@@ -448,6 +511,9 @@ router.patch('/users/:id', requireOwner, async (req: Request, res: Response, nex
       normalizedData.isActive = data.accountStatus === ACTIVE_STATUS;
     }
 
+    // The coordinator closes the global fence. Drop this request's default
+    // admission at the handoff so it cannot wait on its own response.
+    settleWorkspaceAuthorizationRequest(req);
     const committed = await projectAuthorizationTransitionCoordinator.updateUserAuthorization({
       initiatedByUserId: req.user!.userId,
       targetUserId: id,
@@ -461,12 +527,17 @@ router.patch('/users/:id', requireOwner, async (req: Request, res: Response, nex
       normalizedData.username
       && normalizedData.username !== existing.username
       && getPortalFeatureCapabilities().mail.available
+      && isMailProvisioningConfigured()
     ) {
+      let releaseMailboxAdmission: (() => void) | null = null;
       try {
+        releaseMailboxAdmission = acquireGlobalWorkspaceAuthorizationMutationLease();
         await provisionUserMailbox(String(normalizedData.username), id, { makePrimary: true });
         console.log(`[admin] Provisioned mailbox for user ${String(normalizedData.username)}`);
       } catch (err) {
         console.error('[admin] Mailbox provisioning failed (non-fatal):', err);
+      } finally {
+        releaseMailboxAdmission?.();
       }
     }
 
@@ -504,6 +575,45 @@ router.patch('/users/:id', requireOwner, async (req: Request, res: Response, nex
 });
 
 /**
+ * GET /api/admin/users/:id/deletion-readiness
+ * Machine-readable capability and target protection contract.
+ */
+router.get(
+  '/users/:id/deletion-readiness',
+  requireOwner,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const [target, retirement] = await Promise.all([
+        prisma.user.findUnique({
+          where: { id: req.params.id },
+          select: { id: true, role: true },
+        }),
+        readAdminUserRetirement(req.params.id),
+      ]);
+      if (!target) throw new AppError(404, 'User not found');
+      res.json({
+        ...getAdminUserDeletionReadiness(),
+        startupRecovery: getAdminUserRetirementStartupRecoverySummary(),
+        target: {
+          id: target.id,
+          selfProtected: target.id === req.user!.userId,
+          ownerProtected: isOwnerRole(target.role),
+        },
+        retirement: retirement ? {
+          id: retirement.id,
+          phase: retirement.phase,
+          status: retirement.status,
+          lastErrorCode: retirement.lastErrorCode,
+          manuallyRetryable: retirement.status === 'BLOCKED',
+        } : null,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
  * DELETE /api/admin/users/:id
  * Delete a user (cannot delete self)
  */
@@ -515,20 +625,90 @@ router.delete('/users/:id', requireOwner, async (req: Request, res: Response, ne
       throw new AppError(400, 'Cannot delete your own account');
     }
 
-    const existing = await prisma.user.findUnique({ where: { id } });
-    if (!existing) throw new AppError(404, 'User not found');
-    if (isOwnerRole(existing.role)) throw new AppError(400, 'Cannot delete owner account');
+    const durable = await readAdminUserRetirement(id);
+    let targetEmailDigest: string | undefined;
+    let targetEmail: string | null = null;
+    if (!durable) {
+      const existing = await prisma.user.findUnique({
+        where: { id },
+        select: { id: true, email: true, role: true },
+      });
+      if (!existing) throw new AppError(404, 'User not found');
+      if (isOwnerRole(existing.role)) throw new AppError(400, 'Cannot delete owner account');
+      const confirmationPhrase = confirmationForUserDeletion(existing.email);
+      if (!isTypedConfirmationMatch(confirmationPhrase, req.body?.confirmation)) {
+        throw new AppError(
+          400,
+          `Type ${confirmationPhrase} to permanently delete this user and their Portal data.`,
+        );
+      }
+      targetEmail = existing.email;
+      targetEmailDigest = emailDigestForAdminUserRetirement(existing.email);
+    }
 
-    // Portal 4 project state is keyed by both workspace owner and actor. Until
-    // identity-aware retirement can remove every UUID-derived local/external
-    // artifact, cascading a User is unsafe even when they own no Project.
-    // The ProjectIdentity ownership FK is also RESTRICTed as defense in depth.
-    res.status(409).json({
-      error: ADMIN_USER_DELETION_RETIREMENT_MESSAGE,
-      code: ADMIN_USER_DELETION_RETIREMENT_CODE,
-      retryable: false,
+    settleWorkspaceAuthorizationRequest(req);
+    const retirement = await retireAdminUserAccount({
+      targetUserId: id,
+      requestedByUserId: req.user!.userId,
+      expectedTargetEmailDigest: targetEmailDigest,
+    });
+    if (durable?.status !== 'COMPLETE') {
+      await prisma.activityLog.create({
+        data: {
+          userId: req.user!.userId,
+          action: 'USER_RETIRED',
+          resource: 'admin',
+          resourceId: id,
+          severity: 'WARNING',
+          translatedMessage: targetEmail
+            ? `Owner retired user ${targetEmail}`
+            : `Owner completed durable user retirement ${id}`,
+          metadata: {
+            retiredUserId: id,
+            retirementId: retirement.id,
+            authorizationTransitionId: retirement.authorizationTransitionId,
+          },
+        },
+      }).catch(() => {});
+    }
+    res.json({
+      success: true,
+      retirement: {
+        id: retirement.id,
+        status: retirement.status,
+        completed: retirement.status === 'COMPLETE',
+        idempotent: durable?.status === 'COMPLETE',
+      },
     });
   } catch (error) {
+    const publicFailure = publicAdminUserRetirementFailure(error);
+    if (publicFailure) {
+      res.status(publicFailure.statusCode).json(publicFailure.body);
+      return;
+    }
+    if (error instanceof ProjectAuthorizationTransitionError) {
+      res.status(error.statusCode).json({
+        error: error.message,
+        code: error.code,
+        retryable: error.retryable,
+        ...(error.code === 'ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE'
+          && Array.isArray((error as any).blockers)
+          ? {
+              blockers: (error as any).blockers,
+              blockersTruncated: (error as any).truncated === true,
+            }
+          : {}),
+      });
+      return;
+    }
+    if (isTransactionConflictError(error)) {
+      res.status(409).json({
+        error: 'User retirement conflicted with another transaction. Retry the exact request.',
+        code: 'ADMIN_USER_RETIREMENT_TRANSACTION_CONFLICT',
+        retryable: true,
+      });
+      return;
+    }
     next(error);
   }
 });
@@ -540,6 +720,7 @@ router.delete('/users/:id', requireOwner, async (req: Request, res: Response, ne
 router.post('/users/:id/transfer-ownership', requireOwner, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const targetId = req.params.id;
+    settleWorkspaceAuthorizationRequest(req);
     const transfer = await projectAuthorizationTransitionCoordinator.transferOwnership({
       sourceOwnerUserId: req.user!.userId,
       targetUserId: targetId,
@@ -913,7 +1094,7 @@ router.post('/registration-requests/:id/approve', requireOwner, async (req: Requ
       });
     }
 
-    if (mailCapability.available) {
+    if (mailCapability.available && isMailProvisioningConfigured()) {
       try {
         await provisionUserMailbox(approvedUsername, approvedUserId, { makePrimary: true });
       } catch (err) {
@@ -1356,7 +1537,7 @@ router.post('/settings/test-email', requireOwner, async (req: Request, res: Resp
 
 
 const uploadImage = createImageUpload('image');
-const AGENT_PROVIDERS = ['OPENCLAW', 'CLAUDE_CODE', 'CODEX', 'GROK', 'AGENT_ZERO', 'GEMINI', 'OLLAMA'] as const;
+const AGENT_PROVIDERS = ['OPENCLAW', 'CLAUDE_CODE', 'CODEX', 'GROK', 'AGENT_ZERO', 'GEMINI', 'OLLAMA', 'HERMES', 'OPENCODE'] as const;
 
 function sendImageUploadFailure(res: Response, error: unknown): boolean {
   const failure = classifyImageUploadFailure(error);
@@ -1642,23 +1823,7 @@ router.get('/coding-tools-status', requireOwner, async (_req: Request, res: Resp
   }
 });
 
-router.post('/install-coding-tool', requireOwner, async (req: Request, res: Response) => {
-  try {
-    const { toolId, confirmation } = z.object({
-      toolId: z.string().min(1),
-      confirmation: z.string().max(200).optional(),
-    }).parse(req.body);
-    const confirmationPhrase = confirmationForToolInstall(toolId);
-    if (!isTypedConfirmationMatch(confirmationPhrase, confirmation)) {
-      throw new AppError(400, `Type ${confirmationPhrase} to install this host-level coding tool.`);
-    }
-    installCodingTool(toolId);
-    res.json({ success: true, toolId });
-  } catch (err: any) {
-    const status = err instanceof AppError ? err.statusCode : 500;
-    res.status(status).json({ error: err?.message ? `Failed to install: ${String(err.message).substring(0, 200)}` : 'Installation failed' });
-  }
-});
+router.post('/install-coding-tool', requireOwner, sendHostNativeRuntimeMutationUnavailable);
 
 router.get('/domain-status', requireOwner, async (_req: Request, res: Response, next: NextFunction) => {
   try {

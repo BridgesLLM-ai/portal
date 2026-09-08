@@ -29,6 +29,8 @@ export interface TerminalToolCapability {
   label: string;
   category: string;
   installed: boolean;
+  /** Explicit on current backends; optional so an updater handoff fails closed. */
+  executionAvailable?: boolean;
   executable: string | null;
   version: string | null;
   helpCommand: string;
@@ -63,6 +65,16 @@ export interface TerminalCapabilities {
   };
 }
 
+const MANAGED_PACKAGE_ONLY_TOOL_IDS = new Set(['codex', 'claude', 'claude-code']);
+
+export function isTerminalToolExecutionAvailable(tool: TerminalToolCapability): boolean {
+  return tool.executionAvailable !== false && !MANAGED_PACKAGE_ONLY_TOOL_IDS.has(tool.id);
+}
+
+export function isManagedPackageOnlyTerminalTool(tool: TerminalToolCapability): boolean {
+  return MANAGED_PACKAGE_ONLY_TOOL_IDS.has(tool.id);
+}
+
 export function buildTerminalCatalog(capabilities: TerminalCapabilities | null): TerminalSuggestion[] {
   if (!capabilities) return [];
   const catalog = new Map<string, TerminalSuggestion>();
@@ -81,15 +93,17 @@ export function buildTerminalCatalog(capabilities: TerminalCapabilities | null):
     });
   }
   for (const tool of capabilities.tools) {
-    if (!tool.installed) continue;
-    catalog.set(tool.helpCommand, {
-      command: tool.helpCommand,
-      description: `${tool.label} help from the installed CLI`,
-      category: tool.category,
-      source: 'tool-help',
-      risk: 'read_only',
-      confirmation: 'none',
-    });
+    if (!tool.installed || !isTerminalToolExecutionAvailable(tool)) continue;
+    if (tool.helpCommand.trim()) {
+      catalog.set(tool.helpCommand, {
+        command: tool.helpCommand,
+        description: `${tool.label} help from the installed CLI`,
+        category: tool.category,
+        source: 'tool-help',
+        risk: 'read_only',
+        confirmation: 'none',
+      });
+    }
     for (const command of tool.commands) {
       catalog.set(command, {
         command,

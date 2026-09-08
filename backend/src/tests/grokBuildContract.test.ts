@@ -20,24 +20,19 @@ describe('Grok Build operator tooling contract', () => {
     expect(source).toMatch(/grokAcpProtocolVersion:\s*result\.protocolVersion/);
   });
 
-  test('uses only the checksum-verified Portal lifecycle helper for installation', () => {
+  test('keeps Portal Grok tooling status-only until native-artifact transactions ship', () => {
     const adapter = getToolAdapter('grok-build');
     expect(adapter).toBeDefined();
-    expect(adapter?.install).toEqual([
-      expect.objectContaining({
-        command: 'bash /opt/bridgesllm/portal/installer/grok-build-runtime.sh converge',
-      }),
-    ]);
-    expect(SAFE_INSTALL_ALLOWLIST).toContain(adapter?.install[0]?.command);
+    expect(adapter?.install).toEqual([]);
+    expect([...SAFE_INSTALL_ALLOWLIST].some((command) => command.includes('grok-build-runtime.sh'))).toBe(false);
     expect([...SAFE_INSTALL_ALLOWLIST].some((command) => command.includes('x.ai/cli/install.sh'))).toBe(false);
   });
 
-  test('suppresses self-updates in every Portal-owned Grok command', () => {
+  test('keeps maintenance detection non-executing while explaining supported host chats', () => {
     const adapter = getToolAdapter('grok-build');
-    const commands = [adapter?.detect?.command, ...(adapter?.commands.map((entry) => entry.command) || [])];
-    expect(commands.length).toBeGreaterThan(1);
-    for (const command of commands) {
-      expect(command).toMatch(/^GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update(?:\s|$)/);
-    }
+    expect(adapter?.detect?.command).toBe("test -x /usr/local/bin/grok && printf '%s\\n' detected");
+    expect(adapter?.commands).toEqual([]);
+    expect(adapter?.description).toContain('Host Operator chats are supported');
+    expect(adapter?.description).toContain('Project Sandbox execution is not available');
   });
 });

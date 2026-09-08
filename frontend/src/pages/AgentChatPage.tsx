@@ -4,6 +4,7 @@
  */
 import { lazy, Suspense } from 'react';
 import { Loader2 } from 'lucide-react';
+import TaskConversationNavigation from '../components/chat/TaskConversationNavigation';
 import { ChatStateProvider } from '../contexts/ChatStateProvider';
 
 const LazyChatInterface = lazy(() => import('../components/chat/ChatInterface'));
@@ -11,7 +12,9 @@ const LazyChatInterface = lazy(() => import('../components/chat/ChatInterface'))
 export default function AgentChatPage() {
   return (
     <ChatStateProvider>
-      <div className="h-full">
+      <div className="flex h-full min-h-0 flex-col">
+        <TaskConversationNavigation />
+        <div className="min-h-0 flex-1">
         <Suspense
           fallback={(
             <div className="h-full flex items-center justify-center bg-[#080B20]">
@@ -24,6 +27,7 @@ export default function AgentChatPage() {
         >
           <LazyChatInterface />
         </Suspense>
+        </div>
       </div>
     </ChatStateProvider>
   );

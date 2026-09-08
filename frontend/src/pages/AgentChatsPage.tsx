@@ -20,23 +20,26 @@ import { agentJobsAPI, AgentJob, TranscriptEntry } from '../api/agentJobs';
 /* ─── Constants ─────────────────────────────────────────────────────────── */
 
 const ADAPTER_DEFAULTS: Record<string, string> = {
-  codex: 'codex exec "Say hello briefly and exit."',
-  'claude-code': 'claude -p "Say hello briefly and exit."',
-  openclaw: 'openclaw gateway status',
   'agent-zero': 'docker ps --filter name=agent-zero --format "table {{.Status}}\t{{.Ports}}"',
   gemini: 'gemini --version',
   shell: 'echo "hello"',
 };
 
 const ADAPTER_MODEL_FLAGS: Record<string, string> = {
-  codex: '--model',
-  'claude-code': '--model',
-  openclaw: '--model',
   gemini: '--model',
 };
 
 const MODEL_STORAGE_PREFIX = 'agentChats.lastModel.';
 const MAX_RENDERED_TRANSCRIPT_ENTRIES = 2000;
+
+export function managedHostAgentJobToolIdBlocked(toolId: unknown): boolean {
+  const rawToolId = String(toolId || '').trim().toLowerCase();
+  const normalizedToolId = rawToolId.startsWith('_install:') ? rawToolId.slice('_install:'.length) : rawToolId;
+  return normalizedToolId === 'openclaw'
+    || normalizedToolId === 'codex'
+    || normalizedToolId === 'claude'
+    || normalizedToolId === 'claude-code';
+}
 
 const TOOL_META: Record<string, { emoji: string; label: string; color: string; accent: string }> = {
   codex: { emoji: '\u26a1', label: 'Codex', color: 'text-amber-400', accent: 'border-l-amber-400' },
@@ -200,24 +203,6 @@ function RuntimeTimer({ startedAt, finishedAt, status }: { startedAt?: string | 
   );
 }
 
-/* ─── Quick-start card ──────────────────────────────────────────────────── */
-
-function QuickStartCard({ emoji, title, desc, onClick }: { emoji: string; title: string; desc: string; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      className="group flex flex-col items-center gap-3 p-5 rounded-2xl border border-white/[0.06] bg-white/[0.02] hover:bg-violet-500/[0.06] hover:border-violet-500/20 transition-all duration-200 hover:shadow-lg hover:shadow-violet-500/5 cursor-pointer"
-    >
-      <span className="text-3xl group-hover:scale-110 transition-transform duration-200">{emoji}</span>
-      <div className="text-center">
-        <div className="text-sm font-semibold text-slate-200 group-hover:text-white transition-colors">{title}</div>
-        <div className="text-xs text-slate-500 mt-0.5">{desc}</div>
-      </div>
-      <ChevronRight size={14} className="text-slate-600 group-hover:text-violet-400 group-hover:translate-x-0.5 transition-all" />
-    </button>
-  );
-}
-
 /* ─── Message bubble ────────────────────────────────────────────────────── */
 
 function MessageBubble({ entry, toolId, isStreaming }: { entry: TranscriptEntry; toolId: string; isStreaming: boolean }) {
@@ -337,10 +322,10 @@ export default function AgentChatsPage() {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [input, setInput] = useState('');
   const [showModal, setShowModal] = useState(false);
-  const [toolId, setToolId] = useState('codex');
-  const [command, setCommand] = useState(ADAPTER_DEFAULTS.codex);
+  const [toolId, setToolId] = useState('shell');
+  const [command, setCommand] = useState(ADAPTER_DEFAULTS.shell);
   const [cwd, setCwd] = useState('');
-  const [model, setModel] = useState(localStorage.getItem(`${MODEL_STORAGE_PREFIX}codex`) || '');
+  const [model, setModel] = useState(localStorage.getItem(`${MODEL_STORAGE_PREFIX}shell`) || '');
   const [isStartingJob, setIsStartingJob] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
   const [socketState, setSocketState] = useState<'connecting' | 'connected' | 'error'>('connecting');
@@ -356,6 +341,7 @@ export default function AgentChatsPage() {
   const selectedJob = useMemo(() => jobs.find((j) => j.id === selectedJobId) || null, [jobs, selectedJobId]);
   const adapterSupportsModel = !!ADAPTER_MODEL_FLAGS[toolId];
   const isRunning = selectedJob?.status === 'running';
+  const selectedManagedHostJobBlocked = managedHostAgentJobToolIdBlocked(selectedJob?.toolId);
 
   // Auto-scroll
   useEffect(() => {
@@ -427,6 +413,10 @@ export default function AgentChatsPage() {
     const state = location.state as any;
     const startJobState = state?.startJob;
     if (!startJobState?.toolId || !startJobState?.command) return;
+    if (managedHostAgentJobToolIdBlocked(startJobState.toolId)) {
+      navigate('/agent-chats', { replace: true });
+      return;
+    }
     const sig = JSON.stringify(startJobState);
     if (startJobLock.current === sig) {
       navigate('/agent-chats', { replace: true });
@@ -610,7 +600,7 @@ export default function AgentChatsPage() {
 
   const sendInput = async (e: FormEvent) => {
     e.preventDefault();
-    if (!selectedJobId || !input.trim()) return;
+    if (!selectedJobId || !input.trim() || selectedManagedHostJobBlocked) return;
     setIsThinking(true);
     await agentJobsAPI.input(selectedJobId, `${input}\n`);
     setInput('');
@@ -639,6 +629,7 @@ export default function AgentChatsPage() {
     setIsStartingJob(true);
     try {
       const computedCommand = buildCommand();
+      if (managedHostAgentJobToolIdBlocked(toolId)) return;
       const job = await agentJobsAPI.start({
         toolId,
         command: computedCommand,
@@ -653,15 +644,6 @@ export default function AgentChatsPage() {
       setIsStartingJob(false);
     }
   };
-
-  const startQuickJob = useCallback(async (tid: string) => {
-    try {
-      const cmd = ADAPTER_DEFAULTS[tid] || 'echo hello';
-      const job = await agentJobsAPI.start({ toolId: tid, command: cmd, title: `${tid}: ${cmd}` });
-      setJobs((prev) => [job, ...prev]);
-      setSelectedJobId(job.id);
-    } catch { /* no-op */ }
-  }, []);
 
   // Manual refresh: reload transcript and reconnect socket
   const handleRefresh = useCallback(async () => {
@@ -834,11 +816,7 @@ export default function AgentChatsPage() {
                 </div>
                 <h2 className="text-xl font-bold text-slate-200 mb-2">Start an agent run</h2>
                 <p className="text-sm text-slate-500 mb-8">Choose an agent to get started, or create a custom run.</p>
-                <div className="grid grid-cols-3 gap-3">
-                  <QuickStartCard emoji={'\ud83e\udd9e'} title="OpenClaw" desc="Gateway status" onClick={() => startQuickJob('openclaw')} />
-                  <QuickStartCard emoji={'\ud83e\udde0'} title="Claude Code" desc="Interactive coding" onClick={() => startQuickJob('claude-code')} />
-                  <QuickStartCard emoji={'\u26a1'} title="Codex" desc="Code generation" onClick={() => startQuickJob('codex')} />
-                </div>
+                <p className="text-xs text-slate-600">OpenClaw host runs require supervised host maintenance.</p>
               </div>
             </div>
           ) : (
@@ -882,7 +860,9 @@ export default function AgentChatsPage() {
                     ? 'border-white/10 focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20 text-slate-200 placeholder:text-slate-500'
                     : 'border-white/[0.06] text-slate-500 placeholder:text-slate-600 cursor-not-allowed'
                 }`}
-                placeholder={isRunning ? 'Send input to agent\u2026' : 'No running job'}
+                placeholder={selectedManagedHostJobBlocked
+                  ? 'Managed host input requires supervision'
+                  : (isRunning ? 'Send input to agent\u2026' : 'No running job')}
                 aria-label="Agent job input"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -903,7 +883,7 @@ export default function AgentChatsPage() {
                   ? 'bg-violet-600 hover:bg-violet-500 text-white shadow-md shadow-violet-600/20'
                   : 'bg-slate-800/50 text-slate-600 cursor-not-allowed'
               }`}
-              disabled={!isRunning || !input.trim()}
+              disabled={!isRunning || !input.trim() || selectedManagedHostJobBlocked}
             >
               <Send size={16} />
             </button>
@@ -942,9 +922,6 @@ export default function AgentChatsPage() {
               <div>
                 <label htmlFor="agent-run-adapter" className="text-xs text-slate-400 font-medium mb-1 block">Agent</label>
                 <select id="agent-run-adapter" aria-label="Agent" className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-violet-500/40" value={toolId} onChange={(e) => setToolId(e.target.value)}>
-                  <option value="codex">{'\u26a1'} Codex</option>
-                  <option value="claude-code">{'\ud83e\udde0'} Claude Code</option>
-                  <option value="openclaw">{'\ud83e\udd9e'} OpenClaw</option>
                   <option value="agent-zero">{'\ud83e\udd16'} Agent Zero</option>
                   <option value="gemini">{'\u2728'} Gemini</option>
                   <option value="shell">{'\ud83d\udda5\ufe0f'} Shell</option>

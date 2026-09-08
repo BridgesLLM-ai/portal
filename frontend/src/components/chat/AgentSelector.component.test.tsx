@@ -35,7 +35,7 @@ const manyOpenClawAgents = [
 function mockProviderAndAgentCatalogs() {
   localStorage.setItem('agent-chat-agents-cache', JSON.stringify(manyOpenClawAgents));
   mocks.clientGet.mockImplementation(async (url: string) => {
-    if (url === '/gateway/providers') return { data: { providers: providerCatalog } };
+    if (url === '/gateway/harnesses') return { data: { providers: providerCatalog } };
     if (url === '/gateway/agents') return { data: { agents: manyOpenClawAgents } };
     throw new Error(`Unexpected GET ${url}`);
   });
@@ -52,6 +52,23 @@ describe('AgentSelector', () => {
     mocks.clientGet.mockReset();
     localStorage.clear();
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+  });
+
+  it('opens existing conversations when transcript recovery requests a selection', async () => {
+    useAuthStore.setState({ isAuthenticated: true });
+    const onViewSession = vi.fn();
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/harnesses') return { data: { providers: providerCatalog } };
+      if (url === '/gateway/agents') return { data: { agents: [] } };
+      if (url === '/gateway/sessions') return { data: { sessions: [{ key: 'agent:main:available', title: 'Available conversation' }] } };
+      throw new Error('Unexpected request');
+    });
+    const { rerender } = render(<AgentSelector value="OPENCLAW" onChange={vi.fn()} onViewSession={onViewSession} openConversationsRequest={0} />);
+    expect(screen.queryByRole('searchbox', { name: 'Search sessions' })).not.toBeInTheDocument();
+    rerender(<AgentSelector value="OPENCLAW" onChange={vi.fn()} onViewSession={onViewSession} openConversationsRequest={1} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: /Available conversation/ }));
+    expect(onViewSession).toHaveBeenCalledWith('agent:main:available');
   });
 
   it('renders the selected sub-agent avatar supplied by authenticated client settings', () => {
@@ -83,35 +100,105 @@ describe('AgentSelector', () => {
       />,
     );
 
-    const selector = screen.getByRole('button', { name: 'Select agent provider' });
+    const selector = screen.getByRole('button', { name: 'Choose agent' });
     expect(selector).toBeDisabled();
     await user.click(selector);
     expect(onChange).not.toHaveBeenCalled();
     expect(mocks.clientGet).not.toHaveBeenCalled();
   });
 
-  it('lists every provider before a long OpenClaw agent catalog', async () => {
+  it('finds named agents and default assistants in one directory without changing selection on search', async () => {
     mockProviderAndAgentCatalogs();
     const user = userEvent.setup();
-    render(<AgentSelector value="OPENCLAW" onChange={vi.fn()} />);
+    const onChange = vi.fn();
+    render(<AgentSelector value="OPENCLAW" onChange={onChange} />);
+    await user.click(screen.getByRole('button', { name: 'Choose agent' }));
+    expect(await screen.findByRole('button', { name: /Codex/i })).toBeVisible();
+    const search = screen.getByRole('searchbox', { name: 'Find an agent' });
+    await user.type(search, 'Agent 01');
+    const agent = await screen.findByRole('button', { name: /OpenClaw Agent 01/i });
+    expect(agent).toHaveTextContent('OpenClaw · Configured agent');
+    expect(screen.queryByRole('button', { name: /Codex/i })).not.toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+    await user.clear(search);
+    await user.type(search, 'Codex');
+    await user.click(screen.getByRole('button', { name: /Codex/i }));
+    expect(onChange).toHaveBeenLastCalledWith({ provider: 'CODEX', agentId: undefined });
+  });
 
-    await user.click(screen.getByRole('button', { name: 'Select agent provider' }));
+  it('shows implemented Hermes and OpenCode as selectable while DeepSeek stays display-only', async () => {
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/harnesses') {
+        return {
+          data: {
+            harnesses: [
+              {
+                id: 'OPENCLAW',
+                displayName: 'OpenClaw',
+                implemented: true,
+                selectable: true,
+                installed: true,
+                usable: true,
+                releaseStage: 'stable',
+                transport: 'gateway',
+              },
+              {
+                id: 'HERMES',
+                displayName: 'Hermes',
+                implemented: true,
+                selectable: true,
+                usable: true,
+                releaseStage: 'stable',
+                transport: 'acp-stdio',
+              },
+              {
+                id: 'OPENCODE',
+                displayName: 'OpenCode',
+                implemented: true,
+                selectable: true,
+                usable: true,
+                releaseStage: 'stable',
+                transport: 'acp-stdio',
+              },
+              {
+                id: 'DEEPSEEK_HARNESS',
+                displayName: 'DeepSeek Harness',
+                implemented: false,
+                selectable: false,
+                usable: false,
+                releaseStage: 'developer-preview',
+                transport: 'json-rpc-stdio',
+                unavailableReason: 'Developer Preview: persistent Agent Chat parity is not available.',
+              },
+            ],
+          },
+        };
+      }
+      if (url === '/gateway/agents') return { data: { agents: [] } };
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<AgentSelector value="OPENCLAW" onChange={onChange} />);
 
-    const codex = await screen.findByRole('button', { name: /Codex/i });
-    const agentZero = screen.getByRole('button', { name: /Agent Zero/i });
-    const agentGroup = screen.getByRole('group', { name: 'OpenClaw agents' });
-    const firstOpenClawAgent = within(agentGroup).getByRole('button', { name: /OpenClaw Agent 01/i });
+    await user.click(screen.getByRole('button', { name: 'Choose agent' }));
+    const hermes = await screen.findByRole('button', { name: /Hermes/i });
+    const opencode = screen.getByRole('button', { name: /OpenCode/i });
+    const deepSeekHarness = screen.getByRole('button', { name: /DeepSeek Harness/i });
 
-    expect(codex).toBeVisible();
-    expect(agentZero).toBeVisible();
-    expect(codex.compareDocumentPosition(firstOpenClawAgent) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(agentZero.compareDocumentPosition(firstOpenClawAgent) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(hermes).toBeEnabled();
+    expect(opencode).toBeEnabled();
+    expect(deepSeekHarness).toBeDisabled();
+    expect(within(deepSeekHarness).getByText('Developer Preview')).toBeInTheDocument();
+    expect(deepSeekHarness).toHaveTextContent('Preview — not available for chat in this release.');
+    await user.click(deepSeekHarness);
+    expect(onChange).not.toHaveBeenCalled();
   });
 
   it('updates a cold checking provider row in place when shared polling settles it', async () => {
     let providerRequestCount = 0;
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         providerRequestCount += 1;
         return {
           data: {
@@ -147,20 +234,20 @@ describe('AgentSelector', () => {
     const user = userEvent.setup();
     render(<AgentSelector value="CODEX" onChange={vi.fn()} />);
 
-    await user.click(screen.getByRole('button', { name: 'Select agent provider' }));
+    await user.click(screen.getByRole('button', { name: 'Choose agent' }));
     const codex = await screen.findByRole('button', { name: /Codex/i });
     expect(codex).toBeDisabled();
     expect(within(codex).getByText('Checking')).toBeInTheDocument();
 
     await waitFor(() => expect(codex).toBeEnabled(), { timeout: 2_500 });
-    expect(within(codex).getByText('Native')).toBeInTheDocument();
+    expect(within(codex).getByText('Ready')).toBeInTheDocument();
     expect(providerRequestCount).toBe(2);
   });
 
   it('keeps ready rows selectable while a slower provider row is still checking', async () => {
     let providerRequestCount = 0;
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         providerRequestCount += 1;
         return {
           data: {
@@ -196,7 +283,7 @@ describe('AgentSelector', () => {
     const user = userEvent.setup();
     render(<AgentSelector value="CODEX" onChange={vi.fn()} />);
 
-    await user.click(screen.getByRole('button', { name: 'Select agent provider' }));
+    await user.click(screen.getByRole('button', { name: 'Choose agent' }));
     const openClaw = await screen.findByRole('button', { name: /OpenClaw/i });
     const codex = screen.getByRole('button', { name: /Codex/i });
 
@@ -212,7 +299,7 @@ describe('AgentSelector', () => {
     const user = userEvent.setup();
     render(<AgentSelector value="OPENCLAW" onChange={onChange} />);
 
-    const selector = screen.getByRole('button', { name: 'Select agent provider' });
+    const selector = screen.getByRole('button', { name: 'Choose agent' });
     await user.click(selector);
     await user.click(await screen.findByRole('button', { name: /Codex/i }));
     expect(onChange).toHaveBeenLastCalledWith({ provider: 'CODEX', agentId: undefined });
@@ -225,7 +312,7 @@ describe('AgentSelector', () => {
   it('loads selected native-provider capabilities before the selector opens so history is not hidden', async () => {
     useAuthStore.setState({ isAuthenticated: true });
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         return {
           data: {
             providers: [
@@ -256,7 +343,7 @@ describe('AgentSelector', () => {
     render(<AgentSelector value="CODEX" onChange={vi.fn()} onViewSession={vi.fn()} />);
 
     const history = await screen.findByTitle('Codex sessions');
-    expect(screen.getByRole('button', { name: 'Select agent provider' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('button', { name: 'Choose agent' })).toHaveAttribute('aria-expanded', 'false');
     await user.click(history);
 
     expect(await screen.findByText('First native session')).toBeInTheDocument();
@@ -266,10 +353,51 @@ describe('AgentSelector', () => {
     );
   });
 
+  it('reaches older sessions by search and paging without changing the harness or active-run evidence', async () => {
+    useAuthStore.setState({ isAuthenticated: true });
+    const sessions = Array.from({ length: 43 }, (_, index) => ({
+      sessionId: `codex-session-${index}`,
+      title: `Work ${String(index).padStart(2, '0')}`,
+      preview: index === 42 ? 'Older deployment investigation' : undefined,
+      status: 'active',
+      runActive: index === 1,
+    }));
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/harnesses') return { data: { providers: [{
+        name: 'CODEX', displayName: 'Codex', installed: true, usable: true,
+        implemented: true, capabilities: { supportsSessionList: true },
+      }] } };
+      if (url === '/gateway/sessions') return { data: { sessions } };
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const onViewSession = vi.fn();
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<AgentSelector value="CODEX" onChange={onChange} onViewSession={onViewSession} currentSessionKey="codex-session-1" />);
+    await user.click(await screen.findByTitle('Codex sessions'));
+    expect(await screen.findByText('Work 19')).toBeVisible();
+    expect(screen.queryByText('Work 42')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /Show more sessions/ }));
+    expect(screen.getByText('Work 39')).toBeVisible();
+    await user.type(screen.getByRole('searchbox', { name: 'Search sessions' }), 'deployment');
+    expect(screen.getByText('Work 42')).toBeVisible();
+    expect(screen.queryByText('Work 39')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /Work 42/ }));
+    expect(onViewSession).toHaveBeenLastCalledWith('codex-session-42');
+    expect(onChange).not.toHaveBeenCalled();
+    await user.click(screen.getByTitle('Codex sessions'));
+    await user.clear(screen.getByRole('searchbox', { name: 'Search sessions' }));
+    await user.click(screen.getByRole('button', { name: 'Running only' }));
+    expect(within(screen.getByRole('dialog', { name: 'Codex sessions' })).getByRole('button', { name: /Work 01/ })).toHaveAttribute('aria-current', 'page');
+    expect(screen.queryByText('Work 00')).not.toBeInTheDocument();
+    await user.type(screen.getByRole('searchbox', { name: 'Search sessions' }), 'no match');
+    expect(screen.getByText('No sessions match your search.')).toBeVisible();
+  });
+
   it('shows the live dot only for run-attested sessions, never every retained active session', async () => {
     useAuthStore.setState({ isAuthenticated: true });
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         return {
           data: {
             providers: [{
@@ -330,7 +458,7 @@ describe('AgentSelector', () => {
     useAuthStore.setState({ isAuthenticated: true });
     const sessionKey = 'agent:main:parallel-work';
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') return { data: { providers: providerCatalog } };
+      if (url === '/gateway/harnesses') return { data: { providers: providerCatalog } };
       if (url === '/gateway/sessions') {
         return {
           data: {
@@ -379,7 +507,7 @@ describe('AgentSelector', () => {
   it('keeps fresh native-provider history available while the provider catalog is unresolved', async () => {
     useAuthStore.setState({ isAuthenticated: true });
     mocks.clientGet.mockImplementation((url: string) => {
-      if (url === '/gateway/providers') return new Promise(() => {});
+      if (url === '/gateway/harnesses') return new Promise(() => {});
       if (url === '/gateway/sessions') {
         return Promise.resolve({
           data: {
@@ -406,7 +534,7 @@ describe('AgentSelector', () => {
     useAuthStore.setState({ isAuthenticated: true });
     let sessionRequestCount = 0;
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') throw new Error('provider catalog unavailable');
+      if (url === '/gateway/harnesses') throw new Error('harness catalog unavailable');
       if (url === '/gateway/sessions') {
         sessionRequestCount += 1;
         if (sessionRequestCount === 1) throw new Error('session list temporarily unavailable');
@@ -434,7 +562,7 @@ describe('AgentSelector', () => {
   it('hides native history when the provider catalog explicitly denies session listing', async () => {
     useAuthStore.setState({ isAuthenticated: true });
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         return {
           data: {
             providers: [
@@ -463,20 +591,20 @@ describe('AgentSelector', () => {
     mockProviderAndAgentCatalogs();
     const user = userEvent.setup();
     render(<AgentSelector value="OPENCLAW" onChange={vi.fn()} />);
-    const opener = screen.getByRole('button', { name: 'Select agent provider' });
+    const opener = screen.getByRole('button', { name: 'Choose agent' });
 
     await user.click(opener);
-    expect(await screen.findByRole('dialog', { name: 'Available agent providers' })).toBeInTheDocument();
+    expect(await screen.findByRole('dialog', { name: 'Choose an agent' })).toBeInTheDocument();
     await user.keyboard('{Escape}');
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Available agent providers' })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Choose an agent' })).not.toBeInTheDocument());
     expect(opener).toHaveFocus();
   });
 
   it('preserves the last good provider catalog when a refresh fails', async () => {
     let providerRequestCount = 0;
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         providerRequestCount += 1;
         if (providerRequestCount === 1) return { data: { providers: providerCatalog } };
         throw new Error('temporary provider catalog outage');
@@ -488,17 +616,17 @@ describe('AgentSelector', () => {
     const user = userEvent.setup();
     render(<AgentSelector value="CODEX" onChange={onChange} />);
 
-    const selector = screen.getByRole('button', { name: 'Select agent provider' });
+    const selector = screen.getByRole('button', { name: 'Choose agent' });
     await user.click(selector);
     expect(await screen.findByRole('button', { name: /Agent Zero/i })).toBeVisible();
-    await waitFor(() => expect(screen.queryByText(/Loading available agents and providers/i)).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText(/Loading available harnesses and agents/i)).not.toBeInTheDocument());
 
     await user.click(selector);
     invalidateAgentChatProviderCatalog();
     await user.click(selector);
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Couldn’t refresh providers. Showing the last available list.',
+      'Couldn’t refresh harnesses. Showing the last available list.',
     );
     expect(screen.getByRole('button', { name: /Codex/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: /Agent Zero/i })).toBeDisabled();
@@ -508,7 +636,7 @@ describe('AgentSelector', () => {
   it('does not silently switch away from a provider while its row is rechecking', async () => {
     let providerRequestCount = 0;
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         providerRequestCount += 1;
         if (providerRequestCount === 1) return { data: { providers: providerCatalog } };
         return {
@@ -535,10 +663,10 @@ describe('AgentSelector', () => {
     const user = userEvent.setup();
     render(<AgentSelector value="CODEX" onChange={onChange} />);
 
-    const selector = screen.getByRole('button', { name: 'Select agent provider' });
+    const selector = screen.getByRole('button', { name: 'Choose agent' });
     await user.click(selector);
     expect(await screen.findByRole('button', { name: /Agent Zero/i })).toBeVisible();
-    await waitFor(() => expect(screen.queryByText(/Loading available agents and providers/i)).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText(/Loading available harnesses and agents/i)).not.toBeInTheDocument());
 
     await user.click(selector);
     invalidateAgentChatProviderCatalog();
@@ -553,7 +681,7 @@ describe('AgentSelector', () => {
     let providerRequestCount = 0;
     localStorage.setItem('agent-chat-agents-cache', JSON.stringify(manyOpenClawAgents));
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         providerRequestCount += 1;
         if (providerRequestCount === 1) throw new Error('provider catalog unavailable');
         return { data: { providers: providerCatalog } };
@@ -565,16 +693,16 @@ describe('AgentSelector', () => {
     const user = userEvent.setup();
     render(<AgentSelector value="CODEX" onChange={onChange} />);
 
-    await user.click(screen.getByRole('button', { name: 'Select agent provider' }));
+    await user.click(screen.getByRole('button', { name: 'Choose agent' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Couldn’t load providers. Your current selection is unchanged.',
+      'Couldn’t load harnesses. Your current selection is unchanged.',
     );
     expect(screen.queryByRole('button', { name: /OpenClaw/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('group', { name: 'OpenClaw agents' })).not.toBeInTheDocument();
     expect(onChange).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole('button', { name: 'Retry loading providers' }));
+    await user.click(screen.getByRole('button', { name: 'Retry loading harnesses' }));
 
     expect(await screen.findByRole('button', { name: /Agent Zero/i })).toBeVisible();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
@@ -585,7 +713,7 @@ describe('AgentSelector', () => {
   it('cancels the shared provider request when its final mounted consumer unmounts', async () => {
     let requestSignal: AbortSignal | undefined;
     mocks.clientGet.mockImplementation((url: string, config?: { signal?: AbortSignal }) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         requestSignal = config?.signal;
         return new Promise(() => {});
       }
@@ -615,21 +743,21 @@ describe('AgentSelector', () => {
         <AgentSelector value="OPENCLAW" onChange={vi.fn()} onViewSession={vi.fn()} />
       </div>,
     );
-    const opener = screen.getByRole('button', { name: 'Select agent provider' });
+    const opener = screen.getByRole('button', { name: 'Choose agent' });
 
     await user.click(opener);
-    const dialog = await screen.findByRole('dialog', { name: 'Available agent providers' });
+    const dialog = await screen.findByRole('dialog', { name: 'Choose an agent' });
     expect(dialog).toHaveAttribute('aria-modal', 'true');
     expect(dialog.closest('[data-anchored-popover-mode="sheet"]')).not.toBeNull();
     expect(container).not.toContainElement(dialog);
     expect(container).toHaveAttribute('inert');
     expect(document.body.style.overflow).toBe('hidden');
-    expect(screen.getByRole('button', { name: 'Close agent selector' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close agent picker' })).toBeInTheDocument();
     expect(document.body.innerHTML).not.toContain('z-[9998]');
     expect(document.body.innerHTML).not.toContain('z-[9999]');
 
     await user.keyboard('{Escape}');
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Available agent providers' })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Choose an agent' })).not.toBeInTheDocument());
     await waitFor(() => expect(opener).toHaveFocus());
 
     const sessionOpener = screen.getByTitle('OpenClaw sessions');
@@ -647,7 +775,7 @@ describe('AgentSelector', () => {
     useAuthStore.setState({ isAuthenticated: true });
     const sessionParams: Array<Record<string, string> | undefined> = [];
     mocks.clientGet.mockImplementation(async (url: string, config?: any) => {
-      if (url === '/gateway/providers') return { data: { providers: providerCatalog } };
+      if (url === '/gateway/harnesses') return { data: { providers: providerCatalog } };
       if (url === '/gateway/agents') return { data: { agents: manyOpenClawAgents } };
       if (url === '/gateway/sessions') {
         sessionParams.push(config?.params);
@@ -675,7 +803,7 @@ describe('AgentSelector', () => {
     useAuthStore.setState({ isAuthenticated: true });
     const requestedAgentIds: Array<string | undefined> = [];
     mocks.clientGet.mockImplementation(async (url: string, config?: any) => {
-      if (url === '/gateway/providers') return { data: { providers: providerCatalog } };
+      if (url === '/gateway/harnesses') return { data: { providers: providerCatalog } };
       if (url === '/gateway/agents') return { data: { agents: manyOpenClawAgents } };
       if (url === '/gateway/sessions') {
         requestedAgentIds.push(config?.params?.agentId);
@@ -708,7 +836,7 @@ describe('AgentSelector', () => {
 
   it('keeps the default agent selectable while its availability row is rechecking', async () => {
     mocks.clientGet.mockImplementation(async (url: string) => {
-      if (url === '/gateway/providers') {
+      if (url === '/gateway/harnesses') {
         return {
           data: {
             providers: [{
@@ -742,11 +870,11 @@ describe('AgentSelector', () => {
       <AgentSelector value="OPENCLAW" agentId="helper-one" onChange={onChange} />,
     );
 
-    await user.click(screen.getByRole('button', { name: 'Select agent provider' }));
+    await user.click(screen.getByRole('button', { name: 'Choose agent' }));
     // A sub-agent row is always selectable, so the row that returns to the
     // default agent must be too. Gating it on availability made "go back to
     // the main agent" a no-op during a routine recheck.
-    const defaultAgentRow = await screen.findByRole('button', { name: /OpenClaw/i });
+    const defaultAgentRow = await screen.findByRole('button', { name: /OpenClaw.*Main agent/i });
     expect(defaultAgentRow).toBeEnabled();
     await user.click(defaultAgentRow);
     expect(onChange).toHaveBeenLastCalledWith({ provider: 'OPENCLAW', agentId: undefined });

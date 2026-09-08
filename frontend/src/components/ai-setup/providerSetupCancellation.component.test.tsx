@@ -282,26 +282,19 @@ describe('provider setup active-session cancellation', () => {
     );
   });
 
-  it('keeps Claude setup open on 409 and closes only after cancellation is confirmed', async () => {
+  it('keeps Claude setup credential-only and closes without creating cancellation authority', async () => {
     const user = userEvent.setup();
     const onCancel = vi.fn();
-    installCancellationRace((url) => {
-      if (url.endsWith('/claude/start')) {
-        return {
-          success: true,
-          sessionId: 'claude-session',
-          authUrl: 'https://claude.ai/oauth/authorize?code=true',
-        };
-      }
-      throw new Error(`Unexpected POST ${url}`);
-    });
 
     render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    await user.click(screen.getByRole('button', { name: 'Connect Claude' }));
-    expect(await screen.findByText(/A new tab opened/i)).toBeInTheDocument();
 
-    await expectFailClosedThenConfirmedClose('Close Claude setup', onCancel, user);
-    expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'claude-session' }, { timeout: 10_000 });
+    expect(screen.getByText(/accepts an existing Claude setup-token/i)).toBeInTheDocument();
+    expect(screen.getByText(/never starts a Claude host process/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Connect Claude' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Close Claude setup' }));
+
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(mocks.post).not.toHaveBeenCalled();
   });
 
   it('keeps the GitHub device flow open on 409 and closes only after cancellation is confirmed', async () => {
@@ -351,28 +344,18 @@ describe('provider setup active-session cancellation', () => {
     expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'google-session' }, { timeout: 10_000 });
   });
 
-  it('does not swallow an indeterminate native CLI cancellation', async () => {
+  it('does not manufacture native cancellation authority for unavailable host Codex', async () => {
     const user = userEvent.setup();
     const onCancel = vi.fn();
-    installCancellationRace((url) => {
-      if (url.endsWith('/native-cli/start')) {
-        return {
-          success: true,
-          sessionId: 'codex-session',
-          status: 'starting',
-          verificationUrl: 'https://auth.openai.com/codex/device',
-          deviceCode: 'CODEX-1234',
-        };
-      }
-      throw new Error(`Unexpected POST ${url}`);
-    });
 
     render(<NativeCliSetupFlow provider="codex" apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    await user.click(screen.getByRole('button', { name: 'Start Codex Login' }));
-    expect(await screen.findByText('CODEX-1234')).toBeInTheDocument();
 
-    await expectFailClosedThenConfirmedClose('Close Codex login', onCancel, user);
-    expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'codex-session' }, { timeout: 10_000 });
+    expect(screen.getByRole('alert')).toHaveTextContent(/Interactive host Codex login is unavailable.*Supervised Agent Chat can use an existing attested host credential/i);
+    expect(screen.queryByRole('button', { name: 'Start Codex Login' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Close Codex login' }));
+
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(mocks.post).not.toHaveBeenCalled();
   });
 
   it('transitions a credential-committed cancellation race into explicit provider review', async () => {
@@ -433,20 +416,6 @@ describe('provider setup active-session cancellation', () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
-  it('retains a rejected Claude start session until cleanup is confirmed', async () => {
-    const user = userEvent.setup();
-    const onCancel = vi.fn();
-    installRejectedStartRecovery('/claude/start', 'claude-recovery');
-
-    render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    await user.click(screen.getByRole('button', { name: 'Connect Claude' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(/Portal is still stopping and reconciling this login process/i);
-
-    await expectFailClosedThenConfirmedClose('Close Claude setup', onCancel, user);
-    expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'claude-recovery' }, { timeout: 10_000 });
-    expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/claude/start'))).toHaveLength(1);
-  });
-
   it('retains a rejected device-code start session until cleanup is confirmed', async () => {
     const user = userEvent.setup();
     const onCancel = vi.fn();
@@ -474,33 +443,6 @@ describe('provider setup active-session cancellation', () => {
     await expectFailClosedThenConfirmedClose('Close provider setup', onCancel, user);
     expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'oauth-recovery' }, { timeout: 10_000 });
     expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/oauth/start'))).toHaveLength(1);
-  });
-
-  it('retains a rejected native CLI start session until cleanup is confirmed', async () => {
-    const user = userEvent.setup();
-    const onCancel = vi.fn();
-    installRejectedStartRecovery('/native-cli/start', 'native-recovery');
-
-    render(<NativeCliSetupFlow provider="codex" apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    await user.click(screen.getByRole('button', { name: 'Start Codex Login' }));
-    expect(await screen.findByText(/Portal is still stopping and reconciling this login process/i)).toBeInTheDocument();
-
-    await expectFailClosedThenConfirmedClose('Close Codex login', onCancel, user);
-    expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'native-recovery' }, { timeout: 10_000 });
-    expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/native-cli/start'))).toHaveLength(1);
-  });
-
-  it('does not release a rejected Claude recovery session from terminal GET status alone', async () => {
-    const user = userEvent.setup();
-    const onCancel = vi.fn();
-    installTerminalRejectedStartRecovery('/claude/start', '/oauth/status/', 'claude-terminal');
-
-    render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    await user.click(screen.getByRole('button', { name: 'Connect Claude' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(/Terminal status still requires cancellation/i);
-    await user.click(screen.getByRole('button', { name: 'Close Claude setup' }));
-    await waitFor(() => expect(onCancel).toHaveBeenCalledTimes(1));
-    expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'claude-terminal' }, { timeout: 10_000 });
   });
 
   it('does not release a rejected OpenClaw recovery session from terminal GET status alone', async () => {
@@ -534,37 +476,6 @@ describe('provider setup active-session cancellation', () => {
     expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'device-terminal' }, { timeout: 10_000 });
   });
 
-  it('does not release a rejected native recovery session from terminal GET status alone', async () => {
-    vi.useFakeTimers({
-      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
-    });
-    const onCancel = vi.fn();
-    installTerminalRejectedStartRecovery('/native-cli/start', '/native-cli/status/', 'native-terminal');
-
-    render(<NativeCliSetupFlow provider="codex" apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Start Codex Login' }));
-    await vi.waitFor(() => expect(screen.getByText(/Portal is reconciling an interrupted provider start/i)).toBeInTheDocument());
-    await vi.advanceTimersByTimeAsync(1000);
-    await vi.waitFor(() => expect(screen.getByText(/Terminal status still requires cancellation/i)).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('button', { name: 'Close Codex login' }));
-    await vi.waitFor(() => expect(onCancel).toHaveBeenCalledTimes(1));
-    expect(mocks.post).toHaveBeenCalledWith('/ai-setup/oauth/cancel', { sessionId: 'native-terminal' }, { timeout: 10_000 });
-  });
-
-  it('blocks a second Claude start after a rejected start committed a credential', async () => {
-    const user = userEvent.setup();
-    const onCancel = vi.fn();
-    installCommittedStart('/claude/start', 'claude-committed');
-
-    render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    await user.click(screen.getByRole('button', { name: 'Connect Claude' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(/credential changed during cleanup/i);
-    expect(screen.queryByRole('button', { name: 'Try Again' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Close Claude setup' })).toBeDisabled();
-    await user.click(screen.getByRole('button', { name: /Close and review provider status/i }));
-    expect(onCancel).toHaveBeenCalledTimes(1);
-  });
-
   it('blocks a second device-code start after a rejected start committed a credential', async () => {
     const user = userEvent.setup();
     const onCancel = vi.fn();
@@ -594,19 +505,6 @@ describe('provider setup active-session cancellation', () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
-  it('blocks a second native CLI start after a rejected start committed a credential', async () => {
-    const user = userEvent.setup();
-    const onCancel = vi.fn();
-    installCommittedStart('/native-cli/start', 'native-committed');
-
-    render(<NativeCliSetupFlow provider="codex" apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    await user.click(screen.getByRole('button', { name: 'Start Codex Login' }));
-    expect(await screen.findByText(/credential changed during cleanup/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Close Codex login' })).toBeDisabled();
-    await user.click(screen.getByRole('button', { name: /Close and review provider status/i }));
-    expect(onCancel).toHaveBeenCalledTimes(1);
-  });
-
   it('fails closed when a device-code start response is lost', async () => {
     mocks.post.mockRejectedValueOnce(new Error('connection lost after send'));
     render(<DeviceCodeFlow apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
@@ -624,37 +522,12 @@ describe('provider setup active-session cancellation', () => {
     expect(screen.queryByRole('button', { name: 'Try Again' })).not.toBeInTheDocument();
   });
 
-  it('fails closed when Claude or native CLI start responses are lost', async () => {
-    mocks.post.mockRejectedValueOnce(new Error('connection lost after send'));
-    const claude = render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Connect Claude' }));
-    expect(await screen.findByRole('button', { name: /Close and review provider status/i })).toBeInTheDocument();
-    claude.unmount();
-
-    mocks.post.mockRejectedValueOnce(new Error('connection lost after send'));
-    render(<NativeCliSetupFlow provider="codex" apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Start Codex Login' }));
-    expect(await screen.findByRole('button', { name: /Close and review provider status/i })).toBeInTheDocument();
-  });
-
-  it('rejects malformed successful starts without a session across every session-backed flow', async () => {
+  it('rejects malformed successful starts without a session across supported session-backed flows', async () => {
     mocks.post.mockResolvedValueOnce({ data: { success: true } });
     const device = render(<DeviceCodeFlow apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: 'Start Sign-In' }));
     expect(await screen.findByRole('button', { name: /Close and review provider status/i })).toBeInTheDocument();
     device.unmount();
-
-    mocks.post.mockResolvedValueOnce({ data: { success: true } });
-    const claude = render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Connect Claude' }));
-    expect(await screen.findByRole('button', { name: /Close and review provider status/i })).toBeInTheDocument();
-    claude.unmount();
-
-    mocks.post.mockResolvedValueOnce({ data: { success: true, status: 'starting' } });
-    const native = render(<NativeCliSetupFlow provider="codex" apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Start Codex Login' }));
-    expect(await screen.findByRole('button', { name: /Close and review provider status/i })).toBeInTheDocument();
-    native.unmount();
 
     mocks.post.mockResolvedValueOnce({ data: { success: true, status: 'awaiting_callback' } });
     render(<OAuthSetupFlow provider={googleProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
@@ -714,27 +587,6 @@ describe('provider setup active-session cancellation', () => {
       );
       expect(onCancel).toHaveBeenCalledTimes(1);
     });
-  });
-
-  it('admits only one same-frame Claude start request', async () => {
-    const pending = deferred<{ data: Record<string, unknown> }>();
-    const onCancel = vi.fn();
-    mocks.post.mockImplementation((url: string) => {
-      if (url.endsWith('/claude/start')) return pending.promise;
-      throw new Error(`Unexpected POST ${url}`);
-    });
-    render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-
-    const start = screen.getByRole('button', { name: 'Connect Claude' });
-    const close = screen.getByRole('button', { name: 'Close Claude setup' });
-    fireEvent.click(start);
-    fireEvent.click(start);
-    fireEvent.click(close);
-    expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/claude/start'))).toHaveLength(1);
-    expect(onCancel).not.toHaveBeenCalled();
-
-    pending.resolve({ data: { success: true, instantComplete: true, method: 'cli-reuse' } });
-    expect(await screen.findByText(/Claude connected successfully/i)).toBeInTheDocument();
   });
 
   it('admits only one same-frame device-code start request', async () => {
@@ -852,27 +704,6 @@ describe('provider setup active-session cancellation', () => {
     await vi.waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
   });
 
-  it('admits only one same-frame native CLI start request', async () => {
-    const pending = deferred<{ data: Record<string, unknown> }>();
-    const onCancel = vi.fn();
-    mocks.post.mockImplementation((url: string) => {
-      if (url.endsWith('/native-cli/start')) return pending.promise;
-      throw new Error(`Unexpected POST ${url}`);
-    });
-    render(<NativeCliSetupFlow provider="codex" apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-
-    const start = screen.getByRole('button', { name: 'Start Codex Login' });
-    const close = screen.getByRole('button', { name: 'Close Codex login' });
-    fireEvent.click(start);
-    fireEvent.click(start);
-    fireEvent.click(close);
-    expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/native-cli/start'))).toHaveLength(1);
-    expect(onCancel).not.toHaveBeenCalled();
-
-    pending.resolve({ data: { success: true, sessionId: 'native-once', status: 'starting', verificationUrl: 'https://auth.openai.com/codex/device', deviceCode: 'ONCE-CODEX' } });
-    expect(await screen.findByText('ONCE-CODEX')).toBeInTheDocument();
-  });
-
   it('admits only one same-frame cancellation request', async () => {
     const cancellation = deferred<{ data: Record<string, unknown>; status: number }>();
     const onCancel = vi.fn();
@@ -928,69 +759,8 @@ describe('provider setup active-session cancellation', () => {
     expect(onComplete).not.toHaveBeenCalled();
   });
 
-  it('admits one native completion when callback and an older status request race', async () => {
-    vi.useFakeTimers({
-      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
-    });
-    const status = deferred<{ data: Record<string, unknown> }>();
-    const onComplete = vi.fn();
-    mocks.get.mockImplementation((url: string) => {
-      if (url.includes('/native-cli/status/')) return status.promise;
-      throw new Error(`Unexpected GET ${url}`);
-    });
-    mocks.post.mockImplementation(async (url: string) => {
-      if (url.endsWith('/native-cli/start')) {
-        return { data: { success: true, sessionId: 'native-race', status: 'starting', authUrl: 'https://claude.ai/oauth/authorize?code=true' } };
-      }
-      if (url.endsWith('/native-cli/callback')) return { data: { success: true } };
-      throw new Error(`Unexpected POST ${url}`);
-    });
-
-    render(<NativeCliSetupFlow provider="claude-code" apiBase="/ai-setup" onComplete={onComplete} onCancel={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Start Claude Code Login' }));
-    await vi.waitFor(() => expect(screen.getByRole('textbox', { name: 'Authorization code' })).toBeInTheDocument());
-    await vi.advanceTimersByTimeAsync(1000);
-    await vi.waitFor(() => expect(mocks.get).toHaveBeenCalledTimes(1));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Authorization code' }), { target: { value: 'callback-code' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Submit Code' }));
-    await vi.waitFor(() => expect(screen.getByText(/CLI is now authenticated/i)).toBeInTheDocument());
-
-    status.resolve({ data: { status: 'complete' } });
-    await vi.advanceTimersByTimeAsync(1500);
-    expect(onComplete).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(onComplete).toHaveBeenCalledTimes(1);
-  });
-
-  it('cancels the delayed native completion callback when the done dialog closes', async () => {
-    vi.useFakeTimers({
-      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
-    });
-    const onComplete = vi.fn();
-    const onCancel = vi.fn();
-    mocks.post.mockImplementation(async (url: string) => {
-      if (url.endsWith('/native-cli/start')) {
-        return { data: { success: true, sessionId: 'native-close', status: 'starting', authUrl: 'https://claude.ai/oauth/authorize?code=true' } };
-      }
-      if (url.endsWith('/native-cli/callback')) return { data: { success: true } };
-      throw new Error(`Unexpected POST ${url}`);
-    });
-
-    render(<NativeCliSetupFlow provider="claude-code" apiBase="/ai-setup" onComplete={onComplete} onCancel={onCancel} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Start Claude Code Login' }));
-    await vi.waitFor(() => expect(screen.getByRole('textbox', { name: 'Authorization code' })).toBeInTheDocument());
-    fireEvent.change(screen.getByRole('textbox', { name: 'Authorization code' }), { target: { value: 'callback-code' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Submit Code' }));
-    await vi.waitFor(() => expect(screen.getByText(/CLI is now authenticated/i)).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('button', { name: 'Close Claude Code login' }));
-    expect(onCancel).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(onComplete).not.toHaveBeenCalled();
-  });
-
-  it('admits one callback and one model mutation while each request is unresolved', async () => {
+  it('admits one supported OAuth callback and finishes credential-only without a model mutation', async () => {
     const callback = deferred<{ data: Record<string, unknown> }>();
-    const model = deferred<{ data: Record<string, unknown> }>();
     let callbackAccepted = false;
     mocks.get.mockImplementation(async (url: string) => {
       if (url.endsWith('/status')) return { data: { defaultModel: null } };
@@ -1012,7 +782,6 @@ describe('provider setup active-session cancellation', () => {
           return response;
         });
       }
-      if (url.endsWith('/set-default-model')) return model.promise;
       throw new Error(`Unexpected POST ${url}`);
     });
     const onComplete = vi.fn();
@@ -1030,12 +799,12 @@ describe('provider setup active-session cancellation', () => {
     callback.resolve({ data: { success: true } });
     expect(await screen.findByText(/Signed in successfully/i)).toBeInTheDocument();
 
-    const save = screen.getByRole('button', { name: /Save and Finish/i });
-    fireEvent.click(save);
-    fireEvent.click(save);
-    expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/set-default-model'))).toHaveLength(1);
-    model.resolve({ data: { success: true } });
+    expect(screen.getByText(/did not register models, change the default route, restart the gateway, or probe a host model turn/i)).toBeInTheDocument();
+    const finish = screen.getByRole('button', { name: 'Finish' });
+    fireEvent.click(finish);
+    fireEvent.click(finish);
     await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+    expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/set-default-model'))).toHaveLength(0);
   });
 
   it('admits only one same-frame manual setup-token save', async () => {
@@ -1047,58 +816,27 @@ describe('provider setup active-session cancellation', () => {
     const onComplete = vi.fn();
     const user = userEvent.setup();
     render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={onComplete} onCancel={vi.fn()} />);
-    await user.click(screen.getByRole('button', { name: /Paste a setup-token manually/i }));
+    await user.click(screen.getByRole('button', { name: /Paste an existing setup-token/i }));
     await user.type(screen.getByRole('textbox', { name: 'Claude setup token' }), 'test-token-value');
 
     const submit = screen.getByRole('button', { name: /Save Token/i });
     fireEvent.click(submit);
     fireEvent.click(submit);
     expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/save-setup-token'))).toHaveLength(1);
+    expect(mocks.post).toHaveBeenCalledWith(
+      '/ai-setup/save-setup-token',
+      expect.objectContaining({
+        provider: 'anthropic',
+        token: 'test-token-value',
+        setDefault: false,
+        operationId: expect.any(String),
+      }),
+    );
+    expect(mocks.post.mock.calls.some(([url]) => /\/(?:claude\/start|claude\/complete|set-default-model)$/.test(String(url)))).toBe(false);
     save.resolve({ data: { success: true } });
     await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
-  });
-
-  it('keeps polling a recovered native session after a terminal status until cancellation re-attests it', async () => {
-    vi.useFakeTimers({
-      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
-    });
-    let statusCalls = 0;
-    const onCancel = vi.fn();
-    mocks.get.mockImplementation(async (url: string) => {
-      if (url.includes('/native-cli/status/native-recovery-repeat')) {
-        statusCalls += 1;
-        return { data: { status: 'error', cleanupPending: false, error: 'The retained process is terminal.' } };
-      }
-      throw new Error(`Unexpected GET ${url}`);
-    });
-    mocks.post.mockImplementation(async (url: string) => {
-      if (url.endsWith('/native-cli/start')) {
-        throw {
-          response: {
-            status: 500,
-            data: {
-              success: false,
-              sessionId: 'native-recovery-repeat',
-              cleanupPending: true,
-              credentialState: 'indeterminate',
-              error: 'Portal is reconciling an interrupted native login.',
-            },
-          },
-        };
-      }
-      throw new Error(`Unexpected POST ${url}`);
-    });
-
-    render(<NativeCliSetupFlow provider="codex" apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Start Codex Login' }));
-    await vi.waitFor(() => expect(screen.getByText(/reconciling an interrupted native login/i)).toBeInTheDocument());
-
-    await vi.advanceTimersByTimeAsync(1000);
-    await vi.waitFor(() => expect(statusCalls).toBe(1));
-    await vi.waitFor(() => expect(screen.getByText(/must still re-attest it through cancellation/i)).toBeInTheDocument());
-    await vi.advanceTimersByTimeAsync(2000);
-    await vi.waitFor(() => expect(statusCalls).toBe(2));
-    expect(onCancel).not.toHaveBeenCalled();
+    expect(await screen.findByText(/Claude credential saved/i)).toBeInTheDocument();
+    expect(screen.getByText(/Host model routing activation is unavailable in this release until a separately supported maintenance operation ships/i)).toBeInTheDocument();
   });
 
   it('bounds an unresolved Antigravity catalog verification', async () => {
@@ -1133,39 +871,6 @@ describe('provider setup active-session cancellation', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await vi.waitFor(() => expect(screen.getByText(/Timed out while Portal verified the Antigravity model catalog/i)).toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'Close Antigravity login' })).not.toBeDisabled();
-  });
-
-  it('bounds an unresolved Claude credential finalization', async () => {
-    vi.useFakeTimers({
-      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
-    });
-    const completion = deferred<{ data: Record<string, unknown> }>();
-    mocks.get.mockImplementation(async (url: string) => {
-      if (url.endsWith('/status')) return { data: { defaultModel: null } };
-      if (url.includes('/oauth/status/claude-finalize-timeout')) return { data: { status: 'complete' } };
-      if (url.endsWith('/models')) return { data: { models: [] } };
-      throw new Error(`Unexpected GET ${url}`);
-    });
-    mocks.post.mockImplementation((url: string) => {
-      if (url.endsWith('/claude/start')) {
-        return Promise.resolve({
-          data: {
-            success: true,
-            sessionId: 'claude-finalize-timeout',
-            authUrl: 'https://claude.ai/oauth/authorize?code=true',
-          },
-        });
-      }
-      if (url.endsWith('/claude/complete')) return completion.promise;
-      throw new Error(`Unexpected POST ${url}`);
-    });
-
-    render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Connect Claude' }));
-    await vi.waitFor(() => expect(mocks.post.mock.calls.some(([url]) => String(url).endsWith('/claude/complete'))).toBe(true));
-    await vi.advanceTimersByTimeAsync(20_000);
-    await vi.waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/Timed out while Portal verified the Claude credential/i));
-    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Close Claude setup' })).not.toBeDisabled());
   });
 
   it('keeps status polling bounded, non-overlapping, and stale-response safe', async () => {

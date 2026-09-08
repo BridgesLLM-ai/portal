@@ -43,9 +43,15 @@ import {
   AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER,
   AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL,
   AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL,
+  AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
+  AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
   getAgentZeroProjectSandboxImageId,
+  getAgentZeroProjectLegacyV25SourceCommit,
+  getAgentZeroProjectLegacyV25UpstreamImageRef,
   getAgentZeroProjectSourceCommit,
   getAgentZeroProjectUpstreamImageRef,
+  normalizeAgentZeroProjectSandboxImageId,
+  type AgentZeroProjectImageGeneration,
 } from './AgentZeroProjectImage';
 import {
   attestAgentZeroProjectEgressPlane,
@@ -301,13 +307,20 @@ function resolveAgentZeroProjectImage(
   return imageId && context.runtimeImageDigest === imageId ? imageId : null;
 }
 
-function expectedDerivedImageIdentity(architecture: string): {
+function expectedDerivedImageIdentity(
+  architecture: string,
+  generation: AgentZeroProjectImageGeneration = AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
+): {
   architecture: 'amd64' | 'arm64';
   sourceCommit: string;
   upstreamDigest: string;
 } | null {
-  const sourceCommit = getAgentZeroProjectSourceCommit(architecture);
-  const upstreamRef = getAgentZeroProjectUpstreamImageRef(architecture);
+  const sourceCommit = generation === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
+    ? getAgentZeroProjectLegacyV25SourceCommit(architecture)
+    : getAgentZeroProjectSourceCommit(architecture);
+  const upstreamRef = generation === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
+    ? getAgentZeroProjectLegacyV25UpstreamImageRef(architecture)
+    : getAgentZeroProjectUpstreamImageRef(architecture);
   if (!sourceCommit || !upstreamRef) return null;
   const upstreamDigest = upstreamRef.split('@')[1] || '';
   const normalizedArchitecture = upstreamDigest
@@ -320,9 +333,10 @@ function expectedDerivedImageIdentity(architecture: string): {
 function exactDerivedImageLabels(
   labelsInput: unknown,
   architecture: string,
+  generation: AgentZeroProjectImageGeneration = AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
 ): boolean {
   const labels = isRecord(labelsInput) ? labelsInput : {};
-  const expected = expectedDerivedImageIdentity(architecture);
+  const expected = expectedDerivedImageIdentity(architecture, generation);
   return Boolean(expected)
     && /^[a-f0-9]{64}$/.test(String(labels[AGENT_ZERO_PROJECT_IMAGE_RECIPE_LABEL] || ''))
     && labels[AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL] === expected!.sourceCommit
@@ -334,13 +348,14 @@ function exactDerivedImageInspect(
   inspect: Record<string, any>,
   imageRef: string,
   architecture: string,
+  generation: AgentZeroProjectImageGeneration = AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
 ): boolean {
-  const expected = expectedDerivedImageIdentity(architecture);
+  const expected = expectedDerivedImageIdentity(architecture, generation);
   return Boolean(expected)
     && String(inspect.Id || '').toLowerCase() === imageRef
     && String(inspect.Os || '').toLowerCase() === 'linux'
     && String(inspect.Architecture || '').toLowerCase() === expected!.architecture
-    && exactDerivedImageLabels(inspect.Config?.Labels, architecture);
+    && exactDerivedImageLabels(inspect.Config?.Labels, architecture, generation);
 }
 
 export function resolveAgentZeroProjectStateRoot(override?: string): string {
@@ -1012,6 +1027,7 @@ function exactContainerIsolation(
   expectedInternalNetworkId: string,
   networkGeneration: AgentZeroRuntimeNetworkGeneration,
   confinementGeneration: AgentZeroRuntimeConfinementGeneration = 'CURRENT',
+  imageGeneration: AgentZeroProjectImageGeneration = AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
 ): boolean {
   const host = inspect.HostConfig || {};
   const labels = inspect.Config?.Labels || {};
@@ -1060,7 +1076,7 @@ function exactContainerIsolation(
     && labels[AGENT_ZERO_PROJECT_ID_LABEL] === descriptor.projectIdentityId
     && labels[AGENT_ZERO_PROJECT_ACTOR_LABEL] === descriptor.actorUserId
     && labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL] === runtimeFingerprint
-    && exactDerivedImageLabels(labels, architecture)
+    && exactDerivedImageLabels(labels, architecture, imageGeneration)
     && host.Privileged !== true
     && host.ReadonlyRootfs === true
     && emptyList(host.CapAdd)
@@ -1410,7 +1426,7 @@ export function probeAgentZeroProjectSandboxRuntime(
   } catch {
     return emptyStatus(
       descriptor,
-      'The isolated Agent Zero v2.5 Project runtime or its controlled-egress identity is unavailable.',
+      'The isolated Agent Zero v2.10 Project runtime or its controlled-egress identity is unavailable.',
     );
   }
 
@@ -1502,7 +1518,7 @@ export function probeAgentZeroProjectSandboxRuntime(
         ? 'Agent Zero Project Sandbox shared egress plane, membership, or ordered firewall is missing or drifted.'
         : !qualified
           ? 'Agent Zero Project Sandbox is isolated but lacks a current exact live public-egress, escape, replay, gateway, and model qualification.'
-          : 'Agent Zero v2.5 Project Sandbox has a current exact live qualification.';
+          : 'Agent Zero v2.10 Project Sandbox has a current exact live qualification.';
 
   return {
     ready: structuralIsolation && volumeProvenance && egressPlaneReady,
@@ -1852,10 +1868,48 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
     } catch {
       throw new Error('Existing Agent Zero project container could not be bound to an exact recognized egress plane.');
     }
+    const existingImageRef = normalizeAgentZeroProjectSandboxImageId(container.Image);
+    const imageGeneration: AgentZeroProjectImageGeneration | null = existingImageRef === imageRef
+      && exactDerivedImageLabels(
+        container.Config?.Labels,
+        architecture,
+        AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
+      )
+      ? AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION
+      : existingImageRef
+        && exactDerivedImageLabels(
+          container.Config?.Labels,
+          architecture,
+          AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
+        )
+        ? AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
+        : null;
+    if (!existingImageRef || !imageGeneration) {
+      throw new Error('Existing Agent Zero project container is neither the current nor a recognized legacy image generation.');
+    }
+    if (imageGeneration === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION) {
+      let legacyImage: Record<string, any>;
+      try {
+        legacyImage = parseSingleInspect(
+          runCommand('docker', ['image', 'inspect', existingImageRef]),
+          'Agent Zero v2.5 project predecessor image',
+        );
+      } catch {
+        throw new Error('Existing Agent Zero v2.5 project predecessor image inspection is unavailable.');
+      }
+      if (!exactDerivedImageInspect(
+        legacyImage,
+        existingImageRef,
+        architecture,
+        AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
+      )) {
+        throw new Error('Existing Agent Zero v2.5 project predecessor image identity is not exact.');
+      }
+    }
     const currentFingerprint = buildAgentZeroProjectRuntimeFingerprint({
       context,
       descriptor,
-      imageRef,
+      imageRef: existingImageRef,
       spec,
       bridgeGatewayIpv4: preflightBridgeGatewayIpv4,
       runtimeIpv4: preflightRuntimeIpv4,
@@ -1864,7 +1918,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
     const legacyFingerprint = buildAgentZeroProjectRuntimeFingerprintValue({
       context,
       descriptor,
-      imageRef,
+      imageRef: existingImageRef,
       spec: preConfinementSpec,
       bridgeGatewayIpv4: preflightBridgeGatewayIpv4,
       modelBridgeCredential,
@@ -1873,18 +1927,19 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
     const preConfinementFingerprint = buildAgentZeroProjectRuntimeFingerprintValue({
       context,
       descriptor,
-      imageRef,
+      imageRef: existingImageRef,
       spec: preConfinementSpec,
       bridgeGatewayIpv4: preflightBridgeGatewayIpv4,
       runtimeIpv4: preflightRuntimeIpv4,
       modelBridgeCredential,
       includeConfinement: false,
     });
-    const current = preflightNetworkBinding.generation === 'CURRENT'
+    const current = imageGeneration === AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION
+      && preflightNetworkBinding.generation === 'CURRENT'
       && exactContainerIsolation(
       container,
       descriptor,
-      imageRef,
+      existingImageRef,
       architecture,
       spec,
       currentFingerprint,
@@ -1895,13 +1950,35 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       requireRunning,
       preflightInternalNetworkId,
       'IMMUTABLE_ID',
+      'CURRENT',
+      imageGeneration,
     );
-    const currentNameMode = !current
+    const legacyV25Immutable = !current
+      && imageGeneration === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
+      && preflightNetworkBinding.generation === 'CURRENT'
+      && exactContainerIsolation(
+        container,
+        descriptor,
+        existingImageRef,
+        architecture,
+        spec,
+        currentFingerprint,
+        preflightBridgeGatewayIpv4,
+        preflightRuntimeIpv4,
+        modelBridgeCredential,
+        authCredentials,
+        requireRunning,
+        preflightInternalNetworkId,
+        'IMMUTABLE_ID',
+        'CURRENT',
+        imageGeneration,
+      );
+    const currentNameMode = !current && !legacyV25Immutable
       && preflightNetworkBinding.generation === 'CURRENT'
       && exactContainerIsolation(
       container,
       descriptor,
-      imageRef,
+      existingImageRef,
       architecture,
       spec,
       currentFingerprint,
@@ -1912,13 +1989,15 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       requireRunning,
       preflightInternalNetworkId,
       'CURRENT_NAME_MODE',
+      'CURRENT',
+      imageGeneration,
     );
-    const preConfinement = !current && !currentNameMode
+    const preConfinement = !current && !legacyV25Immutable && !currentNameMode
       && preflightNetworkBinding.generation === 'LEGACY_PRE_CONFINEMENT'
       && exactContainerIsolation(
       container,
       descriptor,
-      imageRef,
+      existingImageRef,
       architecture,
       preConfinementSpec,
       preConfinementFingerprint,
@@ -1930,13 +2009,14 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       preflightInternalNetworkId,
       'DETERMINISTIC_NAME',
       'LEGACY_PRE_CONFINEMENT',
+      imageGeneration,
     );
-    const legacy = !current && !currentNameMode && !preConfinement
+    const legacy = !current && !legacyV25Immutable && !currentNameMode && !preConfinement
       && preflightNetworkBinding.generation === 'LEGACY_PRE_CONFINEMENT'
       && exactContainerIsolation(
       container,
       descriptor,
-      imageRef,
+      existingImageRef,
       architecture,
       preConfinementSpec,
       legacyFingerprint,
@@ -1948,8 +2028,9 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       preflightInternalNetworkId,
       'DETERMINISTIC_NAME',
       'LEGACY_PRE_CONFINEMENT',
+      imageGeneration,
     );
-    if (!current && !currentNameMode && !preConfinement && !legacy) {
+    if (!current && !legacyV25Immutable && !currentNameMode && !preConfinement && !legacy) {
       throw new Error('Existing Agent Zero project container is neither the current nor a recognized legacy generation.');
     }
     currentContainerId = exactAgentZeroContainerId(container);
@@ -1957,7 +2038,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       attestCurrentBeforeEgress = (candidate) => exactContainerIsolation(
         candidate,
         descriptor,
-        imageRef,
+        existingImageRef,
         architecture,
         spec,
         currentFingerprint,
@@ -1968,20 +2049,26 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         requireRunning,
         preflightInternalNetworkId,
         'IMMUTABLE_ID',
+        'CURRENT',
+        imageGeneration,
       );
     }
-    if (currentNameMode || preConfinement || legacy) {
-      const retirementFingerprint = currentNameMode
+    if (legacyV25Immutable || currentNameMode || preConfinement || legacy) {
+      const retirementFingerprint = legacyV25Immutable || currentNameMode
         ? currentFingerprint
         : preConfinement
           ? preConfinementFingerprint
           : legacyFingerprint;
       const retirementRuntimeIpv4 = legacy ? null : preflightRuntimeIpv4;
-      const retirementSpec = currentNameMode ? spec : preConfinementSpec;
+      const retirementSpec = legacyV25Immutable || currentNameMode ? spec : preConfinementSpec;
       const retirementNetworkGeneration: AgentZeroRuntimeNetworkGeneration
-        = currentNameMode ? 'CURRENT_NAME_MODE' : 'DETERMINISTIC_NAME';
+        = legacyV25Immutable
+          ? 'IMMUTABLE_ID'
+          : currentNameMode
+            ? 'CURRENT_NAME_MODE'
+            : 'DETERMINISTIC_NAME';
       const retirementConfinement: AgentZeroRuntimeConfinementGeneration
-        = currentNameMode ? 'CURRENT' : 'LEGACY_PRE_CONFINEMENT';
+        = legacyV25Immutable || currentNameMode ? 'CURRENT' : 'LEGACY_PRE_CONFINEMENT';
       const beforeStopInventory = inspectExactAgentZeroProjectRuntimeInventory(
         runCommand,
         descriptor,
@@ -1997,7 +2084,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       if (!exactContainerIsolation(
         beforeStop,
         descriptor,
-        imageRef,
+        existingImageRef,
         architecture,
         retirementSpec,
         retirementFingerprint,
@@ -2009,6 +2096,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         preflightInternalNetworkId,
         retirementNetworkGeneration,
         retirementConfinement,
+        imageGeneration,
       )) {
         throw new Error('Recognized legacy Agent Zero project container changed before retirement.');
       }
@@ -2019,7 +2107,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       if (!stopped || !exactContainerIsolation(
         stopped,
         descriptor,
-        imageRef,
+        existingImageRef,
         architecture,
         retirementSpec,
         retirementFingerprint,
@@ -2031,6 +2119,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         preflightInternalNetworkId,
         retirementNetworkGeneration,
         retirementConfinement,
+        imageGeneration,
       )) {
         throw new Error('Recognized legacy Agent Zero project container changed before retirement.');
       }

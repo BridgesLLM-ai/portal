@@ -1,11 +1,19 @@
+import { bindProjectWorkHostSession, currentProjectWork, trackProjectWorkDispatch } from '../services/projectWorkHost';
+import { adoptProjectWorkDraft } from '../services/projectWorkDraft';
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'fs';
+import { closeSync, existsSync, fstatSync, openSync, opendirSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'fs';
 import { execFile, execFileSync } from 'child_process';
 import path from 'path';
-import { AgentRegistry, AgentProviderName } from '../agents';
+import {
+  AGENT_HARNESS_CATALOG,
+  AgentRegistry,
+  AgentProviderName,
+  REGISTERED_AGENT_HARNESS_IDS,
+  requireHarnessDefinition,
+} from '../agents';
 import {
   AgentAbortError,
   type AgentExecutionContext,
@@ -22,6 +30,7 @@ import {
 import { readLastOpenClawUnavailableModelIds, listProviderModels } from '../agents/providerModels';
 import {
   AskUserQuestionError,
+  readPendingAskUserQuestionForActor,
 } from '../services/askUserQuestionBroker';
 import {
   resolveAskUserQuestionRunOwner,
@@ -59,7 +68,7 @@ import {
   isGatewayTransportError,
   createSession,
   listGatewayModels,
-  readLocalSessionRegistryEntry,
+  getSessionHistory,
   withOpenClawSessionMutation,
 } from '../utils/openclawGatewayRpc';
 import {
@@ -83,6 +92,7 @@ import {
   type ExecApprovalResolved,
 } from '../agents/providers/PersistentGatewayWs';
 import {
+  getPendingNativeCliApprovalProvider,
   onNativeCliApprovalRequest,
   onNativeCliApprovalResolved,
   resolveNativeCliApproval,
@@ -96,6 +106,10 @@ import {
 import { streamEventBus, type StreamEvent, type StreamInfo } from '../services/StreamEventBus';
 import { readRuntimeTurnEvents } from '../services/RuntimeTurnEventHistory';
 import type { RuntimeTurnEvent } from '../services/RuntimeTurnEvents';
+import {
+  readAgentChatDiagnosticHistory,
+  type AgentChatDiagnosticEvent,
+} from '../services/AgentChatDiagnosticHistory';
 import { verifyAccessToken, JwtPayload } from '../utils/jwt';
 import { buildSignedDevice, getOrCreateDeviceKeys } from '../utils/deviceIdentity';
 import { prisma } from '../config/database';
@@ -121,7 +135,7 @@ import type { Server as HttpServer, IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { config } from '../config/env';
-import { PRIVILEGED_CONFIRMATION, isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
+import { PRIVILEGED_CONFIRMATION } from '../utils/privilegedConfirmation';
 import { parseSafeCookieHeader } from '../utils/safeCookies';
 import { sanitizeThinkingSubject } from '../utils/thinkingSubject';
 import {
@@ -138,8 +152,14 @@ import {
   getOpenClawSetupReadiness,
   TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
   TESTED_OPENCLAW_RUNTIME_VERSION,
-  matchesTestedRuntime,
 } from '../services/openclawSetupReadiness';
+import {
+  askUserRuntimeReportIsReady,
+  NATIVE_BRIDGESLLM_ASK_USER_PLUGIN_VERSION,
+  questionAuthorityForOpenClawVersion,
+  RETAINED_LEGACY_BRIDGESLLM_ASK_USER_PLUGIN_VERSION,
+  type OpenClawQuestionAuthority,
+} from '../services/openClawQuestionRuntimeReadiness';
 import {
   buildUsageStatsPayload,
   isValidUsageAgentFilter,
@@ -154,13 +174,25 @@ import {
   type OpenClawHostRunHandle,
 } from '../services/openClawHostRunJournal';
 import {
-  assertOpenClawGatewayAuthorizationFenceReleased,
-} from '../services/openClawGatewayAuthorizationFence';
-import {
   buildPortalOpenClawIdempotencyKey,
   normalizePortalClientMessageId,
   portalClientMessageIdFromIdempotencyKey,
 } from '../agents/providers/PortalMessageIdentity';
+import {
+  assertOpenClawHostMutationAvailable,
+  OpenClawHostMutationUnavailableError,
+} from '../services/hostRuntimeMaintenancePolicy';
+import {
+  assertCachedOpenClawExecutionAdmitted,
+  assertOpenClawExecutionAdmitted,
+  OpenClawExecutionAdmissionError,
+} from '../services/openClawExecutionAdmission';
+import { assertHostAgentRunAttachable } from '../services/hostAgentRunJournal';
+import {
+  isNativeBinaryProvider,
+  isUnqualifiedNativeBinaryProvider,
+  NativeBinaryRuntimeUnqualifiedError,
+} from '../config/unqualifiedNativeBinaryLane';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -185,9 +217,67 @@ class OpenClawHostRunQuarantinePersistenceError extends Error {
   }
 }
 
-async function sendHostOperatorProviderMessage(
+async function assertHostOperatorProviderExecutionAvailable(providerName: AgentProviderName): Promise<void> {
+  assertQualifiedNativeBinaryProvider(providerName);
+  if (providerName === 'OPENCLAW') {
+    await assertOpenClawExecutionAdmitted();
+  }
+}
+
+function assertQualifiedNativeBinaryProvider(providerName: AgentProviderName): void {
+  if (isNativeBinaryProvider(providerName) && isUnqualifiedNativeBinaryProvider(providerName)) {
+    throw new NativeBinaryRuntimeUnqualifiedError(providerName);
+  }
+}
+
+function isOpenClawExecutionAdmissionFailure(
+  error: unknown,
+): error is OpenClawExecutionAdmissionError | OpenClawHostMutationUnavailableError {
+  return error instanceof OpenClawExecutionAdmissionError
+    || error instanceof OpenClawHostMutationUnavailableError;
+}
+
+function confirmedOpenClawAbortRunIds(
+  value: unknown,
+  expectedRunId?: string,
+): string[] | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const response = value as Record<string, unknown>;
+  if (response.aborted !== true || !Array.isArray(response.runIds)) return null;
+  const runIds: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of response.runIds) {
+    if (
+      typeof candidate !== 'string'
+      || !candidate
+      || candidate.trim() !== candidate
+      || seen.has(candidate)
+    ) return null;
+    seen.add(candidate);
+    runIds.push(candidate);
+  }
+  if (runIds.length === 0) return null;
+  const expected = typeof expectedRunId === 'string' ? expectedRunId.trim() : '';
+  if (expected && !seen.has(expected)) return null;
+  return runIds;
+}
+
+async function sendHostOperatorProviderMessage(input: HostOperatorProviderSend): Promise<AgentSendResult> {
+  return trackProjectWorkDispatch(input, () => sendUntrackedHostOperatorProviderMessage(input));
+}
+
+async function sendUntrackedHostOperatorProviderMessage(
   input: HostOperatorProviderSend,
 ): Promise<AgentSendResult> {
+  assertQualifiedNativeBinaryProvider(input.provider.providerName);
+  // Native Host Operator providers enforce their durable systemd-scope run
+  // boundary inside the provider. OpenClaw gets a synchronous final marker/WAL recheck against
+  // the bounded readiness attestation established at route admission; this
+  // seam never launches expensive readiness probes immediately before IO.
+  if (input.provider.providerName === 'OPENCLAW') {
+    assertCachedOpenClawExecutionAdmitted();
+  }
+
   if (input.provider.providerName !== 'OPENCLAW') {
     return input.provider.sendMessage(
       input.sessionId,
@@ -199,6 +289,9 @@ async function sendHostOperatorProviderMessage(
     );
   }
 
+  // Mandatory final fence. Route-level checks prevent refused session/model
+  // mutations, but only this centralized seam covers every Portal-owned
+  // OpenClaw HOST_OPERATOR dispatch immediately before journaling/provider IO.
   const actorUserId = String(input.sender?.userId || '').trim();
   const actorAuthorizationVersion = Number(input.sender?.authorizationVersion);
   const requestId = String(input.sender?.requestId || '').trim();
@@ -276,18 +369,44 @@ const GATEWAY_URL = getOpenClawApiUrl();
 const FALLBACK_OPENCLAW_PACKAGE_DIR = '/usr/lib/node_modules/openclaw';
 const PORTAL_ROOT = path.resolve(__dirname, '../../..');
 const OPENCLAW_COMPAT_HOTFIX_SCRIPT = path.join(PORTAL_ROOT, 'scripts', 'patch-openclaw-long-run-relay-hotfix.sh');
+const OPENCLAW_2026_9_1_CONTRACT_VERIFIER = path.join(
+  PORTAL_ROOT,
+  'installer',
+  'verify-openclaw-2026.9.1-stock-contract.mjs',
+);
 const GEMINI_CLI_TMP_DIR = path.join(process.env.HOME || '/root', '.gemini', 'tmp');
 const GEMINI_CLI_PROVIDER = 'google-gemini-cli';
 const GEMINI_CLI_TRANSCRIPT_INDEX_TTL_MS = 30000;
-const MAINTENANCE_HISTORY_DIR = path.join(PORTAL_ROOT, 'backend', '.data', 'maintenance-history');
-const MAINTENANCE_HISTORY_DEDUP_WINDOW_MS = 4000;
 const DEFAULT_HISTORY_PAGE_SIZE = 100;
 const MAX_HISTORY_PAGE_SIZE = 100;
 const MAX_HISTORY_CURSOR_LENGTH = 2048;
 const MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES = 50_000;
+const MAX_HISTORY_JSONL_READ_BYTES = 16 * 1024 * 1024;
+const MAX_HISTORY_JSONL_WORK_BYTES = 32 * 1024 * 1024;
+const MAX_HISTORY_JSONL_LINE_BYTES = 1024 * 1024;
+const MAX_HISTORY_JSONL_PARSE_PASSES = 16;
+const MAX_HISTORY_JSONL_RAW_LINES = 200_000;
+const MAX_HISTORY_ADAPTIVE_PASSES = 10;
+const MAX_HISTORY_REQUEST_READ_BYTES = 32 * 1024 * 1024;
+const MAX_HISTORY_REQUEST_WORK_BYTES = 64 * 1024 * 1024;
+const MAX_HISTORY_REQUEST_PASSES = 96;
+const MAX_HISTORY_REQUEST_FILE_READS = 64;
+const MAX_HISTORY_REQUEST_CANDIDATE_IDS = 64;
+const MAX_HISTORY_REQUEST_DIRECTORY_ENTRIES = 16_384;
+const MAX_HISTORY_REQUEST_TRAJECTORY_CANDIDATES = 512;
+const MAX_HISTORY_OPTIONAL_RECOVERY_READ_BYTES = 8 * 1024 * 1024;
+const MAX_OPENCLAW_GATEWAY_HISTORY_PASSES = 64;
+const OPENCLAW_GATEWAY_HISTORY_CONTEXT_PAGE_SIZE = 1_000;
+const MAX_HISTORY_OPTIONAL_RECOVERY_WORK_BYTES = 16 * 1024 * 1024;
+const MAX_HISTORY_OPTIONAL_RECOVERY_PASSES = 24;
+const MAX_HISTORY_OPTIONAL_RECOVERY_FILE_READS = 24;
+const HISTORY_ESSENTIAL_RESERVE_READ_BYTES = MAX_HISTORY_JSONL_READ_BYTES;
+const HISTORY_ESSENTIAL_RESERVE_WORK_BYTES = MAX_HISTORY_JSONL_WORK_BYTES;
+const HISTORY_ESSENTIAL_RESERVE_PASSES = MAX_HISTORY_JSONL_PARSE_PASSES * 2;
+const HISTORY_ESSENTIAL_RESERVE_FILE_READS = MAX_HISTORY_JSONL_PARSE_PASSES;
+const HISTORY_ESSENTIAL_RESERVE_DIRECTORY_ENTRIES = 4_096;
 const HISTORY_CURSOR_PURPOSE = 'gateway-history-before-v1';
 const DIRECT_GATEWAY_CHAT_SEND_TIMEOUT_MS = 30_000;
-const maintenanceHistoryDedup = new Map<string, number>();
 
 type HistoryCursorAnchor = {
   id: string;
@@ -309,6 +428,13 @@ type HistoryCursorPayload = {
     | {
         kind: 'agent-zero-sequence-v1';
         beforeSequence: number;
+      }
+    | {
+        kind: 'openclaw-gateway-offset-v3';
+        nextOffset: number;
+        sessionId: string;
+        totalMessages: number;
+        anchorSeq: number;
       };
 };
 
@@ -324,6 +450,176 @@ type NativeHistoryTailResult = {
 };
 
 class HistoryCursorError extends Error {}
+class HistoryProjectionLimitError extends HistoryCursorError {}
+
+type HistoryReadBudget = {
+  maxReadBytes: number;
+  maxWorkBytes: number;
+  maxPasses: number;
+  maxFileReads: number;
+  maxCandidateIds: number;
+  maxDirectoryEntries: number;
+  readBytes: number;
+  workBytes: number;
+  passes: number;
+  fileReads: number;
+  directoryEntries: number;
+  candidateIds: Set<string>;
+  registryCache: Map<string, any[]>;
+  trajectoryFileCandidatesCache: Map<string, Array<{ filePath: string; mtimeMs: number }>>;
+};
+
+function createHistoryReadBudget(overrides: Partial<Pick<
+  HistoryReadBudget,
+  'maxReadBytes' | 'maxWorkBytes' | 'maxPasses' | 'maxFileReads' | 'maxCandidateIds'
+  | 'maxDirectoryEntries'
+>> = {}): HistoryReadBudget {
+  return {
+    maxReadBytes: overrides.maxReadBytes ?? MAX_HISTORY_REQUEST_READ_BYTES,
+    maxWorkBytes: overrides.maxWorkBytes ?? MAX_HISTORY_REQUEST_WORK_BYTES,
+    maxPasses: overrides.maxPasses ?? MAX_HISTORY_REQUEST_PASSES,
+    maxFileReads: overrides.maxFileReads ?? MAX_HISTORY_REQUEST_FILE_READS,
+    maxCandidateIds: overrides.maxCandidateIds ?? MAX_HISTORY_REQUEST_CANDIDATE_IDS,
+    maxDirectoryEntries: overrides.maxDirectoryEntries ?? MAX_HISTORY_REQUEST_DIRECTORY_ENTRIES,
+    readBytes: 0,
+    workBytes: 0,
+    passes: 0,
+    fileReads: 0,
+    directoryEntries: 0,
+    candidateIds: new Set<string>(),
+    registryCache: new Map<string, any[]>(),
+    trajectoryFileCandidatesCache: new Map(),
+  };
+}
+
+function consumeHistoryReadBudget(
+  budget: HistoryReadBudget,
+  usage: { readBytes?: number; workBytes?: number; passes?: number; fileReads?: number },
+): void {
+  const nextReadBytes = budget.readBytes + Math.max(0, usage.readBytes || 0);
+  const nextWorkBytes = budget.workBytes + Math.max(0, usage.workBytes || 0);
+  const nextPasses = budget.passes + Math.max(0, usage.passes || 0);
+  const nextFileReads = budget.fileReads + Math.max(0, usage.fileReads || 0);
+  if (
+    nextReadBytes > budget.maxReadBytes
+    || nextWorkBytes > budget.maxWorkBytes
+    || nextPasses > budget.maxPasses
+    || nextFileReads > budget.maxFileReads
+  ) {
+    throw new HistoryProjectionLimitError('History projection exceeded its aggregate request budget');
+  }
+  budget.readBytes = nextReadBytes;
+  budget.workBytes = nextWorkBytes;
+  budget.passes = nextPasses;
+  budget.fileReads = nextFileReads;
+}
+
+function consumeHistoryDirectoryEntry(budget: HistoryReadBudget, message: string): void {
+  const nextDirectoryEntries = budget.directoryEntries + 1;
+  if (nextDirectoryEntries > budget.maxDirectoryEntries) {
+    throw new HistoryProjectionLimitError(message);
+  }
+  budget.directoryEntries = nextDirectoryEntries;
+}
+
+function createOptionalHistoryRecoveryBudget(parent: HistoryReadBudget): HistoryReadBudget {
+  const recovery = createHistoryReadBudget({
+    maxReadBytes: Math.min(
+      MAX_HISTORY_OPTIONAL_RECOVERY_READ_BYTES,
+      Math.max(0, parent.maxReadBytes - parent.readBytes - HISTORY_ESSENTIAL_RESERVE_READ_BYTES),
+    ),
+    maxWorkBytes: Math.min(
+      MAX_HISTORY_OPTIONAL_RECOVERY_WORK_BYTES,
+      Math.max(0, parent.maxWorkBytes - parent.workBytes - HISTORY_ESSENTIAL_RESERVE_WORK_BYTES),
+    ),
+    maxPasses: Math.min(
+      MAX_HISTORY_OPTIONAL_RECOVERY_PASSES,
+      Math.max(0, parent.maxPasses - parent.passes - HISTORY_ESSENTIAL_RESERVE_PASSES),
+    ),
+    maxFileReads: Math.min(
+      MAX_HISTORY_OPTIONAL_RECOVERY_FILE_READS,
+      Math.max(0, parent.maxFileReads - parent.fileReads - HISTORY_ESSENTIAL_RESERVE_FILE_READS),
+    ),
+    maxCandidateIds: parent.maxCandidateIds,
+    maxDirectoryEntries: Math.max(
+      0,
+      parent.maxDirectoryEntries
+        - parent.directoryEntries
+        - HISTORY_ESSENTIAL_RESERVE_DIRECTORY_ENTRIES,
+    ),
+  });
+  recovery.candidateIds = new Set(parent.candidateIds);
+  recovery.trajectoryFileCandidatesCache = parent.trajectoryFileCandidatesCache;
+  return recovery;
+}
+
+function absorbOptionalHistoryRecoveryBudget(
+  parent: HistoryReadBudget,
+  recovery: HistoryReadBudget,
+): void {
+  consumeHistoryReadBudget(parent, {
+    readBytes: recovery.readBytes,
+    workBytes: recovery.workBytes,
+    passes: recovery.passes,
+    fileReads: recovery.fileReads,
+  });
+  const nextDirectoryEntries = parent.directoryEntries + recovery.directoryEntries;
+  if (nextDirectoryEntries > parent.maxDirectoryEntries) {
+    throw new HistoryProjectionLimitError('History projection exceeded its aggregate request directory entry budget');
+  }
+  parent.directoryEntries = nextDirectoryEntries;
+  parent.candidateIds = new Set(recovery.candidateIds);
+}
+
+function readBoundedHistoryUtf8File(
+  filePath: string,
+  historyBudget: HistoryReadBudget,
+  limitMessage: string,
+): string {
+  consumeHistoryReadBudget(historyBudget, { passes: 1, fileReads: 1 });
+  const remainingBytes = Math.min(
+    historyBudget.maxReadBytes - historyBudget.readBytes,
+    historyBudget.maxWorkBytes - historyBudget.workBytes,
+  );
+  if (remainingBytes < 1) throw new HistoryProjectionLimitError(limitMessage);
+
+  const fd = openSync(filePath, 'r');
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size < 0 || stat.size > remainingBytes) {
+      throw new HistoryProjectionLimitError(limitMessage);
+    }
+
+    // Read one byte beyond the descriptor-attested size. A concurrent append
+    // therefore fails closed instead of crossing the amount charged below.
+    const capacity = Math.min(remainingBytes + 1, stat.size + 1);
+    const buffer = Buffer.allocUnsafe(capacity);
+    let bytesRead = 0;
+    while (bytesRead < capacity) {
+      const count = readSync(fd, buffer, bytesRead, capacity - bytesRead, bytesRead);
+      if (count <= 0) break;
+      bytesRead += count;
+    }
+    if (bytesRead > stat.size || bytesRead > remainingBytes) {
+      throw new HistoryProjectionLimitError(limitMessage);
+    }
+    consumeHistoryReadBudget(historyBudget, {
+      readBytes: bytesRead,
+      workBytes: bytesRead,
+    });
+    return buffer.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function registerHistoryCandidateId(budget: HistoryReadBudget, sessionId: string): void {
+  if (budget.candidateIds.has(sessionId)) return;
+  if (budget.candidateIds.size >= budget.maxCandidateIds) {
+    throw new HistoryProjectionLimitError('History projection exceeded its candidate session budget');
+  }
+  budget.candidateIds.add(sessionId);
+}
 
 function historyCursorSecret(): string {
   return config.jwtSecret;
@@ -403,7 +699,17 @@ function decodeHistoryCursorPayload(rawCursor: unknown, expectedScope: string): 
     const validAgentZero = payload.source?.kind === 'agent-zero-sequence-v1'
       && Number.isSafeInteger(payload.source.beforeSequence)
       && payload.source.beforeSequence >= 1;
-    if (!validNative && !validAgentZero) {
+    const validOpenClawGateway = payload.source?.kind === 'openclaw-gateway-offset-v3'
+      && Number.isSafeInteger(payload.source.nextOffset)
+      && payload.source.nextOffset >= 1
+      && typeof payload.source.sessionId === 'string'
+      && /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(payload.source.sessionId)
+      && Number.isSafeInteger(payload.source.totalMessages)
+      && payload.source.totalMessages >= payload.source.nextOffset
+      && Number.isSafeInteger(payload.source.anchorSeq)
+      && payload.source.anchorSeq >= 1
+      && payload.source.anchorSeq <= payload.source.totalMessages;
+    if (!validNative && !validAgentZero && !validOpenClawGateway) {
       throw new HistoryCursorError('Invalid history cursor');
     }
   }
@@ -565,6 +871,23 @@ function readNativeHistoryPage(params: {
   }
 }
 
+function readNativeForwardHistory(params: {
+  providerName: AgentProviderName;
+  sessionId: string;
+  limit: number;
+  afterId: string;
+  readTail?: (limit: number) => NativeHistoryTailResult;
+}): any[] {
+  const readTail = params.readTail || ((limit: number) => (
+    readNativeSessionHistoryTail(params.providerName, params.sessionId, limit)
+  ));
+  const tail = readTail(Math.min(params.limit + 1, 101));
+  let messages = tail.messages;
+  const anchorIndex = messages.findIndex((message: any) => message?.id === params.afterId);
+  if (anchorIndex >= 0) messages = messages.slice(anchorIndex + 1);
+  return messages.slice(-params.limit);
+}
+
 async function readAgentZeroHistoryPage(params: {
   provider: unknown;
   sessionId: string;
@@ -687,38 +1010,6 @@ function getOpenClawPackageMetadata(): OpenClawPackageMetadata | null {
 
 function getOpenClawDistDir(): string {
   return path.join(getOpenClawPackageMetadata()?.packageDir || FALLBACK_OPENCLAW_PACKAGE_DIR, 'dist');
-}
-
-async function waitForGatewayVersionClear(timeoutMs = 12000) {
-  const deadline = Date.now() + timeoutMs;
-  let last: any = null;
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    last = await getOpenClawVersionStatus({ force: true, refreshReadiness: true }).catch((err: any) => ({
-      installedVersion: null,
-      installedPackageVersion: null,
-      runningVersion: null,
-      codexPluginVersion: null,
-      codexPluginInstallSpec: null,
-      latestVersion: null,
-      updateChannel: null,
-      testedCorePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-      testedRuntimeVersion: TESTED_OPENCLAW_RUNTIME_VERSION,
-      testedCodexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
-      testedPairReady: false,
-      testedPairReason: err?.message || 'Tested OpenClaw pair verification failed while waiting for gateway restart',
-      mismatch: false,
-      restartRecommended: false,
-      reason: null,
-      listenerPid: null,
-      listenerStartedAt: null,
-      installedPackageMtime: null,
-      probeOk: false,
-      probeError: err?.message || 'Version status check failed while waiting for gateway restart',
-    }));
-    if (last?.probeOk && !last?.restartRecommended) return last;
-  }
-  return last;
 }
 
 function getGatewayListenerProcess(): { pid: number | null; startedAt: string | null; startedAtMs: number | null } {
@@ -853,7 +1144,6 @@ async function probeOpenClawVersionStatusWithDependencies(
   const installedPackageMtime = installedPackageMtimeMs ? new Date(installedPackageMtimeMs).toISOString() : null;
   const probeError = readiness.gatewayProbeError;
 
-  const expectedCodexPluginSpec = `@openclaw/codex@${OPENCLAW_CODEX_PLUGIN_VERSION}`;
   const testedPairReady = readiness.testedPairReady;
   const testedPairBlocker = readiness.blockers.find((blocker) => [
     'not-installed',
@@ -865,17 +1155,9 @@ async function probeOpenClawVersionStatusWithDependencies(
   ].includes(blocker.code));
   const testedPairReason = testedPairReady
     ? null
-    : installedPackageVersion !== TESTED_OPENCLAW_CORE_PACKAGE_VERSION
-    ? `OpenClaw package ${installedPackageVersion || 'unknown'} is installed; Portal 4.0 is tested with ${TESTED_OPENCLAW_CORE_PACKAGE_VERSION}.`
-    : !matchesTestedRuntime(installedVersion)
-      ? `OpenClaw CLI runtime ${installedVersion || 'unknown'} does not match tested runtime ${TESTED_OPENCLAW_RUNTIME_VERSION}.`
-      : !matchesTestedRuntime(runningVersion)
-        ? `OpenClaw gateway runtime ${runningVersion || 'unknown'} does not match tested runtime ${TESTED_OPENCLAW_RUNTIME_VERSION}.`
-        : readiness.blockers.some((blocker) => blocker.code === 'codex-plugin-mismatch')
-          ? `OpenClaw Codex plugin must be the pinned npm install ${expectedCodexPluginSpec}; detected ${codexPluginInstallSpec || codexPluginVersion || 'unknown'}.`
-          : !readiness.gatewayProbeOk
-            ? testedPairBlocker?.message || 'OpenClaw gateway RPC probe did not validate the tested runtime pair.'
-            : testedPairBlocker?.message || 'OpenClaw did not validate the tested runtime pair.';
+    : testedPairBlocker?.message
+      || readiness.blockers[0]?.message
+      || 'OpenClaw did not validate one exact tested runtime family.';
 
   const exactVersionMismatch = Boolean(installedVersion && runningVersion && installedVersion !== runningVersion);
   const listenerOlderThanInstall = Boolean(
@@ -961,7 +1243,7 @@ async function getOpenClawVersionStatus(
     : getLightweightOpenClawVersionStatus('OpenClaw version probe scheduled.');
 }
 
-let geminiCliTranscriptIndexCache: { at: number; index: Map<string, string> } | null = null;
+let geminiCliTranscriptIndexCache: { at: number; index: Map<string, string>; cacheBytes: number } | null = null;
 
 function resolveOpenClawDistBundle(prefix: string | string[]): string | null {
   try {
@@ -1022,6 +1304,86 @@ function resolveOpenClawExtensionImportedBundle(extensionRelativePath: string, p
 }
 
 function getOpenClawCompatibilityHotfixStatus() {
+  const packageMetadata = getOpenClawPackageMetadata();
+  if (packageMetadata?.version === '2026.9.1') {
+    const scriptExists = existsSync(OPENCLAW_COMPAT_HOTFIX_SCRIPT);
+    const verifierExists = existsSync(OPENCLAW_2026_9_1_CONTRACT_VERIFIER);
+    const issues: string[] = [];
+    let coreContractReady = false;
+    let askUserPluginVersionReady = false;
+    let askUserPluginReady = false;
+    try {
+      if (verifierExists) {
+        execFileSync(process.execPath, [
+          OPENCLAW_2026_9_1_CONTRACT_VERIFIER,
+          'bridged-core',
+          packageMetadata.packageDir,
+        ], {
+          env: buildOpenClawCliEnv(),
+          timeout: 20_000,
+          stdio: 'ignore',
+        });
+        coreContractReady = true;
+      }
+    } catch {
+      coreContractReady = false;
+    }
+    try {
+      const stateRoot = path.join(process.env.HOME || '/root', '.openclaw');
+      const config = JSON.parse(readFileSync(path.join(stateRoot, 'openclaw.json'), 'utf8'));
+      const pluginEntry = config?.plugins?.entries?.['bridgesllm-ask-user'];
+      const allow = config?.plugins?.allow;
+      const bundledPackage = JSON.parse(readFileSync(
+        path.join(PORTAL_ROOT, 'installer/openclaw-ask-user-plugin/package.json'),
+        'utf8',
+      ));
+      const installedPackage = JSON.parse(readFileSync(
+        path.join(stateRoot, 'extensions/bridgesllm-ask-user/package.json'),
+        'utf8',
+      ));
+      askUserPluginVersionReady = typeof bundledPackage?.version === 'string'
+        && bundledPackage.version.length > 0
+        && installedPackage?.version === bundledPackage.version;
+      askUserPluginReady = config?.plugins?.enabled !== false
+        && pluginEntry?.enabled === true
+        && (allow === undefined || (Array.isArray(allow) && allow.includes('bridgesllm-ask-user')))
+        && askUserPluginVersionReady
+        && !Object.prototype.hasOwnProperty.call(config?.agents?.defaults || {}, 'cliBackends');
+    } catch {
+      askUserPluginReady = false;
+    }
+    if (!scriptExists) issues.push('Portal compatibility bridge script is not installed.');
+    if (!verifierExists) issues.push('Portal OpenClaw 2026.9.1 contract verifier is not installed.');
+    else if (!coreContractReady) issues.push('The exact OpenClaw 2026.9.1 Portal bridge contract is not present.');
+    if (!askUserPluginReady) issues.push('The Portal ask-user plugin is not registered under the OpenClaw 2026.9.1 config contract.');
+    const supported = scriptExists && verifierExists && askUserPluginReady;
+    return {
+      contractKind: 'openclaw-2026.9.1-native',
+      scriptExists,
+      supported,
+      applied: supported && coreContractReady,
+      relaySupported: true,
+      geminiSupported: true,
+      detectorPatched: true,
+      relayPatched: coreContractReady,
+      replyPatched: true,
+      geminiCliPatched: true,
+      geminiCliYoloPatched: true,
+      geminiRuntimePatched: true,
+      claudeAskUserSupported: true,
+      claudeAskUserPatched: true,
+      claudeAskUserBridgeReady: askUserPluginReady,
+      claudeAskUserTimeoutsReady: undefined,
+      askUserPluginVersionReady,
+      executeRuntimeNativeToolWiring: true,
+      heartbeatRunner: null,
+      replyBundle: null,
+      executeRuntime: null,
+      claudeCliShared: null,
+      geminiCliBackend: null,
+      issues,
+    };
+  }
   const openClawDistDir = getOpenClawDistDir();
   const heartbeatEventsFilterPath = resolveOpenClawDistBundle('heartbeat-events-filter-');
   const heartbeatRunnerPath = resolveOpenClawDistBundle('heartbeat-runner-');
@@ -1144,6 +1506,7 @@ function getOpenClawCompatibilityHotfixStatus() {
     && claudeAskUserPatched;
 
   return {
+    contractKind: 'legacy-hotfix',
     scriptExists,
     supported,
     applied,
@@ -1173,11 +1536,17 @@ function getOpenClawCompatibilityHotfixStatus() {
 interface OpenClawAskUserRuntimeReadiness {
   ready: boolean;
   pluginLoaded: boolean;
-  toolExecutionCallable: boolean;
-  activeRunSteerCallable: boolean;
-  pendingMethodCallable: boolean;
-  answerMethodCallable: boolean;
-  dismissMethodCallable: boolean;
+  questionAuthority: OpenClawQuestionAuthority | null;
+  openClawVersion: string | null;
+  legacyQuestionToolExecutionCallable: boolean;
+  legacyPendingMethodCallable: boolean;
+  legacyAnswerMethodCallable: boolean;
+  legacyDismissMethodCallable: boolean;
+  nativeAskUserToolCatalogReady: boolean;
+  questionScopeReady: boolean;
+  questionListCallable: boolean;
+  questionGetCallable: boolean;
+  questionResolveCallable: boolean;
   steerMethodCallable: boolean;
   issue?: string;
 }
@@ -1190,55 +1559,63 @@ interface OpenClawAskUserRuntimeReadinessDependencies {
   stateRoot: string;
 }
 
-const REQUIRED_ASK_USER_GATEWAY_METHODS = new Set([
-  'bridgesllm.ask_user.probe',
-  'bridgesllm.ask_user.pending',
-  'bridgesllm.ask_user.answer',
-  'bridgesllm.ask_user.dismiss',
-  'bridgesllm.ask_user.steer',
-]);
+function nativeAskUserToolCatalogIsReady(result: any): boolean {
+  if (!result?.ok || !Array.isArray(result.data?.groups)) return false;
+  const tools = result.data.groups.flatMap((group: any) => (
+    Array.isArray(group?.tools)
+      ? group.tools.map((tool: any) => ({ ...tool, groupSource: group?.source }))
+      : []
+  ));
+  const nativeAskUser = tools.filter((tool: any) => tool?.id === 'ask_user');
+  return nativeAskUser.length === 1
+    && nativeAskUser[0]?.source === 'core'
+    && nativeAskUser[0]?.groupSource === 'core'
+    && !tools.some((tool: any) => tool?.id === 'ask_user_question');
+}
 
-function askUserRuntimeReportIsReady(params: {
-  report: any;
-  expectedVersion: string;
-  expectedRoot: string;
-  expectedSource: string;
-  resolveRealPath: (target: string) => string;
-}): boolean {
-  const { report, expectedVersion, expectedRoot, expectedSource, resolveRealPath } = params;
-  const plugin = report?.plugin;
-  const toolNames = plugin?.toolNames;
-  const typedHooks = report?.typedHooks;
-  const gatewayMethods = report?.gatewayMethods;
-  const diagnostics = report?.diagnostics;
-  let pluginPathsReady = false;
-  try {
-    pluginPathsReady = typeof plugin?.rootDir === 'string'
-      && typeof plugin?.source === 'string'
-      && resolveRealPath(plugin.rootDir) === resolveRealPath(expectedRoot)
-      && resolveRealPath(plugin.source) === resolveRealPath(expectedSource);
-  } catch {
-    pluginPathsReady = false;
-  }
+function gatewayProbeHasQuestionScope(report: any): boolean {
+  if (report?.ok !== true || !Array.isArray(report?.targets)) return false;
+  const primary = report.targets.find((target: any) => (
+    typeof report.primaryTargetId === 'string' && target?.id === report.primaryTargetId
+  )) || report.targets.find((target: any) => target?.active === true);
   return Boolean(
-    expectedVersion
-    && plugin?.id === 'bridgesllm-ask-user'
-    && plugin?.version === expectedVersion
-    && plugin?.status === 'loaded'
-    && plugin?.enabled === true
-    && plugin?.activated === true
-    && !plugin?.error
-    && pluginPathsReady
-    && Array.isArray(toolNames)
-    && toolNames.includes('ask_user_question')
-    && plugin?.hookCount === 1
-    && Array.isArray(typedHooks)
-    && typedHooks.some((item: any) => item?.name === 'before_tool_call')
-    && Array.isArray(gatewayMethods)
-    && [...REQUIRED_ASK_USER_GATEWAY_METHODS].every((method) => gatewayMethods.includes(method))
-    && Array.isArray(diagnostics)
-    && !diagnostics.some((item: any) => item?.level === 'error')
+    primary?.connect?.ok === true
+    && Array.isArray(primary?.auth?.scopes)
+    && primary.auth.scopes.includes('operator.questions'),
   );
+}
+
+function gatewayNotFoundProbeIsValid(result: any, expectedId: string): boolean {
+  const code = String(result?.errorCode || '').toLowerCase();
+  const message = String(result?.errorMessage || result?.error || '').toLowerCase();
+  return result?.ok === false
+    && code === 'invalid_request'
+    && message.includes(expectedId.toLowerCase())
+    && message.includes('not found');
+}
+
+function failedOpenClawAskUserReadiness(
+  issue: string,
+  partial: Partial<OpenClawAskUserRuntimeReadiness> = {},
+): OpenClawAskUserRuntimeReadiness {
+  return {
+    ready: false,
+    pluginLoaded: false,
+    questionAuthority: null,
+    openClawVersion: null,
+    legacyQuestionToolExecutionCallable: false,
+    legacyPendingMethodCallable: false,
+    legacyAnswerMethodCallable: false,
+    legacyDismissMethodCallable: false,
+    nativeAskUserToolCatalogReady: false,
+    questionScopeReady: false,
+    questionListCallable: false,
+    questionGetCallable: false,
+    questionResolveCallable: false,
+    steerMethodCallable: false,
+    ...partial,
+    issue,
+  };
 }
 
 async function getOpenClawAskUserRuntimeReadiness(
@@ -1259,21 +1636,43 @@ async function getOpenClawAskUserRuntimeReadiness(
     stateRoot: defaultStateRoot,
     ...dependencyOverrides,
   };
-  let expectedVersion = '';
-  try {
-    expectedVersion = dependencies.readBundledVersion();
-  } catch {
-    return {
-      ready: false,
-      pluginLoaded: false,
-      toolExecutionCallable: false,
-      activeRunSteerCallable: false,
-      pendingMethodCallable: false,
-      answerMethodCallable: false,
-      dismissMethodCallable: false,
-      steerMethodCallable: false,
-      issue: 'Could not read the bundled ask-user plugin version.',
-    };
+
+  const statusProbe = await dependencies.callGatewayRpc('status', {
+    includeChannelSummary: false,
+  }, 10_000);
+  const openClawVersion = typeof statusProbe.data?.runtimeVersion === 'string'
+    ? statusProbe.data.runtimeVersion.trim()
+    : '';
+  const questionAuthority = statusProbe.ok
+    ? questionAuthorityForOpenClawVersion(openClawVersion)
+    : null;
+  if (!questionAuthority) {
+    return failedOpenClawAskUserReadiness(
+      statusProbe.ok
+        ? `OpenClaw ${openClawVersion || 'unknown'} is not a supported question runtime.`
+        : `OpenClaw runtime version attestation failed: ${statusProbe.errorMessage || statusProbe.error || 'unknown error'}`,
+      { openClawVersion: openClawVersion || null },
+    );
+  }
+
+  let expectedVersion = RETAINED_LEGACY_BRIDGESLLM_ASK_USER_PLUGIN_VERSION;
+  if (questionAuthority === 'native') {
+    let bundledVersion = '';
+    try {
+      bundledVersion = dependencies.readBundledVersion();
+    } catch {
+      return failedOpenClawAskUserReadiness(
+        'Could not read the bundled OpenClaw runtime-guard plugin version.',
+        { questionAuthority, openClawVersion },
+      );
+    }
+    if (bundledVersion !== NATIVE_BRIDGESLLM_ASK_USER_PLUGIN_VERSION) {
+      return failedOpenClawAskUserReadiness(
+        `Bundled OpenClaw runtime-guard plugin must be ${NATIVE_BRIDGESLLM_ASK_USER_PLUGIN_VERSION}; detected ${bundledVersion || 'unknown'}.`,
+        { questionAuthority, openClawVersion },
+      );
+    }
+    expectedVersion = NATIVE_BRIDGESLLM_ASK_USER_PLUGIN_VERSION;
   }
 
   const inspection = await dependencies.runCli(
@@ -1290,69 +1689,25 @@ async function getOpenClawAskUserRuntimeReadiness(
     expectedVersion,
     expectedRoot,
     expectedSource: path.join(expectedRoot, 'index.js'),
+    questionAuthority,
     resolveRealPath: dependencies.resolveRealPath,
   });
   if (!pluginLoaded) {
-    return {
-      ready: false,
-      pluginLoaded: false,
-      toolExecutionCallable: false,
-      activeRunSteerCallable: false,
-      pendingMethodCallable: false,
-      answerMethodCallable: false,
-      dismissMethodCallable: false,
-      steerMethodCallable: false,
-      issue: inspection.ok
-        ? 'The ask-user plugin is installed but its runtime tool, hook, or gateway methods are not fully active.'
-        : `OpenClaw could not inspect the ask-user plugin runtime: ${inspection.stderr || inspection.error || 'unknown error'}`,
-    };
+    return failedOpenClawAskUserReadiness(inspection.ok
+      ? questionAuthority === 'native'
+        ? 'OpenClaw 2026.9.1 is not running the exact 4.0 steer-only plugin surface.'
+        : 'OpenClaw 2026.7.1 is not running the exact 3.3 legacy question plugin surface.'
+      : `OpenClaw could not inspect the runtime-guard plugin: ${inspection.stderr || inspection.error || 'unknown error'}`, {
+      questionAuthority,
+      openClawVersion,
+    });
   }
 
   const nonce = randomUUID();
-  const sessionKey = `agent:main:bridgesllm-ask-user-readiness-${nonce}`;
+  const questionId = `bridgesllm-native-question-readiness-${nonce}`;
+  const sessionKey = `agent:main:bridgesllm-runtime-readiness-${nonce}`;
   const expectedRunId = `readiness-${nonce}`;
   const requestId = `readiness-request-${nonce}`;
-  const semanticProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.probe', {
-    nonce,
-  }, 10_000);
-  const toolExecutionCallable = semanticProbe.ok
-    && semanticProbe.data?.ok === true
-    && semanticProbe.data?.code === 'SEMANTIC_PROBE_OK'
-    && semanticProbe.data?.toolName === 'ask_user_question'
-    && semanticProbe.data?.answer === true
-    && semanticProbe.data?.dismiss === true
-    && semanticProbe.data?.steer === true;
-  const activeRunSteerCallable = toolExecutionCallable
-    && semanticProbe.data?.activeRunSteer === true;
-
-  const pendingProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.pending', {
-    sessionKey,
-    expectedRunId,
-  }, 10_000);
-  const pendingMethodCallable = pendingProbe.ok
-    && pendingProbe.data?.pending === false
-    && pendingProbe.data?.code === 'NO_ACTIVE_RUN';
-
-  const answerProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.answer', {
-    sessionKey,
-    expectedRunId,
-    requestId,
-    text: 'BridgesLLM readiness probe.',
-  }, 10_000);
-  const answerMethodCallable = answerProbe.ok
-    && answerProbe.data?.accepted === false
-    && answerProbe.data?.code === 'NO_ACTIVE_RUN'
-    && answerProbe.data?.requestId === requestId;
-
-  const dismissProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.dismiss', {
-    sessionKey,
-    expectedRunId,
-    requestId,
-  }, 10_000);
-  const dismissMethodCallable = dismissProbe.ok
-    && dismissProbe.data?.accepted === false
-    && dismissProbe.data?.code === 'NO_ACTIVE_RUN'
-    && dismissProbe.data?.requestId === requestId;
 
   const steerProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.steer', {
     sessionKey,
@@ -1364,61 +1719,152 @@ async function getOpenClawAskUserRuntimeReadiness(
     && steerProbe.data?.accepted === false
     && steerProbe.data?.code === 'NO_ACTIVE_RUN'
     && steerProbe.data?.requestId === requestId;
-  const ready = toolExecutionCallable
-    && activeRunSteerCallable
-    && pendingMethodCallable
-    && answerMethodCallable
-    && dismissMethodCallable
-    && steerMethodCallable;
-  const failedProbe = !toolExecutionCallable
-    ? ['tool execution', semanticProbe]
-    : !activeRunSteerCallable
-      ? ['active-run steering', semanticProbe]
-    : !pendingMethodCallable
-      ? ['pending', pendingProbe]
-      : !answerMethodCallable
-        ? ['answer', answerProbe]
-        : !dismissMethodCallable
-          ? ['dismiss', dismissProbe]
-          : !steerMethodCallable
-            ? ['steer', steerProbe]
-            : null;
+
+  const commonReady = steerMethodCallable;
+  const commonFailure = !steerMethodCallable
+    ? ['exact-run steer', steerProbe]
+    : null;
+
+  if (questionAuthority === 'legacy-custom') {
+    const semanticProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.probe', {
+      nonce,
+    }, 10_000);
+    const legacyQuestionToolExecutionCallable = semanticProbe.ok
+      && semanticProbe.data?.ok === true
+      && semanticProbe.data?.code === 'SEMANTIC_PROBE_OK'
+      && semanticProbe.data?.toolName === 'ask_user_question'
+      && semanticProbe.data?.answer === true
+      && semanticProbe.data?.dismiss === true
+      && semanticProbe.data?.steer === true
+      && semanticProbe.data?.activeRunSteer === true;
+    const pendingProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.pending', {
+      sessionKey,
+      expectedRunId,
+    }, 10_000);
+    const legacyPendingMethodCallable = pendingProbe.ok
+      && pendingProbe.data?.pending === false
+      && pendingProbe.data?.code === 'NO_ACTIVE_RUN';
+    const answerProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.answer', {
+      sessionKey,
+      expectedRunId,
+      requestId,
+      text: 'BridgesLLM readiness probe.',
+    }, 10_000);
+    const legacyAnswerMethodCallable = answerProbe.ok
+      && answerProbe.data?.accepted === false
+      && answerProbe.data?.code === 'NO_ACTIVE_RUN'
+      && answerProbe.data?.requestId === requestId;
+    const dismissProbe = await dependencies.callGatewayRpc('bridgesllm.ask_user.dismiss', {
+      sessionKey,
+      expectedRunId,
+      requestId,
+    }, 10_000);
+    const legacyDismissMethodCallable = dismissProbe.ok
+      && dismissProbe.data?.accepted === false
+      && dismissProbe.data?.code === 'NO_ACTIVE_RUN'
+      && dismissProbe.data?.requestId === requestId;
+    const ready = commonReady
+      && legacyQuestionToolExecutionCallable
+      && legacyPendingMethodCallable
+      && legacyAnswerMethodCallable
+      && legacyDismissMethodCallable;
+    const failedProbe = commonFailure
+      || (!legacyQuestionToolExecutionCallable
+        ? ['legacy ask-user tool execution', semanticProbe]
+        : !legacyPendingMethodCallable
+          ? ['legacy pending', pendingProbe]
+          : !legacyAnswerMethodCallable
+            ? ['legacy answer', answerProbe]
+            : !legacyDismissMethodCallable
+              ? ['legacy dismiss', dismissProbe]
+              : null);
+    return {
+      ready,
+      pluginLoaded: true,
+      questionAuthority,
+      openClawVersion,
+      legacyQuestionToolExecutionCallable,
+      legacyPendingMethodCallable,
+      legacyAnswerMethodCallable,
+      legacyDismissMethodCallable,
+      nativeAskUserToolCatalogReady: false,
+      questionScopeReady: false,
+      questionListCallable: false,
+      questionGetCallable: false,
+      questionResolveCallable: false,
+      steerMethodCallable,
+      ...(ready ? {} : {
+        issue: `OpenClaw legacy question/runtime readiness failed at ${failedProbe?.[0]}: ${(failedProbe?.[1] as any)?.errorMessage || (failedProbe?.[1] as any)?.error || 'unexpected response'}`,
+      }),
+    };
+  }
+
+  const gatewayProbe = await dependencies.runCli(
+    ['gateway', 'probe', '--json', '--timeout', '3000'],
+    12_000,
+  );
+  const questionScopeReady = gatewayProbe.ok
+    && gatewayProbeHasQuestionScope(parseJsonLoose(gatewayProbe.stdout));
+
+  const toolCatalogProbe = await dependencies.callGatewayRpc('tools.catalog', {
+    agentId: 'main',
+    includePlugins: false,
+  }, 10_000);
+  const nativeAskUserToolCatalogReady = nativeAskUserToolCatalogIsReady(toolCatalogProbe);
+
+  const questionListProbe = await dependencies.callGatewayRpc('question.list', {}, 10_000);
+  const questionListCallable = questionListProbe.ok
+    && Array.isArray(questionListProbe.data?.questions);
+
+  const questionGetProbe = await dependencies.callGatewayRpc('question.get', {
+    id: questionId,
+  }, 10_000);
+  const questionGetCallable = gatewayNotFoundProbeIsValid(questionGetProbe, questionId);
+
+  const questionResolveProbe = await dependencies.callGatewayRpc('question.resolve', {
+    id: questionId,
+    cancel: true,
+    resolvedBy: 'bridgesllm-readiness',
+  }, 10_000);
+  const questionResolveCallable = gatewayNotFoundProbeIsValid(questionResolveProbe, questionId);
+
+  const ready = nativeAskUserToolCatalogReady
+    && questionScopeReady
+    && questionListCallable
+    && questionGetCallable
+    && questionResolveCallable
+    && commonReady;
+  const failedProbe = commonFailure
+    || (!nativeAskUserToolCatalogReady
+      ? ['native ask_user tool catalog', toolCatalogProbe]
+      : !questionScopeReady
+        ? ['operator.questions scope', gatewayProbe]
+        : !questionListCallable
+          ? ['question.list', questionListProbe]
+          : !questionGetCallable
+            ? ['question.get', questionGetProbe]
+            : !questionResolveCallable
+              ? ['question.resolve', questionResolveProbe]
+              : null);
   return {
     ready,
     pluginLoaded: true,
-    toolExecutionCallable,
-    activeRunSteerCallable,
-    pendingMethodCallable,
-    answerMethodCallable,
-    dismissMethodCallable,
+    questionAuthority,
+    openClawVersion,
+    legacyQuestionToolExecutionCallable: false,
+    legacyPendingMethodCallable: false,
+    legacyAnswerMethodCallable: false,
+    legacyDismissMethodCallable: false,
+    nativeAskUserToolCatalogReady,
+    questionScopeReady,
+    questionListCallable,
+    questionGetCallable,
+    questionResolveCallable,
     steerMethodCallable,
     ...(ready ? {} : {
-      issue: `The ask-user plugin loaded, but its ${failedProbe?.[0]} semantic probe failed: ${(failedProbe?.[1] as any)?.errorMessage || (failedProbe?.[1] as any)?.error || 'unexpected response'}`,
+      issue: `OpenClaw question/runtime readiness failed at ${failedProbe?.[0]}: ${(failedProbe?.[1] as any)?.errorMessage || (failedProbe?.[1] as any)?.error || (failedProbe?.[1] as any)?.stderr || 'unexpected response'}`,
     }),
   };
-}
-
-async function restartOpenClawGatewayBySystemService(): Promise<string> {
-  await assertOpenClawGatewayAuthorizationFenceReleased();
-  if (
-    !existsSync('/run/systemd/system')
-    || !existsSync('/usr/bin/systemctl')
-    || !existsSync('/etc/systemd/system/openclaw-gateway.service')
-  ) {
-    throw new Error('The installer-owned OpenClaw gateway system service is unavailable.');
-  }
-  const restartRun = await execFileText(
-    '/usr/bin/systemctl',
-    ['restart', 'openclaw-gateway.service'],
-    45_000,
-  );
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-  const output = [restartRun.stdout, restartRun.stderr].filter(Boolean).join('\n').trim();
-  return output || 'Restarted openclaw-gateway via systemd system service.';
-}
-
-async function restartOpenClawGateway(): Promise<string> {
-  return await restartOpenClawGatewayBySystemService();
 }
 
 async function execFileText(
@@ -1444,21 +1890,6 @@ async function execFileText(
       resolve({ stdout: normalizedStdout, stderr: normalizedStderr });
     });
   });
-}
-
-/**
- * Resolve sessions directory for a given session key.
- * Session keys follow the pattern `agent:<agentId>:...`
- * Falls back to main agent if pattern doesn't match.
- */
-function resolveSessionsDir(sessionKey?: string): string {
-  if (!sessionKey) return SESSIONS_DIR;
-  const match = sessionKey.match(/^agent:([a-zA-Z0-9_-]+):/);
-  if (!match) return SESSIONS_DIR;
-  const agentId = match[1];
-  const agentDir = path.join(AGENTS_BASE, agentId, 'sessions');
-  if (existsSync(agentDir)) return agentDir;
-  return SESSIONS_DIR;
 }
 
 function normalizePortalNewSessionAlias(rawSession: unknown): string {
@@ -1804,7 +2235,19 @@ async function assertExistingGatewaySessionAccess(
   if (await isProjectChatActivitySession(sessionKey, database, user.userId)) {
     throw new Error('Admin access required');
   }
+  // A Portal-scoped Agent Chat key is already cryptographically namespaced to
+  // this actor. Authorize it read-only without creating/touching AgentSession;
+  // this is also how a never-created `:new-` probe returns an honest empty
+  // result while Portal-owned host execution is fenced.
+  const embeddedActorId = openClawSessionActorId(sessionKey);
+  if (embeddedActorId && embeddedActorId !== user.userId.toLowerCase()) {
+    throw new Error('Admin access required');
+  }
+  if (isPortalAgentChatSessionKeyForUser(sessionKey, user)) return;
   const ownerUserId = await findOpenClawAgentSessionOwner(sessionKey, database);
+  // Match the Owner's host-session list and send admission without writing a
+  // claim during history/stream delivery. An existing other-user claim wins.
+  if (!ownerUserId && isOwnerRole(user.role)) return;
   if (ownerUserId !== user.userId) throw new Error('Admin access required');
 }
 
@@ -1815,6 +2258,8 @@ const NATIVE_AGENT_SESSION_PROVIDERS: readonly AgentProviderName[] = Object.free
   'GROK',
   'AGENT_ZERO',
   'OLLAMA',
+  'HERMES',
+  'OPENCODE',
 ]);
 
 function findNativeAgentSessionOwner(sessionId: string): string | null {
@@ -2113,15 +2558,7 @@ function assertProviderExecutionContext(providerName: AgentProviderName, executi
   );
 }
 
-const REGISTERED_AGENT_PROVIDER_NAMES = new Set<AgentProviderName>([
-  'OPENCLAW',
-  'CLAUDE_CODE',
-  'CODEX',
-  'GROK',
-  'AGENT_ZERO',
-  'GEMINI',
-  'OLLAMA',
-]);
+const REGISTERED_AGENT_PROVIDER_NAMES = new Set<AgentProviderName>(REGISTERED_AGENT_HARNESS_IDS);
 
 class UnknownAgentProviderError extends Error {
   constructor(provider: string) {
@@ -2137,6 +2574,13 @@ function normalizeProviderName(input: unknown): AgentProviderName {
     throw new UnknownAgentProviderError(provider);
   }
   return provider as AgentProviderName;
+}
+
+/** Additive 4.1 request alias; legacy `provider` remains authoritative fallback. */
+function harnessOrProviderInput(input: unknown): unknown {
+  if (!input || typeof input !== 'object') return undefined;
+  const candidate = input as { harness?: unknown; provider?: unknown };
+  return candidate.harness ?? candidate.provider;
 }
 
 function isProviderModelResetAlias(value: unknown): boolean {
@@ -2221,11 +2665,16 @@ async function resolveNativeSessionForTurn(input: NativeSessionForTurnInput): Pr
     const initialModel = providerName === 'AGENT_ZERO'
       ? await validatedNativeModelSelection(providerName, requested)
       : requested || undefined;
-    return input.provider.startSession(input.userId, {
+    const createdSession = await input.provider.startSession(input.userId, {
       executionContext: input.executionContext,
       model: initialModel,
       metadata: { requestedBy: input.userEmail },
     });
+    if (input.executionContext.scope === 'HOST_OPERATOR') {
+      await adoptProjectWorkDraft({ actorUserId: input.userId, provider: providerName,
+        draftSession: input.clientSession, session: createdSession });
+    }
+    return createdSession;
   }
 
   const capabilities = getProviderCapabilities(providerName);
@@ -2276,7 +2725,7 @@ function humanizeProviderError(providerName: AgentProviderName, rawMessage: stri
 
   if (/not logged in|not signed in|please run \/login|grok login/i.test(message)) {
     if (providerName === 'CLAUDE_CODE') {
-      return 'Claude Code is installed on the server but not logged in yet. Run /login in Claude Code, then try again.';
+      return 'Claude Project Sandbox needs a credential. Use its process-free sign-in in AI Setup. Interactive host Claude login remains unavailable; supervised Agent Chat can use an existing attested host credential.';
     }
     if (providerName === 'GROK') {
       return 'Grok Build is installed but not signed in on this server. Complete the native Grok device login in AI Setup, then try again. OpenClaw xAI auth is separate.';
@@ -2289,7 +2738,7 @@ function humanizeProviderError(providerName: AgentProviderName, rawMessage: stri
   }
 
   if (/failed to connect to websocket: HTTP error: 500 Internal Server Error, url: wss:\/\/api\.openai\.com\/v1\/responses/i.test(message)) {
-    return 'Codex could not reach the OpenAI Responses service from this server. Check Codex authentication/networking and try again.';
+    return 'Codex Project Sandbox could not reach the OpenAI Responses service. Check its Project credential and network policy; supervised host Agent Chat is a separate execution boundary.';
   }
 
   if (/ECONNREFUSED|connect ECONNREFUSED|gateway.*not connected|Cannot connect to OpenClaw gateway/i.test(message)) {
@@ -2403,6 +2852,14 @@ function extractText(content: any): string {
   return extractSanitizedText(content);
 }
 
+// User text is not assistant control output: preserve literal protocol words.
+function extractUserHistoryText(content: any): string {
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content.filter((block: any) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block: any) => block.text).join('\n').trim();
+}
+
 function defaultCompactionNoticeText(compactionMeta?: any): string {
   const signal = String(compactionMeta?.phase || compactionMeta?.status || '').trim().toLowerCase();
   if (signal === 'start' || signal === 'started' || signal === 'compacting' || signal === 'compaction_start') {
@@ -2439,95 +2896,6 @@ function isCompactionNoticeText(text: unknown): boolean {
   ].some((pattern) => pattern.test(marker));
 }
 
-
-function maintenanceHistoryPathForSession(sessionKey: string): string {
-  const digest = createHash('sha256').update(sessionKey || 'main').digest('hex').slice(0, 32);
-  return path.join(MAINTENANCE_HISTORY_DIR, `${digest}.jsonl`);
-}
-
-function defaultMaintenanceNoticeText(evt: StreamEvent): string {
-  if (evt.type === 'compaction_start') return 'Compacting context…';
-  if (evt.type === 'compaction_end') return evt.completed === false ? 'Context maintenance finished.' : 'Context compacted';
-  return evt.maintenanceKind === 'maintenance' ? 'Context maintenance in progress…' : 'Context maintenance finished.';
-}
-
-function buildMaintenanceHistoryMarker(sessionKey: string, evt: StreamEvent): any | null {
-  if (!sessionKey) return null;
-  const text = typeof evt.content === 'string' && evt.content.trim()
-    ? evt.content.trim()
-    : defaultMaintenanceNoticeText(evt);
-  if (!text || !isCompactionNoticeText(text)) return null;
-
-  const isCompaction = evt.type === 'compaction_start'
-    || (evt.type === 'compaction_end' && evt.completed !== false && evt.maintenanceKind !== 'maintenance');
-  const timestamp = new Date().toISOString();
-  const markerId = `maintenance-${createHash('sha256').update(`${sessionKey}:${timestamp}:${evt.type}:${text}`).digest('hex').slice(0, 24)}`;
-  return {
-    id: markerId,
-    role: 'system',
-    content: text,
-    provenance: isCompaction ? 'compaction' : 'hidden-history-artifact',
-    timestamp,
-    maintenanceKind: isCompaction ? 'compaction' : 'maintenance',
-    __portal: {
-      kind: isCompaction ? 'compaction' : 'maintenance',
-      source: 'stream-event',
-      eventType: evt.type,
-    },
-  };
-}
-
-function recordMaintenanceHistoryMarker(sessionKey: string, evt: StreamEvent): void {
-  const marker = buildMaintenanceHistoryMarker(sessionKey, evt);
-  if (!marker) return;
-  const dedupKey = `${sessionKey}:${marker.maintenanceKind}:${marker.content}`;
-  const now = Date.now();
-  const last = maintenanceHistoryDedup.get(dedupKey) || 0;
-  if (now - last < MAINTENANCE_HISTORY_DEDUP_WINDOW_MS) return;
-  maintenanceHistoryDedup.set(dedupKey, now);
-
-  try {
-    mkdirSync(MAINTENANCE_HISTORY_DIR, { recursive: true });
-    appendFileSync(maintenanceHistoryPathForSession(sessionKey), JSON.stringify(marker) + '\n', 'utf8');
-  } catch (err: any) {
-    console.warn('[gateway-maintenance-history] Failed to record maintenance marker:', err?.message || err);
-  }
-}
-
-function readMaintenanceHistoryMarkers(sessionKey: string, limit = 200): any[] {
-  if (!sessionKey || limit <= 0) return [];
-  const filePath = maintenanceHistoryPathForSession(sessionKey);
-  if (!existsSync(filePath)) return [];
-
-  try {
-    const lines = readLastJsonlLines(filePath, Math.max(limit * 2, limit)).lines;
-    return lines
-      .map((line) => {
-        try { return JSON.parse(line); } catch { return null; }
-      })
-      .filter((entry) => entry?.role === 'system' && typeof entry?.content === 'string' && entry.content.trim())
-      .slice(-Math.max(limit, 1));
-  } catch (err: any) {
-    console.warn('[gateway-maintenance-history] Failed to read maintenance markers:', err?.message || err);
-    return [];
-  }
-}
-
-function mergeMaintenanceHistoryMarkers(sessionKey: string, messages: any[], limit = 200): any[] {
-  const markers = readMaintenanceHistoryMarkers(sessionKey, limit);
-  if (markers.length === 0) return messages;
-
-  const seenIds = new Set<string>();
-  const combined = [...messages, ...markers]
-    .filter((message) => {
-      const id = typeof message?.id === 'string' ? message.id : '';
-      if (id && seenIds.has(id)) return false;
-      if (id) seenIds.add(id);
-      return true;
-    })
-    .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
-  return combined.slice(-Math.max(limit, 1));
-}
 
 function sanitizeHistoryText(text: string): string {
   return stripOpenClawReplyTags(stripEnvelope(text || '')).replace(/\r\n/g, '\n').trim();
@@ -2589,12 +2957,24 @@ function getSessionKeyLookupVariants(sessionKey: string): string[] {
   return Array.from(variants);
 }
 
-function resolveSessionRegistryEntries(sessionKey: string, sessionsDir = SESSIONS_DIR): any[] {
+function resolveSessionRegistryEntries(
+  sessionKey: string,
+  sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
+): any[] {
   const sessionsFile = path.join(sessionsDir, 'sessions.json');
   if (!existsSync(sessionsFile)) return [];
+  const registryCacheKey = `${sessionsFile}\0${String(sessionKey || '').trim()}`;
+  const cached = historyBudget?.registryCache.get(registryCacheKey);
+  if (cached) return cached;
 
   try {
-    const data = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
+    const raw = readBoundedHistoryUtf8File(
+      sessionsFile,
+      historyBudget,
+      'History session registry exceeds the aggregate request byte budget',
+    );
+    const data = JSON.parse(raw);
     const sessions = (Array.isArray(data.sessions) && data.sessions.length === 0) ? data : (data.sessions || data);
     const variants = new Set(getSessionKeyLookupVariants(sessionKey));
     const entries: any[] = [];
@@ -2603,16 +2983,20 @@ function resolveSessionRegistryEntries(sessionKey: string, sessionsDir = SESSION
       for (const key of variants) {
         if (sessions[key]) entries.push(sessions[key]);
       }
+      historyBudget?.registryCache.set(registryCacheKey, entries);
       return entries;
     }
 
     if (Array.isArray(sessions)) {
-      return sessions.filter((session: any) => {
+      const matched = sessions.filter((session: any) => {
         const key = String(session?.key || session?.sessionKey || session?.id || '').trim();
         return key && variants.has(key);
       });
+      historyBudget?.registryCache.set(registryCacheKey, matched);
+      return matched;
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof HistoryProjectionLimitError) throw error;
     return [];
   }
 
@@ -2631,25 +3015,60 @@ function resolveGeminiCliBindingSessionId(entry: any): string | null {
   return legacySessionId || null;
 }
 
-function walkGeminiCliTranscriptFiles(dirPath: string, results: string[], depth = 0): void {
+type BoundedHistoryDirectoryWalk = {
+  inspectedEntries: number;
+  maxEntries: number;
+  maxFiles: number;
+  historyBudget?: HistoryReadBudget;
+};
+
+function walkGeminiCliTranscriptFiles(
+  dirPath: string,
+  results: string[],
+  depth = 0,
+  state: BoundedHistoryDirectoryWalk = {
+    inspectedEntries: 0,
+    maxEntries: MAX_HISTORY_REQUEST_DIRECTORY_ENTRIES,
+    maxFiles: MAX_HISTORY_REQUEST_CANDIDATE_IDS,
+  },
+): void {
   if (depth > 6 || !existsSync(dirPath)) return;
 
-  let entries: any[] = [];
+  let directory: ReturnType<typeof opendirSync> | null = null;
   try {
-    entries = readdirSync(dirPath, { withFileTypes: true }) as any[];
+    directory = opendirSync(dirPath);
   } catch {
     return;
   }
 
-  for (const entry of entries) {
-    const fullPath = path.join(dirPath, entry.name);
-    if (entry.isDirectory?.()) {
-      walkGeminiCliTranscriptFiles(fullPath, results, depth + 1);
-      continue;
+  try {
+    while (true) {
+      const entry = directory.readSync();
+      if (!entry) break;
+      if (state.historyBudget) {
+        consumeHistoryDirectoryEntry(
+          state.historyBudget,
+          'Gemini transcript discovery exceeded the aggregate request directory entry budget',
+        );
+      }
+      state.inspectedEntries += 1;
+      if (state.inspectedEntries > state.maxEntries) {
+        throw new HistoryProjectionLimitError('Gemini transcript discovery exceeded the directory entry budget');
+      }
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        walkGeminiCliTranscriptFiles(fullPath, results, depth + 1, state);
+        continue;
+      }
+      if (!entry.isFile() || (!entry.name.endsWith('.json') && !entry.name.endsWith('.jsonl'))) continue;
+      if (!fullPath.includes(`${path.sep}chats${path.sep}`)) continue;
+      if (results.length >= state.maxFiles) {
+        throw new HistoryProjectionLimitError('Gemini transcript discovery exceeded the file candidate budget');
+      }
+      results.push(fullPath);
     }
-    if (!entry.isFile?.() || (!entry.name.endsWith('.json') && !entry.name.endsWith('.jsonl'))) continue;
-    if (!fullPath.includes(`${path.sep}chats${path.sep}`)) continue;
-    results.push(fullPath);
+  } finally {
+    directory.closeSync();
   }
 }
 
@@ -2674,9 +3093,16 @@ function mergeGeminiCliTranscriptRecord(existing: any, next: any): any {
   };
 }
 
-function loadGeminiCliTranscript(filePath: string): { sessionId: string; messages: any[] } | null {
+function loadGeminiCliTranscript(
+  filePath: string,
+  historyBudget = createHistoryReadBudget(),
+): { sessionId: string; messages: any[] } | null {
   try {
-    const raw = readFileSync(filePath, 'utf-8');
+    const raw = readBoundedHistoryUtf8File(
+      filePath,
+      historyBudget,
+      'Gemini transcript exceeds the aggregate history byte budget',
+    );
     if (!raw.trim()) return null;
 
     if (filePath.endsWith('.jsonl')) {
@@ -2721,23 +3147,38 @@ function loadGeminiCliTranscript(filePath: string): { sessionId: string; message
     if (!sessionId) return null;
     const messages = Array.isArray(parsed?.messages) ? parsed.messages : [];
     return { sessionId, messages };
-  } catch {
+  } catch (error) {
+    if (error instanceof HistoryProjectionLimitError) throw error;
     return null;
   }
 }
 
-function getGeminiCliTranscriptIndex(): Map<string, string> {
+function getGeminiCliTranscriptIndex(historyBudget?: HistoryReadBudget): Map<string, string> {
   const now = Date.now();
   if (geminiCliTranscriptIndexCache && (now - geminiCliTranscriptIndexCache.at) < GEMINI_CLI_TRANSCRIPT_INDEX_TTL_MS) {
+    if (historyBudget) {
+      consumeHistoryReadBudget(historyBudget, {
+        workBytes: geminiCliTranscriptIndexCache.cacheBytes,
+        passes: 1,
+      });
+    }
     return geminiCliTranscriptIndexCache.index;
   }
 
   const index = new Map<string, string>();
   const files: string[] = [];
-  walkGeminiCliTranscriptFiles(GEMINI_CLI_TMP_DIR, files);
+  walkGeminiCliTranscriptFiles(GEMINI_CLI_TMP_DIR, files, 0, {
+    inspectedEntries: 0,
+    maxEntries: historyBudget?.maxDirectoryEntries ?? MAX_HISTORY_REQUEST_DIRECTORY_ENTRIES,
+    maxFiles: historyBudget?.maxCandidateIds ?? MAX_HISTORY_REQUEST_CANDIDATE_IDS,
+    historyBudget,
+  });
+  if (historyBudget && files.length > historyBudget.maxCandidateIds) {
+    throw new HistoryProjectionLimitError('Gemini transcript discovery exceeded the history file candidate budget');
+  }
 
   for (const filePath of files) {
-    const loaded = loadGeminiCliTranscript(filePath);
+    const loaded = loadGeminiCliTranscript(filePath, historyBudget);
     const sessionId = loaded?.sessionId || '';
     if (!sessionId) continue;
 
@@ -2756,13 +3197,23 @@ function getGeminiCliTranscriptIndex(): Map<string, string> {
     }
   }
 
-  geminiCliTranscriptIndexCache = { at: now, index };
+  const cacheBytes = Array.from(index).reduce(
+    (total, [sessionId, filePath]) => total
+      + Buffer.byteLength(sessionId, 'utf8')
+      + Buffer.byteLength(filePath, 'utf8')
+      + 32,
+    64,
+  );
+  geminiCliTranscriptIndexCache = { at: now, index, cacheBytes };
   return index;
 }
 
-function resolveGeminiCliTranscriptPath(cliSessionId: string): string | null {
+function resolveGeminiCliTranscriptPath(
+  cliSessionId: string,
+  historyBudget?: HistoryReadBudget,
+): string | null {
   if (!cliSessionId) return null;
-  return getGeminiCliTranscriptIndex().get(cliSessionId) || null;
+  return getGeminiCliTranscriptIndex(historyBudget).get(cliSessionId) || null;
 }
 
 function extractGeminiCliText(content: unknown): string {
@@ -2812,12 +3263,16 @@ function extractGeminiCliToolResult(rawResult: unknown): string {
   return parts.join('\n\n').trim();
 }
 
-function readGeminiCliImportedMessages(cliSessionId: string, limit = 200): any[] {
-  const transcriptPath = resolveGeminiCliTranscriptPath(cliSessionId);
+function readGeminiCliImportedMessages(
+  cliSessionId: string,
+  limit = 200,
+  historyBudget?: HistoryReadBudget,
+): any[] {
+  const transcriptPath = resolveGeminiCliTranscriptPath(cliSessionId, historyBudget);
   if (!transcriptPath) return [];
 
   try {
-    const loaded = loadGeminiCliTranscript(transcriptPath);
+    const loaded = loadGeminiCliTranscript(transcriptPath, historyBudget);
     const rawMessages = Array.isArray(loaded?.messages) ? loaded.messages : [];
     const importedMessages: any[] = [];
 
@@ -2887,7 +3342,8 @@ function readGeminiCliImportedMessages(cliSessionId: string, limit = 200): any[]
     }
 
     return importedMessages.slice(-limit);
-  } catch {
+  } catch (error) {
+    if (error instanceof HistoryProjectionLimitError) throw error;
     return [];
   }
 }
@@ -2998,6 +3454,50 @@ function browserSafeActiveStreamSnapshot(
       return !activeRunId || !event.runId || event.runId === activeRunId;
     }),
   };
+}
+
+async function attestHostAgentRunBrowserStreamSnapshot(
+  providerName: AgentProviderName,
+  sessionId: string,
+  snapshot: OpenClawActiveStreamSnapshot,
+  executionScope: AgentExecutionContext['scope'] | undefined,
+  actor: Pick<JwtPayload, 'userId' | 'authorizationVersion'> | undefined,
+): Promise<OpenClawActiveStreamSnapshot> {
+  if (
+    !snapshot.active
+    || (providerName !== 'CODEX' && providerName !== 'CLAUDE_CODE')
+    || executionScope === 'PROJECT_SANDBOX'
+  ) {
+    return snapshot;
+  }
+  if (executionScope !== 'HOST_OPERATOR') {
+    return inactiveOpenClawSnapshot('unknown', false);
+  }
+  try {
+    const runId = normalizeHostStreamRunId(snapshot.runId);
+    const actorAuthorizationVersion = Number(actor?.authorizationVersion);
+    if (
+      !runId
+      || !actor?.userId
+      || !Number.isSafeInteger(actorAuthorizationVersion)
+      || actorAuthorizationVersion < 1
+    ) {
+      throw new Error('Host agent attachment authority is incomplete');
+    }
+    await assertHostAgentRunAttachable({
+      actorUserId: actor.userId,
+      actorAuthorizationVersion,
+      provider: providerName,
+      sessionId,
+      runId,
+    });
+    return snapshot;
+  } catch {
+    // History remains readable, but an in-memory bus snapshot is not process
+    // continuity authority. Never project or attach it as live unless the
+    // exact durable run and systemd scope are still attested.
+    return inactiveOpenClawSnapshot('unknown', false);
+  }
 }
 
 function getProviderOwnedBusStreamSnapshot(sessionKey: string): OpenClawActiveStreamSnapshot {
@@ -3160,10 +3660,43 @@ function getOpenClawRuntimeActiveStreamSnapshot(
   };
 }
 
-async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<OpenClawActiveStreamSnapshot> {
+async function getOpenClawActiveStreamSnapshot(
+  sessionKey: string,
+  historyBudget = createHistoryReadBudget(),
+  sessionsDir?: string,
+): Promise<OpenClawActiveStreamSnapshot> {
   if (!sessionKey) return inactiveOpenClawSnapshot('unknown', false);
 
-  const latestMarker = getLatestMeaningfulConversationMarker(readSessionMessagesEnhancedForSessionKey(sessionKey, 20));
+  let latestCanonicalMessages: any[] = [];
+  try {
+    if (sessionsDir) {
+      // Explicit directory injection is retained only for bounded legacy-fixture
+      // tests. Production 2026.9.1 paths must use the Gateway's SQLite-backed
+      // projection and never infer live state from stale JSON/JSONL files.
+      latestCanonicalMessages = readSessionMessagesEnhancedForSessionKey(
+        sessionKey,
+        20,
+        sessionsDir,
+        historyBudget,
+      );
+    } else {
+      const history = await getSessionHistory(sessionKey, { limit: 20 });
+      if (history.ok && history.data) {
+        latestCanonicalMessages = projectOpenClawGatewayHistoryMessages(
+          sessionKey,
+          history.data.messages,
+          20,
+          false,
+        );
+      }
+    }
+  } catch (error) {
+    if (error instanceof HistoryProjectionLimitError) throw error;
+    // Canonical history is a secondary terminality signal. The process-owned
+    // bus and sessions.describe state below remain authoritative when the
+    // SQLite projection is rebuilding or temporarily unavailable.
+  }
+  const latestMarker = getLatestMeaningfulConversationMarker(latestCanonicalMessages);
 
   const info = streamEventBus.getStreamStatus(sessionKey);
   if (info) {
@@ -3296,6 +3829,27 @@ async function getOpenClawActiveStreamSnapshot(sessionKey: string): Promise<Open
   if (runtimeSnapshot) return runtimeSnapshot;
 
   return inactiveOpenClawSnapshot('unknown', false);
+}
+
+async function getOpenClawActiveStreamSnapshotAfterHistory(
+  sessionKey: string,
+  historyBudget = createHistoryReadBudget(),
+  sessionsDir?: string,
+): Promise<OpenClawActiveStreamSnapshot> {
+  try {
+    return await getOpenClawActiveStreamSnapshot(sessionKey, historyBudget, sessionsDir);
+  } catch (error) {
+    if (!(error instanceof HistoryProjectionLimitError)) throw error;
+    // History has already been projected successfully. Active-state transcript
+    // reconciliation is secondary and must not discard that canonical result.
+    // An in-process bus lane remains trustworthy without another disk read;
+    // otherwise return an unknown, non-clearing state rather than resurrecting
+    // an unverified runtime-history overlay or failing the history response.
+    const busSnapshot = getProviderOwnedBusStreamSnapshot(sessionKey);
+    return busSnapshot.active
+      ? busSnapshot
+      : inactiveOpenClawSnapshot('unknown', false);
+  }
 }
 
 type OpenClawConflictRunProbe =
@@ -3612,16 +4166,6 @@ function graduateRuntimeReasoningSnapshot(
   if (typeof latest === 'string') tracker.graduated[lane] = latest;
 }
 
-// Rail placeholders ("Thinking…") and maintenance notices are transient status
-// strip material; persisted status events replaying them as durable thought
-// bubbles resurrects the pre-rail thinking bubble in history.
-function isGenericStatusPlaceholderText(text: string): boolean {
-  const normalized = String(text || '').trim();
-  if (!normalized) return true;
-  if (/^(thinking|working|reasoning|processing|responding|running|typing)\s*(…|\.{1,3})?$/i.test(normalized)) return true;
-  return isCompactionNoticeText(normalized);
-}
-
 function runtimeTurnEventGroupKey(event: RuntimeTurnEvent, fallbackIndex: number): string {
   const runId = typeof event.runId === 'string' && event.runId.trim() ? event.runId.trim() : '';
   if (runId) return runId;
@@ -3782,14 +4326,17 @@ function buildRuntimeHistoryMessages(
       if (typeof event.provenance === 'string' && event.provenance.trim()) provenance = event.provenance.trim();
 
       if (event.type === 'assistant_status') {
-        if (event.visible && event.text && !isGenericStatusPlaceholderText(event.text)) {
+        // Compatibility for older event files: only provider-attested preamble
+        // progress is model-authored reasoning. Ordinary harness/lifecycle
+        // statuses remain rail-only and are never reconstructed as thought.
+        if (event.visible && event.text && event.source?.preambleProgress === true) {
           const projectedStatus = projectRuntimeReasoningSnapshot(
             reasoningSnapshots,
-            'status',
+            'preamble',
             sanitizeHistoryText(event.text),
             event.replace === true,
           );
-          appendSegment('thinking', projectedStatus, event.ts, event.replace === true, 'status');
+          appendSegment('thinking', projectedStatus, event.ts, event.replace === true, 'preamble');
         }
       } else if (event.type === 'assistant_reasoning') {
         const lane: RuntimeReasoningSnapshotLane = event.source?.preambleProgress === true
@@ -3848,7 +4395,9 @@ function buildRuntimeHistoryMessages(
         }
       } else if (event.type === 'turn_error') {
         graduateActiveReasoning();
-        if (!finalText) finalText = sanitizeHistoryText(event.text || '');
+        // Error text is banner state, not model-authored transcript content.
+        // The terminal marker remains useful for restart/run reconciliation;
+        // any real partial assistant text/reasoning/tools above is preserved.
       }
     }
 
@@ -5206,38 +5755,85 @@ function finalizeEnhancedHistoryMessages(sessionKey: string, messages: any[], li
   // reconciliation. Otherwise hundreds of one-tool assistant rows consume the
   // retained-message preview, push the early residual activity overlay outside
   // `limit`, and force fail-closed reconciliation to repeat the terminal answer.
-  const collapsedCanonical = collapseFragmentedToolOnlyAssistantHistory(
-    mergeMaintenanceHistoryMarkers(sessionKey, messages, Math.max(limit * 2, 200)),
+  // Keep the internal maintenance prompt sentinel through runtime-event
+  // reconciliation so every canonical and overlay fragment is filtered under
+  // the same machine-owned turn boundary.
+  const collapsedCanonical = collapseFragmentedToolOnlyAssistantHistory(messages);
+  // Runtime reconciliation must retain enough pre-filter context that a tail of
+  // heartbeat/flush activity cannot evict real conversation rows before the
+  // maintenance projection is removed.
+  const mergeLimit = Math.min(
+    Math.max(limit * 4, collapsedCanonical.length + limit, 200),
+    MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES,
   );
-  return collapseFragmentedToolOnlyAssistantHistory(mergeRuntimeTurnEventHistory(
+  const merged = mergeRuntimeTurnEventHistory(
     sessionKey,
     collapsedCanonical,
-    limit,
-  ));
+    mergeLimit,
+  );
+  return collapseFragmentedToolOnlyAssistantHistory(
+    filterRoutineMaintenanceHistory(merged),
+  );
+}
+
+function isHistoryTurnBoundaryMessage(message: any): boolean {
+  return message?.role === 'user'
+    || message?.__portal?.kind === 'internal-maintenance-prompt';
+}
+
+function historyWindowStartsAtTurnBoundary(messages: any[]): boolean {
+  const first = messages.find(Boolean);
+  return !first || isHistoryTurnBoundaryMessage(first);
+}
+
+/**
+ * A bounded tail can begin in the middle of an arbitrarily fragmented turn.
+ * Until the preceding user/control prompt is present, assistant reasoning and
+ * tool rows cannot be classified as authored conversation versus maintenance.
+ * At the hard retention ceiling, fail closed for that incomplete leading turn
+ * while preserving every later turn whose user boundary is present.
+ */
+function trimIncompleteLeadingHistoryTurn(messages: any[]): any[] {
+  const boundaryIndex = messages.findIndex(isHistoryTurnBoundaryMessage);
+  return boundaryIndex >= 0 ? messages.slice(boundaryIndex) : [];
 }
 
 function readSessionMessagesEnhancedForSessionKeyWithMetadata(
   sessionKey: string,
   limit = 200,
   sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
 ): RecentSessionMessagesRead<any> {
   // Transcript rows are sparse among tool plumbing and control artifacts, so
   // start with a modest enrichment window and let the lower-level tail reader
   // grow only when filtering proves that more raw lines are actually needed.
-  const geminiCliSessionIds = resolveSessionRegistryEntries(sessionKey, sessionsDir)
+  const geminiCliSessionIds = resolveSessionRegistryEntries(sessionKey, sessionsDir, historyBudget)
     .map((entry) => resolveGeminiCliBindingSessionId(entry))
     .filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+  if (geminiCliSessionIds.length > historyBudget.maxCandidateIds) {
+    throw new HistoryProjectionLimitError('History projection exceeded its imported session candidate budget');
+  }
+  for (const cliSessionId of geminiCliSessionIds) {
+    registerHistoryCandidateId(historyBudget, `gemini:${cliSessionId}`);
+  }
   let readLimit = Math.min(Math.max(limit * 3, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  let adaptivePasses = 0;
 
   while (true) {
+    if (adaptivePasses >= MAX_HISTORY_ADAPTIVE_PASSES) {
+      throw new HistoryProjectionLimitError('History projection exceeded its bounded adaptive scan budget');
+    }
+    adaptivePasses += 1;
+    consumeHistoryReadBudget(historyBudget, { passes: 1 });
     const localRead = readBestOpenClawSessionMessagesForSessionKeyWithMetadata(
       sessionKey,
       readLimit,
       sessionsDir,
+      historyBudget,
     );
     const localMessages = localRead.messages;
     const importedMessages = geminiCliSessionIds
-      .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, readLimit))
+      .flatMap((cliSessionId) => readGeminiCliImportedMessages(cliSessionId, readLimit, historyBudget))
       .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp))
       .slice(-Math.max(readLimit, 1));
 
@@ -5256,15 +5852,22 @@ function readSessionMessagesEnhancedForSessionKeyWithMetadata(
       }
     }
 
-    const finalized = finalizeEnhancedHistoryMessages(
-      sessionKey,
-      combined.slice(-Math.max(readLimit, 1)),
-      limit,
-    );
     const importedSourceComplete = importedMessages.length < readLimit;
     const sourceComplete = localRead.sourceComplete && importedSourceComplete;
+    const leadingTurnBoundaryComplete = sourceComplete || historyWindowStartsAtTurnBoundary(combined);
+    const projectionInput = (
+      !leadingTurnBoundaryComplete
+      && readLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
+    )
+      ? trimIncompleteLeadingHistoryTurn(combined)
+      : combined;
+    const finalized = finalizeEnhancedHistoryMessages(
+      sessionKey,
+      projectionInput.slice(-Math.max(readLimit, 1)),
+      limit,
+    );
     if (
-      finalized.length >= limit
+      (finalized.length >= limit && leadingTurnBoundaryComplete)
       || sourceComplete
       || readLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
     ) {
@@ -5274,8 +5877,18 @@ function readSessionMessagesEnhancedForSessionKeyWithMetadata(
   }
 }
 
-function readSessionMessagesEnhancedForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
-  return readSessionMessagesEnhancedForSessionKeyWithMetadata(sessionKey, limit, sessionsDir).messages;
+function readSessionMessagesEnhancedForSessionKey(
+  sessionKey: string,
+  limit = 200,
+  sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
+): any[] {
+  return readSessionMessagesEnhancedForSessionKeyWithMetadata(
+    sessionKey,
+    limit,
+    sessionsDir,
+    historyBudget,
+  ).messages;
 }
 
 async function recoverRecentOpenClawAssistantReply(
@@ -5286,19 +5899,16 @@ async function recoverRecentOpenClawAssistantReply(
   const waitMs = Math.max(500, options?.waitMs ?? 8000);
   const pollMs = Math.max(200, options?.pollMs ?? 500);
   const deadline = Date.now() + waitMs;
-  const sessionsDir = resolveSessionsDir(sessionKey);
-  let explicitSessionId = '';
-
-  try {
-    const info = await getSessionInfo(sessionKey);
-    explicitSessionId = typeof info?.data?.sessionId === 'string' ? info.data.sessionId.trim() : '';
-  } catch {}
 
   while (Date.now() <= deadline) {
-    let messages = readSessionMessagesEnhancedForSessionKey(sessionKey, 30, sessionsDir);
-    if ((!messages || messages.length === 0) && explicitSessionId) {
-      messages = readSessionMessagesEnhanced(explicitSessionId, 30, sessionsDir);
-    }
+    const history = await getSessionHistory(sessionKey, { limit: 30 });
+    if (!history.ok || !history.data) return null;
+    const messages = projectOpenClawGatewayHistoryMessages(
+      sessionKey,
+      history.data.messages,
+      30,
+      true,
+    );
     const recovered = [...messages]
       .reverse()
       .find((entry) => {
@@ -5331,24 +5941,415 @@ function shouldAttemptOpenClawReplyRecovery(
     && Boolean(pendingError || (typeof requestedModel === 'string' && requestedModel.trim()));
 }
 
+function isCanonicalOpenClawInternalContextEnvelope(text: string): boolean {
+  const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  const lines = normalized.split('\n');
+  if (
+    lines.length < 3
+    || lines[0] !== '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>'
+    || lines.at(-1) !== '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>'
+  ) return false;
+  return lines[1] === 'OpenClaw runtime context (internal):'
+    || lines[1] === '[Internal task completion event]';
+}
+
+function isCanonicalUntrustedMetadataEnvelope(text: string): boolean {
+  const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  const match = normalized.match(/^(?:Sender|Conversation info) \(untrusted metadata\):\n```json\n([\s\S]+)\n```$/);
+  if (!match) return false;
+  try {
+    const parsed = JSON.parse(match[1]);
+    return Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed));
+  } catch {
+    return false;
+  }
+}
+
 function isHiddenHistoryArtifactText(text: string): boolean {
   const normalized = String(text || '').trim();
   if (!normalized) return false;
 
+  if (
+    isCanonicalOpenClawInternalContextEnvelope(normalized)
+    || isCanonicalUntrustedMetadataEnvelope(normalized)
+  ) return true;
+
   return [
     /^System \(untrusted\):/i,
     /^An async command you ran earlier has completed\./i,
-    /^Read HEARTBEAT\.md if it exists/i,
+    /^Read HEARTBEAT\.md if it exists\.?$/i,
+    /^Read HEARTBEAT\.md if it exists \(workspace context\)\. Follow it strictly\. Do not infer or repeat old tasks from prior chats\. If nothing needs attention, reply HEARTBEAT_OK\.$/i,
+    /^\[[^\]\n]*heartbeat[^\]\n]*\]$/i,
     /^HEARTBEAT_OK$/i,
     /^Heartbeat check complete(?:d)?\.?$/i,
-    /^Pre-compaction memory flush\./i,
+    /^Pre-compaction memory flush\.$/i,
     /^Memory flush complete(?:d)?\.?$/i,
     /^\[System\]\s+Your previous turn was interrupted by a gateway restart/i,
-    /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
-    /Handle the result internally\./i,
-    /Sender \(untrusted metadata\):/i,
-    /Conversation info \(untrusted metadata\):/i,
   ].some((pattern) => pattern.test(normalized));
+}
+
+// Provenance is emitted by OpenClaw's applyInputProvenanceToUserMessage.
+// Text (including an exact protocol phrase) is never evidence of ownership.
+function isInternalUserHistoryMessage(entry: any): boolean {
+  const provenance = entry?.message?.provenance ?? entry?.provenance;
+  return provenance?.kind === 'internal_system';
+}
+
+function routineMaintenancePromptKind(text: string): 'heartbeat' | 'memory-flush' | null {
+  const normalized = String(text || '').trim();
+  if (!normalized) return null;
+  if (
+    /^Read HEARTBEAT\.md if it exists\.?$/i.test(normalized)
+    || /^Read HEARTBEAT\.md if it exists \(workspace context\)\. Follow it strictly\. Do not infer or repeat old tasks from prior chats\. If nothing needs attention, reply HEARTBEAT_OK\.$/i.test(normalized)
+    || /^\[[^\]\n]*heartbeat[^\]\n]*\]$/i.test(normalized)
+  ) {
+    return 'heartbeat';
+  }
+  if (/^Pre-compaction memory flush\.$/i.test(normalized)) return 'memory-flush';
+  return null;
+}
+
+function internalMaintenancePromptMessage(entry: any, text: string): any {
+  return {
+    ...entry,
+    id: entry?.id,
+    role: 'internal',
+    content: text,
+    timestamp: entry?.timestamp,
+    __portal: {
+      kind: 'internal-maintenance-prompt',
+      maintenanceKind: routineMaintenancePromptKind(text),
+    },
+  };
+}
+
+function internalMaintenanceOutcomeMessage(entry: any, text: string, model?: string): any {
+  return {
+    id: entry?.id,
+    role: 'assistant',
+    content: text,
+    ...(model ? { model } : {}),
+    timestamp: entry?.timestamp,
+    __portal: { kind: 'internal-maintenance-outcome' },
+  };
+}
+
+function isRoutineMaintenanceOutcome(message: any): boolean {
+  if (!message || message.role !== 'assistant') return false;
+  if (message?.__portal?.kind === 'internal-maintenance-outcome') return true;
+  const content = typeof message.content === 'string' ? message.content.trim() : '';
+  return Boolean(content && (isHiddenHistoryArtifactText(content) || isControlOnlyAssistantText(content)));
+}
+
+function actionableHeartbeatHistoryAlert(message: any): any | null {
+  if (!message || message.role !== 'assistant') return null;
+  const content = typeof message.content === 'string' ? message.content.trim() : '';
+  if (!content || isHiddenHistoryArtifactText(content) || isControlOnlyAssistantText(content)) return null;
+
+  // A heartbeat warning is the one machine-owned outcome that belongs on the
+  // user surface. Keep only its final text; reasoning, tool plumbing, runtime
+  // overlay metadata, and provisional fragments remain internal.
+  const {
+    thinkingContent: _thinkingContent,
+    thinkingSubject: _thinkingSubject,
+    segments: _segments,
+    toolCalls: _toolCalls,
+    __portal: _portal,
+    ...alert
+  } = message;
+  return { ...alert, role: 'assistant', content };
+}
+
+/**
+ * Remove machine-owned maintenance turns from the user conversation projection.
+ * The source JSONL remains untouched for diagnostics. A non-OK heartbeat reply is
+ * deliberately retained as an actionable assistant message.
+ */
+function filterRoutineMaintenanceHistory(messages: any[]): any[] {
+  const projected: any[] = [];
+  let maintenanceKind: 'heartbeat' | 'memory-flush' | null = null;
+  let pendingHeartbeatAlert: any | null = null;
+
+  const flushHeartbeatAlert = () => {
+    if (maintenanceKind === 'heartbeat' && pendingHeartbeatAlert) {
+      projected.push(pendingHeartbeatAlert);
+    }
+    pendingHeartbeatAlert = null;
+  };
+
+  for (const message of messages) {
+    if (!message) continue;
+
+    if (message?.__portal?.kind === 'internal-maintenance-prompt') {
+      flushHeartbeatAlert();
+      maintenanceKind = message?.__portal?.maintenanceKind === 'heartbeat'
+        ? 'heartbeat'
+        : 'memory-flush';
+      continue;
+    }
+
+    const content = typeof message.content === 'string' ? message.content.trim() : '';
+    const legacyMaintenanceMarker = message.role === 'system'
+      && (
+        message.provenance === 'compaction'
+        || message.provenance === 'hidden-history-artifact'
+        || message?.__openclaw?.kind === 'compaction'
+        || message?.__portal?.kind === 'maintenance'
+      )
+      && (isCompactionNoticeText(content) || routineMaintenancePromptKind(content) !== null);
+    if (legacyMaintenanceMarker) continue;
+
+    if (message.role === 'user') {
+      flushHeartbeatAlert();
+      maintenanceKind = null;
+      projected.push(message);
+      continue;
+    }
+
+    if (maintenanceKind) {
+      if (message.role === 'assistant') {
+        if (isRoutineMaintenanceOutcome(message)) {
+          pendingHeartbeatAlert = null;
+        } else if (maintenanceKind === 'heartbeat') {
+          const alert = actionableHeartbeatHistoryAlert(message);
+          if (alert) pendingHeartbeatAlert = alert;
+        }
+      }
+      // The machine-owned turn remains open across every assistant/reasoning/
+      // tool fragment. Only the next real user turn (or another maintenance
+      // prompt) is an authoritative boundary.
+      continue;
+    }
+
+    if (isRoutineMaintenanceOutcome(message)) continue;
+    projected.push(message);
+  }
+
+  flushHeartbeatAlert();
+  return projected;
+}
+
+type LegacyDiagnosticCandidate =
+  | { kind: 'maintenance-prompt'; maintenanceKind: 'heartbeat' | 'memory-flush'; timestamp: string; sourceId: string }
+  | { kind: 'assistant'; routine: boolean; hasText: boolean; timestamp: string; sourceId: string }
+  | { kind: 'user-boundary'; timestamp: string; sourceId: string }
+  | { kind: 'compaction'; timestamp: string; sourceId: string }
+  | { kind: 'restart'; timestamp: string; sourceId: string };
+
+function sourceTimestamp(value: unknown): string | null {
+  let timestamp = typeof value === 'number' ? value : Date.parse(String(value || ''));
+  if (typeof value === 'number' && value > 0 && value < 10_000_000_000) timestamp = value * 1000;
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
+  return new Date(timestamp).toISOString();
+}
+
+function rawMessageText(content: unknown): string {
+  if (typeof content === 'string') return content.trim().slice(0, 2_000);
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((block: any) => block?.type === 'text' && typeof block?.text === 'string')
+    .map((block: any) => block.text)
+    .join('\n')
+    .trim()
+    .slice(0, 2_000);
+}
+
+function legacyDiagnosticEvent(params: {
+  sessionKey: string;
+  sourceId: string;
+  timestamp: string;
+  severity: AgentChatDiagnosticEvent['severity'];
+  category: AgentChatDiagnosticEvent['category'];
+  title: string;
+  detail: string;
+  sourceType: string;
+  presentation?: AgentChatDiagnosticEvent['presentation'];
+}): AgentChatDiagnosticEvent {
+  const id = createHash('sha256')
+    .update([
+      params.sessionKey,
+      params.sourceId,
+      params.timestamp,
+      params.sourceType,
+      params.title,
+    ].join('\u0000'))
+    .digest('hex')
+    .slice(0, 32);
+  return {
+    schema: 'bridgesllm.agent-chat-diagnostic.v1',
+    id: `legacy-${id}`,
+    timestamp: params.timestamp,
+    severity: params.severity,
+    category: params.category,
+    title: params.title,
+    detail: params.detail,
+    sourceType: params.sourceType,
+    presentation: params.presentation || 'internal',
+  };
+}
+
+/**
+ * Seed the diagnostic drawer from existing canonical OpenClaw JSONL without
+ * changing or exposing that transcript. Only exact machine-owned markers and
+ * fixed browser-safe summaries leave this function.
+ */
+function readLegacyOpenClawMaintenanceDiagnostics(params: {
+  sessionKey: string;
+  sessionId: string;
+  sessionsDir: string;
+  limit: number;
+  historyBudget?: HistoryReadBudget;
+}): { events: AgentChatDiagnosticEvent[]; truncated: boolean } {
+  const candidateLimit = Math.min(Math.max(params.limit * 12, 240), 2_400);
+  const read = readRecentSessionMessagesWithMetadata<LegacyDiagnosticCandidate>({
+    sessionId: params.sessionId,
+    sessionsDir: params.sessionsDir,
+    limit: candidateLimit,
+    minRawLineWindow: candidateLimit,
+    historyBudget: params.historyBudget,
+    parseLine: (line) => {
+      try {
+        const entry = JSON.parse(line);
+        const timestamp = sourceTimestamp(entry?.timestamp ?? entry?.message?.timestamp);
+        if (!timestamp) return null;
+        const sourceId = typeof entry?.id === 'string' && entry.id.trim()
+          ? entry.id.trim().slice(0, 200)
+          : createHash('sha256').update(line).digest('hex').slice(0, 24);
+        const compactionMeta = entry?.message?.__openclaw ?? entry?.__openclaw;
+        if (entry?.type === 'compaction' || compactionMeta?.kind === 'compaction') {
+          return { kind: 'compaction', timestamp, sourceId };
+        }
+        if (entry?.type !== 'message' || !entry?.message) return null;
+        const role = String(entry.message.role || '').toLowerCase();
+        const text = rawMessageText(entry.message.content);
+        if (role === 'user') {
+          const maintenanceKind = isInternalUserHistoryMessage(entry) ? routineMaintenancePromptKind(text) : null;
+          if (maintenanceKind) {
+            return { kind: 'maintenance-prompt', maintenanceKind, timestamp, sourceId };
+          }
+          return { kind: 'user-boundary', timestamp, sourceId };
+        }
+        if (role === 'assistant') {
+          return {
+            kind: 'assistant',
+            routine: isHiddenHistoryArtifactText(text) || isControlOnlyAssistantText(text),
+            hasText: Boolean(text),
+            timestamp,
+            sourceId,
+          };
+        }
+        if (/gateway restart/i.test(text)) return { kind: 'restart', timestamp, sourceId };
+        return null;
+      } catch {
+        return null;
+      }
+    },
+  });
+
+  const events: AgentChatDiagnosticEvent[] = [];
+  let maintenanceKind: 'heartbeat' | 'memory-flush' | null = null;
+  let maintenanceSourceId = '';
+  let lastMaintenanceTimestamp = '';
+  let pendingHeartbeatAttention: LegacyDiagnosticCandidate & { kind: 'assistant' } | null = null;
+
+  const finishMaintenance = () => {
+    if (!maintenanceKind) return;
+    if (maintenanceKind === 'heartbeat' && pendingHeartbeatAttention) {
+      events.push(legacyDiagnosticEvent({
+        sessionKey: params.sessionKey,
+        sourceId: pendingHeartbeatAttention.sourceId,
+        timestamp: pendingHeartbeatAttention.timestamp,
+        severity: 'warning',
+        category: 'maintenance',
+        title: 'Heartbeat reported attention',
+        detail: 'The heartbeat returned a non-routine result. Its actionable summary remains in the conversation banner.',
+        sourceType: 'legacy-heartbeat-outcome',
+        presentation: 'banner',
+      }));
+    } else if (lastMaintenanceTimestamp) {
+      events.push(legacyDiagnosticEvent({
+        sessionKey: params.sessionKey,
+        sourceId: maintenanceSourceId,
+        timestamp: lastMaintenanceTimestamp,
+        severity: 'info',
+        category: 'maintenance',
+        title: maintenanceKind === 'heartbeat' ? 'Heartbeat completed' : 'Memory flush completed',
+        detail: maintenanceKind === 'heartbeat'
+          ? 'The scheduled heartbeat completed without a conversational reply.'
+          : 'Durable memory maintenance completed outside the conversation timeline.',
+        sourceType: `legacy-${maintenanceKind}-outcome`,
+      }));
+    }
+    maintenanceKind = null;
+    maintenanceSourceId = '';
+    lastMaintenanceTimestamp = '';
+    pendingHeartbeatAttention = null;
+  };
+
+  for (const candidate of read.messages) {
+    if (candidate.kind === 'maintenance-prompt') {
+      finishMaintenance();
+      maintenanceKind = candidate.maintenanceKind;
+      maintenanceSourceId = candidate.sourceId;
+      lastMaintenanceTimestamp = candidate.timestamp;
+      events.push(legacyDiagnosticEvent({
+        sessionKey: params.sessionKey,
+        sourceId: candidate.sourceId,
+        timestamp: candidate.timestamp,
+        severity: 'info',
+        category: 'maintenance',
+        title: candidate.maintenanceKind === 'heartbeat' ? 'Heartbeat started' : 'Memory flush started',
+        detail: candidate.maintenanceKind === 'heartbeat'
+          ? 'The scheduled heartbeat began outside the conversation timeline.'
+          : 'Durable memory maintenance began outside the conversation timeline.',
+        sourceType: `legacy-${candidate.maintenanceKind}-prompt`,
+      }));
+      continue;
+    }
+    if (candidate.kind === 'user-boundary') {
+      finishMaintenance();
+      continue;
+    }
+    if (candidate.kind === 'assistant' && maintenanceKind) {
+      if (!candidate.hasText) continue;
+      lastMaintenanceTimestamp = candidate.timestamp;
+      if (candidate.routine) pendingHeartbeatAttention = null;
+      else if (maintenanceKind === 'heartbeat') pendingHeartbeatAttention = candidate;
+      continue;
+    }
+    if (candidate.kind === 'compaction') {
+      events.push(legacyDiagnosticEvent({
+        sessionKey: params.sessionKey,
+        sourceId: candidate.sourceId,
+        timestamp: candidate.timestamp,
+        severity: 'info',
+        category: 'maintenance',
+        title: 'Context compaction recorded',
+        detail: 'OpenClaw recorded a context-compaction lifecycle event outside the conversation timeline.',
+        sourceType: 'legacy-compaction',
+      }));
+      continue;
+    }
+    if (candidate.kind === 'restart') {
+      events.push(legacyDiagnosticEvent({
+        sessionKey: params.sessionKey,
+        sourceId: candidate.sourceId,
+        timestamp: candidate.timestamp,
+        severity: 'warning',
+        category: 'lifecycle',
+        title: 'Gateway restart interrupted a turn',
+        detail: 'OpenClaw recorded an interrupted-turn recovery marker.',
+        sourceType: 'legacy-gateway-restart',
+        presentation: 'banner',
+      }));
+    }
+  }
+  finishMaintenance();
+
+  return {
+    events: events.slice(-params.limit),
+    truncated: !read.sourceComplete || events.length > params.limit,
+  };
 }
 
 function isDeliveryStatusArtifactText(text: string): boolean {
@@ -5423,45 +6424,6 @@ function extractReadableReasoningSummary(payload: any): string {
   return extractSanitizedText(parts.join('\n\n'));
 }
 
-function summarizeHiddenHistoryArtifactText(text: string): string | null {
-  const normalized = String(text || '').trim();
-  if (!normalized) return null;
-
-  if (/<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i.test(normalized) && /\[Internal task completion event\]/i.test(normalized)) {
-    const sourceMatch = normalized.match(/^source:\s*(.+)$/im);
-    const source = sourceMatch?.[1]?.trim().toLowerCase() || '';
-    if (source === 'subagent') return 'Delegated task completed';
-    if (source) return 'Background task completed';
-    return 'Background work completed';
-  }
-
-  if (/^An async command you ran earlier has completed\./i.test(normalized)) {
-    return 'Earlier async command completed';
-  }
-
-  if (/^\[System\]\s+Your previous turn was interrupted by a gateway restart/i.test(normalized)) {
-    return 'Previous turn interrupted by gateway restart';
-  }
-
-  if (/^Read HEARTBEAT\.md if it exists/i.test(normalized)) {
-    return 'Heartbeat check started';
-  }
-
-  if (/^HEARTBEAT_OK$/i.test(normalized) || /^Heartbeat check complete(?:d)?\.?$/i.test(normalized)) {
-    return 'Heartbeat check completed';
-  }
-
-  if (/^Pre-compaction memory flush\./i.test(normalized)) {
-    return 'Memory flush started';
-  }
-
-  if (/^Memory flush complete(?:d)?\.?$/i.test(normalized)) {
-    return 'Memory flush completed';
-  }
-
-  return null;
-}
-
 function summarizeTaskText(raw: unknown, max = 220): string | null {
   const text = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
   if (!text) return null;
@@ -5489,38 +6451,56 @@ function pickTaskPromptCandidate(session: any): string | null {
   );
 }
 
-function readLastJsonlLines(filePath: string, maxLines: number): { lines: string[]; hitStart: boolean } {
-  if (!existsSync(filePath) || maxLines <= 0) return { lines: [], hitStart: true };
+function readLastJsonlLines(
+  filePath: string,
+  maxLines: number,
+  maxBytes = MAX_HISTORY_JSONL_READ_BYTES,
+): { lines: string[]; hitStart: boolean; bytesRead: number; byteLimitReached: boolean } {
+  if (!existsSync(filePath) || maxLines <= 0) {
+    return { lines: [], hitStart: true, bytesRead: 0, byteLimitReached: false };
+  }
 
   const stat = statSync(filePath);
-  if (!stat.size) return { lines: [], hitStart: true };
+  if (!stat.size) return { lines: [], hitStart: true, bytesRead: 0, byteLimitReached: false };
 
   const fd = openSync(filePath, 'r');
   const chunkSize = 64 * 1024;
   let position = stat.size;
-  let text = '';
+  const chunks: Buffer[] = [];
   let newlineCount = 0;
   let hitStart = false;
+  let totalBytesRead = 0;
 
   try {
-    while (position > 0 && newlineCount <= maxLines) {
-      const bytesToRead = Math.min(chunkSize, position);
+    while (position > 0 && newlineCount <= maxLines && totalBytesRead < maxBytes) {
+      const bytesToRead = Math.min(chunkSize, position, maxBytes - totalBytesRead);
       position -= bytesToRead;
       const buffer = Buffer.allocUnsafe(bytesToRead);
       const bytesRead = readSync(fd, buffer, 0, bytesToRead, position);
       if (bytesRead <= 0) break;
+      totalBytesRead += bytesRead;
       for (let i = 0; i < bytesRead; i++) {
         if (buffer[i] === 10) newlineCount++;
       }
-      text = buffer.subarray(0, bytesRead).toString('utf-8') + text;
+      chunks.unshift(buffer.subarray(0, bytesRead));
     }
     hitStart = position === 0;
   } finally {
     closeSync(fd);
   }
 
-  const lines = text.split('\n').filter((line) => line.trim());
-  return { lines: lines.slice(-maxLines), hitStart };
+  const text = Buffer.concat(chunks, totalBytesRead).toString('utf-8');
+  const split = text.split('\n');
+  // A bounded backwards read that did not reach byte zero begins in the
+  // middle of an untrusted JSONL record. Never parse that partial prefix.
+  if (!hitStart) split.shift();
+  const lines = split.filter((line) => line.trim()).slice(-maxLines);
+  return {
+    lines,
+    hitStart,
+    bytesRead: totalBytesRead,
+    byteLimitReached: !hitStart && totalBytesRead >= maxBytes,
+  };
 }
 
 type RecentSessionMessagesRead<T> = {
@@ -5535,6 +6515,7 @@ function readRecentSessionMessagesWithMetadata<T>(params: {
   parseLine: (line: string) => T | null;
   minRawLineWindow?: number;
   growthFactor?: number;
+  historyBudget?: HistoryReadBudget;
 }): RecentSessionMessagesRead<T> {
   const {
     sessionId,
@@ -5543,21 +6524,48 @@ function readRecentSessionMessagesWithMetadata<T>(params: {
     parseLine,
     minRawLineWindow = 200,
     growthFactor = 4,
+    historyBudget = createHistoryReadBudget(),
   } = params;
 
   const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
   if (!existsSync(filePath) || limit <= 0) return { messages: [], sourceComplete: true };
 
   const rawWindowFloor = Math.max(limit, minRawLineWindow);
-  let rawLineWindow = Math.max(rawWindowFloor, limit * growthFactor);
+  let rawLineWindow = Math.min(
+    Math.max(rawWindowFloor, limit * growthFactor),
+    MAX_HISTORY_JSONL_RAW_LINES,
+  );
   let hitStart = false;
+  let workBytes = 0;
+  let parsePasses = 0;
 
   while (true) {
-    const { lines, hitStart: reachedStart } = readLastJsonlLines(filePath, rawLineWindow);
+    if (parsePasses >= MAX_HISTORY_JSONL_PARSE_PASSES || workBytes >= MAX_HISTORY_JSONL_WORK_BYTES) {
+      throw new HistoryProjectionLimitError('History JSONL projection exceeded its bounded read budget');
+    }
+    consumeHistoryReadBudget(historyBudget, { passes: 1, fileReads: 1 });
+    const remainingWorkBytes = MAX_HISTORY_JSONL_WORK_BYTES - workBytes;
+    const remainingRequestBytes = historyBudget.maxReadBytes - historyBudget.readBytes;
+    const readBudget = Math.min(MAX_HISTORY_JSONL_READ_BYTES, remainingWorkBytes, remainingRequestBytes);
+    if (readBudget <= 0) {
+      throw new HistoryProjectionLimitError('History projection exceeded its aggregate request byte budget');
+    }
+    const {
+      lines,
+      hitStart: reachedStart,
+      bytesRead,
+      byteLimitReached,
+    } = readLastJsonlLines(filePath, rawLineWindow, readBudget);
+    parsePasses += 1;
+    workBytes += bytesRead;
+    consumeHistoryReadBudget(historyBudget, { readBytes: bytesRead, workBytes: bytesRead });
     hitStart = reachedStart;
     const parsed: T[] = [];
 
     for (const line of lines) {
+      if (Buffer.byteLength(line, 'utf8') > MAX_HISTORY_JSONL_LINE_BYTES) {
+        throw new HistoryProjectionLimitError('History JSONL record exceeds the bounded row budget');
+      }
       const message = parseLine(line);
       if (message) parsed.push(message);
     }
@@ -5575,7 +6583,13 @@ function readRecentSessionMessagesWithMetadata<T>(params: {
       };
     }
 
-    rawLineWindow *= 2;
+    if (byteLimitReached && historyBudget.readBytes >= historyBudget.maxReadBytes) {
+      throw new HistoryProjectionLimitError('History projection exceeded its aggregate request byte budget');
+    }
+    if (byteLimitReached || rawLineWindow >= MAX_HISTORY_JSONL_RAW_LINES) {
+      throw new HistoryProjectionLimitError('History JSONL projection could not reach a safe bounded boundary');
+    }
+    rawLineWindow = Math.min(rawLineWindow * 2, MAX_HISTORY_JSONL_RAW_LINES);
   }
 }
 
@@ -5586,24 +6600,45 @@ function readRecentSessionMessages<T>(params: {
   parseLine: (line: string) => T | null;
   minRawLineWindow?: number;
   growthFactor?: number;
+  historyBudget?: HistoryReadBudget;
 }): T[] {
   return readRecentSessionMessagesWithMetadata(params).messages;
 }
 
 /** Legacy text-only history reader (kept for backward compat) */
-async function readSessionMessages(sessionId: string, limit = 100, sessionsDir = SESSIONS_DIR): Promise<any[]> {
-  return readRecentSessionMessages({
-    sessionId,
-    limit,
-    sessionsDir,
-    parseLine: (line) => {
+async function readSessionMessages(
+  sessionId: string,
+  limit = 100,
+  sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
+): Promise<any[]> {
+  const parseLine = (line: string): any | null => {
       try {
         const entry = JSON.parse(line);
         if (entry.type !== 'message' || !entry.message) return null;
         const role = entry.message.role;
         if (role !== 'user' && role !== 'assistant') return null;
-        const text = extractText(entry.message.content);
-        if (!text) return null;
+        const rawText = typeof entry.message.content === 'string'
+          ? entry.message.content.trim()
+          : Array.isArray(entry.message.content)
+            ? entry.message.content
+                .filter((block: any) => block?.type === 'text' && typeof block?.text === 'string')
+                .map((block: any) => block.text)
+                .join('\n')
+                .trim()
+            : '';
+        const text = role === 'user' ? extractUserHistoryText(entry.message.content) : extractText(entry.message.content);
+        if (!text) {
+          if (role === 'assistant' && rawText && (
+            isControlOnlyAssistantText(rawText) || isHiddenHistoryArtifactText(rawText)
+          )) {
+            return internalMaintenanceOutcomeMessage(entry, rawText);
+          }
+          return null;
+        }
+        if (role === 'user' && isInternalUserHistoryMessage(entry) && routineMaintenancePromptKind(text)) {
+          return internalMaintenancePromptMessage(entry, text);
+        }
         if (role === 'assistant') {
           const reasoningMirrorText = extractReasoningMirrorHistoryText(entry.message, text);
           if (reasoningMirrorText && !isHiddenHistoryArtifactText(reasoningMirrorText)) {
@@ -5616,14 +6651,50 @@ async function readSessionMessages(sessionId: string, limit = 100, sessionsDir =
               provenance: 'reasoning-mirror',
             };
           }
-          if (isControlOnlyAssistantText(text)) return null;
+          if (isControlOnlyAssistantText(text) || isHiddenHistoryArtifactText(text)) {
+            return internalMaintenanceOutcomeMessage(entry, text);
+          }
         }
         return { id: entry.id, role, content: text, timestamp: entry.timestamp };
       } catch {
         return null;
       }
-    },
-  });
+  };
+  let readLimit = Math.min(Math.max(limit * 3, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  let adaptivePasses = 0;
+
+  while (true) {
+    if (adaptivePasses >= MAX_HISTORY_ADAPTIVE_PASSES) {
+      throw new HistoryProjectionLimitError('History projection exceeded its bounded adaptive scan budget');
+    }
+    adaptivePasses += 1;
+    consumeHistoryReadBudget(historyBudget, { passes: 1 });
+    const read = readRecentSessionMessagesWithMetadata({
+      sessionId,
+      limit: readLimit,
+      sessionsDir,
+      parseLine,
+      historyBudget,
+    });
+    const leadingTurnBoundaryComplete = read.sourceComplete
+      || historyWindowStartsAtTurnBoundary(read.messages);
+    const projectionInput = (
+      !leadingTurnBoundaryComplete
+      && readLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
+    )
+      ? trimIncompleteLeadingHistoryTurn(read.messages)
+      : read.messages;
+    const projected = filterRoutineMaintenanceHistory(projectionInput);
+
+    if (
+      (projected.length >= limit && leadingTurnBoundaryComplete)
+      || read.sourceComplete
+      || readLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
+    ) {
+      return projected.slice(-Math.max(limit, 1));
+    }
+    readLimit = Math.min(readLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  }
 }
 
 // Narrow test surface for legacy history compatibility. Keep private helpers
@@ -5631,6 +6702,7 @@ async function readSessionMessages(sessionId: string, limit = 100, sessionsDir =
 export const __gatewayHistoryTest = {
   readSessionMessages,
   readRecentSessionMessages,
+  createHistoryReadBudget,
   readSessionMessagesEnhanced,
   readSessionMessagesEnhancedForSessionKey,
   buildHistoryPage,
@@ -5638,8 +6710,10 @@ export const __gatewayHistoryTest = {
   historyCursorScope,
   parseHistoryLimit,
   readNativeHistoryPage,
+  readNativeForwardHistory,
   readAgentZeroHistoryPage,
   readOpenClawHistoryPage,
+  readOpenClawGatewayHistoryPage,
   readBoundedJsonlTailText,
   mergeHistorySegments,
   mergeHistoryToolCalls,
@@ -5647,6 +6721,7 @@ export const __gatewayHistoryTest = {
   readBestOpenClawSessionMessagesForSessionKey,
   getOpenClawRuntimeActiveStreamSnapshot,
   getOpenClawActiveStreamSnapshot,
+  getOpenClawActiveStreamSnapshotAfterHistory,
   buildRuntimeHistoryMessages,
   mergeRuntimeTurnEventHistory,
   mergeRuntimeHistoryMessages,
@@ -5655,6 +6730,7 @@ export const __gatewayHistoryTest = {
   reconcileMergedRuntimeHistoryContent,
   getLatestMeaningfulConversationMarker,
   annotateAgentChatSessionRunActivity,
+  readLegacyOpenClawMaintenanceDiagnostics,
 };
 
 /**
@@ -5664,11 +6740,13 @@ function readSessionMessagesEnhancedWithMetadata(
   sessionId: string,
   limit = 200,
   sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
 ): RecentSessionMessagesRead<any> {
   const read = readRecentSessionMessagesWithMetadata({
     sessionId,
     limit,
     sessionsDir,
+    historyBudget,
     parseLine: (line) => {
       try {
         const entry = JSON.parse(line);
@@ -5685,32 +6763,15 @@ function readSessionMessagesEnhancedWithMetadata(
           };
         }
         if (entry.type === 'compaction') {
-          const compactionMeta = typeof entry.__openclaw === 'object' && entry.__openclaw
-            ? entry.__openclaw
-            : {};
-          return {
-            id: entry.id,
-            role: 'system',
-            content: extractCompactionNoticeText(null, compactionMeta),
-            timestamp: entry.timestamp,
-            __openclaw: {
-              ...compactionMeta,
-              kind: 'compaction',
-              id: compactionMeta.id || entry.id,
-            },
-          };
+          // Compaction is operational lifecycle, not model-authored history.
+          // The live rail owns its presentation; the source row remains in JSONL.
+          return null;
         }
 
         if (entry.type !== 'message' || !entry.message) return null;
         const compactionMeta = entry.message?.__openclaw ?? entry.__openclaw;
         if (compactionMeta?.kind === 'compaction') {
-          return {
-            id: entry.id,
-            role: 'system',
-            content: extractCompactionNoticeText(entry.message.content, compactionMeta),
-            timestamp: entry.timestamp,
-            __openclaw: compactionMeta,
-          };
+          return null;
         }
         const role = entry.message.role;
         const content = entry.message.content;
@@ -5731,18 +6792,16 @@ function readSessionMessagesEnhancedWithMetadata(
         );
 
         if (role === 'user') {
-          const text = extractText(content);
+          const text = extractUserHistoryText(content);
           if (!text) return null;
-          if (isHiddenHistoryArtifactText(text)) {
-            const summary = summarizeHiddenHistoryArtifactText(text);
-            if (!summary) return null;
-            return {
-              id: entry.id,
-              role: 'system',
-              content: summary,
-              provenance: 'hidden-history-artifact',
-              timestamp: entry.timestamp,
-            };
+          if (isInternalUserHistoryMessage(entry) && routineMaintenancePromptKind(text)) {
+            return internalMaintenancePromptMessage(entry, text);
+          }
+          if (isInternalUserHistoryMessage(entry) && isHiddenHistoryArtifactText(text)) {
+            // OpenClaw control injections are runtime inputs, not authored
+            // conversation. Operational recovery is surfaced through the
+            // transient banner/rail contract instead of durable chat cards.
+            return null;
           }
           return { id: entry.id, role: 'user', content: text, timestamp: entry.timestamp };
         }
@@ -5797,12 +6856,16 @@ function readSessionMessagesEnhancedWithMetadata(
               .map(b => b.text!)
               .join('\n');
             const text = extractSanitizedText(allText);
+            const isInternalMaintenanceOutcome = isControlOnlyAssistantText(allText)
+              || isHiddenHistoryArtifactText(allText);
             const thinkingContent = extractSanitizedText(thinkingBlocks.join('\n'));
             const hasVisibleText = Boolean(text)
               && !isControlOnlyAssistantText(text)
               && !isHiddenHistoryArtifactText(text);
             const hasVisibleThinking = Boolean(thinkingContent) && !isHiddenHistoryArtifactText(thinkingContent);
-            if (!hasVisibleText && !hasVisibleThinking && !hasToolCalls) return null;
+            if (!hasVisibleText && !hasVisibleThinking && !hasToolCalls && !isInternalMaintenanceOutcome) {
+              return null;
+            }
 
             return {
               id: entry.id,
@@ -5814,9 +6877,13 @@ function readSessionMessagesEnhancedWithMetadata(
               // Include segments for frontend to reconstruct graduated timeline
               segments: hasToolCalls && segments.length > 0 ? segments : undefined,
               timestamp: entry.timestamp,
+              ...(isInternalMaintenanceOutcome
+                ? { __portal: { kind: 'internal-maintenance-outcome' } }
+                : {}),
             };
           }
 
+          const rawText = typeof content === 'string' ? content : '';
           const text = extractText(content);
           const reasoningMirrorText = extractReasoningMirrorHistoryText(entry.message, text);
           if (reasoningMirrorText && !isHiddenHistoryArtifactText(reasoningMirrorText)) {
@@ -5830,7 +6897,10 @@ function readSessionMessagesEnhancedWithMetadata(
               provenance: 'reasoning-mirror',
             };
           }
-          if (!text || isControlOnlyAssistantText(text) || isHiddenHistoryArtifactText(text)) return null;
+          if (isControlOnlyAssistantText(rawText) || isHiddenHistoryArtifactText(rawText)) {
+            return internalMaintenanceOutcomeMessage(entry, rawText.trim(), executedModel);
+          }
+          if (!text) return null;
           return { id: entry.id, role: 'assistant', content: text, model: executedModel, timestamp: entry.timestamp };
         }
 
@@ -5858,8 +6928,41 @@ function readSessionMessagesEnhancedWithMetadata(
   };
 }
 
-function readSessionMessagesEnhanced(sessionId: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
-  return readSessionMessagesEnhancedWithMetadata(sessionId, limit, sessionsDir).messages;
+function readSessionMessagesEnhanced(
+  sessionId: string,
+  limit = 200,
+  sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
+): any[] {
+  let readLimit = Math.min(Math.max(limit * 3, 200), MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  let adaptivePasses = 0;
+
+  while (true) {
+    if (adaptivePasses >= MAX_HISTORY_ADAPTIVE_PASSES) {
+      throw new HistoryProjectionLimitError('History projection exceeded its bounded adaptive scan budget');
+    }
+    adaptivePasses += 1;
+    consumeHistoryReadBudget(historyBudget, { passes: 1 });
+    const read = readSessionMessagesEnhancedWithMetadata(sessionId, readLimit, sessionsDir, historyBudget);
+    const leadingTurnBoundaryComplete = read.sourceComplete
+      || historyWindowStartsAtTurnBoundary(read.messages);
+    const projectionInput = (
+      !leadingTurnBoundaryComplete
+      && readLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
+    )
+      ? trimIncompleteLeadingHistoryTurn(read.messages)
+      : read.messages;
+    const projected = filterRoutineMaintenanceHistory(projectionInput);
+
+    if (
+      (projected.length >= limit && leadingTurnBoundaryComplete)
+      || read.sourceComplete
+      || readLimit >= MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES
+    ) {
+      return projected.slice(-Math.max(limit, 1));
+    }
+    readLimit = Math.min(readLimit * 2, MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES);
+  }
 }
 
 function toHistoryTimestampMs(value: unknown): number {
@@ -5981,67 +7084,407 @@ function hydrateHistoryToolCalls(messages: any[]): any[] {
   return hydrated;
 }
 
-function augmentDirectHistoryPayload(payload: any, sessionKey: string, limit = 200): any {
-  if (!payload || !Array.isArray(payload.messages) || !sessionKey) return payload;
+function projectOpenClawGatewayHistoryMessage(message: any): any | null {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
+  const role = String(message.role || '').trim();
+  const timestamp = message.timestamp ?? message.createdAt;
+  const id = String(message.id || message.__openclaw?.id || '').trim();
 
-  try {
-    const sessionsDir = resolveSessionsDir(sessionKey);
-    const enhancedMessages = readSessionMessagesEnhancedForSessionKey(sessionKey, limit, sessionsDir);
-    if (enhancedMessages.length === 0) return payload;
-
-    const compactionMessages = enhancedMessages
-      .filter((message) => message?.role === 'system' && (message?.__openclaw?.kind === 'compaction' || isCompactionNoticeText(message?.content)))
-      .map((message) => ({
-        id: message.id,
-        role: 'system',
-        content: extractCompactionNoticeText(message?.content, message?.__openclaw),
-        timestamp: message.timestamp,
-        __openclaw: message.__openclaw || { kind: 'compaction', id: message.id },
-      }));
-
-    if (compactionMessages.length === 0) return payload;
-
-    const seenIds = new Set<string>();
-    const combined = [...payload.messages, ...compactionMessages]
-      .filter((message) => {
-        const messageId = typeof message?.id === 'string' ? message.id : '';
-        if (messageId && seenIds.has(messageId)) return false;
-        if (messageId) seenIds.add(messageId);
-        return true;
-      })
-      .sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
-
-    return {
-      ...payload,
-      messages: combined.slice(-Math.max(limit, 1)),
-    };
-  } catch (err) {
-    console.warn('[gateway-direct] Failed to augment chat.history payload:', err);
-    return payload;
+  if (role === 'user') {
+    const content = extractUserHistoryText(message.content ?? message.text ?? '');
+    if (!content) return null;
+    // The maintenance prompt is the authoritative turn boundary that owns all
+    // following reasoning/tool fragments. Preserve it as an internal sentinel
+    // until the complete raw window has been projected; dropping it as a
+    // generic hidden artifact can expose a memory-flush turn at a page edge.
+    if (isInternalUserHistoryMessage(message) && routineMaintenancePromptKind(content)) {
+      return internalMaintenancePromptMessage({ ...message, id, timestamp }, content);
+    }
+    if (isInternalUserHistoryMessage(message) && isHiddenHistoryArtifactText(content)) return null;
+    return { ...message, id, role, content, timestamp };
   }
+
+  if (role === 'assistant') {
+    const contentBlocks = Array.isArray(message.content) ? message.content : [];
+    const content = extractSanitizedText(extractText(message.content ?? message.text ?? ''));
+    const thinkingBlocks = contentBlocks
+      .filter((block: any) => block?.type === 'thinking')
+      .map((block: any) => String(block.thinking ?? block.text ?? ''));
+    const toolCallsFromContent = contentBlocks.flatMap((block: any) => {
+      if (!block || typeof block !== 'object') return [];
+      if (!['toolCall', 'tool_use'].includes(String(block.type || '')) || !block.name) return [];
+      return [{
+        id: block.id,
+        name: block.name,
+        arguments: block.arguments ?? block.input,
+      }];
+    });
+    const toolCalls = Array.isArray(message.toolCalls) && message.toolCalls.length > 0
+      ? message.toolCalls
+      : toolCallsFromContent;
+    const thinkingContent = extractSanitizedText(
+      String(message.thinkingContent || thinkingBlocks.join('\n')),
+    );
+    if (
+      !content
+      && !thinkingContent
+      && toolCalls.length === 0
+      && !message.__portal
+    ) return null;
+    return {
+      ...message,
+      id,
+      role,
+      content,
+      timestamp,
+      ...(thinkingContent ? { thinkingContent } : {}),
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    };
+  }
+
+  if (role === 'toolResult' || role === 'tool') {
+    return {
+      ...message,
+      id,
+      role: 'toolResult',
+      content: extractText(message.content ?? message.text ?? ''),
+      timestamp,
+    };
+  }
+
+  if (role === 'system') {
+    const content = message.__openclaw?.kind === 'compaction'
+      ? extractCompactionNoticeText(message.content, message.__openclaw)
+      : extractText(message.content ?? message.text ?? '');
+    if (!content) return null;
+    return { ...message, id, role, content, timestamp };
+  }
+
+  return null;
+}
+
+function projectOpenClawGatewayHistoryMessages(
+  sessionKey: string,
+  messages: any[],
+  limit: number,
+  enhanced: boolean,
+): any[] {
+  const projected = stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(
+    messages.map(projectOpenClawGatewayHistoryMessage).filter(Boolean),
+  ));
+  const finalized = enhanced
+    ? finalizeEnhancedHistoryMessages(sessionKey, projected, Math.max(limit, 1))
+    : filterRoutineMaintenanceHistory(projected);
+  return finalized.slice(-Math.max(limit, 1));
+}
+
+function projectOpenClawGatewayHistoryWindow(messages: any[]): any[] {
+  return stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(
+    messages.map(projectOpenClawGatewayHistoryMessage).filter(Boolean),
+  ));
+}
+
+function openClawGatewayHistoryWindowStartsAtTurnBoundary(messages: any[]): boolean {
+  const first = messages.find(Boolean);
+  return Boolean(first && isHistoryTurnBoundaryMessage(first));
+}
+
+function openClawGatewayHistoryMessageSeq(message: any): number | null {
+  const seq = message?.__openclaw?.seq;
+  return Number.isSafeInteger(seq) && seq >= 1 ? seq : null;
+}
+
+function sliceOpenClawGatewayHistoryPage(messages: any[], limit: number): any[] {
+  let start = Math.max(0, messages.length - Math.max(limit, 1));
+
+  // One stored transcript record can project to more than one display row.
+  // Keep that record atomic so a continuation never silently skips siblings.
+  const boundarySeq = openClawGatewayHistoryMessageSeq(messages[start]);
+  if (boundarySeq !== null) {
+    while (start > 0 && openClawGatewayHistoryMessageSeq(messages[start - 1]) === boundarySeq) {
+      start -= 1;
+    }
+  } else {
+    // Enhanced runtime overlays can precede their canonical stored row. Walk
+    // back to a durable transcript anchor; if none exists the caller will scan
+    // farther or fail closed rather than mint an unverifiable cursor.
+    while (start > 0 && openClawGatewayHistoryMessageSeq(messages[start]) === null) {
+      start -= 1;
+    }
+  }
+  return messages.slice(start);
+}
+
+function validateOpenClawGatewayHistoryPayload(params: {
+  history: Awaited<ReturnType<typeof getSessionHistory>>;
+  requestedOffset: number;
+  expectedSessionId?: string;
+}): { sessionId: string; totalMessages: number; nextOffset?: number; hasMore: boolean; messages: any[] } {
+  const { history, requestedOffset, expectedSessionId } = params;
+  if (!history.ok || !history.data) {
+    throw new Error(history.error || 'OpenClaw chat.history failed');
+  }
+  const sessionId = history.data.sessionId || '';
+  if (expectedSessionId && sessionId !== expectedSessionId) {
+    throw new HistoryCursorError('History cursor belongs to a replaced OpenClaw session');
+  }
+  if (history.data.offset !== undefined && history.data.offset !== requestedOffset) {
+    throw new HistoryProjectionLimitError('OpenClaw chat.history returned a mismatched pagination offset');
+  }
+  const legacyUnpagedPayload = requestedOffset === 0
+    && history.data.offset === undefined
+    && history.data.nextOffset === undefined
+    && history.data.hasMore === undefined
+    && history.data.totalMessages === undefined;
+  const totalMessages = legacyUnpagedPayload
+    ? history.data.messages.length
+    : history.data.totalMessages;
+  if (
+    !Number.isSafeInteger(totalMessages)
+    || (totalMessages as number) < 0
+    || (totalMessages as number) < history.data.messages.length
+    || requestedOffset > (totalMessages as number)
+  ) {
+    throw new HistoryProjectionLimitError('OpenClaw chat.history returned an unsafe transcript total');
+  }
+  const hasMore = legacyUnpagedPayload ? false : history.data.hasMore === true;
+  const nextOffset = history.data.nextOffset;
+  if (
+    hasMore
+    && (
+      !sessionId
+      || history.data.messages.length === 0
+      || !Number.isSafeInteger(nextOffset)
+      || (nextOffset as number) <= requestedOffset
+      || (nextOffset as number) > (totalMessages as number)
+    )
+  ) {
+    throw new HistoryProjectionLimitError('OpenClaw chat.history returned an unsafe pagination boundary');
+  }
+  return {
+    sessionId,
+    totalMessages: totalMessages as number,
+    ...(nextOffset !== undefined ? { nextOffset } : {}),
+    hasMore,
+    messages: history.data.messages,
+  };
+}
+
+type OpenClawGatewayHistoryPageResult = HistoryPageResult & {
+  sessionId: string;
+};
+
+async function readOpenClawGatewayHistoryPage(params: {
+  sessionKey: string;
+  enhanced: boolean;
+  limit: number;
+  scope: string;
+  beforeCursor?: unknown;
+  getHistory?: typeof getSessionHistory;
+}): Promise<OpenClawGatewayHistoryPageResult> {
+  const decoded = params.beforeCursor
+    ? decodeHistoryCursorPayload(params.beforeCursor, params.scope)
+    : undefined;
+  const source = decoded?.source?.kind === 'openclaw-gateway-offset-v3'
+    ? decoded.source
+    : undefined;
+  if (decoded && !source) {
+    throw new HistoryCursorError('History cursor predates the OpenClaw 2026.9.1 session store');
+  }
+
+  const getHistory = params.getHistory || getSessionHistory;
+  let requestedOffset = source?.nextOffset ?? 0;
+  let stableSessionId = source?.sessionId || '';
+  let stableTotalMessages: number | undefined = source?.totalMessages;
+  let rawMessages: any[] = [];
+  let scannedRawMessages = 0;
+
+  if (source && decoded) {
+    // A same-session branch switch can keep or grow totalMessages while making
+    // an offset cursor point into a different transcript. First discover the
+    // current total, then prove that the signed display anchor still occupies
+    // its immutable transcript sequence. Pure tail appends preserve that seq;
+    // rewinds and branch switches that invalidate this page do not.
+    let expectedTotal = source.totalMessages;
+    let validated = false;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const discoveryOffset = source.nextOffset + (expectedTotal - source.totalMessages);
+      const discovery = validateOpenClawGatewayHistoryPayload({
+        history: await getHistory(params.sessionKey, { limit: 1, offset: discoveryOffset }),
+        requestedOffset: discoveryOffset,
+        expectedSessionId: source.sessionId,
+      });
+      if (discovery.totalMessages < source.totalMessages) {
+        throw new HistoryCursorError('OpenClaw session history shrank after this cursor was issued');
+      }
+      if (discovery.totalMessages !== expectedTotal) {
+        expectedTotal = discovery.totalMessages;
+      }
+
+      const anchorOffset = expectedTotal - source.anchorSeq;
+      const anchorProbe = validateOpenClawGatewayHistoryPayload({
+        history: await getHistory(params.sessionKey, { limit: 16, offset: anchorOffset }),
+        requestedOffset: anchorOffset,
+        expectedSessionId: source.sessionId,
+      });
+      if (anchorProbe.totalMessages !== expectedTotal) {
+        if (anchorProbe.totalMessages < source.totalMessages) {
+          throw new HistoryCursorError('OpenClaw session history shrank after this cursor was issued');
+        }
+        expectedTotal = anchorProbe.totalMessages;
+        continue;
+      }
+      const anchorStillAtSignedSequence = anchorProbe.messages
+        .map(projectOpenClawGatewayHistoryMessage)
+        .filter(Boolean)
+        .some((message) => (
+          openClawGatewayHistoryMessageSeq(message) === source.anchorSeq
+          && historyAnchorMatches(message, decoded.anchor)
+        ));
+      if (!anchorStillAtSignedSequence) {
+        throw new HistoryCursorError('OpenClaw history changed after this cursor was issued');
+      }
+      validated = true;
+      break;
+    }
+    if (!validated) {
+      throw new HistoryCursorError('OpenClaw history changed while this cursor was being validated');
+    }
+    stableTotalMessages = expectedTotal;
+    requestedOffset = source.nextOffset + (expectedTotal - source.totalMessages);
+  }
+
+  // Pagination is over raw Gateway records, while Portal deliberately removes
+  // heartbeat, memory-flush, and delivery artifacts. An entire raw page can
+  // therefore project to no conversational rows even though older real
+  // messages remain. Advance those empty raw pages here; rejecting the first
+  // one makes every older row permanently unreachable from the signed cursor.
+  // Keep the raw pages together, oldest first, so maintenance and tool-result
+  // state can cross an upstream page boundary before Portal projects it.
+  for (let pass = 0; pass < MAX_OPENCLAW_GATEWAY_HISTORY_PASSES; pass += 1) {
+    const requestLimit = rawMessages.length === 0
+      ? params.limit
+      : OPENCLAW_GATEWAY_HISTORY_CONTEXT_PAGE_SIZE;
+    const page = validateOpenClawGatewayHistoryPayload({
+      history: await getHistory(params.sessionKey, {
+        limit: requestLimit,
+        offset: requestedOffset,
+      }),
+      requestedOffset,
+      expectedSessionId: stableSessionId || undefined,
+    });
+    const history = {
+      ok: true,
+      data: {
+        sessionId: page.sessionId,
+        messages: page.messages,
+        offset: requestedOffset,
+        ...(page.nextOffset !== undefined ? { nextOffset: page.nextOffset } : {}),
+        hasMore: page.hasMore,
+        totalMessages: page.totalMessages,
+      },
+    } as const;
+    const sessionId = history.data.sessionId || '';
+    if (sessionId) stableSessionId = sessionId;
+
+    const totalMessages = history.data.totalMessages;
+    if (stableTotalMessages !== undefined) {
+      if ((totalMessages as number) < stableTotalMessages) {
+        throw new HistoryCursorError('OpenClaw session history shrank after this cursor was issued');
+      }
+      if ((totalMessages as number) > stableTotalMessages) {
+        // Never combine pages from two moving snapshots. Cursor reads are
+        // ancestry-validated above; if the transcript grows during the scan,
+        // force the client to retry rather than mixing shifted offsets.
+        throw new HistoryCursorError('OpenClaw history changed while this page was being read');
+      }
+    } else {
+      stableTotalMessages = totalMessages as number;
+    }
+
+    scannedRawMessages += history.data.messages.length;
+    if (scannedRawMessages > MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES) {
+      throw new HistoryProjectionLimitError('OpenClaw chat.history exceeded the bounded raw-message scan budget');
+    }
+    rawMessages = [...history.data.messages, ...rawMessages];
+    const projectedWindow = projectOpenClawGatewayHistoryWindow(rawMessages);
+    const hasMoreBefore = history.data.hasMore === true;
+    const leadingTurnBoundaryComplete = !hasMoreBefore
+      || openClawGatewayHistoryWindowStartsAtTurnBoundary(projectedWindow);
+    const safeProjectionInput = leadingTurnBoundaryComplete
+      ? projectedWindow
+      : [];
+    const fullMessages = params.enhanced
+      ? finalizeEnhancedHistoryMessages(
+          params.sessionKey,
+          safeProjectionInput,
+          MAX_HISTORY_ADAPTIVE_SCAN_MESSAGES,
+        )
+      : filterRoutineMaintenanceHistory(safeProjectionInput);
+    const messages = sliceOpenClawGatewayHistoryPage(fullMessages, params.limit);
+    const nextOffset = history.data.nextOffset;
+
+    if (
+      (leadingTurnBoundaryComplete && messages.length >= params.limit)
+      || !hasMoreBefore
+    ) {
+      if (!hasMoreBefore) {
+        return {
+          messages,
+          sessionId: stableSessionId || params.sessionKey,
+          hasMoreBefore: false,
+          beforeCursor: null,
+        };
+      }
+      const anchorSeq = openClawGatewayHistoryMessageSeq(messages[0]);
+      if (anchorSeq === null || anchorSeq > stableTotalMessages) {
+        throw new HistoryProjectionLimitError('OpenClaw chat.history could not establish a durable page anchor');
+      }
+      const durableNextOffset = stableTotalMessages - anchorSeq + 1;
+      if (!Number.isSafeInteger(durableNextOffset) || durableNextOffset < 1) {
+        throw new HistoryProjectionLimitError('OpenClaw chat.history returned an unsafe durable page boundary');
+      }
+      return {
+        messages,
+        sessionId: stableSessionId || params.sessionKey,
+        hasMoreBefore: true,
+        beforeCursor: encodeHistoryCursor(params.scope, messages[0], {
+          kind: 'openclaw-gateway-offset-v3',
+          nextOffset: durableNextOffset,
+          sessionId: stableSessionId,
+          totalMessages: stableTotalMessages,
+          anchorSeq,
+        }),
+      };
+    }
+
+    if (!Number.isSafeInteger(nextOffset)) {
+      throw new HistoryProjectionLimitError('OpenClaw chat.history returned an unsafe pagination boundary');
+    }
+    requestedOffset = nextOffset as number;
+  }
+
+  throw new HistoryProjectionLimitError(
+    'OpenClaw chat.history exceeded the bounded turn-boundary projection budget',
+  );
 }
 
 
-function addSessionFileCandidate(candidates: string[], seen: Set<string>, sessionId: unknown, sessionsDir: string): void {
+function addSessionFileCandidate(
+  candidates: string[],
+  seen: Set<string>,
+  sessionId: unknown,
+  sessionsDir: string,
+  historyBudget: HistoryReadBudget,
+): void {
   const normalized = typeof sessionId === 'string' ? sessionId.trim() : '';
   if (!normalized || seen.has(normalized)) return;
   if (!existsSync(path.join(sessionsDir, `${normalized}.jsonl`))) return;
+  registerHistoryCandidateId(historyBudget, normalized);
   seen.add(normalized);
   candidates.push(normalized);
 }
 
-// Trajectory logs are large (tens of MB across a session dir) and history /
-// stream-status requests used to re-read every file on every call, which cost
-// multiple seconds per session switch and blocked the event loop. Index which
-// session keys each trajectory file contains, keyed by mtime+size, so requests
-// only read the few files that actually mention the requested session.
-type TrajectoryFileIndexEntry = {
-  mtimeMs: number;
-  size: number;
-  sessionKeys: Set<string>;
-};
-const trajectoryFileIndexCache = new Map<string, TrajectoryFileIndexEntry>();
-const TRAJECTORY_SESSION_KEY_RE = /"sessionKey"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
 // Trajectory files are a best-effort recovery source, not the canonical
 // transcript. Long-running agents can grow them to hundreds of megabytes, so
 // opening a chat must never synchronously deserialize their lifetime contents.
@@ -6050,7 +7493,11 @@ const TRAJECTORY_SESSION_KEY_RE = /"sessionKey"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
 const MAX_TRAJECTORY_RECOVERY_BYTES = 8 * 1024 * 1024;
 const MAX_TRAJECTORY_RECOVERY_FILES = 24;
 
-function readBoundedJsonlTailText(filePath: string, maxBytes = MAX_TRAJECTORY_RECOVERY_BYTES): string {
+function readBoundedJsonlTailText(
+  filePath: string,
+  maxBytes = MAX_TRAJECTORY_RECOVERY_BYTES,
+  historyBudget?: HistoryReadBudget,
+): string {
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) return '';
   let stat: ReturnType<typeof statSync>;
   try {
@@ -6061,12 +7508,22 @@ function readBoundedJsonlTailText(filePath: string, maxBytes = MAX_TRAJECTORY_RE
   if (!stat.isFile() || stat.size <= 0) return '';
 
   const length = Math.min(stat.size, maxBytes);
+  if (historyBudget) {
+    const remaining = historyBudget.maxReadBytes - historyBudget.readBytes;
+    if (length > remaining) {
+      throw new HistoryProjectionLimitError('History projection exceeded its aggregate request byte budget');
+    }
+    consumeHistoryReadBudget(historyBudget, { passes: 1, fileReads: 1 });
+  }
   const start = stat.size - length;
   const fd = openSync(filePath, 'r');
   try {
     const buffer = Buffer.allocUnsafe(length);
     const bytesRead = readSync(fd, buffer, 0, length, start);
     if (bytesRead <= 0) return '';
+    if (historyBudget) {
+      consumeHistoryReadBudget(historyBudget, { readBytes: bytesRead, workBytes: bytesRead });
+    }
     let text = buffer.subarray(0, bytesRead).toString('utf8');
     // A bounded tail can begin in the middle of a JSON record. Discard that
     // fragment rather than feeding malformed or attacker-shaped bytes to the
@@ -6086,118 +7543,151 @@ function readBoundedJsonlTailText(filePath: string, maxBytes = MAX_TRAJECTORY_RE
   }
 }
 
-function getTrajectoryFileIndex(filePath: string): TrajectoryFileIndexEntry | null {
-  let stat: ReturnType<typeof statSync>;
-  try {
-    stat = statSync(filePath);
-  } catch {
-    trajectoryFileIndexCache.delete(filePath);
-    return null;
-  }
-
-  const cached = trajectoryFileIndexCache.get(filePath);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
-
-  const raw = readBoundedJsonlTailText(filePath);
-  if (!raw) {
-    trajectoryFileIndexCache.delete(filePath);
-    return null;
-  }
-
-  const sessionKeys = new Set<string>();
-  TRAJECTORY_SESSION_KEY_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = TRAJECTORY_SESSION_KEY_RE.exec(raw))) {
+function listRecentTrajectoryFiles(
+  sessionsDir: string,
+  historyBudget?: HistoryReadBudget,
+): string[] {
+  let recentFiles = historyBudget?.trajectoryFileCandidatesCache.get(sessionsDir);
+  if (!recentFiles) {
+    const trajectoryNames: string[] = [];
+    let directory: ReturnType<typeof opendirSync> | null = null;
     try {
-      sessionKeys.add(JSON.parse(`"${match[1]}"`));
+      directory = opendirSync(sessionsDir);
     } catch {
-      sessionKeys.add(match[1]);
+      return [];
     }
+
+    try {
+      if (historyBudget) consumeHistoryReadBudget(historyBudget, { passes: 1 });
+      let inspectedEntries = 0;
+      while (true) {
+        const entry = directory.readSync();
+        if (!entry) break;
+        if (historyBudget) {
+          consumeHistoryDirectoryEntry(
+            historyBudget,
+            'History projection exceeded its aggregate request directory entry budget',
+          );
+        }
+        inspectedEntries += 1;
+        if (inspectedEntries > (historyBudget?.maxDirectoryEntries ?? MAX_HISTORY_REQUEST_DIRECTORY_ENTRIES)) {
+          throw new HistoryProjectionLimitError('History projection exceeded its directory entry budget');
+        }
+        if (!entry.isFile() || !entry.name.endsWith('.trajectory.jsonl')) continue;
+        if (trajectoryNames.length >= MAX_HISTORY_REQUEST_TRAJECTORY_CANDIDATES) {
+          throw new HistoryProjectionLimitError('History projection exceeded its trajectory file candidate budget');
+        }
+        trajectoryNames.push(entry.name);
+      }
+    } finally {
+      directory.closeSync();
+    }
+
+    recentFiles = trajectoryNames
+      .map((name) => {
+        const filePath = path.join(sessionsDir, name);
+        try {
+          return { filePath, mtimeMs: statSync(filePath).mtimeMs };
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is { filePath: string; mtimeMs: number } => Boolean(entry))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .slice(0, MAX_TRAJECTORY_RECOVERY_FILES);
+    historyBudget?.trajectoryFileCandidatesCache.set(sessionsDir, recentFiles);
   }
 
-  const entry: TrajectoryFileIndexEntry = { mtimeMs: stat.mtimeMs, size: stat.size, sessionKeys };
-  trajectoryFileIndexCache.set(filePath, entry);
-  return entry;
+  return recentFiles.map(({ filePath }) => filePath);
 }
 
-function listTrajectoryFilesForSessionVariants(variants: Set<string>, sessionsDir: string): string[] {
-  let entries: any[] = [];
-  try {
-    entries = readdirSync(sessionsDir, { withFileTypes: true }) as any[];
-  } catch {
-    return [];
-  }
-
-  const recentFiles = entries
-    .filter((entry) => entry.isFile?.() && entry.name.endsWith('.trajectory.jsonl'))
-    .map((entry) => {
-      const filePath = path.join(sessionsDir, entry.name);
-      try {
-        return { filePath, mtimeMs: statSync(filePath).mtimeMs };
-      } catch {
-        return null;
-      }
-    })
-    .filter((entry): entry is { filePath: string; mtimeMs: number } => Boolean(entry))
-    .sort((a, b) => b.mtimeMs - a.mtimeMs)
-    .slice(0, MAX_TRAJECTORY_RECOVERY_FILES);
-
-  const matching: string[] = [];
-  for (const { filePath } of recentFiles) {
-    const index = getTrajectoryFileIndex(filePath);
-    if (!index) continue;
-    for (const variant of variants) {
-      if (index.sessionKeys.has(variant)) {
-        matching.push(filePath);
-        break;
-      }
-    }
-  }
-  return matching;
-}
-
-// Long-lived sessions (agent:main:main) appear in nearly every trajectory file,
-// so the key index alone cannot skip reads for them. Cache each file's parsed
-// per-session extraction keyed by mtime+size: finished trajectory files parse
-// once for the process lifetime and only the actively-written file re-parses.
+// Cache each file's parsed per-session extraction keyed by mtime+size. Discovery
+// and extraction share this one bounded read; optional recovery must never read
+// the same trajectory once for an index and again for its actual messages.
 type TrajectoryParsedExtraction = {
   candidateSessionIds: string[];
   messages: any[];
 };
+type CachedTrajectoryParsedExtraction = TrajectoryParsedExtraction & {
+  cacheBytes: number;
+};
 type TrajectoryParsedCacheEntry = {
   mtimeMs: number;
   size: number;
-  bySessionKey: Map<string, TrajectoryParsedExtraction>;
+  cacheBytes: number;
+  bySessionKey: Map<string, CachedTrajectoryParsedExtraction>;
 };
 const trajectoryParsedCache = new Map<string, TrajectoryParsedCacheEntry>();
 const TRAJECTORY_PARSED_CACHE_MAX_SESSION_KEYS_PER_FILE = 8;
+const TRAJECTORY_PARSED_CACHE_MAX_FILES = 32;
+const TRAJECTORY_PARSED_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const TRAJECTORY_PARSED_CACHE_MAX_EXTRACTION_BYTES = 4 * 1024 * 1024;
+let trajectoryParsedCacheBytes = 0;
 
-function readTrajectoryFileExtraction(filePath: string, sessionKey: string, variants: Set<string>): TrajectoryParsedExtraction | null {
+function deleteTrajectoryParsedCacheEntry(filePath: string): void {
+  const cached = trajectoryParsedCache.get(filePath);
+  if (!cached) return;
+  trajectoryParsedCache.delete(filePath);
+  trajectoryParsedCacheBytes = Math.max(0, trajectoryParsedCacheBytes - cached.cacheBytes);
+}
+
+function touchTrajectoryParsedCacheEntry(filePath: string, entry: TrajectoryParsedCacheEntry): void {
+  trajectoryParsedCache.delete(filePath);
+  trajectoryParsedCache.set(filePath, entry);
+}
+
+function pruneTrajectoryParsedCache(): void {
+  while (
+    trajectoryParsedCache.size > TRAJECTORY_PARSED_CACHE_MAX_FILES
+    || trajectoryParsedCacheBytes > TRAJECTORY_PARSED_CACHE_MAX_BYTES
+  ) {
+    const oldestPath = trajectoryParsedCache.keys().next().value as string | undefined;
+    if (!oldestPath) break;
+    deleteTrajectoryParsedCacheEntry(oldestPath);
+  }
+}
+
+function serializedTrajectoryExtractionBytes(extraction: TrajectoryParsedExtraction): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(extraction), 'utf8');
+  } catch {
+    return TRAJECTORY_PARSED_CACHE_MAX_EXTRACTION_BYTES + 1;
+  }
+}
+
+function readTrajectoryFileExtraction(
+  filePath: string,
+  sessionKey: string,
+  variants: Set<string>,
+  historyBudget?: HistoryReadBudget,
+): TrajectoryParsedExtraction | null {
   let stat: ReturnType<typeof statSync>;
   try {
     stat = statSync(filePath);
   } catch {
-    trajectoryParsedCache.delete(filePath);
+    deleteTrajectoryParsedCacheEntry(filePath);
     return null;
   }
 
   let entry = trajectoryParsedCache.get(filePath);
   if (!entry || entry.mtimeMs !== stat.mtimeMs || entry.size !== stat.size) {
-    entry = { mtimeMs: stat.mtimeMs, size: stat.size, bySessionKey: new Map() };
-    trajectoryParsedCache.set(filePath, entry);
+    if (entry) deleteTrajectoryParsedCacheEntry(filePath);
+    entry = { mtimeMs: stat.mtimeMs, size: stat.size, cacheBytes: 0, bySessionKey: new Map() };
   }
 
   const cached = entry.bySessionKey.get(sessionKey);
   if (cached) {
+    if (historyBudget) consumeHistoryReadBudget(historyBudget, { workBytes: cached.cacheBytes, passes: 1 });
+    touchTrajectoryParsedCacheEntry(filePath, entry);
     return {
       candidateSessionIds: [...cached.candidateSessionIds],
       messages: structuredClone(cached.messages),
     };
   }
 
-  const raw = readBoundedJsonlTailText(filePath);
+  const raw = readBoundedJsonlTailText(filePath, MAX_TRAJECTORY_RECOVERY_BYTES, historyBudget);
   if (!raw) {
-    trajectoryParsedCache.delete(filePath);
+    deleteTrajectoryParsedCacheEntry(filePath);
     return null;
   }
 
@@ -6232,65 +7722,74 @@ function readTrajectoryFileExtraction(filePath: string, sessionKey: string, vari
     }
   }
 
-  if (entry.bySessionKey.size >= TRAJECTORY_PARSED_CACHE_MAX_SESSION_KEYS_PER_FILE) {
-    entry.bySessionKey.clear();
+  const extraction = { candidateSessionIds, messages };
+  const cacheBytes = serializedTrajectoryExtractionBytes(extraction);
+  const remainingWorkBytes = historyBudget
+    ? historyBudget.maxWorkBytes - historyBudget.workBytes
+    : Number.POSITIVE_INFINITY;
+  if (
+    cacheBytes <= TRAJECTORY_PARSED_CACHE_MAX_EXTRACTION_BYTES
+    && cacheBytes <= remainingWorkBytes
+  ) {
+    if (entry.bySessionKey.size >= TRAJECTORY_PARSED_CACHE_MAX_SESSION_KEYS_PER_FILE) {
+      trajectoryParsedCacheBytes = Math.max(0, trajectoryParsedCacheBytes - entry.cacheBytes);
+      entry.cacheBytes = 0;
+      entry.bySessionKey.clear();
+    }
+    if (historyBudget) consumeHistoryReadBudget(historyBudget, { workBytes: cacheBytes });
+    const prior = entry.bySessionKey.get(sessionKey);
+    if (prior) {
+      entry.cacheBytes -= prior.cacheBytes;
+      trajectoryParsedCacheBytes = Math.max(0, trajectoryParsedCacheBytes - prior.cacheBytes);
+    }
+    entry.bySessionKey.set(sessionKey, {
+      candidateSessionIds: [...candidateSessionIds],
+      messages: structuredClone(messages),
+      cacheBytes,
+    });
+    entry.cacheBytes += cacheBytes;
+    trajectoryParsedCacheBytes += cacheBytes;
+    touchTrajectoryParsedCacheEntry(filePath, entry);
+    pruneTrajectoryParsedCache();
+  } else if (trajectoryParsedCache.has(filePath)) {
+    touchTrajectoryParsedCacheEntry(filePath, entry);
   }
-  entry.bySessionKey.set(sessionKey, {
-    candidateSessionIds: [...candidateSessionIds],
-    messages: structuredClone(messages),
-  });
 
   return { candidateSessionIds, messages };
 }
 
-function findTrajectorySessionFileIdsForSessionKey(sessionKey: string, sessionsDir = SESSIONS_DIR): string[] {
-  const variants = new Set(getSessionKeyLookupVariants(sessionKey));
-  if (variants.size === 0 || !existsSync(sessionsDir)) return [];
-
+function findCanonicalSessionFileIdsForSessionKey(
+  sessionKey: string,
+  sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
+): string[] {
   const candidates: string[] = [];
   const seen = new Set<string>();
 
-  for (const filePath of listTrajectoryFilesForSessionVariants(variants, sessionsDir)) {
-    const extraction = readTrajectoryFileExtraction(filePath, sessionKey, variants);
-    if (!extraction) continue;
-    for (const candidateSessionId of extraction.candidateSessionIds) {
-      addSessionFileCandidate(candidates, seen, candidateSessionId, sessionsDir);
-    }
+  const registryEntries = resolveSessionRegistryEntries(sessionKey, sessionsDir, historyBudget);
+  if (registryEntries.length > historyBudget.maxCandidateIds) {
+    throw new HistoryProjectionLimitError('History projection exceeded its registry entry budget');
   }
-
-  return candidates;
-}
-
-function findSessionFileIdsForSessionKey(sessionKey: string, sessionsDir = SESSIONS_DIR): string[] {
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-
-  for (const entry of resolveSessionRegistryEntries(sessionKey, sessionsDir)) {
-    addSessionFileCandidate(candidates, seen, entry?.sessionId || entry?.id, sessionsDir);
+  for (const entry of registryEntries) {
+    addSessionFileCandidate(candidates, seen, entry?.sessionId || entry?.id, sessionsDir, historyBudget);
     const usageFamilySessionIds = Array.isArray(entry?.usageFamilySessionIds)
       ? entry.usageFamilySessionIds
       : [];
+    if (usageFamilySessionIds.length > historyBudget.maxCandidateIds) {
+      throw new HistoryProjectionLimitError('History projection exceeded its usage-family candidate budget');
+    }
     for (const familySessionId of usageFamilySessionIds) {
-      addSessionFileCandidate(candidates, seen, familySessionId, sessionsDir);
+      addSessionFileCandidate(candidates, seen, familySessionId, sessionsDir, historyBudget);
     }
   }
 
   for (const key of getSessionKeyLookupVariants(sessionKey)) {
-    addSessionFileCandidate(candidates, seen, key, sessionsDir);
+    addSessionFileCandidate(candidates, seen, key, sessionsDir, historyBudget);
     const parts = key.split(':');
-    if (parts.length >= 3) addSessionFileCandidate(candidates, seen, parts.slice(2).join(':'), sessionsDir);
-  }
-
-  for (const sessionId of findTrajectorySessionFileIdsForSessionKey(sessionKey, sessionsDir)) {
-    addSessionFileCandidate(candidates, seen, sessionId, sessionsDir);
+    if (parts.length >= 3) addSessionFileCandidate(candidates, seen, parts.slice(2).join(':'), sessionsDir, historyBudget);
   }
 
   return candidates;
-}
-
-/** Resolve a session key to its JSONL file id */
-function resolveSessionFileId(sessionKey: string, sessionsDir = SESSIONS_DIR): string | null {
-  return findSessionFileIdsForSessionKey(sessionKey, sessionsDir)[0] || null;
 }
 
 function mapTrajectoryRuntimeMessage(rawMessage: any, fallbackId: string, fallbackTimestamp: unknown): any | null {
@@ -6367,15 +7866,36 @@ function mapTrajectoryRuntimeMessage(rawMessage: any, fallbackId: string, fallba
   return null;
 }
 
-function readTrajectoryMessagesForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
+type TrajectorySessionRecovery = {
+  candidateSessionIds: string[];
+  messages: any[];
+};
+
+function readTrajectoryRecoveryForSessionKey(
+  sessionKey: string,
+  limit = 200,
+  sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
+): TrajectorySessionRecovery {
   const variants = new Set(getSessionKeyLookupVariants(sessionKey));
-  if (variants.size === 0 || !existsSync(sessionsDir)) return [];
+  if (variants.size === 0 || !existsSync(sessionsDir)) {
+    return { candidateSessionIds: [], messages: [] };
+  }
 
   const rawMessages: any[] = [];
+  const candidateSessionIds: string[] = [];
+  const seenCandidateSessionIds = new Set<string>();
 
-  for (const filePath of listTrajectoryFilesForSessionVariants(variants, sessionsDir)) {
-    const extraction = readTrajectoryFileExtraction(filePath, sessionKey, variants);
+  for (const filePath of listRecentTrajectoryFiles(sessionsDir, historyBudget)) {
+    const extraction = readTrajectoryFileExtraction(filePath, sessionKey, variants, historyBudget);
     if (!extraction) continue;
+    for (const candidateSessionId of extraction.candidateSessionIds) {
+      const normalized = candidateSessionId.trim();
+      if (!normalized || seenCandidateSessionIds.has(normalized)) continue;
+      registerHistoryCandidateId(historyBudget, normalized);
+      seenCandidateSessionIds.add(normalized);
+      candidateSessionIds.push(normalized);
+    }
     rawMessages.push(...extraction.messages);
   }
 
@@ -6390,7 +7910,11 @@ function readTrajectoryMessagesForSessionKey(sessionKey: string, limit = 200, se
       return true;
     });
 
-  return stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(deduped)).slice(-Math.max(limit, 1));
+  return {
+    candidateSessionIds,
+    messages: stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(deduped))
+      .slice(-Math.max(limit, 1)),
+  };
 }
 
 function getHistoryTimestampRange(messages: any[]): { min: number; max: number } | null {
@@ -6426,8 +7950,9 @@ function readBestOpenClawSessionMessagesForSessionKeyWithMetadata(
   sessionKey: string,
   limit = 200,
   sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
 ): RecentSessionMessagesRead<any> {
-  const candidates = findSessionFileIdsForSessionKey(sessionKey, sessionsDir);
+  const candidates = findCanonicalSessionFileIdsForSessionKey(sessionKey, sessionsDir, historyBudget);
   const seen = new Set<string>();
   const combined: any[] = [];
   const canonicalMessages: any[] = [];
@@ -6461,7 +7986,7 @@ function readBestOpenClawSessionMessagesForSessionKeyWithMetadata(
   };
 
   for (const sessionId of candidates) {
-    const read = readSessionMessagesEnhancedWithMetadata(sessionId, limit, sessionsDir);
+    const read = readSessionMessagesEnhancedWithMetadata(sessionId, limit, sessionsDir, historyBudget);
     sourceComplete = sourceComplete && read.sourceComplete;
     for (const message of read.messages) {
       canonicalMessages.push(message);
@@ -6469,13 +7994,56 @@ function readBestOpenClawSessionMessagesForSessionKeyWithMetadata(
     }
   }
 
-  const trajectoryMessages = filterTrajectoryMessagesNearCanonicalMessages(
-    readTrajectoryMessagesForSessionKey(sessionKey, limit, sessionsDir),
-    canonicalMessages,
-  );
-
-  for (const message of trajectoryMessages) {
-    pushMessage(message);
+  // Trajectory recovery is optional. Canonical JSONL is resolved and read
+  // first; recovery gets a small residual child budget whose exhaustion is
+  // absorbed and omitted instead of turning valid durable history into an
+  // error. Discovery and extraction share one parsed file read.
+  const recoveryBudget = createOptionalHistoryRecoveryBudget(historyBudget);
+  try {
+    if (
+      recoveryBudget.maxReadBytes > 0
+      && recoveryBudget.maxWorkBytes > 0
+      && recoveryBudget.maxPasses > 0
+      && recoveryBudget.maxFileReads > 0
+      && recoveryBudget.maxDirectoryEntries > 0
+    ) {
+      const recovery = readTrajectoryRecoveryForSessionKey(
+        sessionKey,
+        limit,
+        sessionsDir,
+        recoveryBudget,
+      );
+      const recoveredCanonicalMessages: any[] = [];
+      let recoveredSourceComplete = true;
+      const seenRecoveryCandidates = new Set(candidates);
+      for (const sessionId of recovery.candidateSessionIds) {
+        if (seenRecoveryCandidates.has(sessionId)) continue;
+        seenRecoveryCandidates.add(sessionId);
+        if (!existsSync(path.join(sessionsDir, `${sessionId}.jsonl`))) continue;
+        const read = readSessionMessagesEnhancedWithMetadata(
+          sessionId,
+          limit,
+          sessionsDir,
+          recoveryBudget,
+        );
+        recoveredSourceComplete = recoveredSourceComplete && read.sourceComplete;
+        recoveredCanonicalMessages.push(...read.messages);
+      }
+      const trajectoryMessages = filterTrajectoryMessagesNearCanonicalMessages(
+        recovery.messages,
+        [...canonicalMessages, ...recoveredCanonicalMessages],
+      );
+      sourceComplete = sourceComplete && recoveredSourceComplete;
+      canonicalMessages.push(...recoveredCanonicalMessages);
+      for (const message of recoveredCanonicalMessages) pushMessage(message);
+      for (const message of trajectoryMessages) pushMessage(message);
+    }
+  } catch (error) {
+    if (!(error instanceof HistoryProjectionLimitError)) throw error;
+    // Recovery is deliberately best-effort. Its bounded tail may be absent or
+    // too large without invalidating canonical session history.
+  } finally {
+    absorbOptionalHistoryRecoveryBudget(historyBudget, recoveryBudget);
   }
 
   combined.sort((a, b) => toHistoryTimestampMs(a?.timestamp) - toHistoryTimestampMs(b?.timestamp));
@@ -6490,8 +8058,18 @@ function readBestOpenClawSessionMessagesForSessionKeyWithMetadata(
   };
 }
 
-function readBestOpenClawSessionMessagesForSessionKey(sessionKey: string, limit = 200, sessionsDir = SESSIONS_DIR): any[] {
-  return readBestOpenClawSessionMessagesForSessionKeyWithMetadata(sessionKey, limit, sessionsDir).messages;
+function readBestOpenClawSessionMessagesForSessionKey(
+  sessionKey: string,
+  limit = 200,
+  sessionsDir = SESSIONS_DIR,
+  historyBudget = createHistoryReadBudget(),
+): any[] {
+  return readBestOpenClawSessionMessagesForSessionKeyWithMetadata(
+    sessionKey,
+    limit,
+    sessionsDir,
+    historyBudget,
+  ).messages;
 }
 
 async function readOpenClawHistoryPage(params: {
@@ -6502,7 +8080,9 @@ async function readOpenClawHistoryPage(params: {
   limit: number;
   scope: string;
   beforeCursor?: unknown;
+  historyBudget?: HistoryReadBudget;
 }): Promise<HistoryPageResult> {
+  const historyBudget = params.historyBudget || createHistoryReadBudget();
   const anchor = params.beforeCursor
     ? decodeHistoryCursor(params.beforeCursor, params.scope)
     : undefined;
@@ -6518,15 +8098,26 @@ async function readOpenClawHistoryPage(params: {
         params.sessionKey,
         scanLimit,
         params.sessionsDir,
+        historyBudget,
       );
       messages = read.messages;
       sourceComplete = read.sourceComplete;
     } else {
-      messages = await readSessionMessages(params.sessionId, scanLimit, params.sessionsDir);
+      messages = await readSessionMessages(
+        params.sessionId,
+        scanLimit,
+        params.sessionsDir,
+        historyBudget,
+      );
       sourceComplete = messages.length < scanLimit;
     }
 
     if (!anchor) {
+      if (!sourceComplete && messages.length === 0) {
+        throw new HistoryProjectionLimitError(
+          'History projection could not establish a safe cursor within the retained scan window',
+        );
+      }
       return buildHistoryPage(messages, params.limit, params.scope, undefined, sourceComplete);
     }
 
@@ -6545,38 +8136,29 @@ async function readOpenClawHistoryPage(params: {
   }
 }
 
-const PROVENANCE: Record<string, string> = {
-  OPENCLAW: 'via OpenClaw',
-  CLAUDE_CODE: 'via Claude CLI',
-  CODEX: 'via Codex CLI',
-  GROK: 'via Grok Build CLI',
-  GEMINI: 'via Antigravity',
-  AGENT_ZERO: 'via Agent Zero',
-};
+function harnessTurnProvenance(providerName: AgentProviderName): string {
+  return requireHarnessDefinition(providerName).provenanceLabel;
+}
 
 // These providers publish HOST_OPERATOR turns into StreamEventBus themselves.
 // Their browser transport must consume that bus and leave the legacy callback
 // arguments as no-ops, otherwise every chunk/status/tool/terminal event is sent
 // twice (once by the callback and once by the bus/global reconnect path).
-const PROVIDER_OWNED_HOST_STREAMS = new Set<AgentProviderName>([
-  'OPENCLAW',
-  'CLAUDE_CODE',
-  'CODEX',
-  'GEMINI',
-]);
+const PROVIDER_OWNED_HOST_STREAMS = new Set<AgentProviderName>(
+  AGENT_HARNESS_CATALOG
+    .filter((definition) => (
+      definition.compatibilityProviderId !== null
+      && definition.hostStreamOwnership === 'provider'
+    ))
+    .map((definition) => definition.compatibilityProviderId as AgentProviderName),
+);
 
 function providerPublishesHostStream(providerName: AgentProviderName): boolean {
   return PROVIDER_OWNED_HOST_STREAMS.has(providerName);
 }
 
 function providerUsesHostStreamBus(providerName: AgentProviderName): boolean {
-  return providerName === 'OPENCLAW'
-    || providerName === 'CLAUDE_CODE'
-    || providerName === 'CODEX'
-    || providerName === 'GROK'
-    || providerName === 'AGENT_ZERO'
-    || providerName === 'GEMINI'
-    || providerName === 'OLLAMA';
+  return requireHarnessDefinition(providerName).hostStreamOwnership !== 'none';
 }
 
 function reserveHostStreamRoute(params: {
@@ -7133,28 +8715,9 @@ router.get('/health', authenticateToken, async (req: Request, res: Response) => 
 // but the detached listener is still the older in-memory runtime.
 router.post('/restart', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
   try {
-    const before = await getOpenClawVersionStatus({ force: true }).catch(() => null);
-    const restartOutput = await restartOpenClawGatewayBySystemService();
-    const after = await waitForGatewayVersionClear(
-      OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS,
-    );
-
-    reconnectPersistentWs();
-    const ok = Boolean(after && !after.restartRecommended && after.probeOk);
-
-    res.status(ok ? 200 : 500).json({
-      ok,
-      restarted: ok,
-      message: ok
-        ? 'OpenClaw gateway restarted.'
-        : 'The installer-owned OpenClaw gateway service restarted but did not pass its version probe.',
-      before,
-      after,
-      stdout: restartOutput.slice(-4000),
-      stderr: '',
-    });
-  } catch (err: any) {
-    res.status(500).json({ ok: false, restarted: false, error: err?.message || 'OpenClaw gateway restart failed' });
+    assertOpenClawHostMutationAvailable('restart');
+  } catch (error) {
+    askUserErrorResponse(res, error);
   }
 });
 
@@ -7189,7 +8752,7 @@ router.get('/compatibility-hotfix', authenticateToken, requireAdmin, async (_req
       ...status,
       note: status.applied
         ? 'Portal compatibility hotfixes are already present in the installed OpenClaw bundles.'
-        : 'Installer/update usually auto-apply this temporary patch on affected installs. Use it as a fallback after a separate OpenClaw upgrade or if the compatibility markers are missing; it will restart the OpenClaw gateway.',
+        : 'Compatibility repair is installer-owned. Portal reports status here but cannot apply the patch or restart OpenClaw in this release.',
       confirmationPhrase: PRIVILEGED_CONFIRMATION.compatibilityHotfix,
     });
   } catch (err: any) {
@@ -7197,60 +8760,27 @@ router.get('/compatibility-hotfix', authenticateToken, requireAdmin, async (_req
   }
 });
 
-router.post('/compatibility-hotfix/apply', authenticateToken, requireOwner, async (req: Request, res: Response) => {
+router.post('/compatibility-hotfix/apply', authenticateToken, requireOwner, async (_req: Request, res: Response) => {
   try {
-    if (!isTypedConfirmationMatch(PRIVILEGED_CONFIRMATION.compatibilityHotfix, req.body?.confirmation)) {
-      res.status(400).json({
-        error: `Type ${PRIVILEGED_CONFIRMATION.compatibilityHotfix} to confirm patching the installed runtime and restarting OpenClaw.`,
-        confirmationPhrase: PRIVILEGED_CONFIRMATION.compatibilityHotfix,
-      });
-      return;
-    }
-    const before = getOpenClawCompatibilityHotfixStatus();
-    if (!before.scriptExists) {
-      res.status(500).json({ error: 'Portal hotfix script is missing from this install.' });
-      return;
-    }
-    if (!before.supported) {
-      res.status(500).json({ error: 'This OpenClaw install does not expose the runtime bundles expected by the compatibility hotfix.', status: before });
-      return;
-    }
-    const beforeAskUserRuntime = await getOpenClawAskUserRuntimeReadiness();
-    if (!beforeAskUserRuntime.ready) {
-      res.status(500).json({
-        error: 'The Portal ask-user bridge is not active in the running OpenClaw gateway; refusing to disable Claude native questions.',
-        status: before,
-        askUserRuntime: beforeAskUserRuntime,
-      });
-      return;
-    }
-
-    const openClawDistDir = getOpenClawDistDir();
-    const patchRun = await execFileText('bash', [OPENCLAW_COMPAT_HOTFIX_SCRIPT, openClawDistDir], 30000, {
-      PORTAL_OPENCLAW_HOTFIX_STRICT: '1',
-      PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-    });
-    const restartOutput = await restartOpenClawGateway();
-    const after = getOpenClawCompatibilityHotfixStatus();
-    const afterAskUserRuntime = await getOpenClawAskUserRuntimeReadiness();
-    const applied = after.applied && afterAskUserRuntime.ready;
-
-    res.json({
-      ok: applied,
-      alreadyApplied: before.applied,
-      status: after,
-      askUserRuntime: afterAskUserRuntime,
-      patchOutput: [patchRun.stdout, patchRun.stderr].filter(Boolean).join('\n'),
-      restartOutput,
-      message: applied
-        ? 'Compatibility hotfix applied; OpenClaw restarted with the ask-user runtime bridge active.'
-        : 'Hotfix command ran, but the patched runtime and callable ask-user bridge were not both verified afterward.',
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: 'Failed to apply compatibility hotfix', detail: err.message });
+    assertOpenClawHostMutationAvailable('compatibility-hotfix');
+  } catch (error) {
+    askUserErrorResponse(res, error);
   }
 });
 
+router.get('/harnesses', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.vary('Authorization');
+    res.vary('Cookie');
+    res.json({ harnesses: await AgentRegistry.listHarnessesAsync() });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to list harnesses', detail: err.message });
+  }
+});
+
+// 4.1 compatibility alias. Existing Portal clients and stored `provider`
+// preferences keep using this shape while new clients prefer `/harnesses`.
 router.get('/providers', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
   try {
     res.setHeader('Cache-Control', 'private, no-store, max-age=0');
@@ -7264,7 +8794,8 @@ router.get('/providers', authenticateToken, requireAdmin, async (_req: Request, 
 
 router.get('/models', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const providerName = normalizeProviderName(req.query.provider);
+    const providerName = normalizeProviderName(harnessOrProviderInput(req.query));
+    assertQualifiedNativeBinaryProvider(providerName);
     const capabilities = getProviderCapabilities(providerName);
     if (!capabilities) {
       res.status(400).json({ error: `Unknown provider: ${providerName}` });
@@ -7279,17 +8810,22 @@ router.get('/models', authenticateToken, async (req: Request, res: Response) => 
       ? readLastOpenClawUnavailableModelIds()
       : [];
     res.json({
+      harness: providerName,
       provider: providerName,
       capabilities,
       models,
       ...(unavailableModelIds.length > 0 ? { unavailableModelIds } : {}),
     });
   } catch (err: any) {
+    if (err instanceof NativeBinaryRuntimeUnqualifiedError) {
+      res.status(err.statusCode).json({ error: err.message, code: err.code, retryable: err.retryable });
+      return;
+    }
     if (err instanceof UnknownAgentProviderError) {
       res.status(400).json({ error: err.message });
       return;
     }
-    const providerName = String(req.query.provider || 'OPENCLAW').trim().toUpperCase();
+    const providerName = String(harnessOrProviderInput(req.query) || 'OPENCLAW').trim().toUpperCase();
     if (providerName === 'AGENT_ZERO') {
       const status = err instanceof AgentZeroOAuthModelCatalogError
         && err.code !== 'CATALOG_UNAVAILABLE'
@@ -7312,7 +8848,7 @@ router.get('/models', authenticateToken, async (req: Request, res: Response) => 
 
 router.get('/commands', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
-    const providerName = normalizeProviderName(req.query.provider);
+    const providerName = normalizeProviderName(harnessOrProviderInput(req.query));
     const providerInfo = AgentRegistry.listProviders().find((p) => p.name === providerName);
     if (!providerInfo) {
       res.status(400).json({ error: `Unknown provider: ${providerName}` });
@@ -7321,6 +8857,7 @@ router.get('/commands', authenticateToken, requireAdmin, async (req: Request, re
 
     const commands = await getProviderCommandCatalog(providerName);
     res.json({
+      harness: providerName,
       provider: providerName,
       capabilities: providerInfo.capabilities,
       commands,
@@ -7359,12 +8896,13 @@ function annotateAgentChatSessionRunActivity<T extends AgentChatSessionActivityS
 
 router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
-    const providerName = req.query.provider === undefined
+    const requestedHarness = harnessOrProviderInput(req.query);
+    const providerName = requestedHarness === undefined
       ? undefined
-      : normalizeProviderName(req.query.provider);
+      : normalizeProviderName(requestedHarness);
     if (providerName) {
       try {
-        const provider = AgentRegistry.get(providerName);
+        const provider = await AgentRegistry.getAsync(providerName);
         const sessions = await provider.listSessions(req.user!.userId);
         res.json({ sessions: annotateAgentChatSessionRunActivity(sessions) });
         return;
@@ -7386,7 +8924,7 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
       res.status(400).json({ error: 'Invalid OpenClaw agent' });
       return;
     }
-    const openClawProvider = AgentRegistry.get('OPENCLAW');
+    const openClawProvider = await AgentRegistry.getAsync('OPENCLAW');
     // The OWNER runs this host, so Agent Chat shows the sessions that already
     // exist on it — including ones OpenClaw itself created. Without this, any
     // chat started outside the Portal is invisible here forever, because only
@@ -7448,7 +8986,6 @@ async function getUsageStatsSnapshot(selectedAgent: string) {
 
   const promise = (async () => {
     const { sessions, cronJobs } = await loadUsageStatsSources(selectedAgent, {
-      agentsDir: path.join(process.env.HOME || '/root', '.openclaw/agents'),
       gatewayCall: gatewayRpcCall,
       runOpenClaw: async (args, timeoutMs) => (
         await execFileText('openclaw', args, timeoutMs)
@@ -7511,7 +9048,7 @@ function normalizeGatewayTaskStatus(status: unknown, endedAt?: unknown): 'runnin
   return 'unknown';
 }
 
-function mapOpenClawLedgerTask(task: any) {
+export function mapOpenClawLedgerTask(task: any) {
   const id = String(task?.taskId || task?.id || task?.runId || task?.sourceId || '').trim();
   if (!id) return null;
   const kind = String(task?.kind || task?.runtime || '').toLowerCase() || 'task';
@@ -7541,10 +9078,13 @@ function collapseKeyForTaskSession(session: any) {
   return key;
 }
 
-function mapOpenClawTaskSession(session: any) {
+export function mapOpenClawTaskSession(session: any) {
   const status = normalizeGatewayTaskStatus(session.status, session.endedAt);
   return {
     id: collapseKeyForTaskSession(session) || session.key || session.sessionKey || session.id || 'unknown',
+    // The display/task identity may collapse cron runs; navigation must retain
+    // the exact session returned by sessions.list, never a ledger task id.
+    sessionKey: session.key || session.sessionKey || null,
     name: session.displayName || session.origin?.label || session.key?.split(':').pop() || 'Task',
     status,
     model: normalizeGatewayModelId(session.model) || session.modelProvider || 'unknown',
@@ -7656,21 +9196,16 @@ router.get('/tasks', requireAdmin, async (_req: Request, res: Response) => {
 router.get('/session-info', authenticateToken, async (req: Request, res: Response) => {
   try {
     const sessionKey = await resolveOpenClawSessionKey(req.query.session as string, req.user);
-    await assertGatewaySessionAccess(sessionKey, req.user!);
-    let result = await getSessionInfo(sessionKey);
-    if ((!result.ok || !result.data) && sessionKey.includes(':new-')) {
-      const created = await createSession(sessionKey);
-      if (created.ok) {
-        result = await getSessionInfo(created.key || sessionKey);
-      }
-    }
+    const actorScopedPortalSession = isPortalAgentChatSessionKeyForUser(sessionKey, req.user!);
+    await assertExistingGatewaySessionAccess(sessionKey, req.user!);
+    const result = await getSessionInfo(sessionKey);
     if (!result.ok) {
       // Silent probes are used by UI components that can legitimately mount
       // before a just-created gateway session has durable metadata. Return a
       // non-error payload so Chrome does not report expected 404s as console
       // noise during normal Project Chat startup.
       const silentProbe = ['1', 'true', 'yes'].includes(String(req.query.silent || '').toLowerCase());
-      if (silentProbe && !isGatewayTransportError(result.error)) {
+      if ((silentProbe || actorScopedPortalSession) && !isGatewayTransportError(result.error)) {
         res.json({ session: null, missing: true, error: result.error || 'Session not found' });
         return;
       }
@@ -7688,11 +9223,24 @@ router.get('/session-info', authenticateToken, async (req: Request, res: Respons
 
 router.post('/session-create', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const providerName = normalizeProviderName(req.body?.provider);
+    const providerName = normalizeProviderName(harnessOrProviderInput(req.body));
     if (providerName !== 'OPENCLAW') {
-      res.status(400).json({ error: 'Session creation only supported for OPENCLAW provider' });
+      // Allocate a durable native conversation without inference. Project-only
+      // chats need a real parent in history before their first worker starts.
+      const executionContext = requireHostOperatorExecutionContext(req.user!);
+      await assertHostOperatorProviderExecutionAvailable(providerName);
+      assertProviderExecutionContext(providerName, executionContext);
+      const provider = await AgentRegistry.getAsync(providerName);
+      const sessionId = await resolveNativeSessionForTurn({ provider,
+        userId: req.user!.userId, userEmail: req.user!.email,
+        clientSession: typeof req.body.session === 'string' ? req.body.session : 'main',
+        executionContext, requestedModel: req.body.model,
+      });
+      await assertGatewaySessionAccess(sessionId, req.user!, { providerName });
+      res.json({ ok: true, key: sessionId });
       return;
     }
+    await assertOpenClawExecutionAdmitted();
 
     const rawSession = typeof req.body?.session === 'string' ? req.body.session.trim() : '';
     if (!rawSession) {
@@ -7734,11 +9282,18 @@ router.post('/session-create', authenticateToken, requireApproved, async (req: R
   } catch (err: any) {
     const status = err instanceof UnknownAgentProviderError
       ? 400
-      : err?.message === 'Admin access required' ? 403 : 500;
+      : isOpenClawExecutionAdmissionFailure(err)
+        ? err.statusCode
+        : err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({
-      error: status === 400
+      error: isOpenClawExecutionAdmissionFailure(err)
+        ? err.message
+        : status === 400
         ? err.message
         : status === 403 ? 'Admin access required' : 'Failed to create session',
+      ...(isOpenClawExecutionAdmissionFailure(err)
+        ? { code: err.code, retryable: err.retryable }
+        : {}),
       ...(status === 500 ? { detail: err.message } : {}),
     });
   }
@@ -7746,7 +9301,8 @@ router.post('/session-create', authenticateToken, requireApproved, async (req: R
 
 router.post('/session-model', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const providerName = normalizeProviderName(req.body?.provider);
+    const providerName = normalizeProviderName(harnessOrProviderInput(req.body));
+    await assertHostOperatorProviderExecutionAvailable(providerName);
     const rawModel = typeof req.body?.model === 'string' ? req.body.model.trim() : '';
     const explicitResetRequested = req.body?.reset === true;
     const resetAliasRequested = isProviderModelResetAlias(rawModel);
@@ -7854,9 +9410,13 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
       reset: resetRequested,
     });
   } catch (err: any) {
-    const rawProviderName = String(req.body?.provider || 'OPENCLAW').trim().toUpperCase();
+    const rawProviderName = String(harnessOrProviderInput(req.body) || 'OPENCLAW').trim().toUpperCase();
     const status = err instanceof UnknownAgentProviderError
       ? 400
+      : err instanceof NativeBinaryRuntimeUnqualifiedError
+        ? err.statusCode
+      : isOpenClawExecutionAdmissionFailure(err)
+        ? err.statusCode
       : err instanceof NativeSessionModelMutationError
       ? err.status
       : err instanceof AgentZeroOAuthModelCatalogError
@@ -7864,6 +9424,8 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
         : 500;
     const safeDetail = err instanceof NativeSessionModelMutationError
       || err instanceof AgentZeroOAuthModelCatalogError
+      || isOpenClawExecutionAdmissionFailure(err)
+      || err instanceof NativeBinaryRuntimeUnqualifiedError
       ? err.message
       : rawProviderName === 'AGENT_ZERO'
         ? humanizeProviderError('AGENT_ZERO', err?.message || String(err))
@@ -7871,6 +9433,7 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
     res.status(status).json({
       error: safeDetail || 'Failed to patch session model',
       ...(err?.code ? { code: err.code } : {}),
+      ...(err instanceof NativeBinaryRuntimeUnqualifiedError ? { retryable: err.retryable } : {}),
     });
   }
 });
@@ -7881,7 +9444,7 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
  */
 router.post('/session-patch', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const providerName = normalizeProviderName(req.body?.provider);
+    const providerName = normalizeProviderName(harnessOrProviderInput(req.body));
     const rawSession = typeof req.body?.session === 'string' ? req.body.session.trim() : '';
     const settings = typeof req.body?.settings === 'object' && req.body.settings !== null ? req.body.settings : {};
 
@@ -7895,6 +9458,7 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
       res.status(400).json({ error: 'Session patching only supported for OPENCLAW provider' });
       return;
     }
+    await assertOpenClawExecutionAdmitted();
 
     const sessionKey = await resolveOpenClawSessionKey(rawSession, req.user);
     await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
@@ -7971,7 +9535,8 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
     // session's recorded override when patching thinking without a model.
     if (patch.thinkingLevel && !patch.model) {
       try {
-        const registryEntry = readLocalSessionRegistryEntry(sessionKey);
+        const sessionInfo = await getSessionInfo(sessionKey);
+        const registryEntry = sessionInfo.ok && sessionInfo.data ? sessionInfo.data : null;
         const overrideModel = typeof registryEntry?.model === 'string' ? registryEntry.model.trim() : '';
         if (overrideModel) {
           const overrideProvider = typeof registryEntry?.modelProvider === 'string' ? registryEntry.modelProvider.trim() : '';
@@ -7997,11 +9562,18 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
     console.error('[gateway] session-patch error:', err);
     const status = err instanceof UnknownAgentProviderError
       ? 400
-      : err?.message === 'Admin access required' ? 403 : 500;
+      : isOpenClawExecutionAdmissionFailure(err)
+        ? err.statusCode
+        : err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({
-      error: status === 400
+      error: isOpenClawExecutionAdmissionFailure(err)
+        ? err.message
+        : status === 400
         ? err.message
         : status === 403 ? 'Admin access required' : 'Failed to patch session',
+      ...(isOpenClawExecutionAdmissionFailure(err)
+        ? { code: err.code, retryable: err.retryable }
+        : {}),
       ...(status === 500 ? { detail: err.message } : {}),
     });
   }
@@ -8042,6 +9614,13 @@ router.post('/config-path', authenticateToken, requireApproved, async (req: Requ
       res.status(400).json({ error: 'path required' });
       return;
     }
+    if (pathStr !== 'agents.defaults.compaction.notifyUser') {
+      // Model, heartbeat, runtime, and unknown config paths can retarget a
+      // future autonomous host turn. Keep reads available, but reject every
+      // unproven mutation before config.get/config.patch. The one allowlisted
+      // path changes only Portal notification presentation.
+      assertOpenClawHostMutationAvailable('configuration');
+    }
     const cfgResult = await gatewayRpcCall('config.get', {});
     if (!cfgResult.ok) {
       res.status(502).json({ error: cfgResult.error || 'config.get failed' });
@@ -8065,6 +9644,12 @@ router.post('/config-path', authenticateToken, requireApproved, async (req: Requ
     }
     res.json({ ok: true, path: pathStr, value: readConfigPath(updated, pathStr) });
   } catch (err: any) {
+    if (
+      err instanceof OpenClawHostMutationUnavailableError
+    ) {
+      res.status(err.statusCode).json({ error: err.message, code: err.code, retryable: err.retryable });
+      return;
+    }
     res.status(500).json({ error: 'Failed to patch config path', detail: err.message });
   }
 });
@@ -8290,7 +9875,7 @@ async function handleNativePortalSlashCommand(params: {
         : params.requestedModel
           ? normalizeRequestedModel(params.providerName, params.requestedModel)
           : session.model;
-      const newSessionId = await AgentRegistry.get(params.providerName).startSession(params.userId, {
+      const newSessionId = await (await AgentRegistry.getAsync(params.providerName)).startSession(params.userId, {
         executionContext: params.executionContext,
         model: nextModel || undefined,
         metadata: { requestedBy: params.userEmail },
@@ -8318,9 +9903,84 @@ async function handleNativePortalSlashCommand(params: {
   }
 }
 
+router.get('/session-events', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const providerName = normalizeProviderName(harnessOrProviderInput(req.query));
+    let sessionKey = providerName === 'OPENCLAW'
+      ? await resolveOpenClawSessionKey(req.query.session as string, req.user)
+      : String(req.query.session || '').trim();
+    const requestedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(Math.floor(requestedLimit), 1), 200)
+      : 100;
+
+    await assertExistingGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    if (providerName !== 'OPENCLAW') {
+      const nativeSession = getOwnedNativeSession(
+        providerName,
+        req.user!.userId,
+        sessionKey,
+        undefined,
+        { metadataOnly: true },
+      );
+      if (!nativeSession) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({
+          provider: providerName,
+          sessionId: sessionKey,
+          events: [],
+          truncated: false,
+          generatedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      sessionKey = nativeSession.sessionId;
+    }
+
+    const stored = readAgentChatDiagnosticHistory(sessionKey, limit);
+    const merged = [...stored.events]
+      .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp));
+    const seen = new Set<string>();
+    const events: AgentChatDiagnosticEvent[] = [];
+    for (const event of merged) {
+      const timestampBucket = Math.floor(Date.parse(event.timestamp) / 1_000);
+      const key = [timestampBucket, event.category, event.title, event.runId || ''].join('\u0000');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      events.push(event);
+      if (events.length >= limit) break;
+    }
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      provider: providerName,
+      sessionId: sessionKey,
+      events,
+      truncated: stored.truncated || merged.length > events.length,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    const status = err?.message === 'Admin access required'
+      ? 403
+      : err instanceof UnknownAgentProviderError || err instanceof HistoryCursorError
+        ? 400
+        : 500;
+    if (status === 500) {
+      console.warn('[gateway] Session-event diagnostics failed:', err?.message || err);
+    }
+    res.status(status).json({
+      error: status === 403
+        ? 'Admin access required'
+        : status === 400
+          ? err.message
+          : 'Failed to load session events',
+    });
+  }
+});
+
 router.get('/history', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const providerName = normalizeProviderName(req.query.provider);
+    const providerName = normalizeProviderName(harnessOrProviderInput(req.query));
     const sessionKey = providerName === 'OPENCLAW'
       ? await resolveOpenClawSessionKey(req.query.session as string, req.user)
       : String(req.query.session || '').trim();
@@ -8334,18 +9994,8 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
       return;
     }
 
-    await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    await assertExistingGatewaySessionAccess(sessionKey, req.user!, { providerName });
     if (providerName === 'OPENCLAW') {
-      if (isElevatedRole(req.user!.role)) {
-        try {
-          // History is the authenticated Agent Chat bootstrap/reconnect path,
-          // including the optional direct transport. Registering here covers
-          // pre-upgrade and resumed sessions before their next send.
-          await attestAgentChatActivitySession(sessionKey, req.user!.userId, undefined, req.user!.role);
-        } catch (error) {
-          console.warn('[gateway] Agent activity history attestation could not be persisted:', error);
-        }
-      }
       subscribeBackendToLiveSessionEvents(sessionKey);
     }
 
@@ -8370,10 +10020,17 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
         }
         const scope = historyCursorScope(req.user!.userId, providerName, nativeSession.sessionId);
         const activeStreamCandidate = await getProviderActiveStreamSnapshot(providerName, nativeSession.sessionId);
-        const activeStream = resolveAttachableHostStreamSnapshot(
+        const resolvedActiveStream = resolveAttachableHostStreamSnapshot(
           nativeSession.sessionId,
           activeStreamCandidate,
         ) || activeStreamCandidate;
+        const activeStream = await attestHostAgentRunBrowserStreamSnapshot(
+          providerName,
+          nativeSession.sessionId,
+          resolvedActiveStream as OpenClawActiveStreamSnapshot,
+          nativeSession.executionContext?.scope,
+          req.user,
+        );
         if (!afterId && providerName !== 'AGENT_ZERO') {
           const page = readNativeHistoryPage({
             providerName,
@@ -8396,7 +10053,7 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
         }
 
         if (!afterId && providerName === 'AGENT_ZERO') {
-          const provider = AgentRegistry.get(providerName);
+          const provider = await AgentRegistry.getAsync(providerName);
           const page = await readAgentZeroHistoryPage({
             provider,
             sessionId: nativeSession.sessionId,
@@ -8417,29 +10074,19 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
           return;
         }
 
-        // Forward-cursor reconnect remains a bounded provider projection. The
-        // initial/older-page path above uses Agent Zero's stable sequence cursor.
-        const provider = AgentRegistry.get(providerName);
-        let messages = await provider.getHistory(nativeSession.sessionId);
-        if (afterId) {
-          const idx = messages.findIndex((message: any) => message.id === afterId);
-          if (idx >= 0) messages = messages.slice(idx + 1);
-          res.json({ messages: messages.slice(-limit), sessionId: nativeSession.sessionId, activeStream });
-          return;
-        }
-
-        const anchor = beforeCursor ? decodeHistoryCursor(beforeCursor, scope) : undefined;
-        const page = buildHistoryPage(messages, limit, scope, anchor, true);
-        res.json({
-          messages: page.messages,
+        // Forward-cursor reconnect needs only the newest bounded window. The
+        // old path called provider.getHistory(), which could deserialize the
+        // entire native JSONL lifetime before slicing it back to one browser
+        // page. Reading limit+1 durable messages preserves the old result:
+        // when the anchor is present we return only newer rows; when it is
+        // older/missing, both paths return the newest `limit` rows.
+        const messages = readNativeForwardHistory({
+          providerName,
           sessionId: nativeSession.sessionId,
-          activeStream,
-          pagination: {
-            beforeCursor: page.beforeCursor,
-            hasMoreBefore: page.hasMoreBefore,
-            pageSize: limit,
-          },
+          limit,
+          afterId,
         });
+        res.json({ messages, sessionId: nativeSession.sessionId, activeStream });
         return;
       } catch (err: any) {
         console.warn(`[gateway] Provider ${providerName} getHistory failed: ${err.message}`);
@@ -8452,63 +10099,40 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
       }
     }
 
-    // OPENCLAW (and default): resolve directly from JSONL, with Gemini CLI import fallback
-    const sessionsDir = resolveSessionsDir(sessionKey);
-    const fileId = resolveSessionFileId(sessionKey, sessionsDir);
-    const sessionId = fileId || sessionKey;
+    // OpenClaw 2026.9.1 owns session history in per-agent SQLite. The Gateway's
+    // chat.history projection is the only normal read path; Portal must not
+    // infer live state from the retired sessions.json/JSONL compatibility files.
     const scope = historyCursorScope(req.user!.userId, providerName, sessionKey);
 
     if (afterId) {
-      let messages = enhanced
-        ? readSessionMessagesEnhancedForSessionKey(sessionKey, limit, sessionsDir)
-        : await readSessionMessages(sessionId, limit, sessionsDir);
-
-      if (!fileId && messages.length === 0) {
-        const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
-        const activeStream = browserSafeActiveStreamSnapshot(
-          providerName,
-          resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate) || activeStreamCandidate,
-        );
-        res.json({ messages: [], sessionId, activeStream });
-        return;
+      const history = await getSessionHistory(sessionKey, { limit });
+      if (!history.ok || !history.data) {
+        throw new Error(history.error || 'OpenClaw chat.history failed');
       }
-
+      let messages = projectOpenClawGatewayHistoryMessages(
+        sessionKey,
+        history.data.messages,
+        limit,
+        enhanced,
+      );
       const idx = messages.findIndex((message: any) => message.id === afterId);
       if (idx >= 0) messages = messages.slice(idx + 1);
-      const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
+      const activeStreamCandidate = await getOpenClawActiveStreamSnapshotAfterHistory(sessionKey);
       const revalidatedActiveStream = resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate)
         || activeStreamCandidate;
       const activeStream = browserSafeActiveStreamSnapshot(providerName, revalidatedActiveStream);
-      res.json({ messages, sessionId, activeStream });
+      res.json({ messages, sessionId: history.data.sessionId || sessionKey, activeStream });
       return;
     }
 
-    const page = await readOpenClawHistoryPage({
+    const page = await readOpenClawGatewayHistoryPage({
       sessionKey,
-      sessionId,
-      sessionsDir,
       enhanced,
       limit,
       scope,
       beforeCursor,
     });
-
-    if (!fileId && page.messages.length === 0) {
-      const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
-      const activeStream = browserSafeActiveStreamSnapshot(
-        providerName,
-        resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate) || activeStreamCandidate,
-      );
-      res.json({
-        messages: [],
-        sessionId,
-        activeStream,
-        pagination: { beforeCursor: null, hasMoreBefore: false, pageSize: limit },
-      });
-      return;
-    }
-
-    const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
+    const activeStreamCandidate = await getOpenClawActiveStreamSnapshotAfterHistory(sessionKey);
     const activeStream = browserSafeActiveStreamSnapshot(
       providerName,
       resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate) || activeStreamCandidate,
@@ -8516,7 +10140,7 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
 
     res.json({
       messages: page.messages,
-      sessionId,
+      sessionId: page.sessionId,
       activeStream,
       pagination: {
         beforeCursor: page.beforeCursor,
@@ -8547,7 +10171,8 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
 
 // POST /api/gateway/send — SSE streaming (kept as fallback)
 router.post('/send', authenticateToken, requireApproved, async (req: Request, res: Response) => {
-  const { message, session = 'main', provider: providerName, model: requestedModel, agentId } = req.body;
+  const { message, session = 'main', model: requestedModel, agentId } = req.body;
+  const requestedHarness = harnessOrProviderInput(req.body);
   if (!message) { res.status(400).json({ error: 'message required' }); return; }
 
   let releaseAuthorizationLease: () => void;
@@ -8568,19 +10193,23 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
   const wantStream = req.query.stream === '1' || req.headers.accept === 'text/event-stream';
 
   try {
-    const routedProviderName = routeProviderForRequestedModel(providerName, requestedModel);
+    const routedProviderName = routeProviderForRequestedModel(requestedHarness, requestedModel);
     // Authorize the host trust zone before provider lookup or any session write.
     // Project Chat sends through its project route and only uses this gateway
     // transport for its already-bound sandbox session history/reconnect lane.
     const executionContext = requireHostOperatorExecutionContext(req.user!);
+    await assertHostOperatorProviderExecutionAvailable(routedProviderName);
     assertProviderExecutionContext(routedProviderName, executionContext);
-    const provider = AgentRegistry.get(routedProviderName);
-    const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
+    const provider = await AgentRegistry.getAsync(routedProviderName);
+    const provenance = harnessTurnProvenance(provider.providerName);
     const providerPublishesStream = providerPublishesHostStream(provider.providerName);
 
     const clientSession = typeof session === 'string' && session.trim().length > 0 ? session.trim() : '';
     let sessionId: string;
-    if (provider.providerName === 'OPENCLAW') {
+    const projectWorkSession = await bindProjectWorkHostSession(provider, executionContext);
+    if (projectWorkSession) {
+      sessionId = projectWorkSession;
+    } else if (provider.providerName === 'OPENCLAW') {
       sessionId = await resolveOpenClawTurnSessionKey(
         clientSession,
         agentId,
@@ -8634,6 +10263,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           model: normalizeGatewayModelId(slashResult.metadata?.model)
             || normalizeGatewayModelId(loadNativeSession(provider.providerName, slashResult.sessionId)?.model)
             || null,
+          harness: provider.providerName,
           provider: provider.providerName,
           provenance,
           sessionId: slashResult.sessionId,
@@ -8644,7 +10274,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     }
 
     if (wantStream) {
-      const routeRunId = randomUUID();
+      const routeRunId = currentProjectWork()?.requestId || randomUUID();
       let handleStreamAuthorityRevocation = () => {};
       const streamAuthority = await establishLongLivedAccessAuthorization({
         payload: req.user!,
@@ -8683,7 +10313,14 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         res.write(data);
         if (typeof (res as any).flush === 'function') (res as any).flush();
       };
-      sseWrite(`data: ${JSON.stringify({ type: 'session', sessionId, provenance, model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || null })}\n\n`);
+      sseWrite(`data: ${JSON.stringify({
+        type: 'session',
+        sessionId,
+        harness: provider.providerName,
+        provider: provider.providerName,
+        provenance,
+        model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || null,
+      })}\n\n`);
 
       let sseAlive = true;
       let sseFinished = false;
@@ -8783,7 +10420,13 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           activeStream = await reconcileOpenClawActiveTurnConflict(sessionId);
         } else {
           const candidate = await getProviderActiveStreamSnapshot(provider.providerName, sessionId);
-          activeStream = (resolveAttachableHostStreamSnapshot(sessionId, candidate) || candidate) as OpenClawActiveStreamSnapshot;
+          activeStream = await attestHostAgentRunBrowserStreamSnapshot(
+            provider.providerName,
+            sessionId,
+            (resolveAttachableHostStreamSnapshot(sessionId, candidate) || candidate) as OpenClawActiveStreamSnapshot,
+            executionContext.scope,
+            req.user,
+          );
         }
 
         if (streamUnsub) {
@@ -9022,7 +10665,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         return;
       }
 
-      const onStatus = (evt: { type: string; content: string; [key: string]: any }) => {
+      const onStatus = (evt: { type: string; content?: string; [key: string]: any }) => {
         gotRealStatus = true;
         if (evt.type === 'exec_approval' && evt.approval) {
           const approval = evt.approval as ExecApprovalRequest;
@@ -9100,10 +10743,11 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       }
 
       try {
-        const result = await (provider as any).sendMessage(
+        const result = await sendHostOperatorProviderMessage({
+          provider,
           sessionId,
           message,
-          (chunk: string) => {
+          onChunk: (chunk: string) => {
             if (!streamEventBus.startStream(sessionId, routeRunId, {
               provenance,
               model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || undefined,
@@ -9114,8 +10758,8 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           },
           onStatus,
           onExecApproval,
-          senderIdentity,
-        );
+          sender: senderIdentity,
+        });
         if (fallbackTimer) {
           clearTimeout(fallbackTimer);
           fallbackTimer = null;
@@ -9158,7 +10802,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
     }
 
     // Non-streaming
-    const nonStreamingRunId = randomUUID();
+    const nonStreamingRunId = currentProjectWork()?.requestId || randomUUID();
     const senderIdentity = req.user
       ? {
           label: req.user.email,
@@ -9242,6 +10886,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
       res.json({
         response: result.fullText,
         model: normalizeGatewayModelId(result.metadata?.model) || null,
+        harness: provider.providerName,
         provider: provider.providerName,
         provenance,
         sessionId: resolvedSessionId,
@@ -9270,6 +10915,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           res.json({
             response: recovered.content,
             model: recovered.model,
+            harness: provider.providerName,
             provider: provider.providerName,
             provenance,
             sessionId,
@@ -9302,6 +10948,8 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
   } catch (err: any) {
     const status = err instanceof UnknownAgentProviderError
       ? 400
+      : err instanceof NativeBinaryRuntimeUnqualifiedError
+        ? err.statusCode
       : err?.message === 'Admin access required'
         ? 403
         : err instanceof AgentZeroOAuthModelCatalogError
@@ -9317,12 +10965,17 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
         : status === 403
           ? 'Admin access required'
           : (redactNativeProviderText(
-              humanizeProviderError(normalizeProviderName(req.body?.provider), err?.message || String(err)),
+              humanizeProviderError(normalizeProviderName(harnessOrProviderInput(req.body)), err?.message || String(err)),
             ) || 'Agent error');
     res.status(status).json({
       error: friendlyError,
       detail: safeDetail,
-      ...(err instanceof AgentZeroOAuthModelCatalogError ? { code: err.code } : {}),
+      ...(err instanceof AgentZeroOAuthModelCatalogError
+        || err instanceof NativeBinaryRuntimeUnqualifiedError
+        || err instanceof OpenClawExecutionAdmissionError
+        || err instanceof OpenClawHostMutationUnavailableError
+        ? { code: err.code, retryable: err instanceof AgentZeroOAuthModelCatalogError ? undefined : err.retryable }
+        : {}),
     });
   } finally {
     settleWorkspaceAuthorizationRequest(req);
@@ -9387,12 +11040,12 @@ router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res
 
 // GET /api/gateway/stream-status — check if a stream is active for a session
 router.get('/stream-status', authenticateToken, async (req: Request, res: Response) => {
-  const providerName = normalizeProviderName(req.query.provider);
+  const providerName = normalizeProviderName(harnessOrProviderInput(req.query));
   const sessionKey = providerName === 'OPENCLAW'
     ? await resolveOpenClawSessionKey(req.query.session as string, req.user)
     : String(req.query.session || '').trim();
   try {
-    await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    await assertExistingGatewaySessionAccess(sessionKey, req.user!, { providerName });
   } catch (err: any) {
     res.status(403).json({ error: 'Admin access required', detail: err.message });
     return;
@@ -9409,19 +11062,19 @@ router.get('/stream-status', authenticateToken, async (req: Request, res: Respon
 
 router.post('/chat/abort', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
   const { session, runId } = req.body;
-  const providerName = normalizeProviderName(req.body?.provider);
+  const providerName = normalizeProviderName(harnessOrProviderInput(req.body));
   const sessionKey = providerName === 'OPENCLAW'
     ? await resolveOpenClawSessionKey(session, req.user)
     : String(session || '').trim();
   console.log(`[gateway] HTTP ABORT REQUEST: provider=${providerName} session=${sessionKey} runId=${runId || 'none'}`);
   try {
-    await assertGatewaySessionAccess(sessionKey, req.user!, { providerName });
+    await assertExistingGatewaySessionAccess(sessionKey, req.user!, { providerName });
 
     if (providerName !== 'OPENCLAW') {
-      const provider = AgentRegistry.get(providerName);
+      const provider = await AgentRegistry.getAsync(providerName);
       const expectedRunId = typeof runId === 'string' && runId.trim() ? runId.trim() : undefined;
       const aborted = await provider.abortActiveRun?.(sessionKey, expectedRunId);
-      res.json({ ok: aborted === true, sessionKey, provider: providerName, runId: expectedRunId || null });
+      res.json({ ok: aborted === true, sessionKey, harness: providerName, provider: providerName, runId: expectedRunId || null });
       return;
     }
 
@@ -9442,11 +11095,8 @@ router.post('/chat/abort', authenticateToken, requireApproved, async (req: Reque
     // cancelled, so anything else — a missing payload, a truthy non-boolean, an
     // empty body — means we did not confirm a stop. Treating that as success is
     // what made the button clear the UI while the agent kept running.
-    const abortedRunIds = Array.isArray(result.data?.runIds)
-      ? result.data.runIds.filter((value: unknown): value is string => typeof value === 'string' && value.length > 0)
-      : [];
-    const aborted = result.data?.aborted === true;
-    if (!aborted) {
+    const abortedRunIds = confirmedOpenClawAbortRunIds(result.data, runId);
+    if (!abortedRunIds) {
       console.warn(
         `[gateway] HTTP ABORT NOT CONFIRMED: session=${sessionKey} runId=${runId || 'none'} `
         + `payload=${JSON.stringify(result.data ?? null)}`,
@@ -9454,15 +11104,16 @@ router.post('/chat/abort', authenticateToken, requireApproved, async (req: Reque
       res.json({
         ok: false,
         sessionKey,
+        harness: providerName,
         provider: providerName,
         runId: runId || null,
-        runIds: abortedRunIds,
+        runIds: [],
         detail: 'The gateway did not confirm that a run was aborted. It may have already finished, or the run is still active.',
       });
       return;
     }
     clearHostStreamIfCurrentRun(sessionKey, abortRunIdentity);
-    res.json({ ok: true, sessionKey, provider: providerName, runId: runId || null, runIds: abortedRunIds });
+    res.json({ ok: true, sessionKey, harness: providerName, provider: providerName, runId: runId || null, runIds: abortedRunIds });
   } catch (err: any) {
     const status = err?.message === 'Admin access required' ? 403 : 500;
     res.status(status).json({
@@ -9476,7 +11127,6 @@ router.post('/chat/abort', authenticateToken, requireApproved, async (req: Reque
 
 
 router.post('/chat/inject', authenticateToken, requireApproved, async (req: Request, res: Response): Promise<void> => {
-  const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
   const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
   if (!isElevatedRole(req.user!.role)) {
     res.status(403).json({ error: 'Admin access required' });
@@ -9487,16 +11137,31 @@ router.post('/chat/inject', authenticateToken, requireApproved, async (req: Requ
     return;
   }
   try {
+    await assertOpenClawExecutionAdmitted();
+    const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
     await assertGatewaySessionAccess(sessionKey, req.user!);
     await injectChatMessage(sessionKey, text);
     res.json({ ok: true, sessionKey });
   } catch (err: any) {
-    const status = err?.message === 'Admin access required' ? 403 : 500;
-    res.status(status).json({ error: status === 403 ? 'Admin access required' : 'Failed to inject chat message', detail: err.message });
+    const status = isOpenClawExecutionAdmissionFailure(err)
+      ? err.statusCode
+      : err?.message === 'Admin access required' ? 403 : 500;
+    res.status(status).json({
+      error: isOpenClawExecutionAdmissionFailure(err)
+        ? err.message
+        : status === 403 ? 'Admin access required' : 'Failed to inject chat message',
+      ...(isOpenClawExecutionAdmissionFailure(err)
+        ? { code: err.code, retryable: err.retryable }
+        : { detail: err.message }),
+    });
   }
 });
 
 function pendingUserInputRouteError(res: Response, error: unknown): void {
+  if (isOpenClawExecutionAdmissionFailure(error)) {
+    res.status(error.statusCode).json({ error: error.message, code: error.code, retryable: error.retryable });
+    return;
+  }
   if (error instanceof PendingUserInputAnswerError) {
     res.status(error.statusCode).json({ error: error.message, code: error.code });
     return;
@@ -9537,6 +11202,7 @@ router.post('/answer-user-input', authenticateToken, requireApproved, async (req
     return;
   }
   try {
+    await assertOpenClawExecutionAdmitted();
     const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
     const ownership = await resolveAskUserQuestionRunOwner({
       sessionKey,
@@ -9571,6 +11237,7 @@ router.post('/session-steer', authenticateToken, requireApproved, async (req: Re
     return;
   }
   try {
+    await assertOpenClawExecutionAdmitted();
     const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
     await assertGatewaySessionAccess(sessionKey, req.user!);
     const result = await steerSessionMessage(sessionKey, expectedRunId, message, requestId);
@@ -9584,13 +11251,25 @@ async function resolveAnyExecApproval(
   approvalId: string,
   decision: NativeCliApprovalDecision,
 ): Promise<{ ok: boolean; error?: string; notFound?: boolean }> {
-  const nativeResult = resolveNativeCliApproval(approvalId, decision);
-  if (nativeResult.ok) return nativeResult;
+  const nativeProviderName = getPendingNativeCliApprovalProvider(approvalId);
+  if (nativeProviderName) {
+    // Provider identity is registry-owned; never trust request text or parse
+    // the display id for this continuation decision. A positive native
+    // decision only resolves the in-process provider promise. The provider
+    // freshly attests the admitted CLI before reserving its retry scope.
+    return resolveNativeCliApproval(approvalId, decision);
+  }
 
   // Native-prefixed ids live only in the in-process registry; a miss means
   // the approval expired, was resolved elsewhere, or the backend restarted.
   if (approvalId.startsWith('native-')) {
     return { ok: false, error: 'Approval no longer pending', notFound: true };
+  }
+
+  // Persistent approvals belong to OpenClaw. Deny remains available as
+  // cleanup; allow decisions fail closed before gateway I/O.
+  if (decision !== 'deny') {
+    assertOpenClawHostMutationAvailable('approval');
   }
 
   if (!isPersistentWsConnected()) {
@@ -9618,6 +11297,12 @@ router.post('/exec-approval/resolve', authenticateToken, requireAdmin, async (re
     }
     res.json({ ok: true, approvalId, decision });
   } catch (err: any) {
+    if (
+      err instanceof OpenClawHostMutationUnavailableError
+    ) {
+      res.status(err.statusCode).json({ error: err.message, code: err.code, retryable: err.retryable });
+      return;
+    }
     res.status(500).json({ error: 'Internal error', detail: err.message });
   }
 });
@@ -9935,6 +11620,28 @@ function resolveAttachableHostStreamSnapshot(
   return getProviderOwnedBusStreamSnapshot(sessionKey);
 }
 
+function nativeSnapshotRunMatchesRevalidation(
+  providerName: AgentProviderName | undefined,
+  candidate: StreamInfo | OpenClawActiveStreamSnapshot | null | undefined,
+  revalidatedRunId: string | null,
+): boolean {
+  if (!candidate || (providerName !== 'CODEX' && providerName !== 'CLAUDE_CODE')) {
+    return true;
+  }
+  const candidateRunId = normalizeHostStreamRunId(candidate.runId);
+  return candidateRunId !== null && candidateRunId === revalidatedRunId;
+}
+
+function nativeEventMatchesRevalidatedRun(
+  providerName: AgentProviderName | undefined,
+  event: StreamEvent,
+  revalidatedRunId: string | null,
+): boolean {
+  if (providerName !== 'CODEX' && providerName !== 'CLAUDE_CODE') return true;
+  return revalidatedRunId !== null
+    && normalizeHostStreamRunId(event.runId) === revalidatedRunId;
+}
+
 function isPreliminaryOpenClawStreamError(
   providerName: AgentProviderName | undefined,
   event: StreamEvent,
@@ -9972,6 +11679,11 @@ function attachBrowserWsToSessionStream(params: {
   const status = resolveAttachableHostStreamSnapshot(sessionKey, streamInfo);
   if (!status) return false;
 
+  const revalidatedRunId = normalizeHostStreamRunId(status.runId);
+  if (!nativeSnapshotRunMatchesRevalidation(providerName, streamInfo, revalidatedRunId)) {
+    return false;
+  }
+
   if (!status.active) {
     if (sendResume) wsSend(ws, { type: 'stream_ended', sessionKey });
     return false;
@@ -9979,14 +11691,17 @@ function attachBrowserWsToSessionStream(params: {
 
   // Snapshot/history/reconnect attachments lock to the synchronously
   // revalidated run. Live-send attachments pass no streamInfo and retain their
-  // dynamic matcher so OpenClaw can adopt its first upstream run ID.
-  const revalidatedRunId = normalizeHostStreamRunId(status.runId);
+  // dynamic matcher so OpenClaw can adopt its first upstream run ID. Native
+  // Codex/Claude snapshots carry a durable-proof run identity implicitly: the
+  // revalidation may reject it, but it must never substitute the current
+  // in-memory run for it.
   const snapshotRunMatcher = streamInfo && providerName && status.active && revalidatedRunId
     ? createHostStreamRunMatcher(providerName, revalidatedRunId, { openClawRunIdKnown: true })
     : null;
 
   let unsubscribed = false;
   const unsub = streamEventBus.subscribe(sessionKey, (evt: StreamEvent) => {
+    if (!nativeEventMatchesRevalidatedRun(providerName, evt, revalidatedRunId)) return;
     if (snapshotRunMatcher?.matches(evt) === false) return;
     if (acceptEvent?.(evt) === false) return;
     onEvent?.(evt);
@@ -9998,7 +11713,12 @@ function attachBrowserWsToSessionStream(params: {
     const runId = typeof evt.runId === 'string' && evt.runId.trim()
       ? evt.runId.trim()
       : (typeof activeStream?.runId === 'string' && activeStream.runId.trim() ? activeStream.runId.trim() : undefined);
-    wsSend(ws, { ...evt, sessionKey, ...(runId ? { runId } : {}) });
+    wsSend(ws, {
+      ...evt,
+      sessionKey,
+      ...(providerName ? { harness: providerName, provider: providerName } : {}),
+      ...(runId ? { runId } : {}),
+    });
     if (evt.type === 'error') {
       // StreamEventBus notifies the session subscribers before its global
       // subscribers. Keep this socket registered through the rest of the
@@ -10048,6 +11768,7 @@ function attachBrowserWsToSessionStream(params: {
     wsSend(ws, {
       type: 'stream_resume',
       sessionKey,
+      ...(providerName ? { harness: providerName, provider: providerName } : {}),
       phase,
       toolName: status.toolName || null,
       toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
@@ -10073,14 +11794,20 @@ function attachSseToSessionStream(params: {
 }): (() => void) | null {
   const { sessionKey, providerName, streamInfo, user, write, finish } = params;
   const status = resolveAttachableHostStreamSnapshot(sessionKey, streamInfo);
-  if (!status?.active) return null;
+  if (!status) return null;
 
   const revalidatedRunId = normalizeHostStreamRunId(status.runId);
+  if (!nativeSnapshotRunMatchesRevalidation(providerName, streamInfo, revalidatedRunId)) {
+    return null;
+  }
+  if (!status.active) return null;
+
   const runMatcher = revalidatedRunId
     ? createHostStreamRunMatcher(providerName, revalidatedRunId, { openClawRunIdKnown: true })
     : createHostStreamRunMatcher(providerName, '', { openClawRunIdKnown: false });
   let closed = false;
   const unsubscribe = streamEventBus.subscribe(sessionKey, (event: StreamEvent) => {
+    if (!nativeEventMatchesRevalidatedRun(providerName, event, revalidatedRunId)) return;
     if (closed || !runMatcher.matches(event)) return;
     if (isPreliminaryOpenClawStreamError(providerName, event)) return;
     const runtimeEvent = event as any;
@@ -10103,6 +11830,8 @@ function attachSseToSessionStream(params: {
       write(`data: ${JSON.stringify({
         ...event,
         sessionKey,
+        harness: providerName,
+        provider: providerName,
         ...(eventRunId ? { runId: eventRunId } : {}),
       })}\n\n`);
     } catch {
@@ -10133,6 +11862,8 @@ function attachSseToSessionStream(params: {
     write(`data: ${JSON.stringify({
       type: 'stream_resume',
       sessionKey,
+      harness: providerName,
+      provider: providerName,
       phase,
       toolName: status.toolName || null,
       toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
@@ -10159,7 +11890,7 @@ function attachSseToSessionStream(params: {
 }
 
 async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
-  const providerName = normalizeProviderName(msg.provider);
+  const providerName = normalizeProviderName(harnessOrProviderInput(msg));
   const sessionKey = providerName === 'OPENCLAW'
     ? await resolveOpenClawSessionKey(msg.session, user)
     : String(msg.session || '').trim();
@@ -10167,7 +11898,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
 
   try {
     const limit = parseHistoryLimit(msg.limit);
-    await assertGatewaySessionAccess(sessionKey, user, { providerName });
+    await assertExistingGatewaySessionAccess(sessionKey, user, { providerName });
     if (providerName === 'OPENCLAW') subscribeBackendToLiveSessionEvents(sessionKey);
     // Try provider abstraction for non-OpenClaw providers only.
     if (providerName !== 'OPENCLAW') {
@@ -10193,7 +11924,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
         const scope = historyCursorScope(user.userId, providerName, nativeSession.sessionId);
         let resolvedPage: HistoryPageResult;
         if (providerName === 'AGENT_ZERO') {
-          const provider = AgentRegistry.get(providerName);
+          const provider = await AgentRegistry.getAsync(providerName);
           resolvedPage = await readAgentZeroHistoryPage({
             provider,
             sessionId: nativeSession.sessionId,
@@ -10211,10 +11942,17 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
           });
         }
         const activeStreamCandidate = await getProviderActiveStreamSnapshot(providerName, nativeSession.sessionId);
-        const activeStream = resolveAttachableHostStreamSnapshot(
+        const resolvedActiveStream = resolveAttachableHostStreamSnapshot(
           nativeSession.sessionId,
           activeStreamCandidate,
         ) || activeStreamCandidate;
+        const activeStream = await attestHostAgentRunBrowserStreamSnapshot(
+          providerName,
+          nativeSession.sessionId,
+          resolvedActiveStream as OpenClawActiveStreamSnapshot,
+          nativeSession.executionContext?.scope,
+          user,
+        );
         wsSend(ws, {
           type: 'history',
           messages: resolvedPage.messages,
@@ -10228,7 +11966,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
           requestId,
         });
         if (activeStream.active && providerUsesHostStreamBus(providerName)) {
-          attachBrowserWsToSessionStream({
+          const attached = attachBrowserWsToSessionStream({
             ws,
             sessionKey: nativeSession.sessionId,
             providerName,
@@ -10236,6 +11974,15 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
             sendResume: true,
             keepSubscriptionAfterDone: false,
           });
+          if (!attached) {
+            wsSend(ws, {
+              type: 'stream_status',
+              sessionKey: nativeSession.sessionId,
+              active: false,
+              inactiveReason: 'unknown',
+              safeToClear: false,
+            });
+          }
         }
         return;
       } catch (err: any) {
@@ -10244,15 +11991,11 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
       }
     }
 
-    // JSONL-based enhanced history with Gemini CLI import fallback
-    const sessionsDir = resolveSessionsDir(sessionKey);
-    const fileId = resolveSessionFileId(sessionKey, sessionsDir);
-    const sessionId = fileId || sessionKey;
+    // OpenClaw 2026.9.1 owns history in per-agent SQLite. Browser history is
+    // projected exclusively through the Gateway's chat.history RPC.
     const scope = historyCursorScope(user.userId, providerName, sessionKey);
-    const page = await readOpenClawHistoryPage({
+    const page = await readOpenClawGatewayHistoryPage({
       sessionKey,
-      sessionId,
-      sessionsDir,
       enhanced: true,
       limit,
       scope,
@@ -10261,7 +12004,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
     wsSend(ws, {
       type: 'history',
       messages: page.messages,
-      sessionId,
+      sessionId: page.sessionId,
       pagination: {
         beforeCursor: page.beforeCursor,
         hasMoreBefore: page.hasMoreBefore,
@@ -10272,7 +12015,7 @@ async function handleWsHistory(ws: WebSocket, msg: any, user: JwtPayload) {
 
     // After sending history, check if there's an active stream on this session.
     // If so, send a stream_resume event and subscribe to StreamEventBus.
-    const activeStreamCandidate = await getOpenClawActiveStreamSnapshot(sessionKey);
+    const activeStreamCandidate = await getOpenClawActiveStreamSnapshotAfterHistory(sessionKey);
     const activeStream = browserSafeActiveStreamSnapshot(
       providerName,
       resolveAttachableHostStreamSnapshot(sessionKey, activeStreamCandidate) || activeStreamCandidate,
@@ -10302,7 +12045,8 @@ async function handleWsSend(
   user: JwtPayload,
   onQuarantinePersistenceFailure?: () => void,
 ) {
-  const { message, session = 'main', provider: providerName, model: requestedModel, agentId } = msg;
+  const { message, session = 'main', model: requestedModel, agentId } = msg;
+  const requestedHarness = harnessOrProviderInput(msg);
   if (!message) { wsSend(ws, { type: 'error', content: 'message required' }); return; }
 
   let streamKeepalive: ReturnType<typeof setInterval> | null = null;
@@ -10311,14 +12055,15 @@ async function handleWsSend(
   let providerNameForError: AgentProviderName = 'OPENCLAW';
 
   try {
-    routedProviderName = routeProviderForRequestedModel(providerName, requestedModel);
+    routedProviderName = routeProviderForRequestedModel(requestedHarness, requestedModel);
     providerNameForError = routedProviderName;
     // Reject unauthorized Agent Chat sends before provider lookup/session creation.
     const executionContext = requireHostOperatorExecutionContext(user);
+    await assertHostOperatorProviderExecutionAvailable(routedProviderName);
     assertProviderExecutionContext(routedProviderName, executionContext);
-    const provider = AgentRegistry.get(routedProviderName);
+    const provider = await AgentRegistry.getAsync(routedProviderName);
     providerNameForError = provider.providerName;
-    const provenance = PROVENANCE[provider.providerName] || `via ${provider.displayName}`;
+    const provenance = harnessTurnProvenance(provider.providerName);
     const isOpenClawProvider = provider.providerName === 'OPENCLAW';
     const providerPublishesStream = providerPublishesHostStream(provider.providerName);
 
@@ -10381,6 +12126,8 @@ async function handleWsSend(
         wsSend(ws, {
           type: 'session',
           sessionId: slashResult.sessionId,
+          harness: provider.providerName,
+          provider: provider.providerName,
           provenance,
           model: normalizeGatewayModelId(slashResult.metadata?.model)
             || normalizeGatewayModelId(loadNativeSession(provider.providerName, slashResult.sessionId)?.model)
@@ -10389,6 +12136,8 @@ async function handleWsSend(
         wsSend(ws, {
           type: 'done',
           content: slashResult.content || '',
+          harness: provider.providerName,
+          provider: provider.providerName,
           provenance,
           model: normalizeGatewayModelId(slashResult.metadata?.model)
             || normalizeGatewayModelId(loadNativeSession(provider.providerName, slashResult.sessionId)?.model)
@@ -10402,6 +12151,8 @@ async function handleWsSend(
     wsSend(ws, {
       type: 'session',
       sessionId,
+      harness: provider.providerName,
+      provider: provider.providerName,
       provenance,
       model: normalizeGatewayModelId(typeof requestedModel === 'string' ? requestedModel : '') || null,
     });
@@ -10457,11 +12208,18 @@ async function handleWsSend(
         const activeStreamCandidate = provider.providerName === 'OPENCLAW'
           ? await reconcileOpenClawActiveTurnConflict(sessionId)
           : await getProviderActiveStreamSnapshot(provider.providerName, sessionId);
-        const activeStream: OpenClawActiveStreamSnapshot = provider.providerName === 'OPENCLAW'
+        const resolvedActiveStream: OpenClawActiveStreamSnapshot = provider.providerName === 'OPENCLAW'
           ? activeStreamCandidate
           : (resolveAttachableHostStreamSnapshot(sessionId, activeStreamCandidate) || activeStreamCandidate) as OpenClawActiveStreamSnapshot;
+        const activeStream = await attestHostAgentRunBrowserStreamSnapshot(
+          provider.providerName,
+          sessionId,
+          resolvedActiveStream,
+          executionContext.scope,
+          user,
+        );
         if (activeStream.active) {
-          attachBrowserWsToSessionStream({
+          const attached = attachBrowserWsToSessionStream({
             ws,
             sessionKey: sessionId,
             providerName: provider.providerName,
@@ -10469,6 +12227,15 @@ async function handleWsSend(
             sendResume: true,
             keepSubscriptionAfterDone: isOpenClawProvider,
           });
+          if (!attached) {
+            wsSend(ws, {
+              type: 'stream_status',
+              sessionKey: sessionId,
+              active: false,
+              inactiveReason: 'unknown',
+              safeToClear: false,
+            });
+          }
         } else if (activeStream.safeToClear) {
           wsSend(ws, {
             type: 'stream_ended',
@@ -10765,22 +12532,30 @@ async function handleWsSend(
     };
 
     try {
-      const result = await (provider as any).sendMessage(
+      const result = await sendHostOperatorProviderMessage({
+        provider,
         sessionId,
         message,
         onChunk,
         onStatus,
         onExecApproval,
-        {
+        sender: {
           label: user.email,
           userId: user.userId,
           role: user.role,
           authorizationVersion: Number(user.authorizationVersion ?? 1),
         },
-      );
+      });
       clearTimeout(fallbackTimer);
       if (streamKeepalive) clearInterval(streamKeepalive);
-      wsSend(ws, { type: 'done', content: result.fullText, provenance, metadata: result.metadata });
+      wsSend(ws, {
+        type: 'done',
+        content: result.fullText,
+        harness: provider.providerName,
+        provider: provider.providerName,
+        provenance,
+        metadata: result.metadata,
+      });
     } catch (sendErr: unknown) {
       clearTimeout(fallbackTimer);
       throw sendErr;
@@ -10802,29 +12577,35 @@ async function handleWsSend(
       content: err instanceof UnknownAgentProviderError
         ? err.message
         : redactNativeProviderText(humanizeProviderError(providerNameForError, errMsg)) || 'Agent error',
-      ...(err instanceof AgentZeroOAuthModelCatalogError ? { code: err.code } : {}),
+      ...(err instanceof AgentZeroOAuthModelCatalogError
+        || err instanceof NativeBinaryRuntimeUnqualifiedError
+        || err instanceof OpenClawExecutionAdmissionError
+        || err instanceof OpenClawHostMutationUnavailableError
+        ? { code: err.code, retryable: err instanceof AgentZeroOAuthModelCatalogError ? undefined : err.retryable }
+        : {}),
     });
   }
 }
 
 async function handleWsAbort(ws: WebSocket, msg: any, user?: JwtPayload) {
-  const providerName = normalizeProviderName(msg.provider);
+  const providerName = normalizeProviderName(harnessOrProviderInput(msg));
   const requestId = typeof msg.requestId === 'string' && msg.requestId.trim() ? msg.requestId.trim() : null;
   const sessionKey = providerName === 'OPENCLAW'
     ? await resolveOpenClawSessionKey(msg.session, user)
     : String(msg.session || '').trim();
   console.log(`[gateway] ABORT REQUEST: provider=${providerName} session=${sessionKey} runId=${msg.runId || 'none'}`);
   try {
-    if (user) await assertGatewaySessionAccess(sessionKey, user, { providerName });
+    if (user) await assertExistingGatewaySessionAccess(sessionKey, user, { providerName });
 
     if (providerName !== 'OPENCLAW') {
-      const provider = AgentRegistry.get(providerName);
+      const provider = await AgentRegistry.getAsync(providerName);
       const expectedRunId = typeof msg.runId === 'string' && msg.runId.trim() ? msg.runId.trim() : undefined;
       const aborted = await provider.abortActiveRun?.(sessionKey, expectedRunId);
       wsSend(ws, {
         type: 'abort_result',
         ok: aborted === true,
         sessionKey,
+        harness: providerName,
         provider: providerName,
         runId: expectedRunId || null,
         requestId,
@@ -10837,7 +12618,10 @@ async function handleWsAbort(ws: WebSocket, msg: any, user?: JwtPayload) {
     const abortRunIdentity = captureHostStreamRunIdentity(sessionKey, msg.runId);
     const result = await gatewayRpcCall('chat.abort', payload);
     console.log(`[gateway] ABORT RESULT: ok=${result.ok} error=${result.error || 'none'}`);
-    const aborted = result.ok && result.data?.aborted !== false;
+    const abortedRunIds = result.ok
+      ? confirmedOpenClawAbortRunIds(result.data, msg.runId)
+      : null;
+    const aborted = abortedRunIds !== null;
 
     // Tear down the stream subscription for this WS + session.
     // Without this, the subscription stays alive (for sub-agent resume),
@@ -10852,9 +12636,11 @@ async function handleWsAbort(ws: WebSocket, msg: any, user?: JwtPayload) {
       type: 'abort_result',
       ok: aborted,
       sessionKey,
+      harness: providerName,
       provider: providerName,
       runId: typeof msg.runId === 'string' && msg.runId.trim() ? msg.runId.trim() : null,
       requestId,
+      runIds: abortedRunIds || [],
       error: aborted
         ? undefined
         : (redactNativeProviderText(result.error || 'Abort was not confirmed') || 'Abort was not confirmed'),
@@ -10864,6 +12650,7 @@ async function handleWsAbort(ws: WebSocket, msg: any, user?: JwtPayload) {
       type: 'abort_result',
       ok: false,
       sessionKey,
+      harness: providerName,
       provider: providerName,
       runId: typeof msg.runId === 'string' && msg.runId.trim() ? msg.runId.trim() : null,
       requestId,
@@ -10874,7 +12661,6 @@ async function handleWsAbort(ws: WebSocket, msg: any, user?: JwtPayload) {
 
 
 async function handleWsInject(ws: WebSocket, msg: any, user?: JwtPayload) {
-  const sessionKey = await resolveOpenClawSessionKey(msg.session, user);
   const text = typeof msg.text === 'string' ? msg.text.trim() : '';
   if (!user || !isElevatedRole(user.role)) {
     wsSend(ws, { type: 'inject_result', ok: false, error: 'Admin access required' });
@@ -10884,12 +12670,22 @@ async function handleWsInject(ws: WebSocket, msg: any, user?: JwtPayload) {
     wsSend(ws, { type: 'inject_result', ok: false, error: 'text required' });
     return;
   }
+  const actor = user;
   try {
-    await assertGatewaySessionAccess(sessionKey, user);
+    await assertOpenClawExecutionAdmitted();
+    const sessionKey = await resolveOpenClawSessionKey(msg.session, actor);
+    await assertGatewaySessionAccess(sessionKey, actor);
     await injectChatMessage(sessionKey, text);
     wsSend(ws, { type: 'inject_result', ok: true, sessionKey });
   } catch (err: any) {
-    wsSend(ws, { type: 'inject_result', ok: false, error: err.message });
+    wsSend(ws, {
+      type: 'inject_result',
+      ok: false,
+      error: err.message,
+      ...(isOpenClawExecutionAdmissionFailure(err)
+        ? { code: err.code, retryable: err.retryable }
+        : {}),
+    });
   }
 }
 
@@ -10908,7 +12704,15 @@ async function handleWsExecApproval(ws: WebSocket, msg: any, user?: JwtPayload) 
     const result = await resolveAnyExecApproval(approvalId, decision);
     wsSend(ws, { type: 'approval_result', ok: result.ok, approvalId, decision, error: result.ok ? undefined : result.error });
   } catch (err: any) {
-    wsSend(ws, { type: 'approval_result', ok: false, approvalId, error: err.message });
+    wsSend(ws, {
+      type: 'approval_result',
+      ok: false,
+      approvalId,
+      error: err.message,
+      ...(err instanceof OpenClawHostMutationUnavailableError
+        ? { code: err.code, retryable: err.retryable }
+        : {}),
+    });
   }
 }
 
@@ -10934,10 +12738,10 @@ async function denyExecApprovalForUnauthorizedUser(approval: ExecApprovalRequest
 
 async function handleWsReconnect(
   ws: WebSocket,
-  msg: { session?: string; provider?: string; streamClientId?: string },
+  msg: { session?: string; harness?: string; provider?: string; streamClientId?: string },
   user?: JwtPayload,
 ): Promise<void> {
-  const providerName = normalizeProviderName(msg.provider);
+  const providerName = normalizeProviderName(harnessOrProviderInput(msg));
   const sessionKey = providerName === 'OPENCLAW'
     ? await resolveOpenClawSessionKey(msg.session, user)
     : String(msg.session || '').trim();
@@ -10947,7 +12751,7 @@ async function handleWsReconnect(
   }
 
   try {
-    if (user) await assertGatewaySessionAccess(sessionKey, user, { providerName });
+    if (user) await assertExistingGatewaySessionAccess(sessionKey, user, { providerName });
     if (providerName === 'OPENCLAW') subscribeBackendToLiveSessionEvents(sessionKey);
   } catch (err: any) {
     const reconnectError = err?.message === 'Admin access required'
@@ -10955,10 +12759,6 @@ async function handleWsReconnect(
       : `Reconnect failed: ${redactNativeProviderText(err?.message || String(err)) || 'Agent error'}`;
     wsSend(ws, { type: 'error', content: reconnectError });
     return;
-  }
-
-  if (user?.userId) {
-    takeOverSseDelivery(user.userId, sessionKey, msg.streamClientId);
   }
 
   const streamInfoCandidate = await getProviderActiveStreamSnapshot(providerName, sessionKey);
@@ -10979,7 +12779,41 @@ async function handleWsReconnect(
     return;
   }
 
-  attachBrowserWsToSessionStream({
+  let attestedHostRunId: string | undefined;
+  if (providerName === 'CODEX' || providerName === 'CLAUDE_CODE') {
+    try {
+      const nativeSession = loadNativeSession(providerName, sessionKey);
+      if (!nativeSession?.executionContext) throw new Error('Native host session authority is unavailable');
+      if (nativeSession.executionContext.scope === 'HOST_OPERATOR') {
+        const runId = normalizeHostStreamRunId(streamInfo.runId);
+        const actorAuthorizationVersion = Number(user?.authorizationVersion);
+        if (
+          !runId
+          || !user?.userId
+          || !Number.isSafeInteger(actorAuthorizationVersion)
+          || actorAuthorizationVersion < 1
+        ) {
+          throw new Error('Host agent attachment authority is incomplete');
+        }
+        await assertHostAgentRunAttachable({
+          actorUserId: user.userId,
+          actorAuthorizationVersion,
+          provider: providerName,
+          sessionId: sessionKey,
+          runId,
+        });
+        attestedHostRunId = runId;
+      }
+    } catch (error) {
+      wsSend(ws, {
+        type: 'error',
+        content: `Reconnect failed: ${redactNativeProviderText(error instanceof Error ? error.message : String(error)) || 'host run is unavailable'}`,
+      });
+      return;
+    }
+  }
+
+  const attached = attachBrowserWsToSessionStream({
     ws,
     sessionKey,
     providerName,
@@ -10990,6 +12824,20 @@ async function handleWsReconnect(
       if (evt.type === 'text') debugLog(`[Gateway] RECONNECT→browser TEXT: len=${(evt.content||'').length} "${(evt.content||'').substring(0, 40)}..."`);
     },
   });
+  if (!attached) {
+    if (attestedHostRunId) {
+      runWsStreamCleanup(ws, sessionKey);
+      wsSend(ws, {
+        type: 'error',
+        content: 'Reconnect failed: active host run changed during attachment',
+      });
+    }
+    return;
+  }
+
+  if (user?.userId) {
+    takeOverSseDelivery(user.userId, sessionKey, msg.streamClientId);
+  }
   debugLog(`[gateway-ws] Client reconnected to active stream: ${sessionKey}`);
 }
 
@@ -11044,12 +12892,12 @@ function enqueueOrderedSessionDelivery(
 
 function shouldSendGlobalStreamCopy(
   socketHadDirectSubscription: boolean,
-  evt: Pick<StreamEvent, 'type' | 'maintenanceKind'>,
+  _evt: Pick<StreamEvent, 'type' | 'maintenanceKind'>,
 ): boolean {
-  const isMaintenanceEvent = evt.type === 'compaction_start'
-    || evt.type === 'compaction_end'
-    || evt.maintenanceKind === 'maintenance';
-  return !socketHadDirectSubscription || isMaintenanceEvent;
+  // A socket with an exact session subscription already receives this event.
+  // Maintenance uses the same single delivery lane as every other stream event;
+  // the global subscription is only the fallback for unattached/restarted tabs.
+  return !socketHadDirectSubscription;
 }
 
 function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
@@ -11098,10 +12946,6 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
         await assertAgentStreamSessionAccess(sessionKey, user);
         await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
 
-        // Maintenance history is a durable write and therefore remains inside
-        // the short event-delivery lease.
-        recordMaintenanceHistoryMarker(sessionKey, evt);
-
         if (
           activitySubject
           || activityType === 'done'
@@ -11125,9 +12969,8 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
           }
         }
 
-        // Skip the global copy only when this exact browser socket already owns
-        // a direct subscription. Maintenance events deliberately use both
-        // paths so the composer rail and durable marker survive transitions.
+        // Skip the global copy when this exact browser socket already owns a
+        // direct subscription. The global lane remains a reconnect fallback.
         if (!sendGlobalCopy) return;
 
         await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
@@ -11609,9 +13452,6 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
             clearTimeout(meta.timeoutTimer);
             meta.timeoutTimer = undefined;
           }
-          if (msg.ok && meta?.method === 'chat.history' && meta.sessionKey) {
-            msg.payload = augmentDirectHistoryPayload(msg.payload, meta.sessionKey, meta.limit || 200);
-          }
           const browserResponse = await settleDirectGatewayChatSendResponse(meta, msg);
           const browserRequestId = meta?.browserRequestId ?? idMap.get(gatewayId) ?? gatewayId;
           clearDirectRequestMeta(gatewayId);
@@ -12089,7 +13929,9 @@ export const __gatewayExecutionScopeTest = {
   parseExactOpenClawConflictRun,
   reconcileOpenClawActiveTurnConflict,
   browserSafeActiveStreamSnapshot,
+  attestHostAgentRunBrowserStreamSnapshot,
   attachBrowserWsToSessionStream,
+  attachSseToSessionStream,
   wsHasSessionStreamSubscription,
   shouldSendGlobalStreamCopy,
   captureHostStreamRunIdentity,
@@ -12106,6 +13948,7 @@ export const __gatewayExecutionScopeTest = {
   settleDirectGatewayChatSendResponse,
   scheduleDirectGatewayChatRunTimeout,
   normalizeRequestedModel,
+  harnessOrProviderInput,
   isProviderModelResetAlias,
   routeProviderForRequestedModel,
   humanizeProviderError,
@@ -12120,12 +13963,16 @@ export const __gatewayExecutionScopeTest = {
   directGatewayEventSessionKey,
   isDirectGatewayEventAllowed,
   sendHostOperatorProviderMessage,
+  confirmedOpenClawAbortRunIds,
   clearAgentActivityScopePending: () => agentActivityScopePending.clear(),
   directGatewayChatSendTimeoutMs: DIRECT_GATEWAY_CHAT_SEND_TIMEOUT_MS,
   handleWsSend,
   handleWsAbort,
+  handleWsExecApproval,
+  handleWsHistory,
   handleWsReconnect,
   enqueueOrderedSessionDelivery,
+  nativeAgentSessionProviders: [...NATIVE_AGENT_SESSION_PROVIDERS],
 };
 
 // Narrow test surface for the dashboard's OpenClaw version checks. The
@@ -12176,6 +14023,10 @@ function normalizeRequestedModel(providerName: AgentProviderName, rawModel: stri
 
 /** Provider-neutral ask-user channel, projected through an owner-scoped broker. */
 function askUserErrorResponse(res: Response, error: unknown): void {
+  if (isOpenClawExecutionAdmissionFailure(error)) {
+    res.status(error.statusCode).json({ error: error.message, code: error.code, retryable: error.retryable });
+    return;
+  }
   if (error instanceof AskUserQuestionError) {
     if ([
       'ASK_USER_NOT_FOUND',
@@ -12216,6 +14067,7 @@ export const __gatewayAskUserTest = {
 
 router.get('/ask-user/pending', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
+    await assertOpenClawExecutionAdmitted();
     const actorUserId = req.user?.userId || '';
     const actorAuthorizationVersion = Number(req.user?.authorizationVersion ?? 1);
     const requestedSession = typeof req.query.session === 'string' && req.query.session.trim()
@@ -12234,8 +14086,10 @@ router.get('/ask-user/pending', authenticateToken, requireApproved, async (req: 
 
 router.post('/ask-user/answer', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
+    await assertOpenClawExecutionAdmitted();
     const id = String(req.body?.id || '');
     const actorUserId = req.user?.userId || '';
+    readPendingAskUserQuestionForActor(id, actorUserId);
     const { record, idempotentReplay } = await deliverAskUserQuestionAnswer({
       id,
       answers: (req.body?.answers && typeof req.body.answers === 'object') ? req.body.answers : {},
@@ -12249,6 +14103,7 @@ router.post('/ask-user/answer', authenticateToken, requireApproved, async (req: 
 
 router.post('/ask-user/dismiss', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
+    await assertOpenClawExecutionAdmitted();
     const id = String(req.body?.id || '');
     const actorUserId = req.user?.userId || '';
     const { idempotentReplay } = await deliverAskUserQuestionDismissal({

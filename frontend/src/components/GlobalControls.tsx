@@ -118,7 +118,7 @@ export default function GlobalControls({ children, onToggleSidebar, onToggleAssi
 
       {/* Keyboard hint overlay */}
       {showKeyboardHint && !routeOperationActive && (
-        <ViewportOverlay anchor="bottom-left" zIndex={1100} margin="1.5rem" className="max-w-[min(20rem,calc(100vw-3rem))]">
+        <ViewportOverlay anchor="bottom-left" zIndex={1100} margin="1.5rem" className="hidden md:block max-w-[min(20rem,calc(100vw-3rem))]">
           <div className="bg-[#0A0E27]/95 border border-emerald-500/30 rounded-xl p-4 shadow-2xl backdrop-blur-xl animate-fade-in">
             <div className="flex items-start justify-between gap-3 mb-2">
               <div className="flex-1">

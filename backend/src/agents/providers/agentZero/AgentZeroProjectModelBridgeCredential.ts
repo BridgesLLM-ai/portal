@@ -162,7 +162,18 @@ function requireProtectedDirectory(
   options: AgentZeroProjectModelBridgeCredentialOptions,
   create: boolean,
 ): void {
-  if (create) fs.mkdirSync(directory, { recursive: true, mode: 0o750 });
+  // The canonical root is provisioned only by the signed lifecycle. Project
+  // work must not create a second authority or repair missing host state.
+  if (create && directory !== AGENT_ZERO_PROJECT_MODEL_BRIDGE_DEFAULT_ROOT) {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o750 });
+  }
+  if (directory === AGENT_ZERO_PROJECT_MODEL_BRIDGE_DEFAULT_ROOT) {
+    const parent = fs.lstatSync(path.dirname(directory));
+    if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== 0
+      || (parent.mode & 0o7777) !== 0o750 || parent.gid === 0) {
+      throw new Error('Managed bridge state has not been provisioned.');
+    }
+  }
   const stat = fs.lstatSync(directory);
   if (!stat.isDirectory()
     || stat.isSymbolicLink()

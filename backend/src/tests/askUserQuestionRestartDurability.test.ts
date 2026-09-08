@@ -1,5 +1,3 @@
-import fs from 'fs';
-import path from 'path';
 import {
   ASK_USER_MAX_WAIT_MS,
   __resetAskUserQuestionsForTests,
@@ -28,17 +26,14 @@ jest.mock('openclaw/plugin-sdk/agent-harness-runtime', () => ({
 const askUserPlugin = require('../../../installer/openclaw-ask-user-plugin/index.js');
 
 /**
- * Accepted-answer receipts are process-local, in both the Portal broker and the
- * OpenClaw plugin. These tests pin the invariant that makes that safe rather
- * than merely convenient:
+ * OpenClaw 2026.9.1 owns native question state and settlement. The Portal
+ * broker is only a bounded presentation cache, and plugin 4.0 owns no question
+ * tool, hook, answer method, or question receipt. After either process restarts,
+ * Portal must re-attest the native request before it can present or settle it.
  *
- *   A receipt only ever has to outlive a transport failure, never a process.
- *
- * The pending native request and its receipt are owned by the same OpenClaw
- * process. If that process restarts, the embedded run that was waiting on the
- * answer dies with it, so there is nothing left to deliver an answer into and a
- * replay is not merely unavailable — it is meaningless. Every restart path must
- * therefore fail closed, and no path may ever settle a question twice.
+ * Plugin 4.0 does retain exact-run steering with process-local deduplication.
+ * The steering checks below pin that narrow boundary without recreating the
+ * retired custom question authority in a mixed-generation fixture.
  */
 
 const sessionKey = 'agent:main:portal-owner';
@@ -60,86 +55,57 @@ type GatewayHandler = (input: {
 }) => Promise<void>;
 
 /**
- * Models the patched OpenClaw bundle: one in-process registry of active runs,
- * each holding at most one pending native request. `restart()` is the whole
- * point — it drops runs and receipts together, exactly as a gateway restart
- * does, because both live in the same process.
+ * Models the pinned OpenClaw active-run steering bridge. `restart()` drops the
+ * active run and plugin steering receipts together, as a Gateway restart does.
  */
 class FakeOpenClawProcess {
-  private runs = new Map<string, { requestId: string; settled: boolean }>();
+  private activeRunId: string | null = null;
 
-  startRun(): void {
-    this.runs.set(`${sessionKey}\0${expectedRunId}`, { requestId, settled: false });
+  startRun(runId = expectedRunId): void {
+    this.activeRunId = runId;
   }
 
   restart(): void {
-    this.runs.clear();
+    this.activeRunId = null;
     askUserPlugin.__test.reset();
-  }
-
-  private lookup(session: unknown, runId: unknown) {
-    const run = this.runs.get(`${String(session)}\0${String(runId)}`);
-    if (!run) return { ok: false as const, code: 'NO_ACTIVE_RUN' };
-    return { ok: true as const, run };
   }
 
   readonly api = Object.freeze({
     version: 1,
-    read: (session: unknown, runId: unknown) => {
-      const lookup = this.lookup(session, runId);
-      if (!lookup.ok || lookup.run.settled) return null;
-      return {
-        requestId,
-        runId: expectedRunId,
-        createdAt: 1_000,
-        expiresAt: 601_000,
-        questions: [{
-          id: 'database',
-          header: 'Database',
-          question: 'Which database should I use?',
-          isOther: false,
-          isSecret: false,
-          options: [{ label: 'PostgreSQL' }, { label: 'SQLite' }],
-        }],
-      };
-    },
-    answer: (session: unknown, runId: unknown, id: unknown) => {
-      const lookup = this.lookup(session, runId);
-      if (!lookup.ok) return lookup;
-      if (lookup.run.settled) {
-        return { ok: false as const, code: 'NO_PENDING_INPUT', runId: expectedRunId };
+    steer: async (session: unknown, runId: unknown) => {
+      if (String(session) !== sessionKey || this.activeRunId === null) {
+        return { ok: false as const, code: 'NO_ACTIVE_RUN' };
       }
-      if (String(id) !== lookup.run.requestId) {
-        return { ok: false as const, code: 'REQUEST_MISMATCH', runId: expectedRunId };
+      if (String(runId) !== this.activeRunId) {
+        return { ok: false as const, code: 'RUN_MISMATCH', runId: this.activeRunId };
       }
-      lookup.run.settled = true;
-      this.settlements += 1;
-      return { ok: true as const, code: 'ANSWERED', requestId, runId: expectedRunId };
+      this.deliveries += 1;
+      return { ok: true as const, code: 'STEERED', runId: this.activeRunId };
     },
-    dismiss: (session: unknown, runId: unknown) => {
-      const lookup = this.lookup(session, runId);
-      if (!lookup.ok) return lookup;
-      lookup.run.settled = true;
-      this.settlements += 1;
-      return { ok: true as const, code: 'DISMISSED', requestId, runId: expectedRunId };
-    },
-    steer: async () => ({ ok: false as const, code: 'PENDING_INPUT', runId: expectedRunId }),
   });
 
-  /** How many times the run was actually settled. Must never exceed one. */
-  settlements = 0;
+  /** How many times text actually entered an active run. */
+  deliveries = 0;
 }
 
-function registerPlugin(): Map<string, GatewayHandler> {
-  const registrations = new Map<string, GatewayHandler>();
+interface PluginRegistrations {
+  methods: Map<string, GatewayHandler>;
+  tools: unknown[];
+  hooks: unknown[];
+}
+
+function registerPlugin(): PluginRegistrations {
+  const methods = new Map<string, GatewayHandler>();
+  const tools: unknown[] = [];
+  const hooks: unknown[] = [];
   askUserPlugin.register({
     registerGatewayMethod: (method: string, handler: GatewayHandler) => {
-      registrations.set(method, handler);
+      methods.set(method, handler);
     },
-    registerTool: () => undefined,
-    on: () => undefined,
+    registerTool: (...args: unknown[]) => { tools.push(args); },
+    on: (...args: unknown[]) => { hooks.push(args); },
   });
-  return registrations;
+  return { methods, tools, hooks };
 }
 
 async function invoke(
@@ -155,11 +121,11 @@ async function invoke(
   return response;
 }
 
-describe('native pending-input restart semantics', () => {
-  const runtimeSymbol = askUserPlugin.__test.RUNTIME_SYMBOL;
-  const answerMethod = askUserPlugin.__test.GATEWAY_METHODS.answer;
+describe('OpenClaw 2026.9.1 plugin ownership and steering restart semantics', () => {
+  const runtimeSymbol = askUserPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL;
+  const steerMethod = askUserPlugin.__test.GATEWAY_METHODS.steer;
   let openclaw: FakeOpenClawProcess;
-  let handlers: Map<string, GatewayHandler>;
+  let registrations: PluginRegistrations;
 
   beforeEach(() => {
     __resetAskUserQuestionsForTests();
@@ -171,7 +137,7 @@ describe('native pending-input restart semantics', () => {
       configurable: true,
     });
     mockResolveActiveEmbeddedRunSessionId.mockReturnValue(sessionKey);
-    handlers = registerPlugin();
+    registrations = registerPlugin();
   });
 
   afterEach(() => {
@@ -180,78 +146,65 @@ describe('native pending-input restart semantics', () => {
     askUserPlugin.__test.reset();
   });
 
-  const answerParams = {
+  const steerParams = {
     sessionKey,
     expectedRunId,
     requestId,
     text: 'PostgreSQL',
   };
 
-  test('a receipt can never expire while its own request is still answerable', () => {
-    // The receipt window has to cover the entire window in which a retry is
-    // still meaningful. The request's own ceiling is OpenClaw's documented
-    // per-hook budget, which the hotfix pins in the patched bundle.
-    const hotfix = fs.readFileSync(
-      path.join(__dirname, '../../../scripts/patch-openclaw-codex-pending-input-hotfix.sh'),
-      'utf8',
-    );
-    const declared = hotfix.match(/BRIDGESLLM_PENDING_INPUT_TTL_MS\s*=\s*([^;\n]+);/);
-    expect(declared).not.toBeNull();
-    // eslint-disable-next-line no-eval
-    const requestTtlMs = Number(eval(declared![1]));
-    expect(requestTtlMs).toBe(ASK_USER_MAX_WAIT_MS);
-    expect(askUserPlugin.__test.TERMINAL_RECEIPT_TTL_MS).toBeGreaterThan(requestTtlMs);
+  test('registers only exact-run steer', () => {
+    expect(askUserPlugin.__test.GATEWAY_METHODS).toEqual({
+      steer: 'bridgesllm.ask_user.steer',
+    });
+    expect([...registrations.methods.keys()]).toEqual(['bridgesllm.ask_user.steer']);
+    expect(registrations.tools).toEqual([]);
+    expect(registrations.hooks).toEqual([]);
+    expect(askUserPlugin.__test.RUNTIME_SYMBOL).toBeUndefined();
+    expect(askUserPlugin.__test.GENERIC_PENDING_TTL_MS).toBeUndefined();
+    expect(askUserPlugin.__test.GATEWAY_METHODS.answer).toBeUndefined();
+    expect(askUserPlugin.__test.GATEWAY_METHODS.pending).toBeUndefined();
+    expect(askUserPlugin.__test.GATEWAY_METHODS.dismiss).toBeUndefined();
   });
 
-  test('an interrupted response replays the exact answer and settles the run once', async () => {
-    const first = await invoke(handlers.get(answerMethod)!, answerParams);
+  test('an interrupted response replays the exact steer and enters the run once', async () => {
+    const first = await invoke(registrations.methods.get(steerMethod)!, steerParams);
     expect(first.payload).toMatchObject({ accepted: true, replayed: false });
-    expect(openclaw.settlements).toBe(1);
+    expect(openclaw.deliveries).toBe(1);
 
-    // Portal never saw that response. The exact retry must be admitted from the
-    // receipt rather than re-entering the runtime.
-    const replay = await invoke(handlers.get(answerMethod)!, answerParams);
+    const replay = await invoke(registrations.methods.get(steerMethod)!, steerParams);
     expect(replay.payload).toMatchObject({ accepted: true, replayed: true });
-    expect(openclaw.settlements).toBe(1);
+    expect(openclaw.deliveries).toBe(1);
   });
 
-  test('a changed answer after an interrupted response is refused, never delivered', async () => {
-    await invoke(handlers.get(answerMethod)!, answerParams);
-    const conflicting = await invoke(handlers.get(answerMethod)!, {
-      ...answerParams,
+  test('changed text under a completed steer identity is refused', async () => {
+    await invoke(registrations.methods.get(steerMethod)!, steerParams);
+    const conflicting = await invoke(registrations.methods.get(steerMethod)!, {
+      ...steerParams,
       text: 'SQLite',
     });
     expect(conflicting.payload?.accepted).not.toBe(true);
     expect(conflicting.payload).toMatchObject({ code: 'REQUEST_CONFLICT' });
-    expect(openclaw.settlements).toBe(1);
+    expect(openclaw.deliveries).toBe(1);
   });
 
-  test('a gateway restart makes replay impossible instead of duplicating the answer', async () => {
-    const accepted = await invoke(handlers.get(answerMethod)!, answerParams);
+  test('a gateway restart drops steering receipts and rejects a stale run identity', async () => {
+    const accepted = await invoke(registrations.methods.get(steerMethod)!, steerParams);
     expect(accepted.payload).toMatchObject({ accepted: true });
-    expect(openclaw.settlements).toBe(1);
+    expect(openclaw.deliveries).toBe(1);
 
-    // The response is lost and the gateway restarts. The run that was waiting
-    // on this answer died with the process, so there is nothing to replay into.
     openclaw.restart();
 
-    const afterRestart = await invoke(handlers.get(answerMethod)!, answerParams);
+    const afterRestart = await invoke(registrations.methods.get(steerMethod)!, steerParams);
     expect(afterRestart.payload?.accepted).not.toBe(true);
-    // The provider-neutral adapter remains loaded after restart, but owns no
-    // pending call from the dead process. Either way the stale answer is
-    // explicitly rejected rather than entering a newer run.
-    expect(afterRestart.payload).toMatchObject({ code: 'NO_PENDING_INPUT' });
-    expect(openclaw.settlements).toBe(1);
+    expect(afterRestart.payload).toMatchObject({ code: 'NO_ACTIVE_RUN' });
+    expect(openclaw.deliveries).toBe(1);
 
-    // A brand new run in the restarted process is a different request. The old
-    // request identity must not unlock it.
-    openclaw.startRun();
-    const staleIdentity = await invoke(handlers.get(answerMethod)!, {
-      ...answerParams,
-      requestId: 'request-33333333-3333-4333-8333-333333333333',
-    });
+    openclaw.startRun('portal-run-44444444-4444-4444-8444-444444444444');
+    const staleIdentity = await invoke(registrations.methods.get(steerMethod)!, steerParams);
     expect(staleIdentity.payload?.accepted).not.toBe(true);
-    expect(openclaw.settlements).toBe(1);
+    expect(staleIdentity.payload).toMatchObject({ code: 'RUN_MISMATCH' });
+    expect(openclaw.deliveries).toBe(1);
   });
 });
 

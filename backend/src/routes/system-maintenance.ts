@@ -21,6 +21,12 @@ import {
   getOpenClawSetupReadiness,
   type OpenClawSetupReadiness,
 } from '../services/openclawSetupReadiness';
+import {
+  getNativeHostCliStatus,
+  type NativeHostCliStatus,
+  type NativeHostCliStatusTool,
+} from '../services/nativeHostCliStatus';
+import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
 
 type MaintenanceSeverity = 'healthy' | 'info' | 'warning' | 'critical';
 type MaintenanceActionRisk = 'safe' | 'scheduled' | 'manual';
@@ -458,7 +464,7 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     id: 'create-maintenance-backup',
     label: 'Create Maintenance Backup',
     title: 'Create maintenance backup',
-    description: 'Creates and verifies a comprehensive recovery backup before maintenance work.',
+    description: 'Creates and verifies a comprehensive Portal data backup before maintenance work.',
     risk: 'scheduled',
     downtimeExpected: true,
     requiresOwner: true,
@@ -467,10 +473,28 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     requiresBackup: false,
     requiresMaintenanceWindow: true,
     automationLevel: 'guarded',
-    impact: 'Temporarily pauses Portal and agent services while it fences all required recovery data, then publishes only an authenticated complete archive.',
-    recovery: 'If capture fails, services are recovered from the quiescence journal and any degraded salvage archive remains outside restore admission.',
+    impact: 'Saves Portal settings, projects, and files. Pause project edits for a consistent file checkpoint. Runtime installations and provider logins are not included.',
+    recovery: 'A failed capture is not admitted for maintenance. Existing backups and installed data remain unchanged; correct the reported failure and create a new backup.',
     confirmationPhrase: 'CREATE MAINTENANCE BACKUP',
     command: 'set -euo pipefail\nsystemctl start bridgesllm-backup@comprehensive.service',
+  },
+  'update-compatible-ai-tools': {
+    id: 'update-compatible-ai-tools',
+    label: 'Update Compatible AI Tools',
+    title: 'Update compatible AI tools',
+    description: 'Installs the exact OpenClaw, Codex, Claude Code, and ClawHub versions qualified for this Portal release.',
+    risk: 'scheduled',
+    downtimeExpected: true,
+    requiresOwner: true,
+    changesSystem: true,
+    destructive: false,
+    requiresBackup: true,
+    requiresMaintenanceWindow: true,
+    automationLevel: 'guarded',
+    impact: 'Temporarily pauses AI-tool execution while one signed, exact compatibility bundle is installed and verified as a unit.',
+    recovery: 'If qualification fails, the transaction restores the complete previous CLI and OpenClaw tuple before execution resumes.',
+    confirmationPhrase: 'UPDATE COMPATIBLE AI TOOLS',
+    command: 'set -euo pipefail\nexec /bin/bash /opt/bridgesllm/portal/installer/install.sh --maintain-tools --plain',
   },
 };
 
@@ -760,13 +784,80 @@ export function buildOpenClawMaintenanceComponent(
   };
 }
 
+export function buildNativeCliMaintenanceComponent(
+  toolId: NativeHostCliStatusTool,
+  label: string,
+  expectedVersion: string,
+  observed: NativeHostCliStatus,
+): MaintenanceCompatibilityComponent {
+  const exact = observed.executionEligible
+    && observed.state === 'verified'
+    && observed.observedVersion === expectedVersion;
+  const status: MaintenanceCompatibilityComponent['status'] = exact
+    ? 'ok'
+    : observed.state === 'indeterminate'
+      ? 'unknown'
+      : 'blocked';
+  return {
+    id: toolId,
+    label,
+    installedVersion: observed.observedVersion,
+    supportedVersion: `Exact Portal-qualified ${expectedVersion}`,
+    policy: 'known-compatible',
+    status,
+    note: exact
+      ? `The complete root-owned ${label} package tree matches the Portal admission catalog.`
+      : `Portal cannot admit this ${label} package as the exact ${expectedVersion} compatibility target (${observed.reasonCode || observed.state}).`,
+  };
+}
+
+const COMPATIBILITY_BUNDLE_COMPONENT_IDS = new Set([
+  'openclaw',
+  'codex',
+  'claude-code',
+  'clawhub',
+]);
+
+export function buildCompatibleAiToolsIssue(
+  compatibility: MaintenanceCompatibility,
+): MaintenanceIssue | null {
+  const mismatches = compatibility.components.filter((component) => (
+    COMPATIBILITY_BUNDLE_COMPONENT_IDS.has(component.id) && component.status !== 'ok'
+  ));
+  if (mismatches.length === 0) return null;
+  return {
+    id: 'compatible-ai-tools-update-required',
+    title: 'Compatible AI tools need one bundle update',
+    detail: mismatches.map((component) => (
+      `${component.label}: ${component.installedVersion || 'not verified'}; requires ${component.supportedVersion}`
+    )).join(' · '),
+    severity: 'warning',
+    category: 'updates',
+    recommendation: 'Owner: open Admin > Maintenance and run Update Compatible AI Tools. Portal updates these runtimes together; do not update individual tools independently.',
+    actionId: 'update-compatible-ai-tools',
+    downtimeExpected: true,
+    automationSafe: true,
+  };
+}
+
 async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
   const root = portalRoot();
-  const [openClawReadiness, caddyVersion, stalwartVersion, caddyCandidateRaw] = await Promise.all([
+  const [
+    openClawReadiness,
+    caddyVersion,
+    stalwartVersion,
+    caddyCandidateRaw,
+    codexStatus,
+    claudeStatus,
+    clawhubStatus,
+  ] = await Promise.all([
     getOpenClawSetupReadiness(),
     firstCommandLine('command -v caddy >/dev/null 2>&1 && caddy version'),
     firstCommandLine('command -v stalwart-mail >/dev/null 2>&1 && stalwart-mail --version || command -v stalwart >/dev/null 2>&1 && stalwart --version'),
     firstCommandLine("apt-cache policy caddy 2>/dev/null | awk '/Candidate:/ {print $2}'"),
+    getNativeHostCliStatus('codex'),
+    getNativeHostCliStatus('claude-code'),
+    getNativeHostCliStatus('clawhub'),
   ]);
 
   // A pending Caddy update only exists when apt's candidate differs from the
@@ -788,6 +879,24 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
     components: [
       buildPortalMaintenanceComponent(portalCompatibilitySnapshot(root)),
       buildOpenClawMaintenanceComponent(openClawReadiness),
+      buildNativeCliMaintenanceComponent(
+        'codex',
+        'Codex CLI',
+        PORTAL_TOOL_VERSIONS.codexCli,
+        codexStatus,
+      ),
+      buildNativeCliMaintenanceComponent(
+        'claude-code',
+        'Claude Code',
+        PORTAL_TOOL_VERSIONS.claudeCode,
+        claudeStatus,
+      ),
+      buildNativeCliMaintenanceComponent(
+        'clawhub',
+        'ClawHub CLI',
+        PORTAL_TOOL_VERSIONS.clawhub,
+        clawhubStatus,
+      ),
       {
         id: 'stalwart',
         label: 'Mail server',
@@ -1039,8 +1148,17 @@ export async function verifyMaintenanceBackupArchive(
   const timeoutMs = Number.isFinite(dependencies.timeoutMs)
     ? Math.max(1, Math.min(MAINTENANCE_BACKUP_VERIFY_TIMEOUT_MS, Math.trunc(dependencies.timeoutMs!)))
     : MAINTENANCE_BACKUP_VERIFY_TIMEOUT_MS;
+  // The installed backup service publishes Portal data archives in 5.0.
+  // Select their strict, receipt-authenticated verifier; never fall back to a
+  // different format when verification fails. Legacy full archives retain
+  // their original recovery verifier and admission rules.
+  const isDataBackup = /^portal-comprehensive-\d{8}-\d{6}-data-[a-f0-9]{8}\.tar\.gz$/
+    .test(path.basename(candidate.fullPath));
+  const command = isDataBackup
+    ? `/usr/bin/python3 ${shellQuote(path.join(path.dirname(restoreScript), 'backup-data.py'))} verify ${shellQuote(candidate.fullPath)} --require-receipt`
+    : `/bin/bash ${shellQuote(restoreScript)} --verify-archive ${shellQuote(candidate.fullPath)}`;
   const verification = await (dependencies.runShellImpl || runShell)(
-    `/bin/bash ${shellQuote(restoreScript)} --verify-archive ${shellQuote(candidate.fullPath)}`,
+    command,
     timeoutMs,
   );
   if (!verification.ok) return false;
@@ -1401,6 +1519,8 @@ async function collectMaintenanceStatus() {
     : [];
 
   const issues: MaintenanceIssue[] = [];
+  const compatibleAiToolsIssue = buildCompatibleAiToolsIssue(compatibility);
+  if (compatibleAiToolsIssue) issues.push(compatibleAiToolsIssue);
 
   if (apt.available && apt.cacheAgeHours !== null && apt.cacheAgeHours > 48) {
     issues.push({

@@ -11,12 +11,17 @@ import {
   TerminalSystemdScopeError,
   type PreparedTerminalSystemdScope,
 } from '../services/terminalSystemdScopeBoundary';
+import {
+  attachNativeCliInteractiveTerminal,
+  cancelOAuthFlow,
+} from '../services/oauthFlowManager';
 
 const DEFAULT_TERMINAL_COLS = 80;
 const DEFAULT_TERMINAL_ROWS = 24;
 const MAX_TERMINAL_COLS = 500;
 const MAX_TERMINAL_ROWS = 200;
 export const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
+export const MAX_HARNESS_SETUP_INPUT_BYTES = 16 * 1024;
 
 interface TerminalAuthorizationControl {
   revoked: boolean;
@@ -90,7 +95,11 @@ export function setupTerminalNamespace(io: SocketIOServer) {
           : 'Account is not permitted for terminal access'));
         return;
       }
-      if (authorizationControl.revoked || socket.disconnected) {
+      // Socket.IO only sets `connected` in `_onconnect()`, which runs after this
+      // middleware resolves, so `socket.disconnected` is unconditionally true
+      // here. Revocation is carried by the explicit control flag; a client that
+      // vanished mid-handshake is detected on the engine socket instead.
+      if (authorizationControl.revoked || socket.conn?.readyState === 'closed') {
         result.dispose();
         next(new Error('Authorization changed during connection'));
         return;
@@ -291,5 +300,141 @@ export function setupTerminalNamespace(io: SocketIOServer) {
       releaseLeaseBeforeBoundary?.();
       try { socket.disconnect(true); } catch {}
     });
+  });
+}
+
+/**
+ * Interactive transport for an already-created Hermes/OpenCode setup wizard.
+ * Unlike /terminal this never spawns a caller-selected process: the REST start
+ * route owns the exact executable, argv, environment, credential lifecycle,
+ * and user binding before this namespace can attach.
+ */
+export function setupHarnessSetupNamespace(io: SocketIOServer) {
+  const harnessSetup = io.of('/harness-setup');
+
+  harnessSetup.use((socket, next) => {
+    let token = socket.handshake.auth?.token;
+    if (!token || typeof token !== 'string') {
+      const cookies = parseSafeCookieHeader(socket.handshake.headers?.cookie || '');
+      token = cookies.accessToken;
+    }
+    if (!token || typeof token !== 'string') return next(new Error('Authentication required'));
+
+    const payload = verifyAccessToken(token);
+    if (!payload) return next(new Error('Invalid or expired token'));
+
+    const authorizationControl: TerminalAuthorizationControl = { revoked: false };
+    (socket as any).harnessSetupAuthorizationControl = authorizationControl;
+    const revokeInteractiveAuthority = () => {
+      authorizationControl.revoked = true;
+      authorizationControl.requestTermination?.();
+      try { socket.disconnect(true); } catch {}
+    };
+    void establishLongLivedAccessAuthorization({
+      payload,
+      authorize: (identity) => canUseInteractivePortal(
+        identity.role,
+        identity.accountStatus,
+        true,
+      ) && isElevatedRole(identity.role),
+      onRevoke: revokeInteractiveAuthority,
+    }).then((result) => {
+      if (!result.ok) {
+        next(new Error(result.reason === 'session_revoked'
+          ? 'This sign-in session is no longer active'
+          : 'Account is not permitted for harness setup'));
+        return;
+      }
+      // Socket.IO only sets `connected` in `_onconnect()`, which runs after this
+      // middleware resolves, so `socket.disconnected` is unconditionally true
+      // here. Revocation is carried by the explicit control flag; a client that
+      // vanished mid-handshake is detected on the engine socket instead.
+      if (authorizationControl.revoked || socket.conn?.readyState === 'closed') {
+        result.dispose();
+        next(new Error('Authorization changed during connection'));
+        return;
+      }
+      (socket as any).user = result.identity;
+      (socket as any).authorizationUnsubscribe = result.dispose;
+      socket.conn?.once?.('close', result.dispose);
+      next();
+    }).catch((error) => next(error));
+  });
+
+  harnessSetup.on('connection', (socket) => {
+    const unsubscribeAuthorization = (socket as any).authorizationUnsubscribe as
+      | (() => void)
+      | undefined;
+    const authorizationControl = (socket as any).harnessSetupAuthorizationControl as
+      | TerminalAuthorizationControl
+      | undefined;
+    const rawSessionId = socket.handshake.query?.sessionId;
+    const sessionId = typeof rawSessionId === 'string' ? rawSessionId.trim() : '';
+    const userId = String((socket as any).user?.userId || '').trim();
+    const ownerId = userId ? `user:${userId}` : '';
+    if (!ownerId || !/^oauth_[a-z0-9]+_[a-z0-9]{1,16}$/u.test(sessionId)) {
+      socket.emit('setup_error', { error: 'Harness setup session is invalid.' });
+      unsubscribeAuthorization?.();
+      socket.disconnect(true);
+      return;
+    }
+
+    const attachment = attachNativeCliInteractiveTerminal(sessionId, ownerId);
+    if (!attachment) {
+      socket.emit('setup_error', { error: 'Harness setup session was not found or is not owned by this account.' });
+      unsubscribeAuthorization?.();
+      socket.disconnect(true);
+      return;
+    }
+
+    let disposed = false;
+    const detachData = attachment.onData((data) => {
+      if (!disposed && !socket.disconnected) socket.emit('output', data);
+    });
+    const detachExit = attachment.onExit(({ exitCode }) => {
+      if (!disposed && !socket.disconnected) socket.emit('terminal_exit', { exitCode });
+    });
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      detachData();
+      detachExit();
+      unsubscribeAuthorization?.();
+    };
+    const cancelOwnedSetup = () => {
+      void cancelOAuthFlow(sessionId, ownerId).finally(() => {
+        if (!socket.disconnected) socket.disconnect(true);
+      });
+    };
+    if (authorizationControl) authorizationControl.requestTermination = cancelOwnedSetup;
+
+    socket.on('input', (data: unknown) => {
+      if (typeof data !== 'string'
+        || Buffer.byteLength(data, 'utf8') > MAX_HARNESS_SETUP_INPUT_BYTES) {
+        socket.emit('setup_error', { error: 'Harness setup input exceeded the 16 KiB safety limit.' });
+        return;
+      }
+      try {
+        attachment.write(data);
+      } catch (error: any) {
+        socket.emit('setup_error', { error: error?.message || 'Harness setup input is no longer available.' });
+      }
+    });
+    socket.on('resize', (size: unknown) => {
+      const dimensions = normalizeTerminalDimensions(
+        (size as { cols?: unknown } | null)?.cols,
+        (size as { rows?: unknown } | null)?.rows,
+      );
+      try { attachment.resize(dimensions.cols, dimensions.rows); } catch {}
+    });
+    socket.on('disconnect', dispose);
+
+    if (attachment.output) socket.emit('output', attachment.output);
+    socket.emit('terminal_ready', {
+      provider: attachment.provider,
+      status: attachment.status,
+      processExited: attachment.processExited,
+    });
+    if (attachment.processExited) socket.emit('terminal_exit', { exitCode: null });
   });
 }

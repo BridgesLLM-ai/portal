@@ -26,15 +26,15 @@ import {
   type AgentZeroRuntimeStatus,
 } from './AgentZeroRuntime';
 
-export const AGENT_ZERO_HOST_GATEWAY_CLI_VERSION = '2.5';
-export const AGENT_ZERO_HOST_GATEWAY_CLI_TAG = 'v2.5';
-export const AGENT_ZERO_HOST_GATEWAY_CLI_COMMIT = 'db0e53eba65326ee0792cbb007abfda31114b3f2';
+export const AGENT_ZERO_HOST_GATEWAY_CLI_VERSION = '2.10';
+export const AGENT_ZERO_HOST_GATEWAY_CLI_TAG = 'v2.10';
+export const AGENT_ZERO_HOST_GATEWAY_CLI_COMMIT = '42fb7fcde3f7f5ca70d3cf02f972f3854e403442';
 export const AGENT_ZERO_HOST_GATEWAY_ARCHIVE_SHA256 =
-  '97cc0396b55e517775a0790d974d4c81c6534926fead01b02d150807180521b6';
+  '403d7b453983caf67a8a0976f9842f23bac4697f7a7756c39870d467793c1c40';
 export const AGENT_ZERO_HOST_GATEWAY_RUNTIME_CONSTRAINTS_SHA256 =
-  'bfe27824fca3f23ffc4a1b06b8b2194d59db48ebaeb05c09ca1e46332075a327';
+  'e19e4907251ef75d7cca3f500a9f0ba476bcb4d20451751e2ebed8c08a3ccc71';
 export const AGENT_ZERO_HOST_GATEWAY_BUILD_CONSTRAINTS_SHA256 =
-  '7ded8dd591c408dfbe552eeffacb5e75dcddb02cd3072c8cec3653494a37aa19';
+  '701698e7490e500313195ea676b2c1925117709541a0ee4913636405a932371d';
 
 export const AGENT_ZERO_HOST_GATEWAY_BINARY =
   '/var/lib/bridgesllm/agent-zero-runtime/a0-cli/bin/a0';
@@ -193,7 +193,7 @@ function parseProvenance(payload: string): Map<string, string> {
   }
   for (const [key, expected] of Object.entries(REQUIRED_PROVENANCE)) {
     if (values.get(key) !== expected) {
-      throw new AgentZeroHostGatewayError('Managed Agent Zero host-gateway provenance is outside the tested v2.5 pin.');
+      throw new AgentZeroHostGatewayError('Managed Agent Zero host-gateway provenance is outside the tested v2.10 pin.');
     }
   }
   return values;
@@ -530,7 +530,7 @@ export class AgentZeroHostGatewayManager implements AgentZeroHostGatewayControll
     try {
       this.verifyInstallation();
       this.status = {
-        ...stoppedStatus('Official A0 CLI v2.5 host gateway is installed and will start on first authorized use.'),
+        ...stoppedStatus('Official A0 CLI v2.10 host gateway is installed and will start on first authorized use.'),
         installed: true,
         cliVersion: AGENT_ZERO_HOST_GATEWAY_CLI_VERSION,
       };
@@ -711,7 +711,7 @@ export class AgentZeroHostGatewayManager implements AgentZeroHostGatewayControll
         installed: true,
         running: true,
         ready: true,
-        reason: 'Agent Zero v2.5 host gateway is authenticated with read/write/exec access.',
+        reason: 'Agent Zero v2.10 host gateway is authenticated with read/write/exec access.',
       };
       return this.snapshot();
     } catch (error) {
@@ -753,7 +753,7 @@ export class AgentZeroHostGatewayManager implements AgentZeroHostGatewayControll
     }
     if (deadline !== undefined) this.assertWithinReadinessDeadline(deadline);
     if (version !== AGENT_ZERO_HOST_GATEWAY_CLI_VERSION) {
-      throw new AgentZeroHostGatewayError('Managed Agent Zero host-gateway executable is outside the tested v2.5 pin.');
+      throw new AgentZeroHostGatewayError('Managed Agent Zero host-gateway executable is outside the tested v2.10 pin.');
     }
 
     // The runtime probe and shared authentication manager independently verify

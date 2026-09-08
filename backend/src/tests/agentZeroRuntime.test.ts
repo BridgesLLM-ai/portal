@@ -67,7 +67,7 @@ function capabilities(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     protocol: 'a0-connector.v1',
     version: '0.1.0',
-    agent_zero_version: 'v2.5',
+    agent_zero_version: 'v2.10',
     auth: ['session'],
     auth_required: true,
     transports: ['http', 'websocket'],
@@ -101,7 +101,7 @@ function probe(overrides: {
 }
 
 describe('Agent Zero managed runtime contract', () => {
-  test('maps supported architectures to immutable v2.5 manifest digests', () => {
+  test('maps supported architectures to immutable v2.10 manifest digests', () => {
     expect(normalizeAgentZeroArchitecture('x86_64')).toBe('amd64');
     expect(normalizeAgentZeroArchitecture('aarch64')).toBe('arm64');
     expect(normalizeAgentZeroArchitecture('riscv64')).toBeNull();
@@ -115,7 +115,7 @@ describe('Agent Zero managed runtime contract', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
+      version: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,

@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { managedDesktopSystemdRunArgv } from '../utils/desktopEnv';
+import { __desktopEnvTest, managedDesktopSystemdRunArgv } from '../utils/desktopEnv';
 import {
   REMOTE_DESKTOP_OPEN_MAX_ENTRIES,
   REMOTE_DESKTOP_OPEN_TTL_MS,
@@ -123,8 +123,14 @@ describe('Remote Desktop chat-linked file opening', () => {
       'bridgesllm-open-path-test.service',
       '/usr/bin/mousepad',
       ['--disable-server', snapshotPath],
+      252,
     );
-    expect(argv.slice(-3)).toEqual(['/usr/bin/mousepad', '--disable-server', snapshotPath]);
+    expect(__desktopEnvTest.decodeDesktopArgv(argv.at(-1)!)).toEqual([
+      '/usr/bin/mousepad',
+      '--disable-server',
+      snapshotPath,
+    ]);
+    expect(argv.every((value) => !value.includes('$') && !value.includes('%'))).toBe(true);
     expect(argv).not.toContain('/bin/bash');
     expect(argv).not.toContain('-c');
   });

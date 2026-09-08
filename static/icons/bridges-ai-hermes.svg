@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Hermes terminal runtime launcher">
+  <defs>
+    <linearGradient id="hermes-bg" x1="18" y1="12" x2="108" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3b1d0b"/>
+      <stop offset="1" stop-color="#120b19"/>
+    </linearGradient>
+    <linearGradient id="hermes-mark" x1="38" y1="30" x2="91" y2="98" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#f97316"/>
+    </linearGradient>
+  </defs>
+  <rect x="7" y="7" width="114" height="114" rx="29" fill="url(#hermes-bg)" stroke="#fb923c" stroke-width="4"/>
+  <path d="M28 42c11-10 20-13 31-12l-8 12c-8 1-14 4-20 9l-3-9Zm72 0c-11-10-20-13-31-12l8 12c8 1 14 4 20 9l3-9Z" fill="#fed7aa" opacity=".92"/>
+  <path d="M43 37v54m42-54v54M43 63h42" fill="none" stroke="url(#hermes-mark)" stroke-linecap="round" stroke-width="11"/>
+  <circle cx="64" cy="64" r="8" fill="#fff7ed"/>
+  <path d="m60 64 4 4 8-10" fill="none" stroke="#9a3412" stroke-linecap="round" stroke-linejoin="round" stroke-width="3"/>
+</svg>

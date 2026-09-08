@@ -1,72 +1,39 @@
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
+import { buildNativeCliEnvironment } from './providers/native/NativeCliEnvironment';
+import { isUnqualifiedNativeBinaryProvider } from '../config/unqualifiedNativeBinaryLane';
 
-export interface AntigravityModelDescriptor {
-  id: string;
-  displayName: string;
-}
-
-let cachedModelList: { expiresAt: number; models: AntigravityModelDescriptor[] } | null = null;
-
-export function invalidateAntigravityModelCache(): void {
-  cachedModelList = null;
-}
-
-function slugifyModelName(name: string): string {
-  return name
-    .trim()
-    .toLowerCase()
-    .replace(/\bgpt oss\b/g, 'gpt-oss')
-    .replace(/[^a-z0-9.]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
+export interface AntigravityModelDescriptor { id: string; displayName: string; }
+let cache: { expiresAt: number; models: AntigravityModelDescriptor[] } | null = null;
+let inFlight: Promise<AntigravityModelDescriptor[]> | null = null;
+let generation = 0;
+export function invalidateAntigravityModelCache(): void { cache = null; inFlight = null; generation++; }
 
 export function parseAntigravityModelList(output: string): AntigravityModelDescriptor[] {
   const models = new Map<string, AntigravityModelDescriptor>();
-
-  for (const rawLine of String(output || '').split(/\r?\n/)) {
-    const displayName = rawLine.trim();
-    if (!displayName || !/^Gemini\b/i.test(displayName)) continue;
-
-    const match = displayName.match(/^(.+?)(?:\s+\((Low|Medium|High|Thinking)\))?$/i);
-    const base = slugifyModelName(match?.[1] || displayName);
-    const tier = String(match?.[2] || '').trim().toLowerCase();
-    if (!base) continue;
-
-    const id = tier && tier !== 'medium' && tier !== 'thinking'
-      ? `${base}-${tier}`
-      : base;
-
-    if (!models.has(id)) {
-      models.set(id, { id, displayName });
-    }
+  for (const line of String(output || '').split(/\r?\n/)) {
+    // Current CLI emits the exact runtime id, a tab, and the display label.
+    // Never synthesize model ids from human labels or borrow OpenClaw's catalog.
+    const match = line.trim().match(/^([a-z0-9][a-z0-9._-]{0,127})\t+([^\t]+)$/);
+    if (match) models.set(match[1], { id: match[1], displayName: match[2].trim() });
   }
-
-  return Array.from(models.values());
+  return [...models.values()];
 }
 
-export function listAntigravityModelsFromCli(): AntigravityModelDescriptor[] {
-  if (cachedModelList && cachedModelList.expiresAt > Date.now()) {
-    return cachedModelList.models;
-  }
-
-  try {
-    const output = execFileSync('agy', ['models'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        NO_COLOR: '1',
-        AGY_CLI_DISABLE_AUTO_UPDATE: '1',
-        SSH_CONNECTION: process.env.SSH_CONNECTION || 'portal-model-discovery 127.0.0.1 127.0.0.1 0',
-      },
-      timeout: 10000,
-      maxBuffer: 1024 * 1024 * 2,
+export function listAntigravityModelsFromCli(): Promise<AntigravityModelDescriptor[]> {
+  if (isUnqualifiedNativeBinaryProvider('GEMINI')) return Promise.resolve([]);
+  if (cache && cache.expiresAt > Date.now()) return Promise.resolve(cache.models);
+  if (inFlight) return inFlight;
+  const startedGeneration = generation;
+  const pending = new Promise<AntigravityModelDescriptor[]>((resolve) => {
+    execFile('agy', ['models'], {
+      env: buildNativeCliEnvironment('GEMINI'), timeout: 12_000, maxBuffer: 512 * 1024,
+    }, (error, stdout) => {
+      const models = error ? [] : parseAntigravityModelList(String(stdout || ''));
+      if (startedGeneration === generation) cache = { expiresAt: Date.now() + (models.length ? 60_000 : 3_000), models };
+      resolve(models);
     });
-    const models = parseAntigravityModelList(output);
-    cachedModelList = { models, expiresAt: Date.now() + 60_000 };
-    return models;
-  } catch {
-    cachedModelList = { models: [], expiresAt: Date.now() + 5_000 };
-    return [];
-  }
+  });
+  inFlight = pending;
+  void pending.finally(() => { if (inFlight === pending) inFlight = null; });
+  return pending;
 }

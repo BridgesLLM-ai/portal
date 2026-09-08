@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { execFile, execFileSync } from 'child_process';
 import { isDeepStrictEqual } from 'util';
 import type { AgentProviderName } from '../agents/AgentProvider.interface';
@@ -12,7 +13,7 @@ import {
   type NativeCliAuthState,
 } from '../agents/nativeCliAuth';
 import { AI_PROVIDERS } from '../config/aiProviders';
-import { buildOpenClawCliEnv, extractJsonFromCliOutput, normalizePortalModelId, repairClaudeSubscriptionConfig } from '../utils/openclawCli';
+import { buildOpenClawCliEnv, extractJsonFromCliOutput, normalizePortalModelId } from '../utils/openclawCli';
 import {
   createAmazonBedrockReadiness,
   getAmazonBedrockReadiness,
@@ -26,7 +27,8 @@ export const AUTH_PROFILES_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'ag
 export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'models.json');
 export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
 export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
-export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.7.1-1';
+export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.9.1';
+export const LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION = '2026.7.1-1';
 const LEGACY_OPENCLAW_HOME = path.join(HOME_DIR, '.clawdbot');
 const LEGACY_PLUGIN_INSTALLS_PATH = path.join(OPENCLAW_HOME, 'plugins', 'installs.json');
 const LEGACY_GLOBAL_CODEX_PLUGIN_DIR = path.join(OPENCLAW_HOME, 'npm', 'node_modules', '@openclaw', 'codex');
@@ -80,8 +82,11 @@ export interface OpenClawUpgradeStatePreparationResult {
   readyForGatewayStart: boolean;
   legacyStateAction: 'absent' | 'not-needed' | 'already-linked' | 'quarantined' | 'failed';
   legacyStateBackupPath: string | null;
+  legacyStateTreeSha256?: string | null;
   legacyPluginIndexAction: 'absent' | 'not-needed' | 'pruned' | 'quarantined-redundant' | 'quarantined-invalid' | 'failed';
   legacyPluginIndexBackupPath: string | null;
+  legacyPluginIndexBackupSha256?: string | null;
+  legacyPluginIndexAfterSha256?: string | null;
   removedPluginRecordIds: string[];
   retainedPluginRecordIds: string[];
   warnings: string[];
@@ -200,6 +205,190 @@ function shouldRemoveCodexInstallEntry(entry: any, expectedVersion: string): boo
 
 function timestampForBackup(): string {
   return new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+}
+
+type OpenClawUpgradeStateJournal = {
+  contractVersion: 1;
+  state: 'preparing' | 'prepared' | 'restored';
+  phase: string;
+  preparation: OpenClawUpgradeStatePreparationResult;
+  recoveryPreparation: OpenClawUpgradeStatePreparationResult | null;
+  updatedAt: string;
+};
+
+function sha256Buffer(value: Buffer | string): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function fsyncDirectory(directory: string): void {
+  const descriptor = fs.openSync(directory, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function fsyncFile(target: string): void {
+  const descriptor = fs.openSync(target, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function currentProcessIdentity(): { uid: number; gid: number } {
+  if (typeof process.getuid !== 'function' || typeof process.getgid !== 'function') {
+    throw new Error('OpenClaw upgrade-state recovery requires a POSIX process identity');
+  }
+  return { uid: process.getuid(), gid: process.getgid() };
+}
+
+function directoryTreeSha256(rootPath: string): string {
+  const root = path.resolve(rootPath);
+  const identity = currentProcessIdentity();
+  const entries: string[] = [];
+  const walk = (target: string, relativePath: string) => {
+    const details = fs.lstatSync(target);
+    const mode = details.mode & 0o777;
+    if (details.uid !== identity.uid || details.gid !== identity.gid || (mode & 0o022) !== 0) {
+      throw new Error(`Unsafe legacy OpenClaw state ownership or mode: ${target}`);
+    }
+    if (details.isSymbolicLink()) throw new Error(`Unsupported legacy OpenClaw state link: ${target}`);
+    if (details.isDirectory()) {
+      entries.push(`d\0${relativePath}\0${mode}\0`);
+      for (const child of fs.readdirSync(target).sort()) {
+        walk(path.join(target, child), relativePath ? path.join(relativePath, child) : child);
+      }
+      return;
+    }
+    if (!details.isFile() || details.nlink !== 1) {
+      throw new Error(`Unsupported legacy OpenClaw state entry: ${target}`);
+    }
+    entries.push(`f\0${relativePath}\0${mode}\0${details.size}\0${sha256Buffer(fs.readFileSync(target))}\0`);
+  };
+  walk(root, '');
+  return sha256Buffer(entries.join('\n'));
+}
+
+function openClawUpgradeStateJournalPath(): string | null {
+  const configured = String(process.env.PORTAL_OPENCLAW_UPGRADE_STATE_JOURNAL || '').trim();
+  if (!configured) return null;
+  if (!path.isAbsolute(configured) || path.normalize(configured) !== configured) {
+    throw new Error('OpenClaw upgrade-state journal path must be canonical and absolute');
+  }
+  const parent = path.dirname(configured);
+  const parentDetails = fs.lstatSync(parent);
+  if (
+    !parentDetails.isDirectory()
+    || parentDetails.isSymbolicLink()
+    || parentDetails.uid !== 0
+    || parentDetails.gid !== 0
+    || (parentDetails.mode & 0o777) !== 0o700
+  ) {
+    throw new Error('OpenClaw upgrade-state journal parent is unsafe');
+  }
+  return configured;
+}
+
+function readOpenClawUpgradeStateJournal(target: string): OpenClawUpgradeStateJournal | null {
+  if (!fs.existsSync(target)) return null;
+  const details = fs.lstatSync(target);
+  if (
+    !details.isFile()
+    || details.isSymbolicLink()
+    || details.uid !== 0
+    || details.gid !== 0
+    || details.nlink !== 1
+    || (details.mode & 0o022) !== 0
+    || details.size <= 0
+    || details.size > 1024 * 1024
+  ) {
+    throw new Error('OpenClaw upgrade-state journal is unsafe');
+  }
+  const parsed = JSON.parse(fs.readFileSync(target, 'utf8')) as OpenClawUpgradeStateJournal;
+  if (
+    parsed?.contractVersion !== 1
+    || !['preparing', 'prepared', 'restored'].includes(parsed.state)
+    || typeof parsed.phase !== 'string'
+    || !parsed.preparation
+  ) {
+    throw new Error('OpenClaw upgrade-state journal is invalid');
+  }
+  return parsed;
+}
+
+function mergeOpenClawUpgradeStateRecoveryPreparation(
+  existing: OpenClawUpgradeStatePreparationResult | null | undefined,
+  current: OpenClawUpgradeStatePreparationResult,
+): OpenClawUpgradeStatePreparationResult | null {
+  const legacyArmed = current.legacyStateAction === 'quarantined'
+    && Boolean(current.legacyStateBackupPath && current.legacyStateTreeSha256);
+  const pluginArmed = (
+    current.legacyPluginIndexAction === 'pruned'
+      || current.legacyPluginIndexAction === 'quarantined-redundant'
+  ) && Boolean(current.legacyPluginIndexBackupPath);
+  if (!existing && !legacyArmed && !pluginArmed) return null;
+
+  const merged = structuredClone(existing || current);
+  if (legacyArmed) {
+    merged.legacyStateAction = current.legacyStateAction;
+    merged.legacyStateBackupPath = current.legacyStateBackupPath;
+    merged.legacyStateTreeSha256 = current.legacyStateTreeSha256;
+  }
+  if (pluginArmed) {
+    merged.legacyPluginIndexAction = current.legacyPluginIndexAction;
+    merged.legacyPluginIndexBackupPath = current.legacyPluginIndexBackupPath;
+    merged.legacyPluginIndexBackupSha256 = current.legacyPluginIndexBackupSha256;
+    merged.legacyPluginIndexAfterSha256 = current.legacyPluginIndexAfterSha256;
+    merged.removedPluginRecordIds = [...current.removedPluginRecordIds];
+    merged.retainedPluginRecordIds = [...current.retainedPluginRecordIds];
+  }
+  return merged;
+}
+
+function writeOpenClawUpgradeStateJournal(
+  preparation: OpenClawUpgradeStatePreparationResult,
+  state: OpenClawUpgradeStateJournal['state'],
+  phase: string,
+  armRecovery = false,
+): void {
+  const target = openClawUpgradeStateJournalPath();
+  if (!target) return;
+  const existing = readOpenClawUpgradeStateJournal(target);
+  if (existing && phase === 'initialized') {
+    throw new Error('An OpenClaw upgrade-state journal already exists and must be reconciled first');
+  }
+  const record: OpenClawUpgradeStateJournal = {
+    contractVersion: 1,
+    state,
+    phase,
+    preparation,
+    recoveryPreparation: armRecovery
+      ? mergeOpenClawUpgradeStateRecoveryPreparation(existing?.recoveryPreparation, preparation)
+      : (existing?.recoveryPreparation || null),
+    updatedAt: new Date().toISOString(),
+  };
+  const parent = path.dirname(target);
+  const temporary = path.join(parent, `.${path.basename(target)}.${process.pid}.${Math.random().toString(16).slice(2)}`);
+  const descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  fs.chmodSync(temporary, 0o600);
+  fs.renameSync(temporary, target);
+  fsyncDirectory(parent);
+}
+
+function finalizeOpenClawUpgradeState(
+  result: OpenClawUpgradeStatePreparationResult,
+): OpenClawUpgradeStatePreparationResult {
+  writeOpenClawUpgradeStateJournal(result, 'prepared', 'prepared', true);
+  return result;
 }
 
 function uniqueBackupPath(basePath: string): string {
@@ -487,6 +676,7 @@ export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationRe
     retainedPluginRecordIds: [],
     warnings: [],
   };
+  writeOpenClawUpgradeStateJournal(result, 'preparing', 'initialized');
 
   if (fs.existsSync(LEGACY_OPENCLAW_HOME)) {
     const legacyIsSymlink = fs.lstatSync(LEGACY_OPENCLAW_HOME).isSymbolicLink();
@@ -505,9 +695,23 @@ export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationRe
     } else {
       const backupPath = uniqueBackupPath(`${LEGACY_OPENCLAW_HOME}.portal-backup-${timestampForBackup()}`);
       try {
-        fs.renameSync(LEGACY_OPENCLAW_HOME, backupPath);
         result.legacyStateAction = 'quarantined';
         result.legacyStateBackupPath = backupPath;
+        result.legacyStateTreeSha256 = directoryTreeSha256(LEGACY_OPENCLAW_HOME);
+        writeOpenClawUpgradeStateJournal(
+          result,
+          'preparing',
+          'legacy-state-mutation-armed',
+          true,
+        );
+        fs.renameSync(LEGACY_OPENCLAW_HOME, backupPath);
+        fsyncDirectory(path.dirname(LEGACY_OPENCLAW_HOME));
+        writeOpenClawUpgradeStateJournal(
+          result,
+          'preparing',
+          'legacy-state-mutated',
+          true,
+        );
       } catch (error) {
         result.readyForGatewayStart = false;
         result.legacyStateAction = 'failed';
@@ -516,13 +720,13 @@ export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationRe
     }
   }
 
-  if (!fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)) return result;
+  if (!fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)) return finalizeOpenClawUpgradeState(result);
 
   if (fs.lstatSync(LEGACY_PLUGIN_INSTALLS_PATH).isSymbolicLink()) {
     result.readyForGatewayStart = false;
     result.legacyPluginIndexAction = 'failed';
     result.warnings.push('Legacy OpenClaw plugin metadata is a symlink and was left untouched for manual review.');
-    return result;
+    return finalizeOpenClawUpgradeState(result);
   }
 
   let legacyIndex: any;
@@ -538,7 +742,7 @@ export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationRe
     result.readyForGatewayStart = false;
     result.legacyPluginIndexAction = 'failed';
     result.warnings.push(`Legacy OpenClaw plugin metadata is invalid and was left untouched: ${error instanceof Error ? error.message : String(error)}`);
-    return result;
+    return finalizeOpenClawUpgradeState(result);
   }
 
   const legacyRecords = collectLegacyPluginInstallRecords(legacyIndex);
@@ -546,7 +750,7 @@ export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationRe
     result.readyForGatewayStart = false;
     result.legacyPluginIndexAction = 'failed';
     result.warnings.push('Legacy OpenClaw plugin metadata has an unsupported structure and was left untouched.');
-    return result;
+    return finalizeOpenClawUpgradeState(result);
   }
   const legacyRecordIds = Object.keys(legacyRecords).sort();
   const current = readPersistedPluginInstallRecords();
@@ -555,12 +759,12 @@ export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationRe
     result.legacyPluginIndexAction = 'failed';
     result.warnings.push(current.warning);
     result.retainedPluginRecordIds = legacyRecordIds;
-    return result;
+    return finalizeOpenClawUpgradeState(result);
   }
   if (!current.available) {
     result.legacyPluginIndexAction = 'not-needed';
     result.retainedPluginRecordIds = legacyRecordIds;
-    return result;
+    return finalizeOpenClawUpgradeState(result);
   }
 
   const overlappingIds = legacyRecordIds.filter((pluginId) => (
@@ -576,7 +780,7 @@ export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationRe
     result.legacyPluginIndexAction = 'failed';
     result.retainedPluginRecordIds = legacyRecordIds;
     result.warnings.push(`Legacy plugin metadata could not be proven redundant for: ${unresolvedIds.join(', ')}`);
-    return result;
+    return finalizeOpenClawUpgradeState(result);
   }
 
   const removed = pruneLegacyPluginInstallRecords(legacyIndex, coveredIds);
@@ -586,35 +790,63 @@ export function prepareOpenClawUpgradeState(): OpenClawUpgradeStatePreparationRe
   result.retainedPluginRecordIds = retained;
   if (removed.length === 0) {
     result.legacyPluginIndexAction = 'not-needed';
-    return result;
+    return finalizeOpenClawUpgradeState(result);
   }
 
   const backupPath = uniqueBackupPath(`${LEGACY_PLUGIN_INSTALLS_PATH}.portal-backup-${timestampForBackup()}`);
   try {
+    result.legacyPluginIndexAction = retained.length === 0
+      ? 'quarantined-redundant'
+      : 'pruned';
+    result.legacyPluginIndexBackupPath = backupPath;
+    result.legacyPluginIndexBackupSha256 = sha256Buffer(fs.readFileSync(LEGACY_PLUGIN_INSTALLS_PATH));
+    result.legacyPluginIndexAfterSha256 = retained.length === 0
+      ? null
+      : sha256Buffer(`${JSON.stringify(legacyIndex, null, 2)}\n`);
+    writeOpenClawUpgradeStateJournal(
+      result,
+      'preparing',
+      'legacy-plugin-backup-pending',
+      true,
+    );
     if (retained.length === 0) {
       fs.renameSync(LEGACY_PLUGIN_INSTALLS_PATH, backupPath);
-      result.legacyPluginIndexAction = 'quarantined-redundant';
+      fsyncDirectory(path.dirname(LEGACY_PLUGIN_INSTALLS_PATH));
     } else {
       const sourceMode = fs.statSync(LEGACY_PLUGIN_INSTALLS_PATH).mode & 0o777;
       fs.copyFileSync(LEGACY_PLUGIN_INSTALLS_PATH, backupPath);
       fs.chmodSync(backupPath, sourceMode);
+      fsyncFile(backupPath);
+      fsyncDirectory(path.dirname(backupPath));
+      writeOpenClawUpgradeStateJournal(
+        result,
+        'preparing',
+        'legacy-plugin-mutation-armed',
+        true,
+      );
       const temporaryPath = uniqueBackupPath(`${LEGACY_PLUGIN_INSTALLS_PATH}.portal-write-${process.pid}`);
       try {
         fs.writeFileSync(temporaryPath, `${JSON.stringify(legacyIndex, null, 2)}\n`, { mode: sourceMode });
+        fsyncFile(temporaryPath);
         fs.renameSync(temporaryPath, LEGACY_PLUGIN_INSTALLS_PATH);
+        fsyncDirectory(path.dirname(LEGACY_PLUGIN_INSTALLS_PATH));
       } finally {
         if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true });
       }
-      result.legacyPluginIndexAction = 'pruned';
     }
-    result.legacyPluginIndexBackupPath = backupPath;
+    writeOpenClawUpgradeStateJournal(
+      result,
+      'preparing',
+      'legacy-plugin-mutated',
+      true,
+    );
   } catch (error) {
     result.readyForGatewayStart = false;
     result.legacyPluginIndexAction = 'failed';
     result.warnings.push(`Could not reconcile the legacy OpenClaw plugin index: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  return result;
+  return finalizeOpenClawUpgradeState(result);
 }
 
 /** Restore artifacts moved or pruned by prepareOpenClawUpgradeState(). */
@@ -635,14 +867,45 @@ export function restoreOpenClawUpgradeState(
       result.restored = false;
       result.warnings.push('Refused to restore a legacy-state backup from an unexpected path.');
     } else if (!fs.existsSync(backupPath)) {
-      result.restored = false;
-      result.warnings.push(`Legacy-state backup is missing: ${backupPath}`);
-    } else if (fs.existsSync(LEGACY_OPENCLAW_HOME)) {
-      result.restored = false;
-      result.warnings.push(`Could not restore ${LEGACY_OPENCLAW_HOME} because the path now exists.`);
+      try {
+        if (!preparation.legacyStateTreeSha256
+          || !fs.existsSync(LEGACY_OPENCLAW_HOME)
+          || directoryTreeSha256(LEGACY_OPENCLAW_HOME) !== preparation.legacyStateTreeSha256) {
+          throw new Error('the pre-mutation legacy-state target is not intact');
+        }
+        result.legacyStateRestored = true;
+      } catch (error) {
+        result.restored = false;
+        result.warnings.push(`Legacy-state backup is missing: ${backupPath} (${error instanceof Error ? error.message : String(error)})`);
+      }
     } else {
       try {
-        fs.renameSync(backupPath, LEGACY_OPENCLAW_HOME);
+        const expectedTreeSha256 = preparation.legacyStateTreeSha256;
+        if (!expectedTreeSha256 || directoryTreeSha256(backupPath) !== expectedTreeSha256) {
+          throw new Error('legacy-state backup tree no longer matches its sealed preparation identity');
+        }
+        if (fs.existsSync(LEGACY_OPENCLAW_HOME)) {
+          if (directoryTreeSha256(LEGACY_OPENCLAW_HOME) !== expectedTreeSha256) {
+            throw new Error(`${LEGACY_OPENCLAW_HOME} drifted before recovery`);
+          }
+        } else {
+          const temporaryPath = uniqueBackupPath(`${LEGACY_OPENCLAW_HOME}.portal-restore-${process.pid}`);
+          try {
+            fs.cpSync(backupPath, temporaryPath, {
+              recursive: true,
+              dereference: false,
+              preserveTimestamps: true,
+              errorOnExist: true,
+            });
+            if (directoryTreeSha256(temporaryPath) !== expectedTreeSha256) {
+              throw new Error('legacy-state recovery copy did not preserve the sealed tree');
+            }
+            fs.renameSync(temporaryPath, LEGACY_OPENCLAW_HOME);
+            fsyncDirectory(path.dirname(LEGACY_OPENCLAW_HOME));
+          } finally {
+            if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { recursive: true, force: true });
+          }
+        }
         result.legacyStateRestored = true;
       } catch (error) {
         result.restored = false;
@@ -662,15 +925,40 @@ export function restoreOpenClawUpgradeState(
       result.restored = false;
       result.warnings.push('Refused to restore a legacy plugin-index backup from an unexpected path.');
     } else if (!fs.existsSync(backupPath)) {
-      result.restored = false;
-      result.warnings.push(`Legacy plugin-index backup is missing: ${backupPath}`);
+      try {
+        if (!preparation.legacyPluginIndexBackupSha256
+          || !fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)
+          || sha256Buffer(fs.readFileSync(LEGACY_PLUGIN_INSTALLS_PATH)) !== preparation.legacyPluginIndexBackupSha256) {
+          throw new Error('the pre-mutation plugin index is not intact');
+        }
+        result.legacyPluginIndexRestored = true;
+      } catch (error) {
+        result.restored = false;
+        result.warnings.push(`Legacy plugin-index backup is missing: ${backupPath} (${error instanceof Error ? error.message : String(error)})`);
+      }
     } else {
       try {
+        const backupSha256 = sha256Buffer(fs.readFileSync(backupPath));
+        if (!preparation.legacyPluginIndexBackupSha256
+          || backupSha256 !== preparation.legacyPluginIndexBackupSha256) {
+          throw new Error('legacy plugin-index backup no longer matches its sealed preparation identity');
+        }
+        if (fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)) {
+          const currentSha256 = sha256Buffer(fs.readFileSync(LEGACY_PLUGIN_INSTALLS_PATH));
+          const accepted = new Set([backupSha256]);
+          if (preparation.legacyPluginIndexAfterSha256) {
+            accepted.add(preparation.legacyPluginIndexAfterSha256);
+          }
+          if (!accepted.has(currentSha256)) {
+            throw new Error('legacy plugin index drifted before recovery');
+          }
+        }
         fs.mkdirSync(path.dirname(LEGACY_PLUGIN_INSTALLS_PATH), { recursive: true });
         const sourceMode = fs.statSync(backupPath).mode & 0o777;
         const temporaryPath = uniqueBackupPath(`${LEGACY_PLUGIN_INSTALLS_PATH}.portal-restore-${process.pid}`);
         fs.copyFileSync(backupPath, temporaryPath);
         fs.chmodSync(temporaryPath, sourceMode);
+        fsyncFile(temporaryPath);
         let diagnosticPath: string | null = null;
         if (fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)) {
           diagnosticPath = uniqueBackupPath(`${LEGACY_PLUGIN_INSTALLS_PATH}.failed-upgrade-${timestampForBackup()}`);
@@ -678,6 +966,7 @@ export function restoreOpenClawUpgradeState(
         }
         try {
           fs.renameSync(temporaryPath, LEGACY_PLUGIN_INSTALLS_PATH);
+          fsyncDirectory(path.dirname(LEGACY_PLUGIN_INSTALLS_PATH));
         } catch (error) {
           if (diagnosticPath && fs.existsSync(diagnosticPath) && !fs.existsSync(LEGACY_PLUGIN_INSTALLS_PATH)) {
             fs.renameSync(diagnosticPath, LEGACY_PLUGIN_INSTALLS_PATH);
@@ -694,7 +983,27 @@ export function restoreOpenClawUpgradeState(
     }
   }
 
+  if (result.restored) {
+    writeOpenClawUpgradeStateJournal(preparation, 'restored', 'restored', true);
+  }
   return result;
+}
+
+/** Recover the exact pre-mutation snapshot sealed in the durable installer journal. */
+export function restoreOpenClawUpgradeStateFromJournal(): OpenClawUpgradeStateRestoreResult {
+  const target = openClawUpgradeStateJournalPath();
+  if (!target) throw new Error('OpenClaw upgrade-state journal path is not configured');
+  const journal = readOpenClawUpgradeStateJournal(target);
+  if (!journal) throw new Error('OpenClaw upgrade-state journal is missing');
+  if (!journal.recoveryPreparation) {
+    return {
+      restored: true,
+      legacyStateRestored: false,
+      legacyPluginIndexRestored: false,
+      warnings: [],
+    };
+  }
+  return restoreOpenClawUpgradeState(journal.recoveryPreparation);
 }
 
 function sqlite3Available(): boolean {
@@ -825,7 +1134,6 @@ export function repairOpenClawCodexPluginInstallState(expectedVersion = OPENCLAW
 }
 
 export function readOpenClawConfig(): any {
-  repairClaudeSubscriptionConfig();
   return safeReadJson(CONFIG_PATH, {});
 }
 
@@ -1329,9 +1637,18 @@ function writeProviderSecret(options: {
  * This bypasses the 'openclaw onboard' CLI which doesn't reliably persist
  * API keys for non-OAuth providers.
  */
-export function saveProviderApiKey(provider: string, apiKey: string): { profileId: string } {
+export function saveProviderApiKey(
+  provider: string,
+  apiKey: string,
+  options: { normalizeAuthOrder?: boolean } = {},
+): { profileId: string } {
   if (provider === 'xai') {
-    return saveProviderApiKeyToOpenClawAuthStore(provider, apiKey);
+    return saveProviderApiKeyToOpenClawAuthStore(
+      provider,
+      apiKey,
+      `${provider}:portal-api-key`,
+      options,
+    );
   }
   const authType = isApiKeyProvider(provider) ? 'api_key' : 'token';
   const profileId = `${provider}:default`;
@@ -1369,6 +1686,7 @@ export function saveProviderApiKeyToOpenClawAuthStore(
   provider: string,
   apiKey: string,
   profileId = `${provider}:portal-api-key`,
+  options: { normalizeAuthOrder?: boolean } = {},
 ): { profileId: string } {
   const normalizedProvider = String(provider || '').trim();
   const normalizedProfileId = String(profileId || '').trim();
@@ -1456,14 +1774,16 @@ export function saveProviderApiKeyToOpenClawAuthStore(
     );
   }
 
-  try {
-    clearProviderAuthOrder(normalizedProvider);
-  } catch (error: any) {
-    throw new ProviderApiKeySaveError(
-      `The ${normalizedProvider} API key was saved, but authentication routing cleanup failed: ${error?.message || 'unknown error'}`,
-      'committed',
-      normalizedProfileId,
-    );
+  if (options.normalizeAuthOrder !== false) {
+    try {
+      clearProviderAuthOrder(normalizedProvider);
+    } catch (error: any) {
+      throw new ProviderApiKeySaveError(
+        `The ${normalizedProvider} API key was saved, but authentication routing cleanup failed: ${error?.message || 'unknown error'}`,
+        'committed',
+        normalizedProfileId,
+      );
+    }
   }
 
   return { profileId: normalizedProfileId };
@@ -1951,6 +2271,11 @@ export function getProviderStatuses(options: ProviderStatusOptions = {}): Provid
     let effectiveProfileId: string | null = null;
     let effectiveAuthType: string | null = null;
     const nativeProvider = getNativeProviderLinkedToOpenClawProvider(provider.id);
+    const managedNativeHostUnavailable = nativeProvider === 'CODEX' || nativeProvider === 'CLAUDE_CODE';
+    // Interactive host login stays disabled in this OpenClaw credential
+    // catalog, but the read-only credential status is also the Project Sandbox
+    // signal. Preserve it while withholding login actions at the catalog/UI
+    // boundary; supervised Agent Chat has its own execution authority.
     const nativeAuth = nativeProvider
       ? (options.nativeAuthStatuses?.[nativeProvider] || getNativeCliAuthStatus(nativeProvider))
       : null;
@@ -2004,7 +2329,7 @@ export function getProviderStatuses(options: ProviderStatusOptions = {}): Provid
         error = `Provider has recorded ${errorCount} recent error${errorCount === 1 ? '' : 's'}.`;
       }
 
-      if (provider.id !== 'anthropic' && nativeAuth?.status && !['authenticated', 'not_applicable'].includes(nativeAuth.status)) {
+      if (!managedNativeHostUnavailable && provider.id !== 'anthropic' && nativeAuth?.status && !['authenticated', 'not_applicable'].includes(nativeAuth.status)) {
         warning = `${nativeAuth.message} OpenClaw can use this provider, but the portal's native ${nativeProvider} adapter still needs its own server-side auth.`;
       }
 

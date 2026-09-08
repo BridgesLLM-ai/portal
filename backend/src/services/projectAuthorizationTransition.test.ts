@@ -1,8 +1,10 @@
+import crypto from 'crypto';
 import {
   PRIVILEGED_CONFIRMATION,
   confirmationForOwnershipTransfer,
 } from '../utils/privilegedConfirmation';
 import {
+  ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE_CODE,
   createProjectAuthorizationTransitionCoordinator,
   PROJECT_AUTHORIZATION_TRANSITION_ACTIVE_CODE,
   PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
@@ -102,6 +104,10 @@ class FakeDatabase {
   $transaction = async (operation: (transaction: this) => Promise<any>) => operation(this);
 
   projectAuthorizationTransition = {
+    findFirst: async () => null,
+  } as any;
+
+  adminUserRetirement = {
     findFirst: async () => null,
   } as any;
 
@@ -482,7 +488,194 @@ function harness(database = new FakeDatabase().initialize()) {
   };
 }
 
+function retirementSealBlockerHarness(input: {
+  promotions?: any[];
+  repairs?: any[];
+  ownedLifecycle?: any[];
+}) {
+  const adminCreates: any[] = [];
+  const transitionCreates: any[] = [];
+  const events: string[] = [];
+  const database: any = {
+    $transaction: async (operation: (transaction: any) => Promise<any>) => operation(database),
+    projectAuthorizationTransition: {
+      findFirst: jest.fn(async () => null),
+      create: jest.fn(async ({ data }: any) => {
+        transitionCreates.push(data);
+        return data;
+      }),
+    },
+    adminUserRetirement: {
+      findUnique: jest.fn(async () => null),
+      create: jest.fn(async ({ data }: any) => {
+        adminCreates.push(data);
+        return data;
+      }),
+    },
+    user: {
+      findUnique: jest.fn(async ({ where }: any) => (
+        where.id === 'owner'
+          ? user({ id: 'owner', email: 'owner@example.com', username: 'owner', role: 'OWNER' })
+          : user({ id: 'target', email: 'target@example.com', username: 'target' })
+      )),
+      findMany: jest.fn(async () => [{ id: 'owner' }, { id: 'target' }]),
+    },
+    projectDependencyPromotionDecision: {
+      findMany: jest.fn(async () => input.promotions || []),
+    },
+    projectDependencyRepairOperation: {
+      findMany: jest.fn(async () => input.repairs || []),
+    },
+    projectIdentity: {
+      findMany: jest.fn(async ({ where }: any) => (
+        where?.workspaceOwnerId === 'target' ? input.ownedLifecycle || [] : []
+      )),
+    },
+    projectAuthorizationTransitionProject: {
+      createMany: jest.fn(async () => ({ count: 0 })),
+    },
+  };
+  const coordinator = createProjectAuthorizationTransitionCoordinator({
+    database,
+    buildUserRetirementManifest: jest.fn(async () => {
+      throw new Error('dependency blockers must be checked before manifest construction');
+    }),
+    closeAdmission: () => ({
+      waitForMutationDrain: async () => { events.push('drained'); },
+      release: () => { events.push('released'); },
+    }),
+    acquireAdmissionHandoff: () => () => undefined,
+    quiesceAgentJobs: jest.fn(),
+    quiesceHostRuns: jest.fn(),
+    quiesceOpenClawHostRuns: jest.fn(),
+    cleanupProject: jest.fn(),
+    assertProjectRoot: jest.fn(),
+    gateway: {} as any,
+    publish: jest.fn(),
+    publishSessions: jest.fn(),
+    now: () => NOW,
+    randomUUID: () => '11111111-1111-4111-8111-111111111111',
+    randomBytes: () => Buffer.alloc(32, 1),
+  } as any);
+  return { coordinator, database, adminCreates, transitionCreates, events };
+}
+
 describe('durable Project authorization transitions', () => {
+  test.each([
+    {
+      name: 'foreign promotion actor evidence in any status',
+      input: {
+        promotions: [{
+          operationId: '22222222-2222-4222-8222-222222222222',
+          actorUserId: 'target',
+          projectIdentityId: 'foreign-project',
+          workspaceOwnerId: 'owner',
+          projectName: 'owner-project',
+          status: 'APPLIED',
+        }],
+      },
+      blocker: {
+        kind: 'PROMOTION_DECISION',
+        operationId: '22222222-2222-4222-8222-222222222222',
+        actorReference: true,
+        ownedProject: false,
+      },
+    },
+    {
+      name: 'owned Project promotion evidence in an applied status',
+      input: {
+        promotions: [{
+          operationId: '44444444-4444-4444-8444-444444444444',
+          actorUserId: 'owner',
+          projectIdentityId: 'target-project',
+          workspaceOwnerId: 'target',
+          projectName: 'target-project',
+          status: 'APPLIED',
+        }],
+      },
+      blocker: {
+        kind: 'PROMOTION_DECISION',
+        operationId: '44444444-4444-4444-8444-444444444444',
+        actorReference: false,
+        ownedProject: true,
+      },
+    },
+    {
+      name: 'live repair evidence',
+      input: {
+        repairs: [{
+          repairId: '33333333-3333-4333-8333-333333333333',
+          actorUserId: 'target',
+          projectIdentityId: 'target-project',
+          workspaceOwnerId: 'target',
+          projectName: 'target-project',
+          status: 'PROMOTING',
+          phase: 'ALL_NEW',
+        }],
+      },
+      blocker: {
+        kind: 'REPAIR_OPERATION',
+        repairId: '33333333-3333-4333-8333-333333333333',
+        phase: 'ALL_NEW',
+        actorReference: true,
+        ownedProject: true,
+      },
+    },
+    {
+      name: 'owned Project lifecycle evidence',
+      input: {
+        ownedLifecycle: [{
+          id: 'target-project',
+          projectName: 'target-project',
+          lifecycleStatus: 'RENAMING',
+          legacyOpenClawMigrationStatus: 'CURRENT',
+        }],
+      },
+      blocker: {
+        kind: 'OWNED_PROJECT_LIFECYCLE',
+        projectIdentityId: 'target-project',
+        lifecycleStatus: 'RENAMING',
+      },
+    },
+  ])('refuses $name before atomically creating either journal', async ({ input, blocker }) => {
+    const test = retirementSealBlockerHarness(input);
+    await expect(test.coordinator.sealUserRetirementAdmission({
+      initiatedByUserId: 'owner',
+      targetUserId: 'target',
+      expectedTargetEmailDigest: crypto
+        .createHash('sha256')
+        .update(JSON.stringify('target@example.com'))
+        .digest('hex'),
+    })).rejects.toMatchObject({
+      code: ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE_CODE,
+      statusCode: 409,
+      retryable: true,
+      blockers: [expect.objectContaining(blocker)],
+      truncated: false,
+    });
+    expect(test.adminCreates).toEqual([]);
+    expect(test.transitionCreates).toEqual([]);
+    expect(test.events).toEqual(['drained', 'released']);
+    expect(test.database.projectDependencyPromotionDecision.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          OR: [
+            { status: 'AUTHORIZED' },
+            { actorUserId: 'target' },
+            { workspaceOwnerId: 'target' },
+          ],
+        },
+      }),
+    );
+    expect(test.database.projectDependencyRepairOperation.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          NOT: { status: 'APPLIED', phase: 'COMPLETE' },
+        },
+      }),
+    );
+  });
+
   test('quiesces every plane before one exact user generation commit', async () => {
     const test = harness();
     const result = await test.coordinator.updateUserAuthorization({
@@ -1024,6 +1217,33 @@ describe('durable Project authorization transitions', () => {
       (event) => event === 'gateway:started',
     )).toHaveLength(startsBefore);
     expect(test.database.transitions[0].phase).toBe('COMMITTED');
+  });
+
+  test.each([true, false])('recovers a 9.1 lifecycle proof only with a fresh boundary (%s)', async (fresh) => {
+    const test = harness();
+    test.setFailGatewayStart(true);
+    await expect(test.coordinator.updateUserAuthorization({
+      initiatedByUserId: 'owner', targetUserId: 'target', update: { sandboxEnabled: true },
+    })).rejects.toMatchObject({ code: 'PROJECT_AUTHORIZATION_TRANSITION_FAILED' });
+    const row = test.database.transitions[0];
+    expect(row.phase).toBe('COMMITTED');
+    for (const attempt of row.hostRuntimeQuiescenceProof.attempts) {
+      const session = attempt.openClawHostRuns.sessions[0];
+      session.beforeSessionId = session.resetSessionId;
+      session.resetBoundary = {
+        lifecycleRevision: '7283cd2d-6e89-4e88-9fbf-edc0878d845f',
+        beforeUpdatedAt: 1000, updatedAt: fresh ? 2000 : 1000,
+      };
+    }
+    test.setFailGatewayStart(false);
+    const recovery = test.coordinator.recoverUnfinished();
+    if (fresh) {
+      await expect(recovery).resolves.toMatchObject({ recovered: true });
+      expect(row.phase).toBe('COMPLETE');
+    } else {
+      await expect(recovery).rejects.toMatchObject({ code: 'PROJECT_AUTHORIZATION_TRANSITION_JOURNAL_INVALID' });
+      expect(row.phase).toBe('COMMITTED');
+    }
   });
 
   test('rejects a corrupted proof on PROVIDER_FENCED recovery before authorization commit', async () => {

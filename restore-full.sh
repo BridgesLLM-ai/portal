@@ -84,7 +84,8 @@ valid_restore_phase_gate_phase() {
     files_restore_pending|files_restored|openclaw_restore_pending|\
     openclaw_restored|stalwart_restore_pending|stalwart_restored|\
     migration_pending|migrated|verification_pending|verified|committed|\
-    committed_exclusion_release_pending|committed_exclusion_released)
+    rollback_pending|committed_exclusion_release_pending|\
+    committed_exclusion_released)
       return 0
       ;;
     *)
@@ -141,6 +142,7 @@ allowed_phases = {
     "migrated",
     "verification_pending",
     "verified",
+    "rollback_pending",
     "committed",
     "committed_exclusion_release_pending",
     "committed_exclusion_released",
@@ -772,12 +774,39 @@ import stat
 import sys
 
 path, requested = sys.argv[1:]
-info = os.lstat(path)
-if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-        or info.st_uid != 0 or info.st_nlink != 1
-        or info.st_mode & 0o022 or info.st_size <= 0 or info.st_size > 1024 * 1024):
-    raise SystemExit(1)
-text = open(path, "r", encoding="utf-8").read()
+descriptor = os.open(
+    path,
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    before = os.fstat(descriptor)
+    if (not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0 or before.st_gid != 0 or before.st_nlink != 1
+            or before.st_mode & 0o022 or before.st_size <= 0
+            or before.st_size > 1024 * 1024):
+        raise SystemExit(1)
+    chunks = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            raise SystemExit(1)
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise SystemExit(1)
+    after = os.fstat(descriptor)
+    if any(
+        getattr(before, field) != getattr(after, field)
+        for field in (
+            "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+            "st_size", "st_mtime_ns", "st_ctime_ns",
+        )
+    ):
+        raise SystemExit(1)
+    text = b"".join(chunks).decode("utf-8")
+finally:
+    os.close(descriptor)
 if "\x00" in text or "\r" in text:
     raise SystemExit(1)
 assignment = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -814,15 +843,83 @@ database_authority_environment() {
   printf '%s\n' "${authority}"
 }
 
+seal_environment_authority_copy() {
+  local source="$1" authority="$2"
+  [[ -f "${source}" && ! -L "${source}" ]] || return 1
+  [[ ! -e "${authority}" && ! -L "${authority}" ]] || return 1
+  python3 - "${source}" "${authority}" <<'PY' || return 1
+import os
+import stat
+import sys
+
+source, target = sys.argv[1:]
+source_descriptor = os.open(
+    source,
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+target_descriptor = -1
+try:
+    before = os.fstat(source_descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_size <= 0
+        or before.st_size > 1024 * 1024
+    ):
+        raise SystemExit(1)
+    target_descriptor = os.open(
+        target,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    target_info = os.fstat(target_descriptor)
+    if (
+        not stat.S_ISREG(target_info.st_mode)
+        or target_info.st_uid != 0
+        or target_info.st_gid != 0
+        or target_info.st_nlink != 1
+    ):
+        raise SystemExit(1)
+    os.fchmod(target_descriptor, 0o600)
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(source_descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            raise SystemExit(1)
+        offset = 0
+        while offset < len(chunk):
+            count = os.write(target_descriptor, chunk[offset:])
+            if count <= 0:
+                raise SystemExit(1)
+            offset += count
+        remaining -= len(chunk)
+    if os.read(source_descriptor, 1):
+        raise SystemExit(1)
+    after = os.fstat(source_descriptor)
+    if any(
+        getattr(before, field) != getattr(after, field)
+        for field in (
+            "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+            "st_size", "st_mtime_ns", "st_ctime_ns",
+        )
+    ):
+        raise SystemExit(1)
+    os.fsync(target_descriptor)
+finally:
+    if target_descriptor >= 0:
+        os.close(target_descriptor)
+    os.close(source_descriptor)
+PY
+  fsync_directory "$(dirname -- "${authority}")"
+}
+
 seal_database_authority_environment() {
   local authority="${TRANSACTION_DIR}/database-authority.env"
-  [[ -f "${PORTAL_ENV_FILE}" && ! -L "${PORTAL_ENV_FILE}" ]] || return 1
-  [[ ! -e "${authority}" && ! -L "${authority}" ]] || return 1
-  install -m 600 -o root -g root -- "${PORTAL_ENV_FILE}" "${authority}" \
-    || return 1
-  cmp -s -- "${PORTAL_ENV_FILE}" "${authority}" || return 1
-  sync -f -- "${authority}" || return 1
-  fsync_directory "${TRANSACTION_DIR}"
+  seal_environment_authority_copy "${PORTAL_ENV_FILE}" "${authority}"
 }
 
 restore_database_peer_fields() {
@@ -1075,8 +1172,12 @@ if inherited_source:
         != (source_info.st_dev, source_info.st_ino, source_info.st_size)
     ):
         raise SystemExit(1)
-    os.set_inheritable(source_descriptor, True)
-    arguments[arguments.index(marker)] = f"/proc/self/fd/{source_descriptor}"
+    # pg_restore opens a named /proc/self/fd path again after setuid, which
+    # cannot reopen a root-only archive. Its standard-input mode consumes the
+    # already admitted descriptor without changing archive ownership or mode.
+    os.dup2(source_descriptor, 0, inheritable=True)
+    os.close(source_descriptor)
+    arguments.remove(marker)
 elif marker in arguments:
     raise SystemExit(1)
 uid = document.get("osUid")
@@ -1223,8 +1324,14 @@ PY
 }
 
 capture_restore_database_peer_authority() {
-  local target="${TRANSACTION_DIR}/database-exclusion.json"
-  local temporary="${TRANSACTION_DIR}/.database-exclusion-${TRANSACTION_ID}"
+  local purpose="${1:-exclusion}" authority_name
+  case "${purpose}" in
+    exclusion) authority_name=database-exclusion ;;
+    prevalidation) authority_name=database-prevalidation ;;
+    *) return 1 ;;
+  esac
+  local target="${TRANSACTION_DIR}/${authority_name}.json"
+  local temporary="${TRANSACTION_DIR}/.${authority_name}-${TRANSACTION_ID}"
   local database_url authority storage bytes topology relation_count extra
   local database_name portal_role token observed
   [[ ! -e "${target}" && ! -L "${target}" \
@@ -3117,13 +3224,20 @@ import sys
 admission_path, authority_root, sealed_env, launcher = sys.argv[1:]
 document = json.load(open(admission_path, "r", encoding="utf-8"))
 authority = document.get("recoveryAuthority")
+recovery_schema = document.get("recoverySchema")
 expected_paths = {
     "restore-full.sh",
     "backup-full.sh",
-    "backend/.env.production",
     "installer/install.sh",
     "installer/portal-recovery-archive.py",
 }
+if recovery_schema in {
+    "bridgesllm.portal-recovery.v2",
+    "bridgesllm.portal-recovery.v4",
+}:
+    expected_paths.add("backend/.env.production")
+elif recovery_schema != "bridgesllm.portal-recovery.v3":
+    raise SystemExit(1)
 if (
     document.get("schema") != "bridgesllm.restore-admission.v2"
     or not isinstance(authority, dict)
@@ -3132,27 +3246,45 @@ if (
     raise SystemExit(1)
 
 def digest_regular(path: pathlib.Path, *, executable: bool = False) -> str:
-    info = os.lstat(path)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or stat.S_ISLNK(info.st_mode)
-        or info.st_uid != 0
-        or info.st_gid != 0
-        or info.st_nlink != 1
-        or info.st_mode & 0o022
-        or (executable and not info.st_mode & 0o100)
-        or info.st_size <= 0
-        or info.st_size > 32 * 1024 * 1024
-    ):
-        raise SystemExit(1)
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or before.st_mode & 0o022
+            or (executable and not before.st_mode & 0o100)
+            or before.st_size <= 0
+            or before.st_size > 32 * 1024 * 1024
+        ):
+            raise SystemExit(1)
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
             if not chunk:
-                break
+                raise SystemExit(1)
             digest.update(chunk)
-    return digest.hexdigest()
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SystemExit(1)
+        after = os.fstat(descriptor)
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in (
+                "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+                "st_size", "st_mtime_ns", "st_ctime_ns",
+            )
+        ):
+            raise SystemExit(1)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 root = pathlib.Path(authority_root)
 for relative, expected in authority.items():
@@ -3644,6 +3776,7 @@ PY
 
 verify_archive() {
   local archive="$1" version database_authority="${PORTAL_ENV_FILE}"
+  local temporary_database_authority=""
   local -a helper_test_args=()
   local -a protected_args=()
   [[ "${archive}" == /* ]] || die "Archive path must be absolute"
@@ -3657,8 +3790,6 @@ verify_archive() {
     && ! -L "${TRANSACTION_DIR}/database-authority.env" ]]; then
     database_authority="${TRANSACTION_DIR}/database-authority.env"
   fi
-  select_postgresql_toolchain_for_authority "${database_authority}" \
-    || die "PostgreSQL server/client major or supported security floor admission failed"
   local temporary admission_root cleanup_root=""
   if [[ -n "${TRANSACTION_DIR}" && -d "${TRANSACTION_DIR}" && ! -L "${TRANSACTION_DIR}" ]]; then
     admission_root="${TRANSACTION_DIR}"
@@ -3672,6 +3803,22 @@ verify_archive() {
   temporary="${admission_root}/.admission-${TRANSACTION_ID:-verify}.json"
   [[ ! -e "${temporary}" && ! -L "${temporary}" ]] \
     || die "Restore admission temporary path already exists"
+  if [[ "${database_authority}" == "${PORTAL_ENV_FILE}" ]]; then
+    temporary_database_authority="${admission_root}/database-authority.env"
+    if ! seal_environment_authority_copy \
+        "${PORTAL_ENV_FILE}" "${temporary_database_authority}"; then
+      rm -f -- "${temporary_database_authority}"
+      [[ -z "${cleanup_root}" ]] || rmdir -- "${cleanup_root}" 2>/dev/null || true
+      die "Installed Portal environment could not be sealed for archive admission"
+    fi
+    database_authority="${temporary_database_authority}"
+  fi
+  select_postgresql_toolchain_for_authority "${database_authority}" \
+    || {
+      rm -f -- "${temporary_database_authority}"
+      [[ -z "${cleanup_root}" ]] || rmdir -- "${cleanup_root}" 2>/dev/null || true
+      die "PostgreSQL server/client major or supported security floor admission failed"
+    }
   if [[ -n "${BRIDGESLLM_RESTORE_TEST_ROOT:-}" ]]; then
     helper_test_args=(--test-root "${BRIDGESLLM_RESTORE_TEST_ROOT}")
   fi
@@ -3699,12 +3846,13 @@ verify_archive() {
     --pg-restore "${RESTORE_PG_RESTORE_BIN}" \
     --postgres-major "${RESTORE_POSTGRESQL_CLIENT_MAJOR}" \
     --expected-version "${version}" \
-    --current-env "${PORTAL_ENV_FILE}" \
+    --current-env "${database_authority}" \
+    --current-env-target "${PORTAL_ENV_FILE}" \
     --output "${temporary}" \
     "${helper_test_args[@]}" \
     "${protected_args[@]}" \
     || {
-      rm -f -- "${temporary}"
+      rm -f -- "${temporary}" "${temporary_database_authority}"
       [[ -z "${cleanup_root}" ]] || rmdir -- "${cleanup_root}"
       die "Archive version, profile, environment, database, or target admission failed"
     }
@@ -3713,7 +3861,7 @@ verify_archive() {
     fsync_directory "$(dirname -- "${ADMISSION_FILE}")" \
       || die "Restore admission was not committed durably"
   else
-    rm -f -- "${temporary}"
+    rm -f -- "${temporary}" "${temporary_database_authority}"
     [[ -z "${cleanup_root}" ]] || rmdir -- "${cleanup_root}"
   fi
 }
@@ -4290,6 +4438,16 @@ restore_test_fault_point() {
   if [[ "${phase}" == "${requested}" ]]; then
     die "Injected restore fixture failure after phase ${phase}"
   fi
+}
+
+restore_test_kill_after_rollback_files() {
+  [[ -z "${BRIDGESLLM_RESTORE_TEST_KILL_AFTER_ROLLBACK_FILES:-}" ]] \
+    && return 0
+  [[ "${BRIDGESLLM_RESTORE_TEST_KILL_AFTER_ROLLBACK_FILES}" == "1" \
+    && -n "${BRIDGESLLM_RESTORE_TEST_ROOT:-}" ]] \
+    || die "Rollback hard-kill injection is restricted to an attested test fixture"
+  kill -KILL "$$"
+  return 1
 }
 
 advance_phase() {
@@ -4929,12 +5087,14 @@ if admission_phase == "pre-downtime":
         "path": transaction_dir,
         # Keep a conservative allowance for the plain rollback dump plus its
         # temporary predecessor while it is durably published.
+        # Also admit a disposable read-only code view, conservatively bounded
+        # by the complete expanded archive. It is never promoted or restored.
         "bytes": (
-            expanded
+            expanded * 2
             + rollback
             + (database_bytes * 5 + 16 * 1024**2) * 2
         ),
-        "inodes": outer_inodes + nested_inodes + len(maximal) + 64,
+        "inodes": (outer_inodes + nested_inodes) * 2 + len(maximal) + 64,
     }
 else:
     # The source archive, expanded staging tree, and rollback snapshot already
@@ -5621,6 +5781,86 @@ PY
   rm -f -- "${components_file}"
   sync_tree "${TRANSACTION_DIR}" \
     || die "Staged recovery payloads were not committed durably"
+}
+
+merge_staged_portal_environment() {
+  local recovery_schema final_environment
+  local -a environment_authority=()
+  mapfile -t environment_authority < <(python3 - "${ADMISSION_FILE}" <<'PY'
+import json
+import re
+import sys
+document = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+if document.get("schema") != "bridgesllm.restore-admission.v2":
+    raise SystemExit(1)
+value = document.get("recoverySchema")
+if value not in {
+    "bridgesllm.portal-recovery.v2",
+    "bridgesllm.portal-recovery.v3",
+    "bridgesllm.portal-recovery.v4",
+}:
+    raise SystemExit(1)
+authority = document.get("environmentAuthority")
+expected_policy = {
+    "bridgesllm.portal-recovery.v2": "exact-v2",
+    "bridgesllm.portal-recovery.v3": "portal-only-preserve-openclaw-v3",
+    "bridgesllm.portal-recovery.v4": "exact-full-v4",
+}[value]
+if (
+    not isinstance(authority, dict)
+    or set(authority) != {
+        "schema", "policy", "archivedSha256", "currentSha256", "mergedSha256",
+    }
+    or authority.get("schema") != "bridgesllm.portal-environment-authority.v1"
+    or authority.get("policy") != expected_policy
+    or any(
+        re.fullmatch(r"[a-f0-9]{64}", str(authority.get(name, ""))) is None
+        for name in ("archivedSha256", "currentSha256", "mergedSha256")
+    )
+):
+    raise SystemExit(1)
+print(value)
+print(authority["archivedSha256"])
+print(authority["currentSha256"])
+print(authority["mergedSha256"])
+PY
+) || return 1
+  [[ "${#environment_authority[@]}" -eq 4 ]] || return 1
+  recovery_schema="${environment_authority[0]}"
+  final_environment="${TRANSACTION_DIR}/final-portal-environment.env"
+  [[ ! -e "${final_environment}" && ! -L "${final_environment}" ]] \
+    || return 1
+  if [[ "${recovery_schema}" == "bridgesllm.portal-recovery.v3" ]]; then
+    if ! python3 "${ARCHIVE_HELPER}" merge-environment \
+        --archived "${TRANSACTION_DIR}/stage/configs/portal-backend.env.production" \
+        --current "${TRANSACTION_DIR}/database-authority.env" \
+        --output "${final_environment}" \
+        --expected-archived-sha256 "${environment_authority[1]}" \
+        --expected-current-sha256 "${environment_authority[2]}" \
+        --expected-output-sha256 "${environment_authority[3]}"; then
+      rm -f -- "${final_environment}"
+      return 1
+    fi
+  elif [[ "${recovery_schema}" == "bridgesllm.portal-recovery.v2" \
+      || "${recovery_schema}" == "bridgesllm.portal-recovery.v4" ]]; then
+    seal_environment_authority_copy \
+      "${TRANSACTION_DIR}/stage/configs/portal-backend.env.production" \
+      "${final_environment}" || return 1
+  else
+    return 1
+  fi
+  fsync_directory "${TRANSACTION_DIR}"
+}
+
+assert_portal_environment_authority() {
+  local phase="$1"
+  python3 "${ARCHIVE_HELPER}" assert-environment \
+    --admission "${ADMISSION_FILE}" \
+    --sealed-current "${TRANSACTION_DIR}/database-authority.env" \
+    --staged "${TRANSACTION_DIR}/stage/configs/portal-backend.env.production" \
+    --merged "${TRANSACTION_DIR}/final-portal-environment.env" \
+    --live "${PORTAL_ENV_FILE}" \
+    --phase "${phase}"
 }
 
 admitted_components() {
@@ -6565,13 +6805,20 @@ for entry in document.get("components", []):
 portal_entry = by_id.get("portal-install")
 environment_entry = by_id.get("portal-environment")
 authority = document.get("recoveryAuthority")
+recovery_schema = document.get("recoverySchema")
 authority_paths = {
     "restore-full.sh",
     "backup-full.sh",
-    "backend/.env.production",
     "installer/install.sh",
     "installer/portal-recovery-archive.py",
 }
+if recovery_schema in {
+    "bridgesllm.portal-recovery.v2",
+    "bridgesllm.portal-recovery.v4",
+}:
+    authority_paths.add("backend/.env.production")
+elif recovery_schema != "bridgesllm.portal-recovery.v3":
+    raise SystemExit(1)
 if (
     not isinstance(portal_entry, dict)
     or set(portal_entry) != {
@@ -6600,83 +6847,84 @@ if (
     or set(authority) != authority_paths
 ):
     raise SystemExit(1)
-for relative, expected_digest in authority.items():
-    path = pathlib.Path(portal_root) / relative
+
+def safe_digest(path, maximum):
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
-        info = os.lstat(path)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or before.st_mode & 0o022
+            or before.st_size <= 0
+            or before.st_size > maximum
+        ):
+            raise SystemExit(1)
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(1)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SystemExit(1)
+        after = os.fstat(descriptor)
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in (
+                "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+                "st_size", "st_mtime_ns", "st_ctime_ns",
+            )
+        ):
+            raise SystemExit(1)
+        return digest.hexdigest(), before.st_size, stat.S_IMODE(before.st_mode)
+    finally:
+        os.close(descriptor)
+
+for relative, expected_digest in authority.items():
+    try:
+        path = (
+            pathlib.Path(admission_path).parent / "database-authority.env"
+            if relative == "backend/.env.production"
+            else pathlib.Path(portal_root) / relative
+        )
+        observed_digest, observed_size, observed_mode = safe_digest(
+            path,
+            32 * 1024 * 1024,
+        )
     except OSError:
         raise SystemExit(1)
     if (
         not isinstance(expected_digest, str)
         or len(expected_digest) != 64
         or any(char not in "0123456789abcdef" for char in expected_digest)
-        or not stat.S_ISREG(info.st_mode)
-        or stat.S_ISLNK(info.st_mode)
-        or info.st_uid != 0
-        or info.st_gid != 0
-        or info.st_nlink != 1
-        or info.st_mode & 0o022
-        or info.st_size <= 0
-        or info.st_size > 32 * 1024 * 1024
+        or observed_digest != expected_digest
+        or (
+            relative == "backend/.env.production"
+            and observed_mode != 0o600
+        )
     ):
         raise SystemExit(1)
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    if digest.hexdigest() != expected_digest:
-        raise SystemExit(1)
-    if relative == "backend/.env.production":
-        sealed = pathlib.Path(admission_path).parent / "database-authority.env"
-        try:
-            sealed_info = os.lstat(sealed)
-        except OSError:
-            raise SystemExit(1)
-        if (
-            not stat.S_ISREG(sealed_info.st_mode)
-            or stat.S_ISLNK(sealed_info.st_mode)
-            or sealed_info.st_uid != 0
-            or sealed_info.st_gid != 0
-            or sealed_info.st_nlink != 1
-            or stat.S_IMODE(sealed_info.st_mode) != 0o600
-        ):
-            raise SystemExit(1)
-        sealed_digest = hashlib.sha256()
-        with sealed.open("rb", buffering=0) as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                sealed_digest.update(chunk)
-        if sealed_digest.hexdigest() != expected_digest:
-            raise SystemExit(1)
-    else:
+    if relative != "backend/.env.production":
         runtime_path = pathlib.Path(authority_root) / relative
         try:
-            runtime_info = os.lstat(runtime_path)
+            runtime_digest, runtime_size, _ = safe_digest(
+                runtime_path,
+                32 * 1024 * 1024,
+            )
         except OSError:
             raise SystemExit(1)
         if (
-            not stat.S_ISREG(runtime_info.st_mode)
-            or stat.S_ISLNK(runtime_info.st_mode)
-            or runtime_info.st_uid != 0
-            or runtime_info.st_gid != 0
-            or runtime_info.st_nlink != 1
-            or runtime_info.st_mode & 0o022
-            or runtime_info.st_size != info.st_size
+            runtime_size != observed_size
+            or runtime_digest != expected_digest
         ):
-            raise SystemExit(1)
-        runtime_digest = hashlib.sha256()
-        with runtime_path.open("rb", buffering=0) as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                runtime_digest.update(chunk)
-        if runtime_digest.hexdigest() != expected_digest:
             raise SystemExit(1)
 PY
 }
@@ -8088,18 +8336,21 @@ PY
 }
 
 restore_environment_file() {
-  local staged="${TRANSACTION_DIR}/stage/configs/portal-backend.env.production"
+  local staged="${TRANSACTION_DIR}/final-portal-environment.env"
   [[ -f "${staged}" && ! -L "${staged}" ]] || die "Staged Portal environment is missing"
   ensure_safe_parent_directory "${PORTAL_ENV_FILE}" file \
     || die "Portal environment parent is unsafe"
   local temporary
-  temporary="$(mktemp "$(dirname -- "${PORTAL_ENV_FILE}")/.env.production.restore.XXXXXX")"
-  install -m 600 -o root -g root -- "${staged}" "${temporary}"
-  sync -f -- "${temporary}" \
+  temporary="$(dirname -- "${PORTAL_ENV_FILE}")/.env.production.restore-${TRANSACTION_ID}"
+  [[ ! -e "${temporary}" && ! -L "${temporary}" ]] \
+    || die "Portal environment temporary path is unsafe"
+  seal_environment_authority_copy "${staged}" "${temporary}" \
     || die "Restored Portal environment content was not committed durably"
   mv -f -- "${temporary}" "${PORTAL_ENV_FILE}"
   fsync_directory "$(dirname -- "${PORTAL_ENV_FILE}")" \
     || die "Restored Portal environment was not committed durably"
+  assert_portal_environment_authority files-restored \
+    || die "Restored Portal environment differs from its admitted merged authority"
 }
 
 stop_restore_migration() {
@@ -8163,22 +8414,24 @@ PY
 }
 
 restore_prevalidation_inaccessible_paths() {
-  local admission bytes topology relation_count extra authority database_url
-  local uri socket_directories
+  local admission bytes topology relation_count extra socket_directories
+  local peer_authority="${TRANSACTION_DIR}/database-prevalidation.json"
   admission="$(database_storage_admission)" || return 1
   IFS='|' read -r bytes topology relation_count extra <<<"${admission}"
   [[ "${bytes}" =~ ^[1-9][0-9]*$ \
     && "${relation_count}" =~ ^[1-9][0-9]*$ \
     && -n "${topology}" && -z "${extra}" ]] || return 1
-  authority="$(database_authority_environment)" || return 1
-  database_url="$(read_env_value "${authority}" DATABASE_URL)" || return 1
-  uri="$(database_command_identity)" || return 1
-  socket_directories="$(run_with_restore_pgpass "${database_url}" \
-    "${RESTORE_PSQL_BIN}" --dbname="${uri}" --no-psqlrc \
-    --set=ON_ERROR_STOP=1 -qAt \
+  # The Portal role cannot inspect this setting. Reuse the attested local
+  # peer connection, but keep its read-only snapshot separate from the later
+  # database-exclusion authority: merely inspecting paths must not arm a fence.
+  if [[ ! -e "${peer_authority}" && ! -L "${peer_authority}" ]]; then
+    capture_restore_database_peer_authority prevalidation || return 1
+  fi
+  socket_directories="$(RESTORE_DATABASE_PEER_AUTHORITY_OVERRIDE="${peer_authority}" \
+    run_restore_peer_psql target -qAt \
     --command="SELECT current_setting('unix_socket_directories');")" \
     || return 1
-  python3 - "${topology}" "${socket_directories}" <<'PY'
+  python3 - "${topology}" "${socket_directories}" "${peer_authority}" <<'PY'
 import json
 import os
 import pathlib
@@ -8186,6 +8439,9 @@ import stat
 import sys
 
 document = json.loads(sys.argv[1])
+peer_document = json.load(open(sys.argv[3], "r", encoding="utf-8"))
+if peer_document.get("topology") != document:
+    raise SystemExit(1)
 raw = [document.get("dataDirectory"), document.get("walDirectory")]
 raw.extend(
     entry.get("path")
@@ -8633,7 +8889,33 @@ validation_schema_fingerprint() {
     rm -f -- "${temporary}"
     return 1
   fi
-  digest="$(sha256sum "${temporary}" | cut -d' ' -f1)" || {
+  # PostgreSQL security releases add a fresh psql restrict key to every
+  # dump. This file is compared, never executed: canonicalize only the
+  # matching framing pair, retaining every schema byte between the markers.
+  digest="$(python3 - "${temporary}" <<'PY'
+import hashlib
+import pathlib
+import re
+import sys
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+lines = data.splitlines(keepends=True)
+markers = []
+for index, line in enumerate(lines):
+    if line.startswith((b"\\restrict", b"\\unrestrict")):
+        match = re.fullmatch(rb"\\(unrestrict|restrict) ([A-Za-z0-9]{1,256})(\r?\n)?", line)
+        if match is None:
+            raise SystemExit("malformed PostgreSQL schema restrict marker")
+        markers.append((index, match.group(1), match.group(2), match.group(3) or b""))
+if markers:
+    if (len(markers) != 2 or markers[0][1] != b"restrict"
+        or markers[1][1] != b"unrestrict" or markers[0][2] != markers[1][2]):
+        raise SystemExit("PostgreSQL schema restrict pair differs")
+    for index, command, key, ending in markers:
+        lines[index] = b"\\" + command + b" SCHEMA-COMPARISON" + ending
+print(hashlib.sha256(b"".join(lines)).hexdigest())
+PY
+  )" || {
     rm -f -- "${temporary}"
     return 1
   }
@@ -8696,10 +8978,32 @@ if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
 expected = {}
 for entry in sorted(root.iterdir(), key=lambda item: item.name):
     info = os.lstat(entry)
+    # Prisma ships this provider lock beside (not inside) migrations.
+    if entry.name == "migration_lock.toml":
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1
+            or not 0 < info.st_size <= 4096
+        ):
+            raise SystemExit(1)
+        settings = [
+            line.strip() for line in entry.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if len(settings) != 1 or not re.fullmatch(
+            r'provider\s*=\s*"postgresql"\s*(?:#[^\r\n]*)?', settings[0]
+        ):
+            raise SystemExit(1)
+        continue
+    # The shipped history includes 0000_initial and YYYYMMDD names; Prisma's
+    # generated YYYYMMDDHHMMSS format is not the only valid history shape.
     if (
         not stat.S_ISDIR(info.st_mode)
         or stat.S_ISLNK(info.st_mode)
-        or not re.fullmatch(r"[0-9]{14}_[A-Za-z0-9_]+", entry.name)
+        or not re.fullmatch(
+            r"(?:[0-9]{4}|[0-9]{8}|[0-9]{14})_[A-Za-z0-9_]+", entry.name
+        )
     ):
         raise SystemExit(1)
     migration = entry / "migration.sql"
@@ -8738,7 +9042,6 @@ for row in observed:
         if (
             row["checksum"] != expected[row["name"]]
             or row["finishedAt"] is None
-            or row["steps"] != 1
         ):
             raise SystemExit(1)
         active.append((row["name"], row["checksum"]))
@@ -8797,18 +9100,28 @@ authority = json.load(open(authority_path, "r", encoding="utf-8"))
 assignment = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 lines = []
 seen = False
+names = set()
 for raw in open(source, "r", encoding="utf-8").read().splitlines():
+    if not raw or raw.lstrip().startswith(("#", ";")):
+        continue
     match = assignment.fullmatch(raw)
-    if match and (
-        match.group(1).startswith("PG")
-        or match.group(1).startswith("POSTGRES")
+    if match is None or match.group(1) in names:
+        raise SystemExit(1)
+    name = match.group(1)
+    names.add(name)
+    upper_name = name.upper()
+    if "OPENCLAW" in upper_name or "CLAWDBOT" in upper_name:
+        continue
+    if (
+        name.startswith("PG")
+        or name.startswith("POSTGRES")
         or (
-            match.group(1) != "DATABASE_URL"
-            and "DATABASE_URL" in match.group(1)
+            name != "DATABASE_URL"
+            and "DATABASE_URL" in name
         )
     ):
         continue
-    if match and match.group(1) == "DATABASE_URL":
+    if name == "DATABASE_URL":
         if seen:
             raise SystemExit(1)
         seen = True
@@ -8821,7 +9134,6 @@ for raw in open(source, "r", encoding="utf-8").read().splitlines():
             urlsplit(value).query, keep_blank_values=True
         )
         query = {
-            "host": authority["socketDirectory"],
             "application_name": application,
             "sslmode": "disable",
             "schema": original_query.get("schema", ["public"])[-1],
@@ -8832,7 +9144,7 @@ for raw in open(source, "r", encoding="utf-8").read().splitlines():
             + quote(authority["applicationRole"], safe="")
             + ":"
             + quote(authority["applicationPassword"], safe="")
-            + "@localhost:"
+            + "@127.0.0.1:"
             + str(authority["port"])
             + "/"
             + quote(authority["database"], safe="")
@@ -8851,7 +9163,13 @@ descriptor = os.open(
     0o600,
 )
 try:
-    os.write(descriptor, ("\n".join(lines) + "\n").encode("utf-8"))
+    payload = ("\n".join(lines) + "\n").encode("utf-8")
+    written = 0
+    while written < len(payload):
+        count = os.write(descriptor, payload[written:])
+        if count <= 0:
+            raise OSError("short validation environment write")
+        written += count
     os.fsync(descriptor)
 finally:
     os.close(descriptor)
@@ -8917,7 +9235,8 @@ PY
     --property=DynamicUser=yes
     --property="RuntimeDirectory=${unit}"
     --property=RuntimeDirectoryMode=0755
-    --property=RuntimeDirectoryPreserve=no
+    # Keep startup-failure paths available until their inode receipt is sealed.
+    --property=RuntimeDirectoryPreserve=yes
     --property="StateDirectory=${unit}"
     --property=StateDirectoryMode=0700
     --property=NoNewPrivileges=yes
@@ -8936,7 +9255,7 @@ PY
     --property=ProcSubset=pid
     --property=InaccessiblePaths=-/run/docker.sock
     --property=InaccessiblePaths=-/var/run/docker.sock
-    --property=RestrictAddressFamilies=AF_UNIX
+    "--property=RestrictAddressFamilies=AF_UNIX AF_INET"
     --property=LockPersonality=yes
     --property=SystemCallArchitectures=native
     --property=UMask=0077
@@ -8946,32 +9265,34 @@ PY
     properties+=(--property="InaccessiblePaths=${database_path}")
   done
   stop_restore_validation_cluster || return 1
+  # systemd expands ExecStart dollars before Bash; $$ delivers one literal $.
   "${RESTORE_SYSTEMD_RUN_BIN}" \
     --unit="${unit}" \
     --description="BridgesLLM disposable restore validation database ${TRANSACTION_ID}" \
     --quiet "${properties[@]}" \
     /bin/bash -c '
 set -Eeuo pipefail
-data="${STATE_DIRECTORY}/data"
-socket="${RUNTIME_DIRECTORY}/socket"
-install -d -m 700 "${data}"
-install -d -m 755 "${socket}"
-"$1" --pgdata="${data}" --username="$3" \
+data="$${STATE_DIRECTORY}/data"
+socket="$${RUNTIME_DIRECTORY}/socket"
+install -d -m 700 "$${data}"
+install -d -m 755 "$${socket}"
+"$$1" --pgdata="$${data}" --username="$$3" \
   --auth-local=reject --auth-host=reject \
-  --encoding="$7" --lc-collate="$8" --lc-ctype="$9" >/dev/null
-cat >"${data}/pg_hba.conf" <<EOF
+  --encoding="$$7" --lc-collate="$$8" --lc-ctype="$$9" >/dev/null
+cat >"$${data}/pg_hba.conf" <<EOF
 local replication all reject
-local "$4" "$5" scram-sha-256
-local "$4" "$3" peer map=bridgesllm_restore_admin
-local postgres "$3" peer map=bridgesllm_restore_admin
+local "$$4" "$$5" scram-sha-256
+local "$$4" "$$3" peer map=bridgesllm_restore_admin
+local postgres "$$3" peer map=bridgesllm_restore_admin
 local all all reject
+host "$$4" "$$5" 127.0.0.1/32 scram-sha-256
 EOF
-cat >"${data}/pg_ident.conf" <<EOF
-bridgesllm_restore_admin root "$3"
+cat >"$${data}/pg_ident.conf" <<EOF
+bridgesllm_restore_admin root "$$3"
 EOF
-chmod 600 "${data}/pg_hba.conf"
-chmod 600 "${data}/pg_ident.conf"
-exec "$2" --pgdata="${data}" -h "" -k "${socket}" -p "$6" \
+chmod 600 "$${data}/pg_hba.conf"
+chmod 600 "$${data}/pg_ident.conf"
+exec "$$2" -D "$${data}" -h 127.0.0.1 -k "$${socket}" -p "$$6" \
   -c unix_socket_permissions=0777 -c fsync=on \
   -c full_page_writes=on -c synchronous_commit=on -c jit=off \
   -c max_prepared_transactions=0
@@ -9030,13 +9351,14 @@ expected_hba = (
     f'local "{database}" "{admin_role}" peer map=bridgesllm_restore_admin\n'
     f'local postgres "{admin_role}" peer map=bridgesllm_restore_admin\n'
     "local all all reject\n"
+    f'host "{database}" "{application_role}" 127.0.0.1/32 scram-sha-256\n'
 )
 expected_ident = (
     f'bridgesllm_restore_admin root "{admin_role}"\n'
 )
 expected = {
     "prepared": "0",
-    "listen": "",
+    "listen": "127.0.0.1",
     "hbaErrors": 0,
     "identErrors": 0,
     "hba": expected_hba,
@@ -9262,53 +9584,61 @@ def directory_receipt(path, mode, expected_owner=None):
             os.close(descriptor)
         os.close(parent)
 
+def symlink_receipt(alias):
+    alias_parent = safe_parent(alias.parent)
+    alias_descriptor = None
+    try:
+        alias_info = os.stat(
+            alias.name, dir_fd=alias_parent, follow_symlinks=False
+        )
+        alias_descriptor = os.open(
+            alias.name, path_flags, dir_fd=alias_parent
+        )
+        opened_alias = os.fstat(alias_descriptor)
+        expected_target = f"private/{unit}"
+        if (
+            not stat.S_ISLNK(alias_info.st_mode)
+            or (opened_alias.st_dev, opened_alias.st_ino)
+                != (alias_info.st_dev, alias_info.st_ino)
+            or alias_info.st_uid != 0
+            or alias_info.st_gid != 0
+            or alias_info.st_dev != os.fstat(alias_parent).st_dev
+            or mount_id(alias_descriptor) != mount_id(alias_parent)
+            or os.readlink(alias.name, dir_fd=alias_parent) != expected_target
+        ):
+            raise SystemExit(1)
+        return {
+            "path": str(alias),
+            "dev": alias_info.st_dev,
+            "ino": alias_info.st_ino,
+            "mountId": mount_id(alias_descriptor),
+            "uid": alias_info.st_uid,
+            "gid": alias_info.st_gid,
+            "mode": stat.S_IMODE(alias_info.st_mode),
+            "target": expected_target,
+        }
+    finally:
+        if alias_descriptor is not None:
+            os.close(alias_descriptor)
+        os.close(alias_parent)
+
 state_record = directory_receipt(state, 0o700)
 owner = (state_record["uid"], state_record["gid"])
+runtime_alias_record = None
+if runtime.is_symlink():
+    runtime_alias_record = symlink_receipt(runtime)
+    runtime = runtime.parent / "private" / unit
 runtime_record = directory_receipt(runtime, 0o755, owner)
-alias_parent = safe_parent(alias.parent)
-alias_descriptor = None
-try:
-    alias_info = os.stat(
-        alias.name, dir_fd=alias_parent, follow_symlinks=False
-    )
-    alias_descriptor = os.open(
-        alias.name, path_flags, dir_fd=alias_parent
-    )
-    opened_alias = os.fstat(alias_descriptor)
-    expected_target = f"private/{unit}"
-    if (
-        not stat.S_ISLNK(alias_info.st_mode)
-        or (opened_alias.st_dev, opened_alias.st_ino)
-            != (alias_info.st_dev, alias_info.st_ino)
-        or alias_info.st_uid != 0
-        or alias_info.st_gid != 0
-        or alias_info.st_dev != os.fstat(alias_parent).st_dev
-        or mount_id(alias_descriptor) != mount_id(alias_parent)
-        or os.readlink(alias.name, dir_fd=alias_parent) != expected_target
-    ):
-        raise SystemExit(1)
-    alias_record = {
-        "path": str(alias),
-        "dev": alias_info.st_dev,
-        "ino": alias_info.st_ino,
-        "mountId": mount_id(alias_descriptor),
-        "uid": alias_info.st_uid,
-        "gid": alias_info.st_gid,
-        "mode": stat.S_IMODE(alias_info.st_mode),
-        "target": expected_target,
-    }
-finally:
-    if alias_descriptor is not None:
-        os.close(alias_descriptor)
-    os.close(alias_parent)
+alias_record = symlink_receipt(alias)
 
 document = {
-    "schema": "bridgesllm.validation-state-receipt.v1",
+    "schema": "bridgesllm.validation-state-receipt.v2",
     "operationId": operation_id,
     "unit": unit,
     "dynamicUid": owner[0],
     "dynamicGid": owner[1],
     "runtime": runtime_record,
+    "runtimeAlias": runtime_alias_record,
     "state": state_record,
     "alias": alias_record,
 }
@@ -9369,12 +9699,19 @@ if (
 ):
     raise SystemExit(1)
 document = json.load(open(receipt, "r", encoding="utf-8"))
+receipt_version = document.get("schema")
+expected_keys = {
+    "schema", "operationId", "unit", "dynamicUid", "dynamicGid",
+    "runtime", "state", "alias",
+}
+if receipt_version == "bridgesllm.validation-state-receipt.v2":
+    expected_keys.add("runtimeAlias")
 if (
-    set(document) != {
-        "schema", "operationId", "unit", "dynamicUid", "dynamicGid",
-        "runtime", "state", "alias",
+    set(document) != expected_keys
+    or receipt_version not in {
+        "bridgesllm.validation-state-receipt.v1",
+        "bridgesllm.validation-state-receipt.v2",
     }
-    or document.get("schema") != "bridgesllm.validation-state-receipt.v1"
     or document.get("operationId") != operation_id
     or document.get("unit") != unit
     or not isinstance(document.get("dynamicUid"), int)
@@ -9454,6 +9791,17 @@ def validate_record(record, path, mode, *, alias_record=False):
     ):
         raise SystemExit(1)
 
+runtime_alias = None
+runtime_alias_record = document.get("runtimeAlias")
+if runtime_alias_record is not None:
+    runtime_alias = runtime
+    validate_record(runtime_alias_record, runtime_alias, 0o777, alias_record=True)
+    if (
+        (runtime_alias_record["uid"], runtime_alias_record["gid"]) != (0, 0)
+        or runtime_alias_record["target"] != f"private/{unit}"
+    ):
+        raise SystemExit(1)
+    runtime = runtime.parent / "private" / unit
 validate_record(document["runtime"], runtime, 0o755)
 validate_record(document["state"], state, 0o700)
 validate_record(document["alias"], alias, 0o777, alias_record=True)
@@ -9493,32 +9841,36 @@ try:
             raise SystemExit(1)
         opened[name] = descriptor
 
-    alias_parent = safe_parent(alias.parent)
-    parents["alias"] = alias_parent
-    try:
-        alias_descriptor = os.open(
-            alias.name, path_flags, dir_fd=alias_parent
-        )
-    except FileNotFoundError:
-        opened["alias"] = None
-    else:
-        alias_info = os.fstat(alias_descriptor)
-        record = document["alias"]
-        if (
-            not stat.S_ISLNK(alias_info.st_mode)
-            or (alias_info.st_dev, alias_info.st_ino)
-                != (record["dev"], record["ino"])
-            or mount_id(alias_descriptor) != record["mountId"]
-            or (alias_info.st_uid, alias_info.st_gid) != (0, 0)
-            or stat.S_IMODE(alias_info.st_mode) != record["mode"]
-            or os.readlink(alias.name, dir_fd=alias_parent)
-                != record["target"]
-            or alias_info.st_dev != os.fstat(alias_parent).st_dev
-            or mount_id(alias_descriptor) != mount_id(alias_parent)
-        ):
-            os.close(alias_descriptor)
-            raise SystemExit(1)
-        opened["alias"] = alias_descriptor
+    aliases = [("alias", alias, document["alias"])]
+    if runtime_alias is not None:
+        aliases.append(("runtimeAlias", runtime_alias, runtime_alias_record))
+    for alias_name, alias_path, alias_record in aliases:
+        alias_parent = safe_parent(alias_path.parent)
+        parents[alias_name] = alias_parent
+        try:
+            alias_descriptor = os.open(
+                alias_path.name, path_flags, dir_fd=alias_parent
+            )
+        except FileNotFoundError:
+            opened[alias_name] = None
+        else:
+            alias_info = os.fstat(alias_descriptor)
+            record = alias_record
+            if (
+                not stat.S_ISLNK(alias_info.st_mode)
+                or (alias_info.st_dev, alias_info.st_ino)
+                    != (record["dev"], record["ino"])
+                or mount_id(alias_descriptor) != record["mountId"]
+                or (alias_info.st_uid, alias_info.st_gid) != (0, 0)
+                or stat.S_IMODE(alias_info.st_mode) != record["mode"]
+                or os.readlink(alias_path.name, dir_fd=alias_parent)
+                    != record["target"]
+                or alias_info.st_dev != os.fstat(alias_parent).st_dev
+                or mount_id(alias_descriptor) != mount_id(alias_parent)
+            ):
+                os.close(alias_descriptor)
+                raise SystemExit(1)
+            opened[alias_name] = alias_descriptor
 
     def remove_contents(descriptor, root_device, root_mount):
         info = os.fstat(descriptor)
@@ -9604,16 +9956,18 @@ try:
         )
         os.fsync(parents[name])
 
-    if opened["alias"] is not None:
-        current = os.stat(
-            alias.name, dir_fd=parents["alias"], follow_symlinks=False
-        )
-        if inode_identity(current) != inode_identity(
-            os.fstat(opened["alias"])
-        ):
-            raise SystemExit(1)
-        os.unlink(alias.name, dir_fd=parents["alias"])
-        os.fsync(parents["alias"])
+    for alias_name, alias_path, _ in aliases:
+        if opened[alias_name] is not None:
+            current = os.stat(
+                alias_path.name, dir_fd=parents[alias_name], follow_symlinks=False
+            )
+            if inode_identity(current) != inode_identity(
+                os.fstat(opened[alias_name])
+            ):
+                raise SystemExit(1)
+            os.unlink(alias_path.name, dir_fd=parents[alias_name])
+            os.fsync(parents[alias_name])
+
 finally:
     for descriptor in opened.values():
         if descriptor is not None:
@@ -9629,9 +9983,11 @@ stop_restore_validation_cluster() {
     || return 1
   local unit="bridgesllm-restore-postgres-${TRANSACTION_ID}"
   local runtime="${RESTORE_VALIDATION_RUNTIME_ROOT}/${unit}"
+  local private_runtime="${RESTORE_VALIDATION_RUNTIME_ROOT}/private/${unit}"
   local state="${RESTORE_VALIDATION_STATE_ROOT}/${unit}"
   local alias="${RESTORE_VALIDATION_STATE_ALIAS_ROOT}/${unit}"
-  if [[ ! -e "${runtime}" && ! -L "${runtime}" \
+  if [[ ! -e "${private_runtime}" && ! -L "${private_runtime}" \
+    && ! -e "${runtime}" && ! -L "${runtime}" \
     && ! -e "${state}" && ! -L "${state}" \
     && ! -e "${alias}" && ! -L "${alias}" ]]; then
     "${RESTORE_SYSTEMCTL_BIN}" reset-failed "${unit}.service" \
@@ -9645,7 +10001,8 @@ stop_restore_validation_cluster() {
   [[ "${active}" == "inactive" || "${active}" == "failed" ]] || return 1
   "${RESTORE_SYSTEMCTL_BIN}" clean --what=state,runtime \
     "${unit}.service" >/dev/null 2>&1 || true
-  if [[ -e "${runtime}" || -L "${runtime}" \
+  if [[ -e "${private_runtime}" || -L "${private_runtime}" \
+    || -e "${runtime}" || -L "${runtime}" \
     || -e "${state}" || -L "${state}" \
     || -e "${alias}" || -L "${alias}" ]]; then
     # StateDirectory survives a cold boot even after transient unit metadata
@@ -9655,7 +10012,8 @@ stop_restore_validation_cluster() {
   fi
   "${RESTORE_SYSTEMCTL_BIN}" reset-failed "${unit}.service" \
     >/dev/null 2>&1 || true
-  [[ ! -e "${runtime}" && ! -L "${runtime}" \
+  [[ ! -e "${private_runtime}" && ! -L "${private_runtime}" \
+    && ! -e "${runtime}" && ! -L "${runtime}" \
     && ! -e "${state}" && ! -L "${state}" \
     && ! -e "${alias}" && ! -L "${alias}" ]] \
     || return 1
@@ -9713,10 +10071,176 @@ if (
 PY
 }
 
+prepare_restore_validation_code() {
+  local staged_portal="$1"
+  local target="${TRANSACTION_DIR}/validation-code"
+  # A restore retains the installation's private 0600/0700 modes. Never
+  # relax that authority tree just to let DynamicUser execute its code.
+  # This disposable, non-promoted projection has no environment/user data;
+  # only the service's private mount namespace exposes its read-only view.
+  python3 - "${staged_portal}" "${target}" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import stat
+import sys
+
+source, target = map(pathlib.Path, sys.argv[1:])
+receipt = target.parent / "validation-code.json"
+parent = os.lstat(target.parent)
+if (
+    not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+    or parent.st_uid != 0 or parent.st_gid != 0
+    or stat.S_IMODE(parent.st_mode) != 0o700
+):
+    raise SystemExit("validation code parent is not private")
+required = (
+    "backend/package.json", "backend/dist",
+    "backend/node_modules", "backend/prisma",
+)
+optional = (
+    "backend/package-lock.json",
+    "backend/prisma.config.js", "backend/prisma.config.mjs",
+    "backend/prisma.config.cjs", "backend/prisma.config.ts",
+    "frontend/dist", "compatibility", "installer", "skills", "static",
+)
+roots = list(required)
+for name in required:
+    if not (source / name).exists():
+        raise SystemExit("validation code member missing: " + name)
+roots += [name for name in optional if os.path.lexists(source / name)]
+
+def inventory(root, *, projected=False):
+    records = {}
+    def visit(relative):
+        path = root / relative
+        item = os.lstat(path)
+        if item.st_uid != 0 or item.st_gid != 0:
+            raise ValueError("validation code owner changed")
+        if stat.S_ISLNK(item.st_mode):
+            link = os.readlink(path)
+            resolved = (path.parent / link).resolve(strict=True)
+            if os.path.isabs(link) or not resolved.is_relative_to(root.resolve()):
+                raise ValueError("validation code link escapes its view")
+            records[relative] = {"kind": "link", "target": link}
+        elif stat.S_ISDIR(item.st_mode):
+            if projected and stat.S_IMODE(item.st_mode) != 0o555:
+                raise ValueError("validation code directory is writable")
+            records[relative] = {"kind": "directory"}
+            for child in sorted(os.listdir(path)):
+                visit(relative + "/" + child)
+        elif stat.S_ISREG(item.st_mode):
+            executable = bool(item.st_mode & 0o111)
+            if projected and (
+                item.st_nlink != 1
+                or stat.S_IMODE(item.st_mode) != (0o555 if executable else 0o444)
+            ):
+                raise ValueError("validation code file is not private-view read-only")
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                before = os.fstat(fd)
+                with os.fdopen(os.dup(fd), "rb") as handle:
+                    digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                after = os.fstat(fd)
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+                ):
+                    raise ValueError("validation code changed while reading")
+            finally:
+                os.close(fd)
+            records[relative] = {
+                "kind": "file", "size": item.st_size,
+                "sha256": digest, "executable": executable,
+            }
+        else:
+            raise ValueError("validation code contains a special file")
+    for relative in roots:
+        visit(relative)
+    return records
+
+for name in roots:
+    for relative in (pathlib.PurePosixPath(name).parent, *pathlib.PurePosixPath(name).parents):
+        directory = source / str(relative)
+        item = os.lstat(directory)
+        if (not stat.S_ISDIR(item.st_mode) or stat.S_ISLNK(item.st_mode)
+            or item.st_uid != 0 or item.st_gid != 0):
+            raise SystemExit("validation code ancestry is unsafe")
+expected = inventory(source)
+payload = json.dumps({"schema": "bridgesllm.restore-code-view.v1", "members": expected}, sort_keys=True).encode()
+# A link into an omitted environment/data member must not become public.
+for relative, record in expected.items():
+    if record["kind"] == "link":
+        resolved = (source / relative).resolve(strict=True).relative_to(source.resolve()).as_posix()
+        if resolved not in expected:
+            raise SystemExit("validation code link targets an excluded member")
+
+if not os.path.lexists(target):
+    target.mkdir(mode=0o700)
+    for relative in roots:
+        src, dst = source / relative, target / relative
+        dst.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        if src.is_dir() and not src.is_symlink():
+            shutil.copytree(src, dst, symlinks=True, copy_function=shutil.copyfile)
+        elif src.is_symlink():
+            os.symlink(os.readlink(src), dst)
+        else:
+            shutil.copyfile(src, dst, follow_symlinks=False)
+    # copyfile intentionally does not copy ACLs/xattrs from the authority tree.
+    for relative, record in expected.items():
+        if record["kind"] == "file":
+            os.chmod(target / relative, 0o555 if record["executable"] else 0o444)
+    for directory, dirs, files in os.walk(target, followlinks=False):
+        os.chmod(directory, 0o555)
+    if inventory(source) != expected or inventory(target, projected=True) != expected:
+        raise SystemExit("validation code copy differs from the sealed source")
+    fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(os.dup(fd), "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+else:
+    item = os.lstat(receipt)
+    if (
+        not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode)
+        or item.st_uid != 0 or item.st_gid != 0 or item.st_nlink != 1
+        or stat.S_IMODE(item.st_mode) != 0o600
+    ):
+        raise SystemExit("validation code receipt is unsafe")
+    if item.st_size != len(payload) or receipt.read_bytes() != payload:
+        raise SystemExit("validation code source changed")
+
+# Inventory all projected paths, including otherwise-unvisited parents, so
+# an extra file cannot smuggle state or configuration into the sandbox.
+item = os.lstat(target)
+if (not stat.S_ISDIR(item.st_mode) or stat.S_ISLNK(item.st_mode)
+    or item.st_uid != 0 or item.st_gid != 0 or stat.S_IMODE(item.st_mode) != 0o555):
+    raise SystemExit("validation code root is unsafe")
+allowed = set(expected)
+for name in tuple(allowed):
+    allowed.update(str(p) for p in pathlib.PurePosixPath(name).parents if str(p) != ".")
+observed = set()
+for directory, dirs, files in os.walk(target, followlinks=False):
+    item = os.lstat(directory)
+    if (not stat.S_ISDIR(item.st_mode) or stat.S_ISLNK(item.st_mode)
+        or item.st_uid != 0 or item.st_gid != 0 or stat.S_IMODE(item.st_mode) != 0o555):
+        raise SystemExit("validation code view ancestry changed")
+    for name in dirs + files:
+        observed.add((pathlib.Path(directory) / name).relative_to(target).as_posix())
+if observed != allowed or inventory(target, projected=True) != expected:
+    raise SystemExit("validation code view changed")
+print(target)
+PY
+}
+
 run_migrations() {
   local unit="bridgesllm-restore-migration-${TRANSACTION_ID}"
   local runner_pid="" migration_status=0 validation_environment=""
-  local staged_portal=""
+  local staged_portal="" validation_code="" code_mount="/run/bridgesllm-restore-code-${TRANSACTION_ID}"
   local -a database_paths=()
   local -a sandbox_properties=(
     --property=NoNewPrivileges=yes
@@ -9735,9 +10259,12 @@ run_migrations() {
     --property=InaccessiblePaths=-/var/run/docker.sock
     --property=DynamicUser=yes
     --property=PrivateNetwork=yes
+    "--property=JoinsNamespaceOf=bridgesllm-restore-postgres-${TRANSACTION_ID}.service"
   )
   staged_portal="$(component_source_root portal-install "${PORTAL_DIR}")" \
     || die "Staged Portal root is unavailable before validation migrations"
+  validation_code="$(prepare_restore_validation_code "${staged_portal}")" \
+    || die "Private read-only validation code could not be prepared"
   capture_restore_prevalidation_inaccessible_paths database_paths \
     || die "Migration PostgreSQL storage boundary is unavailable"
   (( ${#database_paths[@]} > 0 )) \
@@ -9765,7 +10292,7 @@ run_migrations() {
   "${RESTORE_SYSTEMD_RUN_BIN}" \
     --unit="${unit}" \
     --description="BridgesLLM offline restore migrations ${TRANSACTION_ID}" \
-    --working-directory="${PORTAL_DIR}/backend" \
+    --working-directory="${code_mount}/backend" \
     --wait --collect --quiet \
     --property=Type=exec \
     --property=Restart=no \
@@ -9773,10 +10300,10 @@ run_migrations() {
     --property=RuntimeMaxSec=1800 \
     --property=TimeoutStopSec=30 \
     --property="EnvironmentFile=${validation_environment}" \
-    --property="BindReadOnlyPaths=${staged_portal}:${PORTAL_DIR}" \
+    --property="BindReadOnlyPaths=${validation_code}:${code_mount}" \
     "${sandbox_properties[@]}" \
     /usr/bin/env \
-      "PGAPPNAME=${unit}" HOME=/tmp \
+      HOME=/tmp \
       npm_config_cache=/tmp/bridgesllm-npm-cache \
       npm_config_offline=true npm_config_yes=false \
       CHECKPOINT_DISABLE=1 DO_NOT_TRACK=1 \
@@ -10005,7 +10532,7 @@ candidate_private_health() {
 
 verify_candidate() {
   local unit="bridgesllm-restore-candidate-${TRANSACTION_ID}"
-  local validation_environment="" staged_portal=""
+  local validation_environment="" staged_portal="" validation_code="" code_mount="/run/bridgesllm-restore-code-${TRANSACTION_ID}"
   local -a database_paths=()
   local -a sandbox_properties=(
     --property=NoNewPrivileges=yes
@@ -10024,11 +10551,14 @@ verify_candidate() {
     --property=InaccessiblePaths=-/var/run/docker.sock
     --property=DynamicUser=yes
     --property=PrivateNetwork=yes
+    "--property=JoinsNamespaceOf=bridgesllm-restore-postgres-${TRANSACTION_ID}.service"
   )
   assert_validation_port_unused \
     || die "Restore validation port is already owned by another process"
   staged_portal="$(component_source_root portal-install "${PORTAL_DIR}")" \
     || die "Staged Portal root is unavailable before candidate validation"
+  validation_code="$(prepare_restore_validation_code "${staged_portal}")" \
+    || die "Private read-only validation code could not be prepared"
   capture_restore_prevalidation_inaccessible_paths database_paths \
     || die "Candidate PostgreSQL storage boundary is unavailable"
   (( ${#database_paths[@]} > 0 )) \
@@ -10052,16 +10582,16 @@ verify_candidate() {
   "${RESTORE_SYSTEMD_RUN_BIN}" \
     --unit="${unit}" \
     --description="BridgesLLM offline restore candidate ${TRANSACTION_ID}" \
-    --working-directory="${PORTAL_DIR}/backend" \
+    --working-directory="${code_mount}/backend" \
     --property=Type=exec \
     --property=Restart=no \
     --property=KillMode=control-group \
     --property=RuntimeMaxSec=600 \
     --property=TimeoutStopSec=30 \
     --property="EnvironmentFile=${validation_environment}" \
-    --property="BindReadOnlyPaths=${staged_portal}:${PORTAL_DIR}" \
+    --property="BindReadOnlyPaths=${validation_code}:${code_mount}" \
     "${sandbox_properties[@]}" \
-    /usr/bin/env "PGAPPNAME=${unit}" HOME=/tmp \
+    /usr/bin/env HOME=/tmp \
       HOST=127.0.0.1 PORT="${RESTORE_PORT}" PORTAL_UPDATE_VALIDATION_MODE=1 \
       /usr/bin/node dist/server.js >/dev/null \
     || {
@@ -10309,6 +10839,11 @@ safe_remove_created_ancestor() {
 
 rollback_transaction() {
   log "Rolling the interrupted restore back to its pre-restore snapshot"
+  local phase
+  phase="$(journal_field phase)" || return 1
+  if [[ "${phase}" != "rollback_pending" ]]; then
+    advance_phase "${phase}" rollback_pending || return 1
+  fi
   quiesce_recovery_mutators || return 1
   settle_restore_database_exclusion || return 1
   assert_restore_database_exclusion || return 1
@@ -10347,9 +10882,11 @@ rollback_transaction() {
       esac
     done < "${TRANSACTION_DIR}/rollback/roots.tsv"
   fi
-  local phase
+  assert_portal_environment_authority rollback || return 1
+  restore_test_kill_after_rollback_files
   phase="$(journal_field phase)" || return 1
-  advance_phase "${phase}" rollback_complete || return 1
+  [[ "${phase}" == "rollback_pending" ]] || return 1
+  advance_phase rollback_pending rollback_complete || return 1
   advance_phase rollback_complete rollback_exclusion_release_pending || return 1
   release_restore_database_exclusion || return 1
   advance_phase rollback_exclusion_release_pending \
@@ -10519,6 +11056,43 @@ for record, project in records:
 PY
 }
 
+reattach_restored_project_roots() {
+  # Extraction recreates directory inodes. Reattach only ACTIVE identities
+  # beneath the admitted projects root, with both runtimes stopped.
+  local phase rows sql
+  phase="$(journal_field phase)" || return 1
+  case "$phase" in
+    files_restored|rollback_pending|rollback_complete|rollback_exclusion_released|committed_exclusion_released) ;;
+    *) return 0 ;;
+  esac
+  [[ "$("$RESTORE_SYSTEMCTL_BIN" show bridgesllm-product.service -p MainPID --value)" == 0 \
+    && "$("$RESTORE_SYSTEMCTL_BIN" show openclaw-gateway.service -p MainPID --value)" == 0 ]] || return 1
+  rows="$(run_restore_peer_psql target -Atc \
+    'SELECT COALESCE(json_agg(row_to_json(p)), '\''[]'\''::json) FROM (SELECT id, "canonicalRoot", "rootDevice", "rootInode", "rootBirthtimeNs", generation FROM public."ProjectIdentity" WHERE "lifecycleStatus" = '\''ACTIVE'\'') p')" || return 1
+  sql="$(node - "$ADMISSION_FILE" 4<<<"$rows" <<'JS'
+const fs = require('fs'), path = require('path');
+const admission = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const component = admission.components.find(c => c.id === 'projects' && c.kind === 'directory');
+if (!component || fs.realpathSync(component.target) !== component.target) throw Error('No admitted project root');
+const rows = JSON.parse(fs.readFileSync(4, 'utf8'));
+const quote = s => "'" + String(s).replace(/'/g, "''") + "'";
+const statements = [];
+for (const row of rows) {
+  const root = row.canonicalRoot;
+  const rel = path.relative(component.target, root);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || fs.realpathSync(root) !== root) throw Error('Project outside restored root');
+  const st = fs.lstatSync(root, {bigint:true});
+  if (!st.isDirectory() || st.isSymbolicLink()) throw Error('Restored project is not a directory');
+  const values = [st.dev.toString(), st.ino.toString(), st.birthtimeNs.toString()];
+  if (values[0] === row.rootDevice && values[1] === row.rootInode && values[2] === row.rootBirthtimeNs) continue;
+  statements.push('UPDATE public."ProjectIdentity" SET "rootDevice"='+quote(values[0])+', "rootInode"='+quote(values[1])+', "rootBirthtimeNs"='+quote(values[2])+', generation=generation+1 WHERE id='+quote(row.id)+' AND "canonicalRoot"='+quote(root)+' AND generation='+Number(row.generation)+';');
+}
+process.stdout.write(statements.join('\n') || 'SELECT 1;');
+JS
+)" || return 1
+  printf '%s\n' "$sql" | run_restore_peer_psql target --single-transaction >/dev/null
+}
+
 finish_recovered_service_state() {
   local phase
   phase="$(journal_field phase)" || return 1
@@ -10527,6 +11101,7 @@ finish_recovered_service_state() {
     assert_host_restore_target_mounts_clear || return 1
   fi
   release_restore_database_exclusion || return 1
+  reattach_restored_project_roots || return 1
   remove_boot_fences || return 1
   restore_service_state || return 1
   verify_restored_service_health || return 1
@@ -10538,6 +11113,7 @@ finish_committed_transaction() {
   quiesce_recovery_mutators || return 1
   local phase
   phase="$(journal_field phase)" || return 1
+  assert_portal_environment_authority commit || return 1
   if [[ "${phase}" == "committed" ]]; then
     settle_restore_database_exclusion || return 1
     assert_restore_database_exclusion || return 1
@@ -10589,7 +11165,7 @@ recover_transaction() {
     files_restore_pending|files_restored|openclaw_restore_pending|\
     openclaw_restored|stalwart_restore_pending|stalwart_restored|\
     migration_pending|migrated|verification_pending|verified|\
-    rollback_complete|rollback_exclusion_release_pending|\
+    rollback_pending|rollback_complete|rollback_exclusion_release_pending|\
     rollback_exclusion_released|committed|\
     committed_exclusion_release_pending|committed_exclusion_released)
       assert_sealed_recovery_authority || return 1
@@ -10602,10 +11178,37 @@ recover_transaction() {
     files_restore_pending|files_restored|openclaw_restore_pending|\
     openclaw_restored|stalwart_restore_pending|stalwart_restored|\
     migration_pending|migrated|verification_pending|verified|\
-    rollback_complete|rollback_exclusion_release_pending|\
+    rollback_pending|rollback_complete|rollback_exclusion_release_pending|\
     rollback_exclusion_released|committed|\
     committed_exclusion_release_pending|committed_exclusion_released)
       assert_host_restore_target_mounts_clear || return 1
+      ;;
+  esac
+  case "${phase}" in
+    prepared|fenced|quiesced|database_exclusion_pending|database_excluded|\
+    staging_pending|staged|rollback_snapshot_pending|\
+    rollback_snapshot_complete|database_restore_pending|database_restored)
+      assert_portal_environment_authority pre-files || return 1
+      ;;
+    files_restore_pending)
+      # Promotion may have removed the old file but not yet installed the
+      # merged one. This phase is rollback-only and deliberately indeterminate.
+      ;;
+    rollback_pending)
+      # Rollback is replayable from its sealed snapshots. The live environment
+      # may be either pre-restore, merged, or between atomic replacements.
+      ;;
+    files_restored|openclaw_restore_pending|openclaw_restored|\
+    stalwart_restore_pending|stalwart_restored|migration_pending|migrated|\
+    verification_pending|verified)
+      assert_portal_environment_authority files-restored || return 1
+      ;;
+    rollback_complete|rollback_exclusion_release_pending|\
+    rollback_exclusion_released)
+      assert_portal_environment_authority rollback || return 1
+      ;;
+    committed|committed_exclusion_release_pending|committed_exclusion_released)
+      assert_portal_environment_authority commit || return 1
       ;;
   esac
   case "${phase}" in
@@ -10622,7 +11225,7 @@ recover_transaction() {
     rollback_snapshot_complete|database_restore_pending|database_restored|\
     files_restore_pending|files_restored|openclaw_restore_pending|openclaw_restored|\
     stalwart_restore_pending|stalwart_restored|migration_pending|migrated|\
-    verification_pending|verified)
+    verification_pending|verified|rollback_pending)
       rollback_transaction
       ;;
     rollback_complete|rollback_exclusion_release_pending)
@@ -10711,6 +11314,8 @@ start_transaction() {
     || die "Restore runtime paths do not match the admitted Portal targets"
   assert_disk_admission || die "Restore disk admission failed before downtime"
   extract_archive
+  merge_staged_portal_environment \
+    || die "Portal environment could not preserve current OpenClaw authority"
   select_validation_postgresql_server_toolchain \
     || die "A matching trusted PostgreSQL validation server runtime is unavailable"
   capture_restore_validation_database_authority \
@@ -10763,9 +11368,12 @@ start_transaction() {
   advance_phase database_restore_pending database_restored
 
   advance_phase database_restored files_restore_pending
+  assert_portal_environment_authority pre-files \
+    || die "Portal environment digest authority changed before file restore"
   restore_component_set files
   restore_environment_file
   advance_phase files_restore_pending files_restored
+  reattach_restored_project_roots || die "Restored project identity reattachment failed"
 
   advance_phase files_restored openclaw_restore_pending
   restore_component_set openclaw
@@ -10785,6 +11393,8 @@ start_transaction() {
 
   assert_restore_database_exclusion \
     || die "PostgreSQL exclusivity changed before restore commit"
+  assert_portal_environment_authority commit \
+    || die "Restored Portal environment changed before restore commit"
   advance_phase verified committed
   finish_committed_transaction \
     || die "Restore committed but canonical service state did not finish; rerun --recover"

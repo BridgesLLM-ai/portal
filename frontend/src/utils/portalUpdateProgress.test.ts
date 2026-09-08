@@ -116,7 +116,7 @@ describe('Portal self-update progress contract', () => {
         phase: 'complete',
         percent: 100,
         label: 'Update complete',
-        detail: 'Portal v4.0.14 finished the signed update and postflight checks.',
+        detail: 'Portal v4.0.14 finished the signed update and exact-version Portal verification.',
         updatedAt: '2026-08-10T06:01:00Z',
         finishedAt: '2026-08-10T06:01:00Z',
       }));

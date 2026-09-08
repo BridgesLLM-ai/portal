@@ -1,16 +1,19 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import {
   SharePasswordAttemptLimiter,
   __shareAccessSecurityTest,
   isValidShareToken,
   issueShareGrant,
   parseShareLinkOptions,
+  parseShareLinkPolicyPatch,
   shareCredentialStateIsValid,
   shareLinkAvailability,
   shareGrantCookieName,
   shareGrantTtlMs,
   sharePasswordBinding,
+  shareVisitorIdentityHash,
   validateSharePassword,
   verifyShareGrant,
 } from '../utils/shareAccessSecurity';
@@ -25,23 +28,27 @@ describe('share access security', () => {
       maxUses: '3',
       rateLimitMaxRequests: '25',
       rateLimitWindowSeconds: '300',
+      maxConcurrentVisitors: '10',
     }, now)).toEqual({
       expiresAt: new Date(now + 60_000),
       maxUses: 3,
       rateLimitMaxRequests: 25,
       rateLimitWindowSeconds: 300,
+      maxConcurrentVisitors: 10,
     });
     expect(parseShareLinkOptions({}, now)).toEqual({
       expiresAt: null,
       maxUses: null,
       rateLimitMaxRequests: null,
       rateLimitWindowSeconds: null,
+      maxConcurrentVisitors: null,
     });
     expect(parseShareLinkOptions({ rateLimitMaxRequests: 10 }, now)).toEqual({
       expiresAt: null,
       maxUses: null,
       rateLimitMaxRequests: 10,
       rateLimitWindowSeconds: 60,
+      maxConcurrentVisitors: null,
     });
     expect(() => parseShareLinkOptions({ expiresAt: new Date(now - 1).toISOString() }, now)).toThrow('future date');
     expect(() => parseShareLinkOptions({ maxUses: 0 }, now)).toThrow('Max uses');
@@ -52,6 +59,45 @@ describe('share access security', () => {
     expect(() => parseShareLinkOptions({ rateLimitWindowSeconds: 60 }, now)).toThrow('request count is required');
     expect(() => parseShareLinkOptions({ rateLimitMaxRequests: 10, rateLimitWindowSeconds: 30 }, now)).toThrow('60, 300, or 3600');
     expect(() => parseShareLinkOptions({ rateLimitMaxRequests: 10, rateLimitWindowSeconds: 60.5 }, now)).toThrow('60, 300, or 3600');
+    expect(() => parseShareLinkOptions({ maxConcurrentVisitors: 0 }, now)).toThrow('Concurrent visitors');
+    expect(() => parseShareLinkOptions({ maxConcurrentVisitors: 10_001 }, now)).toThrow('Concurrent visitors');
+  });
+
+  test('edits only supplied policy fields and resets a changed durable rate window', () => {
+    const now = 1_700_000_000_000;
+    const current = {
+      expiresAt: null,
+      maxUses: 20,
+      rateLimitMaxRequests: 30,
+      rateLimitWindowSeconds: 60,
+      maxConcurrentVisitors: 3,
+    };
+    expect(parseShareLinkPolicyPatch({
+      maxUses: 10,
+      maxConcurrentVisitors: null,
+      rateLimitWindowSeconds: 300,
+    }, current, now)).toEqual({
+      maxUses: 10,
+      maxConcurrentVisitors: null,
+      rateLimitMaxRequests: 30,
+      rateLimitWindowSeconds: 300,
+      rateLimitRequestCount: 0,
+      rateLimitWindowStartedAt: null,
+    });
+    expect(parseShareLinkPolicyPatch({ rateLimitMaxRequests: null }, current, now)).toEqual({
+      rateLimitMaxRequests: null,
+      rateLimitWindowSeconds: null,
+      rateLimitRequestCount: 0,
+      rateLimitWindowStartedAt: null,
+    });
+    expect(parseShareLinkPolicyPatch({ expiresAt: null }, current, now)).toEqual({ expiresAt: null });
+    expect(() => parseShareLinkPolicyPatch({
+      rateLimitMaxRequests: null,
+      rateLimitWindowSeconds: 60,
+    }, current, now)).toThrow('request count is required');
+    expect(() => parseShareLinkPolicyPatch({
+      maxConcurrentVisitors: 10_001,
+    }, current, now)).toThrow('Concurrent visitors');
   });
 
   test('reports disabled, expired, and exhausted links as unavailable', () => {
@@ -97,6 +143,38 @@ describe('share access security', () => {
     );
   });
 
+  test('share-serving diagnostics never interpolate the bearer capability', () => {
+    const routeSource = fs.readFileSync(path.resolve(__dirname, '../routes/apps.ts'), 'utf8');
+    expect(routeSource).not.toMatch(/Serving HTML with <base> tag:[^\n]*token:/);
+    expect(routeSource).toContain('The share token is a bearer capability. Never write it to logs.');
+  });
+
+  test('both management surfaces persist editable limits and Project shares stay bounded', () => {
+    const appsRoute = fs.readFileSync(path.resolve(__dirname, '../routes/apps.ts'), 'utf8');
+    const projectsRoute = fs.readFileSync(path.resolve(__dirname, '../routes/projects.ts'), 'utf8');
+    expect(appsRoute).toContain('maxConcurrentVisitors: options.maxConcurrentVisitors');
+    expect(appsRoute).toContain('parseShareLinkPolicyPatch(body');
+    expect(appsRoute).toContain("action: hasPolicyUpdate\n          ? 'APP_SHARE_POLICY_UPDATE'");
+    expect(projectsRoute).toContain('maxConcurrentVisitors: shareOptions.maxConcurrentVisitors');
+    expect(projectsRoute).toContain('parseShareLinkPolicyPatch(body');
+    expect(projectsRoute).toContain('if (!hasPolicyUpdate && !hasAccessUpdate)');
+    expect(projectsRoute).toContain("typeof isPublic !== 'boolean'");
+    expect(projectsRoute).toContain('existingShareCount >= MAX_SHARE_LINKS_PER_APP');
+    expect(projectsRoute).toContain('parseShareLinkPagination(req.query)');
+    expect(projectsRoute).toContain('take: paginationRequest.limit + 1');
+    expect(projectsRoute).toContain('pagination: page.pagination');
+  });
+
+  test('every post-auth share content route uses durable concurrent admission', () => {
+    const appsRoute = fs.readFileSync(path.resolve(__dirname, '../routes/apps.ts'), 'utf8');
+    expect(appsRoute.match(/admitShareRequest\(req, res, (?:link|shareLink), \{ rateLimit: true \}\)/g))
+      .toHaveLength(3);
+    expect(appsRoute.match(/admitShareRequest\(req, res, (?:link|shareLink), \{ rateLimit: false \}\)/g))
+      .toHaveLength(3);
+    expect(appsRoute).toContain("code: 'SHARE_CONCURRENT_LIMITED'");
+    expect(appsRoute).toContain("code: 'SHARE_CONCURRENT_UNAVAILABLE'");
+  });
+
   test('rejects malformed tokens and bcrypt-truncating passwords', () => {
     expect(isValidShareToken(token)).toBe(true);
     expect(isValidShareToken('../short')).toBe(false);
@@ -118,6 +196,15 @@ describe('share access security', () => {
     expect(verifyShareGrant(grant, { kind: 'visit', token, linkId: 'link-2' }, 'secret', now)).toBe(false);
     expect(verifyShareGrant(grant, { kind: 'visit', token, linkId: 'link-1' }, 'secret', now + 60_001)).toBe(false);
     expect(shareGrantCookieName('visit', token)).toMatch(/^share_visit_[a-f0-9]{24}$/);
+    const visitorIdentity = shareVisitorIdentityHash(grant, { token, linkId: 'link-1' }, 'secret', now);
+    expect(visitorIdentity).toMatch(/^[0-9a-f]{64}$/);
+    expect(shareVisitorIdentityHash(grant, { token, linkId: 'link-1' }, 'secret', now)).toBe(visitorIdentity);
+    const secondGrant = issueShareGrant({
+      kind: 'visit', token, linkId: 'link-1', expiresAt: now + 60_000,
+    }, 'secret', now);
+    expect(secondGrant).not.toBe(grant);
+    expect(shareVisitorIdentityHash(secondGrant, { token, linkId: 'link-1' }, 'secret', now))
+      .not.toBe(visitorIdentity);
 
     const passwordGrant = issueShareGrant({
       kind: 'password',
@@ -132,6 +219,33 @@ describe('share access security', () => {
     expect(verifyShareGrant(passwordGrant, {
       kind: 'password', token, linkId: 'link-1', binding: sharePasswordBinding('bcrypt-hash-v2'),
     }, 'secret', now)).toBe(false);
+
+    // Existing v1 visitor cookies remain valid after the v2 visitor-id upgrade.
+    const legacyPayload = Buffer.from(JSON.stringify({
+      v: 1,
+      kind: 'visit',
+      token,
+      linkId: 'link-1',
+      expiresAt: now + 60_000,
+    })).toString('base64url');
+    const legacySignature = crypto.createHmac('sha256', 'secret').update(legacyPayload).digest('base64url');
+    const legacyGrant = `${legacyPayload}.${legacySignature}`;
+    expect(verifyShareGrant(legacyGrant, { kind: 'visit', token, linkId: 'link-1' }, 'secret', now)).toBe(true);
+    expect(shareVisitorIdentityHash(legacyGrant, { token, linkId: 'link-1' }, 'secret', now))
+      .toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('concurrent lease migration stores only bounded digests and cascades link cleanup', () => {
+    const migrationPath = path.resolve(
+      __dirname,
+      '../../prisma/migrations/20260820_share_concurrent_request_leases/migration.sql',
+    );
+    const migration = fs.readFileSync(migrationPath, 'utf8');
+    expect(migration).toContain('"maxConcurrentVisitors" BETWEEN 1 AND 10000');
+    expect(migration).toContain('"leaseExpiresAt" <= "createdAt" + INTERVAL \'6 minutes\'');
+    expect(migration).toContain('ON DELETE CASCADE');
+    expect(migration).toContain("CHECK (\"visitorIdHash\" ~ '^[0-9a-f]{64}$')");
+    expect(migration).not.toMatch(/cookie|passwordHash|apiTarget|secret/i);
   });
 
   test('keeps visitor slots for 30 days while password grants expire after one hour', () => {

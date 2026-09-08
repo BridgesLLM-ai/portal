@@ -13,6 +13,7 @@ export interface ShareLinkPolicyOptions {
   maxUses?: number;
   rateLimitMaxRequests?: number;
   rateLimitWindowSeconds?: ShareRateLimitWindowSeconds;
+  maxConcurrentVisitors?: number;
 }
 
 export interface ProjectShareCreateOptions extends ShareLinkPolicyOptions {
@@ -29,6 +30,7 @@ export interface ProjectShareLink {
   maxUses: number | null;
   rateLimitMaxRequests: number | null;
   rateLimitWindowSeconds: ShareRateLimitWindowSeconds | null;
+  maxConcurrentVisitors: number | null;
   expiresAt: string | null;
   createdAt: string;
 }
@@ -39,15 +41,34 @@ export interface ProjectShareCreateResponse {
   hostedUrl: string;
 }
 
+export interface ShareLinkPagination {
+  hasMore: boolean;
+  nextCursor: string | null;
+  limit: number;
+}
+
+export interface ShareLinkPageRequest {
+  cursor?: string;
+  limit?: number;
+}
+
 export interface ProjectShareListResponse {
   shares: ProjectShareLink[];
+  pagination: ShareLinkPagination;
 }
 
 export interface ProjectShareUpdateOptions {
   isPublic?: boolean;
   password?: string;
   isActive?: boolean;
+  expiresAt?: string | null;
+  maxUses?: number | null;
+  rateLimitMaxRequests?: number | null;
+  rateLimitWindowSeconds?: ShareRateLimitWindowSeconds | null;
+  maxConcurrentVisitors?: number | null;
 }
+
+export type AppShareUpdateOptions = ProjectShareUpdateOptions;
 
 export type ProjectChatProviderName =
   | 'OPENCLAW'
@@ -152,6 +173,8 @@ export interface ProjectChatProviderCapabilitiesResponse {
 }
 
 export interface ProjectChatPersistedMessage {
+  /** Present on raw runtime history; never inferred from content. */
+  provenance?: string | { kind: string };
   id?: string;
   role: string;
   content: string;
@@ -182,6 +205,11 @@ export interface ProjectChatPersistedMessage {
     order?: number;
   }>;
   presentationTruncated?: boolean;
+  /** A pre-constraint oversized database row was returned as an explicit,
+   * bounded placeholder. The original content was never hydrated. */
+  contentTruncated?: boolean;
+  truncationReason?: 'row_logical_byte_limit';
+  originalLogicalBytes?: number;
 }
 
 export interface ProjectChatHistoryPage {
@@ -190,6 +218,12 @@ export interface ProjectChatHistoryPage {
     hasMore: boolean;
     nextCursor: string | null;
     limit: number;
+    /** Newer backends filter legacy maintenance turns before selecting a page. */
+    maintenanceBoundaryVerified?: boolean;
+    responseLogicalBytes?: number;
+    responseLogicalByteLimit?: number;
+    byteLimited?: boolean;
+    rowTruncationCount?: number;
   };
   session: {
     status: string;
@@ -299,12 +333,13 @@ export const appsAPI = {
     const { data } = await client.post(`/apps/${id}/share`, options || {});
     return data;
   },
-  getShareLinks: async (id: string) => {
-    const { data } = await client.get(`/apps/${id}/share`);
+  getShareLinks: async (id: string, page: ShareLinkPageRequest = {}) => {
+    const { data } = await client.get(`/apps/${id}/share`, { params: page });
     return data;
   },
-  updateShareLink: async (id: string, linkId: string, isActive: boolean) => {
-    const { data } = await client.patch(`/apps/${id}/share/${encodeURIComponent(linkId)}`, { isActive });
+  updateShareLink: async (id: string, linkId: string, updates: AppShareUpdateOptions | boolean) => {
+    const payload = typeof updates === 'boolean' ? { isActive: updates } : updates;
+    const { data } = await client.patch(`/apps/${id}/share/${encodeURIComponent(linkId)}`, payload);
     return data;
   },
   deleteShareLink: async (id: string, linkId: string) => {
@@ -706,6 +741,7 @@ export interface ProjectTreeEntry {
   type: 'file' | 'directory';
   path: string;
   size?: number;
+  modifiedAt?: string;
   gitStatus?: string;
 }
 
@@ -1328,6 +1364,7 @@ function validateProjectTreeEntry(value: unknown): ProjectTreeEntry {
       || !Number.isSafeInteger(record.size)
       || record.size < 0
     ))
+    || (record.modifiedAt !== undefined && (typeof record.modifiedAt !== 'string' || !Number.isFinite(Date.parse(record.modifiedAt))))
     || (record.gitStatus !== undefined && typeof record.gitStatus !== 'string')
   ) {
     throw new Error('Project tree entry is malformed');
@@ -1337,6 +1374,7 @@ function validateProjectTreeEntry(value: unknown): ProjectTreeEntry {
     type: record.type,
     path: record.path,
     ...(record.size === undefined ? {} : { size: record.size }),
+    ...(record.modifiedAt === undefined ? {} : { modifiedAt: record.modifiedAt as string }),
     ...(record.gitStatus === undefined ? {} : { gitStatus: record.gitStatus }),
   };
 }
@@ -1435,6 +1473,11 @@ export function validateProjectChatHistoryPage(value: unknown): ProjectChatHisto
     || !Number.isSafeInteger(pagination.limit)
     || Number(pagination.limit) < 1
     || Number(pagination.limit) > 100
+    || (pagination.maintenanceBoundaryVerified !== undefined && typeof pagination.maintenanceBoundaryVerified !== 'boolean')
+    || (pagination.responseLogicalBytes !== undefined && (!Number.isSafeInteger(pagination.responseLogicalBytes) || Number(pagination.responseLogicalBytes) < 0))
+    || (pagination.responseLogicalByteLimit !== undefined && (!Number.isSafeInteger(pagination.responseLogicalByteLimit) || Number(pagination.responseLogicalByteLimit) < 1))
+    || (pagination.byteLimited !== undefined && typeof pagination.byteLimited !== 'boolean')
+    || (pagination.rowTruncationCount !== undefined && (!Number.isSafeInteger(pagination.rowTruncationCount) || Number(pagination.rowTruncationCount) < 0))
     || (pagination.hasMore === true && !(typeof pagination.nextCursor === 'string' && pagination.nextCursor))
     || typeof session.status !== 'string'
     || !isProjectChatProviderName(session.activeProvider)
@@ -1636,8 +1679,8 @@ export const projectsAPI = {
     const { data } = await client.post(`/projects/${projectSegment(name)}/share`, options);
     return data;
   },
-  listShares: async (name: string): Promise<ProjectShareListResponse> => {
-    const { data } = await client.get(`/projects/${projectSegment(name)}/shares`);
+  listShares: async (name: string, page: ShareLinkPageRequest = {}): Promise<ProjectShareListResponse> => {
+    const { data } = await client.get(`/projects/${projectSegment(name)}/shares`, { params: page });
     return data;
   },
   updateShare: async (name: string, linkId: string, updates: ProjectShareUpdateOptions) => {
@@ -1961,6 +2004,7 @@ export const usageAPI = {
 
 export interface CompatibilityHotfixStatus {
   ok?: boolean;
+  contractKind?: 'legacy-hotfix' | 'openclaw-2026.9.1-native';
   applied: boolean;
   supported: boolean;
   scriptExists: boolean;
@@ -2008,6 +2052,27 @@ export interface GatewayPendingQuestion {
   }>;
 }
 
+export interface AgentChatDiagnosticEvent {
+  schema: 'bridgesllm.agent-chat-diagnostic.v1';
+  id: string;
+  timestamp: string;
+  severity: 'info' | 'warning' | 'error';
+  category: 'maintenance' | 'lifecycle' | 'runtime';
+  title: string;
+  detail: string;
+  sourceType: string;
+  presentation: 'rail' | 'banner' | 'internal';
+  runId?: string;
+}
+
+export interface AgentChatDiagnosticEventsResponse {
+  provider: string;
+  sessionId: string;
+  events: AgentChatDiagnosticEvent[];
+  truncated: boolean;
+  generatedAt: string;
+}
+
 export const gatewayAPI = {
   status: async () => {
     const { data } = await client.get('/gateway/status');
@@ -2039,7 +2104,7 @@ export const gatewayAPI = {
     } as any);
     return data;
   },
-  answerQuestion: async (id: string, answers: Record<string, string>) => {
+  answerQuestion: async (id: string, answers: Record<string, string | string[]>) => {
     const { data } = await client.post(
       '/gateway/ask-user/answer',
       { id, answers },
@@ -2057,6 +2122,18 @@ export const gatewayAPI = {
   },
   history: async (session = 'agent:main:main', afterId?: string) => {
     const { data } = await client.get('/gateway/history', { params: { session, after: afterId } });
+    return data;
+  },
+  sessionEvents: async (
+    session = 'agent:main:main',
+    provider = 'OPENCLAW',
+    options: { limit?: number; signal?: AbortSignal } = {},
+  ): Promise<AgentChatDiagnosticEventsResponse> => {
+    const { data } = await client.get('/gateway/session-events', {
+      params: { session, provider, ...(options.limit ? { limit: options.limit } : {}) },
+      signal: options.signal,
+      _silent: true,
+    } as any);
     return data;
   },
   sessionInfo: async (session = 'agent:main:main', options?: { silent?: boolean }) => {

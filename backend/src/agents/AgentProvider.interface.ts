@@ -7,8 +7,38 @@
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
-/** Provider identifiers — kept in sync with the Prisma AgentProviderType enum. */
-export type AgentProviderName = 'OPENCLAW' | 'CLAUDE_CODE' | 'CODEX' | 'GROK' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA';
+/**
+ * Stable runtime/harness identity. A harness is the program that owns an agent
+ * session; it is deliberately not a model-provider account or a model id.
+ */
+export type AgentHarnessId =
+  | 'OPENCLAW'
+  | 'CLAUDE_CODE'
+  | 'CODEX'
+  | 'GROK'
+  | 'AGENT_ZERO'
+  | 'GEMINI'
+  | 'OLLAMA'
+  | 'HERMES'
+  | 'OPENCODE'
+  | 'DEEPSEEK_HARNESS';
+
+/**
+ * Harness ids supported by the legacy `provider` persistence/API surface.
+ * Keep this subset in sync with the Prisma AgentProviderType enum; planned
+ * harnesses do not enter persistence until their concrete adapters ship.
+ */
+export type PersistedAgentProviderName = Exclude<
+  AgentHarnessId,
+  'DEEPSEEK_HARNESS'
+>;
+
+/**
+ * @deprecated Compatibility name for persisted/runtime provider fields.
+ * New harness-aware code should use AgentHarnessId. This alias intentionally
+ * remains the Prisma-compatible subset during the additive 4.1 transition.
+ */
+export type AgentProviderName = PersistedAgentProviderName;
 
 /** Opaque session handle returned by startSession. */
 export type AgentSessionId = string;

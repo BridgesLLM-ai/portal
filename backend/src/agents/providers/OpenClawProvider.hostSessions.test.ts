@@ -24,7 +24,7 @@ jest.mock('./PersistentGatewayWs', () => ({
 const gatewayRpc = require('../../utils/openclawGatewayRpc') as {
   gatewayRpcCall: jest.Mock;
 };
-const { OpenClawProvider } = require('./OpenClawProvider') as typeof import('./OpenClawProvider');
+const { OpenClawProvider, __openClawProviderTest } = require('./OpenClawProvider') as typeof import('./OpenClawProvider');
 
 const OWNER = '11111111-2222-4333-8444-555555555555';
 const OTHER = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -239,6 +239,66 @@ describe('OpenClawProvider session presentation', () => {
     });
 
     expect(session.title).toBe('Release war room');
+    expect(gatewayRpc.gatewayRpcCall).not.toHaveBeenCalledWith(
+      'sessions.patch',
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  test('locally replaces the legacy Portal gateway-client title with the derived title without patching', async () => {
+    const key = 'agent:main:new-1781111111111';
+    const session = await listOne({
+      key,
+      displayName: 'Portal Backend RPC',
+      derivedTitle: '**Recovered investigation**',
+    });
+
+    expect(session.title).toBe('Recovered investigation');
+    expect(gatewayRpc.gatewayRpcCall).not.toHaveBeenCalledWith(
+      'sessions.patch',
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  test('uses a deterministic non-client fallback without patching when a legacy title has no derived title', async () => {
+    const key = 'agent:main:new-1781111111111';
+    const session = await listOne({ key, displayName: 'Portal Backend RPC' });
+    const expected = __openClawProviderTest.legacyPortalSessionDisplayLabel({
+      key,
+      displayName: 'Portal Backend RPC',
+    });
+
+    expect(expected).toMatch(/^Portal chat · [0-9a-f]{6}$/);
+    expect(session.title).toBe(expected);
+    expect(gatewayRpc.gatewayRpcCall).not.toHaveBeenCalledWith(
+      'sessions.patch',
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  test('corrects every returned legacy title locally without issuing write RPCs', async () => {
+    const sessions = Array.from({ length: 12 }, (_, index) => ({
+      key: `agent:main:dashboard:legacy-${index}`,
+      kind: 'direct',
+      displayName: 'Portal Backend RPC',
+    }));
+    gatewayRpc.gatewayRpcCall.mockImplementation(async (method: string) => (
+      method === 'sessions.list'
+        ? { ok: true, data: { sessions } }
+        : { ok: true, data: {} }
+    ));
+
+    const results = await new OpenClawProvider().listSessions(OWNER, {
+      includeHostSessions: true,
+      hostAgentIds: ['main'],
+    });
+
+    expect(results).toHaveLength(12);
+    expect(results.every((session) => /^Portal chat · [0-9a-f]{6}$/.test(session.title || ''))).toBe(true);
+    expect(gatewayRpc.gatewayRpcCall.mock.calls.filter(([method]) => method === 'sessions.patch')).toHaveLength(0);
   });
 
   test('a session with no title of its own reports none, rather than an empty one', async () => {

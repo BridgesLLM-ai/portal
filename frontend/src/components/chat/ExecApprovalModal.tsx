@@ -19,9 +19,18 @@ interface ExecApprovalModalProps {
   queueCount?: number;
   onResolve: (approvalId: string, decision: 'allow-once' | 'deny' | 'allow-always') => void | Promise<void>;
   onDismiss: (approvalId: string) => void;
+  allowDisabled?: boolean;
+  allowDisabledReason?: string;
 }
 
-export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismiss }: ExecApprovalModalProps) {
+export function ExecApprovalModal({
+  approval,
+  queueCount = 1,
+  onResolve,
+  onDismiss,
+  allowDisabled = false,
+  allowDisabledReason,
+}: ExecApprovalModalProps) {
   const [timeLeft, setTimeLeft] = useState<number>(0);
   const [isClosing, setIsClosing] = useState(false);
   const [resolvingDecision, setResolvingDecision] = useState<ExecApprovalDecision | null>(null);
@@ -64,7 +73,7 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
   }, [approval.expiresAtMs, handleDismiss]);
 
   const handleDecision = useCallback((decision: ExecApprovalDecision) => {
-    if (isResolving) return;
+    if (isResolving || (decision !== 'deny' && allowDisabled)) return;
     setResolvingDecision(decision);
     setResolveError(null);
     Promise.resolve(onResolve(approval.id, decision)).catch((err: any) => {
@@ -74,7 +83,7 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
         ? `Couldn't submit decision (${detail}) — retry or deny.`
         : "Couldn't submit decision — retry or deny.");
     });
-  }, [approval.id, onResolve, isResolving]);
+  }, [allowDisabled, approval.id, onResolve, isResolving]);
 
   const handleButtonClick = useCallback((decision: ExecApprovalDecision) => (
     event: React.MouseEvent<HTMLButtonElement>,
@@ -246,6 +255,13 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
                   </div>
                 </div>
               )}
+              {allowDisabled && allowDisabledReason ? (
+                <div className="px-6 pb-2">
+                  <div role="alert" className="rounded-xl border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">
+                    {allowDisabledReason}
+                  </div>
+                </div>
+              ) : null}
 
               {/* Action buttons */}
               <div className="flex flex-col gap-3 border-t border-white/10 px-6 py-4 sm:flex-row sm:items-center">
@@ -266,7 +282,7 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
                 <button
                   type="button"
                   onClick={handleButtonClick('allow-always')}
-                  disabled={isResolving}
+                  disabled={isResolving || allowDisabled}
                   aria-busy={resolvingDecision === 'allow-always'}
                   className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-violet-500/20 hover:bg-violet-500/30 text-violet-400 rounded-xl transition-colors font-medium disabled:opacity-50"
                 >
@@ -278,7 +294,7 @@ export function ExecApprovalModal({ approval, queueCount = 1, onResolve, onDismi
                 <button
                   type="button"
                   onClick={handleButtonClick('allow-once')}
-                  disabled={isResolving}
+                  disabled={isResolving || allowDisabled}
                   aria-busy={resolvingDecision === 'allow-once'}
                   className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 rounded-xl transition-colors font-medium disabled:opacity-50"
                 >

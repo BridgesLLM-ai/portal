@@ -21,7 +21,6 @@ const DEFAULT_MAX_HISTORY_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const READ_CHUNK_BYTES = 256 * 1024;
 const MAX_REQUESTED_EVENTS = 50_000;
 const PERSISTED_TYPES = new Set<RuntimeTurnEventType>([
-  'assistant_status',
   'assistant_reasoning',
   'tool_started',
   'tool_output',
@@ -112,7 +111,6 @@ function sanitizeEvent(event: RuntimeTurnEvent): RuntimeTurnEvent | null {
 // event that is flushed when the thought settles (next non-replace event,
 // turn end, or a history read).
 const pendingReasoningBySession = new Map<string, RuntimeTurnEvent>();
-const pendingStatusBySession = new Map<string, RuntimeTurnEvent>();
 const lastRunBySession = new Map<string, string>();
 
 function rotateHistoryFile(filePath: string): void {
@@ -160,13 +158,6 @@ function flushPendingReasoning(sessionKey: string, dir: string): void {
   appendEventLine(sessionKey, dir, pending);
 }
 
-function flushPendingStatus(sessionKey: string, dir: string): void {
-  const pending = pendingStatusBySession.get(sessionKey);
-  if (!pending) return;
-  pendingStatusBySession.delete(sessionKey);
-  appendEventLine(sessionKey, dir, pending);
-}
-
 export function recordRuntimeTurnEvent(sessionKey: string, event: RuntimeTurnEvent): void {
   if (!sessionKey || process.env.PORTAL_DISABLE_RUNTIME_TURN_EVENT_HISTORY === '1') return;
   const dir = resolveHistoryDir();
@@ -177,7 +168,6 @@ export function recordRuntimeTurnEvent(sessionKey: string, event: RuntimeTurnEve
 
   try {
     if (sanitized.type === 'assistant_reasoning') {
-      flushPendingStatus(sessionKey, dir);
       const pending = pendingReasoningBySession.get(sessionKey);
       const sameReasoningLane = Boolean(sanitized.source?.preambleProgress)
         === Boolean(pending?.source?.preambleProgress);
@@ -195,18 +185,7 @@ export function recordRuntimeTurnEvent(sessionKey: string, event: RuntimeTurnEve
       return;
     }
 
-    if (sanitized.type === 'assistant_status' && sanitized.replace === true) {
-      flushPendingReasoning(sessionKey, dir);
-      const pending = pendingStatusBySession.get(sessionKey);
-      if (pending && (pending.runId || '') !== (sanitized.runId || '')) {
-        flushPendingStatus(sessionKey, dir);
-      }
-      pendingStatusBySession.set(sessionKey, sanitized);
-      return;
-    }
-
     flushPendingReasoning(sessionKey, dir);
-    flushPendingStatus(sessionKey, dir);
     appendEventLine(sessionKey, dir, sanitized);
   } catch (err: any) {
     console.warn('[runtime-turn-event-history] Failed to record turn event:', err?.message || err);
@@ -221,7 +200,6 @@ export function readRuntimeTurnEvents(sessionKey: string, limit = DEFAULT_LIMIT)
   // Mid-turn reads (resume replay, history fetch) must see the live thought.
   try {
     flushPendingReasoning(sessionKey, dir);
-    flushPendingStatus(sessionKey, dir);
   } catch (err: any) {
     console.warn('[runtime-turn-event-history] Failed to flush pending reasoning:', err?.message || err);
   }

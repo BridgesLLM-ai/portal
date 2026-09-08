@@ -9,6 +9,10 @@ const findUniqueMock = jest.fn();
 const updateManyMock = jest.fn();
 const updateMock = jest.fn();
 const getAppTargetMock = jest.fn();
+const claimShareConcurrentUseMock = jest.fn();
+const releaseShareConcurrentUseMock = jest.fn();
+const stopShareConcurrentUseHeartbeatMock = jest.fn();
+const startShareConcurrentUseHeartbeatMock = jest.fn();
 
 jest.mock('../config/database', () => ({
   prisma: {
@@ -23,6 +27,11 @@ jest.mock('../config/database', () => ({
 jest.mock('../config/env', () => ({ config: { jwtSecret: 'test-share-secret' } }));
 jest.mock('../services/app-process.service', () => ({ getAppTarget: getAppTargetMock }));
 jest.mock('../services/virusScan', () => ({ scanFile: jest.fn() }));
+jest.mock('../services/shareConcurrentUse', () => ({
+  claimShareConcurrentUse: claimShareConcurrentUseMock,
+  releaseShareConcurrentUse: releaseShareConcurrentUseMock,
+  startShareConcurrentUseHeartbeat: startShareConcurrentUseHeartbeatMock,
+}));
 
 import { shareRouter } from '../routes/apps';
 
@@ -97,6 +106,7 @@ describe('share app routes', () => {
     rateLimitWindowSeconds: null,
     rateLimitRequestCount: 0,
     rateLimitWindowStartedAt: null,
+    maxConcurrentVisitors: null as number | null,
     app: {
       id: appId,
       userId: 'user-1',
@@ -114,6 +124,12 @@ describe('share app routes', () => {
     findFirstMock.mockResolvedValue(makeLink());
     updateManyMock.mockResolvedValue({ count: 1 });
     getAppTargetMock.mockReturnValue('http://172.30.0.4:5002');
+    claimShareConcurrentUseMock.mockResolvedValue({ status: 'unlimited' });
+    releaseShareConcurrentUseMock.mockResolvedValue({ status: 'released' });
+    startShareConcurrentUseHeartbeatMock.mockReturnValue({
+      stop: stopShareConcurrentUseHeartbeatMock,
+      renewNow: jest.fn(),
+    });
     global.fetch = jest.fn(async () => new Response('ok', {
       status: 200,
       headers: {
@@ -182,6 +198,7 @@ describe('share app routes', () => {
     const second = await request(server, `/${token}/api/attacker-selected/login`, visitCookie);
     expect(second.status).toBe(200);
     expect(updateManyMock).toHaveBeenCalledTimes(1);
+    expect(claimShareConcurrentUseMock).not.toHaveBeenCalled();
   });
 
   test('fails closed when the share row and App owner are inconsistent', async () => {
@@ -435,6 +452,117 @@ describe('share app routes', () => {
       data: { currentUses: { increment: 1 } },
     }));
     expect(findUniqueMock).not.toHaveBeenCalled();
+  });
+
+  test('returns a bounded public 429 without consuming a visitor slot or exposing authority', async () => {
+    const link = makeLink();
+    link.maxUses = 5;
+    link.maxConcurrentVisitors = 1;
+    findFirstMock.mockResolvedValue(link);
+    claimShareConcurrentUseMock.mockResolvedValueOnce({
+      status: 'limited',
+      retryAfterSeconds: 17,
+    });
+
+    const response = await request(server, `/${token}/progress`);
+
+    expect(response.status).toBe(429);
+    expect(response.headers['retry-after']).toBe('17');
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(JSON.parse(response.body)).toEqual({
+      error: 'Share link concurrent visitor limit reached. Try again later.',
+      code: 'SHARE_CONCURRENT_LIMITED',
+      retryAfterSeconds: 17,
+    });
+    expect(response.body).not.toContain(token);
+    expect(response.body).not.toContain('app-bound-secret');
+    expect(response.body).not.toContain('127.0.0.1:5010');
+    expect(updateManyMock).not.toHaveBeenCalled();
+    expect(releaseShareConcurrentUseMock).not.toHaveBeenCalled();
+  });
+
+  test('fails closed when durable concurrent admission cannot be verified', async () => {
+    const link = makeLink();
+    link.maxUses = 5;
+    link.maxConcurrentVisitors = 1;
+    findFirstMock.mockResolvedValue(link);
+    claimShareConcurrentUseMock.mockResolvedValueOnce({
+      status: 'unavailable',
+      reason: 'store_error',
+    });
+
+    const response = await request(server, `/${token}/progress`);
+
+    expect(response.status).toBe(503);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(JSON.parse(response.body)).toEqual({
+      error: 'Share link concurrent-use policy could not be verified.',
+      code: 'SHARE_CONCURRENT_UNAVAILABLE',
+      retryable: true,
+    });
+    expect(updateManyMock).not.toHaveBeenCalled();
+    expect(releaseShareConcurrentUseMock).not.toHaveBeenCalled();
+  });
+
+  test('releases an acquired request lease on response completion using only digests and the opaque token', async () => {
+    const leaseToken = 'A'.repeat(43);
+    const link = makeLink();
+    link.maxUses = 5;
+    link.maxConcurrentVisitors = 1;
+    findFirstMock.mockResolvedValue(link);
+    claimShareConcurrentUseMock.mockResolvedValueOnce({
+      status: 'acquired',
+      leaseToken,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+    });
+
+    const response = await request(server, `/${token}/progress`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(response.status).toBe(200);
+    expect(claimShareConcurrentUseMock).toHaveBeenCalledWith({
+      shareLinkId: 'link-1',
+      visitorIdHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    const visitorIdHash = claimShareConcurrentUseMock.mock.calls[0][0].visitorIdHash;
+    expect(releaseShareConcurrentUseMock).toHaveBeenCalledTimes(1);
+    expect(releaseShareConcurrentUseMock).toHaveBeenCalledWith({
+      shareLinkId: 'link-1',
+      visitorIdHash,
+      leaseToken,
+    });
+    expect(startShareConcurrentUseHeartbeatMock).toHaveBeenCalledWith({
+      shareLinkId: 'link-1',
+      visitorIdHash,
+      leaseToken,
+    }, expect.any(Function));
+    expect(stopShareConcurrentUseHeartbeatMock).toHaveBeenCalledTimes(1);
+    expect(response.body).not.toContain(leaseToken);
+    expect(response.body).not.toContain(visitorIdHash);
+  });
+
+  test('releases an acquired lease when durable visitor-slot commitment fails', async () => {
+    const leaseToken = 'B'.repeat(43);
+    const link = makeLink();
+    link.maxUses = 5;
+    link.maxConcurrentVisitors = 1;
+    findFirstMock.mockResolvedValue(link);
+    claimShareConcurrentUseMock.mockResolvedValueOnce({
+      status: 'acquired',
+      leaseToken,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+    });
+    updateManyMock.mockResolvedValueOnce({ count: 0 });
+
+    const response = await request(server, `/${token}/progress`);
+
+    expect(response.status).toBe(404);
+    expect(releaseShareConcurrentUseMock).toHaveBeenCalledTimes(1);
+    expect(releaseShareConcurrentUseMock).toHaveBeenCalledWith(expect.objectContaining({
+      shareLinkId: 'link-1',
+      leaseToken,
+      visitorIdHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
   });
 
   test('does not charge the request window for password authentication', async () => {

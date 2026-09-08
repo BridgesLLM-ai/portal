@@ -3,6 +3,7 @@ jest.mock('node-pty', () => ({ spawn: jest.fn() }));
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import * as pty from 'node-pty';
 import { __resetClaudeSetupStartLeaseForTests, applyPortalOwnedProviderFileRemoval, applyProviderRemovalConfigPatch, buildPortalOwnedProviderFileRemoval, buildProviderRegistrationSeedModels, buildProviderRemovalConfigPatch, captureFileSnapshot, classifyPortalOwnedApiKeyRemoval, classifyProviderRuntimeFailure, classifyRcSafeProviderRemoval, createAiSetupRouter, credentialEntryProofSummary, credentialWriteRequestFingerprint, ensureNativeCliFinalizationStarted, ExclusiveProviderOperationGate, filterXaiChatModels, getExpectedXaiProbeModel, getOAuthRequestOwnerId, getProviderDefaultModelPayload, getProviderRemovalCapability, getSafeXaiChatModelCatalog, matchesProviderModel, mergeDiscoveredProviderModelsIntoConfig, normalizeModelPayload, portalCredentialProfileContainsSubmittedSecret, presentProviderCredentialEnvironmentVariables, ProviderRemovalPreflightBlockedError, providerCredentialAliases, providerRemovalUsesUnverifiableCredentialSurface, readJsonStrictIfPresent, readStableCredentialWriteProof, removeProviderCredentialRoutingReferences, resolveModelRegistrationProvider, restoreSnapshotsWithCompareAndSwap, runClaudeSetupCompletionOnce, runClaudeSetupStartOnce, runNativeCliCompletionFinalizerOnce, runOAuthCompletionFinalizerOnce, runOpenClawWithSecretInput, shouldParkProviderRemovalFailure } from '../routes/ai-setup';
 import { __deleteOAuthSessionForTests, __setOAuthSessionForTests, isOAuthSessionCleanupPending, type OAuthSession } from '../services/oauthFlowManager';
 import {
@@ -10,6 +11,9 @@ import {
   __readProviderCredentialLifecycleLedgerForTests,
   __setProviderCredentialLifecycleLedgerPathForTests,
   claimProviderCredentialWriteLifecycle,
+  claimProviderCredentialLifecycle,
+  markProviderCredentialLifecycle,
+  bindProviderCredentialLifecycle,
   parkProviderCredentialRemovalLifecycle,
 } from '../services/providerCredentialLifecycleLedger';
 
@@ -135,6 +139,93 @@ describe('xAI provider operation serialization', () => {
 });
 
 describe('durable credential-write route contracts', () => {
+  test.each([
+    ['/claude/start', {}],
+    ['/native-cli/start', { provider: 'codex', forceReauth: true }],
+  ])('%s rejects an unsupervised native credential process before spawning it', async (routePath, body) => {
+    __resetClaudeSetupStartLeaseForTests();
+    (pty.spawn as jest.Mock).mockClear();
+    const router = createAiSetupRouter();
+    const layer = (router as any).stack.find((entry: any) => (
+      entry.route?.path === routePath && entry.route?.methods?.post
+    ));
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    const response: any = { status: jest.fn(), json: jest.fn() };
+    response.status.mockReturnValue(response);
+    response.json.mockReturnValue(response);
+
+    await handler({ body, user: { userId: 'owner' } }, response);
+
+    expect(response.status).toHaveBeenCalledWith(503);
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
+      success: false,
+      code: 'HOST_CREDENTIAL_FLOW_UNAVAILABLE',
+      retryable: false,
+    }));
+    expect(pty.spawn).not.toHaveBeenCalled();
+  });
+
+  test('reports Gemini runtime smoke as unqualified rather than as a credential-flow failure', async () => {
+    const router = createAiSetupRouter();
+    const layer = (router as any).stack.find((entry: any) => (
+      entry.route?.path === '/provider/:id/smoke' && entry.route?.methods?.post
+    ));
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    const response: any = { status: jest.fn(), json: jest.fn() };
+    response.status.mockReturnValue(response);
+    response.json.mockReturnValue(response);
+
+    await handler({ params: { id: 'google-gemini-cli' } }, response);
+
+    expect(response.status).toHaveBeenCalledWith(503);
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
+      ok: false,
+      code: 'NATIVE_BINARY_RUNTIME_UNQUALIFIED',
+      retryable: false,
+      error: expect.stringMatching(/detection-only/i),
+    }));
+  });
+
+  test.each([
+    ['/oauth/start', { provider: 'openai-codex' }, 'oauth-device'],
+    ['/oauth/start', { provider: 'xai' }, 'oauth-device'],
+    ['/oauth/device/start', { provider: 'github-copilot' }, 'oauth-device'],
+    ['/set-default-model', { provider: 'openai', model: 'openai/gpt-5' }, 'configuration'],
+    ['/restart-gateway', {}, 'restart'],
+  ])('%s rejects the exact OpenClaw host mutation before spawning it', async (routePath, body, operation) => {
+    (pty.spawn as jest.Mock).mockClear();
+    const router = createAiSetupRouter();
+    const layer = (router as any).stack.find((entry: any) => (
+      entry.route?.path === routePath && entry.route?.methods?.post
+    ));
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    const response: any = { status: jest.fn(), json: jest.fn() };
+    response.status.mockReturnValue(response);
+    response.json.mockReturnValue(response);
+
+    await handler({ body, user: { userId: 'owner' } }, response);
+
+    expect(response.status).toHaveBeenCalledWith(503);
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
+      success: false,
+      code: 'OPENCLAW_HOST_MUTATION_UNAVAILABLE',
+      retryable: false,
+      operation,
+    }));
+    expect(pty.spawn).not.toHaveBeenCalled();
+  });
+
+  test('reset lifecycle copy does not promise a host sign-in that remains fenced', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ai-setup.ts'), 'utf8');
+    const resetRoute = source.slice(
+      source.indexOf("router.post('/oauth/reset-lifecycle'"),
+      source.indexOf("router.post('/oauth/device/start'"),
+    );
+    expect(resetRoute).toContain('interactive host sign-in remains unavailable, while Host Operator Agent Chat can use an existing credential after fresh CLI admission');
+    expect(resetRoute).not.toContain('You can start the sign-in again');
+    expect(resetRoute).not.toContain('you can start the sign-in');
+  });
+
   test('rejects manual-only providers before key validation or credential admission', async () => {
     const router = createAiSetupRouter();
     const manualOnlyProviders = [
@@ -239,7 +330,7 @@ describe('durable credential-write route contracts', () => {
         success: false,
         credentialSaved: false,
         credentialState: 'indeterminate',
-        error: expect.stringMatching(/full credential and routing transaction/i),
+        error: expect.stringMatching(/cannot prove.*credential write completed|remains parked/i),
       }));
       expect(response.json.mock.calls[0][0]).not.toHaveProperty('operationDisposition');
       const records = Object.values(__readProviderCredentialLifecycleLedgerForTests().records);
@@ -682,6 +773,25 @@ describe('durable credential-write route contracts', () => {
     expect(restart).not.toContain('SIGUSR1');
     expect(restart).not.toContain('pgrep');
     expect(restart).not.toContain('falling back');
+
+    const providerRemoval = source.slice(
+      source.indexOf("router.delete('/provider/:id'"),
+      source.indexOf('return router;', source.indexOf("router.delete('/provider/:id'")),
+    );
+    const admittedMutation = providerRemoval.slice(
+      providerRemoval.indexOf('const admission = claimProviderCredentialRemovalOperationLifecycle'),
+      providerRemoval.indexOf('} catch (error: any)'),
+    );
+    const rollback = providerRemoval.slice(providerRemoval.indexOf('} catch (error: any)'));
+    expect(source.match(/await restartGateway\(\)/g)).toHaveLength(2);
+    expect(admittedMutation).toContain('applyProviderRemovalConfigPatch');
+    expect(admittedMutation.indexOf('applyProviderRemovalConfigPatch'))
+      .toBeLessThan(admittedMutation.indexOf('await restartGateway()'));
+    expect(rollback).toContain('restoreSnapshotsWithCompareAndSwap');
+    expect(rollback.indexOf('restoreSnapshotsWithCompareAndSwap'))
+      .toBeLessThan(rollback.indexOf('await restartGateway()'));
+    expect(source.slice(0, source.indexOf("router.delete('/provider/:id'")))
+      .not.toContain('await restartGateway()');
   });
 
   test('admits both secret-write routes before mutation and receipts before responding', () => {
@@ -695,10 +805,9 @@ describe('durable credential-write route contracts', () => {
       source.indexOf("router.post('/set-default-model'"),
     );
 
+    expect(saveKeyRoute).not.toContain("beginXaiSetup('api-key'");
     expect(saveKeyRoute.indexOf('claimProviderCredentialWriteLifecycle('))
-      .toBeLessThan(saveKeyRoute.indexOf("beginXaiSetup('api-key'"));
-    expect(saveKeyRoute.indexOf('claimProviderCredentialWriteLifecycle('))
-      .toBeLessThan(saveKeyRoute.indexOf('saveProviderApiKey(provider, apiKey)'));
+      .toBeLessThan(saveKeyRoute.indexOf('saveProviderApiKey(provider, apiKey,'));
     expect(saveKeyRoute.lastIndexOf('completeProviderCredentialWriteLifecycle('))
       .toBeLessThan(saveKeyRoute.lastIndexOf('res.json(responsePayload)'));
     const recoveredKeyBranch = saveKeyRoute.slice(
@@ -708,7 +817,7 @@ describe('durable credential-write route contracts', () => {
     expect(recoveredKeyBranch).not.toContain('saveProviderApiKey');
     expect(recoveredKeyBranch).not.toContain('portalCredentialTargetContainsSubmittedSecret');
     expect(recoveredKeyBranch).toContain('credentialCommitIndeterminate = true');
-    expect(recoveredKeyBranch).toContain('full credential and routing transaction');
+    expect(recoveredKeyBranch).toMatch(/cannot prove.*credential write completed/i);
     expect(recoveredKeyBranch).not.toContain('attestProviderCredentialLifecycleFingerprint');
 
     expect(setupTokenRoute.indexOf('claimProviderCredentialWriteLifecycle('))
@@ -1081,6 +1190,7 @@ describe('ai-setup model normalization', () => {
   test('register merge persists discovered provider models into allowlist and fallbacks', () => {
     const merged = mergeDiscoveredProviderModelsIntoConfig({
       agents: {
+        entries: { main: {} },
         defaults: {
           model: {
             primary: 'openai/gpt-5.5',
@@ -1101,9 +1211,9 @@ describe('ai-setup model normalization', () => {
     expect(merged.addedAllowlist).toEqual(['openai/gpt-5.4', 'openai/gpt-5.4-mini']);
     expect(merged.addedFallbacks).toEqual(['openai/gpt-5.4-mini']);
     expect(merged.config.agents.defaults.model.fallbacks).toEqual(['openai/gpt-5.4', 'openai/gpt-5.4-mini']);
-    expect(merged.config.agents.defaults.models['openai/gpt-5.4']).toEqual({});
-    expect(merged.config.agents.defaults.models['openai/gpt-5.4-mini']).toEqual({});
-    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai/gpt-5.4']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(merged.config.agents.defaults.models['openai/gpt-5.4-mini']).toEqual({ agentRuntime: { id: 'codex' } });
+    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
     expect(merged.config.agents.defaults.models['openai-codex/gpt-5.5']).toBeUndefined();
     expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toBeUndefined();
   });
@@ -1111,6 +1221,7 @@ describe('ai-setup model normalization', () => {
   test('register merge repairs Codex model-scoped runtime metadata', () => {
     const merged = mergeDiscoveredProviderModelsIntoConfig({
       agents: {
+        entries: { main: {} },
         defaults: {
           model: { primary: 'openai-codex/gpt-5.5', fallbacks: [] },
           models: {
@@ -1124,8 +1235,81 @@ describe('ai-setup model normalization', () => {
     expect(merged.changed).toBe(true);
     expect(merged.addedAllowlist).toEqual([]);
     expect(merged.addedFallbacks).toEqual([]);
-    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({ agentRuntime: { id: 'codex' } });
     expect(merged.config.agents.defaults.models['codex/gpt-5.5']).toBeUndefined();
+  });
+
+  test('register merge does not turn ordinary OpenAI API models into Codex routes', () => {
+    const merged = mergeDiscoveredProviderModelsIntoConfig({
+      agents: {
+        entries: { main: {} },
+        defaults: {
+          model: { primary: 'openai/gpt-5.5', fallbacks: [] },
+          models: {
+            'openai/gpt-5.5': {},
+            'openai/gpt-4.1': { agentRuntime: { id: 'openclaw' }, alias: 'API route' },
+          },
+        },
+      },
+    }, 'openai', ['openai/gpt-5.5', 'openai/gpt-4.1-mini']);
+
+    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai/gpt-4.1']).toEqual({
+      agentRuntime: { id: 'openclaw' },
+      alias: 'API route',
+    });
+    expect(merged.config.agents.defaults.models['openai/gpt-4.1-mini']).toEqual({});
+  });
+
+  test('register merge preserves an explicit OpenClaw opt-out during Codex discovery', () => {
+    const merged = mergeDiscoveredProviderModelsIntoConfig({
+      agents: {
+        entries: { main: {} },
+        defaults: {
+          model: { primary: 'openai/gpt-5.5', fallbacks: [] },
+          models: {
+            'openai/gpt-5.5': {
+              alias: 'Platform API',
+              agentRuntime: { id: 'openclaw', fallback: 'none' },
+            },
+          },
+        },
+      },
+    }, 'openai-codex', ['openai/gpt-5.5']);
+
+    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({
+      alias: 'Platform API',
+      agentRuntime: { id: 'openclaw', fallback: 'none' },
+    });
+  });
+
+  test('register merge preserves retained 2026.7.1 Codex routing without adding 9.1 metadata', () => {
+    const merged = mergeDiscoveredProviderModelsIntoConfig({
+      agents: {
+        list: [{ id: 'main', default: true }],
+        defaults: {
+          model: { primary: 'openai/gpt-5.5', fallbacks: [] },
+          models: {
+            'openai/gpt-5.5': { agentRuntime: { id: 'codex' } },
+          },
+        },
+      },
+    }, 'openai-codex', ['openai/gpt-5.5', 'openai/gpt-5.4']);
+
+    expect(merged.config.agents.list).toEqual([{ id: 'main', default: true }]);
+    expect(merged.config.agents.defaults.models['openai/gpt-5.5']).toEqual({});
+    expect(merged.config.agents.defaults.models['openai/gpt-5.4']).toEqual({});
+  });
+
+  test.each([
+    { defaults: { models: {} } },
+    { list: [{ id: 'main' }], entries: { main: {} }, defaults: { models: {} } },
+  ])('register merge refuses an unknown or mixed Codex roster contract', (agents) => {
+    expect(() => mergeDiscoveredProviderModelsIntoConfig(
+      { agents },
+      'openai-codex',
+      ['openai/gpt-5.5'],
+    )).toThrow(/roster contract/i);
   });
 
   test('register merge preserves Antigravity provider namespace before persisting models', () => {
@@ -1206,8 +1390,13 @@ describe('ai-setup model normalization', () => {
 
   test('setup model fallback exposes provider defaults without requiring OpenClaw model discovery', () => {
     expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toEqual(
-      expect.arrayContaining(['openai/gpt-5.6-sol', 'openai/gpt-5.6-terra', 'openai/gpt-5.6-luna']),
+      expect.arrayContaining(['openai/gpt-6-astra', 'openai/gpt-5.6-sol', 'openai/gpt-5.6-terra', 'openai/gpt-5.6-luna']),
     );
+    const astra = getProviderDefaultModelPayload('openai-codex')
+      .find((model) => model.id === 'openai/gpt-6-astra');
+    expect(astra?.name).toBe('GPT-6 Astra');
+    expect(astra?.raw?.description).toMatch(/availability depends.*ChatGPT account/i);
+    expect(astra?.raw?.description).toMatch(/does not confirm access/i);
     expect(getProviderDefaultModelPayload('openai-codex').map((model) => model.id)).toContain('openai/gpt-5.5');
     expect(getProviderDefaultModelPayload('google-gemini-cli').map((model) => model.id)).toEqual([
       'google/gemini-3.1-pro-preview',
@@ -1227,6 +1416,7 @@ describe('ai-setup model normalization', () => {
       'openai/gpt-5.6-sol',
       'openai/gpt-5.5',
     ]);
+    expect(getProviderDefaultModelPayload('openai').map((model) => model.id)).not.toContain('openai/gpt-6-astra');
     expect(getProviderDefaultModelPayload('google').map((model) => model.id)).toEqual([
       'google/gemini-3.1-pro-preview',
       'google/gemini-3-flash-preview',
@@ -1326,7 +1516,7 @@ describe('ai-setup model normalization', () => {
     expect(action).toHaveBeenCalledTimes(1);
   });
 
-  test('starts slow Codex finalization once without awaiting it in a status request', async () => {
+  test('deduplicates Codex finalization from a completed retained status', async () => {
     const sessionId = `native_background_${Date.now()}_${Math.random()}`;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -1336,13 +1526,12 @@ describe('ai-setup model normalization', () => {
     expect(ensureNativeCliFinalizationStarted(status, finalizer)).toBe(true);
     expect(ensureNativeCliFinalizationStarted(status, finalizer)).toBe(false);
     expect(finalizer).toHaveBeenCalledTimes(1);
-
     release();
     await gate;
     await new Promise((resolve) => setImmediate(resolve));
   });
 
-  test('records a rejected background Codex finalizer as committed without eternal cleanup', async () => {
+  test('surfaces retained Codex finalizer failure without losing committed credential truth', async () => {
     const sessionId = `native_background_failure_${Date.now()}_${Math.random()}`;
     const session = {
       id: sessionId,
@@ -1372,8 +1561,7 @@ describe('ai-setup model normalization', () => {
         credentialResolution: 'committed',
         finalizationPending: false,
       });
-      expect(session.error).toMatch(/credential was saved.*finalization failed/i);
-      expect(session.error).not.toContain('token');
+      expect(session.error).toMatch(/finalization failed.*gateway recovery failed/i);
       expect(isOAuthSessionCleanupPending(session)).toBe(false);
     } finally {
       __deleteOAuthSessionForTests(sessionId);
@@ -1400,6 +1588,55 @@ describe('ai-setup model normalization', () => {
       credentialState: 'committed',
     }, finalizer)).toBe(false);
     expect(finalizer).not.toHaveBeenCalled();
+  });
+
+  test('settles a retained Claude completion from 202 finalizing to 200 finalized', async () => {
+    const sessionId = `native_claude_status_${Date.now()}_${Math.random()}`;
+    const session = {
+      id: sessionId,
+      ownerId: 'user:owner',
+      provider: 'claude-code',
+      mode: 'oauth',
+      process: { kill: jest.fn() },
+      processExited: true,
+      status: 'complete',
+      error: null,
+      createdAt: Date.now(),
+      completedAt: Date.now(),
+      profileKeyBefore: [],
+      credentialResolution: 'committed',
+      finalizationPending: false,
+    } as unknown as OAuthSession;
+    __setOAuthSessionForTests(session);
+
+    try {
+      const router = createAiSetupRouter();
+      const layer = (router as any).stack.find((entry: any) => (
+        entry.route?.path === '/native-cli/status/:sessionId' && entry.route?.methods?.get
+      ));
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+      const response: any = { status: jest.fn(), json: jest.fn() };
+      response.status.mockReturnValue(response);
+      response.json.mockReturnValue(response);
+
+      await handler({ params: { sessionId }, user: { userId: 'owner' } }, response);
+      expect(response.status).toHaveBeenCalledWith(202);
+      expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
+        finalized: false,
+        finalizing: true,
+      }));
+
+      await new Promise((resolve) => setImmediate(resolve));
+      response.status.mockClear();
+      response.json.mockClear();
+      await handler({ params: { sessionId }, user: { userId: 'owner' } }, response);
+      expect(response.status).toHaveBeenCalledWith(200);
+      expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
+        finalized: true,
+      }));
+    } finally {
+      __deleteOAuthSessionForTests(sessionId);
+    }
   });
 
   test('shares native CLI finalizer failure and permits a verified retry', async () => {
@@ -1483,7 +1720,8 @@ describe('ai-setup model normalization', () => {
     );
 
     expect(claudeRoutes).not.toMatch(/importClaudeCliAuthProfile|completeClaudeCliImportForSession|usedCliImport/);
-    expect(claudeRoutes).toMatch(/owned setup-token session did not produce a reusable token/);
+    expect(claudeRoutes).toContain("new NativeHostCredentialFlowUnavailableError('claude-code')");
+    expect(claudeRoutes).not.toMatch(/commitClaudeSetupTokenCredential|registerProviderModels|restartGateway/);
   });
 
   test('joins Claude completion and retains only verified success', async () => {
@@ -1528,5 +1766,45 @@ describe('ai-setup model normalization', () => {
   test('Gemini CLI smoke failures get user-actionable messages', () => {
     expect(classifyProviderRuntimeFailure('FatalAuthenticationError: Manual authorization is required but the current session is non-interactive.')).toContain('server-side auth is not usable headlessly');
     expect(classifyProviderRuntimeFailure('IneligibleTierError: UNSUPPORTED_CLIENT')).toContain('Google rejected this Gemini CLI account/client');
+  });
+});
+
+
+describe('native harness interrupted setup recovery', () => {
+  test.each(['hermes', 'opencode'] as const)('%s resets only its own inactive lifecycle', async (provider) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-native-reset-'));
+    fs.chmodSync(directory, 0o700);
+    __setProviderCredentialLifecycleLedgerPathForTests(path.join(directory, 'ledger.json'));
+    try {
+      const namespace = `credential-domain:${provider}`;
+      const claim = claimProviderCredentialLifecycle(namespace, 'user:owner', 'interrupted-setup', { baselineFingerprint: 'before' });
+      markProviderCredentialLifecycle(claim, 'committed', 'after-pairing');
+      const unrelated = claimProviderCredentialLifecycle('credential-domain:unrelated', 'user:owner', 'keep', {});
+      const router = createAiSetupRouter();
+      const layer = (router as any).stack.find((entry: any) => entry.route?.path === '/oauth/reset-lifecycle');
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+      const response: any = { status: jest.fn(), json: jest.fn() };
+      response.status.mockReturnValue(response);
+      response.json.mockReturnValue(response);
+      await handler({ body: { provider }, user: { userId: 'someone-else' } }, response);
+      expect(response.status).toHaveBeenLastCalledWith(409);
+      expect(response.json).toHaveBeenLastCalledWith(expect.objectContaining({ code: 'PROVIDER_LIFECYCLE_OWNER_MISMATCH' }));
+      expect(__readProviderCredentialLifecycleLedgerForTests().records[namespace]).toBeDefined();
+      response.status.mockClear();
+      await handler({ body: { provider }, user: { userId: 'owner' } }, response);
+      expect(response.json).toHaveBeenLastCalledWith(expect.objectContaining({ success: true, cleared: true }));
+      expect(__readProviderCredentialLifecycleLedgerForTests().records[namespace]).toBeUndefined();
+      expect(__readProviderCredentialLifecycleLedgerForTests().records[unrelated.namespace]).toBeDefined();
+      const active = claimProviderCredentialLifecycle(namespace, 'user:owner', 'live', {});
+      bindProviderCredentialLifecycle(active, 'live-session', { binding: { kind: 'owned-child', processPid: process.pid } });
+      await handler({ body: { provider }, user: { userId: 'owner' } }, response);
+      expect(response.status).toHaveBeenLastCalledWith(409);
+      expect(response.json).toHaveBeenLastCalledWith(expect.objectContaining({ code: 'PROVIDER_LIFECYCLE_BUSY' }));
+      expect(__readProviderCredentialLifecycleLedgerForTests().records[namespace]).toBeDefined();
+    } finally {
+      __clearProviderCredentialLifecycleLedgerForTests();
+      __setProviderCredentialLifecycleLedgerPathForTests(null);
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

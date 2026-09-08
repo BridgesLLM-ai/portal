@@ -35,6 +35,19 @@ function capabilitiesFixture(): TerminalCapabilities {
         executable: null, version: null, helpCommand: 'docker --help',
         sourceUrl: 'https://docs.docker.com/', commands: [],
       },
+      {
+        // Simulates a briefly older backend that reports the package as
+        // installed but has no executionAvailable field.
+        id: 'codex', label: 'Codex CLI', category: 'agents', installed: true,
+        executable: '/usr/bin/codex', version: '0.153.2', helpCommand: 'codex --help',
+        sourceUrl: 'https://developers.openai.com/codex/cli/', commands: ['codex exec'],
+      },
+      {
+        id: 'claude', label: 'Claude Code', category: 'agents', installed: true,
+        executionAvailable: false,
+        executable: null, version: '2.1.260', helpCommand: '',
+        sourceUrl: 'https://docs.anthropic.com/en/docs/claude-code/overview', commands: [],
+      },
     ],
   };
 }
@@ -47,6 +60,7 @@ describe('terminal capability catalog', () => {
       'openclaw --help',
       'openclaw gateway',
     ]);
+    expect(catalog.map((entry) => entry.command).join('\n')).not.toMatch(/codex|claude/i);
   });
 
   test('keeps the empty state bounded to curated actions', () => {

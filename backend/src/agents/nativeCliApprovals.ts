@@ -24,6 +24,7 @@ type ApprovalResolvedCallback = (resolved: ExecApprovalResolved) => void;
 
 interface PendingNativeApproval {
   approval: ExecApprovalRequest;
+  providerName: AgentProviderName;
   resolve: (decision: NativeCliApprovalDecision) => void;
   timeout: ReturnType<typeof setTimeout>;
 }
@@ -91,7 +92,7 @@ export function requestNativeCliApproval(draft: NativeCliApprovalDraft): Promise
     };
 
     const timeout = setTimeout(() => finish('deny'), timeoutMs);
-    pending.set(approval.id, { approval, resolve: finish, timeout });
+    pending.set(approval.id, { approval, providerName: draft.providerName, resolve: finish, timeout });
     draft.signal?.addEventListener('abort', onAbort, { once: true });
     if (draft.signal?.aborted) {
       finish('deny');
@@ -119,6 +120,13 @@ export function resolveNativeCliApproval(
 
 export function getPendingNativeCliApproval(approvalId: string): ExecApprovalRequest | null {
   return pending.get(approvalId)?.approval || null;
+}
+
+/** Registry-owned provider identity for an exact pending approval. */
+export function getPendingNativeCliApprovalProvider(
+  approvalId: string,
+): AgentProviderName | null {
+  return pending.get(approvalId)?.providerName || null;
 }
 
 /**

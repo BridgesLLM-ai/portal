@@ -22,6 +22,7 @@ import { getGatewayToken } from '../../utils/gatewayToken';
 import { redactNativeProviderText } from './native/NativeProviderDiagnostics';
 import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
 import { portalClientMessageIdFromIdempotencyKey } from './PortalMessageIdentity';
+import { questionAuthorityForOpenClawVersion } from '../../services/openClawQuestionRuntimeReadiness';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -36,7 +37,24 @@ let GATEWAY_TOKEN = getGatewayToken();
 const CLIENT_ID = 'gateway-client';
 const CLIENT_MODE = 'backend';
 const GATEWAY_ROLE = 'operator';
-const GATEWAY_SCOPES = ['operator.admin', 'operator.read', 'operator.approvals'];
+const GATEWAY_SCOPES = [
+  'operator.admin',
+  'operator.read',
+  'operator.approvals',
+  'operator.questions',
+];
+const OPENCLAW_QUESTION_SCOPE = 'operator.questions';
+
+function gatewayMethodRequiresQuestionScope(method: string): boolean {
+  return method === 'question.list'
+    || method === 'question.get'
+    || method === 'question.resolve';
+}
+
+function gatewayMethodHasRequiredScope(method: string, scopes: Iterable<string>): boolean {
+  return !gatewayMethodRequiresQuestionScope(method)
+    || new Set(scopes).has(OPENCLAW_QUESTION_SCOPE);
+}
 
 function isExpectedGatewayReconnectError(error: unknown): boolean {
   const message = String((error as any)?.message || error || '').trim();
@@ -210,6 +228,7 @@ type ApprovalResolvedCallback = (resolved: ExecApprovalResolved) => void;
 let singletonWs: WebSocket | null = null;
 let isConnecting = false;
 let isAuthenticated = false;
+let authenticatedGatewayScopes = new Set<string>();
 let messageCounter = 0;
 let reconnectAttempts = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2315,7 +2334,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       replace: true,
       preambleProgress: true,
       runId: effectiveRunId,
-    });
+    }, { attestedPreambleProgress: true });
     return;
   }
 
@@ -3188,6 +3207,7 @@ function connect(): void {
 
   isConnecting = true;
   isAuthenticated = false;
+  authenticatedGatewayScopes.clear();
 
   const keys = getOrCreateDeviceKeys();
   let connectId: string | undefined;
@@ -3274,6 +3294,13 @@ function connect(): void {
           ws.close();
           return;
         }
+        authenticatedGatewayScopes = new Set(
+          Array.isArray(msg.payload?.auth?.scopes)
+            ? msg.payload.auth.scopes.filter((scope: unknown): scope is string => (
+              typeof scope === 'string'
+            ))
+            : [],
+        );
         isAuthenticated = true;
         isConnecting = false;
         reconnectAttempts = 0;
@@ -3449,6 +3476,7 @@ function connect(): void {
     singletonWs = null;
     isConnecting = false;
     isAuthenticated = false;
+    authenticatedGatewayScopes.clear();
     activeSessionMessageSubscriptions.clear();
 
     // Reject any pending RPC calls
@@ -3526,6 +3554,7 @@ export function shutdownPersistentGatewayWs(): void {
   }
   isConnecting = false;
   isAuthenticated = false;
+  authenticatedGatewayScopes.clear();
 }
 
 /**
@@ -3661,6 +3690,14 @@ export async function callGatewayRpc(method: string, params: Record<string, any>
   if (!isAuthenticated) {
     throw new Error('Persistent WebSocket not authenticated');
   }
+  if (!gatewayMethodHasRequiredScope(method, authenticatedGatewayScopes)) {
+    const error = new Error(
+      `OpenClaw did not grant ${OPENCLAW_QUESTION_SCOPE}; refusing native question RPC.`,
+    ) as Error & { errorCode?: string; errorMessage?: string };
+    error.errorCode = 'FORBIDDEN';
+    error.errorMessage = error.message;
+    throw error;
+  }
 
   const requestId = nextId();
   const rpcSessionKey = typeof params.sessionKey === 'string' ? params.sessionKey.trim() : '';
@@ -3741,9 +3778,16 @@ export async function callGatewayRpc(method: string, params: Record<string, any>
   });
 }
 
-export const PENDING_USER_INPUT_READ_GATEWAY_METHOD = 'bridgesllm.ask_user.pending';
-export const PENDING_USER_INPUT_GATEWAY_METHOD = 'bridgesllm.ask_user.answer';
-export const PENDING_USER_INPUT_DISMISS_GATEWAY_METHOD = 'bridgesllm.ask_user.dismiss';
+// OpenClaw 2026.9.1 owns structured human input in the Gateway. Portal reads
+// and resolves those native records directly. Portal-only 4.1 updates can also
+// retain OpenClaw 2026.7.1-2 with the installed 3.4 legacy bridge, so dispatch
+// is selected from the attested live runtime family rather than bundled bytes.
+export const PENDING_USER_INPUT_READ_GATEWAY_METHOD = 'question.list';
+export const PENDING_USER_INPUT_GATEWAY_METHOD = 'question.resolve';
+export const PENDING_USER_INPUT_DISMISS_GATEWAY_METHOD = 'question.resolve';
+export const LEGACY_PENDING_USER_INPUT_READ_GATEWAY_METHOD = 'bridgesllm.ask_user.pending';
+export const LEGACY_PENDING_USER_INPUT_GATEWAY_METHOD = 'bridgesllm.ask_user.answer';
+export const LEGACY_PENDING_USER_INPUT_DISMISS_GATEWAY_METHOD = 'bridgesllm.ask_user.dismiss';
 export const ACTIVE_RUN_STEER_GATEWAY_METHOD = 'bridgesllm.ask_user.steer';
 // The pinned OpenClaw adapter cancels an uncommitted steer after 10 seconds.
 // Keep the Portal transport deadline above that cancellation/response window so
@@ -3754,8 +3798,7 @@ export interface PendingUserInputQuestion {
   id: string;
   question: string;
   header?: string;
-  /** Pinned Codex/OpenClaw native schema accepts one answer per question. */
-  multiSelect: false;
+  multiSelect: boolean;
   isOther?: boolean;
   isSecret?: boolean;
   options: Array<{ label: string; description?: string }>;
@@ -3796,6 +3839,29 @@ type PendingUserInputRpc = (
   params: Record<string, any>,
   timeoutMs?: number,
 ) => Promise<any>;
+
+export type PendingUserInputAuthority = 'legacy-custom' | 'native';
+
+export function pendingUserInputAuthorityForVersion(
+  version: unknown,
+): PendingUserInputAuthority | null {
+  return questionAuthorityForOpenClawVersion(version);
+}
+
+export async function resolvePendingUserInputAuthorityWithRpc(
+  rpc: PendingUserInputRpc,
+): Promise<PendingUserInputAuthority> {
+  const payload = await rpc('status', { includeChannelSummary: false }, 10_000);
+  const authority = pendingUserInputAuthorityForVersion(payload?.runtimeVersion);
+  if (!authority) {
+    throw new PendingUserInputAnswerError(
+      'UNSUPPORTED_OPENCLAW_QUESTION_RUNTIME',
+      'The active OpenClaw runtime does not expose a supported question authority.',
+      503,
+    );
+  }
+  return authority;
+}
 
 const PENDING_INPUT_IDENTIFIER_CONTROLS = /[\u0000-\u001F\u007F]/;
 const PENDING_INPUT_TEXT_CONTROLS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
@@ -3877,7 +3943,7 @@ function pendingInputTimestamp(value: unknown, label: string): number | undefine
 }
 
 function pendingInputQuestions(value: unknown): PendingUserInputQuestion[] {
-  if (!Array.isArray(value) || value.length < 1 || value.length > 4) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 3) {
     throw new PendingUserInputAnswerError(
       'INVALID_GATEWAY_RESPONSE',
       'OpenClaw returned an invalid pending-input question list.',
@@ -3893,24 +3959,35 @@ function pendingInputQuestions(value: unknown): PendingUserInputQuestion[] {
       );
     }
     const candidate = entry as Record<string, unknown>;
-    // OpenClaw 2026.7.1's native `readQuestion` schema has no multi-select
-    // field and `buildAgentHarnessUserInputAnswers` emits one answer per
-    // question. The generic streamed AskQuestionCard owns multi-select; never
-    // invent comma-delimited semantics for this native channel.
-    if (candidate.multiSelect !== undefined && candidate.multiSelect !== false) {
+    if (candidate.multiSelect !== undefined && typeof candidate.multiSelect !== 'boolean') {
       throw new PendingUserInputAnswerError(
         'INVALID_GATEWAY_RESPONSE',
-        'OpenClaw returned unsupported native multi-select input.',
+        'OpenClaw returned an invalid native multi-select flag.',
         502,
       );
     }
-    const id = pendingInputResponseIdentifier(candidate.id, 'question id', 256);
-    const question = pendingInputDisplayText(candidate.question, 'question text', 2_000);
-    const header = candidate.header == null
-      ? undefined
-      : pendingInputDisplayText(candidate.header, 'question header', 64);
+    // Native secret-store questions must stay on OpenClaw's masked consent
+    // surface. Routing one through Portal would put the cleartext answer in a
+    // normal JSON request and defeat the 9.1 secret-input boundary.
+    if (candidate.isSecret === true || candidate.secretStore !== undefined) {
+      throw new PendingUserInputAnswerError(
+        'UNSUPPORTED_SECRET_INPUT',
+        'OpenClaw returned a secret question that Portal cannot answer safely.',
+        409,
+      );
+    }
+    const id = pendingInputResponseIdentifier(candidate.questionId, 'question id', 256);
+    if (!/^[a-z][a-z0-9_]*$/.test(id)) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned an invalid native question identity.',
+        502,
+      );
+    }
+    const question = pendingInputDisplayText(candidate.question, 'question text', 4_096);
+    const header = pendingInputDisplayText(candidate.header, 'question header', 12);
     const rawOptions = candidate.options == null ? [] : candidate.options;
-    if (!Array.isArray(rawOptions) || rawOptions.length > 8) {
+    if (!Array.isArray(rawOptions) || rawOptions.length > 4) {
       throw new PendingUserInputAnswerError(
         'INVALID_GATEWAY_RESPONSE',
         'OpenClaw returned invalid pending-input options.',
@@ -3935,6 +4012,77 @@ function pendingInputQuestions(value: unknown): PendingUserInputQuestion[] {
     return {
       id,
       question,
+      header,
+      multiSelect: candidate.multiSelect === true,
+      ...(candidate.isOther === true ? { isOther: true } : {}),
+      options,
+    };
+  });
+  if (new Set(questions.map((question) => question.id)).size !== questions.length) {
+    throw new PendingUserInputAnswerError(
+      'INVALID_GATEWAY_RESPONSE',
+      'OpenClaw returned duplicate pending-input question identities.',
+      502,
+    );
+  }
+  return questions;
+}
+
+function legacyPendingInputQuestions(value: unknown): PendingUserInputQuestion[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 4) {
+    throw new PendingUserInputAnswerError(
+      'INVALID_GATEWAY_RESPONSE',
+      'OpenClaw returned an invalid legacy pending-input question list.',
+      502,
+    );
+  }
+  const questions = value.map((entry): PendingUserInputQuestion => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned an invalid legacy pending-input question.',
+        502,
+      );
+    }
+    const candidate = entry as Record<string, unknown>;
+    if (candidate.multiSelect !== undefined && candidate.multiSelect !== false) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw 2026.7.1 returned unsupported multi-select input.',
+        502,
+      );
+    }
+    const id = pendingInputResponseIdentifier(candidate.id, 'question id', 256);
+    const question = pendingInputDisplayText(candidate.question, 'question text', 2_000);
+    const header = candidate.header == null
+      ? undefined
+      : pendingInputDisplayText(candidate.header, 'question header', 64);
+    const rawOptions = candidate.options == null ? [] : candidate.options;
+    if (!Array.isArray(rawOptions) || rawOptions.length > 8) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned invalid legacy pending-input options.',
+        502,
+      );
+    }
+    const options = rawOptions.map((option) => {
+      if (!option || typeof option !== 'object' || Array.isArray(option)) {
+        throw new PendingUserInputAnswerError(
+          'INVALID_GATEWAY_RESPONSE',
+          'OpenClaw returned an invalid legacy pending-input option.',
+          502,
+        );
+      }
+      const item = option as Record<string, unknown>;
+      const label = pendingInputDisplayText(item.label, 'option label', 200);
+      const description = item.description == null || item.description === ''
+        ? undefined
+        : pendingInputDisplayText(item.description, 'option description', 500);
+      return description ? { label, description } : { label };
+    });
+    return {
+      id,
+      question,
       ...(header ? { header } : {}),
       multiSelect: false,
       ...(candidate.isOther === true ? { isOther: true } : {}),
@@ -3945,7 +4093,7 @@ function pendingInputQuestions(value: unknown): PendingUserInputQuestion[] {
   if (new Set(questions.map((question) => question.id)).size !== questions.length) {
     throw new PendingUserInputAnswerError(
       'INVALID_GATEWAY_RESPONSE',
-      'OpenClaw returned duplicate pending-input question identities.',
+      'OpenClaw returned duplicate legacy pending-input question identities.',
       502,
     );
   }
@@ -3965,55 +4113,74 @@ function rejectedPendingInputResponse(payload: any): never {
   );
 }
 
-export async function readPendingUserInputWithRpc(
-  rpc: PendingUserInputRpc,
-  sessionKey: unknown,
-  expectedRunId: unknown,
-): Promise<PendingUserInputSnapshot> {
-  const normalizedSessionKey = pendingInputIdentifier(sessionKey, 'sessionKey', 512);
-  const normalizedRunId = pendingInputIdentifier(expectedRunId, 'expectedRunId', 512);
-  const payload = await rpc(PENDING_USER_INPUT_READ_GATEWAY_METHOD, {
-    sessionKey: normalizedSessionKey,
-    expectedRunId: normalizedRunId,
-  }, 10_000);
-  if (typeof payload?.pending !== 'boolean') {
+interface NativeQuestionRecord {
+  id: string;
+  sessionKey: string;
+  runId: string;
+  status: 'pending' | 'answered' | 'cancelled' | 'expired';
+  questions: PendingUserInputQuestion[];
+  createdAt: number;
+  expiresAt: number;
+  answers?: Record<string, string[]>;
+}
+
+function nativeQuestionAnswers(value: unknown): Record<string, string[]> | undefined {
+  if (value == null) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new PendingUserInputAnswerError(
       'INVALID_GATEWAY_RESPONSE',
-      'OpenClaw returned an invalid pending-input response.',
+      'OpenClaw returned invalid question answers.',
       502,
     );
   }
-  if (payload.pending === false) {
-    if (payload.runId != null && payload.runId !== normalizedRunId) {
+  const raw = (value as Record<string, unknown>).answers;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new PendingUserInputAnswerError(
+      'INVALID_GATEWAY_RESPONSE',
+      'OpenClaw returned invalid question answers.',
+      502,
+    );
+  }
+  const answers = Object.create(null) as Record<string, string[]>;
+  for (const [id, values] of Object.entries(raw as Record<string, unknown>)) {
+    const questionId = pendingInputResponseIdentifier(id, 'answer question id', 256);
+    if (!Array.isArray(values) || values.length < 1 || values.length > 8) {
       throw new PendingUserInputAnswerError(
         'INVALID_GATEWAY_RESPONSE',
-        'OpenClaw returned a mismatched pending-input run.',
+        'OpenClaw returned invalid question answer values.',
         502,
       );
     }
-    const code = typeof payload.code === 'string' ? payload.code.trim() : '';
-    if (code && code !== 'NO_PENDING_INPUT' && code !== 'NO_ACTIVE_RUN') {
-      throw new PendingUserInputAnswerError(
-        code,
-        'OpenClaw could not inspect the active pending-input request.',
-        code === 'HOTFIX_UNAVAILABLE' ? 503 : 502,
-      );
-    }
-    return { pending: false };
+    answers[questionId] = values.map((entry) => (
+      pendingInputDisplayText(entry, 'question answer', 4_000)
+    ));
   }
-  const requestId = pendingInputResponseIdentifier(payload.requestId, 'requestId', 256);
-  const runId = pendingInputResponseIdentifier(payload.runId, 'runId', 512);
-  if (runId !== normalizedRunId) {
+  return answers;
+}
+
+function parseNativeQuestionRecord(value: unknown): NativeQuestionRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new PendingUserInputAnswerError(
       'INVALID_GATEWAY_RESPONSE',
-      'OpenClaw returned a mismatched pending-input run.',
+      'OpenClaw returned an invalid question record.',
       502,
     );
   }
-  const questions = pendingInputQuestions(payload.questions);
-  const createdAt = pendingInputTimestamp(payload.createdAt, 'createdAt');
-  const expiresAt = pendingInputTimestamp(payload.expiresAt, 'expiresAt');
-  if (createdAt !== undefined && expiresAt !== undefined && expiresAt <= createdAt) {
+  const candidate = value as Record<string, unknown>;
+  const id = pendingInputResponseIdentifier(candidate.id, 'requestId', 256);
+  const sessionKey = pendingInputResponseIdentifier(candidate.sessionKey, 'sessionKey', 512);
+  const runId = pendingInputResponseIdentifier(candidate.runId, 'runId', 512);
+  const status = candidate.status;
+  if (status !== 'pending' && status !== 'answered' && status !== 'cancelled' && status !== 'expired') {
+    throw new PendingUserInputAnswerError(
+      'INVALID_GATEWAY_RESPONSE',
+      'OpenClaw returned an invalid question status.',
+      502,
+    );
+  }
+  const createdAt = pendingInputTimestamp(candidate.createdAtMs, 'createdAtMs');
+  const expiresAt = pendingInputTimestamp(candidate.expiresAtMs, 'expiresAtMs');
+  if (createdAt === undefined || expiresAt === undefined || expiresAt <= createdAt) {
     throw new PendingUserInputAnswerError(
       'INVALID_GATEWAY_RESPONSE',
       'OpenClaw returned an invalid pending-input lifetime.',
@@ -4021,12 +4188,236 @@ export async function readPendingUserInputWithRpc(
     );
   }
   return {
-    pending: true,
-    requestId,
+    id,
+    sessionKey,
     runId,
-    questions,
-    ...(createdAt !== undefined ? { createdAt } : {}),
-    ...(expiresAt !== undefined ? { expiresAt } : {}),
+    status,
+    questions: pendingInputQuestions(candidate.questions),
+    createdAt,
+    expiresAt,
+    ...(candidate.answers === undefined ? {} : { answers: nativeQuestionAnswers(candidate.answers) }),
+  };
+}
+
+async function readNativeQuestionWithRpc(
+  rpc: PendingUserInputRpc,
+  requestId: string,
+): Promise<NativeQuestionRecord> {
+  let payload: any;
+  try {
+    payload = await rpc('question.get', { id: requestId }, 10_000);
+  } catch (error) {
+    // After local validation, OpenClaw's INVALID_REQUEST on question.get means
+    // the record is gone or hidden by its session-sharing boundary. Project
+    // both cases as the same privacy-preserving terminal result.
+    if ((error as { errorCode?: unknown })?.errorCode === 'INVALID_REQUEST') {
+      throw new PendingUserInputAnswerError(
+        'REQUEST_NOT_FOUND',
+        'That OpenClaw run is no longer waiting for input.',
+        404,
+      );
+    }
+    throw error;
+  }
+  return parseNativeQuestionRecord(payload?.question);
+}
+
+function nativeQuestionHasIdentity(
+  value: unknown,
+  sessionKey: string,
+  runId: string,
+): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.sessionKey === sessionKey && candidate.runId === runId;
+}
+
+function assertNativeQuestionIdentity(
+  record: NativeQuestionRecord,
+  sessionKey: string,
+  runId: string,
+  requestId?: string,
+): void {
+  if (
+    record.sessionKey !== sessionKey
+    || record.runId !== runId
+    || (requestId !== undefined && record.id !== requestId)
+  ) {
+    throw new PendingUserInputAnswerError(
+      'REQUEST_MISMATCH',
+      'That OpenClaw question no longer matches the requested run.',
+      404,
+    );
+  }
+}
+
+function buildNativeAnswerPayload(
+  record: NativeQuestionRecord,
+  text: string,
+  structuredAnswers?: Record<string, string | string[]>,
+): Record<string, string[]> {
+  if (structuredAnswers === undefined) {
+    if (record.questions.length !== 1) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_REQUEST',
+        'Structured answers are required for a multi-question prompt.',
+        400,
+      );
+    }
+    return { [record.questions[0].id]: [text] };
+  }
+  const suppliedKeys = Object.keys(structuredAnswers);
+  const expectedKeys = record.questions.map((question) => question.id);
+  if (
+    suppliedKeys.length !== expectedKeys.length
+    || suppliedKeys.some((key) => !expectedKeys.includes(key))
+  ) {
+    throw new PendingUserInputAnswerError(
+      'INVALID_REQUEST',
+      'Structured answers do not match the pending OpenClaw questions.',
+      400,
+    );
+  }
+  const answers = Object.create(null) as Record<string, string[]>;
+  for (const question of record.questions) {
+    const raw = structuredAnswers[question.id];
+    const rawValues = Array.isArray(raw) ? raw : [raw];
+    if (
+      rawValues.length < 1
+      || rawValues.length > 8
+      || (!question.multiSelect && rawValues.length !== 1)
+    ) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_REQUEST',
+        question.multiSelect
+          ? 'A multi-select answer must contain between one and eight values.'
+          : 'A single-select question requires exactly one answer.',
+        400,
+      );
+    }
+    answers[question.id] = [...new Set(rawValues.map((value) => pendingInputText(value)))];
+  }
+  return answers;
+}
+
+function nativeAnswersMatch(
+  actual: Record<string, string[]> | undefined,
+  expected: Record<string, string[]>,
+): boolean {
+  if (!actual) return false;
+  const keys = Object.keys(expected);
+  return Object.keys(actual).length === keys.length
+    && keys.every((key) => (
+      Array.isArray(actual[key])
+      && actual[key].length === expected[key].length
+      && actual[key].every((value, index) => value === expected[key][index])
+    ));
+}
+
+export async function readPendingUserInputWithRpc(
+  rpc: PendingUserInputRpc,
+  sessionKey: unknown,
+  expectedRunId: unknown,
+  authority: PendingUserInputAuthority = 'native',
+): Promise<PendingUserInputSnapshot> {
+  const normalizedSessionKey = pendingInputIdentifier(sessionKey, 'sessionKey', 512);
+  const normalizedRunId = pendingInputIdentifier(expectedRunId, 'expectedRunId', 512);
+  if (authority === 'legacy-custom') {
+    const legacyPayload = await rpc(LEGACY_PENDING_USER_INPUT_READ_GATEWAY_METHOD, {
+      sessionKey: normalizedSessionKey,
+      expectedRunId: normalizedRunId,
+    }, 10_000);
+    if (typeof legacyPayload?.pending !== 'boolean') {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned an invalid legacy pending-input response.',
+        502,
+      );
+    }
+    if (legacyPayload.pending === false) {
+      if (legacyPayload.runId != null && legacyPayload.runId !== normalizedRunId) {
+        throw new PendingUserInputAnswerError(
+          'INVALID_GATEWAY_RESPONSE',
+          'OpenClaw returned a mismatched legacy pending-input run.',
+          502,
+        );
+      }
+      const code = typeof legacyPayload.code === 'string' ? legacyPayload.code.trim() : '';
+      if (code && code !== 'NO_PENDING_INPUT' && code !== 'NO_ACTIVE_RUN') {
+        throw new PendingUserInputAnswerError(
+          code,
+          'OpenClaw could not inspect the active legacy pending-input request.',
+          code === 'HOTFIX_UNAVAILABLE' ? 503 : 502,
+        );
+      }
+      return { pending: false };
+    }
+    const requestId = pendingInputResponseIdentifier(
+      legacyPayload.requestId,
+      'requestId',
+      256,
+    );
+    const runId = pendingInputResponseIdentifier(legacyPayload.runId, 'runId', 512);
+    if (runId !== normalizedRunId) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned a mismatched legacy pending-input run.',
+        502,
+      );
+    }
+    const questions = legacyPendingInputQuestions(legacyPayload.questions);
+    const createdAt = pendingInputTimestamp(legacyPayload.createdAt, 'createdAt');
+    const expiresAt = pendingInputTimestamp(legacyPayload.expiresAt, 'expiresAt');
+    if (createdAt !== undefined && expiresAt !== undefined && expiresAt <= createdAt) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned an invalid legacy pending-input lifetime.',
+        502,
+      );
+    }
+    return {
+      pending: true,
+      requestId,
+      runId,
+      questions,
+      ...(createdAt !== undefined ? { createdAt } : {}),
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
+    };
+  }
+  const payload = await rpc(PENDING_USER_INPUT_READ_GATEWAY_METHOD, {}, 10_000);
+  if (!Array.isArray(payload?.questions)) {
+    throw new PendingUserInputAnswerError(
+      'INVALID_GATEWAY_RESPONSE',
+      'OpenClaw returned an invalid native question list.',
+      502,
+    );
+  }
+  // question.list is caller-wide, not session-scoped, and native records are
+  // allowed to omit sessionKey/runId. Select the exact Portal-owned identity
+  // before strict parsing so an unrelated prompt cannot break this session's
+  // reconciliation (or make another session's unsupported prompt observable).
+  const matches = payload.questions
+    .filter((entry: unknown) => (
+      nativeQuestionHasIdentity(entry, normalizedSessionKey, normalizedRunId)
+    ))
+    .map((entry: unknown) => parseNativeQuestionRecord(entry))
+    .filter((record: NativeQuestionRecord) => record.status === 'pending');
+  if (matches.length === 0) return { pending: false };
+  if (matches.length !== 1) {
+    throw new PendingUserInputAnswerError(
+      'PENDING_INPUT_AMBIGUOUS',
+      'OpenClaw returned more than one pending question for the same run.',
+      409,
+    );
+  }
+  const record = matches[0];
+  return {
+    pending: true,
+    requestId: record.id,
+    runId: record.runId,
+    questions: record.questions,
+    createdAt: record.createdAt,
+    expiresAt: record.expiresAt,
   };
 }
 
@@ -4036,34 +4427,87 @@ export async function answerPendingUserInputWithRpc(
   expectedRunId: unknown,
   requestId: unknown,
   text: unknown,
+  structuredAnswers?: Record<string, string | string[]>,
+  authority: PendingUserInputAuthority = 'native',
 ): Promise<PendingUserInputAnswerResult> {
   const normalizedSessionKey = pendingInputIdentifier(sessionKey, 'sessionKey', 512);
   const normalizedRunId = pendingInputIdentifier(expectedRunId, 'expectedRunId', 512);
   const normalizedRequestId = pendingInputIdentifier(requestId, 'requestId', 256);
   const normalizedText = pendingInputText(text);
-  const payload = await rpc(PENDING_USER_INPUT_GATEWAY_METHOD, {
-    sessionKey: normalizedSessionKey,
-    expectedRunId: normalizedRunId,
-    requestId: normalizedRequestId,
-    text: normalizedText,
-  }, 10_000);
-
-  if (payload?.accepted !== true) rejectedPendingInputResponse(payload);
-  if (
-    payload.requestId !== normalizedRequestId
-    || payload.runId !== normalizedRunId
-    || typeof payload.replayed !== 'boolean'
-  ) {
+  if (authority === 'legacy-custom') {
+    const legacyPayload = await rpc(LEGACY_PENDING_USER_INPUT_GATEWAY_METHOD, {
+      sessionKey: normalizedSessionKey,
+      expectedRunId: normalizedRunId,
+      requestId: normalizedRequestId,
+      text: normalizedText,
+    }, 10_000);
+    if (legacyPayload?.accepted !== true) rejectedPendingInputResponse(legacyPayload);
+    if (
+      legacyPayload.requestId !== normalizedRequestId
+      || legacyPayload.runId !== normalizedRunId
+      || typeof legacyPayload.replayed !== 'boolean'
+    ) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned an invalid legacy pending-input response.',
+        502,
+      );
+    }
+    return {
+      accepted: true,
+      replayed: legacyPayload.replayed,
+      idempotentReplay: legacyPayload.replayed,
+      requestId: normalizedRequestId,
+      runId: normalizedRunId,
+    };
+  }
+  const record = await readNativeQuestionWithRpc(rpc, normalizedRequestId);
+  assertNativeQuestionIdentity(record, normalizedSessionKey, normalizedRunId, normalizedRequestId);
+  const answers = buildNativeAnswerPayload(record, normalizedText, structuredAnswers);
+  if (record.status === 'answered' && nativeAnswersMatch(record.answers, answers)) {
+    return {
+      accepted: true,
+      replayed: true,
+      idempotentReplay: true,
+      requestId: normalizedRequestId,
+      runId: normalizedRunId,
+    };
+  }
+  if (record.status !== 'pending') {
     throw new PendingUserInputAnswerError(
-      'INVALID_GATEWAY_RESPONSE',
-      'OpenClaw returned an invalid pending-input response.',
-      502,
+      'REQUEST_NOT_FOUND',
+      'That OpenClaw run is no longer waiting for input.',
+      404,
     );
+  }
+  let replayed = false;
+  try {
+    const payload = await rpc(PENDING_USER_INPUT_GATEWAY_METHOD, {
+      id: normalizedRequestId,
+      answers: { answers },
+      resolvedBy: 'bridgesllm-portal',
+    }, 10_000);
+    if (payload?.status !== 'answered' || !nativeAnswersMatch(nativeQuestionAnswers(payload.answers), answers)) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned an invalid question resolution.',
+        502,
+      );
+    }
+  } catch (error) {
+    const settled = await readNativeQuestionWithRpc(rpc, normalizedRequestId).catch(() => null);
+    if (
+      !settled
+      || settled.status !== 'answered'
+      || !nativeAnswersMatch(settled.answers, answers)
+    ) throw error;
+    assertNativeQuestionIdentity(settled, normalizedSessionKey, normalizedRunId, normalizedRequestId);
+    replayed = true;
   }
   return {
     accepted: true,
-    replayed: payload.replayed,
-    idempotentReplay: payload.replayed,
+    replayed,
+    idempotentReplay: replayed,
     requestId: normalizedRequestId,
     runId: normalizedRunId,
   };
@@ -4074,31 +4518,79 @@ export async function dismissPendingUserInputWithRpc(
   sessionKey: unknown,
   expectedRunId: unknown,
   requestId: unknown,
+  authority: PendingUserInputAuthority = 'native',
 ): Promise<PendingUserInputAnswerResult> {
   const normalizedSessionKey = pendingInputIdentifier(sessionKey, 'sessionKey', 512);
   const normalizedRunId = pendingInputIdentifier(expectedRunId, 'expectedRunId', 512);
   const normalizedRequestId = pendingInputIdentifier(requestId, 'requestId', 256);
-  const payload = await rpc(PENDING_USER_INPUT_DISMISS_GATEWAY_METHOD, {
-    sessionKey: normalizedSessionKey,
-    expectedRunId: normalizedRunId,
-    requestId: normalizedRequestId,
-  }, 10_000);
-  if (payload?.accepted !== true) rejectedPendingInputResponse(payload);
-  if (
-    payload.requestId !== normalizedRequestId
-    || payload.runId !== normalizedRunId
-    || typeof payload.replayed !== 'boolean'
-  ) {
+  if (authority === 'legacy-custom') {
+    const legacyPayload = await rpc(LEGACY_PENDING_USER_INPUT_DISMISS_GATEWAY_METHOD, {
+      sessionKey: normalizedSessionKey,
+      expectedRunId: normalizedRunId,
+      requestId: normalizedRequestId,
+    }, 10_000);
+    if (legacyPayload?.accepted !== true) rejectedPendingInputResponse(legacyPayload);
+    if (
+      legacyPayload.requestId !== normalizedRequestId
+      || legacyPayload.runId !== normalizedRunId
+      || typeof legacyPayload.replayed !== 'boolean'
+    ) {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned an invalid legacy pending-input dismissal response.',
+        502,
+      );
+    }
+    return {
+      accepted: true,
+      replayed: legacyPayload.replayed,
+      idempotentReplay: legacyPayload.replayed,
+      requestId: normalizedRequestId,
+      runId: normalizedRunId,
+    };
+  }
+  const record = await readNativeQuestionWithRpc(rpc, normalizedRequestId);
+  assertNativeQuestionIdentity(record, normalizedSessionKey, normalizedRunId, normalizedRequestId);
+  if (record.status === 'cancelled') {
+    return {
+      accepted: true,
+      replayed: true,
+      idempotentReplay: true,
+      requestId: normalizedRequestId,
+      runId: normalizedRunId,
+    };
+  }
+  if (record.status !== 'pending') {
     throw new PendingUserInputAnswerError(
-      'INVALID_GATEWAY_RESPONSE',
-      'OpenClaw returned an invalid pending-input dismissal response.',
-      502,
+      'REQUEST_NOT_FOUND',
+      'That OpenClaw run is no longer waiting for input.',
+      404,
     );
+  }
+  let replayed = false;
+  try {
+    const payload = await rpc(PENDING_USER_INPUT_DISMISS_GATEWAY_METHOD, {
+      id: normalizedRequestId,
+      cancel: true,
+      resolvedBy: 'bridgesllm-portal',
+    }, 10_000);
+    if (payload?.status !== 'cancelled') {
+      throw new PendingUserInputAnswerError(
+        'INVALID_GATEWAY_RESPONSE',
+        'OpenClaw returned an invalid question dismissal.',
+        502,
+      );
+    }
+  } catch (error) {
+    const settled = await readNativeQuestionWithRpc(rpc, normalizedRequestId).catch(() => null);
+    if (!settled || settled.status !== 'cancelled') throw error;
+    assertNativeQuestionIdentity(settled, normalizedSessionKey, normalizedRunId, normalizedRequestId);
+    replayed = true;
   }
   return {
     accepted: true,
-    replayed: payload.replayed,
-    idempotentReplay: payload.replayed,
+    replayed,
+    idempotentReplay: replayed,
     requestId: normalizedRequestId,
     runId: normalizedRunId,
   };
@@ -4143,22 +4635,26 @@ export async function steerActiveRunWithRpc(
 }
 
 /**
- * Answer a Codex `requestUserInput` prompt on the exact active embedded run.
- * Unlike `sessions.steer`, this never interrupts a run; unlike `chat.send`, it
- * can never create a new run after the target settles.
+ * Resolve one question on the exact embedded run using the live runtime's
+ * attested 7.1 legacy or 9.1 native authority. Unlike `chat.send`, neither path
+ * can create a new run after the target settles.
  */
 export async function answerPendingUserInput(
   sessionKey: unknown,
   expectedRunId: unknown,
   requestId: unknown,
   text: unknown,
+  structuredAnswers?: Record<string, string | string[]>,
 ): Promise<PendingUserInputAnswerResult> {
+  const authority = await resolvePendingUserInputAuthorityWithRpc(callGatewayRpc);
   return answerPendingUserInputWithRpc(
     callGatewayRpc,
     sessionKey,
     expectedRunId,
     requestId,
     text,
+    structuredAnswers,
+    authority,
   );
 }
 
@@ -4166,7 +4662,8 @@ export async function readPendingUserInput(
   sessionKey: unknown,
   expectedRunId: unknown,
 ): Promise<PendingUserInputSnapshot> {
-  return readPendingUserInputWithRpc(callGatewayRpc, sessionKey, expectedRunId);
+  const authority = await resolvePendingUserInputAuthorityWithRpc(callGatewayRpc);
+  return readPendingUserInputWithRpc(callGatewayRpc, sessionKey, expectedRunId, authority);
 }
 
 export async function dismissPendingUserInput(
@@ -4174,11 +4671,13 @@ export async function dismissPendingUserInput(
   expectedRunId: unknown,
   requestId: unknown,
 ): Promise<PendingUserInputAnswerResult> {
+  const authority = await resolvePendingUserInputAuthorityWithRpc(callGatewayRpc);
   return dismissPendingUserInputWithRpc(
     callGatewayRpc,
     sessionKey,
     expectedRunId,
     requestId,
+    authority,
   );
 }
 
@@ -4536,6 +5035,7 @@ export function clearRun(sessionKey: string): void {
 }
 
 export const __persistentGatewayWsTest = {
+  gatewayMethodHasRequiredScope,
   answerPendingUserInputWithRpc,
   dismissPendingUserInputWithRpc,
   readPendingUserInputWithRpc,

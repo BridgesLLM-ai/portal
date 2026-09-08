@@ -61,7 +61,6 @@ type WizardActionKind =
   | 'configure-domain'
   | 'install-mail'
   | 'test-email'
-  | 'install-coding-tool'
   | 'pull-model'
   | 'tailnet-onboarding'
   | 'install-rd'
@@ -224,7 +223,9 @@ interface CodingToolStatusResponse {
     description: string;
     installed: boolean;
     version: string;
-    installCmd: string;
+    state?: 'verified' | 'absent' | 'unsupported' | 'status_only' | 'drifted' | 'busy' | 'recovering' | 'recovery-required' | 'indeterminate';
+    installAvailable: boolean;
+    installUnavailableCode?: string;
   }>;
 }
 
@@ -393,7 +394,7 @@ function StepShell({ children, stepKey }: { children: ReactNode; stepKey?: strin
   );
 }
 
-export default function SetupWizardPage() {
+export default function SetupWizardPage({ onSetupResolved }: { onSetupResolved?: () => void }) {
   const navigate = useNavigate();
   const { restoreSession } = useAuthStore();
   const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -630,6 +631,7 @@ export default function SetupWizardPage() {
 
   const navigateAfterWizardAction = useCallback((owner: WizardActionOwner, target: string) => {
     if (wizardActionRef.current !== owner) return;
+    onSetupResolved?.();
     const guard = setupNavigationGuardRef.current;
     const state = window.history.state as Record<string, unknown> | null;
     if (guard?.owner === owner && state?.[SETUP_NAVIGATION_GUARD_STATE_KEY] === guard.token) {
@@ -649,9 +651,10 @@ export default function SetupWizardPage() {
     setupNavigationGuardRef.current = null;
     finishWizardAction(owner);
     navigate(target, { replace: true });
-  }, [finishWizardAction, navigate]);
+  }, [finishWizardAction, navigate, onSetupResolved]);
 
   const navigateAfterSetupRecovery = useCallback((target: string) => {
+    onSetupResolved?.();
     const guard = setupNavigationGuardRef.current;
     const state = window.history.state as Record<string, unknown> | null;
     if (guard && state?.[SETUP_NAVIGATION_GUARD_STATE_KEY] === guard.token) {
@@ -665,7 +668,7 @@ export default function SetupWizardPage() {
       return;
     }
     navigate(target, { replace: true });
-  }, [navigate]);
+  }, [navigate, onSetupResolved]);
 
   const wizardActionActive = activeWizardAction !== null;
   const ownsWizardAction = (kind: WizardActionKind, subject?: string) => (
@@ -1115,28 +1118,6 @@ export default function SetupWizardPage() {
     }
   };
 
-  const handleInstallCodingTool = async (tool: CodingToolStatusResponse['tools'][number]) => {
-    const toolSnapshot = { id: tool.id, name: tool.name };
-    const owner = claimWizardAction({
-      kind: 'install-coding-tool',
-      step,
-      label: `Installing ${toolSnapshot.name}…`,
-      subject: toolSnapshot.id,
-    });
-    if (!owner) return;
-    setError('');
-    try {
-      await api.post('/setup/install-coding-tool', { toolId: toolSnapshot.id });
-      await loadAiStatus();
-      sounds.success();
-    } catch (err: any) {
-      setError(friendlyError(err, `Failed to install ${toolSnapshot.name}`));
-      sounds.error();
-    } finally {
-      releaseWizardAction(owner);
-    }
-  };
-
   const handleRdSetup = async () => {
     const owner = claimWizardAction({ kind: 'install-rd', step, label: 'Setting up Remote Desktop…' });
     if (!owner) return;
@@ -1529,7 +1510,7 @@ export default function SetupWizardPage() {
       </div>
       {quickSetup && (
         <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-4 text-sm text-emerald-100">
-          After this account is created, the portal will restart and take you directly to AI Providers. OpenClaw sign-in happens there, after its gateway is ready to save credentials.
+          After this account is created, the portal will restart and take you directly to Model Providers. OpenClaw sign-in happens there, after its gateway is ready to save credentials.
         </div>
       )}
       <div className="grid gap-4 md:grid-cols-2">
@@ -2074,7 +2055,7 @@ export default function SetupWizardPage() {
             <div>
               <h3 className="text-lg font-semibold text-white">AI Coding Tools</h3>
               <p className="mt-1 text-sm text-slate-400">
-                Install the CLI tools that connect to cloud AI providers. These must be installed before you can sign in to a provider below.
+                A standard fresh install receives the exact Portal-compatible runtime bundle automatically. Setup shows read-only status; an existing host updates the bundle later through Owner-only Admin &gt; Maintenance.
               </p>
             </div>
             <button type="button" aria-label="Refresh AI coding tools" onClick={loadAiStatus} disabled={wizardActionActive} className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-300 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
@@ -2098,25 +2079,26 @@ export default function SetupWizardPage() {
                     )}
                   </div>
                   {tool.installed ? (
-                    <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-sm text-emerald-300">
-                      <CheckCircle2 className="h-4 w-4" /> Installed
-                    </span>
+                    <div className="max-w-[16rem] text-left md:text-right">
+                      <span className="inline-flex items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-sm text-amber-200">
+                        <CheckCircle2 className="h-4 w-4" /> Package detected
+                      </span>
+                      <p className="mt-1 text-xs text-slate-500">Portal verifies this package before use. Per-tool changes stay disabled so the qualified bundle cannot drift apart.</p>
+                    </div>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => handleInstallCodingTool(tool)}
-                      aria-busy={ownsWizardAction('install-coding-tool', tool.id)}
-                      disabled={wizardActionActive}
-                      className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {ownsWizardAction('install-coding-tool', tool.id) ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                      {ownsWizardAction('install-coding-tool', tool.id) ? 'Installing…' : 'Install'}
-                    </button>
+                    <div className="max-w-[16rem] text-left md:text-right">
+                      <span className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-sm text-slate-400">
+                        <Lock className="h-4 w-4" /> Read-only status
+                      </span>
+                      <p className="mt-1 text-xs text-slate-500">
+                        Setup cannot change an individual native runtime. Owner can repair the qualified bundle under Admin &gt; Maintenance after Setup.
+                      </p>
+                    </div>
                   )}
                 </div>
               ))}
               <p className="text-xs text-slate-500">
-                These are optional. You can install them later from Settings → System.
+                Coding-tool status is read-only during Setup. Fresh installs receive the exact bundle automatically; existing hosts use Admin &gt; Maintenance &gt; Update Compatible AI Tools. Provider availability still depends on each account's credentials.
               </p>
             </div>
           )}
@@ -2130,7 +2112,7 @@ export default function SetupWizardPage() {
           <div className="rounded-2xl border border-sky-500/20 bg-sky-500/10 p-5">
             <h3 className="font-semibold text-sky-100">Cloud provider sign-in moves to after launch</h3>
             <p className="mt-2 text-sm leading-relaxed text-slate-300">
-              OpenClaw and its credential store are not ready for a durable sign-in yet. The wizard will not start an OAuth or token flow that cannot persist its credentials. After the portal restarts, you will land on AI Providers and continue there with the tested runtime online.
+              OpenClaw and its credential store are not ready for a durable sign-in yet. The wizard will not start an OAuth or token flow that cannot persist its credentials. After the portal restarts, you will land on Model Providers and continue there with the tested runtime online.
             </p>
           </div>
         )}
@@ -2225,7 +2207,7 @@ export default function SetupWizardPage() {
               </div>
             </div>
           ) : (
-            <div className="mt-5 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">Ollama is not responding right now. You can install or troubleshoot it later in Settings.</div>
+            <div className="mt-5 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">Ollama is not responding right now. Runtime status and troubleshooting remain available in Settings; package installation is unavailable until the durable Ollama adapter ships.</div>
           )}
         </div>
 
@@ -2434,7 +2416,7 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
           <div>
             <h3 className="text-sm font-semibold text-white">Share limited operational telemetry</h3>
             <p className="mt-1 text-sm text-slate-400">
-              Enabled by default and optional. The Portal sends a report shortly after startup and then about every 24 hours while it remains running. That report contains a random install ID, Portal and dependency versions, Portal user count, uptime, Node version, operating system, and architecture. Messages, prompts, project files, credentials, usernames, and email addresses are not included. You can turn this off now or later in Settings. Installer lifecycle tracking is separate: install and update milestones include the event type, Portal version, operating system name and version, and the random install ID. This switch controls Portal operational telemetry, not those installer events.
+              Enabled by default and optional. The Portal sends a report shortly after startup and then about every 24 hours while it remains running. That report contains a random install ID, Portal and dependency versions, Portal user count, uptime, Node version, operating system, and architecture. Messages, prompts, project files, credentials, usernames, and email addresses are not included. You can turn this off now or later in Settings. Fresh-install lifecycle tracking is separate: its start and completion events include the event type, Portal version, operating system name and version, and the random install ID. Ordinary Portal updates do not send installer lifecycle events. This switch controls Portal operational telemetry, not those installer events.
             </p>
             {!allowTelemetry && <p className="mt-2 text-xs text-amber-300/90">Portal operational reports are off. Dashboard version checks and manual refreshes still work.</p>}
           </div>
@@ -2535,19 +2517,13 @@ Search indexing: ${searchEngineVisibility === 'visible' ? 'Enabled' : 'Hidden'}`
       <div className="min-h-dvh bg-slate-950 px-4 py-10 text-slate-100">
         <div className="mx-auto flex min-h-[80vh] max-w-2xl items-center justify-center">
           <div className="w-full rounded-3xl border border-slate-800 bg-slate-900/80 p-8 text-center shadow-2xl shadow-black/30 backdrop-blur">
-            <motion.div initial={{ scale: 0.4, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ type: 'spring', stiffness: 220, damping: 16 }} className="mx-auto flex h-24 w-24 items-center justify-center rounded-full bg-emerald-500/15 ring-8 ring-emerald-500/10">
-              <CheckCircle2 className="h-12 w-12 text-emerald-400" />
-            </motion.div>
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.15 }}>
-              <h2 className="mt-6 text-3xl font-bold text-white">Portal ready</h2>
-              <p className="mt-2 text-slate-400">Applying your settings and restarting the server...</p>
-              <div className="mt-4 flex justify-center">
-                <div className="h-1.5 w-32 overflow-hidden rounded-full bg-slate-800">
-                  <div className="h-full animate-pulse rounded-full bg-emerald-500/60" style={{ animation: 'pulse 1.5s ease-in-out infinite, grow 8s ease-out forwards' }} />
-                </div>
-              </div>
-              <style>{`@keyframes grow { from { width: 20%; } to { width: 100%; } }`}</style>
-            </motion.div>
+            <div className="mx-auto flex h-24 w-24 items-center justify-center rounded-full bg-emerald-500/15 ring-8 ring-emerald-500/10" aria-hidden="true">
+              <Loader2 className="h-12 w-12 animate-spin text-emerald-400 motion-reduce:animate-none" />
+            </div>
+            <div role="status" aria-live="polite">
+              <h2 className="mt-6 text-3xl font-bold text-white">Confirming Portal startup</h2>
+              <p className="mt-2 text-slate-400">Your account is saved. Waiting for the server to respond and restore your session.</p>
+            </div>
           </div>
         </div>
       </div>

@@ -167,6 +167,61 @@ run_guard() {
     "$SESSION_GUARD" "$@" >/dev/null 2>&1
 }
 
+recent_guard_heartbeat_is_verified() {
+  # The main guard already runs every semantic predicate before READY and
+  # WATCHDOG=1. Do not make a second copy compete with it on every timer tick.
+  # This observer never sends a heartbeat or extends the watchdog deadline.
+  # Any absent/stale/untrusted receipt falls back to the existing full repair.
+  python3 - "$VNC_SERVICE" "$SESSION_GUARD" <<'HEARTBEAT_PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+unit, guard = sys.argv[1:]
+try:
+    fields = ('LoadState', 'ActiveState', 'NotifyAccess', 'MainPID',
+              'WatchdogUSec', 'WatchdogTimestampMonotonic', 'ExecMainStartTimestampMonotonic')
+    result = subprocess.run(['systemctl', 'show', unit] + ['--property=' + key for key in fields],
+                            capture_output=True, text=True, timeout=10, check=True)
+    if len(result.stdout) > 4096:
+        raise ValueError('oversized service receipt')
+    values = {}
+    for line in result.stdout.splitlines():
+        key, value = line.split('=', 1)
+        if key in values or key not in fields:
+            raise ValueError('ambiguous service receipt')
+        values[key] = value
+    if set(values) != set(fields):
+        raise ValueError('incomplete service receipt')
+    if (values['LoadState'] != 'loaded' or values['ActiveState'] != 'active'
+            or values['NotifyAccess'] != 'main' or values['WatchdogUSec'] != '45s'):
+        raise ValueError('service is not supervised by the managed main-PID watchdog')
+    for key in ('MainPID', 'WatchdogTimestampMonotonic', 'ExecMainStartTimestampMonotonic'):
+        if not values[key].isascii() or not values[key].isdigit():
+            raise ValueError('invalid receipt number')
+    pid = int(values['MainPID'])
+    heartbeat = int(values['WatchdogTimestampMonotonic'])
+    started = int(values['ExecMainStartTimestampMonotonic'])
+    now = time.monotonic_ns() // 1000
+    if pid <= 1 or not 0 < started <= heartbeat <= now or now - heartbeat >= 45_000_000:
+        raise ValueError('stale or impossible heartbeat')
+    process = Path('/proc') / str(pid)
+    if process.stat().st_uid != 0:
+        raise ValueError('main guard is not privileged')
+    args = (process / 'cmdline').read_bytes().split(b'\0')
+    if args and args[-1] == b'':
+        args.pop()
+    if (len(args) != 5 or args[0] not in (b'bash', b'/bin/bash', b'/usr/bin/bash')
+            or args[1] != os.fsencode(guard) or args[2] != b'watch'
+            or any(not value.isdigit() or int(value) <= 1 for value in args[3:])):
+        raise ValueError('main PID is not the managed semantic guard')
+except (OSError, ValueError, subprocess.SubprocessError):
+    raise SystemExit(1)
+HEARTBEAT_PY
+}
+
 unit_property() {
   local unit="$1" property="$2" value
   value="$(systemctl show "$unit" --property="$property" --value 2>/dev/null)" || return 1
@@ -447,6 +502,16 @@ if [[ "$VNC_LOAD_STATE" != 'loaded' || "$WEB_LOAD_STATE" != 'loaded' ]]; then
 fi
 if units_are_transitioning; then
   write_state recovering 'Remote Desktop services are already changing state; this timer tick did not interfere.' \
+    "$now" "$last_recovery" ''
+  exit 0
+fi
+
+# A fresh, main-PID-only receipt attests the same complete semantic check.
+# If the guard stalls, systemd's unchanged 45-second deadline still expires;
+# this timer cannot keep it alive or turn an invalid receipt into health.
+if [[ "$VNC_ACTIVE_STATE" == 'active' && "$WEB_ACTIVE_STATE" == 'active' ]] \
+  && recent_guard_heartbeat_is_verified; then
+  write_state healthy 'Remote Desktop services have a recent verified semantic guard heartbeat.' \
     "$now" "$last_recovery" ''
   exit 0
 fi

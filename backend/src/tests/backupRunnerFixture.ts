@@ -31,7 +31,7 @@ export function createAttestedBackupRoot(prefix: string): AttestedBackupRoot {
     path.join('/root', `bridgesllm-installer-data-test-${safePrefix}-`),
   );
   fs.chmodSync(cleanupRoot, 0o700);
-  const fixtureRoot = path.join(cleanupRoot, 'backup-fixture');
+  const fixtureRoot = path.join(cleanupRoot, 'restore-fixture');
   fs.mkdirSync(fixtureRoot, { mode: 0o700 });
   return { cleanupRoot, fixtureRoot };
 }
@@ -78,6 +78,7 @@ export function createBackupRunnerFixture(
     restoreStateRoot,
     installerStateRoot,
     path.dirname(operationLock),
+    path.join(testRoot, 'tmp'),
     installRoot,
     stateDir,
     path.join(backupRoot, 'daily'),
@@ -115,6 +116,19 @@ export function createBackupRunnerFixture(
     path.join(portalRoot, 'installer', 'install.sh'),
   );
   fs.chmodSync(path.join(portalRoot, 'installer', 'install.sh'), 0o700);
+  for (const script of ['restore-full.sh', 'backup-full.sh']) {
+    fs.copyFileSync(path.join(repositoryRoot, script), path.join(portalRoot, script));
+    fs.chmodSync(path.join(portalRoot, script), 0o700);
+  }
+  for (const command of ['systemd-run', 'initdb', 'postgres', 'npx']) {
+    writeSealedCommand(path.join(commandsRoot, command), '#!/bin/sh\nexit 1\n');
+  }
+  fs.copyFileSync(
+    path.join(repositoryRoot, 'installer', 'portal-recovery-archive.py'),
+    path.join(portalRoot, 'installer', 'portal-recovery-archive.py'),
+  );
+  fs.writeFileSync(path.join(portalRoot, 'backend', 'package.json'),
+    JSON.stringify({ name: 'portal-backup-fixture', version: '4.0.0' }), { mode: 0o600 });
   fs.writeFileSync(
     path.join(portalRoot, 'backend', '.env.production'),
     `DATABASE_URL=${options.databaseUrl || 'postgresql://portal:test@127.0.0.1:5432/portal'}\n`,
@@ -138,8 +152,20 @@ export function createBackupRunnerFixture(
     systemctl: path.join(commandsRoot, 'systemctl'),
   };
 
-  writeSealedCommand(commands.systemctl, '#!/bin/sh\nexit 1\n');
-  writeSealedCommand(commands.docker, '#!/bin/sh\nexit 1\n');
+  writeSealedCommand(commands.systemctl, `#!/bin/sh
+case "$*" in
+  *--property=LoadState*) printf '%s\\n' not-found ;;
+  *--property=ActiveState*) printf '%s\\n' inactive ;;
+  *daemon-reload*) exit 0 ;;
+  *) exit 1 ;;
+esac
+`);
+  writeSealedCommand(commands.docker, `#!/bin/sh
+case "$*" in
+  *"container ls"*|"ps "*|ps) exit 0 ;;
+  *) printf '%s\\n' 'No such container' >&2; exit 1 ;;
+esac
+`);
   writeSealedCommand(commands.curl, '#!/bin/sh\nexit 1\n');
   writeSealedCommand(commands.pgDump, `#!/usr/bin/env python3
 import sys
@@ -177,76 +203,24 @@ if "--file=/dev/null" in arguments:
     raise SystemExit(0)
 raise SystemExit(1)
 `);
-  writeSealedCommand(commands.psql, `#!/usr/bin/env python3
-import json
-import sys
+  // Reuse the executing recovery fixture's PostgreSQL fence model, including
+  // role admission, guarded snapshot, and exact restoration of connection state.
+  const recoveryFixture = fs.readFileSync(
+    path.join(repositoryRoot, 'scripts/validation/restore-full-static.sh'), 'utf8',
+  );
+  const psqlMarker = 'cat > "${commands_root}/psql" <<\'PY\'\n';
+  const psqlStart = recoveryFixture.indexOf(psqlMarker);
+  if (psqlStart < 0) throw new Error('Recovery fixture PostgreSQL model is missing');
+  const psqlEnd = recoveryFixture.indexOf('\nPY\n', psqlStart + psqlMarker.length);
+  if (psqlEnd < 0) throw new Error('Recovery fixture PostgreSQL model is unterminated');
+  writeSealedCommand(commands.psql, recoveryFixture
+    .slice(psqlStart + psqlMarker.length, psqlEnd)
+    .replace('print("160014")', `print("${postgresServerVersionNum}")`));
+  fs.mkdirSync(path.join(testRoot, 'postgres', 'pg_wal'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(testRoot, 'database-guard.json'), JSON.stringify({
+    connectionLimit: -1, portalCanLogin: true, token: '',
+  }), { mode: 0o600 });
 
-if sys.argv[1:] == ["--version"]:
-    print("psql (PostgreSQL) 16.14")
-    raise SystemExit(0)
-
-command = next(
-    (
-        argument.partition("=")[2]
-        for argument in sys.argv[1:]
-        if argument.startswith("--command=")
-    ),
-    None,
-)
-if command is not None:
-    if "current_setting('server_version_num')" in command:
-        print("${postgresServerVersionNum}")
-    elif "pg_database_size(current_database())" in command:
-        if "FROM pg_class" in command and "relkind IN" in command:
-            print("1048576|64")
-        else:
-            print("1048576")
-    elif "FROM pg_class" in command and "relkind IN" in command:
-        print("64")
-    else:
-        print("0")
-    raise SystemExit(0)
-
-first = sys.stdin.buffer.readline()
-statements = []
-if first.startswith(b"BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;"):
-    statements.append(first)
-    while not any(
-        b"current_setting('temp_tablespaces')" in line
-        for line in statements
-    ):
-        line = sys.stdin.buffer.readline()
-        if not line:
-            raise SystemExit(1)
-        statements.append(line)
-    identity = json.dumps({
-        "schema": "bridgesllm.postgresql-database-identity.v1",
-        "postgresMajor": 16,
-        "encoding": "UTF8",
-        "lcCollate": "C",
-        "lcCtype": "C",
-        "localeProvider": "libc",
-        "providerLocale": None,
-        "icuRules": None,
-        "collationVersion": None,
-        "collationActualVersion": None,
-    }, separators=(",", ":"))
-    print("BRIDGESLLM_BACKUP_SNAPSHOT_V1", flush=True)
-    print("00000003-0000001B-1", flush=True)
-    print("1048576", flush=True)
-    print("64", flush=True)
-    print(identity, flush=True)
-    print("0|owner-null", flush=True)
-    print("0", flush=True)
-    for line in sys.stdin.buffer:
-        if b"BRIDGESLLM_BACKUP_IDENTITY_END_V1" in line:
-            print(identity, flush=True)
-            print("BRIDGESLLM_BACKUP_IDENTITY_END_V1", flush=True)
-        if line.strip() == b"\\\\q":
-            break
-    raise SystemExit(0)
-raise SystemExit(1)
-`);
 
   const env: Record<string, string> = {
     PORTAL_ROOT: portalRoot,

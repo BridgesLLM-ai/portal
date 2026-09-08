@@ -1,4 +1,7 @@
+// This suite attests filesystem/container policy through its executor; it does not query a database.
+jest.mock('../config/database', () => ({ prisma: {} }));
 import crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -14,6 +17,7 @@ import {
   type ProjectEgressPlaneSpec,
 } from './projectEgressPlane';
 import { PROJECT_EGRESS_POLICY_VERSION } from './projectEgressPolicy';
+import { computeOpenClaw92SandboxConfigHash, resolveOpenClawWorkspaceQualifiedRuntime } from './openclawWorkspaceQualifiedIdentity';
 import {
   OPENCLAW_PROJECT_KERNEL_RUNTIME,
   OPENCLAW_PROJECT_RUNTIME_POLICY_VERSION,
@@ -24,6 +28,7 @@ import {
   __openClawProjectSandboxTest,
   attestOpenClawProjectContainer,
   buildOpenClawProjectSandboxPlan,
+  buildOpenClawProjectSandboxPlanForRuntime,
   computeOpenClawProjectConfigHash,
   deriveOpenClawProjectAgentId,
   deriveOpenClawProjectSessionKey,
@@ -93,7 +98,7 @@ afterEach(() => {
   }
 });
 
-function makeFixture(): Fixture {
+function makeFixture(mountFormatVersion: 3 | 4 | 5 = 4): Fixture {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-project-sandbox-'));
   tempRoots.push(tempRoot);
   const projectRoot = path.join(tempRoot, 'projects', 'actor', 'project-a');
@@ -158,6 +163,7 @@ function makeFixture(): Fixture {
     openClawHome,
     egressSpec: spec,
     egressHandle: handle,
+    mountFormatVersion,
   });
   return { tempRoot, projectRoot, openClawHome, context, egress, spec, handle, plan };
 }
@@ -171,6 +177,21 @@ function currentNetworkResolver(fixture: Fixture) {
 
 function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function persistedAgentEntries(agents: Record<string, any>[]): Record<string, Record<string, any>> {
+  return Object.fromEntries(agents.map((agent) => {
+    const { id, ...entry } = agent;
+    return [id, entry];
+  }));
+}
+
+function explicitAgentRoster(agents: Record<string, any>[]): Record<string, any> {
+  return {
+    ownership: 'explicit',
+    defaults: { systemAgent: { agentId: 'main' } },
+    entries: persistedAgentEntries(agents),
+  };
 }
 
 function makeInspect(
@@ -193,16 +214,17 @@ function makeInspect(
       Entrypoint: null,
       Labels: {
         'openclaw.sandbox': '1',
-        'openclaw.sessionKey': plan.sessionKey,
+        'openclaw.sessionKey': plan.runtimeScopeKey,
         [OPENCLAW_PROJECT_ACTOR_LABEL]: hashOpenClawProjectLabelIdentity(plan.actorUserId),
         [OPENCLAW_PROJECT_IDENTITY_LABEL]: hashOpenClawProjectLabelIdentity(plan.projectIdentityId),
         [OPENCLAW_PROJECT_AGENT_LABEL]: plan.agentId,
         'openclaw.createdAtMs': '123456789',
-        'openclaw.mountFormatVersion': '3',
+        'openclaw.mountFormatVersion': String(plan.mountFormatVersion === 5 ? 4 : plan.mountFormatVersion),
+        ...(plan.mountFormatVersion >= 4 ? { 'openclaw.createArgsEpoch': '2026-08-25-container-env-file' } : {}),
         'openclaw.configHash': plan.configHash,
         [PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]: plan.runtimeFingerprint,
       },
-      WorkingDir: '/workspace/project',
+      WorkingDir: plan.mountFormatVersion === 5 ? '/workspace' : '/workspace/project',
       ExposedPorts: null,
       Volumes: null,
     },
@@ -212,6 +234,7 @@ function makeInspect(
     },
     HostConfig: {
       ReadonlyRootfs: true,
+      Init: plan.mountFormatVersion >= 4,
       CapAdd: null,
       CapDrop: ['ALL'],
       SecurityOpt: [
@@ -262,8 +285,8 @@ function makeInspect(
         Type: 'bind',
         Source: plan.sandboxWorkspaceDir,
         Destination: '/workspace',
-        Mode: 'ro,z',
-        RW: false,
+        Mode: plan.mountFormatVersion === 5 ? 'z' : 'ro,z',
+        RW: plan.mountFormatVersion === 5,
         Propagation: 'rprivate',
       },
       {
@@ -274,6 +297,14 @@ function makeInspect(
         RW: true,
         Propagation: 'rprivate',
       },
+      ...(plan.mountFormatVersion === 5 ? [{
+        Type: 'bind',
+        Source: path.join(plan.sandboxWorkspaceDir, 'skills'),
+        Destination: '/workspace/skills',
+        Mode: 'ro,z',
+        RW: false,
+        Propagation: 'rprivate',
+      }] : []),
     ],
     NetworkSettings: {
       Ports: null,
@@ -303,6 +334,7 @@ function rpcResult(config: Record<string, any>, hash = 'config-hash') {
 function legacyPreConfinementFixture(fixture: Fixture): Fixture {
   const desiredDocker: Record<string, any> = {
     ...deepClone(fixture.plan.desiredDocker),
+    workdir: '/workspace/project',
     seccompProfile: '',
     apparmorProfile: '',
   };
@@ -330,6 +362,7 @@ function legacyPreConfinementFixture(fixture: Fixture): Fixture {
     plan: {
       ...fixture.plan,
       desiredDocker,
+      mountFormatVersion: 3,
       configHash,
       runtimeFingerprint,
       networkMode: fixture.spec.internalNetworkName,
@@ -462,7 +495,7 @@ describe('OpenClaw Project sandbox desired policy', () => {
       'xai/*': { agentRuntime: { id: 'openclaw' } },
     });
     expect(plan.desiredAgent.tools.allow).toEqual([
-      'exec', 'process', 'read', 'write', 'edit', 'apply_patch', 'ask_user_question',
+      'exec', 'process', 'read', 'write', 'edit', 'apply_patch', 'ask_user', 'request_user_input',
     ]);
     expect(plan.desiredAgent.tools.deny).toEqual(expect.arrayContaining([
       'group:web', 'group:media', 'web_search', 'web_fetch', 'image', 'browser', 'gateway',
@@ -471,11 +504,55 @@ describe('OpenClaw Project sandbox desired policy', () => {
     expect(plan.desiredAgent.tools.elevated).toEqual({ enabled: false });
     expect(plan.desiredAgent.tools.exec).toMatchObject({ host: 'sandbox', security: 'full', ask: 'off' });
     expect(plan.desiredAgent.tools.sandbox.tools).toEqual({
-      allow: ['exec', 'process', 'read', 'write', 'edit', 'apply_patch', 'ask_user_question'],
+      allow: ['exec', 'process', 'read', 'write', 'edit', 'apply_patch', 'ask_user', 'request_user_input'],
       deny: plan.desiredAgent.tools.deny,
     });
     expect(plan.expectedEnvironment.HTTP_PROXY).toContain('portal-project-egress');
     expect(plan.expectedEnvironment.NO_PROXY).toBe('');
+  });
+
+  test('current sandbox hash includes 9.x epochs and the automatic workspace mount cannot duplicate the project bind', () => {
+    const fixture = makeFixture(4);
+    const plan = fixture.plan;
+    const destinations = [plan.desiredDocker.workdir, ...plan.desiredDocker.binds.map((bind: string) => bind.split(':')[1])];
+    expect(destinations).toEqual(['/workspace', '/workspace/project']);
+    expect(new Set(destinations).size).toBe(destinations.length);
+    const args = __openClawProjectSandboxTest.buildContainerCreateArgs(plan, 123);
+    expect(args).toContain('--init');
+    expect(args).toContain('openclaw.mountFormatVersion=4');
+    expect(args).toContain('openclaw.createArgsEpoch=2026-08-25-container-env-file');
+    expect(args.filter((arg: string, i: number) => args[i - 1] === '-v')).toEqual([
+      `${plan.sandboxWorkspaceDir}:/workspace:ro,z`, `${plan.projectRoot}:/workspace/project:rw`,
+    ]);
+    const legacy = makeFixture(3).plan;
+    const legacyArgs = __openClawProjectSandboxTest.buildContainerCreateArgs(legacy, 123);
+    expect(legacyArgs).not.toContain('--init');
+    expect(legacyArgs).toContain('openclaw.mountFormatVersion=3');
+    expect(legacy.mountFormatVersion).toBe(3);
+  });
+
+  (process.env.PORTAL_OPENCLAW_CONTRACT_DIST ? test : test.skip)('matches the installed current OpenClaw hash and automatic mount builder', () => {
+    const plan = makeFixture(4).plan;
+    const script = `
+      import fs from 'node:fs'; import path from 'node:path'; import {pathToFileURL} from 'node:url';
+      const root = process.env.PORTAL_OPENCLAW_CONTRACT_DIST;
+      const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+      const dockerFile = fs.readdirSync(root).find(n => /^docker-.*\\.js$/.test(n) && fs.readFileSync(path.join(root,n),'utf8').includes('mountFormatVersion: 4'));
+      if (!dockerFile) throw new Error('No current sandbox contract found');
+      const docker = fs.readFileSync(path.join(root,dockerFile),'utf8');
+      const hashFile = docker.match(/from "(\\.\\/sanitize-env-vars-[^"]+)"/)[1];
+      const mountsFile = docker.match(/from "(\\.\\/workspace-mounts-[^"]+)"/)[1];
+      const h = await import(pathToFileURL(path.resolve(root,hashFile)).href);
+      const m = await import(pathToFileURL(path.resolve(root,mountsFile)).href);
+      const inputState = { docker: input.docker, dockerEnvPolicyEpoch: h.t(input.docker.env), workspaceAccess:'none', workspaceDir:input.workspace, agentWorkspaceDir:input.agentWorkspace, mountFormatVersion:4, createArgsEpoch:'2026-08-25-container-env-file', readOnlyWorkspaceSkillMounts:[] };
+      const args=[]; m.n({args,workspaceDir:input.workspace,agentWorkspaceDir:input.agentWorkspace,workdir:input.docker.workdir,workspaceAccess:'none',readOnlyWorkspaceSkillMounts:[]});
+      process.stdout.write(JSON.stringify({hash:h.o(inputState),mounts:args.filter((v,i)=>args[i-1]==='-v').concat(input.docker.binds).map(v=>v.split(':')[1])}));
+    `;
+    const result = JSON.parse(execFileSync(process.execPath, ['--max-old-space-size=96', '--input-type=module', '-e', script], {
+      input: JSON.stringify({docker:plan.desiredDocker,workspace:plan.sandboxWorkspaceDir,agentWorkspace:plan.agentWorkspaceDir}), encoding:'utf8', timeout:15000,
+    }));
+    expect(result.hash).toBe(plan.configHash);
+    expect(result.mounts).toEqual(['/workspace', '/workspace/project']);
   });
 
   test('matches OpenClaw 2026.7.1 slug and stable config-hash behavior', () => {
@@ -492,6 +569,7 @@ describe('OpenClaw Project sandbox desired policy', () => {
       docker: fixture.plan.desiredDocker,
       sandboxWorkspaceDir: fixture.plan.sandboxWorkspaceDir,
       agentWorkspaceDir: fixture.plan.agentWorkspaceDir,
+      mountFormatVersion: fixture.plan.mountFormatVersion,
     })).toBe(fixture.plan.configHash);
     expect(fixture.plan.configHash).toMatch(/^[a-f0-9]{64}$/);
     expect(fixture.plan.containerName.length).toBeLessThanOrEqual(63);
@@ -678,53 +756,107 @@ describe('OpenClaw Project runtime attestation', () => {
 });
 
 describe('OpenClaw config convergence', () => {
+  test('preserves the 2026.7.1 list contract and uses an explicit whole-array replacement', async () => {
+    const fixture = makeFixture(3);
+    const staleAgent = deepClone(fixture.plan.desiredAgent);
+    staleAgent.tools.deny.push('stale-deny-entry');
+    const expectedList = [{ id: 'main', default: true }, fixture.plan.desiredAgent];
+    const rpc = jest.fn()
+      .mockResolvedValueOnce(rpcResult({
+        agents: { defaults: {}, list: [{ id: 'main' }, staleAgent] },
+      }, 'before'))
+      .mockResolvedValueOnce({ ok: true, data: { hash: 'after' } })
+      .mockResolvedValueOnce(rpcResult({
+        agents: { defaults: {}, list: expectedList },
+      }, 'after'));
+
+    await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc);
+
+    expect(rpc).toHaveBeenCalledTimes(3);
+    expect(rpc).toHaveBeenNthCalledWith(2, 'config.patch', {
+      raw: JSON.stringify({ agents: { list: expectedList } }),
+      baseHash: 'before',
+      replacePaths: ['agents.list'],
+    }, 15_000);
+  });
+
   test('patches the entire agent, then synchronously re-reads and verifies effective global policy', async () => {
     const fixture = makeFixture();
     const staleAgent = deepClone(fixture.plan.desiredAgent);
     staleAgent.tools.deny.push('stale-deny-entry');
     staleAgent.tools.sandbox.tools.deny.push('stale-sandbox-deny-entry');
+    const beforeAgents = {
+      ...explicitAgentRoster([{ id: 'main' }, staleAgent]),
+      futureAgentSetting: { opaque: true },
+    };
+    // OpenClaw 2026.9.1 attaches `agents.list` to config.get results as a
+    // non-enumerable compatibility projection. It is readable at runtime but
+    // must never be copied into the persisted merge patch.
+    Object.defineProperty(beforeAgents, 'list', {
+      configurable: true,
+      enumerable: false,
+      value: [{ id: 'main' }, staleAgent],
+    });
     const rpc = jest.fn()
-      .mockResolvedValueOnce(rpcResult({ agents: { list: [{ id: 'main' }, staleAgent] } }, 'before'))
+      .mockResolvedValueOnce(rpcResult({
+        agents: beforeAgents,
+      }, 'before'))
       .mockResolvedValueOnce({ ok: true, data: { hash: 'after' } })
-      .mockResolvedValueOnce(rpcResult({ agents: { list: [{ id: 'main' }, fixture.plan.desiredAgent] } }, 'after'));
+      .mockResolvedValueOnce(rpcResult({
+        agents: {
+          ...explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
+          futureAgentSetting: { opaque: true },
+        },
+      }, 'after'));
 
     await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc);
 
     expect(rpc).toHaveBeenCalledTimes(3);
     expect(rpc.mock.calls[1][0]).toBe('config.patch');
     expect(rpc.mock.calls[1][1].baseHash).toBe('before');
-    expect(rpc.mock.calls[1][1].replacePaths).toEqual([
-      'agents.list[].tools.deny',
-      'agents.list[].tools.sandbox.tools.deny',
-    ]);
+    expect(rpc.mock.calls[1][1].replacePaths).toEqual(expect.arrayContaining([
+      `agents.entries.${AGENT_ID}.tools.deny`,
+      `agents.entries.${AGENT_ID}.tools.sandbox.tools.deny`,
+    ]));
     const raw = JSON.parse(rpc.mock.calls[1][1].raw);
-    // `main` is pinned as the default agent so project agents joining the list
-    // can never capture OpenClaw's default routing (probes, unscoped CLI ops).
-    expect(raw.agents.list).toEqual([{ id: 'main', default: true }, fixture.plan.desiredAgent]);
+    expect(raw.agents.entries[AGENT_ID].tools.deny).toEqual(fixture.plan.desiredAgent.tools.deny);
+    expect(raw.agents.entries[AGENT_ID].tools.sandbox.tools.deny)
+      .toEqual(fixture.plan.desiredAgent.tools.sandbox.tools.deny);
+    expect(raw.agents.entries[AGENT_ID]).not.toHaveProperty('id');
+    expect(raw.agents).not.toHaveProperty('list');
+    expect(raw.agents).not.toHaveProperty('futureAgentSetting');
   });
 
-  test('pins default routing on main even when the project agent is already exact', async () => {
+  test('migrates legacy main ownership while preserving an exact keyed Project agent', async () => {
     const fixture = makeFixture();
+    const main = { id: 'main', default: true, name: 'Host main' };
     const rpc = jest.fn()
       .mockResolvedValueOnce(rpcResult({
-        agents: { list: [fixture.plan.desiredAgent, { id: 'main' }] },
+        agents: { entries: persistedAgentEntries([fixture.plan.desiredAgent, main]) },
       }, 'before'))
       .mockResolvedValueOnce({ ok: true, data: { hash: 'after' } })
       .mockResolvedValueOnce(rpcResult({
-        agents: { list: [{ id: 'main', default: true }, fixture.plan.desiredAgent] },
+        agents: {
+          ...explicitAgentRoster([{ id: 'main', name: 'Host main' }, fixture.plan.desiredAgent]),
+        },
       }, 'after'));
 
     await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc);
 
     expect(rpc.mock.calls[1][0]).toBe('config.patch');
     const raw = JSON.parse(rpc.mock.calls[1][1].raw);
-    expect(raw.agents.list).toEqual([{ id: 'main', default: true }, fixture.plan.desiredAgent]);
+    expect(raw.agents).toMatchObject({
+      ownership: 'explicit',
+      defaults: { systemAgent: { agentId: 'main' } },
+      entries: { main: { default: null } },
+    });
+    expect(raw.agents).not.toHaveProperty('list');
   });
 
-  test('does not patch an already exact agent when the host main agent remains default', async () => {
+  test('does not patch an already exact keyed agent with explicit host ownership', async () => {
     const fixture = makeFixture();
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [{ id: 'main', default: true }, fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
     await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc);
     expect(rpc).toHaveBeenCalledTimes(1);
@@ -734,23 +866,30 @@ describe('OpenClaw config convergence', () => {
   test('restores the implicit main agent before an exact lone Project agent can capture default routing', async () => {
     const fixture = makeFixture();
     const rpc = jest.fn()
-      .mockResolvedValueOnce(rpcResult({ agents: { list: [fixture.plan.desiredAgent] } }, 'before'))
+      .mockResolvedValueOnce(rpcResult({
+        agents: { entries: persistedAgentEntries([fixture.plan.desiredAgent]) },
+      }, 'before'))
       .mockResolvedValueOnce({ ok: true, data: { hash: 'after' } })
       .mockResolvedValueOnce(rpcResult({
-        agents: { list: [{ id: 'main', default: true }, fixture.plan.desiredAgent] },
+        agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
       }, 'after'));
 
     await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc);
 
     const raw = JSON.parse(rpc.mock.calls[1][1].raw);
-    expect(raw.agents.list).toEqual([{ id: 'main', default: true }, fixture.plan.desiredAgent]);
+    expect(raw.agents).toMatchObject({
+      ownership: 'explicit',
+      defaults: { systemAgent: { agentId: 'main' } },
+      entries: { main: {} },
+    });
+    expect(raw.agents.entries[AGENT_ID]).toBeUndefined();
   });
 
   test.each([
     ['get failure', [{ ok: false, error: 'offline' }], 'CONFIG_GET_FAILED'],
     ['invalid get', [{ ok: true, data: { config: {} } }], 'CONFIG_GET_INVALID'],
-    ['patch failure', [rpcResult({ agents: { list: [] } }), { ok: false, error: 'rejected' }], 'CONFIG_PATCH_FAILED'],
-    ['reread mismatch', [rpcResult({ agents: { list: [] } }), { ok: true }, rpcResult({ agents: { list: [] } })], 'CONFIG_REREAD_MISMATCH'],
+    ['patch failure', [rpcResult({ agents: explicitAgentRoster([{ id: 'main' }]) }), { ok: false, error: 'rejected' }], 'CONFIG_PATCH_FAILED'],
+    ['reread mismatch', [rpcResult({ agents: explicitAgentRoster([{ id: 'main' }]) }), { ok: true }, rpcResult({ agents: explicitAgentRoster([{ id: 'main' }]) })], 'CONFIG_REREAD_MISMATCH'],
   ])('fails closed on %s', async (_label, responses, code) => {
     const fixture = makeFixture();
     const rpc = jest.fn();
@@ -762,19 +901,19 @@ describe('OpenClaw config convergence', () => {
   test('retains bounded structured gateway detail when config.patch is rejected', async () => {
     const fixture = makeFixture();
     const rpc = jest.fn()
-      .mockResolvedValueOnce(rpcResult({ agents: { list: [] } }, 'before'))
+      .mockResolvedValueOnce(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }]) }, 'before'))
       .mockResolvedValueOnce({
         ok: false,
         error: 'legacy flattened message',
         errorCode: 'INVALID_REQUEST',
-        errorMessage: 'config.patch would remove entries from array path(s): agents.list[].tools.deny',
+        errorMessage: `config.patch would remove entries from array path(s): agents.entries.${AGENT_ID}.tools.deny`,
       });
 
     await expect(__openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc))
       .rejects.toMatchObject({
         code: 'CONFIG_PATCH_FAILED',
         gatewayErrorCode: 'INVALID_REQUEST',
-        gatewayErrorMessage: 'config.patch would remove entries from array path(s): agents.list[].tools.deny',
+        gatewayErrorMessage: `config.patch would remove entries from array path(s): agents.entries.${AGENT_ID}.tools.deny`,
       });
   });
 
@@ -788,8 +927,11 @@ describe('OpenClaw config convergence', () => {
     ]) {
       const rpc = jest.fn().mockResolvedValue(rpcResult({
         agents: {
-          defaults: { sandbox: { docker } },
-          list: [fixture.plan.desiredAgent],
+          ...explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
+          defaults: {
+            systemAgent: { agentId: 'main' },
+            sandbox: { docker },
+          },
         },
       }));
       await expect(__openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc))
@@ -797,13 +939,19 @@ describe('OpenClaw config convergence', () => {
     }
   });
 
-  test('rejects duplicate agent identities', async () => {
+  test('rejects case-normalized duplicate keyed agent identities', async () => {
     const fixture = makeFixture();
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent, fixture.plan.desiredAgent] },
+      agents: {
+        ownership: 'explicit',
+        entries: {
+          [AGENT_ID]: persistedAgentEntries([fixture.plan.desiredAgent])[AGENT_ID],
+          [AGENT_ID.toUpperCase()]: persistedAgentEntries([fixture.plan.desiredAgent])[AGENT_ID],
+        },
+      },
     }));
     await expect(__openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc))
-      .rejects.toMatchObject({ code: 'DUPLICATE_AGENT' });
+      .rejects.toMatchObject({ code: 'CONFIG_AGENT_ENTRIES_INVALID' });
   });
 });
 
@@ -839,7 +987,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
       }),
     };
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [{ id: 'main', default: true }, fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
     const constrainRuntime = jest.fn(async () => undefined);
     const ensureEgressPlane = jest.fn(async () => fixture.handle);
@@ -847,6 +995,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     const overrides = {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -890,7 +1039,8 @@ describe('OpenClaw Project sandbox orchestration', () => {
       egress: fixture.egress,
     }, overrides)).resolves.toMatchObject({ containerName: fixture.plan.containerName });
     expect(ensureEgressPlane).toHaveBeenCalledTimes(1);
-    expect(rpc).toHaveBeenCalledTimes(2);
+    expect(rpc).toHaveBeenCalledTimes(4);
+    expect(rpc.mock.calls.every(([method]) => method === 'config.get')).toBe(true);
     expect(calls.filter((call) => call[1] === 'container' && call[2] === 'create')).toHaveLength(1);
     expect(calls.filter((call) => call[1] === 'container' && call[2] === 'start')).toHaveLength(1);
 
@@ -911,7 +1061,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
 
   test('fails before config/runtime work when egress identity or attestation mismatches', async () => {
     const fixture = makeFixture();
-    const rpc = jest.fn();
+    const rpc = jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) }));
     const executor: ProjectEgressCommandExecutor = {
       run: jest.fn(async (_command, args) => {
         if (args[0] === 'container' && args[1] === 'ls') {
@@ -938,11 +1088,12 @@ describe('OpenClaw Project sandbox orchestration', () => {
     }, {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: async () => ({ ...fixture.handle, policyFingerprint: 'wrong' }),
     })).rejects.toMatchObject({ code: 'EGRESS_ATTESTATION' });
-    expect(rpc).not.toHaveBeenCalled();
+    expect(rpc.mock.calls.every(([method]) => method === 'config.get')).toBe(true);
 
     await expect(ensureOpenClawProjectSandbox({
       context: fixture.context,
@@ -953,6 +1104,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     }, {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: async () => ({
@@ -960,7 +1112,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
         proxyEnvironment: { ...fixture.handle.proxyEnvironment, ALL_PROXY: 'http://host:3128' },
       }),
     })).rejects.toMatchObject({ code: 'EGRESS_PROXY_ENVIRONMENT' });
-    expect(rpc).not.toHaveBeenCalled();
+    expect(rpc.mock.calls.every(([method]) => method === 'config.get')).toBe(true);
   });
 
   test('leaves an unattested drifted runtime untouched and unavailable', async () => {
@@ -1064,7 +1216,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
       }),
     };
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
     const constrainRuntime = jest.fn(async () => {
       fs.renameSync(fixture.projectRoot, `${fixture.projectRoot}-old`);
@@ -1080,6 +1232,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     }, {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: async () => fixture.handle,
@@ -1105,7 +1258,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
       return fixture.handle;
     });
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
 
     await expect(ensureOpenClawProjectSandbox({
@@ -1117,6 +1270,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     }, {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -1166,6 +1320,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
         openClawHome: base.openClawHome,
         egressSpec: base.spec,
         egressHandle: base.handle,
+        mountFormatVersion: base.plan.mountFormatVersion,
       }),
     };
   }
@@ -1182,7 +1337,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     const executor = new RuntimeInventoryExecutor(fixture);
     executor.add(stale);
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
 
     await expect(ensureOpenClawProjectSandbox({
@@ -1194,6 +1349,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     }, {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: jest.fn(async () => fixture.handle),
@@ -1225,7 +1381,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     const executor = new RuntimeInventoryExecutor(fixture);
     executor.add(stale);
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
 
     await expect(ensureOpenClawProjectSandbox({
@@ -1237,6 +1393,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     }, {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: jest.fn(async () => fixture.handle),
@@ -1259,11 +1416,12 @@ describe('OpenClaw Project sandbox orchestration', () => {
     const executor = new RuntimeInventoryExecutor(fixture);
     executor.add(stale);
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
     const overrides = {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: jest.fn(async () => fixture.handle),
@@ -1314,8 +1472,9 @@ describe('OpenClaw Project sandbox orchestration', () => {
       openClawHome: fixture.openClawHome,
       egress: fixture.egress,
     }, {
-      rpc: jest.fn(),
+      rpc: jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) })),
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -1342,8 +1501,9 @@ describe('OpenClaw Project sandbox orchestration', () => {
       openClawHome: fixture.openClawHome,
       egress: fixture.egress,
     }, {
-      rpc: jest.fn(),
+      rpc: jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) })),
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -1382,8 +1542,9 @@ describe('OpenClaw Project sandbox orchestration', () => {
       openClawHome: fixture.openClawHome,
       egress: fixture.egress,
     }, {
-      rpc: jest.fn(),
+      rpc: jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) })),
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -1412,8 +1573,9 @@ describe('OpenClaw Project sandbox orchestration', () => {
       openClawHome: fixture.openClawHome,
       egress: fixture.egress,
     }, {
-      rpc: jest.fn(),
+      rpc: jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) })),
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -1464,8 +1626,9 @@ describe('OpenClaw Project sandbox orchestration', () => {
       openClawHome: fixture.openClawHome,
       egress: fixture.egress,
     }, {
-      rpc: jest.fn(),
+      rpc: jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) })),
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -1499,8 +1662,9 @@ describe('OpenClaw Project sandbox orchestration', () => {
       openClawHome: fixture.openClawHome,
       egress: fixture.egress,
     }, {
-      rpc: jest.fn(),
+      rpc: jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) })),
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -1547,8 +1711,9 @@ describe('OpenClaw Project sandbox orchestration', () => {
       openClawHome: fixture.openClawHome,
       egress: fixture.egress,
     }, {
-      rpc: jest.fn(),
+      rpc: jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) })),
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane,
@@ -1591,8 +1756,9 @@ describe('OpenClaw Project sandbox orchestration', () => {
       openClawHome: fixture.openClawHome,
       egress: fixture.egress,
     }, {
-      rpc: jest.fn(),
+      rpc: jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) })),
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: jest.fn(async () => fixture.handle),
@@ -1609,7 +1775,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     const executor = new RuntimeInventoryExecutor(fixture);
     executor.add(foreign, false);
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
 
     await expect(ensureOpenClawProjectSandbox({
@@ -1621,6 +1787,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     }, {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: jest.fn(async () => fixture.handle),
@@ -1690,7 +1857,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
       return result;
     };
     const rpc = jest.fn().mockResolvedValue(rpcResult({
-      agents: { list: [fixture.plan.desiredAgent] },
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
     }));
 
     await expect(ensureOpenClawProjectSandbox({
@@ -1702,6 +1869,7 @@ describe('OpenClaw Project sandbox orchestration', () => {
     }, {
       rpc,
       executor,
+      readRuntimeVersion: () => [2026, 9, 1] as const,
       buildEgressSpec: () => fixture.spec,
       resolveInternalNetworkBinding: currentNetworkResolver(fixture),
       ensureEgressPlane: jest.fn(async () => fixture.handle),
@@ -1711,5 +1879,182 @@ describe('OpenClaw Project sandbox orchestration', () => {
     expect(executor.calls.some(({ args }) => (
       args[0] === 'container' && args[1] === 'rm' && args.at(-1) === 'e'.repeat(64)
     ))).toBe(false);
+  });
+});
+
+
+describe('OpenClaw 2026.9.2 workspace-qualified runtime (format 5)', () => {
+  test('plans the exact Gateway identity: qualified scope key, workspace slug name, rw workspace + ro skills binds, 9.2 configHash', () => {
+    const f = makeFixture(5);
+    const { plan } = f;
+    const prefix = `p4oc-${f.context.policyFingerprint.slice(0, 16)}-`;
+    const identity = resolveOpenClawWorkspaceQualifiedRuntime({
+      sessionKey: SESSION_KEY, agentWorkspaceDir: plan.agentWorkspaceDir,
+      sandboxWorkspaceRoot: plan.sandboxWorkspaceRoot, containerPrefix: prefix,
+    });
+    expect(plan.runtimeScopeKey).toBe(identity.scopeKey);
+    expect(plan.runtimeScopeKey).toMatch(new RegExp(`^${SESSION_KEY}:workspace:[a-f0-9]{32}$`));
+    expect(plan.containerName).toBe(identity.containerName);
+    expect(plan.containerName).toHaveLength(63);
+    expect(plan.sandboxWorkspaceDir).toBe(identity.sandboxWorkspaceDir);
+    expect(fs.lstatSync(path.join(plan.sandboxWorkspaceDir, 'skills')).isDirectory()).toBe(true);
+    expect(plan.expectedBinds).toEqual([
+      `${plan.sandboxWorkspaceDir}:/workspace:z`,
+      `${plan.projectRoot}:/workspace/project:rw`,
+      `${plan.sandboxWorkspaceDir}/skills:/workspace/skills:ro,z`,
+    ]);
+    expect(plan.desiredDocker.workdir).toBe('/workspace');
+    expect(plan.configHash).toBe(computeOpenClaw92SandboxConfigHash({
+      docker: plan.desiredDocker, workspaceAccess: 'none', workspaceDir: plan.sandboxWorkspaceDir,
+      agentWorkspaceDir: plan.agentWorkspaceDir,
+      readOnlyWorkspaceSkillMounts: [`${plan.sandboxWorkspaceDir}/skills:/workspace/skills:ro`],
+    }));
+    const v4Fixture = makeFixture(4);
+    const v4 = v4Fixture.plan;
+    expect(plan.configHash).not.toBe(v4.configHash);
+    expect(plan.runtimeFingerprint).not.toBe(v4.runtimeFingerprint);
+    expect(v4.containerName).toBe(`p4oc-${v4Fixture.context.policyFingerprint.slice(0, 16)}-${slugifyOpenClawProjectSessionKey(SESSION_KEY)}`.slice(0, 63));
+    expect(v4.runtimeScopeKey).toBe(SESSION_KEY);
+  });
+
+  test('create args label the qualified scope key, keep --init and start in /workspace', () => {
+    const f = makeFixture(5);
+    const args = __openClawProjectSandboxTest.buildContainerCreateArgs(f.plan, 1_700_000_000_000);
+    expect(args).toContain(`openclaw.sessionKey=${f.plan.runtimeScopeKey}`);
+    expect(args).toContain('openclaw.mountFormatVersion=4');
+    expect(args).toContain('openclaw.createArgsEpoch=2026-08-25-container-env-file');
+    expect(args).toContain(`openclaw.configHash=${f.plan.configHash}`);
+    expect(args).toContain('--init');
+    expect(args[args.indexOf('--workdir') + 1]).toBe('/workspace');
+    for (const bind of f.plan.expectedBinds) expect(args).toContain(bind);
+    expect(args.filter((value) => value === '-v')).toHaveLength(3);
+  });
+
+  test('attests the complete format-5 runtime and rejects a format-4 shaped one under the same plan', () => {
+    const f = makeFixture(5);
+    const inspect = makeInspect(f, true);
+    expect(attestOpenClawProjectContainer({ plan: f.plan, spec: f.spec, inspect, requireRunning: true }).containerId).toBe('d'.repeat(64));
+    const stale = deepClone(inspect);
+    stale.Config.WorkingDir = '/workspace/project';
+    expectSandboxCode(() => attestOpenClawProjectContainer({ plan: f.plan, spec: f.spec, inspect: stale, requireRunning: true }), 'RUNTIME_WORKDIR');
+    const roWorkspace = deepClone(inspect);
+    roWorkspace.Mounts[0].RW = false;
+    expectSandboxCode(() => attestOpenClawProjectContainer({ plan: f.plan, spec: f.spec, inspect: roWorkspace, requireRunning: true }), 'RUNTIME_WORKSPACE_MOUNT');
+    const noSkills = deepClone(inspect);
+    noSkills.Mounts.pop();
+    expectSandboxCode(() => attestOpenClawProjectContainer({ plan: f.plan, spec: f.spec, inspect: noSkills, requireRunning: true }), 'RUNTIME_MOUNTS');
+    const wrongKey = deepClone(inspect);
+    wrongKey.Config.Labels['openclaw.sessionKey'] = SESSION_KEY;
+    expectSandboxCode(() => attestOpenClawProjectContainer({ plan: f.plan, spec: f.spec, inspect: wrongKey, requireRunning: true }), 'RUNTIME_LABELS');
+  });
+
+  test('selects format 5 only for keyed entries on OpenClaw >= 2026.9.2', () => {
+    const { usesWorkspaceQualifiedRuntime } = __openClawProjectSandboxTest;
+    expect(usesWorkspaceQualifiedRuntime([2026, 9, 2])).toBe(true);
+    expect(usesWorkspaceQualifiedRuntime([2026, 10, 0])).toBe(true);
+    expect(usesWorkspaceQualifiedRuntime([2027, 1, 0])).toBe(true);
+    expect(usesWorkspaceQualifiedRuntime([2026, 9, 1])).toBe(false);
+    expect(usesWorkspaceQualifiedRuntime([2026, 8, 30])).toBe(false);
+    expect(usesWorkspaceQualifiedRuntime(null)).toBe(false);
+  });
+
+  test('replaces only an unadopted Gateway-provisioned runtime of this exact agent occupying the format-5 name', async () => {
+    const fixture = makeFixture(5);
+    const executor = new RuntimeInventoryExecutor(fixture);
+    const provisioned = makeInspect(fixture, true);
+    provisioned.Id = 'e'.repeat(64);
+    provisioned.Config.Labels = {
+      'openclaw.sandbox': '1',
+      'openclaw.sessionKey': fixture.plan.runtimeScopeKey,
+      'openclaw.createdAtMs': '1',
+      'openclaw.mountFormatVersion': '4',
+      'openclaw.createArgsEpoch': '2026-08-25-container-env-file',
+      'openclaw.configHash': fixture.plan.configHash,
+    };
+    executor.add(provisioned, false);
+    expect(__openClawProjectSandboxTest.isUnadoptedGatewayProvisionedRuntime(fixture.plan, provisioned)).toBe(true);
+    const foreignKey = deepClone(provisioned);
+    foreignKey.Config.Labels['openclaw.sessionKey'] = `${SESSION_KEY}:workspace:${'0'.repeat(32)}`;
+    expect(__openClawProjectSandboxTest.isUnadoptedGatewayProvisionedRuntime(fixture.plan, foreignKey)).toBe(false);
+    const portalLabelled = deepClone(provisioned);
+    portalLabelled.Config.Labels[OPENCLAW_PROJECT_ACTOR_LABEL] = hashOpenClawProjectLabelIdentity('other-actor');
+    expect(__openClawProjectSandboxTest.isUnadoptedGatewayProvisionedRuntime(fixture.plan, portalLabelled)).toBe(false);
+    expect(__openClawProjectSandboxTest.isUnadoptedGatewayProvisionedRuntime(makeFixture(4).plan, provisioned)).toBe(false);
+
+    const rpc = jest.fn().mockResolvedValue(rpcResult({
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
+    }));
+    const result = await ensureOpenClawProjectSandbox({
+      context: fixture.context,
+      agentId: AGENT_ID,
+      sessionKey: SESSION_KEY,
+      openClawHome: fixture.openClawHome,
+      egress: fixture.egress,
+    }, {
+      rpc,
+      executor,
+      readRuntimeVersion: () => [2026, 9, 2] as const,
+      buildEgressSpec: () => fixture.spec,
+      resolveInternalNetworkBinding: currentNetworkResolver(fixture),
+      ensureEgressPlane: jest.fn(async () => fixture.handle),
+      constrainRuntime: jest.fn(async () => undefined) as any,
+    });
+    expect(result.containerName).toBe(fixture.plan.containerName);
+    expect(result.configHash).toBe(fixture.plan.configHash);
+    expect(result.containerId).toBe('d'.repeat(64));
+    expect(executor.runtimes.has('e'.repeat(64))).toBe(false);
+    expect(executor.calls.some(({ args }) => args[0] === 'container' && args[1] === 'rm' && args.at(-1) === 'e'.repeat(64))).toBe(true);
+  });
+
+  test('retires the format-4 agent-slug generation when the format-5 plan converges', async () => {
+    const fixture = makeFixture(5);
+    const plan4 = buildOpenClawProjectSandboxPlan({
+      context: fixture.context, agentId: AGENT_ID, sessionKey: SESSION_KEY, openClawHome: fixture.openClawHome,
+      egressSpec: fixture.spec, egressHandle: fixture.handle, mountFormatVersion: 4,
+    });
+    expect(plan4.containerName).not.toBe(fixture.plan.containerName);
+    const stale = makeInspect({ ...fixture, plan: plan4 }, true);
+    stale.Id = 'a'.repeat(64);
+    const executor = new RuntimeInventoryExecutor(fixture);
+    executor.add(stale);
+    const rpc = jest.fn().mockResolvedValue(rpcResult({
+      agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]),
+    }));
+    const result = await ensureOpenClawProjectSandbox({
+      context: fixture.context, agentId: AGENT_ID, sessionKey: SESSION_KEY,
+      openClawHome: fixture.openClawHome, egress: fixture.egress,
+    }, {
+      rpc,
+      executor,
+      readRuntimeVersion: () => [2026, 9, 2] as const,
+      buildEgressSpec: () => fixture.spec,
+      resolveInternalNetworkBinding: currentNetworkResolver(fixture),
+      ensureEgressPlane: jest.fn(async () => fixture.handle),
+      constrainRuntime: jest.fn(async () => undefined) as any,
+    });
+    expect(result.containerName).toBe(fixture.plan.containerName);
+    expect(result.containerId).toBe('d'.repeat(64));
+    expect(executor.runtimes.has('a'.repeat(64))).toBe(false);
+    expect(executor.calls.some(({ args }) => args[0] === 'container' && args[1] === 'rm' && args.at(-1) === 'a'.repeat(64))).toBe(true);
+  });
+});
+
+describe('qualification reconstructs the attested sandbox recipe', () => {
+  test.each([3, 4, 5] as const)('preserves version %s through initial and final qualification', (version) => {
+    const f = makeFixture(version);
+    const plan = buildOpenClawProjectSandboxPlanForRuntime({ context: f.context,
+      agentId: AGENT_ID, sessionKey: SESSION_KEY, openClawHome: f.openClawHome,
+      egressSpec: f.spec, egressHandle: f.handle, runtime: f.plan });
+    expect(plan).toEqual(f.plan);
+  });
+  test('refuses mixed or unrecognized attested identities', () => {
+    const f = makeFixture(4);
+    const input = { context: f.context, agentId: AGENT_ID, sessionKey: SESSION_KEY,
+      openClawHome: f.openClawHome, egressSpec: f.spec, egressHandle: f.handle };
+    const legacy = buildOpenClawProjectSandboxPlan({ ...input, mountFormatVersion: 3 });
+    expectSandboxCode(() => buildOpenClawProjectSandboxPlanForRuntime({ ...input,
+      runtime: { configHash: legacy.configHash, runtimeFingerprint: f.plan.runtimeFingerprint } }), 'RUNTIME_FINGERPRINT');
+    expectSandboxCode(() => buildOpenClawProjectSandboxPlanForRuntime({ ...input,
+      runtime: { configHash: 'unknown', runtimeFingerprint: 'unknown' } }), 'RUNTIME_FINGERPRINT');
   });
 });

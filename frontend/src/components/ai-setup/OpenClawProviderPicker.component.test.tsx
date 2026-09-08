@@ -127,7 +127,6 @@ describe('OpenClawProviderPicker provider boundaries', () => {
         statusMap={new Map()}
         onSelect={onSelect}
         onRemove={vi.fn()}
-        onDeviceFlow={vi.fn()}
         onClose={vi.fn()}
       />,
     );
@@ -146,7 +145,6 @@ describe('OpenClawProviderPicker provider boundaries', () => {
         statusMap={new Map()}
         onSelect={onSelect}
         onRemove={vi.fn()}
-        onDeviceFlow={vi.fn()}
         onClose={vi.fn()}
       />,
     );
@@ -177,7 +175,6 @@ describe('OpenClawProviderPicker provider boundaries', () => {
         ])}
         onSelect={onSelect}
         onRemove={onRemove}
-        onDeviceFlow={vi.fn()}
         onClose={vi.fn()}
       />,
     );

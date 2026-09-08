@@ -25,15 +25,15 @@ function providerStatus(
 }
 
 describe('QuickStartBanner native credential badges', () => {
-  it('does not apply an expired OpenClaw profile timestamp to an authenticated native CLI', () => {
+  it('does not offer unqualified Grok or Antigravity native setup controls', () => {
     const statusMap = new Map<string, ProviderStatus>([
       ['xai', providerStatus('xai', 'authenticated')],
     ]);
     render(<QuickStartBanner compact statusMap={statusMap} onChoose={vi.fn()} onNativeCliLogin={vi.fn()} />);
 
-    const grokCard = screen.getByRole('button', { name: /Grok Build/i });
-    expect(within(grokCard).queryByText('Expired')).not.toBeInTheDocument();
-    expect(within(grokCard).queryByText('Needs login')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Grok Build/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Antigravity/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /OpenClaw/i })).toBeInTheDocument();
   });
 
   it('shows native login state instead of the unrelated OpenClaw expiry label', () => {
@@ -42,8 +42,35 @@ describe('QuickStartBanner native credential badges', () => {
     ]);
     render(<QuickStartBanner compact statusMap={statusMap} onChoose={vi.fn()} onNativeCliLogin={vi.fn()} />);
 
-    const claudeCard = screen.getByRole('button', { name: /Claude Code/i });
+    const claudeCard = screen.getByRole('button', { name: /Claude Project Sandbox/i });
     expect(within(claudeCard).getByText('Needs login')).toBeInTheDocument();
     expect(within(claudeCard).queryByText('Expired')).not.toBeInTheDocument();
+  });
+
+  it('shows Portal-profile harness setup only on authenticated Settings surfaces', () => {
+    const onNativeCliLogin = vi.fn();
+    const view = render(
+      <QuickStartBanner
+        compact
+        onChoose={vi.fn()}
+        onNativeCliLogin={onNativeCliLogin}
+        showHarnessNativeCards={false}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /Hermes/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /OpenCode/i })).not.toBeInTheDocument();
+
+    view.rerender(
+      <QuickStartBanner
+        compact
+        onChoose={vi.fn()}
+        onNativeCliLogin={onNativeCliLogin}
+        showHarnessNativeCards
+      />,
+    );
+    screen.getByRole('button', { name: /Hermes/i }).click();
+    screen.getByRole('button', { name: /OpenCode/i }).click();
+    expect(onNativeCliLogin).toHaveBeenNthCalledWith(1, 'hermes');
+    expect(onNativeCliLogin).toHaveBeenNthCalledWith(2, 'opencode');
   });
 });

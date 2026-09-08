@@ -12,9 +12,9 @@ const CHECKPOINT: PortalSelfUpdateProgress = {
   expectedVersion: '4.0.15',
   status: 'running',
   phase: 'postflight',
-  percent: 97,
-  label: 'Completing host services and cleanup',
-  detail: 'Portal is online while host integration converges.',
+  percent: 99,
+  label: 'Verifying the updated Portal',
+  detail: 'Final exact-version Portal verification is still running.',
   startedAt: '2026-08-10T10:00:00.000Z',
   updatedAt: '2026-08-10T10:10:00.000Z',
   finishedAt: null,
@@ -25,7 +25,7 @@ const CHECKPOINT: PortalSelfUpdateProgress = {
 };
 
 describe('session restore curtain during a Portal update', () => {
-  it('keeps real last-confirmed progress visible while reconnecting automatically', () => {
+  it('keeps the last-confirmed semantic checkpoint visible without presenting an ordinal as measured progress', () => {
     render(
       <SessionRestoreFallback
         onRetry={vi.fn()}
@@ -41,14 +41,37 @@ describe('session restore curtain during a Portal update', () => {
     );
 
     expect(screen.getByRole('heading', { name: 'Portal is restarting' })).toBeInTheDocument();
-    expect(screen.getByText('Completing host services and cleanup')).toBeInTheDocument();
-    expect(screen.getByRole('progressbar', { name: 'Portal update progress' })).toHaveAttribute('aria-valuenow', '97');
-    expect(screen.getByRole('progressbar')).toHaveAttribute(
+    expect(screen.getByText('Verifying the updated Portal')).toBeInTheDocument();
+    expect(screen.getByText('Final exact-version Portal verification is still running.')).toBeInTheDocument();
+    const progressbar = screen.getByRole('progressbar', { name: 'Portal update progress' });
+    expect(progressbar).not.toHaveAttribute('aria-valuenow');
+    expect(screen.queryByText('99%')).not.toBeInTheDocument();
+    expect(progressbar).toHaveAttribute(
       'aria-valuetext',
-      expect.stringContaining('reconnect automatically'),
+      'Verifying the updated Portal. Portal is restarting and will reconnect automatically.',
     );
     expect(screen.getByText('Reconnecting automatically…')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Retry now' })).toBeEnabled();
+  });
+
+  it('reports an indeterminate wait before the first durable checkpoint exists', () => {
+    render(
+      <SessionRestoreFallback
+        onRetry={vi.fn()}
+        onSignOut={vi.fn()}
+        updateRecovery={{
+          operationId: CHECKPOINT.operationId,
+          checkpoint: null,
+          attemptCount: 0,
+          isRetrying: false,
+          retryNow: vi.fn().mockResolvedValue(false),
+        }}
+      />,
+    );
+
+    expect(screen.getByText('Waiting for the first durable progress checkpoint…')).toBeInTheDocument();
+    expect(screen.queryByRole('progressbar', { name: 'Portal update progress' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/%/)).not.toBeInTheDocument();
   });
 
   it('retains the ordinary fail-closed alert when no exact updater identity exists', () => {

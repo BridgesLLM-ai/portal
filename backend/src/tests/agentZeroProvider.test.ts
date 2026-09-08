@@ -31,6 +31,7 @@ const {
 const {
   AgentZeroConnectorClient,
 } = require('../agents/providers/agentZero/AgentZeroConnectorClient') as typeof import('../agents/providers/agentZero/AgentZeroConnectorClient');
+const nativeSessionStore = require('../agents/providers/NativeSessionStore') as typeof import('../agents/providers/NativeSessionStore');
 
 const SESSION_COOKIE = 'session=server-side-secret-cookie';
 
@@ -39,8 +40,8 @@ const HOST_GATEWAY_READY_STATUS: AgentZeroHostGatewayStatus = {
   installed: true,
   running: true,
   ready: true,
-  cliVersion: '2.5',
-  expectedCliVersion: '2.5',
+  cliVersion: '2.10',
+  expectedCliVersion: '2.10',
   gatewayId: 'bridgesllm-portal-host',
   capabilities: {
     scope: 'HOST_OPERATOR',
@@ -70,6 +71,27 @@ function hostConfig(userId: string, extra: Partial<AgentSessionConfig> = {}): Ag
   };
 }
 
+function projectConfig(userId: string): AgentSessionConfig {
+  return {
+    executionContext: {
+      scope: 'PROJECT_SANDBOX',
+      source: 'PORTAL_SERVER',
+      userId,
+      projectId: 'project-agent-zero-boundary',
+      workspaceOwnerId: userId,
+      projectName: 'agent-zero-boundary',
+      canonicalRoot: '/var/lib/bridgesllm/projects/agent-zero-boundary',
+      rootDevice: '1',
+      rootInode: '2',
+      rootBirthtimeNs: '3',
+      runtimePolicyVersion: 'portal-project-sandbox-test',
+      egressPolicyVersion: 'portal-project-egress-test',
+      runtimeImageDigest: `sha256:${'b'.repeat(64)}`,
+      policyFingerprint: 'agent-zero-boundary-policy',
+    },
+  };
+}
+
 function oauthModelSelection(id: string): AgentZeroSelectableOAuthModel {
   const separator = id.indexOf('/');
   const providerId = id.slice(0, separator) as AgentZeroSelectableOAuthModel['providerId'];
@@ -88,7 +110,7 @@ function capabilities(features: string[], authRequired = true): Record<string, u
   return {
     protocol: 'a0-connector.v1',
     version: '0.1.0',
-    agent_zero_version: '2.5',
+    agent_zero_version: '2.10',
     auth: ['session'],
     auth_required: authRequired,
     transports: ['http', 'websocket'],
@@ -185,7 +207,7 @@ class ProviderStreamSocket implements AgentZeroSocketLike {
     if (event === 'connector_hello') {
       ok({
         protocol: 'a0-connector.v1',
-        agent_zero_version: '2.5',
+        agent_zero_version: '2.10',
         features: ['connector_subscribe_context', 'connector_send_message'],
       });
     } else if (event === 'connector_subscribe_context') {
@@ -301,7 +323,7 @@ describe('AgentZeroConnectorClient', () => {
 
     await expect(client.getCapabilities()).resolves.toMatchObject({
       protocol: 'a0-connector.v1',
-      agentZeroVersion: '2.5',
+      agentZeroVersion: '2.10',
       authRequired: true,
       features: ['chat_create'],
     });
@@ -460,6 +482,27 @@ describe('AgentZeroProvider response normalization', () => {
 });
 
 describe('AgentZeroProvider HTTP adapter', () => {
+  test('advertises Project capability without admitting it to the host adapter', async () => {
+    mockGetProviderAvailability.mockReturnValue({
+      capabilities: { supportedExecutionScopes: ['HOST_OPERATOR', 'PROJECT_SANDBOX'] },
+    });
+    const fetchMock = sequentialFetch(jsonResponse(capabilities(['chat_create'])));
+    const provider = new AgentZeroProvider({ sessionCookie: SESSION_COOKIE, fetchImpl: fetchMock, hostGateway });
+
+    await expect(provider.startSession('user-project-boundary', projectConfig('user-project-boundary')))
+      .rejects.toThrow(/expected HOST_OPERATOR/i);
+    expect(hostGateway.ensureReady).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const projectSession = nativeSessionStore.createNativeSession(
+      'AGENT_ZERO',
+      'user-project-boundary',
+      projectConfig('user-project-boundary'),
+    );
+    await expect(provider.listSessions('user-project-boundary')).resolves.toEqual([]);
+    nativeSessionStore.deleteNativeSession('AGENT_ZERO', projectSession.sessionId);
+  });
+
   test('keeps the production execution-scope gate fail-closed', async () => {
     mockGetProviderAvailability.mockReturnValue({
       capabilities: { supportedExecutionScopes: [] },

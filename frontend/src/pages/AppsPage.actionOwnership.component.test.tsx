@@ -615,7 +615,10 @@ describe('AppsPage share action ownership', () => {
       url: '/share/created-token',
       hostedUrl: '/hosted/owner-1-alpha/',
     });
-    mocks.listShares.mockReset().mockResolvedValue({ shares: [] });
+    mocks.listShares.mockReset().mockResolvedValue({
+      shares: [],
+      pagination: { hasMore: false, nextCursor: null, limit: 100 },
+    });
     mocks.updateShare.mockReset().mockResolvedValue({ ok: true });
     mocks.ollamaStatus.mockReset().mockResolvedValue({
       available: false,
@@ -2108,6 +2111,7 @@ describe('AppsPage share action ownership', () => {
     expect(await screen.findByText('Portal contained an interrupted dependency promotion.')).toBeVisible();
     expect(screen.getByText(/Do not edit or run this Project/i)).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Repair dependency update' })).not.toBeInTheDocument();
+    expect(mocks.activeDependencyRepairs).not.toHaveBeenCalled();
     expect(mocks.dependencyRepairStatus).not.toHaveBeenCalled();
   });
 
@@ -3743,6 +3747,7 @@ describe('AppsPage share action ownership', () => {
         expiresAt: null,
         createdAt: '2026-07-21T12:00:00.000Z',
       }],
+      pagination: { hasMore: false, nextCursor: null, limit: 100 },
     });
     renderApps('/projects?project=alpha');
     await waitFor(() => expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page'));
@@ -3767,9 +3772,43 @@ describe('AppsPage share action ownership', () => {
     expect(mocks.share).not.toHaveBeenCalled();
   });
 
+  it('hydrates every retained share-link page with an advancing cursor', async () => {
+    const share = (id: string, token: string) => ({
+      id,
+      token,
+      isActive: true,
+      isPublic: true,
+      currentUses: 0,
+      maxUses: null,
+      rateLimitMaxRequests: null,
+      rateLimitWindowSeconds: null,
+      maxConcurrentVisitors: null,
+      expiresAt: null,
+      createdAt: '2026-07-21T12:00:00.000Z',
+    });
+    mocks.listShares
+      .mockResolvedValueOnce({
+        shares: [share('newest-link', 'newest-token')],
+        pagination: { hasMore: true, nextCursor: 'share-page-2', limit: 100 },
+      })
+      .mockResolvedValueOnce({
+        shares: [share('older-link', 'older-token')],
+        pagination: { hasMore: false, nextCursor: null, limit: 100 },
+      });
+
+    renderApps('/projects?project=alpha');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page'));
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Share' }));
+
+    expect(await screen.findByText('/share/newest-token')).toBeVisible();
+    expect(screen.getByText('/share/older-token')).toBeVisible();
+    expect(mocks.listShares).toHaveBeenNthCalledWith(1, 'alpha');
+    expect(mocks.listShares).toHaveBeenNthCalledWith(2, 'alpha', { cursor: 'share-page-2' });
+  });
+
   it('does not let a delayed older share success replace a newer authoritative list', async () => {
-    const olderRead = deferred<{ shares: Array<Record<string, unknown>> }>();
-    const newerRead = deferred<{ shares: Array<Record<string, unknown>> }>();
+    const olderRead = deferred<{ shares: Array<Record<string, unknown>>; pagination: { hasMore: boolean; nextCursor: string | null; limit: number } }>();
+    const newerRead = deferred<{ shares: Array<Record<string, unknown>>; pagination: { hasMore: boolean; nextCursor: string | null; limit: number } }>();
     const share = (id: string, token: string) => ({
       id,
       token,
@@ -3796,13 +3835,19 @@ describe('AppsPage share action ownership', () => {
     await waitFor(() => expect(mocks.listShares).toHaveBeenCalledTimes(2));
 
     await act(async () => {
-      newerRead.resolve({ shares: [share('newer-link', 'newer-token')] });
+      newerRead.resolve({
+        shares: [share('newer-link', 'newer-token')],
+        pagination: { hasMore: false, nextCursor: null, limit: 100 },
+      });
       await newerRead.promise;
     });
     expect(await screen.findByText('/share/newer-token')).toBeVisible();
 
     await act(async () => {
-      olderRead.resolve({ shares: [share('older-link', 'older-token')] });
+      olderRead.resolve({
+        shares: [share('older-link', 'older-token')],
+        pagination: { hasMore: false, nextCursor: null, limit: 100 },
+      });
       await olderRead.promise;
     });
     expect(screen.getByText('/share/newer-token')).toBeVisible();
@@ -3810,8 +3855,8 @@ describe('AppsPage share action ownership', () => {
   });
 
   it('does not let a delayed older share failure clear a newer authoritative list', async () => {
-    const olderRead = deferred<{ shares: Array<Record<string, unknown>> }>();
-    const newerRead = deferred<{ shares: Array<Record<string, unknown>> }>();
+    const olderRead = deferred<{ shares: Array<Record<string, unknown>>; pagination: { hasMore: boolean; nextCursor: string | null; limit: number } }>();
+    const newerRead = deferred<{ shares: Array<Record<string, unknown>>; pagination: { hasMore: boolean; nextCursor: string | null; limit: number } }>();
     mocks.listShares
       .mockReturnValueOnce(olderRead.promise)
       .mockReturnValueOnce(newerRead.promise);
@@ -3839,6 +3884,7 @@ describe('AppsPage share action ownership', () => {
           expiresAt: null,
           createdAt: '2026-07-21T12:00:00.000Z',
         }],
+        pagination: { hasMore: false, nextCursor: null, limit: 100 },
       });
       await newerRead.promise;
     });
@@ -3871,8 +3917,8 @@ describe('AppsPage share action ownership', () => {
     mocks.writeFile.mockReturnValueOnce(autosave.promise);
     mocks.updateShare.mockReturnValueOnce(mutation.promise);
     mocks.listShares
-      .mockResolvedValueOnce({ shares: [activeShare] })
-      .mockResolvedValueOnce({ shares: [{ ...activeShare, isActive: false }] });
+      .mockResolvedValueOnce({ shares: [activeShare], pagination: { hasMore: false, nextCursor: null, limit: 100 } })
+      .mockResolvedValueOnce({ shares: [{ ...activeShare, isActive: false }], pagination: { hasMore: false, nextCursor: null, limit: 100 } });
 
     renderApps();
     await waitForAlphaFile();
@@ -3903,7 +3949,7 @@ describe('AppsPage share action ownership', () => {
   });
 
   it('clears stale share controls after failed readback and single-flights an explicit retry', async () => {
-    const freshReadback = deferred<{ shares: Array<Record<string, unknown>> }>();
+    const freshReadback = deferred<{ shares: Array<Record<string, unknown>>; pagination: { hasMore: boolean; nextCursor: string | null; limit: number } }>();
     const staleShare = {
       id: 'stale-link',
       token: 'stale-token',
@@ -3916,7 +3962,7 @@ describe('AppsPage share action ownership', () => {
     };
     const freshShare = { ...staleShare, id: 'fresh-link', token: 'fresh-token', isActive: false };
     mocks.listShares
-      .mockResolvedValueOnce({ shares: [staleShare] })
+      .mockResolvedValueOnce({ shares: [staleShare], pagination: { hasMore: false, nextCursor: null, limit: 100 } })
       .mockRejectedValueOnce(new Error('Share readback unavailable.'))
       .mockReturnValueOnce(freshReadback.promise);
 
@@ -3945,7 +3991,10 @@ describe('AppsPage share action ownership', () => {
     expect(screen.getByRole('button', { name: 'Create Public Link' })).toBeDisabled();
 
     await act(async () => {
-      freshReadback.resolve({ shares: [freshShare] });
+      freshReadback.resolve({
+        shares: [freshShare],
+        pagination: { hasMore: false, nextCursor: null, limit: 100 },
+      });
       await freshReadback.promise;
     });
 
@@ -3967,8 +4016,8 @@ describe('AppsPage share action ownership', () => {
       createdAt: '2026-07-21T12:00:00.000Z',
     };
     mocks.listShares
-      .mockResolvedValueOnce({ shares: [activeShare] })
-      .mockResolvedValueOnce({ shares: [{ ...activeShare, isActive: false }] });
+      .mockResolvedValueOnce({ shares: [activeShare], pagination: { hasMore: false, nextCursor: null, limit: 100 } })
+      .mockResolvedValueOnce({ shares: [{ ...activeShare, isActive: false }], pagination: { hasMore: false, nextCursor: null, limit: 100 } });
     mocks.updateShare.mockReturnValueOnce(mutation.promise);
     renderApps('/projects?project=alpha');
     await waitFor(() => expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page'));

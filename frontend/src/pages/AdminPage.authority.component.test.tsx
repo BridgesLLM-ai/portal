@@ -422,30 +422,36 @@ describe('AdminPage authority mutation admission', () => {
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Promote Alice to SUB_ADMIN?' })).not.toBeInTheDocument());
   });
 
-  it('keeps identity-aware user deletion retired without issuing a request', async () => {
+  it('requires the exact account-bound phrase before retiring a user', async () => {
+    const user = userEvent.setup();
+    mocks.deleteUser.mockResolvedValueOnce({ success: true });
     renderAdmin();
 
-    const retirementNote = await screen.findByRole('note', { name: 'User deletion unavailable' });
-    expect(retirementNote).toHaveTextContent('Portal 4 identity-aware project and OpenClaw cleanup is retirement-pending.');
-
-    const aliceRow = screen.getByText('alice@example.com').closest('tr');
+    const aliceRow = (await screen.findByText('alice@example.com')).closest('tr');
     const bobRow = screen.getByText('bob@example.com').closest('tr');
     expect(aliceRow).not.toBeNull();
     expect(bobRow).not.toBeNull();
-    const aliceDelete = within(aliceRow!).getByRole('button', { name: 'Delete alice@example.com unavailable' });
-    const bobDelete = within(bobRow!).getByRole('button', { name: 'Delete bob@example.com unavailable' });
+    const aliceDelete = within(aliceRow!).getByRole('button', { name: 'Delete alice@example.com' });
+    const bobDelete = within(bobRow!).getByRole('button', { name: 'Delete bob@example.com' });
 
-    expect(aliceDelete).toBeDisabled();
-    expect(bobDelete).toBeDisabled();
-    expect(bobDelete).toHaveAttribute('aria-describedby', 'admin-user-deletion-retirement-note');
+    expect(aliceDelete).toBeEnabled();
+    expect(bobDelete).toBeEnabled();
     expect(within(bobRow!).getByRole('button', { name: 'Transfer' })).toBeEnabled();
 
-    fireEvent.click(aliceDelete);
-    fireEvent.click(bobDelete);
+    await user.click(aliceDelete);
+    const dialog = await screen.findByRole('dialog', { name: 'Delete Alice?' });
+    const confirmation = within(dialog).getByRole('textbox', {
+      name: /Type DELETE alice@example\.com to continue/i,
+    });
+    const submit = within(dialog).getByRole('button', { name: 'Delete user' });
+    expect(submit).toBeDisabled();
+    await user.type(confirmation, 'DELETE alice@example.com');
+    await user.click(submit);
 
-    expect(mocks.deleteUser).not.toHaveBeenCalled();
-    expect(screen.queryByRole('dialog', { name: /Delete (Alice|Bob)\?/ })).not.toBeInTheDocument();
-    expect(screen.getByText('alice@example.com')).toBeInTheDocument();
+    expect(mocks.deleteUser).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteUser).toHaveBeenCalledWith('user-a', 'DELETE alice@example.com');
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Delete Alice?' })).not.toBeInTheDocument());
+    expect(screen.queryByText('alice@example.com')).not.toBeInTheDocument();
     expect(screen.getByText('bob@example.com')).toBeInTheDocument();
   });
 

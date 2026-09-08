@@ -5399,6 +5399,23 @@ export interface ProjectDeploymentPromotion {
   rollback: () => void;
 }
 
+export type ProjectDeploymentPromotionCheckpoint =
+  | 'after-deployment-journal-create'
+  | 'after-persistent-data-stage'
+  | 'after-previous-deployment-move'
+  | 'after-deployment-promote'
+  | 'after-deployment-commit';
+
+export class ProjectDeploymentPromotionRecoveryError extends Error {
+  readonly code = 'PROJECT_DEPLOYMENT_PROMOTION_QUARANTINED';
+  readonly retryable = false;
+
+  constructor(message = 'Interrupted App deployment promotion is ambiguous and remains quarantined.') {
+    super(message);
+    this.name = 'ProjectDeploymentPromotionRecoveryError';
+  }
+}
+
 export class ProjectDeploymentReplayStaleError extends Error {
   readonly code = 'PROJECT_RUNTIME_RECOVERY_REPLAY_STALE';
 
@@ -5406,6 +5423,675 @@ export class ProjectDeploymentReplayStaleError extends Error {
     super('The Project source changed after the failed runtime action, so Portal did not replay it.');
     this.name = 'ProjectDeploymentReplayStaleError';
   }
+}
+
+const MANAGED_DEPLOYMENT_PERSISTENT_ROOTS = Object.freeze(['data'] as const);
+const DEPLOYMENT_PROMOTION_JOURNAL_VERSION = 1;
+const DEPLOYMENT_PROMOTION_JOURNAL_MAX_BYTES = 64 * 1024;
+const DEPLOYMENT_PROMOTION_JOURNAL_STATES = new Set([
+  'COPYING',
+  'PREPARED',
+  'PERSISTENCE_STAGED',
+  'PREVIOUS_MOVED',
+  'PROMOTED',
+  'ROLLING_BACK',
+  'COMMITTED',
+] as const);
+
+type DeploymentPromotionJournalState =
+  | 'COPYING'
+  | 'PREPARED'
+  | 'PERSISTENCE_STAGED'
+  | 'PREVIOUS_MOVED'
+  | 'PROMOTED'
+  | 'ROLLING_BACK'
+  | 'COMMITTED';
+
+interface DeploymentPromotionIdentity {
+  device: string;
+  inode: string;
+  birthtimeNs: string;
+}
+
+interface DeploymentPromotionJournal {
+  schemaVersion: 1;
+  operationId: string;
+  destinationRoot: string;
+  destinationParent: string;
+  stagingRoot: string;
+  previousRoot: string;
+  failedRoot: string;
+  existingIdentity: DeploymentPromotionIdentity | null;
+  stagingIdentity: DeploymentPromotionIdentity;
+  persistentRoots: string[];
+  state: DeploymentPromotionJournalState;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function deploymentRecoveryFail(message: string): never {
+  throw new ProjectDeploymentPromotionRecoveryError(message);
+}
+
+function deploymentPromotionIdentity(candidate: string): DeploymentPromotionIdentity {
+  const entry = fs.lstatSync(candidate, { bigint: true });
+  if (entry.isSymbolicLink() || !entry.isDirectory()) {
+    deploymentRecoveryFail('App deployment promotion evidence has an unsupported root type.');
+  }
+  if (fs.realpathSync.native(candidate) !== candidate) {
+    deploymentRecoveryFail('App deployment promotion evidence no longer uses its canonical path.');
+  }
+  return {
+    device: entry.dev.toString(),
+    inode: entry.ino.toString(),
+    birthtimeNs: entry.birthtimeNs.toString(),
+  };
+}
+
+function optionalDeploymentPromotionIdentity(candidate: string): DeploymentPromotionIdentity | null {
+  try {
+    return deploymentPromotionIdentity(candidate);
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function deploymentPromotionIdentitiesMatch(
+  left: DeploymentPromotionIdentity | null,
+  right: DeploymentPromotionIdentity | null,
+): boolean {
+  if (!left || !right) return left === right;
+  return left.device === right.device
+    && left.inode === right.inode
+    && left.birthtimeNs === right.birthtimeNs;
+}
+
+function deploymentPromotionJournalFile(destinationRoot: string, operationId: string): string {
+  return path.join(
+    path.dirname(destinationRoot),
+    `.${path.basename(destinationRoot)}.deployment-${operationId}.json`,
+  );
+}
+
+function deploymentPromotionJournalTemporaryPrefix(journalFile: string): string {
+  return `${path.basename(journalFile)}.tmp-`;
+}
+
+function writeExactFileAndSync(file: string, content: string, exclusive: boolean): void {
+  const descriptor = fs.openSync(
+    file,
+    (exclusive ? fs.constants.O_CREAT | fs.constants.O_EXCL : fs.constants.O_CREAT | fs.constants.O_TRUNC)
+      | fs.constants.O_WRONLY
+      | (fs.constants.O_NOFOLLOW || 0),
+    0o600,
+  );
+  try {
+    fs.fchmodSync(descriptor, 0o600);
+    fs.writeFileSync(descriptor, content, 'utf8');
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function writeDeploymentPromotionJournal(
+  journalFile: string,
+  journal: DeploymentPromotionJournal,
+  exclusive: boolean,
+): void {
+  const next: DeploymentPromotionJournal = {
+    ...journal,
+    persistentRoots: [...journal.persistentRoots],
+    updatedAt: new Date().toISOString(),
+  };
+  const serialized = `${JSON.stringify(next)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > DEPLOYMENT_PROMOTION_JOURNAL_MAX_BYTES) {
+    deploymentRecoveryFail('App deployment promotion journal exceeded its safety limit.');
+  }
+  const temporary = `${journalFile}.tmp-${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
+  try {
+    writeExactFileAndSync(temporary, serialized, true);
+    if (exclusive) {
+      // link(2) publishes the fully fsynced inode with O_EXCL semantics. A
+      // crash can leave the private temporary hard link behind, but never a
+      // partial final journal; recovery removes that exact-name temporary
+      // before requiring the final journal to have one link.
+      fs.linkSync(temporary, journalFile);
+    } else {
+      fs.renameSync(temporary, journalFile);
+    }
+    fsyncPromotionDirectory(path.dirname(journalFile));
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch {
+      // Preserve the primary journal-write failure. A private, identity-bound
+      // temporary file is harmless and will be removed during recovery.
+    }
+    throw error;
+  }
+  try { fs.unlinkSync(temporary); } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  fsyncPromotionDirectory(path.dirname(journalFile));
+  Object.assign(journal, next);
+}
+
+function updateDeploymentPromotionJournal(
+  journalFile: string,
+  journal: DeploymentPromotionJournal,
+  state: DeploymentPromotionJournalState,
+): void {
+  journal.state = state;
+  writeDeploymentPromotionJournal(journalFile, journal, false);
+}
+
+function assertDeploymentJournalIdentity(value: unknown): value is DeploymentPromotionIdentity {
+  if (!value || typeof value !== 'object') return false;
+  const identity = value as DeploymentPromotionIdentity;
+  return /^\d+$/.test(identity.device)
+    && /^\d+$/.test(identity.inode)
+    && /^\d+$/.test(identity.birthtimeNs);
+}
+
+function readDeploymentPromotionJournal(
+  journalFile: string,
+  destinationRoot: string,
+): DeploymentPromotionJournal {
+  const entry = fs.lstatSync(journalFile);
+  if (
+    entry.isSymbolicLink()
+    || !entry.isFile()
+    || entry.uid !== currentOwnerUid()
+    || entry.gid !== currentOwnerGid()
+    || (entry.mode & 0o777) !== 0o600
+    || entry.nlink !== 1
+    || entry.size < 2
+    || entry.size > DEPLOYMENT_PROMOTION_JOURNAL_MAX_BYTES
+    || fs.realpathSync.native(journalFile) !== journalFile
+  ) deploymentRecoveryFail('App deployment promotion journal is not a private server-owned file.');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+  } catch {
+    deploymentRecoveryFail('App deployment promotion journal is malformed.');
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    deploymentRecoveryFail('App deployment promotion journal is malformed.');
+  }
+  const journal = parsed as DeploymentPromotionJournal;
+  const destinationParent = path.dirname(destinationRoot);
+  const operationId = String(journal.operationId || '');
+  const nonceValid = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(operationId);
+  const expectedStaging = path.join(destinationParent, `.${path.basename(destinationRoot)}.deploy-${operationId}`);
+  const expectedPrevious = path.join(destinationParent, `.${path.basename(destinationRoot)}.previous-${operationId}`);
+  const expectedFailed = path.join(destinationParent, `.${path.basename(destinationRoot)}.failed-${operationId}`);
+  if (
+    journal.schemaVersion !== DEPLOYMENT_PROMOTION_JOURNAL_VERSION
+    || !nonceValid
+    || journal.destinationRoot !== destinationRoot
+    || journal.destinationParent !== destinationParent
+    || journal.stagingRoot !== expectedStaging
+    || journal.previousRoot !== expectedPrevious
+    || journal.failedRoot !== expectedFailed
+    || journalFile !== deploymentPromotionJournalFile(destinationRoot, operationId)
+    || !assertDeploymentJournalIdentity(journal.stagingIdentity)
+    || (journal.existingIdentity !== null && !assertDeploymentJournalIdentity(journal.existingIdentity))
+    || !Array.isArray(journal.persistentRoots)
+    || JSON.stringify(journal.persistentRoots) !== JSON.stringify(MANAGED_DEPLOYMENT_PERSISTENT_ROOTS)
+    || !DEPLOYMENT_PROMOTION_JOURNAL_STATES.has(journal.state)
+  ) deploymentRecoveryFail('App deployment promotion journal is incomplete or unsafe.');
+  return journal;
+}
+
+function removeExactDeploymentDirectory(
+  candidate: string,
+  expected: DeploymentPromotionIdentity,
+  label: string,
+): void {
+  const observed = optionalDeploymentPromotionIdentity(candidate);
+  if (!deploymentPromotionIdentitiesMatch(observed, expected)) {
+    deploymentRecoveryFail(`${label} changed identity before cleanup.`);
+  }
+  const rootEntry = fs.lstatSync(candidate, { bigint: true });
+  if (descendantMountBoundaries(candidate).length > 0) {
+    deploymentRecoveryFail(`${label} crosses a mount or bind-mount boundary.`);
+  }
+  const verifyContainedTree = (current: string): void => {
+    const entry = fs.lstatSync(current, { bigint: true });
+    if (entry.dev !== rootEntry.dev) {
+      deploymentRecoveryFail(`${label} crosses a filesystem boundary.`);
+    }
+    if (!entry.isDirectory()) return;
+    for (const child of fs.readdirSync(current).sort()) verifyContainedTree(path.join(current, child));
+  };
+  verifyContainedTree(candidate);
+  fs.rmSync(candidate, { recursive: true, force: false });
+  fsyncPromotionDirectory(path.dirname(candidate));
+}
+
+function cleanupDeploymentJournalTemporaries(journalFile: string): void {
+  const parent = path.dirname(journalFile);
+  const prefix = deploymentPromotionJournalTemporaryPrefix(journalFile);
+  for (const name of fs.readdirSync(parent).filter((candidate) => candidate.startsWith(prefix))) {
+    const candidate = path.join(parent, name);
+    const entry = fs.lstatSync(candidate);
+    if (
+      entry.isSymbolicLink()
+      || !entry.isFile()
+      || entry.uid !== currentOwnerUid()
+      || entry.gid !== currentOwnerGid()
+      || (entry.mode & 0o777) !== 0o600
+      || entry.nlink < 1
+      || entry.nlink > 2
+      || entry.size > DEPLOYMENT_PROMOTION_JOURNAL_MAX_BYTES
+      || fs.realpathSync.native(candidate) !== candidate
+    ) deploymentRecoveryFail('App deployment promotion has unsafe temporary journal evidence.');
+    fs.unlinkSync(candidate);
+  }
+  fsyncPromotionDirectory(parent);
+}
+
+function cleanupDeploymentPromotionJournal(journalFile: string): void {
+  cleanupDeploymentJournalTemporaries(journalFile);
+  try {
+    fs.unlinkSync(journalFile);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  fsyncPromotionDirectory(path.dirname(journalFile));
+}
+
+function rollbackDeploymentPromotionJournal(
+  journalFile: string,
+  journal: DeploymentPromotionJournal,
+): void {
+  if (journal.state === 'COMMITTED') {
+    deploymentRecoveryFail('A committed App deployment promotion cannot be rolled back.');
+  }
+  updateDeploymentPromotionJournal(journalFile, journal, 'ROLLING_BACK');
+  const destinationIdentity = optionalDeploymentPromotionIdentity(journal.destinationRoot);
+  const stagingIdentity = optionalDeploymentPromotionIdentity(journal.stagingRoot);
+  const previousIdentity = optionalDeploymentPromotionIdentity(journal.previousRoot);
+  const failedIdentity = optionalDeploymentPromotionIdentity(journal.failedRoot);
+
+  const destinationIsOld = deploymentPromotionIdentitiesMatch(
+    destinationIdentity,
+    journal.existingIdentity,
+  );
+  const destinationIsNew = deploymentPromotionIdentitiesMatch(
+    destinationIdentity,
+    journal.stagingIdentity,
+  );
+  const stagingIsNew = deploymentPromotionIdentitiesMatch(stagingIdentity, journal.stagingIdentity);
+  const previousIsOld = deploymentPromotionIdentitiesMatch(previousIdentity, journal.existingIdentity);
+  const failedIsNew = deploymentPromotionIdentitiesMatch(failedIdentity, journal.stagingIdentity);
+
+  if (journal.existingIdentity) {
+    if (destinationIsOld && !previousIdentity) {
+      if (stagingIdentity) {
+        if (!stagingIsNew) deploymentRecoveryFail('Staged App deployment changed identity during rollback.');
+        removeExactDeploymentDirectory(journal.stagingRoot, journal.stagingIdentity, 'Staged App deployment');
+      }
+      if (failedIdentity) {
+        if (!failedIsNew) deploymentRecoveryFail('Failed App deployment changed identity during rollback.');
+        removeExactDeploymentDirectory(journal.failedRoot, journal.stagingIdentity, 'Failed App deployment');
+      }
+    } else if (!destinationIdentity && previousIsOld) {
+      fs.renameSync(journal.previousRoot, journal.destinationRoot);
+      fsyncPromotionDirectory(journal.destinationParent);
+      if (stagingIdentity) {
+        if (!stagingIsNew) deploymentRecoveryFail('Staged App deployment changed identity during rollback.');
+        removeExactDeploymentDirectory(journal.stagingRoot, journal.stagingIdentity, 'Staged App deployment');
+      }
+      if (failedIdentity) {
+        if (!failedIsNew) deploymentRecoveryFail('Failed App deployment changed identity during rollback.');
+        removeExactDeploymentDirectory(journal.failedRoot, journal.stagingIdentity, 'Failed App deployment');
+      }
+    } else if (destinationIsNew && previousIsOld && !stagingIdentity && !failedIdentity) {
+      fs.renameSync(journal.destinationRoot, journal.failedRoot);
+      fsyncPromotionDirectory(journal.destinationParent);
+      fs.renameSync(journal.previousRoot, journal.destinationRoot);
+      fsyncPromotionDirectory(journal.destinationParent);
+      removeExactDeploymentDirectory(journal.failedRoot, journal.stagingIdentity, 'Failed App deployment');
+    } else {
+      deploymentRecoveryFail('Interrupted App deployment has an ambiguous rollback topology.');
+    }
+  } else if (!previousIdentity) {
+    if (destinationIsNew && !stagingIdentity && !failedIdentity) {
+      fs.renameSync(journal.destinationRoot, journal.failedRoot);
+      fsyncPromotionDirectory(journal.destinationParent);
+      removeExactDeploymentDirectory(journal.failedRoot, journal.stagingIdentity, 'Failed App deployment');
+    } else if (!destinationIdentity && stagingIsNew && !failedIdentity) {
+      removeExactDeploymentDirectory(journal.stagingRoot, journal.stagingIdentity, 'Staged App deployment');
+    } else if (!destinationIdentity && !stagingIdentity && failedIsNew) {
+      removeExactDeploymentDirectory(journal.failedRoot, journal.stagingIdentity, 'Failed App deployment');
+    } else if (destinationIdentity || stagingIdentity || failedIdentity) {
+      deploymentRecoveryFail('Interrupted initial App deployment has an ambiguous rollback topology.');
+    }
+  } else {
+    deploymentRecoveryFail('Initial App deployment unexpectedly displaced an older generation.');
+  }
+  cleanupDeploymentPromotionJournal(journalFile);
+}
+
+function finalizeDeploymentPromotionJournal(
+  journalFile: string,
+  journal: DeploymentPromotionJournal,
+): void {
+  const destinationIdentity = optionalDeploymentPromotionIdentity(journal.destinationRoot);
+  const previousIdentity = optionalDeploymentPromotionIdentity(journal.previousRoot);
+  if (!deploymentPromotionIdentitiesMatch(destinationIdentity, journal.stagingIdentity)) {
+    deploymentRecoveryFail('Committed App deployment changed identity before cleanup.');
+  }
+  if (previousIdentity && !deploymentPromotionIdentitiesMatch(previousIdentity, journal.existingIdentity)) {
+    deploymentRecoveryFail('Prior App deployment changed identity before cleanup.');
+  }
+  if (previousIdentity) {
+    removeExactDeploymentDirectory(journal.previousRoot, previousIdentity, 'Prior App deployment');
+  }
+  cleanupDeploymentPromotionJournal(journalFile);
+}
+
+function cleanupOrphanDeploymentStagingRoots(destinationRoot: string): void {
+  const destinationParent = path.dirname(destinationRoot);
+  const prefix = `.${path.basename(destinationRoot)}.deploy-`;
+  for (const name of fs.readdirSync(destinationParent).filter((candidate) => candidate.startsWith(prefix)).sort()) {
+    const nonce = name.slice(prefix.length);
+    // Only the random identity format minted by prepareDeploymentTree is
+    // eligible. UUID staging belongs to the separately journaled legacy-App
+    // rebind and must never be swept here.
+    if (!/^\d+-[a-f0-9]{16}$/.test(nonce)) continue;
+    if (fs.existsSync(deploymentPromotionJournalFile(destinationRoot, nonce))) continue;
+    cleanupDeploymentJournalTemporaries(
+      deploymentPromotionJournalFile(destinationRoot, nonce),
+    );
+    const candidate = path.join(destinationParent, name);
+    const entry = fs.lstatSync(candidate);
+    if (
+      entry.isSymbolicLink()
+      || !entry.isDirectory()
+      || entry.uid !== currentOwnerUid()
+      || entry.gid !== currentOwnerGid()
+      || (entry.mode & 0o777) !== 0o700
+      || fs.realpathSync.native(candidate) !== candidate
+    ) deploymentRecoveryFail('Unjournaled App deployment staging is not private server-owned evidence.');
+    removeExactDeploymentDirectory(
+      candidate,
+      deploymentPromotionIdentity(candidate),
+      'Unjournaled App deployment staging',
+    );
+  }
+}
+
+function recoverInterruptedDeploymentPromotionForDestination(destinationRoot: string): {
+  rolledBack: number;
+  committed: number;
+} {
+  const destinationParent = path.dirname(destinationRoot);
+  cleanupOrphanDeploymentStagingRoots(destinationRoot);
+  const journalPrefix = `.${path.basename(destinationRoot)}.deployment-`;
+  const journals = fs.readdirSync(destinationParent)
+    .filter((name) => name.startsWith(journalPrefix) && name.endsWith('.json'))
+    .sort();
+  if (journals.length > 1) {
+    deploymentRecoveryFail('Multiple unresolved App deployment promotions target one destination.');
+  }
+  if (journals.length === 0) return { rolledBack: 0, committed: 0 };
+  const journalFile = path.join(destinationParent, journals[0]);
+  cleanupDeploymentJournalTemporaries(journalFile);
+  const journal = readDeploymentPromotionJournal(journalFile, destinationRoot);
+  if (journal.state === 'COMMITTED') {
+    finalizeDeploymentPromotionJournal(journalFile, journal);
+    return { rolledBack: 0, committed: 1 };
+  }
+  rollbackDeploymentPromotionJournal(journalFile, journal);
+  return { rolledBack: 1, committed: 0 };
+}
+
+export function listInterruptedDeploymentPromotionTargets(deploymentRoot: string): string[] {
+  const root = path.resolve(deploymentRoot);
+  const rootEntry = fs.lstatSync(root);
+  if (
+    !path.isAbsolute(deploymentRoot)
+    || root !== deploymentRoot
+    || rootEntry.isSymbolicLink()
+    || !rootEntry.isDirectory()
+    || rootEntry.uid !== currentOwnerUid()
+    || rootEntry.gid !== currentOwnerGid()
+    || (rootEntry.mode & 0o022) !== 0
+    || fs.realpathSync.native(root) !== root
+  ) deploymentRecoveryFail('App deployment storage root is unsafe.');
+  const targets = new Set<string>();
+  for (const name of fs.readdirSync(root).sort()) {
+    const match = /^\.(.+)\.deployment-([A-Za-z0-9][A-Za-z0-9._-]{0,127})\.json$/.exec(name);
+    if (!match) continue;
+    if (!match[1] || match[1].includes('/') || match[1].includes('\\') || match[1].includes('\0')) {
+      deploymentRecoveryFail('App deployment promotion journal names an unsafe destination.');
+    }
+    targets.add(path.join(root, match[1]));
+  }
+  return [...targets].sort();
+}
+
+export function recoverInterruptedDeploymentPromotions(deploymentRoot: string): {
+  rolledBack: number;
+  committed: number;
+} {
+  let targets = listInterruptedDeploymentPromotionTargets(deploymentRoot);
+  const root = path.resolve(deploymentRoot);
+  const orphanTargets = new Set<string>();
+  for (const name of fs.readdirSync(root).sort()) {
+    const match = /^\.(.+)\.deploy-(\d+-[a-f0-9]{16})$/.exec(name);
+    if (!match) continue;
+    if (!match[1] || match[1].includes('/') || match[1].includes('\\') || match[1].includes('\0')) {
+      deploymentRecoveryFail('Unjournaled App deployment staging names an unsafe destination.');
+    }
+    orphanTargets.add(path.join(root, match[1]));
+  }
+  for (const target of [...orphanTargets].sort()) cleanupOrphanDeploymentStagingRoots(target);
+  targets = listInterruptedDeploymentPromotionTargets(deploymentRoot);
+  let rolledBack = 0;
+  let committed = 0;
+  for (const target of targets) {
+    const result = recoverInterruptedDeploymentPromotionForDestination(target);
+    rolledBack += result.rolledBack;
+    committed += result.committed;
+  }
+  return { rolledBack, committed };
+}
+
+function persistentDeploymentTreeDigest(root: string): string {
+  const canonicalRoot = path.resolve(root);
+  const rootEntry = fs.lstatSync(canonicalRoot, { bigint: true });
+  if (rootEntry.isSymbolicLink() || !rootEntry.isDirectory() || fs.realpathSync.native(canonicalRoot) !== canonicalRoot) {
+    throw new Error('Managed deployment data must be a real directory');
+  }
+  if (descendantMountBoundaries(canonicalRoot).length > 0) {
+    throw new Error('Managed deployment data cannot cross a mount or bind-mount boundary');
+  }
+  const digest = crypto.createHash('sha256');
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const visit = (candidate: string, relative: string): void => {
+    const before = fs.lstatSync(candidate, { bigint: true });
+    if (before.dev !== rootEntry.dev || fs.realpathSync.native(candidate) !== candidate) {
+      throw new Error('Managed deployment data escaped its filesystem boundary');
+    }
+    const mode = Number(before.mode & 0o7777n);
+    if (before.isDirectory()) {
+      digest.update(JSON.stringify([relative, 'directory', mode, before.uid.toString(), before.gid.toString()]));
+      for (const child of fs.readdirSync(candidate).sort()) {
+        visit(path.join(candidate, child), relative ? `${relative}/${child}` : child);
+      }
+    } else if (before.isFile() && !before.isSymbolicLink()) {
+      if (before.nlink !== 1n) throw new Error('Managed deployment data cannot contain hard-linked files');
+      digest.update(JSON.stringify([
+        relative,
+        'file',
+        mode,
+        before.uid.toString(),
+        before.gid.toString(),
+        before.size.toString(),
+      ]));
+      const descriptor = fs.openSync(candidate, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      try {
+        let offset = 0n;
+        while (offset < before.size) {
+          const readOffset = Number(offset);
+          const bytesRead = fs.readSync(
+            descriptor,
+            buffer,
+            0,
+            Math.min(buffer.length, Number(before.size - offset)),
+            readOffset,
+          );
+          if (bytesRead <= 0) throw new Error('Managed deployment data changed while being copied');
+          digest.update(buffer.subarray(0, bytesRead));
+          offset += BigInt(bytesRead);
+        }
+        const after = fs.fstatSync(descriptor, { bigint: true });
+        if (
+          after.dev !== before.dev
+          || after.ino !== before.ino
+          || after.birthtimeNs !== before.birthtimeNs
+          || after.ctimeNs !== before.ctimeNs
+          || after.mtimeNs !== before.mtimeNs
+          || after.size !== before.size
+          || after.mode !== before.mode
+          || after.uid !== before.uid
+          || after.gid !== before.gid
+          || after.nlink !== before.nlink
+        ) throw new Error('Managed deployment data changed while being copied');
+      } finally {
+        fs.closeSync(descriptor);
+      }
+    } else {
+      throw new Error('Managed deployment data contains an unsupported filesystem entry');
+    }
+    const after = fs.lstatSync(candidate, { bigint: true });
+    if (
+      after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.birthtimeNs !== before.birthtimeNs
+      || after.ctimeNs !== before.ctimeNs
+      || after.mtimeNs !== before.mtimeNs
+      || after.size !== before.size
+      || after.mode !== before.mode
+      || after.uid !== before.uid
+      || after.gid !== before.gid
+      || after.nlink !== before.nlink
+    ) throw new Error('Managed deployment data changed during attestation');
+  };
+  visit(canonicalRoot, '');
+  return digest.digest('hex');
+}
+
+function copyPersistentDeploymentTree(source: string, target: string): void {
+  const expectedDigest = persistentDeploymentTreeDigest(source);
+  fs.cpSync(source, target, {
+    recursive: true,
+    dereference: false,
+    errorOnExist: true,
+    force: false,
+    preserveTimestamps: true,
+  });
+  const preserveMetadata = (sourceEntry: string, targetEntry: string): void => {
+    const sourceStat = fs.lstatSync(sourceEntry);
+    const targetStat = fs.lstatSync(targetEntry);
+    if (sourceStat.isSymbolicLink() || targetStat.isSymbolicLink()) {
+      throw new Error('Managed deployment data cannot contain symbolic links');
+    }
+    if (sourceStat.isDirectory() !== targetStat.isDirectory() || sourceStat.isFile() !== targetStat.isFile()) {
+      throw new Error('Managed deployment data changed type during copy');
+    }
+    if (sourceStat.isDirectory()) {
+      for (const child of fs.readdirSync(sourceEntry).sort()) {
+        preserveMetadata(path.join(sourceEntry, child), path.join(targetEntry, child));
+      }
+    }
+    fs.chownSync(targetEntry, sourceStat.uid, sourceStat.gid);
+    fs.chmodSync(targetEntry, sourceStat.mode & 0o7777);
+  };
+  preserveMetadata(source, target);
+  const sourceDigest = persistentDeploymentTreeDigest(source);
+  const targetDigest = persistentDeploymentTreeDigest(target);
+  if (sourceDigest !== expectedDigest || targetDigest !== expectedDigest) {
+    throw new Error('Managed deployment data changed while it was preserved');
+  }
+}
+
+function stageManagedDeploymentPersistentRoots(
+  destinationRoot: string,
+  stagingRoot: string,
+  operationId: string,
+): void {
+  const scratchRoot = path.join(stagingRoot, `.bridgesllm-persistent-${operationId}`);
+  if (fs.existsSync(scratchRoot)) {
+    throw new Error('Deployment staging contains a reserved persistence path');
+  }
+  fs.mkdirSync(scratchRoot, { mode: 0o700 });
+  try {
+    for (const rootName of MANAGED_DEPLOYMENT_PERSISTENT_ROOTS) {
+      const liveRoot = path.join(destinationRoot, rootName);
+      let liveEntry: fs.Stats | null = null;
+      try {
+        liveEntry = fs.lstatSync(liveRoot);
+      } catch (error: any) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      if (!liveEntry) continue;
+      if (liveEntry.isSymbolicLink() || !liveEntry.isDirectory()) {
+        throw new Error(`Managed deployment data path ${rootName} must be a real directory`);
+      }
+      const stagedRoot = path.join(stagingRoot, rootName);
+      let stagedEntry: fs.Stats | null = null;
+      try {
+        stagedEntry = fs.lstatSync(stagedRoot);
+      } catch (error: any) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      if (stagedEntry && (stagedEntry.isSymbolicLink() || !stagedEntry.isDirectory())) {
+        throw new Error(`Deployment source conflicts with managed persistent path ${rootName}`);
+      }
+      const preservedRoot = path.join(scratchRoot, rootName);
+      copyPersistentDeploymentTree(liveRoot, preservedRoot);
+      if (stagedEntry) fs.rmSync(stagedRoot, { recursive: true, force: false });
+      fs.renameSync(preservedRoot, stagedRoot);
+    }
+  } finally {
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+  }
+}
+
+function validateStagedManagedDeploymentPersistentRoots(stagingRoot: string): void {
+  for (const rootName of MANAGED_DEPLOYMENT_PERSISTENT_ROOTS) {
+    const candidate = path.join(stagingRoot, rootName);
+    let entry: fs.Stats | null = null;
+    try {
+      entry = fs.lstatSync(candidate);
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    if (!entry) continue;
+    if (entry.isSymbolicLink() || !entry.isDirectory()) {
+      throw new Error(`Deployment source conflicts with managed persistent path ${rootName}`);
+    }
+    persistentDeploymentTreeDigest(candidate);
+  }
+}
+
+function fsyncDeploymentTreeSync(root: string): void {
+  const entry = fs.lstatSync(root);
+  if (entry.isSymbolicLink()) throw new Error('Deployment staging cannot contain symbolic links');
+  if (entry.isFile()) {
+    const descriptor = fs.openSync(root, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+    return;
+  }
+  if (!entry.isDirectory()) throw new Error('Deployment staging contains an unsupported filesystem entry');
+  for (const child of fs.readdirSync(root).sort()) {
+    fsyncDeploymentTreeSync(path.join(root, child));
+  }
+  fsyncPromotionDirectory(root);
 }
 
 function fingerprintCopiedDeploymentTree(root: string): string {
@@ -5469,6 +6155,9 @@ function prepareDeploymentTree(
     excludeStaticPrivateFiles: boolean;
     expectedSourceDigest?: string;
     preparationNonce?: string;
+    journaled?: boolean;
+    preserveManagedData?: boolean;
+    testCheckpoint?: (checkpoint: ProjectDeploymentPromotionCheckpoint) => void;
   },
 ): ProjectDeploymentPromotion {
   const sourceRoot = assertSafeWorkspace(source);
@@ -5505,12 +6194,21 @@ function prepareDeploymentTree(
 
   const destinationParent = path.dirname(destinationRoot);
   const parentEntry = fs.lstatSync(destinationParent);
-  if (parentEntry.isSymbolicLink() || !parentEntry.isDirectory()) {
-    throw new Error('Static deployment destination parent must be a real directory');
+  if (
+    parentEntry.isSymbolicLink()
+    || !parentEntry.isDirectory()
+    || parentEntry.uid !== currentOwnerUid()
+    || parentEntry.gid !== currentOwnerGid()
+    || (parentEntry.mode & 0o022) !== 0
+  ) {
+    throw new Error('Static deployment destination parent must be a private server-owned real directory');
   }
   if (fs.realpathSync(destinationParent) !== destinationParent) {
     throw new Error('Static deployment destination parent must use its canonical path');
   }
+  const journaled = options.journaled !== false;
+  const preserveManagedData = options.preserveManagedData === true;
+  if (journaled) recoverInterruptedDeploymentPromotionForDestination(destinationRoot);
   const existingEntry = (() => {
     try { return fs.lstatSync(destinationRoot); } catch (error: any) {
       if (error?.code === 'ENOENT') return null;
@@ -5520,6 +6218,10 @@ function prepareDeploymentTree(
   if (existingEntry?.isSymbolicLink()) {
     throw new Error('Static deployment destination cannot be a symbolic link');
   }
+  if (existingEntry && (
+    !existingEntry.isDirectory()
+    || fs.realpathSync.native(destinationRoot) !== destinationRoot
+  )) throw new Error('Static deployment destination must be a real canonical directory');
 
   const nonce = options.preparationNonce
     ? String(options.preparationNonce)
@@ -5529,14 +6231,68 @@ function prepareDeploymentTree(
   }
   const stagingRoot = path.join(destinationParent, `.${path.basename(destinationRoot)}.deploy-${nonce}`);
   const previousRoot = path.join(destinationParent, `.${path.basename(destinationRoot)}.previous-${nonce}`);
+  const failedRoot = path.join(destinationParent, `.${path.basename(destinationRoot)}.failed-${nonce}`);
+  const journalFile = deploymentPromotionJournalFile(destinationRoot, nonce);
+  if (
+    fs.existsSync(stagingRoot)
+    || fs.existsSync(previousRoot)
+    || fs.existsSync(failedRoot)
+    || (journaled && fs.existsSync(journalFile))
+  ) throw new Error('Deployment preparation evidence already exists');
+
+  fs.mkdirSync(stagingRoot, { mode: 0o700 });
+  fs.chmodSync(stagingRoot, 0o700);
+  const stagingEntry = fs.lstatSync(stagingRoot);
+  if (
+    stagingEntry.isSymbolicLink()
+    || !stagingEntry.isDirectory()
+    || stagingEntry.uid !== currentOwnerUid()
+    || stagingEntry.gid !== currentOwnerGid()
+    || (stagingEntry.mode & 0o777) !== 0o700
+  ) {
+    fs.rmSync(stagingRoot, { recursive: true, force: true });
+    throw new Error('Deployment staging root is not private server-owned state');
+  }
+  const stagingBigIntEntry = fs.lstatSync(stagingRoot, { bigint: true });
+  const stagingPromotionIdentity = deploymentPromotionIdentity(stagingRoot);
+  const sourceRootEntry = fs.lstatSync(sourceRoot);
+  const now = new Date().toISOString();
+  const journal: DeploymentPromotionJournal | null = journaled ? {
+    schemaVersion: 1,
+    operationId: nonce,
+    destinationRoot,
+    destinationParent,
+    stagingRoot,
+    previousRoot,
+    failedRoot,
+    existingIdentity: existingEntry ? deploymentPromotionIdentity(destinationRoot) : null,
+    stagingIdentity: stagingPromotionIdentity,
+    persistentRoots: preserveManagedData ? [...MANAGED_DEPLOYMENT_PERSISTENT_ROOTS] : [],
+    state: 'COPYING',
+    createdAt: now,
+    updatedAt: now,
+  } : null;
+  if (journal) {
+    writeDeploymentPromotionJournal(journalFile, journal, true);
+    options.testCheckpoint?.('after-deployment-journal-create');
+  }
   let sourceDigest = '';
   try {
-    fs.cpSync(sourceRoot, stagingRoot, {
-      recursive: true,
-      dereference: false,
-      filter: shouldInclude,
-    });
+    for (const child of fs.readdirSync(sourceRoot).sort()) {
+      const sourceChild = path.join(sourceRoot, child);
+      if (!shouldInclude(sourceChild)) continue;
+      fs.cpSync(sourceChild, path.join(stagingRoot, child), {
+        recursive: true,
+        dereference: false,
+        filter: shouldInclude,
+      });
+    }
+    if (!journal) {
+      fs.chownSync(stagingRoot, sourceRootEntry.uid, sourceRootEntry.gid);
+      fs.chmodSync(stagingRoot, sourceRootEntry.mode & 0o7777);
+    }
     assertNoLinks(stagingRoot);
+    if (preserveManagedData) validateStagedManagedDeploymentPersistentRoots(stagingRoot);
     sourceDigest = fingerprintCopiedDeploymentTree(stagingRoot);
     if (
       options.expectedSourceDigest !== undefined
@@ -5544,13 +6300,20 @@ function prepareDeploymentTree(
     ) {
       throw new ProjectDeploymentReplayStaleError();
     }
+    fsyncDeploymentTreeSync(stagingRoot);
+    fsyncPromotionDirectory(destinationParent);
+    if (journal) updateDeploymentPromotionJournal(journalFile, journal, 'PREPARED');
   } catch (error) {
-    try { fs.rmSync(stagingRoot, { recursive: true, force: true }); } catch {}
+    try {
+      if (journal && fs.existsSync(journalFile)) {
+        rollbackDeploymentPromotionJournal(journalFile, journal);
+      } else {
+        fs.rmSync(stagingRoot, { recursive: true, force: true });
+      }
+    } catch {}
     throw error;
   }
 
-  const stagingEntry = fs.lstatSync(stagingRoot);
-  const stagingBigIntEntry = fs.lstatSync(stagingRoot, { bigint: true });
   const sameEntry = (left: fs.Stats, right: fs.Stats): boolean => (
     left.dev === right.dev && left.ino === right.ino
   );
@@ -5585,18 +6348,46 @@ function prepareDeploymentTree(
         throw new Error('Static deployment destination cannot be a symbolic link');
       }
       try {
+        if (preserveManagedData && currentEntry) {
+          stageManagedDeploymentPersistentRoots(destinationRoot, stagingRoot, nonce);
+          if (journal) updateDeploymentPromotionJournal(journalFile, journal, 'PERSISTENCE_STAGED');
+          options.testCheckpoint?.('after-persistent-data-stage');
+        }
+        if (journal) {
+          fs.chownSync(stagingRoot, sourceRootEntry.uid, sourceRootEntry.gid);
+          fs.chmodSync(stagingRoot, sourceRootEntry.mode & 0o7777);
+        }
+        fsyncDeploymentTreeSync(stagingRoot);
+        fsyncPromotionDirectory(destinationParent);
         if (currentEntry) {
           fs.renameSync(destinationRoot, previousRoot);
           previousMoved = true;
+          fsyncPromotionDirectory(destinationParent);
+          if (journal) updateDeploymentPromotionJournal(journalFile, journal, 'PREVIOUS_MOVED');
+          options.testCheckpoint?.('after-previous-deployment-move');
         }
         fs.renameSync(stagingRoot, destinationRoot);
+        fsyncPromotionDirectory(destinationParent);
         const promotedEntry = fs.lstatSync(destinationRoot);
         if (!sameEntry(stagingEntry, promotedEntry)) {
           throw new Error('Deployment staging identity changed during promotion');
         }
         promoted = true;
+        if (journal) updateDeploymentPromotionJournal(journalFile, journal, 'PROMOTED');
+        options.testCheckpoint?.('after-deployment-promote');
       } catch (error) {
-        if (previousMoved && !fs.existsSync(destinationRoot) && fs.existsSync(previousRoot)) {
+        if (journal && fs.existsSync(journalFile)) {
+          try {
+            rollbackDeploymentPromotionJournal(journalFile, journal);
+            previousMoved = false;
+            settled = true;
+          } catch (rollbackError: any) {
+            throw Object.assign(
+              new Error(`Deployment promotion failed and the prior deployment could not be restored: ${rollbackError.message}`),
+              { cause: error },
+            );
+          }
+        } else if (previousMoved && !fs.existsSync(destinationRoot) && fs.existsSync(previousRoot)) {
           try {
             fs.renameSync(previousRoot, destinationRoot);
             previousMoved = false;
@@ -5613,11 +6404,30 @@ function prepareDeploymentTree(
     finalize: () => {
       if (settled) return;
       if (!promoted) throw new Error('Deployment preparation was not promoted');
+      if (journal) {
+        updateDeploymentPromotionJournal(journalFile, journal, 'COMMITTED');
+        options.testCheckpoint?.('after-deployment-commit');
+        settled = true;
+        try {
+          finalizeDeploymentPromotionJournal(journalFile, journal);
+        } catch (error) {
+          // COMMITTED is durable authority to keep the replacement. Startup
+          // recovery will retry exact old-generation cleanup without turning a
+          // successfully started App into a reported deployment failure.
+          console.warn('[Project Deploy] Committed deployment cleanup deferred:', error);
+        }
+        return;
+      }
       if (previousMoved) fs.rmSync(previousRoot, { recursive: true, force: true });
       settled = true;
     },
     rollback: () => {
       if (settled) return;
+      if (journal) {
+        rollbackDeploymentPromotionJournal(journalFile, journal);
+        settled = true;
+        return;
+      }
       if (!promoted) {
         const currentStaging = fs.lstatSync(stagingRoot);
         if (!sameEntry(stagingEntry, currentStaging)) {
@@ -5627,7 +6437,6 @@ function prepareDeploymentTree(
         settled = true;
         return;
       }
-      const failedRoot = path.join(destinationParent, `.${path.basename(destinationRoot)}.failed-${nonce}`);
       const promotedEntry = currentDestinationEntry();
       if (!promotedEntry || !sameEntry(stagingEntry, promotedEntry)) {
         throw new Error('Promoted deployment identity changed before rollback');
@@ -5649,7 +6458,10 @@ function prepareDeploymentTree(
 }
 
 export function copyStaticDeploymentTree(source: string, destination: string): void {
-  const promotion = prepareDeploymentTree(source, destination, { excludeStaticPrivateFiles: true });
+  const promotion = prepareDeploymentTree(source, destination, {
+    excludeStaticPrivateFiles: true,
+    preserveManagedData: true,
+  });
   promotion.promote();
   promotion.finalize();
 }
@@ -5659,11 +6471,18 @@ export function prepareFullstackDeploymentTree(
   destination: string,
   expectedSourceDigest?: string,
   preparationNonce?: string,
+  testCheckpoint?: (checkpoint: ProjectDeploymentPromotionCheckpoint) => void,
 ): ProjectDeploymentPromotion {
   return prepareDeploymentTree(source, destination, {
     excludeStaticPrivateFiles: false,
+    // A caller-supplied nonce belongs to the separately journaled legacy-App
+    // identity rebind. That path targets a new destination and moves the
+    // staged inode under its own durable authority.
+    journaled: preparationNonce === undefined,
+    preserveManagedData: preparationNonce === undefined,
     ...(expectedSourceDigest ? { expectedSourceDigest } : {}),
     ...(preparationNonce ? { preparationNonce } : {}),
+    ...(testCheckpoint ? { testCheckpoint } : {}),
   });
 }
 
@@ -5684,7 +6503,11 @@ export function copyFullstackDeploymentTree(
  * redeploy as stale host-executed code.
  */
 export function copyDesktopRuntimeDeploymentTree(source: string, destination: string): void {
-  const promotion = prepareDeploymentTree(source, destination, { excludeStaticPrivateFiles: false });
+  const promotion = prepareDeploymentTree(source, destination, {
+    excludeStaticPrivateFiles: false,
+    journaled: false,
+    preserveManagedData: false,
+  });
   promotion.promote();
   promotion.finalize();
 }

@@ -1,6 +1,7 @@
 import http from 'http';
 import express, { NextFunction, Request, Response } from 'express';
 
+let mockRole: 'OWNER' | 'USER' = 'OWNER';
 const getUserMailAccountsMock = jest.fn();
 const getUserMailCredentialsMock = jest.fn();
 const ensureRuntimeDirectoryMock = jest.fn();
@@ -52,7 +53,7 @@ jest.mock('../middleware/auth', () => ({
     req.user = {
       userId: 'tailnet-user',
       email: 'owner@example.com',
-      role: 'OWNER',
+      role: mockRole,
       accountStatus: 'ACTIVE',
     };
     next();
@@ -213,6 +214,8 @@ describe('Tailnet mail runtime capability gate', () => {
   let originalOriginMode: string | undefined;
   let originalFetch: typeof global.fetch;
   let fetchMock: jest.Mock;
+  const sharedKeys = ['STALWART_SUPPORT_PASS', 'STALWART_NOREPLY_PASS', 'EXTRA_SHARED_MAIL_ACCOUNT_ID'] as const;
+  const priorShared = Object.fromEntries(sharedKeys.map(key => [key, process.env[key]]));
 
   beforeAll(async () => {
     originalOriginMode = process.env.ORIGIN_MODE;
@@ -226,6 +229,8 @@ describe('Tailnet mail runtime capability gate', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRole = 'OWNER';
+    for (const key of sharedKeys) delete process.env[key];
     process.env.ORIGIN_MODE = 'tailnet';
     fetchMock = jest.fn();
     global.fetch = fetchMock as unknown as typeof global.fetch;
@@ -234,8 +239,44 @@ describe('Tailnet mail runtime capability gate', () => {
   afterAll(async () => {
     if (originalOriginMode === undefined) delete process.env.ORIGIN_MODE;
     else process.env.ORIGIN_MODE = originalOriginMode;
+    for (const key of sharedKeys) {
+      if (priorShared[key] === undefined) delete process.env[key];
+      else process.env[key] = priorShared[key];
+    }
     global.fetch = originalFetch;
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test('does not advertise unconfigured shared inboxes to the owner', async () => {
+    process.env.ORIGIN_MODE = 'domain';
+    getUserMailAccountsMock.mockResolvedValue([]);
+    const response = await request(server, 'GET', '/mail/accounts');
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ accounts: [], hasMailbox: false });
+  });
+
+  test.each(['support', 'noreply'])('unconfigured shared %s uses the empty inbox path without JMAP access', async (account) => {
+    process.env.ORIGIN_MODE = 'domain';
+    const response = await request(server, 'GET', '/mail/mailboxes?account=' + account);
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ error: 'no_mailbox', mailboxes: [] });
+    expect(mailServiceMocks.getMailboxes).not.toHaveBeenCalled();
+  });
+
+  test('configured shared inboxes stay available only to elevated users', async () => {
+    process.env.ORIGIN_MODE = 'domain';
+    process.env.STALWART_SUPPORT_PASS = 'synthetic-shared-fixture-only';
+    process.env.STALWART_NOREPLY_PASS = 'synthetic-noreply-fixture-only';
+    getUserMailAccountsMock.mockResolvedValue([]);
+    mailServiceMocks.getMailboxes.mockResolvedValue([]);
+    const accounts = await request(server, 'GET', '/mail/accounts');
+    expect((accounts.body.accounts as Array<{ id: string }>).map(x => x.id)).toEqual(['support', 'noreply']);
+    expect((await request(server, 'GET', '/mail/mailboxes?account=support')).status).toBe(200);
+    expect(mailServiceMocks.getMailboxes).toHaveBeenCalledWith('support', 'synthetic-shared-fixture-only');
+    mailServiceMocks.getMailboxes.mockClear();
+    mockRole = 'USER';
+    expect((await request(server, 'GET', '/mail/mailboxes?account=support')).status).toBe(403);
+    expect(mailServiceMocks.getMailboxes).not.toHaveBeenCalled();
   });
 
   test('rejects account discovery before mailbox auto-provisioning, Prisma, or Stalwart access', async () => {

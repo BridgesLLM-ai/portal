@@ -7,6 +7,7 @@ import { AgentAbortError } from '../agents/AgentProvider.interface';
 import { streamEventBus, type StreamEvent } from './StreamEventBus';
 import {
   getProjectChatProviderAdapter,
+  getProjectChatProviderCleanupController,
   projectChatProviderDisplayName,
   type DurableProjectProvider,
 } from './projectChatProviderRegistry';
@@ -173,32 +174,6 @@ function attestedPreambleReasoning(event: StreamEvent): Record<string, unknown> 
   return turnEvent as unknown as Record<string, unknown>;
 }
 
-function isGenericAssistantStatusText(value: unknown): boolean {
-  const normalized = typeof value === 'string' ? value.trim() : '';
-  if (!normalized) return true;
-  if (/^(thinking|working|reasoning|processing|responding|running|typing)\s*(…|\.{1,3})?$/i.test(normalized)) {
-    return true;
-  }
-  return /\b(?:compacting context|context compacted|context maintenance|memory flush|heartbeat check)\b/i.test(normalized);
-}
-
-function attestedVisibleAssistantStatus(event: StreamEvent): Record<string, unknown> | null {
-  const turnEvent = event.turnEvent;
-  if (
-    event.type !== 'status'
-    || event.transient === true
-    || !turnEvent
-    || turnEvent.schema !== 'bridgesllm.runtime-turn-event.v1'
-    || turnEvent.type !== 'assistant_status'
-    || turnEvent.visible !== true
-    || turnEvent.source?.transport !== 'portal-stream-event-bus'
-    || turnEvent.source?.eventType !== 'status'
-    || turnEvent.source?.preambleProgress === true
-    || isGenericAssistantStatusText(turnEvent.text)
-  ) return null;
-  return turnEvent as unknown as Record<string, unknown>;
-}
-
 function boundedPreambleItemId(
   event: StreamEvent,
   turnEvent: Record<string, unknown> | null,
@@ -218,16 +193,13 @@ function sanitizeEvent(event: StreamEvent): StreamEvent {
   // envelope. Only the StreamEventBus-attested turn event may promote it to
   // Project reasoning; a raw provider flag on its own is not sufficient.
   const preambleTurnEvent = attestedPreambleReasoning(event);
-  const statusTurnEvent = preambleTurnEvent ? null : attestedVisibleAssistantStatus(event);
   const type = preambleTurnEvent
     ? 'thinking'
     : (SAFE_EVENT_TYPES.has(event.type) ? event.type : 'status');
   const sanitized: StreamEvent = { type };
   const attestedText = typeof preambleTurnEvent?.text === 'string'
     ? preambleTurnEvent.text
-    : typeof statusTurnEvent?.text === 'string'
-      ? statusTurnEvent.text
-      : event.content;
+    : event.content;
   if (attestedText != null) sanitized.content = boundedText(attestedText);
   const subject = sanitizeThinkingSubject(preambleTurnEvent?.subject ?? event.subject);
   if (subject) sanitized.subject = subject;
@@ -246,7 +218,6 @@ function sanitizeEvent(event: StreamEvent): StreamEvent {
     sanitized.maintenanceKind = event.maintenanceKind;
   }
   if (event.transient === true) sanitized.transient = true;
-  if (statusTurnEvent) sanitized.assistantStatus = true;
   if (preambleTurnEvent) {
     sanitized.preambleProgress = true;
     const preambleItemId = boundedPreambleItemId(event, preambleTurnEvent);
@@ -257,9 +228,7 @@ function sanitizeEvent(event: StreamEvent): StreamEvent {
     const preambleItemId = boundedPreambleItemId(event, null);
     if (preambleItemId) sanitized.preambleItemId = preambleItemId;
   }
-  const replace = preambleTurnEvent?.replace === true
-    || statusTurnEvent?.replace === true
-    || event.replace === true;
+  const replace = preambleTurnEvent?.replace === true || event.replace === true;
   if (replace) sanitized.replace = true;
   if (typeof event.exitCode === 'number' && Number.isFinite(event.exitCode)) sanitized.exitCode = event.exitCode;
   return sanitized;
@@ -300,7 +269,11 @@ function appendEvent(state: ProjectNativeRunState, event: StreamEvent): ProjectN
   state.updatedAt = next.ts;
   state.events.push(next);
   if (state.events.length > MAX_EVENTS) state.events.splice(0, state.events.length - MAX_EVENTS);
-  streamEventBus.publish(state.sessionId || state.initialSessionId, { ...next, brokerEnvelope: true });
+  streamEventBus.publish(
+    state.sessionId || state.initialSessionId,
+    { ...next, brokerEnvelope: true },
+    next.preambleProgress === true ? { attestedPreambleProgress: true } : undefined,
+  );
   return next;
 }
 
@@ -597,7 +570,7 @@ export async function abortProjectNativeRun(input: {
 }): Promise<boolean> {
   const state = states.get(brokerKey(input.userId, input.projectId, input.provider));
   if (!state?.active) return false;
-  const provider = getProjectChatProviderAdapter(input.provider);
+  const provider = getProjectChatProviderCleanupController(input.provider);
   const candidates = Array.from(new Set([state.sessionId, state.initialSessionId].filter(Boolean))) as string[];
   for (const sessionId of candidates) {
     if (await provider.abortActiveRun?.(sessionId, state.runId || undefined)) return true;
@@ -653,7 +626,7 @@ export async function quiesceProjectNativeRunForDestructiveReset(input: {
       const sessionId = String(initial.sessionId || '').trim();
       abortConfirmed = Boolean(
         sessionId
-        && await getProjectChatProviderAdapter(input.provider).abortActiveRun?.(sessionId, runId),
+        && await getProjectChatProviderCleanupController(input.provider).abortActiveRun?.(sessionId, runId),
       );
     }
     const afterAbort = getProjectNativeRunSnapshot(input);

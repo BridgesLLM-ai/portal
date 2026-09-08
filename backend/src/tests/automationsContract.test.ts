@@ -2,9 +2,15 @@ import http from 'http';
 import express, { NextFunction, Request, Response } from 'express';
 
 const gatewayRpcCallMock = jest.fn();
+const assertOpenClawExecutionAdmittedMock = jest.fn();
 
 jest.mock('../utils/openclawGatewayRpc', () => ({
   gatewayRpcCall: gatewayRpcCallMock,
+}));
+
+jest.mock('../services/openClawExecutionAdmission', () => ({
+  ...jest.requireActual('../services/openClawExecutionAdmission'),
+  assertOpenClawExecutionAdmitted: assertOpenClawExecutionAdmittedMock,
 }));
 
 jest.mock('../middleware/auth', () => ({
@@ -20,6 +26,22 @@ jest.mock('../middleware/auth', () => ({
 }));
 
 import automationsRouter from '../routes/automations';
+import { OpenClawExecutionAdmissionError } from '../services/openClawExecutionAdmission';
+
+function maintenanceError(): OpenClawExecutionAdmissionError {
+  return new OpenClawExecutionAdmissionError({
+    state: 'maintenance',
+    ready: false,
+    reason: 'OpenClaw execution is paused while supervised host maintenance is active.',
+    checkedAt: '2026-08-22T21:00:00.000Z',
+    evidence: {
+      authorizationFence: 'absent',
+      maintenanceMarker: 'present',
+      hostMutationJournal: 'absent',
+    },
+    readinessBlockers: [],
+  });
+}
 
 async function request(server: http.Server, input: {
   method: string;
@@ -65,6 +87,7 @@ describe('Automations gateway contract', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    assertOpenClawExecutionAdmittedMock.mockResolvedValue({ state: 'ready', ready: true });
     gatewayRpcCallMock.mockImplementation(async (method: string) => {
       if (method === 'cron.list') {
         return {
@@ -120,7 +143,7 @@ describe('Automations gateway contract', () => {
     expect(gatewayRpcCallMock).not.toHaveBeenCalled();
   });
 
-  it('creates one isolated no-delivery agent job without replaying a failed mutation', async () => {
+  it('creates one admitted isolated no-delivery agent job without replaying a failed mutation', async () => {
     const created = await request(server, {
       method: 'POST',
       path: '/automations',
@@ -136,6 +159,7 @@ describe('Automations gateway contract', () => {
       },
     });
     expect(created.status).toBe(200);
+    expect(assertOpenClawExecutionAdmittedMock).toHaveBeenCalledTimes(1);
     expect(gatewayRpcCallMock).toHaveBeenCalledTimes(1);
     expect(gatewayRpcCallMock).toHaveBeenCalledWith('cron.add', expect.objectContaining({
       name: 'Daily report',
@@ -162,17 +186,77 @@ describe('Automations gateway contract', () => {
     expect(gatewayRpcCallMock).toHaveBeenCalledTimes(1);
   });
 
-  it('uses explicit nulls to clear saved model and thinking overrides', async () => {
+  it('uses explicit nulls to clear saved model and thinking overrides after admission', async () => {
     const response = await request(server, {
       method: 'PUT',
       path: '/automations/cron-1',
       body: { model: null, thinking: null },
     });
     expect(response.status).toBe(200);
+    expect(assertOpenClawExecutionAdmittedMock).toHaveBeenCalledTimes(1);
     expect(gatewayRpcCallMock).toHaveBeenNthCalledWith(2, 'cron.update', {
       id: 'cron-1',
       patch: {
         payload: { kind: 'agentTurn', model: null, thinking: null },
+        delivery: { mode: 'none' },
+      },
+    }, 45000);
+  });
+
+  it('rejects newly enabled execution while maintenance is active', async () => {
+    assertOpenClawExecutionAdmittedMock.mockRejectedValueOnce(maintenanceError());
+    const response = await request(server, {
+      method: 'POST',
+      path: '/automations',
+      body: {
+        name: 'Blocked job',
+        message: 'Do not schedule this yet',
+        scheduleType: 'hourly',
+        tz: 'UTC',
+      },
+    });
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      code: 'OPENCLAW_EXECUTION_MAINTENANCE',
+      retryable: true,
+    });
+    expect(gatewayRpcCallMock).not.toHaveBeenCalled();
+  });
+
+  it('allows an existing disabled job to be repaired during maintenance without creating execution authority', async () => {
+    gatewayRpcCallMock.mockImplementation(async (method: string) => {
+      if (method === 'cron.list') {
+        return {
+          ok: true,
+          data: {
+            jobs: [{
+              id: 'disabled-job',
+              name: 'Disabled agent job',
+              enabled: false,
+              sessionTarget: 'isolated',
+              payload: { kind: 'agentTurn', message: 'Old task' },
+            }],
+            hasMore: false,
+          },
+        };
+      }
+      return { ok: true, data: { id: 'disabled-job' } };
+    });
+    assertOpenClawExecutionAdmittedMock.mockRejectedValue(maintenanceError());
+
+    const response = await request(server, {
+      method: 'PUT',
+      path: '/automations/disabled-job',
+      body: { message: 'Repaired while still disabled' },
+    });
+
+    expect(response.status).toBe(200);
+    expect(assertOpenClawExecutionAdmittedMock).not.toHaveBeenCalled();
+    expect(gatewayRpcCallMock).toHaveBeenNthCalledWith(2, 'cron.update', {
+      id: 'disabled-job',
+      patch: {
+        payload: { kind: 'agentTurn', message: 'Repaired while still disabled' },
         delivery: { mode: 'none' },
       },
     }, 45000);
@@ -205,19 +289,15 @@ describe('Automations gateway contract', () => {
 
     expect(response.status).toBe(409);
     expect(response.body.error).toMatch(/managed in OpenClaw/i);
+    expect(assertOpenClawExecutionAdmittedMock).not.toHaveBeenCalled();
     expect(gatewayRpcCallMock).toHaveBeenCalledTimes(1);
-    expect(gatewayRpcCallMock).toHaveBeenCalledWith(
-      'cron.list',
-      { includeDisabled: true, limit: 200, offset: 0 },
-      30000,
-    );
   });
 
   it.each([
     { method: 'POST', path: '/automations/command-job/toggle', body: { enabled: false } },
-    { method: 'POST', path: '/automations/command-job/run' },
     { method: 'DELETE', path: '/automations/command-job' },
-  ])('refuses lifecycle mutations for non-agent OpenClaw jobs', async ({ method, path, body }) => {
+  ])('retains cleanup admission but refuses unsupported non-agent jobs', async ({ method, path, body }) => {
+    assertOpenClawExecutionAdmittedMock.mockRejectedValue(maintenanceError());
     gatewayRpcCallMock.mockImplementation(async (rpcMethod: string) => {
       if (rpcMethod === 'cron.list') {
         return {
@@ -241,5 +321,14 @@ describe('Automations gateway contract', () => {
     expect(response.body.error).toMatch(/managed in OpenClaw/i);
     expect(gatewayRpcCallMock).toHaveBeenCalledTimes(1);
     expect(gatewayRpcCallMock).toHaveBeenCalledWith('cron.list', expect.anything(), 30000);
+    expect(assertOpenClawExecutionAdmittedMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects run-now before job discovery or cron mutation', async () => {
+    assertOpenClawExecutionAdmittedMock.mockRejectedValueOnce(maintenanceError());
+    const response = await request(server, { method: 'POST', path: '/automations/command-job/run' });
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ code: 'OPENCLAW_EXECUTION_MAINTENANCE', retryable: true });
+    expect(gatewayRpcCallMock).not.toHaveBeenCalled();
   });
 });

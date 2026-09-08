@@ -1,181 +1,81 @@
-# Backup and recovery
+# Back up Portal data
 
-Portal backups are recovery artifacts, not ordinary exports. They contain
-private project files, application data, database records, mail state, and
-agent state in plaintext inside an authenticated archive. Store them like root
-credentials: restrict access, encrypt off-host copies, and never attach one to
-a public issue.
+Portal backups protect the work you made, not the whole VPS.
 
-## Choose the right backup
+| Backup | Included |
+| --- | --- |
+| Standard — daily, weekly, monthly | Portal database and settings, projects, uploads, app files, assets, and the keys needed to read saved Portal settings |
+| Comprehensive | The same Portal data, plus available agent personality files and Portal-native conversation history as a reference export |
 
-The Dashboard offers two useful classes of backup:
+Neither format installs or restores OpenClaw, AI tools, containers, model downloads,
+the operating system, or mail. Provider logins and upstream runtime databases are
+excluded. Use your VPS provider's snapshot service for whole-server recovery.
 
-- **Standard** (`daily`, `weekly`, or `monthly`) is an online data snapshot.
-  Portal and OpenClaw remain available while it runs. It is useful for
-  preserving data, but it is not the supported whole-host restore point because
-  running services and databases were not fenced as one transaction.
-- **Comprehensive** briefly fences the affected services and databases so the
-  archive can satisfy the full restore contract. Use this before host
-  maintenance or any operation for which the Dashboard promises rollback.
+## Create and download
 
-A recent filename is not proof that either backup completed. Use the status the
-Portal reports after authenticated archive inspection:
+Use **Settings → Backups**. Existing schedules use the same data-only runner.
+Portal remains online. PostgreSQL uses a consistent database snapshot; project
+files are copied live, so pause project edits for a cross-file checkpoint.
 
-- **Complete** means every required component was captured and the archive
-  passed its integrity and authentication contract.
-- **Incomplete — salvage only** means one or more required components were
-  omitted. The Portal names the omitted components. You may download the
-  archive for manual recovery, but it cannot authorize an update, maintenance
-  action, or supported full restore.
-- **Unclassified** is a legacy archive without a current authenticated
-  classification. Treat it as unusable until the installed verifier accepts
-  it; age and size alone do not make it safe.
+The UI reports **Complete** only after archive verification and authenticated
+publication. Missing optional agent context is reported in the manifest; it does
+not turn a saved project backup into a failure.
 
-Retention lock is separate from completeness. Locking an incomplete archive
-prevents automatic deletion; it does not turn it into a complete backup.
+Archives contain private files and Portal settings keys. Keep a private,
+encrypted off-server copy. Do not attach an archive to an issue.
 
-## Verify before relying on an archive
+Retention keeps seven daily, four weekly, three monthly, and three comprehensive
+data backups. A retention lock keeps a backup until you explicitly unlock it.
+Legacy archives are not pruned by the new runner.
 
-Run verification on the host that owns the backup trust key:
+## Verify
 
-```bash
-sudo /opt/bridgesllm/portal/backup-full.sh \
-  --verify-archive /absolute/path/to/portal-....tar.gz
-```
+Use the installed helper on a private, root-owned copy:
 
-For a supported full restore, use the stricter restore admission check. It
-accepts comprehensive archives only:
+~~~bash
+sudo python3 /opt/bridgesllm/portal/backup-data.py verify /absolute/path/to/backup.tar.gz
+~~~
 
-```bash
-sudo /opt/bridgesllm/portal/restore-full.sh \
-  --verify-archive /absolute/path/to/portal-comprehensive-....tar.gz
-```
+This reads the archive, validates its paths and format, and checks the database
+dump's checksum without changing installed data. On the original host, the
+--require-receipt option additionally authenticates the archive against its
+publication receipt and local trust key.
 
-Verification checks the signed inventory, HMAC authentication, required
-components, nested archive policy, unsafe links and special files, and the
-restore contract. It does not modify the running Portal.
+## Restore projects and settings
 
-## What a cross-host restore needs
+Install the same Portal version, with the same data layout, first. Save current
+work, pause running agents/apps, and use the command shown beside the backup in
+Settings:
 
-Copying the `.tar.gz` file is not enough. A different host also needs:
+~~~bash
+sudo python3 /opt/bridgesllm/portal/backup-data.py restore /absolute/path/to/backup.tar.gz --confirm
+~~~
 
-1. The archive's separately safeguarded trust key. By default the source host
-   keeps it at `/var/lib/bridgesllm/backup-trust/archive-hmac.key`. Never store
-   the only copy inside the archive it authenticates.
-2. The exact Portal release expected by the archive.
-3. Compatible Portal environment and database authority. Restore admission
-   rejects a different database topology or ambiguous environment instead of
-   guessing.
-4. Enough protected disk space for the archive, transaction staging, and the
-   previous installation until commit finishes.
+The helper verifies and stages the archive, loads its database into an isolated
+PostgreSQL database, and checks restored project roots before switching data.
+Portal and its OpenClaw gateway briefly stop for the switch. The installation,
+runtime versions, and service definitions are not restored from the archive.
 
-Keep the trust key in a separate encrypted secret store or offline recovery
-package. Restrict it to root and verify its ownership and mode after copying.
+The previous database and data directories remain in the printed recovery
+location. A failed switch attempts to restore them. If recovery itself fails,
+service start remains fenced and restore.json identifies the retained databases
+and directories for your administrator or agent. Do not delete this checkpoint
+until Portal works correctly. Restores need room for both old and staged data.
 
-## If a backup fails
+Saved Portal accounts come from the backup. Provider subscription logins remain
+on the destination host; sign in again if restoring to another VPS.
 
-The useful distinction is the failed component, not the generic word
-"backup."
+The optional agent-export directory is **reference material**, not an automatic
+replacement of a running harness. Import the personality files or conversations
+you want after configuring that harness. OpenClaw's runtime database and
+provider-internal history are deliberately outside this contract.
 
-- `projects` plus an ordinary `.venv/bin/python3` link should be accepted by a
-  current release. A link to an unapproved host path such as `/etc` or a secret
-  directory remains unsafe and must fail.
-- `openclaw-state` failures can identify a live SQLite snapshot or inventory
-  change. Do not delete agent databases to make a backup pass.
-- A degraded archive belongs to the bounded salvage area and never replaces the
-  newest complete backup.
-- Repeated scheduled failures remain visible in Backup Settings. Do not rely on
-  a green systemd timer alone; the timer can fire while every archive degrades.
+## Older full-server archives
 
-If verification reports a trust-key, version, environment, or database
-mismatch, repair that exact prerequisite. Do not copy manifests, edit an
-archive, disable HMAC checks, or broaden the allowed symlink roots. Those
-shortcuts remove the evidence the restore transaction depends on.
+Existing full-server archives remain listed as **Legacy server archive**. They
+use restore-full.sh, not the data helper. Their original trust key, matching
+Portal release, and legacy offline-recovery requirements still apply.
+Read the installed restore-full.sh --help before using one.
 
-## If startup reports a dependency-promotion quarantine
-
-The Portal can deliberately remain on a status-only `503` response with this
-public code:
-
-```text
-PROJECT_DEPENDENCY_PROMOTION_QUARANTINED
-```
-
-This is a recovery fence, not a normal crash loop. It means startup could not
-prove that an interrupted Project dependency installation has one consistent
-database and filesystem outcome. The real Portal routes, WebSockets, and
-background jobs remain closed while the same process keeps the health endpoint
-available. An updater must treat this response as unhealthy and follow its
-normal journaled rollback path.
-
-There are two different operator surfaces:
-
-- If the whole Portal is serving the status-only response, application routes
-  are intentionally closed. Do not try to bypass the fence through an API or
-  edit the Project directly. Startup will resume an already-authorized repair
-  only when its database receipt, filesystem journal, staged-tree digest, and
-  pinned backup still agree.
-- If the Portal is otherwise available and one Project card reports a contained
-  dependency promotion, an Owner can use **Repair dependency update** on that
-  card. This action is deliberately Project-specific; other users can see the
-  warning but cannot authorize the repair.
-
-The Owner repair only force-forwards the exact staged generation named by the
-original durable decision. It does not merge unknown live files, preserve a
-mixed generation, or abandon the staged generation. Before the button is
-enabled, create a new authenticated **Complete** comprehensive backup after the
-quarantine time and let Portal finish strict restore verification. Review the
-exact Project identity, generation, promotion receipt, and backup shown in the
-dialog, then type the displayed Project-specific confirmation phrase.
-
-Keep the dialog open while practical, but a lost browser response or browser
-reload is not a reason to submit a second repair. On reload, an Owner session
-rediscovers the exact active repair receipt through a bounded read-only surface
-even while the ordinary Project inventory is fenced. The dialog distinguishes
-a backup that is eligible for a new repair from the exact recovery archive
-already pinned to an admitted repair; never create a second repair or replace
-that pinned evidence. The Project stays fenced until the staged generation is
-verified all-new, the original decision is applied, the pinned backup is
-reverified, displaced evidence is retired, and the exact Project identity
-returns to `ACTIVE`.
-
-Portal makes a bounded number of same-process continuation attempts while it
-retains the Project writer fence and backup exclusion locks. If live
-continuation becomes unavailable—for example after a lost lock holder—or those
-attempts are exhausted, the dialog reports that startup recovery is required
-and Portal requests a controlled service restart. Current-process polling and
-mutation stop at that point; do not press the force-forward action again. After
-Portal restarts, reload Projects. Portal will rediscover either the exact
-durable receipt or the still-quarantined pre-repair operation, without inventing
-a receipt that was never committed. Startup resumes only when the available
-database receipt, disk journal, staged-tree digest, Project binding, and pinned
-backup evidence agree.
-
-Preserve both sides of the evidence. Do not delete a promotion journal,
-staging directory, repair journal, backup lock, pinned archive, or database
-decision row by hand, and do not repeatedly restart the service hoping that the
-fence clears. Check the local service log for the Project dependency recovery
-entry, then use one of these supported paths:
-
-1. Correct the exact storage or database availability problem reported in the
-   local log, without mutating the interrupted Project evidence.
-2. If the evidence is damaged or cannot be attested, restore a verified
-   **Complete** comprehensive archive using the normal restore procedure.
-
-After a repair completes without an automatic startup handoff—or after a
-restore—deliberately restart the Portal once. Startup reruns the
-database-plus-filesystem reconciliation before opening any application route.
-A clean restart removes completed recovery evidence automatically; a repeated
-quarantine means the proof is still unresolved and should remain preserved for
-support analysis.
-
-## Before an update or maintenance action
-
-The Dashboard may first find a fresh *candidate* by age and size. That is only
-an inventory hint. The action is authorized after strict archive verification,
-and the verifier may select an older fresh complete candidate if the newest one
-is incomplete.
-
-Security or package maintenance can change the host. A Portal backup protects
-Portal recovery data; it does not uninstall or roll back operating-system
-packages. Review the maintenance action's own rollback implications separately.
+The old full-server machinery is retained only for compatibility. Normal UI and
+scheduled backups no longer enter it.

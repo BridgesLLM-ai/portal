@@ -3,7 +3,6 @@ import type {
   AgentProviderName,
   AttestedProjectRuntimeCleanup,
 } from '../agents/AgentProvider.interface';
-import { AgentRegistry } from '../agents';
 import {
   deleteNativeSession,
   listNativeProjectSessions,
@@ -57,7 +56,10 @@ import {
   clearProjectNativeRun,
   getProjectNativeRunSnapshot,
 } from './projectNativeRunBroker';
-import { getProjectChatProviderAdapter } from './projectChatProviderRegistry';
+import {
+  getProjectChatProviderAdapter,
+  getProjectChatProviderCleanupController,
+} from './projectChatProviderRegistry';
 import {
   PROJECT_RUNTIME_CLEANUP_PROVIDERS,
   type ProjectRuntimeCleanupAdapter,
@@ -68,6 +70,13 @@ import {
 } from './projectRuntimeCleanup';
 import type { ProjectEgressCommandExecutor } from './projectEgressPlane';
 import { deleteSession, gatewayRpcCall } from '../utils/openclawGatewayRpc';
+import {
+  collectOpenClawConfigArrayPaths,
+  exactOpenClawAgent,
+  persistedOpenClawAgentEntry,
+  readOpenClawAgentConfigContract,
+  type OpenClawAgentConfigContract,
+} from './openclawAgentConfigContract';
 
 interface RpcResult {
   ok: boolean;
@@ -132,6 +141,14 @@ export interface NativeCliProjectRuntimeCleanupAdapterDependencies {
   }): void;
 }
 
+export interface CodexProjectRuntimeCleanupAdapterDependencies {
+  executor: ProjectEgressCommandExecutor;
+  listSessions(scope: ProjectRuntimeCleanupScope): NativeSessionData[];
+  abortSession(sessionId: string, expectedRunId?: string): Promise<boolean>;
+  terminateSession(sessionId: string): Promise<void>;
+  deleteSession(sessionId: string): void;
+}
+
 export interface OllamaProjectRuntimeCleanupAdapterDependencies {
   executor: ProjectEgressCommandExecutor;
   listSessions(scope: ProjectRuntimeCleanupScope): NativeSessionData[];
@@ -145,6 +162,18 @@ const defaultDependencies: ProjectRuntimeCleanupAdapterDependencies = {
   executor: codexProjectEgressCommandExecutor,
   rpc: gatewayRpcCall,
   deleteOpenClawSession: deleteSession,
+};
+
+const defaultCodexProjectDependencies: CodexProjectRuntimeCleanupAdapterDependencies = {
+  executor: codexProjectEgressCommandExecutor,
+  listSessions: (scope) => nativeSessionsForScope('CODEX', scope),
+  abortSession: async (sessionId, expectedRunId) => (
+    await getProjectChatProviderCleanupController('CODEX').abortActiveRun?.(sessionId, expectedRunId)
+  ) || false,
+  terminateSession: async (sessionId) => {
+    await getProjectChatProviderCleanupController('CODEX').terminateSession(sessionId);
+  },
+  deleteSession: (sessionId) => deleteNativeSession('CODEX', sessionId),
 };
 
 const OPENCLAW_SESSION_DELETE_MAX_ATTEMPTS = 3;
@@ -178,13 +207,66 @@ function openClawConfigSize(config: Record<string, any>): number {
   return Buffer.byteLength(`${JSON.stringify(config, null, 2)}\n`, 'utf8');
 }
 
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stableOpenClawConfigValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableOpenClawConfigValue);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map((key) => [key, stableOpenClawConfigValue(value[key])]),
+  );
+}
+
+function openClawConfigValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(stableOpenClawConfigValue(left))
+    === JSON.stringify(stableOpenClawConfigValue(right));
+}
+
+function createOpenClawConfigMergePatch(base: unknown, target: unknown): unknown {
+  if (!isRecord(base) || !isRecord(target)) return structuredClone(target);
+  const patch: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(base), ...Object.keys(target)])) {
+    if (!Object.prototype.hasOwnProperty.call(target, key)) {
+      patch[key] = null;
+      continue;
+    }
+    if (!Object.prototype.hasOwnProperty.call(base, key)) {
+      patch[key] = structuredClone(target[key]);
+      continue;
+    }
+    if (isRecord(base[key]) && isRecord(target[key])) {
+      const child = createOpenClawConfigMergePatch(base[key], target[key]);
+      if (isRecord(child) && Object.keys(child).length === 0) continue;
+      patch[key] = child;
+      continue;
+    }
+    if (!openClawConfigValuesEqual(base[key], target[key])) {
+      patch[key] = structuredClone(target[key]);
+    }
+  }
+  return patch;
+}
+
 function openClawConfigWithoutAgent(
   config: Record<string, any>,
   agentId: string,
 ): Record<string, any> {
   const next = structuredClone(config);
-  const agents = Array.isArray(next?.agents?.list) ? next.agents.list : [];
-  next.agents = { ...(next.agents || {}), list: agents.filter((entry: any) => entry?.id !== agentId) };
+  const contract = readOpenClawAgentConfigContract(next);
+  if (!exactOpenClawAgent(contract, agentId)) return next;
+  next.agents = contract.storage === 'list'
+    ? {
+        ...contract.agentsConfig,
+        list: contract.list.filter((entry) => entry.id !== agentId),
+      }
+    : {
+        ...contract.agentsConfig,
+        entries: Object.fromEntries(
+          Object.entries(contract.entries).filter(([id]) => id !== agentId),
+        ),
+      };
   return next;
 }
 
@@ -198,14 +280,16 @@ function openClawAgentDeletionWouldTripSizeGuard(
 }
 
 function replaceOpenClawAgent(
-  config: Record<string, any>,
+  contract: OpenClawAgentConfigContract,
   agentId: string,
   replacement: Record<string, any>,
-): Record<string, any>[] {
-  const agents = Array.isArray(config?.agents?.list) ? config.agents.list : [];
-  const matches = agents.filter((entry: any) => entry?.id === agentId);
-  if (matches.length !== 1) throw new Error('OpenClaw Project agent changed before staged deletion');
-  return agents.map((entry: any) => entry?.id === agentId ? replacement : entry);
+): Record<string, any>[] | Record<string, Record<string, any>> {
+  if (!exactOpenClawAgent(contract, agentId)) {
+    throw new Error('OpenClaw Project agent changed before staged deletion');
+  }
+  return contract.storage === 'list'
+    ? contract.list.map((entry) => entry.id === agentId ? replacement : entry)
+    : { ...contract.entries, [agentId]: persistedOpenClawAgentEntry(replacement) };
 }
 
 /**
@@ -228,9 +312,9 @@ async function stageOpenClawProjectAgentDeletion(
   if (!openClawAgentDeletionWouldTripSizeGuard(config, agentId)) return;
   if (!hash) throw new Error('OpenClaw Project agent config hash was unavailable before staged deletion');
 
-  const currentAgents = Array.isArray(config?.agents?.list) ? config.agents.list : [];
-  const initial = currentAgents.find((entry: any) => entry?.id === agentId);
-  if (!initial || typeof initial !== 'object') {
+  let contract = readOpenClawAgentConfigContract(config);
+  const initial = exactOpenClawAgent(contract, agentId);
+  if (!initial) {
     throw new Error('OpenClaw Project agent disappeared before staged deletion');
   }
   const keepIdentity = (entry: Record<string, any>): Record<string, any> => ({
@@ -339,16 +423,43 @@ async function stageOpenClawProjectAgentDeletion(
   let current = structuredClone(initial) as Record<string, any>;
   for (const [stageIndex, stage] of stages.entries()) {
     const replacement = stage(current);
-    if (JSON.stringify(replacement) === JSON.stringify(current)) continue;
-    const agents = replaceOpenClawAgent(config, agentId, replacement);
+    if (openClawConfigValuesEqual(replacement, current)) continue;
+    const roster = replaceOpenClawAgent(contract, agentId, replacement);
     const predicted = structuredClone(config) as Record<string, any>;
-    predicted.agents = { ...(predicted.agents || {}), list: agents };
+    predicted.agents = contract.storage === 'list'
+      ? { ...contract.agentsConfig, list: roster }
+      : { ...contract.agentsConfig, entries: roster };
     if (openClawConfigSize(predicted) < Math.floor(openClawConfigSize(config) * 0.5)) {
       throw new Error(`OpenClaw Project agent could not be reduced within the config write guard at stage ${stageIndex + 1}`);
     }
+    const exactCurrent = exactOpenClawAgent(contract, agentId);
+    if (!exactCurrent) throw new Error('OpenClaw Project agent disappeared during staged deletion');
+    const currentForPatch = contract.storage === 'list'
+      ? exactCurrent
+      : persistedOpenClawAgentEntry(exactCurrent);
+    const replacementForPatch = contract.storage === 'list'
+      ? replacement
+      : persistedOpenClawAgentEntry(replacement);
     response = await dependencies.rpc('config.patch', {
-      raw: JSON.stringify({ agents: { list: agents } }),
+      raw: contract.storage === 'list'
+        ? JSON.stringify({ agents: { list: roster } })
+        : JSON.stringify({
+            agents: {
+              entries: {
+                [agentId]: createOpenClawConfigMergePatch(currentForPatch, replacementForPatch),
+              },
+            },
+          }),
       baseHash: hash,
+      // 7.1 owns the roster as one array. Its config writer requires the
+      // authored array path itself, not synthetic per-entry paths. 9.1 owns a
+      // keyed record, so only arrays nested under the exact entry are replaced.
+      replacePaths: contract.storage === 'list'
+        ? ['agents.list']
+        : collectOpenClawConfigArrayPaths(
+            currentForPatch,
+            `agents.entries.${agentId}`,
+          ),
     }, OPENCLAW_CONFIG_RPC_TIMEOUT_MS);
     if (!response.ok) throw new Error('OpenClaw Project agent staged config reduction failed');
     response = await dependencies.rpc('config.get', {}, OPENCLAW_CONFIG_RPC_TIMEOUT_MS);
@@ -357,9 +468,9 @@ async function stageOpenClawProjectAgentDeletion(
     if (!response.ok || !config || typeof config !== 'object' || !hash) {
       throw new Error('OpenClaw Project agent staged config could not be verified');
     }
-    const reread = (Array.isArray(config?.agents?.list) ? config.agents.list : [])
-      .filter((entry: any) => entry?.id === agentId);
-    if (reread.length !== 1 || JSON.stringify(reread[0]) !== JSON.stringify(replacement)) {
+    contract = readOpenClawAgentConfigContract(config);
+    const reread = exactOpenClawAgent(contract, agentId);
+    if (!reread || !openClawConfigValuesEqual(reread, replacement)) {
       throw new Error('OpenClaw Project agent changed during staged deletion');
     }
     current = replacement;
@@ -374,7 +485,7 @@ const defaultAgentZeroDependencies: AgentZeroProjectRuntimeCleanupAdapterDepende
   teardown: teardownAgentZeroProjectRuntimeResources,
   listSessions: (scope) => nativeSessionsForScope('AGENT_ZERO', scope),
   abortSession: async (sessionId, runId) => (
-    await getProjectChatProviderAdapter('AGENT_ZERO').abortActiveRun?.(sessionId, runId)
+    await getProjectChatProviderCleanupController('AGENT_ZERO').abortActiveRun?.(sessionId, runId)
   ) || false,
   deleteSession: (sessionId) => deleteNativeSession('AGENT_ZERO', sessionId),
   hardAbort: (context) => hardAbortAgentZeroProjectRuntime(context),
@@ -391,9 +502,11 @@ const defaultNativeCliProjectDependencies: NativeCliProjectRuntimeCleanupAdapter
   executor: nativeCliProjectEgressCommandExecutor,
   listSessions: (provider, scope) => nativeSessionsForScope(provider, scope),
   abortSession: async (provider, sessionId, expectedRunId) => (
-    await AgentRegistry.get(provider).abortActiveRun?.(sessionId, expectedRunId)
+    await getProjectChatProviderCleanupController(provider).abortActiveRun?.(sessionId, expectedRunId)
   ) || false,
-  terminateSession: async (provider, sessionId) => AgentRegistry.get(provider).terminateSession(sessionId),
+  terminateSession: async (provider, sessionId) => (
+    getProjectChatProviderCleanupController(provider).terminateSession(sessionId)
+  ),
   deleteSession: (provider, sessionId) => deleteNativeSession(provider, sessionId),
   hasManagedState: hasNativeCliProjectManagedStateForIdentity,
   removeManagedState: removeNativeCliProjectManagedStateForIdentity,
@@ -403,10 +516,10 @@ const defaultOllamaProjectDependencies: OllamaProjectRuntimeCleanupAdapterDepend
   executor: ollamaProjectCommandExecutor,
   listSessions: (scope) => nativeSessionsForScope('OLLAMA', scope),
   abortSession: async (sessionId, expectedRunId) => (
-    await getProjectChatProviderAdapter('OLLAMA').abortActiveRun?.(sessionId, expectedRunId)
+    await getProjectChatProviderCleanupController('OLLAMA').abortActiveRun?.(sessionId, expectedRunId)
   ) || false,
   terminateSession: async (sessionId) => {
-    await getProjectChatProviderAdapter('OLLAMA').terminateSession(sessionId);
+    await getProjectChatProviderCleanupController('OLLAMA').terminateSession(sessionId);
   },
   deleteSession: (sessionId) => deleteNativeSession('OLLAMA', sessionId),
   convergeInMemoryState: async (input) => {
@@ -486,7 +599,10 @@ function providerMatches(value: string, provider: ProjectRuntimeCleanupProvider)
 
 function exactNativeProvider(provider: ProjectRuntimeCleanupProvider): AgentProviderName | null {
   if (provider === 'GROK_BUILD') return 'GROK';
-  if (provider === 'CLAUDE_CODE' || provider === 'CODEX' || provider === 'GEMINI' || provider === 'OLLAMA') {
+  if (provider === 'CLAUDE_CODE'
+    || provider === 'CODEX'
+    || provider === 'GEMINI'
+    || provider === 'OLLAMA') {
     return provider;
   }
   return null;
@@ -658,13 +774,11 @@ async function listOpenClawResources(
   if (!configResult.ok) throw new Error('OpenClaw configuration could not be inspected for Project cleanup');
   const config = configResult.data?.config || configResult.data?.parsed;
   if (!config || typeof config !== 'object') throw new Error('OpenClaw configuration inspection returned an invalid shape');
-  const agents = Array.isArray(config?.agents?.list) ? config.agents.list : [];
+  const contract = readOpenClawAgentConfigContract(config);
   for (const actorUserId of scope.knownActorIds) {
     const agentId = deriveOpenClawProjectAgentId({ userId: actorUserId, projectId: scope.projectIdentity.id });
     const sessionKey = deriveOpenClawProjectSessionKey({ userId: actorUserId, projectId: scope.projectIdentity.id });
-    const matchingAgents = agents.filter((entry: any) => entry && entry.id === agentId);
-    if (matchingAgents.length > 1) throw new Error('OpenClaw Project agent identity was duplicated');
-    if (matchingAgents.length === 1) {
+    if (exactOpenClawAgent(contract, agentId)) {
       resources.push(Object.freeze({
         id: `openclaw-agent:${agentId}`,
         kind: 'OPENCLAW_AGENT',
@@ -752,9 +866,9 @@ export function createOpenClawProjectRuntimeCleanupAdapter(
 
 async function listCodexResources(
   scope: ProjectRuntimeCleanupScope,
-  dependencies: ProjectRuntimeCleanupAdapterDependencies,
+  dependencies: CodexProjectRuntimeCleanupAdapterDependencies,
 ): Promise<ProjectRuntimeResource[]> {
-  const resources: ProjectRuntimeResource[] = nativeSessionsForScope('CODEX', scope)
+  const resources: ProjectRuntimeResource[] = dependencies.listSessions(scope)
     .map((session) => nativeSessionResource('CODEX', session));
   const projectLabelValue = hashCodexProjectRuntimeLabelIdentity(scope.projectIdentity.id);
   const containers = await listContainersByLabel(
@@ -793,9 +907,9 @@ async function listCodexResources(
 }
 
 export function createCodexProjectRuntimeCleanupAdapter(
-  overrides: Partial<ProjectRuntimeCleanupAdapterDependencies> = {},
+  overrides: Partial<CodexProjectRuntimeCleanupAdapterDependencies> = {},
 ): ProjectRuntimeCleanupAdapter {
-  const dependencies = { ...defaultDependencies, ...overrides };
+  const dependencies = { ...defaultCodexProjectDependencies, ...overrides };
   return {
     provider: 'CODEX',
     enumerate: (scope) => listCodexResources(scope, dependencies),
@@ -825,9 +939,9 @@ export function createCodexProjectRuntimeCleanupAdapter(
     async cleanup(scope, resources) {
       for (const resource of resources.filter((entry) => entry.kind === 'NATIVE_SESSION')) {
         const sessionId = resource.id.slice('native-session:'.length);
-        await AgentRegistry.get('CODEX').abortActiveRun?.(sessionId);
-        await AgentRegistry.get('CODEX').terminateSession(sessionId);
-        deleteNativeSession('CODEX', sessionId);
+        await dependencies.abortSession(sessionId);
+        await dependencies.terminateSession(sessionId);
+        dependencies.deleteSession(sessionId);
       }
       for (const actorUserId of scope.knownActorIds) {
         clearProjectNativeRun({ userId: actorUserId, projectId: scope.projectIdentity.id, provider: 'CODEX' });

@@ -1,4 +1,4 @@
-import { ANTIGRAVITY_NO_UPDATE_ENV, PORTAL_TOOL_VERSIONS } from './toolVersions';
+import { unqualifiedNativeBinaryReason } from './unqualifiedNativeBinaryLane';
 
 export type ToolTier = 1 | 2;
 
@@ -30,14 +30,29 @@ export type ToolAdapter = {
   tier: ToolTier;
 };
 
+export const HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE = Object.freeze({
+  status: 503,
+  code: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
+  error: 'Per-tool native host runtime changes are unavailable. Portal-qualified tools are updated only as one compatibility bundle.',
+  retryable: false,
+  remediation: 'Owner: use Admin > Maintenance > Update Compatible AI Tools for the exact OpenClaw, Codex, Claude Code, and ClawHub bundle. Do not update individual tools independently.',
+} as const);
+
+export const HOST_NATIVE_AGENT_TOOL_IDS = Object.freeze(new Set([
+  'agent-zero',
+  'antigravity',
+  'claude-code',
+  'codex',
+  'gemini',
+  'grok-build',
+  'hermes',
+  'opencode',
+]));
+
 export const FFMPEG_INSTALL_COMMAND =
   'command -v apt-get >/dev/null 2>&1 && apt-get -o DPkg::Lock::Timeout=300 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg';
 
 export const SAFE_INSTALL_ALLOWLIST = new Set<string>([
-  `command -v npm >/dev/null 2>&1 && npm install -g --no-audit --no-fund @anthropic-ai/claude-code@${PORTAL_TOOL_VERSIONS.claudeCode}`,
-  `command -v npm >/dev/null 2>&1 && npm install -g --no-audit --no-fund @openai/codex@${PORTAL_TOOL_VERSIONS.codexCli}`,
-  'bash /opt/bridgesllm/portal/installer/grok-build-runtime.sh converge',
-  'bash /opt/bridgesllm/portal/installer/antigravity-runtime.sh converge',
   FFMPEG_INSTALL_COMMAND,
 ]);
 
@@ -45,87 +60,43 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   {
     id: 'openclaw',
     name: 'OpenClaw',
-    description: 'Primary local orchestration CLI for agents, sessions, and gateway control.',
+    description: 'Portal-owned orchestration runtime. Agent Chat uses the durable Gateway run journal; Owner updates it only with the exact compatibility bundle under Admin > Maintenance.',
     detect: { command: 'openclaw --version' },
     // OpenClaw is an atomic core/plugin compatibility pair owned by the Portal
     // installer. Generic one-click installation would bypass rollback and the
     // exact package/readiness gates.
     install: [],
-    commands: [
-      { label: 'OpenClaw TUI', command: 'openclaw tui', description: 'Launch interactive OpenClaw TUI.' },
-      { label: 'OpenClaw Status', command: 'openclaw status', description: 'Show gateway/health status.' },
-      { label: 'Gateway Status', command: '/usr/bin/systemctl status --no-pager openclaw-gateway.service', description: 'Check the Portal-owned gateway service.' },
-      { label: 'Start Gateway', command: '/usr/bin/systemctl start openclaw-gateway.service', description: 'Start the Portal-owned gateway service.' },
-      { label: 'Version Check', command: 'openclaw --version', description: 'Verify installed version.' },
-    ],
+    commands: [],
     authRequired: false,
     tier: 1,
   },
   {
     id: 'claude-code',
     name: 'Claude Code',
-    description: 'Anthropic CLI coding agent for interactive coding sessions.',
-    detect: { command: 'claude --version' },
-    install: [
-      {
-        label: 'Install Claude Code globally',
-        command: `command -v npm >/dev/null 2>&1 && npm install -g --no-audit --no-fund @anthropic-ai/claude-code@${PORTAL_TOOL_VERSIONS.claudeCode}`,
-        description: `Install the Portal-tested Claude Code ${PORTAL_TOOL_VERSIONS.claudeCode} release.`,
-      },
-    ],
-    commands: [
-      { label: 'Claude (new session)', command: 'claude', description: 'Start Claude Code session.' },
-      { label: 'Claude Continue', command: 'claude --continue', description: 'Continue recent session.' },
-      { label: 'Claude Resume', command: 'claude --resume', description: 'Resume a paused session.' },
-      { label: 'Version Check', command: 'claude --version', description: 'Verify installed version.' },
-    ],
-    authRequired: true,
-    authHint: "Run 'claude' first time to authenticate via browser",
+    description: 'Root-owned, hash-admitted Claude Code runtime for Portal Agent Chat. Owner updates it only with the exact compatibility bundle under Admin > Maintenance.',
+    install: [],
+    commands: [],
+    authRequired: false,
     tier: 1,
   },
   {
     id: 'codex',
     name: 'OpenAI Codex',
-    description: 'OpenAI CLI coding agent for autonomous and supervised tasks.',
-    detect: { command: 'codex --version' },
-    install: [
-      {
-        label: 'Install Codex globally',
-        command: `command -v npm >/dev/null 2>&1 && npm install -g --no-audit --no-fund @openai/codex@${PORTAL_TOOL_VERSIONS.codexCli}`,
-        description: `Install the Portal-tested Codex CLI ${PORTAL_TOOL_VERSIONS.codexCli} release.`,
-      },
-    ],
-    commands: [
-      { label: 'Codex (interactive)', command: 'codex', description: 'Start Codex session.' },
-      { label: 'Codex Workspace Session', command: 'codex --sandbox workspace-write --ask-for-approval on-request', description: 'Run with workspace-only writes and supervised escalation.' },
-      { label: 'Codex Resume Latest', command: 'codex resume --last', description: 'Resume the most recent Codex session.' },
-      { label: 'Version Check', command: 'codex --version', description: 'Verify installed version.' },
-    ],
-    authRequired: true,
-    authHint: 'Requires OPENAI_API_KEY or OAuth auth',
+    description: 'Root-owned, hash-admitted Codex runtime for Portal Agent Chat. Owner updates it only with the exact compatibility bundle under Admin > Maintenance.',
+    install: [],
+    commands: [],
+    authRequired: false,
     tier: 1,
   },
 
   {
     id: 'grok-build',
     name: 'Grok Build',
-    description: 'xAI native coding agent with subscription OAuth and API-key support.',
-    detect: { command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update --version' },
-    install: [
-      {
-        label: 'Install the Portal-tested Grok Build CLI',
-        command: 'bash /opt/bridgesllm/portal/installer/grok-build-runtime.sh converge',
-        description: 'Install the exact checksum-verified Portal release with automatic rollback on verification failure.',
-      },
-    ],
-    commands: [
-      { label: 'Grok Build (interactive)', command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update', description: 'Start an interactive Grok Build session without changing the Portal-tested binary.' },
-      { label: 'Grok Build Device Login', command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update login --device-auth', description: 'Authenticate a headless server with xAI.' },
-      { label: 'List Models', command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update models', description: 'List models available to the signed-in account.' },
-      { label: 'Version Check', command: 'GROK_DISABLE_AUTOUPDATER=1 grok --no-auto-update --version', description: 'Verify the installed pinned version.' },
-    ],
-    authRequired: true,
-    authHint: "Run 'grok --no-auto-update login --device-auth' or use the Portal native Grok login flow. OpenClaw xAI auth is separate.",
+    description: unqualifiedNativeBinaryReason('GROK'),
+    detect: { command: "test -x /usr/local/bin/grok && printf '%s\\n' detected" },
+    install: [],
+    commands: [],
+    authRequired: false,
     tier: 1,
   },
   {
@@ -152,7 +123,7 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   {
     id: 'agent-zero',
     name: 'Agent Zero',
-    description: 'Managed Agent Zero v2.5 runtime. The provider stays disabled until its host and project trust gates are proven.',
+    description: 'Managed Agent Zero v2.10 runtime. The provider stays disabled until its host and project trust gates are proven.',
     detect: {
       command: 'bash /opt/bridgesllm/portal/installer/agent-zero-runtime.sh status',
       timeoutMs: 20_000,
@@ -172,23 +143,11 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   {
     id: 'gemini',
     name: 'Google Antigravity',
-    description: 'Google Antigravity CLI for native AI coding and generation sessions.',
-    detect: { command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy --version` },
-    install: [
-      {
-        label: 'Install the Portal-tested Google Antigravity CLI',
-        command: 'bash /opt/bridgesllm/portal/installer/antigravity-runtime.sh converge',
-        description: `Install checksum-verified Antigravity ${PORTAL_TOOL_VERSIONS.antigravity} with automatic rollback.`,
-      },
-    ],
-    commands: [
-      { label: 'Antigravity (interactive)', command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy`, description: 'Start interactive Antigravity without replacing the Portal-tested binary.' },
-      { label: 'Antigravity Print', command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy --print "Say hello briefly"`, description: 'Run a one-shot Antigravity task.' },
-      { label: 'List Models', command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy models`, description: 'Verify Google sign-in and list available models.' },
-      { label: 'Version Check', command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy --version`, description: 'Verify the installed pinned version.' },
-    ],
-    authRequired: true,
-    authHint: "Run 'agy' first time to authenticate with Google, or use the portal native Antigravity login flow.",
+    description: unqualifiedNativeBinaryReason('GEMINI'),
+    detect: { command: "test -x /usr/local/bin/agy && printf '%s\\n' detected" },
+    install: [],
+    commands: [],
+    authRequired: false,
     tier: 1,
   },
   {

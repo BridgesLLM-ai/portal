@@ -11,6 +11,9 @@ const mocks = vi.hoisted(() => ({
   classify: vi.fn(),
   autocomplete: vi.fn(),
   lookup: vi.fn(),
+  gatewaySessions: vi.fn(),
+  gatewayHistory: vi.fn(),
+  gatewaySendStream: vi.fn(),
   sockets: [] as Array<{
     listeners: Map<string, (...args: unknown[]) => void>;
     emit: ReturnType<typeof vi.fn>;
@@ -96,9 +99,9 @@ vi.mock('../api/endpoints', () => ({
     lookup: mocks.lookup,
   },
   gatewayAPI: {
-    sessions: vi.fn(async () => ({ sessions: [] })),
-    history: vi.fn(async () => ({ messages: [] })),
-    sendStream: vi.fn(() => new AbortController()),
+    sessions: mocks.gatewaySessions,
+    history: mocks.gatewayHistory,
+    sendStream: mocks.gatewaySendStream,
   },
 }));
 
@@ -166,10 +169,47 @@ describe('Terminal modal and transient interaction ownership', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 });
     mocks.sockets.length = 0;
+    window.sessionStorage.clear();
     mocks.capabilities.mockResolvedValue(destructiveCapabilities);
     mocks.classify.mockResolvedValue(typedWarning);
     mocks.autocomplete.mockResolvedValue({ suggestions: [] });
     mocks.lookup.mockResolvedValue({ results: [] });
+    mocks.gatewaySessions.mockReset().mockResolvedValue({ sessions: [] });
+    mocks.gatewayHistory.mockReset().mockResolvedValue({ messages: [] });
+    mocks.gatewaySendStream.mockReset().mockImplementation(() => new AbortController());
+  });
+
+  it('discards persisted legacy OpenClaw tabs before mount and keeps reload shell-only', async () => {
+    const storageKey = 'portal:terminal-state:v1';
+    window.sessionStorage.setItem(storageKey, JSON.stringify({
+      tabs: [
+        { id: 'legacy-chat', label: '💬 Assistant', type: 'chat' },
+        { id: 'legacy-tui', label: '💬 OpenClaw', type: 'openclaw-tui' },
+      ],
+      activeTabId: 'legacy-tui',
+    }));
+
+    const firstMount = render(<TerminalPage />);
+    await screen.findByRole('button', { name: /Restart demo service/i });
+    expect(screen.getAllByRole('tab')).toHaveLength(1);
+    expect(screen.getByRole('tab')).toHaveTextContent('bash');
+    expect(screen.queryByText('💬 OpenClaw')).not.toBeInTheDocument();
+    expect(mocks.gatewaySessions).not.toHaveBeenCalled();
+    expect(mocks.gatewayHistory).not.toHaveBeenCalled();
+    expect(mocks.gatewaySendStream).not.toHaveBeenCalled();
+    await waitFor(() => {
+      const persisted = JSON.parse(window.sessionStorage.getItem(storageKey) || '{}');
+      expect(persisted.tabs).toEqual([
+        expect.objectContaining({ type: 'shell' }),
+      ]);
+    });
+
+    firstMount.unmount();
+    render(<TerminalPage />);
+    await screen.findByRole('button', { name: /Restart demo service/i });
+    expect(screen.getAllByRole('tab')).toHaveLength(1);
+    expect(screen.getByRole('tab')).toHaveTextContent('bash');
+    expect(mocks.gatewaySendStream).not.toHaveBeenCalled();
   });
 
   it('blocks Terminal shortcuts during confirmation, lets Escape cancel once, and restores trigger focus', async () => {
@@ -375,7 +415,7 @@ describe('Terminal modal and transient interaction ownership', () => {
     }));
 
     expect(await screen.findByText(
-      'Failed to reach the configured Ollama backend. Check Settings → AI Providers and retry.',
+      'Failed to reach the configured Ollama backend. Check Settings → Model Providers and retry.',
     )).toBeVisible();
     expect(screen.queryByText(/Is Ollama running/)).not.toBeInTheDocument();
   });

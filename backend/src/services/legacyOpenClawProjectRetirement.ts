@@ -7,6 +7,10 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../config/database';
 import { gatewayRpcCall } from '../utils/openclawGatewayRpc';
 import { LEGACY_OPENCLAW_RETIREMENT_PENDING_MESSAGE } from './legacyOpenClawRetirementPolicy';
+import {
+  materializeOpenClawAgentList,
+  readOpenClawAgentConfigContract,
+} from './openclawAgentConfigContract';
 import { attestProjectRoot, ensureProjectIdentity } from './projectIdentity';
 
 const LEGACY_OPENCLAW_DESTRUCTIVE_RETIREMENT_ENABLED = false as const;
@@ -683,12 +687,28 @@ function attestLegacyAgent(entry: Record<string, any>, roots: RetirementRoots): 
   });
 }
 
-function configAgentList(config: Record<string, any>): Record<string, any>[] {
-  const raw = config?.agents?.list;
-  if (raw === undefined) return [];
-  if (!Array.isArray(raw)) fail('CONFIG_SHAPE', 'OpenClaw agents.list was not an array');
-  if (raw.length > MAX_CONFIG_AGENTS) fail('CONFIG_LIMIT', 'OpenClaw agents.list exceeded the retirement safety limit');
-  return raw.filter(isRecord);
+function configAgentEntries(config: Record<string, any>): Record<string, any>[] {
+  const agents = config.agents;
+  // Both qualified runtimes allow a defaults-only configuration with an
+  // implicit main agent. This read-only inventory has no explicit legacy
+  // Project agents to retire; it must not invent a persisted roster/write
+  // family. Container/session collision scans still run. Explicit malformed
+  // or unknown roster shapes continue through the strict contract below.
+  if (isRecord(agents)
+    && Object.keys(agents).every((key) => key === 'defaults')
+    && !Object.prototype.hasOwnProperty.call(agents, 'list')
+    && !Object.prototype.hasOwnProperty.call(agents, 'entries')
+    && (!Object.prototype.hasOwnProperty.call(agents, 'defaults') || isRecord(agents.defaults))) {
+    return [];
+  }
+  try {
+    return materializeOpenClawAgentList(readOpenClawAgentConfigContract(config));
+  } catch {
+    fail(
+      'CONFIG_SHAPE',
+      `OpenClaw agent roster did not match a Portal-qualified 2026.7.1 or 2026.9.1 contract (limit ${MAX_CONFIG_AGENTS})`,
+    );
+  }
 }
 
 export function discoverLegacyOpenClawProjectAgents(
@@ -703,7 +723,7 @@ export function discoverLegacyOpenClawProjectAgents(
       });
   const candidates: LegacyAgentCandidate[] = [];
   const seen = new Set<string>();
-  for (const entry of configAgentList(config)) {
+  for (const entry of configAgentEntries(config)) {
     const agentId = typeof entry.id === 'string' ? entry.id : '';
     const exactLegacyId = parseLegacyAgentId(agentId);
     const runtimeSignal = hasLegacyAgentRuntimeSignal(entry, roots);
@@ -726,6 +746,111 @@ export function discoverLegacyOpenClawProjectAgents(
   }
   if (candidates.length > MAX_LEGACY_AGENTS) {
     fail('AGENT_LIMIT', 'Legacy Project agent count exceeded the bounded retirement limit');
+  }
+  return candidates;
+}
+
+interface LegacyProjectCreationCollisionScope {
+  workspaceOwnerId: string;
+  projectName: string;
+  canonicalRoot: string;
+}
+
+function legacyProjectCreationCollisionSources(
+  roots: RetirementRoots,
+  scope: LegacyProjectCreationCollisionScope,
+): ReadonlySet<string> {
+  if (!USER_ID_PATTERN.test(scope.workspaceOwnerId)) {
+    fail('PROJECT_IDENTITY', 'Current Project owner was not an exact Portal user identity');
+  }
+  if (
+    !scope.projectName
+    || scope.projectName === '.'
+    || scope.projectName === '..'
+    || scope.projectName.length > 255
+    || path.basename(scope.projectName) !== scope.projectName
+    || scope.projectName.includes('\\')
+    || /[\u0000-\u001f\u007f]/.test(scope.projectName)
+  ) {
+    fail('PROJECT_IDENTITY', 'Current Project name was not an exact server-owned path segment');
+  }
+  return new Set([
+    scope.canonicalRoot,
+    ...roots.portalProjectsRoots.map((projectsRoot) => (
+      path.join(projectsRoot, scope.workspaceOwnerId, scope.projectName)
+    )),
+  ]);
+}
+
+function possibleLegacyProjectBindSource(value: unknown): string | null {
+  if (typeof value !== 'string' || value.includes('\0')) return null;
+  const match = value.match(/^(.+):(\/home\/user\/project|\/workspace\/project)(?::.*)?$/);
+  if (!match || !path.isAbsolute(match[1])) return null;
+  return path.resolve(match[1]);
+}
+
+function possibleLegacyProjectBindMatches(
+  value: unknown,
+  collisionSources: ReadonlySet<string>,
+): boolean {
+  const source = possibleLegacyProjectBindSource(value);
+  return source !== null && collisionSources.has(source);
+}
+
+function possibleLegacyProjectMountSourceMatches(
+  value: unknown,
+  collisionSources: ReadonlySet<string>,
+): boolean {
+  if (typeof value !== 'string' || value.includes('\0') || !path.isAbsolute(value)) return false;
+  return collisionSources.has(path.resolve(value));
+}
+
+/**
+ * Creation needs a name/root collision proof, not a retirement inventory.
+ * Scope using the raw Project bind before strict attestation so a preserved,
+ * bind-less 3.x agent cannot take down creation for every unrelated Project.
+ * Once an entry points at this exact owner/name/root, the full retirement-grade
+ * attestation still applies and any ambiguity fails closed.
+ */
+function discoverLegacyOpenClawProjectAgentsForCreationCollision(
+  config: Record<string, any>,
+  roots: RetirementRoots,
+  scope: LegacyProjectCreationCollisionScope,
+): LegacyAgentCandidate[] {
+  const collisionSources = legacyProjectCreationCollisionSources(roots, scope);
+  const candidates: LegacyAgentCandidate[] = [];
+  const seen = new Set<string>();
+  for (const entry of configAgentEntries(config)) {
+    const sandbox = isRecord(entry.sandbox) ? entry.sandbox : {};
+    const docker = isRecord(sandbox.docker) ? sandbox.docker : {};
+    const binds = Array.isArray(docker.binds) ? docker.binds : [];
+    if (!binds.some((bind) => possibleLegacyProjectBindMatches(bind, collisionSources))) {
+      continue;
+    }
+
+    const agentId = typeof entry.id === 'string' ? entry.id : '';
+    const exactLegacyId = parseLegacyAgentId(agentId);
+    const runtimeSignal = hasLegacyAgentRuntimeSignal(entry, roots);
+    if (agentId === 'main' || /^p4oc-[a-f0-9]{40}$/.test(agentId)) {
+      if (runtimeSignal) {
+        fail('PROTECTED_AGENT_DRIFT', `Protected OpenClaw agent ${agentId} matched this legacy Project runtime`);
+      }
+      continue;
+    }
+    if (!exactLegacyId) {
+      if (agentId.startsWith('portal-') || runtimeSignal) {
+        fail('AMBIGUOUS_AGENT', 'An OpenClaw agent pointed at this Project without an exact legacy identity');
+      }
+      continue;
+    }
+    if (seen.has(agentId)) {
+      fail('DUPLICATE_AGENT', `Legacy Project agent ${agentId} was duplicated for this Project`);
+    }
+    seen.add(agentId);
+    candidates.push(attestLegacyAgent(entry, roots));
+  }
+  if (candidates.length > MAX_LEGACY_AGENTS) {
+    fail('AGENT_LIMIT', 'Legacy Project collision candidate count exceeded the bounded safety limit');
   }
   return candidates;
 }
@@ -1040,10 +1165,23 @@ function buildRoots(input: {
 
 export class LegacyOpenClawProjectCreationCollisionError extends Error {
   readonly code = 'LEGACY_OPENCLAW_PROJECT_NAME_COLLISION';
+  readonly legacyAgentIds: readonly string[];
+  readonly evidence: readonly string[];
+  readonly recoveryPath = '/admin?tab=maintenance';
 
-  constructor() {
-    super('This Project name still has preserved OpenClaw 3.x state and cannot be reused safely.');
+  constructor(input: { legacyAgentIds?: readonly string[]; evidence?: readonly string[] } = {}) {
+    const legacyAgentIds = Object.freeze([...new Set(input.legacyAgentIds || [])].sort());
+    const evidence = Object.freeze([...new Set(input.evidence || [])].sort());
+    const subject = legacyAgentIds.length > 0
+      ? `the preserved OpenClaw 3.x agent${legacyAgentIds.length === 1 ? '' : 's'} ${legacyAgentIds.join(', ')}`
+      : 'preserved OpenClaw 3.x Project Chat records';
+    super(
+      `This Project name is still owned by ${subject}. `
+      + 'Open Admin → Maintenance → Preserved OpenClaw 3.x agents to inspect the exact evidence before migrating or detaching it.',
+    );
     this.name = 'LegacyOpenClawProjectCreationCollisionError';
+    this.legacyAgentIds = legacyAgentIds;
+    this.evidence = evidence;
   }
 }
 
@@ -1097,11 +1235,16 @@ export async function assertNoLegacyOpenClawProjectCreationCollision(input: {
   const dependencies = { ...defaultDependencies, ...(options.dependencies || {}) };
   const database = options.database || prisma as unknown as LegacyOpenClawProjectRetirementDatabase;
   const root = attestProjectRoot(input.projectRoot);
+  const collisionScope: LegacyProjectCreationCollisionScope = {
+    workspaceOwnerId: input.workspaceOwnerId,
+    projectName: input.projectName,
+    canonicalRoot: root.canonicalRoot,
+  };
   const runtimeCandidates = await withSerializedProjectCreationRuntimeScan(async () => {
     const budget: OperationBudget = { rpcCalls: 0, dockerCalls: 0 };
     const localConfig = await dependencies.readConfig(roots.openClawConfigPath);
     const localAgents = localConfig
-      ? discoverLegacyOpenClawProjectAgents(localConfig, roots)
+      ? discoverLegacyOpenClawProjectAgentsForCreationCollision(localConfig, roots, collisionScope)
       : [];
     const gatewayConfig = parseConfigRpc(await boundedRpc(
       dependencies,
@@ -1110,14 +1253,18 @@ export async function assertNoLegacyOpenClawProjectCreationCollision(input: {
       {},
       CONFIG_RPC_TIMEOUT_MS,
     ));
-    const gatewayAgents = discoverLegacyOpenClawProjectAgents(gatewayConfig, roots);
+    const gatewayAgents = discoverLegacyOpenClawProjectAgentsForCreationCollision(
+      gatewayConfig,
+      roots,
+      collisionScope,
+    );
     if (!dependencies.dockerAvailable()) {
       fail('DOCKER_UNAVAILABLE', 'Docker inventory could not be inspected before current Project enrollment');
     }
-    const containers = await discoverLegacyContainers(dependencies, budget, roots);
+    const containers = await discoverLegacyContainers(dependencies, budget, roots, collisionScope);
     return [...localAgents, ...gatewayAgents, ...containers];
   });
-  const runtimeCollision = runtimeCandidates.some((candidate) => (
+  const runtimeCollisions = runtimeCandidates.filter((candidate) => (
     candidate.userId === input.workspaceOwnerId
     && (
       candidate.projectName === input.projectName
@@ -1145,8 +1292,16 @@ export async function assertNoLegacyOpenClawProjectCreationCollision(input: {
       take: 1,
     }),
   ]);
-  if (runtimeCollision || sessions.length > 0 || bindings.length > 0 || messages.length > 0) {
-    throw new LegacyOpenClawProjectCreationCollisionError();
+  if (runtimeCollisions.length > 0 || sessions.length > 0 || bindings.length > 0 || messages.length > 0) {
+    throw new LegacyOpenClawProjectCreationCollisionError({
+      legacyAgentIds: runtimeCollisions.map((candidate) => candidate.agentId),
+      evidence: [
+        ...(runtimeCollisions.length > 0 ? ['legacy-runtime'] : []),
+        ...(sessions.length > 0 ? ['project-chat-session'] : []),
+        ...(bindings.length > 0 ? ['project-chat-provider-binding'] : []),
+        ...(messages.length > 0 ? ['project-chat-message'] : []),
+      ],
+    });
   }
 }
 
@@ -1830,7 +1985,11 @@ async function discoverLegacyContainers(
   dependencies: LegacyOpenClawProjectRetirementDependencies,
   budget: OperationBudget,
   roots: RetirementRoots,
+  collisionScope?: LegacyProjectCreationCollisionScope,
 ): Promise<LegacyContainerCandidate[]> {
+  const collisionSources = collisionScope
+    ? legacyProjectCreationCollisionSources(roots, collisionScope)
+    : null;
   const listed = await dockerCall(dependencies, budget, [
     'container', 'ls', '--all', '--no-trunc',
     '--format', '{{.ID}}',
@@ -1849,6 +2008,16 @@ async function discoverLegacyContainers(
     const inspect = await inspectContainer(dependencies, budget, id.toLowerCase());
     if (!inspect || String(inspect.Id || '').toLowerCase() !== id.toLowerCase()) {
       fail('DOCKER_RACE', `OpenClaw sandbox container ${id} changed during discovery`);
+    }
+    if (collisionSources) {
+      const projectMountRelevant = (inspect.Mounts || []).some((mount) => (
+        (mount.Destination === '/home/user/project' || mount.Destination === '/workspace/project')
+        && possibleLegacyProjectMountSourceMatches(mount.Source, collisionSources)
+      ));
+      const projectBindRelevant = (inspect.HostConfig?.Binds || []).some((bind) => (
+        possibleLegacyProjectBindMatches(bind, collisionSources)
+      ));
+      if (!projectMountRelevant && !projectBindRelevant) continue;
     }
     const candidate = attestLegacyContainer(inspect, roots);
     if (candidate) candidates.push(candidate);

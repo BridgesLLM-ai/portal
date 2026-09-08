@@ -488,14 +488,12 @@ describe('dashboard role-aware loading', () => {
     }
   });
 
-  it('admits only one gateway restart before the busy state can render', async () => {
-    const restart = deferred<{ data: { ok: boolean; openclawVersion: { restartRecommended: boolean } } }>();
+  it('reports restart maintenance without exposing a Portal restart control', async () => {
     mocks.authUser.current = { id: 'owner-1', role: 'OWNER', email: 'owner@example.com' };
     mocks.clientPost.mockImplementation((url: string) => {
       if (url === '/admin/check-updates') {
         return Promise.resolve({ data: { ...verifiedUpdate, updateAvailable: false } });
       }
-      if (url === '/gateway/restart') return restart.promise;
       return Promise.resolve({ data: {} });
     });
     mocks.clientGet.mockImplementation(async (url: string) => {
@@ -518,19 +516,13 @@ describe('dashboard role-aware loading', () => {
     });
 
     render(<DashboardPage />);
-    const restartButton = await screen.findByRole('button', { name: 'Restart OpenClaw' }, { timeout: 3000 });
-    act(() => {
-      restartButton.click();
-      restartButton.click();
-    });
-
-    expect(mocks.clientPost.mock.calls.filter(([url]) => url === '/gateway/restart')).toHaveLength(1);
-    expect(await screen.findByRole('button', { name: 'Restarting…' })).toHaveAttribute('aria-busy', 'true');
-
-    await act(async () => {
-      restart.resolve({ data: { ok: true, openclawVersion: { restartRecommended: false } } });
-      await restart.promise;
-    });
+    expect(await screen.findByText(
+      'Portal cannot restart OpenClaw in this release.',
+      {},
+      { timeout: 4_000 },
+    )).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Restart OpenClaw' })).not.toBeInTheDocument();
+    expect(mocks.clientPost.mock.calls.filter(([url]) => url === '/gateway/restart')).toHaveLength(0);
   });
 
   it('admits only one gateway reconnect before the busy state can render', async () => {
@@ -801,7 +793,9 @@ describe('dashboard role-aware loading', () => {
     expect(guardedReads[0]).toBeNull();
     expect(guardedReads[1]).toEqual(runningProgress);
     expect(screen.getByRole('dialog', { name: 'Updating Portal to v4.1.0' })).toBeVisible();
-    expect(screen.getByRole('progressbar', { name: 'Installing signed release' })).toHaveAttribute('aria-valuenow', '48');
+    expect(screen.getByRole('progressbar', { name: 'Installing signed release' })).not.toHaveAttribute('aria-valuenow');
+    expect(screen.queryByText('48%')).not.toBeInTheDocument();
+    expect(screen.getByText(/Working…/)).toBeVisible();
     expect(screen.getByText('Installing signed release')).toHaveFocus();
     expect(screen.queryByRole('textbox', { name: /UPDATE PORTAL/i })).not.toBeInTheDocument();
     expect(screen.getByText('Release verified')).toBeVisible();
@@ -818,7 +812,9 @@ describe('dashboard role-aware loading', () => {
     expect(screen.queryByRole('dialog', { name: 'Updating Portal to v4.1.0' })).not.toBeInTheDocument();
     expect(reviewButton).toHaveTextContent('View update progress');
     expect(reviewButton).toBeEnabled();
-    expect(screen.getByRole('progressbar', { name: 'Portal update progress' })).toHaveAttribute('aria-valuenow', '48');
+    expect(screen.getByRole('progressbar', { name: 'Portal update progress' })).not.toHaveAttribute('aria-valuenow');
+    expect(screen.queryByText('48%')).not.toBeInTheDocument();
+    expect(screen.getByText('Applying the verified Portal bundle and database migrations.')).toBeVisible();
     fireEvent.click(reviewButton);
     expect(screen.getByRole('dialog', { name: 'Updating Portal to v4.1.0' })).toBeVisible();
 
@@ -1002,7 +998,7 @@ describe('dashboard role-aware loading', () => {
     expect(currentRoute).toHaveTextContent('/settings');
   });
 
-  it('reattaches an active server-owned update on mount and restores determinate progress', async () => {
+  it('reattaches an active server-owned update with semantic progress and reconnect context', async () => {
     const monitorResult = deferred<any>();
     const runningProgress = updateProgress('running', {
       percent: 61,
@@ -1011,7 +1007,7 @@ describe('dashboard role-aware loading', () => {
     });
     sessionStorage.setItem('dashboard-self-update-operation-id', UPDATE_OPERATION_ID);
     sessionStorage.setItem('dashboard-self-update-expected-version', '4.1.0');
-    mockOwnerBackgroundChecks(staleBackupUpdate, new Error('Portal restarting'));
+    mockOwnerBackgroundChecks({ ...verifiedUpdate, updateAvailable: false }, new Error('Portal restarting'));
     mocks.monitorPortalSelfUpdate.mockImplementationOnce(async (
       _expectedVersion: string,
       _operationId: string | undefined,
@@ -1031,8 +1027,21 @@ describe('dashboard role-aware loading', () => {
       { _silent: true },
     );
     expect(mocks.monitorPortalSelfUpdate.mock.calls[0][1]).toBe(UPDATE_OPERATION_ID);
-    expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' })).toHaveAttribute('aria-valuenow', '61');
+    expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' })).not.toHaveAttribute('aria-valuenow');
+    expect(screen.queryByText('61%')).not.toBeInTheDocument();
+    expect(screen.getByText('Release verified')).toBeVisible();
+    expect(screen.getByText('The API may be briefly unavailable while services restart.')).toBeVisible();
     expect(screen.getByText(/live feedback will resume automatically/i)).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide for now' }));
+    expect(screen.queryByRole('dialog', { name: 'Updating Portal to v4.1.0' })).not.toBeInTheDocument();
+    const activeUpdateProgress = screen.getByRole('progressbar', { name: 'Portal update progress' });
+    expect(activeUpdateProgress).not.toHaveAttribute('aria-valuenow');
+    expect(screen.queryByText('61%')).not.toBeInTheDocument();
+    const activeUpdateStatus = activeUpdateProgress.closest('[role="status"]');
+    expect(activeUpdateStatus).not.toBeNull();
+    expect(activeUpdateStatus).toHaveTextContent('Restarting Portal services');
+    expect(activeUpdateStatus).toHaveTextContent('The API may be briefly unavailable while services restart.');
 
     await act(async () => {
       const terminal = updateProgress('failed');
@@ -1093,7 +1102,8 @@ describe('dashboard role-aware loading', () => {
         expect.anything(),
       );
       expect(screen.getByRole('dialog', { name: 'Updating Portal to v4.1.0' })).toBeVisible();
-      expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' })).toHaveAttribute('aria-valuenow', '61');
+      expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' })).not.toHaveAttribute('aria-valuenow');
+      expect(screen.queryByText('61%')).not.toBeInTheDocument();
       expect(mocks.clientPost.mock.calls.filter(([url]) => url === '/admin/self-update')).toHaveLength(0);
 
       await act(async () => {
@@ -1111,7 +1121,7 @@ describe('dashboard role-aware loading', () => {
   it('shows recovery-required as a durable terminal result and exposes no second update action', async () => {
     const recoveryProgress = updateProgress('recovery_required', {
       label: 'Manual recovery required',
-      detail: 'Automatic rollback could not restore every host integration.',
+      detail: 'Automatic recovery could not prove a safe Portal terminal state.',
     });
     // Blocking attention receipts reappear from the server even after a new
     // tab or an explicit local acknowledgement cleared session tracking.
@@ -1153,10 +1163,10 @@ describe('dashboard role-aware loading', () => {
     expect(mocks.clientPost.mock.calls.filter(([url]) => url === '/admin/self-update')).toHaveLength(0);
   });
 
-  it('keeps a follow-up-required operation visible after the release is no longer available', async () => {
+  it('keeps a final-verification operation visible after the release is no longer available', async () => {
     const attentionProgress = updateProgress('updated_with_errors', {
-      label: 'Portal updated; host cleanup needs attention',
-      detail: 'The target Portal is running, but a follow-up host task failed.',
+      label: 'Portal updated; final verification incomplete',
+      detail: 'The target Portal is installed, but exact final verification did not complete.',
     });
     mockOwnerBackgroundChecks({
       ...verifiedUpdate,
@@ -1167,12 +1177,12 @@ describe('dashboard role-aware loading', () => {
 
     render(<DashboardPage />);
 
-    expect(await screen.findByRole('dialog', { name: 'Portal updated with follow-up required' })).toBeVisible();
-    expect(screen.getByText(/new Portal committed and is serving, but ancillary host work failed/i)).toBeVisible();
+    expect(await screen.findByRole('dialog', { name: 'Portal update needs attention' })).toBeVisible();
+    expect(screen.getByText(/new Portal is installed, but the updater did not finish cleanly/i)).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
 
-    expect(screen.queryByRole('dialog', { name: 'Portal updated with follow-up required' })).not.toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent('Portal updated; host cleanup needs attention');
+    expect(screen.queryByRole('dialog', { name: 'Portal update needs attention' })).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Portal updated; final verification incomplete');
     expect(screen.getByRole('button', { name: 'Review update result' })).toBeEnabled();
     expect(screen.queryByText(/Update available:/i)).not.toBeInTheDocument();
   });
@@ -1223,10 +1233,14 @@ describe('dashboard role-aware loading', () => {
   it.each([
     ['failed', 'Portal update failed', true],
     ['rolled_back', 'Portal update rolled back', true],
-    ['updated_with_errors', 'Portal updated with follow-up required', false],
+    ['updated_with_errors', 'Portal update needs attention', false],
   ] as const)('renders the %s terminal status with the correct retry policy', async (status, title, retryable) => {
     const terminalProgress = updateProgress(status, {
-      label: status === 'rolled_back' ? 'Previous Portal restored' : 'Portal updated; cleanup failed',
+      label: status === 'rolled_back'
+        ? 'Previous Portal restored'
+        : status === 'updated_with_errors'
+          ? 'Portal updated; final verification incomplete'
+          : 'Signed Portal update did not complete',
     });
     sessionStorage.setItem('dashboard-self-update-operation-id', UPDATE_OPERATION_ID);
     sessionStorage.setItem('dashboard-self-update-expected-version', '4.1.0');

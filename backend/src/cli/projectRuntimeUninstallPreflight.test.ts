@@ -435,6 +435,49 @@ describe('global managed project firewall cleanup', () => {
     expect(fixture.calls.every(({ args }) => !args.includes('*'))).toBe(true);
   });
 
+  test.each(['10.201.0.112/28', 'fd00::/64'])(
+    'removes the exact host reply/deny pair emitted by the egress plane for %s', async (subnet) => {
+      const comment = `p4e-v1:${'a'.repeat(64)}:${'b'.repeat(64)}`;
+      const family = subnet.includes(':') ? '/usr/sbin/ip6tables' : '/usr/sbin/iptables';
+      const fixture = statefulFirewallRunner({
+        '/usr/sbin/iptables': [], '/usr/sbin/ip6tables': [],
+        [family]: [
+          '-P INPUT ACCEPT', '-N P4E-HOST-V1', '-A INPUT -j P4E-HOST-V1',
+          `-A P4E-HOST-V1 -s ${subnet} -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment ${comment} -j ACCEPT`,
+          `-A P4E-HOST-V1 -s ${subnet} -m comment --comment ${comment} -j REJECT`,
+          '-A INPUT -p tcp --dport 22 -j ACCEPT',
+        ],
+      });
+      await expect(cleanupKnownProjectFirewallResiduals(fixture.runner)).resolves.toBe(3);
+      expect(fixture.states.get(family)).toEqual([
+        '-P INPUT ACCEPT', '-A INPUT -p tcp --dport 22 -j ACCEPT',
+      ]);
+    },
+  );
+
+  test.each(['NEW,RELATED,ESTABLISHED', 'missing-deny', 'different-subnet', 'different-owner'])(
+    'refuses an unowned or incomplete host reply rule before mutation: %s', async (variant) => {
+      const comment = `p4e-v1:${'a'.repeat(64)}:${'b'.repeat(64)}`;
+      const state = variant.startsWith('NEW') ? variant : 'RELATED,ESTABLISHED';
+      const denySubnet = variant === 'different-subnet' ? '10.202.0.0/28' : '10.201.0.112/28';
+      const denyComment = variant === 'different-owner' ? `p4e-v1:${'c'.repeat(64)}:${'b'.repeat(64)}` : comment;
+      const fixture = statefulFirewallRunner({
+        '/usr/sbin/iptables': [
+          '-N P4E-HOST-V1', '-A INPUT -j P4E-HOST-V1',
+          `-A P4E-HOST-V1 -s 10.201.0.112/28 -m conntrack --ctstate ${state} -m comment --comment ${comment} -j ACCEPT`,
+          ...(variant === 'missing-deny' ? [] : [
+            `-A P4E-HOST-V1 -s ${denySubnet} -m comment --comment ${denyComment} -j REJECT`,
+          ]),
+        ],
+        '/usr/sbin/ip6tables': [],
+      });
+      await expect(cleanupKnownProjectFirewallResiduals(fixture.runner)).rejects.toMatchObject({
+        code: 'PROJECT_FIREWALL_AMBIGUOUS_CHAIN',
+      });
+      expect(fixture.calls.every(({ args }) => args[1] === '-S')).toBe(true);
+    },
+  );
+
   test('fails before mutation on ambiguous chains and on enumeration errors', async () => {
     const identity = 'd'.repeat(64);
     const chain = `P4E-${identity.slice(0, 23).toUpperCase()}`;
@@ -465,6 +508,31 @@ describe('uninstall preflight CLI guards', () => {
       run: async () => ({ code: 3, stdout: '' }),
     })).resolves.toBeUndefined();
   });
+
+  test('accepts an absent partial-install service only after an exact systemd proof', async () => {
+    const runner = { run: jest.fn(async (_file: string, args: readonly string[]) => (
+      args[0] === 'is-active' ? { code: 4, stdout: '' } : {
+        code: 0,
+        stdout: 'MainPID=0\nControlPID=0\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nFragmentPath=\n',
+      }
+    )) };
+    await expect(assertPortalServiceStopped(runner)).resolves.toBeUndefined();
+    expect(runner.run).toHaveBeenCalledTimes(2);
+    expect(runner.run.mock.calls[1][1][0]).toBe('show');
+  });
+
+  test.each(['MainPID=25', 'ControlPID=25', 'ActiveState=active', 'LoadState=loaded',
+    'FragmentPath=/etc/systemd/system/bridgesllm-product.service'])(
+    'rejects an absent-service proof with conflicting state: %s', async (changed) => {
+      const fields = ['MainPID=0', 'ControlPID=0', 'LoadState=not-found', 'ActiveState=inactive', 'SubState=dead', 'FragmentPath='];
+      const key = changed.split('=')[0];
+      const payload = fields.map((line) => line.startsWith(key + '=') ? changed : line).join('\n');
+      await expect(assertPortalServiceStopped({
+        run: async (_file, args) => args[0] === 'is-active'
+          ? { code: 4, stdout: '' } : { code: 0, stdout: payload },
+      })).rejects.toMatchObject({ code: 'PORTAL_SERVICE_STATE_UNKNOWN' });
+    },
+  );
 
   test('accepts only bounded arguments and absolute environment paths', () => {
     expect(parseProjectRuntimeUninstallArguments([

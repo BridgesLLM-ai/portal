@@ -55,7 +55,53 @@ export interface AdminAuthorizationSafety {
   retryable: boolean;
 }
 
+export interface LegacyOpenClawAgentRegistration {
+  agentId: string;
+  userPrefix: string | null;
+  projectSlug: string | null;
+  bindCount: number | null;
+  state: 'STALE_BINDLESS' | 'BOUND' | 'AMBIGUOUS' | 'DUPLICATE';
+  detachable: boolean;
+  reason: string;
+  fingerprint: string;
+  preservesTranscripts: true;
+  preservesWorkspace: true;
+}
+
+export interface LegacyOpenClawAgentInventory {
+  configHash: string;
+  agents: LegacyOpenClawAgentRegistration[];
+  preservation: {
+    transcripts: true;
+    workspaces: true;
+    projectFiles: true;
+  };
+}
+
 export const adminAPI = {
+  listLegacyOpenClawAgents: async (): Promise<LegacyOpenClawAgentInventory> => {
+    const { data } = await client.get('/admin/legacy-openclaw-agents');
+    return data;
+  },
+
+  detachLegacyOpenClawAgent: async (
+    agentId: string,
+    expectedFingerprint: string,
+    confirmation: string,
+  ): Promise<{
+    ok: true;
+    agentId: string;
+    receiptId: string;
+    transcriptsPreserved: true;
+    workspacePreserved: true;
+  }> => {
+    const { data } = await client.post(
+      `/admin/legacy-openclaw-agents/${encodeURIComponent(agentId)}/detach`,
+      { expectedFingerprint, confirmation },
+    );
+    return data;
+  },
+
   // Users
   listUsers: async (params?: { page?: number; limit?: number; search?: string }): Promise<{
     users: AdminUser[];

@@ -2,12 +2,16 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { TextDecoder } from 'util';
 import type { Request, Response } from 'express';
+import { appApiBindingKey } from './appApiProxyAuth';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MIN_TIMEOUT_MS = 5_000;
 const MAX_TIMEOUT_MS = 120_000;
-const MAX_VALIDATED_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_VALIDATED_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MIN_VALIDATED_JSON_RESPONSE_BYTES = 1024 * 1024;
+const MAX_VALIDATED_JSON_RESPONSE_BYTES = 64 * 1024 * 1024;
 const INITIAL_JSON_BUFFER_BYTES = 64 * 1024;
+const APP_API_JSON_RESPONSE_LIMIT_PREFIX = 'APP_API_JSON_RESPONSE_MAX_BYTES_';
 
 export const APP_API_BACKEND_UNCONFIGURED_CODE = 'APP_API_BACKEND_UNCONFIGURED';
 export const APP_API_REQUEST_PATH_INVALID_CODE = 'APP_API_REQUEST_PATH_INVALID';
@@ -16,10 +20,8 @@ export const APP_API_UPSTREAM_UNAVAILABLE_CODE = 'APP_API_UPSTREAM_UNAVAILABLE';
 export const APP_API_UPSTREAM_RESPONSE_TOO_LARGE_CODE = 'APP_API_UPSTREAM_RESPONSE_TOO_LARGE';
 
 class AppApiUpstreamResponseTooLargeError extends Error {
-  readonly maxBytes = MAX_VALIDATED_JSON_RESPONSE_BYTES;
-
-  constructor() {
-    super(`App API JSON response exceeded ${MAX_VALIDATED_JSON_RESPONSE_BYTES} bytes`);
+  constructor(readonly maxBytes: number) {
+    super(`App API JSON response exceeded ${maxBytes} bytes`);
     this.name = 'AppApiUpstreamResponseTooLargeError';
   }
 }
@@ -41,6 +43,33 @@ export function appApiProxyTimeoutMs(environment: NodeJS.ProcessEnv = process.en
   const configured = Number(environment.APP_API_PROXY_TIMEOUT_MS);
   if (!Number.isFinite(configured)) return DEFAULT_TIMEOUT_MS;
   return Math.max(MIN_TIMEOUT_MS, Math.min(MAX_TIMEOUT_MS, Math.floor(configured)));
+}
+
+function configuredJsonResponseLimit(value: unknown): number | undefined {
+  const raw = String(value ?? '').trim();
+  if (!/^[1-9]\d*$/u.test(raw)) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) return undefined;
+  return Math.max(MIN_VALIDATED_JSON_RESPONSE_BYTES, Math.min(MAX_VALIDATED_JSON_RESPONSE_BYTES, parsed));
+}
+
+/**
+ * JSON remains validate-before-commit, but operators can raise the bounded
+ * buffer for a concrete App whose legitimate API documents exceed 8 MiB.
+ * The immutable App id wins over the global setting; invalid settings fail
+ * back to the lower default instead of silently creating an unbounded proxy.
+ */
+export function appApiJsonResponseLimitBytes(
+  appId: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): number {
+  const binding = appApiBindingKey(appId);
+  const appValue = binding
+    ? configuredJsonResponseLimit(environment[`${APP_API_JSON_RESPONSE_LIMIT_PREFIX}${binding}`])
+    : undefined;
+  if (appValue !== undefined) return appValue;
+  return configuredJsonResponseLimit(environment.APP_API_JSON_RESPONSE_MAX_BYTES)
+    ?? DEFAULT_VALIDATED_JSON_RESPONSE_BYTES;
 }
 
 export function serializeAppApiRequestBody(
@@ -161,15 +190,17 @@ class BoundedJsonBuffer {
   private storage = Buffer.allocUnsafe(INITIAL_JSON_BUFFER_BYTES);
   private length = 0;
 
+  constructor(private readonly maxBytes: number) {}
+
   append(chunk: Buffer): void {
     const required = this.length + chunk.length;
-    if (required > MAX_VALIDATED_JSON_RESPONSE_BYTES) {
-      throw new AppApiUpstreamResponseTooLargeError();
+    if (required > this.maxBytes) {
+      throw new AppApiUpstreamResponseTooLargeError(this.maxBytes);
     }
     if (required > this.storage.length) {
       let capacity = this.storage.length;
       while (capacity < required) {
-        capacity = Math.min(MAX_VALIDATED_JSON_RESPONSE_BYTES, capacity * 2);
+        capacity = Math.min(this.maxBytes, capacity * 2);
       }
       const expanded = Buffer.allocUnsafe(capacity);
       this.storage.copy(expanded, 0, 0, this.length);
@@ -238,17 +269,21 @@ function applyAppApiResponseMetadata(
 async function bufferAndValidateJson(
   upstream: globalThis.Response,
   res: Response,
-  options: { locationBasePath?: string },
+  options: { locationBasePath?: string; jsonResponseLimitBytes?: number },
 ): Promise<void> {
   const body = upstream.body!;
   const reader = body.getReader();
   const declaredLength = declaredIdentityContentLength(upstream);
-  if (declaredLength !== undefined && declaredLength > MAX_VALIDATED_JSON_RESPONSE_BYTES) {
+  const maxBytes = options.jsonResponseLimitBytes ?? DEFAULT_VALIDATED_JSON_RESPONSE_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_VALIDATED_JSON_RESPONSE_BYTES) {
+    throw new Error('App API JSON response limit was invalid');
+  }
+  if (declaredLength !== undefined && declaredLength > maxBytes) {
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
-    throw new AppApiUpstreamResponseTooLargeError();
+    throw new AppApiUpstreamResponseTooLargeError(maxBytes);
   }
-  const buffered = new BoundedJsonBuffer();
+  const buffered = new BoundedJsonBuffer(maxBytes);
   let readerOwned = true;
   try {
     while (true) {
@@ -283,7 +318,7 @@ async function bufferAndValidateJson(
 export async function streamAppApiResponse(
   upstream: globalThis.Response,
   res: Response,
-  options: { locationBasePath?: string } = {},
+  options: { locationBasePath?: string; jsonResponseLimitBytes?: number } = {},
 ): Promise<void> {
   if (!upstream.body) {
     applyAppApiResponseMetadata(upstream, res, options);
@@ -312,6 +347,9 @@ export const __appApiProxyTest = {
   DEFAULT_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
+  DEFAULT_VALIDATED_JSON_RESPONSE_BYTES,
+  MIN_VALIDATED_JSON_RESPONSE_BYTES,
   MAX_VALIDATED_JSON_RESPONSE_BYTES,
+  APP_API_JSON_RESPONSE_LIMIT_PREFIX,
   RESPONSE_HEADER_ALLOWLIST,
 };

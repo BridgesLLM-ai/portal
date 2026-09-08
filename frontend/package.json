@@ -1,10 +1,10 @@
 {
   "name": "bridgesllm-frontend",
-  "version": "4.0.19",
+  "version": "5.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build && node scripts/validate-themed-control-contrast.mjs",
+    "build": "tsc && vite build --configLoader runner && node scripts/validate-themed-control-contrast.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "lint": "node scripts/lint.mjs",
@@ -25,6 +25,7 @@
     "framer-motion": "^10.16.4",
     "lucide-react": "^0.294.0",
     "marked": "^17.0.6",
+    "mermaid": "11.12.0",
     "monaco-editor": "^0.55.1",
     "qrcode.react": "^4.2.0",
     "react": "^18.2.0",

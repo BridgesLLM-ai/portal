@@ -9,6 +9,10 @@ import {
 import { attestLegacyOpenClawProjectSessionKeys } from './projectChatLegacyMigration';
 import { LEGACY_OPENCLAW_RETIREMENT_PENDING_MESSAGE } from './legacyOpenClawRetirementPolicy';
 import {
+  materializeOpenClawAgentList,
+  readOpenClawAgentConfigContract,
+} from './openclawAgentConfigContract';
+import {
   assertLegacyOpenClawProjectMigrationInactive,
   assertNoLegacyOpenClawProjectEvidence,
 } from './legacyOpenClawProjectRetirement';
@@ -164,12 +168,11 @@ function configAgents(result: { ok: boolean; data?: unknown; error?: unknown }):
       ? data.parsed
       : null;
   if (!config) throw new Error('Legacy OpenClaw Project agent inspection returned an invalid shape');
-  const agents = isRecord(config.agents) ? config.agents.list : undefined;
-  if (agents === undefined) return [];
-  if (!Array.isArray(agents) || agents.length > 2_048 || agents.some((entry) => !isRecord(entry))) {
+  try {
+    return materializeOpenClawAgentList(readOpenClawAgentConfigContract(config));
+  } catch {
     throw new Error('Legacy OpenClaw Project agent inspection returned an invalid shape');
   }
-  return agents;
 }
 
 function attestLegacyAgentEntry(input: {

@@ -1,12 +1,12 @@
 /**
- * AgentSelector — polished dropdown for switching between agent providers
- * and OpenClaw sub-agents. Sessions appear in a separate dropdown button
- * for any provider that supports session listing.
- * Uses provider avatars from public appearance settings and sub-agent avatars
+ * AgentSelector — searchable agent directory, with each harness shown as
+ * the engine beneath its agent identity. Conversations use a separate history button
+ * for any harness that supports session listing.
+ * Uses harness avatars from public appearance settings and sub-agent avatars
  * from authenticated operator settings or the authenticated agent catalog.
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { ChevronDown, Check, Users, Radio, Loader2, History, X } from 'lucide-react';
+import { ChevronDown, Check, Users, Radio, Loader2, History, X, Search } from 'lucide-react';
 import client from '../../api/client';
 import { useAuthStore } from '../../contexts/AuthContext';
 import { getShortModelLabel } from '../../utils/modelId';
@@ -14,7 +14,7 @@ import {
   formatAgentChatProviderCatalogLoadError,
   isAgentChatProviderCatalogAbortError,
   loadAgentChatProviderCatalog,
-  type AgentChatProviderCatalogEntry,
+  type AgentChatHarnessCatalogEntry,
 } from '../../utils/agentChatProviderCatalog';
 import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
 import AnchoredPopover from '../AnchoredPopover';
@@ -89,7 +89,7 @@ function DropdownSheet({
 
 /* ─── Types ─────────────────────────────────────────────────────────────── */
 
-type ProviderInfo = AgentChatProviderCatalogEntry;
+type HarnessInfo = AgentChatHarnessCatalogEntry;
 
 interface OpenClawAgent {
   id: string;
@@ -127,6 +127,7 @@ interface AgentSelectorProps {
   onChange: (selection: AgentSelection) => void;
   disabled?: boolean;
   onViewSession?: (sessionKey: string) => void;
+  openConversationsRequest?: number;
   currentSessionKey?: string;
   currentSessionLabel?: string;
   currentSessionActive?: boolean;
@@ -143,8 +144,8 @@ const STORAGE_KEY = 'agent-chat-provider';
 const AGENT_STORAGE_KEY = 'agent-chat-agentId';
 const AGENTS_CACHE_KEY = 'agent-chat-agents-cache';
 
-/** Provider-level fallback colors / labels (used when no avatar image exists) */
-const PROVIDER_META: Record<string, { emoji: string; color: string; label: string; initials: string; avatarBg: string; avatarText: string }> = {
+/** Harness-level fallback colors / labels (used when no avatar image exists). */
+const HARNESS_META: Record<string, { emoji: string; color: string; label: string; initials: string; avatarBg: string; avatarText: string }> = {
   OPENCLAW:    { emoji: '🟢', color: 'text-emerald-400', label: 'OpenClaw', initials: 'OC', avatarBg: 'bg-emerald-600/20', avatarText: 'text-emerald-300' },
   CLAUDE_CODE: { emoji: '🟣', color: 'text-violet-400',  label: 'Claude Code', initials: 'CL', avatarBg: 'bg-violet-600/20', avatarText: 'text-violet-300' },
   CODEX:       { emoji: '🔵', color: 'text-sky-400',     label: 'Codex', initials: 'CX', avatarBg: 'bg-sky-600/20', avatarText: 'text-sky-300' },
@@ -152,6 +153,9 @@ const PROVIDER_META: Record<string, { emoji: string; color: string; label: strin
   AGENT_ZERO:  { emoji: '🟡', color: 'text-amber-400',   label: 'Agent Zero', initials: 'A0', avatarBg: 'bg-amber-600/20', avatarText: 'text-amber-300' },
   GEMINI:      { emoji: '🔷', color: 'text-cyan-400',    label: 'Antigravity', initials: 'AG', avatarBg: 'bg-cyan-600/20', avatarText: 'text-cyan-300' },
   OLLAMA:      { emoji: '🔴', color: 'text-rose-400',    label: 'Ollama', initials: 'OL', avatarBg: 'bg-rose-600/20', avatarText: 'text-rose-300' },
+  HERMES:      { emoji: '🟠', color: 'text-amber-300',   label: 'Hermes', initials: 'HE', avatarBg: 'bg-amber-600/20', avatarText: 'text-amber-200' },
+  OPENCODE:    { emoji: '🟦', color: 'text-indigo-300',  label: 'OpenCode', initials: 'OP', avatarBg: 'bg-indigo-600/20', avatarText: 'text-indigo-200' },
+  DEEPSEEK_HARNESS: { emoji: '🔷', color: 'text-blue-300', label: 'DeepSeek Harness', initials: 'DS', avatarBg: 'bg-blue-600/20', avatarText: 'text-blue-200' },
 };
 
 /** Default identity emojis for well-known agent names */
@@ -198,16 +202,35 @@ function formatTime(dateStr?: string): string {
   }
 }
 
-function getProviderStatusLabel(provider: ProviderInfo): string {
-  if (provider.availabilityState === 'checking') return 'Checking';
-  if (provider.availabilityState === 'stale') {
-    return provider.checking ? 'Rechecking' : 'Stale';
+function getHarnessSummary(harness: HarnessInfo): string {
+  if (harness.releaseStage === 'developer-preview' || harness.releaseStage === 'planned') {
+    return 'Preview — not available for chat in this release.';
   }
-  if (provider.availabilityState === 'error') return 'Unavailable';
-  if (!provider.implemented) return 'Not implemented';
-  if (!provider.installed) return 'Not installed';
-  if (provider.native && provider.nativeAuthStatus === 'needs_login') return 'Needs login';
-  return provider.native ? 'Native' : 'Gateway';
+  if (harness.checking || harness.availabilityState === 'checking') return 'Checking your connection…';
+  if (harness.nativeAuthStatus === 'needs_login') return `Connect your ${harness.displayName} account in Model Providers.`;
+  if (harness.installed === false) return 'Set up this harness in Agent Tools to get started.';
+  if (harness.usable) {
+    if ((harness.harnessId || harness.name) === 'OPENCLAW') return 'Your agents, tools, and conversations through OpenClaw.';
+    if ((harness.harnessId || harness.name) === 'OLLAMA') return 'Chat with a model running on your own hardware.';
+    return 'Connected and available in Portal.';
+  }
+  return 'Connection unavailable. Check Model Providers for details.';
+}
+
+function getHarnessStatusLabel(harness: HarnessInfo): string {
+  if (harness.releaseStage === 'developer-preview') return 'Developer Preview';
+  if (harness.releaseStage === 'planned' && harness.selectable === false) return 'Planned';
+  if (harness.availabilityState === 'checking') return 'Checking';
+  if (harness.availabilityState === 'stale') {
+    return harness.checking ? 'Rechecking' : 'Stale';
+  }
+  if (harness.availabilityState === 'error') return 'Unavailable';
+  if (harness.selectable === false) return 'Unavailable';
+  if (!harness.implemented) return 'Not implemented';
+  if (!harness.installed) return 'Not installed';
+  if (harness.native && harness.nativeAuthStatus === 'needs_login') return 'Needs login';
+  if (harness.usable && (harness.harnessId || harness.name) === 'OPENCLAW') return 'Gateway online';
+  return harness.usable ? 'Ready' : 'Unavailable';
 }
 
 function formatNewSessionSlug(slug: string): string | null {
@@ -321,6 +344,11 @@ function SessionDropdown({
   disabled?: boolean;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const [query, setQuery] = useState('');
+  const [runningOnly, setRunningOnly] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(20);
+
+  useEffect(() => { setVisibleCount(20); }, [query, runningOnly]);
 
   const sessionHasActiveRun = (session: GatewaySession): boolean => {
     const key = getSessionKey(session);
@@ -331,6 +359,16 @@ function SessionDropdown({
   };
   const runningSessions = sessions.filter(sessionHasActiveRun);
   const otherSessions = sessions.filter((session) => !sessionHasActiveRun(session));
+  const search = query.trim().toLocaleLowerCase();
+  const matchingSessions = [...runningSessions, ...(runningOnly ? [] : otherSessions)]
+    .filter((session) => {
+      const key = getSessionKey(session);
+      return key && (!search || [
+        getSessionLabel(session, activityTitles[key]), session.title,
+        session.preview, key, session.channel,
+      ].some((value) => typeof value === 'string' && value.toLocaleLowerCase().includes(search)));
+    });
+  const visibleSessions = matchingSessions.slice(0, visibleCount);
   const hasActiveRun = currentSessionActive === true || runningSessions.length > 0;
   const countLabel = loading && sessions.length === 0 ? '…' : hasLoaded ? String(sessions.length) : '—';
   const matchedCurrentSession = currentSessionKey
@@ -362,7 +400,7 @@ function SessionDropdown({
         title={`${providerLabel} sessions`}
       >
         <History size={12} />
-        <span className="hidden sm:inline truncate">{headerLabel}</span>
+        <span className="inline truncate max-w-[160px] sm:max-w-none">{headerLabel}</span>
         {(loading || hasLoaded) && (
           <span className="hidden sm:inline-flex items-center gap-1 tabular-nums rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-slate-400">
             {loading ? <Loader2 size={9} className="animate-spin text-sky-400" /> : null}
@@ -386,17 +424,39 @@ function SessionDropdown({
         open={open}
         onClose={() => onOpenChange(false)}
         anchorRef={triggerRef}
-        width={256}
+        width={384}
         align="end"
-        title="Select session"
+        title="Conversations"
         ariaLabel={`${providerLabel} sessions`}
         closeLabel="Close session selector"
       >
-        <div className="max-h-[320px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
+        <div className="border-b border-white/[0.06] p-3 space-y-2">
+          <label className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-slate-400">
+            <Search size={14} aria-hidden="true" />
+            <input
+              type="search"
+              aria-label="Search sessions"
+              placeholder="Search titles, messages, or session IDs"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              className="min-w-0 flex-1 bg-transparent text-xs text-white placeholder:text-slate-500 outline-none"
+            />
+          </label>
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <button type="button" aria-pressed={runningOnly} onClick={() => setRunningOnly((value) => !value)}
+              className={`min-h-[32px] rounded-lg border px-2.5 ${runningOnly ? 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200' : 'border-white/10 text-slate-400 hover:text-white'}`}>
+              Running only
+            </button>
+            <span className="text-slate-400" aria-live="polite">
+              {hasLoaded ? `${matchingSessions.length} matching session${matchingSessions.length === 1 ? '' : 's'}` : 'History not loaded'}
+            </span>
+          </div>
+        </div>
+        <div className="min-h-0 max-h-[380px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
           <div className="px-3 pt-2.5 pb-1.5">
             <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
               <Radio size={10} className="text-emerald-400" />
-              {providerLabel} Sessions
+              {providerLabel} Conversations
               <span className="ml-auto text-[9px] bg-emerald-500/15 text-emerald-400 px-1.5 py-0.5 rounded-full font-medium tabular-nums">
                 {countLabel}
               </span>
@@ -427,56 +487,51 @@ function SessionDropdown({
             </div>
           )}
 
-          {runningSessions.length > 0 && (
-            <div>
-              {runningSessions.map((s, idx) => {
-                const key = getSessionKey(s);
-                const label = getSessionLabel(s, activityTitles[key]);
-                return (
-                  <button
-                    key={key || `active-${idx}`}
-                    onClick={() => { onViewSession(key); onOpenChange(false); }}
-                    className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-slate-300 hover:text-white hover:bg-white/[0.06] transition-colors"
-                  >
-                    <span
-                      aria-label={`${label} has an active turn`}
-                      title={`${label} has an active turn`}
-                      className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0"
-                    />
-                    <span className="flex-1 text-left truncate text-[12px] font-medium">
-                      {label}
-                    </span>
-                    <span className="text-[10px] text-slate-600 flex-shrink-0">
-                      {formatTime(s.lastActivityAt || s.createdAt)}
-                    </span>
-                  </button>
-                );
-              })}
+          {!loading && !error && sessions.length > 0 && matchingSessions.length === 0 && (
+            <div className="px-4 py-6 text-xs text-slate-400">
+              {search ? 'No sessions match your search.' : 'No running sessions.'}
             </div>
           )}
 
-          {runningSessions.length > 0 && otherSessions.length > 0 && (
-            <div className="mx-3 border-t border-white/[0.05] my-1" />
-          )}
-
-          {otherSessions.slice(0, 10).map((s, idx) => {
-            const key = getSessionKey(s);
+          {visibleSessions.map((session) => {
+            const key = getSessionKey(session);
+            const label = getSessionLabel(session, activityTitles[key]);
+            const running = sessionHasActiveRun(session);
+            const selected = key === currentSessionKey;
             return (
               <button
-                key={key || `other-${idx}`}
+                type="button"
+                key={key}
+                aria-current={selected ? 'page' : undefined}
+                title={label}
                 onClick={() => { onViewSession(key); onOpenChange(false); }}
-                className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-slate-500 hover:text-slate-300 hover:bg-white/[0.04] transition-colors"
+                className={`w-full flex items-center gap-2.5 px-4 py-3 text-sm transition-colors ${selected ? 'bg-sky-500/10 text-sky-100' : 'text-slate-300 hover:text-white hover:bg-white/[0.06]'}`}
               >
-                <span className="w-1.5 h-1.5 rounded-full bg-slate-600 flex-shrink-0" />
-                <span className="flex-1 text-left truncate text-[12px]">
-                  {getSessionLabel(s, activityTitles[key])}
+                <span
+                  aria-label={running ? `${label} has an active turn` : undefined}
+                  className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${running ? 'bg-emerald-400 motion-safe:animate-pulse' : 'bg-slate-600'}`}
+                />
+                <span className="min-w-0 flex-1 text-left">
+                  <span className="block truncate text-xs font-medium">{label}</span>
+                  {session.preview && session.preview !== label && (
+                    <span className="block truncate mt-0.5 text-[11px] text-slate-400">{session.preview}</span>
+                  )}
+                  {session.channel && <span className="block text-[10px] text-slate-500">{session.channel}</span>}
                 </span>
-                <span className="text-[10px] text-slate-600 flex-shrink-0">
-                  {formatTime(s.lastActivityAt || s.createdAt)}
+                <span className="text-[10px] text-slate-400 flex-shrink-0">
+                  {formatTime(session.lastActivityAt || session.createdAt)}
                 </span>
+                {selected && <Check size={12} aria-label="Current session" />}
               </button>
             );
           })}
+
+          {matchingSessions.length > visibleCount && (
+            <button type="button" onClick={() => setVisibleCount((count) => count + 20)}
+              className="w-full min-h-[40px] border-t border-white/[0.06] text-xs text-sky-300 hover:bg-white/[0.04]">
+              Show more sessions ({matchingSessions.length - visibleCount} remaining)
+            </button>
+          )}
 
           <div className="h-1" />
         </div>
@@ -500,12 +555,15 @@ export default function AgentSelector({
   subAgentAvatars = {},
   assistantName,
   disabled = false,
+  openConversationsRequest = 0,
 }: AgentSelectorProps) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
-  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [providers, setProviders] = useState<HarnessInfo[]>([]);
   const [agents, setAgents] = useState<OpenClawAgent[]>([]);
   const [sessions, setSessions] = useState<GatewaySession[]>([]);
   const [open, setOpen] = useState(false);
+  const [agentQuery, setAgentQuery] = useState('');
+  useEffect(() => { if (!open) setAgentQuery(''); }, [open]);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
@@ -520,7 +578,7 @@ export default function AgentSelector({
   const lastProviderRetryRef = useRef(0);
   const selectedProviderSessionCapability = value === 'OPENCLAW'
     ? true
-    : providers.find((provider) => provider.name === value)?.capabilities?.supportsSessionList;
+    : providers.find((harness) => harness.harnessId === value || harness.name === value)?.capabilities?.supportsSessionList;
   // The catalog is advisory while absent, loading, or failed. Only an explicit
   // false suppresses history; otherwise the sessions endpoint is authoritative.
   const canAttemptSessionList = selectedProviderSessionCapability !== false;
@@ -531,9 +589,18 @@ export default function AgentSelector({
     setSessionsOpen(false);
   }, [disabled]);
 
-  // Fetch providers when the selector opens. A selected native provider also
+  const lastConversationsRequestRef = useRef(openConversationsRequest);
+  useEffect(() => {
+    if (lastConversationsRequestRef.current === openConversationsRequest) return;
+    lastConversationsRequestRef.current = openConversationsRequest;
+    if (disabled || !canAttemptSessionList) return;
+    setOpen(false);
+    setSessionsOpen(true);
+  }, [openConversationsRequest, disabled, canAttemptSessionList]);
+
+  // Fetch harnesses when the selector opens. A selected native harness also
   // needs its capability row on first paint so session history is not hidden
-  // until the user happens to open the unrelated provider selector.
+  // until the user happens to open the unrelated harness selector.
   useEffect(() => {
     const needsSelectedProviderCapabilities = Boolean(onViewSession) && value !== 'OPENCLAW';
     if ((!open && !needsSelectedProviderCapabilities) || disabled) return;
@@ -712,7 +779,7 @@ export default function AgentSelector({
   }
 
   // Determine display for current selection
-  const currentMeta = PROVIDER_META[value] || { emoji: '🤖', color: 'text-slate-400', label: value, initials: '??', avatarBg: 'bg-slate-600/20', avatarText: 'text-slate-300' };
+  const currentMeta = HARNESS_META[value] || { emoji: '🤖', color: 'text-slate-400', label: value, initials: '??', avatarBg: 'bg-slate-600/20', avatarText: 'text-slate-300' };
 
   let displayLabel: string;
   let displayAvatarUrl: string | undefined;
@@ -722,7 +789,9 @@ export default function AgentSelector({
 
   const effectiveAgentId = value === 'OPENCLAW' ? normalizeOpenClawAgentId(agentId) : undefined;
   const openClawAgents = agents.filter((agent) => agent.id !== 'main');
-  const hasOpenClawProvider = providers.some((provider) => provider.name === 'OPENCLAW');
+  const hasOpenClawProvider = providers.some((harness) => (
+    harness.harnessId === 'OPENCLAW' || harness.name === 'OPENCLAW'
+  ));
 
   if (value === 'OPENCLAW' && effectiveAgentId) {
     const matchedAgent = agents.find(a => a.id === effectiveAgentId);
@@ -739,107 +808,28 @@ export default function AgentSelector({
     displayTextClass = currentMeta.avatarText;
   }
 
-  return (
-    <div className="flex items-center gap-1.5">
-      {/* ── Agent Dropdown ──────────────────────────────────────── */}
-      <div className="relative">
-        <button
-          ref={triggerRef}
-          onClick={() => { if (!disabled) setOpen(!open); }}
-          disabled={disabled}
-          aria-label="Select agent provider"
-          aria-haspopup="dialog"
-          aria-expanded={open}
-          className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-sm text-slate-300 transition-colors disabled:cursor-wait disabled:opacity-50"
-        >
-          <AvatarCircle
-            src={displayAvatarUrl}
-            fallback={displayFallback}
-            size="sm"
-            bgClass={displayBg}
-            textClass={displayTextClass}
-          />
-          <span className="truncate max-w-[80px] sm:max-w-[160px]">{displayLabel}</span>
-          {loading ? (
-            <Loader2 size={13} className="animate-spin text-sky-400" />
-          ) : (
-            <ChevronDown
-              size={14}
-              className={`text-slate-500 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
-            />
-          )}
-        </button>
-
-        {/* ── Dropdown Panel ──────────────────────────────────────── */}
-        <DropdownSheet
-          open={open}
-          onClose={() => setOpen(false)}
-          anchorRef={triggerRef}
-          width={288}
-          align="start"
-          title="Select agent"
-          ariaLabel="Available agent providers"
-          closeLabel="Close agent selector"
-        >
-          <div className="max-h-[420px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
-            {/* ── PROVIDERS Section ────────────────────────────────── */}
-            <div className="px-3 pt-3 pb-1">
-              <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
-                <Users size={10} />
-                Providers
-              </div>
-            </div>
-
-            {loading && (
-              <div className="mx-3 mb-2 rounded-lg border border-sky-400/15 bg-sky-500/10 px-3 py-2 text-xs text-sky-100 flex items-center gap-2">
-                <Loader2 size={12} className="animate-spin text-sky-300" />
-                <span>Loading available agents and providers…</span>
-              </div>
-            )}
-
-            {!loading && providerLoadError && (
-              <div
-                role="alert"
-                className="mx-3 mb-2 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100"
-              >
-                <div>
-                  {providers.length > 0
-                    ? `Couldn’t refresh providers. Showing the last available list. ${providerLoadError}`
-                    : `Couldn’t load providers. Your current selection is unchanged. ${providerLoadError}`}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setProviderRefreshNonce((nonce) => nonce + 1)}
-                  disabled={disabled}
-                  className="mt-2 rounded-md border border-amber-300/30 bg-amber-400/10 px-2 py-1 font-medium text-amber-100 transition-colors hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Retry loading providers
-                </button>
-              </div>
-            )}
-
-            {!loading && !providerLoadError && providers.length === 0 && (
-              <div className="px-4 py-4 text-xs text-slate-500">
-                No providers returned yet. Try refresh if this stays empty.
-              </div>
-            )}
-
-            {providers.map((p) => {
-              const meta = PROVIDER_META[p.name] || { emoji: '🤖', color: 'text-slate-400', label: p.displayName, initials: '??', avatarBg: 'bg-slate-600/20', avatarText: 'text-slate-300' };
-              const isOpenClaw = p.name === 'OPENCLAW';
-              const isSelectedProvider = p.name === value;
-              const providerAvatarUrl = agentAvatars[p.name] || undefined;
+  const renderProvider = (p: HarnessInfo) => {
+              const harnessId = p.harnessId || p.name;
+              const meta = HARNESS_META[harnessId] || { emoji: '🤖', color: 'text-slate-400', label: p.displayName, initials: '??', avatarBg: 'bg-slate-600/20', avatarText: 'text-slate-300' };
+              const isOpenClaw = harnessId === 'OPENCLAW';
+              const isSelectedProvider = harnessId === value || p.name === value;
+              const providerAvatarUrl = agentAvatars[harnessId] || agentAvatars[p.name] || undefined;
               const availabilityUnsettled = p.checking === true
                 || p.stale === true
                 || p.availabilityState === 'checking'
                 || p.availabilityState === 'stale'
                 || p.availabilityState === 'error';
-              const isUsable = !providerLoadError && !availabilityUnsettled && p.usable === true;
-              const statusLabel = getProviderStatusLabel(p);
-              const detailLabel = p.nativeAuthMessage || p.reason || (p.version ? `Detected ${p.version}` : undefined);
+              const catalogSelectable = p.selectable !== false && p.implemented !== false;
+              const isUsable = catalogSelectable && !providerLoadError && !availabilityUnsettled && p.usable === true;
+              // Moving between OpenClaw sub-agents does not select a different
+              // harness. Keep that path available during a transient recheck,
+              // but never override an explicit non-selectable catalog row.
+              const canSelect = isUsable || (isOpenClaw && value === 'OPENCLAW' && catalogSelectable);
+              const statusLabel = getHarnessStatusLabel(p);
+              const detailLabel = getHarnessSummary(p);
 
               return (
-                <div key={p.name}>
+                <div key={harnessId}>
                   {isOpenClaw ? (
                     // The default agent stays selectable whenever its own
                     // sub-agents are, which is any time the selector is not
@@ -849,8 +839,8 @@ export default function AgentSelector({
                     // flight, because the sub-agent rows below never had
                     // that gate. The status pill still reports the state.
                     <button
-                      onClick={() => handleSelect('OPENCLAW', undefined)}
-                      disabled={disabled}
+                      onClick={() => canSelect && handleSelect('OPENCLAW', undefined)}
+                      disabled={disabled || !canSelect}
                       className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm transition-colors ${
                         isSelectedProvider && !effectiveAgentId
                           ? 'accent-active'
@@ -869,7 +859,7 @@ export default function AgentSelector({
                           <span className={`font-medium ${meta.color}`}>{assistantName || meta.label}</span>
                           <span className={`text-[10px] px-1.5 py-0.5 rounded border ${isUsable ? 'border-emerald-500/30 text-emerald-300' : 'border-amber-500/30 text-amber-300'}`}>{statusLabel}</span>
                         </div>
-                        {detailLabel && <div className="text-[10px] text-slate-500 truncate">{detailLabel}</div>}
+                        <div className="text-[10px] text-slate-500 truncate">{meta.label} · {isOpenClaw ? 'Main agent' : 'Default assistant'}</div>{detailLabel && <div className="text-[10px] text-slate-500 truncate">{detailLabel}</div>}
                       </div>
                       {agentsLoading && (
                         <Loader2 size={11} className="text-slate-600 animate-spin ml-auto flex-shrink-0" />
@@ -880,8 +870,8 @@ export default function AgentSelector({
                     </button>
                   ) : (
                     <button
-                      onClick={() => isUsable && handleSelect(p.name)}
-                      disabled={disabled || !isUsable}
+                      onClick={() => canSelect && handleSelect(harnessId)}
+                      disabled={disabled || !canSelect}
                       className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm transition-colors ${
                         !isUsable
                           ? 'text-slate-500 cursor-not-allowed opacity-60'
@@ -902,7 +892,7 @@ export default function AgentSelector({
                           <span className="font-medium truncate">{meta.label}</span>
                           <span className={`text-[10px] px-1.5 py-0.5 rounded border ${isUsable ? 'border-sky-500/30 text-sky-300' : 'border-amber-500/30 text-amber-300'}`}>{statusLabel}</span>
                         </div>
-                        {detailLabel && <div className="text-[10px] text-slate-500 truncate">{detailLabel}</div>}
+                        <div className="text-[10px] text-slate-500 truncate">{meta.label} · {isOpenClaw ? 'Main agent' : 'Default assistant'}</div>{detailLabel && <div className="text-[10px] text-slate-500 truncate">{detailLabel}</div>}
                       </div>
                       {isSelectedProvider && !effectiveAgentId && isUsable && (
                         <Check size={14} className="accent-text" />
@@ -912,60 +902,138 @@ export default function AgentSelector({
 
                 </div>
               );
-            })}
+  };
 
-            {hasOpenClawProvider && openClawAgents.length > 0 && (
-              <div role="group" aria-label="OpenClaw agents" className="border-t border-white/[0.06] pb-1">
-                <div className="px-3 pb-1 pt-2.5">
-                  <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                    <Users size={10} />
-                    OpenClaw agents
-                  </div>
-                </div>
-                {openClawAgents.map((agent) => {
-                  const isSelected = value === 'OPENCLAW' && effectiveAgentId === agent.id;
-                  const agentAvUrl = getSubAgentAvatarUrl(agent);
-                  return (
-                    <button
-                      key={agent.id}
-                      onClick={() => handleSelect('OPENCLAW', agent.id)}
-                      disabled={disabled}
-                      className={`w-full flex items-center gap-2.5 pl-9 pr-4 py-2.5 text-sm transition-colors ${
-                        isSelected
-                          ? 'accent-active'
-                          : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
-                      }`}
-                    >
-                      <AvatarCircle
-                        src={agentAvUrl}
-                        fallback={getAgentEmoji(agent)}
-                        size="sm"
-                        bgClass="bg-white/[0.06]"
-                        textClass="text-slate-300"
-                      />
-                      <span className="flex-1 text-left">{getAgentLabel(agent, assistantName)}</span>
-                      {agent.model && (
-                        <span className="text-[10px] text-slate-600 font-mono truncate max-w-[80px]">
-                          {getShortModelLabel(agent.model)}
-                        </span>
-                      )}
-                      {isSelected && (
-                        <Check size={13} className="accent-text flex-shrink-0" />
-                      )}
-                    </button>
-                  );
-                })}
+  const openClawProvider = providers.find((entry) => (entry.harnessId || entry.name) === 'OPENCLAW');
+  const canSelectOpenClawAgent = Boolean(openClawProvider && openClawProvider.selectable !== false
+    && openClawProvider.implemented !== false && (value === 'OPENCLAW' || (!providerLoadError
+      && openClawProvider.usable === true && !openClawProvider.checking && !openClawProvider.stale
+      && !['checking', 'stale', 'error'].includes(openClawProvider.availabilityState || ''))));
+  const directory = [
+    ...providers.map((entry) => {
+      const harness = entry.harnessId || entry.name;
+      const label = harness === 'OPENCLAW' ? assistantName || 'OpenClaw' : HARNESS_META[harness]?.label || entry.displayName;
+      return { key: harness, label, search: `${label} ${harness} ${entry.displayName}`, render: () => renderProvider(entry) };
+    }),
+    ...(hasOpenClawProvider ? openClawAgents.map((agent) => ({
+      key: `OPENCLAW:${agent.id}`, label: getAgentLabel(agent, assistantName),
+      search: `${getAgentLabel(agent, assistantName)} ${agent.id} OpenClaw ${agent.model || ''}`,
+      render: () => <button key={agent.id} type="button" disabled={disabled || !canSelectOpenClawAgent}
+        onClick={() => handleSelect('OPENCLAW', agent.id)}
+        className={`flex w-full items-center gap-2.5 px-4 py-2.5 text-sm transition-colors disabled:opacity-50 ${value === 'OPENCLAW' && effectiveAgentId === agent.id ? 'accent-active' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
+        <AvatarCircle src={getSubAgentAvatarUrl(agent)} fallback={getAgentEmoji(agent)} size="sm" bgClass="bg-white/[0.06]" textClass="text-slate-300" />
+        <span className="min-w-0 flex-1 text-left"><span className="block truncate font-medium">{getAgentLabel(agent, assistantName)}</span>
+          <span className="block truncate text-[10px] text-slate-500">OpenClaw · Configured agent{agent.model ? ` · ${getShortModelLabel(agent.model)}` : ''}</span></span>
+        {value === 'OPENCLAW' && effectiveAgentId === agent.id && <Check size={13} className="accent-text shrink-0" />}
+      </button>,
+    })) : []),
+  ].filter((entry) => entry.search.toLowerCase().includes(agentQuery.trim().toLowerCase()))
+    .sort((a, b) => a.label.localeCompare(b.label));
+
+  return (
+    <div className="flex items-center gap-1.5">
+      {/* ── Agent Dropdown ──────────────────────────────────────── */}
+      <div className="relative">
+        <button
+          ref={triggerRef}
+          onClick={() => { if (!disabled) setOpen(!open); }}
+          disabled={disabled}
+          aria-label="Choose agent"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] text-sm text-slate-300 transition-colors disabled:cursor-wait disabled:opacity-50"
+        >
+          <AvatarCircle
+            src={displayAvatarUrl}
+            fallback={displayFallback}
+            size="sm"
+            bgClass={displayBg}
+            textClass={displayTextClass}
+          />
+          <span className="min-w-0 max-w-[100px] text-left sm:max-w-[160px]"><span className="block truncate">{displayLabel}</span><span className="block truncate text-[9px] leading-tight text-slate-500">{currentMeta.label}</span></span>
+          {loading ? (
+            <Loader2 size={13} className="animate-spin text-sky-400" />
+          ) : (
+            <ChevronDown
+              size={14}
+              className={`text-slate-500 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+            />
+          )}
+        </button>
+
+        {/* ── Dropdown Panel ──────────────────────────────────────── */}
+        <DropdownSheet
+          open={open}
+          onClose={() => setOpen(false)}
+          anchorRef={triggerRef}
+          width={336}
+          align="start"
+          title="Talk to…"
+          ariaLabel="Choose an agent"
+          closeLabel="Close agent picker"
+        >
+          <div className="shrink-0 border-b border-white/10 p-3">
+            <p className="mb-2 text-sm font-medium text-white">Talk to…</p>
+            <label className="flex items-center gap-2 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-slate-400">
+              <Search size={14} /><input type="search" aria-label="Find an agent" placeholder="Search agents or harnesses…" value={agentQuery} onChange={(event) => setAgentQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none" />
+            </label>
+          </div>
+          <div className="min-h-0 max-h-[420px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
+            {/* ── HARNESSES Section ────────────────────────────────── */}
+            <div className="px-3 pt-3 pb-1">
+              <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
+                <Users size={10} />
+                Agents & assistants
+              </div>
+            </div>
+
+            {loading && (
+              <div className="mx-3 mb-2 rounded-lg border border-sky-400/15 bg-sky-500/10 px-3 py-2 text-xs text-sky-100 flex items-center gap-2">
+                <Loader2 size={12} className="animate-spin text-sky-300" />
+                <span>Loading available harnesses and agents…</span>
               </div>
             )}
+
+            {!loading && providerLoadError && (
+              <div
+                role="alert"
+                className="mx-3 mb-2 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100"
+              >
+                <div>
+                  {providers.length > 0
+                    ? `Couldn’t refresh harnesses. Showing the last available list. ${providerLoadError}`
+                    : `Couldn’t load harnesses. Your current selection is unchanged. ${providerLoadError}`}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setProviderRefreshNonce((nonce) => nonce + 1)}
+                  disabled={disabled}
+                  className="mt-2 rounded-md border border-amber-300/30 bg-amber-400/10 px-2 py-1 font-medium text-amber-100 transition-colors hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Retry loading harnesses
+                </button>
+              </div>
+            )}
+
+            {!loading && !providerLoadError && providers.length === 0 && (
+              <div className="px-4 py-4 text-xs text-slate-500">
+                No harnesses returned yet. Try refresh if this stays empty.
+              </div>
+            )}
+
+            {directory.map((entry) => <div key={entry.key}>{entry.render()}</div>)}
+            {!loading && !providerLoadError && providers.length > 0 && directory.length === 0 && <p className="px-4 py-6 text-xs text-slate-400">No agents match this search.</p>}
+
 
             <div className="h-1.5" />
           </div>
         </DropdownSheet>
       </div>
 
-      {/* ── Sessions Dropdown (providers with session history) ───── */}
+      {/* ── Sessions Dropdown (harnesses with session history) ───── */}
       {canAttemptSessionList && onViewSession && (
         <SessionDropdown
+          key={`${value}:${agentId || DEFAULT_OPENCLAW_AGENT_ID}`}
           sessions={sessions}
           loading={sessionsLoading}
           hasLoaded={sessionsLoaded}

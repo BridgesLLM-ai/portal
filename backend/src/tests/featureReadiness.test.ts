@@ -12,8 +12,10 @@ jest.mock('child_process', () => ({
 import {
   FEATURE_READINESS_MATRIX,
   buildOllamaFeatureReadiness,
+  buildSuggestedNextActions,
   evaluateFeatureReadinessCheck,
   isSuccessfulReadinessHttpStatus,
+  probeLocalOllamaVersion,
   probePinnedCliVersion,
   summarizeFeature,
   type ReadinessCheckResult,
@@ -178,6 +180,26 @@ describe('feature readiness contract', () => {
     expect(tailnet.checks[0]).not.toHaveProperty('url');
     expect(JSON.stringify(tailnet)).not.toContain('http://');
     expect(JSON.stringify(tailnet)).not.toContain('https://');
+  });
+
+  test('keeps missing local Ollama package guidance fail-closed in next actions', () => {
+    const { local } = ollamaFeatures();
+    const binary = local.checks.find((item) => item.id === 'ollamaBinary');
+    expect(binary?.remediation).toBe(
+      'Ollama package installation is unavailable until the durable Ollama adapter ships. Runtime status and service troubleshooting remain available.',
+    );
+
+    const actions = buildSuggestedNextActions([{
+      id: local.id,
+      label: local.label,
+      status: 'missing',
+      applicable: true,
+      checks: [{ ...binary!, ok: false, message: 'ollama is absent' }],
+    }]);
+    expect(actions).toEqual([
+      'Ollama (Local): Ollama package installation is unavailable until the durable Ollama adapter ships. Runtime status and service troubleshooting remain available.',
+    ]);
+    expect(actions.join(' ')).not.toMatch(/install Ollama/i);
   });
 
   test('LOCAL selection probes the exact central authority and the local binary only', async () => {
@@ -358,7 +380,7 @@ describe('feature readiness contract', () => {
     process.env.HTTPS_PROXY = 'http://proxy.invalid:3128';
     process.env.ALL_PROXY = 'socks5://proxy.invalid:1080';
     mockedExecFile.mockImplementation(((_command: string, _args: string[], _options: unknown, callback: Function) => {
-      callback(null, 'ollama version 0.11.0\n', '');
+      callback(null, `ollama version ${PORTAL_TOOL_VERSIONS.ollama}\n`, '');
       return {} as any;
     }) as any);
 
@@ -369,7 +391,7 @@ describe('feature readiness contract', () => {
       expect(definition).toBeDefined();
       await expect(evaluateFeatureReadinessCheck(definition!)).resolves.toMatchObject({
         ok: true,
-        message: 'ollama version 0.11.0',
+        message: `Portal-tested Ollama ${PORTAL_TOOL_VERSIONS.ollama} (verified)`,
       });
       expect(mockedExecFile).toHaveBeenCalledWith(
         'ollama',
@@ -447,23 +469,23 @@ describe('probePinnedCliVersion', () => {
     await expect(probePinnedCliVersion({
       binary: 'agy',
       args: ['--version'],
-      tested: '1.1.7',
-      env: { AGY_CLI_DISABLE_AUTO_UPDATE: '1' },
-    })).resolves.toEqual({ ok: false, message: 'Installed 9.9.9 has drifted from the Portal-tested 1.1.7.' });
+      tested: '1.1.17',
+      env: { AGY_CLI_DISABLE_AUTO_UPDATE: 'true' },
+    })).resolves.toEqual({ ok: false, message: 'Installed 9.9.9 has drifted from the Portal-tested 1.1.17.' });
   });
 
   test('fails closed on missing binaries and versionless output', async () => {
     mockedExecFile.mockImplementation(((_command: string, _args: string[], _options: unknown, callback: Function) => {
       callback(new Error('spawn grok ENOENT'), '', '');
     }) as any);
-    await expect(probePinnedCliVersion({ binary: 'grok', args: ['--no-auto-update', '--version'], tested: '0.2.112' }))
-      .resolves.toMatchObject({ ok: false, message: expect.stringContaining('Could not verify the Portal-tested 0.2.112') });
+    await expect(probePinnedCliVersion({ binary: 'grok', args: ['--no-auto-update', '--version'], tested: '1.0.5' }))
+      .resolves.toMatchObject({ ok: false, message: expect.stringContaining('Could not verify the Portal-tested 1.0.5') });
 
     mockedExecFile.mockImplementation(((_command: string, _args: string[], _options: unknown, callback: Function) => {
       callback(null, 'no digits here', '');
     }) as any);
-    await expect(probePinnedCliVersion({ binary: 'grok', args: ['--version'], tested: '0.2.112' }))
-      .resolves.toEqual({ ok: false, message: 'No version reported (Portal-tested 0.2.112).' });
+    await expect(probePinnedCliVersion({ binary: 'grok', args: ['--version'], tested: '1.0.5' }))
+      .resolves.toEqual({ ok: false, message: 'No version reported (Portal-tested 1.0.5).' });
   });
 
   test('the probe never inherits ambient endpoint or proxy environment', async () => {
@@ -474,30 +496,53 @@ describe('probePinnedCliVersion', () => {
         LC_ALL: 'C',
         GROK_DISABLE_AUTOUPDATER: '1',
       });
-      callback(null, 'grok 0.2.112\n', '');
+      callback(null, 'grok 1.0.5\n', '');
     }) as any);
     await expect(probePinnedCliVersion({
       binary: 'grok',
       args: ['--no-auto-update', '--version'],
-      tested: '0.2.112',
+      tested: '1.0.5',
       env: { GROK_DISABLE_AUTOUPDATER: '1' },
-    })).resolves.toEqual({ ok: true, message: 'Portal-tested 0.2.112 (verified)' });
+    })).resolves.toEqual({ ok: true, message: 'Portal-tested 1.0.5 (verified)' });
   });
 
-  test('the Agent Tools matrix pins every native provider CLI to the portal catalog', () => {
+  test('local Ollama readiness requires the exact Portal-qualified release', async () => {
+    mockedExecFile.mockImplementationOnce(((_command: string, _args: string[], options: { env?: Record<string, string> }, callback: Function) => {
+      expect(options.env).toMatchObject({ OLLAMA_HOST: 'http://127.0.0.1:11434' });
+      callback(null, `ollama version is ${PORTAL_TOOL_VERSIONS.ollama}\n`, '');
+    }) as any);
+    await expect(probeLocalOllamaVersion()).resolves.toEqual({
+      ok: true,
+      message: `Portal-tested Ollama ${PORTAL_TOOL_VERSIONS.ollama} (verified)`,
+    });
+
+    mockedExecFile.mockImplementationOnce(((_command: string, _args: string[], _options: unknown, callback: Function) => {
+      callback(null, 'ollama version is 0.32.14\n', '');
+    }) as any);
+    await expect(probeLocalOllamaVersion()).resolves.toEqual({
+      ok: false,
+      message: `Installed Ollama 0.32.14 has drifted from the Portal-tested ${PORTAL_TOOL_VERSIONS.ollama}.`,
+    });
+  });
+
+  test('the Agent Tools matrix omits unqualified native-binary probes', () => {
     const agentTools = FEATURE_READINESS_MATRIX.find((feature) => feature.id === 'agentTools');
     const byId = Object.fromEntries((agentTools?.checks || []).map((check) => [check.id, check]));
-    expect(byId.codex?.pinnedCli).toMatchObject({ binary: 'codex', tested: PORTAL_TOOL_VERSIONS.codexCli });
-    expect(byId.claude?.pinnedCli).toMatchObject({ binary: 'claude', tested: PORTAL_TOOL_VERSIONS.claudeCode });
-    expect(byId.antigravity?.pinnedCli).toMatchObject({
-      binary: 'agy',
-      tested: PORTAL_TOOL_VERSIONS.antigravity,
-      env: { AGY_CLI_DISABLE_AUTO_UPDATE: '1' },
-    });
-    expect(byId.grokBuild?.pinnedCli).toMatchObject({
-      binary: 'grok',
-      tested: PORTAL_TOOL_VERSIONS.grokBuild,
-      env: { GROK_DISABLE_AUTOUPDATER: '1' },
-    });
+    expect(byId.codex).toMatchObject({ nativeHostCliTool: 'codex' });
+    expect(byId.codex?.pinnedCli).toBeUndefined();
+    expect(byId.codex?.command).toBeUndefined();
+    expect(byId.claude).toMatchObject({ nativeHostCliTool: 'claude-code' });
+    expect(byId.claude?.pinnedCli).toBeUndefined();
+    expect(byId.claude?.command).toBeUndefined();
+    for (const providerId of ['codex', 'claude']) {
+      expect(byId[providerId]?.remediation).toMatch(
+        /Admin > Maintenance > Update Compatible AI Tools/i,
+      );
+      expect(byId[providerId]?.remediation).not.toMatch(
+        /Host Tools Maintenance|supervised host maintenance|--maintain-tools/i,
+      );
+    }
+    expect(byId.antigravity).toBeUndefined();
+    expect(byId.grokBuild).toBeUndefined();
   });
 });

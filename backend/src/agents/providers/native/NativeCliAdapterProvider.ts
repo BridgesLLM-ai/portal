@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { withPortalGuideReference } from '../../../services/portalOperatingGuide';
 import { randomUUID } from 'crypto';
 import type {
   AgentMessage,
@@ -59,6 +60,22 @@ import {
   terminateHostAgentRunAttempt,
   type HostAgentRunHandle,
 } from '../../../services/hostAgentRunJournal';
+import { attestNativeHostCli } from '../../../services/nativeHostCliAdmission';
+
+type NativeHostCliIdentity = Readonly<{
+  toolId: 'codex' | 'claude-code';
+  executablePath: '/usr/bin/codex' | '/usr/bin/claude';
+}>;
+
+function nativeHostCliIdentity(provider: AgentProviderName): NativeHostCliIdentity | null {
+  if (provider === 'CODEX') {
+    return Object.freeze({ toolId: 'codex', executablePath: '/usr/bin/codex' });
+  }
+  if (provider === 'CLAUDE_CODE') {
+    return Object.freeze({ toolId: 'claude-code', executablePath: '/usr/bin/claude' });
+  }
+  return null;
+}
 
 function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
@@ -287,7 +304,9 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
       config.executionContext,
     );
     if (config.executionContext.scope === 'HOST_OPERATOR') {
-      const readiness = await getNativeProviderReadiness(this.adapter.providerName);
+      const readiness = await getNativeProviderReadiness(this.adapter.providerName, {
+        executionScope: 'HOST_OPERATOR',
+      });
       if (!readiness.usable) throw new Error(readiness.message);
     }
     const resolvedConfig = this.adapter.configureSession
@@ -317,7 +336,9 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
     // sync cached-availability gate raced the background auth recheck: an
     // ambiguous "checking" snapshot failed Project turns and qualification
     // probes closed even though a live verification would have admitted them.
-    const readiness = await getNativeProviderReadiness(this.adapter.providerName);
+    const readiness = await getNativeProviderReadiness(this.adapter.providerName, {
+      executionScope: session.executionContext.scope,
+    });
     if (!readiness.usable) throw new Error(readiness.message);
     if (session.executionContext.scope === 'HOST_OPERATOR') {
       admittedReadiness = readiness;
@@ -330,14 +351,21 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
     const runId = typeof sender?.requestId === 'string' && sender.requestId.trim()
       ? sender.requestId.trim()
       : randomUUID();
-    if (publishToHostBus && sender?.userId && sender.userId !== session.userId) {
-      throw new Error(`${this.adapter.displayName} sender does not own this host session`);
+    const actorUserId = typeof sender?.userId === 'string' ? sender.userId : '';
+    const actorAuthorizationVersion = Number(sender?.authorizationVersion);
+    if (publishToHostBus && (
+      !actorUserId
+      || actorUserId !== session.userId
+      || !Number.isSafeInteger(actorAuthorizationVersion)
+      || actorAuthorizationVersion < 1
+    )) {
+      throw new Error(`${this.adapter.displayName} host execution requires current owner authorization evidence`);
     }
     const hostRunHandle = publishToHostBus
       ? await beginHostAgentRun({
           id: runId,
-          actorUserId: sender?.userId || session.userId,
-          actorAuthorizationVersion: Number(sender?.authorizationVersion),
+          actorUserId,
+          actorAuthorizationVersion,
           provider: this.adapter.providerName,
           sessionId: portalSessionId,
         })
@@ -776,6 +804,9 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
       attempt.onCloseDeadline = () => { void handleAttemptCloseDeadline(attempt); };
       turn.currentAttempt = attempt;
       let invocationResolved = false;
+      const hostCli = publishToHostBus
+        ? nativeHostCliIdentity(this.adapter.providerName)
+        : null;
 
       try {
         // Do not race invocation construction against the local AbortSignal.
@@ -784,7 +815,16 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
         // supply the authoritative abort hook for that boundary.
         // Defer the adapter call by one microtask so invocationPromise is
         // installed before a synchronous approval callback can re-enter abort.
-        attempt.invocationPromise = Promise.resolve().then(() => this.adapter.buildInvocation(ctx!));
+        attempt.invocationPromise = Promise.resolve().then(async () => {
+          const invocation = await this.adapter.buildInvocation(ctx!);
+          if (hostCli && invocation.command !== hostCli.executablePath) {
+            throw new Error(`${this.adapter.displayName} host invocation did not use its admitted executable`);
+          }
+          if (hostCli && invocation.stdinText !== ctx!.message) {
+            throw new Error(`${this.adapter.displayName} host invocation did not isolate its prompt on stdin`);
+          }
+          return invocation;
+        });
         const invocation = await attempt.invocationPromise;
         clearInvocationAbortDeadline(attempt);
         invocationResolved = true;
@@ -819,12 +859,20 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
         const hostRunReservation = turn.hostRunHandle
           ? await reserveHostAgentRunAttempt(turn.hostRunHandle)
           : null;
+        // Attest after invocation construction and durable reservation, as
+        // close to the systemd spawn as the asynchronous boundary permits.
+        // The fixed PATH below prevents a catalogued JS launcher from using
+        // an ambient /usr/local interpreter between admission and exec.
+        if (hostCli) {
+          await attestNativeHostCli(hostCli.toolId, hostCli.executablePath);
+        }
         const gatedLaunch = turn.hostRunHandle && hostRunReservation
           ? await spawnGatedHostAgentRunAttempt({
               handle: turn.hostRunHandle,
               reservation: hostRunReservation,
               command: invocation.command,
               args: invocation.args,
+              stdinText: invocation.stdinText,
               options: {
                 ...spawnOptions,
                 detached: true,
@@ -968,15 +1016,29 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
         ctx = {
           session,
           originalSessionId: portalSessionId,
-          message,
+          message: withPortalGuideReference(message, publishToHostBus && session.messages.length === 1),
           onChunk,
-          onStatus,
+          // Legacy adapter tool/progress callbacks must share the same canonical
+          // publication path as emitStatus, even when no immediate HTTP callback
+          // exists. Session-identity announcements (`type: 'session'`, emitted
+          // when a native thread starts) are immediate-callback metadata only:
+          // publishing them on the host bus makes the browser adopt the run's
+          // native session and abandon the project conversation that owns the
+          // work card, dock, rail and composer-side approvals.
+          onStatus: (event) => {
+            if (event?.type === 'session') {
+              if (turn.settlePromise) return;
+              onStatus?.(sanitizeNativeProviderEvent<Record<string, unknown>>({ ...(event as any), runId }) as any);
+              return;
+            }
+            ctx?.emitStatus(typeof event.content === 'string' ? event.content : '', event as any);
+          },
           onExecApproval,
           fullText: '',
           lastAssistantMessage: '',
           stderr: '',
           exitCode: null,
-          state: { portalRunId: runId },
+          state: { portalRunId: runId, originalUserMessage: message },
           emitChunk: (chunk) => {
             if (!chunk || turn.settlePromise) return;
             onChunk?.(chunk);

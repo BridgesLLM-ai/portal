@@ -125,6 +125,7 @@ export async function deliverNativeAskUserQuestionAnswer(
       prepared.runId,
       prepared.toolCallId,
       prepared.text,
+      prepared.answers,
     );
     const record = dependencies.commitAnswer(prepared, reservation);
     return { record, idempotentReplay: delivery.idempotentReplay };

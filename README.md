@@ -26,25 +26,28 @@ Bring your own providers — Claude, Codex, Gemini, API keys, or Ollama running 
 curl -fsSL https://bridgesllm.ai/install.sh | sudo bash
 ```
 
+Choose **Install** on a new server, or **Update / Repair** when Portal is already installed. Update and Repair preserve your data and leave AI runtimes unchanged. Nothing changes until you choose. For unattended installation, add `-s -- --install`; use `--repair` to reinstall Portal files without deleting data.
+
 Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · root or sudo. A domain unlocks HTTPS, mail, and public share links.
 
-## What changed in 4.0
+## What changed in 4.1
 
-4.0 is a foundation release. Less new surface area, more of the workstation actually holding together under load, restarts, and upgrades.
+4.1 turns the 4.0 foundation into a calmer workstation: stronger long-running chat, truthful provider readiness, safer recovery, and updates that keep the Portal and its AI tools compatible without silently changing the host.
 
-- **Answer an agent from wherever you are.** When an agent needs a decision, a notification follows you across the Portal. Expand it, pick an option or type a reply, send. No hunting for the tab it came from.
-- **Long turns survive a closed laptop.** Reconnect mid-run and the conversation replays instead of pretending it died. Steer or cancel a turn in flight; tool calls and thinking stay attached to the message they belong to.
-- **Every project runs in its own box.** A project agent gets one writable workspace and the public internet. Your host, your other projects, private networks, and credentials stay out of reach — verified before each turn, not assumed at startup.
-- **Upgrades stop eating your work.** Backups now cover project and standalone app sources. Update and restore bring back the apps that were running, and a failed promotion leaves the last good deployment in place.
-- **Provider setup tells you the truth up front.** The Portal confirms the model you picked is the model that will actually run, and says a provider is unavailable at setup time instead of failing quietly three prompts later.
-- **Updates you can watch and undo.** One button in the Dashboard: signed release notes, backup check, migrations, health checks, automatic rollback if the new build won't come up healthy.
-- **Everything else got a pass.** Setup, Files, Mail, Terminal, Remote Desktop, Apps, Tasks, Skills, Settings, Admin, light mode, and accessibility all got reliability and clarity work.
+- **Existing-install updates change Portal, not the whole host.** OpenClaw, native CLIs, Docker/AppArmor, Project runtimes, Remote Desktop, Ollama, and unrelated services stay unchanged while the signed Portal transaction stages, proves, and cuts over the new release.
+- **AI-tool updates are explicit compatibility bundles.** After the Portal update, the Dashboard can install one Portal-qualified set of OpenClaw 2026.9.1, Codex CLI 0.153.2, Claude Code 2.1.260, and ClawHub 0.23.3. Exact versions and package identities are signed and verified together; upstream `latest` tags and independent self-updaters are not used.
+- **The transition is staged, not improvised.** An ordinary Portal-only update can retain the supported OpenClaw 2026.7.1 lane without mutating or restarting it. The separate compatibility action then moves the complete tested tool tuple, or restores the complete predecessor tuple on failure. Fresh installs converge directly to the same qualified bundle.
+- **Long Agent Chat runs keep one identity.** Reconnect, history, steering, clarification replies, and confirmed aborts stay attached to the exact run through refreshes, retries, Gateway restarts, and competing tabs.
+- **Provider readiness is evidence, not optimism.** Codex and Claude re-check exact root-owned local packages before launch. GPT-6 Astra appears through the Codex runtime when the qualified bundle is installed, but its availability still depends on the connected OpenAI account. Hermes and OpenCode appear when their runtimes and credentials qualify. Missing or drifted tools are shown as unavailable rather than repaired behind your back.
+- **Backups protect your work, not the whole VPS.** Standard backups save projects and Portal settings/data. Comprehensive adds available agent personality and Portal-native history as reference exports. AI runtimes, provider logins, mail, and the operating system are excluded; legacy archives keep their existing readers.
+- **Progress means what it says.** Fresh installs use semantic phases, measured percentages only for measured work, stable narrow-terminal output, and clean plain/`NO_COLOR` fallbacks. Dashboard updates stop presenting compatibility markers as fake precision.
+- **Account retirement is transactional.** Admission closes first, then managed sessions, projects, files, apps, shares, credentials, and runtime state are removed or reassigned with durable recovery evidence.
 
-Read the complete [4.0.19 changelog](CHANGELOG.md#4019---2026-08-12) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
+Read the complete [5.0.0 changelog](CHANGELOG.md#500---2026-09-08) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
 
 ## What you get
 
-**Agent Chat** — One conversation surface for OpenClaw and native harnesses. Switch providers and models mid-thread, watch tool calls as they run, approve what needs approving, steer or stop a turn, and pick the conversation back up after a reload.
+**Agent Chat** — One conversation surface for OpenClaw and native harnesses, with separate saved histories. Switch harnesses, use supported model controls, inspect tasks and tool calls, render Mermaid diagrams, steer or stop a turn, and return after a reload.
 
 **Projects and code sandbox** — Create or import a project, edit in Monaco, run Git, install dependencies, preview or deploy, and hand the whole thing to an agent scoped to that one workspace.
 
@@ -58,7 +61,7 @@ Read the complete [4.0.19 changelog](CHANGELOG.md#4019---2026-08-12) and [releas
 
 **Terminal, tasks, and skills** — A browser terminal on the host, scheduled recurring agent work, background jobs you can inspect, and skills from [ClawHub](https://clawhub.ai).
 
-**Setup and admin** — Setup creates a secure Owner first, then walks optional domain/TLS, mail, providers, local models, and Remote Desktop. Admin covers accounts, storage, alerts, backups, maintenance, and updates. The [backup and recovery guide](docs/BACKUP_AND_RECOVERY.md) explains complete, salvage-only, and cross-host recovery requirements.
+**Setup and admin** — Setup creates a secure Owner first, then walks optional domain/TLS, mail, providers, local models, and Remote Desktop. Admin covers accounts, storage, alerts, backups, maintenance, and updates. The [backup and recovery guide](docs/BACKUP_AND_RECOVERY.md) explains data-backup scope, verification, restore, and legacy archive compatibility.
 
 ## Architecture
 
@@ -102,19 +105,24 @@ Use the Owner-only **Update** button in the Dashboard. From SSH:
 curl -fsSL https://bridgesllm.ai/install.sh | sudo bash -s -- --update
 ```
 
-Either path verifies one signed artifact, checks for a fresh backup, applies migrations, validates the tested OpenClaw core/plugin pair, runs authenticated health checks afterward, and rolls back if the candidate can't come up. Unrelated host-tool upgrades stay in explicit maintenance actions rather than riding along inside every Portal update.
+Either path authenticates the signed release and exact installer, checks backup recoverability, stages the Portal while the current service remains online, proves a private candidate, and cuts over only after its runtime, schema, and readiness match the requested version. A failed Portal transaction rolls back its owned state.
 
-### Read this before upgrading to 4.0
+Ordinary Portal updates do not install, repair, configure, approve, or restart OpenClaw, Codex, Claude Code, ClawHub, Docker/AppArmor, Project runtimes, Remote Desktop, Ollama, or unrelated services. The retained OpenClaw 2026.7.1 lane remains supported while you review the new Portal. When you are ready, the Owner-only **Update compatible AI tools** action installs the exact Portal-qualified OpenClaw 2026.9.1, Codex CLI 0.153.2, Claude Code 2.1.260, and ClawHub 0.23.3 bundle. It does not follow upstream `latest` tags, and a failed transaction restores the prior tested tuple instead of leaving mixed versions. Fresh installs converge to that same exact bundle.
 
-- **Everyone signs in once more.** Accounts and managed data carry over.
-- **3.x projects and apps carry over** — files, the apps attached to them, and which apps were running. Projects still carrying old OpenClaw state stay readable, but Project Chat, rename, and delete wait until that state can be reconciled safely. The Portal would rather block than guess.
+### Read this before upgrading to 4.1
+
+- **Portal update first, compatibility update second.** The Portal stage keeps the current AI runtime online. The separate tool stage is deliberate because OpenClaw, its plugins, and native harnesses must move and roll back as one tested compatibility unit.
+- **GPT-6 Astra is account-dependent.** Portal uses the exact `gpt-6-astra` model ID through the qualified Codex runtime and never silently makes it the default or fallback. A connected OpenAI account still has to be entitled to use it.
+- **Do not independently update the managed tools.** Package drift is reported as needing repair. The compatibility action—not an upstream self-updater—is the supported route back to an attested bundle.
+- **Existing upgrades do not add Hermes or OpenCode automatically.** Those optional runtimes remain available only when their own installed packages and credentials qualify.
+- **DeepSeek API models and the native DeepSeek Harness are different paths.** API-model access remains available through supported providers; the native Harness is disabled and non-selectable in 4.1.
 - **A Complete wipe only removes what it recorded.** If you copied managed data somewhere else before uninstalling, check the host yourself.
 
 ## Privacy and telemetry
 
 Your data, files, projects, credentials, and services stay on your server. Requests to an external AI provider leave it, under that provider's terms; public shares and enabled mail protocols are reachable from outside on purpose.
 
-Fresh 4.0 setup defaults limited operational telemetry to **on** and shows you the choice before setup finishes. When enabled, the Portal reports shortly after startup and roughly every 24 hours while running. That report carries a random install ID, Portal and dependency versions, user count, uptime, Node version, OS, and architecture. It carries no messages, prompts, project files, credentials, usernames, or email addresses. Turning it off stops that report. Separately, opening the Dashboard checks the version endpoint for updates, and the installer reports install/update milestones with the event type, version, OS, and install ID — normal request metadata reaches the receiving service either way.
+Fresh setup defaults limited operational telemetry to **on** and shows you the choice before setup finishes. When enabled, the Portal reports shortly after startup and roughly every 24 hours while running. That report carries a random install ID, Portal and dependency versions, user count, uptime, Node version, OS, and architecture. It carries no messages, prompts, project files, credentials, usernames, or email addresses. Turning it off stops that report. Separately, opening the Dashboard checks the version endpoint for updates, and a fresh installation sends start and completion events with the event type, version, OS, and install ID. Ordinary Portal updates do not send installer lifecycle events. Normal request metadata reaches the receiving service either way.
 
 ## Windows test drive (WSL 2 beta)
 
@@ -146,10 +154,10 @@ These boundaries assume a supported host and correct operator configuration. Rep
 
 ## Roadmap
 
-- [ ] 4.1: retire multi-user accounts only once sessions, projects, files, apps, shares, and runtime state can be removed or reassigned in one transaction
-- [ ] 4.1: prove Complete wipe positively, beyond the recorded managed paths
+- [ ] Prove Complete wipe positively beyond the recorded managed paths before broadening its authority
 - [ ] Deep-link agent questions to the exact conversation, plus a durable notification history
 - [ ] Qualify more Project Chat providers against the same filesystem and egress escape matrix
+- [ ] Add and qualify a native DeepSeek SDK harness, separate from DeepSeek API-model access
 - [ ] Grow the Windows/WSL preview into a supported local profile
 - [ ] Broaden browser, mobile, long-turn, and low-spec performance testing
 

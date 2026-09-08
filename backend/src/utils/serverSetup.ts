@@ -5,7 +5,13 @@ import { execFileSync, execSync } from "child_process";
 import dns from "dns/promises";
 import { AppError } from "../middleware/errorHandler";
 import { appContentOriginIsDistinct, configuredAppContentOrigin } from "./appContentSecurity";
-import { ANTIGRAVITY_NO_UPDATE_ENV, PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import { HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE } from '../config/toolAdapters';
+import { unqualifiedNativeBinaryReason } from '../config/unqualifiedNativeBinaryLane';
+import {
+  getNativeHostCliStatus,
+  type NativeHostCliStatusState,
+  type NativeHostCliStatusTool,
+} from '../services/nativeHostCliStatus';
 
 /**
  * Poll until HTTPS responds with a valid cert, or timeout.
@@ -89,40 +95,39 @@ const defaultCaddyCommandRunner: CaddyCommandRunner = {
 export interface CodingToolStatus {
   id: string;
   name: string;
-  command: string;
   description: string;
-  installCmd: string;
   installed: boolean;
   version: string;
+  state?: NativeHostCliStatusState;
+  installAvailable: boolean;
+  installUnavailableCode?: string;
 }
 
-const CODING_TOOL_CHECKS = [
+const ADMITTED_HOST_CODING_TOOLS: ReadonlyArray<{
+  id: NativeHostCliStatusTool;
+  name: string;
+  description: string;
+}> = [
   {
     id: 'codex',
     name: 'Codex CLI',
-    command: 'codex --version',
     description: 'OpenAI coding agent — excels at multi-file refactoring and building features',
-    installCmd: `npm install -g --no-audit --no-fund @openai/codex@${PORTAL_TOOL_VERSIONS.codexCli}`,
   },
   {
     id: 'claude-code',
     name: 'Claude Code',
-    command: 'claude --version',
     description: 'Anthropic coding agent — strong at architecture, reviews, and complex reasoning',
-    installCmd: `npm install -g --no-audit --no-fund @anthropic-ai/claude-code@${PORTAL_TOOL_VERSIONS.claudeCode}`,
-  },
-  {
-    id: 'antigravity',
-    name: 'Google Antigravity',
-    command: `${ANTIGRAVITY_NO_UPDATE_ENV} agy --version`,
-    description: 'Google coding agent — native replacement for Gemini CLI',
-    installCmd: 'bash /opt/bridgesllm/portal/installer/antigravity-runtime.sh converge',
   },
 ] as const;
 
-const CODING_TOOL_INSTALL_MAP: Record<string, string> = Object.fromEntries(
-  CODING_TOOL_CHECKS.map((tool) => [tool.id, tool.installCmd]),
-);
+const CODING_TOOL_CHECKS = [
+  {
+    id: 'antigravity',
+    name: 'Google Antigravity',
+    path: '/usr/local/bin/agy',
+    description: unqualifiedNativeBinaryReason('GEMINI'),
+  },
+] as const;
 
 export function getPublicIp(): string {
   if (process.env.PUBLIC_IP && process.env.PUBLIC_IP !== '0.0.0.0') return process.env.PUBLIC_IP;
@@ -697,27 +702,36 @@ export async function configureDomainAndHttps(domain: string): Promise<{
 }
 
 export async function getCodingToolsStatus(): Promise<{ tools: CodingToolStatus[] }> {
-  const tools = CODING_TOOL_CHECKS.map((tool) => {
+  const admittedHostTools = await Promise.all(ADMITTED_HOST_CODING_TOOLS.map(async (tool) => {
+    const status = await getNativeHostCliStatus(tool.id);
+    return {
+      ...tool,
+      installed: status.installed === true,
+      version: status.observedVersion || '',
+      state: status.state,
+      installAvailable: false,
+      installUnavailableCode: HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.code,
+    } satisfies CodingToolStatus;
+  }));
+  const genericTools = CODING_TOOL_CHECKS.map((tool) => {
     let installed = false;
-    let version = '';
 
     try {
-      const output = execSync(tool.command, { timeout: 5000, encoding: 'utf8' }).trim();
+      fs.accessSync(tool.path, fs.constants.X_OK);
       installed = true;
-      version = output.split('\n')[0].replace(/^[^0-9]*/, '').trim() || output.substring(0, 50);
     } catch {
       installed = false;
     }
 
-    return { ...tool, installed, version };
+    const { path: _path, ...publicTool } = tool;
+    return {
+      ...publicTool,
+      installed,
+      version: '',
+      installAvailable: false,
+      installUnavailableCode: HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.code,
+    } satisfies CodingToolStatus;
   });
 
-  return { tools };
-}
-
-export function installCodingTool(toolId: string): void {
-  const cmd = CODING_TOOL_INSTALL_MAP[toolId];
-  if (!cmd) throw new AppError(400, 'Unknown tool');
-
-  execSync(cmd, { timeout: 120000, encoding: 'utf8' });
+  return { tools: [...admittedHostTools, ...genericTools] };
 }

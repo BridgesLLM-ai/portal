@@ -27,34 +27,51 @@ log() {
   printf '[bridges-rd-session-guard] %s\n' "$*"
 }
 
+process_has_display() {
+  local pid="$1" entry
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/${pid}/environ" ]] || return 1
+  # /proc environment records are NUL-delimited. Builtin reads avoid a tr/grep
+  # process pair for every inspected desktop process under installation load.
+  while IFS= read -r -d '' entry; do
+    [[ "$entry" == "DISPLAY=${DISPLAY_NUM}" || "$entry" == "DISPLAY=${DISPLAY_NUM}.0" ]] && return 0
+  done < "/proc/${pid}/environ"
+  return 1
+}
+
 process_on_display() {
-  local process_name="$1"
-  local pid
+  local process_name="$1" pid
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
-    if tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
-      | grep -Eq "^DISPLAY=${DISPLAY_NUM//./\\.}(\\.0)?$"; then
-      return 0
-    fi
+    process_has_display "$pid" && return 0
   done < <(pgrep -u "$RD_USER" -x "$process_name" 2>/dev/null || true)
   return 1
 }
 
 desktop_session_pid() {
-  pgrep -u "$RD_USER" -x xfce4-session 2>/dev/null | head -n 1
+  local pid
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    process_has_display "$pid" || continue
+    printf '%s\n' "$pid"
+    return 0
+  done < <(pgrep -u "$RD_USER" -x xfce4-session 2>/dev/null || true)
+  return 1
 }
 
 desktop_session_env_value() {
-  local key="$1"
-  local pid
+  local key="$1" pid entry
   pid="$(desktop_session_pid || true)"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
-    | sed -n "s/^${key}=//p" \
-    | head -n 1
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/${pid}/environ" ]] || return 1
+  while IFS= read -r -d '' entry; do
+    if [[ "$entry" == "${key}="* ]]; then
+      printf '%s' "${entry#*=}"
+      return 0
+    fi
+  done < "/proc/${pid}/environ"
+  return 1
 }
 
-run_xfconf() {
+run_desktop_bus_command() {
   local dbus_address xdg_runtime
   dbus_address="$(desktop_session_env_value DBUS_SESSION_BUS_ADDRESS || true)"
   xdg_runtime="$(desktop_session_env_value XDG_RUNTIME_DIR || true)"
@@ -65,11 +82,15 @@ run_xfconf() {
     XAUTHORITY="$XAUTHORITY_FILE" \
     DBUS_SESSION_BUS_ADDRESS="$dbus_address" \
     XDG_RUNTIME_DIR="${xdg_runtime:-/tmp/bridges-rd-runtime}" \
-    xfconf-query "$@"
+    "$@"
+}
+
+run_xfconf() {
+  run_desktop_bus_command xfconf-query "$@"
 }
 
 known_locker_running() {
-  ps -u "$RD_USER" -o args= 2>/dev/null \
+  ps -ww -u "$RD_USER" -o args= 2>/dev/null \
     | grep -Eq '(^|/)(xfce4-screensaver|light-locker|xscreensaver|xss-lock)( |$)'
 }
 
@@ -77,10 +98,7 @@ foreign_greeter_on_display() {
   local pid
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
-    if tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
-      | grep -Eq "^DISPLAY=${DISPLAY_NUM//./\\.}(\\.0)?$"; then
-      return 0
-    fi
+    process_has_display "$pid" && return 0
   done < <(pgrep -f '(^|/)(lightdm-gtk-greeter|slick-greeter)( |$)' 2>/dev/null || true)
   return 1
 }
@@ -103,35 +121,48 @@ EOF
 }
 
 locker_autostart_is_disabled() {
-  local entry path
+  local entry path line hidden disabled
   for entry in xfce4-screensaver.desktop light-locker.desktop xscreensaver.desktop; do
     path="${AUTOSTART_DIR}/${entry}"
     [[ -f "$path" && ! -L "$path" ]] || return 1
     [[ "$(stat -c '%U:%G:%a' "$path" 2>/dev/null || true)" == "${RD_USER}:${RD_USER}:644" ]] || return 1
-    grep -Fx 'Hidden=true' "$path" >/dev/null 2>&1 || return 1
-    grep -Fx 'X-GNOME-Autostart-enabled=false' "$path" >/dev/null 2>&1 || return 1
+    hidden=false; disabled=false
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" == 'Hidden=true' ]] && hidden=true
+      [[ "$line" == 'X-GNOME-Autostart-enabled=false' ]] && disabled=true
+    done < "$path"
+    [[ "$hidden" == true && "$disabled" == true ]] || return 1
   done
 }
 
 converge_xfce_lock_policy() {
-  run_xfconf -c xfce4-session -p /general/LockCommand -s /bin/true >/dev/null 2>&1 \
-    || run_xfconf -c xfce4-session -p /general/LockCommand --create -t string -s /bin/true >/dev/null 2>&1 \
-    || true
-  run_xfconf -c xfce4-keyboard-shortcuts -p '/commands/custom/<Primary><Alt>l' -s /bin/true >/dev/null 2>&1 \
-    || run_xfconf -c xfce4-keyboard-shortcuts -p '/commands/custom/<Primary><Alt>l' --create -t string -s /bin/true >/dev/null 2>&1 \
-    || true
-  # The stock actions plugin exposes a Lock Screen action. A separator keeps
-  # the panel layout stable without offering an impossible password prompt.
-  run_xfconf -c xfce4-panel -p /plugins/plugin-14 -s separator >/dev/null 2>&1 || true
+  # Resolve the session bus and privilege boundary once for all writes, just
+  # as for the read-only snapshot. Cold-start repair must not repeatedly pay
+  # the environment lookup/PAM cost while XFCE itself is still starting.
+  run_desktop_bus_command /bin/sh -c '
+    xfconf-query -c xfce4-session -p /general/LockCommand -s /bin/true >/dev/null 2>&1 \
+      || xfconf-query -c xfce4-session -p /general/LockCommand --create -t string -s /bin/true >/dev/null 2>&1 \
+      || true
+    xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/<Primary><Alt>l" -s /bin/true >/dev/null 2>&1 \
+      || xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/<Primary><Alt>l" --create -t string -s /bin/true >/dev/null 2>&1 \
+      || true
+    # Preserve the managed panel layout without an impossible password prompt.
+    xfconf-query -c xfce4-panel -p /plugins/plugin-14 -s separator >/dev/null 2>&1 || true
+  ' || true
 }
 
 xfce_lock_policy_is_disabled() {
-  [[ "$(run_xfconf -c xfce4-session -p /general/LockCommand 2>/dev/null || true)" == '/bin/true' ]] \
-    || return 1
-  [[ "$(run_xfconf -c xfce4-keyboard-shortcuts -p '/commands/custom/<Primary><Alt>l' 2>/dev/null || true)" == '/bin/true' ]] \
-    || return 1
-  [[ "$(run_xfconf -c xfce4-panel -p /plugins/plugin-14 2>/dev/null || true)" == 'separator' ]] \
-    || return 1
+  # Resolve the desktop bus and drop privileges once for this read-only
+  # snapshot. Repeating the process/environment/PAM setup for each property
+  # consumed most of the watchdog budget on a loaded fresh-install host.
+  run_desktop_bus_command /bin/sh -c '
+    lock_command="$(xfconf-query -c xfce4-session -p /general/LockCommand 2>/dev/null)" || exit 1
+    [ "$lock_command" = /bin/true ] || exit 1
+    lock_shortcut="$(xfconf-query -c xfce4-keyboard-shortcuts -p "/commands/custom/<Primary><Alt>l" 2>/dev/null)" || exit 1
+    [ "$lock_shortcut" = /bin/true ] || exit 1
+    actions_plugin="$(xfconf-query -c xfce4-panel -p /plugins/plugin-14 2>/dev/null)" || exit 1
+    [ "$actions_plugin" = separator ]
+  '
 }
 
 prepare_display_lock() {
@@ -165,20 +196,23 @@ reset_idle_policy() {
 screen_policy_is_safe() {
   local state
   state="$(DISPLAY="$DISPLAY_NUM" XAUTHORITY="$XAUTHORITY_FILE" xset q 2>&1)" || return 1
-  grep -Eq 'prefer blanking:[[:space:]]+no' <<< "$state" || return 1
-  grep -Eq 'timeout:[[:space:]]+0([[:space:]]|$)' <<< "$state" || return 1
-  grep -Eq 'DPMS is Disabled|Server does not have the DPMS Extension' <<< "$state" || return 1
+  [[ "$state" =~ prefer\ blanking:[[:space:]]+no ]] || return 1
+  [[ "$state" =~ timeout:[[:space:]]+0([[:space:]]|$) ]] || return 1
+  [[ "$state" == *'DPMS is Disabled'* || "$state" == *'Server does not have the DPMS Extension'* ]] || return 1
 }
 
 check_session() {
+  # Exit 2 means the desktop runtime is absent/not responsive, not policy
+  # drift. Policy writes cannot start these processes and must not contend
+  # with their cold-start work. Both nonzero outcomes remain not-ready.
   DISPLAY="$DISPLAY_NUM" XAUTHORITY="$XAUTHORITY_FILE" xdpyinfo >/dev/null 2>&1 \
-    || { log "display ${DISPLAY_NUM} is not responsive"; return 1; }
+    || { log "display ${DISPLAY_NUM} is not responsive"; return 2; }
   process_on_display xfce4-session \
-    || { log "xfce4-session is missing from ${DISPLAY_NUM}"; return 1; }
+    || { log "xfce4-session is missing from ${DISPLAY_NUM}"; return 2; }
   process_on_display xfwm4 \
-    || { log "xfwm4 is missing from ${DISPLAY_NUM}"; return 1; }
+    || { log "xfwm4 is missing from ${DISPLAY_NUM}"; return 2; }
   process_on_display xfdesktop \
-    || { log "xfdesktop is missing from ${DISPLAY_NUM}"; return 1; }
+    || { log "xfdesktop is missing from ${DISPLAY_NUM}"; return 2; }
   ! known_locker_running \
     || { log "a password locker is running for ${RD_USER}"; return 1; }
   ! foreign_greeter_on_display \
@@ -199,14 +233,25 @@ repair_session() {
   reset_idle_policy
 }
 
+check_or_repair_session() {
+  local result=0
+  check_session || result=$?
+  case "$result" in
+    0) return 0 ;;
+    2) return 2 ;;
+  esac
+  repair_session && check_session
+}
+
 watch_session() {
   [[ "$VNC_PID" =~ ^[0-9]+$ ]] || { log 'watch requires a VNC pid'; return 2; }
   [[ "$XFCE_PID" =~ ^[0-9]+$ ]] || { log 'watch requires an XFCE pid'; return 2; }
 
   local failures=0
   while kill -0 "$VNC_PID" 2>/dev/null && kill -0 "$XFCE_PID" 2>/dev/null; do
-    repair_session
-    if check_session; then
+    # Healthy checks are read-only. Repair only observed drift, and still
+    # require the complete semantic check before sending a heartbeat.
+    if check_or_repair_session; then
       failures=0
       # The launcher execs this guard after READY, so its PID remains the
       # systemd main PID. Attribute each heartbeat to that stable parent of
@@ -236,8 +281,9 @@ case "$ACTION" in
     terminate_known_lockers
     ;;
   repair)
-    repair_session
-    check_session
+    # The recovery timer and startup both use this action. Leave an already
+    # healthy desktop untouched, then verify any repair before accepting it.
+    check_or_repair_session
     ;;
   check)
     check_session

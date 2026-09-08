@@ -4,6 +4,7 @@ import path from 'path';
 const projectRoutesPath = path.resolve(__dirname, '../routes/projects.ts');
 const serverPath = path.resolve(__dirname, '../server.ts');
 const appsPath = path.resolve(__dirname, '../routes/apps.ts');
+const appProcessPath = path.resolve(__dirname, '../services/app-process.service.ts');
 
 function routeBlock(start: string, end: string): string {
   const source = fs.readFileSync(projectRoutesPath, 'utf8');
@@ -179,14 +180,44 @@ describe('Project deployment control contract', () => {
     const prepare = deploy.indexOf('prepareFullstackDeploymentTree(');
     const imagePreflight = deploy.indexOf('await assertProjectRuntimeImageAvailable()', prepare);
     const claim = deploy.indexOf('await claimProjectRuntimeRecoveryProof(', imagePreflight);
+    const quiesce = deploy.indexOf('await quiesceAppForDeployment(', claim);
     const promote = deploy.indexOf('fullstackPromotion.promote()', claim);
     const appMutation = deploy.indexOf('app = await prisma.app.update({', promote);
 
     expect(prepare).toBeGreaterThan(-1);
     expect(imagePreflight).toBeGreaterThan(prepare);
     expect(claim).toBeGreaterThan(imagePreflight);
+    expect(quiesce).toBeGreaterThan(claim);
+    expect(deploy.slice(quiesce, promote)).toContain('workloadId: previousFullstackApp.id');
+    expect(promote).toBeGreaterThan(quiesce);
     expect(promote).toBeGreaterThan(claim);
     expect(appMutation).toBeGreaterThan(promote);
+  });
+
+  test('startup quiesces an exact App runtime before converging an interrupted deployment', () => {
+    const source = fs.readFileSync(appProcessPath, 'utf8');
+    const quiesceStart = source.indexOf('export async function quiesceAppForDeployment');
+    const quiesceEnd = source.indexOf('export async function forgetAppRuntime', quiesceStart);
+    expect(quiesceStart).toBeGreaterThanOrEqual(0);
+    expect(quiesceEnd).toBeGreaterThan(quiesceStart);
+    const quiesceOperation = source.slice(quiesceStart, quiesceEnd);
+    expect(quiesceOperation).toContain('updateDatabase: false');
+    expect(quiesceOperation).toContain('persistState: false');
+
+    const start = source.indexOf('export async function restoreRunningApps()');
+    const end = source.indexOf('export async function initializeAppProcessRuntime()', start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const restore = source.slice(start, end);
+    const discover = restore.indexOf('listInterruptedDeploymentPromotionTargets(deploymentRoot)');
+    const quiesce = restore.indexOf('await stopProjectAppContainer(runtimeIdentity)', discover);
+    const recover = restore.indexOf('recoverInterruptedDeploymentPromotions(deploymentRoot)', quiesce);
+    const ordinaryRestore = restore.indexOf('for (const app of apps)', recover);
+
+    expect(discover).toBeGreaterThanOrEqual(0);
+    expect(quiesce).toBeGreaterThan(discover);
+    expect(recover).toBeGreaterThan(quiesce);
+    expect(ordinaryRestore).toBeGreaterThan(recover);
   });
 
   test('runtime mutations share the Project lifecycle lock and re-read identity under it', () => {

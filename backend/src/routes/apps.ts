@@ -9,6 +9,7 @@ import {
 } from '../utils/appApiProxyAuth';
 import {
   appApiBackendUnconfiguredResponse,
+  appApiJsonResponseLimitBytes,
   appApiRequestPathInvalidResponse,
   appApiUpstreamFailureResponse,
   createAppApiAbortContext,
@@ -37,18 +38,40 @@ import {
   SharePasswordAttemptLimiter,
   isValidShareToken,
   issueShareGrant,
+  MAX_RETURNED_SHARE_LINKS_PER_APP,
+  MAX_SHARE_LINKS_PER_APP,
   parseShareLinkOptions,
+  parseShareLinkPolicyPatch,
   shareCredentialStateIsValid,
   shareGrantTtlMs,
   shareGrantCookieName,
   sharePasswordBinding,
+  shareVisitorIdentityHash,
   validateSharePassword,
   verifyShareGrant,
 } from '../utils/shareAccessSecurity';
 import { claimShareRateLimit } from '../services/shareRateLimit';
+import {
+  claimShareConcurrentUse,
+  releaseShareConcurrentUse,
+  startShareConcurrentUseHeartbeat,
+} from '../services/shareConcurrentUse';
 import { APP_ZIP_LIMITS, safeExtractZipToNewDirectory } from '../services/safeZipExtraction';
+import {
+  ShareLinkPaginationError,
+  buildShareLinkPage,
+  parseShareLinkPagination,
+  shareLinkCursorWhere,
+} from '../utils/shareLinkPagination';
 import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
 import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
+import { AppError } from '../middleware/errorHandler';
+import {
+  acquireWorkspaceAuthorizationMutationLease,
+  admitWorkspaceAuthorizationMutation,
+  admitWorkspaceAuthorizationRead,
+  settleWorkspaceAuthorizationRequest,
+} from '../services/workspaceAuthorizationBarrier';
 import {
   ProjectExternalRuntimeLifecycleError,
   ProjectInvalidRuntimeBindingError,
@@ -80,8 +103,6 @@ const HOSTED_APPS_DIR = process.env.APPS_ROOT || '/var/www/bridgesllm-apps';
 const MAX_APP_DESCRIPTION_LENGTH = 4_000;
 const MAX_SHARE_HTML_BYTES = 5 * 1024 * 1024;
 const MAX_APPS_PER_USER = 500;
-const MAX_SHARE_LINKS_PER_APP = 1_000;
-const MAX_RETURNED_SHARE_LINKS_PER_APP = 100;
 
 function redactShareLink<T extends { passwordHash?: string | null }>(shareLink: T): Omit<T, 'passwordHash'> {
   const { passwordHash: _passwordHash, ...safeShareLink } = shareLink;
@@ -240,18 +261,22 @@ router.get('/', authenticateToken, requireApproved, async (req: Request, res: Re
       where: { userId: req.user!.userId },
       include: {
         shareLinks: {
-          orderBy: { createdAt: 'desc' },
-          take: MAX_RETURNED_SHARE_LINKS_PER_APP,
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: MAX_RETURNED_SHARE_LINKS_PER_APP + 1,
         },
       },
       orderBy: { createdAt: 'desc' },
       take: MAX_APPS_PER_USER,
     });
 
-    const safeApps = apps.map(({ shareLinks, ...app }) => ({
-      ...app,
-      shareLinks: shareLinks.map((shareLink) => redactShareLink(shareLink)),
-    }));
+    const safeApps = apps.map(({ shareLinks, ...app }) => {
+      const page = buildShareLinkPage(shareLinks, MAX_RETURNED_SHARE_LINKS_PER_APP);
+      return {
+        ...app,
+        shareLinks: page.rows.map((shareLink) => redactShareLink(shareLink)),
+        shareLinksPagination: page.pagination,
+      };
+    });
 
     res.json({ apps: safeApps });
   } catch (error) {
@@ -400,6 +425,7 @@ router.post('/:id/share', authenticateToken, requireApproved, async (req: Reques
         maxUses: options.maxUses,
         rateLimitMaxRequests: options.rateLimitMaxRequests,
         rateLimitWindowSeconds: options.rateLimitWindowSeconds,
+        maxConcurrentVisitors: options.maxConcurrentVisitors,
         isPublic,
         passwordHash,
       },
@@ -418,6 +444,7 @@ router.post('/:id/share', authenticateToken, requireApproved, async (req: Reques
           maxUses: options.maxUses,
           rateLimitMaxRequests: options.rateLimitMaxRequests,
           rateLimitWindowSeconds: options.rateLimitWindowSeconds,
+          maxConcurrentVisitors: options.maxConcurrentVisitors,
         },
       },
     }).catch(() => {});
@@ -432,28 +459,55 @@ router.post('/:id/share', authenticateToken, requireApproved, async (req: Reques
 // GET /api/apps/:id/share - bounded owner-scoped share history
 router.get('/:id/share', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
+    const paginationRequest = parseShareLinkPagination(req.query);
     const app = await prisma.app.findFirst({ where: { id: req.params.id, userId: req.user!.userId }, select: { id: true } });
     if (!app) { res.status(404).json({ error: 'App not found' }); return; }
     const shareLinks = await prisma.appShareLink.findMany({
-      where: { appId: app.id, userId: req.user!.userId },
-      orderBy: { createdAt: 'desc' },
-      take: MAX_RETURNED_SHARE_LINKS_PER_APP,
+      where: {
+        appId: app.id,
+        userId: req.user!.userId,
+        ...shareLinkCursorWhere(paginationRequest.cursor),
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: paginationRequest.limit + 1,
     });
-    res.json({ shareLinks: shareLinks.map((link) => redactShareLink(link)) });
+    const page = buildShareLinkPage(shareLinks, paginationRequest.limit);
+    res.json({
+      shareLinks: page.rows.map((link) => redactShareLink(link)),
+      pagination: page.pagination,
+    });
   } catch (error) {
+    if (error instanceof ShareLinkPaginationError) {
+      res.status(400).json({ error: error.message, code: 'SHARE_LINK_PAGINATION_INVALID' });
+      return;
+    }
     console.error('List app share links error:', error);
     res.status(500).json({ error: 'Failed to list share links' });
   }
 });
 
-// PATCH /api/apps/:id/share/:linkId - enable/disable an owned retained link
+// PATCH /api/apps/:id/share/:linkId - edit policy or enable/disable an owned link
 router.patch('/:id/share/:linkId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    if (typeof req.body?.isActive !== 'boolean') {
-      res.status(400).json({ error: 'isActive boolean is required' });
+    const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+    const policyFields = [
+      'expiresAt',
+      'maxUses',
+      'rateLimitMaxRequests',
+      'rateLimitWindowSeconds',
+      'maxConcurrentVisitors',
+    ] as const;
+    const hasPolicyUpdate = policyFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+    const hasActiveUpdate = Object.prototype.hasOwnProperty.call(body, 'isActive');
+    if (!hasPolicyUpdate && !hasActiveUpdate) {
+      res.status(400).json({ error: 'A share policy field or isActive boolean is required' });
       return;
     }
-    if (req.body.isActive) {
+    if (hasActiveUpdate && typeof body.isActive !== 'boolean') {
+      res.status(400).json({ error: 'isActive must be a boolean' });
+      return;
+    }
+    if (body.isActive === true || hasPolicyUpdate) {
       const unavailable = portalFeatureUnavailableResponse('appHosting');
       if (unavailable) {
         res.status(409).json(unavailable);
@@ -472,29 +526,73 @@ router.patch('/:id/share/:linkId', authenticateToken, requireApproved, async (re
       return;
     }
 
-    if (req.body.isActive) {
-      if (link.expiresAt && link.expiresAt.getTime() <= Date.now()) {
+    let policyPatch;
+    try {
+      policyPatch = parseShareLinkPolicyPatch(body, {
+        expiresAt: link.expiresAt,
+        maxUses: link.maxUses,
+        rateLimitMaxRequests: link.rateLimitMaxRequests,
+        rateLimitWindowSeconds: link.rateLimitWindowSeconds,
+        maxConcurrentVisitors: link.maxConcurrentVisitors,
+      });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+
+    const prospectiveExpiresAt = policyPatch.expiresAt !== undefined ? policyPatch.expiresAt : link.expiresAt;
+    const prospectiveMaxUses = policyPatch.maxUses !== undefined ? policyPatch.maxUses : link.maxUses;
+    if (body.isActive === true) {
+      if (prospectiveExpiresAt && prospectiveExpiresAt.getTime() <= Date.now()) {
         res.status(409).json({ error: 'Expired links cannot be reactivated; create a new link' });
         return;
       }
-      if (link.maxUses !== null && link.currentUses >= link.maxUses) {
+      if (prospectiveMaxUses !== null && link.currentUses >= prospectiveMaxUses) {
         res.status(409).json({ error: 'Links that reached their visit limit cannot be reactivated; create a new link' });
         return;
       }
     }
 
-    const updated = await prisma.appShareLink.update({
-      where: { id: link.id },
-      data: { isActive: req.body.isActive },
+    const updated = await prisma.$transaction(async (tx) => {
+      const value = await tx.appShareLink.update({
+        where: { id: link.id },
+        data: {
+          ...policyPatch,
+          ...(hasActiveUpdate ? { isActive: body.isActive as boolean } : {}),
+        },
+      });
+      if (body.isActive === false
+        || (Object.prototype.hasOwnProperty.call(body, 'maxConcurrentVisitors')
+          && policyPatch.maxConcurrentVisitors === null)) {
+        await tx.appShareRequestLease.deleteMany({ where: { shareLinkId: link.id } });
+      }
+      return value;
     });
     await prisma.activityLog.create({
       data: {
         userId: req.user!.userId,
-        action: req.body.isActive ? 'APP_SHARE_ENABLE' : 'APP_SHARE_DISABLE',
+        action: hasPolicyUpdate
+          ? 'APP_SHARE_POLICY_UPDATE'
+          : body.isActive ? 'APP_SHARE_ENABLE' : 'APP_SHARE_DISABLE',
         resource: 'app',
         resourceId: req.params.id,
         severity: 'INFO',
-        metadata: { shareLinkId: link.id },
+        metadata: {
+          shareLinkId: link.id,
+          ...(hasPolicyUpdate ? {
+            expiresAt: prospectiveExpiresAt,
+            maxUses: prospectiveMaxUses,
+            rateLimitMaxRequests: policyPatch.rateLimitMaxRequests !== undefined
+              ? policyPatch.rateLimitMaxRequests
+              : link.rateLimitMaxRequests,
+            rateLimitWindowSeconds: policyPatch.rateLimitWindowSeconds !== undefined
+              ? policyPatch.rateLimitWindowSeconds
+              : link.rateLimitWindowSeconds,
+            maxConcurrentVisitors: policyPatch.maxConcurrentVisitors !== undefined
+              ? policyPatch.maxConcurrentVisitors
+              : link.maxConcurrentVisitors,
+          } : {}),
+        },
       },
     }).catch(() => {});
     res.json({ shareLink: redactShareLink(updated) });
@@ -628,12 +726,60 @@ async function enforceShareAccessWindow(
   return true;
 }
 
-async function claimShareVisit(
+function admitResolvedShareLinkRequest(
+  req: Request,
+  res: Response,
+  link: { userId: string },
+): boolean {
+  const readOnly = req.method === 'GET' || req.method === 'HEAD';
+  return readOnly
+    ? admitWorkspaceAuthorizationRead(req, res, link.userId)
+    : admitWorkspaceAuthorizationMutation(req, res, link.userId);
+}
+
+interface PreparedShareVisitor {
+  grant: string;
+  visitorIdHash: string;
+  alreadyCounted: boolean;
+}
+
+function prepareShareVisitor(
+  req: Request,
+  link: { id: string; token: string },
+): PreparedShareVisitor | null {
+  const cookieName = shareGrantCookieName('visit', link.token);
+  const existing = req.cookies?.[cookieName];
+  const existingIdentity = shareVisitorIdentityHash(
+    existing,
+    { token: link.token, linkId: link.id },
+    config.jwtSecret,
+  );
+  if (existingIdentity && typeof existing === 'string') {
+    return { grant: existing, visitorIdHash: existingIdentity, alreadyCounted: true };
+  }
+
+  const maxAge = shareGrantTtlMs('visit');
+  const grant = issueShareGrant({
+    kind: 'visit',
+    token: link.token,
+    linkId: link.id,
+    expiresAt: Date.now() + maxAge,
+  }, config.jwtSecret);
+  const visitorIdHash = shareVisitorIdentityHash(
+    grant,
+    { token: link.token, linkId: link.id },
+    config.jwtSecret,
+  );
+  return visitorIdHash ? { grant, visitorIdHash, alreadyCounted: false } : null;
+}
+
+async function commitShareVisit(
   req: Request,
   res: Response,
   link: { id: string; token: string; maxUses: number | null },
+  visitor: PreparedShareVisitor,
 ): Promise<boolean> {
-  if (hasShareGrant(req, link, 'visit')) return true;
+  if (visitor.alreadyCounted) return true;
 
   const activeWindow = {
     id: link.id,
@@ -657,7 +803,14 @@ async function claimShareVisit(
     return false;
   }
 
-  grantShareAccess(req, res, link, 'visit');
+  const maxAge = shareGrantTtlMs('visit');
+  res.cookie(shareGrantCookieName('visit', link.token), visitor.grant, {
+    httpOnly: true,
+    secure: requestIsSecure(req),
+    sameSite: 'strict',
+    maxAge,
+    path: `/share/${link.token}`,
+  });
   return true;
 }
 
@@ -676,6 +829,144 @@ function preflightShareVisit(
     return false;
   }
   return true;
+}
+
+async function admitShareRequest(
+  req: Request,
+  res: Response,
+  link: {
+    id: string;
+    token: string;
+    maxUses: number | null;
+    currentUses: number;
+    isActive: boolean;
+    expiresAt: Date | null;
+    rateLimitMaxRequests: number | null;
+    rateLimitWindowSeconds: number | null;
+    rateLimitRequestCount: number;
+    rateLimitWindowStartedAt: Date | null;
+    maxConcurrentVisitors: number | null;
+    userId: string;
+  },
+  options: { rateLimit: boolean },
+): Promise<boolean> {
+  let releasePortalMutationLease: (() => void) | null = null;
+  try {
+    releasePortalMutationLease = acquireWorkspaceAuthorizationMutationLease(link.userId);
+  } catch (error) {
+    if (!(error instanceof AppError) || error.statusCode !== 409) throw error;
+    res.status(409).json({
+      error: 'Workspace authorization is changing. Retry after the Portal reloads.',
+      code: 'WORKSPACE_SCOPE_CHANGED',
+    });
+    return false;
+  }
+  try {
+    if (!preflightShareVisit(req, res, link)) return false;
+    if (options.rateLimit && !(await enforceShareRateLimit(link, res))) return false;
+
+    const visitor = prepareShareVisitor(req, link);
+    if (!visitor) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(503).json({
+        error: 'Share visitor identity could not be verified.',
+        code: 'SHARE_VISITOR_IDENTITY_UNAVAILABLE',
+        retryable: true,
+      });
+      return false;
+    }
+
+  // Null is the explicit, database-owned legacy/default policy. As with the
+  // existing request-rate policy, a request that read null before an Owner's
+  // update keeps that snapshot; every request that reads a configured cap goes
+  // through the durable row-lock authority below.
+    const claim = link.maxConcurrentVisitors === null
+      ? { status: 'unlimited' as const }
+      : await claimShareConcurrentUse({
+        shareLinkId: link.id,
+        visitorIdHash: visitor.visitorIdHash,
+      });
+    if (claim.status === 'limited') {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Retry-After', String(claim.retryAfterSeconds));
+    res.status(429).json({
+      error: 'Share link concurrent visitor limit reached. Try again later.',
+      code: 'SHARE_CONCURRENT_LIMITED',
+      retryAfterSeconds: claim.retryAfterSeconds,
+    });
+    return false;
+    }
+    if (claim.status === 'unavailable') {
+    console.warn('[Share Concurrent Use] Admission could not be verified', {
+      shareLinkId: link.id,
+      reason: claim.reason,
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(503).json({
+      error: 'Share link concurrent-use policy could not be verified.',
+      code: 'SHARE_CONCURRENT_UNAVAILABLE',
+      retryable: true,
+    });
+    return false;
+    }
+
+    const release = async () => {
+    if (claim.status !== 'acquired') return;
+    const released = await releaseShareConcurrentUse({
+      shareLinkId: link.id,
+      visitorIdHash: visitor.visitorIdHash,
+      leaseToken: claim.leaseToken,
+    });
+    if (released.status === 'unavailable') {
+      console.warn('[Share Concurrent Use] Lease release could not be verified', {
+        shareLinkId: link.id,
+        reason: released.reason,
+      });
+    }
+    };
+
+    let visitCommitted: boolean;
+    try {
+      visitCommitted = await commitShareVisit(req, res, link, visitor);
+    } catch (error) {
+      await release();
+      throw error;
+    }
+    if (!visitCommitted) {
+      await release();
+      return false;
+    }
+
+    if (claim.status === 'acquired') {
+    let released = false;
+    const heartbeat = startShareConcurrentUseHeartbeat({
+      shareLinkId: link.id,
+      visitorIdHash: visitor.visitorIdHash,
+      leaseToken: claim.leaseToken,
+    }, (result) => {
+      console.warn('[Share Concurrent Use] Lease authority was lost while a response was open', {
+        shareLinkId: link.id,
+        status: result.status,
+        reason: result.reason,
+      });
+      // The response may already be streaming, so there is no honest JSON error
+      // left to send. Terminating the transport prevents work from continuing
+      // after its database-owned concurrency authority can no longer be proven.
+      if (!res.writableEnded && !res.destroyed) res.destroy();
+    });
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      heartbeat.stop();
+      void release();
+    };
+    res.once('finish', releaseOnce);
+    res.once('close', releaseOnce);
+    }
+    return true;
+  } finally {
+    releasePortalMutationLease?.();
+  }
 }
 
 function renderPasswordLandingPage(token: string, projectName?: string, errorMessage?: string): string {
@@ -825,12 +1116,25 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
           } else {
             modifiedHtml = baseTag + '\n' + html;
           }
-          console.log(`[Share] Serving HTML with <base> tag: ${resolvedPath} (token: ${token})`);
+          // The share token is a bearer capability. Never write it to logs.
+          console.log(`[Share] Serving HTML with <base> tag: ${resolvedPath}`);
           res.setHeader('Content-Type', 'text/html; charset=utf-8');
           res.send(modifiedHtml);
         } else {
           console.log(`[Share] Serving file: ${resolvedPath}`);
-          res.sendFile(resolvedPath);
+          await new Promise<void>((resolve) => {
+            res.sendFile(resolvedPath, (error) => {
+              if (error) {
+                console.error('[Share] Static file transfer failed:', error);
+                if (!res.headersSent && !res.destroyed) {
+                  res.status((error as any).statusCode || 500).send('Server error');
+                } else if (!res.writableEnded && !res.destroyed) {
+                  res.end();
+                }
+              }
+              resolve();
+            });
+          });
         }
         return true;
       } else {
@@ -874,6 +1178,7 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Not found' });
       return;
     }
+    if (!admitResolvedShareLinkRequest(req, res, link)) return;
 
     if (!(await enforceShareAccessWindow(link, res))) {
       return;
@@ -887,9 +1192,7 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
       }
     }
 
-    if (!preflightShareVisit(req, res, link)) return;
-    if (!(await enforceShareRateLimit(link, res))) return;
-    if (!(await claimShareVisit(req, res, link))) return;
+    if (!(await admitShareRequest(req, res, link, { rateLimit: true }))) return;
 
     // Do not read a potentially large request body until the share token,
     // access window, and optional password session have all been validated.
@@ -973,7 +1276,10 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
         redirect: 'manual',
         signal: abortContext.signal,
       });
-      await streamAppApiResponse(upstream, res, { locationBasePath: `/share/${token}` });
+      await streamAppApiResponse(upstream, res, {
+        locationBasePath: `/share/${token}`,
+        jsonResponseLimitBytes: appApiJsonResponseLimitBytes(link.app.id),
+      });
       console.log(`[ShareAPI] ${method} app=${link.app.id} path=/api/${proxiedPath} status=${upstream.status}`);
     } finally {
       proxyTimedOut = abortContext.didTimeout();
@@ -987,20 +1293,30 @@ shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
       res.status(failure.status).json(failure.body);
     }
     else if (!res.writableEnded) res.end();
+  } finally {
+    settleWorkspaceAuthorizationRequest(req);
   }
 });
 
 // GET /share/:token/progress - Load saved progress
 shareRouter.get('/:token/password.css', async (req: Request, res: Response) => {
-  res.setHeader('Cache-Control', 'no-store');
-  const shareLink = await findShareLink(req.params.token);
-  if (!shareLink) {
-    res.status(404).send('Not found');
-    return;
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    const shareLink = await findShareLink(req.params.token);
+    if (!shareLink) {
+      res.status(404).send('Not found');
+      return;
+    }
+    if (!admitResolvedShareLinkRequest(req, res, shareLink)) return;
+    if (!(await enforceShareAccessWindow(shareLink, res))) return;
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.type('text/css').send(SHARE_PASSWORD_STYLESHEET);
+  } catch (error) {
+    console.error('Share password stylesheet error:', error);
+    if (!res.headersSent) res.status(500).send('Server error');
+  } finally {
+    settleWorkspaceAuthorizationRequest(req);
   }
-  if (!(await enforceShareAccessWindow(shareLink, res))) return;
-  res.setHeader('Cache-Control', 'private, max-age=300');
-  res.type('text/css').send(SHARE_PASSWORD_STYLESHEET);
 });
 
 shareRouter.get('/:token/progress', async (req: Request, res: Response) => {
@@ -1008,6 +1324,7 @@ shareRouter.get('/:token/progress', async (req: Request, res: Response) => {
     const { token } = req.params;
     const link = await findShareLink(token);
     if (!link) { res.status(404).json({ error: 'Not found' }); return; }
+    if (!admitResolvedShareLinkRequest(req, res, link)) return;
     if (!(await enforceShareAccessWindow(link, res))) { return; }
 
     // Check password session if protected
@@ -1016,14 +1333,14 @@ shareRouter.get('/:token/progress', async (req: Request, res: Response) => {
         res.status(401).json({ error: 'Unauthorized' }); return;
       }
     }
-    if (!preflightShareVisit(req, res, link)) return;
-    if (!(await enforceShareRateLimit(link, res))) return;
-    if (!(await claimShareVisit(req, res, link))) return;
+    if (!(await admitShareRequest(req, res, link, { rateLimit: true }))) return;
 
     res.json({ data: link.progressData || null });
   } catch (error) {
     console.error('Load progress error:', error);
     res.status(500).json({ error: 'Server error' });
+  } finally {
+    settleWorkspaceAuthorizationRequest(req);
   }
 });
 
@@ -1033,6 +1350,7 @@ shareRouter.put('/:token/progress', async (req: Request, res: Response) => {
     const { token } = req.params;
     const link = await findShareLink(token);
     if (!link) { res.status(404).json({ error: 'Not found' }); return; }
+    if (!admitResolvedShareLinkRequest(req, res, link)) return;
     if (!(await enforceShareAccessWindow(link, res))) { return; }
 
     // Check password session if protected
@@ -1041,9 +1359,7 @@ shareRouter.put('/:token/progress', async (req: Request, res: Response) => {
         res.status(401).json({ error: 'Unauthorized' }); return;
       }
     }
-    if (!preflightShareVisit(req, res, link)) return;
-    if (!(await enforceShareRateLimit(link, res))) return;
-    if (!(await claimShareVisit(req, res, link))) return;
+    if (!(await admitShareRequest(req, res, link, { rateLimit: true }))) return;
 
     // Validate payload size (max 1MB)
     const body = JSON.stringify(req.body);
@@ -1068,6 +1384,8 @@ shareRouter.put('/:token/progress', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Save progress error:', error);
     res.status(500).json({ error: 'Server error' });
+  } finally {
+    settleWorkspaceAuthorizationRequest(req);
   }
 });
 
@@ -1089,6 +1407,7 @@ shareRouter.post('/:token/auth', async (req: Request, res: Response) => {
       sendShareAuthFailure(req, res, 404, 'This shared link is unavailable.', 'SHARE_LINK_NOT_FOUND', token);
       return;
     }
+    if (!admitResolvedShareLinkRequest(req, res, link)) return;
     projectName = link.app.name;
     if (!link.app.isActive || link.userId !== link.app.userId) {
       sendShareAuthFailure(
@@ -1138,7 +1457,7 @@ shareRouter.post('/:token/auth', async (req: Request, res: Response) => {
     }
 
     passwordAttemptLimiter.success(ip, token);
-    if (!(await claimShareVisit(req, res, link))) return;
+    if (!(await admitShareRequest(req, res, link, { rateLimit: false }))) return;
     grantShareAccess(req, res, link, 'password');
     if (isNativeShareAuthForm(req)) {
       res.redirect(303, `/share/${encodeURIComponent(link.token)}`);
@@ -1156,6 +1475,8 @@ shareRouter.post('/:token/auth', async (req: Request, res: Response) => {
       token,
       projectName,
     );
+  } finally {
+    settleWorkspaceAuthorizationRequest(req);
   }
 });
 
@@ -1168,6 +1489,7 @@ shareRouter.get('/:token', async (req: Request, res: Response) => {
       res.status(404).send('App not found or link expired');
       return;
     }
+    if (!admitResolvedShareLinkRequest(req, res, shareLink)) return;
 
     if (!(await enforceShareAccessWindow(shareLink, res))) {
       return;
@@ -1182,7 +1504,7 @@ shareRouter.get('/:token', async (req: Request, res: Response) => {
       }
     }
 
-    if (!(await claimShareVisit(req, res, shareLink))) return;
+    if (!(await admitShareRequest(req, res, shareLink, { rateLimit: false }))) return;
 
     // Serve index.html
     if (await serveAppFile(shareLink.app, 'index.html', res, token)) return;
@@ -1190,6 +1512,8 @@ shareRouter.get('/:token', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Serve shared app error:', error);
     res.status(500).send('Server error');
+  } finally {
+    settleWorkspaceAuthorizationRequest(req);
   }
 });
 
@@ -1202,6 +1526,7 @@ shareRouter.get('/:token/*', async (req: Request, res: Response) => {
       res.status(404).send('Not found');
       return;
     }
+    if (!admitResolvedShareLinkRequest(req, res, shareLink)) return;
 
     if (!(await enforceShareAccessWindow(shareLink, res))) {
       return;
@@ -1228,13 +1553,15 @@ shareRouter.get('/:token/*', async (req: Request, res: Response) => {
       }
     }
 
-    if (!(await claimShareVisit(req, res, shareLink))) return;
+    if (!(await admitShareRequest(req, res, shareLink, { rateLimit: false }))) return;
     console.log(`[Share] Wildcard route: link=${shareLink.id}, path=${requestedPath}`);
     if (await serveAppFile(shareLink.app, requestedPath, res, token)) return;
     res.status(404).send('Not found');
   } catch (error) {
     console.error('Serve shared asset error:', error);
     res.status(500).send('Server error');
+  } finally {
+    settleWorkspaceAuthorizationRequest(req);
   }
 });
 

@@ -21,6 +21,8 @@ describe('server-owned AI provider catalog', () => {
 
   it('makes unsupported guided setup explicit and keeps every selectable API-key flow validated', () => {
     const expectedManual = [
+      'openai-codex',
+      'google-gemini-cli',
       'opencode',
       'ollama',
       'huggingface',
@@ -69,31 +71,54 @@ describe('server-owned AI provider catalog', () => {
 
   it('uses the session-owned setup-token flow as the primary Anthropic path', () => {
     const anthropic = getPublicAiProviderCatalog().find((provider) => provider.id === 'anthropic');
+    const instructions = (anthropic?.setupInstructions || []).map((instruction) => instruction.detail).join(' ');
     expect(anthropic?.primaryAuthType).toBe('setup_token');
-    expect(anthropic?.description).toMatch(/session-owned setup-token flow/i);
-    expect(anthropic?.description).toMatch(/never imported implicitly/i);
+    expect(anthropic?.guidedSetup).toMatchObject({ status: 'available', authTypes: ['setup_token', 'api_key'] });
+    expect(anthropic?.description).toMatch(/API key or an existing setup-token/i);
+    expect(anthropic?.description).toMatch(/Project Sandbox/i);
     expect(anthropic?.defaultModels.map((model) => model.id)).toContain('anthropic/claude-sonnet-4-6');
+    expect(anthropic?.defaultModels.map((model) => model.id)).toContain('anthropic/claude-fable-5-1');
     expect(anthropic?.defaultModels.map((model) => model.id)).toContain('anthropic/claude-fable-5');
     expect(anthropic?.dangerNote).toBeUndefined();
+    expect(instructions).toMatch(
+      /routing activation is unavailable in this release until a separately supported maintenance operation ships/i,
+    );
+    expect(instructions).not.toMatch(/Host Tools Maintenance|supervised host maintenance/i);
     expect(JSON.stringify(anthropic)).not.toMatch(/extra usage.*(required|enable)|enable.*extra usage/i);
   });
 
-  it('keeps xAI subscription OAuth and API-key billing as explicit separate paths', () => {
+  it('keeps xAI guided setup credential-only while host mutation is unavailable', () => {
     const xai = getPublicAiProviderCatalog().find((provider) => provider.id === 'xai');
-    expect(xai?.primaryAuthType).toBe('oauth');
+    const maintenanceCopy = `${(xai?.authOptions || []).map((option) => option.description).join(' ')} ${(xai?.setupInstructions || []).map((instruction) => instruction.detail).join(' ')}`;
+    expect(xai?.primaryAuthType).toBe('api_key');
+    expect(AI_PROVIDERS.find((provider) => provider.id === 'xai')?.authTypes).toEqual(['api_key']);
+    expect(xai?.guidedSetup).toMatchObject({ status: 'available', authTypes: ['api_key'] });
     expect(xai?.authOptions).toEqual([
-      expect.objectContaining({ type: 'oauth', recommended: true }),
-      expect.objectContaining({ type: 'api_key' }),
+      expect.objectContaining({ type: 'api_key', recommended: true }),
     ]);
-    expect(`${xai?.pricingNote} ${xai?.description}`).not.toMatch(/free monthly|\$\d+.*credit/i);
+    expect(xai?.pricingNote).toContain('OpenClaw subscription OAuth is unavailable from Portal in this release.');
+    expect(`${xai?.pricingNote} ${xai?.description}`).not.toMatch(/supervised host execution/i);
+    expect(maintenanceCopy).toMatch(
+      /unavailable in this release until a separately supported maintenance operation ships/i,
+    );
+    expect(maintenanceCopy).not.toMatch(/Host Tools Maintenance|supervised host maintenance/i);
   });
 
-  it('documents current Codex device authorization without a stale localhost callback', () => {
+  it('describes OpenClaw Gemini OAuth as unavailable without promising a future supervisor', () => {
+    const gemini = getPublicAiProviderCatalog().find((provider) => provider.id === 'google-gemini-cli');
+    expect(gemini?.guidedSetup).toMatchObject({ status: 'manual' });
+    expect(gemini?.guidedSetup.status === 'manual' ? gemini.guidedSetup.reason : null).toBe(
+      'Portal cannot launch the OpenClaw Gemini OAuth process in this release. Existing credentials remain readable.',
+    );
+    expect(JSON.stringify(gemini)).not.toMatch(/supervised host execution/i);
+  });
+
+  it('marks Codex host authorization unavailable without advertising a launch recipe', () => {
     const codex = getPublicAiProviderCatalog().find((provider) => provider.id === 'openai-codex');
     const instructions = JSON.stringify(codex?.setupInstructions || []);
-    expect(instructions).toMatch(/device code login/i);
-    expect(instructions).toMatch(/developers\.openai\.com\/codex\/auth/i);
-    expect(instructions).not.toMatch(/127\.0\.0\.1:1455|paste the (?:full|entire) url/i);
+    expect(codex?.guidedSetup).toMatchObject({ status: 'manual' });
+    expect(instructions).toMatch(/host (?:setup|sign-in) unavailable/i);
+    expect(instructions).not.toMatch(/start openai sign-in|display a short-lived code|device code login/i);
   });
 
   it('publishes Bedrock as AWS SDK setup instead of a fake OAuth flow', () => {

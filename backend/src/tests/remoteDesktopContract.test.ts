@@ -43,21 +43,63 @@ describe('Remote Desktop release contract', () => {
     expect(route).toContain('MAX_REMOTE_DESKTOP_CLIPBOARD_BYTES');
   });
 
-  test('automatic OpenClaw restarts are authorization-fenced and system-unit-only', () => {
+  test('startup and auto-setup defer OpenClaw skill, agent/default mutation, and activation', () => {
     const route = readRepo('backend/src/routes/remote-desktop.ts');
-    const restartHelper = route.slice(
-      route.indexOf('async function restartOpenClawGatewaySystemUnit'),
-      route.indexOf('type DesktopClipboardSelection'),
+    const startupReconcile = route.slice(
+      route.indexOf('export async function reconcilePortalVisibleBrowserDefaults'),
+      route.indexOf('type RemoteDesktopRecoveryResult'),
+    );
+    const autoSetup = route.slice(
+      route.indexOf('export async function runRemoteDesktopAutoSetup'),
+      route.indexOf("router.post('/auto-setup'"),
     );
 
-    expect(restartHelper.indexOf('await assertOpenClawGatewayAuthorizationFenceReleased()'))
-      .toBeLessThan(restartHelper.indexOf("execFile(\n      '/usr/bin/systemctl'"));
-    expect(restartHelper).toContain("['restart', 'openclaw-gateway.service']");
-    expect(restartHelper).toContain("fs.existsSync('/run/systemd/system')");
-    expect(restartHelper).toContain("fs.existsSync('/usr/bin/systemctl')");
-    expect(route.match(/restartOpenClawGatewaySystemUnit\(/g)).toHaveLength(3);
+    expect(startupReconcile).not.toContain('ensurePortalVisibleBrowserDefaults()');
+    expect(startupReconcile).not.toContain('systemctl');
+    expect(startupReconcile).toContain('startup made no OpenClaw configuration changes');
+    expect(autoSetup).not.toContain('ensurePortalVisibleBrowserDefaults()');
+    expect(autoSetup).not.toContain('openclaw-gateway.service');
+    expect(autoSetup).toContain('agent configuration, or Portal agent defaults are changed here');
+    expect(autoSetup).not.toContain("skills/bridgesllm-portal");
+    expect(autoSetup).not.toContain("skills/shared-browser");
+    expect(autoSetup).not.toContain("code: 'HOST_TOOL_SUPERVISOR_UNAVAILABLE'");
+    expect(autoSetup).not.toContain('maintenanceRequired: true');
+    expect(route).not.toContain('ensurePortalVisibleBrowserDefaults');
+    expect(route).not.toContain('ensurePortalVisibleBrowserAgentConfig');
+    expect(startupReconcile).not.toContain('writeFileSync');
+    expect(route).not.toContain('restartOpenClawGatewaySystemUnit');
     expect(route).not.toContain("runShell('openclaw gateway restart'");
     expect(route).not.toContain("runShell('systemctl restart openclaw-gateway.service'");
+  });
+
+  test('healthy Remote Desktop can be ready without changing optional OpenClaw configuration', () => {
+    const route = readRepo('backend/src/routes/remote-desktop.ts');
+    const statusRoute = route.slice(
+      route.indexOf("router.get('/status'"),
+      route.indexOf('// ── Remote Desktop clipboard bridge'),
+    );
+
+    expect(statusRoute).not.toContain('openClawMaintenanceRequired');
+    expect(statusRoute).not.toContain('maintenanceRequired: true');
+    expect(statusRoute).toContain("status = 'ready'");
+    expect(statusRoute).toContain('desktopSessionPolicy.healthy && sessionGuardSupervised');
+    expect(statusRoute).toContain('automaticHealthReady && windowFitLauncherCurrent');
+    expect(statusRoute).not.toContain('ensurePortalVisibleBrowserDefaults');
+    expect(statusRoute).not.toContain('writeFileSync');
+    expect(statusRoute).not.toContain('systemSetting.upsert');
+    expect(statusRoute).toContain('Remote Desktop is ready, including Shared Browser, audio, and clipboard.');
+  });
+
+  test('setup-token Remote Desktop wrapper preserves busy and typed maintenance status', () => {
+    const setup = readRepo('backend/src/routes/setup-v3.ts');
+    const installRoute = setup.slice(
+      setup.indexOf("router.post('/install-rd'"),
+      setup.indexOf("router.get('/coding-tools-status'"),
+    );
+    expect(installRoute).toContain("step.step === 'Remote Desktop operation busy'");
+    expect(installRoute).toContain('busy ? 409');
+    expect(installRoute).toContain('result.maintenanceRequired ? 503');
+    expect(installRoute).toContain('.json(result)');
   });
 
   test('fresh install and repair converge on the same bundled launcher', () => {
@@ -182,8 +224,8 @@ describe('Remote Desktop release contract', () => {
     expect(aiProviders).toContain('runtime_catalog()');
     expect(aiProviders).toContain('Claude Code (Terminal Runtime)');
     expect(aiProviders).toContain('OpenAI Codex (Terminal Runtime)');
-    expect(aiProviders).toContain('Grok Build (Terminal Runtime)');
-    expect(aiProviders).toContain('Google Antigravity (Terminal Runtime)');
+    expect(aiProviders).not.toContain('Grok Build (Terminal Runtime)');
+    expect(aiProviders).not.toContain('Google Antigravity (Terminal Runtime)');
     expect(aiProviders).toContain('Ollama (Local Runtime Terminal)');
     // Agent Zero ships a web-UI launcher opened via a click-time backend
     // session exchange; the Agent Zero password never touches the desktop.
@@ -241,8 +283,10 @@ describe('Remote Desktop release contract', () => {
     const route = readRepo('backend/src/routes/remote-desktop.ts');
     expect(desktopEnv).toContain('XAUTHORITY');
     expect(desktopEnv).toContain("execFileSync('/usr/bin/setpriv'");
-    expect(desktopEnv).toContain("execFileSync('systemd-run'");
-    expect(desktopEnv).toContain("execFileSync('systemctl', ['stop', unitName]");
+    expect(desktopEnv).toContain("const SYSTEMD_RUN = '/usr/bin/systemd-run'");
+    expect(desktopEnv).toContain("const SYSTEMCTL = '/usr/bin/systemctl'");
+    expect(desktopEnv).toContain('execFileSync(SYSTEMD_RUN');
+    expect(desktopEnv).toContain("execFileSync(SYSTEMCTL, ['stop', unitName]");
     expect(desktopEnv).not.toContain(`su - ${'bridgesrd'}`);
     expect(desktopEnv).not.toContain("'-lc'");
     expect(route).toContain("XAUTHORITY: '/home/bridgesrd/.Xauthority'");
@@ -272,24 +316,26 @@ describe('Remote Desktop release contract', () => {
     expect(service).toContain("targetType: 'file'");
     expect(service).not.toContain("targetType: 'directory'");
     expect(desktopEnv).toContain('managedDesktopSystemdRunArgv');
-    expect(desktopEnv).toContain("'--',\n    executable,\n    ...args");
+    expect(desktopEnv).toContain('expansionSafeDesktopExecArgv([executable, ...args])');
+    expect(desktopEnv).toContain("? ['--expand-environment=no']");
+    expect(desktopEnv).toContain("value.includes('$') || value.includes('%')");
     expect(server).toContain('await startRemoteDesktopOpenPathCleanup()');
     expect(server).toContain('stopRemoteDesktopOpenPathCleanup();');
   });
 
-  test('the managed Portal skill ships bounded file-link guidance and converges at startup', () => {
+  test('the managed Portal skill ships bounded guidance while runtime convergence stays deferred', () => {
     const skill = readRepo('skills/bridgesllm-portal/SKILL.md');
     const guide = readRepo('skills/bridgesllm-portal/references/files-and-projects.md');
     const inventory = readRepo('installer/release-required-members.txt').split('\n');
     const route = readRepo('backend/src/routes/remote-desktop.ts');
     const server = readRepo('backend/src/server.ts');
-    const managedSkillReconcile = route.slice(
-      route.indexOf('export function reconcilePortalManagedSkill'),
-      route.indexOf('export async function reconcileRemoteDesktopLauncherAssets'),
+    const autoSetup = route.slice(
+      route.indexOf('export async function runRemoteDesktopAutoSetup'),
+      route.indexOf("router.post('/auto-setup'"),
     );
     const visibleDefaults = route.slice(
-      route.indexOf('async function ensurePortalVisibleBrowserDefaults'),
-      route.indexOf('export function reconcilePortalManagedSkill'),
+      route.indexOf('export async function reconcilePortalVisibleBrowserDefaults'),
+      route.indexOf('type RemoteDesktopRecoveryResult'),
     );
 
     expect(skill).toContain('return a real Markdown link');
@@ -318,9 +364,14 @@ describe('Remote Desktop release contract', () => {
     expect(guide).toContain('Never substitute a signed');
     expect(inventory).toContain('portal/skills/bridgesllm-portal/SKILL.md');
     expect(inventory).toContain('portal/skills/bridgesllm-portal/references/files-and-projects.md');
-    expect(server).toContain('reconcilePortalManagedSkill();');
-    expect(managedSkillReconcile).toContain('ensurePortalSkillInstalled()');
-    expect(managedSkillReconcile).not.toContain('restartOpenClawGatewaySystemUnit');
-    expect(visibleDefaults).not.toContain('ensurePortalSkillInstalled()');
+    expect(server).not.toContain('reconcilePortalManagedSkill');
+    expect(route).not.toContain('ensurePortalSkillInstalled');
+    expect(route).not.toContain('reconcilePortalManagedSkill');
+    expect(autoSetup).not.toContain('Reconcile OpenClaw skill, visible-browser agent, and defaults');
+    expect(autoSetup).toContain('agent configuration, or Portal agent defaults are changed here');
+    expect(autoSetup).not.toContain("skills/bridgesllm-portal");
+    expect(autoSetup).not.toContain("skills/shared-browser");
+    expect(visibleDefaults).not.toContain('writeFileSync');
+    expect(visibleDefaults).not.toContain('systemSetting.upsert');
   });
 });

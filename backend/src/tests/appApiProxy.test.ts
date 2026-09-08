@@ -3,6 +3,7 @@ import { PassThrough } from 'stream';
 import {
   __appApiProxyTest,
   appApiBackendUnconfiguredResponse,
+  appApiJsonResponseLimitBytes,
   appApiProxyTimeoutMs,
   appApiUpstreamFailureResponse,
   createAppApiAbortContext,
@@ -26,6 +27,26 @@ describe('app API proxy transport', () => {
     expect(appApiProxyTimeoutMs({})).toBe(60_000);
     expect(appApiProxyTimeoutMs({ APP_API_PROXY_TIMEOUT_MS: '1' })).toBe(5_000);
     expect(appApiProxyTimeoutMs({ APP_API_PROXY_TIMEOUT_MS: '999999' })).toBe(120_000);
+  });
+
+  test('selects a bounded JSON cap globally or by immutable App id', () => {
+    expect(appApiJsonResponseLimitBytes('app-123', {})).toBe(
+      __appApiProxyTest.DEFAULT_VALIDATED_JSON_RESPONSE_BYTES,
+    );
+    expect(appApiJsonResponseLimitBytes('app-123', {
+      APP_API_JSON_RESPONSE_MAX_BYTES: String(12 * 1024 * 1024),
+    })).toBe(12 * 1024 * 1024);
+    expect(appApiJsonResponseLimitBytes('app-123', {
+      APP_API_JSON_RESPONSE_MAX_BYTES: String(12 * 1024 * 1024),
+      APP_API_JSON_RESPONSE_MAX_BYTES_APP_123: String(20 * 1024 * 1024),
+    })).toBe(20 * 1024 * 1024);
+    expect(appApiJsonResponseLimitBytes('app-123', {
+      APP_API_JSON_RESPONSE_MAX_BYTES: 'not-a-number',
+      APP_API_JSON_RESPONSE_MAX_BYTES_APP_123: String(100 * 1024 * 1024),
+    })).toBe(__appApiProxyTest.MAX_VALIDATED_JSON_RESPONSE_BYTES);
+    expect(appApiJsonResponseLimitBytes('app-123', {
+      APP_API_JSON_RESPONSE_MAX_BYTES_APP_123: '512',
+    })).toBe(__appApiProxyTest.MIN_VALIDATED_JSON_RESPONSE_BYTES);
   });
 
   test('aborts a stalled upstream instead of waiting indefinitely', () => {
@@ -183,7 +204,7 @@ describe('app API proxy transport', () => {
   test('rejects JSON beyond the validation cap before committing status', async () => {
     const { output } = responseOutput();
     const payload = JSON.stringify({
-      value: 'x'.repeat(__appApiProxyTest.MAX_VALIDATED_JSON_RESPONSE_BYTES + 1),
+      value: 'x'.repeat(__appApiProxyTest.DEFAULT_VALIDATED_JSON_RESPONSE_BYTES + 1),
     });
     const upstream = new Response(payload, {
       status: 200,
@@ -202,11 +223,29 @@ describe('app API proxy transport', () => {
       status: 502,
       body: expect.objectContaining({
         code: 'APP_API_UPSTREAM_RESPONSE_TOO_LARGE',
-        maxBytes: __appApiProxyTest.MAX_VALIDATED_JSON_RESPONSE_BYTES,
+        maxBytes: __appApiProxyTest.DEFAULT_VALIDATED_JSON_RESPONSE_BYTES,
         retryable: false,
       }),
     });
     output.destroy();
+  });
+
+  test('accepts valid JSON above the default when the selected App cap allows it', async () => {
+    const { output, chunks } = responseOutput();
+    const payload = JSON.stringify({
+      value: 'x'.repeat(__appApiProxyTest.DEFAULT_VALIDATED_JSON_RESPONSE_BYTES + 32),
+    });
+    const upstream = new Response(payload, {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+
+    await streamAppApiResponse(upstream, output, {
+      jsonResponseLimitBytes: 12 * 1024 * 1024,
+    });
+
+    expect(output.status).toHaveBeenCalledWith(200);
+    expect(Buffer.concat(chunks).byteLength).toBe(Buffer.byteLength(payload));
   });
 
   test('streams with backpressure and does not forward upstream cookies', async () => {

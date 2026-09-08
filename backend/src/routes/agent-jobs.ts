@@ -25,6 +25,22 @@ function errorStatus(error: unknown, fallback: number): number {
     : fallback;
 }
 
+export const HOST_NATIVE_AGENT_JOB_UNAVAILABLE = Object.freeze({
+  status: 503,
+  code: 'HOST_NATIVE_AGENT_JOB_UNAVAILABLE',
+  error: 'Provider identities are not accepted as Agent Jobs tool IDs. Use Agent Chat, which owns provider routing, the authenticated HostAgentRun journal, and the systemd scope. Explicit user-authored shell jobs remain separate host commands.',
+  retryable: false,
+} as const);
+
+export function hostNativeAgentJobToolIdBlocked(toolId: unknown): boolean {
+  const rawToolId = String(toolId || '').trim().toLowerCase();
+  const normalizedToolId = rawToolId.startsWith('_install:') ? rawToolId.slice('_install:'.length) : rawToolId;
+  return normalizedToolId === 'openclaw'
+    || normalizedToolId === 'codex'
+    || normalizedToolId === 'claude'
+    || normalizedToolId === 'claude-code';
+}
+
 // POST /api/agent-jobs
 router.post('/', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -32,6 +48,14 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
 
     if (!toolId || !command || typeof toolId !== 'string' || typeof command !== 'string') {
       res.status(400).json({ error: 'toolId and command are required' });
+      return;
+    }
+    if (hostNativeAgentJobToolIdBlocked(toolId)) {
+      res.status(HOST_NATIVE_AGENT_JOB_UNAVAILABLE.status).json({
+        error: HOST_NATIVE_AGENT_JOB_UNAVAILABLE.error,
+        code: HOST_NATIVE_AGENT_JOB_UNAVAILABLE.code,
+        retryable: HOST_NATIVE_AGENT_JOB_UNAVAILABLE.retryable,
+      });
       return;
     }
 
@@ -177,13 +201,24 @@ router.post('/:id/input', async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    const job = await prisma.agentJob.findUnique({ where: { id: req.params.id }, select: { userId: true } });
+    const job = await prisma.agentJob.findUnique({
+      where: { id: req.params.id },
+      select: { userId: true, toolId: true },
+    });
     if (!job) {
       res.status(404).json({ error: 'Job not found' });
       return;
     }
     if (!canAccessAll(req) && job.userId !== req.user!.userId) {
       res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+    if (hostNativeAgentJobToolIdBlocked(job.toolId)) {
+      res.status(HOST_NATIVE_AGENT_JOB_UNAVAILABLE.status).json({
+        error: HOST_NATIVE_AGENT_JOB_UNAVAILABLE.error,
+        code: HOST_NATIVE_AGENT_JOB_UNAVAILABLE.code,
+        retryable: HOST_NATIVE_AGENT_JOB_UNAVAILABLE.retryable,
+      });
       return;
     }
 

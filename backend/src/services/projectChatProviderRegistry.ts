@@ -1,6 +1,8 @@
 import type { AgentProvider, AgentProviderName } from '../agents/AgentProvider.interface';
 import { AgentRegistry } from '../agents';
+import type { AgentProviderCleanupController } from '../agents/AgentRegistry';
 import { config } from '../config/env';
+import { unqualifiedNativeBinaryReason } from '../config/unqualifiedNativeBinaryLane';
 import { AgentZeroProjectProvider } from '../agents/providers/agentZero/AgentZeroProjectProvider';
 import type { AgentZeroProjectModelSelection } from '../agents/providers/agentZero/AgentZeroProjectModelBridgeCredential';
 import {
@@ -32,7 +34,7 @@ export const OPENCLAW_PROJECT_RUNTIME = 'openclaw-dedicated-project-agent';
 export const OPENCLAW_PROJECT_RUNTIME_POLICY_VERSION = 'portal-project-sandbox-v2';
 export const PROJECT_CHAT_EGRESS_POLICY_VERSION = 'portal-project-egress-v1';
 
-/** Providers with a complete, confined Project runtime foundation. */
+/** Providers with a Project foundation or retained persisted cleanup custody. */
 export type QualifiableProjectProvider = Extract<
   AgentProviderName,
   'OPENCLAW' | 'CODEX' | 'CLAUDE_CODE' | 'AGENT_ZERO' | 'GEMINI' | 'OLLAMA'
@@ -42,6 +44,9 @@ export type QualifiableProjectProvider = Extract<
 export type DurableProjectProvider = QualifiableProjectProvider;
 
 export type NativeProjectProvider = Exclude<DurableProjectProvider, 'OPENCLAW'>;
+
+/** Providers that may advertise positive Project execution after qualification. */
+export type PositiveProjectExecutionProvider = Exclude<QualifiableProjectProvider, 'GEMINI'>;
 
 export interface ProjectChatProviderAdapter extends AgentProvider {
   resetSession?(sessionId: string): Promise<void>;
@@ -118,12 +123,12 @@ const DESCRIPTORS: Readonly<Record<QualifiableProjectProvider, ProjectChatProvid
 export class ProjectChatProviderRuntimeUnavailableError extends Error {
   readonly provider: QualifiableProjectProvider;
 
-  constructor(provider: QualifiableProjectProvider) {
+  constructor(provider: QualifiableProjectProvider, reason?: string) {
     const displayName = DESCRIPTORS[provider]?.displayName || provider;
-    super(
+    super(reason || (
       `${displayName} Project runtime is not installed and attested on this server. `
-      + 'Install the supported provider runtime, then run the Portal updater to enable it.',
-    );
+      + 'Install the supported provider runtime, then run the Portal updater to enable it.'
+    ));
     this.name = 'ProjectChatProviderRuntimeUnavailableError';
     this.provider = provider;
   }
@@ -135,6 +140,19 @@ export const QUALIFIABLE_PROJECT_PROVIDERS: readonly QualifiableProjectProvider[
   'CLAUDE_CODE',
   'AGENT_ZERO',
   'GEMINI',
+  'OLLAMA',
+]);
+
+/**
+ * Positive execution inventory. GEMINI remains in the broader foundation set
+ * solely so persisted Project state can be identified and cleaned up while
+ * Antigravity is detection-only.
+ */
+export const POSITIVE_PROJECT_EXECUTION_PROVIDERS: readonly PositiveProjectExecutionProvider[] = Object.freeze([
+  'OPENCLAW',
+  'CODEX',
+  'CLAUDE_CODE',
+  'AGENT_ZERO',
   'OLLAMA',
 ]);
 
@@ -172,6 +190,12 @@ export function getProjectChatProviderRuntimeDescriptor(
 export function requireProjectChatProviderRuntimeImageDigest(
   provider: QualifiableProjectProvider,
 ): string {
+  if (provider === 'GEMINI') {
+    throw new ProjectChatProviderRuntimeUnavailableError(
+      provider,
+      unqualifiedNativeBinaryReason('GEMINI'),
+    );
+  }
   const descriptor = getProjectChatProviderRuntimeDescriptor(provider);
   let imageId = '';
   try {
@@ -197,13 +221,47 @@ const agentZeroProjectProvider = new AgentZeroProjectProvider();
 // The Main Ollama adapter has host-level HTTP access and no coding tool
 // confinement. Project Chat must use this dedicated networkless tool runtime.
 const ollamaProjectProvider = new OllamaProjectProvider();
-
 export function getProjectChatProviderAdapter(
   provider: DurableProjectProvider,
 ): ProjectChatProviderAdapter {
   if (provider === 'AGENT_ZERO') return agentZeroProjectProvider;
   if (provider === 'OLLAMA') return ollamaProjectProvider;
-  return AgentRegistry.get(provider) as ProjectChatProviderAdapter;
+  return AgentRegistry.getSharedProjectSandboxProvider(provider) as ProjectChatProviderAdapter;
+}
+
+export interface ProjectChatProviderCleanupController extends AgentProviderCleanupController {
+  readonly providerName: DurableProjectProvider;
+}
+
+function cleanupControllerForProjectAdapter(
+  adapter: ProjectChatProviderAdapter,
+): ProjectChatProviderCleanupController {
+  const abortActiveRun = adapter.abortActiveRun?.bind(adapter);
+  return Object.freeze({
+    providerName: adapter.providerName as DurableProjectProvider,
+    ...(abortActiveRun ? { abortActiveRun } : {}),
+    terminateSession: adapter.terminateSession.bind(adapter),
+  });
+}
+
+/**
+ * Resolve only the negative Project lifecycle. Agent Zero and Ollama keep
+ * their dedicated confined adapters; shared and detection-only providers use
+ * the registry's equally narrow cleanup facade. No positive method crosses
+ * this boundary.
+ */
+export function getProjectChatProviderCleanupController(
+  provider: DurableProjectProvider,
+): ProjectChatProviderCleanupController {
+  const controller = provider === 'AGENT_ZERO'
+    ? cleanupControllerForProjectAdapter(agentZeroProjectProvider)
+    : provider === 'OLLAMA'
+      ? cleanupControllerForProjectAdapter(ollamaProjectProvider)
+      : AgentRegistry.getProviderCleanupController(provider) as ProjectChatProviderCleanupController;
+  if (controller.providerName !== provider) {
+    throw new Error(`${projectChatProviderDisplayName(provider)} cleanup adapter identity changed`);
+  }
+  return controller;
 }
 
 export async function resetProjectChatProviderSession(input: {
@@ -228,5 +286,5 @@ export async function terminateProjectChatProviderSession(input: {
   provider: DurableProjectProvider;
   sessionId: string;
 }): Promise<void> {
-  await getProjectChatProviderAdapter(input.provider).terminateSession(input.sessionId);
+  await getProjectChatProviderCleanupController(input.provider).terminateSession(input.sessionId);
 }

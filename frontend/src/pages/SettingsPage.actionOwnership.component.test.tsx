@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   sendTestEmail: vi.fn(),
   clientGet: vi.fn(),
   clientPost: vi.fn(),
+  clientPatch: vi.fn(),
   clientPut: vi.fn(),
   clientDelete: vi.fn(),
   twoFactorStatus: vi.fn(),
@@ -34,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   runtimeStatus: vi.fn(),
   refreshPublicSettings: vi.fn(),
   remotePanelMutation: vi.fn(),
+  aiProviderSetupProps: vi.fn(),
   publicSettings: {
     current: {
       originMode: 'domain',
@@ -43,7 +45,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../contexts/AuthContext', () => ({
-  useAuthStore: () => ({ user: mocks.authUser.current, silentLogout: mocks.silentLogout }),
+  useAuthStore: (selector?: (state: any) => unknown) => {
+    const state = { user: mocks.authUser.current, silentLogout: mocks.silentLogout };
+    return selector ? selector(state) : state;
+  },
 }));
 
 vi.mock('../contexts/ThemeContext', () => ({
@@ -73,6 +78,7 @@ vi.mock('../api/client', () => ({
   default: {
     get: mocks.clientGet,
     post: mocks.clientPost,
+    patch: mocks.clientPatch,
     put: mocks.clientPut,
     delete: mocks.clientDelete,
   },
@@ -121,7 +127,12 @@ vi.mock('../utils/sounds', () => ({
 }));
 
 vi.mock('../components/settings/BackupsTab', () => ({ default: () => <div>Backups</div> }));
-vi.mock('../components/ai-setup/AiProviderSetup', () => ({ default: () => <div>AI setup</div> }));
+vi.mock('../components/ai-setup/AiProviderSetup', () => ({
+  default: (props: any) => {
+    mocks.aiProviderSetupProps(props);
+    return <div>AI setup</div>;
+  },
+}));
 vi.mock('../components/settings/AgentZeroSetupPanel', () => ({ default: () => <div>Agent Zero setup</div> }));
 vi.mock('../components/settings/OllamaTailnetSetup', async () => {
   const context = await vi.importActual<
@@ -296,9 +307,21 @@ describe('SettingsPage synchronous action ownership', () => {
     mocks.refreshPublicSettings.mockResolvedValue(null);
     mocks.remotePanelMutation.mockResolvedValue(undefined);
     mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/harnesses') return { data: { harnesses: [
+        { harnessId: 'OPENCLAW', name: 'OPENCLAW', compatibilityProviderId: 'OPENCLAW', displayName: 'OpenClaw', implemented: true, selectable: true, installed: true, usable: true, availabilityState: 'ready', releaseStage: 'stable', auth: { owner: 'model-provider-account' }, capabilities: { supportedExecutionScopes: ['HOST_OPERATOR'] } },
+        { harnessId: 'CODEX', name: 'CODEX', compatibilityProviderId: 'CODEX', displayName: 'Codex', implemented: true, selectable: true, installed: true, usable: false, availabilityState: 'runtime_unavailable', releaseStage: 'stable', auth: { owner: 'harness-local-login' }, nativeAuthMessage: 'Project Sandbox credential; host login unavailable.', capabilities: { supportedExecutionScopes: ['PROJECT_SANDBOX'] } },
+        { harnessId: 'HERMES', name: 'HERMES', compatibilityProviderId: 'HERMES', displayName: 'Hermes', implemented: true, selectable: true, installed: true, usable: true, availabilityState: 'ready', releaseStage: 'stable', auth: { owner: 'harness-local-login' }, nativeAuthLoginCommand: 'hermes model', nativeAuthMessage: 'Hermes uses its dedicated profile.', models: { catalogOwner: 'harness' }, capabilities: { supportedExecutionScopes: ['HOST_OPERATOR'] } },
+        { harnessId: 'OPENCODE', name: 'OPENCODE', compatibilityProviderId: 'OPENCODE', displayName: 'OpenCode', implemented: true, selectable: true, installed: false, usable: false, availabilityState: 'ready', releaseStage: 'stable', auth: { owner: 'harness-local-login' }, nativeAuthLoginCommand: 'opencode auth login', models: { catalogOwner: 'harness' }, capabilities: { supportedExecutionScopes: ['HOST_OPERATOR'] } },
+        { harnessId: 'AGENT_ZERO', name: 'AGENT_ZERO', compatibilityProviderId: 'AGENT_ZERO', displayName: 'Agent Zero', implemented: true, selectable: true, installed: true, usable: false, availabilityState: 'ready', releaseStage: 'stable', auth: { owner: 'harness-local-login' }, capabilities: { supportedExecutionScopes: ['HOST_OPERATOR'] } },
+        { harnessId: 'DEEPSEEK_HARNESS', name: 'DEEPSEEK_HARNESS', compatibilityProviderId: null, displayName: 'DeepSeek Harness', implemented: false, selectable: false, installed: null, usable: false, availabilityState: 'ready', releaseStage: 'developer-preview' },
+      ] } };
+      if (url === '/users/me/agent-harness-preference') return { data: { defaultHarness: 'OPENCLAW', revision: 0 } };
       if (url === '/admin/email-status') return { data: { connected: false, server: '', protocol: '', sender: '', url: '', error: null } };
       if (url === '/admin/mailboxes') return { data: { mailboxes: [{ userId: 'user-1', username: 'alice', email: 'alice@example.com', createdAt: '2026-07-01', lastLoginAt: null }] } };
-      if (url === '/admin/coding-tools-status') return { data: { tools: [{ id: 'codex', name: 'Codex CLI', description: 'Coding agent', installed: false, version: '' }] } };
+      if (url === '/admin/coding-tools-status') return { data: { tools: [
+        { id: 'codex', name: 'Codex CLI', description: 'Managed package', installed: false, version: '', state: 'absent', installAvailable: false, installUnavailableCode: 'HOST_TOOL_INSTALL_AFTER_SETUP' },
+        { id: 'opencode', name: 'OpenCode', description: 'Coding agent', installed: false, version: '', state: 'absent', installAvailable: false, installUnavailableCode: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE' },
+      ] } };
       if (url === '/admin/domain-status') return { data: { currentDomain: '', publicIp: '203.0.113.10', httpsActive: false } };
       if (url === '/ollama/models') return { data: { models: [], inventories: { local: { models: [] }, tailnet: { models: [] } } } };
       if (url === '/ollama/pulls') return { data: { pulls: [] } };
@@ -306,6 +329,9 @@ describe('SettingsPage synchronous action ownership', () => {
       return { data: {} };
     });
     mocks.clientPost.mockResolvedValue({ data: {} });
+    mocks.clientPatch.mockImplementation(async (_url: string, body: { harnessId: string }) => ({
+      data: { defaultHarness: body.harnessId, revision: 1 },
+    }));
     mocks.clientPut.mockResolvedValue({ data: {} });
     mocks.clientDelete.mockResolvedValue({ data: {} });
   });
@@ -1086,13 +1112,13 @@ describe('SettingsPage synchronous action ownership', () => {
     act(() => {
       toggle.click();
       toggle.click();
-      within(panel).getByRole('button', { name: 'Open AI Providers' }).click();
+      within(panel).getByRole('button', { name: 'Open Model Providers' }).click();
       screen.getByRole('tab', { name: 'Profile' }).click();
     });
     expect(mocks.patchConfigPath).toHaveBeenCalledTimes(1);
     expect(mocks.patchConfigPath).toHaveBeenCalledWith('agents.defaults.compaction.notifyUser', true);
     expect(toggle).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByRole('tab', { name: 'Agents' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: 'Harnesses' })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByRole('tab', { name: 'Profile' })).toBeDisabled();
 
     await act(async () => {
@@ -1104,9 +1130,83 @@ describe('SettingsPage synchronous action ownership', () => {
     expect(screen.getByRole('tab', { name: 'Profile' })).toBeEnabled();
   });
 
+  it('uses harness catalog readiness and persists only an implemented default harness', async () => {
+    renderSettings('agents');
+    const panel = await screen.findByRole('tabpanel');
+
+    expect(await within(panel).findByText('Harnesses 2 ready')).toBeVisible();
+    const select = await within(panel).findByRole('combobox', { name: 'Default Assistant harness' });
+    expect(within(select).getByRole('option', { name: 'OpenClaw' })).toBeDisabled();
+    expect(within(select).getByRole('option', { name: 'Codex — setup required' })).toBeEnabled();
+    expect(within(select).getByRole('option', { name: 'Hermes' })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: 'OpenCode — setup required' })).toBeInTheDocument();
+    expect(within(select).queryByRole('option', { name: /DeepSeek/ })).not.toBeInTheDocument();
+    expect(within(panel).getByText('Harness login: hermes model')).toBeVisible();
+    expect(within(panel).getByText('Harness login: opencode auth login')).toBeVisible();
+    expect(within(panel).getAllByText('Models: discovered from the harness after login')).toHaveLength(2);
+    expect(within(panel).getAllByText('Project Chat: Supported in an isolated project workspace')).toHaveLength(1);
+    expect(within(panel).getAllByText('Project Chat: Not supported').length).toBeGreaterThanOrEqual(4);
+
+    await userEvent.selectOptions(select, 'HERMES');
+    await waitFor(() => expect(mocks.clientPatch).toHaveBeenCalledWith(
+      '/users/me/agent-harness-preference',
+      { harnessId: 'HERMES' },
+    ));
+    expect(await within(panel).findByText('Current default: Hermes')).toBeVisible();
+  });
+
+  it('preserves an existing supervised managed default without rewriting it', async () => {
+    const baseGet = mocks.clientGet.getMockImplementation();
+    mocks.clientGet.mockImplementation((url: string, ...args: unknown[]) => {
+      if (url === '/users/me/agent-harness-preference') {
+        return Promise.resolve({ data: { defaultHarness: 'CODEX', revision: 4 } });
+      }
+      return baseGet?.(url, ...args);
+    });
+
+    renderSettings('agents');
+    const panel = await screen.findByRole('tabpanel');
+    const select = await within(panel).findByRole('combobox', { name: 'Default Assistant harness' });
+    const currentManaged = within(select).getByRole('option', { name: 'Codex — setup required' });
+
+    expect(currentManaged).toBeEnabled();
+    expect(select).toHaveValue('CODEX');
+    expect(within(panel).getByText('Current default: Codex')).toBeVisible();
+    expect(mocks.clientPatch).not.toHaveBeenCalled();
+  });
+
+  it('hands Hermes and OpenCode setup to their exact Portal profiles while keeping Remote Desktop and Zen separate', async () => {
+    renderSettings('agents');
+    const panel = await screen.findByRole('tabpanel');
+    expect(await within(panel).findByRole('button', { name: 'Configure Hermes Portal profile' })).toBeVisible();
+    expect(within(panel).getByRole('button', { name: 'Configure OpenCode Portal profile' })).toBeVisible();
+    expect(within(panel).getAllByText(/Remote Desktop CLI profile and the OpenCode Zen model-provider account remain separate/i)).toHaveLength(2);
+
+    await userEvent.click(within(panel).getByRole('button', { name: 'Configure OpenCode Portal profile' }));
+    expect(await screen.findByText('AI setup')).toBeVisible();
+    expect(mocks.aiProviderSetupProps).toHaveBeenLastCalledWith(expect.objectContaining({
+      mode: 'settings',
+      apiBase: '/ai-setup',
+      initialNativeCliProvider: 'opencode',
+    }));
+  });
+
+  it('keeps Agent Zero setup inside its harness row and opens controls on demand', async () => {
+    renderSettings('agents');
+    const panel = await screen.findByRole('tabpanel');
+    const configure = await within(panel).findByRole('button', { name: 'Configure Agent Zero' });
+    expect(screen.queryByText('Agent Zero setup')).not.toBeInTheDocument();
+    await userEvent.click(configure);
+    const dialog = await screen.findByRole('dialog', { name: 'Configure Agent Zero' });
+    expect(await within(dialog).findByText('Agent Zero setup')).toBeVisible();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Close Agent Zero settings' }));
+    expect(screen.queryByRole('dialog', { name: 'Configure Agent Zero' })).not.toBeInTheDocument();
+  });
+
   it('mounts one canonical Remote GPU surface and keeps local CPU policy compact without legacy model APIs', async () => {
     renderSettings('ai-providers');
     const panel = await screen.findByRole('tabpanel');
+    await userEvent.click(within(panel).getByText('Remote GPU'));
     expect(await within(panel).findByText('Remote GPU management')).toBeVisible();
     expect(within(panel).queryByText('Local Models (Ollama)')).not.toBeInTheDocument();
     expect(within(panel).queryByLabelText('Ollama model to pull')).not.toBeInTheDocument();
@@ -1287,38 +1387,15 @@ describe('SettingsPage synchronous action ownership', () => {
     });
   });
 
-  it('keeps host-tool, mailbox, and hotfix confirmations exclusive, retryable, and immutable', async () => {
+  it('keeps native host tools read-only while mailbox confirmation and hotfix status remain available', async () => {
     renderSettings('system');
-    const installTrigger = await screen.findByRole('button', { name: 'Install' });
-    const deleteTrigger = screen.getByRole('button', { name: 'Delete' });
-    act(() => {
-      installTrigger.click();
-      deleteTrigger.click();
-    });
-    let dialog = await screen.findByRole('dialog', { name: 'Install Codex CLI?' });
-    expect(screen.queryByRole('dialog', { name: /Delete mailbox/ })).not.toBeInTheDocument();
-    await userEvent.type(within(dialog).getByRole('textbox'), 'INSTALL CODEX');
-    const pendingInstall = deferred<{ data: unknown }>();
-    mocks.clientPost.mockReturnValueOnce(pendingInstall.promise);
-    const confirmInstall = within(dialog).getByRole('button', { name: 'Install host tool' });
-    act(() => {
-      confirmInstall.click();
-      confirmInstall.click();
-      fireEvent.keyDown(document, { key: 'Escape' });
-    });
-    expect(mocks.clientPost).toHaveBeenCalledTimes(1);
-    expect(mocks.clientPost).toHaveBeenCalledWith('/admin/install-coding-tool', { toolId: 'codex', confirmation: 'INSTALL CODEX' });
-    expect(within(dialog).getByRole('button', { name: 'Installing host tool…' })).toHaveAttribute('aria-busy', 'true');
-    await act(async () => {
-      pendingInstall.reject({ response: { data: { error: 'Package manager busy' } } });
-      await pendingInstall.promise.catch(() => undefined);
-    });
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Package manager busy');
-    expect(dialog).toBeVisible();
-    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText('OpenCode')).toBeVisible();
+    expect(screen.getAllByText(/Read-only status · managed runtime is not installed/i)).not.toHaveLength(0);
+    expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
+    expect(mocks.clientPost).not.toHaveBeenCalledWith('/admin/install-coding-tool', expect.anything());
 
     await userEvent.click(screen.getByRole('button', { name: 'Delete' }));
-    dialog = await screen.findByRole('dialog', { name: 'Delete mailbox alice?' });
+    const dialog = await screen.findByRole('dialog', { name: 'Delete mailbox alice?' });
     await userEvent.type(within(dialog).getByRole('textbox'), 'DELETE MAILBOX alice');
     const pendingDelete = deferred<{ data: unknown }>();
     mocks.clientDelete.mockReturnValueOnce(pendingDelete.promise);
@@ -1336,24 +1413,12 @@ describe('SettingsPage synchronous action ownership', () => {
     expect(await within(dialog).findByRole('alert')).toHaveTextContent('Mailbox still locked');
     await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
 
-    await userEvent.click(screen.getByRole('button', { name: /Apply compatibility patches and restart/ }));
-    dialog = await screen.findByRole('dialog', { name: 'Apply OpenClaw compatibility hotfix?' });
-    await userEvent.type(within(dialog).getByRole('textbox'), 'APPLY OPENCLAW HOTFIX');
-    const pendingHotfix = deferred<any>();
-    mocks.applyCompatibilityHotfix.mockReturnValueOnce(pendingHotfix.promise);
-    const confirmHotfix = within(dialog).getByRole('button', { name: 'Apply hotfix + restart' });
-    act(() => {
-      confirmHotfix.click();
-      confirmHotfix.click();
-    });
-    expect(mocks.applyCompatibilityHotfix).toHaveBeenCalledTimes(1);
-    expect(mocks.applyCompatibilityHotfix).toHaveBeenCalledWith('APPLY OPENCLAW HOTFIX');
-    await act(async () => {
-      pendingHotfix.reject({ response: { data: { detail: 'Gateway restart was refused' } } });
-      await pendingHotfix.promise.catch(() => undefined);
-    });
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Gateway restart was refused');
-    expect(dialog).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'OpenClaw Compatibility Hotfix' })).toBeVisible();
+    expect(screen.getByText(/Owner updates the exact OpenClaw and native-tool bundle under Admin > Maintenance/i)).toBeVisible();
+    expect(screen.getByText('Update via Admin > Maintenance')).toBeVisible();
+    expect(screen.queryByRole('button', { name: /Apply compatibility patches and restart/ })).not.toBeInTheDocument();
+    expect(mocks.applyCompatibilityHotfix).not.toHaveBeenCalled();
+    expect(mocks.clientPost).not.toHaveBeenCalledWith('/admin/install-coding-tool', expect.anything());
   });
 
   it('mounts embed-origin policy only for the Owner Security tab', async () => {

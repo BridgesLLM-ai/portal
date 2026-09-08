@@ -2,7 +2,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { EventEmitter } from 'events';
-import type { NativeCliInvocation, NativeCliProviderAdapter } from './types';
+import type { NativeCliInvocation, NativeCliProviderAdapter, NativeCliTurnContext } from './types';
+import type { NativeCliAdapterProvider as NativeCliAdapterProviderType } from './NativeCliAdapterProvider';
 
 jest.mock('child_process', () => ({
   ...jest.requireActual('child_process'),
@@ -47,6 +48,20 @@ jest.mock('../../../services/authorizationChangeBus', () => ({
   subscribeToAuthorizationChanges: jest.fn(() => () => undefined),
 }));
 
+jest.mock('../../../services/nativeHostCliAdmission', () => ({
+  attestNativeHostCli: jest.fn(async () => undefined),
+}));
+
+jest.mock('./projectSandbox/CodexProjectSandbox', () => ({
+  CODEX_PROJECT_RUNTIME: 'test-codex-project-runtime',
+  buildCodexProjectInvocation: jest.fn(),
+}));
+
+jest.mock('./projectSandbox/ClaudeCodeProjectSandbox', () => ({
+  CLAUDE_CODE_PROJECT_RUNTIME: 'test-claude-project-runtime',
+  buildClaudeCodeProjectInvocation: jest.fn(),
+}));
+
 jest.mock('../../nativeProviderReadiness', () => ({
   ...jest.requireActual('../../nativeProviderReadiness'),
   getNativeProviderReadiness: jest.fn(async (provider: string) => ({
@@ -89,9 +104,19 @@ const { AgentAbortError } = require('../../AgentProvider.interface') as typeof i
 const { streamEventBus } = require('../../../services/StreamEventBus') as typeof import('../../../services/StreamEventBus');
 const { listPendingNativeCliApprovals } = require('../../nativeCliApprovals') as typeof import('../../nativeCliApprovals');
 const nativeProviderReadiness = require('../../nativeProviderReadiness') as typeof import('../../nativeProviderReadiness');
+const nativeHostCliAdmission = require('../../../services/nativeHostCliAdmission') as {
+  attestNativeHostCli: jest.Mock<Promise<void>, [string, string?]>;
+};
 const hostRunJournal = require('../../../services/hostAgentRunJournal') as {
   terminateHostAgentRunAttempt: jest.Mock<Promise<boolean>, [Record<string, unknown>]>;
+  beginHostAgentRun: jest.Mock;
+  reserveHostAgentRunAttempt: jest.Mock;
+  spawnGatedHostAgentRunAttempt: jest.Mock;
+  activateGatedHostAgentRunAttempt: jest.Mock;
+  settleHostAgentRun: jest.Mock;
 };
+const { codexAdapter } = require('./adapters/codex') as typeof import('./adapters/codex');
+const { claudeCodeAdapter } = require('./adapters/claude') as typeof import('./adapters/claude');
 
 class FakeChild extends EventEmitter {
   stdout = new EventEmitter();
@@ -104,15 +129,31 @@ class TestNativeProvider extends NativeCliAdapterProvider {
   constructor(adapter: NativeCliProviderAdapter) {
     super(adapter);
   }
+
+  override sendMessage(
+    ...args: Parameters<NativeCliAdapterProviderType['sendMessage']>
+  ): ReturnType<NativeCliAdapterProviderType['sendMessage']> {
+    if (!args[5]) {
+      args[5] = {
+        label: 'owner',
+        userId: 'owner-1',
+        authorizationVersion: 7,
+        requestId: `test-run-${args[0]}`,
+      };
+    }
+    return super.sendMessage(...args);
+  }
 }
 
 function adapter(overrides: Partial<NativeCliProviderAdapter> = {}): NativeCliProviderAdapter {
-  return {
+  const requestedBuild = overrides.buildInvocation
+    || ((ctx: NativeCliTurnContext) => ({ command: '/usr/bin/codex', args: [], stdinText: ctx.message }));
+  const result: NativeCliProviderAdapter = {
     providerName: 'CODEX',
     displayName: 'Lifecycle Test CLI',
-    cliCommand: 'lifecycle-test-cli',
+    cliCommand: '/usr/bin/codex',
     messageIdPrefix: 'lifecycle-test',
-    buildInvocation: () => ({ command: 'lifecycle-test-cli', args: [] }),
+    buildInvocation: requestedBuild,
     handleStdoutLine: (line, ctx) => {
       ctx.appendFullText(line);
       ctx.emitChunk(line);
@@ -120,12 +161,35 @@ function adapter(overrides: Partial<NativeCliProviderAdapter> = {}): NativeCliPr
     getResultText: (ctx) => ctx.fullText,
     ...overrides,
   };
+  // Lifecycle tests use a minimal synthetic adapter. Preserve the production
+  // host-prompt invariant without repeating stdinText in every unrelated
+  // abort/settlement fixture.
+  result.buildInvocation = async (ctx) => {
+    const invocation = await requestedBuild(ctx);
+    if (
+      ctx.session.executionContext?.scope === 'HOST_OPERATOR'
+      && (result.providerName === 'CODEX' || result.providerName === 'CLAUDE_CODE')
+      && invocation.stdinText === undefined
+    ) {
+      return { ...invocation, stdinText: ctx.message };
+    }
+    return invocation;
+  };
+  return result;
 }
 
 const createdSessionIds: string[] = [];
 
 function createSession(): string {
   const session = sessionStore.createNativeSession('CODEX', 'owner-1', {
+    executionContext: createHostOperatorExecutionContext('owner-1'),
+  });
+  createdSessionIds.push(session.sessionId);
+  return session.sessionId;
+}
+
+function createClaudeSession(): string {
+  const session = sessionStore.createNativeSession('CLAUDE_CODE', 'owner-1', {
     executionContext: createHostOperatorExecutionContext('owner-1'),
   });
   createdSessionIds.push(session.sessionId);
@@ -158,6 +222,42 @@ function queueChild(child = new FakeChild()): FakeChild {
   return child;
 }
 
+function hostInvocationContext(input: {
+  message?: string;
+  model?: string;
+  metadata?: Record<string, unknown>;
+  state?: Record<string, any>;
+} = {}): NativeCliTurnContext {
+  return {
+    session: {
+      sessionId: 'native-host-session',
+      userId: 'owner-1',
+      cwd: '/var/portal-files/user-owner-1',
+      createdAt: new Date().toISOString(),
+      messages: [],
+      executionContext: createHostOperatorExecutionContext('owner-1'),
+      ...(input.model ? { model: input.model } : {}),
+      metadata: input.metadata || {},
+    } as any,
+    originalSessionId: 'native-host-session',
+    message: input.message || 'hello',
+    fullText: '',
+    lastAssistantMessage: '',
+    stderr: '',
+    exitCode: null,
+    state: input.state || {},
+    emitChunk: jest.fn(),
+    emitStatus: jest.fn(),
+    setFullText: jest.fn(),
+    appendFullText: jest.fn(),
+    setLastAssistantMessage: jest.fn(),
+    appendStderr: jest.fn(),
+    requestApproval: jest.fn(async () => 'deny'),
+    updateSessionMetadata: jest.fn(),
+    stripAnsi: (text: string) => text,
+  };
+}
+
 async function waitFor(predicate: () => boolean, message: string): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;
@@ -169,11 +269,19 @@ async function waitFor(predicate: () => boolean, message: string): Promise<void>
 afterEach(() => {
   jest.useRealTimers();
   spawnMock.mockReset();
+  nativeHostCliAdmission.attestNativeHostCli.mockReset();
+  nativeHostCliAdmission.attestNativeHostCli.mockResolvedValue(undefined);
   hostRunJournal.terminateHostAgentRunAttempt.mockClear();
+  hostRunJournal.beginHostAgentRun.mockClear();
+  hostRunJournal.reserveHostAgentRunAttempt.mockClear();
+  hostRunJournal.spawnGatedHostAgentRunAttempt.mockClear();
+  hostRunJournal.activateGatedHostAgentRunAttempt.mockClear();
+  hostRunJournal.settleHostAgentRun.mockClear();
   jest.mocked(nativeProviderReadiness.recordNativeProviderAuthFailure).mockClear();
   for (const sessionId of createdSessionIds.splice(0)) {
     streamEventBus.clearStream(sessionId);
     try { sessionStore.deleteNativeSession('CODEX', sessionId); } catch {}
+    try { sessionStore.deleteNativeSession('CLAUDE_CODE', sessionId); } catch {}
   }
   expect(listPendingNativeCliApprovals()).toEqual([]);
 });
@@ -185,6 +293,142 @@ afterAll(() => {
 });
 
 describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
+  test('requires exact owner and positive authorization evidence before beginning a host run', async () => {
+    const provider = new TestNativeProvider(adapter());
+    const sessionId = createSession();
+    const rawSend = NativeCliAdapterProvider.prototype.sendMessage.bind(provider);
+
+    await expect(rawSend(sessionId, 'missing sender')).rejects.toThrow(/owner authorization evidence/i);
+    await expect(rawSend(
+      sessionId,
+      'wrong owner',
+      undefined,
+      undefined,
+      undefined,
+      { label: 'other owner', userId: 'other-owner', authorizationVersion: 7 },
+    )).rejects.toThrow(/owner authorization evidence/i);
+    await expect(rawSend(
+      sessionId,
+      'missing generation',
+      undefined,
+      undefined,
+      undefined,
+      { label: 'owner', userId: 'owner-1', authorizationVersion: 0 },
+    )).rejects.toThrow(/owner authorization evidence/i);
+
+    expect(hostRunJournal.beginHostAgentRun).not.toHaveBeenCalled();
+    expect(nativeHostCliAdmission.attestNativeHostCli).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test('freshly attests the exact absolute CLI immediately before every host spawn', async () => {
+    const firstChild = queueChild();
+    const secondChild = queueChild();
+    const buildInvocation = jest.fn((ctx: any) => {
+      if (ctx.state.turnAttempt === 1) ctx.state.retryRequested = true;
+      return { command: '/usr/bin/codex', args: [] };
+    });
+    const provider = new TestNativeProvider(adapter({
+      buildInvocation,
+      finalizeTurn: (ctx) => {
+        if (ctx.state.turnAttempt === 1) ctx.state.retryRequested = true;
+      },
+    }));
+    const sessionId = createSession();
+    const send = provider.sendMessage(sessionId, 'attested retry');
+
+    await waitFor(() => spawnMock.mock.calls.length === 1, 'first attested child was not spawned');
+    firstChild.emit('close', 0, null);
+    await waitFor(() => spawnMock.mock.calls.length === 2, 'second attested child was not spawned');
+    secondChild.stdout.emit('data', Buffer.from('done\n'));
+    secondChild.emit('close', 0, null);
+    await expect(send).resolves.toMatchObject({ fullText: 'done' });
+
+    expect(nativeHostCliAdmission.attestNativeHostCli).toHaveBeenCalledTimes(2);
+    expect(nativeHostCliAdmission.attestNativeHostCli).toHaveBeenNthCalledWith(
+      1,
+      'codex',
+      '/usr/bin/codex',
+    );
+    expect(nativeHostCliAdmission.attestNativeHostCli).toHaveBeenNthCalledWith(
+      2,
+      'codex',
+      '/usr/bin/codex',
+    );
+    expect(buildInvocation.mock.invocationCallOrder[0])
+      .toBeLessThan(hostRunJournal.reserveHostAgentRunAttempt.mock.invocationCallOrder[0]);
+    expect(hostRunJournal.reserveHostAgentRunAttempt.mock.invocationCallOrder[0])
+      .toBeLessThan(nativeHostCliAdmission.attestNativeHostCli.mock.invocationCallOrder[0]);
+    expect(nativeHostCliAdmission.attestNativeHostCli.mock.invocationCallOrder[0])
+      .toBeLessThan(hostRunJournal.spawnGatedHostAgentRunAttempt.mock.invocationCallOrder[0]);
+    expect(hostRunJournal.reserveHostAgentRunAttempt).toHaveBeenCalledTimes(2);
+    expect(hostRunJournal.spawnGatedHostAgentRunAttempt).toHaveBeenCalledTimes(2);
+    expect(hostRunJournal.activateGatedHostAgentRunAttempt).toHaveBeenCalledTimes(2);
+    expect(hostRunJournal.beginHostAgentRun).toHaveBeenCalledTimes(1);
+  });
+
+  test('fails after invocation construction and reservation but before spawn when late admission rejects', async () => {
+    const buildInvocation = jest.fn(() => ({ command: '/usr/bin/codex', args: [] }));
+    const provider = new TestNativeProvider(adapter({ buildInvocation }));
+    const sessionId = createSession();
+    nativeHostCliAdmission.attestNativeHostCli.mockRejectedValueOnce(
+      new Error('native CLI identity changed'),
+    );
+
+    await expect(provider.sendMessage(sessionId, 'reject admission')).rejects.toBeInstanceOf(Error);
+    expect(hostRunJournal.beginHostAgentRun).toHaveBeenCalledTimes(1);
+    expect(nativeHostCliAdmission.attestNativeHostCli).toHaveBeenCalledWith(
+      'codex',
+      '/usr/bin/codex',
+    );
+    expect(buildInvocation).toHaveBeenCalledTimes(1);
+    expect(hostRunJournal.reserveHostAgentRunAttempt).toHaveBeenCalledTimes(1);
+    expect(hostRunJournal.spawnGatedHostAgentRunAttempt).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(hostRunJournal.settleHostAgentRun).toHaveBeenCalledWith(
+      expect.objectContaining({ actorUserId: 'owner-1', actorAuthorizationVersion: 7 }),
+      'ERROR',
+      expect.any(String),
+      { outcome: 'error' },
+    );
+  });
+
+  test('rejects a relative or substituted host command before admission or reservation', async () => {
+    const provider = new TestNativeProvider(adapter({
+      buildInvocation: () => ({ command: 'codex', args: [] }),
+    }));
+    const sessionId = createSession();
+
+    await expect(provider.sendMessage(sessionId, 'relative command')).rejects.toBeInstanceOf(Error);
+    expect(nativeHostCliAdmission.attestNativeHostCli).not.toHaveBeenCalled();
+    expect(hostRunJournal.reserveHostAgentRunAttempt).not.toHaveBeenCalled();
+    expect(hostRunJournal.spawnGatedHostAgentRunAttempt).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test('binds Claude host attempts to its own tool identity and absolute executable', async () => {
+    const child = queueChild();
+    const provider = new TestNativeProvider(adapter({
+      providerName: 'CLAUDE_CODE',
+      cliCommand: '/usr/bin/claude',
+      buildInvocation: () => ({ command: '/usr/bin/claude', args: ['-p', 'hello'] }),
+    }));
+    const sessionId = createClaudeSession();
+    const send = provider.sendMessage(sessionId, 'claude turn');
+    await waitFor(() => spawnMock.mock.calls.length === 1, 'Claude child was not spawned');
+    child.stdout.emit('data', Buffer.from('answer\n'));
+    child.emit('close', 0, null);
+    await expect(send).resolves.toMatchObject({ fullText: 'answer' });
+
+    expect(nativeHostCliAdmission.attestNativeHostCli).toHaveBeenCalledWith(
+      'claude-code',
+      '/usr/bin/claude',
+    );
+    expect(hostRunJournal.spawnGatedHostAgentRunAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ command: '/usr/bin/claude' }),
+    );
+  });
+
   test('reserves before invocation construction so concurrent sends cannot overlap', async () => {
     let resolveBuild!: (invocation: NativeCliInvocation) => void;
     const build = new Promise<NativeCliInvocation>((resolve) => { resolveBuild = resolve; });
@@ -209,7 +453,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     expect(provider.hasActiveRun(sessionId)).toBe(true);
     expect(authoritativeAbort).not.toHaveBeenCalled();
 
-    resolveBuild({ command: 'lifecycle-test-cli', args: [], abort: authoritativeAbort });
+    resolveBuild({ command: '/usr/bin/codex', args: [], abort: authoritativeAbort });
     await expect(abort).resolves.toBe(true);
     expect(await firstOutcome).toBeInstanceOf(AgentAbortError);
     expect(authoritativeAbort).toHaveBeenCalledTimes(1);
@@ -221,7 +465,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     const provider = new TestNativeProvider(adapter({
       buildInvocation: async (ctx) => {
         await ctx.requestApproval({ command: 'echo waiting', timeoutMs: 120_000 });
-        return { command: 'lifecycle-test-cli', args: [] };
+        return { command: '/usr/bin/codex', args: [] };
       },
     }));
     const sessionId = createSession();
@@ -232,7 +476,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
       undefined,
       undefined,
       approvalSeen,
-      { userId: 'owner-1', label: 'owner', role: 'OWNER' },
+      { userId: 'owner-1', label: 'owner', role: 'OWNER', authorizationVersion: 7 },
     ).then((result) => result, (error) => error);
 
     await waitFor(() => approvalSeen.mock.calls.length === 1, 'approval was not requested');
@@ -289,7 +533,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     expect(authoritativeAbort).not.toHaveBeenCalled();
 
     jest.useRealTimers();
-    resolveBuild({ command: 'lifecycle-test-cli', args: [], abort: authoritativeAbort });
+    resolveBuild({ command: '/usr/bin/codex', args: [], abort: authoritativeAbort });
     await waitFor(() => authoritativeAbort.mock.calls.length === 1, 'late abort hook was not invoked');
     await expect(provider.abortActiveRun(sessionId)).resolves.toBe(false);
     expect(authoritativeAbort).toHaveBeenCalledTimes(1);
@@ -332,7 +576,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     const authoritativeAbort = jest.fn(async () => undefined);
     const provider = new TestNativeProvider(adapter({
       buildInvocation: () => ({
-        command: 'lifecycle-test-cli',
+        command: '/usr/bin/codex',
         args: [],
         abort: authoritativeAbort,
       }),
@@ -366,7 +610,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     const authoritativeAbort = jest.fn(() => authoritativeAbortPending);
     const provider = new TestNativeProvider(adapter({
       buildInvocation: () => ({
-        command: 'lifecycle-test-cli',
+        command: '/usr/bin/codex',
         args: [],
         abort: authoritativeAbort,
       }),
@@ -478,7 +722,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
       undefined,
       undefined,
       undefined,
-      { label: 'owner', userId: 'owner-1', role: 'OWNER', requestId: 'reconnect-terminal-run' },
+      { label: 'owner', userId: 'owner-1', role: 'OWNER', authorizationVersion: 7, requestId: 'reconnect-terminal-run' },
     );
     await waitFor(() => spawnMock.mock.calls.length === 1, 'child was not spawned');
 
@@ -504,7 +748,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
       : jest.fn(async () => { throw new Error('provider cleanup unavailable'); });
     const provider = new TestNativeProvider(adapter({
       buildInvocation: () => ({
-        command: 'lifecycle-test-cli',
+        command: '/usr/bin/codex',
         args: [],
         abort: authoritativeAbort,
       }),
@@ -543,7 +787,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     const authoritativeAbort = jest.fn(async () => false);
     const provider = new TestNativeProvider(adapter({
       buildInvocation: () => ({
-        command: 'lifecycle-test-cli',
+        command: '/usr/bin/codex',
         args: [],
         abort: authoritativeAbort,
       }),
@@ -562,7 +806,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     const authoritativeAbort = jest.fn(async () => false);
     const provider = new TestNativeProvider(adapter({
       buildInvocation: () => ({
-        command: 'lifecycle-test-cli',
+        command: '/usr/bin/codex',
         args: [],
         abort: authoritativeAbort,
       }),
@@ -597,7 +841,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
       undefined,
       undefined,
       undefined,
-      { label: 'owner', userId: 'owner-1', role: 'OWNER', requestId: 'durable-run-id' },
+      { label: 'owner', userId: 'owner-1', role: 'OWNER', authorizationVersion: 7, requestId: 'durable-run-id' },
     ).then(
       (result) => result,
       (error) => error,
@@ -631,7 +875,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     const authoritativeAbort = jest.fn(async () => undefined);
     const provider = new TestNativeProvider(adapter({
       buildInvocation: () => ({
-        command: 'lifecycle-test-cli',
+        command: '/usr/bin/codex',
         args: [],
         abort: authoritativeAbort,
       }),
@@ -694,7 +938,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     const authoritativeAbort = jest.fn(async () => undefined);
     const provider = new TestNativeProvider(adapter({
       buildInvocation: () => ({
-        command: 'lifecycle-test-cli',
+        command: '/usr/bin/codex',
         args: [],
         abort: authoritativeAbort,
       }),
@@ -726,7 +970,7 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     const authoritativeAbort = new Promise<void>((resolve) => { resolveAuthoritativeAbort = resolve; });
     const provider = new TestNativeProvider(adapter({
       buildInvocation: () => ({
-        command: 'lifecycle-test-cli',
+        command: '/usr/bin/codex',
         args: [],
         abort: () => authoritativeAbort,
       }),
@@ -788,4 +1032,232 @@ describe('NativeCliAdapterProvider logical-turn lifecycle', () => {
     expect(history.filter((entry) => entry.role === 'assistant')).toHaveLength(1);
     expect(provider.hasActiveRun(sessionId)).toBe(false);
   });
+});
+
+describe('native host-operator adapter invocations', () => {
+  test('builds Codex start and resume argv only for the admitted absolute executable', async () => {
+    const fresh = await codexAdapter.buildInvocation(hostInvocationContext({
+      message: 'fresh prompt',
+      model: 'gpt-5.6',
+    }));
+    expect(fresh).toEqual({
+      command: '/usr/bin/codex',
+      args: [
+        'exec',
+        '--skip-git-repo-check',
+        '--color',
+        'never',
+        '--json',
+        '--sandbox',
+        'workspace-write',
+        '--model',
+        'gpt-5.6',
+        '-c',
+        'model_reasoning_effort="medium"',
+        '-c',
+        'model_reasoning_summary="auto"',
+        '-',
+      ],
+      stdinText: 'fresh prompt',
+    });
+
+    const resumed = await codexAdapter.buildInvocation(hostInvocationContext({
+      message: 'resume prompt',
+      metadata: { nativeSessionId: 'codex-thread-1' },
+      state: { codexApprovedExecution: true },
+    }));
+    expect(resumed).toEqual({
+      command: '/usr/bin/codex',
+      args: [
+        'exec',
+        'resume',
+        'codex-thread-1',
+        '--skip-git-repo-check',
+        '--json',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '-c',
+        'model_reasoning_effort="medium"',
+        '-c',
+        'model_reasoning_summary="auto"',
+        '-',
+      ],
+      stdinText: 'resume prompt',
+    });
+
+    const unapprovedResume = await codexAdapter.buildInvocation(hostInvocationContext({
+      message: 'private unapproved resume prompt',
+      metadata: { nativeSessionId: 'codex-thread-2' },
+    }));
+    expect(unapprovedResume).toEqual({
+      command: '/usr/bin/codex',
+      args: [
+        'exec',
+        'resume',
+        'codex-thread-2',
+        '--skip-git-repo-check',
+        '--json',
+        '-c',
+        'sandbox_mode="workspace-write"',
+        '-c',
+        'model_reasoning_effort="medium"',
+        '-c',
+        'model_reasoning_summary="auto"',
+        '-',
+      ],
+      stdinText: 'private unapproved resume prompt',
+    });
+  });
+
+  test('builds Claude start and resume argv only for the admitted absolute executable', async () => {
+    const fresh = await claudeCodeAdapter.buildInvocation(hostInvocationContext({
+      message: 'fresh prompt',
+      model: 'claude-sonnet-4-5',
+      metadata: { nativeSessionId: 'claude-session-1' },
+      state: {
+        approvedAllowedTools: ['Bash', 'Read'],
+        approvedAddDirs: ['/srv/project', '/srv/shared'],
+      },
+    }));
+    expect(fresh).toEqual({
+      command: '/usr/bin/claude',
+      args: [
+        '-p',
+        '--verbose',
+        '--output-format',
+        'stream-json',
+        '--include-partial-messages',
+        '--safe-mode',
+        '--disable-slash-commands',
+        '--strict-mcp-config',
+        '--mcp-config',
+        '{"mcpServers":{}}',
+        '--setting-sources',
+        '',
+        '--permission-mode',
+        'dontAsk',
+        '--allowedTools',
+        'Bash Read',
+        '--add-dir',
+        '/srv/project',
+        '--add-dir',
+        '/srv/shared',
+        '--session-id',
+        'claude-session-1',
+        '--model',
+        'claude-sonnet-4-5',
+      ],
+      stdinText: 'fresh prompt',
+    });
+
+    const resumed = await claudeCodeAdapter.buildInvocation(hostInvocationContext({
+      message: 'resume prompt',
+      metadata: {
+        nativeSessionId: 'claude-session-1',
+        nativeSessionEstablished: true,
+      },
+    }));
+    expect(resumed).toEqual({
+      command: '/usr/bin/claude',
+      args: [
+        '-p',
+        '--verbose',
+        '--output-format',
+        'stream-json',
+        '--include-partial-messages',
+        '--safe-mode',
+        '--disable-slash-commands',
+        '--strict-mcp-config',
+        '--mcp-config',
+        '{"mcpServers":{}}',
+        '--setting-sources',
+        '',
+        '--permission-mode',
+        'dontAsk',
+        '--resume',
+        'claude-session-1',
+      ],
+      stdinText: 'resume prompt',
+    });
+  });
+});
+
+
+test('real Codex tools reach durable host activity and the immediate callback exactly once', async () => {
+  const previous = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+  process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = path.join(sessionsDir, 'tool-replay-proof');
+  const child = queueChild();
+  const provider = new TestNativeProvider(codexAdapter);
+  const sessionId = createSession();
+  const status = jest.fn();
+  const events: any[] = [];
+  const unsubscribe = streamEventBus.subscribe(sessionId, event => events.push(event));
+  try {
+    const send = provider.sendMessage(sessionId, 'read the selected project fixture', undefined, status);
+    await waitFor(() => child.stdout.listenerCount('data') > 0, 'adapter stdout listener missing');
+    const item = { id: 'fixture-command-1', type: 'command_execution', command: 'cat target.txt' };
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'item.started', item }) + '\n'));
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'item.completed', item: { ...item, aggregated_output: 'fixture-result', exit_code: 0, status: 'completed' } }) + '\n'));
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Fixture read.' } }) + '\n'));
+    child.emit('close', 0, null);
+    await send;
+    expect(events.filter(e => e.type === 'tool_start')).toHaveLength(1);
+    expect(events.filter(e => e.type === 'tool_end')).toHaveLength(1);
+    expect(status.mock.calls.filter(([e]) => e.type === 'tool_start')).toHaveLength(1);
+    expect(status.mock.calls.filter(([e]) => e.type === 'tool_end')).toHaveLength(1);
+    const { readRuntimeTurnEvents } = require('../../../services/RuntimeTurnEventHistory');
+    const tools = readRuntimeTurnEvents(sessionId, 100).filter((e: any) => e.type.startsWith('tool_'));
+    expect(tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'tool_started', visible: true, sessionKey: sessionId,
+        tool: expect.objectContaining({ name: 'shell', arguments: { command: 'cat target.txt' } }) }),
+      expect.objectContaining({ type: 'tool_output', visible: true, sessionKey: sessionId,
+        tool: expect.objectContaining({ result: 'fixture-result' }) }),
+    ]));
+    expect(new Set(tools.map((e: any) => e.runId)).size).toBe(1);
+    expect(tools[0].runId).toBeTruthy();
+  } finally {
+    unsubscribe();
+    if (previous === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previous;
+  }
+});
+
+test('legacy session announcements stay on the immediate callback and never reach the host bus or durable activity', async () => {
+  const previous = process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+  process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = path.join(sessionsDir, 'session-announce-proof');
+  const child = queueChild();
+  const provider = new TestNativeProvider(codexAdapter);
+  const sessionId = createSession();
+  const status = jest.fn();
+  const events: any[] = [];
+  const unsubscribe = streamEventBus.subscribe(sessionId, event => events.push(event));
+  try {
+    const send = provider.sendMessage(sessionId, 'announce the native thread', undefined, status);
+    await waitFor(() => child.stdout.listenerCount('data') > 0, 'adapter stdout listener missing');
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'thread.started', thread_id: 'thread-fixture-1' }) + '\n'));
+    const item = { id: 'fixture-command-2', type: 'command_execution', command: 'cat target.txt' };
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'item.started', item }) + '\n'));
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'item.completed', item: { ...item, aggregated_output: 'fixture-result', exit_code: 0, status: 'completed' } }) + '\n'));
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Thread announced.' } }) + '\n'));
+    child.emit('close', 0, null);
+    await send;
+    // The immediate callback still receives the announcement exactly once,
+    // sanitized and bound to the run, so existing consumers keep working.
+    const announced = status.mock.calls.filter(([e]) => e.type === 'session');
+    expect(announced).toHaveLength(1);
+    expect(announced[0][0]).toMatchObject({ type: 'session', sessionId, nativeSessionId: 'thread-fixture-1' });
+    expect(typeof announced[0][0].runId).toBe('string');
+    // The browser-facing bus and durable journal never see a session switch,
+    // while tool activity keeps its canonical publication.
+    expect(events.filter(e => e.type === 'session')).toHaveLength(0);
+    expect(events.filter(e => e.type === 'tool_start')).toHaveLength(1);
+    expect(events.filter(e => e.type === 'tool_end')).toHaveLength(1);
+    const { readRuntimeTurnEvents } = require('../../../services/RuntimeTurnEventHistory');
+    const durable = readRuntimeTurnEvents(sessionId, 100);
+    expect(durable.filter((e: any) => e.type === 'session')).toHaveLength(0);
+    expect(durable.filter((e: any) => e.type.startsWith('tool_')).length).toBeGreaterThanOrEqual(2);
+  } finally {
+    unsubscribe();
+    if (previous === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
+    else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previous;
+  }
 });

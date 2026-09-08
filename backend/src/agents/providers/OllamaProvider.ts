@@ -111,7 +111,12 @@ async function resolveDefaultModel(
 
 function requireSession(sessionId: AgentSessionId): NativeSessionData {
   const session = loadNativeSession('OLLAMA', sessionId);
-  if (session) return session;
+  if (session) {
+    // OllamaProjectProvider stores sessions under the same durable provider id.
+    // Never let this host-network adapter claim a confined Project session.
+    assertExecutionContextBinding(session.executionContext, session.userId, 'HOST_OPERATOR');
+    return session;
+  }
   throw new Error(`Ollama session not found: ${sessionId}`);
 }
 
@@ -511,7 +516,9 @@ export class OllamaProvider implements AgentProvider {
   private readonly activeRuns = new Map<AgentSessionId, OllamaHostActiveRun>();
 
   async startSession(userId: string, config: AgentSessionConfig): Promise<AgentSessionId> {
-    assertExecutionContextBinding(config.executionContext, userId);
+    // Project Chat uses the dedicated networkless OllamaProjectProvider. The
+    // harness advertises that capability, but this host adapter remains host-only.
+    assertExecutionContextBinding(config.executionContext, userId, 'HOST_OPERATOR');
     assertProviderSupportsExecutionScope(
       this.providerName,
       getProviderCapabilities(this.providerName)?.supportedExecutionScopes,
@@ -696,7 +703,9 @@ export class OllamaProvider implements AgentProvider {
   }
 
   async listSessions(userId: string): Promise<AgentSessionSummary[]> {
-    return listNativeSessions('OLLAMA', userId);
+    return listNativeSessions('OLLAMA', userId).filter(
+      (session) => session.metadata?.executionScope === 'HOST_OPERATOR',
+    );
   }
 
   async abortActiveRun(sessionId: AgentSessionId, expectedRunId?: string): Promise<boolean> {

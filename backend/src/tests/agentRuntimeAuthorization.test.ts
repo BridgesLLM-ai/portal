@@ -2,6 +2,8 @@ import http from 'http';
 import express, { NextFunction, Request, Response } from 'express';
 
 const execMock = jest.fn();
+const mockReconcileAgentZeroRuntime = jest.fn();
+const mockGetNativeHostCliStatus = jest.fn();
 
 jest.mock('child_process', () => ({
   ...jest.requireActual('child_process'),
@@ -20,19 +22,41 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
+jest.mock('../agents/providers/agentZero/AgentZeroSetupControl', () => ({
+  ...jest.requireActual('../agents/providers/agentZero/AgentZeroSetupControl'),
+  reconcileAgentZeroRuntime: mockReconcileAgentZeroRuntime,
+}));
+
+jest.mock('../services/nativeHostCliStatus', () => ({
+  ...jest.requireActual('../services/nativeHostCliStatus'),
+  getNativeHostCliStatus: mockGetNativeHostCliStatus,
+}));
+
 import agentRuntimeRouter from '../routes/agent-runtime';
 import { TOOL_ADAPTERS } from '../config/toolAdapters';
+import { NATIVE_HOST_CLI_EXECUTION_CONTRACT } from '../services/nativeHostCliStatus';
 
-async function request(server: http.Server, role: string) {
+async function request(
+  server: http.Server,
+  role: string,
+  options: { method?: 'GET' | 'POST'; path?: string; body?: string } = {},
+) {
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Server is not listening');
+  const body = options.body ?? '';
   return new Promise<{ status: number; body: any }>((resolve, reject) => {
     const req = http.request({
       hostname: '127.0.0.1',
       port: address.port,
-      method: 'GET',
-      path: '/agent-runtime/status',
-      headers: { 'x-test-role': role },
+      method: options.method ?? 'GET',
+      path: options.path ?? '/agent-runtime/status',
+      headers: {
+        'x-test-role': role,
+        ...(options.method === 'POST' ? {
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body)),
+        } : {}),
+      },
     }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
@@ -42,7 +66,7 @@ async function request(server: http.Server, role: string) {
       });
     });
     req.on('error', reject);
-    req.end();
+    req.end(body);
   });
 }
 
@@ -53,8 +77,20 @@ describe('Agent runtime host-inventory authorization', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     execMock.mockImplementation((_command, _options, callback) => callback(null, '1.2.3\n', ''));
+    mockGetNativeHostCliStatus.mockImplementation(async (toolId: 'codex' | 'claude-code') => ({
+      toolId,
+      executablePath: toolId === 'codex' ? '/usr/bin/codex' : '/usr/bin/claude',
+      state: 'verified',
+      installed: true,
+      executionEligible: true,
+      checkedAt: new Date().toISOString(),
+      observedVersion: toolId === 'codex' ? '0.145.0' : '2.1.220',
+      fingerprint: 'a'.repeat(64),
+      reasonCode: null,
+    }));
     fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, status: 200 } as any);
     const app = express();
+    app.use(express.json());
     app.use('/agent-runtime', agentRuntimeRouter);
     server = http.createServer(app);
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -95,17 +131,41 @@ describe('Agent runtime host-inventory authorization', () => {
     }
   });
 
-  test('routes gateway control presets through the Portal-owned system unit', () => {
-    const openClaw = TOOL_ADAPTERS.find((entry) => entry.id === 'openclaw');
-    const gatewayCommands = openClaw?.commands.filter((entry) => (
-      entry.label === 'Gateway Status' || entry.label === 'Start Gateway'
-    )) || [];
+  test('advertises only admitted Codex and Claude host execution under the native admission contract', async () => {
+    const response = await request(server, 'OWNER');
+    expect(response.status).toBe(200);
+    for (const id of ['codex', 'claude-code']) {
+      expect(response.body.adapters).toContainEqual(expect.objectContaining({
+        id,
+        available: true,
+        state: 'verified',
+        executionContract: NATIVE_HOST_CLI_EXECUTION_CONTRACT,
+      }));
+    }
+  });
 
-    expect(gatewayCommands).toHaveLength(2);
-    expect(gatewayCommands.every((entry) => (
-      entry.command.startsWith('/usr/bin/systemctl ')
-      && entry.command.endsWith(' openclaw-gateway.service')
-      && !entry.command.includes('openclaw gateway')
-    ))).toBe(true);
+  test('does not advertise typed OpenClaw launch or lifecycle presets', () => {
+    const openClaw = TOOL_ADAPTERS.find((entry) => entry.id === 'openclaw');
+    expect(openClaw?.detect).toEqual({ command: 'openclaw --version' });
+    expect(openClaw?.commands).toEqual([]);
+    expect(openClaw?.description).toBe(
+      'Portal-owned orchestration runtime. Agent Chat uses the durable Gateway run journal; Owner updates it only with the exact compatibility bundle under Admin > Maintenance.',
+    );
+  });
+
+  test('keeps the late Agent Zero reconcile route fixed unavailable without touching host lifecycle', async () => {
+    const response = await request(server, 'OWNER', {
+      method: 'POST',
+      path: '/agent-runtime/agent-zero/runtime/reconcile',
+      body: JSON.stringify({ confirmation: 'SET UP AGENT ZERO' }),
+    });
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      code: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
+      retryable: false,
+    });
+    expect(mockReconcileAgentZeroRuntime).not.toHaveBeenCalled();
+    expect(execMock).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

@@ -123,7 +123,7 @@ describe('Agent Tools provider scope', () => {
     const listbox = await screen.findByRole('listbox', { name: 'OpenClaw agents' });
     expect(listbox).toHaveTextContent('OpenClaw agent scope');
     expect(listbox).toHaveTextContent(
-      'Agent Tools is OpenClaw-scoped. Agent Chat providers are selected in Agent Chat.',
+      'These controls manage OpenClaw agents. Use Workspace for other harnesses and native tools.',
     );
     expect(listbox.closest('[data-anchored-popover-root="true"]')).not.toBeNull();
 

@@ -14,9 +14,17 @@ import React, {
   useState,
 } from 'react';
 import client from '../api/client';
+import { authoredHistoryText, isInternalHistoryUser } from '../utils/historyProvenance';
 import { gatewayAPI } from '../api/endpoints';
 import type { GatewayPendingQuestion } from '../api/endpoints';
 import { authAPI } from '../api/auth';
+import {
+  AGENT_HARNESS_SELECTION_EVENT,
+  AGENT_HARNESS_SELECTION_STORAGE_KEY,
+  loadAndApplyDefaultAgentHarness,
+  persistSelectedAgentHarness,
+  readSelectedAgentHarness,
+} from '../api/agentHarnessPreference';
 import { useAuthStore } from './AuthContext';
 import {
   createGraduatedThinkingSnapshotTracker,
@@ -43,7 +51,10 @@ import {
   type GatewayChatMessage,
 } from '../utils/openclawGatewayClient';
 import { normalizeAgentChatModelId } from '../utils/agentChatModelSelection';
-import { applyAgentChatSessionModel } from '../utils/agentChatModelSwitch';
+import {
+  applyAgentChatSessionModel,
+  deriveAgentChatSessionModel,
+} from '../utils/agentChatModelSwitch';
 import {
   appendCompletedToolCallIfMissing,
   appendToolCallToMessage,
@@ -493,16 +504,30 @@ function getOrCreateStreamClientId(): string {
 
 const HISTORY_ENVELOPE_TIMESTAMP_RE = /\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\s+[A-Z]{2,4}\]\s*/;
 
+function isCanonicalUntrustedMetadataPrefix(value: string): boolean {
+  let remaining = String(value || '').trim();
+  let matched = false;
+  while (remaining) {
+    const block = remaining.match(/^(?:Conversation info|Sender) \(untrusted metadata\):\s*```json\s*\n?([\s\S]*?)\n?```\s*/i);
+    if (!block) return false;
+    try {
+      const parsed = JSON.parse(block[1]);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    } catch {
+      return false;
+    }
+    matched = true;
+    remaining = remaining.slice(block[0].length).trim();
+  }
+  return matched;
+}
+
 function stripHistoryEnvelope(text: string): string {
   if (!text) return text;
   const match = text.match(HISTORY_ENVELOPE_TIMESTAMP_RE);
   if (match && match.index !== undefined) {
     const beforeTimestamp = text.substring(0, match.index);
-    if (
-      match.index === 0
-      || beforeTimestamp.includes('Conversation info (untrusted metadata)')
-      || beforeTimestamp.includes('Sender (untrusted metadata)')
-    ) {
+    if (isCanonicalUntrustedMetadataPrefix(beforeTimestamp)) {
       return text.substring(match.index + match[0].length).trim();
     }
   }
@@ -515,67 +540,54 @@ function sanitizeHistoryMessageText(text: string): string {
     .trim();
 }
 
+function isCanonicalOpenClawInternalContextEnvelope(text: string): boolean {
+  const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  const lines = normalized.split('\n');
+  if (
+    lines.length < 3
+    || lines[0] !== '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>'
+    || lines.at(-1) !== '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>'
+  ) return false;
+  return lines[1] === 'OpenClaw runtime context (internal):'
+    || lines[1] === '[Internal task completion event]';
+}
+
+function isCanonicalUntrustedMetadataEnvelope(text: string): boolean {
+  const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  const match = normalized.match(/^(?:Sender|Conversation info) \(untrusted metadata\):\n```json\n([\s\S]+)\n```$/);
+  if (!match) return false;
+  try {
+    const parsed = JSON.parse(match[1]);
+    return Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed));
+  } catch {
+    return false;
+  }
+}
+
 function isHiddenHistoryArtifactText(text: string): boolean {
   const normalized = String(text || '').trim();
   if (!normalized) return false;
 
+  if (
+    isCanonicalOpenClawInternalContextEnvelope(normalized)
+    || isCanonicalUntrustedMetadataEnvelope(normalized)
+  ) return true;
+
   return [
     /^System \(untrusted\):/i,
     /^An async command you ran earlier has completed\./i,
-    /^Read HEARTBEAT\.md if it exists/i,
+    /^Read HEARTBEAT\.md if it exists\.?$/i,
+    /^Read HEARTBEAT\.md if it exists \(workspace context\)\. Follow it strictly\. Do not infer or repeat old tasks from prior chats\. If nothing needs attention, reply HEARTBEAT_OK\.$/i,
     // Configured heartbeat prompts are conventionally one bracketed line
     // containing "heartbeat" (e.g. "[OpenClaw heartbeat poll]"); rendering
     // them as user bubbles presented machine polling as conversation.
     /^\[[^\]\n]*heartbeat[^\]\n]*\]$/i,
     /^HEARTBEAT_OK$/i,
     /^Heartbeat check complete(?:d)?\.?$/i,
-    /^Pre-compaction memory flush\./i,
+    /^Pre-compaction memory flush\.$/i,
     /^Memory flush complete(?:d)?\.?$/i,
     /^\[System\]\s+Your previous turn was interrupted by a gateway restart/i,
-    /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
-    /Handle the result internally\./i,
-    /Sender \(untrusted metadata\):/i,
-    /Conversation info \(untrusted metadata\):/i,
   ].some((pattern) => pattern.test(normalized));
-}
-
-function summarizeHiddenHistoryArtifactText(text: string): string | null {
-  const normalized = String(text || '').trim();
-  if (!normalized) return null;
-
-  if (/<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i.test(normalized) && /\[Internal task completion event\]/i.test(normalized)) {
-    const sourceMatch = normalized.match(/^source:\s*(.+)$/im);
-    const source = sourceMatch?.[1]?.trim().toLowerCase() || '';
-    if (source === 'subagent') return 'Delegated task completed';
-    if (source) return 'Background task completed';
-    return 'Background work completed';
-  }
-
-  if (/^An async command you ran earlier has completed\./i.test(normalized)) {
-    return 'Earlier async command completed';
-  }
-
-  if (/^\[System\]\s+Your previous turn was interrupted by a gateway restart/i.test(normalized)) {
-    return 'Previous turn interrupted by gateway restart';
-  }
-
-  if (/^Read HEARTBEAT\.md if it exists/i.test(normalized)) {
-    return 'Heartbeat check started';
-  }
-
-  if (/^HEARTBEAT_OK$/i.test(normalized) || /^Heartbeat check complete(?:d)?\.?$/i.test(normalized)) {
-    return 'Heartbeat check completed';
-  }
-
-  if (/^Pre-compaction memory flush\./i.test(normalized)) {
-    return 'Memory flush started';
-  }
-
-  if (/^Memory flush complete(?:d)?\.?$/i.test(normalized)) {
-    return 'Memory flush completed';
-  }
-
-  return null;
 }
 
 const MODEL_STORAGE_PREFIX = 'agentChats.lastModel.';
@@ -627,24 +639,21 @@ function normalizeToolCalls(toolCalls: any, defaultStatus: ToolCall['status'] = 
     });
 }
 
-function defaultCompactionNoticeText(meta?: Record<string, any> | null): string {
-  const signal = String(meta?.phase || meta?.status || '').trim().toLowerCase();
-  if (signal === 'start' || signal === 'started' || signal === 'compacting' || signal === 'compaction_start') {
-    return 'Compacting context…';
-  }
-  if (meta?.completed === false || signal === 'incomplete' || signal === 'did_not_complete') {
-    return 'Context maintenance finished.';
-  }
-  return 'Context compacted';
+type RoutineMaintenanceKind = 'heartbeat' | 'memory-flush';
+
+function routineMaintenancePromptKind(text: string): RoutineMaintenanceKind | null {
+  const normalized = String(text || '').trim();
+  if (
+    /^\[[^\]\n]*heartbeat[^\]\n]*\]$/i.test(normalized)
+    || /^Read HEARTBEAT\.md if it exists\.?$/i.test(normalized)
+    || /^Read HEARTBEAT\.md if it exists \(workspace context\)\. Follow it strictly\. Do not infer or repeat old tasks from prior chats\. If nothing needs attention, reply HEARTBEAT_OK\.$/i.test(normalized)
+  ) return 'heartbeat';
+  if (/^Pre-compaction memory flush\.$/i.test(normalized)) return 'memory-flush';
+  return null;
 }
 
-function resolveCompactionNoticeText(text: string, meta?: Record<string, any> | null): string {
-  const normalized = sanitizeHistoryMessageText(text);
-  return normalized || defaultCompactionNoticeText(meta);
-}
-
-function isHeartbeatPollMarkerText(text: string): boolean {
-  return /^\[[^\]\n]*heartbeat[^\]\n]*\]$/i.test(String(text || '').trim());
+function isRoutineMaintenancePromptText(text: string): boolean {
+  return routineMaintenancePromptKind(text) !== null;
 }
 
 /**
@@ -656,38 +665,83 @@ function isHeartbeatPollMarkerText(text: string): boolean {
  */
 export function parseHistoryMessages(rawMessages: any[]): ChatMessage[] {
   const parsed: ChatMessage[] = [];
-  let inHeartbeatTurn = false;
+  let maintenanceKind: RoutineMaintenanceKind | null = null;
+  let pendingHeartbeatAlert: ChatMessage | null = null;
+
+  const flushHeartbeatAlert = () => {
+    if (maintenanceKind === 'heartbeat' && pendingHeartbeatAlert) {
+      parsed.push(pendingHeartbeatAlert);
+    }
+    pendingHeartbeatAlert = null;
+  };
+
   for (const raw of rawMessages) {
     const role = raw?.role;
     const text = sanitizeHistoryMessageText(typeof raw?.content === 'string' ? raw.content : '');
-    if (role === 'user' || role === 'system') {
-      inHeartbeatTurn = role === 'user' && isHeartbeatPollMarkerText(text);
+    const promptKind = isInternalHistoryUser(raw)
+      ? routineMaintenancePromptKind(text)
+      : raw?.__portal?.kind === 'internal-maintenance-prompt'
+        ? (raw?.__portal?.maintenanceKind === 'heartbeat' ? 'heartbeat' : 'memory-flush')
+        : null;
+    if (promptKind) {
+      flushHeartbeatAlert();
+      maintenanceKind = promptKind;
+      continue;
     }
-    if (inHeartbeatTurn && role === 'assistant' && isHiddenHistoryArtifactText(text)) {
+    if (role === 'system' && isStandaloneMaintenanceNoticeContent(text)) {
+      continue;
+    }
+    if (role === 'user') {
+      flushHeartbeatAlert();
+      maintenanceKind = null;
+    } else if (maintenanceKind) {
+      if (role === 'assistant') {
+        const isRoutineOutcome = raw?.__portal?.kind === 'internal-maintenance-outcome'
+          || isHiddenHistoryArtifactText(text)
+          || isControlOnlyAssistantContent(text);
+        if (isRoutineOutcome) {
+          pendingHeartbeatAlert = null;
+        } else if (maintenanceKind === 'heartbeat' && text) {
+          const alert = parseHistoryMessage(raw);
+          if (alert?.role === 'assistant') {
+            const {
+              thinkingContent: _thinkingContent,
+              thinkingSubject: _thinkingSubject,
+              segments: _segments,
+              toolCalls: _toolCalls,
+              ...textOnlyAlert
+            } = alert;
+            pendingHeartbeatAlert = textOnlyAlert;
+          }
+        }
+      }
+      continue;
+    } else if (role === 'assistant' && (
+      raw?.__portal?.kind === 'internal-maintenance-outcome'
+      || isHiddenHistoryArtifactText(text)
+      || isControlOnlyAssistantContent(text)
+    )) {
       continue;
     }
     const message = parseHistoryMessage(raw);
     if (message) parsed.push(message);
   }
+  flushHeartbeatAlert();
   return parsed;
 }
 
 function parseHistoryMessage(m: any): ChatMessage | null {
   if (m?.__openclaw?.kind === 'compaction') {
-    return {
-      id: m.id || `compaction-${m.__openclaw.id || Date.now()}`,
-      role: 'system',
-      content: resolveCompactionNoticeText(typeof m.content === 'string' ? m.content : '', m.__openclaw),
-      createdAt: new Date(m.timestamp || Date.now()),
-      provenance: 'compaction',
-    };
+    return null;
   }
 
   const rawContent = typeof m.content === 'string' ? m.content : '';
-  const sanitizedHistoryText = sanitizeHistoryMessageText(rawContent);
+  const sanitizedHistoryText = m.role === 'user' && !isInternalHistoryUser(m)
+    ? authoredHistoryText(rawContent) : sanitizeHistoryMessageText(rawContent);
   const rawThinkingContent = typeof m.thinkingContent === 'string' ? sanitizeAssistantContent(m.thinkingContent) : '';
   const rawThinkingSubject = sanitizeThinkingSubject(m.thinkingSubject);
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
+  if (m.role === 'system' && isStandaloneMaintenanceNoticeContent(sanitizedHistoryText)) return null;
   if (!isTruncationPlaceholder && isAssistantMaintenanceNoticeMessage({ ...m, content: sanitizedHistoryText, thinkingContent: rawThinkingContent })) {
     return null;
   }
@@ -697,16 +751,8 @@ function parseHistoryMessage(m: any): ChatMessage | null {
   if (m.role === 'assistant' && !isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
   }
-  if ((m.role === 'user' || m.role === 'system') && isHiddenHistoryArtifactText(sanitizedHistoryText)) {
-    const summary = summarizeHiddenHistoryArtifactText(sanitizedHistoryText);
-    if (!summary) return null;
-    return {
-      id: m.id || nextId(),
-      role: 'system',
-      content: summary,
-      createdAt: new Date(m.timestamp || Date.now()),
-      provenance: 'hidden-history-artifact',
-    };
+  if ((isInternalHistoryUser(m) || m.role === 'system') && isHiddenHistoryArtifactText(sanitizedHistoryText)) {
+    return null;
   }
 
   const msg: ChatMessage = {
@@ -716,7 +762,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
       ? 'Earlier assistant output was omitted from history because the message was too large.'
       : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : sanitizedHistoryText),
     createdAt: new Date(m.timestamp || Date.now()),
-    provenance: m.provenance || (m.__openclaw?.kind === 'compaction' ? 'compaction' : undefined),
+    provenance: typeof m.provenance === 'string' ? m.provenance : undefined,
     model: typeof m.model === 'string' ? m.model : undefined,
     thinkingContent: rawThinkingContent || undefined,
     thinkingSubject: rawThinkingSubject || undefined,
@@ -733,9 +779,6 @@ function parseHistoryMessage(m: any): ChatMessage | null {
       ? {
           ...(typeof m.__portal.thinkingCursors.raw === 'string'
             ? { raw: sanitizeAssistantContent(m.__portal.thinkingCursors.raw) }
-            : {}),
-          ...(typeof m.__portal.thinkingCursors.status === 'string'
-            ? { status: sanitizeAssistantContent(m.__portal.thinkingCursors.status) }
             : {}),
           ...(typeof m.__portal.thinkingCursors.preamble === 'string'
             ? { preamble: sanitizeAssistantContent(m.__portal.thinkingCursors.preamble) }
@@ -755,6 +798,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
       const source = ['status', 'reasoning', 'preamble', 'text'].includes(String(segment?.source || ''))
         ? segment.source as TextSegment['source']
         : undefined;
+      if (source === 'status') return [];
       if (!text.trim() && !subject) return [];
       return [{
         text,
@@ -773,6 +817,13 @@ function parseHistoryMessage(m: any): ChatMessage | null {
     msg.toolCallId = m.toolCallId;
     msg.toolName = m.toolName;
   }
+  if (
+    msg.role === 'assistant'
+    && !msg.content.trim()
+    && !msg.thinkingContent
+    && !(Array.isArray(msg.segments) && msg.segments.length > 0)
+    && !(Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0)
+  ) return null;
   return msg;
 }
 
@@ -867,7 +918,8 @@ function extractTextFromGatewayMessage(msg: GatewayChatMessage): string {
       ? gatewayTextFromBlocks(msg.content)
       : '';
 
-  return sanitizeHistoryMessageText(rawText);
+  return msg.role === 'user' && !isInternalHistoryUser(msg)
+    ? authoredHistoryText(rawText) : sanitizeHistoryMessageText(rawText);
 }
 
 /**
@@ -1041,19 +1093,15 @@ function isVerifiedDirectContinuationFrame(evt: GatewayEvent): boolean {
  */
 function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
   if (msg.__openclaw?.kind === 'compaction') {
-    return {
-      id: msg.id || msg.messageId || `compaction-${msg.__openclaw.id || Date.now()}`,
-      role: 'system',
-      content: resolveCompactionNoticeText(extractTextFromGatewayMessage(msg), msg.__openclaw),
-      createdAt: new Date(msg.timestamp || Date.now()),
-      provenance: 'compaction',
-    };
+    return null;
   }
 
   const text = extractTextFromGatewayMessage(msg);
   const toolCalls = extractToolCallsFromGatewayMessage(msg);
   const thinking = extractThinkingFromGatewayMessage(msg);
   const isTruncationPlaceholder = msg.role === 'assistant' && text === CHAT_HISTORY_OMITTED_PLACEHOLDER;
+  if (isInternalHistoryUser(msg) && isRoutineMaintenancePromptText(text)) return null;
+  if (msg.role === 'system' && isStandaloneMaintenanceNoticeContent(text)) return null;
   if (!isTruncationPlaceholder && isAssistantMaintenanceNoticeMessage({ role: msg.role, content: text, thinkingContent: thinking, toolCalls })) {
     return null;
   }
@@ -1063,16 +1111,8 @@ function mapGatewayMessage(msg: GatewayChatMessage): ChatMessage | null {
   if (msg.role === 'assistant' && !isTruncationPlaceholder && isHiddenHistoryArtifactText(text) && !thinking && !toolCalls?.length) {
     return null;
   }
-  if ((msg.role === 'user' || msg.role === 'system') && isHiddenHistoryArtifactText(text)) {
-    const summary = summarizeHiddenHistoryArtifactText(text);
-    if (!summary) return null;
-    return {
-      id: msg.id || msg.messageId || `gw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      role: 'system',
-      content: summary,
-      createdAt: new Date(msg.timestamp || Date.now()),
-      provenance: 'hidden-history-artifact',
-    };
+  if ((isInternalHistoryUser(msg) || msg.role === 'system') && isHiddenHistoryArtifactText(text)) {
+    return null;
   }
   if (!text && msg.role !== 'assistant' && msg.role !== 'toolResult') {
     return null;
@@ -1412,9 +1452,9 @@ function isDeliveryStatusText(text: string): boolean {
     /^sent\b.{0,260}\.?$/i,
     /^sent message to (?:web ?chat|current(?: chat| run)?|the user)\.?$/i,
     /^message sent(?: to (?:web ?chat|current(?: chat| run)?|the user))?\.?$/i,
-    /^answered in (?:the )?web ?chat(?:.*)?\.?$/i,
+    /^answered in (?:the )?web ?chat(?:\b.*)?\.?$/i,
     /^reported .{1,180} in (?:the )?web ?chat\.?$/i,
-    /^elaborated in (?:the )?web ?chat(?:.*)?\.?$/i,
+    /^elaborated in (?:the )?web ?chat(?:\b.*)?\.?$/i,
   ].some((pattern) => pattern.test(normalized));
 }
 
@@ -2267,21 +2307,6 @@ function mergeLoadedHistoryWithLocalMessages(
   for (const localMessage of localTail) {
     if (alreadyRepresented(localMessage)) continue;
 
-    const delegatedArtifactIndex = localMessage.role === 'user' && localMessage.pendingAck
-      ? merged.findIndex((candidate) => {
-          if (candidate.role !== 'system' || candidate.provenance !== 'hidden-history-artifact') return false;
-          return candidate.createdAt.getTime() >= localMessage.createdAt.getTime();
-        })
-      : -1;
-
-    if (delegatedArtifactIndex >= 0) {
-      merged.splice(delegatedArtifactIndex, 0, {
-        ...localMessage,
-        pendingAck: false,
-      });
-      continue;
-    }
-
     if (localMessage.queued) {
       merged.push(localMessage);
     } else {
@@ -2385,6 +2410,7 @@ export interface ChatStateContextValue {
   isRunning: boolean;
   isLoadingHistory: boolean;
   historyError: string | null;
+  historyErrorRetryable?: boolean;
   hasOlderHistory: boolean;
   isLoadingOlderHistory: boolean;
   olderHistoryError: string | null;
@@ -2392,6 +2418,8 @@ export interface ChatStateContextValue {
   streamingPhase: StreamingPhase;
   activeToolName: string | null;
   statusText: string | null;
+  operationalBanner: ChatOperationalBanner | null;
+  dismissOperationalBanner: () => void;
   lastProvenance: string | null;
   thinkingContent: string;
   thinkingSubject: string;
@@ -2449,6 +2477,13 @@ export interface ChatStateContextValue {
   sessionAvailability: 'unknown' | 'present' | 'missing';
 }
 
+export interface ChatOperationalBanner {
+  id: string;
+  message: string;
+  severity: 'warning' | 'error';
+  source: 'stream-recovery' | 'runtime';
+}
+
 const ChatStateContext = createContext<ChatStateContextValue | null>(null);
 
 export function useChatState(): ChatStateContextValue {
@@ -2488,6 +2523,8 @@ function normalizeInitialSession(provider: string, session: string, agentId?: st
   if (p === 'OPENCLAW' && s === 'agent:main:main' && agentKey !== 'main') return `agent:${agentKey}:main`;
   if (p === 'OPENCLAW' && s.startsWith('new-')) return `agent:${agentKey}:${s}`;
   if (p !== 'OPENCLAW' && s.startsWith('agent:')) return 'main';
+  const nativeOwner = s.match(/^(claude_code|codex|grok|agent_zero|gemini|ollama|hermes|opencode)-/i)?.[1]?.toUpperCase();
+  if (nativeOwner && nativeOwner !== p) return 'main';
   return s;
 }
 
@@ -2516,6 +2553,8 @@ function readStoredSession(provider: string, agentId?: string | null): string {
     return normalizeInitialSession(provider, providerScoped, agentId);
   }
   const legacy = localStorage.getItem(LEGACY_SESSION_STORAGE_KEY) || 'main';
+  // A legacy global selection belongs to its named harness, never the next one.
+  if (!legacy.toLowerCase().startsWith(`${normalizedProvider.toLowerCase()}-`)) return 'main';
   return normalizeInitialSession(provider, legacy, agentId);
 }
 
@@ -2687,6 +2726,17 @@ function defaultLifecycleStatusText(signal: LifecycleMaintenanceSignal): string 
   return 'Agent is thinking…';
 }
 
+function isAttestedPreambleStatusEvent(data: any): boolean {
+  return data?.type === 'status'
+    && (
+      data?.preambleProgress === true
+      || (
+        data?.turnEvent?.type === 'assistant_reasoning'
+        && data?.turnEvent?.source?.preambleProgress === true
+      )
+    );
+}
+
 function getCodexAppServerProgressStatus(stream: unknown, data: any): string | null {
   const streamName = typeof stream === 'string' ? stream.trim().toLowerCase() : '';
   if (!streamName.startsWith('codex_app_server.')) return null;
@@ -2722,21 +2772,22 @@ function getCodexAppServerProgressStatus(stream: unknown, data: any): string | n
 
 export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const publicSettings = usePublicSettings();
+  const authenticatedUserId = useAuthStore((state) => state.user?.id || '');
   const configuredDirectGateway = publicSettings?.useDirectGateway ?? BUILD_TIME_USE_DIRECT_GATEWAY;
   const useDirectGateway = configuredDirectGateway && DIRECT_GATEWAY_AUTHORIZATION_BROKER_READY;
 
   // Persisted selection state
   const [provider, setProviderRaw] = useState(
-    () => localStorage.getItem('agent-chat-provider') || 'OPENCLAW',
+    () => readSelectedAgentHarness(),
   );
   const [session, setSessionRaw] = useState(() => {
-    const storedProvider = localStorage.getItem('agent-chat-provider') || 'OPENCLAW';
+    const storedProvider = readSelectedAgentHarness();
     const storedAgentId = readStoredAgentId();
     return readStoredSession(storedProvider, storedAgentId);
   });
   const [agentId, setAgentIdRaw] = useState<string | undefined>(() => readStoredAgentId());
   const [selectedModel, setSelectedModelRaw] = useState(() => {
-    const p = localStorage.getItem('agent-chat-provider') || 'OPENCLAW';
+    const p = readSelectedAgentHarness();
     const stored = normalizeProviderModel(p, localStorage.getItem(MODEL_STORAGE_PREFIX + p) || '');
     // Agent Zero's persisted preference is only a candidate. Keep it out of
     // active UI/runtime state until the current authenticated catalog proves
@@ -2749,6 +2800,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     return stored;
   });
+  const [operationalBanner, setOperationalBanner] = useState<ChatOperationalBanner | null>(null);
+  const dismissOperationalBanner = useCallback(() => setOperationalBanner(null), []);
   // Selection setters are called back-to-back when the user changes provider,
   // agent, and session. Keep their imperative view synchronous so a later
   // setter in the same event cannot persist state under the previous provider.
@@ -2759,21 +2812,23 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
 
   // Wrapped setters with localStorage persistence
   const setProvider = useCallback((p: string) => {
-    providerRef.current = p;
-    localStorage.setItem('agent-chat-provider', p);
-    setProviderRaw(p);
-    const nextSession = readStoredSession(p, agentIdRef.current);
+    const normalizedProvider = String(p || 'OPENCLAW').trim().toUpperCase() || 'OPENCLAW';
+    setOperationalBanner(null);
+    providerRef.current = normalizedProvider;
+    persistSelectedAgentHarness(normalizedProvider);
+    setProviderRaw(normalizedProvider);
+    const nextSession = readStoredSession(normalizedProvider, agentIdRef.current);
     sessionRef.current = nextSession;
     setSessionRaw(nextSession);
-    const stored = normalizeProviderModel(p, localStorage.getItem(MODEL_STORAGE_PREFIX + p) || '');
-    if (p === 'AGENT_ZERO') {
+    const stored = normalizeProviderModel(normalizedProvider, localStorage.getItem(MODEL_STORAGE_PREFIX + normalizedProvider) || '');
+    if (normalizedProvider === 'AGENT_ZERO') {
       modelRef.current = '';
       setSelectedModelRaw('');
       return;
     }
     // Same guard, but only for OpenClaw. Native providers legitimately use bare IDs.
-    if (stored && p === 'OPENCLAW' && !stored.includes('/')) {
-      localStorage.removeItem(MODEL_STORAGE_PREFIX + p);
+    if (stored && normalizedProvider === 'OPENCLAW' && !stored.includes('/')) {
+      localStorage.removeItem(MODEL_STORAGE_PREFIX + normalizedProvider);
       modelRef.current = '';
       setSelectedModelRaw('');
     } else {
@@ -2781,6 +2836,37 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       setSelectedModelRaw(stored);
     }
   }, []);
+
+  useEffect(() => {
+    if (!authenticatedUserId) return undefined;
+    let cancelled = false;
+    const selectExternalHarness = (harnessId: unknown) => {
+      const normalized = String(harnessId || '').trim().toUpperCase();
+      if (!normalized || providerRef.current === normalized) return;
+      setProvider(normalized);
+    };
+    const handleSelection = (event: Event) => {
+      selectExternalHarness((event as CustomEvent<{ harnessId?: unknown }>).detail?.harnessId);
+    };
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === AGENT_HARNESS_SELECTION_STORAGE_KEY) selectExternalHarness(event.newValue);
+    };
+    window.addEventListener(AGENT_HARNESS_SELECTION_EVENT, handleSelection);
+    window.addEventListener('storage', handleStorage);
+    void loadAndApplyDefaultAgentHarness(authenticatedUserId)
+      .then((preference) => {
+        if (!cancelled) selectExternalHarness(preference.selectedHarness);
+      })
+      .catch(() => {
+        // Keep the last local selection. The normal catalog gate still blocks
+        // sends unless the server can attest that harness as usable.
+      });
+    return () => {
+      cancelled = true;
+      window.removeEventListener(AGENT_HARNESS_SELECTION_EVENT, handleSelection);
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, [authenticatedUserId, setProvider]);
   const setSession = useCallback((s: string) => {
     const normalized = persistStoredSession(providerRef.current, s, agentIdRef.current);
     sessionRef.current = normalized;
@@ -2824,35 +2910,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   }, [provider, session, agentId]);
 
   const deriveSessionModel = useCallback((sessionInfo: any): string => {
-    const joinModel = (providerName: string, modelName: string): string => {
-      const providerKey = providerName.trim();
-      const modelKey = modelName.trim();
-      if (!providerKey || !modelKey) return '';
-      return providerRef.current === 'OPENCLAW' && !modelKey.includes('/')
-        ? `${providerKey}/${modelKey}`
-        : modelKey;
-    };
-
-    const resolvedProvider = typeof sessionInfo?.resolved?.modelProvider === 'string' ? sessionInfo.resolved.modelProvider.trim() : '';
-    const resolvedModel = typeof sessionInfo?.resolved?.model === 'string' ? sessionInfo.resolved.model.trim() : '';
-    if (resolvedProvider && resolvedModel) return joinModel(resolvedProvider, resolvedModel);
-
-    const providerName = typeof sessionInfo?.modelProvider === 'string' ? sessionInfo.modelProvider.trim() : '';
-    const modelName = typeof sessionInfo?.model === 'string' ? sessionInfo.model.trim() : '';
-    if (providerName && modelName) return joinModel(providerName, modelName);
-    if (modelName && modelName.includes('/')) return modelName;
-
-    const nestedProvider = typeof sessionInfo?.currentModel?.provider === 'string' ? sessionInfo.currentModel.provider.trim() : '';
-    const nestedModel = typeof sessionInfo?.currentModel?.model === 'string' ? sessionInfo.currentModel.model.trim() : '';
-    if (nestedProvider && nestedModel) return joinModel(nestedProvider, nestedModel);
-    if (nestedModel && nestedModel.includes('/')) return nestedModel;
-
-    const overrideProvider = typeof sessionInfo?.providerOverride === 'string' ? sessionInfo.providerOverride.trim() : '';
-    const overrideModel = typeof sessionInfo?.modelOverride === 'string' ? sessionInfo.modelOverride.trim() : '';
-    if (overrideProvider && overrideModel) return joinModel(overrideProvider, overrideModel);
-    if (overrideModel && overrideModel.includes('/')) return overrideModel;
-
-    return '';
+    return deriveAgentChatSessionModel(providerRef.current, sessionInfo);
   }, []);
 
   const switchModel = useCallback(async (m: string) => {
@@ -2887,7 +2945,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       patchSessionModel: gatewayAPI.patchSessionModel,
       createSession: gatewayAPI.createSession,
     });
-    if (result.patchResponse) applyPatchedSessionProfile(result.patchResponse);
+    if (result.patchResponse) {
+      applyPatchedSessionProfile(result.patchResponse);
+      // Keep "Default" as an intentional empty selection, but for a concrete
+      // model switch trust the harness readback over the optimistic request.
+      if (m.trim()) {
+        const appliedModel = deriveAgentChatSessionModel(currentProvider, result.patchResponse);
+        if (appliedModel) setSelectedModel(appliedModel);
+      }
+    }
     return { deferred: result.deferred };
   }, [setSelectedModel]);
 
@@ -2984,6 +3050,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const [isRunning, setIsRunning] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyErrorRetryable, setHistoryErrorRetryable] = useState(true);
   const [hasOlderHistory, setHasOlderHistory] = useState(false);
   const [isLoadingOlderHistory, setIsLoadingOlderHistory] = useState(false);
   const [olderHistoryError, setOlderHistoryError] = useState<string | null>(null);
@@ -3282,11 +3349,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         }));
       }
 
-      setMessages(prev => {
-        const content = 'Live stream connection interrupted; reloaded latest history.';
-        const last = prev[prev.length - 1];
-        if (last?.role === 'system' && last.content === content) return prev;
-        return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(), provenance: 'stream-recovery-timeout' }];
+      setOperationalBanner({
+        id: `stream-recovery-${Date.now()}`,
+        message: 'Live stream connection was interrupted. Portal reloaded the latest saved history; verify the final reply before retrying the turn.',
+        severity: 'warning',
+        source: 'stream-recovery',
       });
       void loadHistoryInternalRef.current?.(sessionKey, providerName, { force: true, refreshActiveSnapshot: true });
     }, STREAM_RECOVERY_GRACE_MS);
@@ -3342,9 +3409,16 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       : getToolStatusText(toolName, providerStatus)
   ), []);
 
-  const setLiveRunPhase = useCallback((preferredPhase: 'thinking' | 'streaming', nextStatusText?: string | null) => {
+  const setLiveRunPhase = useCallback((
+    preferredPhase: 'thinking' | 'streaming',
+    nextStatusText?: string | null,
+    options?: { allowProviderStatus?: boolean },
+  ) => {
     const runningToolName = getRunningToolName();
-    const railStatusText = getRailSafeStatusText(nextStatusText);
+    const railStatusText = getRailSafeStatusText(nextStatusText)
+      || (options?.allowProviderStatus === true
+        ? sanitizeThinkingSubject(nextStatusText) || null
+        : null);
 
     if (runningToolName) {
       setStreamingPhase('tool');
@@ -3974,17 +4048,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     activityTitleTimersRef.current.clear();
   }, []);
 
-  const appendSystemNotice = useCallback((content: string, provenance?: string) => {
-    const now = Date.now();
-    setMessages(prev => {
-      const last = prev[prev.length - 1];
-      if (last?.role === 'system' && last.content === content && now - last.createdAt.getTime() < 4000) {
-        return prev;
-      }
-      return [...prev, { id: nextId(), role: 'system', content, createdAt: new Date(now), provenance }];
-    });
-  }, []);
-
   const reconcileIncomingRunEpoch = useCallback((
     incomingRunId: string | null,
     options?: { continuationVerified?: boolean },
@@ -4021,7 +4084,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     const turnEvent = payload?.turnEvent;
     const isVisibleReasoningStatus = turnEvent?.type === 'assistant_status'
       && turnEvent?.visible === true
-      && turnEvent?.source?.eventType === 'status';
+      && turnEvent?.source?.eventType === 'status'
+      && turnEvent?.source?.preambleProgress === true;
     if (turnEvent?.type !== 'assistant_reasoning' && !isVisibleReasoningStatus) return;
     const runId = normalizeRunId(turnEvent.runId || payload?.runId);
     const seq = Number(turnEvent.seq);
@@ -4084,7 +4148,6 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       compactionPhaseRef.current = 'compacted';
       setCompactionPhase('compacted');
       setStatusText(noticeText);
-      appendSystemNotice(noticeText, 'compaction');
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
       compactionTimerRef.current = setTimeout(() => {
         compactionPhaseRef.current = 'idle';
@@ -4099,19 +4162,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     compactionPhaseRef.current = 'idle';
     setCompactionPhase('idle');
     setStatusText(noticeText);
-    appendSystemNotice(noticeText, 'hidden-history-artifact');
     if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     compactionTimerRef.current = setTimeout(() => {
       setStatusText((prev) => (prev === noticeText ? null : prev));
       compactionTimerRef.current = null;
     }, 3000);
-  }, [appendSystemNotice]);
+  }, []);
 
   const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
     if (phase !== 'idle' && phase !== 'compacting' && phase !== 'compacted') return;
     // Snapshot hydration is replay/reconnect state, not a live lifecycle event.
     // Replaying a completed compaction marker on every refresh creates a fake rail.
-    // Live compaction_end events still use applyCompactionState('end') and render once.
+    // Live completion remains a short-lived composer-rail status, never a
+    // conversation card.
     const effectivePhase = phase === 'compacted' ? 'idle' : phase;
     if (compactionTimerRef.current) {
       clearTimeout(compactionTimerRef.current);
@@ -5058,6 +5121,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setIsLoadingOlderHistory(false);
     setIsLoadingHistory(true);
     setHistoryError(null);
+    setHistoryErrorRetryable(true);
 
     let historyActiveStream: any = undefined;
     let historyPagination: { beforeCursor: string | null; hasMoreBefore: boolean } = {
@@ -5429,7 +5493,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       console.error('[ChatState] History load failed:', err);
       if (historyGenRef.current === myGen) {
-        setHistoryError(effectiveProvider === 'AGENT_ZERO'
+        const status = Number((err as any)?.response?.status || 0);
+        const retryable = status !== 403 && status !== 404;
+        setHistoryErrorRetryable(retryable);
+        setHistoryError(!retryable
+          ? (status === 403
+            ? 'This saved conversation is not accessible to your account. Choose another conversation. No history was deleted.'
+            : 'This conversation could not be found. Choose an available conversation. Your other saved chats are unchanged.')
+          : effectiveProvider === 'AGENT_ZERO'
           ? 'Agent Zero chat history could not be loaded. Retry now; if it fails again, repair the managed runtime in Agent Settings.'
           : 'Chat history could not be loaded. Retry to restore this transcript.');
       }
@@ -5650,6 +5721,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setHasOlderHistory(false);
     setIsLoadingOlderHistory(false);
     setOlderHistoryError(null);
+    setOperationalBanner(null);
     setIsSwitchingSession(true);
     setIsLoadingHistory(true);
     clearActiveStreamState();
@@ -5861,6 +5933,36 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    const isRuntimeBannerEvent = data?.presentation === 'banner';
+    if (isRuntimeBannerEvent) {
+      const message = sanitizeAssistantContent(String(
+        data?.content || (data?.type === 'error' ? 'The harness reported an error.' : ''),
+      )).trim();
+      if (message) {
+        const bannerId = [
+          'runtime',
+          resolvedTurnSession,
+          incomingPortalRunId || 'session',
+          String(data?.seq ?? data?.turnEvent?.seq ?? data?.type ?? 'event'),
+        ].join(':');
+        setOperationalBanner((current) => current?.id === bannerId ? current : {
+          id: bannerId,
+          message,
+          severity: data?.type === 'error' || data?.severity === 'error' ? 'error' : 'warning',
+          source: 'runtime',
+        });
+      }
+      // A banner-class status is actionable UI state, not composer progress.
+      if (data?.type === 'status') return;
+    }
+
+    if (
+      data?.presentation === 'internal'
+      && ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status'].includes(data?.type)
+    ) {
+      return;
+    }
+
     // A new Portal WebSocket connection is an explicit runtime-sequence epoch.
     // Verified run_resumed events above are the other reset authority; treating
     // any arbitrary seq=1 as a restart replayed stale turn windows into the UI.
@@ -5935,11 +6037,38 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         contentLength: typeof data.content === 'string' ? data.content.length : 0,
       });
     }
+    const maintenanceRailForEvent = data.type === 'status'
+      ? resolveMaintenanceRailStatus(data)
+      : null;
+    const isMaintenanceLifecycleEvent = data.type === 'compaction_start'
+      || data.type === 'compaction_end'
+      || maintenanceRailForEvent?.isMaintenanceStatus === true;
+    const isAttestedPreambleStatus = isAttestedPreambleStatusEvent(data);
+    if (
+      data.type === 'status'
+      && maintenanceRailForEvent?.isMaintenanceStatus
+      && !streamingAssistantIdRef.current
+      && !isStreamActiveRef.current
+    ) {
+      if (maintenanceRailForEvent.update) applyCompactionState(maintenanceRailForEvent.update);
+      return;
+    }
+    if (
+      isAttestedPreambleStatus
+      && !streamingAssistantIdRef.current
+      && (isStreamActiveRef.current || normalizeRunId(data?.runId))
+    ) {
+      ensureStreamingAssistantBubble({ idPrefix: 'resume-preamble', content: '', resetIfCreated: true });
+      isStreamActiveRef.current = true;
+      if (!streamTransportRef.current) streamTransportRef.current = 'portal';
+      directClientRef.current?.setActiveStreamSession(sessionRef.current || null);
+      setIsRunning(true);
+    }
     // Only process stream events if we have an active assistant message.
     // Some event types are allowed without a bubble so we can wait for visible
     // content before materializing a resumed turn.
-    const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_status', 'stream_ended', 'run_resumed', 'user_message', 'history_changed', 'active_turn_conflict'];
-    const autoCreateBubbleTypes = ['text', 'thinking', 'status', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
+    const passthrough = ['session', 'exec_approval', 'exec_approval_resolved', 'connected', 'keepalive', 'status', 'compaction_start', 'compaction_end', 'stream_resume', 'stream_status', 'stream_ended', 'run_resumed', 'user_message', 'history_changed', 'active_turn_conflict'];
+    const autoCreateBubbleTypes = ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'toolCall', 'toolResult', 'segment_break'];
     const waitForVisibleStreamTypes = ['thinking', 'done', 'error'];
     if (!streamingAssistantIdRef.current && data.type === 'text' && typeof data.content === 'string' && isControlOrMaintenanceAssistantContent(data.content)) {
       return;
@@ -5958,7 +6087,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     // Read assistantId AFTER potential bubble creation so it picks up the new ref
     const assistantId = streamingAssistantIdRef.current;
-    if (assistantId || isStreamActiveRef.current) {
+    if ((assistantId || isStreamActiveRef.current) && !isMaintenanceLifecycleEvent) {
       resetStreamWatchdog();
     }
     if (data.type === 'done' || data.type === 'error' || data.type === 'stream_ended') {
@@ -6008,34 +6137,22 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         break;
       }
       case 'status': {
-        const maintenanceRail = resolveMaintenanceRailStatus(data);
+        const maintenanceRail = maintenanceRailForEvent || resolveMaintenanceRailStatus(data);
         if (maintenanceRail.update) applyCompactionState(maintenanceRail.update);
-        if (!assistantId && !isStreamActiveRef.current) break;
-        // Show OpenClaw's live thinking status immediately. Some provider/runtime
-        // combinations do not expose private reasoning deltas, so the status event
-        // is the only honest in-turn signal before tools begin.
+        // A verified run may legitimately emit only transient token progress.
+        // Keep that in the rail without materializing an assistant or marking
+        // the composer active; visible model/tool output establishes the turn.
+        const hasInactiveRailAuthority = Boolean(
+          incomingPortalRunId
+          && currentRunIdRef.current === incomingPortalRunId
+          && (data.presentation === 'rail' || data.transient === true),
+        );
+        if (!assistantId && !isStreamActiveRef.current && !hasInactiveRailAuthority) break;
         const runningToolName = getRunningToolName();
-        if (data.transient === true && !maintenanceRail.isMaintenanceStatus) {
-          setLiveRunPhase('thinking', typeof data.content === 'string' ? data.content : null);
-          resetStreamWatchdog({ visible: true });
+        if (maintenanceRail.isMaintenanceStatus) {
           break;
         }
-        if (!maintenanceRail.isMaintenanceStatus && !runningToolName && data.preambleProgress !== true) {
-          const statusThinkingChunk = extractThinkingChunk(
-            'status',
-            data.content,
-            data?.turnEvent?.visible === true ? false : assembledRef.current.length > 0,
-          );
-          if (statusThinkingChunk && assembledRef.current.trim()) {
-            graduateLiveTextSegment(assistantId);
-          }
-          appendThinkingChunk(assistantId, statusThinkingChunk, {
-            replace: data.replace === true,
-            lane: 'status',
-          });
-          if (statusThinkingChunk) resetStreamWatchdog({ visible: true });
-        }
-        if (data.preambleProgress === true && !runningToolName) {
+        if (isAttestedPreambleStatus && !runningToolName) {
           // OpenClaw marks provider-authored preamble progress explicitly. For
           // Opus turns whose private reasoning body is encrypted/empty, this is
           // the only readable thinking signal. Keep its cumulative snapshot in
@@ -6056,9 +6173,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           if (preambleThinking) resetStreamWatchdog({ visible: true });
           setStatusText(sanitizeThinkingSubject(data.content) || null);
           setStreamingPhase('thinking');
-        }
-        if (!assembledRef.current || runningToolName) {
-          setLiveRunPhase('thinking', maintenanceRail.displayStatusText);
+        } else if (!runningToolName) {
+          // Harness/runtime status is live rail state, never model reasoning.
+          setLiveRunPhase('thinking', data.content, { allowProviderStatus: true });
         }
         break;
       }
@@ -6385,10 +6502,18 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           clearTimeout(compactionTimerRef.current);
           compactionTimerRef.current = null;
         }
-        if (assistantId) {
+        if (assistantId && !isRuntimeBannerEvent) {
           setMessages(prev => prev.map(m =>
             m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(data.content, 'Unknown error') } : m
           ));
+        } else if (assistantId) {
+          setMessages(prev => prev.filter((message) => (
+            message.id !== assistantId
+            || Boolean(message.content.trim())
+            || Boolean(message.thinkingContent?.trim())
+            || Boolean(message.segments?.length)
+            || Boolean(message.toolCalls?.length)
+          )));
         }
         setStatusText(null);
         setStreamingPhase('idle');
@@ -6444,6 +6569,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       case 'run_resumed': {
         debugLog(streamingAssistantIdRef.current ? 'run_resumed agent continuing after sub-agent' : 'run_resumed resumed without visible bubble');
+        if (!streamingAssistantIdRef.current && !isStreamActiveRef.current) {
+          // A continuation hint alone is not proof of visible work. A later
+          // stream_resume snapshot or model/tool event will establish the run.
+          break;
+        }
         isStreamActiveRef.current = true;
         if (!streamTransportRef.current) streamTransportRef.current = 'portal';
         setIsRunning(true);
@@ -6533,6 +6663,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
 
     setStatusText(null);
+    setOperationalBanner(null);
     setStreamingPhase('idle');
     resetLiveThinkingTimeline();
     setActiveToolName(null);
@@ -6899,6 +7030,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             break;
           }
 
+          setOperationalBanner({
+            id: `runtime:${payloadSession || currentSession || 'main'}:${incomingRunId || currentRunIdRef.current || 'session'}:direct-error`,
+            message: errorMsg,
+            severity: 'error',
+            source: 'runtime',
+          });
+
           setStatusText(null);
           setStreamingPhase('idle');
           setActiveToolName(null);
@@ -6915,9 +7053,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           resetLiveThinkingTimeline();
 
           if (cid) {
-            setMessages(prev => prev.map(m =>
-              m.id === cid ? { ...m, content: '⚠️ ' + errorMsg } : m
-            ));
+            setMessages(prev => prev.filter((message) => (
+              message.id !== cid
+              || Boolean(message.content.trim())
+              || Boolean(message.thinkingContent?.trim())
+              || Boolean(message.segments?.length)
+              || Boolean(message.toolCalls?.length)
+            )));
           }
           break;
         }
@@ -6928,29 +7070,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const codexProgressStatus = getCodexAppServerProgressStatus(payload.stream, rawData);
 
       if (codexProgressStatus) {
-        const runningToolName = getRunningToolName();
-        let assistantId = streamingAssistantIdRef.current;
-        if (!assistantId) {
-          assistantId = ensureStreamingAssistantBubble({ idPrefix: 'direct-progress', content: '', resetIfCreated: true }).assistantId;
+        // Direct Codex lifecycle/hook/item status has the same contract as
+        // Portal WS/SSE status: rail-only, transient, and incapable of
+        // manufacturing an assistant bubble or an idle running turn.
+        if (isStreamActiveRef.current || streamingAssistantIdRef.current || currentRunIdRef.current) {
+          setSessionAvailability('present');
+          setLiveRunPhase('thinking', codexProgressStatus);
+          resetStreamWatchdog();
         }
-        isStreamActiveRef.current = true;
-        streamTransportRef.current = 'direct';
-        setIsRunning(true);
-        setSessionAvailability('present');
-        directClientRef.current?.setActiveStreamSession(payloadSession || currentSession || null);
-        if (!runningToolName) {
-          const statusThinkingChunk = extractThinkingChunk('status', codexProgressStatus, false);
-          if (statusThinkingChunk && assembledRef.current.trim()) {
-            graduateDirectLiveTextSegment(assistantId);
-          }
-          appendThinkingChunk(
-            assistantId,
-            statusThinkingChunk,
-            { lane: 'status' },
-          );
-        }
-        setLiveRunPhase('thinking', codexProgressStatus);
-        resetStreamWatchdog({ visible: !runningToolName });
         return;
       }
 
@@ -7240,7 +7367,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           });
           scheduleSessionTelemetryRefresh(250);
         }
-        resetStreamWatchdog();
+        if (isStreamActiveRef.current || streamingAssistantIdRef.current) resetStreamWatchdog();
       } else if (payload.stream === 'lifecycle') {
         const data = payload.data as any;
         const lifecyclePhase = String(data?.phase || data?.status || '').toLowerCase();
@@ -7286,11 +7413,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           ? lifecycleStatusText
           : (lifecycleStatusText || defaultLifecycleStatusText(lifecycleSignal));
 
-        const lifecycleBelongsToActiveRun = Boolean(incomingRunId)
-          || isStreamActiveRef.current
+        const lifecycleBelongsToActiveRun = isStreamActiveRef.current
           || Boolean(streamingAssistantIdRef.current)
           || Boolean(getRunningToolName());
-        if (lifecycleBelongsToActiveRun && (lifecyclePhase === 'started' || lifecyclePhase === 'running' || lifecyclePhase === 'start' || lifecycleSignal !== 'idle')) {
+        if (
+          lifecycleSignal === 'idle'
+          && lifecycleBelongsToActiveRun
+          && (lifecyclePhase === 'started' || lifecyclePhase === 'running' || lifecyclePhase === 'start')
+        ) {
           isStreamActiveRef.current = true;
           streamTransportRef.current = 'direct';
           setIsRunning(true);
@@ -7640,6 +7770,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setIsLoadingOlderHistory(false);
     setOlderHistoryError(null);
     setStatusText(null);
+    setOperationalBanner(null);
     setLastProvenance(null);
     setStreamingPhase('idle');
     setActiveToolName(null);
@@ -7967,6 +8098,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // Fence every history/stream-status observation that began before this
     // accepted local turn. A delayed inactive R1 snapshot must never clear R2.
     localTurnEpochRef.current += 1;
+
+    // A retry supersedes the previous turn's runtime error, not maintenance warnings.
+    setOperationalBanner(current => current?.source === 'runtime' && current.severity === 'error' ? null : current);
 
     // Each accepted user turn starts a fresh backend runtime sequence. This is
     // required for native providers as well as OpenClaw: some continuations do
@@ -8303,9 +8437,46 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           if (streamingAssistantIdRef.current) {
             assistantId = streamingAssistantIdRef.current;
           }
+          const isSseBannerEvent = evt?.presentation === 'banner';
+          if (isSseBannerEvent) {
+            const message = sanitizeAssistantContent(String(
+              evt?.content || (evt?.type === 'error' ? 'The harness reported an error.' : ''),
+            )).trim();
+            if (message) {
+              const bannerId = [
+                'runtime',
+                sessionRef.current || 'main',
+                normalizeRunId(evt?.runId) || 'session',
+                String(evt?.seq ?? evt?.turnEvent?.seq ?? evt?.type ?? 'event'),
+              ].join(':');
+              setOperationalBanner((current) => current?.id === bannerId ? current : {
+                id: bannerId,
+                message,
+                severity: evt?.type === 'error' || evt?.severity === 'error' ? 'error' : 'warning',
+                source: 'runtime',
+              });
+            }
+            if (evt?.type === 'status') continue;
+          }
+          if (
+            evt?.presentation === 'internal'
+            && ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status'].includes(evt?.type)
+          ) {
+            continue;
+          }
+          const sseMaintenanceRail = evt?.type === 'status'
+            ? resolveMaintenanceRailStatus(evt)
+            : null;
+          const isSseAttestedPreambleStatus = isAttestedPreambleStatusEvent(evt);
+          const isSseMaintenanceLifecycle = evt?.type === 'compaction_start'
+            || evt?.type === 'compaction_end'
+            || sseMaintenanceRail?.isMaintenanceStatus === true;
           if (
             !assistantId
-            && ['text', 'thinking', 'status', 'tool_start', 'tool_update', 'tool_end', 'tool_used'].includes(evt?.type)
+            && (
+              ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used'].includes(evt?.type)
+              || isSseAttestedPreambleStatus
+            )
           ) {
             assistantId = ensureStreamingAssistantBubble({
               idPrefix: 'sse-resume',
@@ -8321,7 +8492,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           }
           recordRuntimeReplaySequence(evt);
           recordReasoningTurnSequence(evt);
-          if (SSE_LIVE_EVENT_TYPES.has(evt.type)) {
+          if (SSE_LIVE_EVENT_TYPES.has(evt.type) && !isSseMaintenanceLifecycle) {
             const visibleSseActivity = (
               evt.type === 'text'
               && typeof evt.content === 'string'
@@ -8360,13 +8531,12 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             setStatusText(null);
             setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: assembled } : m));
           } else if (evt.type === 'status') {
-            const maintenanceRail = resolveMaintenanceRailStatus(evt);
+            const maintenanceRail = sseMaintenanceRail || resolveMaintenanceRailStatus(evt);
             if (maintenanceRail.update) applyCompactionState(maintenanceRail.update);
             const runningToolName = getRunningToolName();
-            if (evt.transient === true && !maintenanceRail.isMaintenanceStatus) {
-              setLiveRunPhase('thinking', typeof evt.content === 'string' ? evt.content : null);
-              resetStreamWatchdog({ visible: true });
-            } else if (!maintenanceRail.isMaintenanceStatus && !runningToolName && evt.preambleProgress === true) {
+            if (maintenanceRail.isMaintenanceStatus) {
+              // applyCompactionState owns the transient rail.
+            } else if (!runningToolName && isSseAttestedPreambleStatus) {
               const preambleThinking = extractThinkingChunk('thinking', evt.content, assembled.length > 0);
               if (preambleThinking && assembledRef.current.trim()) {
                 graduateLiveTextSegment(assistantId);
@@ -8379,21 +8549,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               if (preambleThinking) resetStreamWatchdog({ visible: true });
               setStatusText(sanitizeThinkingSubject(evt.content) || null);
               setStreamingPhase('thinking');
-            } else if (!maintenanceRail.isMaintenanceStatus && !runningToolName) {
-              const thinkingChunk = extractThinkingChunk(
-                'status',
-                evt.content,
-                evt?.turnEvent?.visible === true ? false : assembled.length > 0,
-              );
-              if (thinkingChunk && assembledRef.current.trim()) {
-                graduateLiveTextSegment(assistantId);
-                assembled = '';
-              }
-              appendThinkingChunk(assistantId, thinkingChunk, { replace: evt.replace === true, lane: 'status' });
-              if (thinkingChunk) resetStreamWatchdog({ visible: true });
-            }
-            if (evt.transient !== true && (!assembled || runningToolName)) {
-              setLiveRunPhase('thinking', maintenanceRail.displayStatusText);
+            } else if (!runningToolName) {
+              setLiveRunPhase('thinking', evt.content, { allowProviderStatus: true });
             }
           } else if (evt.type === 'thinking') {
             applyThinkingSubject(assistantId, evt.subject);
@@ -8625,9 +8782,19 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               clearTimeout(compactionTimerRef.current);
               compactionTimerRef.current = null;
             }
-            setMessages(prev => prev.map(m =>
-              m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(evt.content, 'Error') } : m
-            ));
+            if (!isSseBannerEvent) {
+              setMessages(prev => prev.map(m =>
+                m.id === assistantId ? { ...m, content: '⚠️ ' + normalizeAgentError(evt.content, 'Error') } : m
+              ));
+            } else {
+              setMessages(prev => prev.filter((message) => (
+                message.id !== assistantId
+                || Boolean(message.content.trim())
+                || Boolean(message.thinkingContent?.trim())
+                || Boolean(message.segments?.length)
+                || Boolean(message.toolCalls?.length)
+              )));
+            }
             setStatusText(null);
             setStreamingPhase('idle');
             setActiveToolName(null);
@@ -9025,6 +9192,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     isRunning,
     isLoadingHistory,
     historyError,
+    historyErrorRetryable,
     hasOlderHistory,
     isLoadingOlderHistory,
     olderHistoryError,
@@ -9032,6 +9200,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     streamingPhase,
     activeToolName,
     statusText,
+    operationalBanner,
+    dismissOperationalBanner,
     lastProvenance,
     thinkingContent,
     thinkingSubject,

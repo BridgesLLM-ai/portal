@@ -278,7 +278,7 @@ test('keeps transient reasoning progress out of the terminal presentation', () =
   }]);
 });
 
-test('persists only broker-attested visible status thoughts across terminal refresh', () => {
+test('keeps ordinary broker status out of the terminal presentation', () => {
   const presentation = buildProjectChatMessagePresentation([
     event(1, {
       type: 'status',
@@ -301,9 +301,9 @@ test('persists only broker-attested visible status thoughts across terminal refr
     }),
   ]);
 
-  expect(presentation?.segments?.map(({ kind, text, order }) => ({ kind, text, order }))).toEqual([
-    { kind: 'thinking', text: 'Reviewing the first result.', order: 1 },
-    { kind: 'thinking', text: 'Checking the second result.', order: 4 },
+  expect(presentation?.segments).toBeUndefined();
+  expect(presentation?.toolCalls).toEqual([
+    expect.objectContaining({ id: 'read-1', name: 'read', status: 'done' }),
   ]);
 });
 

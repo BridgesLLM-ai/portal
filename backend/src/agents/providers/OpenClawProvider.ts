@@ -50,13 +50,11 @@ import {
   gatewayRpcCall,
   patchSessionModel,
   deleteSession,
+  getSessionHistory,
 } from '../../utils/openclawGatewayRpc';
 import { extractTextFromContent as extractSanitizedText } from '../../utils/chatText';
-import { existsSync, readFileSync } from 'fs';
-import path from 'path';
+import { createHash } from 'crypto';
 
-const AGENTS_BASE = path.join(process.env.HOME || '/root', '.openclaw/agents');
-const SESSIONS_DIR = path.join(AGENTS_BASE, 'main/sessions');
 const OPENCLAW_STREAM_INACTIVITY_TIMEOUT_MS = Math.max(
   60 * 60 * 1000,
   Number(process.env.OPENCLAW_STREAM_INACTIVITY_TIMEOUT_MS) || 12 * 60 * 60 * 1000,
@@ -93,123 +91,52 @@ async function waitForAuthoritativeOpenClawRunTerminal(runId: string): Promise<b
   return result.ok && hasAuthoritativeOpenClawTerminalSnapshot(result.data, runId);
 }
 
-function resolveAgentSessionsDir(sessionKey?: string): string {
-  if (!sessionKey) return SESSIONS_DIR;
-  const match = sessionKey.match(/^agent:([a-zA-Z0-9_-]+):/);
-  if (!match) return SESSIONS_DIR;
-  const agentDir = path.join(AGENTS_BASE, match[1], 'sessions');
-  return existsSync(agentDir) ? agentDir : SESSIONS_DIR;
-}
-
 function extractText(content: unknown): string {
   return extractSanitizedText(content);
 }
 
-async function readSessionMessages(sessionFileId: string, limit = 200, sessionsDir = SESSIONS_DIR): Promise<AgentMessage[]> {
-  const filePath = path.join(sessionsDir, `${sessionFileId}.jsonl`);
-  if (!existsSync(filePath)) return [];
+function projectGatewayHistoryMessage(entry: any, index: number): AgentMessage | null {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const rawRole = String(entry.role || '').trim();
+  const role: AgentMessage['role'] | null = rawRole === 'user'
+    ? 'user'
+    : rawRole === 'assistant'
+      ? 'assistant'
+      : rawRole === 'system' || rawRole === 'toolResult' || rawRole === 'tool'
+        ? 'system'
+        : null;
+  if (!role) return null;
 
-  const lines = readFileSync(filePath, 'utf-8').split('\n').filter((l) => l.trim());
-  const messages: AgentMessage[] = [];
+  const content = extractText(entry.content ?? entry.text ?? '');
+  const contentToolCalls = Array.isArray(entry.content)
+    ? entry.content.flatMap((block: any) => {
+        if (!block || typeof block !== 'object') return [];
+        if (!['toolCall', 'tool_use'].includes(String(block.type || '')) || !block.name) return [];
+        return [{
+          id: block.id,
+          name: block.name,
+          arguments: block.arguments ?? block.input,
+        }];
+      })
+    : [];
+  const toolCalls = Array.isArray(entry.toolCalls) && entry.toolCalls.length > 0
+    ? entry.toolCalls
+    : contentToolCalls;
+  if (!content && toolCalls.length === 0 && role !== 'system') return null;
 
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type !== 'message' || !entry.message) continue;
-      const role = entry.message.role as string;
-      const content = entry.message.content;
-
-      if (role === 'user') {
-        const text = extractText(content);
-        if (text) {
-          messages.push({
-            id: entry.id || '',
-            role: 'user',
-            content: text,
-            timestamp: entry.timestamp || new Date().toISOString(),
-          });
-        }
-      } else if (role === 'assistant') {
-        if (Array.isArray(content)) {
-          const textParts: string[] = [];
-          const toolCalls: any[] = [];
-          for (const block of content) {
-            if (block.type === 'text' && block.text) textParts.push(block.text);
-            else if (block.type === 'toolCall' && block.name) {
-              toolCalls.push({ id: block.id, name: block.name, arguments: block.arguments });
-            }
-          }
-          const text = extractSanitizedText(textParts.join('\n'));
-          if (text || toolCalls.length > 0) {
-            messages.push({
-              id: entry.id || '',
-              role: 'assistant',
-              content: text,
-              timestamp: entry.timestamp || new Date().toISOString(),
-              toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-            } as any);
-          }
-        } else {
-          const text = extractText(content);
-          if (text) {
-            messages.push({
-              id: entry.id || '',
-              role: 'assistant',
-              content: text,
-              timestamp: entry.timestamp || new Date().toISOString(),
-            });
-          }
-        }
-      } else if (role === 'toolResult') {
-        messages.push({
-          id: entry.id || '',
-          role: 'system' as any,
-          content: extractText(content),
-          timestamp: entry.timestamp || new Date().toISOString(),
-          toolCallId: entry.message.toolCallId,
-          toolName: entry.message.toolName,
-        } as any);
-      } else if (role === 'system') {
-        const text = extractText(content);
-        if (text) {
-          messages.push({
-            id: entry.id || '',
-            role: 'system',
-            content: text,
-            timestamp: entry.timestamp || new Date().toISOString(),
-          });
-        }
-      }
-    } catch {
-      // ignore malformed line
-    }
-  }
-
-  return messages.slice(-limit);
-}
-
-function resolveSessionFileId(sessionKey: string, sessionsDir = SESSIONS_DIR): string | null {
-  const sessionsFile = path.join(sessionsDir, 'sessions.json');
-  if (!existsSync(sessionsFile)) return null;
-
-  try {
-    const data = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
-    // data.sessions may be an empty array (truthy in JS), so fall back to top-level dict
-    const raw = data.sessions;
-    const sessions = (Array.isArray(raw) && raw.length === 0) ? data : (raw || data);
-
-    if (typeof sessions === 'object' && !Array.isArray(sessions)) {
-      const entry = sessions[sessionKey];
-      return entry?.sessionId || entry?.id || null;
-    }
-    if (Array.isArray(sessions)) {
-      const match = sessions.find((s: any) => s.key === sessionKey || s.id === sessionKey);
-      return match?.sessionId || match?.id || null;
-    }
-  } catch {}
-
-  const directFile = path.join(sessionsDir, `${sessionKey}.jsonl`);
-  return existsSync(directFile) ? sessionKey : null;
+  const timestamp = normalizeSessionTimestamp(entry.timestamp ?? entry.createdAt);
+  const projected = {
+    id: String(entry.id || entry.__openclaw?.id || createHash('sha256')
+      .update(`${index}\0${role}\0${timestamp}\0${content}`)
+      .digest('hex')),
+    role,
+    content,
+    timestamp,
+    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    ...(entry.toolCallId ? { toolCallId: entry.toolCallId } : {}),
+    ...(entry.toolName ? { toolName: entry.toolName } : {}),
+  };
+  return projected as AgentMessage;
 }
 
 /**
@@ -401,6 +328,7 @@ function sendMessageViaPersistentWs(
 }
 
 const SESSION_TITLE_MAX_LENGTH = 120;
+const LEGACY_PORTAL_SESSION_DISPLAY_NAME = 'Portal Backend RPC';
 
 /**
  * Plain-text title for a session, as OpenClaw itself named it.
@@ -422,6 +350,20 @@ function openClawSessionTitle(session: { displayName?: unknown; derivedTitle?: u
   return plain.length > SESSION_TITLE_MAX_LENGTH
     ? `${plain.slice(0, SESSION_TITLE_MAX_LENGTH - 1).trimEnd()}…`
     : plain;
+}
+
+function legacyPortalSessionDisplayLabel(session: {
+  key?: unknown;
+  displayName?: unknown;
+  derivedTitle?: unknown;
+}): string | null {
+  if (String(session.displayName || '').trim() !== LEGACY_PORTAL_SESSION_DISPLAY_NAME) return null;
+  const derived = openClawSessionTitle({ derivedTitle: session.derivedTitle });
+  if (derived && derived !== LEGACY_PORTAL_SESSION_DISPLAY_NAME) return derived;
+  const key = String(session.key || '').trim();
+  if (!key) return null;
+  const suffix = createHash('sha256').update(key).digest('hex').slice(0, 6);
+  return `Portal chat · ${suffix}`;
 }
 
 /**
@@ -536,10 +478,13 @@ export class OpenClawProvider implements AgentProvider {
   }
 
   async getHistory(sessionId: AgentSessionId): Promise<AgentMessage[]> {
-    const sessionsDir = resolveAgentSessionsDir(sessionId);
-    const fileId = resolveSessionFileId(sessionId, sessionsDir);
-    if (!fileId) return [];
-    return readSessionMessages(fileId, 200, sessionsDir);
+    const history = await getSessionHistory(sessionId, { limit: 200 });
+    if (!history.ok || !history.data) {
+      throw new Error(history.error || 'OpenClaw chat.history failed');
+    }
+    return history.data.messages
+      .map(projectGatewayHistoryMessage)
+      .filter((message): message is AgentMessage => Boolean(message));
   }
 
   async listSessions(
@@ -585,7 +530,7 @@ export class OpenClawProvider implements AgentProvider {
     }));
 
     const seen = new Set<string>();
-    return snapshots
+    const visibleSessions = snapshots
       .flat()
       .filter((session: any) => {
         const key = String(session.key || '').trim();
@@ -595,12 +540,17 @@ export class OpenClawProvider implements AgentProvider {
         if (!visible) return false;
         seen.add(key);
         return true;
-      })
+      });
+    return visibleSessions
       .map((s: any) => {
         // OpenClaw already names every conversation from its own content and
         // reports it as displayName/derivedTitle. Dropping those was why Agent
         // Chat could only ever show `Session 0b3a4512` for a real chat.
-        const title = openClawSessionTitle(s);
+        // Historical gateway-client fallback names are presentation debris.
+        // Correct them locally, but never mutate from this polled read path:
+        // sessions.patch has no compare-and-set guard and could overwrite an
+        // operator rename made after the sessions.list snapshot was captured.
+        const title = legacyPortalSessionDisplayLabel(s) || openClawSessionTitle(s);
         return {
           sessionId: s.key,
           status: 'active' as const,
@@ -670,4 +620,5 @@ export function getPendingApprovalsCount(): number {
 export const __openClawProviderTest = {
   upstreamRunIdForPortalRun,
   hasAuthoritativeOpenClawTerminalSnapshot,
+  legacyPortalSessionDisplayLabel,
 };

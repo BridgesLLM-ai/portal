@@ -41,6 +41,7 @@ const ACTOR_ID = 'actor-00000000-0000-4000-8000-000000000001';
 const PROJECT_KEY = 'a'.repeat(64);
 const CONTAINER_ID = 'b'.repeat(64);
 const INTERNAL_NETWORK = 'p4e-in-agent-zero-test';
+const TEST_OWNER_UID = typeof process.getuid === 'function' ? process.getuid() : 0;
 
 function context(projectId = PROJECT_ID, actorId = ACTOR_ID): ProjectSandboxExecutionContext {
   return {
@@ -123,6 +124,7 @@ function issueBridgeCredential(
     credentialRoot,
     tokenFactory: () => tokenCharacter.repeat(43),
     generationFactory: () => generation,
+    expectedOwnerUid: TEST_OWNER_UID,
   });
 }
 
@@ -418,7 +420,10 @@ describe('Agent Zero Project immutable runtime cleanup', () => {
 
   test('recovers a detached empty firewall chain only with immutable actor evidence', async () => {
     fs.rmSync(runtime.stateDir, { recursive: true });
-    expect(revokeAgentZeroProjectModelBridgeCredential(PROJECT_KEY, { credentialRoot })).toBe(true);
+    expect(revokeAgentZeroProjectModelBridgeCredential(PROJECT_KEY, {
+      credentialRoot,
+      expectedOwnerUid: TEST_OWNER_UID,
+    })).toBe(true);
     const executor = new CleanupExecutor(runtime, {
       includeContainer: false,
       includeVolume: false,

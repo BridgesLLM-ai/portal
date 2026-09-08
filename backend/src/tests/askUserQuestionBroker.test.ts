@@ -1,6 +1,7 @@
 import {
   __resetAskUserQuestionsForTests,
   AskUserQuestionError,
+  ASK_USER_DEFAULT_WAIT_MS,
   ASK_USER_MAX_WAIT_MS,
   commitAskUserQuestionAnswer,
   commitAskUserQuestionCancellation,
@@ -81,7 +82,7 @@ describe('native ask-user question broker', () => {
       releaseAskUserQuestionDelivery(reservation);
     }
     expect(record.state).toBe('answered');
-    expect(record.answers).toEqual({ database: 'PostgreSQL' });
+    expect(record.answers).toEqual({ database: ['PostgreSQL'] });
     expect(Object.getPrototypeOf(record.answers)).toBeNull();
     expect(formatAskUserAnswerForModel(record)).toBe('PostgreSQL');
   });
@@ -219,7 +220,7 @@ describe('native ask-user question broker', () => {
         answers: supplied,
       });
       expect(prepared.text).toBe('literal answer');
-      expect(prepared.answers[questionId]).toBe('literal answer');
+      expect(prepared.answers[questionId]).toEqual(['literal answer']);
       expect(Object.getPrototypeOf(prepared.answers)).toBeNull();
     },
   );
@@ -268,7 +269,7 @@ describe('native ask-user question broker', () => {
     })).toThrow(/identities must be unique/i);
   });
 
-  test('broker rejects duplicate native IDs and unsupported multi-select fail closed', () => {
+  test('broker rejects duplicate native IDs and preserves multi-select values losslessly', () => {
     expect(() => register({
       questions: [
         { id: 'duplicate', question: 'One?', options: [] },
@@ -277,23 +278,37 @@ describe('native ask-user question broker', () => {
     })).toThrow(/identities must be unique/i);
     expect(listPendingAskUserQuestions({ actorUserId: 'user-1' })).toEqual([]);
 
-    expect(() => register({
+    const multi = register({
+      toolCallId: 'native-request-multi',
       questions: [{
         id: 'many',
         question: 'Pick several?',
         multiSelect: true,
         options: [{ label: 'A' }, { label: 'B' }],
       }],
-    })).toThrow(/do not support multi-select/i);
-    expect(listPendingAskUserQuestions({ actorUserId: 'user-1' })).toEqual([]);
+    });
+    const prepared = prepareAskUserQuestionAnswer({
+      id: multi.id,
+      actorUserId: 'user-1',
+      answers: { many: ['2', 'A', 'A'] },
+    });
+    expect(prepared.answers).toEqual({ many: ['B', 'A'] });
+    expect(prepared.text).toBe('B, A');
+    expect(() => prepareAskUserQuestionAnswer({
+      id: multi.id,
+      actorUserId: 'user-1',
+      answers: { many: [] },
+    })).toThrow(/between one and eight values/i);
   });
 
-  test('wait budget remains bounded and subscribers stay owner-scoped', () => {
+  test('native default and extended wait budgets remain exact while subscribers stay owner-scoped', () => {
     const seen: string[] = [];
     const foreign: string[] = [];
     const unsubscribe = subscribeAskUserQuestions('user-1', (entry) => seen.push(entry.state));
     const unsubscribeForeign = subscribeAskUserQuestions('user-2', (entry) => foreign.push(entry.state));
-    const record = register({ waitMs: 99_999_999 });
+    const defaultRecord = register({ toolCallId: 'native-request-default-budget' });
+    expect(defaultRecord.expiresAt - defaultRecord.createdAt).toBe(ASK_USER_DEFAULT_WAIT_MS);
+    const record = register({ toolCallId: 'native-request-max-budget', waitMs: 99_999_999 });
     expect(record.expiresAt - record.createdAt).toBe(ASK_USER_MAX_WAIT_MS);
     const reservation = reserveAskUserQuestionDelivery(record.id, 'user-1');
     try {
@@ -303,7 +318,7 @@ describe('native ask-user question broker', () => {
       unsubscribe();
       unsubscribeForeign();
     }
-    expect(seen).toEqual(['pending', 'cancelled']);
+    expect(seen).toEqual(['pending', 'pending', 'cancelled']);
     expect(foreign).toEqual([]);
   });
 

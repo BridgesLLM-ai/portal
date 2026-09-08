@@ -5,68 +5,67 @@ import { execFileSync, execSync } from 'child_process';
 import { createHash } from 'crypto';
 import { z } from 'zod';
 import {
+  NativeBinaryRuntimeUnqualifiedError,
+  isUnqualifiedNativeBinaryProvider,
+  unqualifiedNativeBinaryReason,
+} from '../config/unqualifiedNativeBinaryLane';
+import {
   getAiProviderMeta,
   getPublicAiProviderCatalog,
   isGuidedSetupAuthTypeAvailable,
 } from '../config/aiProviders';
 import { validateApiKey } from '../services/aiProviderValidator';
 import {
+  assertOpenClawHostMutationAvailable,
+  NativeHostCredentialFlowUnavailableError,
+  OpenClawHostMutationUnavailableError,
+  type OpenClawHostMutationOperation,
+} from '../services/hostRuntimeMaintenancePolicy';
+import {
   cancelOAuthFlow,
-  beginClaudeSetupTokenFinalization,
-  commitClaudeSetupTokenCredential,
   completeNativeCliFlow,
-  completeOAuthFlow,
   forceReleaseCredentialLifecycleLease,
-  getClaudeSetupToken,
   getCredentialLifecycleNamespaceForNativeProvider,
   getCredentialLifecycleNamespaceForOpenClawProvider,
   getOAuthFlowStatus,
   isClaudeSetupTokenLeaseReleasable,
-  finishClaudeSetupTokenFinalization,
   markOAuthFlowFinalized,
   markOAuthFlowFinalizationError,
   markOAuthFlowFinalizationPending,
   markOAuthFlowFinalizationWarning,
-  pasteCodeToClaudeSession,
   startClaudeSetupTokenFlow,
-  startDeviceCodeFlow,
   startNativeCliFlow,
-  startOAuthFlow,
 } from '../services/oauthFlowManager';
 import {
   AUTH_PROFILES_PATH,
   CONFIG_PATH,
   MODELS_JSON_PATH,
-  clearProviderAuthOrder,
   getDefaultModel,
   getFallbackModels,
   getProviderStatusesAsync,
-  pinCodexExternalCliAuthProfile,
-  pinProviderAuthProfile,
   readAuthProfiles,
   readOpenClawAuthStoreProfilesAsync,
-  readOpenClawConfig,
-  registerProviderRuntimeModels,
   saveProviderApiKey,
   invalidateOpenClawAuthStoreProfilesCache,
   ProviderApiKeySaveError,
 } from '../services/openclawConfigManager';
 import { gatewayRpcCall, listGatewayModels } from '../utils/openclawGatewayRpc';
 import {
-  ensureOpenClawProviderPluginEnabled,
   rollbackOpenClawProviderPluginLease,
   type OpenClawPluginLease,
 } from '../services/openclawPluginManager';
-import { probeOpenClawAuthProfile } from '../services/openclawAuthProbe';
-import { invalidateNativeCliAuthStatus } from '../agents/nativeCliAuth';
+import { getNativeCliAuthStatusAsync, invalidateNativeCliAuthStatus } from '../agents/nativeCliAuth';
 import { invalidateAntigravityModelCache, listAntigravityModelsFromCli } from '../agents/antigravityModels';
-import { getNativeProviderReadiness, invalidateNativeProviderReadiness } from '../agents/nativeProviderReadiness';
+import { invalidateNativeProviderReadiness, getNativeProviderReadiness } from '../agents/nativeProviderReadiness';
+import {
+  invalidateAcpModelCatalog,
+  refreshAcpModelCatalogFromRuntime,
+} from '../agents/providers/native/acp/AcpModelCatalog';
 import {
   buildOpenClawCliEnv,
   canonicalizeProviderModelId,
   extractJsonFromCliOutput,
   normalizePortalModelId,
-  repairClaudeSubscriptionConfig,
   usesClaudeCliAuthProfile,
 } from '../utils/openclawCli';
 import {
@@ -88,6 +87,10 @@ import {
   type ClaimedProviderCredentialLifecycle,
 } from '../services/providerCredentialLifecycleLedger';
 import { assertOpenClawGatewayAuthorizationFenceReleased } from '../services/openClawGatewayAuthorizationFence';
+import {
+  readOpenClawAgentConfigContract,
+  type OpenClawAgentConfigFamily,
+} from '../services/openclawAgentConfigContract';
 
 const providerIdSchema = z.string().min(1).refine((value) => Boolean(getAiProviderMeta(value)), 'Unknown provider');
 const guidedApiKeyProviderIdSchema = providerIdSchema.refine(
@@ -168,48 +171,19 @@ const PORTAL_OWNED_REMOVABLE_API_KEY_PROVIDERS = new Set([
 ]);
 const handledNativeCliCompletions = new Set<string>();
 const nativeCliCompletionFinalizers = new Map<string, Promise<void>>();
-// Codex finalization can include model registration plus a gateway restart.
-// Keep it out of the browser's short status request and deduplicate repeated
-// polls while that work is running.
+// Native finalization refreshes the provider-specific credential/readiness
+// generation (and dynamic model catalogs for ACP harnesses). Keep it out of
+// the browser's short status request and deduplicate repeated polls.
 const nativeCliFinalizationKickoffs = new Set<string>();
 const handledOAuthCompletions = new Set<string>();
 const oauthCompletionFinalizers = new Map<string, Promise<void>>();
-// Sessions whose finalization has been kicked off in the background from a
-// status poll, so repeated polls do not spawn duplicate finalizers.
-const oauthFinalizationKickoffs = new Set<string>();
-
-/**
- * Start OAuth finalization (model registration, gateway restart, live probe)
- * in the background and return immediately. Finalization can take tens of
- * seconds; running it inside a status poll made the browser's short request
- * timeout abort with a misleading "server unreachable" error before the real
- * result was ever recorded. Errors are persisted on the session for every
- * provider so the next poll surfaces an honest outcome.
- */
-function ensureOAuthFinalizationStarted(status: any): void {
-  if (!status?.id || status.status !== 'complete' || !status.createdProfileId) return;
-  if (handledOAuthCompletions.has(status.id) || oauthFinalizationKickoffs.has(status.id)) return;
-  oauthFinalizationKickoffs.add(status.id);
-  markOAuthFlowFinalizationPending(status.id, true);
-  void finalizeOAuthCompletion(status)
-    .catch((error: any) => {
-      // finalizeOAuthCompletion records xAI errors itself; record here for
-      // every other provider so a failed finalization is never silent.
-      markOAuthFlowFinalizationError(status.id, error?.message || String(error));
-      console.error('[AI-Setup] background OAuth finalization failed:', error?.message || error);
-    })
-    .finally(() => {
-      oauthFinalizationKickoffs.delete(status.id);
-      markOAuthFlowFinalizationPending(status.id, false);
-    });
-}
 
 export function ensureNativeCliFinalizationStarted(
   status: any,
   finalizer: (status: any) => Promise<void> = finalizeNativeCliCompletion,
 ): boolean {
   if (!status?.id
-    || status.provider !== 'codex'
+    || !['claude-code', 'codex', 'hermes', 'opencode'].includes(status.provider)
     || status.status !== 'complete'
     || status.credentialState !== 'committed') return false;
   if (handledNativeCliCompletions.has(status.id) || nativeCliFinalizationKickoffs.has(status.id)) return false;
@@ -219,7 +193,7 @@ export function ensureNativeCliFinalizationStarted(
   void finalizer(status)
     .catch((error: any) => {
       markOAuthFlowFinalizationError(status.id, error?.message || String(error));
-      console.error('[AI-Setup] background Codex finalization failed:', error?.message || error);
+      console.error(`[AI-Setup] background ${status.provider} finalization failed:`, error?.message || error);
     })
     .finally(() => {
       nativeCliFinalizationKickoffs.delete(status.id);
@@ -304,26 +278,6 @@ export class ExclusiveProviderOperationGate {
 
 const xaiOperationGate = new ExclusiveProviderOperationGate();
 
-function beginXaiSetup(kind: ActiveXaiSetup['kind'], ownerId?: string): ActiveXaiSetup {
-  const token = xaiOperationGate.acquire(kind);
-  try {
-    const setup: ActiveXaiSetup = {
-      token,
-      kind,
-      lease: ensureOpenClawProviderPluginEnabled('xai', 'xai'),
-      sessionId: null,
-      ownerId: ownerId || null,
-      monitor: null,
-      finalizing: false,
-    };
-    activeXaiSetup = setup;
-    return setup;
-  } catch (error) {
-    xaiOperationGate.release(token);
-    throw error;
-  }
-}
-
 // Explicit operator recovery: drop any in-process xAI setup gate and its
 // monitor so a stuck lifecycle reset is not blocked by stale in-memory state.
 // The xAI plugin stays enabled so the operator's retry can proceed.
@@ -336,40 +290,6 @@ function forceReleaseActiveXaiSetup(): void {
   }
   xaiOperationGate.release(setup.token);
   if (activeXaiSetup?.token === setup.token) activeXaiSetup = null;
-}
-
-function bindXaiOAuthSession(setup: ActiveXaiSetup, sessionId: string): void {
-  if (activeXaiSetup?.token !== setup.token) {
-    throw new Error('xAI setup ownership changed before the OAuth session was created.');
-  }
-  setup.sessionId = sessionId;
-  setup.monitor = setInterval(() => {
-    if (activeXaiSetup?.token !== setup.token) {
-      if (setup.monitor) clearInterval(setup.monitor);
-      setup.monitor = null;
-      return;
-    }
-    try {
-      const status = getOAuthFlowStatus(sessionId, setup.ownerId || undefined);
-      if (status?.createdProfileId && status.status === 'complete') {
-        if (!setup.finalizing) {
-          setup.finalizing = true;
-          void finalizeOAuthCompletion(status).catch((error: any) => {
-            console.error('[AI-Setup] background xAI finalization failed:', error?.message || error);
-          }).finally(() => {
-            if (activeXaiSetup?.token === setup.token) setup.finalizing = false;
-          });
-        }
-      } else if (status?.createdProfileId && status.status === 'error') {
-        commitXaiSetup(setup);
-      } else if (!status || (['cancelled', 'expired', 'error'].includes(status.status) && !status.cleanupPending)) {
-        rollbackXaiSetup(setup);
-      }
-    } catch (error: any) {
-      console.error('[AI-Setup] xAI setup lifecycle reconciliation failed:', error?.message || error);
-    }
-  }, 2_000);
-  setup.monitor.unref?.();
 }
 
 function commitXaiSetup(setup: ActiveXaiSetup | null | undefined): void {
@@ -413,6 +333,7 @@ function oauthStartFailurePayload(error: any, fallback: string): Record<string, 
     success: false,
     error: error?.message || fallback,
     ...(typeof error?.code === 'string' ? { code: error.code } : {}),
+    ...(typeof error?.retryable === 'boolean' ? { retryable: error.retryable } : {}),
     ...(sessionId ? { sessionId: String(sessionId) } : {}),
     ...(error?.cleanupPending ? { cleanupPending: true } : {}),
     ...(error?.credentialState ? { credentialState: error.credentialState } : {}),
@@ -422,6 +343,28 @@ function oauthStartFailurePayload(error: any, fallback: string): Record<string, 
 function providerSetupErrorStatus(error: any): number {
   const status = Number(error?.statusCode);
   return status === 400 || status === 409 || status === 503 ? status : 500;
+}
+
+function rejectPortalOwnedOpenClawExecution(
+  operation: OpenClawHostMutationOperation,
+  res: Response,
+): void {
+  try {
+    assertOpenClawHostMutationAvailable(operation);
+  } catch (error) {
+    if (error instanceof OpenClawHostMutationUnavailableError) {
+      res.status(error.statusCode).json({
+        success: false,
+        error: error.message,
+        code: error.code,
+        retryable: error.retryable,
+        operation: error.operation,
+        operationDisposition: 'not_admitted',
+      });
+      return;
+    }
+    throw error;
+  }
 }
 
 function credentialOperationWasNotAdmitted(error: unknown, options: {
@@ -1981,30 +1924,6 @@ export function getExpectedXaiProbeModel(provider: string, setDefault: boolean |
   return provider === 'xai' && setDefault && model ? model : undefined;
 }
 
-/**
- * The live model probe is advisory everywhere a credential is already
- * committed: the probe executes a real turn through OpenClaw's default-agent
- * routing, which can fail for environmental reasons (a project sandbox owning
- * default routing, docker hiccups) while the credential itself works — proven
- * by direct main-agent turns. A probe failure therefore yields a user-facing
- * warning, never a rollback of an otherwise valid configuration.
- */
-function runAdvisoryAuthProbe(
-  provider: string,
-  profileId: string,
-  probeTimeoutMs: number,
-  expectedModel?: string,
-): string | null {
-  try {
-    probeOpenClawAuthProfile(provider, profileId, probeTimeoutMs, expectedModel);
-    return null;
-  } catch (probeError: any) {
-    const message = probeError?.message || 'The live model probe was inconclusive.';
-    console.warn(`[AI-Setup] advisory ${provider} model probe failed:`, message);
-    return `${message} The configuration was saved anyway; if the model does not respond in chat, review the provider account.`;
-  }
-}
-
 function runOpenClaw(args: string[], timeout = 30000) {
   const raw = execFileSync(OPENCLAW_BIN, args, {
     timeout,
@@ -2032,41 +1951,6 @@ export function runOpenClawWithSecretInput(args: string[], secret: string, timeo
     throw new Error('OpenClaw did not accept the setup-token. The credential domain remains locked for safe retry.');
   }
 }
-
-const PROVIDER_MODEL_DISCOVERY_FALLBACKS: Record<string, string[]> = {
-  anthropic: [
-    'anthropic/claude-fable-5',
-    'anthropic/claude-opus-5',
-    'anthropic/claude-opus-4-8',
-    'anthropic/claude-sonnet-4-6',
-    'anthropic/claude-haiku-4-5',
-  ],
-  'openai-codex': [
-    'openai/gpt-5.6-sol',
-    'openai/gpt-5.6-terra',
-    'openai/gpt-5.6-luna',
-    'openai/gpt-5.5',
-  ],
-  'google-gemini-cli': [
-    'google/gemini-3.1-pro-preview',
-    'google/gemini-3-flash-preview',
-    'google/gemini-3.1-flash-lite',
-  ],
-  'google-antigravity': [
-    'google-antigravity/gemini-3.5-flash',
-    'google-antigravity/gemini-3.5-flash-high',
-    'google-antigravity/gemini-3.5-flash-low',
-    'google-antigravity/gemini-3.1-pro-high',
-    'google-antigravity/gemini-3.1-pro-low',
-  ],
-  xai: [
-    'xai/grok-4.5',
-    'xai/grok-build-0.1',
-    'xai/grok-4.3',
-    'xai/grok-4.20-beta-latest-reasoning',
-    'xai/grok-4.20-beta-latest-non-reasoning',
-  ],
-};
 
 const DEFAULT_ONLY_MODEL_DISCOVERY_PROVIDERS = new Set([
   'anthropic',
@@ -2204,7 +2088,44 @@ function dedupeProviderModels(provider: string, models: Array<string | null | un
   return deduped;
 }
 
-function repairProviderModelRuntimeMetadata(config: any, provider: string, authProfilesForRuntime = readAuthProfiles()): boolean {
+function ensureCodexModelRuntimePolicy(
+  entry: any,
+  family: OpenClawAgentConfigFamily,
+): boolean {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+
+  const currentRuntimeId = String(entry.agentRuntime?.id || '').trim().toLowerCase();
+  if (family === '2026.7.1') {
+    // The retained runtime routes canonical openai/* through Codex by default.
+    // Preserve the 4.1.0 behavior: explicit Codex pins are legacy metadata on
+    // this family and must not be introduced by a Portal-only update.
+    if (currentRuntimeId === 'codex' || currentRuntimeId === 'codex-cli') {
+      delete entry.agentRuntime;
+      return true;
+    }
+    return false;
+  }
+  // OpenClaw 2026.9.1 treats explicit non-default model policy as authoritative.
+  // Preserve an intentional OpenClaw (or third-party) route instead of letting
+  // Codex subscription discovery silently hijack it.
+  if (currentRuntimeId && !['auto', 'default', 'codex', 'codex-cli'].includes(currentRuntimeId)) {
+    return false;
+  }
+  if (currentRuntimeId === 'codex') return false;
+
+  entry.agentRuntime = {
+    ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}),
+    id: 'codex',
+  };
+  return true;
+}
+
+function repairProviderModelRuntimeMetadata(
+  config: any,
+  provider: string,
+  authProfilesForRuntime = readAuthProfiles(),
+  codexFamily?: OpenClawAgentConfigFamily,
+): boolean {
   const models = config?.agents?.defaults?.models;
   if (!models || typeof models !== 'object') return false;
 
@@ -2219,9 +2140,9 @@ function repairProviderModelRuntimeMetadata(config: any, provider: string, authP
     let entry = rawEntry;
     let effectiveModelId = modelId;
 
-    // OpenClaw 2026.7.1 makes openai/* the canonical Codex-runtime route. Move
-    // legacy provider keys onto canonical declarations while preserving GPT-5.5
-    // as the compatibility choice for workspaces without GPT-5.6 access.
+    // OpenClaw 2026.9.1 retires codex/* and openai-codex/* model refs. Move
+    // legacy provider keys onto canonical openai/* declarations; runtime intent
+    // remains separate model-scoped metadata.
     if ((provider === 'openai-codex' || provider === 'codex')
       && (modelId.startsWith('openai/') || modelId.startsWith('openai-codex/') || modelId.startsWith('codex/'))) {
       effectiveModelId = canonicalizeDiscoveredProviderModelId(provider, modelId);
@@ -2278,11 +2199,10 @@ function repairProviderModelRuntimeMetadata(config: any, provider: string, authP
       continue;
     }
 
-    // openai/* agent turns route through the bundled Codex app-server runtime
-    // by default on OpenClaw 2026.7.1, so explicit codex runtime pins are
-    // legacy metadata and should be removed.
-    if (effectiveModelId.startsWith('openai/') && String(entry.agentRuntime?.id || '').trim() === 'codex') {
-      delete entry.agentRuntime;
+    if ((provider === 'openai-codex' || provider === 'codex')
+      && effectiveModelId.startsWith('openai/')
+      && codexFamily
+      && ensureCodexModelRuntimePolicy(entry, codexFamily)) {
       changed = true;
     }
   }
@@ -2312,10 +2232,7 @@ export function getProviderDefaultModelPayload(provider: string | null): any[] {
 
 function readDiscoveredProviderModelsFromCli(provider: string): string[] {
   if (provider === 'google-antigravity') {
-    const antigravityModels = listAntigravityModelsFromCli()
-      .map((model) => canonicalizeProviderModelId(provider, model.id))
-      .filter((modelId) => matchesProviderModel(provider, modelId));
-    if (antigravityModels.length) return dedupeProviderModels(provider, antigravityModels);
+    return [];
   }
 
   if (DEFAULT_ONLY_MODEL_DISCOVERY_PROVIDERS.has(provider)) {
@@ -2342,22 +2259,6 @@ function readDiscoveredProviderModelsFromCli(provider: string): string[] {
   return [];
 }
 
-async function readDiscoveredProviderModelsFromGateway(provider: string): Promise<string[]> {
-  if (DEFAULT_ONLY_MODEL_DISCOVERY_PROVIDERS.has(provider) || provider === 'google-antigravity') {
-    return [];
-  }
-
-  try {
-    const rpcResult = await listGatewayModels();
-    if (!rpcResult.ok) return [];
-    return parseDiscoveredProviderModels(provider, rpcResult.models || [])
-      .filter((modelId) => matchesProviderModel(provider, modelId));
-  } catch (err: any) {
-    console.warn(`[AI-Setup] Gateway model discovery failed for ${provider}: ${err.message}`);
-    return [];
-  }
-}
-
 export function mergeDiscoveredProviderModelsIntoConfig(
   config: any,
   provider: string,
@@ -2368,6 +2269,10 @@ export function mergeDiscoveredProviderModelsIntoConfig(
   const next = config && typeof config === 'object'
     ? JSON.parse(JSON.stringify(config))
     : {};
+  const shouldRouteCodex = provider === 'openai-codex' || provider === 'codex';
+  const codexFamily = shouldRouteCodex
+    ? readOpenClawAgentConfigContract(next).family
+    : undefined;
 
   next.agents = next.agents || {};
   next.agents.defaults = next.agents.defaults || {};
@@ -2383,9 +2288,15 @@ export function mergeDiscoveredProviderModelsIntoConfig(
   const fallbackSet = new Set(existingFallbacks);
   const addedAllowlist: string[] = [];
   const addedFallbacks: string[] = [];
+  const shouldPinCodexRuntime = shouldRouteCodex && codexFamily === '2026.9.1';
   const shouldPinAnthropicCliRuntime = provider === 'anthropic' && usesClaudeCliAuthProfile(next, authProfilesForRuntime);
   const shouldPinGoogleGeminiCliRuntime = provider === 'google-gemini-cli';
-  let changed = repairProviderModelRuntimeMetadata(next, provider, authProfilesForRuntime);
+  let changed = repairProviderModelRuntimeMetadata(
+    next,
+    provider,
+    authProfilesForRuntime,
+    codexFamily,
+  );
 
   for (const modelId of dedupeProviderModels(provider, discoveredModels)) {
     if (!next.agents.defaults.models[modelId] || typeof next.agents.defaults.models[modelId] !== 'object') {
@@ -2396,12 +2307,9 @@ export function mergeDiscoveredProviderModelsIntoConfig(
       changed = true;
     }
 
-    if ((provider === 'openai-codex' || provider === 'codex') && modelId.startsWith('openai/')) {
+    if (shouldPinCodexRuntime && modelId.startsWith('openai/')) {
       const entry = next.agents.defaults.models[modelId];
-      if (String(entry.agentRuntime?.id || '').trim() === 'codex') {
-        // Canonical openai/* ids use the Codex app-server runtime by default
-        // on OpenClaw 2026.7.1; explicit pins are legacy metadata.
-        delete entry.agentRuntime;
+      if (ensureCodexModelRuntimePolicy(entry, codexFamily!)) {
         changed = true;
       }
     }
@@ -2484,61 +2392,6 @@ export function filterXaiChatModels(models: string[] | undefined, catalog: strin
   return dedupeProviderModels('xai', models || []).filter((modelId) => allowed.has(modelId));
 }
 
-async function registerProviderModels(provider: string, options?: { preserveProviderTransport?: boolean; seedModels?: string[] }) {
-  const discoveredViaCli = readDiscoveredProviderModelsFromCli(provider);
-  const discoveredViaGateway = discoveredViaCli.length ? [] : await readDiscoveredProviderModelsFromGateway(provider);
-  const seedModels = dedupeProviderModels(provider, options?.seedModels || [])
-    .filter((modelId) => matchesProviderModel(provider, modelId));
-  const discoveredRuntimeModels = [...seedModels, ...discoveredViaCli, ...discoveredViaGateway];
-  const shouldUseStaticFallbacks = provider !== 'xai' || discoveredRuntimeModels.length === 0;
-  const staticFallbacks = shouldUseStaticFallbacks
-    ? dedupeProviderModels(provider, [
-      ...(PROVIDER_MODEL_DISCOVERY_FALLBACKS[provider] || []),
-      ...((getAiProviderMeta(provider)?.defaultModels || []).map((model) => canonicalizeProviderModelId(provider, model.id))),
-    ])
-    : [];
-
-  const discoveredModels = dedupeProviderModels(provider, [
-    ...discoveredRuntimeModels,
-    ...staticFallbacks,
-  ]).filter((modelId) => matchesProviderModel(provider, modelId));
-
-  if (!discoveredModels.length) {
-    console.log(`[AI-Setup] No models discovered for ${provider}`);
-    return { changed: false, models: [] as string[], addedAllowlist: [] as string[], addedFallbacks: [] as string[] };
-  }
-
-  if (provider === 'google-antigravity') {
-    console.log(`[AI-Setup] Discovered ${discoveredModels.length} ${provider} native models; not registering them into OpenClaw because Antigravity is handled by Portal's native GEMINI adapter.`);
-    return {
-      changed: false,
-      models: discoveredModels,
-      addedAllowlist: [] as string[],
-      addedFallbacks: [] as string[],
-    };
-  }
-
-  const openclawConfig = readOpenClawConfig();
-  const merged = mergeDiscoveredProviderModelsIntoConfig(openclawConfig, provider, discoveredModels, readAuthProfiles(), {
-    addFallbacks: provider !== 'xai',
-  });
-  const runtimeModels = registerProviderRuntimeModels(provider, discoveredModels, {
-    preserveProviderTransport: options?.preserveProviderTransport,
-  });
-  if (merged.changed) {
-    atomicWriteJson(CONFIG_PATH, merged.config);
-    if (provider === 'anthropic') repairClaudeSubscriptionConfig();
-  }
-
-  console.log(`[AI-Setup] Registered ${discoveredModels.length} ${provider} models (${merged.addedAllowlist.length} allowlisted, ${merged.addedFallbacks.length} fallback additions, ${runtimeModels.addedModels.length} runtime additions)`);
-  return {
-    changed: merged.changed || runtimeModels.changed,
-    models: discoveredModels,
-    addedAllowlist: merged.addedAllowlist,
-    addedFallbacks: merged.addedFallbacks,
-  };
-}
-
 async function waitForGatewayHealth(timeoutMs = 60000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -2580,7 +2433,11 @@ async function finalizeNativeCliCompletion(status: any) {
           ? 'GROK'
           : status.provider === 'gemini'
             ? 'GEMINI'
-            : null;
+            : status.provider === 'hermes'
+              ? 'HERMES'
+              : status.provider === 'opencode'
+                ? 'OPENCODE'
+                : null;
     if (nativeProvider) {
       // A completed native login is the explicit credential-generation
       // transition that may release an earlier provider rejection. Refresh
@@ -2595,22 +2452,32 @@ async function finalizeNativeCliCompletion(status: any) {
       invalidateAntigravityModelCache();
       return;
     }
-    if (status.provider === 'google-gemini-cli') {
-      await registerProviderModels('google-gemini-cli');
-      return;
-    }
-    if (status.provider === 'codex') {
-      pinCodexExternalCliAuthProfile();
-      await registerProviderModels('openai-codex');
-      await restartGateway();
-      return;
-    }
     if (status.provider === 'grok') {
       // Native Grok Build auth belongs to ~/.grok and is independent from the
       // OpenClaw xAI SQLite store. No gateway restart or credential copy.
       return;
     }
-    await restartGateway();
+    if (status.provider === 'hermes' || status.provider === 'opencode') {
+      const provider = status.provider === 'hermes' ? 'HERMES' : 'OPENCODE';
+      invalidateAcpModelCatalog(provider);
+      try {
+        const models = await refreshAcpModelCatalogFromRuntime(provider);
+        markOAuthFlowFinalizationWarning(
+          status.id,
+          models.length > 0
+            ? null
+            : `${provider === 'HERMES' ? 'Hermes' : 'OpenCode'} authenticated, but its ACP session did not advertise any models. Portal will retry discovery when the first session starts.`,
+        );
+      } catch (error: any) {
+        markOAuthFlowFinalizationWarning(
+          status.id,
+          `${provider === 'HERMES' ? 'Hermes' : 'OpenCode'} authenticated, but Portal could not refresh its dynamic model catalog yet: ${error?.message || error}`,
+        );
+      }
+      return;
+    }
+    // Unknown or legacy completion identities remain read-only. Never turn a
+    // finalizer change into an implicit gateway lifecycle mutation.
   });
   markOAuthFlowFinalized(status.id);
 }
@@ -2746,83 +2613,6 @@ export async function runClaudeSetupCompletionOnce<T>(
   }
 }
 
-async function finalizeOAuthCompletion(status: any): Promise<void> {
-  if (!status?.id || status.status !== 'complete') return;
-  await runOAuthCompletionFinalizerOnce(status.id, async () => {
-    if (!status.provider || !status.createdProfileId) {
-      throw new Error('Provider sign-in completed, but its OpenClaw auth profile could not be resolved yet. Retry status in a moment.');
-    }
-
-    if (status.provider === 'openai-codex') {
-      pinCodexExternalCliAuthProfile(status.createdProfileId);
-    } else if (status.provider !== 'xai') {
-      pinProviderAuthProfile(status.authProvider || status.provider, status.createdProfileId, 'oauth');
-    }
-
-    const rollbackSnapshots = status.provider === 'xai'
-      ? [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)]
-      : [];
-    let expectedRollbackState: FileSnapshot[] = [];
-
-    try {
-      if (status.provider === 'xai') {
-        clearProviderAuthOrder('xai');
-      }
-      await registerProviderModels(status.provider, {
-        // xAI is a bundled provider. OpenClaw owns both its subscription and
-        // API-key transports; Portal may extend the model allowlist but must
-        // never author or delete models.providers.xai transport configuration.
-        preserveProviderTransport: status.provider === 'xai',
-      });
-      if (rollbackSnapshots.length) {
-        expectedRollbackState = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
-      }
-      await restartGateway();
-      if (status.provider === 'xai') {
-        // The credential is already committed to OpenClaw's auth store and its
-        // models are registered. The live model probe is advisory: xAI OAuth is
-        // subscription/entitlement-gated, so a probe can be inconclusive
-        // ("unknown") or fail for an account that Portal cannot verify yet even
-        // when the credential is valid. A probe failure must NOT strand a valid
-        // setup — record a non-fatal warning and let the operator pick a
-        // default model. A genuine problem surfaces at first use with an
-        // actionable message.
-        try {
-          probeOpenClawAuthProfile('xai', status.createdProfileId, 20_000);
-          markOAuthFlowFinalizationWarning(status.id, null);
-        } catch (probeError: any) {
-          console.warn('[AI-Setup] xAI live model probe was inconclusive; completing setup with a warning:', probeError?.message || probeError);
-          markOAuthFlowFinalizationWarning(
-            status.id,
-            `${probeError?.message || 'Portal could not confirm a live xAI model response.'} Setup completed and you can select a default model; if a model does not respond, your xAI plan may not include API access.`,
-          );
-        }
-        commitXaiOAuthSession(status.id);
-      }
-    } catch (error: any) {
-      if (rollbackSnapshots.length) {
-        try {
-          if (expectedRollbackState.length) {
-            restoreSnapshotsWithCompareAndSwap(rollbackSnapshots, expectedRollbackState);
-          } else if (!rollbackSnapshots.every(fileSnapshotMatchesCurrent)) {
-            throw new Error('OpenClaw configuration changed before Portal established a safe OAuth rollback checkpoint.');
-          }
-          clearProviderAuthOrder('xai');
-          await restartGateway();
-        } catch (rollbackError: any) {
-          throw new Error(`Provider authentication was saved, final setup failed, and the restored gateway configuration did not recover: ${rollbackError?.message || rollbackError}`);
-        }
-      }
-      if (status.provider === 'xai') {
-        markOAuthFlowFinalizationError(status.id, error?.message || String(error));
-        commitXaiOAuthSession(status.id);
-      }
-      throw error;
-    }
-  });
-  markOAuthFlowFinalized(status.id);
-}
-
 async function fetchGatewayHealth() {
   const url = `${GATEWAY_HEALTH_URL.replace(/\/$/, '')}/health`;
 
@@ -2857,42 +2647,6 @@ export function classifyProviderRuntimeFailure(output: string): string {
     return 'Gemini CLI auth worked, but Google rejected the request for quota or rate-limit reasons.';
   }
   return normalized.slice(0, 600) || 'Provider runtime smoke test failed.';
-}
-
-function runGoogleGeminiCliSmoke() {
-  try {
-    const output = execFileSync('gemini', [
-      '-p',
-      'Reply with exactly GEMINI_OK.',
-      '--model',
-      'gemini-3-flash-preview',
-      '--output-format',
-      'json',
-    ], {
-      timeout: 75000,
-      encoding: 'utf8',
-      env: buildOpenClawCliEnv(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      maxBuffer: 1024 * 1024 * 4,
-    });
-
-    return {
-      ok: /GEMINI_OK/i.test(output),
-      provider: 'google-gemini-cli',
-      model: 'google/gemini-3-flash-preview',
-      error: /GEMINI_OK/i.test(output) ? null : 'Gemini CLI returned without the expected smoke-test response.',
-    };
-  } catch (error: any) {
-    const stdout = typeof error?.stdout === 'string' ? error.stdout : error?.stdout?.toString?.('utf8') || '';
-    const stderr = typeof error?.stderr === 'string' ? error.stderr : error?.stderr?.toString?.('utf8') || '';
-    const combined = `${stdout}\n${stderr}`.trim() || error?.message || 'Gemini CLI smoke test failed.';
-    return {
-      ok: false,
-      provider: 'google-gemini-cli',
-      model: 'google/gemini-3-flash-preview',
-      error: classifyProviderRuntimeFailure(combined),
-    };
-  }
 }
 
 export function normalizeModelPayload(models: any[], providerHint?: string | null): any[] {
@@ -2937,60 +2691,24 @@ export function createAiSetupRouter(): Router {
       res.status(400).json({ error: parsed.error.issues.map((i: any) => i.message).join("; ") || "Invalid request" });
       return;
     }
-
-    let xaiSetup: ActiveXaiSetup | null = null;
-    try {
-      if (parsed.data.provider === 'qwen-portal') {
-        runOpenClaw(['plugins', 'enable', 'qwen-portal-auth'], 15000);
-      }
-      if (parsed.data.provider === 'xai') {
-        xaiSetup = beginXaiSetup('oauth', getOAuthRequestOwnerId(req));
-      }
-      const result = await startOAuthFlow(parsed.data.provider, {
-        googleProjectId: parsed.data.googleProjectId,
-        ownerId: getOAuthRequestOwnerId(req),
-      });
-      if (xaiSetup) bindXaiOAuthSession(xaiSetup, result.sessionId);
-      res.json(result);
-    } catch (error: any) {
-      let detail = error?.message || 'Failed to start OAuth flow';
-      if (xaiSetup) {
-        try {
-          if (error?.credentialCommitted) {
-            commitXaiSetup(xaiSetup);
-          } else if (error?.cleanupPending && error?.oauthSessionId) {
-            bindXaiOAuthSession(xaiSetup, String(error.oauthSessionId));
-          } else if (!error?.oauthSessionId || error?.credentialState === 'absent') {
-            rollbackXaiSetup(xaiSetup);
-          } else {
-            // A durable session exists but did not produce authoritative
-            // credential absence. Retain the xAI lease and exact session
-            // binding so status/cancel can finish reconciliation safely.
-            bindXaiOAuthSession(xaiSetup, String(error.oauthSessionId));
-          }
-        } catch (rollbackError: any) {
-          detail = `${detail} Plugin policy rollback also failed: ${rollbackError?.message || rollbackError}`;
-        }
-      }
-      res.status(providerSetupErrorStatus(error)).json({
-        ...oauthStartFailurePayload(error, 'Failed to start OAuth flow'),
-        error: detail,
-      });
-    }
+    // Every provider in this route launches `openclaw models auth login` in a
+    // Portal-owned PTY. Credential entry remains available through the
+    // process-free save routes; interactive OpenClaw login awaits supervision.
+    rejectPortalOwnedOpenClawExecution('oauth-device', res);
   });
 
   // Owner-initiated recovery from a stuck credential lifecycle. A failed
   // sign-in can leave a terminal record that makes every retry throw
-  // PROVIDER_CREDENTIAL_LIFECYCLE_CONFLICT. This clears that bookkeeping (and
-  // any parked removal fence) so a fresh sign-in can start; it never touches
-  // the credential store — the operator's next sign-in overwrites it.
+  // PROVIDER_CREDENTIAL_LIFECYCLE_CONFLICT. This clears only that bookkeeping
+  // (and any parked removal fence); it never touches the credential store or
+  // imply that Portal may launch another interactive host sign-in.
   router.post('/oauth/reset-lifecycle', async (req: Request, res: Response) => {
     // Every provider with a credential-lifecycle domain must be resettable.
     // This deliberately includes anthropic: the Claude wizard has its own
     // start route, so validating against oauthStartSchema silently made the
     // one provider most likely to hold a stuck fence impossible to reset.
     const parsed = z.object({
-      provider: z.enum(['anthropic', 'openai-codex', 'google-gemini-cli', 'google-antigravity', 'qwen-portal', 'xai']),
+      provider: z.enum(['anthropic', 'openai-codex', 'google-gemini-cli', 'google-antigravity', 'qwen-portal', 'xai', 'hermes', 'opencode']),
     }).safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'A valid provider is required.' });
@@ -3004,9 +2722,12 @@ export function createAiSetupRouter(): Router {
       if (provider === 'xai') {
         try { forceReleaseActiveXaiSetup(); } catch { /* best effort */ }
       }
-      const namespace = provider === 'google-antigravity'
-        ? getCredentialLifecycleNamespaceForNativeProvider('gemini')
-        : getCredentialLifecycleNamespaceForOpenClawProvider(provider);
+      const isInteractiveHarness = provider === 'hermes' || provider === 'opencode';
+      const namespace = isInteractiveHarness
+        ? getCredentialLifecycleNamespaceForNativeProvider(provider)
+        : provider === 'google-antigravity'
+          ? getCredentialLifecycleNamespaceForNativeProvider('gemini')
+          : getCredentialLifecycleNamespaceForOpenClawProvider(provider);
       const result = resetStuckProviderCredentialLifecycle(namespace, ownerId);
       if (result.reason === 'owner_mismatch') {
         res.status(409).json({ success: false, code: 'PROVIDER_LIFECYCLE_OWNER_MISMATCH', error: 'This provider authorization belongs to another account.' });
@@ -3026,23 +2747,19 @@ export function createAiSetupRouter(): Router {
       res.json({
         success: true,
         cleared: result.cleared || leaseRelease === 'released',
-        message: (result.cleared || leaseRelease === 'released')
-          ? 'Cleared the stuck provider authorization. You can start the sign-in again.'
-          : 'No stuck provider authorization was found; you can start the sign-in.',
+        message: isInteractiveHarness
+          ? 'Interrupted setup cleared. Your saved login is unchanged; configure this harness again to finish setup.'
+          : (result.cleared || leaseRelease === 'released')
+          ? 'Cleared the stuck authorization lifecycle; interactive host sign-in remains unavailable, while Host Operator Agent Chat can use an existing credential after fresh CLI admission.'
+          : 'No stuck authorization lifecycle was found; interactive host sign-in remains unavailable, while Host Operator Agent Chat can use an existing credential after fresh CLI admission.',
       });
     } catch (error: any) {
       res.status(500).json({ success: false, error: error?.message || 'Could not reset the provider authorization lifecycle.' });
     }
   });
 
-  router.post('/oauth/device/start', async (req: Request, res: Response) => {
-    try {
-      const result = await startDeviceCodeFlow('github-copilot', getOAuthRequestOwnerId(req));
-      res.json(result);
-    } catch (error: any) {
-      res.status(providerSetupErrorStatus(error))
-        .json(oauthStartFailurePayload(error, 'Failed to start device-code flow'));
-    }
+  router.post('/oauth/device/start', async (_req: Request, res: Response) => {
+    rejectPortalOwnedOpenClawExecution('oauth-device', res);
   });
 
   router.post('/oauth/callback', async (req: Request, res: Response) => {
@@ -3052,19 +2769,13 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    try {
-      const ownerId = getOAuthRequestOwnerId(req);
-      const result = await completeOAuthFlow(parsed.data.sessionId, parsed.data.callbackUrl, ownerId);
-      if (!result.success) {
-        res.status(500).json(result);
-        return;
-      }
-      const sessionStatus = getOAuthFlowStatus(parsed.data.sessionId, ownerId);
-      await finalizeOAuthCompletion(sessionStatus);
-      res.json({ success: true });
-    } catch (error: any) {
-      res.status(500).json({ success: false, error: error?.message || 'Failed to complete OAuth flow' });
+    const ownerId = getOAuthRequestOwnerId(req);
+    const retainedStatus = getOAuthFlowStatus(parsed.data.sessionId, ownerId);
+    if (!retainedStatus) {
+      res.status(404).json({ error: 'OAuth session not found' });
+      return;
     }
+    rejectPortalOwnedOpenClawExecution('oauth-device', res);
   });
 
   router.post('/oauth/cancel', async (req: Request, res: Response) => {
@@ -3115,6 +2826,20 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
+    if (status.status === 'complete') {
+      const error = new OpenClawHostMutationUnavailableError('oauth-device');
+      res.json({
+        ...status,
+        finalized: false,
+        finalizing: false,
+        executionUnavailable: true,
+        error: error.message,
+        code: error.code,
+        retryable: error.retryable,
+      });
+      return;
+    }
+
     if (status.provider === 'xai' && status.createdProfileId && status.status === 'error') {
       commitXaiOAuthSession(status.id);
     } else if (status.provider === 'xai' && status.credentialState === 'absent' && !status.cleanupPending) {
@@ -3128,28 +2853,6 @@ export function createAiSetupRouter(): Router {
         });
         return;
       }
-    }
-
-    if (status.status === 'complete' && !status.createdProfileId) {
-      // OpenClaw can emit its completion marker just before the SQLite-backed
-      // auth profile commit becomes visible. Keep this a non-fatal pending state
-      // so the browser polls the same completed session instead of re-authing.
-      res.status(202).json({ ...status, finalized: false });
-      return;
-    }
-
-    if (status.status === 'complete' && !handledOAuthCompletions.has(status.id)) {
-      // Finalization (gateway restart + live credential probe) can take tens of
-      // seconds. Kick it off in the background and answer this poll immediately;
-      // blocking here made the browser abort with a false "server unreachable".
-      ensureOAuthFinalizationStarted(status);
-      const latest = getOAuthFlowStatus(status.id, getOAuthRequestOwnerId(req)) || status;
-      if (latest.status === 'error') {
-        res.status(200).json({ ...latest, finalized: false });
-        return;
-      }
-      res.status(202).json({ ...latest, finalized: false, finalizing: true });
-      return;
     }
 
     res.json({ ...status, finalized: handledOAuthCompletions.has(status.id) });
@@ -3176,12 +2879,40 @@ export function createAiSetupRouter(): Router {
       ...provider,
       removal: getProviderRemovalCapability(provider.id),
     }));
+    const harnessAuthStatuses = await Promise.all((['HERMES', 'OPENCODE'] as const).map(async (nativeProvider) => {
+      const auth = await getNativeCliAuthStatusAsync(nativeProvider);
+      const id = nativeProvider === 'HERMES' ? 'portal-hermes' : 'portal-opencode';
+      return {
+        id,
+        status: auth.status === 'authenticated'
+          ? 'configured' as const
+          : auth.status === 'unknown'
+            ? 'error' as const
+            : 'unconfigured' as const,
+        authType: 'native_cli',
+        profileId: id,
+        currentModel: null,
+        isDefault: false,
+        error: auth.status === 'unknown' ? auth.message : null,
+        cooldownUntil: null,
+        lastUsed: null,
+        expiresAt: null,
+        warning: null,
+        nativeProvider,
+        nativeCliAuthStatus: auth.status,
+        nativeCliAuthMessage: auth.message,
+        nativeCliLoginCommand: auth.loginCommand || null,
+        requiresSeparateNativeLogin: true,
+        readiness: null,
+        removal: getProviderRemovalCapability(id),
+      };
+    }));
 
     res.json({
       openclawInstalled,
       openclawVersion,
       gatewayRunning,
-      providers: providersWithRemovalCapabilities,
+      providers: [...providersWithRemovalCapabilities, ...harnessAuthStatuses],
       defaultModel: getDefaultModel(),
       fallbackModels: getFallbackModels(),
       configuredProfileCount: configuredProviders.length,
@@ -3199,8 +2930,13 @@ export function createAiSetupRouter(): Router {
     }
 
     if (parsed.data === 'google-gemini-cli') {
-      const result = runGoogleGeminiCliSmoke();
-      res.status(result.ok ? 200 : 502).json(result);
+      const error = new NativeBinaryRuntimeUnqualifiedError('GEMINI');
+      res.status(error.statusCode).json({
+        ok: false,
+        code: error.code,
+        error: error.message,
+        retryable: error.retryable,
+      });
       return;
     }
 
@@ -3238,13 +2974,23 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
+    if (parsed.data.setDefault === true) {
+      rejectPortalOwnedOpenClawExecution('configuration', res);
+      return;
+    }
+
     const { provider, apiKey, setDefault, model, operationId } = parsed.data;
     const normalizedModel = canonicalizeProviderModelId(provider, model || '');
     const authProviderId = provider === 'openai-codex' ? 'openai' : provider;
     const lifecycleNamespace = getCredentialLifecycleNamespaceForOpenClawProvider(authProviderId);
     const ownerId = getOAuthRequestOwnerId(req);
     const savedProfileId = provider === 'xai' ? 'xai:portal-api-key' : `${provider}:default`;
-    const responsePayload = { success: true, profileId: savedProfileId, model: normalizedModel || null };
+    const responsePayload = {
+      success: true,
+      profileId: savedProfileId,
+      model: normalizedModel || null,
+      warning: 'Credential saved. Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.',
+    };
     const requestFingerprint = credentialWriteRequestFingerprint({
       provider,
       secret: apiKey,
@@ -3261,15 +3007,11 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    let rollbackSnapshots: FileSnapshot[] = [];
-    let expectedRollbackState: FileSnapshot[] = [];
     let credentialSaved = false;
     let credentialCommitIndeterminate = false;
-    let xaiSetup: ActiveXaiSetup | null = null;
     let writeClaim: ClaimedProviderCredentialLifecycle | null = null;
     let writeDisposition: 'admitted' | 'recovered' | 'completed' | null = null;
     let mutationStarted = false;
-    let validatedChatModels: string[] = [];
     const settleFailedWriteClaim = (safeToRelease = false) => {
       if (!writeClaim) return;
       if (safeToRelease) releaseProviderCredentialLifecycle(writeClaim);
@@ -3326,14 +3068,11 @@ export function createAiSetupRouter(): Router {
 
       if (admission.disposition === 'recovered') {
         // A fixed profile containing the submitted secret proves only that the
-        // first Portal JSON write may have landed. It does not prove that the
-        // later auth declaration/order, model routing, default selection, and
-        // gateway settlement all completed. Never replay the secret and never
-        // certify that partial state as a completed operation without a durable
-        // receipt covering the final proof.
+        // first write may have landed. Never replay the secret or certify that
+        // partial state as complete without the durable receipt.
         credentialCommitIndeterminate = true;
         throw new DurableCredentialLifecycleRecoveryRequiredError(
-          'Portal cannot prove that the interrupted request completed its full credential and routing transaction. The secret will not be written again; the operation remains parked for server review.',
+          'Portal cannot prove that the interrupted credential write completed. The secret will not be written again; the operation remains parked for server review.',
         );
       } else {
         const validation = await validateApiKey(provider, apiKey);
@@ -3342,25 +3081,12 @@ export function createAiSetupRouter(): Router {
           res.status(400).json({ ...validation, operationDisposition: 'not_admitted' });
           return;
         }
-        validatedChatModels = provider === 'xai'
-          ? filterXaiChatModels(validation.models, xaiChatCatalog)
-          : (validation.models || []);
-      }
-
-      if (provider === 'xai') {
-        mutationStarted = true;
-        xaiSetup = beginXaiSetup('api-key', ownerId);
-      }
-      if (provider === 'xai') {
-        // Preserve the plugin-policy change selected by the user if the
-        // credential becomes durable and a later setup step fails.
-        rollbackSnapshots = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
       }
       if (admission.disposition === 'admitted') {
         // Bundled providers such as xAI are committed through OpenClaw's locked
         // auth-store control plane; legacy API providers use Portal-managed files.
         mutationStarted = true;
-        const saved = saveProviderApiKey(provider, apiKey);
+        const saved = saveProviderApiKey(provider, apiKey, { normalizeAuthOrder: false });
         if (saved.profileId !== savedProfileId) {
           throw new DurableCredentialLifecycleRecoveryRequiredError(
             'The provider saved an unexpected credential profile. The domain remains locked for review.',
@@ -3368,42 +3094,9 @@ export function createAiSetupRouter(): Router {
         }
         credentialSaved = true;
       }
-      if (provider === 'xai') {
-        expectedRollbackState = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
-      }
-
-      if (setDefault && normalizedModel) {
-        try { runOpenClaw(['models', 'set', normalizedModel], 10000); } catch (setModelError) {
-          if (provider === 'xai') throw setModelError;
-          const config = readOpenClawConfig();
-          if (!config.agents) config.agents = {};
-          if (!config.agents.defaults) config.agents.defaults = {};
-          if (!config.agents.defaults.model) config.agents.defaults.model = {};
-          config.agents.defaults.model.primary = normalizedModel;
-          const fs = require('fs');
-          fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
-        }
-      }
-      if (provider === 'xai') {
-        expectedRollbackState = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
-      }
-
-      await registerProviderModels(provider, {
-        seedModels: buildProviderRegistrationSeedModels(provider, validatedChatModels, normalizedModel, xaiChatCatalog),
-      });
-      if (provider === 'xai') {
-        expectedRollbackState = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
-      }
-      await restartGateway();
-      if (provider === 'xai') {
-        const probeWarning = runAdvisoryAuthProbe(
-          'xai',
-          savedProfileId,
-          20_000,
-          getExpectedXaiProbeModel(provider, setDefault, normalizedModel),
-        );
-        if (probeWarning) (responsePayload as any).warning = probeWarning;
-      }
+      // Credential-only checkpoint: do not register Host models, alter
+      // defaults/fallbacks/runtime metadata, restart the gateway, or run a
+      // live model probe. Those positive activation steps require supervision.
       const finalProof = await readStableCredentialWriteProof(
         () => readOpenClawAndPortalCredentialProof(provider, authProviderId),
       );
@@ -3424,50 +3117,13 @@ export function createAiSetupRouter(): Router {
         credentialWriteResultFingerprint(responsePayload, finalProof.fingerprint),
       );
       writeClaim = null;
-      if (xaiSetup) commitXaiSetup(xaiSetup);
       res.json(responsePayload);
     } catch (error: any) {
       if (provider === 'xai' && !credentialSaved && error instanceof ProviderApiKeySaveError) {
         credentialSaved = error.credentialState === 'committed';
         credentialCommitIndeterminate = error.credentialState === 'indeterminate';
       }
-      let pluginRollbackError: string | null = null;
-      if (rollbackSnapshots.length) {
-        try {
-          if (!expectedRollbackState.length && error instanceof ProviderApiKeySaveError) {
-            // The supported save helper is synchronous. Capture the post-error
-            // bytes now so the immediate CAS rollback cannot erase a later
-            // request's unrelated config update.
-            expectedRollbackState = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
-          }
-          restoreSnapshotsWithCompareAndSwap(rollbackSnapshots, expectedRollbackState);
-          clearProviderAuthOrder('xai');
-          if (xaiSetup && !credentialSaved && !credentialCommitIndeterminate) rollbackXaiSetup(xaiSetup);
-          else if (xaiSetup) commitXaiSetup(xaiSetup);
-          await restartGateway();
-        } catch (rollbackError: any) {
-          if (xaiSetup && (credentialSaved || credentialCommitIndeterminate)) {
-            commitXaiSetup(xaiSetup);
-          } else if (xaiSetup) {
-            try { rollbackXaiSetup(xaiSetup); } catch {}
-          }
-          settleFailedWriteClaim(false);
-          res.status(500).json({
-            success: false,
-            credentialSaved,
-            credentialState: credentialCommitIndeterminate ? 'indeterminate' : (credentialSaved ? 'committed' : 'absent'),
-            error: `xAI setup failed and the restored gateway configuration did not recover: ${rollbackError?.message || rollbackError}`,
-          });
-          return;
-        }
-      } else if (xaiSetup && !credentialSaved && !credentialCommitIndeterminate) {
-        try {
-          rollbackXaiSetup(xaiSetup);
-        } catch (rollbackError: any) {
-          pluginRollbackError = rollbackError?.message || String(rollbackError);
-        }
-      }
-      const detail = `${error?.message || 'Failed to save API key'}${pluginRollbackError ? ` Plugin policy rollback also failed: ${pluginRollbackError}` : ''}`;
+      const detail = error?.message || 'Failed to save API key';
       const safeToRelease = writeDisposition === 'admitted'
         && !mutationStarted
         && (!(error instanceof ProviderApiKeySaveError) || error.credentialState === 'absent');
@@ -3504,9 +3160,9 @@ export function createAiSetupRouter(): Router {
         ...(typeof (error as any)?.code === 'string' ? { code: (error as any).code } : {}),
         ...(operationNotAdmitted ? { operationDisposition: 'not_admitted' } : {}),
         error: credentialSaved && provider === 'xai'
-          ? `The xAI credential was saved, but final setup failed and configuration changes were rolled back: ${detail}`
+          ? `The xAI credential was saved, but Portal could not complete the credential receipt: ${detail}`
           : (credentialCommitIndeterminate && provider === 'xai'
-            ? `Portal could not prove whether OpenClaw committed the xAI credential. The xAI plugin was left enabled; retry status or disconnect xAI before entering another key. ${detail}`
+            ? `Portal could not prove whether OpenClaw committed the xAI credential. Retry status or disconnect xAI before entering another key. ${detail}`
             : detail),
       });
     }
@@ -3532,62 +3188,20 @@ export function createAiSetupRouter(): Router {
     const { sessionId, code } = req.body;
     if (!sessionId || !code) { res.status(400).json({ error: 'sessionId and code required' }); return; }
 
-    try {
-      const result = await pasteCodeToClaudeSession(sessionId, code, getOAuthRequestOwnerId(req));
-      res.json(result);
-    } catch (error: any) {
-      console.error('[Claude] paste-code error:', error.message);
-      res.status(500).json({ success: false, error: error?.message || 'Failed to paste code' });
-    }
+    // A retained pre-upgrade PTY session is still a managed Claude host
+    // process. Refuse before writing any authorization code to it.
+    const error = new NativeHostCredentialFlowUnavailableError('claude-code');
+    res.status(error.statusCode).json(oauthStartFailurePayload(error, 'Failed to paste code'));
   });
 
   router.post('/claude/complete', async (req: Request, res: Response) => {
     const { sessionId } = req.body;
     if (!sessionId) { res.status(400).json({ error: 'sessionId required' }); return; }
 
-    try {
-      const ownerId = getOAuthRequestOwnerId(req);
-      if (!getOAuthFlowStatus(sessionId, ownerId)) {
-        res.status(404).json({ success: false, error: 'Claude setup session not found' });
-        return;
-      }
-      const response = await runClaudeSetupCompletionOnce(sessionId, async () => {
-        const generation = beginClaudeSetupTokenFinalization(sessionId, ownerId);
-        if (generation === null) {
-          return { success: false, error: 'Claude setup completion no longer owns an active authorization session.' };
-        }
-        try {
-          const result = await getClaudeSetupToken(sessionId, ownerId);
-          if (!result.success) return result;
-          if (!result.token) {
-            return { success: false, error: 'Claude authentication completed, but the owned setup-token session did not produce a reusable token.' };
-          }
-
-          const saveResult = commitClaudeSetupTokenCredential(
-            sessionId,
-            result.token,
-            generation,
-            ownerId,
-          );
-          if (!saveResult.success) return saveResult;
-
-          await registerProviderModels('anthropic');
-          // Restart gateway after the allowlist/fallback updates are persisted.
-          await restartGateway();
-          return { success: true };
-        } catch (error: any) {
-          markOAuthFlowFinalizationError(sessionId, error?.message || String(error));
-          throw error;
-        } finally {
-          finishClaudeSetupTokenFinalization(sessionId, generation, ownerId);
-        }
-      });
-      res.json(response);
-    } catch (error: any) {
-      console.error('[Claude] complete error:', error.message);
-      res.status(error instanceof ProviderSetupInProgressError ? error.statusCode : 500)
-        .json({ success: false, error: error?.message || 'Failed to complete Claude setup' });
-    }
+    // Existing sessions must not bypass the new-start fence and proceed into
+    // token extraction, credential commit, model registration, or restart.
+    const error = new NativeHostCredentialFlowUnavailableError('claude-code');
+    res.status(error.statusCode).json(oauthStartFailurePayload(error, 'Failed to complete Claude setup'));
   });
 
   router.post('/save-setup-token', async (req: Request, res: Response) => {
@@ -3600,13 +3214,23 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
+    if (parsed.data.setDefault === true) {
+      rejectPortalOwnedOpenClawExecution('configuration', res);
+      return;
+    }
+
     const { provider, token, setDefault, model, operationId } = parsed.data;
     const authProviderId = provider;
     const lifecycleNamespace = getCredentialLifecycleNamespaceForOpenClawProvider(authProviderId);
     const ownerId = getOAuthRequestOwnerId(req);
     const savedProfileId = `${provider}:portal-setup-token`;
     const normalizedModel = canonicalizeProviderModelId(provider, model || '');
-    const responsePayload = { success: true, profileId: savedProfileId, model: normalizedModel || null };
+    const responsePayload = {
+      success: true,
+      profileId: savedProfileId,
+      model: normalizedModel || null,
+      warning: 'Credential saved. Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.',
+    };
     const requestFingerprint = credentialWriteRequestFingerprint({
       provider,
       secret: token,
@@ -3685,13 +3309,8 @@ export function createAiSetupRouter(): Router {
         ], token, 30000);
       }
 
-      if (setDefault && normalizedModel) {
-        runOpenClaw(['models', 'set', normalizedModel], 10000);
-        repairClaudeSubscriptionConfig(normalizedModel);
-      }
-
-      await registerProviderModels(provider);
-      await restartGateway();
+      // Credential-only checkpoint: no Host model registration, routing
+      // repair, gateway restart, or embedded model probe.
 
       const finalProof = await readStableCredentialWriteProof(
         () => readOpenClawAndPortalCredentialProof(provider, authProviderId),
@@ -3701,15 +3320,9 @@ export function createAiSetupRouter(): Router {
           'Provider setup finished without authoritative setup-token readback. The credential domain remains locked for review.',
         );
       }
-      {
-        const probeWarning = runAdvisoryAuthProbe(
-          provider,
-          savedProfileId,
-          20_000,
-          setDefault && normalizedModel ? normalizedModel : undefined,
-        );
-        if (probeWarning) (responsePayload as any).warning = probeWarning;
-      }
+      // The authoritative credential readback above is the terminal proof.
+      // A live model probe would launch a host binary outside a user-requested
+      // Agent Chat turn, so credential setup stops here.
 
       completeProviderCredentialWriteLifecycle(
         writeClaim,
@@ -3765,83 +3378,9 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    let rollbackSnapshots: FileSnapshot[] = [];
-    let expectedRollbackState: FileSnapshot[] = [];
-    let xaiModelToken: string | null = null;
-    try {
-      const normalizedModel = normalizePortalModelId(parsed.data.model);
-      if (parsed.data.provider === 'xai' || normalizedModel.startsWith('xai/')) {
-        xaiModelToken = xaiOperationGate.acquire('model-selection');
-      }
-      const currentConfig = readOpenClawConfig();
-      const configuredModels = currentConfig?.agents?.defaults?.models;
-      const registrationProvider = resolveModelRegistrationProvider(
-        normalizedModel,
-        parsed.data.provider,
-        configuredModels,
-      );
-      if (parsed.data.provider && !matchesProviderModel(parsed.data.provider, normalizedModel)) {
-        res.status(400).json({ error: 'Selected model must belong to the provider being configured' });
-        return;
-      }
-      if (registrationProvider === 'xai' && !getSafeXaiChatModelCatalog().includes(normalizedModel)) {
-        res.status(400).json({ error: 'The selected xAI model is not an OpenClaw chat model and cannot be used as the agent default.' });
-        return;
-      }
-      if (registrationProvider === 'xai') {
-        if (!parsed.data.profileId) {
-          res.status(400).json({ error: 'The exact xAI credential profile is required before Portal can live-test this model.' });
-          return;
-        }
-        invalidateOpenClawAuthStoreProfilesCache();
-        const exactProfile = (await readOpenClawAuthStoreProfilesAsync('xai', { strict: true }))[parsed.data.profileId];
-        if (!exactProfile || exactProfile.provider !== 'xai' || !['oauth', 'api_key'].includes(exactProfile.type)) {
-          res.status(400).json({ error: 'The selected xAI credential is no longer present in OpenClaw. Reconnect xAI before choosing a default model.' });
-          return;
-        }
-        rollbackSnapshots = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
-      }
-      runOpenClaw(['models', 'set', normalizedModel], 10000);
-      if (rollbackSnapshots.length) {
-        expectedRollbackState = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
-      }
-      repairClaudeSubscriptionConfig(normalizedModel);
-      // Also register all models for this provider (handles auto-completion case)
-      if (registrationProvider) await registerProviderModels(registrationProvider);
-      if (rollbackSnapshots.length) {
-        expectedRollbackState = [captureFileSnapshot(CONFIG_PATH), captureFileSnapshot(MODELS_JSON_PATH)];
-      }
-      await restartGateway();
-      const probeWarning = registrationProvider === 'xai' && parsed.data.profileId
-        ? runAdvisoryAuthProbe('xai', parsed.data.profileId, 20_000, normalizedModel)
-        : null;
-      res.json({
-        success: true,
-        model: normalizedModel,
-        ...(probeWarning ? { warning: probeWarning } : {}),
-      });
-    } catch (error: any) {
-      if (rollbackSnapshots.length) {
-        try {
-          if (expectedRollbackState.length) {
-            restoreSnapshotsWithCompareAndSwap(rollbackSnapshots, expectedRollbackState);
-          } else if (!rollbackSnapshots.every(fileSnapshotMatchesCurrent)) {
-            throw new Error('OpenClaw failed before Portal could establish a rollback checkpoint; the current configuration was left untouched for safety.');
-          }
-          await restartGateway();
-        } catch (rollbackError: any) {
-          res.status(500).json({
-            success: false,
-            error: `The xAI model failed its live credential test and Portal could not restore the prior gateway configuration: ${rollbackError?.message || rollbackError}`,
-          });
-          return;
-        }
-      }
-      const statusCode = error instanceof ProviderSetupInProgressError ? error.statusCode : 500;
-      res.status(statusCode).json({ success: false, error: error?.message || 'Failed to set default model' });
-    } finally {
-      xaiOperationGate.release(xaiModelToken);
-    }
+    // Primary model changes can retarget a future autonomous OpenClaw turn.
+    // Reject before config reads, operation-gate claims, CLI/RPC, or writes.
+    rejectPortalOwnedOpenClawExecution('configuration', res);
   });
 
   router.post('/set-fallbacks', async (req: Request, res: Response) => {
@@ -3851,20 +3390,7 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    try {
-      const normalizedFallbacks = parsed.data.fallbacks.map((model) => normalizePortalModelId(model)).filter(Boolean);
-      const xaiFallbacks = normalizedFallbacks.filter((model) => model.startsWith('xai/'));
-      if (xaiFallbacks.length) {
-        res.status(400).json({ error: 'xAI fallback models require exact-profile live verification and cannot be added through this endpoint yet. Choose a live-tested xAI default model instead.' });
-        return;
-      }
-      runOpenClaw(['models', 'fallbacks', 'set', ...normalizedFallbacks], 15000);
-      repairClaudeSubscriptionConfig();
-      await restartGateway();
-      res.json({ success: true, fallbacks: normalizedFallbacks });
-    } catch (error: any) {
-      res.status(500).json({ success: false, error: error?.message || 'Failed to set fallback models' });
-    }
+    rejectPortalOwnedOpenClawExecution('configuration', res);
   });
 
   router.get('/models', async (req: Request, res: Response) => {
@@ -3878,51 +3404,35 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
+    if (providerFilter === 'google-antigravity' && isUnqualifiedNativeBinaryProvider('GEMINI')) {
+      res.status(503).json({
+        code: 'NATIVE_BINARY_RUNTIME_UNQUALIFIED',
+        error: unqualifiedNativeBinaryReason('GEMINI'),
+        source: 'detection-only',
+        exact: exactNativeCatalog,
+        models: [],
+      });
+      return;
+    }
+
     if (providerFilter === 'google-antigravity') {
-      let readiness: Awaited<ReturnType<typeof getNativeProviderReadiness>> | null = null;
-      if (exactNativeCatalog) {
-        readiness = await getNativeProviderReadiness('GEMINI', { force: true });
-        if (readiness.state !== 'live_verified' || !readiness.usable) {
-          res.status(readiness.state === 'needs_login' ? 409 : 503).json({
-            error: readiness.message,
-            source: 'native-cli',
-            exact: true,
-            readiness,
-          });
-          return;
-        }
-        // Exact setup handoff must reflect the current account, not a model
-        // list cached before re-authentication.
-        invalidateAntigravityModelCache();
-      }
-      const antigravityModels = listAntigravityModelsFromCli();
-      if (antigravityModels.length) {
-        const models = exactNativeCatalog
-          ? antigravityModels.map((model) => ({
-            id: `google-antigravity/${model.id}`,
-            name: model.displayName,
-            provider: providerFilter,
-          }))
-          : normalizeModelPayload(
-            antigravityModels.map((model) => ({
-              id: `google-antigravity/${model.id}`,
-              name: model.displayName,
-            })),
-            providerFilter,
-          ).filter((model) => matchesProviderModel(providerFilter, model.id || model.name || ''));
-        res.json({ models, source: 'native-cli', ...(exactNativeCatalog ? { exact: true, readiness } : {}) });
+      const readiness = await getNativeProviderReadiness('GEMINI');
+      if (!readiness.usable) {
+        res.status(409).json({ code: 'NATIVE_LOGIN_REQUIRED', error: readiness.message,
+          source: 'native-cli', exact: true, readiness, models: [] });
         return;
       }
-      if (exactNativeCatalog) {
-        res.status(503).json({
-          error: 'Antigravity is authenticated, but its exact model catalog could not be loaded. Retry before choosing an Agent Chat model.',
-          source: 'native-cli',
-          exact: true,
-          readiness,
-        });
+      const models = (await listAntigravityModelsFromCli()).map((model) => ({
+        id: `google-antigravity/${model.id}`, name: model.displayName,
+      }));
+      if (!models.length) {
+        res.status(503).json({ code: 'NATIVE_MODEL_CATALOG_UNAVAILABLE',
+          error: 'Antigravity could not refresh its model list. Try again shortly.',
+          source: 'native-cli', exact: true, readiness, models: [] });
         return;
       }
-      warnings.push('Antigravity native model list unavailable; using defaults.');
+      res.json({ source: 'native-cli', exact: true, readiness, models });
+      return;
     }
 
     // xAI transports pass registered model ids through, and the save path
@@ -4098,6 +3608,9 @@ export function createAiSetupRouter(): Router {
       assertProviderRemovalLease(claim);
 
       if (changed) {
+        // Narrow negative-cleanup exception: only an admitted, exact provider
+        // removal mutation may restart here so removed credentials cannot stay
+        // live in the old process. Positive setup/activation never uses this.
         await restartGateway();
         if (!(await fetchGatewayHealth())) {
           throw new ProviderRemovalControlPlaneUnavailableError(
@@ -4142,6 +3655,9 @@ export function createAiSetupRouter(): Router {
       if (claim && mutationMayHaveStarted && beforeRollback.length > 0 && expectedRollbackState.length > 0) {
         try {
           restoreSnapshotsWithCompareAndSwap(beforeRollback, expectedRollbackState);
+          // Narrow rollback-safety exception: after restoring an admitted
+          // provider-removal mutation, restart before proving the old
+          // credential is present again. No positive setup path reaches this.
           await restartGateway();
           if (!(await fetchGatewayHealth())) {
             throw new Error('gateway health did not recover after rollback');
@@ -4221,20 +3737,22 @@ export function createAiSetupRouter(): Router {
   });
 
   router.post('/restart-gateway', async (_req: Request, res: Response) => {
-    try {
-      await restartGateway();
-      const gatewayRunning = await fetchGatewayHealth();
-      res.json({ success: gatewayRunning, message: gatewayRunning ? 'Gateway restarted' : 'Gateway may still be starting' });
-    } catch (error: any) {
-      res.status(500).json({ success: false, error: error?.message || 'Failed to restart gateway' });
-    }
+    rejectPortalOwnedOpenClawExecution('restart', res);
   });
 
   // ── Native CLI OAuth flows ──────────────────────────────────────────
   router.post('/native-cli/start', async (req: Request, res: Response) => {
     const { provider, forceReauth } = req.body;
-    if (!['claude-code', 'codex', 'gemini', 'grok'].includes(provider)) {
+    if (!['claude-code', 'codex', 'gemini', 'grok', 'hermes', 'opencode'].includes(provider)) {
       res.status(400).json({ error: 'Invalid native CLI provider' });
+      return;
+    }
+
+    if ((provider === 'gemini' || provider === 'grok')
+      && isUnqualifiedNativeBinaryProvider(provider === 'gemini' ? 'GEMINI' : 'GROK')) {
+      const nativeProvider = provider === 'gemini' ? 'GEMINI' : 'GROK';
+      const error = new NativeBinaryRuntimeUnqualifiedError(nativeProvider);
+      res.status(error.statusCode).json({ code: error.code, error: error.message });
       return;
     }
 
@@ -4246,7 +3764,7 @@ export function createAiSetupRouter(): Router {
       });
       if (result.status === 'complete') {
         const status = getOAuthFlowStatus(result.sessionId, ownerId);
-        if (provider === 'codex' && status) {
+        if (['claude-code', 'codex', 'hermes', 'opencode'].includes(provider) && status) {
           ensureNativeCliFinalizationStarted(status);
           const latest = getOAuthFlowStatus(result.sessionId, ownerId) || status;
           const finalized = isNativeCliFinalizationComplete(status.id);
@@ -4277,7 +3795,7 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    if (status.status === 'complete' && status.provider === 'codex') {
+    if (status.status === 'complete' && ['claude-code', 'codex', 'hermes', 'opencode'].includes(status.provider)) {
       ensureNativeCliFinalizationStarted(status);
       const latest = getOAuthFlowStatus(status.id, getOAuthRequestOwnerId(req)) || status;
       if (latest.status === 'error') {
@@ -4297,11 +3815,11 @@ export function createAiSetupRouter(): Router {
       try {
         await finalizeNativeCliCompletion(status);
       } catch (error: any) {
-        console.error(`[NativeCLI] gateway restart failed after ${status.provider} login:`, error?.message || error);
+        console.error(`[NativeCLI] finalization failed after ${status.provider} login:`, error?.message || error);
         res.status(500).json({
           ...status,
           success: false,
-          error: `Native CLI auth completed, but gateway restart failed: ${error?.message || 'unknown error'}`,
+          error: `Native CLI auth completed, but Portal finalization failed: ${error?.message || 'unknown error'}`,
         });
         return;
       }
@@ -4317,19 +3835,35 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
+    const ownerId = getOAuthRequestOwnerId(req);
+    const retainedStatus = getOAuthFlowStatus(sessionId, ownerId);
+    if (retainedStatus?.provider === 'codex') {
+      const error = new NativeHostCredentialFlowUnavailableError('codex');
+      res.status(error.statusCode).json(oauthStartFailurePayload(error, 'Failed to complete native CLI flow'));
+      return;
+    }
+
     try {
-      const ownerId = getOAuthRequestOwnerId(req);
       const result = await completeNativeCliFlow(sessionId, callbackUrl, ownerId);
       if (result?.success) {
         try {
           const status = getOAuthFlowStatus(sessionId, ownerId);
+          if (status?.provider === 'claude-code') {
+            await finalizeNativeCliCompletion(status);
+            res.json({
+              ...result,
+              finalized: true,
+              warning: 'Credential saved. Host Agent Chat will re-check both the credential and admitted CLI before the next turn.',
+            });
+            return;
+          }
           await finalizeNativeCliCompletion(status);
         } catch (error: any) {
-          console.error('[NativeCLI] gateway restart failed after callback login:', error?.message || error);
+          console.error('[NativeCLI] finalization failed after callback login:', error?.message || error);
           res.status(500).json({
             ...result,
             success: false,
-            error: `Native CLI auth completed, but gateway restart failed: ${error?.message || 'unknown error'}`,
+            error: `Native CLI auth completed, but Portal finalization failed: ${error?.message || 'unknown error'}`,
           });
           return;
         }
@@ -4338,10 +3872,8 @@ export function createAiSetupRouter(): Router {
     } catch (error: any) {
       const notFound = error?.message === 'Native CLI session not found';
       if (!notFound) console.error('[NativeCLI] callback error:', error.message);
-      res.status(notFound ? 404 : 500).json({
-        success: false,
-        error: error?.message || 'Failed to complete native CLI flow',
-      });
+      res.status(notFound ? 404 : providerSetupErrorStatus(error))
+        .json(oauthStartFailurePayload(error, 'Failed to complete native CLI flow'));
     }
   });
 

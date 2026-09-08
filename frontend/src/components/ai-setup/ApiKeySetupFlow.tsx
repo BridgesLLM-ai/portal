@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, ExternalLink, Loader2, ShieldCheck, X } from 'lucide-react';
 import client from '../../api/client';
 import ViewportModal from '../ViewportModal';
-import ModelSelector, { SelectableModel } from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
 import { useAuthStore } from '../../contexts/AuthContext';
 import {
@@ -36,37 +35,10 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
   const [showKey, setShowKey] = useState(false);
   const [validating, setValidating] = useState(false);
   const [validation, setValidation] = useState<ValidationResponse | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string | null>(null);
-  const [setDefault, setSetDefault] = useState(false);
   const [savingMessage, setSavingMessage] = useState('Saving API key...');
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [credentialWarning, setCredentialWarning] = useState<string | null>(null);
   const saveOperationRef = useRef<DurableCredentialOperation | null>(null);
-
-  // Only auto-select a default model if no default is already configured
-  useEffect(() => {
-    client.get(`${apiBase}/status`).then(({ data }) => {
-      const current = data?.defaultModel || null;
-      if (!current) {
-        setSelectedModel(provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null);
-        setSetDefault(true);
-      }
-    }).catch(() => {});
-  }, [apiBase, provider]);
-
-  const selectableModels = useMemo<SelectableModel[]>(() => {
-    if (validation?.models?.length) {
-      return validation.models.map((modelId) => {
-        const known = provider.defaultModels.find((entry) => entry.id === modelId);
-        return {
-          id: modelId,
-          name: known?.name || modelId.split('/').slice(1).join('/') || modelId,
-          tier: known?.tier,
-          description: known?.description || modelId,
-        };
-      });
-    }
-    return provider.defaultModels;
-  }, [provider.defaultModels, validation?.models]);
 
   const validateKey = async () => {
     setValidating(true);
@@ -77,11 +49,6 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
       const normalizedModels: string[] = Array.from(new Set((data?.models || []).filter((modelId: unknown): modelId is string => typeof modelId === 'string' && modelId.trim().length > 0)));
       setValidation({ ...data, models: normalizedModels });
       if (data.valid) {
-        if (!selectedModel) {
-          const balancedDetected = normalizedModels.find((modelId) => provider.defaultModels.some((entry) => entry.id === modelId && entry.tier === 'balanced'));
-          const preferredModel: string | null = balancedDetected || normalizedModels[0] || provider.defaultModels.find((m) => m.tier === 'balanced')?.id || provider.defaultModels[0]?.id || null;
-          if (preferredModel) setSelectedModel(preferredModel);
-        }
         setStep('model');
       }
     } catch (error: any) {
@@ -99,19 +66,14 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
       saveOperationRef.current = operation;
       setSavingMessage('Saving API key...');
       await new Promise((resolve) => setTimeout(resolve, 250));
-      if (selectedModel && setDefault) {
-        setSavingMessage('Setting model preference...');
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-      setSavingMessage('Restarting AI engine...');
       verifyCredentialOperation(operation);
-      await client.post(`${apiBase}/save-key`, {
+      const { data } = await client.post(`${apiBase}/save-key`, {
         provider: provider.id,
         apiKey,
-        setDefault: selectedModel ? setDefault : false,
-        model: selectedModel || undefined,
+        setDefault: false,
         operationId: operation.operationId,
       });
+      setCredentialWarning(typeof data?.warning === 'string' ? data.warning : null);
       retireCredentialOperation(operation);
       saveOperationRef.current = null;
       setStep('done');
@@ -273,18 +235,9 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
           {step === 'model' ? (
             <div className="space-y-4">
               <div>
-                <h3 className="text-lg font-semibold text-white">Choose a default model (optional)</h3>
-                <p className="mt-1 text-sm text-slate-400">Optionally pick a model to set as your default. You can skip this if you already have one configured.</p>
+                <h3 className="text-lg font-semibold text-white">Save credential</h3>
+                <p className="mt-1 text-sm text-slate-400">Portal can save this credential now. Default-model routing and host activation remain unchanged; those mutations are unavailable in this release until a separately supported maintenance operation ships.</p>
               </div>
-
-              <ModelSelector
-                models={selectableModels}
-                selectedModel={selectedModel}
-                onSelect={setSelectedModel}
-                showSetDefault
-                setDefault={setDefault}
-                onSetDefaultChange={setSetDefault}
-              />
 
               {saveError ? (
                 <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
@@ -301,7 +254,7 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
                   onClick={saveKey}
                   className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-emerald-400"
                 >
-                  {selectedModel ? 'Save & Activate' : 'Save Key'}
+                  Save Key
                 </button>
               </div>
             </div>
@@ -310,7 +263,7 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
           {step === 'saving' ? (
             <div className="rounded-3xl border border-slate-800 bg-slate-950/70 p-8 text-center">
               <Loader2 className="mx-auto h-8 w-8 animate-spin text-emerald-400" />
-              <h3 className="mt-4 text-lg font-semibold text-white">Applying provider configuration</h3>
+              <h3 className="mt-4 text-lg font-semibold text-white">Saving credential</h3>
               <p className="mt-2 text-sm text-slate-400">{savingMessage}</p>
             </div>
           ) : null}
@@ -318,8 +271,9 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
           {step === 'done' ? (
             <div className="rounded-3xl border border-emerald-500/20 bg-emerald-500/10 p-8 text-center">
               <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-300" />
-              <h3 className="mt-4 text-lg font-semibold text-white">{provider.name} is ready</h3>
-              <p className="mt-2 text-sm text-slate-300">The credential was saved and the AI engine was refreshed.</p>
+              <h3 className="mt-4 text-lg font-semibold text-white">{provider.name} credential saved</h3>
+              <p className="mt-2 text-sm text-slate-300">Host model routing was not changed.</p>
+              {credentialWarning ? <p className="mt-2 text-sm text-amber-200">{credentialWarning}</p> : null}
               <button type="button" onClick={onCancel} className="mt-5 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-emerald-400">
                 Done
               </button>

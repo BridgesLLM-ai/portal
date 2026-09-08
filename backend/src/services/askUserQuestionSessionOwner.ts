@@ -1,6 +1,7 @@
 import { prisma } from '../config/database';
 import { canUseInteractivePortal } from '../utils/authz';
 import { deriveOpenClawProjectSessionKey } from './openclawProjectSandbox';
+import { getProjectChatProviderRuntimeDescriptor } from './projectChatProviderRegistry';
 import {
   AskUserQuestionError,
   readPendingAskUserQuestionForActor,
@@ -153,10 +154,12 @@ async function resolveProjectChatOwner(
   now: Date,
 ): Promise<AskUserQuestionRunOwnership | null> {
   const turn = exactSingle(projectTurns);
+  const expectedRuntime = getProjectChatProviderRuntimeDescriptor('OPENCLAW').runtime;
   if (!turn) return null;
   if (
     identity.runId !== `portal-${turn.id}`
     || turn.provider !== 'OPENCLAW'
+    || turn.runtime !== expectedRuntime
     || turn.status !== 'RUNNING'
     || turn.providerSessionId !== identity.sessionKey
     || deriveOpenClawProjectSessionKey({
@@ -200,6 +203,7 @@ async function resolveProjectChatOwner(
         userId: true,
         projectId: true,
         provider: true,
+        runtime: true,
         status: true,
         sessionKey: true,
         externalSessionId: true,
@@ -220,6 +224,7 @@ async function resolveProjectChatOwner(
         sessionKey: true,
         status: true,
         activeProvider: true,
+        runtime: true,
       },
       take: 2,
     }),
@@ -248,6 +253,7 @@ async function resolveProjectChatOwner(
     || binding.userId !== turn.actorUserId
     || binding.projectId !== turn.projectIdentityId
     || binding.provider !== 'OPENCLAW'
+    || binding.runtime !== expectedRuntime
     || binding.status !== 'active'
     || binding.sessionKey !== identity.sessionKey
     || binding.externalSessionId !== identity.sessionKey
@@ -257,6 +263,7 @@ async function resolveProjectChatOwner(
     || session.sessionKey !== identity.sessionKey
     || session.status !== 'active'
     || session.activeProvider !== 'OPENCLAW'
+    || session.runtime !== expectedRuntime
     || !project
     || project.id !== turn.projectIdentityId
     || project.lifecycleStatus !== 'ACTIVE'
@@ -346,6 +353,7 @@ export async function resolveAskUserQuestionRunOwner(
           projectIdentityId: true,
           activeProjectKey: true,
           provider: true,
+          runtime: true,
           status: true,
           providerSessionId: true,
           leaseExpiresAt: true,

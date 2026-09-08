@@ -2,9 +2,9 @@
  * Agent Zero provider backed by the authenticated `_a0_connector` HTTP and
  * Socket.IO APIs.
  *
- * Streaming/replay is implemented against the exact Agent Zero v2.5 connector
+ * Streaming/replay is implemented against the exact Agent Zero v2.10 connector
  * contract. Main Agent Chat host tools are gated through the separately
- * supervised official A0 v2.5 host gateway. Project sandboxing, attachments,
+ * supervised official A0 v2.10 host gateway. Project sandboxing, attachments,
  * execution approvals, and hard abort are still not advertised or emulated.
  */
 
@@ -571,7 +571,10 @@ export class AgentZeroProvider implements AgentProvider {
 
   async startSession(userId: string, config: AgentSessionConfig): Promise<AgentSessionId> {
     const ownerId = validateUserId(userId);
-    assertExecutionContextBinding(config?.executionContext, ownerId);
+    // The catalog describes the Agent Zero harness as available in both Portal
+    // trust zones. Project Chat is nevertheless owned exclusively by
+    // AgentZeroProjectProvider; this host gateway must never accept its context.
+    assertExecutionContextBinding(config?.executionContext, ownerId, 'HOST_OPERATOR');
     assertProviderSupportsExecutionScope(
       this.providerName,
       getProviderAvailability(this.providerName).capabilities.supportedExecutionScopes,
@@ -986,7 +989,9 @@ export class AgentZeroProvider implements AgentProvider {
 
   async listSessions(userId: string): Promise<AgentSessionSummary[]> {
     const ownerId = validateUserId(userId);
-    const localSessions = listNativeSessions('AGENT_ZERO', ownerId);
+    const localSessions = listNativeSessions('AGENT_ZERO', ownerId).filter(
+      (session) => session.metadata?.executionScope === 'HOST_OPERATOR',
+    );
     for (const session of localSessions) this.requireSession(session.sessionId);
     return localSessions.map((local) => ({
       ...local,

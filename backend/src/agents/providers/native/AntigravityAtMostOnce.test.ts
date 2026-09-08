@@ -151,7 +151,7 @@ function expectSingleSanitizedInvocation(): void {
   expect(options).toEqual(expect.objectContaining({
     detached: true,
     env: expect.objectContaining({
-      AGY_CLI_DISABLE_AUTO_UPDATE: '1',
+      AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       NO_COLOR: '1',
     }),
   }));
@@ -275,7 +275,10 @@ describe('Antigravity host turns dispatch at most once', () => {
     );
     await waitFor(() => spawnMock.mock.calls.length === 1, 'Antigravity child was not spawned');
 
-    child.stdout.emit('data', Buffer.from('I will inspect the workspace.\n'));
+    for (const state of ['ACTIVE', 'DONE']) child.stdout.emit('data', Buffer.from(JSON.stringify({
+      event: 'step_update', step_update: { conversation_id: 'native-inspect', step_index: 2,
+        state, step_type: 'tool', tool_name: 'find_by_name', tool_info: { parameters: { Pattern: '*.ts' }, output: 'index.ts' } },
+    }) + '\n'));
     child.emit('close', 0, null);
 
     await expect(outcome).resolves.toMatchObject({
@@ -283,8 +286,8 @@ describe('Antigravity host turns dispatch at most once', () => {
       message: expect.stringMatching(/not retried to prevent duplicate work/i),
     });
     expect(statuses).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'tool_start', toolName: 'inspect' }),
-      expect.objectContaining({ type: 'tool_end', toolName: 'inspect' }),
+      expect.objectContaining({ type: 'tool_start', toolName: 'find_by_name' }),
+      expect.objectContaining({ type: 'tool_end', toolName: 'find_by_name' }),
     ]));
     expectSingleSanitizedInvocation();
   });
@@ -317,10 +320,7 @@ describe('Antigravity host turns dispatch at most once', () => {
       code: 'PROVIDER_FAILED',
       message: expect.stringMatching(/not retried to prevent duplicate work/i),
     });
-    expect(statuses).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'tool_start', toolName: 'antigravity' }),
-      expect.objectContaining({ type: 'tool_end', toolName: 'antigravity', isError: true }),
-    ]));
+    expect(statuses.filter((event) => event.type === 'tool_start' || event.type === 'tool_end')).toEqual([]);
     expectSingleSanitizedInvocation();
   });
 
@@ -339,14 +339,12 @@ describe('Antigravity host turns dispatch at most once', () => {
     );
     await waitFor(() => spawnMock.mock.calls.length === 1, 'trusted Antigravity child was not spawned');
 
-    child.stdout.emit('data', Buffer.from('Partial assistant output before failure.\n'));
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'Partial assistant output before failure.' } }) + '\n'));
     child.stderr.emit('data', Buffer.from('Antigravity provider rejected the request.\n'));
     child.emit('close', 17, null);
 
     await expect(outcome).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
-    expect(statuses.filter((event) => event.type === 'tool_end' && event.toolName === 'antigravity')).toEqual([
-      expect.objectContaining({ isError: true }),
-    ]);
+    expect(statuses.filter((event) => event.type === 'tool_end')).toEqual([]);
     expectSingleSanitizedInvocation();
   });
 
@@ -365,7 +363,7 @@ describe('Antigravity host turns dispatch at most once', () => {
     );
     await waitFor(() => spawnMock.mock.calls.length === 1, 'trusted Antigravity child was not spawned');
 
-    child.stdout.emit('data', Buffer.from('Partial assistant output before authentication stopped the turn.\n'));
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: 'Partial assistant output before authentication stopped the turn.' } }) + '\n'));
     child.stderr.emit('data', Buffer.from(
       'Open https://accounts.google.com/o/oauth2/auth and paste the authorization code.\n',
     ));
@@ -375,9 +373,7 @@ describe('Antigravity host turns dispatch at most once', () => {
       code: 'AUTH_REQUIRED',
       message: expect.stringMatching(/authentication is unavailable/i),
     });
-    expect(statuses.filter((event) => event.type === 'tool_end' && event.toolName === 'antigravity')).toEqual([
-      expect.objectContaining({ isError: true }),
-    ]);
+    expect(statuses.filter((event) => event.type === 'tool_end')).toEqual([]);
     expect(nativeProviderReadiness.recordNativeProviderAuthFailure).toHaveBeenCalledWith(
       'GEMINI',
       expect.stringContaining('accounts.google.com'),

@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { assertProjectWorkScope } from './projectWorkScope';
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
@@ -649,6 +650,7 @@ export async function ensureProjectIdentity(input: {
   const root = attestProjectRoot(input.projectRoot);
   const where = { workspaceOwnerId_projectName: { workspaceOwnerId, projectName } };
   const existing = await database.projectIdentity.findUnique({ where });
+  assertProjectWorkScope(existing);
   if (existing) {
     assertIdentityMatchesRoot(existing, root);
     assertIdentityActive(existing);
@@ -816,6 +818,7 @@ export async function readProjectIdentity(input: {
   const identity = await database.projectIdentity.findUnique({
     where: { workspaceOwnerId_projectName: { workspaceOwnerId, projectName } },
   });
+  assertProjectWorkScope(identity);
   if (!identity) return null;
   assertIdentityMatchesRoot(identity, root);
   assertIdentityActive(identity);
@@ -1396,6 +1399,7 @@ export async function deleteProjectIdentity(input: {
 }
 
 export function assertProjectIdentityRoot(identity: ProjectIdentityRecord, projectRoot: string): AttestedProjectRoot {
+  assertProjectWorkScope(identity);
   const root = attestProjectRoot(projectRoot);
   assertIdentityMatchesRoot(identity, root);
   return root;

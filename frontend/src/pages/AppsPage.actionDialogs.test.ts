@@ -143,10 +143,12 @@ describe('AppsPage action dialog ownership', () => {
     expect(responsiveProjectPanels).toContain('role="alert"');
   });
 
-  it('keeps visitor-slot and shared API throttle controls honest and bounded', () => {
+  it('keeps visitor, concurrent-use, and shared API throttle controls honest and bounded', () => {
     expect(createShareHandler).toContain("Password must be at most 72 UTF-8 bytes");
     expect(createShareHandler).toContain("Visitor slots must be a whole number from 1 to 1,000,000");
     expect(createShareHandler).toContain("API request limit must be a whole number from 1 to 1,000,000");
+    expect(createShareHandler).toContain("Concurrent visitors must be a whole number from 1 to 10,000");
+    expect(createShareHandler).toContain('{ maxConcurrentVisitors }');
     expect(createShareHandler).toContain('rateLimitMaxRequests,');
     expect(createShareHandler).toContain('rateLimitWindowSeconds: request.rateLimitWindowSeconds');
     expect(toggleShareHandler).toContain('visitor slot limit cannot be reactivated');
@@ -159,10 +161,16 @@ describe('AppsPage action dialog ownership', () => {
     expect(responsiveProjectPanels).toContain("'share-password-mismatch-error'");
     expect(responsiveProjectPanels).toContain('aria-invalid={shareMaxUsesInvalid}');
     expect(responsiveProjectPanels).toContain('aria-invalid={shareRateLimitMaxRequestsInvalid}');
+    expect(responsiveProjectPanels).toContain('aria-invalid={shareMaxConcurrentVisitorsInvalid}');
+    expect(responsiveProjectPanels).toContain('aria-label="Share link concurrent visitor limit"');
     expect(responsiveProjectPanels).toContain('aria-label="Limit share link API requests"');
     expect(responsiveProjectPanels).toContain('Each slot grants one browser up to 30 days of access while the link remains active.');
     expect(responsiveProjectPanels).toContain('Counts dynamic API requests only; static files are excluded.');
     expect(responsiveProjectPanels).toContain("'Unlimited API requests'");
+    expect(responsiveProjectPanels).toContain("'Unlimited concurrent visitors'");
+    expect(responsiveProjectPanels).toContain('Edit audience and request limits');
+    expect(appsSource).toContain("kind: 'policy' as const");
+    expect(appsSource).toContain("showToast('Share limits updated')");
     expect(responsiveProjectPanels).toContain('id="share-create-error" role="alert"');
   });
 

@@ -138,9 +138,6 @@ export function normalizeRuntimeTurnEvent(params: {
     }
 
     case 'status': {
-      // Provider progress counters keep an in-flight turn visibly alive, but
-      // are not model-authored reasoning and must not enter durable history.
-      if (event.transient === true) return null;
       // Opus can expose its only readable live reasoning as an attested
       // item.preamble progress frame. It remains a status-shaped transport
       // event for compatibility, but its durable/runtime projection must be
@@ -154,19 +151,16 @@ export function normalizeRuntimeTurnEvent(params: {
           visible: true,
         });
       }
-      return base('assistant_status', {
-        ...(text ? { text } : {}),
-        visible: Boolean(text),
-      });
+      // Harness/runtime status belongs to the transient composer rail. The
+      // original StreamEvent still reaches live subscribers, but it receives
+      // no durable turn-event projection.
+      return null;
     }
 
     case 'run_resumed':
     case 'compaction_start':
     case 'compaction_end':
-      return base('assistant_status', {
-        ...(text ? { text } : {}),
-        visible: Boolean(text),
-      });
+      return null;
 
     case 'tool_start': {
       const name = cleanText(event.toolName) || cleanText(event.name) || cleanText(latestRunningTool(info)?.name) || 'tool';
@@ -206,19 +200,19 @@ export function normalizeRuntimeTurnEvent(params: {
 
     case 'error':
       if (event.terminal !== true) {
-        return base('assistant_status', {
-          ...(text ? { text } : {}),
-          visible: Boolean(text),
-        });
+        return null;
       }
       return base('turn_error', {
         ...(text ? { text } : {}),
-        visible: true,
+        // Terminal errors settle/reconcile the run, but their user-facing
+        // presentation is an actionable banner. Keep the operational marker
+        // out of durable assistant conversation history.
+        visible: false,
         terminal: true,
       });
 
     case 'segment_break':
-      return base('assistant_status', { visible: false });
+      return null;
 
     default:
       return null;

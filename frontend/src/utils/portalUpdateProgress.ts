@@ -273,7 +273,8 @@ export async function monitorPortalSelfUpdate(
       try {
         // Health is only a connectivity signal here. During restart the
         // startup status server advertises the target version before the
-        // updater has completed postflight work, so it can never prove a
+        // updater has published its final Portal-verification checkpoint
+        // (`postflight` on the compatibility wire), so it can never prove a
         // terminal result by itself.
         await api.readPortalVersion();
       } catch {

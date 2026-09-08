@@ -7,6 +7,9 @@ jest.mock('child_process', () => ({
   ...jest.requireActual('child_process'),
   execFile: jest.fn(),
 }));
+jest.mock('../services/nativeHostCliAdmission', () => ({
+  attestNativeHostCli: jest.fn(),
+}));
 
 import {
   __resetNativeReadinessForTests,
@@ -20,8 +23,10 @@ import {
   __resetNativeCliAuthForTests,
   getNativeCliAuthStatus,
 } from './nativeCliAuth';
+import { attestNativeHostCli } from '../services/nativeHostCliAdmission';
 
 const mockedExecFile = jest.mocked(execFile);
+const mockedNativeHostCliAdmission = jest.mocked(attestNativeHostCli);
 
 describe('nativeProviderReadiness cache and invalidation', () => {
   let codexHome: string;
@@ -30,6 +35,15 @@ describe('nativeProviderReadiness cache and invalidation', () => {
   beforeEach(() => {
     __resetNativeReadinessForTests();
     __resetNativeCliAuthForTests();
+    mockedNativeHostCliAdmission.mockReset();
+    mockedNativeHostCliAdmission.mockImplementation(async (toolId, executablePath) => ({
+      toolId,
+      executablePath: executablePath || (toolId === 'codex' ? '/usr/bin/codex' : '/usr/bin/claude'),
+      packageName: toolId === 'codex' ? '@openai/codex' : '@anthropic-ai/claude-code',
+      version: toolId === 'codex' ? '0.153.2' : '2.1.260',
+      fingerprint: 'a'.repeat(64),
+      checkedAt: new Date().toISOString(),
+    }));
     mockedExecFile.mockReset();
     mockedExecFile.mockImplementation(((_command: string, _args: string[], _options: unknown, callback: Function) => {
       callback(null, 'codex-cli 1.2.3', '');
@@ -51,109 +65,241 @@ describe('nativeProviderReadiness cache and invalidation', () => {
     fs.rmSync(codexHome, { recursive: true, force: true });
   });
 
-  test('returns a fresh cached result without spawning another version probe', async () => {
-    const first = await getNativeProviderReadiness('CODEX');
-    const second = await getNativeProviderReadiness('CODEX');
+  test('reports admitted host Codex advisory-ready without spawning the CLI', async () => {
+    await expect(getNativeProviderReadiness('CODEX')).resolves.toMatchObject({
+      state: 'login_present',
+      usable: true,
+      message: expect.stringContaining('login is present locally'),
+      credentialFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+      runtimeFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+      runtimeVersion: '0.153.2',
+    });
+    expect(mockedNativeHostCliAdmission).toHaveBeenCalledWith('codex', '/usr/bin/codex');
+    expect(mockedExecFile).not.toHaveBeenCalled();
+  });
+
+  test('keeps host Codex fail-closed when filesystem admission detects drift', async () => {
+    mockedNativeHostCliAdmission.mockRejectedValueOnce(Object.assign(
+      new Error('native host CLI drift'),
+      { code: 'DRIFT_DETECTED' },
+    ));
+
+    await expect(getNativeProviderReadiness('CODEX', { force: true })).resolves.toMatchObject({
+      state: 'runtime_unavailable',
+      usable: false,
+      message: expect.stringContaining('DRIFT_DETECTED'),
+      runtimeInstalled: true,
+      runtimeAdmissionCode: 'DRIFT_DETECTED',
+    });
+    expect(mockedExecFile).not.toHaveBeenCalled();
+  });
+
+  test('does not let an in-flight host admission overwrite a newer auth rejection', async () => {
+    const admitted = await getNativeProviderReadiness('CODEX');
+    let markAdmissionStarted!: () => void;
+    let releaseAdmission!: () => void;
+    const admissionStarted = new Promise<void>((resolve) => { markAdmissionStarted = resolve; });
+    const admissionReleased = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    mockedNativeHostCliAdmission.mockImplementationOnce(async (toolId, executablePath) => {
+      markAdmissionStarted();
+      await admissionReleased;
+      return {
+        toolId,
+        executablePath: executablePath || '/usr/bin/codex',
+        packageName: '@openai/codex',
+        version: '0.153.2',
+        fingerprint: 'b'.repeat(64),
+        checkedAt: new Date().toISOString(),
+      };
+    });
+
+    const pending = getNativeProviderReadiness('CODEX', { force: true });
+    await admissionStarted;
+    recordNativeProviderAuthFailure(
+      'CODEX',
+      'The provider rejected this credential generation.',
+      admitted,
+      { confirmed: true },
+    );
+    releaseAdmission();
+
+    await expect(pending).resolves.toMatchObject({
+      state: 'needs_login',
+      usable: false,
+      runtimeVersion: '0.153.2',
+      runtimeInstalled: true,
+    });
+    expect(getCachedNativeProviderReadiness('CODEX')).toMatchObject({
+      state: 'needs_login',
+      runtimeVersion: '0.153.2',
+      runtimeInstalled: true,
+    });
+  });
+
+  test('reports package drift before a retained auth rejection for the same credentials', async () => {
+    const admitted = await getNativeProviderReadiness('CODEX');
+    recordNativeProviderAuthFailure(
+      'CODEX',
+      'The provider rejected this credential generation.',
+      admitted,
+      { confirmed: true },
+    );
+    mockedNativeHostCliAdmission.mockRejectedValueOnce(Object.assign(
+      new Error('native host CLI drift'),
+      {
+        code: 'DRIFT_DETECTED',
+        observedVersion: '0.145.0',
+      },
+    ));
+
+    await expect(getNativeProviderReadiness('CODEX', { force: true })).resolves.toMatchObject({
+      state: 'runtime_unavailable',
+      usable: false,
+      runtimeVersion: '0.145.0',
+      runtimeInstalled: true,
+      runtimeAdmissionCode: 'DRIFT_DETECTED',
+    });
+  });
+
+  test('returns a fresh cached Project Sandbox result without spawning a host version probe', async () => {
+    const first = await getNativeProviderReadiness('CODEX', { executionScope: 'PROJECT_SANDBOX' });
+    const second = await getNativeProviderReadiness('CODEX', { executionScope: 'PROJECT_SANDBOX' });
 
     expect(first.state).toBe('login_present');
     expect(second).toBe(first);
-    expect(mockedExecFile).toHaveBeenCalledTimes(1);
+    expect(mockedNativeHostCliAdmission).not.toHaveBeenCalled();
+    expect(mockedExecFile).not.toHaveBeenCalled();
   });
 
-  test('singleflights the CLI version probe across concurrent cold readiness reads', async () => {
-    let releaseVersion!: () => void;
-    let markVersionStarted!: () => void;
-    const versionStarted = new Promise<void>((resolve) => { markVersionStarted = resolve; });
-    mockedExecFile.mockImplementation(((_command: string, _args: string[], _options: unknown, callback: Function) => {
-      markVersionStarted();
-      releaseVersion = () => callback(null, 'codex-cli 1.2.3', '');
+  test.each([
+    ['HERMES', 'PORTAL_HERMES_HOME', 'hermes', ['acp', '--version']],
+    ['OPENCODE', 'PORTAL_OPENCODE_HOME', 'opencode', ['--version']],
+  ] as const)('%s readiness probes the exact CLI inside its isolated environment', async (
+    provider,
+    rootVariable,
+    command,
+    versionArgs,
+  ) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `portal-readiness-${provider.toLowerCase()}-`));
+    const previousRoot = process.env[rootVariable];
+    const previousJwt = process.env.JWT_SECRET;
+    process.env[rootVariable] = root;
+    process.env.JWT_SECRET = 'must-not-leak';
+    if (provider === 'HERMES') {
+      fs.writeFileSync(path.join(root, '.env'), 'OPENROUTER_API_KEY=test-only\n', { mode: 0o600 });
+    } else {
+      const authDirectory = path.join(root, 'data', 'opencode');
+      fs.mkdirSync(authDirectory, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(authDirectory, 'auth.json'), JSON.stringify({
+        openai: { type: 'oauth', access: 'test-only' },
+      }), { mode: 0o600 });
+    }
+    mockedExecFile.mockImplementation(((invokedCommand: string, args: string[], options: any, callback: Function) => {
+      expect(invokedCommand).toBe(command);
+      expect(args).toEqual(versionArgs);
+      expect(options.env.JWT_SECRET).toBeUndefined();
+      if (provider === 'HERMES') {
+        expect(options.env.HERMES_HOME).toBe(fs.realpathSync(root));
+        expect(options.env.HERMES_ACP_SKIP_CONFIGURED_MCP).toBe('1');
+      } else {
+        expect(options.env.XDG_DATA_HOME).toBe(fs.realpathSync(path.join(root, 'data')));
+        expect(options.env.OPENCODE_DISABLE_AUTOUPDATE).toBe('1');
+      }
+      callback(null, `${command} ${provider === 'HERMES' ? '0.20.4' : '1.18.19'}`, '');
       return {} as any;
     }) as any);
 
-    const first = getNativeProviderReadiness('CODEX');
-    const second = getNativeProviderReadiness('CODEX');
-    await versionStarted;
-    expect(mockedExecFile).toHaveBeenCalledTimes(1);
-    releaseVersion();
+    try {
+      __resetNativeReadinessForTests();
+      __setNativeReadinessProbeForTests(provider, async () => ({ state: 'unknown' }));
+      await expect(getNativeProviderReadiness(provider)).resolves.toMatchObject({
+        provider,
+        state: 'login_present',
+        usable: true,
+      });
+      expect(mockedExecFile).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previousRoot === undefined) delete process.env[rootVariable];
+      else process.env[rootVariable] = previousRoot;
+      if (previousJwt === undefined) delete process.env.JWT_SECRET;
+      else process.env.JWT_SECRET = previousJwt;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('invalidates cached OpenCode readiness when its provider/model config changes', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-readiness-opencode-config-'));
+    const previousRoot = process.env.PORTAL_OPENCODE_HOME;
+    const authDirectory = path.join(root, 'data', 'opencode');
+    const configDirectory = path.join(root, 'config', 'opencode');
+    fs.mkdirSync(authDirectory, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(authDirectory, 'auth.json'), JSON.stringify({
+      openai: { type: 'oauth', access: 'test-only' },
+    }), { mode: 0o600 });
+    const configPath = path.join(configDirectory, 'opencode.json');
+    fs.writeFileSync(configPath, JSON.stringify({ model: 'openai/model-a' }), { mode: 0o600 });
+    process.env.PORTAL_OPENCODE_HOME = root;
+    mockedExecFile.mockImplementation(((_command: string, _args: string[], _options: unknown, callback: Function) => {
+      callback(null, 'opencode 1.18.19', '');
+      return {} as any;
+    }) as any);
+
+    try {
+      __resetNativeReadinessForTests();
+      __setNativeReadinessProbeForTests('OPENCODE', async () => ({ state: 'unknown' }));
+      const first = await getNativeProviderReadiness('OPENCODE');
+      const cached = await getNativeProviderReadiness('OPENCODE');
+      expect(cached).toBe(first);
+      expect(mockedExecFile).toHaveBeenCalledTimes(1);
+
+      fs.writeFileSync(configPath, JSON.stringify({ model: 'openai/model-b' }), { mode: 0o600 });
+      const changed = await getNativeProviderReadiness('OPENCODE');
+      expect(changed.credentialFingerprint).not.toBe(first.credentialFingerprint);
+      expect(mockedExecFile).toHaveBeenCalledTimes(2);
+    } finally {
+      if (previousRoot === undefined) delete process.env.PORTAL_OPENCODE_HOME;
+      else process.env.PORTAL_OPENCODE_HOME = previousRoot;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('singleflights Project Sandbox readiness across concurrent cold reads', async () => {
+    let releaseProbe!: () => void;
+    let markProbeStarted!: () => void;
+    const probeStarted = new Promise<void>((resolve) => { markProbeStarted = resolve; });
+    const probeReleased = new Promise<void>((resolve) => { releaseProbe = resolve; });
+    __setNativeReadinessProbeForTests('CODEX', async () => {
+      markProbeStarted();
+      await probeReleased;
+      return { state: 'unknown' };
+    });
+
+    const first = getNativeProviderReadiness('CODEX', { executionScope: 'PROJECT_SANDBOX' });
+    const second = getNativeProviderReadiness('CODEX', { executionScope: 'PROJECT_SANDBOX' });
+    await probeStarted;
+    expect(mockedExecFile).not.toHaveBeenCalled();
+    releaseProbe();
 
     const [firstResult, secondResult] = await Promise.all([first, second]);
     expect(secondResult).toBe(firstResult);
-    expect(mockedExecFile).toHaveBeenCalledTimes(1);
+    expect(mockedExecFile).not.toHaveBeenCalled();
   });
 
-  test('singleflights both Antigravity version and live-auth probes across concurrent catalog reads', async () => {
-    const geminiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-readiness-gemini-singleflight-'));
-    const previousHome = process.env.HOME;
-    const previousGeminiKey = process.env.GEMINI_API_KEY;
-    const previousGoogleKey = process.env.GOOGLE_API_KEY;
-    const configDir = path.join(geminiHome, '.gemini', 'antigravity-cli');
-    fs.mkdirSync(configDir, { recursive: true });
-    fs.writeFileSync(path.join(configDir, 'state.json'), '{}', { mode: 0o600 });
-    process.env.HOME = geminiHome;
-    delete process.env.GEMINI_API_KEY;
-    delete process.env.GOOGLE_API_KEY;
-
-    let releaseModels!: () => void;
-    let markModelsStarted!: () => void;
-    const modelsStarted = new Promise<void>((resolve) => { markModelsStarted = resolve; });
-    const stdinEnds: jest.Mock[] = [];
-    mockedExecFile.mockImplementation(((_command: string, args: string[], _options: any, callback: Function) => {
-      const end = jest.fn();
-      stdinEnds.push(end);
-      expect(_command).toBe('agy');
-      expect(_options?.env?.AGY_CLI_DISABLE_AUTO_UPDATE).toBe('1');
-      if (args[0] === '--version') callback(null, 'agy 1.1.5', '');
-      else if (args[0] === 'models') {
-        markModelsStarted();
-        releaseModels = () => callback(null, 'gemini-3.1-pro-high', '');
-      } else callback(new Error('unexpected command'), '', '');
-      return { stdin: { end } } as any;
-    }) as any);
-
-    try {
-      const first = getNativeProviderReadiness('GEMINI');
-      const second = getNativeProviderReadiness('GEMINI');
-      await modelsStarted;
-      expect(mockedExecFile.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === '--version')).toHaveLength(1);
-      expect(mockedExecFile.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === 'models')).toHaveLength(1);
-      expect(stdinEnds).toHaveLength(2);
-      expect(stdinEnds.every((end) => end.mock.calls.length === 1)).toBe(true);
-      releaseModels();
-
-      const [firstResult, secondResult] = await Promise.all([first, second]);
-      expect(firstResult).toMatchObject({ state: 'live_verified', usable: true });
-      expect(secondResult).toBe(firstResult);
-    } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
-      else process.env.GEMINI_API_KEY = previousGeminiKey;
-      if (previousGoogleKey === undefined) delete process.env.GOOGLE_API_KEY;
-      else process.env.GOOGLE_API_KEY = previousGoogleKey;
-      fs.rmSync(geminiHome, { recursive: true, force: true });
-    }
-  });
-
-  test('keeps an ambiguous Antigravity live probe fail-closed even when an API key is present', async () => {
-    const previousGeminiKey = process.env.GEMINI_API_KEY;
-    process.env.GEMINI_API_KEY = 'test-only-key';
-    mockedExecFile.mockImplementation(((_command: string, args: string[], _options: unknown, callback: Function) => {
-      if (args[0] === '--version') callback(null, 'agy 1.1.5', '');
-      else if (args[0] === 'models') callback(new Error('probe failed'), '', 'provider temporarily unavailable');
-      else callback(new Error('unexpected command'), '', '');
-      return {} as any;
-    }) as any);
-
-    try {
-      await expect(getNativeProviderReadiness('GEMINI')).resolves.toMatchObject({
-        state: 'unknown',
+  test.each(['GEMINI', 'GROK'] as const)(
+    'keeps unqualified %s readiness fixed unavailable without executing vendor bytes',
+    async (provider) => {
+      await expect(getNativeProviderReadiness(provider, { force: true })).resolves.toMatchObject({
+        provider,
+        state: 'runtime_unavailable',
         usable: false,
+        credentialFingerprint: 'not-inspected',
+        runtimeFingerprint: 'unqualified-native-binary-lane',
+        message: expect.stringMatching(/detection-only.*systemd 249\/255.*matching-architecture/i),
       });
-    } finally {
-      if (previousGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
-      else process.env.GEMINI_API_KEY = previousGeminiKey;
-    }
-  });
+      expect(mockedExecFile).not.toHaveBeenCalled();
+    },
+  );
 
   test('an invalidated in-flight refresh cannot repopulate stale readiness', async () => {
     let releaseProbe!: () => void;
@@ -166,7 +312,7 @@ describe('nativeProviderReadiness cache and invalidation', () => {
       return { state: 'live_verified' };
     });
 
-    const pending = getNativeProviderReadiness('CODEX');
+    const pending = getNativeProviderReadiness('CODEX', { executionScope: 'PROJECT_SANDBOX' });
     await probeStarted;
     invalidateNativeProviderReadiness('CODEX');
     releaseProbe();
@@ -175,143 +321,28 @@ describe('nativeProviderReadiness cache and invalidation', () => {
     expect(getCachedNativeProviderReadiness('CODEX')).toBeNull();
   });
 
-  test('an in-flight Antigravity success returns the newer fail-closed rejection state', async () => {
-    const geminiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-readiness-gemini-race-'));
-    const previousHome = process.env.HOME;
-    const configDir = path.join(geminiHome, '.gemini', 'antigravity-cli');
-    fs.mkdirSync(configDir, { recursive: true });
-    fs.writeFileSync(path.join(configDir, 'state.json'), '{}', { mode: 0o600 });
-    process.env.HOME = geminiHome;
-
-    let releaseModels!: () => void;
-    let markModelsStarted!: () => void;
-    const modelsStarted = new Promise<void>((resolve) => { markModelsStarted = resolve; });
-    mockedExecFile.mockImplementation(((_command: string, args: string[], _options: unknown, callback: Function) => {
-      if (args[0] === '--version') callback(null, 'agy 1.1.5', '');
-      else if (args[0] === 'models') {
-        markModelsStarted();
-        releaseModels = () => callback(null, 'gemini-3.1-pro-high', '');
-      } else callback(new Error('unexpected command'), '', '');
-      return {} as any;
-    }) as any);
-
-    try {
-      const pending = getNativeProviderReadiness('GEMINI');
-      await modelsStarted;
-      recordNativeProviderAuthFailure('GEMINI', 'Google provider authentication required (401)');
-      releaseModels();
-
-      await expect(pending).resolves.toMatchObject({ state: 'needs_login', usable: false });
-      expect(getCachedNativeProviderReadiness('GEMINI')).toMatchObject({
-        state: 'needs_login',
-        usable: false,
-      });
-      expect(getNativeCliAuthStatus('GEMINI')).toMatchObject({ status: 'needs_login' });
-    } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      fs.rmSync(geminiHome, { recursive: true, force: true });
-    }
+  test('keeps Antigravity fixed unavailable across stale in-flight test hooks', async () => {
+    await expect(getNativeProviderReadiness('GEMINI')).resolves.toMatchObject({
+      state: 'runtime_unavailable', usable: false,
+    });
+    expect(mockedExecFile).not.toHaveBeenCalled();
   });
 
-  test('a real Antigravity auth rejection invalidates cached success and fails closed immediately', async () => {
-    const geminiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-readiness-gemini-'));
-    const previousHome = process.env.HOME;
-    const configDir = path.join(geminiHome, '.gemini', 'antigravity-cli');
-    fs.mkdirSync(configDir, { recursive: true });
-    fs.writeFileSync(path.join(configDir, 'state.json'), '{}', { mode: 0o600 });
-    process.env.HOME = geminiHome;
-    mockedExecFile.mockImplementation(((_command: string, args: string[], _options: unknown, callback: Function) => {
-      if (args[0] === '--version') callback(null, 'agy 1.1.5', '');
-      else if (args[0] === 'models') callback(null, 'gemini-3.1-pro-high', '');
-      else callback(new Error('unexpected command'), '', '');
-      return {} as any;
-    }) as any);
-
-    try {
-      const verified = await getNativeProviderReadiness('GEMINI');
-      expect(verified).toMatchObject({ state: 'live_verified', usable: true });
-      expect(getNativeCliAuthStatus('GEMINI')).toMatchObject({ status: 'authenticated' });
-
-      recordNativeProviderAuthFailure('GEMINI', 'Google provider authentication required (401)');
-
-      expect(getNativeCliAuthStatus('GEMINI')).toMatchObject({ status: 'needs_login' });
-      await expect(getNativeProviderReadiness('GEMINI')).resolves.toMatchObject({
-        state: 'needs_login',
-        usable: false,
-      });
-      expect(mockedExecFile.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === 'models')).toHaveLength(1);
-    } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      fs.rmSync(geminiHome, { recursive: true, force: true });
-    }
+  test('does not turn Antigravity auth evidence into execution readiness', async () => {
+    await expect(getNativeProviderReadiness('GEMINI')).resolves.toMatchObject({
+      state: 'runtime_unavailable', usable: false,
+    });
+    expect(getNativeCliAuthStatus('GEMINI')).toMatchObject({ status: 'not_applicable' });
+    expect(mockedExecFile).not.toHaveBeenCalled();
   });
 
-  test('binds a typed Antigravity auth rejection to exact credential content', async () => {
-    const geminiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-readiness-gemini-generation-'));
-    const previousHome = process.env.HOME;
-    const previousGeminiKey = process.env.GEMINI_API_KEY;
-    const previousGoogleKey = process.env.GOOGLE_API_KEY;
-    const configDir = path.join(geminiHome, '.gemini', 'antigravity-cli');
-    // Credential attestation covers specific files, not the whole state
-    // directory; jetski_state.pbtxt is the credential-bearing one.
-    const statePath = path.join(configDir, 'jetski_state.pbtxt');
-    fs.mkdirSync(configDir, { recursive: true });
-    fs.writeFileSync(statePath, JSON.stringify({ credential: 'first-generation' }), { mode: 0o600 });
-    process.env.HOME = geminiHome;
-    delete process.env.GEMINI_API_KEY;
-    delete process.env.GOOGLE_API_KEY;
-    mockedExecFile.mockImplementation(((_command: string, args: string[], _options: unknown, callback: Function) => {
-      if (args[0] === '--version') callback(null, 'agy 1.1.5', '');
-      else if (args[0] === 'models') callback(null, 'gemini-3.1-pro-high', '');
-      else callback(new Error('unexpected command'), '', '');
-      return { stdin: { end: jest.fn() } } as any;
-    }) as any);
-
-    try {
-      const admitted = await getNativeProviderReadiness('GEMINI');
-      expect(admitted).toMatchObject({ state: 'live_verified', usable: true });
-
-      // The adapter has already classified this provider-specific prompt as
-      // AUTH_REQUIRED even though the shared raw matcher intentionally does not
-      // trust a bare URL. The typed classification must still fail readiness.
-      recordNativeProviderAuthFailure(
-        'GEMINI',
-        'Complete sign-in at https://accounts.google.com/o/oauth2/auth',
-        admitted,
-        { confirmed: true },
-      );
-
-      await expect(getNativeProviderReadiness('GEMINI', { force: true })).resolves.toMatchObject({
-        state: 'needs_login',
-        usable: false,
-        credentialFingerprint: admitted.credentialFingerprint,
-      });
-
-      fs.chmodSync(statePath, 0o640);
-      const metadataOnlyTime = new Date(Date.now() + 5_000);
-      fs.utimesSync(statePath, metadataOnlyTime, metadataOnlyTime);
-      fs.utimesSync(configDir, metadataOnlyTime, metadataOnlyTime);
-      await expect(getNativeProviderReadiness('GEMINI', { force: true })).resolves.toMatchObject({
-        state: 'needs_login',
-        usable: false,
-        credentialFingerprint: admitted.credentialFingerprint,
-      });
-
-      fs.writeFileSync(statePath, JSON.stringify({ credential: 'second-generation' }), { mode: 0o600 });
-      const recovered = await getNativeProviderReadiness('GEMINI', { force: true });
-      expect(recovered).toMatchObject({ state: 'live_verified', usable: true });
-      expect(recovered.credentialFingerprint).not.toBe(admitted.credentialFingerprint);
-    } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
-      else process.env.GEMINI_API_KEY = previousGeminiKey;
-      if (previousGoogleKey === undefined) delete process.env.GOOGLE_API_KEY;
-      else process.env.GOOGLE_API_KEY = previousGoogleKey;
-      fs.rmSync(geminiHome, { recursive: true, force: true });
-    }
+  test('does not inspect Antigravity credential generations while the lane is unqualified', async () => {
+    await expect(getNativeProviderReadiness('GEMINI', { force: true })).resolves.toMatchObject({
+      state: 'runtime_unavailable',
+      usable: false,
+      credentialFingerprint: 'not-inspected',
+    });
+    expect(mockedExecFile).not.toHaveBeenCalled();
   });
 
   test('keeps a rejected Claude credential generation blocked until credential material changes', async () => {
@@ -328,7 +359,7 @@ describe('nativeProviderReadiness cache and invalidation', () => {
     process.env.CLAUDE_CONFIG_DIR = claudeHome;
 
     try {
-      const admitted = await getNativeProviderReadiness('CLAUDE_CODE');
+      const admitted = await getNativeProviderReadiness('CLAUDE_CODE', { executionScope: 'PROJECT_SANDBOX' });
       expect(admitted).toMatchObject({ state: 'login_present', usable: true });
 
       recordNativeProviderAuthFailure(
@@ -337,7 +368,10 @@ describe('nativeProviderReadiness cache and invalidation', () => {
         admitted,
       );
 
-      await expect(getNativeProviderReadiness('CLAUDE_CODE', { force: true })).resolves.toMatchObject({
+      await expect(getNativeProviderReadiness('CLAUDE_CODE', {
+        force: true,
+        executionScope: 'PROJECT_SANDBOX',
+      })).resolves.toMatchObject({
         state: 'needs_login',
         usable: false,
         credentialFingerprint: admitted.credentialFingerprint,
@@ -348,7 +382,10 @@ describe('nativeProviderReadiness cache and invalidation', () => {
       fs.chmodSync(credentialsPath, 0o640);
       const metadataOnlyTime = new Date(Date.now() + 5_000);
       fs.utimesSync(credentialsPath, metadataOnlyTime, metadataOnlyTime);
-      await expect(getNativeProviderReadiness('CLAUDE_CODE', { force: true })).resolves.toMatchObject({
+      await expect(getNativeProviderReadiness('CLAUDE_CODE', {
+        force: true,
+        executionScope: 'PROJECT_SANDBOX',
+      })).resolves.toMatchObject({
         state: 'needs_login',
         usable: false,
         credentialFingerprint: admitted.credentialFingerprint,
@@ -360,7 +397,10 @@ describe('nativeProviderReadiness cache and invalidation', () => {
           refreshToken: 'second-refresh-token',
         },
       }), { mode: 0o600 });
-      await expect(getNativeProviderReadiness('CLAUDE_CODE', { force: true })).resolves.toMatchObject({
+      await expect(getNativeProviderReadiness('CLAUDE_CODE', {
+        force: true,
+        executionScope: 'PROJECT_SANDBOX',
+      })).resolves.toMatchObject({
         state: 'login_present',
         usable: true,
       });
@@ -383,7 +423,7 @@ describe('nativeProviderReadiness cache and invalidation', () => {
     process.env.CLAUDE_CONFIG_DIR = claudeHome;
 
     try {
-      const admitted = await getNativeProviderReadiness('CLAUDE_CODE');
+      const admitted = await getNativeProviderReadiness('CLAUDE_CODE', { executionScope: 'PROJECT_SANDBOX' });
       let releaseProbe!: () => void;
       let markProbeStarted!: () => void;
       const probeStarted = new Promise<void>((resolve) => { markProbeStarted = resolve; });
@@ -394,7 +434,10 @@ describe('nativeProviderReadiness cache and invalidation', () => {
         return { state: 'live_verified' };
       });
 
-      const pending = getNativeProviderReadiness('CLAUDE_CODE', { force: true });
+      const pending = getNativeProviderReadiness('CLAUDE_CODE', {
+        force: true,
+        executionScope: 'PROJECT_SANDBOX',
+      });
       await probeStarted;
       recordNativeProviderAuthFailure(
         'CLAUDE_CODE',

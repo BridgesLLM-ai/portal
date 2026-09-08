@@ -8,13 +8,13 @@ import {
 
 function status(overrides: Partial<AgentZeroSetupStatus> = {}): AgentZeroSetupStatus {
   const base = {
-    testedVersions: { agentZero: '2.5', connector: '0.1.0', hostBridge: '2.5' },
+    testedVersions: { agentZero: '2.10', connector: '0.1.0', hostBridge: '2.10' },
     credentials: { configured: false, protected: false, reason: 'missing' },
     runtime: {
       installed: false,
       running: false,
       protocolReady: false,
-      expectedVersion: '2.5',
+      expectedVersion: '2.10',
       pinnedImage: false,
       loopbackOnly: false,
       persistentData: false,
@@ -28,7 +28,7 @@ function status(overrides: Partial<AgentZeroSetupStatus> = {}): AgentZeroSetupSt
       installed: false,
       running: false,
       ready: false,
-      expectedCliVersion: '2.5',
+      expectedCliVersion: '2.10',
       gatewayId: 'bridgesllm-portal-host',
       capabilities: {
         scope: 'HOST_OPERATOR',
@@ -61,7 +61,11 @@ function status(overrides: Partial<AgentZeroSetupStatus> = {}): AgentZeroSetupSt
     },
     actions: {
       provisionCredentials: { ownerOnly: true, confirmationPhrase: 'SAVE AGENT ZERO CREDENTIALS' },
-      reconcileRuntime: { ownerOnly: true, confirmationPhrase: 'SET UP AGENT ZERO' },
+      reconcileRuntime: {
+        ownerOnly: true,
+        available: false,
+        unavailableCode: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
+      },
       verifyAuthentication: { ownerOnly: true, available: false },
     },
     provider: { implemented: false, usable: false, supportedExecutionScopes: [] },
@@ -71,14 +75,14 @@ function status(overrides: Partial<AgentZeroSetupStatus> = {}): AgentZeroSetupSt
 }
 
 describe('Agent Zero setup contract', () => {
-  it('routes setup through credentials, runtime reconciliation, auth, then live availability', () => {
+  it('routes setup through credentials, unavailable runtime, auth, then live availability', () => {
     const missing = status();
     expect(nextAgentZeroSetupAction(missing)).toBe('credentials');
 
     const credentials = status({
       credentials: { configured: true, protected: true, reason: 'ready' },
     });
-    expect(nextAgentZeroSetupAction(credentials)).toBe('reconcile');
+    expect(nextAgentZeroSetupAction(credentials)).toBe('unavailable');
 
     const runtime = status({
       credentials: { configured: true, protected: true, reason: 'ready' },

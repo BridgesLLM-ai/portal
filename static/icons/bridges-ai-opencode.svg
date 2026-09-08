@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="OpenCode terminal runtime launcher">
+  <defs>
+    <linearGradient id="opencode-bg" x1="15" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#102a43"/>
+      <stop offset="1" stop-color="#11112b"/>
+    </linearGradient>
+    <linearGradient id="opencode-mark" x1="30" y1="35" x2="99" y2="94" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+  <rect x="7" y="7" width="114" height="114" rx="29" fill="url(#opencode-bg)" stroke="#38bdf8" stroke-width="4"/>
+  <path d="m48 39-22 25 22 25M80 39l22 25-22 25" fill="none" stroke="url(#opencode-mark)" stroke-linecap="round" stroke-linejoin="round" stroke-width="10"/>
+  <path d="m71 31-14 66" fill="none" stroke="#e0f2fe" stroke-linecap="round" stroke-width="7"/>
+  <circle cx="64" cy="64" r="5" fill="#fff"/>
+</svg>

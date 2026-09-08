@@ -1,7 +1,7 @@
 {
   "name": "bridgesllm-ask-user",
-  "version": "3.3.0",
-  "description": "Provides provider-neutral ask-user questions and settles native Codex prompts on the exact attested OpenClaw run.",
+  "version": "4.0.0",
+  "description": "Provides exact-run steering while OpenClaw owns native questions.",
   "main": "index.js",
   "private": true,
   "openclaw": {

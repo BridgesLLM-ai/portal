@@ -4,72 +4,48 @@ jest.mock('openclaw/plugin-sdk/agent-harness-runtime', () => ({
   resolveActiveEmbeddedRunSessionId: mockResolveActiveEmbeddedRunSessionId,
 }), { virtual: true });
 
-// Pin tests to the exact CommonJS entry point the installer copies into the
-// OpenClaw extension directory. OpenClaw supplies the SDK alias mocked above.
+// Pin tests to the exact CommonJS entry point copied into OpenClaw's extension
+// directory. OpenClaw supplies the SDK alias mocked above.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const askUserPlugin = require('../../../installer/openclaw-ask-user-plugin/index.js');
+const runtimeGuardPlugin = require('../../../installer/openclaw-ask-user-plugin/index.js');
 
 type GatewayHandler = (input: {
   params: Record<string, unknown>;
   respond: (ok: boolean, payload?: unknown, error?: unknown) => void;
+  context?: Record<string, any>;
 }) => Promise<void>;
 
-type AskUserTool = {
-  name: string;
-  parameters: Record<string, unknown>;
-  execute: (
-    toolCallId: string,
-    params: Record<string, unknown>,
-    signal?: AbortSignal,
-  ) => Promise<{ content: Array<{ type: string; text: string }> }>;
-};
-
-type AskUserToolFactory = (context: Record<string, unknown>) => AskUserTool | null;
-type BeforeToolCallHandler = (
-  event: Record<string, unknown>,
-  context: Record<string, unknown>,
-) => void;
-
-type Registrations = Map<string, {
+type RegisteredMethod = {
   handler: GatewayHandler;
   options: Record<string, unknown>;
-}> & {
-  toolFactory?: AskUserToolFactory;
-  toolOptions?: Record<string, unknown>;
-  beforeToolCall?: BeforeToolCallHandler;
-  beforeToolCallOptions?: Record<string, unknown>;
+};
+
+type Registrations = {
+  methods: Map<string, RegisteredMethod>;
+  registerTool: jest.Mock;
+  on: jest.Mock;
 };
 
 function register(): Registrations {
-  const registrations = new Map() as Registrations;
-  askUserPlugin.register({
+  const methods = new Map<string, RegisteredMethod>();
+  const registerTool = jest.fn();
+  const on = jest.fn();
+  runtimeGuardPlugin.register({
     registerGatewayMethod: (
       method: string,
       handler: GatewayHandler,
       options: Record<string, unknown>,
-    ) => {
-      registrations.set(method, { handler, options });
-    },
-    registerTool: (factory: AskUserToolFactory, options: Record<string, unknown>) => {
-      registrations.toolFactory = factory;
-      registrations.toolOptions = options;
-    },
-    on: (
-      name: string,
-      handler: BeforeToolCallHandler,
-      options: Record<string, unknown>,
-    ) => {
-      if (name !== 'before_tool_call') throw new Error(`unexpected hook ${name}`);
-      registrations.beforeToolCall = handler;
-      registrations.beforeToolCallOptions = options;
-    },
+    ) => methods.set(method, { handler, options }),
+    registerTool,
+    on,
   });
-  return registrations;
+  return { methods, registerTool, on };
 }
 
 async function invoke(
   handler: GatewayHandler,
   params: Record<string, unknown>,
+  context?: Record<string, any>,
 ): Promise<{ ok: boolean; payload: any; error: any }> {
   let response: any;
   await handler({
@@ -77,1172 +53,148 @@ async function invoke(
     respond: (ok, payload, error) => {
       response = { ok, payload, error };
     },
+    context,
   });
   if (!response) throw new Error('gateway handler did not respond');
   return response;
 }
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
-const expectedRunId = 'portal-run-11111111-1111-4111-8111-111111111111';
-const requestId = 'request-22222222-2222-4222-8222-222222222222';
-const validTarget = {
-  sessionKey: 'agent:main:portal-owner',
-  expectedRunId,
-};
-const validAnswer = {
-  ...validTarget,
-  requestId,
-  text: 'Use PostgreSQL.',
-};
-const pendingSnapshot = {
-  requestId,
-  runId: expectedRunId,
-  createdAt: 1_000,
-  expiresAt: 601_000,
-  questions: [{
-    id: 'database',
-    header: 'Database',
-    question: 'Which database should I use?',
-    isOther: true,
-    isSecret: false,
-    options: [
-      { label: 'PostgreSQL', description: 'Best for production.' },
-      { label: 'SQLite', description: 'Best for a local prototype.' },
-    ],
-  }],
-};
-
-function installRuntime(
-  overrides: Record<string, unknown> = {},
-  symbol = askUserPlugin.__test.RUNTIME_SYMBOL,
-) {
-  const runtime = Object.freeze({
-    version: 1,
-    read: jest.fn(() => pendingSnapshot),
-    answer: jest.fn(() => ({
-      ok: true,
-      code: 'ANSWERED',
-      requestId,
-      runId: expectedRunId,
-    })),
-    dismiss: jest.fn(() => ({
-      ok: true,
-      code: 'DISMISSED',
-      requestId,
-      runId: expectedRunId,
-    })),
-    steer: jest.fn(async () => ({
-      ok: true,
-      code: 'STEERED',
-      runId: expectedRunId,
-    })),
-    ...overrides,
-  });
-  (globalThis as any)[symbol] = runtime;
-  return runtime as any;
-}
-
-function installActiveRunProbeRuntime(overrides: Record<string, unknown> = {}) {
-  return installRuntime({
-    read: jest.fn(() => null),
-    answer: jest.fn((_sessionId, runId) => ({
-      ok: false,
-      code: 'NO_PENDING_INPUT',
-      runId,
-    })),
-    dismiss: jest.fn((_sessionId, runId) => ({
-      ok: false,
-      code: 'NO_PENDING_INPUT',
-      runId,
-    })),
-    steer: jest.fn(async () => ({
-      ok: false,
-      code: 'NO_ACTIVE_RUN',
-    })),
-    ...overrides,
-  }, askUserPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL);
-}
-
 function method(
-  registrations: Map<string, { handler: GatewayHandler; options: Record<string, unknown> }>,
-  name: 'probe' | 'pending' | 'answer' | 'dismiss' | 'steer',
+  registrations: Registrations,
+  name: 'steer',
 ): GatewayHandler {
-  const registered = registrations.get(askUserPlugin.__test.GATEWAY_METHODS[name]);
+  const registered = registrations.methods.get(runtimeGuardPlugin.__test.GATEWAY_METHODS[name]);
   if (!registered) throw new Error(`${name} gateway method was not registered`);
   return registered.handler;
 }
 
-function beginGenericQuestion(
-  registrations: Registrations,
-  options: {
-    runId?: string;
-    toolCallId?: string;
-    signal?: AbortSignal;
-    params?: Record<string, unknown>;
-  } = {},
-) {
-  const runId = options.runId || expectedRunId;
-  const toolCallId = options.toolCallId || requestId;
-  const sessionId = 'internal-session-id';
-  const toolContext = {
-    sessionKey: validTarget.sessionKey,
-    sessionId,
-    activeModel: { provider: 'anthropic', modelId: 'claude-sonnet' },
-  };
-  const tool = registrations.toolFactory?.(toolContext);
-  if (!tool || !registrations.beforeToolCall) throw new Error('ask-user tool was not registered');
-  registrations.beforeToolCall(
-    { toolName: 'ask_user_question', runId, toolCallId, params: options.params || {} },
-    {
-      toolName: 'ask_user_question',
-      sessionKey: validTarget.sessionKey,
-      sessionId,
-      runId,
-      toolCallId,
-    },
-  );
-  const params = options.params || {
-    questions: [{
-      header: 'Database',
-      question: 'Which database should I use?',
-      options: [
-        { label: 'PostgreSQL', description: 'Best for production.' },
-        { label: 'SQLite', description: 'Best for a local prototype.' },
-      ],
-    }],
-  };
-  return {
-    runId,
-    toolCallId,
-    execution: tool.execute(toolCallId, params, options.signal),
-  };
+const expectedRunId = 'portal-run-11111111-1111-4111-8111-111111111111';
+const requestId = 'request-22222222-2222-4222-8222-222222222222';
+const validSteer = {
+  sessionKey: 'agent:main:portal-owner',
+  expectedRunId,
+  requestId,
+  text: 'Continue with PostgreSQL.',
+};
+
+function installActiveRunRuntime(overrides: Record<string, unknown> = {}) {
+  const runtime = Object.freeze({
+    version: 1,
+    steer: jest.fn(async () => ({
+      ok: true,
+      code: 'STEERED',
+      runId: expectedRunId,
+    })),
+    ...overrides,
+  });
+  (globalThis as any)[runtimeGuardPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL] = runtime;
+  return runtime as any;
 }
 
-describe('OpenClaw exact-run ask-user plugin', () => {
+describe('OpenClaw 2026.9.1 exact-run steer plugin', () => {
   beforeEach(() => {
-    askUserPlugin.__test.reset();
+    runtimeGuardPlugin.__test.reset();
     mockResolveActiveEmbeddedRunSessionId.mockReset();
-    for (const symbol of askUserPlugin.__test.RUNTIME_SYMBOLS) {
-      delete (globalThis as any)[symbol];
-    }
+    delete (globalThis as any)[runtimeGuardPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL];
   });
 
   afterEach(() => {
-    for (const symbol of askUserPlugin.__test.RUNTIME_SYMBOLS) {
-      delete (globalThis as any)[symbol];
-    }
+    delete (globalThis as any)[runtimeGuardPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL];
     jest.restoreAllMocks();
   });
 
-  test('registers the provider-neutral tool, identity hook, and exact gateway API', () => {
-    expect(typeof askUserPlugin.register).toBe('function');
-    expect(askUserPlugin.register.constructor.name).toBe('Function');
+  test('registers only exact-run steer while native OpenClaw owns questions', () => {
     const registrations = register();
-    expect([...registrations.keys()]).toEqual([
+
+    expect([...registrations.methods.keys()]).toEqual([
+      'bridgesllm.ask_user.steer',
+    ]);
+    expect(registrations.methods.get('bridgesllm.ask_user.steer')?.options)
+      .toEqual({ scope: 'operator.write' });
+    expect(registrations.registerTool).not.toHaveBeenCalled();
+    expect(registrations.on).not.toHaveBeenCalled();
+    expect([...registrations.methods.keys()]).not.toEqual(expect.arrayContaining([
       'bridgesllm.ask_user.probe',
       'bridgesllm.ask_user.pending',
       'bridgesllm.ask_user.answer',
       'bridgesllm.ask_user.dismiss',
-      'bridgesllm.ask_user.steer',
-    ]);
-    expect([...registrations.values()].every(({ options }) => (
-      JSON.stringify(options) === JSON.stringify({ scope: 'operator.write' })
-    ))).toBe(true);
-    expect(registrations.toolOptions).toEqual({ name: 'ask_user_question' });
-    expect(registrations.beforeToolCallOptions).toEqual({ priority: 100 });
-    const tool = registrations.toolFactory?.({
-      sessionKey: validTarget.sessionKey,
-      sessionId: 'internal-session-id',
-      activeModel: { provider: 'anthropic', modelId: 'claude-sonnet' },
-    });
-    expect(tool).toEqual(expect.objectContaining({
-      name: 'ask_user_question',
-      parameters: expect.objectContaining({ type: 'object' }),
-    }));
+    ]));
   });
 
-  test('runs the live semantic probe through the real tool execute and settlement paths', async () => {
-    installActiveRunProbeRuntime();
-    const response = await invoke(method(register(), 'probe'), {
-      nonce: '0123456789abcdef01234567',
-    });
-
-    expect(response).toEqual({
-      ok: true,
-      payload: {
-        ok: true,
-        code: 'SEMANTIC_PROBE_OK',
-        toolName: 'ask_user_question',
-        answer: true,
-        dismiss: true,
-        steer: true,
-        activeRunSteer: true,
-      },
-      error: undefined,
-    });
-  });
-
-  test('fails readiness when the provider-neutral active-run adapter is absent', async () => {
-    const response = await invoke(method(register(), 'probe'), {
-      nonce: '0123456789abcdef01234567',
-    });
-
-    expect(response).toEqual({
-      ok: true,
-      payload: {
-        ok: false,
-        code: 'SEMANTIC_PROBE_FAILED',
-        toolName: 'ask_user_question',
-        answer: true,
-        dismiss: true,
-        steer: true,
-        activeRunSteer: false,
-      },
-      error: undefined,
-    });
-  });
-
-  test('fails readiness when the active-run adapter does not reject an unattached probe', async () => {
-    installActiveRunProbeRuntime({
-      steer: jest.fn(async () => ({ ok: true, code: 'STEERED' })),
-    });
-    const response = await invoke(method(register(), 'probe'), {
-      nonce: '0123456789abcdef01234567',
-    });
-
-    expect(response.payload).toEqual(expect.objectContaining({
-      ok: false,
-      code: 'SEMANTIC_PROBE_FAILED',
-      activeRunSteer: false,
-    }));
-  });
-
-  test('reads the real request identity and structured questions from the exact run', async () => {
+  test('steers the exact active session and attested run', async () => {
     mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const runtime = installRuntime();
-    const response = await invoke(method(register(), 'pending'), validTarget);
+    const runtime = installActiveRunRuntime();
 
-    expect(response).toEqual({
-      ok: true,
-      payload: { pending: true, ...pendingSnapshot },
-      error: undefined,
-    });
-    expect(mockResolveActiveEmbeddedRunSessionId).toHaveBeenCalledWith(validTarget.sessionKey);
-    expect(runtime.read).toHaveBeenCalledWith('internal-session-id', expectedRunId);
-  });
-
-  test('pauses an Anthropic run, exposes its exact question, and resumes with the answer', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const registrations = register();
-    const pendingTool = beginGenericQuestion(registrations);
-
-    const pending = await invoke(method(registrations, 'pending'), validTarget);
-    expect(pending).toEqual({
-      ok: true,
-      payload: {
-        pending: true,
-        requestId,
-        runId: expectedRunId,
-        createdAt: expect.any(Number),
-        expiresAt: expect.any(Number),
-        questions: [{
-          id: '1',
-          header: 'Database',
-          question: 'Which database should I use?',
-          isOther: true,
-          isSecret: false,
-          options: [
-            { label: 'PostgreSQL', description: 'Best for production.' },
-            { label: 'SQLite', description: 'Best for a local prototype.' },
-          ],
-        }],
-      },
-      error: undefined,
-    });
-
-    expect((await invoke(method(registrations, 'answer'), validAnswer)).payload).toEqual({
-      accepted: true,
-      replayed: false,
-      code: 'ANSWERED',
-      requestId,
-      runId: expectedRunId,
-    });
-    await expect(pendingTool.execution).resolves.toEqual({
-      content: [{ type: 'text', text: 'Use PostgreSQL.' }],
-    });
-  });
-
-  test('continues past an idle native Codex adapter to the provider-neutral pending call', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const nativeRuntime = installRuntime({
-      read: jest.fn(() => null),
-      answer: jest.fn(() => ({ ok: false, code: 'NO_PENDING_INPUT' })),
-    });
-    const registrations = register();
-    const pendingTool = beginGenericQuestion(registrations);
-
-    expect((await invoke(method(registrations, 'pending'), validTarget)).payload.pending).toBe(true);
-    expect((await invoke(method(registrations, 'answer'), validAnswer)).payload.accepted).toBe(true);
-    await expect(pendingTool.execution).resolves.toEqual({
-      content: [{ type: 'text', text: validAnswer.text }],
-    });
-    expect(nativeRuntime.answer).toHaveBeenCalledTimes(1);
-  });
-
-  test('requires a host-attested run binding before a provider-neutral tool can wait', async () => {
-    const registrations = register();
-    const tool = registrations.toolFactory?.({
-      sessionKey: validTarget.sessionKey,
-      sessionId: 'internal-session-id',
-      activeModel: { provider: 'anthropic', modelId: 'claude-sonnet' },
-    });
-    if (!tool) throw new Error('ask-user tool was not registered');
-
-    await expect(tool.execute(requestId, {
-      questions: [{ question: 'Unsafe unbound question?' }],
-    })).rejects.toThrow(/did not attest this exact tool call/i);
-  });
-
-  test('quarantines a provider tool-call id after overlapping runs collide', async () => {
-    let now = 1_000;
-    jest.spyOn(Date, 'now').mockImplementation(() => now);
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const registrations = register();
-    const sessionId = 'internal-session-id';
-    const tool = registrations.toolFactory?.({
-      sessionKey: validTarget.sessionKey,
-      sessionId,
-      activeModel: { provider: 'anthropic', modelId: 'claude-sonnet' },
-    });
-    if (!tool || !registrations.beforeToolCall) throw new Error('ask-user tool was not registered');
-    const reusedToolCallId = 'provider-reused-tool-call';
-    for (const runId of ['run-a', 'run-b']) {
-      registrations.beforeToolCall(
-        { toolName: 'ask_user_question', runId, toolCallId: reusedToolCallId, params: {} },
-        {
-          toolName: 'ask_user_question',
-          sessionKey: validTarget.sessionKey,
-          sessionId,
-          runId,
-          toolCallId: reusedToolCallId,
-        },
-      );
-    }
-
-    await expect(tool.execute(reusedToolCallId, {
-      questions: [{ question: 'Which run owns this?' }],
-    })).rejects.toThrow(/did not attest this exact tool call/i);
-
-    // A timer is not an authority boundary. The delayed execute from run B can
-    // arrive after the original binding TTL, so expiry must not rehabilitate
-    // the provider-owned id inside the same embedded session.
-    now += 30_001;
-
-    // A third hook must not make the identity eligible again. Otherwise the
-    // still-delayed execute from run B could consume run C's binding and wait
-    // on an answer that the Portal correctly attributes to run C.
-    registrations.beforeToolCall(
-      {
-        toolName: 'ask_user_question',
-        runId: 'run-c',
-        toolCallId: reusedToolCallId,
-        params: {},
-      },
-      {
-        toolName: 'ask_user_question',
-        sessionKey: validTarget.sessionKey,
-        sessionId,
-        runId: 'run-c',
-        toolCallId: reusedToolCallId,
-      },
-    );
-    await expect(tool.execute(reusedToolCallId, {
-      questions: [{ question: 'Can delayed run B steal run C?' }],
-    })).rejects.toThrow(/did not attest this exact tool call/i);
-    expect((await invoke(method(registrations, 'pending'), validTarget)).payload).toEqual({
-      pending: false,
-      code: 'NO_PENDING_INPUT',
-    });
-  });
-
-  test('keeps quarantine saturation scoped to the offending embedded session', async () => {
-    const poisonedSessionKey = validTarget.sessionKey;
-    const poisonedSessionId = 'poisoned-internal-session';
-    const freshSessionKey = 'agent:main:fresh-anthropic-session';
-    const freshSessionId = 'fresh-internal-session';
-    mockResolveActiveEmbeddedRunSessionId.mockImplementation((sessionKey: string) => (
-      sessionKey === freshSessionKey ? freshSessionId : poisonedSessionId
-    ));
-    const registrations = register();
-    if (!registrations.beforeToolCall) throw new Error('ask-user hook was not registered');
-
-    for (let index = 0; index < 257; index += 1) {
-      const toolCallId = `colliding-call-${index}`;
-      for (const runId of [`run-a-${index}`, `run-b-${index}`]) {
-        registrations.beforeToolCall(
-          { toolName: 'ask_user_question', runId, toolCallId, params: {} },
-          {
-            toolName: 'ask_user_question',
-            sessionKey: poisonedSessionKey,
-            sessionId: poisonedSessionId,
-            runId,
-            toolCallId,
-          },
-        );
-      }
-    }
-
-    const freshRunId = 'fresh-run';
-    const freshToolCallId = 'fresh-tool-call';
-    const freshTool = registrations.toolFactory?.({
-      sessionKey: freshSessionKey,
-      sessionId: freshSessionId,
-      activeModel: { provider: 'anthropic', modelId: 'claude-sonnet' },
-    });
-    if (!freshTool) throw new Error('ask-user tool was not registered');
-    registrations.beforeToolCall(
-      {
-        toolName: 'ask_user_question',
-        runId: freshRunId,
-        toolCallId: freshToolCallId,
-        params: {},
-      },
-      {
-        toolName: 'ask_user_question',
-        sessionKey: freshSessionKey,
-        sessionId: freshSessionId,
-        runId: freshRunId,
-        toolCallId: freshToolCallId,
-      },
-    );
-    const execution = freshTool.execute(freshToolCallId, {
-      questions: [{ question: 'Does this fresh Anthropic session still work?' }],
-    });
-    const freshTarget = { sessionKey: freshSessionKey, expectedRunId: freshRunId };
-    expect((await invoke(method(registrations, 'pending'), freshTarget)).payload.pending).toBe(true);
-    expect((await invoke(method(registrations, 'answer'), {
-      ...freshTarget,
-      requestId: freshToolCallId,
-      text: 'Yes.',
-    })).payload.accepted).toBe(true);
-    await expect(execution).resolves.toEqual({
-      content: [{ type: 'text', text: 'Yes.' }],
-    });
-  });
-
-  test('keeps active binding capacity scoped to one embedded session', async () => {
-    const busySessionKey = validTarget.sessionKey;
-    const busySessionId = 'busy-internal-session';
-    const freshSessionKey = 'agent:main:fresh-capacity-session';
-    const freshSessionId = 'fresh-capacity-internal-session';
-    mockResolveActiveEmbeddedRunSessionId.mockImplementation((sessionKey: string) => (
-      sessionKey === freshSessionKey ? freshSessionId : busySessionId
-    ));
-    const registrations = register();
-    if (!registrations.beforeToolCall) throw new Error('ask-user hook was not registered');
-
-    for (let index = 0; index < 256; index += 1) {
-      const runId = `held-run-${index}`;
-      const toolCallId = `held-call-${index}`;
-      registrations.beforeToolCall(
-        { toolName: 'ask_user_question', runId, toolCallId, params: {} },
-        {
-          toolName: 'ask_user_question',
-          sessionKey: busySessionKey,
-          sessionId: busySessionId,
-          runId,
-          toolCallId,
-        },
-      );
-    }
-
-    const freshRunId = 'fresh-capacity-run';
-    const freshToolCallId = 'fresh-capacity-call';
-    const freshTool = registrations.toolFactory?.({
-      sessionKey: freshSessionKey,
-      sessionId: freshSessionId,
-      activeModel: { provider: 'anthropic', modelId: 'claude-sonnet' },
-    });
-    if (!freshTool) throw new Error('ask-user tool was not registered');
-    registrations.beforeToolCall(
-      {
-        toolName: 'ask_user_question',
-        runId: freshRunId,
-        toolCallId: freshToolCallId,
-        params: {},
-      },
-      {
-        toolName: 'ask_user_question',
-        sessionKey: freshSessionKey,
-        sessionId: freshSessionId,
-        runId: freshRunId,
-        toolCallId: freshToolCallId,
-      },
-    );
-    const execution = freshTool.execute(freshToolCallId, {
-      questions: [{ question: 'Can an unrelated Anthropic session still ask?' }],
-    });
-    const freshTarget = { sessionKey: freshSessionKey, expectedRunId: freshRunId };
-    expect((await invoke(method(registrations, 'pending'), freshTarget)).payload.pending).toBe(true);
-    expect((await invoke(method(registrations, 'answer'), {
-      ...freshTarget,
-      requestId: freshToolCallId,
-      text: 'Yes.',
-    })).payload.accepted).toBe(true);
-    await expect(execution).resolves.toEqual({
-      content: [{ type: 'text', text: 'Yes.' }],
-    });
-  });
-
-  test('reclaims quarantined ids only after OpenClaw attests a session-id rollover', async () => {
-    const sessionKey = validTarget.sessionKey;
-    let activeSessionId = 'old-internal-session';
-    mockResolveActiveEmbeddedRunSessionId.mockImplementation(() => activeSessionId);
-    const registrations = register();
-    if (!registrations.beforeToolCall) throw new Error('ask-user hook was not registered');
-    const reusedToolCallId = 'rollover-call';
-    for (const runId of ['old-run-a', 'old-run-b']) {
-      registrations.beforeToolCall(
-        { toolName: 'ask_user_question', runId, toolCallId: reusedToolCallId, params: {} },
-        {
-          toolName: 'ask_user_question',
-          sessionKey,
-          sessionId: activeSessionId,
-          runId,
-          toolCallId: reusedToolCallId,
-        },
-      );
-    }
-
-    activeSessionId = 'new-internal-session';
-    const freshRunId = 'new-run';
-    const freshTool = registrations.toolFactory?.({
-      sessionKey,
-      sessionId: activeSessionId,
-      activeModel: { provider: 'anthropic', modelId: 'claude-sonnet' },
-    });
-    if (!freshTool) throw new Error('ask-user tool was not registered');
-    registrations.beforeToolCall(
-      {
-        toolName: 'ask_user_question',
-        runId: freshRunId,
-        toolCallId: reusedToolCallId,
-        params: {},
-      },
-      {
-        toolName: 'ask_user_question',
-        sessionKey,
-        sessionId: activeSessionId,
-        runId: freshRunId,
-        toolCallId: reusedToolCallId,
-      },
-    );
-    const execution = freshTool.execute(reusedToolCallId, {
-      questions: [{ question: 'Did OpenClaw attest the replacement session?' }],
-    });
-    expect((await invoke(method(registrations, 'pending'), {
-      sessionKey,
-      expectedRunId: freshRunId,
-    })).payload.pending).toBe(true);
-    expect((await invoke(method(registrations, 'answer'), {
-      sessionKey,
-      expectedRunId: freshRunId,
-      requestId: reusedToolCallId,
-      text: 'Yes.',
-    })).payload.accepted).toBe(true);
-    await expect(execution).resolves.toEqual({
-      content: [{ type: 'text', text: 'Yes.' }],
-    });
-  });
-
-  test('does not let a stale run answer or dismiss a newer provider-neutral question', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const registrations = register();
-    const pendingTool = beginGenericQuestion(registrations);
-    const staleTarget = { ...validTarget, expectedRunId: 'portal-run-stale' };
-
-    expect((await invoke(method(registrations, 'answer'), {
-      ...validAnswer,
-      expectedRunId: staleTarget.expectedRunId,
-    })).payload).toEqual({ accepted: false, code: 'RUN_MISMATCH', requestId });
-    expect((await invoke(method(registrations, 'dismiss'), {
-      ...staleTarget,
-      requestId,
-    })).payload).toEqual({ accepted: false, code: 'RUN_MISMATCH', requestId });
-
-    expect((await invoke(method(registrations, 'dismiss'), {
-      ...validTarget,
-      requestId,
-    })).payload.accepted).toBe(true);
-    await expect(pendingTool.execution).resolves.toEqual({
-      content: [{ type: 'text', text: 'The user dismissed the question without answering.' }],
-    });
-  });
-
-  test('removes a provider-neutral pending question when its exact run aborts', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const controller = new AbortController();
-    const registrations = register();
-    const pendingTool = beginGenericQuestion(registrations, { signal: controller.signal });
-    expect((await invoke(method(registrations, 'pending'), validTarget)).payload.pending).toBe(true);
-
-    controller.abort();
-    await expect(pendingTool.execution).rejects.toThrow(/run ended while waiting/i);
-    expect((await invoke(method(registrations, 'pending'), validTarget)).payload).toEqual({
-      pending: false,
-      code: 'NO_PENDING_INPUT',
-    });
-  });
-
-  test('rejects malformed provider-neutral questions before publishing pending state', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const registrations = register();
-    const pendingTool = beginGenericQuestion(registrations, {
-      params: {
-        questions: [{
-          question: 'Choose?',
-          options: [{ label: 'Same' }, { label: 'same' }],
-        }],
-      },
-    });
-    await expect(pendingTool.execution).rejects.toThrow(/bounded, answerable questions/i);
-    expect((await invoke(method(registrations, 'pending'), validTarget)).payload).toEqual({
-      pending: false,
-      code: 'NO_PENDING_INPUT',
-    });
-  });
-
-  test('resolves the exact run across the external provider and core runtime channels', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const [providerSymbol, coreSymbol] = askUserPlugin.__test.RUNTIME_SYMBOLS;
-    const providerRuntime = installRuntime({
-      read: jest.fn(() => null),
-      answer: jest.fn(() => ({ ok: false, code: 'NO_ACTIVE_RUN' })),
-    }, providerSymbol);
-    const coreRuntime = installRuntime({}, coreSymbol);
-    const registrations = register();
-
-    expect((await invoke(method(registrations, 'pending'), validTarget)).payload).toEqual({
-      pending: true,
-      ...pendingSnapshot,
-    });
-    expect((await invoke(method(registrations, 'answer'), validAnswer)).payload).toEqual({
-      accepted: true,
-      replayed: false,
-      code: 'ANSWERED',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect(providerRuntime.read).toHaveBeenCalledTimes(1);
-    expect(coreRuntime.read).toHaveBeenCalledTimes(1);
-    expect(providerRuntime.answer).toHaveBeenCalledTimes(1);
-    expect(coreRuntime.answer).toHaveBeenCalledTimes(1);
-  });
-
-  test('prefers the loaded external Codex provider when it owns the exact run', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const [providerSymbol, coreSymbol] = askUserPlugin.__test.RUNTIME_SYMBOLS;
-    const providerRuntime = installRuntime({}, providerSymbol);
-    const coreRuntime = installRuntime({
-      read: jest.fn(() => null),
-      answer: jest.fn(() => ({ ok: false, code: 'NO_ACTIVE_RUN' })),
-    }, coreSymbol);
-    const registrations = register();
-
-    expect((await invoke(method(registrations, 'pending'), validTarget)).payload.pending).toBe(true);
-    expect((await invoke(method(registrations, 'answer'), validAnswer)).payload.accepted).toBe(true);
-    expect(providerRuntime.read).toHaveBeenCalledTimes(1);
-    expect(providerRuntime.answer).toHaveBeenCalledTimes(1);
-    expect(coreRuntime.read).not.toHaveBeenCalled();
-    expect(coreRuntime.answer).not.toHaveBeenCalled();
-  });
-
-  test('answers only the attested run and native request identity', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const runtime = installRuntime();
-    const response = await invoke(method(register(), 'answer'), validAnswer);
-
-    expect(response).toEqual({
+    await expect(invoke(method(register(), 'steer'), validSteer)).resolves.toEqual({
       ok: true,
       payload: {
         accepted: true,
-        replayed: false,
-        code: 'ANSWERED',
+        code: 'STEERED',
         requestId,
         runId: expectedRunId,
+        replayed: false,
       },
       error: undefined,
     });
-    expect(runtime.answer).toHaveBeenCalledWith(
-      'internal-session-id',
-      expectedRunId,
-      requestId,
-      validAnswer.text,
-    );
-  });
-
-  test('dismisses only the attested run and native request identity', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const runtime = installRuntime();
-    const response = await invoke(method(register(), 'dismiss'), {
-      ...validTarget,
-      requestId,
-    });
-
-    expect(response.payload).toEqual({
-      accepted: true,
-      replayed: false,
-      code: 'DISMISSED',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect(runtime.dismiss).toHaveBeenCalledWith(
-      'internal-session-id',
-      expectedRunId,
-      requestId,
-    );
-  });
-
-  test('steers only the attested active run through the dedicated awaited runtime method', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const runtime = installRuntime();
-    const response = await invoke(method(register(), 'steer'), validAnswer);
-
-    expect(response.payload).toEqual({
-      accepted: true,
-      replayed: false,
-      code: 'STEERED',
-      requestId,
-      runId: expectedRunId,
-    });
+    expect(mockResolveActiveEmbeddedRunSessionId)
+      .toHaveBeenCalledWith(validSteer.sessionKey);
     expect(runtime.steer).toHaveBeenCalledWith(
       'internal-session-id',
       expectedRunId,
-      validAnswer.text,
+      validSteer.text,
     );
   });
 
-  test('joins an exact in-flight steer retry and records one completed receipt', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const delivery = deferred<{ ok: true; code: string; runId: string }>();
-    const runtime = installRuntime({
-      steer: jest.fn(() => delivery.promise),
-    });
-    const handler = method(register(), 'steer');
+  test('fails closed when no exact active run can be resolved', async () => {
+    mockResolveActiveEmbeddedRunSessionId.mockReturnValue(undefined);
+    const runtime = installActiveRunRuntime();
 
-    const first = invoke(handler, validAnswer);
-    const retry = invoke(handler, validAnswer);
-
-    expect(runtime.steer).toHaveBeenCalledTimes(1);
-    expect(askUserPlugin.__test.dedupeCounts()).toEqual({ inFlight: 1, terminal: 0 });
-    delivery.resolve({ ok: true, code: 'STEERED', runId: expectedRunId });
-
-    await expect(first).resolves.toMatchObject({
-      payload: { accepted: true, replayed: false, code: 'STEERED' },
-    });
-    await expect(retry).resolves.toMatchObject({
-      payload: { accepted: true, replayed: true, code: 'STEERED' },
-    });
-    expect(askUserPlugin.__test.dedupeCounts()).toEqual({ inFlight: 0, terminal: 1 });
-    expect((await invoke(handler, validAnswer)).payload.replayed).toBe(true);
-    expect(runtime.steer).toHaveBeenCalledTimes(1);
-  });
-
-  test('rejects changed payload or action while the original steer is in flight', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const delivery = deferred<{ ok: true; code: string; runId: string }>();
-    const runtime = installRuntime({
-      steer: jest.fn(() => delivery.promise),
-    });
-    const registrations = register();
-    const first = invoke(method(registrations, 'steer'), validAnswer);
-
-    await expect(invoke(method(registrations, 'steer'), {
-      ...validAnswer,
-      text: 'A conflicting replacement.',
-    })).resolves.toMatchObject({
-      payload: { accepted: false, code: 'REQUEST_CONFLICT', requestId, runId: expectedRunId },
-    });
-    await expect(invoke(method(registrations, 'dismiss'), {
-      ...validTarget,
-      requestId,
-    })).resolves.toMatchObject({
-      payload: { accepted: false, code: 'REQUEST_CONFLICT', requestId, runId: expectedRunId },
-    });
-    expect(runtime.steer).toHaveBeenCalledTimes(1);
-    expect(runtime.dismiss).not.toHaveBeenCalled();
-
-    delivery.resolve({ ok: true, code: 'STEERED', runId: expectedRunId });
-    await first;
-  });
-
-  test('cleans up a rejected in-flight steer so an exact retry can dispatch once more', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const delivery = deferred<{ ok: false; code: string; runId: string }>();
-    const runtime = installRuntime({
-      steer: jest.fn()
-        .mockImplementationOnce(() => delivery.promise)
-        .mockResolvedValueOnce({ ok: true, code: 'STEERED', runId: expectedRunId }),
-    });
-    const handler = method(register(), 'steer');
-    const first = invoke(handler, validAnswer);
-    const retryWhilePending = invoke(handler, validAnswer);
-
-    expect(runtime.steer).toHaveBeenCalledTimes(1);
-    delivery.resolve({ ok: false, code: 'QUEUE_REJECTED', runId: expectedRunId });
-    for (const result of await Promise.all([first, retryWhilePending])) {
-      expect(result.payload).toEqual({
+    await expect(invoke(method(register(), 'steer'), validSteer)).resolves.toEqual({
+      ok: true,
+      payload: {
         accepted: false,
-        code: 'QUEUE_REJECTED',
+        code: 'NO_ACTIVE_RUN',
         requestId,
-        runId: expectedRunId,
-      });
-    }
-    expect(askUserPlugin.__test.dedupeCounts()).toEqual({ inFlight: 0, terminal: 0 });
-
-    expect((await invoke(handler, validAnswer)).payload).toEqual({
-      accepted: true,
-      replayed: false,
-      code: 'STEERED',
-      requestId,
-      runId: expectedRunId,
+      },
+      error: undefined,
     });
-    expect(runtime.steer).toHaveBeenCalledTimes(2);
+    expect(runtime.steer).not.toHaveBeenCalled();
   });
 
-  test('expires completed receipts after the bounded retention window', async () => {
-    let now = 10_000;
-    jest.spyOn(Date, 'now').mockImplementation(() => now);
+  test('deduplicates exact retries and rejects a changed payload for one request id', async () => {
     mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const runtime = installRuntime();
-    const handler = method(register(), 'steer');
+    const runtime = installActiveRunRuntime();
+    const steer = method(register(), 'steer');
 
-    expect((await invoke(handler, validAnswer)).payload.replayed).toBe(false);
-    now += askUserPlugin.__test.TERMINAL_RECEIPT_TTL_MS;
-    expect((await invoke(handler, validAnswer)).payload.replayed).toBe(false);
-    expect(runtime.steer).toHaveBeenCalledTimes(2);
-    expect(askUserPlugin.__test.dedupeCounts()).toEqual({ inFlight: 0, terminal: 1 });
-  });
+    const first = await invoke(steer, validSteer);
+    const replay = await invoke(steer, validSteer);
+    const conflict = await invoke(steer, { ...validSteer, text: 'Use SQLite instead.' });
 
-  test('bounds combined in-flight and completed receipt capacity without evicting live work', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const delivery = deferred<{ ok: true; code: string; runId: string }>();
-    const runtime = installRuntime({
-      steer: jest.fn(() => delivery.promise),
-    });
-    const handler = method(register(), 'steer');
-    const inFlight = Array.from(
-      { length: askUserPlugin.__test.MAX_TERMINAL_RECEIPTS },
-      (_, index) => invoke(handler, { ...validAnswer, requestId: `capacity-${index}` }),
-    );
-
-    expect(askUserPlugin.__test.dedupeCounts()).toEqual({
-      inFlight: askUserPlugin.__test.MAX_TERMINAL_RECEIPTS,
-      terminal: 0,
-    });
-    expect((await invoke(handler, {
-      ...validAnswer,
-      requestId: 'capacity-overflow',
-    })).payload).toEqual({
-      accepted: false,
-      code: 'DEDUPE_CAPACITY',
-      requestId: 'capacity-overflow',
-      runId: expectedRunId,
-    });
-    expect(runtime.steer).toHaveBeenCalledTimes(askUserPlugin.__test.MAX_TERMINAL_RECEIPTS);
-
-    delivery.resolve({ ok: true, code: 'STEERED', runId: expectedRunId });
-    await Promise.all(inFlight);
-    expect(askUserPlugin.__test.dedupeCounts()).toEqual({
-      inFlight: 0,
-      terminal: askUserPlugin.__test.MAX_TERMINAL_RECEIPTS,
-    });
-  });
-
-  test('prefers the provider-neutral exact-run adapter for an Anthropic embedded turn', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const activeRuntime = installRuntime({}, askUserPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL);
-    const coreRuntime = installRuntime({
-      read: jest.fn(() => null),
-      answer: jest.fn(() => ({ ok: false, code: 'NO_ACTIVE_RUN' })),
-      dismiss: jest.fn(() => ({ ok: false, code: 'NO_ACTIVE_RUN' })),
-      steer: jest.fn(async () => ({ ok: false, code: 'NO_ACTIVE_RUN' })),
-    });
-
-    const response = await invoke(method(register(), 'steer'), validAnswer);
-
-    expect(response.payload).toEqual({
-      accepted: true,
-      replayed: false,
-      code: 'STEERED',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect(activeRuntime.steer).toHaveBeenCalledWith(
-      'internal-session-id',
-      expectedRunId,
-      validAnswer.text,
-    );
-    expect(coreRuntime.steer).toHaveBeenCalledTimes(1);
-  });
-
-  test('rejects steering when a generic Anthropic question opens after the pending probe', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const activeRuntime = installRuntime({
-      read: jest.fn(() => null),
-      answer: jest.fn(() => ({ ok: false, code: 'NO_PENDING_INPUT' })),
-      dismiss: jest.fn(() => ({ ok: false, code: 'NO_PENDING_INPUT' })),
-    }, askUserPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL);
-    const registrations = register();
-
-    expect((await invoke(method(registrations, 'pending'), validTarget)).payload).toEqual({
-      pending: false,
-      code: 'NO_PENDING_INPUT',
-    });
-    const pendingTool = beginGenericQuestion(registrations);
-
-    expect((await invoke(method(registrations, 'steer'), validAnswer)).payload).toEqual({
-      accepted: false,
-      code: 'PENDING_INPUT',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect(activeRuntime.steer).not.toHaveBeenCalled();
-    expect((await invoke(method(registrations, 'dismiss'), {
-      ...validTarget,
-      requestId,
-    })).payload.accepted).toBe(true);
-    await pendingTool.execution;
-  });
-
-  test('invokes exact steer before a question scheduled in the generic-to-active microtask gap', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const events: string[] = [];
-    const activeRuntime = installRuntime({
-      steer: jest.fn(async () => {
-        events.push('active-dispatch');
-        await Promise.resolve();
-        return { ok: true, code: 'STEERED', runId: expectedRunId };
-      }),
-    }, askUserPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL);
-    const registrations = register();
-    let pendingTool: ReturnType<typeof beginGenericQuestion> | undefined;
-    const pendingRequestId = 'request-microtask-gap-33333333-3333-4333-8333-333333333333';
-    queueMicrotask(() => {
-      events.push('pending-open');
-      pendingTool = beginGenericQuestion(registrations, { toolCallId: pendingRequestId });
-    });
-
-    const response = await invoke(method(registrations, 'steer'), validAnswer);
-
-    expect(response.payload.accepted).toBe(true);
-    expect(events.slice(0, 2)).toEqual(['active-dispatch', 'pending-open']);
-    expect(activeRuntime.steer).toHaveBeenCalledTimes(1);
-    expect(pendingTool).toBeDefined();
-    expect((await invoke(method(registrations, 'dismiss'), {
-      ...validTarget,
-      requestId: pendingRequestId,
-    })).payload.accepted).toBe(true);
-    await pendingTool!.execution;
-  });
-
-  test('keeps Codex pending-input semantics ahead of the provider-neutral steer adapter', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const codexRuntime = installRuntime({
-      steer: jest.fn(async () => ({
-        ok: false,
-        code: 'PENDING_INPUT',
-        runId: expectedRunId,
-      })),
-    });
-    const activeRuntime = installRuntime({}, askUserPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL);
-
-    expect((await invoke(method(register(), 'steer'), validAnswer)).payload).toEqual({
-      accepted: false,
-      code: 'PENDING_INPUT',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect(codexRuntime.steer).toHaveBeenCalledTimes(1);
-    expect(activeRuntime.steer).not.toHaveBeenCalled();
-  });
-
-  test('uses the Codex exact-turn adapter before the generic active-handle adapter', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const activeRuntime = installRuntime({
-      steer: jest.fn(async () => ({
-        ok: false,
-        code: 'TRANSCRIPT_COMMIT_UNSUPPORTED',
-        runId: expectedRunId,
-      })),
-    }, askUserPlugin.__test.ACTIVE_RUN_RUNTIME_SYMBOL);
-    const codexRuntime = installRuntime();
-
-    const response = await invoke(method(register(), 'steer'), validAnswer);
-
-    expect(response.payload.accepted).toBe(true);
-    expect(codexRuntime.steer).toHaveBeenCalledTimes(1);
-    expect(activeRuntime.steer).not.toHaveBeenCalled();
-  });
-
-  test('replays only the exact accepted steer and does not record asynchronous rejection', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const runtime = installRuntime({
-      steer: jest.fn()
-        .mockResolvedValueOnce({ ok: false, code: 'QUEUE_REJECTED', runId: expectedRunId })
-        .mockResolvedValueOnce({ ok: true, code: 'STEERED', runId: expectedRunId }),
-    });
-    const handler = method(register(), 'steer');
-
-    expect((await invoke(handler, validAnswer)).payload).toEqual({
-      accepted: false,
-      code: 'QUEUE_REJECTED',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect((await invoke(handler, validAnswer)).payload).toEqual({
-      accepted: true,
-      replayed: false,
-      code: 'STEERED',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect((await invoke(handler, validAnswer)).payload).toEqual({
-      accepted: true,
-      replayed: true,
-      code: 'STEERED',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect((await invoke(handler, { ...validAnswer, text: 'different steer' })).payload).toEqual({
+    expect(first.payload).toMatchObject({ accepted: true, replayed: false });
+    expect(replay.payload).toMatchObject({ accepted: true, replayed: true });
+    expect(conflict.payload).toEqual({
       accepted: false,
       code: 'REQUEST_CONFLICT',
       requestId,
       runId: expectedRunId,
     });
-    expect(runtime.steer).toHaveBeenCalledTimes(2);
+    expect(runtime.steer).toHaveBeenCalledTimes(1);
   });
 
-  test('replays an exact accepted answer and rejects changed payload or action', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const runtime = installRuntime();
-    const registrations = register();
-    const handler = method(registrations, 'answer');
-
-    expect((await invoke(handler, validAnswer)).payload.accepted).toBe(true);
-    expect((await invoke(handler, validAnswer)).payload).toEqual({
-      accepted: true,
-      replayed: true,
-      code: 'ANSWERED',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect((await invoke(handler, { ...validAnswer, text: 'Use SQLite.' })).payload).toEqual({
-      accepted: false,
-      code: 'REQUEST_CONFLICT',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect((await invoke(method(registrations, 'dismiss'), {
-      ...validTarget,
-      requestId,
-    })).payload).toEqual({
-      accepted: false,
-      code: 'REQUEST_CONFLICT',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect(runtime.answer).toHaveBeenCalledTimes(1);
-    expect(runtime.dismiss).not.toHaveBeenCalled();
-  });
-
-  test('does not record runtime rejection as a terminal receipt', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    const runtime = installRuntime({
-      answer: jest.fn()
-        .mockReturnValueOnce({ ok: false, code: 'REQUEST_EXPIRED', runId: expectedRunId })
-        .mockReturnValueOnce({ ok: true, code: 'ANSWERED', requestId, runId: expectedRunId }),
-    });
-    const handler = method(register(), 'answer');
-
-    expect((await invoke(handler, validAnswer)).payload.accepted).toBe(false);
-    expect((await invoke(handler, validAnswer)).payload).toEqual({
-      accepted: true,
-      replayed: false,
-      code: 'ANSWERED',
-      requestId,
-      runId: expectedRunId,
-    });
-    expect(runtime.answer).toHaveBeenCalledTimes(2);
-  });
-
-  test.each([
-    ['NO_ACTIVE_RUN', undefined],
-    ['NO_PENDING_INPUT', 'internal-session-id'],
-  ])('fails closed with %s before reading or answering', async (code, sessionId) => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue(sessionId);
-    const registrations = register();
-    const pending = await invoke(method(registrations, 'pending'), validTarget);
-    const answer = await invoke(method(registrations, 'answer'), validAnswer);
-
-    expect(pending.payload).toEqual({ pending: false, code });
-    expect(answer.payload).toEqual({ accepted: false, code, requestId });
-  });
-
-  test('rejects a runtime snapshot whose request or run identity is not exact', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    installRuntime({ read: jest.fn(() => ({ ...pendingSnapshot, runId: 'newer-run' })) });
-
-    expect((await invoke(method(register(), 'pending'), validTarget)).payload).toEqual({
-      pending: false,
-      code: 'HOTFIX_INVALID_STATE',
-    });
-  });
-
-  test('does not convert runtime throws or malformed success into acceptance', async () => {
-    mockResolveActiveEmbeddedRunSessionId.mockReturnValue('internal-session-id');
-    installRuntime({ answer: jest.fn(() => { throw new Error('delivery failed'); }) });
-    expect((await invoke(method(register(), 'answer'), validAnswer)).payload).toEqual({
-      accepted: false,
-      code: 'HOTFIX_ERROR',
-      requestId,
+  test('rejects malformed steer input before resolving or touching a run', async () => {
+    const runtime = installActiveRunRuntime();
+    const response = await invoke(method(register(), 'steer'), {
+      ...validSteer,
+      text: `bad${String.fromCharCode(0)}text`,
     });
 
-    installRuntime({
-      answer: jest.fn(() => ({
-        ok: true,
-        code: 'ANSWERED',
-        requestId,
-        runId: 'different-run',
-      })),
+    expect(response).toMatchObject({
+      ok: false,
+      payload: { accepted: false, code: 'INVALID_REQUEST' },
+      error: { code: 'invalid_request' },
     });
-    expect((await invoke(method(register(), 'answer'), validAnswer)).payload).toEqual({
-      accepted: false,
-      code: 'RUNTIME_REJECTED',
-      requestId,
-    });
-  });
-
-  test.each([
-    [{ ...validAnswer, sessionKey: '' }],
-    [{ ...validAnswer, expectedRunId: `run-${'x'.repeat(600)}` }],
-    [{ ...validAnswer, requestId: `request-${'x'.repeat(300)}` }],
-    [{ ...validAnswer, text: 'bad\u0000text' }],
-    [{ ...validAnswer, text: 'x'.repeat(32_769) }],
-  ])('rejects malformed or unbounded input before resolving a run', async (params) => {
-    const response = await invoke(method(register(), 'answer'), params);
-    expect(response.ok).toBe(false);
-    expect(response.payload).toEqual({ accepted: false, code: 'INVALID_REQUEST' });
-    expect(response.error).toEqual(expect.objectContaining({ code: 'invalid_request' }));
     expect(mockResolveActiveEmbeddedRunSessionId).not.toHaveBeenCalled();
+    expect(runtime.steer).not.toHaveBeenCalled();
   });
+
 });

@@ -1287,3 +1287,48 @@ test('marker hard-kill recovery rejects ambiguous or drifted publication identit
     }
   }
 });
+
+
+test('accepts the exact installed migration suffix and attests it before use', async () => {
+  const gate = __openClawGatewayAuthorizationFenceTest;
+  const show = snapshot({ activeState: 'active', subState: 'running', mainPid: 4312,
+    controlGroup: CONTROL_GROUP,
+    dropInPaths: [gate.OPENCLAW_GATEWAY_DROP_IN, gate.OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN].join(' '),
+  });
+  const dependencies = fixture([show]);
+  const attestMigrationPermitDropIn = jest.fn(() => {});
+  const fence = createOpenClawGatewayAuthorizationFence({ ...dependencies, attestMigrationPermitDropIn });
+  await expect(fence.inspect()).resolves.toMatchObject({ active: true, mainPid: 4312 });
+  expect(attestMigrationPermitDropIn).toHaveBeenCalledTimes(1);
+});
+
+test('refuses an active installer permit before gateway stop or start', async () => {
+  const gate = __openClawGatewayAuthorizationFenceTest;
+  const dependencies = fixture([snapshot({ activeState: 'active', subState: 'running', mainPid: 4312,
+    controlGroup: CONTROL_GROUP,
+    dropInPaths: [gate.OPENCLAW_GATEWAY_DROP_IN, gate.OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN].join(' '),
+  })]);
+  const fence = createOpenClawGatewayAuthorizationFence({ ...dependencies,
+    attestMigrationPermitDropIn: () => { throw new Error('live permit'); },
+  });
+  await expect(fence.stop()).rejects.toThrow('systemd identity');
+  expect(dependencies.systemctl.mock.calls.some(([args]) => ['stop', 'start'].includes(args[0]))).toBe(false);
+});
+
+test('migration gate matches the installer and rejects modified files and outstanding permits', () => {
+  const gate = __openClawGatewayAuthorizationFenceTest;
+  const installer = fs.readFileSync(path.resolve(__dirname, '../../../installer/install.sh'), 'utf8');
+  const content = installer.split("openclaw_gateway_migration_permit_dropin_text() {\n  cat <<'EOF'\n")[1].split('\nEOF\n}')[0] + '\n';
+  expect(gate.OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN_CONTENT).toBe(content);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-gateway-permit-test-'));
+  const dropIn = path.join(directory, 'gate.conf'), permit = path.join(directory, 'permit');
+  try {
+    fs.writeFileSync(dropIn, content, { mode: 0o600 });
+    expect(() => gate.attestMigrationPermitDropInFile(dropIn, permit)).not.toThrow();
+    fs.appendFileSync(dropIn, '\nExecCondition=\n');
+    expect(() => gate.attestMigrationPermitDropInFile(dropIn, permit)).toThrow();
+    fs.writeFileSync(dropIn, content);
+    fs.writeFileSync(permit, 'an outstanding installer permit');
+    expect(() => gate.attestMigrationPermitDropInFile(dropIn, permit)).toThrow('migration still owns');
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});

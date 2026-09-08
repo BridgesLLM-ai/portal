@@ -4,7 +4,6 @@ import client from '../../api/client';
 import ViewportModal from '../ViewportModal';
 import ApiKeySetupFlow from './ApiKeySetupFlow';
 import AwsSdkSetupFlow from './AwsSdkSetupFlow';
-import DeviceCodeFlow from './DeviceCodeFlow';
 import NativeCliSetupFlow from './NativeCliSetupFlow';
 import OAuthSetupFlow from './OAuthSetupFlow';
 import OpenClawProviderPicker from './OpenClawProviderPicker';
@@ -27,7 +26,7 @@ interface AiSetupStatusResponse {
   activeProfiles: string[];
 }
 
-export type NativeCliSetupProvider = 'claude-code' | 'codex' | 'gemini' | 'grok';
+export type NativeCliSetupProvider = 'claude-code' | 'codex' | 'gemini' | 'grok' | 'hermes' | 'opencode';
 
 interface AiProviderSetupProps {
   mode: 'wizard' | 'settings';
@@ -43,9 +42,10 @@ interface AiProviderSetupProps {
    * can be requested again deliberately.
    */
   initialNativeCliProvider?: NativeCliSetupProvider | null;
+  onInitialNativeCliProviderConsumed?: () => void;
 }
 
-export default function AiProviderSetup({ mode, apiBase, onComplete, compact = false, onNativeModelSelected, additionalProviderCards, initialNativeCliProvider = null }: AiProviderSetupProps) {
+export default function AiProviderSetup({ mode, apiBase, onComplete, compact = false, onNativeModelSelected, additionalProviderCards, initialNativeCliProvider = null, onInitialNativeCliProviderConsumed }: AiProviderSetupProps) {
   const settingsMutation = useSettingsMutationCoordinator();
   const settingsClaim = settingsMutation?.claim;
   const settingsRelease = settingsMutation?.release;
@@ -56,7 +56,6 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   const [providers, setProviders] = useState<ProviderUIConfig[]>([]);
   const [activeSetup, setActiveSetup] = useState<ProviderUIConfig | null>(null);
   const [activeAuthType, setActiveAuthType] = useState<ProviderAuthType | null>(null);
-  const [activeDeviceFlow, setActiveDeviceFlow] = useState(false);
   const [activeNativeCliFlow, setActiveNativeCliFlow] = useState<NativeCliSetupProvider | null>(null);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
   const [removalTarget, setRemovalTarget] = useState<{
@@ -131,11 +130,6 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
     releaseSettingsFlow();
   };
 
-  const closeDeviceFlow = () => {
-    setActiveDeviceFlow(false);
-    releaseSettingsFlow();
-  };
-
   const closeNativeCliFlow = () => {
     setActiveNativeCliFlow(null);
     releaseSettingsFlow();
@@ -144,11 +138,6 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   const handleCardChoose = (id: string) => {
     if (id === 'openclaw') {
       setShowProviderPicker(true);
-      return;
-    }
-    if (id === 'github-copilot') {
-      if (!claimSettingsFlow('settings:ai-provider:github-copilot')) return;
-      setActiveDeviceFlow(true);
       return;
     }
     const provider = getProviderConfig(providers, id);
@@ -167,12 +156,17 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
       'CODEX': 'codex',
       'GEMINI': 'gemini',
       'GROK': 'grok',
+      'HERMES': 'hermes',
+      'OPENCODE': 'opencode',
       'claude-code': 'claude-code',
       'codex': 'codex',
       'gemini': 'gemini',
       'grok': 'grok',
+      'hermes': 'hermes',
+      'opencode': 'opencode',
     };
     const mapped = providerMap[nativeProvider];
+    if (mapped === 'codex') return false;
     if (mapped && claimSettingsFlow(`settings:ai-provider:native:${mapped}`)) {
       setActiveNativeCliFlow(mapped);
       return true;
@@ -188,8 +182,9 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
     if (consumedInitialNativeCliProviderRef.current === initialNativeCliProvider) return;
     if (handleNativeCliLogin(initialNativeCliProvider)) {
       consumedInitialNativeCliProviderRef.current = initialNativeCliProvider;
+      onInitialNativeCliProviderConsumed?.();
     }
-  }, [handleNativeCliLogin, initialNativeCliProvider]);
+  }, [handleNativeCliLogin, initialNativeCliProvider, onInitialNativeCliProviderConsumed]);
 
   const beginProviderRemoval = (provider: ProviderUIConfig) => {
     if (!claimSettingsFlow(`settings:ai-provider:remove:${provider.id}`)) return;
@@ -318,7 +313,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
       <div className="space-y-3">
         {/* Header */}
         <div className="flex items-center justify-between">
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">AI Providers</span>
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Model Providers</span>
           <button
             type="button"
             onClick={() => loadStatus(true)}
@@ -366,6 +361,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
             compact
             additionalCards={additionalProviderCards}
             showBuiltInCards={!loading}
+            showHarnessNativeCards={mode === 'settings'}
           />
         ) : null}
 
@@ -379,11 +375,6 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
               setShowProviderPicker(false);
             }}
             onRemove={beginProviderRemoval}
-            onDeviceFlow={() => {
-              if (!claimSettingsFlow('settings:ai-provider:github-copilot')) return;
-              setShowProviderPicker(false);
-              setActiveDeviceFlow(true);
-            }}
             onClose={() => setShowProviderPicker(false)}
           />
         ) : null}
@@ -413,15 +404,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
             apiBase={apiBase}
             onComplete={handleComplete}
             onCancel={closeProviderSetup}
-            onNativeCliLogin={() => {
-              setActiveSetup(null);
-              setActiveAuthType(null);
-              setActiveNativeCliFlow('claude-code');
-            }}
           />
-        ) : null}
-        {activeDeviceFlow ? (
-          <DeviceCodeFlow apiBase={apiBase} onComplete={async () => { await handleComplete(); closeDeviceFlow(); }} onCancel={closeDeviceFlow} />
         ) : null}
         {activeNativeCliFlow ? (
           <NativeCliSetupFlow provider={activeNativeCliFlow} apiBase={apiBase} onComplete={async () => { await handleComplete(); closeNativeCliFlow(); }} onCancel={closeNativeCliFlow} onModelSelected={onNativeModelSelected} />
@@ -438,10 +421,10 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
         <div>
           <div className="flex items-center gap-2 text-white">
             <Cpu className="h-5 w-5 text-emerald-300" />
-            <h3 className="text-lg font-semibold">AI Providers</h3>
+            <h3 className="text-lg font-semibold">Model Providers</h3>
           </div>
           <p className="mt-1 text-sm text-slate-400">
-            Connect a provider to unlock chat, agents, and coding tools.
+            Connect a model-provider account to supply models to Agent Chat, qualified Project Chat, and coding tools.
           </p>
         </div>
         <button
@@ -503,6 +486,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
           statusMap={statusMap}
           additionalCards={additionalProviderCards}
           showBuiltInCards={!loading}
+          showHarnessNativeCards={mode === 'settings'}
         />
       ) : null}
 
@@ -516,11 +500,6 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
             setShowProviderPicker(false);
           }}
           onRemove={beginProviderRemoval}
-          onDeviceFlow={() => {
-            if (!claimSettingsFlow('settings:ai-provider:github-copilot')) return;
-            setShowProviderPicker(false);
-            setActiveDeviceFlow(true);
-          }}
           onClose={() => setShowProviderPicker(false)}
         />
       ) : null}
@@ -551,18 +530,6 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
           apiBase={apiBase}
           onComplete={handleComplete}
           onCancel={closeProviderSetup}
-          onNativeCliLogin={() => {
-            setActiveSetup(null);
-            setActiveAuthType(null);
-            setActiveNativeCliFlow('claude-code');
-          }}
-        />
-      ) : null}
-      {activeDeviceFlow ? (
-        <DeviceCodeFlow
-          apiBase={apiBase}
-          onComplete={async () => { await handleComplete(); closeDeviceFlow(); }}
-          onCancel={closeDeviceFlow}
         />
       ) : null}
       {activeNativeCliFlow ? (

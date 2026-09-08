@@ -14,6 +14,9 @@ describe('atomic user deletion cleanup', () => {
   let withGlobalWorkspaceAuthorizationFenceMock: jest.Mock;
   let updateUserAuthorizationMock: jest.Mock;
   let transferOwnershipMock: jest.Mock;
+  let getAdminUserRetirementStartupRecoverySummaryMock: jest.Mock;
+  let readAdminUserRetirementMock: jest.Mock;
+  let retireAdminUserAccountMock: jest.Mock;
 
   async function loadService(appPath = appSourcePath) {
     jest.resetModules();
@@ -81,6 +84,17 @@ describe('atomic user deletion cleanup', () => {
       ],
       targetEmail: 'next-owner@example.com',
     }));
+    getAdminUserRetirementStartupRecoverySummaryMock = jest.fn(() => ({
+      recovered: [],
+      blocked: [],
+      busy: [],
+    }));
+    readAdminUserRetirementMock = jest.fn(async () => null);
+    retireAdminUserAccountMock = jest.fn(async () => ({
+      id: 'retirement-1',
+      status: 'COMPLETE',
+      authorizationTransitionId: 'transition-1',
+    }));
 
     jest.doMock('../config/database', () => ({ prisma: prismaMock }));
     jest.doMock('../services/app-process.service', () => ({ stopApp }));
@@ -92,13 +106,22 @@ describe('atomic user deletion cleanup', () => {
     }));
     jest.doMock('../utils/openclawGatewayRpc', () => ({
       deleteSession: jest.fn(async () => ({ ok: true })),
-      gatewayRpcCall: jest.fn(async () => ({ ok: true, data: { config: { agents: { list: [] } } } })),
+      gatewayRpcCall: jest.fn(async () => ({ ok: true, data: { config: { agents: { entries: {} } } } })),
     }));
     jest.doMock('../services/authorizationChangeBus', () => ({ publishAuthorizationChanged }));
     jest.doMock('../services/workspaceAuthorizationBarrier', () => ({
       withGlobalWorkspaceAuthorizationFence: withGlobalWorkspaceAuthorizationFenceMock,
       withWorkspaceAuthorizationFence: async (_userId: string, operation: () => Promise<unknown>) => operation(),
       withWorkspaceAuthorizationFences: async (_userIds: string[], operation: () => Promise<unknown>) => operation(),
+      settleWorkspaceAuthorizationRequest: jest.fn(),
+    }));
+    jest.doMock('../services/adminUserRetirementRuntime', () => ({
+      emailDigestForAdminUserRetirement: jest.fn(() => 'a'.repeat(64)),
+      getAdminUserRetirementStartupRecoverySummary:
+        getAdminUserRetirementStartupRecoverySummaryMock,
+      publicAdminUserRetirementFailure: jest.fn(() => null),
+      readAdminUserRetirement: readAdminUserRetirementMock,
+      retireAdminUserAccount: retireAdminUserAccountMock,
     }));
     jest.doMock('../services/projectRuntimeAuthorizationPolicy', () => ({
       ...jest.requireActual('../services/projectRuntimeAuthorizationPolicy'),
@@ -172,7 +195,7 @@ describe('atomic user deletion cleanup', () => {
     expect(fs.existsSync(path.join(outsidePath, 'sentinel.txt'))).toBe(true);
   });
 
-  test('admin route returns terminal 409 without starting a transaction or external cleanup', async () => {
+  test('admin route delegates durable retirement without invoking legacy cleanup', async () => {
     await loadService();
     prismaMock.user.findUnique.mockResolvedValue({
       id: 'target-user',
@@ -190,7 +213,7 @@ describe('atomic user deletion cleanup', () => {
     const request = {
       params: { id: 'target-user' },
       user: { userId: 'owner-user', role: 'OWNER' },
-      body: {},
+      body: { confirmation: 'DELETE target@example.com' },
     };
     const response: any = { status: jest.fn(), json: jest.fn() };
     response.status.mockReturnValue(response);
@@ -198,17 +221,141 @@ describe('atomic user deletion cleanup', () => {
 
     await handler(request, response, next);
 
-    expect(response.status).toHaveBeenCalledWith(409);
+    expect(response.status).not.toHaveBeenCalled();
     expect(response.json).toHaveBeenCalledWith({
-      error: 'Admin user deletion is unavailable while Portal 4 identity-aware user retirement is pending.',
-      code: 'ADMIN_USER_DELETION_RETIREMENT_PENDING',
-      retryable: false,
+      success: true,
+      retirement: {
+        id: 'retirement-1',
+        status: 'COMPLETE',
+        completed: true,
+        idempotent: false,
+      },
     });
     expect(next).not.toHaveBeenCalled();
+    expect(retireAdminUserAccountMock).toHaveBeenCalledWith({
+      targetUserId: 'target-user',
+      requestedByUserId: 'owner-user',
+      expectedTargetEmailDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
     expect(prismaMock.$transaction).not.toHaveBeenCalled();
-    expect(prismaMock.activityLog.create).not.toHaveBeenCalled();
+    expect(prismaMock.activityLog.create).toHaveBeenCalledTimes(1);
     expect(stopApp).not.toHaveBeenCalled();
     expect(deleteMailbox).not.toHaveBeenCalled();
+  });
+
+  test('returns exact actionable dependency blockers from retirement admission', async () => {
+    await loadService();
+    prismaMock.user.findUnique.mockResolvedValue({
+      id: 'target-user',
+      email: 'target@example.com',
+      role: 'USER',
+    });
+    const transitionModule = await import('../services/projectAuthorizationTransition');
+    const dependencyError: any = new transitionModule.ProjectAuthorizationTransitionError(
+      'ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE',
+      'Project dependency evidence is active',
+    );
+    dependencyError.code = 'ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE';
+    dependencyError.statusCode = 409;
+    dependencyError.retryable = true;
+    dependencyError.message = 'Project dependency evidence is active';
+    dependencyError.blockers = [{
+      kind: 'PROMOTION_DECISION',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      projectIdentityId: 'foreign-project',
+      workspaceOwnerId: 'other-owner',
+      projectName: 'foreign-project',
+      status: 'APPLIED',
+      actorReference: true,
+      ownedProject: false,
+    }];
+    dependencyError.truncated = false;
+    retireAdminUserAccountMock.mockRejectedValueOnce(dependencyError);
+
+    const adminRouter = (await import('../routes/admin')).default as any;
+    const layer = adminRouter.stack.find((candidate: any) => (
+      candidate.route?.path === '/users/:id'
+      && candidate.route?.methods?.delete === true
+    ));
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    const response: any = {
+      status: jest.fn(function status() { return response; }),
+      json: jest.fn(),
+    };
+    const next = jest.fn();
+
+    await handler({
+      params: { id: 'target-user' },
+      user: { userId: 'owner-user', role: 'OWNER' },
+      body: { confirmation: 'DELETE target@example.com' },
+    }, response, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(response.status).toHaveBeenCalledWith(409);
+    expect(response.json).toHaveBeenCalledWith({
+      error: 'Project dependency evidence is active',
+      code: 'ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE',
+      retryable: true,
+      blockers: dependencyError.blockers,
+      blockersTruncated: false,
+    });
+    expect(prismaMock.activityLog.create).not.toHaveBeenCalled();
+  });
+
+  test('surfaces bounded BLOCKED recovery state without exposing failure detail', async () => {
+    await loadService();
+    prismaMock.user.findUnique.mockResolvedValue({ id: 'target-user', role: 'USER' });
+    readAdminUserRetirementMock.mockResolvedValueOnce({
+      id: 'retirement-1',
+      phase: 'SHARED_ACTOR_STATE_RETIRED',
+      status: 'BLOCKED',
+      lastErrorCode: 'EXACT_RETRY_REQUIRED',
+      lastErrorDetail: 'private filesystem and database detail',
+    });
+    getAdminUserRetirementStartupRecoverySummaryMock.mockReturnValueOnce({
+      recovered: [],
+      blocked: [{
+        retirementId: 'retirement-1',
+        targetUserId: 'target-user',
+        errorCode: 'EXACT_RETRY_REQUIRED',
+      }],
+      busy: [],
+    });
+
+    const adminRouter = (await import('../routes/admin')).default as any;
+    const layer = adminRouter.stack.find((candidate: any) => (
+      candidate.route?.path === '/users/:id/deletion-readiness'
+      && candidate.route?.methods?.get === true
+    ));
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    const response: any = { json: jest.fn() };
+    const next = jest.fn();
+
+    await handler({
+      params: { id: 'target-user' },
+      user: { userId: 'owner-user', role: 'OWNER' },
+    }, response, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
+      startupRecovery: {
+        recovered: [],
+        blocked: [{
+          retirementId: 'retirement-1',
+          targetUserId: 'target-user',
+          errorCode: 'EXACT_RETRY_REQUIRED',
+        }],
+        busy: [],
+      },
+      retirement: {
+        id: 'retirement-1',
+        phase: 'SHARED_ACTOR_STATE_RETIRED',
+        status: 'BLOCKED',
+        lastErrorCode: 'EXACT_RETRY_REQUIRED',
+        manuallyRetryable: true,
+      },
+    }));
+    expect(JSON.stringify(response.json.mock.calls)).not.toContain('private filesystem');
   });
 
   test('keeps the Project owner FK non-cascading through an atomic migration', () => {
@@ -223,6 +370,19 @@ describe('atomic user deletion cleanup', () => {
     expect(migration).toMatch(/BEGIN;[\s\S]+DROP CONSTRAINT[\s\S]+ON DELETE RESTRICT[\s\S]+COMMIT;/);
     expect(migration).toContain('DROP CONSTRAINT "ProjectIdentity_workspaceOwnerId_fkey"');
     expect(migration).toContain('ON DELETE RESTRICT ON UPDATE CASCADE');
+  });
+
+  test('keeps the durable retirement identifier aligned with its applied UUID migration', () => {
+    const schema = fs.readFileSync(path.join(__dirname, '../../prisma/schema.prisma'), 'utf8');
+    const migration = fs.readFileSync(path.join(
+      __dirname,
+      '../../prisma/migrations/20260820_user_retirement_durable/migration.sql',
+    ), 'utf8');
+
+    expect(schema).toMatch(
+      /model AdminUserRetirement \{[\s\S]*?id\s+String\s+@id\s+@default\(uuid\(\)\)\s+@db\.Uuid/,
+    );
+    expect(migration).toContain('"id" UUID NOT NULL');
   });
 
   test('returns the durable safety contract and delegates authorization changes', async () => {

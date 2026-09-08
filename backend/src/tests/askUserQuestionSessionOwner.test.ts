@@ -11,6 +11,7 @@ import {
   listPendingAskUserQuestions,
 } from '../services/askUserQuestionBroker';
 import { deriveOpenClawProjectSessionKey } from '../services/openclawProjectSandbox';
+import { OPENCLAW_PROJECT_RUNTIME } from '../services/projectChatProviderRegistry';
 
 type Evidence = Partial<Record<keyof AskUserQuestionOwnerDatabase, any[]>>;
 
@@ -117,6 +118,7 @@ function projectEvidence(overrides: Record<string, unknown> = {}): Evidence {
       projectIdentityId: projectId,
       activeProjectKey: projectId,
       provider: 'OPENCLAW',
+      runtime: OPENCLAW_PROJECT_RUNTIME,
       status: 'RUNNING',
       providerSessionId: projectSessionKey,
       leaseExpiresAt,
@@ -134,6 +136,7 @@ function projectEvidence(overrides: Record<string, unknown> = {}): Evidence {
       userId: projectActor,
       projectId,
       provider: 'OPENCLAW',
+      runtime: OPENCLAW_PROJECT_RUNTIME,
       status: 'active',
       sessionKey: projectSessionKey,
       externalSessionId: projectSessionKey,
@@ -144,6 +147,7 @@ function projectEvidence(overrides: Record<string, unknown> = {}): Evidence {
       sessionKey: projectSessionKey,
       status: 'active',
       activeProvider: 'OPENCLAW',
+      runtime: OPENCLAW_PROJECT_RUNTIME,
     }],
     projectIdentity: [{
       id: projectId,
@@ -252,6 +256,73 @@ describe('ask-user exact active-run ownership', () => {
       actorAuthorizationVersion: 9,
       projectIdentityId: projectId,
     });
+  });
+
+  test.each([
+    ['turn', { projectChatTurn: [{ runtime: 'stale-project-runtime' }] }],
+    ['binding', { projectChatProviderBinding: [{ runtime: 'stale-project-runtime' }] }],
+    ['session', { projectChatSession: [{ runtime: 'stale-project-runtime' }] }],
+  ])('rejects a Project Chat question with a mismatched %s runtime', async (_label, mutation) => {
+    const evidence = projectEvidence();
+    for (const [delegate, rows] of Object.entries(mutation)) {
+      const name = delegate as keyof Evidence;
+      evidence[name] = (evidence[name] || []).map((row, index) => (
+        index === 0 ? { ...row, ...(rows as Record<string, unknown>[])[0] } : row
+      ));
+    }
+    await expect(resolveAskUserQuestionRunOwner(
+      projectIdentity,
+      databaseWithEvidence(evidence),
+      new Date('2029-01-01T00:00:00.000Z'),
+    )).rejects.toMatchObject({ code: 'ASK_USER_RUN_UNOWNED', statusCode: 403 });
+  });
+
+  test('discovers and re-attests only the exact owner after a durable Project lease rotation', async () => {
+    const restartBoundary = new Date('2030-01-01T00:00:00.000Z');
+    const expiredDatabase = databaseWithEvidence(projectEvidence({
+      leaseOwner: 'portal-process-before-restart',
+      leaseExpiresAt: restartBoundary,
+    }));
+    await expect(discoverAskUserQuestionRunsForActor({
+      actorUserId: projectActor,
+      actorAuthorizationVersion: 9,
+      sessionKey: projectSessionKey,
+    }, expiredDatabase, restartBoundary)).resolves.toEqual([]);
+
+    const reattachedDatabase = databaseWithEvidence(projectEvidence({
+      leaseOwner: 'portal-process-after-restart',
+      leaseTokenHash: 'b'.repeat(64),
+      heartbeatAt: restartBoundary,
+      leaseExpiresAt: new Date(restartBoundary.getTime() + 300_000),
+    }));
+    await expect(discoverAskUserQuestionRunsForActor({
+      actorUserId: projectActor,
+      actorAuthorizationVersion: 9,
+      sessionKey: projectSessionKey,
+    }, reattachedDatabase, restartBoundary)).resolves.toEqual([{
+      sessionKey: projectSessionKey,
+      runId: projectIdentity.runId,
+      ownerUserId: projectActor,
+      surface: 'project-chat',
+      authorityId: projectTurnId,
+      actorAuthorizationVersion: 9,
+      projectIdentityId: projectId,
+    }]);
+
+    const record = await registerOwnedAskUserQuestion({
+      ...projectIdentity,
+      questions: [{ id: 'continue', question: 'Continue?', options: [{ label: 'Yes' }] }],
+    }, reattachedDatabase);
+    await expect(reattestAskUserQuestionRunForActor(
+      record.id,
+      projectActor,
+      reattachedDatabase,
+    )).resolves.toBe(record);
+    await expect(reattestAskUserQuestionRunForActor(
+      record.id,
+      'cross-user',
+      reattachedDatabase,
+    )).rejects.toMatchObject({ code: 'ASK_USER_NOT_FOUND', statusCode: 404 });
   });
 
   test.each([

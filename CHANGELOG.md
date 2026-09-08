@@ -2,6 +2,294 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.0] - 2026-09-08
+
+### Conversation-first project work
+
+- Keep live worker messages and tool activity in Agent Chat while a persistent
+  workspace holds files, Git changes, deployment state, Stop, and Continue.
+- Show file size, modification time, and net lines added/removed against the last
+  commit. Binary and unavailable counts are labelled explicitly. Preview images,
+  Markdown, and audio in place; file-name links open the exact file in Projects.
+- Preserve the originating conversation during native worker updates and publish
+  real native tool events to the durable activity stream.
+- Stop ordinary startup recovery from resetting unrelated OpenClaw conversations.
+  Existing transcripts are preserved; history hidden by an earlier explicit reset
+  remains subject to OpenClaw's history-window contract.
+- Support OpenClaw 9.2 workspace-qualified isolated Project Chat identities, while
+  retaining exact actor, project, runtime, mount, and network checks.
+
+### Installation reliability
+
+- Include ClawHub's complete, integrity-pinned runtime dependencies and verify
+  the staged CLI starts before publishing native tool changes. Missing dependencies
+  now fail before any installed package is replaced.
+
+### Security
+
+- Pin project file and directory descriptors while reading diffs, metadata, and
+  media, rejecting symlinks and concurrent path replacements that could expose
+  files outside the project.
+- Keep Agent Zero Project bridge credentials at their established location and
+  expose only its read-only tree inside the service's private mount namespace.
+  Fresh installs preserve private parent permissions; committed Portal updates
+  refresh the bridge runtime before canonical traffic without moving credentials.
+
+### Projects, backups, and maintenance
+
+- Resume an interrupted clean-slate uninstall after Docker retires its bridge
+  rules, using exact deletion receipts without changing unrelated firewall rules.
+
+- Include the Agent Chat, harness directory, Mermaid, and backup improvements
+  documented below during the 4.1.10 candidate cycle.
+- Keep projects/settings backups separate from whole-server recovery. Optional
+  agent history/personality exports remain reference material, not runtime config.
+- Keep Portal Update separate from AI runtime maintenance. Retained-data reconnect
+  preserves existing AI tools and project directory permissions.
+- Keep Mail optional: unconfigured Mail does not create mailbox obligations or
+  advertise unavailable shared inboxes.
+
+## [4.1.10] - 2026-09-07
+
+### Agent Chat
+
+- The project worker chooser follows Portal’s accent theme and names the selected
+  OpenClaw agent. Isolated Project Chat recognizes the current OpenClaw 9.x
+  sandbox identity and avoids overlapping workspace mounts.
+
+- Work on an explicitly selected project directly in Agent Chat. Durable cards
+  retain the target project and worker. Working notes, real tool calls/results,
+  and replies appear in the conversation, with project activity on the rail.
+  A pinned workspace keeps files, Git changes, deployment state, Stop and Continue
+  accessible while the chat scrolls; worker questions stay beside the composer.
+  Native workers start in the attested project folder using Agent Chat permissions;
+  OpenClaw receives that exact folder as task context. This is not a project sandbox.
+  Isolated Project Chat remains available in Projects, unchanged.
+- Find named agents and default assistants in one searchable directory, with the
+  harness displayed beneath each identity. Conversations retain their own history.
+
+- Put real task and plan progress in a Tasks dropdown beside the conversation.
+  Harnesses without a task feed do not show invented progress.
+- Render fenced Mermaid diagrams in an isolated, sanitized viewer.
+- Replace the persistent Portal-guide button with a one-time suggestion, and make
+  the packaged guide discoverable by native harnesses without granting new permissions.
+- Add native Grok Build and Antigravity integration, including native model catalogs
+  and conversation continuation. These integrations use host-operator scope;
+  unsupported project-sandbox execution remains unavailable.
+- Correct first-use working-directory creation and expired CLI readiness checks.
+  Interrupted Hermes and OpenCode setup can be reset by its owner without deleting
+  saved credentials or interrupting a running login process.
+- Keep harness labels, streaming messages, and saved conversations separate when
+  switching providers. Search and revisit sessions from the conversation selector.
+- Correct authorized OpenClaw transcript access. An inaccessible conversation now
+  offers a conversation choice instead of an endless retry loop; foreign and
+  project-scoped transcripts remain protected.
+- Group Agent Zero with the other harnesses in settings. Its provider account
+  controls open from the same compact setup layout.
+
+### Backups
+
+- Standard and scheduled backups now save Portal projects, database/settings,
+  uploads, app files, and assets. They do not archive AI runtimes or the VPS.
+- Comprehensive adds available agent personality files and Portal-native
+  conversation history as reference exports, not automatic harness restoration.
+- Verify archives before publication. Restore stages the database and files before
+  switching data and preserves the previous data for recovery. Runtime versions
+  and service definitions are not restored from the archive.
+- Keep legacy archive readers for existing backups. Fix their PostgreSQL input
+  handling and restored project identity binding without returning normal backups
+  to the legacy full-server path.
+
+### Installation and compatibility
+
+- The one-command entry point offers Install on a new host and Update / Repair on
+  an existing host. Explicit unattended actions remain available.
+- Ordinary Portal updates leave AI runtimes unchanged. Repair preserves data and
+  restores a stopped Portal; runtime maintenance remains a separate action.
+- Correct observed migration, rollback, interrupted recovery, firewall cleanup,
+  and commit-cleanup failures. Retain signature, ownership, and data protection checks.
+- Support the compatible OpenClaw 9.2 lane alongside the pinned installation bundle.
+  Runtime/model availability still depends on a connected, entitled provider account.
+- Preserve authored chat text through refresh, pagination, and export, including
+  text that resembles a runtime maintenance notice.
+- Check release dates and source versions before compilation, while retaining the
+  exact immutable-source checks during packaging. Builds use bounded workers.
+
+### Qualification scope
+
+- The 4.1.8/4.1.9 entries below describe unpublished development candidates.
+  Their legacy automatic-rescue claims are not a qualified release guarantee.
+  Public-version upgrade qualification starts from the published 4.0.19 release.
+- A provider appearing in a catalog does not prove account access or a working
+  harness. Developer-preview integrations remain labelled until qualified.
+
+## [4.1.9] - 2026-09-04
+
+### Fixed
+- **The compatible AI-tool bundle no longer invalidates its own Gateway
+  authority.** The installer now publishes and reloads the durable
+  migration-permit drop-in before sealing a pre-existing Gateway unit
+  definition, then revalidates that exact definition before arming the
+  migration fence.
+- **A 4.1.8 transaction stranded by that ordering defect recovers through its
+  sealed helper instead of requiring an operator bypass.** Recovery is limited
+  to the exact affected helper digest and the sole reviewed drop-in delta,
+  preserves the durable fence across reboots and pending process generations,
+  retires only provably stale one-start permits, and restores the old
+  fence-only definition before the sealed helper records lifecycle results.
+
+## [4.1.8] - 2026-09-04
+
+### Added
+- **One Owner action updates the compatible AI-tool bundle after the Portal is
+  updated.** The Dashboard installs exact Portal-qualified OpenClaw 2026.9.1,
+  Codex CLI 0.153.2, Claude Code 2.1.260, and ClawHub 0.23.3 packages rather
+  than following registry `latest` tags or independent self-updaters. Package,
+  executable, plugin, service, and configuration identities are verified before
+  the new tuple is admitted.
+- **GPT-6 Astra is available through the qualified Codex runtime when the
+  connected OpenAI account has access.** Portal uses the exact `gpt-6-astra`
+  model ID, keeps subscription and API-key catalogs separate, and does not make
+  an account-dependent model the automatic default or fallback.
+
+### Changed
+- **OpenClaw and its official stable plugins now target 2026.9.1.** The Codex
+  plugin is bound to Portal's separately attested Codex 0.153.2 App Server,
+  preserving the signed upstream plugin bytes while qualifying the newer native
+  harness and model catalog.
+- **Runtime maintenance is staged after the Portal transaction.** Existing
+  systems can update the Portal while retaining the supported OpenClaw 2026.7.1
+  lane, verify that stage, and then run the separate compatibility-bundle action.
+  Fresh installs converge to the same exact target tuple.
+
+### Fixed
+- **Comprehensive backups now attest native PostgreSQL correctly inside their
+  private PID namespace.** The anonymous credential runner binds parent and
+  child identities in one `/proc` coordinate system, preserving crash
+  containment without misreading namespace-local PIDs as host PIDs. Systemd
+  quiescence, recovery, and publication checks use the explicit local-host
+  transport so the private namespace cannot strand service control. The
+  post-quiescence capacity check preserves exact storage and source topology
+  while accepting only dimensions that remain within the already-held lease: a
+  final database transaction committed during graceful shutdown may grow the
+  dump bound, and the check accepts that redistribution because the aggregate
+  payload and per-component bounds remain the fail-closed limits. When the
+  revalidation still refuses, it reports every drifted dimension with its
+  held and observed bounds instead of failing silently. A component's
+  size bound may likewise redistribute inside the aggregate lease when the
+  backup's own capture-excluded progress records grow a measured root, while
+  member, path, and evidence inventories stay strict.
+- **A runtime migration can no longer settle as a mixed bundle.** Durable
+  journals bind package trees, plugins, native CLI links, Gateway unit identity,
+  activation intent, configuration/session migrations, and the final OpenClaw
+  decision. Pre-commit failures restore the complete predecessor; committed
+  recovery finishes the complete successor and rejects foreign drift.
+- **OpenClaw 2026.9.1 uses its current strict Codex configuration contract.**
+  Retired timeout keys are removed, external App Server command arguments are
+  represented separately, and Portal re-attests the host executable because the
+  plugin's managed-binary doctor intentionally skips external overrides.
+
+### Upgrading
+- Use the ordinary signed Portal update first. Then use the Owner-only **Update
+  compatible AI tools** action when the Dashboard offers it. Do not independently
+  update OpenClaw, Codex, Claude Code, ClawHub, or their managed plugins.
+- GPT-6 Astra availability depends on the connected OpenAI account. Its presence
+  in a model catalog is not an entitlement guarantee; Portal reports a clear
+  account-availability failure when the provider has not enabled it.
+
+## [4.1.2] - 2026-09-03
+
+### Fixed
+- **4.1 candidate reconciliation.** The backup helper's new coherent live-tree
+  capture identity is append-only attested for safe successor updates; strict
+  packaging now admits Sharp's declared WASM fallback; and Terminal admits the
+  Socket.IO handshake before observing connection state.
+
+## [4.1.1] - 2026-08-28
+
+### Fixed
+- **Daily, weekly, and monthly backups no longer require every writable tree to
+  go quiet.** A bounded set of members that changes during capture is frozen
+  through descriptor-safe snapshots, SQLite databases use verified online
+  backups, removed members are recorded as attested absences, and unrelated
+  late drift still fails closed. Comprehensive backups retain exact service-
+  quiesced whole-tree verification.
+- **Release dependency attestation remains strict with Sharp 0.35.3.** Its
+  installed WASM fallback is now an exact declared optional dependency, so the
+  build rejects real orphaned packages without misclassifying that fallback.
+
+### Release note
+- 4.1.1 is the first public 4.1 candidate. The 4.1.0 candidate remained
+  unpublished after its append-only backup-helper identity was sealed before
+  this final backup work landed.
+
+## [4.1.0] - 2026-08-28
+
+### Added
+- **Hermes and OpenCode can join Agent Chat when their installed runtimes and
+  credentials qualify.** Provider readiness now reports the actual installed
+  capability instead of promising a path the host cannot run. The separate
+  native DeepSeek Harness remains disabled and non-selectable in 4.1.
+- **Agent and Project Chat controls bind to the exact run.** Reconnect, history,
+  steering, clarification replies, and confirmed aborts retain the durable run
+  and session identity across refreshes, retries, Gateway restarts, and competing
+  browser tabs.
+- **User retirement is one durable operation.** Account admission closes before
+  managed sessions, projects, files, apps, shares, credentials, and runtime state
+  are removed or reassigned, with recovery evidence retained until completion.
+
+### Changed
+- **Fresh and explicitly supervised installs use OpenClaw 2026.8.1.** Portal
+  qualifies the exact 2026.8.1 core and Codex plugin pair, migrates legacy
+  config and session state transactionally, and uses OpenClaw's native question
+  authority. Ordinary Portal-only updates continue to support the retained exact
+  2026.7.1-2 core, 2026.7.1 runtime, and 2026.7.1-1 Codex plugin without changing
+  or restarting them.
+- **Ordinary existing-install updates are Portal-only.** The signed transaction
+  stages and proves the Portal candidate, updates Portal-owned runtime,
+  dependencies, schema, environment, routing, and service state, and rolls those
+  changes back on failure. It does not install, repair, configure, approve, or
+  restart OpenClaw, native CLIs, Docker/AppArmor, Project runtimes, Remote
+  Desktop, Ollama, or unrelated services.
+- **Codex and Claude Host Operator turns freshly admit the local CLI before every
+  launch.** Each turn reserves its durable `HostAgentRun`, then re-attests the
+  exact root-owned CLI immediately before the authenticated gate launches it in
+  a systemd scope. Absent, unsupported, or drifted installations are reported
+  as unavailable instead of being changed during a Portal update.
+- **Installer progress now describes real work instead of guessed completion.**
+  Fresh installs use a semantic 10-phase plan, or 11 with Tailnet, with measured
+  percentages only when byte or item totals exist. Plain, `NO_COLOR`, narrow
+  terminal, resize, interruption, recovery, and non-TTY output share the same
+  truthful state model. Dashboard updates remain compatible with older update
+  helpers but no longer display their ordinal markers as measured percentages.
+
+### Fixed
+- **Backup and recovery evidence survives more interruption shapes.** Candidate
+  backups, online SQLite snapshots, degraded archives, restore fences, complete
+  wipe receipts, and consecutive-failure alerts now fail closed without treating
+  partial evidence as a successful recovery point.
+- **Projects and hosted Apps preserve identity through promotion and recovery.**
+  App IDs, share targets, deployment paths, runtime intent, bounded archive
+  extraction, and proxied JSON response limits remain attached to the correct
+  generation across migration, rebind, interruption, and restart.
+- **Long Agent Chat sessions settle cleanly.** Exact-run attachment, history
+  pagination, abort races, clarification delivery, replacement runs, and
+  subscriber cleanup no longer silently cross or strand run boundaries.
+
+### Upgrading
+- Ordinary upgrades do not install or repair native host tools. An existing
+  exact OpenClaw 2026.7.1 installation remains supported and unchanged;
+  unsupported or altered tools remain unavailable until the operator performs
+  a separate, explicit maintenance operation.
+- Exact Codex `0.145.0` and `0.149.0`, and Claude `2.1.220` and `2.1.228`, can be
+  admitted when their root-owned package trees and credentials verify. Fresh
+  installs leave Codex, Claude, and ClawHub unchanged.
+- ClawHub `0.23.1` is recognized for status only; marketplace browsing requires
+  an admitted `0.23.3` installation. Existing upgrades do not add Hermes or
+  OpenCode automatically.
+- DeepSeek API-model access is separate from the native DeepSeek Harness. The
+  native harness remains disabled and non-selectable in 4.1.
+
 ## [4.0.19] - 2026-08-12
 
 ### Fixed

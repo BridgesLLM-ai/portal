@@ -21,10 +21,14 @@ describe('safe ZIP extraction', () => {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   });
 
-  async function createZip(fileName: string, build: (archive: archiver.Archiver) => void): Promise<string> {
+  async function createZip(
+    fileName: string,
+    build: (archive: archiver.Archiver) => void,
+    options: { store?: boolean } = {},
+  ): Promise<string> {
     const zipPath = path.join(tempRoot, fileName);
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const archive = archiver('zip', { zlib: { level: 9 }, store: options.store });
     const finished = new Promise<void>((resolve, reject) => {
       output.once('close', resolve);
       output.once('error', reject);
@@ -37,6 +41,27 @@ describe('safe ZIP extraction', () => {
     return zipPath;
   }
 
+  function corruptCentralDirectoryCrc(zipPath: string): void {
+    const raw = fs.readFileSync(zipPath);
+    const centralHeader = raw.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    if (centralHeader < 0) throw new Error('test ZIP lacks a central-directory entry');
+    raw.writeUInt32LE((raw.readUInt32LE(centralHeader + 16) ^ 0xffffffff) >>> 0, centralHeader + 16);
+    fs.writeFileSync(zipPath, raw);
+  }
+
+  function corruptStoredEntryPayload(zipPath: string): void {
+    const raw = fs.readFileSync(zipPath);
+    const localHeader = raw.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+    if (localHeader < 0 || raw.readUInt16LE(localHeader + 8) !== 0) {
+      throw new Error('test ZIP lacks a stored local entry');
+    }
+    const dataOffset = localHeader + 30
+      + raw.readUInt16LE(localHeader + 26)
+      + raw.readUInt16LE(localHeader + 28);
+    raw[dataOffset] ^= 0x01;
+    fs.writeFileSync(zipPath, raw);
+  }
+
   function entry(overrides: Partial<Parameters<typeof validateZipEntry>[0]> = {}) {
     return {
       fileName: 'file.txt',
@@ -44,6 +69,7 @@ describe('safe ZIP extraction', () => {
       uncompressedSize: 5,
       externalFileAttributes: 0,
       generalPurposeBitFlag: 0,
+      compressionMethod: 0,
       ...overrides,
     };
   }
@@ -56,6 +82,8 @@ describe('safe ZIP extraction', () => {
       entry({ fileName: 'dir\\file' }),
       entry({ generalPurposeBitFlag: 1 }),
       entry({ externalFileAttributes: 0o120777 << 16 }),
+      entry({ externalFileAttributes: 0o010644 << 16 }),
+      entry({ compressionMethod: 99 }),
       entry({ compressedSize: 1, uncompressedSize: PROJECT_ZIP_LIMITS.maxEntryBytes + 1 }),
       entry({ compressedSize: 1, uncompressedSize: PROJECT_ZIP_LIMITS.maxCompressionRatio + 1 }),
     ];
@@ -66,6 +94,27 @@ describe('safe ZIP extraction', () => {
     const state = createZipValidationState();
     validateZipEntry(entry(), state, PROJECT_ZIP_LIMITS);
     expect(() => validateZipEntry(entry(), state, PROJECT_ZIP_LIMITS)).toThrow(/duplicate/);
+
+    const parentFileState = createZipValidationState();
+    validateZipEntry(entry({ fileName: 'node' }), parentFileState, PROJECT_ZIP_LIMITS);
+    expect(() => validateZipEntry(
+      entry({ fileName: 'node/child.txt' }),
+      parentFileState,
+      PROJECT_ZIP_LIMITS,
+    )).toThrow(/collision/);
+
+    const childFirstState = createZipValidationState();
+    validateZipEntry(entry({ fileName: 'node/child.txt' }), childFirstState, PROJECT_ZIP_LIMITS);
+    expect(() => validateZipEntry(entry({ fileName: 'node' }), childFirstState, PROJECT_ZIP_LIMITS))
+      .toThrow(/collision/);
+
+    const metadataState = createZipValidationState();
+    expect(() => validateZipEntry(entry({
+      fileNameLength: 5,
+      extraFieldLength: 8,
+      fileCommentLength: 9,
+    }), metadataState, { ...PROJECT_ZIP_LIMITS, maxMetadataBytes: 21 }))
+      .toThrow(/metadata/i);
   });
 
   test('extracts to staging, audits the result, collapses one root, then promotes atomically', async () => {
@@ -210,6 +259,82 @@ describe('safe ZIP extraction', () => {
     await expect(safeExtractZipToNewDirectory(zipPath, destination)).rejects.toThrow(/symbolic link/i);
     expect(fs.existsSync(destination)).toBe(false);
     expect(fs.readdirSync(tempRoot).some((name) => name.includes('.extract-'))).toBe(false);
+  });
+
+  test('rejects a symlink followed by the same regular path before writing any entry', async () => {
+    const outside = path.join(tempRoot, 'outside-sentinel.txt');
+    fs.writeFileSync(outside, 'unchanged');
+    const zipPath = await createZip('symlink-duplicate.zip', (archive) => {
+      archive.append('safe', { name: 'safe.txt' });
+      archive.symlink('same-path', outside);
+      archive.append('overwrite', { name: 'same-path' });
+    });
+    const destination = path.join(tempRoot, 'project');
+    const openSync = jest.spyOn(fs, 'openSync');
+    try {
+      await expect(safeExtractZipToNewDirectory(zipPath, destination))
+        .rejects.toThrow(/symbolic link|duplicate/i);
+      expect(openSync).not.toHaveBeenCalled();
+    } finally {
+      openSync.mockRestore();
+    }
+    expect(fs.readFileSync(outside, 'utf8')).toBe('unchanged');
+    expect(fs.existsSync(destination)).toBe(false);
+    expect(fs.readdirSync(tempRoot).some((name) => name.includes('.extract-'))).toBe(false);
+  });
+
+  test('rejects corrupt and file-directory-collision archives without promotion', async () => {
+    const validZip = await createZip('valid-before-corruption.zip', (archive) => {
+      archive.append('hello', { name: 'readme.txt' });
+    });
+    const truncatedZip = path.join(tempRoot, 'truncated.zip');
+    const complete = fs.readFileSync(validZip);
+    fs.writeFileSync(truncatedZip, complete.subarray(0, complete.length - 12));
+    const corruptDestination = path.join(tempRoot, 'corrupt-project');
+    await expect(safeExtractZipToNewDirectory(truncatedZip, corruptDestination)).rejects.toThrow();
+    expect(fs.existsSync(corruptDestination)).toBe(false);
+
+    const collisionZip = await createZip('collision.zip', (archive) => {
+      archive.append('file', { name: 'node' });
+      archive.append('child', { name: 'node/child.txt' });
+    });
+    const collisionDestination = path.join(tempRoot, 'collision-project');
+    await expect(safeExtractZipToNewDirectory(collisionZip, collisionDestination))
+      .rejects.toThrow(/collision/i);
+    expect(fs.existsSync(collisionDestination)).toBe(false);
+    expect(fs.readdirSync(tempRoot).some((name) => name.includes('.extract-'))).toBe(false);
+  });
+
+  test.each([
+    ['stored', true],
+    ['deflated', false],
+  ] as const)('rejects a same-size CRC-corrupt %s entry without promotion', async (label, store) => {
+    const zipPath = await createZip(`${label}-crc.zip`, (archive) => {
+      archive.append('crc-protected-content'.repeat(64), { name: 'readme.txt' });
+    }, { store });
+    if (store) corruptStoredEntryPayload(zipPath);
+    else corruptCentralDirectoryCrc(zipPath);
+    const destination = path.join(tempRoot, `${label}-crc-project`);
+
+    await expect(safeExtractZipToNewDirectory(zipPath, destination))
+      .rejects.toThrow(/CRC-32/i);
+    expect(fs.existsSync(destination)).toBe(false);
+    expect(fs.readdirSync(tempRoot).some((name) => name.includes('.extract-'))).toBe(false);
+  });
+
+  test('preserves executable mode while ignoring macOS metadata', async () => {
+    const zipPath = await createZip('macos-and-mode.zip', (archive) => {
+      archive.append('metadata', { name: '__MACOSX/._run.sh' });
+      archive.append('#!/bin/sh\necho safe\n', { name: 'source/bin/run.sh', mode: 0o755 });
+      archive.append('hello', { name: 'source/readme.txt', mode: 0o644 });
+    });
+    const destination = path.join(tempRoot, 'project');
+    await safeExtractZipToNewDirectory(zipPath, destination, { collapseSingleRoot: true });
+
+    expect(fs.existsSync(path.join(destination, '__MACOSX'))).toBe(false);
+    expect(fs.readFileSync(path.join(destination, 'bin/run.sh'), 'utf8')).toContain('echo safe');
+    expect(fs.statSync(path.join(destination, 'bin/run.sh')).mode & 0o777).toBe(0o755);
+    expect(fs.statSync(path.join(destination, 'readme.txt')).mode & 0o777).toBe(0o644);
   });
 
   test('enforces aggregate expanded size before promotion', async () => {

@@ -4,12 +4,58 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { getGatewayToken } from '../utils/gatewayToken';
 import { buildOpenClawCliEnv, extractJsonFromCliOutput } from '../utils/openclawCli';
-import { OPENCLAW_CODEX_PLUGIN_VERSION } from './openclawConfigManager';
+import {
+  LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION,
+  OPENCLAW_CODEX_PLUGIN_VERSION,
+} from './openclawConfigManager';
 
 const execFileAsync = promisify(execFile);
 
-export const TESTED_OPENCLAW_CORE_PACKAGE_VERSION = process.env.PORTAL_OPENCLAW_CORE_PACKAGE_VERSION || '2026.7.1-2';
-export const TESTED_OPENCLAW_RUNTIME_VERSION = process.env.PORTAL_OPENCLAW_RUNTIME_VERSION || '2026.7.1';
+export const TESTED_OPENCLAW_CORE_PACKAGE_VERSION = process.env.PORTAL_OPENCLAW_CORE_PACKAGE_VERSION || '2026.9.1';
+export const TESTED_OPENCLAW_RUNTIME_VERSION = process.env.PORTAL_OPENCLAW_RUNTIME_VERSION || '2026.9.1';
+export const LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION = '2026.7.1-2';
+export const LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION = '2026.7.1';
+
+// The family names identify API contracts, not every compatible patch release.
+export const QUALIFIED_OPENCLAW_NATIVE_PATCHES: readonly string[] = Object.freeze(['2026.9.1', '2026.9.2']);
+
+export type OpenClawTestedRuntimeFamily = 'legacy-2026.7.1' | 'current-2026.9.1';
+
+interface OpenClawTestedTuple {
+  family: OpenClawTestedRuntimeFamily;
+  corePackageVersion: string;
+  runtimeVersions: readonly string[];
+  codexPluginVersion: string;
+}
+
+const TESTED_OPENCLAW_TUPLES: readonly OpenClawTestedTuple[] = Object.freeze([
+  Object.freeze({
+    family: 'legacy-2026.7.1',
+    corePackageVersion: LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+    runtimeVersions: Object.freeze([
+      LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION,
+      LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+    ]),
+    codexPluginVersion: LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION,
+  }),
+  Object.freeze({
+    family: 'current-2026.9.1',
+    corePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+    runtimeVersions: Object.freeze(Array.from(new Set([
+      TESTED_OPENCLAW_RUNTIME_VERSION,
+      TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+    ]))),
+    codexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
+  }),
+  ...QUALIFIED_OPENCLAW_NATIVE_PATCHES
+    .filter((version) => version !== TESTED_OPENCLAW_CORE_PACKAGE_VERSION)
+    .map((version): OpenClawTestedTuple => Object.freeze({
+      family: 'current-2026.9.1',
+      corePackageVersion: version,
+      runtimeVersions: Object.freeze([version]),
+      codexPluginVersion: version,
+    })),
+]);
 
 interface OpenClawCliResult {
   ok: boolean;
@@ -57,6 +103,7 @@ export interface OpenClawSetupReadiness {
   testedCorePackageVersion: string;
   testedRuntimeVersion: string;
   testedCodexPluginVersion: string;
+  testedRuntimeFamily?: OpenClawTestedRuntimeFamily | null;
   testedPairReady: boolean;
   ready: boolean;
   blockers: OpenClawSetupReadinessBlocker[];
@@ -82,14 +129,20 @@ function parseOpenClawVersion(raw: unknown): string | null {
   return match?.[1] || null;
 }
 
-// The CLI banner and the gateway probe both report the npm PACKAGE version
-// (for example 2026.7.1-2), while the runtime pin is the unsuffixed release
-// (2026.7.1). Both identify the same tested install; treating the packaging
-// suffix as a mismatch falsely reports a healthy box as running an old build.
 export function matchesTestedRuntime(version: string | null): boolean {
   if (!version) return false;
-  return version === TESTED_OPENCLAW_RUNTIME_VERSION
-    || version === TESTED_OPENCLAW_CORE_PACKAGE_VERSION;
+  return TESTED_OPENCLAW_TUPLES.some((tuple) => tuple.runtimeVersions.includes(version));
+}
+
+function testedTupleForCore(corePackageVersion: string | null): OpenClawTestedTuple | null {
+  if (!corePackageVersion) return null;
+  return TESTED_OPENCLAW_TUPLES.find(
+    (tuple) => tuple.corePackageVersion === corePackageVersion,
+  ) || null;
+}
+
+function runtimeMatchesTuple(version: string | null, tuple: OpenClawTestedTuple | null): boolean {
+  return Boolean(version && tuple?.runtimeVersions.includes(version));
 }
 
 function parseJsonOutput(raw: string): any | null {
@@ -174,26 +227,34 @@ function existingPathChainIsSafeAndWritable(targetPath: string): boolean {
       nearestExisting = current;
     }
 
-    const nearestStat = fs.lstatSync(nearestExisting);
-    if (!nearestStat.isDirectory()) return false;
-    fs.accessSync(nearestExisting, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
-
     if (fs.existsSync(absolute)) {
       const targetStat = fs.lstatSync(absolute);
       if (targetStat.isSymbolicLink()) return false;
       if (targetStat.isDirectory()) {
         fs.accessSync(absolute, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
       } else if (targetStat.isFile()) {
+        const parent = path.dirname(absolute);
+        const parentStat = fs.lstatSync(parent);
+        if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) return false;
+        fs.accessSync(parent, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
         fs.accessSync(absolute, fs.constants.R_OK | fs.constants.W_OK);
       } else {
         return false;
       }
+    } else {
+      const nearestStat = fs.lstatSync(nearestExisting);
+      if (!nearestStat.isDirectory()) return false;
+      fs.accessSync(nearestExisting, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
     }
     return true;
   } catch {
     return false;
   }
 }
+
+export const __openClawSetupReadinessTest = Object.freeze({
+  existingPathChainIsSafeAndWritable,
+});
 
 function isOpenClawCredentialStoreWritable(): boolean {
   const homeDir = process.env.HOME || '/root';
@@ -296,7 +357,9 @@ async function collectOpenClawSetupReadinessUncached(
   const tokenParity = hasToken && authenticatedRpc;
   const credentialStoreWritable = dependencies.credentialStoreWritable();
   const credentialStoreReady = authStoreResult.ok && authStorePayload !== null;
-  const expectedCodexPluginSpec = `@openclaw/codex@${OPENCLAW_CODEX_PLUGIN_VERSION}`;
+  const testedTuple = testedTupleForCore(packageMetadata?.version || null);
+  const expectedCodexPluginVersion = testedTuple?.codexPluginVersion || OPENCLAW_CODEX_PLUGIN_VERSION;
+  const expectedCodexPluginSpec = `@openclaw/codex@${expectedCodexPluginVersion}`;
   const codexPluginVersion = typeof codexPlugin?.plugin?.version === 'string' ? codexPlugin.plugin.version : null;
   // What matters is the identity that was actually resolved and installed, not
   // the spec that was requested. The CLI records `spec: "@openclaw/codex"` for
@@ -318,35 +381,36 @@ async function collectOpenClawSetupReadinessUncached(
       ? codexPlugin.install.version
       : null;
   const codexPluginExact = codexPluginResult.ok
-    && codexPluginVersion === OPENCLAW_CODEX_PLUGIN_VERSION
+    && Boolean(testedTuple)
+    && codexPluginVersion === expectedCodexPluginVersion
     && codexPlugin?.install?.source === 'npm'
     && codexPluginInstallSpec === expectedCodexPluginSpec
-    && codexPluginInstalledVersion === OPENCLAW_CODEX_PLUGIN_VERSION;
+    && codexPluginInstalledVersion === expectedCodexPluginVersion;
   const installed = cliVersionResult.ok && Boolean(version) && Boolean(packageMetadata);
   const blockers: OpenClawSetupReadinessBlocker[] = [];
 
   if (!installed) {
     blockers.push({ code: 'not-installed', message: 'OpenClaw is not installed as a verifiable global package.' });
   }
-  if (packageMetadata?.version !== TESTED_OPENCLAW_CORE_PACKAGE_VERSION) {
+  if (!testedTuple) {
     blockers.push({
       code: 'core-package-mismatch',
-      message: `OpenClaw core must be ${TESTED_OPENCLAW_CORE_PACKAGE_VERSION}; detected ${packageMetadata?.version || 'unknown'}.`,
+      message: `OpenClaw core must match a supported version (${TESTED_OPENCLAW_TUPLES.map((tuple) => tuple.corePackageVersion).join(', ')}); detected ${packageMetadata?.version || 'unknown'}.`,
     });
   }
-  if (!matchesTestedRuntime(version)) {
+  if (!runtimeMatchesTuple(version, testedTuple)) {
     blockers.push({
       code: 'cli-runtime-mismatch',
-      message: `OpenClaw CLI runtime must be ${TESTED_OPENCLAW_RUNTIME_VERSION} (package ${TESTED_OPENCLAW_CORE_PACKAGE_VERSION}); detected ${version || 'unknown'}.`,
+      message: `OpenClaw CLI runtime did not match the installed tested core family; detected ${version || 'unknown'} for core ${packageMetadata?.version || 'unknown'}.`,
     });
   }
   if (!authenticatedRpc) {
     blockers.push({ code: 'gateway-rpc-unavailable', message: 'The OpenClaw gateway did not pass an authenticated RPC probe.' });
   }
-  if (!matchesTestedRuntime(runningVersion)) {
+  if (!runtimeMatchesTuple(runningVersion, testedTuple)) {
     blockers.push({
       code: 'gateway-runtime-mismatch',
-      message: `OpenClaw gateway runtime must be ${TESTED_OPENCLAW_RUNTIME_VERSION} (package ${TESTED_OPENCLAW_CORE_PACKAGE_VERSION}); detected ${runningVersion || 'unknown'}.`,
+      message: `OpenClaw gateway runtime did not match the installed tested core family; detected ${runningVersion || 'unknown'} for core ${packageMetadata?.version || 'unknown'}.`,
     });
   }
   if (!hasToken) {
@@ -368,9 +432,9 @@ async function collectOpenClawSetupReadinessUncached(
   }
 
   const testedPairReady = installed
-    && packageMetadata?.version === TESTED_OPENCLAW_CORE_PACKAGE_VERSION
-    && matchesTestedRuntime(version)
-    && matchesTestedRuntime(runningVersion)
+    && Boolean(testedTuple)
+    && runtimeMatchesTuple(version, testedTuple)
+    && runtimeMatchesTuple(runningVersion, testedTuple)
     && authenticatedRpc
     && codexPluginExact;
   const ready = testedPairReady
@@ -378,6 +442,13 @@ async function collectOpenClawSetupReadinessUncached(
     && credentialStoreReady
     && credentialStoreWritable
     && blockers.length === 0;
+  // The Portal supports a retained 7.1 tuple during a Portal-only update as
+  // well as the current 9.1 tuple. Report the tuple that actually admitted
+  // this host; reporting the default 9.1 constants for a healthy retained
+  // 7.1 host makes the dashboard contradict `testedPairReady`.
+  const reportedTestedTuple = testedTuple || TESTED_OPENCLAW_TUPLES.find(
+    (tuple) => tuple.corePackageVersion === TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
+  )!;
 
   return {
     installed,
@@ -395,9 +466,10 @@ async function collectOpenClawSetupReadinessUncached(
     codexPluginInstallSpec,
     credentialStoreReady,
     credentialStoreWritable,
-    testedCorePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-    testedRuntimeVersion: TESTED_OPENCLAW_RUNTIME_VERSION,
-    testedCodexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
+    testedCorePackageVersion: reportedTestedTuple.corePackageVersion,
+    testedRuntimeVersion: reportedTestedTuple.runtimeVersions[0],
+    testedCodexPluginVersion: reportedTestedTuple.codexPluginVersion,
+    testedRuntimeFamily: testedTuple?.family || null,
     testedPairReady,
     ready,
     blockers,

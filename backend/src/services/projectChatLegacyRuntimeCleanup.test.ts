@@ -54,6 +54,13 @@ function configuredAgent(overrides: Record<string, any> = {}) {
   };
 }
 
+function persistedAgentEntries(agents: Record<string, any>[]) {
+  return Object.fromEntries(agents.map((agent) => {
+    const { id, ...entry } = agent;
+    return [id, entry];
+  }));
+}
+
 function fixture(options: {
   collision?: boolean;
   configuredAgents?: Record<string, any>[];
@@ -65,6 +72,7 @@ function fixture(options: {
   failGlobalMigrationProofAt?: number;
   failGlobalEvidenceProofAt?: number;
   evidenceAppearsAfterFinalScan?: boolean;
+  rosterStorage?: 'list' | 'entries';
 } = {}) {
   let bindingCalls = 0;
   let sessionCalls = 0;
@@ -124,7 +132,16 @@ function fixture(options: {
     }
     return {
       ok: true,
-      data: { config: { agents: { list: configuredAgents } } },
+      data: {
+        config: {
+          agents: options.rosterStorage === 'list'
+            ? { list: configuredAgents }
+            : {
+                ownership: 'explicit',
+                entries: persistedAgentEntries(configuredAgents),
+              },
+        },
+      },
     };
   });
   const listAgentSessions = jest.fn(async (input: {
@@ -178,8 +195,10 @@ function fixture(options: {
   };
 }
 
-test('Clear remains pending and preserves every actor-attested 3.x session form', async () => {
-  const dependencies = fixture();
+test.each(['list', 'entries'] as const)(
+  'Clear remains pending and preserves every actor-attested 3.x session form through %s roster',
+  async (rosterStorage) => {
+  const dependencies = fixture({ rosterStorage });
   await expect(retireLegacyOpenClawProjectRuntime({
     actorUserId: ACTOR,
     targetProjectIds: [TARGET, LEGACY_NAME],
@@ -203,7 +222,8 @@ test('Clear remains pending and preserves every actor-attested 3.x session form'
   expect(dependencies.deleteAgent).not.toHaveBeenCalled();
   expect(dependencies.inspectAgents).toHaveBeenCalledTimes(2);
   expect(dependencies.listAgentSessions.mock.calls.length).toBeGreaterThanOrEqual(2);
-});
+  },
+);
 
 test('Clear remains pending on a persisted legacy key after its config agent disappeared', async () => {
   const dependencies = fixture({ configuredAgents: [] });
@@ -315,17 +335,9 @@ test('refuses a config agent bound to another Project before any Gateway mutatio
   expect(dependencies.deleteAgent).not.toHaveBeenCalled();
 });
 
-test('refuses a duplicated config agent identity before any Gateway mutation', async () => {
-  const driftedDuplicate = configuredAgent({
-    sandbox: {
-      ...configuredAgent().sandbox,
-      docker: {
-        ...configuredAgent().sandbox.docker,
-        binds: ['/portal/projects/another-owner/another-project:/workspace/project:rw'],
-      },
-    },
-  });
-  const dependencies = fixture({ configuredAgents: [configuredAgent(), driftedDuplicate] });
+test('refuses case-normalized duplicate config entry keys before any Gateway mutation', async () => {
+  const normalizedDuplicate = configuredAgent({ id: AGENT_ID.toUpperCase() });
+  const dependencies = fixture({ configuredAgents: [configuredAgent(), normalizedDuplicate] });
   await expect(retireLegacyOpenClawProjectRuntime({
     actorUserId: ACTOR,
     targetProjectIds: [TARGET, LEGACY_NAME],
@@ -342,7 +354,7 @@ test('refuses a duplicated config agent identity before any Gateway mutation', a
     inspectAgents: dependencies.inspectAgents,
     listAgentSessions: dependencies.listAgentSessions,
     attestAgentWorkspace: dependencies.attestAgentWorkspace,
-  })).rejects.toThrow(/duplicated/i);
+  })).rejects.toThrow(/invalid shape/i);
   expect(dependencies.abort).not.toHaveBeenCalled();
   expect(dependencies.deleteSession).not.toHaveBeenCalled();
   expect(dependencies.deleteAgent).not.toHaveBeenCalled();

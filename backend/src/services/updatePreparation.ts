@@ -138,8 +138,9 @@ export const PORTAL_SELF_UPDATE_SCRIPT = [
   'fi',
   // Terminal state is deliberately absent here. systemd invokes the stable
   // helper from ExecStopPost only after it has recorded how this main process
-  // died; success also requires install.sh's durable 99% checkpoint, which is
-  // published only after its authenticated canonical update-ready proof.
+  // died; success also requires install.sh's durable 99% `postflight`
+  // checkpoint. That legacy wire token is published only after final
+  // exact-version Portal verification; it does not represent host maintenance.
   '/bin/sync -f "$2" || true',
   'exit "$update_rc"',
 ].join('\n');

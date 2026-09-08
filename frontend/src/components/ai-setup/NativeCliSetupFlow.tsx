@@ -5,11 +5,12 @@ import { normalizeAgentChatModelId } from '../../utils/agentChatModelSelection';
 import { setAgentChatProviderModelsCache } from '../../utils/agentChatProviderModelsCache';
 import ViewportModal from '../ViewportModal';
 import ModelSelector, { type SelectableModel } from './ModelSelector';
+import HarnessNativeCliTerminal from './HarnessNativeCliTerminal';
 import { cancelOAuthSession } from './oauthCancellation';
 import { getOAuthStartRecoveryDisposition, readStructuredOAuthStartFailure } from './oauthFlowContract';
 
 interface NativeCliSetupFlowProps {
-  provider: 'claude-code' | 'codex' | 'gemini' | 'grok';
+  provider: 'claude-code' | 'codex' | 'gemini' | 'grok' | 'hermes' | 'opencode';
   apiBase: string;
   onComplete: () => void;
   onCancel: () => void;
@@ -30,13 +31,15 @@ async function withNativeDeadline<T>(operation: Promise<T>, timeoutMs: number, m
   }
 }
 
-type Step = 'start' | 'waiting' | 'paste' | 'device' | 'finalizing' | 'catalog' | 'model' | 'done' | 'error';
+type Step = 'start' | 'waiting' | 'paste' | 'device' | 'terminal' | 'finalizing' | 'catalog' | 'model' | 'done' | 'error';
 
 const PROVIDER_LABELS: Record<string, { name: string; color: string }> = {
-  'claude-code': { name: 'Claude Code', color: 'emerald' },
+  'claude-code': { name: 'Claude Project Sandbox', color: 'emerald' },
   codex: { name: 'Codex', color: 'blue' },
   gemini: { name: 'Antigravity', color: 'purple' },
   grok: { name: 'Grok Build', color: 'orange' },
+  hermes: { name: 'Hermes', color: 'emerald' },
+  opencode: { name: 'OpenCode', color: 'blue' },
 };
 
 function antigravityTier(model: { id: string; name: string }): SelectableModel['tier'] {
@@ -78,6 +81,8 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
   const [cancellationError, setCancellationError] = useState<string | null>(null);
   const [recoverySession, setRecoverySession] = useState(false);
   const [reviewState, setReviewState] = useState<'committed' | 'review_required' | null>(null);
+  const [finalizationWarning, setFinalizationWarning] = useState<string | null>(null);
+  const [lifecycleConflict, setLifecycleConflict] = useState(false);
   const operationRef = React.useRef<string | null>(null);
   const [operation, setOperation] = useState<string | null>(null);
   const pollGenerationRef = React.useRef(0);
@@ -100,6 +105,8 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
 
   const meta = PROVIDER_LABELS[provider];
   const isDeviceFlow = provider === 'codex' || provider === 'grok';
+  const isInteractiveHarnessFlow = provider === 'hermes' || provider === 'opencode';
+  const requiresBackgroundFinalization = provider === 'codex' || isInteractiveHarnessFlow;
 
   const loadAntigravityCatalog = React.useCallback(async () => {
     setStep('catalog');
@@ -166,7 +173,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
   const pollRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   React.useEffect(() => {
     let disposed = false;
-    if ((step === 'waiting' || step === 'device' || step === 'paste' || step === 'finalizing' || (step === 'error' && sessionOwned)) && sessionId) {
+    if ((step === 'waiting' || step === 'device' || step === 'paste' || step === 'terminal' || step === 'finalizing' || (step === 'error' && sessionOwned)) && sessionId) {
       const generation = ++pollGenerationRef.current;
       const schedule = () => {
         if (!disposed && generation === pollGenerationRef.current) {
@@ -195,7 +202,8 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
           }
           if (data?.status === 'complete') {
             setSessionOwned(false);
-            if (provider === 'codex' && data?.finalized !== true) {
+            setFinalizationWarning(typeof data?.finalizationWarning === 'string' ? data.finalizationWarning : null);
+            if (requiresBackgroundFinalization && data?.finalized !== true) {
               setError(null);
               setStep('finalizing');
               return;
@@ -238,7 +246,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
         pollRef.current = null;
       }
     };
-  }, [step, sessionId, sessionOwned, recoverySession, apiBase, meta.name, provider, loadAntigravityCatalog, scheduleCompletion]);
+  }, [step, sessionId, sessionOwned, recoverySession, apiBase, meta.name, provider, loadAntigravityCatalog, requiresBackgroundFinalization, scheduleCompletion]);
 
   const cancelAndClose = async () => {
     if (operationRef.current || reviewState) return;
@@ -277,25 +285,26 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
     onCancel();
   };
 
-  const startFlow = async (forceReauth = false) => {
+  const startFlow = async () => {
+    if (provider === 'codex') {
+      setError('Interactive host Codex login is unavailable from Portal. Supervised Agent Chat can use an existing attested host credential.');
+      return;
+    }
     if (sessionOwned || reviewState || !claimOperation('start')) return;
     setLoading(true);
     setError(null);
     setCancellationError(null);
+    setFinalizationWarning(null);
     setRecoverySession(false);
+    setLifecycleConflict(false);
     try {
       const { data } = await client.post(`${apiBase}/native-cli/start`, {
         provider,
         ...(provider === 'gemini' ? { forceReauth: true } : {}),
-        ...(provider === 'codex' && forceReauth ? { forceReauth: true } : {}),
       });
       if (!data.success) {
         const startFailure = readStructuredOAuthStartFailure(data);
-        if (provider === 'codex' && startFailure.code === 'CODEX_REAUTHENTICATION_REQUIRED') {
-          setError(startFailure.error || 'Portal stopped before replacing the existing Codex sign-in.');
-          setStep('start');
-          return;
-        }
+        setLifecycleConflict(isInteractiveHarnessFlow && startFailure.code === 'PROVIDER_CREDENTIAL_LIFECYCLE_CONFLICT');
         const disposition = getOAuthStartRecoveryDisposition(startFailure);
         if (disposition === 'cleanup_required' && startFailure.sessionId) {
           setSessionId(startFailure.sessionId);
@@ -330,7 +339,8 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
           await loadAntigravityCatalog();
           return;
         }
-        if (provider === 'codex' && data?.finalized !== true) {
+        setFinalizationWarning(typeof data?.finalizationWarning === 'string' ? data.finalizationWarning : null);
+        if (requiresBackgroundFinalization && data?.finalized !== true) {
           setStep('finalizing');
           return;
         }
@@ -344,6 +354,8 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
         setDeviceCode(data.deviceCode || null);
         setVerificationUrl(data.verificationUrl || (provider === 'grok' ? 'https://accounts.x.ai/oauth2/device' : 'https://auth.openai.com/codex/device'));
         setStep('device');
+      } else if (isInteractiveHarnessFlow) {
+        setStep('terminal');
       } else {
         // Claude OAuth flow
         setAuthUrl(data.authUrl || null);
@@ -359,12 +371,8 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
       }
     } catch (err: any) {
       const startFailure = readStructuredOAuthStartFailure(err?.response?.data);
+      setLifecycleConflict(isInteractiveHarnessFlow && startFailure.code === 'PROVIDER_CREDENTIAL_LIFECYCLE_CONFLICT');
       const msg = startFailure.error || err?.message || 'Failed to start native CLI flow';
-      if (provider === 'codex' && startFailure.code === 'CODEX_REAUTHENTICATION_REQUIRED') {
-        setError(msg);
-        setStep('start');
-        return;
-      }
       const disposition = getOAuthStartRecoveryDisposition(startFailure);
       if (disposition === 'cleanup_required' && startFailure.sessionId) {
         setSessionId(startFailure.sessionId);
@@ -381,6 +389,28 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
     } finally {
       setLoading(false);
       releaseOperation('start');
+    }
+  };
+
+  const resetInterruptedSetup = async () => {
+    if (!isInteractiveHarnessFlow || !lifecycleConflict || sessionOwned || !claimOperation('reset')) return;
+    setLoading(true);
+    try {
+      const { data } = await client.post(`${apiBase}/oauth/reset-lifecycle`, { provider });
+      if (data?.success !== true) throw new Error(data?.error || 'Could not reset interrupted setup.');
+      setSessionId(null);
+      setSessionOwned(false);
+      setRecoverySession(false);
+      setReviewState(null);
+      setLifecycleConflict(false);
+      setError(null);
+      setCancellationError(null);
+      setStep('start');
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || 'Could not reset interrupted setup.');
+    } finally {
+      setLoading(false);
+      releaseOperation('reset');
     }
   };
 
@@ -445,7 +475,9 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
         return (
           <div className="space-y-4">
             <p className="text-sm text-slate-300">
-              This will authenticate the <strong>{meta.name}</strong> CLI on the server for use with Agent Chat and other portal features.
+              {provider === 'claude-code'
+                ? <>Authorize <strong>{meta.name}</strong> with a process-free credential flow for confined Project sessions. Portal will not launch Claude Code on the host.</>
+                : <>This will authenticate the <strong>{meta.name}</strong> harness in its dedicated Portal server profile for use with Agent Chat{isInteractiveHarnessFlow ? ' and qualified Project Chat sessions' : ' and other portal features'}.</>}
             </p>
             {error ? (
               <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100" role="alert">
@@ -453,18 +485,16 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
               </div>
             ) : null}
             <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm text-amber-100">
-              <strong>Note:</strong> This is separate from OpenClaw auth. The native CLI has its own credential store.
-              {provider === 'claude-code' ? ' This login is for the portal\'s native Claude Code features, not the OpenClaw Claude provider setup.' : ''}
+              <strong>Note:</strong> {provider === 'claude-code'
+                ? 'This Project Sandbox credential is separate from OpenClaw Claude provider setup and does not enable host Claude execution.'
+                : 'This is separate from OpenClaw and Remote Desktop auth. The native CLI has its own Portal credential store.'}
             </div>
             {provider === 'codex' ? (
-              <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-sm text-blue-100">
-                Before starting, enable <strong>device code login</strong> in your personal ChatGPT Security settings, or ask your workspace admin to enable it in Permissions.{' '}
-                <a href="https://developers.openai.com/codex/auth#login-on-headless-devices" target="_blank" rel="noreferrer" className="font-medium text-blue-300 underline hover:text-blue-200">
-                  OpenAI instructions
-                </a>
+              <div className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100" role="alert">
+                Interactive host Codex login is unavailable from Portal. Supervised Agent Chat can use an existing attested host credential; Project Sandbox uses its separate confined credential.
               </div>
             ) : null}
-            <div className="flex justify-end">
+            {provider !== 'codex' ? <div className="flex justify-end">
               <button
                 type="button"
                 onClick={() => { void startFlow(); }}
@@ -472,25 +502,15 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                 className={`inline-flex items-center gap-2 rounded-xl bg-${meta.color}-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-${meta.color}-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400`}
               >
                 {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                {provider === 'gemini' ? 'Connect or Re-authenticate Antigravity' : `Start ${meta.name} Login`}
+                {provider === 'gemini'
+                  ? 'Connect or Re-authenticate Antigravity'
+                  : provider === 'claude-code'
+                    ? 'Authorize Claude Project Sandbox'
+                  : isInteractiveHarnessFlow
+                    ? `Configure Portal ${meta.name}`
+                    : `Start ${meta.name} Login`}
               </button>
-            </div>
-            {provider === 'codex' ? (
-              <div className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-                <p>
-                  Portal will reuse a verified existing Codex sign-in. Replacing it is destructive: Codex clears the current server credential before device authorization, so a cancelled or failed replacement can leave Codex signed out.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => { void startFlow(true); }}
-                  disabled={loading}
-                  className="mt-3 inline-flex items-center gap-2 rounded-lg border border-amber-400/30 bg-amber-500/15 px-3 py-2 text-xs font-semibold text-amber-100 transition hover:bg-amber-500/25 disabled:cursor-wait disabled:opacity-50"
-                >
-                  <AlertTriangle className="h-3.5 w-3.5" />
-                  Replace existing Codex sign-in
-                </button>
-              </div>
-            ) : null}
+            </div> : null}
           </div>
         );
 
@@ -596,11 +616,18 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
           </div>
         );
 
+      case 'terminal':
+        return sessionId ? (
+          <HarnessNativeCliTerminal provider={provider as 'hermes' | 'opencode'} sessionId={sessionId} />
+        ) : null;
+
       case 'finalizing':
         return (
           <div role="status" className="flex items-center gap-3 rounded-xl border border-blue-500/20 bg-blue-500/10 px-4 py-4 text-sm text-blue-100">
             <Loader2 className="h-5 w-5 animate-spin" />
-            Codex is signed in. Portal is registering models and safely restarting the workspace connection…
+            {provider === 'codex'
+              ? 'Codex is signed in. Portal is registering models and safely restarting the workspace connection…'
+              : `${meta.name} setup finished. Portal is verifying the exact harness profile and refreshing its dynamic model catalog…`}
           </div>
         );
 
@@ -660,6 +687,11 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                 {meta.name} CLI is now authenticated!
               </div>
             </div>
+            {finalizationWarning ? (
+              <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100" role="status">
+                {finalizationWarning}
+              </div>
+            ) : null}
           </div>
         );
 
@@ -672,9 +704,23 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                 <div>{error || 'An error occurred'}</div>
               </div>
             </div>
+            {lifecycleConflict && !sessionOwned ? (
+              <div className="space-y-3 text-sm text-slate-300">
+                <p>Reset the interrupted setup, then finish configuring {meta.name}. Your saved login will not be deleted.</p>
+                <button
+                  type="button"
+                  onClick={() => void resetInterruptedSetup()}
+                  disabled={loading || Boolean(operation)}
+                  className="rounded-xl bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                >
+                  {loading ? 'Resetting setup…' : 'Reset interrupted setup'}
+                </button>
+              </div>
+            ) : null}
             <div className="flex justify-end">
               <button
                 type="button"
+                disabled={loading || Boolean(operation)}
                 onClick={reviewState ? acknowledgeReview : () => void cancelAndClose()}
                 className="rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm font-medium text-slate-300 transition hover:bg-slate-700"
               >

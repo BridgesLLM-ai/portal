@@ -27,7 +27,7 @@ router.get('/public', async (_req: Request, res: Response, next: NextFunction) =
     // the next request; do not let an intermediary preserve bootstrap defaults.
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
     res.setHeader('Pragma', 'no-cache');
-    const keys = ['appearance.theme', 'appearance.accentColor', 'appearance.portalName', 'appearance.logoUrl', 'appearance.assistantName', 'appearance.agentAvatar.OPENCLAW', 'appearance.agentAvatar.CLAUDE_CODE', 'appearance.agentAvatar.CODEX', 'appearance.agentAvatar.GROK', 'appearance.agentAvatar.AGENT_ZERO', 'appearance.agentAvatar.GEMINI', 'appearance.agentAvatar.OLLAMA', 'security.registrationMode', 'registrationMode'];
+    const keys = ['appearance.theme', 'appearance.accentColor', 'appearance.portalName', 'appearance.logoUrl', 'appearance.assistantName', 'appearance.agentAvatar.OPENCLAW', 'appearance.agentAvatar.CLAUDE_CODE', 'appearance.agentAvatar.CODEX', 'appearance.agentAvatar.GROK', 'appearance.agentAvatar.AGENT_ZERO', 'appearance.agentAvatar.GEMINI', 'appearance.agentAvatar.OLLAMA', 'appearance.agentAvatar.HERMES', 'appearance.agentAvatar.OPENCODE', 'security.registrationMode', 'registrationMode'];
     const rows = await prisma.systemSetting.findMany({ where: { key: { in: keys } } });
 
     const map: Record<string, string> = {};
@@ -53,6 +53,8 @@ router.get('/public', async (_req: Request, res: Response, next: NextFunction) =
         AGENT_ZERO: map['appearance.agentAvatar.AGENT_ZERO'] || '',
         GEMINI: map['appearance.agentAvatar.GEMINI'] || '',
         OLLAMA: map['appearance.agentAvatar.OLLAMA'] || '',
+        HERMES: map['appearance.agentAvatar.HERMES'] || '',
+        OPENCODE: map['appearance.agentAvatar.OPENCODE'] || '',
       },
       useDirectGateway: normalizeBoolean(process.env.USE_DIRECT_GATEWAY || process.env.VITE_USE_DIRECT_GATEWAY),
       ...getPortalFeatureCapabilities(),

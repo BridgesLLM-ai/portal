@@ -26,6 +26,7 @@ import rehypeHighlight from 'rehype-highlight';
 // with unfenced HTML (e.g. raw <!DOCTYPE html>) would inject into the portal DOM,
 // breaking layout and creating XSS vectors. Code blocks handle HTML rendering safely.
 import DOMPurify from 'dompurify';
+import MermaidDiagram from './MermaidDiagram';
 import { marked } from 'marked';
 import { Copy, Check, Eye, EyeOff, Maximize2, Minimize2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -776,6 +777,9 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
       const childArray = Children.toArray(children);
       const codeChild = childArray.find((child) => isValidElement(child)) as any;
       const className = codeChild?.props?.className;
+      if (getLanguage(className) === 'mermaid') {
+        return <MermaidDiagram source={extractTextContent(codeChild?.props?.children)} isStreaming={isStreaming} />;
+      }
       return (
         <PreviewableCodeBlock className={className} isStreaming={isStreaming} {...props}>
           {children}

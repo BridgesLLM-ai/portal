@@ -5,6 +5,13 @@ import { stopApp } from './app-process.service';
 import { deleteUserMailboxByUserId } from './userMailService';
 import { AVATARS_DIR } from './imageAssets';
 import { deleteSession, gatewayRpcCall } from '../utils/openclawGatewayRpc';
+import { ADMIN_USER_RETIREMENT_READINESS } from './adminUserRetirementLedger';
+import {
+  buildOpenClawAgentRemovalPatch,
+  exactOpenClawAgent,
+  openClawAgentRostersEqual,
+  readOpenClawAgentConfigContract,
+} from './openclawAgentConfigContract';
 
 const PORTAL_DATA_ROOT = process.env.PORTAL_DATA_ROOT || process.env.PORTAL_ROOT || '/portal';
 const PROJECTS_ROOT = path.resolve(process.env.PORTAL_PROJECTS_ROOT || path.join(PORTAL_DATA_ROOT, 'projects'));
@@ -47,6 +54,10 @@ export type UserDeletionCleanupPlan = {
 export const ADMIN_USER_DELETION_RETIREMENT_CODE = 'ADMIN_USER_DELETION_RETIREMENT_PENDING';
 export const ADMIN_USER_DELETION_RETIREMENT_MESSAGE =
   'Admin user deletion is unavailable while Portal 4 identity-aware user retirement is pending.';
+
+export function getAdminUserDeletionReadiness() {
+  return ADMIN_USER_RETIREMENT_READINESS;
+}
 
 export class AdminUserDeletionRetirementPendingError extends Error {
   readonly code = ADMIN_USER_DELETION_RETIREMENT_CODE;
@@ -251,15 +262,23 @@ async function cleanupProjectArtifacts(userId: string, result: UserDeletionClean
     await bestEffort(result, 'remove-project-agent-config', projectAgentId, async () => {
       const cfg = await gatewayRpcCall('config.get', {});
       if (!cfg.ok) throw new Error(cfg.error || 'config.get failed');
-      const config = cfg.data?.config || cfg.data?.parsed || {};
-      const agents: any[] = Array.isArray(config?.agents?.list) ? config.agents.list : [];
-      if (!agents.some((agent) => agent?.id === projectAgentId)) return;
-      const updatedAgents = agents.filter((agent) => agent?.id !== projectAgentId);
+      const contract = readOpenClawAgentConfigContract(cfg.data?.config ?? cfg.data?.parsed);
+      if (!exactOpenClawAgent(contract, projectAgentId)) return;
+      const removal = buildOpenClawAgentRemovalPatch(contract, projectAgentId);
       const patch = await gatewayRpcCall('config.patch', {
-        raw: JSON.stringify({ agents: { list: updatedAgents } }),
+        raw: removal.raw,
         baseHash: cfg.data?.hash || '',
+        replacePaths: removal.replacePaths,
       }, 15000);
       if (!patch.ok) throw new Error(patch.error || 'config.patch failed');
+      const reread = await gatewayRpcCall('config.get', {});
+      if (!reread.ok) throw new Error(reread.error || 'config.get verification failed');
+      const rereadContract = readOpenClawAgentConfigContract(
+        reread.data?.config ?? reread.data?.parsed,
+      );
+      if (!openClawAgentRostersEqual(removal.expected, rereadContract)) {
+        throw new Error('OpenClaw agent config did not match after removal');
+      }
       result.summary.deletedProjectAgentConfigs += 1;
     });
 

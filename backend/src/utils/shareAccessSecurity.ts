@@ -7,10 +7,13 @@ const COMBINED_WINDOW_MS = 60 * 1000;
 const TOKEN_ATTEMPT_LIMIT = 25;
 const TOKEN_WINDOW_MS = 5 * 60 * 1000;
 const MAX_ATTEMPT_BUCKETS = 10_000;
+const MAX_CONCURRENT_VISITORS = 10_000;
+export const MAX_SHARE_LINKS_PER_APP = 1_000;
+export const MAX_RETURNED_SHARE_LINKS_PER_APP = 100;
 
 export type ShareGrantKind = 'password' | 'visit';
 
-interface ShareGrantPayload {
+interface ShareGrantPayloadV1 {
   v: 1;
   kind: ShareGrantKind;
   token: string;
@@ -18,6 +21,17 @@ interface ShareGrantPayload {
   binding?: string;
   expiresAt: number;
 }
+
+interface ShareVisitGrantPayloadV2 {
+  v: 2;
+  kind: 'visit';
+  token: string;
+  linkId: string;
+  visitorId: string;
+  expiresAt: number;
+}
+
+type ShareGrantPayload = ShareGrantPayloadV1 | ShareVisitGrantPayloadV2;
 
 interface AttemptBucket {
   count: number;
@@ -30,7 +44,13 @@ export interface ShareLinkOptions {
   maxUses: number | null;
   rateLimitMaxRequests: number | null;
   rateLimitWindowSeconds: number | null;
+  maxConcurrentVisitors: number | null;
 }
+
+export type ShareLinkPolicyPatch = Partial<ShareLinkOptions> & {
+  rateLimitRequestCount?: 0;
+  rateLimitWindowStartedAt?: null;
+};
 
 export type ShareLinkAvailability = 'active' | 'disabled' | 'expired' | 'exhausted';
 
@@ -72,6 +92,7 @@ export function parseShareLinkOptions(
     maxUses?: unknown;
     rateLimitMaxRequests?: unknown;
     rateLimitWindowSeconds?: unknown;
+    maxConcurrentVisitors?: unknown;
   },
   now = Date.now(),
 ): ShareLinkOptions {
@@ -127,7 +148,103 @@ export function parseShareLinkOptions(
     rateLimitWindowSeconds = parsedWindow;
   }
 
-  return { expiresAt, maxUses, rateLimitMaxRequests, rateLimitWindowSeconds };
+  let maxConcurrentVisitors: number | null = null;
+  if (input.maxConcurrentVisitors !== undefined
+    && input.maxConcurrentVisitors !== null
+    && input.maxConcurrentVisitors !== '') {
+    const parsed = typeof input.maxConcurrentVisitors === 'number'
+      ? input.maxConcurrentVisitors
+      : Number(input.maxConcurrentVisitors);
+    if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_CONCURRENT_VISITORS) {
+      throw new Error(`Concurrent visitors must be a whole number between 1 and ${MAX_CONCURRENT_VISITORS}`);
+    }
+    maxConcurrentVisitors = parsed;
+  }
+
+  return {
+    expiresAt,
+    maxUses,
+    rateLimitMaxRequests,
+    rateLimitWindowSeconds,
+    maxConcurrentVisitors,
+  };
+}
+
+function nullablePositiveInteger(
+  value: unknown,
+  label: string,
+  maximum: number,
+): number | null {
+  if (value === null || value === '') return null;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new Error(`${label} must be a whole number between 1 and ${maximum}`);
+  }
+  return parsed;
+}
+
+/**
+ * Parse only owner-supplied policy fields. Missing fields retain their current
+ * values; explicit null/empty values clear the nullable limit. A rate-policy
+ * change resets its durable fixed window in the same database update.
+ */
+export function parseShareLinkPolicyPatch(
+  input: Record<string, unknown>,
+  current: ShareLinkOptions,
+  now = Date.now(),
+): ShareLinkPolicyPatch {
+  const patch: ShareLinkPolicyPatch = {};
+  if (Object.prototype.hasOwnProperty.call(input, 'expiresAt')) {
+    if (input.expiresAt === null || input.expiresAt === '') {
+      patch.expiresAt = null;
+    } else {
+      const parsed = new Date(String(input.expiresAt));
+      if (!Number.isFinite(parsed.getTime()) || parsed.getTime() <= now) {
+        throw new Error('Expiration must be a valid future date');
+      }
+      patch.expiresAt = parsed;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input, 'maxUses')) {
+    patch.maxUses = nullablePositiveInteger(input.maxUses, 'Max uses', 1_000_000);
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'maxConcurrentVisitors')) {
+    patch.maxConcurrentVisitors = nullablePositiveInteger(
+      input.maxConcurrentVisitors,
+      'Concurrent visitors',
+      MAX_CONCURRENT_VISITORS,
+    );
+  }
+
+  const hasRateMax = Object.prototype.hasOwnProperty.call(input, 'rateLimitMaxRequests');
+  const hasRateWindow = Object.prototype.hasOwnProperty.call(input, 'rateLimitWindowSeconds');
+  if (hasRateMax || hasRateWindow) {
+    const nextMax = hasRateMax
+      ? nullablePositiveInteger(input.rateLimitMaxRequests, 'Rate limit requests', 1_000_000)
+      : current.rateLimitMaxRequests;
+    if (nextMax === null) {
+      if (hasRateWindow && input.rateLimitWindowSeconds !== null && input.rateLimitWindowSeconds !== '') {
+        throw new Error('Rate limit request count is required when a rate limit window is set');
+      }
+      patch.rateLimitMaxRequests = null;
+      patch.rateLimitWindowSeconds = null;
+    } else {
+      const windowValue = hasRateWindow
+        ? input.rateLimitWindowSeconds
+        : (current.rateLimitWindowSeconds ?? 60);
+      const parsedWindow = typeof windowValue === 'number' ? windowValue : Number(windowValue);
+      if (!Number.isSafeInteger(parsedWindow) || ![60, 300, 3600].includes(parsedWindow)) {
+        throw new Error('Rate limit window must be 60, 300, or 3600 seconds');
+      }
+      patch.rateLimitMaxRequests = nextMax;
+      patch.rateLimitWindowSeconds = parsedWindow;
+    }
+    patch.rateLimitRequestCount = 0;
+    patch.rateLimitWindowStartedAt = null;
+  }
+
+  return patch;
 }
 
 export function validateSharePassword(password: unknown): string {
@@ -142,7 +259,7 @@ function signPayload(encoded: string, secret: string): string {
 }
 
 export function issueShareGrant(
-  payload: Omit<ShareGrantPayload, 'v'>,
+  payload: Omit<ShareGrantPayloadV1, 'v'> & { visitorId?: string },
   secret: string,
   now = Date.now(),
 ): string {
@@ -153,8 +270,68 @@ export function issueShareGrant(
     || payload.expiresAt - now > maxTtlMs) {
     throw new Error('Invalid share access grant');
   }
-  const encoded = Buffer.from(JSON.stringify({ v: 1, ...payload } satisfies ShareGrantPayload)).toString('base64url');
+  if (payload.kind === 'password' && payload.visitorId !== undefined) {
+    throw new Error('Invalid share access grant');
+  }
+  const grantPayload: ShareGrantPayload = payload.kind === 'visit'
+    ? {
+      v: 2,
+      kind: 'visit',
+      token: payload.token,
+      linkId: payload.linkId,
+      visitorId: payload.visitorId || crypto.randomBytes(18).toString('base64url'),
+      expiresAt: payload.expiresAt,
+    }
+    : {
+      v: 1,
+      kind: 'password',
+      token: payload.token,
+      linkId: payload.linkId,
+      binding: payload.binding,
+      expiresAt: payload.expiresAt,
+    };
+  if (grantPayload.v === 2 && !/^[A-Za-z0-9_-]{24}$/.test(grantPayload.visitorId)) {
+    throw new Error('Invalid share access grant');
+  }
+  const encoded = Buffer.from(JSON.stringify(grantPayload)).toString('base64url');
   return `${encoded}.${signPayload(encoded, secret)}`;
+}
+
+function readVerifiedShareGrant(
+  grant: unknown,
+  expected: { kind: ShareGrantKind; token: string; linkId: string; binding?: string },
+  secret: string,
+  now: number,
+): ShareGrantPayload | null {
+  try {
+    if (typeof grant !== 'string' || grant.length > 2048) return null;
+    const [encoded, signature, extra] = grant.split('.');
+    if (!encoded || !signature || extra) return null;
+    const supplied = Buffer.from(signature, 'base64url');
+    const wanted = Buffer.from(signPayload(encoded, secret), 'base64url');
+    if (supplied.length !== wanted.length || !crypto.timingSafeEqual(supplied, wanted)) return null;
+
+    const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as ShareGrantPayload;
+    const maxTtlMs = shareGrantTtlMs(parsed.kind);
+    const common = (parsed.v === 1 || parsed.v === 2)
+      && parsed.kind === expected.kind
+      && parsed.token === expected.token
+      && parsed.linkId === expected.linkId
+      && Number.isFinite(parsed.expiresAt)
+      && parsed.expiresAt > now
+      && parsed.expiresAt - now <= maxTtlMs;
+    if (!common) return null;
+    if (parsed.v === 2) {
+      return parsed.kind === 'visit'
+        && expected.binding === undefined
+        && /^[A-Za-z0-9_-]{24}$/.test(parsed.visitorId)
+        ? parsed
+        : null;
+    }
+    return parsed.binding === expected.binding ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 export function verifyShareGrant(
@@ -163,27 +340,26 @@ export function verifyShareGrant(
   secret: string,
   now = Date.now(),
 ): boolean {
-  try {
-    if (typeof grant !== 'string' || grant.length > 2048) return false;
-    const [encoded, signature, extra] = grant.split('.');
-    if (!encoded || !signature || extra) return false;
-    const supplied = Buffer.from(signature, 'base64url');
-    const wanted = Buffer.from(signPayload(encoded, secret), 'base64url');
-    if (supplied.length !== wanted.length || !crypto.timingSafeEqual(supplied, wanted)) return false;
+  return readVerifiedShareGrant(grant, expected, secret, now) !== null;
+}
 
-    const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as ShareGrantPayload;
-    const maxTtlMs = shareGrantTtlMs(parsed.kind);
-    return parsed.v === 1
-      && parsed.kind === expected.kind
-      && parsed.token === expected.token
-      && parsed.linkId === expected.linkId
-      && parsed.binding === expected.binding
-      && Number.isFinite(parsed.expiresAt)
-      && parsed.expiresAt > now
-      && parsed.expiresAt - now <= maxTtlMs;
-  } catch {
-    return false;
-  }
+/**
+ * Return a stable, non-reversible database identity for one signed visitor
+ * grant. Version-2 grants use their random visitor id. Existing version-1
+ * grants remain compatible and are scoped by the exact signed grant bytes.
+ */
+export function shareVisitorIdentityHash(
+  grant: unknown,
+  expected: { token: string; linkId: string },
+  secret: string,
+  now = Date.now(),
+): string | null {
+  const parsed = readVerifiedShareGrant(grant, { kind: 'visit', ...expected }, secret, now);
+  if (!parsed || typeof grant !== 'string') return null;
+  const identity = parsed.v === 2
+    ? `v2:${parsed.linkId}:${parsed.visitorId}`
+    : `v1:${parsed.linkId}:${grant}`;
+  return crypto.createHash('sha256').update(identity).digest('hex');
 }
 
 export function shareGrantTtlMs(kind: ShareGrantKind): number {
@@ -271,4 +447,5 @@ export const __shareAccessSecurityTest = {
   COMBINED_ATTEMPT_LIMIT,
   TOKEN_ATTEMPT_LIMIT,
   MAX_ATTEMPT_BUCKETS,
+  MAX_CONCURRENT_VISITORS,
 };

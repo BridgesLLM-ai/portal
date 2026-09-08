@@ -33,7 +33,7 @@ function connectAndHandshake(
       const newline = inbound.indexOf(0x0a);
       if (newline < 0) return;
       const header = inbound.subarray(0, newline).toString('ascii');
-      const length = /^E([1-9][0-9]*)$/.exec(header);
+      const length = /^T([1-9][0-9]*)$/.exec(header);
       if (!length) {
         reject(new Error('invalid target environment frame'));
         return;
@@ -54,12 +54,17 @@ describe('host agent parent-bound activation gate', () => {
   test('the Node wrapper cannot execute the target before the release byte', async () => {
     const { unit, tag } = identity('91');
     const gate = await createHostAgentRunActivationGate(unit, tag);
-    gate.prepareTargetEnvironment({
-      PATH: process.env.PATH,
-      PORTAL_TARGET_ENV_TEST: 'delivered-over-authenticated-socket',
+    const secretPrompt = 'private-process-table-sentinel';
+    gate.prepareTarget({
+      environment: {
+        PATH: process.env.PATH,
+        PORTAL_TARGET_ENV_TEST: 'delivered-over-authenticated-socket',
+      },
+      stdinText: secretPrompt,
     });
     const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'host-run-gate-wrapper-'));
     const targetMarker = path.join(temporaryRoot, 'executed');
+    const targetPid = path.join(temporaryRoot, 'target-pid');
     const wrapper = spawn(process.execPath, [
       '-e',
       __hostAgentRunJournalTest.ACTIVATION_WRAPPER_SOURCE,
@@ -68,7 +73,7 @@ describe('host agent parent-bound activation gate', () => {
       tag,
       process.execPath,
       '-e',
-      `require('fs').writeFileSync(${JSON.stringify(targetMarker)}, process.env.PORTAL_TARGET_ENV_TEST || '')`,
+      `const fs=require('fs');fs.writeFileSync(${JSON.stringify(targetPid)},String(process.pid));let d='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{fs.writeFileSync(${JSON.stringify(targetMarker)},(process.env.PORTAL_TARGET_ENV_TEST||'')+'\\n'+d);setTimeout(()=>process.exit(0),1000);});`,
     ], {
       cwd: temporaryRoot,
       env: process.env,
@@ -84,10 +89,17 @@ describe('host agent parent-bound activation gate', () => {
     await gate.ready;
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
     expect(fs.existsSync(targetMarker)).toBe(false);
+    expect(fs.readFileSync(`/proc/${wrapper.pid}/cmdline`).includes(secretPrompt)).toBe(false);
     await gate.release();
+    for (let attempt = 0; attempt < 100 && !fs.existsSync(targetPid); attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    const childPid = Number(fs.readFileSync(targetPid, 'utf8'));
+    expect(Number.isSafeInteger(childPid)).toBe(true);
+    expect(fs.readFileSync(`/proc/${childPid}/cmdline`).includes(secretPrompt)).toBe(false);
     await expect(closed).resolves.toEqual({ code: 0, signal: null });
     expect(fs.readFileSync(targetMarker, 'utf8')).toBe(
-      'delivered-over-authenticated-socket',
+      `delivered-over-authenticated-socket\n${secretPrompt}`,
     );
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   });
@@ -95,7 +107,7 @@ describe('host agent parent-bound activation gate', () => {
   test('authenticates the wrapper and emits exactly one release byte', async () => {
     const { unit, tag } = identity('a1');
     const gate = await createHostAgentRunActivationGate(unit, tag);
-    gate.prepareTargetEnvironment({ PATH: '/usr/bin' });
+    gate.prepareTarget({ environment: { PATH: '/usr/bin' } });
     const { socket, received } = await connectAndHandshake(
       gate.socketPath,
       `${tag}\n`,
@@ -111,7 +123,7 @@ describe('host agent parent-bound activation gate', () => {
   test('rejects a wrong token, releases no byte, and removes the socket', async () => {
     const { unit, tag } = identity('b2');
     const gate = await createHostAgentRunActivationGate(unit, tag);
-    gate.prepareTargetEnvironment({ PATH: '/usr/bin' });
+    gate.prepareTarget({ environment: { PATH: '/usr/bin' } });
     const socket = net.createConnection({ path: gate.socketPath });
     socket.once('error', () => undefined);
     socket.once('connect', () => socket.write(`${'f'.repeat(64)}\n`));
@@ -119,6 +131,20 @@ describe('host agent parent-bound activation gate', () => {
     await expect(gate.ready).rejects.toThrow(/identity mismatch/i);
     socket.destroy();
     expect(fs.existsSync(gate.socketPath)).toBe(false);
+  });
+
+  test.each([
+    '',
+    'contains\0nul',
+    'a'.repeat((256 * 1024) + 1),
+  ])('rejects invalid sensitive stdin before any wrapper can receive it', async (stdinText) => {
+    const { unit, tag } = identity(`d${stdinText.length % 10}`);
+    const gate = await createHostAgentRunActivationGate(unit, tag);
+    expect(() => gate.prepareTarget({
+      environment: { PATH: '/usr/bin' },
+      stdinText,
+    })).toThrow(/stdin exceeds its bound/i);
+    await gate.abort();
   });
 
   test('derives only the fixed root-owned runtime path from the exact scope UUID', () => {

@@ -8,6 +8,8 @@ import {
 import { automationsAPI, gatewayAPI } from '../api/endpoints';
 import ViewportModal from '../components/ViewportModal';
 
+const HOST_AUTOMATION_MUTATION_UNAVAILABLE = 'Portal-originated host automation starts and schedule changes are unavailable until Portal can supervise the provider process tree.';
+
 /* ─── Types ─────────────────────────────────────────────── */
 
 interface CronJob {
@@ -296,8 +298,8 @@ function JobCard({ job, activeMutation, onToggle, onEdit, onDelete, onRunNow, on
           aria-label={toggling ? `${job.enabled ? 'Disabling' : 'Enabling'} ${job.name}…` : `${job.enabled ? 'Disable' : 'Enable'} ${job.name}`}
           aria-busy={toggling}
           onClick={handleToggle}
-          disabled={mutationActive || !editable}
-          title={editable ? (job.enabled ? 'Disable' : 'Enable') : 'This job type must be managed in OpenClaw'}
+          disabled={mutationActive || !editable || !job.enabled}
+          title={!editable ? 'This job type must be managed in OpenClaw' : job.enabled ? 'Disable' : HOST_AUTOMATION_MUTATION_UNAVAILABLE}
           className={`relative w-11 h-6 rounded-full transition-colors ${
             job.enabled ? 'bg-emerald-500' : 'bg-slate-700'
           } ${toggling ? 'opacity-50' : ''}`}
@@ -323,21 +325,21 @@ function JobCard({ job, activeMutation, onToggle, onEdit, onDelete, onRunNow, on
         
         <button
           onClick={handleRunNow}
-          disabled={mutationActive || !editable}
+          disabled
           aria-busy={running}
           aria-label={editable ? (running ? `Running ${job.name}…` : `Run ${job.name} now`) : `${job.name} must be managed in OpenClaw`}
           className="p-2 rounded-lg text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
-          title="Run now"
+          title={HOST_AUTOMATION_MUTATION_UNAVAILABLE}
         >
           {running ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
         </button>
         
         <button
           onClick={() => onEdit(job)}
-          disabled={mutationActive || !editable}
+          disabled
           aria-label={editable ? `Edit ${job.name}` : `${job.name} must be edited in OpenClaw`}
           className="p-2 rounded-lg text-slate-400 hover:text-blue-400 hover:bg-blue-500/10 transition-colors disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-400"
-          title={editable ? 'Edit' : 'This job type must be edited in OpenClaw'}
+          title={editable ? HOST_AUTOMATION_MUTATION_UNAVAILABLE : 'This job type must be edited in OpenClaw'}
         >
           <Edit2 size={16} />
         </button>
@@ -945,7 +947,9 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
       </p>
       <button
         onClick={onCreate}
-        className="px-5 py-2.5 rounded-xl bg-emerald-500 text-white font-medium hover:bg-emerald-600 transition-colors flex items-center gap-2"
+        disabled
+        title={HOST_AUTOMATION_MUTATION_UNAVAILABLE}
+        className="px-5 py-2.5 rounded-xl bg-emerald-500 text-white font-medium hover:bg-emerald-600 transition-colors flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
       >
         <Plus size={18} />
         Create Your First Automation
@@ -1046,35 +1050,25 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
   }, [fetchJobs]);
   
   const handleCreate = () => {
-    if (cardMutationAdmissionRef.current) return;
     setEditingJob(null);
-    setModalOpen(true);
+    setActionError(HOST_AUTOMATION_MUTATION_UNAVAILABLE);
   };
   
   const handleEdit = (job: CronJob) => {
-    if (cardMutationAdmissionRef.current) return;
     setEditingJob(job);
-    setModalOpen(true);
+    setActionError(HOST_AUTOMATION_MUTATION_UNAVAILABLE);
   };
   
   const handleSave = async (data: any) => {
-    // Include agentId in the save data if creating new
-    setActionError(null);
-    const saveData = editingJob ? data : { ...data, agent: data.agent || agentId || 'main' };
-    try {
-      if (editingJob) {
-        await automationsAPI.update(editingJob.id, saveData);
-      } else {
-        await automationsAPI.create(saveData);
-      }
-      await fetchJobs({ isRefresh: true });
-    } catch (err) {
-      const message = extractApiError(err, 'Failed to save automation');
-      throw new Error(message);
-    }
+    void data;
+    throw new Error(HOST_AUTOMATION_MUTATION_UNAVAILABLE);
   };
   
   const handleToggle = async (id: string, enabled: boolean) => {
+    if (enabled) {
+      setActionError(HOST_AUTOMATION_MUTATION_UNAVAILABLE);
+      return;
+    }
     if (cardMutationAdmissionRef.current || deleteSubmittingRef.current) return;
     const admission: AutomationCardMutation = { kind: 'toggle', jobId: id };
     cardMutationAdmissionRef.current = admission;
@@ -1128,23 +1122,8 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
   };
   
   const handleRunNow = async (id: string) => {
-    if (cardMutationAdmissionRef.current || deleteSubmittingRef.current) return;
-    const admission: AutomationCardMutation = { kind: 'run', jobId: id };
-    cardMutationAdmissionRef.current = admission;
-    setCardMutation(admission);
-    setActionError(null);
-    try {
-      await automationsAPI.runNow(id);
-      scheduleRefresh(1500);
-    } catch (err) {
-      const message = extractApiError(err, 'Failed to run automation');
-      setActionError(message);
-    } finally {
-      if (cardMutationAdmissionRef.current === admission) {
-        cardMutationAdmissionRef.current = null;
-        setCardMutation(null);
-      }
-    }
+    void id;
+    setActionError(HOST_AUTOMATION_MUTATION_UNAVAILABLE);
   };
   
   const handleViewRuns = (job: CronJob) => {
@@ -1178,7 +1157,8 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
             </button>
             <button
               onClick={handleCreate}
-              disabled={cardMutation !== null}
+              disabled
+              title={HOST_AUTOMATION_MUTATION_UNAVAILABLE}
               className="px-4 py-2.5 rounded-xl bg-emerald-500 text-white font-medium hover:bg-emerald-600 transition-colors flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Plus size={18} />
@@ -1200,7 +1180,8 @@ export function AutomationsContent({ agentId, showHeader = false }: AutomationsC
           </button>
           <button
             onClick={handleCreate}
-            disabled={cardMutation !== null}
+            disabled
+            title={HOST_AUTOMATION_MUTATION_UNAVAILABLE}
             className="px-3 py-2 rounded-lg bg-emerald-500 text-white text-sm font-medium hover:bg-emerald-600 transition-colors flex items-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Plus size={16} />

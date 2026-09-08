@@ -8,7 +8,25 @@
 
 import { normalizeRuntimeTurnEvent, type RuntimeTurnEvent } from './RuntimeTurnEvents';
 import { recordRuntimeTurnEvent } from './RuntimeTurnEventHistory';
+import { recordAgentChatDiagnosticEvent } from './AgentChatDiagnosticHistory';
 import { sanitizeThinkingSubject } from '../utils/thinkingSubject';
+
+export type StreamEventPresentation = 'timeline' | 'rail' | 'banner' | 'internal';
+export type StreamEventDurability = 'durable' | 'transient';
+
+export interface StreamEventPresentationPolicy {
+  presentation: StreamEventPresentation;
+  durability: StreamEventDurability;
+}
+
+export interface StreamEventPublishOptions {
+  /**
+   * The caller has validated that this status came from the harness's
+   * protocol-owned preamble channel. Raw adapter payloads cannot opt into the
+   * durable reasoning lane by supplying a lookalike boolean field.
+   */
+  attestedPreambleProgress?: boolean;
+}
 
 export interface StreamEvent {
   type: 'text' | 'thinking' | 'tool_start' | 'tool_update' | 'tool_end' | 'tool_used' | 'status' | 'done' | 'error' | 'exec_approval' | 'segment_break' | 'compaction_start' | 'compaction_end' | 'run_resumed' | 'user_message' | 'history_changed';
@@ -30,9 +48,62 @@ export interface StreamEvent {
   maintenanceKind?: 'compaction' | 'maintenance';
   /** Live-only rail status that must not become durable transcript content. */
   transient?: boolean;
+  /** Server-owned rendering lane; consumers must not infer this from wording. */
+  presentation?: StreamEventPresentation;
+  /** Whether this event belongs in durable conversation history. */
+  durability?: StreamEventDurability;
   /** Stable BridgesLLM turn-event contract used by Agent Chat. */
   turnEvent?: RuntimeTurnEvent;
   [key: string]: unknown;
+}
+
+/**
+ * Canonical presentation defaults for every harness transport. Concrete
+ * adapters may declare a stricter lane for text/tool events, but status and
+ * maintenance cannot promote themselves into durable reasoning.
+ */
+export function classifyStreamEventPresentation(
+  event: StreamEvent,
+): StreamEventPresentationPolicy {
+  if (event.type === 'status') {
+    return event.preambleProgress === true
+      ? { presentation: 'timeline', durability: 'durable' }
+      : event.presentation === 'banner'
+        ? { presentation: 'banner', durability: 'transient' }
+        : { presentation: 'rail', durability: 'transient' };
+  }
+  if (
+    event.type === 'compaction_start'
+    || event.type === 'compaction_end'
+    || event.type === 'run_resumed'
+    || event.maintenanceKind === 'maintenance'
+  ) {
+    return { presentation: 'rail', durability: 'transient' };
+  }
+  if (event.type === 'error') {
+    return event.terminal === true || event.presentation === 'banner'
+      ? { presentation: 'banner', durability: 'transient' }
+      : { presentation: 'rail', durability: 'transient' };
+  }
+  if (event.type === 'history_changed' || event.type === 'segment_break') {
+    return { presentation: 'internal', durability: 'transient' };
+  }
+  if (event.type === 'done' && !(typeof event.content === 'string' && event.content.length > 0)) {
+    return { presentation: 'internal', durability: 'transient' };
+  }
+  if (event.transient === true) {
+    return { presentation: 'rail', durability: 'transient' };
+  }
+  if (event.presentation === 'internal') {
+    return { presentation: 'internal', durability: 'transient' };
+  }
+  if (event.presentation === 'banner') {
+    return { presentation: 'banner', durability: 'transient' };
+  }
+  if (event.presentation === 'rail') {
+    return { presentation: 'rail', durability: 'transient' };
+  }
+  return { presentation: 'timeline', durability: 'durable' };
 }
 
 export interface StreamToolCall {
@@ -274,7 +345,18 @@ export class StreamEventBus {
    * Publish an event to all subscribers for a session.
    * Also notifies global listeners for session-level events (compaction).
    */
-  publish(sessionKey: string, event: StreamEvent): void {
+  publish(sessionKey: string, rawEvent: StreamEvent, options?: StreamEventPublishOptions): void {
+    // `turnEvent` is output produced by this bus, never caller input. Likewise,
+    // preamble promotion is a trusted-adapter decision carried out-of-band so
+    // an upstream JSON object cannot forge durable reasoning provenance.
+    const {
+      turnEvent: _untrustedTurnEvent,
+      preambleProgress: _untrustedPreambleProgress,
+      ...eventWithoutAttestation
+    } = rawEvent;
+    const event: StreamEvent = options?.attestedPreambleProgress === true
+      ? { ...eventWithoutAttestation, preambleProgress: true }
+      : eventWithoutAttestation;
     const info = this.activeStreams.get(sessionKey);
     const trackedRunId = normalizedRunId(info?.runId);
     const eventRunId = normalizedRunId(event.runId);
@@ -495,10 +577,21 @@ export class StreamEventBus {
       : Object.prototype.hasOwnProperty.call(toolNormalizedEvent, 'subject')
         ? (({ subject: _subject, ...rest }) => rest)(toolNormalizedEvent)
         : toolNormalizedEvent;
-    const nextTurnSeq = (this.turnEventSeq.get(sessionKey) || 0) + 1;
-    const turnEvent = normalizedEvent.turnEvent || normalizeRuntimeTurnEvent({
+    const presentationPolicy = classifyStreamEventPresentation(normalizedEvent);
+    const classifiedEvent: StreamEvent = {
+      ...normalizedEvent,
+      ...presentationPolicy,
+    };
+    recordAgentChatDiagnosticEvent({
       sessionKey,
-      event: normalizedEvent,
+      event: classifiedEvent,
+      policy: presentationPolicy,
+      now,
+    });
+    const nextTurnSeq = (this.turnEventSeq.get(sessionKey) || 0) + 1;
+    const turnEvent = normalizeRuntimeTurnEvent({
+      sessionKey,
+      event: classifiedEvent,
       info,
       seq: nextTurnSeq,
       now,
@@ -528,11 +621,11 @@ export class StreamEventBus {
     }
 
     const outboundBase: StreamEvent = info
-      && !(typeof normalizedEvent.model === 'string' && normalizedEvent.model.trim())
+      && !(typeof classifiedEvent.model === 'string' && classifiedEvent.model.trim())
       && typeof info.model === 'string'
       && info.model.trim()
-        ? { ...normalizedEvent, model: info.model.trim() }
-        : normalizedEvent;
+        ? { ...classifiedEvent, model: info.model.trim() }
+        : classifiedEvent;
     const outboundEvent: StreamEvent = turnEvent
       ? { ...outboundBase, turnEvent }
       : outboundBase;

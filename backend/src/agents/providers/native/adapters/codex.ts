@@ -1,17 +1,15 @@
-import type { NativeCliProviderAdapter } from '../types';
+import {
+  validateNativeHostModel,
+  validateNativeHostPrompt,
+  validateNativeHostSessionId,
+  type NativeCliProviderAdapter,
+} from '../types';
 import { firstAbsolutePathDir, looksLikePermissionFailure } from '../approvalScope';
 import {
   CODEX_PROJECT_RUNTIME,
   buildCodexProjectInvocation,
 } from '../projectSandbox/CodexProjectSandbox';
 
-/**
- * Codex produces no summarisable reasoning unless an effort is requested, and
- * no readable summary unless one is asked for. Both are sent on every managed
- * host-operator turn so Agent Chat can show thinking at all. Kept as
- * named constants because they are the seam a user-facing reasoning control
- * will bind to.
- */
 const CODEX_REASONING_EFFORT = 'medium';
 const CODEX_REASONING_SUMMARY = 'auto';
 
@@ -33,7 +31,7 @@ function markCodexApprovalCandidate(ctx: Parameters<NativeCliProviderAdapter['ha
 export const codexAdapter: NativeCliProviderAdapter = {
   providerName: 'CODEX',
   displayName: 'Codex',
-  cliCommand: 'codex',
+  cliCommand: '/usr/bin/codex',
   messageIdPrefix: 'codex-msg',
   initialStatus: 'Codex is working…',
   spawnErrorPrefix: 'Failed to spawn codex CLI',
@@ -49,7 +47,7 @@ export const codexAdapter: NativeCliProviderAdapter = {
       },
     };
   },
-  buildInvocation: (ctx) => {
+  buildInvocation: async (ctx) => {
     const nativeSessionId = typeof ctx.session.metadata?.nativeSessionId === 'string' && ctx.session.metadata.nativeSessionId.trim()
       ? String(ctx.session.metadata.nativeSessionId).trim()
       : null;
@@ -63,26 +61,28 @@ export const codexAdapter: NativeCliProviderAdapter = {
         message: ctx.message,
       });
     }
+    const hostSessionId = validateNativeHostSessionId(nativeSessionId, false);
+    const hostModel = validateNativeHostModel(ctx.session.model);
+    const hostPrompt = validateNativeHostPrompt(ctx.message);
     const approvedBypass = ctx.state.codexApprovedExecution === true;
-    const args = nativeSessionId
-      ? ['exec', 'resume', nativeSessionId, '--skip-git-repo-check', '--json']
+    const args = hostSessionId
+      ? ['exec', 'resume', hostSessionId, '--skip-git-repo-check', '--json']
       : ['exec', '--skip-git-repo-check', '--color', 'never', '--json'];
     if (approvedBypass) {
       args.push('--dangerously-bypass-approvals-and-sandbox');
-    } else if (!nativeSessionId) {
+    } else if (hostSessionId) {
+      // `codex exec resume` has no --sandbox option. Pin the typed config
+      // override so a resumed ordinary turn cannot inherit a permissive
+      // machine-local config.toml.
+      args.push('-c', 'sandbox_mode="workspace-write"');
+    } else {
       args.push('--sandbox', 'workspace-write');
     }
-    if (ctx.session.model) args.push('--model', ctx.session.model);
-    // Portal never asked Codex for a reasoning effort, so every turn
-    // ran with `reasoning_effort: null`. Codex still emitted `reasoning` items,
-    // but with an empty summary -- nothing to render -- which is why Agent Chat
-    // showed no thinking at all while the Session Controls advertised
-    // "Stream when supported". The handler below already consumes reasoning
-    // text; it was simply never produced.
+    if (hostModel) args.push('--model', hostModel);
     args.push('-c', `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`);
     args.push('-c', `model_reasoning_summary="${CODEX_REASONING_SUMMARY}"`);
-    args.push(ctx.message);
-    return { command: 'codex', args };
+    args.push('-');
+    return { command: '/usr/bin/codex', args, stdinText: hostPrompt };
   },
   handleStdoutLine: (line, ctx) => {
     let parsed: any;

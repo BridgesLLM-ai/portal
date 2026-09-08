@@ -21,8 +21,8 @@ export const AGENT_ZERO_CAPABILITIES_URL =
   `http://${AGENT_ZERO_LOOPBACK_HOST}:${AGENT_ZERO_HOST_PORT}${AGENT_ZERO_CONNECTOR_PATH}/capabilities`;
 
 export const AGENT_ZERO_IMAGE_DIGESTS = {
-  amd64: 'sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb',
-  arm64: 'sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c',
+  amd64: 'sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0',
+  arm64: 'sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8',
 } as const;
 
 export type AgentZeroArchitecture = keyof typeof AGENT_ZERO_IMAGE_DIGESTS;
@@ -210,7 +210,7 @@ function probeAgentZeroRuntimeUncached(options: AgentZeroRuntimeProbeOptions): A
     }
     inspect = raw[0];
   } catch {
-    return failedStatus('Managed Agent Zero v2.5 container is not installed.', architecture, expectedImageRef);
+    return failedStatus('Managed Agent Zero v2.10 container is not installed.', architecture, expectedImageRef);
   }
 
   const imageRef = typeof inspect.Config?.Image === 'string' ? inspect.Config.Image : undefined;
@@ -245,12 +245,12 @@ function probeAgentZeroRuntimeUncached(options: AgentZeroRuntimeProbeOptions): A
 
   const checks: Array<[boolean, string]> = [
     [running, 'container is stopped'],
-    [pinnedImage, 'container image is outside the Portal-tested v2.5 digest'],
+    [pinnedImage, 'container image is outside the Portal-tested v2.10 digest'],
     [loopbackOnly, 'container port is not bound exclusively to 127.0.0.1:50001'],
     [mounts.persistentData, 'container does not use the managed persistent /a0/usr volume'],
     [protectedAuth, 'root-owned private Agent Zero authentication is not mounted'],
     [restartPolicy, 'container restart policy is not unless-stopped'],
-    [protocolCompatible, 'Agent Zero v2.5 public connector protocol readiness failed'],
+    [protocolCompatible, 'Agent Zero v2.10 public connector protocol readiness failed'],
   ];
   const failure = checks.find(([ok]) => !ok)?.[1];
 
@@ -269,7 +269,7 @@ function probeAgentZeroRuntimeUncached(options: AgentZeroRuntimeProbeOptions): A
     protectedAuth,
     restartPolicy,
     protocolCompatible,
-    reason: failure || 'Managed Agent Zero v2.5 runtime is protocol-ready; protected session authentication is checked separately.',
+    reason: failure || 'Managed Agent Zero v2.10 runtime is protocol-ready; protected session authentication is checked separately.',
   };
 }
 
@@ -323,7 +323,7 @@ async function probeAgentZeroRuntimeUncachedAsync(): Promise<AgentZeroRuntimeSta
     inspect = raw[0];
   } catch {
     return failedStatus(
-      'Managed Agent Zero v2.5 container is not installed.',
+      'Managed Agent Zero v2.10 container is not installed.',
       architecture,
       expectedImageRef,
     );
@@ -361,12 +361,12 @@ async function probeAgentZeroRuntimeUncachedAsync(): Promise<AgentZeroRuntimeSta
 
   const checks: Array<[boolean, string]> = [
     [running, 'container is stopped'],
-    [pinnedImage, 'container image is outside the Portal-tested v2.5 digest'],
+    [pinnedImage, 'container image is outside the Portal-tested v2.10 digest'],
     [loopbackOnly, 'container port is not bound exclusively to 127.0.0.1:50001'],
     [mounts.persistentData, 'container does not use the managed persistent /a0/usr volume'],
     [protectedAuth, 'root-owned private Agent Zero authentication is not mounted'],
     [restartPolicy, 'container restart policy is not unless-stopped'],
-    [protocolCompatible, 'Agent Zero v2.5 public connector protocol readiness failed'],
+    [protocolCompatible, 'Agent Zero v2.10 public connector protocol readiness failed'],
   ];
   const failure = checks.find(([ok]) => !ok)?.[1];
 
@@ -385,7 +385,7 @@ async function probeAgentZeroRuntimeUncachedAsync(): Promise<AgentZeroRuntimeSta
     protectedAuth,
     restartPolicy,
     protocolCompatible,
-    reason: failure || 'Managed Agent Zero v2.5 runtime is protocol-ready; protected session authentication is checked separately.',
+    reason: failure || 'Managed Agent Zero v2.10 runtime is protocol-ready; protected session authentication is checked separately.',
   };
 }
 

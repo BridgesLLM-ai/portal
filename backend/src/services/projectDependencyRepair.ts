@@ -517,13 +517,18 @@ export async function verifyProjectDependencyRepairBackupArchive(
   const restoreScript = dependencies.restoreScriptPath
     || process.env.RESTORE_SCRIPT_PATH
     || path.join(process.env.PORTAL_ROOT || '/opt/bridgesllm/portal', 'restore-full.sh');
+  const isDataBackup = /-data-[a-f0-9]{8}\.tar\.gz$/.test(record.backup.path);
+  const command = isDataBackup ? '/usr/bin/python3' : '/bin/bash';
+  const arguments_ = isDataBackup
+    ? [path.join(path.dirname(restoreScript), 'backup-data.py'), 'verify', record.backup.path, '--require-receipt']
+    : [restoreScript, '--verify-archive', record.backup.path];
   const timeoutMs = Number.isFinite(dependencies.timeoutMs)
     ? Math.max(1, Math.min(15 * 60_000, Math.trunc(dependencies.timeoutMs!)))
     : 15 * 60_000;
   return new Promise((resolve) => {
     (dependencies.execFileImpl || execFile)(
-      '/bin/bash',
-      [restoreScript, '--verify-archive', record.backup.path],
+      command,
+      arguments_,
       { timeout: timeoutMs, maxBuffer: 1024 * 1024 },
       (error) => resolve(!error && attestProjectDependencyRepairBackupFingerprint(record.backup)),
     );

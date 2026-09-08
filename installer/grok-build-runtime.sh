@@ -4,10 +4,17 @@ set -Eeuo pipefail
 # Portal-tested native Grok Build runtime. The upstream installer is convenient
 # for interactive work, but it does not publish a checksum or provide rollback.
 # Portal therefore converges the two supported Linux artifacts directly.
-readonly GROK_BUILD_TESTED_VERSION="0.2.112"
-readonly GROK_BUILD_SHA256_X86_64="c2867112f7d89366123fe68a55a23dfb027d3602fc5b5b9cd5c080dacb4a2503"
-readonly GROK_BUILD_SHA256_AARCH64="d21f1aaaba7f2930db0ef7d5a9dc3f814a94c54af208e091f72a239cac02ba39"
+readonly GROK_BUILD_TESTED_VERSION="1.0.5"
+readonly GROK_BUILD_SHA256_X86_64="9ba87444e1819e8f6104adbbf4676a870c204380aa5c3e1c38a926c4ea677238"
+readonly GROK_BUILD_SHA256_AARCH64="1c1fe67d7c35497fb09f44a451f57acc3787add4c9aea2c56f5c7c75dc5ffcf1"
 readonly GROK_BUILD_DOWNLOAD_ROOT="https://x.ai/cli"
+
+# Only the exercised Linux x86-64 Host Operator runtime is released here.
+# Project Sandbox has a separate capability gate and is not enabled by install.
+if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
+  printf 'This native harness is currently supported on Linux x86-64.\n' >&2
+  exit 78
+fi
 
 grok_build_arch() {
   [[ "$(uname -s)" == "Linux" ]] || {
@@ -153,6 +160,4 @@ grok_build_main() {
   esac
 }
 
-if [[ "${GROK_BUILD_RUNTIME_SOURCE_ONLY:-0}" != "1" ]]; then
-  grok_build_main "$@"
-fi
+grok_build_main "$@"

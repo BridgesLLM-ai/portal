@@ -48,6 +48,20 @@ describe('OpenClaw Project qualification model-pin contract', () => {
     expect(sendIndex).toBeGreaterThan(pinIndex);
   });
 
+  test('the model probe rechecks maintenance before Gateway mutation and live dispatch', () => {
+    const probe = block(qualification, 'async function runDefaultModelProbe', '\nasync function ');
+    const pinIndex = probe.indexOf('patchSessionModel(input.sessionKey, pinnedModel)');
+    const stageIndex = probe.indexOf('await stageOpenClawRuntimeChallengeMarker({');
+    const sendIndex = probe.indexOf('provider.sendMessage(');
+    const fences = [...probe.matchAll(/assertCachedOpenClawExecutionAdmitted\(\)/g)]
+      .map((match) => match.index ?? -1);
+
+    expect(fences).toHaveLength(2);
+    expect(fences[0]).toBeLessThan(pinIndex);
+    expect(fences[1]).toBeGreaterThan(stageIndex);
+    expect(fences[1]).toBeLessThan(sendIndex);
+  });
+
   test('the model probe rejects non-embedded agent runtimes before spending a model turn', () => {
     const probe = block(qualification, 'async function runDefaultModelProbe', '\nasync function ');
     const runtimeGuard = probe.indexOf("pinnedRuntimeId !== 'openclaw'");

@@ -13,9 +13,9 @@ const ok = (stdout: string): CliResult => ({ ok: true, stdout, stderr: '' });
 function healthyReadiness(overrides: Partial<OpenClawSetupReadiness> = {}): OpenClawSetupReadiness {
   return {
     installed: true,
-    version: '2026.7.1-2',
-    corePackageVersion: '2026.7.1-2',
-    runningVersion: '2026.7.1-2',
+    version: '2026.9.1',
+    corePackageVersion: '2026.9.1',
+    runningVersion: '2026.9.1',
     gatewayRunning: true,
     authenticatedRpc: true,
     gatewayProbeOk: true,
@@ -23,13 +23,13 @@ function healthyReadiness(overrides: Partial<OpenClawSetupReadiness> = {}): Open
     gatewayUrl: 'http://127.0.0.1:18789',
     hasToken: true,
     tokenParity: true,
-    codexPluginVersion: '2026.7.1-1',
-    codexPluginInstallSpec: '@openclaw/codex@2026.7.1-1',
+    codexPluginVersion: '2026.9.1',
+    codexPluginInstallSpec: '@openclaw/codex@2026.9.1',
     credentialStoreReady: true,
     credentialStoreWritable: true,
-    testedCorePackageVersion: '2026.7.1-2',
-    testedRuntimeVersion: '2026.7.1',
-    testedCodexPluginVersion: '2026.7.1-1',
+    testedCorePackageVersion: '2026.9.1',
+    testedRuntimeVersion: '2026.9.1',
+    testedCodexPluginVersion: '2026.9.1',
     testedPairReady: true,
     ready: true,
     blockers: [],
@@ -46,25 +46,25 @@ describe('OpenClaw dashboard version probe', () => {
     let activeCalls = 0;
     let maximumActiveCalls = 0;
     const responses = new Map<string, CliResult>([
-      ['--version', ok('OpenClaw 2026.7.1-2')],
+      ['--version', ok('OpenClaw 2026.9.1')],
       ['gateway status --require-rpc --timeout 10000 --json', ok(JSON.stringify({
-        gateway: { version: '2026.7.1-2' },
+        gateway: { version: '2026.9.1' },
       }))],
       ['gateway probe --json', ok(JSON.stringify({
         ok: true,
-        targets: [{ self: { version: '2026.7.1-2' } }],
+        targets: [{ self: { version: '2026.9.1' } }],
       }))],
       ['plugins inspect codex --json', ok(JSON.stringify({
-        plugin: { version: '2026.7.1-1' },
+        plugin: { version: '2026.9.1' },
         install: {
           source: 'npm',
-          spec: '@openclaw/codex@2026.7.1-1',
-          version: '2026.7.1-1',
+          spec: '@openclaw/codex@2026.9.1',
+          version: '2026.9.1',
         },
       }))],
       ['models auth --agent main list --json', ok(JSON.stringify({ profiles: [] }))],
       ['update status --json --timeout 3', ok(JSON.stringify({
-        availability: { latestVersion: '2026.7.1-2' },
+        availability: { latestVersion: '2026.9.1' },
         channel: { value: 'stable' },
       }))],
     ]);
@@ -83,7 +83,7 @@ describe('OpenClaw dashboard version probe', () => {
       runOpenClawCli: runCli,
       resolvePackageMetadata: async () => ({
         packageDir: '/usr/lib/node_modules/openclaw',
-        version: '2026.7.1-2',
+        version: '2026.9.1',
       }),
       readGatewayToken: () => 'matching-token',
       credentialStoreWritable: () => true,
@@ -98,7 +98,7 @@ describe('OpenClaw dashboard version probe', () => {
       getSetupReadiness: getOpenClawSetupReadiness,
       getPackageMetadata: () => ({
         packageDir: '/usr/lib/node_modules/openclaw',
-        version: '2026.7.1-2',
+        version: '2026.9.1',
         mtimeMs: 1_750_000_000_000,
       }),
       getListenerProcess: () => ({
@@ -121,12 +121,12 @@ describe('OpenClaw dashboard version probe', () => {
     expect(maximumActiveCalls).toBe(1);
     expect(readiness.ready).toBe(true);
     expect(status).toEqual(expect.objectContaining({
-      installedVersion: '2026.7.1-2',
-      installedPackageVersion: '2026.7.1-2',
-      runningVersion: '2026.7.1-2',
-      codexPluginVersion: '2026.7.1-1',
-      codexPluginInstallSpec: '@openclaw/codex@2026.7.1-1',
-      latestVersion: '2026.7.1-2',
+      installedVersion: '2026.9.1',
+      installedPackageVersion: '2026.9.1',
+      runningVersion: '2026.9.1',
+      codexPluginVersion: '2026.9.1',
+      codexPluginInstallSpec: '@openclaw/codex@2026.9.1',
+      latestVersion: '2026.9.1',
       updateChannel: 'stable',
       testedPairReady: true,
       testedPairReason: null,
@@ -148,12 +148,12 @@ describe('OpenClaw dashboard version probe', () => {
     await __gatewayVersionProbeTest.probeOpenClawVersionStatusWithDependencies({
       runCli: async (args) => {
         events.push(args.join(' '));
-        return ok(JSON.stringify({ availability: { latestVersion: '2026.7.1-2' } }));
+        return ok(JSON.stringify({ availability: { latestVersion: '2026.9.1' } }));
       },
       getSetupReadiness,
       getPackageMetadata: () => ({
         packageDir: '/usr/lib/node_modules/openclaw',
-        version: '2026.7.1-2',
+        version: '2026.9.1',
         mtimeMs: 1_750_000_000_000,
       }),
       getListenerProcess: () => ({ pid: 1234, startedAt: null, startedAtMs: null }),
@@ -182,11 +182,11 @@ describe('OpenClaw dashboard version probe', () => {
     });
 
     const status = await __gatewayVersionProbeTest.probeOpenClawVersionStatusWithDependencies({
-      runCli: async () => ok(JSON.stringify({ availability: { latestVersion: '2026.7.1-2' } })),
+      runCli: async () => ok(JSON.stringify({ availability: { latestVersion: '2026.9.1' } })),
       getSetupReadiness: async () => readiness,
       getPackageMetadata: () => ({
         packageDir: '/usr/lib/node_modules/openclaw',
-        version: '2026.7.1-2',
+        version: '2026.9.1',
         mtimeMs: 1_750_000_000_000,
       }),
       getListenerProcess: () => ({ pid: 1234, startedAt: null, startedAtMs: null }),
@@ -198,11 +198,38 @@ describe('OpenClaw dashboard version probe', () => {
     expect(status.testedPairReason).toBe('The OpenClaw gateway did not pass an authenticated RPC probe.');
   });
 
+  it('preserves the exact family blocker for cross-family runtime tuples', async () => {
+    const familyBlocker = 'OpenClaw CLI runtime did not match the installed tested core family; detected 2026.9.1 for core 2026.7.1-2.';
+    const readiness = healthyReadiness({
+      version: '2026.9.1',
+      corePackageVersion: '2026.7.1-2',
+      runningVersion: '2026.9.1',
+      testedRuntimeFamily: 'legacy-2026.7.1',
+      testedPairReady: false,
+      ready: false,
+      blockers: [{ code: 'cli-runtime-mismatch', message: familyBlocker }],
+    });
+
+    const status = await __gatewayVersionProbeTest.probeOpenClawVersionStatusWithDependencies({
+      runCli: async () => ok(JSON.stringify({ availability: { latestVersion: '2026.9.1' } })),
+      getSetupReadiness: async () => readiness,
+      getPackageMetadata: () => ({
+        packageDir: '/usr/lib/node_modules/openclaw',
+        version: '2026.7.1-2',
+        mtimeMs: 1_750_000_000_000,
+      }),
+      getListenerProcess: () => ({ pid: 1234, startedAt: null, startedAtMs: null }),
+    });
+
+    expect(status.testedPairReady).toBe(false);
+    expect(status.testedPairReason).toBe(familyBlocker);
+  });
+
   it('preserves protocol-mismatch stderr and recommends restarting the stale listener', async () => {
     const readinessDependencies: OpenClawSetupReadinessDependencies = {
       runOpenClawCli: async (args) => {
         const command = args.join(' ');
-        if (command === '--version') return ok('OpenClaw 2026.7.1-2');
+        if (command === '--version') return ok('OpenClaw 2026.9.1');
         if (command.startsWith('gateway status ')) return ok('RPC probe: ok');
         if (command === 'gateway probe --json') {
           return {
@@ -213,11 +240,11 @@ describe('OpenClaw dashboard version probe', () => {
         }
         if (command === 'plugins inspect codex --json') {
           return ok(JSON.stringify({
-            plugin: { version: '2026.7.1-1' },
+            plugin: { version: '2026.9.1' },
             install: {
               source: 'npm',
-              spec: '@openclaw/codex@2026.7.1-1',
-              version: '2026.7.1-1',
+              spec: '@openclaw/codex@2026.9.1',
+              version: '2026.9.1',
             },
           }));
         }
@@ -228,21 +255,21 @@ describe('OpenClaw dashboard version probe', () => {
       },
       resolvePackageMetadata: async () => ({
         packageDir: '/usr/lib/node_modules/openclaw',
-        version: '2026.7.1-2',
+        version: '2026.9.1',
       }),
       readGatewayToken: () => 'matching-token',
       credentialStoreWritable: () => true,
     };
 
     const status = await __gatewayVersionProbeTest.probeOpenClawVersionStatusWithDependencies({
-      runCli: async () => ok(JSON.stringify({ availability: { latestVersion: '2026.7.1-2' } })),
+      runCli: async () => ok(JSON.stringify({ availability: { latestVersion: '2026.9.1' } })),
       getSetupReadiness: (_overrides, options) => getOpenClawSetupReadiness(
         readinessDependencies,
         { ...options, useSharedCache: true },
       ),
       getPackageMetadata: () => ({
         packageDir: '/usr/lib/node_modules/openclaw',
-        version: '2026.7.1-2',
+        version: '2026.9.1',
         mtimeMs: 1_750_000_000_000,
       }),
       getListenerProcess: () => ({ pid: 1234, startedAt: null, startedAtMs: null }),

@@ -4,13 +4,20 @@ set -Eeuo pipefail
 # Portal-tested Google Antigravity CLI runtime. The upstream bootstrapper uses
 # a mutable latest manifest and intentionally leaves an existing binary alone,
 # so it cannot converge or roll back a Portal compatibility pair. These URLs
-# and SHA-512 values are copied from Google's official release manifest for 1.1.7.
-readonly ANTIGRAVITY_TESTED_VERSION="1.1.7"
-readonly ANTIGRAVITY_SHA512_X86_64="720d5a7ff256aa5dd6712513cd5eb6fe031cf9e7523a33bcbda7755120ced53bb64ff985b402ce068e5895e0ffb348c2632545039a1dde6daad591f164d5852f"
-readonly ANTIGRAVITY_SHA512_AARCH64="6b42366c3926994785301af43e01f595c5b8e43eb521166d98478539368b0daafb3211000fb2280ade6a37da0a6c438ef28abc2c82b6c8263017b245878fc506"
-readonly ANTIGRAVITY_URL_X86_64="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.1.7-5951805767680000/linux-x64/cli_linux_x64.tar.gz"
-readonly ANTIGRAVITY_URL_AARCH64="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.1.7-5951805767680000/linux-arm/cli_linux_arm64.tar.gz"
+# and SHA-512 values are copied from Google's official release manifest for 1.1.17.
+readonly ANTIGRAVITY_TESTED_VERSION="1.1.17"
+readonly ANTIGRAVITY_SHA512_X86_64="5c6047a19e80025ea7cecc8152fb263a7f14e80591ee75bdf1ca10191cc0cd1639b5b5ebdce4d1c9d43b14bd2446f038a457821694579f4392b6ca9736512936"
+readonly ANTIGRAVITY_SHA512_AARCH64="ad871538fc8bbd0cf96e11b85e388dadde5cd02164c2921cf7cd30646e343c90a63ef5224f6420612ad6f91fe06f260e332e307968082f3a1f54e53933be847f"
+readonly ANTIGRAVITY_URL_X86_64="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.1.17-5084709148033024/linux-x64/cli_linux_x64.tar.gz"
+readonly ANTIGRAVITY_URL_AARCH64="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.1.17-5084709148033024/linux-arm/cli_linux_arm64.tar.gz"
 readonly ANTIGRAVITY_MAX_ARCHIVE_BYTES=$((128 * 1024 * 1024))
+
+# Only the exercised Linux x86-64 Host Operator runtime is released here.
+# Project Sandbox has a separate capability gate and is not enabled by install.
+if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
+  printf 'This native harness is currently supported on Linux x86-64.\n' >&2
+  exit 78
+fi
 
 antigravity_arch() {
   [[ "$(uname -s)" == "Linux" ]] || {
@@ -45,7 +52,7 @@ antigravity_sha512() {
 
 antigravity_binary_version() {
   local binary="$1" output
-  output="$(AGY_CLI_DISABLE_AUTO_UPDATE=1 "${binary}" --version 2>/dev/null)" || return 1
+  output="$(AGY_CLI_DISABLE_AUTO_UPDATE=true "${binary}" --version 2>/dev/null)" || return 1
   printf '%s\n' "${output}" | sed -nE 's/.*(^|[^0-9])([0-9]+\.[0-9]+\.[0-9]+)([^0-9].*|$)/\2/p' | head -1
 }
 

@@ -23,6 +23,8 @@ import {
 } from '../utils/terminalInput';
 import {
   buildTerminalCatalog,
+  isManagedPackageOnlyTerminalTool,
+  isTerminalToolExecutionAvailable,
   rankTerminalCatalog,
   type TerminalActionRisk,
   type TerminalCapabilities,
@@ -309,7 +311,7 @@ function AssistantAIPanel({ isOpen, onClose, onInsert, getFullBuffer, contextEna
         && currentContextKeyRef.current === snapshot.contextKey
         && mountedRef.current
       ) setDebugError(
-        'Failed to reach the configured Ollama backend. Check Settings → AI Providers and retry.',
+        'Failed to reach the configured Ollama backend. Check Settings → Model Providers and retry.',
       );
     } finally {
       if (debugAttemptRef.current === snapshot) {
@@ -791,9 +793,16 @@ function readPersistedTerminalState(): PersistedTerminalState {
     if (!raw) return buildDefaultTerminalState();
     const parsed = JSON.parse(raw) as PersistedTerminalState;
     if (!Array.isArray(parsed?.tabs) || parsed.tabs.length === 0) return buildDefaultTerminalState();
-    const normalizedTabs = parsed.tabs.filter((tab) => (
-      tab?.id && (tab.type === 'shell' || tab.type === 'chat' || tab.type === 'openclaw-tui')
-    ));
+    // Pre-supervisor builds persisted positive OpenClaw chat/TUI surfaces in
+    // this key. Discard them during the initial state read so neither legacy
+    // component can mount or issue gateway I/O after an upgrade/reload.
+    const normalizedTabs: TabDescriptor[] = parsed.tabs
+      .filter((tab) => tab?.id && tab.type === 'shell')
+      .map((tab) => ({
+        id: String(tab.id),
+        label: typeof tab.label === 'string' && tab.label.trim() ? tab.label : 'bash',
+        type: 'shell',
+      }));
     if (normalizedTabs.length === 0) return buildDefaultTerminalState();
     const activeTabExists = normalizedTabs.some((tab) => tab.id === parsed.activeTabId);
     return {
@@ -2312,13 +2321,23 @@ export default function TerminalPage() {
                       ))}
                     </div>
                     <div className="mt-1 flex gap-1.5 overflow-x-auto scrollbar-none" aria-label="Installed command-line tools">
-                      {capabilities.tools.filter((tool) => tool.installed).map((tool) => (
+                      {capabilities.tools.filter((tool) => tool.installed && isTerminalToolExecutionAvailable(tool)).map((tool) => (
                         <a key={tool.id} href={tool.sourceUrl} target="_blank" rel="noreferrer" title={`${tool.version || 'Installed'} · ${tool.helpCommand} · ${tool.executable || ''}`}
                           className="inline-block max-w-[280px] shrink-0 truncate rounded-md bg-white/[0.025] px-1.5 py-0.5 text-[8px] text-slate-500 hover:text-slate-300">
                           {tool.label}<span className="ml-1 text-slate-600">{tool.version || 'installed'}</span>
                         </a>
                       ))}
                     </div>
+                    {capabilities.tools.some((tool) => isManagedPackageOnlyTerminalTool(tool)) ? (
+                      <div className="mt-1 flex gap-1.5 overflow-x-auto scrollbar-none" aria-label="Managed package status">
+                        {capabilities.tools.filter(isManagedPackageOnlyTerminalTool).map((tool) => (
+                          <span key={tool.id} title={tool.probeError || 'No managed Terminal launcher'}
+                            className="inline-block max-w-[320px] shrink-0 truncate rounded-md bg-amber-500/5 px-1.5 py-0.5 text-[8px] text-amber-300/70">
+                            {tool.label}: {tool.installed ? `${tool.version || 'package verified'} · supervised Agent Chat only` : 'package unavailable'}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
                   </>
                 )}
               </div>

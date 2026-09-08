@@ -322,12 +322,12 @@ export default function ProjectProviderMenu({
       <button
         ref={triggerRef}
         type="button"
-        aria-label="Project chat provider"
+        aria-label="Project chat harness"
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         disabled={disabled}
-        title={selectedCapability?.reason || 'Choose a Project Chat provider'}
+        title={selectedCapability?.reason || 'Choose a Project Chat harness'}
         onClick={() => setOpen((current) => !current)}
         className="flex max-w-[144px] items-center gap-1.5 rounded-lg border border-theme-border bg-theme-surface px-2 py-1 text-[10px] text-theme-text shadow-sm transition-colors hover:bg-theme-bg disabled:cursor-not-allowed disabled:opacity-50"
       >
@@ -361,7 +361,7 @@ export default function ProjectProviderMenu({
           id={menuId}
           role="menu"
           tabIndex={-1}
-          aria-label="Project chat providers"
+          aria-label="Project chat harnesses"
           onKeyDown={handleMenuKeyDown}
           className="flex min-h-0 max-h-full w-full flex-col overflow-hidden rounded-2xl border border-theme-border bg-theme-surface shadow-2xl"
         >
@@ -603,7 +603,7 @@ export default function ProjectProviderMenu({
                           {qualificationPending
                             ? <Loader2 size={11} className="animate-spin" />
                             : <ShieldCheck size={11} />}
-                          {qualificationPending ? 'Preparing…' : 'Prepare provider'}
+                          {qualificationPending ? 'Preparing…' : 'Prepare harness'}
                         </button>
                       ) : (
                         <div className="mt-2 text-[9px] font-medium uppercase tracking-wide text-theme-text-muted">
@@ -619,7 +619,7 @@ export default function ProjectProviderMenu({
 
           <div className="flex items-center gap-1.5 border-t border-theme-border bg-theme-bg px-3 py-2 text-[9px] text-theme-text-muted">
             <ShieldCheck size={10} className="text-emerald-400" />
-            Choose Prepare provider to verify an isolated runtime before using it.
+            Choose Prepare harness to verify an isolated runtime before using it.
           </div>
         </div>
       </AnchoredPopover>

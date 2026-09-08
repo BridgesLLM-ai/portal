@@ -4,11 +4,21 @@ set -euo pipefail
 ROOT="${1:-/usr/lib/node_modules/openclaw/dist}"
 STRICT_MODE="${PORTAL_OPENCLAW_HOTFIX_STRICT:-0}"
 REQUIRED_PACKAGE_VERSION="${PORTAL_REQUIRED_OPENCLAW_PACKAGE_VERSION:-2026.7.1-2}"
+readonly LEGACY_SUPPORTED_PACKAGE_VERSION="2026.7.1-2"
+readonly NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION="2026.9.1"
 
 case "${STRICT_MODE}" in
   0|1) ;;
   *)
     echo "invalid PORTAL_OPENCLAW_HOTFIX_STRICT value: ${STRICT_MODE}" >&2
+    exit 2
+    ;;
+esac
+
+case "${REQUIRED_PACKAGE_VERSION}" in
+  "${LEGACY_SUPPORTED_PACKAGE_VERSION}"|"${NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION}") ;;
+  *)
+    echo "unsupported OpenClaw relay hotfix package version: ${REQUIRED_PACKAGE_VERSION}; this binary hotfix is fenced to ${LEGACY_SUPPORTED_PACKAGE_VERSION} or ${NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION}" >&2
     exit 2
     ;;
 esac
@@ -33,6 +43,16 @@ if package.get("name") != "openclaw" or package.get("version") != expected:
         f"expected openclaw@{expected}"
     )
 PY
+
+if [[ "${REQUIRED_PACKAGE_VERSION}" == "${NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION}" ]]; then
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/installer/patch-openclaw-2026.9.1-portal-contract.mjs"
+  if [[ ! -f "${helper}" || -L "${helper}" ]]; then
+    echo "OpenClaw 2026.9.1 Portal-contract patch helper is missing or unsafe: ${helper}" >&2
+    exit 1
+  fi
+  node "${helper}" "${ROOT}"
+  exit $?
+fi
 
 resolve_bundle() {
   python3 - "$ROOT" "$@" <<'PY'

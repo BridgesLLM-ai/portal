@@ -19,6 +19,7 @@ jest.mock('./terminalSystemdScopeBoundary', () => ({
 
 import {
   closeProjectDependencyPromotionWriterFence,
+  describeProjectDependencyPromotionStartupFailure,
   ProjectDependencyPromotionWriterFenceError,
   type ProjectDependencyPromotionWriterFenceDependencies,
 } from './projectDependencyPromotionWriterFence';
@@ -200,6 +201,69 @@ describe('Project dependency promotion writer fence', () => {
     });
     expect(release).not.toHaveBeenCalled();
     expect(fence.isHeld()).toBe(true);
+  });
+
+  test('preserves the OpenClaw subsystem, nested code, and validated session through the fence', async () => {
+    const release = jest.fn();
+    const nested = Object.assign(new Error('exact OpenClaw reset failed'), {
+      code: 'OPENCLAW_SESSION_RESET_FAILED',
+      sessionKey: 'agent:main:portal-user-1',
+    });
+    const dependencies = quiescenceDependencies([], {
+      quiesceOpenClawHostRuns: jest.fn(async () => { throw nested; }),
+    });
+    const fence = closeProjectDependencyPromotionWriterFence({
+      closeAdmissionAndSettleInstaller: () => ({
+        waitForMutationDrain: async () => {},
+        release,
+      }),
+      releaseProjectLease: jest.fn(),
+    }, dependencies);
+
+    let failure: unknown;
+    try {
+      await fence.proveQuiescent();
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      code: 'PROJECT_DEPENDENCY_PROMOTION_WRITER_FENCE_UNPROVEN',
+      fenceRetained: true,
+      subsystem: 'openClawHostRuns',
+      causeCode: 'OPENCLAW_SESSION_RESET_FAILED',
+      causeMessage: 'exact OpenClaw reset failed',
+      sessionKey: 'agent:main:portal-user-1',
+    });
+    expect(describeProjectDependencyPromotionStartupFailure(failure)).toEqual({
+      code: 'PROJECT_DEPENDENCY_PROMOTION_WRITER_FENCE_UNPROVEN',
+      message: 'A Portal-tracked workspace writer could not be proven quiescent before dependency promotion.',
+      subsystem: 'openClawHostRuns',
+      causeCode: 'OPENCLAW_SESSION_RESET_FAILED',
+      causeMessage: 'exact OpenClaw reset failed',
+      sessionKey: 'agent:main:portal-user-1',
+    });
+    expect(release).not.toHaveBeenCalled();
+    expect(fence.isHeld()).toBe(true);
+  });
+
+  test.each([
+    ['a control character', 'agent:main:unsafe\nsession'],
+    ['an oversized agent id', `agent:${'a'.repeat(2_048)}:x`],
+  ])('drops a session identity with %s from internal diagnostics', (_label, sessionKey) => {
+    const failure = new ProjectDependencyPromotionWriterFenceError(
+      'writer failed',
+      true,
+      'PROJECT_DEPENDENCY_PROMOTION_WRITER_FENCE_UNPROVEN',
+      503,
+      {
+        subsystem: 'openClawHostRuns',
+        causeCode: 'OPENCLAW_SESSION_RESET_FAILED',
+        sessionKey,
+      },
+    );
+
+    expect(failure.sessionKey).toBeNull();
+    expect(describeProjectDependencyPromotionStartupFailure(failure).sessionKey).toBeNull();
   });
 
   test('never reopens when ACTIVE/quarantine attestation is indeterminate', async () => {

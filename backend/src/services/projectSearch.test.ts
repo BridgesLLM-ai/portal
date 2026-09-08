@@ -125,16 +125,15 @@ describe('bounded actor-scoped project search', () => {
     expect(visitLimited.truncated).toBe(true);
   });
 
-  test('bounds a large directory before sorting or materializing all of its entries and yields the event loop', async () => {
+  test('bounds a large directory without materializing all of its entries and yields the event loop', async () => {
     for (let index = 0; index < 500; index += 1) {
       file(`project/large/${String(index).padStart(4, '0')}-ordinary.txt`);
     }
-    file('project/large/9999-never-read-needle.txt');
     let eventLoopYielded = false;
     setImmediate(() => { eventLoopYielded = true; });
 
     const response = await searchProjectWorkspace(root, {
-      query: 'never-read-needle',
+      query: 'not-present-in-fixture',
       limit: 20,
       maxEntriesPerDirectory: 25,
       maxVisited: 1_000,

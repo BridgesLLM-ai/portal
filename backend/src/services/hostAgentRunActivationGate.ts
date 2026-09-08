@@ -9,23 +9,26 @@ export const HOST_AGENT_RUN_RUNTIME_ROOT = '/run/bridgesllm/host-agent-runs';
 const ACTIVATION_HANDSHAKE_TIMEOUT_MS = 30_000;
 const UNIX_SOCKET_PATH_MAX_BYTES = 100;
 const TARGET_ENVIRONMENT_MAX_BYTES = 256 * 1024;
+export const HOST_AGENT_RUN_STDIN_MAX_BYTES = 256 * 1024;
+const TARGET_PAYLOAD_MAX_ENCODED_BYTES = 1024 * 1024;
 const SCOPE_UNIT_PATTERN = /^bridgesllm-host-agent-([0-9a-f]{32})\.scope$/;
 const SCOPE_TAG_PATTERN = /^[0-9a-f]{64}$/;
 
 // Fixed bootstrap used by every host systemd-scope consumer. The systemd-run
 // launcher receives only this wrapper and a root-only gate identity. The target
-// environment and release byte arrive over the authenticated socket only after
-// the caller has durably persisted the exact scope identity.
+// environment, sensitive stdin, and release byte arrive over the authenticated
+// socket only after the caller has durably persisted the exact scope identity.
 export const HOST_AGENT_RUN_ACTIVATION_WRAPPER_SOURCE = `
 const net = require('net');
 const { spawn } = require('child_process');
 const [socketPath, scopeTag, command, ...args] = process.argv.slice(1);
 let settled = false;
 let target = null;
-let phase = 'environment';
+let phase = 'target';
 let inbound = Buffer.alloc(0);
-let expectedEnvironmentBytes = null;
+let expectedTargetBytes = null;
 let targetEnvironment = null;
+let targetStdin = undefined;
 const failClosed = (code = 125) => {
   if (settled) return;
   settled = true;
@@ -39,33 +42,60 @@ socket.once('connect', () => socket.write(scopeTag + '\\n'));
 socket.on('data', (chunk) => {
   if (settled || !Buffer.isBuffer(chunk)) return failClosed();
   inbound = Buffer.concat([inbound, chunk]);
-  if (phase === 'environment') {
-    if (expectedEnvironmentBytes === null) {
+  if (phase === 'target') {
+    if (expectedTargetBytes === null) {
       const newline = inbound.indexOf(0x0a);
       if (newline < 0) {
         if (inbound.length > 32) failClosed();
         return;
       }
       const header = inbound.subarray(0, newline).toString('ascii');
-      if (!/^E[1-9][0-9]{0,7}$/.test(header)) return failClosed();
-      expectedEnvironmentBytes = Number(header.slice(1));
-      if (!Number.isSafeInteger(expectedEnvironmentBytes) || expectedEnvironmentBytes > 400000) {
+      if (!/^T[1-9][0-9]{0,7}$/.test(header)) return failClosed();
+      expectedTargetBytes = Number(header.slice(1));
+      if (!Number.isSafeInteger(expectedTargetBytes) || expectedTargetBytes > 1048576) {
         return failClosed();
       }
       inbound = inbound.subarray(newline + 1);
     }
-    if (inbound.length < expectedEnvironmentBytes) return;
-    if (inbound.length !== expectedEnvironmentBytes) return failClosed();
+    if (inbound.length < expectedTargetBytes) return;
+    if (inbound.length !== expectedTargetBytes) return failClosed();
     try {
-      const decoded = Buffer.from(inbound.toString('ascii'), 'base64').toString('utf8');
+      const encoded = inbound.toString('ascii');
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || encoded.length % 4 !== 0) return failClosed();
+      const decodedBuffer = Buffer.from(encoded, 'base64');
+      if (decodedBuffer.toString('base64') !== encoded) return failClosed();
+      const decoded = decodedBuffer.toString('utf8');
       const parsed = JSON.parse(decoded);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return failClosed();
+      if (
+        !parsed
+        || typeof parsed !== 'object'
+        || Array.isArray(parsed)
+        || Object.keys(parsed).sort().join(',') !== 'environment,stdinBase64'
+        || !parsed.environment
+        || typeof parsed.environment !== 'object'
+        || Array.isArray(parsed.environment)
+      ) return failClosed();
       targetEnvironment = Object.create(null);
-      for (const [key, value] of Object.entries(parsed)) {
+      for (const [key, value] of Object.entries(parsed.environment)) {
         if (!key || key.includes('\\0') || key.includes('=') || typeof value !== 'string' || value.includes('\\0')) {
           return failClosed();
         }
         targetEnvironment[key] = value;
+      }
+      if (parsed.stdinBase64 === null) {
+        targetStdin = undefined;
+      } else {
+        if (
+          typeof parsed.stdinBase64 !== 'string'
+          || !/^[A-Za-z0-9+/]+={0,2}$/.test(parsed.stdinBase64)
+          || parsed.stdinBase64.length % 4 !== 0
+        ) return failClosed();
+        targetStdin = Buffer.from(parsed.stdinBase64, 'base64');
+        if (
+          targetStdin.length < 1
+          || targetStdin.length > 262144
+          || targetStdin.toString('base64') !== parsed.stdinBase64
+        ) return failClosed();
       }
     } catch {
       return failClosed();
@@ -77,15 +107,18 @@ socket.on('data', (chunk) => {
   }
 
   if (inbound.length !== 1 || inbound[0] !== 0x31 || !targetEnvironment) return failClosed();
-  settled = true;
   clearTimeout(deadline);
   socket.destroy();
-  target = spawn(command, args, {
-    cwd: process.cwd(),
-    env: targetEnvironment,
-    stdio: 'inherit',
-    shell: false,
-  });
+  try {
+    target = spawn(command, args, {
+      cwd: process.cwd(),
+      env: targetEnvironment,
+      stdio: [targetStdin === undefined ? 'inherit' : 'pipe', 'inherit', 'inherit'],
+      shell: false,
+    });
+  } catch {
+    process.exit(127);
+  }
   target.once('error', () => process.exit(127));
   target.once('exit', (code, signal) => {
     if (signal) {
@@ -97,6 +130,12 @@ socket.on('data', (chunk) => {
     }
     process.exit(Number.isInteger(code) ? code : 1);
   });
+  if (targetStdin !== undefined) {
+    if (!target.stdin) process.exit(127);
+    target.stdin.on('error', () => {});
+    target.stdin.end(targetStdin);
+  }
+  settled = true;
 });
 socket.once('end', () => failClosed());
 socket.once('close', () => failClosed());
@@ -106,7 +145,10 @@ socket.once('error', () => failClosed());
 export interface HostAgentRunActivationGate {
   readonly socketPath: string;
   readonly ready: Promise<void>;
-  prepareTargetEnvironment(environment: NodeJS.ProcessEnv): void;
+  prepareTarget(input: {
+    environment: NodeJS.ProcessEnv;
+    stdinText?: string;
+  }): void;
   release(): Promise<void>;
   abort(): Promise<void>;
 }
@@ -201,7 +243,7 @@ export async function createHostAgentRunActivationGate(
   let handshakeSettled = false;
   let closed = false;
   let released = false;
-  let encodedTargetEnvironment: string | null = null;
+  let encodedTargetPayload: string | null = null;
   let resolveReady!: () => void;
   let rejectReady!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => {
@@ -242,14 +284,14 @@ export async function createHostAgentRunActivationGate(
           void abortWith(new Error('Host agent activation handshake identity mismatch'));
           return;
         }
-        if (encodedTargetEnvironment === null) {
-          void abortWith(new Error('Host agent target environment was not prepared'));
+        if (encodedTargetPayload === null) {
+          void abortWith(new Error('Host agent target payload was not prepared'));
           return;
         }
         authenticated = true;
         inbound = '';
         socket.write(
-          `E${Buffer.byteLength(encodedTargetEnvironment, 'ascii')}\n${encodedTargetEnvironment}`,
+          `T${Buffer.byteLength(encodedTargetPayload, 'ascii')}\n${encodedTargetPayload}`,
         );
         return;
       }
@@ -344,10 +386,11 @@ export async function createHostAgentRunActivationGate(
   return Object.freeze({
     socketPath,
     ready,
-    prepareTargetEnvironment(environment: NodeJS.ProcessEnv): void {
-      if (closed || acceptedSocket || encodedTargetEnvironment !== null) {
-        throw new Error('Host agent target environment can no longer be prepared');
+    prepareTarget(input: { environment: NodeJS.ProcessEnv; stdinText?: string }): void {
+      if (closed || acceptedSocket || encodedTargetPayload !== null) {
+        throw new Error('Host agent target payload can no longer be prepared');
       }
+      const { environment, stdinText } = input;
       if (!environment || typeof environment !== 'object') {
         throw new Error('Host agent target environment is invalid');
       }
@@ -370,7 +413,28 @@ export async function createHostAgentRunActivationGate(
       if (Buffer.byteLength(serialized, 'utf8') > TARGET_ENVIRONMENT_MAX_BYTES) {
         throw new Error('Host agent target environment exceeds its bound');
       }
-      encodedTargetEnvironment = Buffer.from(serialized, 'utf8').toString('base64');
+      if (
+        stdinText !== undefined
+        && (
+          typeof stdinText !== 'string'
+          || stdinText.includes('\0')
+          || Buffer.byteLength(stdinText, 'utf8') < 1
+          || Buffer.byteLength(stdinText, 'utf8') > HOST_AGENT_RUN_STDIN_MAX_BYTES
+        )
+      ) {
+        throw new Error('Host agent target stdin exceeds its bound');
+      }
+      const payload = JSON.stringify({
+        environment: normalized,
+        stdinBase64: stdinText === undefined
+          ? null
+          : Buffer.from(stdinText, 'utf8').toString('base64'),
+      });
+      encodedTargetPayload = Buffer.from(payload, 'utf8').toString('base64');
+      if (Buffer.byteLength(encodedTargetPayload, 'ascii') > TARGET_PAYLOAD_MAX_ENCODED_BYTES) {
+        encodedTargetPayload = null;
+        throw new Error('Host agent target payload exceeds its bound');
+      }
     },
     async release(): Promise<void> {
       await ready;
@@ -405,6 +469,8 @@ export const __hostAgentRunActivationGateTest = Object.freeze({
   ACTIVATION_HANDSHAKE_TIMEOUT_MS,
   UNIX_SOCKET_PATH_MAX_BYTES,
   TARGET_ENVIRONMENT_MAX_BYTES,
+  TARGET_STDIN_MAX_BYTES: HOST_AGENT_RUN_STDIN_MAX_BYTES,
+  TARGET_PAYLOAD_MAX_ENCODED_BYTES,
   SCOPE_UNIT_PATTERN,
   SCOPE_TAG_PATTERN,
 });

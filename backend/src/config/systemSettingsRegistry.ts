@@ -100,7 +100,7 @@ const exactRules: Record<string, StringRule> = {
   'ollama.defaultModel': modelName,
 };
 
-const providerAvatarKey = /^appearance\.agentAvatar\.(OPENCLAW|CLAUDE_CODE|CODEX|GROK|AGENT_ZERO|GEMINI|OLLAMA)$/;
+const providerAvatarKey = /^appearance\.agentAvatar\.(OPENCLAW|CLAUDE_CODE|CODEX|GROK|AGENT_ZERO|GEMINI|OLLAMA|HERMES|OPENCODE)$/;
 const ollamaTierKey = /^ollama\.local\.tier\.(snappy|smart|best)$/;
 const avatarRule = httpUrl({ allowEmpty: true, allowRelative: true, label: 'Agent avatar URL' });
 

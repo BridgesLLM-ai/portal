@@ -255,7 +255,7 @@ function SetupHandoff({ className = '' }: { className?: string }) {
           </h3>
           <p className="mt-1 text-xs leading-5 text-theme-text-muted">
             Finish Portal setup and sign in as the Owner. Then open Settings →
-            AI Providers → Remote GPU to connect a Windows PC already on your
+            Model Providers → Remote GPU to connect a Windows PC already on your
             tailnet.
           </p>
         </div>

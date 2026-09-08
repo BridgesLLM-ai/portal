@@ -8,6 +8,7 @@ import {
 } from '../agents/executionScope';
 import type { AgentZeroProjectModelSelection } from '../agents/providers/agentZero/AgentZeroProjectModelBridgeCredential';
 import { prisma } from '../config/database';
+import { unqualifiedNativeBinaryReason } from '../config/unqualifiedNativeBinaryLane';
 import { resolveContainedPath } from './containedPath';
 import { agentZeroProjectModelBindingValue } from './agentZeroProjectModel';
 import {
@@ -113,7 +114,7 @@ const PROJECT_CHAT_PROVIDER_CAPABILITIES: readonly ProjectChatProviderCapability
     supportsAbort: true,
     supportsReset: true,
     requiresOAuth: true,
-    reason: 'The isolated v2.5 adapter exists but remains closed until this project passes exact connector 0.1.0 authentication, host/egress escape, WebSocket replay, and model round-trip qualification.',
+    reason: 'The isolated v2.10 adapter exists but remains closed until this project passes exact connector 0.1.0 authentication, host/egress escape, WebSocket replay, and model round-trip qualification.',
   },
   {
     provider: 'GEMINI',
@@ -121,12 +122,12 @@ const PROJECT_CHAT_PROVIDER_CAPABILITIES: readonly ProjectChatProviderCapability
     runtime: getProjectChatProviderRuntimeDescriptor('GEMINI').runtime,
     selectable: false,
     executionScope: null,
-    supportsAttachments: true,
-    supportsModelSelection: true,
-    supportsAbort: true,
-    supportsReset: true,
-    requiresOAuth: true,
-    reason: 'Project sandbox adapter has not passed filesystem escape and session-resume validation.',
+    supportsAttachments: false,
+    supportsModelSelection: false,
+    supportsAbort: false,
+    supportsReset: false,
+    requiresOAuth: false,
+    reason: unqualifiedNativeBinaryReason('GEMINI'),
   },
   {
     provider: 'OLLAMA',

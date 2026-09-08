@@ -4,6 +4,7 @@ import type { ChildProcess, SpawnOptions } from 'child_process';
 import { prisma } from '../config/database';
 import {
   createHostAgentRunActivationGate,
+  HOST_AGENT_RUN_STDIN_MAX_BYTES,
   HOST_AGENT_RUN_ACTIVATION_WRAPPER_SOURCE,
   HOST_AGENT_RUN_RUNTIME_ROOT,
   initializeHostAgentRunGateStorage,
@@ -81,7 +82,22 @@ export interface SpawnGatedHostAgentRunAttemptInput {
   reservation: ReservedHostAgentRunAttempt;
   command: string;
   args: readonly string[];
+  stdinText?: string;
   options: SpawnOptions;
+}
+
+export interface AssertHostAgentRunAttachableInput {
+  runId: string;
+  actorUserId: string;
+  actorAuthorizationVersion: number;
+  provider: string;
+  sessionId: string;
+}
+
+export interface HostAgentRunAttachmentProof {
+  handle: HostAgentRunHandle;
+  attempt: number;
+  identity: PersistedHostAgentRunIdentity;
 }
 
 export interface HostAgentRunQuiescence {
@@ -577,6 +593,76 @@ export function beginHostAgentRun(input: BeginHostAgentRunInput): Promise<HostAg
   return trackOperation(beginHostAgentRunInternal(input));
 }
 
+function attachableHandle(input: AssertHostAgentRunAttachableInput): HostAgentRunHandle {
+  const handle: HostAgentRunHandle = {
+    id: input.runId,
+    actorUserId: input.actorUserId,
+    actorAuthorizationVersion: input.actorAuthorizationVersion,
+    provider: input.provider,
+    sessionId: input.sessionId,
+  };
+  validateHandle(handle);
+  return handle;
+}
+
+async function readAttachableHostAgentRun(
+  handle: HostAgentRunHandle,
+): Promise<{ row: HostAgentRunRow; identity: PersistedHostAgentRunIdentity }> {
+  return await (prisma as any).$transaction(async (transaction: any) => {
+    await assertActorAndTransition(transaction, handle);
+    const row = await transaction.hostAgentRun.findUnique({
+      where: { id: handle.id },
+    }) as HostAgentRunRow | null;
+    const identity = row ? identityFromRow(row) : null;
+    if (
+      !row
+      || !sameHandle(row, handle)
+      || row.status !== 'DISPATCHED'
+      || !identity
+      || !(row.dispatchActivatedAt instanceof Date)
+    ) {
+      throw new HostAgentRunJournalError(
+        'Host agent run is unavailable for attachment',
+        409,
+        'HOST_RUN_ATTACH_UNAVAILABLE',
+      );
+    }
+    return { row, identity };
+  }, { isolationLevel: 'Serializable' });
+}
+
+export function assertHostAgentRunAttachable(
+  input: AssertHostAgentRunAttachableInput,
+): Promise<HostAgentRunAttachmentProof> {
+  const handle = attachableHandle(input);
+  return trackOperation((async () => {
+    await initializeHostAgentRunRuntime();
+    const initial = await readAttachableHostAgentRun(handle);
+    await systemdHostRunBoundary.attestActive(initial.identity);
+
+    // Re-read durable ownership and identity after inspecting systemd, then
+    // re-attest the same scope. Browser attachment must never rest only on an
+    // in-memory stream or on either side of this boundary in isolation.
+    const confirmed = await readAttachableHostAgentRun(handle);
+    if (
+      confirmed.row.attempt !== initial.row.attempt
+      || JSON.stringify(confirmed.identity) !== JSON.stringify(initial.identity)
+    ) {
+      throw new HostAgentRunJournalError(
+        'Host agent attachment identity changed during attestation',
+        409,
+        'HOST_RUN_ATTACH_RACE',
+      );
+    }
+    await systemdHostRunBoundary.attestActive(confirmed.identity);
+    return Object.freeze({
+      handle: Object.freeze({ ...handle }),
+      attempt: confirmed.row.attempt,
+      identity: Object.freeze({ ...confirmed.identity }),
+    });
+  })());
+}
+
 export function reserveHostAgentRunAttempt(
   handle: HostAgentRunHandle,
 ): Promise<ReservedHostAgentRunAttempt> {
@@ -739,6 +825,21 @@ function validateSpawnInput(input: SpawnGatedHostAgentRunAttemptInput): {
     );
   }
   if (
+    input.stdinText !== undefined
+    && (
+      typeof input.stdinText !== 'string'
+      || input.stdinText.includes('\0')
+      || Buffer.byteLength(input.stdinText, 'utf8') < 1
+      || Buffer.byteLength(input.stdinText, 'utf8') > HOST_AGENT_RUN_STDIN_MAX_BYTES
+    )
+  ) {
+    throw new HostAgentRunJournalError(
+      'Host agent sensitive stdin is invalid',
+      400,
+      'HOST_RUN_STDIN_INVALID',
+    );
+  }
+  if (
     typeof input.options.cwd !== 'string'
     || !path.posix.isAbsolute(input.options.cwd)
     || path.posix.normalize(input.options.cwd) !== input.options.cwd
@@ -843,9 +944,10 @@ export function spawnGatedHostAgentRunAttempt(
     try {
       // Loader/runtime variables from the requested CLI must never reach the
       // pre-scope systemd-run process or the wrapper bootstrap. The target
-      // environment travels only over the authenticated root-only socket and
-      // is acknowledged while the wrapper remains pre-exec blocked.
-      gate.prepareTargetEnvironment(env);
+      // environment and sensitive stdin travel only over the authenticated
+      // root-only socket and are acknowledged while the wrapper remains
+      // pre-exec blocked. Neither may appear in systemd-run argv.
+      gate.prepareTarget({ environment: env, stdinText: input.stdinText });
       launched = await systemdHostRunBoundary.launch({
         reservation: input.reservation,
         wrapperCommand: process.execPath,

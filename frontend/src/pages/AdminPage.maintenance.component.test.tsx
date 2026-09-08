@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '../test/setup';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -10,6 +10,8 @@ const adminMocks = vi.hoisted(() => ({
   getStatus: vi.fn(),
   startAction: vi.fn(),
   listJobs: vi.fn(),
+  listLegacyAgents: vi.fn(),
+  detachLegacyAgent: vi.fn(),
 }));
 
 vi.mock('../contexts/AuthContext', () => ({
@@ -29,7 +31,12 @@ vi.mock('../api/agentJobs', () => ({
   agentJobsAPI: { list: adminMocks.listJobs },
 }));
 
-vi.mock('../api/admin', () => ({ adminAPI: {} }));
+vi.mock('../api/admin', () => ({
+  adminAPI: {
+    listLegacyOpenClawAgents: adminMocks.listLegacyAgents,
+    detachLegacyOpenClawAgent: adminMocks.detachLegacyAgent,
+  },
+}));
 
 vi.mock('../utils/sounds', () => ({
   default: { click: vi.fn(), success: vi.fn(), error: vi.fn() },
@@ -91,6 +98,12 @@ describe('AdminPage maintenance admission surface', () => {
     adminMocks.getStatus.mockReset().mockResolvedValue(maintenanceStatus);
     adminMocks.startAction.mockReset().mockResolvedValue({ job: runningMaintenanceJob });
     adminMocks.listJobs.mockReset().mockResolvedValue([]);
+    adminMocks.listLegacyAgents.mockReset().mockResolvedValue({
+      configHash: 'config-hash',
+      agents: [],
+      preservation: { transcripts: true, workspaces: true, projectFiles: true },
+    });
+    adminMocks.detachLegacyAgent.mockReset();
   });
 
   it('requires both the exact phrase and an explicit maintenance-window acknowledgement', async () => {
@@ -240,6 +253,64 @@ describe('AdminPage maintenance admission surface', () => {
     await user.click(screen.getByRole('button', { name: 'Start server change' }));
     await waitFor(() => expect(adminMocks.startAction).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('Apply security updates is running')).toBeVisible();
+  });
+
+  it('detaches an exact bind-less legacy registration behind its own typed confirmation and shows the rollback receipt', async () => {
+    const user = userEvent.setup();
+    const stale = {
+      agentId: 'portal-1234abcd-old_project',
+      userPrefix: '1234abcd',
+      projectSlug: 'old_project',
+      bindCount: 0,
+      state: 'STALE_BINDLESS' as const,
+      detachable: true,
+      reason: 'No Project bind remains.',
+      fingerprint: 'a'.repeat(64),
+      preservesTranscripts: true as const,
+      preservesWorkspace: true as const,
+    };
+    adminMocks.listLegacyAgents
+      .mockResolvedValueOnce({
+        configHash: 'before',
+        agents: [stale],
+        preservation: { transcripts: true, workspaces: true, projectFiles: true },
+      })
+      .mockResolvedValue({
+        configHash: 'after',
+        agents: [],
+        preservation: { transcripts: true, workspaces: true, projectFiles: true },
+      });
+    adminMocks.detachLegacyAgent.mockResolvedValue({
+      ok: true,
+      agentId: stale.agentId,
+      receiptId: 'receipt-123',
+      transcriptsPreserved: true,
+      workspacePreserved: true,
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/admin?tab=maintenance']}>
+        <AdminPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText(stale.agentId)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Detach registration' }));
+    const dialog = screen.getByRole('dialog', { name: 'Detach stale OpenClaw registration' });
+    expect(dialog).toHaveTextContent('does not call OpenClaw\'s agent deletion API');
+    const confirmation = screen.getByRole('textbox', {
+      name: new RegExp(`Type DETACH ${stale.agentId} to continue`, 'i'),
+    });
+    await user.type(confirmation, `DETACH ${stale.agentId}`);
+    await user.click(within(dialog).getByRole('button', { name: 'Detach registration' }));
+
+    await waitFor(() => expect(adminMocks.detachLegacyAgent).toHaveBeenCalledWith(
+      stale.agentId,
+      stale.fingerprint,
+      `DETACH ${stale.agentId}`,
+    ));
+    expect(await screen.findByText(/receipt-123/i)).toBeVisible();
+    expect(screen.getByText(/No files were deleted/i)).toBeVisible();
   });
 
   it('shows persistent refresh failures honestly and waits for the advertised retry window', async () => {

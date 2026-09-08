@@ -105,7 +105,7 @@ describe('DesktopPage Remote Desktop contract', () => {
             {
               step: 'Verify AI runtime launchers',
               ok: false,
-              message: 'AI runtime launcher readiness blocked:\n - antigravity runtime binary at /usr/local/bin/agy failed its Portal command/version contract (expected 1.1.7)',
+              message: 'AI runtime launcher readiness blocked:\n - antigravity runtime binary at /usr/local/bin/agy failed its Portal command/version contract (expected 1.1.17)',
             },
           ],
         },
@@ -121,7 +121,7 @@ describe('DesktopPage Remote Desktop contract', () => {
     const failures = await screen.findAllByText(/1 step needs attention/i);
     expect(failures.length).toBeGreaterThan(0);
     expect(failures[0]).toHaveTextContent('Verify AI runtime launchers');
-    expect(failures[0]).toHaveTextContent('expected 1.1.7');
+    expect(failures[0]).toHaveTextContent('expected 1.1.17');
   });
 
   it('retains setup ownership through the settle delay and exact status readback', async () => {

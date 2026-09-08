@@ -90,6 +90,19 @@ function renderRoutedTasks() {
 }
 
 describe('TasksPage retained job diagnostics', () => {
+  it('links an exact child and parent session, but not an opaque ledger task id', async () => {
+    mocks.gatewayGet.mockResolvedValue({ data: { ok: true, tasks: [
+      { id: 'collapsed-task', name: 'Child research', status: 'done', model: 'model', sessionKey: 'agent:worker:subagent:child-42', parentSession: 'agent:main:main' },
+      { id: 'task-uuid', name: 'Opaque ledger task', status: 'done', model: 'model' },
+    ] } });
+    renderRoutedTasks();
+    const link = await screen.findByRole('link', { name: 'Open conversation' });
+    expect(link).toHaveAttribute('href', '/agent-chats?openclawSession=agent%3Aworker%3Asubagent%3Achild-42');
+    expect(screen.getAllByRole('link', { name: 'Open conversation' })).toHaveLength(1);
+    const card = screen.getByText('Child research').closest('h3')!.parentElement!.parentElement!.parentElement!.parentElement!.parentElement!;
+    await userEvent.click(within(card).getByRole('button', { name: 'Details' }));
+    expect(screen.getByRole('link', { name: 'Open parent conversation' })).toHaveAttribute('href', '/agent-chats?openclawSession=agent%3Amain%3Amain');
+  });
   beforeEach(() => {
     mocks.gatewayGet.mockReset().mockResolvedValue({ data: { ok: true, tasks: [] } });
     mocks.listJobs.mockReset().mockResolvedValue([retainedJob]);

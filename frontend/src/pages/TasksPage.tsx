@@ -3,7 +3,7 @@
  */
 import { useState, useEffect, useCallback, useContext, useMemo, useRef, type ReactNode } from 'react';
 import { motion } from 'framer-motion';
-import { UNSAFE_NavigationContext } from 'react-router-dom';
+import { Link, UNSAFE_NavigationContext } from 'react-router-dom';
 import {
   ListTodo,
   RefreshCw,
@@ -16,6 +16,7 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import client from '../api/client';
+import { taskConversationHref } from '../utils/taskConversation';
 import { agentJobsAPI, type AgentJob } from '../api/agentJobs';
 import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 
@@ -32,6 +33,7 @@ interface Task {
   summary?: string;
   detail?: string | null;
   parentSession?: string;
+  sessionKey?: string | null;
   error?: string;
   portalJobId?: string;
 }
@@ -343,6 +345,8 @@ function TaskCard({
   const prompt = task.prompt && task.prompt !== task.name ? task.prompt : null;
   const summary = task.summary && task.summary !== prompt ? task.summary : null;
   const detail = task.detail && task.detail !== summary ? task.detail : null;
+  const conversationHref = taskConversationHref(task.sessionKey);
+  const parentHref = taskConversationHref(task.parentSession);
   const canExpand = Boolean(prompt || detail || task.error || task.parentSession || task.portalJobId || (summary && summary.length > 180));
 
   return (
@@ -372,6 +376,8 @@ function TaskCard({
         </div>
 
         <div className="flex flex-wrap items-center gap-2 sm:justify-end sm:pl-2">
+          {conversationHref && <Link to={conversationHref} className="inline-flex min-h-[40px] items-center rounded-lg border border-sky-400/20 bg-sky-400/10 px-3 text-xs text-sky-200 hover:bg-sky-400/20">Open conversation</Link>}
+
           <span className={`rounded-full border px-2 py-1 text-xs ${
             task.status === 'running' ? 'border-blue-400/20 bg-blue-500/15 text-blue-200' :
             task.status === 'done' ? 'border-emerald-400/20 bg-emerald-500/15 text-emerald-200' :
@@ -425,13 +431,13 @@ function TaskCard({
 
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="rounded-xl border border-white/5 bg-black/15 px-3 py-2.5 text-xs text-slate-300">
-              <div className="mb-1.5 text-[10px] uppercase tracking-[0.18em] text-slate-500">Task session</div>
+              <div className="mb-1.5 text-[10px] uppercase tracking-[0.18em] text-slate-500">Task ID</div>
               <div className="break-all font-mono text-[11px] text-slate-400">{task.id}</div>
             </div>
             {task.parentSession ? (
               <div className="rounded-xl border border-white/5 bg-black/15 px-3 py-2.5 text-xs text-slate-300">
                 <div className="mb-1.5 text-[10px] uppercase tracking-[0.18em] text-slate-500">Parent session</div>
-                <div className="break-all font-mono text-[11px] text-slate-400">{task.parentSession}</div>
+                {parentHref ? <Link to={parentHref} className="inline-flex min-h-[36px] items-center text-xs text-sky-300 hover:text-sky-200">Open parent conversation</Link> : <div className="break-all font-mono text-[11px] text-slate-400">{task.parentSession}</div>}
               </div>
             ) : null}
           </div>

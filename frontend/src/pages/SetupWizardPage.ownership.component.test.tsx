@@ -3,7 +3,8 @@
 import '../test/setup';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { BrowserRouter, MemoryRouter, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, MemoryRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SetupWizardPage from './SetupWizardPage';
 import { SETUP_SESSION_STORAGE_KEY } from './setupWizardFlow';
@@ -164,7 +165,16 @@ function installGetMocks(
     if (url === '/setup/ollama-status') return { data: ollamaStatus };
     if (url === '/setup/openclaw-status') return { data: openClawStatus };
     if (url === '/setup/coding-tools-status') {
-      return { data: { tools: [{ id: 'codex', name: 'Codex CLI', description: 'Codex command line', installed: false, version: '', installCmd: 'npm i codex' }] } };
+      return { data: { tools: [{
+        id: 'opencode',
+        name: 'OpenCode',
+        description: 'OpenCode command line',
+        installed: false,
+        version: '',
+        state: 'absent',
+        installAvailable: false,
+        installUnavailableCode: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
+      }] } };
     }
     throw new Error(`Unexpected GET ${url}`);
   });
@@ -433,17 +443,10 @@ describe('SetupWizardPage mutation ownership', () => {
     expect(screen.getByRole('button', { name: 'Back' })).toBeEnabled();
   });
 
-  it('serializes coding-tool installs and model pulls through one wizard owner with retryable errors', async () => {
-    const firstToolInstall = deferred<{ data: { ok: boolean } }>();
+  it('keeps native coding-tool acquisition read-only while model pulls retain their own owner', async () => {
     const firstModelPull = deferred<{ data: { ok: boolean } }>();
-    let toolAttempts = 0;
     let modelAttempts = 0;
     setupMocks.post.mockImplementation((url: string) => {
-      if (url === '/setup/install-coding-tool') {
-        toolAttempts += 1;
-        if (toolAttempts === 1) return firstToolInstall.promise;
-        return Promise.resolve({ data: { ok: true } });
-      }
       if (url === '/setup/ollama-pull') {
         modelAttempts += 1;
         if (modelAttempts === 1) return firstModelPull.promise;
@@ -453,40 +456,21 @@ describe('SetupWizardPage mutation ownership', () => {
     });
 
     renderWizard(6);
-    const install = await screen.findByRole('button', { name: 'Install' });
+    expect(await screen.findByText('OpenCode')).toBeVisible();
+    expect(screen.getByText(/Setup cannot change an individual native runtime.*Admin > Maintenance after Setup/i)).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
+    expect(setupMocks.post).not.toHaveBeenCalledWith('/setup/install-coding-tool', expect.anything());
+
     const pull = await screen.findByRole('button', { name: 'Pull' });
     const back = screen.getByRole('button', { name: 'Back' });
 
     act(() => {
-      install.click();
-      install.click();
+      pull.click();
       pull.click();
       back.click();
     });
 
     expect(setupMocks.post).toHaveBeenCalledTimes(1);
-    expect(setupMocks.post).toHaveBeenCalledWith('/setup/install-coding-tool', { toolId: 'codex' });
-    expect(await screen.findByRole('button', { name: 'Installing…' })).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByRole('heading', { name: 'AI setup' })).toBeVisible();
-
-    await act(async () => {
-      firstToolInstall.reject(new Error('Tool install failed.'));
-      await Promise.resolve();
-    });
-    expect(await screen.findByRole('alert')).toHaveTextContent('Tool install failed.');
-    await userEvent.click(screen.getByRole('button', { name: 'Install' }));
-    await waitFor(() => expect(toolAttempts).toBe(2));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Pull' })).toBeEnabled());
-
-    const pullAfterRetry = screen.getByRole('button', { name: 'Pull' });
-    act(() => {
-      pullAfterRetry.click();
-      pullAfterRetry.click();
-      screen.getByRole('button', { name: 'Install' }).click();
-      screen.getByRole('button', { name: /Skip for now/i }).click();
-    });
-
-    expect(modelAttempts).toBe(1);
     expect(setupMocks.post).toHaveBeenLastCalledWith('/setup/ollama-pull', { model: 'test-model:latest' });
     expect(await screen.findByRole('button', { name: 'Pulling…' })).toHaveAttribute('aria-busy', 'true');
 
@@ -498,6 +482,51 @@ describe('SetupWizardPage mutation ownership', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Pull' }));
     await waitFor(() => expect(modelAttempts).toBe(2));
     expect(screen.getByRole('button', { name: 'Back' })).toBeEnabled();
+    expect(setupMocks.post).not.toHaveBeenCalledWith('/setup/install-coding-tool', expect.anything());
+  });
+
+  it('does not promise Ollama installation when the native runtime is unavailable', async () => {
+    const baseGet = setupMocks.get.getMockImplementation();
+    setupMocks.get.mockImplementation((url: string) => {
+      if (url === '/setup/ollama-status') {
+        return Promise.resolve({ data: { ...ollamaStatus, running: false } });
+      }
+      return baseGet?.(url);
+    });
+
+    renderWizard(6);
+
+    expect(await screen.findByText(/Ollama is not responding right now/i)).toHaveTextContent(
+      'Runtime status and troubleshooting remain available in Settings; package installation is unavailable until the durable Ollama adapter ships.',
+    );
+    expect(screen.queryByText(/install or troubleshoot it later/i)).not.toBeInTheDocument();
+  });
+
+  it('shows managed Codex as package maintenance only and never posts an install', async () => {
+    const baseGet = setupMocks.get.getMockImplementation();
+    setupMocks.get.mockImplementation((url: string) => {
+      if (url === '/setup/coding-tools-status') {
+        return Promise.resolve({ data: { tools: [{
+          id: 'codex',
+          name: 'Codex CLI',
+          description: 'Managed Codex package',
+          installed: false,
+          version: '',
+          state: 'absent',
+          installAvailable: false,
+          installUnavailableCode: 'HOST_TOOL_INSTALL_AFTER_SETUP',
+        }] } });
+      }
+      return baseGet?.(url);
+    });
+
+    renderWizard(6);
+
+    expect(await screen.findByText(/Read-only status/i)).toBeVisible();
+    expect(screen.getByText(/Setup cannot change an individual native runtime.*Admin > Maintenance after Setup/i)).toBeVisible();
+    expect(screen.getByText(/Coding-tool status is read-only during Setup.*Fresh installs receive the exact bundle automatically.*Update Compatible AI Tools.*availability still depends on each account's credentials/i)).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
+    expect(setupMocks.post).not.toHaveBeenCalledWith('/setup/install-coding-tool', expect.anything());
   });
 
   it('persists and resumes the native Remote GPU handoff through review', async () => {
@@ -626,7 +655,8 @@ describe('SetupWizardPage mutation ownership', () => {
       if (url === '/setup/complete') return Promise.resolve({ data: { success: true } });
       throw new Error(`Unexpected POST ${url}`);
     });
-    setupMocks.refreshPublicSettings.mockRejectedValue(new Error('Public settings are still unavailable.'));
+    const refresh = deferred<void>();
+    setupMocks.refreshPublicSettings.mockReturnValue(refresh.promise);
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
     const realSetTimeout = globalThis.setTimeout;
     vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
@@ -644,6 +674,16 @@ describe('SetupWizardPage mutation ownership', () => {
     fireEvent.change(screen.getByLabelText('Confirm password'), { target: { value: 'ValidPass1' } });
 
     act(() => screen.getByRole('button', { name: 'Launch Portal' }).click());
+    expect(await screen.findByRole('heading', { name: 'Confirming Portal startup' })).toBeVisible();
+    expect(screen.getByRole('status')).toHaveAttribute('aria-live', 'polite');
+    expect(screen.getByRole('status')).not.toHaveAttribute('aria-busy', 'true');
+    expect(screen.queryByText('Portal ready')).not.toBeInTheDocument();
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+    expect(setupMocks.restoreSession).not.toHaveBeenCalled();
+    await act(async () => {
+      refresh.reject(new Error('Public settings are still unavailable.'));
+      await Promise.resolve();
+    });
     expect(await screen.findByRole('heading', { name: 'Setup status needs confirmation' })).toBeVisible();
     expect(screen.getByRole('alert')).toHaveTextContent('Do not submit setup again');
     expect(screen.queryByText('Portal ready')).not.toBeInTheDocument();
@@ -770,15 +810,25 @@ describe('SetupWizardPage mutation ownership', () => {
 
     window.history.replaceState({}, '', 'https://portal.example.com/outside');
     window.history.pushState({}, '', 'https://portal.example.com/setup?step=2&mode=quick');
-    render(
-      <BrowserRouter>
-        <Routes>
-          <Route path="/setup" element={<SetupWizardPage />} />
-          <Route path="/login" element={<div>Recovered login</div>} />
-          <Route path="/outside" element={<div>Outside setup</div>} />
-        </Routes>
-      </BrowserRouter>,
-    );
+    // Match App's outer setup gate. A child-only routing test missed the
+    // real loop: completed wizard -> login -> stale gate -> wizard -> login.
+    function SetupBoundary() {
+      const [needsSetup, setNeedsSetup] = useState(true);
+      return (
+        <BrowserRouter>
+          <Routes>
+            <Route path="/setup" element={needsSetup
+              ? <SetupWizardPage onSetupResolved={() => setNeedsSetup(false)} />
+              : <Navigate to="/login" replace />} />
+            <Route path="/login" element={needsSetup
+              ? <Navigate to="/setup" replace />
+              : <div>Recovered login</div>} />
+            <Route path="/outside" element={<div>Outside setup</div>} />
+          </Routes>
+        </BrowserRouter>
+      );
+    }
+    render(<SetupBoundary />);
     fireEvent.change(await screen.findByLabelText('Full name'), { target: { value: 'Portal Owner' } });
     fireEvent.change(screen.getByLabelText('Email address'), { target: { value: 'owner@example.com' } });
     fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'ValidPass1' } });

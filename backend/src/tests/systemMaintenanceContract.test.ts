@@ -5,6 +5,8 @@ import crypto from 'crypto';
 import {
   buildPortalMaintenanceComponent,
   buildOpenClawMaintenanceComponent,
+  buildNativeCliMaintenanceComponent,
+  buildCompatibleAiToolsIssue,
   checkedMaintenanceServiceUnits,
   findFreshVerifiedMaintenanceBackup,
   getMaintenanceActionContract,
@@ -185,7 +187,12 @@ describe('system maintenance action contract', () => {
   });
 
   test('keeps every server mutation owner-only with an exact typed confirmation', () => {
-    for (const actionId of ['refresh-package-cache', 'apply-security-updates', 'create-maintenance-backup']) {
+    for (const actionId of [
+      'refresh-package-cache',
+      'apply-security-updates',
+      'create-maintenance-backup',
+      'update-compatible-ai-tools',
+    ]) {
       const action = getMaintenanceActionContract(actionId);
       expect(action).toMatchObject({ changesSystem: true, requiresOwner: true });
       expect(action?.confirmationPhrase).toBeTruthy();
@@ -199,6 +206,7 @@ describe('system maintenance action contract', () => {
   test('requires an explicit maintenance-window acknowledgement for guarded updates', () => {
     const updates = getMaintenanceActionContract('apply-security-updates')!;
     const backup = getMaintenanceActionContract('create-maintenance-backup')!;
+    const compatibleTools = getMaintenanceActionContract('update-compatible-ai-tools')!;
     const refresh = getMaintenanceActionContract('refresh-package-cache')!;
     expect(maintenanceWindowAcknowledgementValid(updates, undefined)).toBe(false);
     expect(maintenanceWindowAcknowledgementValid(updates, false)).toBe(false);
@@ -210,7 +218,57 @@ describe('system maintenance action contract', () => {
     });
     expect(maintenanceWindowAcknowledgementValid(backup, false)).toBe(false);
     expect(maintenanceWindowAcknowledgementValid(backup, true)).toBe(true);
+    expect(compatibleTools).toMatchObject({
+      downtimeExpected: true,
+      requiresBackup: true,
+      requiresMaintenanceWindow: true,
+      automationLevel: 'guarded',
+      confirmationPhrase: 'UPDATE COMPATIBLE AI TOOLS',
+    });
+    expect(compatibleTools.description).toContain('exact OpenClaw, Codex, Claude Code, and ClawHub versions');
+    expect(maintenanceWindowAcknowledgementValid(compatibleTools, false)).toBe(false);
+    expect(maintenanceWindowAcknowledgementValid(compatibleTools, true)).toBe(true);
     expect(maintenanceWindowAcknowledgementValid(refresh, undefined)).toBe(true);
+  });
+
+  test('reports one grouped compatibility-bundle action for any runtime tuple drift', () => {
+    const exact = (toolId: 'codex' | 'claude-code' | 'clawhub', version: string) => ({
+      toolId,
+      executablePath: `/usr/bin/${toolId}`,
+      state: 'verified' as const,
+      installed: true,
+      executionEligible: true,
+      checkedAt: '2026-09-03T12:00:00.000Z',
+      observedVersion: version,
+      fingerprint: 'a'.repeat(64),
+      reasonCode: null,
+    });
+    const codex = buildNativeCliMaintenanceComponent('codex', 'Codex CLI', '0.153.2', exact('codex', '0.153.2'));
+    const claude = buildNativeCliMaintenanceComponent('claude-code', 'Claude Code', '2.1.260', {
+      ...exact('claude-code', '2.1.228'),
+      state: 'status_only',
+      executionEligible: false,
+      reasonCode: 'STATUS_ONLY_VERSION',
+    });
+    const openclaw = buildOpenClawMaintenanceComponent(openClawReadiness());
+    const compatibility = { policy: 'guarded' as const, summary: 'fixture', components: [openclaw, codex, claude] };
+
+    expect(buildCompatibleAiToolsIssue(compatibility)).toMatchObject({
+      id: 'compatible-ai-tools-update-required',
+      actionId: 'update-compatible-ai-tools',
+      downtimeExpected: true,
+      automationSafe: true,
+    });
+    expect(buildCompatibleAiToolsIssue(compatibility)?.detail).toContain('Claude Code');
+    expect(buildCompatibleAiToolsIssue({
+      ...compatibility,
+      components: [openclaw, codex, buildNativeCliMaintenanceComponent(
+        'claude-code',
+        'Claude Code',
+        '2.1.260',
+        exact('claude-code', '2.1.260'),
+      )],
+    })).toBeNull();
   });
 
   test('accepts only a fresh archive that passes integrity verification', async () => {

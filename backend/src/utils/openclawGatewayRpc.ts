@@ -7,15 +7,12 @@
  * Protocol: JSON-RPC over WebSocket with connect handshake.
  */
 import WebSocket from 'ws';
-import fs from 'fs';
-import path from 'path';
 import { getOpenClawWsUrl } from '../config/openclaw';
 import { buildSignedDevice, getOrCreateDeviceKeys } from './deviceIdentity';
 import { getGatewayToken } from './gatewayToken';
 import { ensureOpenClawModelDeclaration } from './openclawCli';
 
 const GATEWAY_WS_URL = getOpenClawWsUrl();
-const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
 const MIN_PROTOCOL_VERSION = 3;
 const MAX_PROTOCOL_VERSION = 4;
 // NOTE: The gateway validates client.id against a fixed schema — only certain values are
@@ -25,7 +22,14 @@ const MAX_PROTOCOL_VERSION = 4;
 const GATEWAY_CLIENT_ID = 'gateway-client';
 const GATEWAY_CLIENT_MODE = 'backend';
 const GATEWAY_ROLE = 'operator';
-const GATEWAY_SCOPES = ['operator.admin', 'operator.read'];
+const GATEWAY_SCOPES = ['operator.admin', 'operator.read', 'operator.questions'];
+const OPENCLAW_QUESTION_SCOPE = 'operator.questions';
+
+function gatewayMethodRequiresQuestionScope(method: string): boolean {
+  return method === 'question.list'
+    || method === 'question.get'
+    || method === 'question.resolve';
+}
 
 interface RpcResponse {
   ok: boolean;
@@ -246,6 +250,24 @@ function openThrowawayGatewayRpc(
               });
               return;
             }
+            const grantedScopes = Array.isArray(msg.payload?.auth?.scopes)
+              ? msg.payload.auth.scopes.filter((scope: unknown): scope is string => (
+                typeof scope === 'string'
+              ))
+              : [];
+            if (
+              gatewayMethodRequiresQuestionScope(method)
+              && !grantedScopes.includes(OPENCLAW_QUESTION_SCOPE)
+            ) {
+              done({
+                ok: false,
+                retriable: false,
+                error: `OpenClaw did not grant ${OPENCLAW_QUESTION_SCOPE}; refusing native question RPC.`,
+                errorCode: 'FORBIDDEN',
+                errorMessage: `OpenClaw did not grant ${OPENCLAW_QUESTION_SCOPE}; refusing native question RPC.`,
+              });
+              return;
+            }
             // Step 2: Send the actual RPC method
             messageId++;
             methodId = String(messageId);
@@ -387,25 +409,30 @@ export async function createSession(sessionKey: string, agentId?: string): Promi
   return { ok: false, error: String(result.error) };
 }
 
-export function readLocalSessionRegistryEntry(sessionKey: string): any | null {
-  const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
-  const sessionsFile = path.join(OPENCLAW_HOME, 'agents', agentId, 'sessions', 'sessions.json');
-  try {
-    const raw = JSON.parse(fs.readFileSync(sessionsFile, 'utf-8'));
-    const entry = raw?.[sessionKey] || (Array.isArray(raw?.sessions) ? raw.sessions.find((s: any) => s?.key === sessionKey) : null);
-    return entry ? { ...entry, agentId: entry.agentId || agentId, key: entry.key || sessionKey } : null;
-  } catch {
-    return null;
+function localSessionAgentId(sessionKey: string): string {
+  const normalized = String(sessionKey || '').trim();
+  if (!normalized || normalized.length > 2048 || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new Error('OpenClaw session key is invalid');
   }
+  const agentId = normalized.startsWith('agent:') ? normalized.split(':')[1] : 'portal';
+  if (!agentId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(agentId)) {
+    throw new Error('OpenClaw session agent identity is invalid');
+  }
+  return agentId;
 }
+
+export type LocalOpenClawSessionIdentity = {
+  agentId: string;
+  sessionKey: string;
+  sessionId: string | null;
+};
+
 
 /**
  * Get the current session info including active model.
  */
 export async function getSessionInfo(sessionKey: string): Promise<{ ok: boolean; data?: any; error?: string }> {
-  // OpenClaw 2026.5+ exposes sessions.describe, which reads one session row
-  // directly. Prefer it over sessions.list: large stores can make list calls
-  // take minutes, which turns harmless telemetry refreshes into 502s.
+  localSessionAgentId(sessionKey);
   const describe = await gatewayRpcCall('sessions.describe', { key: sessionKey }, 8000);
   if (describe.ok) {
     const session = describe.data?.session;
@@ -413,43 +440,117 @@ export async function getSessionInfo(sessionKey: string): Promise<{ ok: boolean;
     return { ok: false, error: 'Session not found' };
   }
 
-  const describeError = String(describe.error || '');
-  const localEntry = readLocalSessionRegistryEntry(sessionKey);
-  if (localEntry && !/unknown method|method not found|unsupported|not available/i.test(describeError)) {
-    return { ok: true, data: { ...localEntry, stale: true, staleReason: describeError || 'Gateway metadata unavailable' } };
+  return { ok: false, error: String(describe.error || 'sessions.describe failed') };
+}
+
+/**
+ * Strict identity read for destructive privacy workflows. This uses only the
+ * supported Gateway contract: private SQLite paths and table layouts are not a
+ * Portal API and may change independently of sessions.describe.
+ */
+export async function readGatewaySessionIdentityStrict(
+  sessionKey: string,
+): Promise<LocalOpenClawSessionIdentity | null> {
+  const normalized = String(sessionKey || '').trim();
+  const agentId = localSessionAgentId(normalized);
+  const described = await getSessionInfo(normalized);
+  if (!described.ok) {
+    if (/session not found|not found/i.test(String(described.error || ''))) return null;
+    throw new Error(`OpenClaw session identity could not be read: ${described.error || 'unknown Gateway failure'}`);
   }
-  if (!/unknown method|method not found|unsupported|not available/i.test(describeError)) {
-    return { ok: false, error: describeError };
+  const session = described.data;
+  if (!session || typeof session !== 'object' || Array.isArray(session)) {
+    throw new Error('OpenClaw sessions.describe returned an invalid session identity');
+  }
+  if (session.key !== normalized) {
+    throw new Error('OpenClaw sessions.describe returned a different session key');
+  }
+  if (session.agentId !== undefined && String(session.agentId).trim() !== agentId) {
+    throw new Error('OpenClaw sessions.describe returned a different agent identity');
+  }
+  const sessionId = typeof session.sessionId === 'string' ? session.sessionId.trim() : '';
+  if (!sessionId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(sessionId)) {
+    throw new Error('OpenClaw sessions.describe returned an invalid transcript identity');
+  }
+  const updatedAt = session.updatedAt;
+  if (!Number.isSafeInteger(updatedAt) || updatedAt < 0) {
+    throw new Error('OpenClaw sessions.describe returned an invalid update identity');
+  }
+  return Object.freeze({ agentId, sessionKey: normalized, sessionId });
+}
+
+export type OpenClawChatHistory = {
+  sessionKey: string;
+  sessionId: string | null;
+  messages: any[];
+  offset?: number;
+  nextOffset?: number;
+  hasMore?: boolean;
+  totalMessages?: number;
+  inFlightRun?: any;
+};
+
+export async function getSessionHistory(
+  sessionKey: string,
+  options: { limit?: number; offset?: number; maxChars?: number } = {},
+): Promise<{ ok: boolean; data?: OpenClawChatHistory; error?: string }> {
+  localSessionAgentId(sessionKey);
+  const limit = options.limit ?? 200;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+    return { ok: false, error: 'OpenClaw chat.history limit is invalid' };
+  }
+  if (options.offset !== undefined && (!Number.isSafeInteger(options.offset) || options.offset < 0)) {
+    return { ok: false, error: 'OpenClaw chat.history offset is invalid' };
+  }
+  if (options.maxChars !== undefined && (!Number.isSafeInteger(options.maxChars) || options.maxChars < 1)) {
+    return { ok: false, error: 'OpenClaw chat.history maxChars is invalid' };
   }
 
-  // Backward-compatible fallback for older gateways that do not implement
-  // sessions.describe. Keep the result bounded and searchable so we never scan
-  // the entire session store on a request path.
-  const agentId = sessionKey.startsWith('agent:') ? sessionKey.split(':')[1] : 'portal';
-  const result = await gatewayRpcCall('sessions.list', { agentId, search: sessionKey, limit: 50 }, 10000);
-
-  if (result.ok) {
-    const data = result.data || {};
-    let sessions: any[] = [];
-    if (Array.isArray(data.sessions)) {
-      sessions = data.sessions;
-    } else if (data.agents && typeof data.agents === 'object') {
-      const requestedAgentSessions = Array.isArray(data.agents?.[agentId]?.sessions)
-        ? data.agents[agentId].sessions
-        : [];
-      sessions = requestedAgentSessions.length > 0
-        ? requestedAgentSessions
-        : Object.values(data.agents).flatMap((agent: any) => Array.isArray(agent?.sessions) ? agent.sessions : []);
+  const result = await gatewayRpcCall('chat.history', {
+    sessionKey,
+    limit,
+    ...(options.offset !== undefined ? { offset: options.offset } : {}),
+    ...(options.maxChars !== undefined ? { maxChars: options.maxChars } : {}),
+  }, 15000);
+  if (!result.ok) return { ok: false, error: String(result.error || 'chat.history failed') };
+  const payload = result.data;
+  if (!payload || !Array.isArray(payload.messages)) {
+    return { ok: false, error: 'OpenClaw chat.history returned an invalid payload' };
+  }
+  if (typeof payload.sessionKey === 'string' && payload.sessionKey !== sessionKey) {
+    return { ok: false, error: 'OpenClaw chat.history returned a different session identity' };
+  }
+  const sessionId = payload.sessionId === undefined || payload.sessionId === null
+    ? null
+    : String(payload.sessionId).trim();
+  if (sessionId !== null && (!sessionId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(sessionId))) {
+    return { ok: false, error: 'OpenClaw chat.history returned an invalid transcript identity' };
+  }
+  for (const [field, value] of [
+    ['offset', payload.offset],
+    ['nextOffset', payload.nextOffset],
+    ['totalMessages', payload.totalMessages],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      return { ok: false, error: `OpenClaw chat.history returned an invalid ${field}` };
     }
-
-    const session = sessions.find((s: any) => s?.key === sessionKey);
-    if (session) {
-      return { ok: true, data: session };
-    }
-    return { ok: false, error: 'Session not found' };
   }
-
-  return { ok: false, error: String(result.error) };
+  if (payload.hasMore !== undefined && typeof payload.hasMore !== 'boolean') {
+    return { ok: false, error: 'OpenClaw chat.history returned an invalid hasMore flag' };
+  }
+  return {
+    ok: true,
+    data: {
+      sessionKey,
+      sessionId,
+      messages: payload.messages,
+      ...(payload.offset !== undefined ? { offset: payload.offset } : {}),
+      ...(payload.nextOffset !== undefined ? { nextOffset: payload.nextOffset } : {}),
+      ...(payload.hasMore !== undefined ? { hasMore: payload.hasMore } : {}),
+      ...(payload.totalMessages !== undefined ? { totalMessages: payload.totalMessages } : {}),
+      ...(payload.inFlightRun !== undefined ? { inFlightRun: payload.inFlightRun } : {}),
+    },
+  };
 }
 
 /**
@@ -472,14 +573,87 @@ export function isGatewayTransportError(error?: string): boolean {
 /**
  * Delete/end an OpenClaw session.
  */
-export async function deleteSession(sessionKey: string): Promise<{ ok: boolean; error?: string }> {
+export type DeleteOpenClawSessionOptions = {
+  agentId?: string;
+  deleteTranscript?: boolean;
+  deleteTranscriptWithoutArchive?: boolean;
+  expectedSessionId?: string | null;
+  archivedOnly?: boolean;
+  emitLifecycleHooks?: boolean;
+};
+
+export type DeleteOpenClawSessionResult = {
+  ok: boolean;
+  key?: string;
+  deleted?: boolean;
+  archived?: string[];
+  error?: string;
+};
+
+export async function deleteSession(
+  sessionKey: string,
+  options: DeleteOpenClawSessionOptions = {},
+): Promise<DeleteOpenClawSessionResult> {
   console.log(`[Gateway RPC] Deleting session: key=${sessionKey}`);
-  
-  const result = await gatewayRpcCall('sessions.delete', { key: sessionKey });
+  const inferredAgentId = localSessionAgentId(sessionKey);
+  const agentId = options.agentId === undefined ? inferredAgentId : String(options.agentId).trim();
+  if (agentId !== inferredAgentId) {
+    return { ok: false, error: 'OpenClaw deletion agent identity does not match the session key' };
+  }
+  const described = await getSessionInfo(sessionKey);
+  if (!described.ok) {
+    if (/session not found|not found/i.test(String(described.error || ''))) {
+      return { ok: true, key: sessionKey, deleted: false, archived: [] };
+    }
+    return { ok: false, error: described.error || 'sessions.describe failed before deletion' };
+  }
+  const describedSessionId = typeof described.data?.sessionId === 'string'
+    ? described.data.sessionId.trim()
+    : '';
+  if (!describedSessionId) {
+    return { ok: false, error: 'OpenClaw session has no immutable transcript identity' };
+  }
+  if (
+    options.expectedSessionId !== undefined
+    && options.expectedSessionId !== null
+    && options.expectedSessionId !== describedSessionId
+  ) {
+    return { ok: false, error: 'OpenClaw session identity changed before deletion' };
+  }
+  const updatedAt = described.data?.updatedAt;
+  if (!Number.isSafeInteger(updatedAt) || updatedAt < 0) {
+    return { ok: false, error: 'OpenClaw session has no valid update identity for deletion' };
+  }
+
+  const result = await gatewayRpcCall('sessions.delete', {
+    key: sessionKey,
+    agentId,
+    expectedSessionId: describedSessionId,
+    expectedSessionUpdatedAt: updatedAt,
+    ...(options.deleteTranscript !== undefined ? { deleteTranscript: options.deleteTranscript } : {}),
+    ...(options.deleteTranscriptWithoutArchive !== undefined
+      ? { deleteTranscriptWithoutArchive: options.deleteTranscriptWithoutArchive }
+      : {}),
+    ...(options.archivedOnly !== undefined ? { archivedOnly: options.archivedOnly } : {}),
+    ...(options.emitLifecycleHooks !== undefined ? { emitLifecycleHooks: options.emitLifecycleHooks } : {}),
+  }, 20000);
   
   if (result.ok) {
+    if (
+      result.data?.ok !== true
+      || typeof result.data?.deleted !== 'boolean'
+      || !Array.isArray(result.data?.archived)
+      || result.data.archived.some((entry: unknown) => typeof entry !== 'string')
+    ) {
+      return { ok: false, error: 'OpenClaw sessions.delete returned an invalid payload' };
+    }
     console.log(`[Gateway RPC] Session deleted successfully: ${sessionKey}`);
-    return { ok: true };
+    return {
+      ok: true,
+      key: typeof result.data.key === 'string' ? result.data.key : sessionKey,
+      deleted: result.data.deleted,
+      archived: result.data.archived,
+    };
   } else {
     console.error(`[Gateway RPC] Failed to delete session: ${result.error}`);
     return { ok: false, error: String(result.error) };

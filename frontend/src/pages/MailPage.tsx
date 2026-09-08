@@ -602,13 +602,13 @@ function MailWorkspace() {
           </div>
           <h2 className="text-lg font-semibold text-white mb-2">No inbox configured</h2>
           <p className="text-sm text-slate-400 mb-6">
-            Your personal inbox has not been provisioned yet. If your username is already set, this should happen automatically after save or account approval.
+            Mail is optional. An owner can enable it in Settings before this account has an inbox.
           </p>
           <button
             onClick={() => navigate('/settings')}
             className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-400 border border-indigo-500/30 text-sm font-medium transition-colors"
           >
-            <SettingsIcon size={16} /> Go to Profile Settings
+            <SettingsIcon size={16} /> Open Settings
           </button>
         </div>
       </div>

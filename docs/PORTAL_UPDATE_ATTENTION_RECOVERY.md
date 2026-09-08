@@ -2,8 +2,9 @@
 
 `updated_with_errors` and `recovery_required` deliberately block another
 Dashboard update. Clearing that block is a root operator action, not a browser
-retry switch. Repair and verify the host first; the acknowledgement only
-removes the current-operation pointer and preserves the historical receipt.
+retry switch. Resolve the reported condition and verify the Portal first; the
+acknowledgement only removes the current-operation pointer and preserves the
+historical receipt.
 
 ## Preconditions
 
@@ -24,7 +25,7 @@ removes the current-operation pointer and preserves the historical receipt.
      -a ! -L /var/lib/bridgesllm-installer/cutover-update.json
    ```
 
-3. Repair the reported host failure and verify Portal health. For
+3. Resolve the reported Portal recovery or final-verification failure. For
    `updated_with_errors`, the installed version must be the receipt's target.
    For `recovery_required`, it must be either the receipt's previous or target
    version. The helper independently attests all four installed version sources

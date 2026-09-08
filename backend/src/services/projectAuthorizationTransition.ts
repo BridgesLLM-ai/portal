@@ -35,6 +35,7 @@ import {
   type OpenClawGatewayUnitSnapshot,
 } from './openClawGatewayAuthorizationFence';
 import {
+  acquireGlobalWorkspaceAuthorizationMutationLease,
   closeGlobalWorkspaceAuthorizationAdmission,
   type WorkspaceAuthorizationFenceController,
 } from './workspaceAuthorizationBarrier';
@@ -49,6 +50,19 @@ import {
   isOwnerRole,
   isSubAdminRole,
 } from '../utils/authz';
+import {
+  digestAdminUserRetirementManifest,
+  type AdminUserRetirementManifestV1,
+  validateAdminUserRetirementManifest,
+} from './adminUserRetirementLedger';
+import {
+  buildAdminUserRetirementManifestSnapshot,
+} from './adminUserRetirementManifest';
+import {
+  ADMIN_USER_RETIREMENT_PARTICIPANT_ACTIVE_CODE,
+  findUnfinishedAdminUserRetirementParticipant,
+  findUnfinishedAdminUserRetirementTarget,
+} from './adminUserRetirementParticipation';
 
 const TRANSITION_SCHEMA_VERSION = 1;
 const TRANSITION_SINGLETON_KEY = 'GLOBAL';
@@ -82,11 +96,14 @@ export const PROJECT_AUTHORIZATION_TRANSITION_ACTIVE_CODE =
   'PROJECT_AUTHORIZATION_TRANSITION_ACTIVE';
 export const PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE =
   'PROJECT_AUTHORIZATION_TRANSITION_DRIFT';
+export const ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE_CODE =
+  'ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE';
 
 export type ProjectAuthorizationTransitionKind =
   | 'USER_AUTHORIZATION_UPDATE'
   | 'CREDENTIAL_RECOVERY'
-  | 'OWNERSHIP_TRANSFER';
+  | 'OWNERSHIP_TRANSFER'
+  | 'USER_RETIREMENT';
 
 export type ProjectAuthorizationTransitionPhase =
   | 'PREPARED'
@@ -154,10 +171,19 @@ interface OwnershipTransferTransitionPayload extends TransitionPayloadBase {
   expectedTarget: AuthorizationUserSnapshot;
 }
 
+interface UserRetirementTransitionPayload extends TransitionPayloadBase {
+  kind: 'USER_RETIREMENT';
+  expectedTarget: AuthorizationUserSnapshot;
+  retirementId: string;
+  retirementManifestDigest: string;
+  retirementTargetAuthorizationVersion: number;
+}
+
 type TransitionPayload =
   | UserAuthorizationTransitionPayload
   | CredentialRecoveryTransitionPayload
-  | OwnershipTransferTransitionPayload;
+  | OwnershipTransferTransitionPayload
+  | UserRetirementTransitionPayload;
 
 interface TransitionProjectRow {
   transitionId: string;
@@ -208,6 +234,23 @@ export interface ProjectOwnershipTransferResult {
   targetEmail: string;
 }
 
+export interface ProjectUserRetirementAdmissionResult {
+  transitionId: string;
+  retirementId: string;
+  targetUserId: string;
+  manifestDigest: string;
+  closedAuthorizationVersion: number;
+  evidenceDigest: string;
+}
+
+export interface ProjectUserRetirementSealResult {
+  transitionId: string;
+  retirementId: string;
+  targetUserId: string;
+  manifestDigest: string;
+  targetAuthorizationVersion: number;
+}
+
 export type ProjectCredentialRecoveryResult = ProjectAuthorizationUserUpdateResult;
 
 export class ProjectAuthorizationTransitionError extends Error {
@@ -219,6 +262,52 @@ export class ProjectAuthorizationTransitionError extends Error {
   ) {
     super(message);
     this.name = 'ProjectAuthorizationTransitionError';
+  }
+}
+
+export type AdminUserRetirementDependencyEvidenceBlocker =
+  | {
+      kind: 'PROMOTION_DECISION';
+      operationId: string;
+      projectIdentityId: string;
+      workspaceOwnerId: string;
+      projectName: string;
+      status: string;
+      actorReference: boolean;
+      ownedProject: boolean;
+    }
+  | {
+      kind: 'REPAIR_OPERATION';
+      repairId: string;
+      projectIdentityId: string;
+      workspaceOwnerId: string;
+      projectName: string;
+      status: string;
+      phase: string;
+      actorReference: boolean;
+      ownedProject: boolean;
+    }
+  | {
+      kind: 'OWNED_PROJECT_LIFECYCLE';
+      projectIdentityId: string;
+      projectName: string;
+      lifecycleStatus: string;
+      legacyOpenClawMigrationStatus: string;
+    };
+
+export class AdminUserRetirementDependencyEvidenceActiveError
+  extends ProjectAuthorizationTransitionError {
+  constructor(
+    public readonly blockers: readonly AdminUserRetirementDependencyEvidenceBlocker[],
+    public readonly truncated: boolean,
+  ) {
+    super(
+      ADMIN_USER_RETIREMENT_DEPENDENCY_EVIDENCE_ACTIVE_CODE,
+      'Project dependency evidence must reach a retirement-safe terminal state before this user can be retired.',
+      409,
+      true,
+    );
+    this.name = 'AdminUserRetirementDependencyEvidenceActiveError';
   }
 }
 
@@ -239,6 +328,40 @@ export async function assertNoProjectAuthorizationTransitionActive(
   }
 }
 
+async function assertNoUnfinishedRetirementParticipants(
+  transaction: any,
+  userIds: readonly string[],
+): Promise<void> {
+  const retirement = await findUnfinishedAdminUserRetirementParticipant(
+    transaction,
+    userIds,
+  );
+  if (!retirement) return;
+  throw new ProjectAuthorizationTransitionError(
+    ADMIN_USER_RETIREMENT_PARTICIPANT_ACTIVE_CODE,
+    'Account changes are paused while this user retirement is unfinished',
+    409,
+    true,
+  );
+}
+
+async function assertNoUnfinishedRetirementTargets(
+  transaction: any,
+  userIds: readonly string[],
+): Promise<void> {
+  const retirement = await findUnfinishedAdminUserRetirementTarget(
+    transaction,
+    userIds,
+  );
+  if (!retirement) return;
+  throw new ProjectAuthorizationTransitionError(
+    ADMIN_USER_RETIREMENT_PARTICIPANT_ACTIVE_CODE,
+    'Credential recovery is paused while this user retirement is unfinished',
+    409,
+    true,
+  );
+}
+
 interface TransitionLease {
   owner: string;
   tokenHash: string;
@@ -248,6 +371,12 @@ interface TransitionLease {
 
 interface TransitionDependencies {
   database: any;
+  buildUserRetirementManifest(
+    targetUserId: string,
+    requestedByUserId: string,
+    database: any,
+  ): Promise<AdminUserRetirementManifestV1>;
+  acquireAdmissionHandoff(): () => void;
   closeAdmission(): WorkspaceAuthorizationFenceController;
   quiesceAgentJobs(userIds: readonly string[]): Promise<AgentJobAuthorizationQuiescence>;
   quiesceHostRuns(userIds: readonly string[]): Promise<HostAgentRunQuiescence>;
@@ -284,6 +413,12 @@ interface TransitionDependencies {
 
 const defaultDependencies: TransitionDependencies = {
   database: prisma,
+  buildUserRetirementManifest: (targetUserId, requestedByUserId, database) => (
+    buildAdminUserRetirementManifestSnapshot(targetUserId, requestedByUserId, {
+      database,
+    })
+  ),
+  acquireAdmissionHandoff: acquireGlobalWorkspaceAuthorizationMutationLease,
   closeAdmission: closeGlobalWorkspaceAuthorizationAdmission,
   quiesceAgentJobs: quiesceAgentJobsForAuthorizationTransition,
   quiesceHostRuns: quiesceHostAgentRunsForAuthorizationTransition,
@@ -320,11 +455,113 @@ function requestFingerprint(value: unknown): string {
   return crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
+function exactSha256Digest(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new ProjectAuthorizationTransitionError(
+      'PROJECT_AUTHORIZATION_TRANSITION_INVALID',
+      `Invalid ${label}`,
+      503,
+      false,
+    );
+  }
+  return value;
+}
+
 function credentialStateDigest(label: string, value: string | null): string {
   return crypto
     .createHash('sha256')
     .update(`${label}\0${value === null ? 'null' : `string\0${value}`}`, 'utf8')
     .digest('hex');
+}
+
+type RetirementAuthorityRow = {
+  id: string;
+  targetUserId: string;
+  requestedByUserId: string;
+  manifestVersion: number;
+  manifest: unknown;
+  manifestDigest: string;
+  targetAuthorizationVersion: number;
+  phase: string;
+  status: string;
+};
+
+function retirementManifestTarget(value: unknown): Record<string, unknown> {
+  const manifest = asObject(value);
+  const target = asObject(manifest.target);
+  if (
+    manifest.version !== 1
+    || typeof manifest.requestedByUserId !== 'string'
+    || Object.keys(target).length === 0
+  ) {
+    throw new ProjectAuthorizationTransitionError(
+      PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+      'User-retirement manifest authority is malformed',
+      503,
+      false,
+    );
+  }
+  return target;
+}
+
+function assertRetirementAuthority(
+  row: RetirementAuthorityRow | null | undefined,
+  expected: {
+    retirementId: string;
+    targetUserId: string;
+    requestedByUserId: string;
+    manifestDigest: string;
+    targetAuthorizationVersion: number;
+    allowedStatuses: readonly string[];
+  },
+): RetirementAuthorityRow {
+  if (
+    !row
+    || row.id !== expected.retirementId
+    || row.targetUserId !== expected.targetUserId
+    || row.requestedByUserId !== expected.requestedByUserId
+    || row.manifestVersion !== 1
+    || row.manifestDigest !== expected.manifestDigest
+    || row.targetAuthorizationVersion !== expected.targetAuthorizationVersion
+    || row.phase !== 'MANIFESTED'
+    || !expected.allowedStatuses.includes(row.status)
+    || requestFingerprint(row.manifest) !== expected.manifestDigest
+  ) {
+    throw new ProjectAuthorizationTransitionError(
+      PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+      'User-retirement journal or immutable manifest changed before admission closure',
+      409,
+      false,
+    );
+  }
+  const target = retirementManifestTarget(row.manifest);
+  if (
+    target.id !== expected.targetUserId
+    || target.authorizationVersion !== expected.targetAuthorizationVersion
+    || asObject(row.manifest).requestedByUserId !== expected.requestedByUserId
+  ) {
+    throw new ProjectAuthorizationTransitionError(
+      PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+      'User-retirement manifest identity changed before admission closure',
+      409,
+      false,
+    );
+  }
+  return row;
+}
+
+function retirementEvidenceDigest(value: {
+  transitionId: string;
+  retirementId: string;
+  targetUserId: string;
+  manifestDigest: string;
+  closedAuthorizationVersion: number;
+}): string {
+  return requestFingerprint({
+    schemaVersion: 1,
+    kind: 'USER_RETIREMENT_ADMISSION_EVIDENCE',
+    ...value,
+  });
 }
 
 function exactString(value: unknown, label: string): string {
@@ -351,6 +588,143 @@ function exactInteger(value: unknown, label: string): number {
     );
   }
   return normalized;
+}
+
+const MAX_RETIREMENT_DEPENDENCY_BLOCKERS = 256;
+
+function blockerString(value: unknown, label: string, maximum = 320): string {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  if (
+    !normalized
+    || normalized.length > maximum
+    || /[\u0000-\u001f\u007f]/.test(normalized)
+  ) {
+    throw new ProjectAuthorizationTransitionError(
+      PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+      `Project dependency ${label} is malformed`,
+      409,
+      false,
+    );
+  }
+  return normalized;
+}
+
+function blockerSortKey(blocker: AdminUserRetirementDependencyEvidenceBlocker): string {
+  if (blocker.kind === 'PROMOTION_DECISION') {
+    return `0\u0000${blocker.operationId}`;
+  }
+  if (blocker.kind === 'REPAIR_OPERATION') {
+    return `1\u0000${blocker.repairId}`;
+  }
+  return `2\u0000${blocker.projectIdentityId}`;
+}
+
+async function assertAdminUserRetirementDependencyEvidenceSafe(
+  transaction: any,
+  targetUserId: string,
+): Promise<void> {
+  const queryBound = MAX_RETIREMENT_DEPENDENCY_BLOCKERS + 1;
+  const [promotionRows, repairRows, ownedLifecycleRows] = await Promise.all([
+    transaction.projectDependencyPromotionDecision.findMany({
+      where: {
+        OR: [
+          { status: 'AUTHORIZED' },
+          { actorUserId: targetUserId },
+          { workspaceOwnerId: targetUserId },
+        ],
+      },
+      orderBy: { operationId: 'asc' },
+      take: queryBound,
+      select: {
+        operationId: true,
+        actorUserId: true,
+        projectIdentityId: true,
+        workspaceOwnerId: true,
+        projectName: true,
+        status: true,
+      },
+    }),
+    transaction.projectDependencyRepairOperation.findMany({
+      where: {
+        NOT: {
+          status: 'APPLIED',
+          phase: 'COMPLETE',
+        },
+      },
+      orderBy: { repairId: 'asc' },
+      take: queryBound,
+      select: {
+        repairId: true,
+        actorUserId: true,
+        projectIdentityId: true,
+        workspaceOwnerId: true,
+        projectName: true,
+        status: true,
+        phase: true,
+      },
+    }),
+    transaction.projectIdentity.findMany({
+      where: {
+        workspaceOwnerId: targetUserId,
+        OR: [
+          { lifecycleStatus: { not: 'ACTIVE' } },
+          { legacyOpenClawMigrationStatus: { not: 'CURRENT' } },
+        ],
+      },
+      orderBy: { id: 'asc' },
+      take: queryBound,
+      select: {
+        id: true,
+        projectName: true,
+        lifecycleStatus: true,
+        legacyOpenClawMigrationStatus: true,
+      },
+    }),
+  ]);
+
+  const blockers: AdminUserRetirementDependencyEvidenceBlocker[] = [
+    ...promotionRows.map((row: any) => ({
+      kind: 'PROMOTION_DECISION' as const,
+      operationId: blockerString(row.operationId, 'promotion operation identity', 200),
+      projectIdentityId: blockerString(row.projectIdentityId, 'Project identity', 200),
+      workspaceOwnerId: blockerString(row.workspaceOwnerId, 'workspace Owner identity', 200),
+      projectName: blockerString(row.projectName, 'Project name'),
+      status: blockerString(row.status, 'promotion status', 32),
+      actorReference: row.actorUserId === targetUserId,
+      ownedProject: row.workspaceOwnerId === targetUserId,
+    })),
+    ...repairRows.map((row: any) => ({
+      kind: 'REPAIR_OPERATION' as const,
+      repairId: blockerString(row.repairId, 'repair identity', 200),
+      projectIdentityId: blockerString(row.projectIdentityId, 'Project identity', 200),
+      workspaceOwnerId: blockerString(row.workspaceOwnerId, 'workspace Owner identity', 200),
+      projectName: blockerString(row.projectName, 'Project name'),
+      status: blockerString(row.status, 'repair status', 32),
+      phase: blockerString(row.phase, 'repair phase', 32),
+      actorReference: row.actorUserId === targetUserId,
+      ownedProject: row.workspaceOwnerId === targetUserId,
+    })),
+    ...ownedLifecycleRows.map((row: any) => ({
+      kind: 'OWNED_PROJECT_LIFECYCLE' as const,
+      projectIdentityId: blockerString(row.id, 'Project identity', 200),
+      projectName: blockerString(row.projectName, 'Project name'),
+      lifecycleStatus: blockerString(row.lifecycleStatus, 'lifecycle status', 64),
+      legacyOpenClawMigrationStatus: blockerString(
+        row.legacyOpenClawMigrationStatus,
+        'legacy migration status',
+        64,
+      ),
+    })),
+  ].sort((left, right) => blockerSortKey(left).localeCompare(blockerSortKey(right)));
+  if (blockers.length === 0) return;
+  const truncated = promotionRows.length >= queryBound
+    || repairRows.length >= queryBound
+    || ownedLifecycleRows.length >= queryBound
+    || blockers.length > MAX_RETIREMENT_DEPENDENCY_BLOCKERS;
+  throw new AdminUserRetirementDependencyEvidenceActiveError(
+    Object.freeze(blockers.slice(0, MAX_RETIREMENT_DEPENDENCY_BLOCKERS)),
+    truncated,
+  );
 }
 
 function userSnapshot(row: any): AuthorizationUserSnapshot {
@@ -739,6 +1113,72 @@ function parsePayload(row: TransitionRow): TransitionPayload {
     });
   }
 
+  if (row.kind === 'USER_RETIREMENT') {
+    const allowedKeys = [
+      'schemaVersion',
+      'kind',
+      'requestFingerprint',
+      'candidateActorIds',
+      'expectedTarget',
+      'retirementId',
+      'retirementManifestDigest',
+      'retirementTargetAuthorizationVersion',
+    ].sort();
+    if (!sameStringArray(Object.keys(raw).sort(), allowedKeys)) {
+      throw journalInvalid('User-retirement transition payload fields are malformed');
+    }
+    let expectedTarget: AuthorizationUserSnapshot;
+    let retirementId: string;
+    let retirementManifestDigest: string;
+    let retirementTargetAuthorizationVersion: number;
+    try {
+      expectedTarget = userSnapshot(raw.expectedTarget);
+      retirementId = exactString(raw.retirementId, 'user-retirement journal identity');
+      retirementManifestDigest = exactSha256Digest(
+        raw.retirementManifestDigest,
+        'user-retirement manifest digest',
+      );
+      retirementTargetAuthorizationVersion = exactInteger(
+        raw.retirementTargetAuthorizationVersion,
+        'user-retirement authorization generation',
+      );
+    } catch {
+      throw journalInvalid('User-retirement transition payload is malformed');
+    }
+    const targetUserId = typeof row.targetUserId === 'string' ? row.targetUserId : '';
+    const initiatedByUserId = typeof row.initiatedByUserId === 'string'
+      ? row.initiatedByUserId
+      : '';
+    if (
+      row.sourceOwnerUserId !== null
+      || expectedTarget.id !== targetUserId
+      || isOwnerRole(expectedTarget.role)
+      || retirementTargetAuthorizationVersion !== expectedTarget.authorizationVersion
+      || !candidateActorIds.includes(expectedTarget.id)
+      || !candidateActorIds.includes(initiatedByUserId)
+      || raw.requestFingerprint !== requestFingerprint({
+        kind: 'USER_RETIREMENT',
+        retirementId,
+        initiatedByUserId,
+        targetUserId,
+        retirementManifestDigest,
+        retirementTargetAuthorizationVersion,
+      })
+    ) {
+      throw journalInvalid('User-retirement transition payload is not bound to its request');
+    }
+    return Object.freeze({
+      schemaVersion: TRANSITION_SCHEMA_VERSION,
+      kind: row.kind,
+      requestFingerprint: raw.requestFingerprint,
+      candidateActorIds: Object.freeze(candidateActorIds) as string[],
+      expectedTarget,
+      retirementId,
+      retirementManifestDigest,
+      retirementTargetAuthorizationVersion,
+    });
+  }
+
   const allowedKeys = [
     'schemaVersion',
     'kind',
@@ -812,6 +1252,7 @@ const OPENCLAW_SESSION_KEY_PATTERN =
 function affectedActorIdsForPayload(payload: TransitionPayload): string[] {
   return payload.kind === 'USER_AUTHORIZATION_UPDATE'
     || payload.kind === 'CREDENTIAL_RECOVERY'
+    || payload.kind === 'USER_RETIREMENT'
     ? [payload.expectedTarget.id]
     // Ownership transfer advances every extant user's authorization
     // generation because the shared-workspace authority root changes.
@@ -960,6 +1401,7 @@ function parseOpenClawSessionResetProof(
     'rowIdentitySha256',
     'schemaVersion',
     'sessionKey',
+    ...(raw.resetBoundary === undefined ? [] : ['resetBoundary']),
   ]) || raw.schemaVersion !== 1) {
     throw journalInvalid('OpenClaw session-reset proof is malformed');
   }
@@ -997,10 +1439,27 @@ function parseOpenClawSessionResetProof(
     raw.rowCount,
     'OpenClaw session row count',
   );
+  let resetBoundary: OpenClawHostRunQuiescence['sessions'][number]['resetBoundary'];
+  if (raw.resetBoundary !== undefined) {
+    const boundary = asObject(raw.resetBoundary);
+    if (
+      !hasExactKeys(boundary, ['lifecycleRevision', 'beforeUpdatedAt', 'updatedAt'])
+      || typeof boundary.lifecycleRevision !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(boundary.lifecycleRevision)
+      || !Number.isSafeInteger(boundary.beforeUpdatedAt) || Number(boundary.beforeUpdatedAt) <= 0
+      || !Number.isSafeInteger(boundary.updatedAt)
+      || Number(boundary.updatedAt) <= Number(boundary.beforeUpdatedAt)
+    ) throw journalInvalid('OpenClaw reset lifecycle boundary is malformed');
+    resetBoundary = {
+      lifecycleRevision: boundary.lifecycleRevision,
+      beforeUpdatedAt: Number(boundary.beforeUpdatedAt),
+      updatedAt: Number(boundary.updatedAt),
+    };
+  }
   if (
     resetSessionId !== readbackSessionId
     || resetSessionId !== reattestedSessionId
-    || (beforeSessionId !== null && beforeSessionId === resetSessionId)
+    || (beforeSessionId !== null && beforeSessionId === resetSessionId && !resetBoundary)
     || typeof raw.rowIdentitySha256 !== 'string'
     || !/^[a-f0-9]{64}$/.test(raw.rowIdentitySha256)
   ) {
@@ -1017,6 +1476,7 @@ function parseOpenClawSessionResetProof(
     resetSessionId,
     readbackSessionId,
     reattestedSessionId,
+    ...(resetBoundary ? { resetBoundary } : {}),
     rowCount,
     rowIdentitySha256: raw.rowIdentitySha256,
     resetAt: resetAt.value,
@@ -1173,8 +1633,63 @@ function optionalTemporal(value: unknown, label: string): Date | string | null |
 function parseCommittedResult(
   row: TransitionRow,
   payload: TransitionPayload,
-): ProjectAuthorizationUserUpdateResult | ProjectOwnershipTransferResult {
+):
+  | ProjectAuthorizationUserUpdateResult
+  | ProjectOwnershipTransferResult
+  | ProjectUserRetirementAdmissionResult {
   const raw = asObject(row.result);
+  if (payload.kind === 'USER_RETIREMENT') {
+    if (!sameStringArray(
+      Object.keys(raw).sort(),
+      [
+        'closedAuthorizationVersion',
+        'evidenceDigest',
+        'manifestDigest',
+        'retirementId',
+        'targetUserId',
+        'transitionId',
+      ],
+    )) {
+      throw journalInvalid('Committed user-retirement result fields are malformed');
+    }
+    let transitionId: string;
+    let retirementId: string;
+    let targetUserId: string;
+    let manifestDigest: string;
+    let closedAuthorizationVersion: number;
+    let evidenceDigest: string;
+    try {
+      transitionId = exactString(raw.transitionId, 'retirement transition identity');
+      retirementId = exactString(raw.retirementId, 'retirement journal identity');
+      targetUserId = exactString(raw.targetUserId, 'retirement target identity');
+      manifestDigest = exactSha256Digest(raw.manifestDigest, 'retirement manifest digest');
+      closedAuthorizationVersion = exactInteger(
+        raw.closedAuthorizationVersion,
+        'retirement closed authorization generation',
+      );
+      evidenceDigest = exactSha256Digest(raw.evidenceDigest, 'retirement evidence digest');
+    } catch {
+      throw journalInvalid('Committed user-retirement result is malformed');
+    }
+    const result = {
+      transitionId,
+      retirementId,
+      targetUserId,
+      manifestDigest,
+      closedAuthorizationVersion,
+    };
+    if (
+      transitionId !== row.id
+      || retirementId !== payload.retirementId
+      || targetUserId !== payload.expectedTarget.id
+      || manifestDigest !== payload.retirementManifestDigest
+      || closedAuthorizationVersion !== payload.expectedTarget.authorizationVersion + 1
+      || evidenceDigest !== retirementEvidenceDigest(result)
+    ) {
+      throw journalInvalid('Committed user-retirement result drifted from its request');
+    }
+    return Object.freeze({ ...result, evidenceDigest });
+  }
   if (
     payload.kind === 'USER_AUTHORIZATION_UPDATE'
     || payload.kind === 'CREDENTIAL_RECOVERY'
@@ -1327,6 +1842,15 @@ export function createProjectAuthorizationTransitionCoordinator(
   const portalInstanceId = `portal-auth-transition:${process.pid}:${dependencies.randomUUID()}`;
   const inFlight = new Map<string, Promise<unknown>>();
   const retainedAdmissions = new Map<string, WorkspaceAuthorizationFenceController>();
+  const acquireAdmissionHandoff = (): (() => void) => {
+    const release = dependencies.acquireAdmissionHandoff();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+  };
 
   const loadTransition = async (id: string): Promise<TransitionRow> => {
     const row = await dependencies.database.projectAuthorizationTransition.findUnique({
@@ -1551,6 +2075,12 @@ export function createProjectAuthorizationTransitionCoordinator(
     // after the first inventory. Let all such requests cross their settlement
     // boundary, then run a second authoritative inventory/reset so none can
     // escape between the first snapshot and the authorization commit.
+    //
+    // The wait is bounded. A timeout throws, which aborts this transition and
+    // releases the fence through the caller's error path -- the safe
+    // direction. Proceeding on a timed-out drain would seal against state
+    // that might still be changing; waiting forever would take the entire
+    // Portal down for one stuck request.
     await admission.waitForMutationDrain();
     await lease.assertHeld();
     const postDrainAttempt = await quiesceHostRuntime();
@@ -1737,6 +2267,10 @@ export function createProjectAuthorizationTransitionCoordinator(
           false,
         );
       }
+      await assertNoUnfinishedRetirementParticipants(
+        transaction,
+        [payload.expectedTarget.id],
+      );
       const existingRow = await transaction.user.findUnique({
         where: { id: payload.expectedTarget.id },
       });
@@ -1856,6 +2390,10 @@ export function createProjectAuthorizationTransitionCoordinator(
           false,
         );
       }
+      await assertNoUnfinishedRetirementTargets(
+        transaction,
+        [payload.expectedTarget.id],
+      );
       const existingRow = await transaction.user.findUnique({
         where: { id: payload.expectedTarget.id },
       });
@@ -1995,6 +2533,164 @@ export function createProjectAuthorizationTransitionCoordinator(
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   };
 
+  const commitUserRetirement = async (
+    row: TransitionRow,
+    payload: UserRetirementTransitionPayload,
+    lease: TransitionLease,
+  ): Promise<ProjectUserRetirementAdmissionResult> => {
+    await lease.assertHeld();
+    return dependencies.database.$transaction(async (transaction: any) => {
+      const currentTransition = await transaction.projectAuthorizationTransition.findFirst({
+        where: {
+          id: row.id,
+          phase: 'PROVIDER_FENCED',
+          leaseOwner: lease.owner,
+          leaseTokenHash: lease.tokenHash,
+        },
+      });
+      if (!currentTransition) {
+        throw new ProjectAuthorizationTransitionError(
+          PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+          'User-retirement transition commit authority changed',
+          503,
+          false,
+        );
+      }
+      const retirement = assertRetirementAuthority(
+        await transaction.adminUserRetirement.findUnique({
+          where: { id: payload.retirementId },
+        }),
+        {
+          retirementId: payload.retirementId,
+          targetUserId: payload.expectedTarget.id,
+          requestedByUserId: row.initiatedByUserId,
+          manifestDigest: payload.retirementManifestDigest,
+          targetAuthorizationVersion: payload.retirementTargetAuthorizationVersion,
+          allowedStatuses: ['PENDING', 'RUNNING', 'BLOCKED'],
+        },
+      );
+      const reattestedManifest = validateAdminUserRetirementManifest(
+        await dependencies.buildUserRetirementManifest(
+          payload.expectedTarget.id,
+          row.initiatedByUserId,
+          transaction,
+        ),
+      );
+      if (
+        digestAdminUserRetirementManifest(reattestedManifest)
+        !== payload.retirementManifestDigest
+      ) {
+        throw new ProjectAuthorizationTransitionError(
+          PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+          'User-retirement identity inventory changed before admission closure committed',
+          409,
+          false,
+        );
+      }
+      const manifestTarget = retirementManifestTarget(retirement.manifest);
+      const existingRow = await transaction.user.findUnique({
+        where: { id: payload.expectedTarget.id },
+      });
+      if (
+        !sameAuthorizationSnapshot(existingRow, payload.expectedTarget, true)
+        || manifestTarget.role !== payload.expectedTarget.role
+        || manifestTarget.username !== payload.expectedTarget.username
+        || manifestTarget.emailDigest !== requestFingerprint(
+          payload.expectedTarget.email.trim().toLowerCase(),
+        )
+      ) {
+        throw new ProjectAuthorizationTransitionError(
+          PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+          'User-retirement target changed before admission closure committed',
+          409,
+          false,
+        );
+      }
+      const manifestedAppIds = reattestedManifest.apps.map((app) => app.id);
+      const manifestedShareLinkIds = reattestedManifest.apps.flatMap(
+        (app) => app.shareLinkIds,
+      );
+      if (
+        new Set(manifestedShareLinkIds).size !== manifestedShareLinkIds.length
+      ) {
+        throw new ProjectAuthorizationTransitionError(
+          PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+          'User-retirement share-link inventory is not globally unique',
+          409,
+          false,
+        );
+      }
+      if (manifestedShareLinkIds.length > 0) {
+        const deactivated = await transaction.appShareLink.updateMany({
+          where: {
+            id: { in: manifestedShareLinkIds },
+            appId: { in: manifestedAppIds },
+            userId: payload.expectedTarget.id,
+          },
+          data: { isActive: false },
+        });
+        if (deactivated.count !== manifestedShareLinkIds.length) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+            'User-retirement share-link inventory changed before deactivation',
+            409,
+            false,
+          );
+        }
+      }
+      const changed = await transaction.user.updateMany({
+        where: {
+          id: payload.expectedTarget.id,
+          email: payload.expectedTarget.email,
+          username: payload.expectedTarget.username,
+          firstName: payload.expectedTarget.firstName,
+          lastName: payload.expectedTarget.lastName,
+          role: payload.expectedTarget.role,
+          accountStatus: payload.expectedTarget.accountStatus,
+          isActive: payload.expectedTarget.isActive,
+          sandboxEnabled: payload.expectedTarget.sandboxEnabled,
+          authorizationVersion: payload.expectedTarget.authorizationVersion,
+        },
+        data: {
+          accountStatus: 'DISABLED',
+          isActive: false,
+          authorizationVersion: { increment: 1 },
+        },
+      });
+      if (changed.count !== 1) {
+        throw new ProjectAuthorizationTransitionError(
+          PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+          'User-retirement authorization generation changed before admission closure',
+          409,
+          false,
+        );
+      }
+      const resultBase = {
+        transitionId: row.id,
+        retirementId: payload.retirementId,
+        targetUserId: payload.expectedTarget.id,
+        manifestDigest: payload.retirementManifestDigest,
+        closedAuthorizationVersion: payload.expectedTarget.authorizationVersion + 1,
+      };
+      const result: ProjectUserRetirementAdmissionResult = {
+        ...resultBase,
+        evidenceDigest: retirementEvidenceDigest(resultBase),
+      };
+      await transaction.projectAuthorizationTransition.update({
+        where: { id: row.id },
+        data: {
+          phase: 'COMMITTED',
+          committedAt: dependencies.now(),
+          result,
+        },
+      });
+      return result;
+    }, {
+      isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      timeout: 30_000,
+    });
+  };
+
   const commitOwnershipTransfer = async (
     row: TransitionRow,
     payload: OwnershipTransferTransitionPayload,
@@ -2018,6 +2714,10 @@ export function createProjectAuthorizationTransitionCoordinator(
           false,
         );
       }
+      await assertNoUnfinishedRetirementParticipants(transaction, [
+        payload.expectedOwner.id,
+        payload.expectedTarget.id,
+      ]);
       const [ownerRow, targetRow] = await Promise.all([
         transaction.user.findUnique({ where: { id: payload.expectedOwner.id } }),
         transaction.user.findUnique({ where: { id: payload.expectedTarget.id } }),
@@ -2087,9 +2787,53 @@ export function createProjectAuthorizationTransitionCoordinator(
   };
 
   const verifyCommittedState = async (
+    row: TransitionRow,
     payload: TransitionPayload,
-    result: ProjectAuthorizationUserUpdateResult | ProjectOwnershipTransferResult,
+    result:
+      | ProjectAuthorizationUserUpdateResult
+      | ProjectOwnershipTransferResult
+      | ProjectUserRetirementAdmissionResult,
   ): Promise<void> => {
+    if (payload.kind === 'USER_RETIREMENT') {
+      const retirementResult = result as ProjectUserRetirementAdmissionResult;
+      const [current, retirement] = await Promise.all([
+        dependencies.database.user.findUnique({
+          where: { id: payload.expectedTarget.id },
+        }),
+        dependencies.database.adminUserRetirement.findUnique({
+          where: { id: payload.retirementId },
+        }),
+      ]);
+      assertRetirementAuthority(retirement, {
+        retirementId: payload.retirementId,
+        targetUserId: payload.expectedTarget.id,
+        requestedByUserId: row.initiatedByUserId,
+        manifestDigest: payload.retirementManifestDigest,
+        targetAuthorizationVersion: payload.retirementTargetAuthorizationVersion,
+        allowedStatuses: ['PENDING', 'RUNNING', 'BLOCKED'],
+      });
+      if (
+        !current
+        || current.id !== payload.expectedTarget.id
+        || current.email !== payload.expectedTarget.email
+        || current.username !== payload.expectedTarget.username
+        || current.firstName !== payload.expectedTarget.firstName
+        || current.lastName !== payload.expectedTarget.lastName
+        || current.role !== payload.expectedTarget.role
+        || current.accountStatus !== 'DISABLED'
+        || current.isActive !== false
+        || current.sandboxEnabled !== payload.expectedTarget.sandboxEnabled
+        || current.authorizationVersion !== retirementResult.closedAuthorizationVersion
+      ) {
+        throw new ProjectAuthorizationTransitionError(
+          PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+          'Committed user-retirement admission closure could not be re-attested',
+          503,
+          false,
+        );
+      }
+      return;
+    }
     if (
       payload.kind === 'USER_AUTHORIZATION_UPDATE'
       || payload.kind === 'CREDENTIAL_RECOVERY'
@@ -2219,7 +2963,7 @@ export function createProjectAuthorizationTransitionCoordinator(
     await lease.assertHeld();
     requireHostRuntimeQuiescenceProof(row.hostRuntimeQuiescenceProof, payload);
     const result = parseCommittedResult(row, payload);
-    await verifyCommittedState(payload, result);
+    await verifyCommittedState(row, payload, result);
     await lease.assertHeld();
 
     // Publication is an idempotent revocation signal: recovery may emit the
@@ -2258,6 +3002,14 @@ export function createProjectAuthorizationTransitionCoordinator(
           });
         }
       }
+    } else if (payload.kind === 'USER_RETIREMENT') {
+      const retirementResult = result as ProjectUserRetirementAdmissionResult;
+      dependencies.publish({
+        type: 'authorization_changed',
+        userId: retirementResult.targetUserId,
+        authorizationVersion: retirementResult.closedAuthorizationVersion,
+        reasons: ['account_status', 'active_status'],
+      });
     } else {
       const ownershipResult = result as ProjectOwnershipTransferResult;
       for (const changed of ownershipResult.changedAuthorizations) {
@@ -2302,17 +3054,35 @@ export function createProjectAuthorizationTransitionCoordinator(
     return result;
   };
 
-  const runTransition = async (id: string): Promise<unknown> => {
+  const runTransition = async (
+    id: string,
+    releaseAdmissionHandoff?: () => void,
+  ): Promise<unknown> => {
+    let handoffReleased = false;
+    const releaseHandoff = () => {
+      if (handoffReleased) return;
+      handoffReleased = true;
+      releaseAdmissionHandoff?.();
+    };
     const existing = inFlight.get(id);
-    if (existing) return existing;
+    if (existing) {
+      releaseHandoff();
+      return existing;
+    }
     const operation = (async () => {
       const lease = await acquireLease(id);
       let admission = retainedAdmissions.get(id) || null;
       let transitionCompleted = false;
       try {
         if (!admission) {
+          // Synchronously exchange the preparatory mutation lease for the
+          // closed fence. No request can interleave between these operations
+          // in this JavaScript process.
+          releaseHandoff();
           admission = dependencies.closeAdmission();
           retainedAdmissions.set(id, admission);
+        } else {
+          releaseHandoff();
         }
         for (;;) {
           const row = await loadTransition(id);
@@ -2363,6 +3133,8 @@ export function createProjectAuthorizationTransitionCoordinator(
               await commitUserUpdate(reprovedRow, payload, lease);
             } else if (payload.kind === 'CREDENTIAL_RECOVERY') {
               await commitCredentialRecovery(reprovedRow, payload, lease);
+            } else if (payload.kind === 'USER_RETIREMENT') {
+              await commitUserRetirement(reprovedRow, payload, lease);
             } else {
               await commitOwnershipTransfer(reprovedRow, payload, lease);
             }
@@ -2414,6 +3186,26 @@ export function createProjectAuthorizationTransitionCoordinator(
           true,
         );
       } finally {
+        releaseHandoff();
+        // The fence is retained on EVERY failure, drain timeouts included.
+        //
+        // An earlier revision released on drain timeout, reasoning that the
+        // timeout happens strictly before any durable authorization change.
+        // That reasoning is false and was rejected in audit. quiesceHostRuntime
+        // runs BEFORE the drain and is destructive: it kills running agent
+        // jobs and resets host/OpenClaw runs, and the journal row is durably
+        // left at QUIESCING. Reopening the Portal to writes in that state lets
+        // a single project create or delete trip the non-retryable manifest
+        // drift check, which wedges the transition permanently and then 409s
+        // every future authorization operation -- role changes, ownership
+        // transfer, credential recovery, retirement -- with no abandon path
+        // short of database surgery.
+        //
+        // Retention keeps the failure recoverable instead. Boot recovery runs
+        // before the HTTP listener binds, so on restart nothing is in flight,
+        // the drain resolves immediately and the transition completes. A
+        // Portal-wide 409 until restart is bad; an unrecoverable authorization
+        // control plane is worse.
         if (transitionCompleted && admission) {
           admission.release();
           if (retainedAdmissions.get(id) === admission) {
@@ -2464,6 +3256,203 @@ export function createProjectAuthorizationTransitionCoordinator(
           status: 'PENDING',
         })),
       });
+    }
+  };
+
+  /**
+   * Establish the first durable USER_RETIREMENT authority without an
+   * admission gap.
+   *
+   * The caller's HTTP admission must already be settled. This method closes
+   * the global fence synchronously, drains every older mutation, and then
+   * seals the complete retirement manifest, retirement journal, transition
+   * journal, and Project snapshots in one serializable transaction. On
+   * success the exact same in-memory fence is adopted by runTransition; it is
+   * never released and reacquired between manifest observation and durable
+   * admission closure.
+   */
+  const sealUserRetirementAdmission = async (input: {
+    initiatedByUserId: string;
+    targetUserId: string;
+    expectedTargetEmailDigest: string;
+  }): Promise<ProjectUserRetirementSealResult> => {
+    const initiatedByUserId = exactString(input.initiatedByUserId, 'initiating owner');
+    const targetUserId = exactString(input.targetUserId, 'retirement target');
+    const expectedTargetEmailDigest = exactSha256Digest(
+      input.expectedTargetEmailDigest,
+      'user-retirement confirmation identity',
+    );
+    if (initiatedByUserId === targetUserId) {
+      throw new ProjectAuthorizationTransitionError(
+        'PROJECT_AUTHORIZATION_TRANSITION_INVALID',
+        'An owner cannot retire their own account',
+        400,
+        false,
+      );
+    }
+
+    const admission = dependencies.closeAdmission();
+    let adopted = false;
+    try {
+      await admission.waitForMutationDrain();
+      const sealed = await dependencies.database.$transaction(async (transaction: any) => {
+        const unresolved = await transaction.projectAuthorizationTransition.findFirst({
+          where: { singletonKey: TRANSITION_SINGLETON_KEY, phase: { not: 'COMPLETE' } },
+        });
+        if (unresolved) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_ACTIVE_CODE,
+            'A different authorization transition is already in progress',
+            409,
+            true,
+          );
+        }
+        const existingRetirement = await transaction.adminUserRetirement.findUnique({
+          where: { targetUserId },
+        });
+        if (existingRetirement) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_ACTIVE_CODE,
+            'User retirement was prepared concurrently. Retry the exact request.',
+            409,
+            true,
+          );
+        }
+
+        const [requesterRow, targetRow] = await Promise.all([
+          transaction.user.findUnique({ where: { id: initiatedByUserId } }),
+          transaction.user.findUnique({ where: { id: targetUserId } }),
+        ]);
+        if (!requesterRow || !isOwnerRole(requesterRow.role)) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+            'User-retirement requester is no longer the Portal Owner',
+            409,
+            false,
+          );
+        }
+        if (!targetRow || isOwnerRole(targetRow.role)) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+            'User-retirement target changed before durable preparation',
+            409,
+            false,
+          );
+        }
+        const expectedTarget = userSnapshot(targetRow);
+        const currentEmailDigest = requestFingerprint(
+          expectedTarget.email.trim().toLowerCase(),
+        );
+        if (currentEmailDigest !== expectedTargetEmailDigest) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+            'User-retirement target changed after deletion was confirmed',
+            409,
+            false,
+          );
+        }
+        await assertAdminUserRetirementDependencyEvidenceSafe(transaction, targetUserId);
+        const manifest = validateAdminUserRetirementManifest(
+          await dependencies.buildUserRetirementManifest(
+            targetUserId,
+            initiatedByUserId,
+            transaction,
+          ),
+        );
+        if (
+          manifest.requestedByUserId !== initiatedByUserId
+          || manifest.target.id !== targetUserId
+          || manifest.target.role !== expectedTarget.role
+          || manifest.target.username !== expectedTarget.username
+          || manifest.target.emailDigest !== currentEmailDigest
+          || manifest.target.authorizationVersion !== expectedTarget.authorizationVersion
+        ) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+            'User-retirement target changed after deletion was confirmed',
+            409,
+            false,
+          );
+        }
+
+        const manifestDigest = digestAdminUserRetirementManifest(manifest);
+        const retirementId = dependencies.randomUUID();
+        const transitionId = dependencies.randomUUID();
+        const fingerprint = requestFingerprint({
+          kind: 'USER_RETIREMENT',
+          retirementId,
+          initiatedByUserId,
+          targetUserId,
+          retirementManifestDigest: manifestDigest,
+          retirementTargetAuthorizationVersion: expectedTarget.authorizationVersion,
+        });
+        const candidateActorIds = (await transaction.user.findMany({
+          select: { id: true },
+          orderBy: { id: 'asc' },
+        })).map((entry: any) => exactString(entry.id, 'candidate actor'));
+        const payload: UserRetirementTransitionPayload = {
+          schemaVersion: TRANSITION_SCHEMA_VERSION,
+          kind: 'USER_RETIREMENT',
+          requestFingerprint: fingerprint,
+          candidateActorIds,
+          expectedTarget,
+          retirementId,
+          retirementManifestDigest: manifestDigest,
+          retirementTargetAuthorizationVersion: expectedTarget.authorizationVersion,
+        };
+
+        await transaction.adminUserRetirement.create({
+          data: {
+            id: retirementId,
+            targetUserId,
+            requestedByUserId: initiatedByUserId,
+            manifestVersion: manifest.version,
+            manifest,
+            manifestDigest,
+            targetAuthorizationVersion: expectedTarget.authorizationVersion,
+            phase: 'MANIFESTED',
+            status: 'PENDING',
+          },
+        });
+        await transaction.projectAuthorizationTransition.create({
+          data: {
+            id: transitionId,
+            singletonKey: TRANSITION_SINGLETON_KEY,
+            kind: payload.kind,
+            phase: 'PREPARED',
+            initiatedByUserId,
+            targetUserId,
+            payload,
+          },
+        });
+        await snapshotProjects(transaction, transitionId);
+        return {
+          transitionId,
+          retirementId,
+          targetUserId,
+          manifestDigest,
+          targetAuthorizationVersion: expectedTarget.authorizationVersion,
+        };
+      }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        timeout: 30_000,
+      });
+
+      retainedAdmissions.set(sealed.transitionId, admission);
+      adopted = true;
+      return sealed;
+    } catch (error) {
+      if (isUniqueConstraintError(error)) {
+        throw new ProjectAuthorizationTransitionError(
+          PROJECT_AUTHORIZATION_TRANSITION_ACTIVE_CODE,
+          'User retirement was prepared concurrently. Retry the exact request.',
+          409,
+          true,
+        );
+      }
+      throw error;
+    } finally {
+      if (!adopted) admission.release();
     }
   };
 
@@ -2575,6 +3564,7 @@ export function createProjectAuthorizationTransitionCoordinator(
             true,
           );
         }
+        await assertNoUnfinishedRetirementTargets(transaction, [targetUserId]);
         const existingRow = await transaction.user.findUnique({
           where: { id: targetUserId },
         });
@@ -2658,6 +3648,187 @@ export function createProjectAuthorizationTransitionCoordinator(
     }
   };
 
+  const findRetirementTransition = async (
+    targetUserId: string,
+    retirementId: string,
+    fingerprint: string,
+  ): Promise<TransitionRow | null> => {
+    const candidate = await dependencies.database.projectAuthorizationTransition.findFirst({
+      where: {
+        kind: 'USER_RETIREMENT',
+        targetUserId,
+      },
+      orderBy: { createdAt: 'desc' },
+    }) as TransitionRow | null;
+    if (!candidate) return null;
+    const payload = parsePayload(candidate);
+    if (
+      payload.kind !== 'USER_RETIREMENT'
+      || payload.retirementId !== retirementId
+      || payload.requestFingerprint !== fingerprint
+    ) {
+      throw new ProjectAuthorizationTransitionError(
+        PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+        'A different user-retirement transition is already bound to this identity',
+        409,
+        false,
+      );
+    }
+    return candidate;
+  };
+
+  const prepareUserRetirement = async (input: {
+    retirementId: string;
+    initiatedByUserId: string;
+    targetUserId: string;
+    manifestDigest: string;
+    targetAuthorizationVersion: number;
+  }): Promise<string> => {
+    const retirementId = exactString(input.retirementId, 'user-retirement journal identity');
+    const initiatedByUserId = exactString(input.initiatedByUserId, 'initiating owner');
+    const targetUserId = exactString(input.targetUserId, 'retirement target');
+    const manifestDigest = exactSha256Digest(
+      input.manifestDigest,
+      'user-retirement manifest digest',
+    );
+    const targetAuthorizationVersion = exactInteger(
+      input.targetAuthorizationVersion,
+      'user-retirement authorization generation',
+    );
+    if (initiatedByUserId === targetUserId) {
+      throw new ProjectAuthorizationTransitionError(
+        'PROJECT_AUTHORIZATION_TRANSITION_INVALID',
+        'An owner cannot retire their own account',
+        400,
+        false,
+      );
+    }
+    const fingerprint = requestFingerprint({
+      kind: 'USER_RETIREMENT',
+      retirementId,
+      initiatedByUserId,
+      targetUserId,
+      retirementManifestDigest: manifestDigest,
+      retirementTargetAuthorizationVersion: targetAuthorizationVersion,
+    });
+    const matching = await findRetirementTransition(
+      targetUserId,
+      retirementId,
+      fingerprint,
+    );
+    if (matching) return matching.id;
+
+    try {
+      return await dependencies.database.$transaction(async (transaction: any) => {
+        const unresolved = await transaction.projectAuthorizationTransition.findFirst({
+          where: { singletonKey: TRANSITION_SINGLETON_KEY, phase: { not: 'COMPLETE' } },
+        });
+        if (unresolved) {
+          const payload = parsePayload(unresolved);
+          if (
+            payload.kind === 'USER_RETIREMENT'
+            && payload.retirementId === retirementId
+            && payload.requestFingerprint === fingerprint
+          ) {
+            return unresolved.id;
+          }
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_ACTIVE_CODE,
+            'A different authorization transition is already in progress',
+            409,
+            true,
+          );
+        }
+        const retirement = await transaction.adminUserRetirement.findUnique({
+          where: { id: retirementId },
+        }) as RetirementAuthorityRow | null;
+        const admittedRetirement = assertRetirementAuthority(retirement, {
+          retirementId,
+          targetUserId,
+          requestedByUserId: initiatedByUserId,
+          manifestDigest,
+          targetAuthorizationVersion,
+          allowedStatuses: ['RUNNING'],
+        });
+        const [requesterRow, targetRow] = await Promise.all([
+          transaction.user.findUnique({ where: { id: initiatedByUserId } }),
+          transaction.user.findUnique({ where: { id: targetUserId } }),
+        ]);
+        if (!requesterRow || !isOwnerRole(requesterRow.role)) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+            'User-retirement requester is no longer the Portal Owner',
+            409,
+            false,
+          );
+        }
+        if (!targetRow || isOwnerRole(targetRow.role)) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+            'User-retirement target changed before durable preparation',
+            409,
+            false,
+          );
+        }
+        const expectedTarget = userSnapshot(targetRow);
+        const manifestTarget = retirementManifestTarget(admittedRetirement.manifest);
+        if (
+          expectedTarget.authorizationVersion !== targetAuthorizationVersion
+          || manifestTarget.id !== targetUserId
+          || manifestTarget.role !== expectedTarget.role
+          || manifestTarget.username !== expectedTarget.username
+          || manifestTarget.emailDigest !== requestFingerprint(
+            expectedTarget.email.trim().toLowerCase(),
+          )
+        ) {
+          throw new ProjectAuthorizationTransitionError(
+            PROJECT_AUTHORIZATION_TRANSITION_DRIFT_CODE,
+            'User-retirement target no longer matches its immutable manifest',
+            409,
+            false,
+          );
+        }
+        const candidateActorIds = (await transaction.user.findMany({
+          select: { id: true },
+          orderBy: { id: 'asc' },
+        })).map((entry: any) => exactString(entry.id, 'candidate actor'));
+        const transitionId = dependencies.randomUUID();
+        const payload: UserRetirementTransitionPayload = {
+          schemaVersion: TRANSITION_SCHEMA_VERSION,
+          kind: 'USER_RETIREMENT',
+          requestFingerprint: fingerprint,
+          candidateActorIds,
+          expectedTarget,
+          retirementId,
+          retirementManifestDigest: manifestDigest,
+          retirementTargetAuthorizationVersion: targetAuthorizationVersion,
+        };
+        await transaction.projectAuthorizationTransition.create({
+          data: {
+            id: transitionId,
+            singletonKey: TRANSITION_SINGLETON_KEY,
+            kind: payload.kind,
+            phase: 'PREPARED',
+            initiatedByUserId,
+            targetUserId,
+            payload,
+          },
+        });
+        await snapshotProjects(transaction, transitionId);
+        return transitionId;
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) throw error;
+      const raced = await findRetirementTransition(
+        targetUserId,
+        retirementId,
+        fingerprint,
+      );
+      if (!raced) throw error;
+      return raced.id;
+    }
+  };
+
   const prepareUserUpdate = async (input: {
     initiatedByUserId: string;
     targetUserId: string;
@@ -2693,6 +3864,10 @@ export function createProjectAuthorizationTransitionCoordinator(
             true,
           );
         }
+        await assertNoUnfinishedRetirementParticipants(
+          transaction,
+          [targetUserId],
+        );
         const existingRow = await transaction.user.findUnique({ where: { id: targetUserId } });
         if (!existingRow) throw new AppError(404, 'User not found');
         const existing = userSnapshot(existingRow);
@@ -2792,6 +3967,31 @@ export function createProjectAuthorizationTransitionCoordinator(
   };
 
   return Object.freeze({
+    sealUserRetirementAdmission,
+
+    async closeUserRetirementAdmission(input: {
+      retirementId: string;
+      initiatedByUserId: string;
+      targetUserId: string;
+      manifestDigest: string;
+      targetAuthorizationVersion: number;
+    }): Promise<ProjectUserRetirementAdmissionResult> {
+      const transitionId = await prepareUserRetirement(input);
+      const prepared = await loadTransition(transitionId);
+      const payload = parsePayload(prepared);
+      if (payload.kind !== 'USER_RETIREMENT') {
+        throw journalInvalid('User-retirement transition changed kind');
+      }
+      if (prepared.phase === 'COMPLETE') {
+        const result = parseCommittedResult(prepared, payload);
+        await verifyCommittedState(prepared, payload, result);
+        return normalizeResult<ProjectUserRetirementAdmissionResult>(result);
+      }
+      return normalizeResult<ProjectUserRetirementAdmissionResult>(
+        await runTransition(transitionId),
+      );
+    },
+
     async recoverEmailTwoFactor(input: {
       targetUserId: string;
       challengeId: string;
@@ -2801,10 +4001,15 @@ export function createProjectAuthorizationTransitionCoordinator(
       ipAddress: string;
       userAgent: string | null;
     }): Promise<ProjectCredentialRecoveryResult> {
-      const transitionId = await prepareCredentialRecovery(input);
-      return normalizeResult<ProjectCredentialRecoveryResult>(
-        await runTransition(transitionId),
-      );
+      const releaseHandoff = acquireAdmissionHandoff();
+      try {
+        const transitionId = await prepareCredentialRecovery(input);
+        return normalizeResult<ProjectCredentialRecoveryResult>(
+          await runTransition(transitionId, releaseHandoff),
+        );
+      } finally {
+        releaseHandoff();
+      }
     },
 
     async updateUserAuthorization(input: {
@@ -2813,11 +4018,16 @@ export function createProjectAuthorizationTransitionCoordinator(
       update: ProjectAuthorizationUserUpdate;
       confirmation?: string;
     }): Promise<ProjectAuthorizationUserUpdateResult> {
-      const prepared = await prepareUserUpdate(input);
-      if (prepared.direct) return prepared.direct;
-      return normalizeResult<ProjectAuthorizationUserUpdateResult>(
-        await runTransition(prepared.transitionId!),
-      );
+      const releaseHandoff = acquireAdmissionHandoff();
+      try {
+        const prepared = await prepareUserUpdate(input);
+        if (prepared.direct) return prepared.direct;
+        return normalizeResult<ProjectAuthorizationUserUpdateResult>(
+          await runTransition(prepared.transitionId!, releaseHandoff),
+        );
+      } finally {
+        releaseHandoff();
+      }
     },
 
     async transferOwnership(input: {
@@ -2825,97 +4035,106 @@ export function createProjectAuthorizationTransitionCoordinator(
       targetUserId: string;
       confirmation?: string;
     }): Promise<ProjectOwnershipTransferResult> {
-      const sourceOwnerUserId = exactString(input.sourceOwnerUserId, 'source owner');
-      const targetUserId = exactString(input.targetUserId, 'target owner');
-      if (sourceOwnerUserId === targetUserId) {
-        throw new AppError(400, 'You already own this account');
-      }
-      const fingerprint = requestFingerprint({
-        kind: 'OWNERSHIP_TRANSFER',
-        sourceOwnerUserId,
-        targetUserId,
-      });
-      let transition = await findMatchingUnresolved(fingerprint);
-      if (!transition) {
-        try {
-          transition = await dependencies.database.$transaction(async (transaction: any) => {
-            const unresolved = await transaction.projectAuthorizationTransition.findFirst({
-              where: { singletonKey: TRANSITION_SINGLETON_KEY, phase: { not: 'COMPLETE' } },
-            });
-            if (unresolved) {
-              const payload = parsePayload(unresolved);
-              if (payload.requestFingerprint === fingerprint) return unresolved;
-              throw new ProjectAuthorizationTransitionError(
-                PROJECT_AUTHORIZATION_TRANSITION_ACTIVE_CODE,
-                'A different authorization transition is already in progress',
-                409,
-                true,
-              );
-            }
-            const [ownerRow, targetRow] = await Promise.all([
-              transaction.user.findUnique({ where: { id: sourceOwnerUserId } }),
-              transaction.user.findUnique({ where: { id: targetUserId } }),
-            ]);
-            if (!ownerRow || !isOwnerRole(ownerRow.role)) {
-              throw new AppError(409, 'Portal ownership changed concurrently. Reload and retry.');
-            }
-            if (!targetRow) throw new AppError(404, 'Target user not found');
-            if (!canAccessPortal(targetRow.accountStatus, targetRow.isActive)) {
-              throw new AppError(400, 'Target user must be active to become owner');
-            }
-            if (isOwnerRole(targetRow.role)) {
-              throw new AppError(400, 'Target user is already owner');
-            }
-            const phrase = confirmationForOwnershipTransfer(targetRow.email);
-            if (!isTypedConfirmationMatch(phrase, input.confirmation)) {
-              throw new AppError(400, `Type ${phrase} to transfer Portal ownership.`);
-            }
-            const candidateActorIds = (await transaction.user.findMany({
-              select: { id: true },
-              orderBy: { id: 'asc' },
-            })).map((entry: any) => exactString(entry.id, 'candidate actor'));
-            const transitionId = dependencies.randomUUID();
-            const payload: OwnershipTransferTransitionPayload = {
-              schemaVersion: TRANSITION_SCHEMA_VERSION,
-              kind: 'OWNERSHIP_TRANSFER',
-              requestFingerprint: fingerprint,
-              candidateActorIds,
-              expectedOwner: userSnapshot(ownerRow),
-              expectedTarget: userSnapshot(targetRow),
-            };
-            const created = await transaction.projectAuthorizationTransition.create({
-              data: {
-                id: transitionId,
-                singletonKey: TRANSITION_SINGLETON_KEY,
-                kind: payload.kind,
-                phase: 'PREPARED',
-                initiatedByUserId: sourceOwnerUserId,
+      const releaseHandoff = acquireAdmissionHandoff();
+      try {
+        const sourceOwnerUserId = exactString(input.sourceOwnerUserId, 'source owner');
+        const targetUserId = exactString(input.targetUserId, 'target owner');
+        if (sourceOwnerUserId === targetUserId) {
+          throw new AppError(400, 'You already own this account');
+        }
+        const fingerprint = requestFingerprint({
+          kind: 'OWNERSHIP_TRANSFER',
+          sourceOwnerUserId,
+          targetUserId,
+        });
+        let transition = await findMatchingUnresolved(fingerprint);
+        if (!transition) {
+          try {
+            transition = await dependencies.database.$transaction(async (transaction: any) => {
+              const unresolved = await transaction.projectAuthorizationTransition.findFirst({
+                where: { singletonKey: TRANSITION_SINGLETON_KEY, phase: { not: 'COMPLETE' } },
+              });
+              if (unresolved) {
+                const payload = parsePayload(unresolved);
+                if (payload.requestFingerprint === fingerprint) return unresolved;
+                throw new ProjectAuthorizationTransitionError(
+                  PROJECT_AUTHORIZATION_TRANSITION_ACTIVE_CODE,
+                  'A different authorization transition is already in progress',
+                  409,
+                  true,
+                );
+              }
+              await assertNoUnfinishedRetirementParticipants(transaction, [
                 sourceOwnerUserId,
                 targetUserId,
-                payload,
-              },
-            });
-            await snapshotProjects(transaction, transitionId);
-            return created;
-          }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-        } catch (error) {
-          if (!isUniqueConstraintError(error)) throw error;
-          const raced = await findMatchingUnresolved(fingerprint);
-          if (!raced) throw error;
-          transition = raced;
+              ]);
+              const [ownerRow, targetRow] = await Promise.all([
+                transaction.user.findUnique({ where: { id: sourceOwnerUserId } }),
+                transaction.user.findUnique({ where: { id: targetUserId } }),
+              ]);
+              if (!ownerRow || !isOwnerRole(ownerRow.role)) {
+                throw new AppError(409, 'Portal ownership changed concurrently. Reload and retry.');
+              }
+              if (!targetRow) throw new AppError(404, 'Target user not found');
+              if (!canAccessPortal(targetRow.accountStatus, targetRow.isActive)) {
+                throw new AppError(400, 'Target user must be active to become owner');
+              }
+              if (isOwnerRole(targetRow.role)) {
+                throw new AppError(400, 'Target user is already owner');
+              }
+              const phrase = confirmationForOwnershipTransfer(targetRow.email);
+              if (!isTypedConfirmationMatch(phrase, input.confirmation)) {
+                throw new AppError(400, `Type ${phrase} to transfer Portal ownership.`);
+              }
+              const candidateActorIds = (await transaction.user.findMany({
+                select: { id: true },
+                orderBy: { id: 'asc' },
+              })).map((entry: any) => exactString(entry.id, 'candidate actor'));
+              const transitionId = dependencies.randomUUID();
+              const payload: OwnershipTransferTransitionPayload = {
+                schemaVersion: TRANSITION_SCHEMA_VERSION,
+                kind: 'OWNERSHIP_TRANSFER',
+                requestFingerprint: fingerprint,
+                candidateActorIds,
+                expectedOwner: userSnapshot(ownerRow),
+                expectedTarget: userSnapshot(targetRow),
+              };
+              const created = await transaction.projectAuthorizationTransition.create({
+                data: {
+                  id: transitionId,
+                  singletonKey: TRANSITION_SINGLETON_KEY,
+                  kind: payload.kind,
+                  phase: 'PREPARED',
+                  initiatedByUserId: sourceOwnerUserId,
+                  sourceOwnerUserId,
+                  targetUserId,
+                  payload,
+                },
+              });
+              await snapshotProjects(transaction, transitionId);
+              return created;
+            }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+          } catch (error) {
+            if (!isUniqueConstraintError(error)) throw error;
+            const raced = await findMatchingUnresolved(fingerprint);
+            if (!raced) throw error;
+            transition = raced;
+          }
         }
-      }
-      if (!transition) {
-        throw new ProjectAuthorizationTransitionError(
-          'PROJECT_AUTHORIZATION_TRANSITION_NOT_FOUND',
-          'Ownership transition journal could not be created',
-          503,
-          false,
+        if (!transition) {
+          throw new ProjectAuthorizationTransitionError(
+            'PROJECT_AUTHORIZATION_TRANSITION_NOT_FOUND',
+            'Ownership transition journal could not be created',
+            503,
+            false,
+          );
+        }
+        return normalizeResult<ProjectOwnershipTransferResult>(
+          await runTransition(transition.id, releaseHandoff),
         );
+      } finally {
+        releaseHandoff();
       }
-      return normalizeResult<ProjectOwnershipTransferResult>(
-        await runTransition(transition.id),
-      );
     },
 
     async recoverUnfinished(): Promise<{ recovered: boolean; transitionId: string | null }> {

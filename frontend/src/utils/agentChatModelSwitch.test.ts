@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   applyAgentChatSessionModel,
+  deriveAgentChatSessionModel,
   hasConcreteAgentChatSession,
   isAgentChatLaunchBoundModelError,
 } from './agentChatModelSwitch';
@@ -89,5 +90,27 @@ describe('Agent Chat session model switching', () => {
     expect(isAgentChatLaunchBoundModelError({
       response: { data: { code: 'MODEL_NOT_ALLOWED' } },
     })).toBe(false);
+  });
+
+  it('reads native harness model IDs back without inventing an OpenClaw prefix', () => {
+    expect(deriveAgentChatSessionModel('HERMES', {
+      modelProvider: 'openrouter',
+      model: 'anthropic/claude-sonnet-4',
+    })).toBe('anthropic/claude-sonnet-4');
+
+    expect(deriveAgentChatSessionModel('OPENCODE', {
+      resolved: { modelProvider: 'openai', model: 'gpt-5.6' },
+      session: { modelProvider: 'stale', model: 'stale-model' },
+    })).toBe('gpt-5.6');
+  });
+
+  it('reads model mutation responses and preserves OpenClaw provider qualification', () => {
+    expect(deriveAgentChatSessionModel('OPENCODE', {
+      session: { currentModel: { provider: 'opencode', model: 'big-pickle' } },
+    })).toBe('big-pickle');
+
+    expect(deriveAgentChatSessionModel('OPENCLAW', {
+      session: { modelProvider: 'openai', model: 'gpt-5.6' },
+    })).toBe('openai/gpt-5.6');
   });
 });

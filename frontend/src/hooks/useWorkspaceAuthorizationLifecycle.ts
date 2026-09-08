@@ -13,6 +13,8 @@ import { resolvePortalLogoUrl } from '../utils/portalBranding';
 
 const PRIVACY_CURTAIN_ID = 'portal-workspace-authorization-curtain';
 const PRIVACY_CURTAIN_STYLE_ID = 'portal-workspace-authorization-curtain-style';
+export const WORKSPACE_AUTHORIZATION_RECONNECT_ATTEMPTS = 6;
+export const WORKSPACE_AUTHORIZATION_CHECK_DEADLINE_MS = 20_000;
 
 // The curtain is a privacy control before it is a visual. Two rules constrain
 // everything below. The opaque base colour is applied to the curtain element
@@ -57,11 +59,134 @@ function curtainLayer(styles: Partial<CSSStyleDeclaration>): HTMLDivElement {
   return layer;
 }
 
+function curtainStatusElement<T extends HTMLElement>(name: string): T | null {
+  return document.querySelector<T>(
+    `#${PRIVACY_CURTAIN_ID} [data-portal-curtain-status="${name}"]`,
+  );
+}
+
+function curtainActionButton(label: string, onClick: () => void, primary: boolean): HTMLButtonElement {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  Object.assign(button.style, {
+    minHeight: '40px',
+    padding: '8px 14px',
+    borderRadius: '10px',
+    border: primary
+      ? `1px solid rgba(${CURTAIN_EMERALD},.7)`
+      : '1px solid rgba(148,163,184,.35)',
+    background: primary
+      ? `rgba(${CURTAIN_EMERALD},.9)`
+      : 'rgba(15,23,42,.72)',
+    color: '#F8FAFC',
+    font: '600 13px/1.2 inherit',
+    cursor: 'pointer',
+  });
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function showWorkspacePrivacyCurtainCheckingState(): void {
+  const curtain = document.getElementById(PRIVACY_CURTAIN_ID);
+  const pill = curtainStatusElement<HTMLDivElement>('container');
+  const ring = curtainStatusElement<HTMLDivElement>('spinner');
+  const label = curtainStatusElement<HTMLSpanElement>('label');
+  const sub = curtainStatusElement<HTMLSpanElement>('detail');
+  const beacon = curtainStatusElement<HTMLSpanElement>('beacon');
+  if (!curtain || !pill || !ring || !label || !sub || !beacon) return;
+
+  curtain.setAttribute('role', 'status');
+  pill.querySelector('[data-portal-curtain-status="actions"]')?.remove();
+  Object.assign(pill.style, {
+    flexWrap: 'nowrap',
+    justifyContent: 'flex-start',
+    borderRadius: '999px',
+  });
+  ring.style.display = '';
+  beacon.style.display = '';
+  label.textContent = 'Refreshing workspace access…';
+  label.style.whiteSpace = 'nowrap';
+  sub.textContent = 'Verifying your permissions';
+  sub.style.whiteSpace = 'nowrap';
+}
+
+interface WorkspacePrivacyCurtainRecoveryActions {
+  onRetry: () => void;
+  onSignInAgain: () => void;
+}
+
+/**
+ * Convert the still-opaque privacy curtain into a bounded recovery surface.
+ * Error objects and transport details deliberately never cross this boundary.
+ */
+export function showWorkspacePrivacyCurtainFailure(
+  logoUrl: string | null | undefined,
+  actions: WorkspacePrivacyCurtainRecoveryActions,
+): void {
+  showWorkspacePrivacyCurtain(logoUrl);
+  const curtain = document.getElementById(PRIVACY_CURTAIN_ID);
+  const pill = curtainStatusElement<HTMLDivElement>('container');
+  const ring = curtainStatusElement<HTMLDivElement>('spinner');
+  const label = curtainStatusElement<HTMLSpanElement>('label');
+  const sub = curtainStatusElement<HTMLSpanElement>('detail');
+  const beacon = curtainStatusElement<HTMLSpanElement>('beacon');
+  if (!curtain || !pill || !ring || !label || !sub || !beacon) return;
+
+  curtain.setAttribute('role', 'alert');
+  ring.style.display = 'none';
+  beacon.style.display = 'none';
+  label.textContent = 'Workspace access check unavailable';
+  label.style.whiteSpace = 'normal';
+  sub.textContent = 'The Portal could not verify your permissions. Authenticated pages remain hidden.';
+  sub.style.whiteSpace = 'normal';
+  Object.assign(pill.style, {
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    borderRadius: '18px',
+  });
+
+  pill.querySelector('[data-portal-curtain-status="actions"]')?.remove();
+  const actionRow = document.createElement('div');
+  actionRow.dataset.portalCurtainStatus = 'actions';
+  Object.assign(actionRow.style, {
+    display: 'flex',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: '8px',
+    width: '100%',
+    paddingTop: '4px',
+  });
+  const retryButton = curtainActionButton('Retry access check', actions.onRetry, true);
+  actionRow.appendChild(retryButton);
+  actionRow.appendChild(curtainActionButton('Sign in again', actions.onSignInAgain, false));
+  pill.appendChild(actionRow);
+  retryButton.focus({ preventScroll: true });
+}
+
+function showWorkspacePrivacyCurtainSignInPending(): void {
+  const label = curtainStatusElement<HTMLSpanElement>('label');
+  const sub = curtainStatusElement<HTMLSpanElement>('detail');
+  const buttons = document.querySelectorAll<HTMLButtonElement>(
+    `#${PRIVACY_CURTAIN_ID} [data-portal-curtain-status="actions"] button`,
+  );
+  if (label) label.textContent = 'Preparing a fresh sign-in…';
+  if (sub) sub.textContent = 'Authenticated pages remain hidden while this session is cleared.';
+  buttons.forEach((button) => {
+    button.disabled = true;
+    button.style.cursor = 'wait';
+    button.style.opacity = '.65';
+  });
+}
+
 export function showWorkspacePrivacyCurtain(logoUrl?: string | null): void {
   if (typeof document === 'undefined') return;
   const resolvedLogoUrl = resolvePortalLogoUrl(logoUrl);
   const root = document.getElementById('root');
   if (root) {
+    if (document.activeElement instanceof HTMLElement && root.contains(document.activeElement)) {
+      document.activeElement.blur();
+    }
     if (!root.dataset.authorizationPreviousVisibility) {
       root.dataset.authorizationPreviousVisibility = root.style.visibility || 'visible';
     }
@@ -102,6 +227,9 @@ export function showWorkspacePrivacyCurtain(logoUrl?: string | null): void {
     placeItems: 'center',
     animation: 'portal-curtain-rise 260ms ease-out both',
   });
+  // The visual children are individually hidden from assistive technology,
+  // but the status/recovery controls below must remain reachable.
+  stage.removeAttribute('aria-hidden');
 
   // Depth first: a cool wash lifts the centre off the flat navy so the mark and
   // the dot field have something to sit in.
@@ -163,6 +291,7 @@ export function showWorkspacePrivacyCurtain(logoUrl?: string | null): void {
 
   const pill = document.createElement('div');
   pill.dataset.portalCurtainLayer = 'status';
+  pill.dataset.portalCurtainStatus = 'container';
   Object.assign(pill.style, {
     position: 'relative',
     zIndex: '1',
@@ -181,6 +310,7 @@ export function showWorkspacePrivacyCurtain(logoUrl?: string | null): void {
   (pill.style as unknown as Record<string, string>).webkitBackdropFilter = 'blur(20px) saturate(1.2)';
 
   const ring = document.createElement('div');
+  ring.dataset.portalCurtainStatus = 'spinner';
   ring.setAttribute('aria-hidden', 'true');
   Object.assign(ring.style, {
     width: '17px',
@@ -197,6 +327,7 @@ export function showWorkspacePrivacyCurtain(logoUrl?: string | null): void {
   Object.assign(copy.style, { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: '0' });
 
   const label = document.createElement('span');
+  label.dataset.portalCurtainStatus = 'label';
   label.textContent = 'Refreshing workspace access…';
   Object.assign(label.style, {
     font: '600 clamp(13px, 3.7vw, 14px)/1.25 inherit',
@@ -205,6 +336,7 @@ export function showWorkspacePrivacyCurtain(logoUrl?: string | null): void {
   });
 
   const sub = document.createElement('span');
+  sub.dataset.portalCurtainStatus = 'detail';
   sub.textContent = 'Verifying your permissions';
   Object.assign(sub.style, {
     font: '500 11.5px/1.25 inherit',
@@ -218,6 +350,7 @@ export function showWorkspacePrivacyCurtain(logoUrl?: string | null): void {
   pill.appendChild(copy);
 
   const beacon = document.createElement('span');
+  beacon.dataset.portalCurtainStatus = 'beacon';
   beacon.setAttribute('aria-hidden', 'true');
   Object.assign(beacon.style, {
     width: '5px',
@@ -304,6 +437,7 @@ export function useWorkspaceAuthorizationLifecycle(
     const userId = user.id;
     const localVersion = Number(user.authorizationVersion ?? 1);
     showWorkspacePrivacyCurtain(logoUrlRef.current);
+    showWorkspacePrivacyCurtainCheckingState();
     const wsUrl = import.meta.env.VITE_WS_URL
       || import.meta.env.VITE_API_URL?.replace('/api', '')
       || window.location.origin;
@@ -311,11 +445,44 @@ export function useWorkspaceAuthorizationLifecycle(
     let authProbe: Promise<void> | null = null;
     let trustedSocketVersion: number | null = null;
     let pageRestorePending = false;
+    let disposed = false;
+    let accessCheckFailed = false;
+    let reconnectErrorCount = 0;
+    let accessCheckDeadline: number | null = null;
+    const hardNavigate = navigate ?? ((url: string) => window.location.replace(url));
+
+    const clearAccessCheckDeadline = () => {
+      if (accessCheckDeadline === null) return;
+      window.clearTimeout(accessCheckDeadline);
+      accessCheckDeadline = null;
+    };
+
+    const markAccessCheckFailed = () => {
+      if (disposed || quarantinedRef.current || accessCheckFailed) return;
+      accessCheckFailed = true;
+      clearAccessCheckDeadline();
+      showWorkspacePrivacyCurtainFailure(logoUrlRef.current, {
+        onRetry: retryAccessCheck,
+        onSignInAgain: signInAgain,
+      });
+      // Stop an exhausted manager from continuing quietly behind the recovery
+      // surface. A deliberate retry below starts a fresh finite attempt window.
+      socket?.disconnect();
+    };
+
+    const armAccessCheckDeadline = () => {
+      if (disposed || quarantinedRef.current || accessCheckFailed || accessCheckDeadline !== null) return;
+      accessCheckDeadline = window.setTimeout(
+        markAccessCheckFailed,
+        WORKSPACE_AUTHORIZATION_CHECK_DEADLINE_MS,
+      );
+    };
 
     const quarantine = (version: number) => {
       if (quarantinedRef.current) return;
       quarantinedRef.current = true;
-      quarantineWorkspaceAuthorization(userId, version, navigate, logoUrlRef.current);
+      clearAccessCheckDeadline();
+      quarantineWorkspaceAuthorization(userId, version, hardNavigate, logoUrlRef.current);
     };
 
     // A response may observe a newer generation between React effect teardown
@@ -339,6 +506,7 @@ export function useWorkspaceAuthorizationLifecycle(
       if (authProbe) return;
       authProbe = restoreSession()
         .then((restored) => {
+          if (disposed || quarantinedRef.current) return;
           if (!restored) return;
           const restoredUser = useAuthStore.getState().user;
           const restoredVersion = Number(restoredUser?.authorizationVersion || 1);
@@ -350,18 +518,58 @@ export function useWorkspaceAuthorizationLifecycle(
               && trustedSocketVersion === localVersion
               && !quarantinedRef.current) {
             pageRestorePending = false;
+            clearAccessCheckDeadline();
             hideWorkspacePrivacyCurtain();
           }
+        })
+        .catch(() => {
+          // The curtain exposes only the fixed recovery copy above. Provider,
+          // network, and server error details may contain sensitive context.
         })
         .finally(() => {
           authProbe = null;
         });
     };
 
+    function retryAccessCheck() {
+      if (disposed || quarantinedRef.current) return;
+      accessCheckFailed = false;
+      reconnectErrorCount = 0;
+      trustedSocketVersion = null;
+      // A deliberate retry creates a fresh authenticated socket admission. A
+      // matching snapshot can therefore recover even if an older BFCache REST
+      // probe is still hung inside the auth store's single-flight request.
+      pageRestorePending = false;
+      showWorkspacePrivacyCurtain(logoUrlRef.current);
+      showWorkspacePrivacyCurtainCheckingState();
+      clearAccessCheckDeadline();
+      armAccessCheckDeadline();
+      verifyAfterTransportLoss();
+      if (socket?.connected) socket.disconnect();
+      socket?.connect();
+    }
+
+    function signInAgain() {
+      if (disposed || quarantinedRef.current) return;
+      // Keep cleanup from uncovering cached workspace DOM while the auth store
+      // and hard navigation converge, including when server logout fails.
+      quarantinedRef.current = true;
+      accessCheckFailed = true;
+      clearAccessCheckDeadline();
+      showWorkspacePrivacyCurtainSignInPending();
+      socket?.disconnect();
+      void Promise.resolve()
+        .then(() => useAuthStore.getState().abandonQuarantinedSession())
+        .catch(() => undefined)
+        .finally(() => hardNavigate('/login'));
+    }
+
+    armAccessCheckDeadline();
+
     socket = io(`${wsUrl}/authorization`, {
       transports: ['websocket', 'polling'],
       reconnection: true,
-      reconnectionAttempts: Infinity,
+      reconnectionAttempts: WORKSPACE_AUTHORIZATION_RECONNECT_ATTEMPTS,
       reconnectionDelay: 500,
       reconnectionDelayMax: 5000,
     });
@@ -372,12 +580,20 @@ export function useWorkspaceAuthorizationLifecycle(
         return;
       }
       if (!Number.isSafeInteger(version) || version !== localVersion) {
+        trustedSocketVersion = null;
         showWorkspacePrivacyCurtain(logoUrlRef.current);
+        showWorkspacePrivacyCurtainCheckingState();
+        armAccessCheckDeadline();
         verifyAfterTransportLoss();
         return;
       }
       trustedSocketVersion = version;
-      if (!pageRestorePending && !quarantinedRef.current) hideWorkspacePrivacyCurtain();
+      reconnectErrorCount = 0;
+      accessCheckFailed = false;
+      if (!pageRestorePending && !quarantinedRef.current) {
+        clearAccessCheckDeadline();
+        hideWorkspacePrivacyCurtain();
+      }
     });
     socket.on('authorization_changed', (event: {
       userId?: unknown;
@@ -388,12 +604,22 @@ export function useWorkspaceAuthorizationLifecycle(
     });
     socket.on('disconnect', () => {
       trustedSocketVersion = null;
-      if (!quarantinedRef.current) showWorkspacePrivacyCurtain(logoUrlRef.current);
+      if (disposed || quarantinedRef.current || accessCheckFailed) return;
+      showWorkspacePrivacyCurtain(logoUrlRef.current);
+      showWorkspacePrivacyCurtainCheckingState();
+      armAccessCheckDeadline();
     });
     socket.on('connect_error', () => {
       trustedSocketVersion = null;
-      if (!quarantinedRef.current) showWorkspacePrivacyCurtain(logoUrlRef.current);
+      if (disposed || quarantinedRef.current || accessCheckFailed) return;
+      reconnectErrorCount += 1;
+      showWorkspacePrivacyCurtain(logoUrlRef.current);
+      showWorkspacePrivacyCurtainCheckingState();
+      armAccessCheckDeadline();
       verifyAfterTransportLoss();
+      if (reconnectErrorCount >= WORKSPACE_AUTHORIZATION_RECONNECT_ATTEMPTS) {
+        markAccessCheckFailed();
+      }
     });
 
     const onPageHide = () => showWorkspacePrivacyCurtain(logoUrlRef.current);
@@ -401,6 +627,8 @@ export function useWorkspaceAuthorizationLifecycle(
       if (!event.persisted || quarantinedRef.current) return;
       pageRestorePending = true;
       showWorkspacePrivacyCurtain(logoUrlRef.current);
+      showWorkspacePrivacyCurtainCheckingState();
+      armAccessCheckDeadline();
       verifyAfterTransportLoss();
       if (!socket?.connected || trustedSocketVersion !== localVersion) socket?.connect();
     };
@@ -408,6 +636,8 @@ export function useWorkspaceAuthorizationLifecycle(
     window.addEventListener('pageshow', onPageShow);
 
     return () => {
+      disposed = true;
+      clearAccessCheckDeadline();
       window.removeEventListener(WORKSPACE_AUTHORIZATION_CHANGED_EVENT, onAuthorizationChange);
       window.removeEventListener('pagehide', onPageHide);
       window.removeEventListener('pageshow', onPageShow);

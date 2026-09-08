@@ -14,6 +14,40 @@ export type AgentChatModelSwitchResult = {
   patchResponse?: unknown;
 };
 
+/**
+ * Read the server-attested model from either a session row or the complete
+ * session-model mutation response. Native harnesses own their model IDs, while
+ * OpenClaw session rows expose provider/model as separate fields.
+ */
+export function deriveAgentChatSessionModel(provider: unknown, sessionInfo: any): string {
+  const normalizedProvider = String(provider || '').trim().toUpperCase();
+  const joinModel = (providerName: unknown, modelName: unknown): string => {
+    const providerKey = typeof providerName === 'string' ? providerName.trim() : '';
+    const modelKey = typeof modelName === 'string' ? modelName.trim() : '';
+    if (!modelKey) return '';
+    return normalizedProvider === 'OPENCLAW' && providerKey && !modelKey.includes('/')
+      ? `${providerKey}/${modelKey}`
+      : modelKey;
+  };
+
+  const deriveFrom = (candidate: any): string => {
+    if (!candidate || typeof candidate !== 'object') return '';
+
+    const resolved = joinModel(candidate?.resolved?.modelProvider, candidate?.resolved?.model);
+    if (resolved) return resolved;
+
+    const direct = joinModel(candidate?.modelProvider, candidate?.model);
+    if (direct) return direct;
+
+    const nested = joinModel(candidate?.currentModel?.provider, candidate?.currentModel?.model);
+    if (nested) return nested;
+
+    return joinModel(candidate?.providerOverride, candidate?.modelOverride);
+  };
+
+  return deriveFrom(sessionInfo) || deriveFrom(sessionInfo?.session);
+}
+
 export function isAgentChatLaunchBoundModelError(error: unknown): boolean {
   const candidate = error as any;
   const code = String(

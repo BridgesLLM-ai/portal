@@ -14,8 +14,9 @@ import type {
 } from '../AgentProvider.interface';
 import { AgentAbortError } from '../AgentProvider.interface';
 import { assertExecutionContextBinding } from '../executionScope';
-import { getProviderAvailability } from '../providerAvailability';
+import { getProviderAvailabilityAsync } from '../providerAvailability';
 import { requestNativeCliApproval } from '../nativeCliApprovals';
+import { withPortalGuideReference } from '../../services/portalOperatingGuide';
 import { isElevatedRole } from '../../utils/authz';
 import {
   appendNativeMessage,
@@ -49,7 +50,7 @@ export class GrokProvider extends NativeCliAdapterProvider {
     onExecApproval?: OnExecApprovalCallback,
     sender?: SenderIdentity,
   ): Promise<AgentSendResult> {
-    const availability = getProviderAvailability('GROK');
+    const availability = await getProviderAvailabilityAsync('GROK');
     if (!availability.usable) {
       throw new Error(availability.reason || 'Grok Build is not ready on this server.');
     }
@@ -119,7 +120,7 @@ export class GrokProvider extends NativeCliAdapterProvider {
         nativeSessionId: establishedSessionId,
       };
       updateNativeSessionMetadata('GROK', session.sessionId, session.metadata);
-      const result = await broker.prompt(message);
+      const result = await broker.prompt(withPortalGuideReference(message, session.messages.length === 1));
       session.metadata = {
         ...(session.metadata || {}),
         nativeSessionId: result.nativeSessionId,

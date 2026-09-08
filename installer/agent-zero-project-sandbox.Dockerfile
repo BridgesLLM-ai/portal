@@ -1,4 +1,4 @@
-ARG A0_BASE_IMAGE=agent0ai/agent-zero@sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb
+ARG A0_BASE_IMAGE=agent0ai/agent-zero@sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0
 FROM ${A0_BASE_IMAGE}
 
 ARG A0_BASE_IMAGE
@@ -17,10 +17,10 @@ LABEL com.bridgesllm.agent-zero-project.recipe-sha256="${PORTAL_RECIPE_SHA256}" 
 # process as the same numeric identity that owns Portal projects on the host.
 RUN test "${A0_BASE_IMAGE}" = "agent0ai/agent-zero@${A0_UPSTREAM_DIGEST}" \
   && { \
-       test "${A0_UPSTREAM_DIGEST}" = "sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb" \
-         || test "${A0_UPSTREAM_DIGEST}" = "sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c"; \
+       test "${A0_UPSTREAM_DIGEST}" = "sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0" \
+         || test "${A0_UPSTREAM_DIGEST}" = "sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8"; \
      } \
-  && test "${A0_SOURCE_COMMIT}" = "d1d48bc9c0e6e253e87c354ce757c518820c6e25" \
+  && test "${A0_SOURCE_COMMIT}" = "b22a144bf59f15b1516084c9e7b88133ba92c8a9" \
   && printf '%s\n' "${PORTAL_RECIPE_SHA256}" | grep -Eq '^[a-f0-9]{64}$' \
   && test "$(git -C /git/agent-zero rev-parse HEAD)" = "${A0_SOURCE_COMMIT}" \
   && test -x /opt/venv-a0/bin/python \

@@ -28,13 +28,13 @@ export class NativeSessionModelMutationError extends Error {
 
 export interface NativeSessionModelMutationDependencies {
   getProviderCapabilities: typeof getProviderCapabilities;
-  getProvider: (providerName: AgentProviderName) => AgentProvider;
+  getProvider: (providerName: AgentProviderName) => AgentProvider | Promise<AgentProvider>;
   updateNativeSessionModel: typeof updateNativeSessionModel;
 }
 
 const DEFAULT_DEPENDENCIES: NativeSessionModelMutationDependencies = {
   getProviderCapabilities,
-  getProvider: (providerName) => AgentRegistry.get(providerName),
+  getProvider: (providerName) => AgentRegistry.getAsync(providerName),
   updateNativeSessionModel,
 };
 
@@ -66,7 +66,7 @@ export async function setNativeSessionModel(
     );
   }
 
-  const provider = dependencies.getProvider(providerName);
+  const provider = await dependencies.getProvider(providerName);
   if (provider.setSessionModel) {
     return provider.setSessionModel(sessionId, model);
   }

@@ -25,6 +25,20 @@ const TOOL_STATUS_REQUEST_TIMEOUT_MS = 10_000;
 const TOOL_INVENTORY_REQUEST_TIMEOUT_MS = 10_000;
 const TOOL_JOB_TIMEOUT_MS = 30 * 60 * 1000;
 const INDETERMINATE_INSTALL_SESSION_KEY = 'bridgesllm.agentTools.indeterminateInstall.v1';
+const NATIVE_RUNTIME_MUTATION_UNAVAILABLE_TOOL_IDS = new Set([
+  'agent-zero',
+  'antigravity',
+  'gemini',
+  'grok-build',
+  'hermes',
+  'opencode',
+]);
+const PORTAL_COMPATIBILITY_BUNDLE_TOOL_IDS = new Set([
+  'openclaw',
+  'codex',
+  'claude-code',
+  'clawhub',
+]);
 
 type InstallPhase = 'starting' | 'waiting' | 'verifying';
 
@@ -114,6 +128,39 @@ function isIndeterminateInstallStart(error: any): boolean {
 }
 
 function statusCopy(tool: AgentTool): { label: string; className: string; icon: typeof CheckCircle2 } {
+  if (tool.status.installUnavailableCode === 'NATIVE_BINARY_RUNTIME_UNQUALIFIED') {
+    return {
+      label: tool.status.installed
+        ? 'Package detected · native execution unavailable'
+        : 'Native execution unavailable',
+      className: 'text-amber-300',
+      icon: ShieldCheck,
+    };
+  }
+  if (tool.managedInstall === 'npm-cli' && tool.status.state === 'verified') {
+    return {
+      label: tool.status.version
+        ? `Package verified · ${tool.status.version} · supervised Agent Chat only`
+        : 'Package verified · supervised Agent Chat only',
+      className: 'text-amber-300',
+      icon: ShieldCheck,
+    };
+  }
+  if (tool.status.state === 'drifted') {
+    return { label: 'Managed runtime drift detected', className: 'text-red-300', icon: AlertCircle };
+  }
+  if (tool.status.state === 'busy') {
+    return { label: 'Host maintenance busy', className: 'text-amber-300', icon: Clock3 };
+  }
+  if (tool.status.state === 'recovering') {
+    return { label: 'Managed runtime recovering', className: 'text-amber-300', icon: Clock3 };
+  }
+  if (tool.status.state === 'recovery-required') {
+    return { label: 'Managed runtime recovery required', className: 'text-red-300', icon: AlertCircle };
+  }
+  if (tool.status.state === 'indeterminate') {
+    return { label: 'Managed runtime verification unavailable', className: 'text-red-300', icon: AlertCircle };
+  }
   if (tool.status.installed) {
     return { label: tool.status.version ? `Ready · ${tool.status.version}` : 'Ready', className: 'text-emerald-300', icon: CheckCircle2 };
   }
@@ -166,6 +213,16 @@ export function ToolsContent({ showHeader = false }: { showHeader?: boolean }) {
   const installTool = async (confirmation: string) => {
     const tool = pendingTool;
     if (!tool || installAdmissionRef.current) return;
+    if (
+      NATIVE_RUNTIME_MUTATION_UNAVAILABLE_TOOL_IDS.has(tool.id)
+      || tool.status.installAvailable !== true
+    ) {
+      setPendingTool(null);
+      setInstallError(PORTAL_COMPATIBILITY_BUNDLE_TOOL_IDS.has(tool.id)
+        ? 'Per-tool changes are disabled. Owner can run Admin > Maintenance > Update Compatible AI Tools to update the exact bundle safely.'
+        : 'Per-tool package changes are disabled; use this runtime\'s dedicated Portal setup or maintenance path.');
+      return;
+    }
     const admission = { toolId: tool.id, phase: 'starting' as InstallPhase };
     installAdmissionRef.current = admission;
     setInstallingId(tool.id);
@@ -292,7 +349,7 @@ export function ToolsContent({ showHeader = false }: { showHeader?: boolean }) {
           <div className="flex items-start gap-2">
             <ShieldCheck size={17} className="mt-1 shrink-0 text-blue-300" />
             <p>
-              This is a shared host inventory for the Owner and Sub Admins. Installation runs only reviewed Portal recipes as serialized, bounded jobs; arbitrary command execution belongs in Agent Chat or Terminal.
+              This is shared, read-only host inventory. Per-tool updates stay disabled so versions cannot drift apart. Owner can update the exact OpenClaw, Codex, Claude Code, and ClawHub bundle under Admin &gt; Maintenance.
             </p>
           </div>
         </div>
@@ -320,6 +377,8 @@ export function ToolsContent({ showHeader = false }: { showHeader?: boolean }) {
               const installing = installingId === tool.id && !modalOwnsInstall;
               const requiresVerification = installProof?.toolId === tool.id;
               const requiresAdmissionReview = indeterminateStart?.toolId === tool.id;
+              const packageMutationUnavailable = tool.status.installAvailable !== true
+                || NATIVE_RUNTIME_MUTATION_UNAVAILABLE_TOOL_IDS.has(tool.id);
               return (
                 <article key={tool.id} className="flex min-w-0 flex-col rounded-2xl border border-white/[0.07] bg-white/[0.03] p-5">
                   <div className="flex items-start justify-between gap-3">
@@ -341,7 +400,13 @@ export function ToolsContent({ showHeader = false }: { showHeader?: boolean }) {
                     <span className="flex items-center gap-1 text-[11px] text-slate-500">
                       <Clock3 size={12} /> checked {new Date(tool.status.checkedAt).toLocaleTimeString()}
                     </span>
-                    {tool.install.length > 0 ? (
+                    {packageMutationUnavailable ? (
+                      <span className="max-w-[12rem] text-right text-[11px] leading-5 text-slate-400">
+                        {PORTAL_COMPATIBILITY_BUNDLE_TOOL_IDS.has(tool.id)
+                          ? 'Read-only here · Owner updates the bundle in Admin > Maintenance'
+                          : 'Read-only here · use this runtime\'s dedicated setup'}
+                      </span>
+                    ) : tool.install.length > 0 ? (
                       <button
                         type="button"
                         onClick={() => {

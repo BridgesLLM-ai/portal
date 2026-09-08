@@ -30,6 +30,8 @@ model User {
   updatedAt            DateTime      @updatedAt
   metadata             Json?         @default("{}")
   avatarPath           String?
+  defaultAgentHarness  String        @default("OPENCLAW")
+  defaultAgentHarnessRevision Int    @default(0)
   mailPassword         String? // Legacy generated password for Stalwart account, null if no mailbox provisioned
 
   // Two-Factor Authentication
@@ -50,6 +52,7 @@ model User {
   chatMessages                    ProjectChatMessage[]
   chatSessions                    ProjectChatSession[]
   projectChatProviderBindings     ProjectChatProviderBinding[]
+  projectWorkCards               ProjectWorkCard[]
   projectChatStates               ProjectChatState[]                    @relation("ProjectChatStateActor")
   projectChatTurns                ProjectChatTurn[]                     @relation("ProjectChatTurnActor")
   projectChatResetJournals        ProjectChatDestructiveResetJournal[]  @relation("ProjectChatResetActor")
@@ -58,6 +61,7 @@ model User {
   ownedDependencyPromotionDecisions ProjectDependencyPromotionDecision[]  @relation("ProjectDependencyPromotionOwner")
   dependencyRepairOperations        ProjectDependencyRepairOperation[]     @relation("ProjectDependencyRepairActor")
   ownedDependencyRepairOperations   ProjectDependencyRepairOperation[]     @relation("ProjectDependencyRepairOwner")
+  projectRuntimeCleanupActors       ProjectRuntimeCleanupActor[]           @relation("ProjectRuntimeCleanupActorUser")
   legacyOpenClawImports           LegacyOpenClawProjectImport[]         @relation("LegacyOpenClawImportActor")
   legacyOpenClawQuarantines       LegacyOpenClawProjectQuarantine[]     @relation("LegacyOpenClawQuarantineActor")
   legacyOpenClawClearTombstones   LegacyOpenClawProjectClearTombstone[] @relation("LegacyOpenClawClearActor")
@@ -74,6 +78,43 @@ model User {
   @@index([email])
   @@index([username])
   @@index([isActive])
+}
+
+// Durable, target-identity retirement authority. This row intentionally has
+// no foreign key to User: it must survive the final User deletion so restart
+// recovery and audit can distinguish a completed retirement from a lost
+// journal. Database constraints and triggers make the manifest and identity
+// authority immutable and phase progression monotonic.
+model AdminUserRetirement {
+  id                         String    @id @default(uuid()) @db.Uuid
+  targetUserId               String    @unique
+  requestedByUserId          String
+  manifestVersion            Int       @default(1)
+  manifest                   Json
+  manifestDigest             String
+  targetAuthorizationVersion Int
+  phase                      String    @default("MANIFESTED")
+  status                     String    @default("PENDING")
+  attempts                   Int       @default(0)
+  leaseTokenHash             String?
+  leaseOwner                 String?
+  leaseExpiresAt             DateTime?
+  lastErrorCode              String?
+  lastErrorDetail            String?
+  startedAt                  DateTime?
+  admissionClosedAt          DateTime?
+  authorizationTransitionId  String?
+  closedAuthorizationVersion Int?
+  admissionEvidenceDigest    String?
+  externalAbsenceVerifiedAt  DateTime?
+  externalAbsenceDigest      String?
+  databaseCommittedAt        DateTime?
+  completedAt                DateTime?
+  createdAt                  DateTime  @default(now())
+  updatedAt                  DateTime  @default(now()) @updatedAt
+
+  @@index([status, leaseExpiresAt])
+  @@index([requestedByUserId])
 }
 
 model MailboxAccount {
@@ -191,6 +232,7 @@ model AppShareLink {
   rateLimitWindowSeconds   Int?
   rateLimitRequestCount    Int       @default(0)
   rateLimitWindowStartedAt DateTime?
+  maxConcurrentVisitors    Int?
   isActive     Boolean   @default(true)
   isPublic     Boolean   @default(true)
   passwordHash String?
@@ -200,10 +242,28 @@ model AppShareLink {
   // Relations
   app  App  @relation(fields: [appId], references: [id], onDelete: Cascade)
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  requestLeases AppShareRequestLease[]
 
   @@index([token])
   @@index([appId])
+  @@index([appId, userId, createdAt(sort: Desc), id(sort: Desc)], map: "AppShareLink_owner_history_keyset_idx")
   @@index([isActive, expiresAt])
+}
+
+// One short-lived row represents one in-flight public share request. Visitor
+// identity is the SHA-256 digest of a signed, link-scoped HttpOnly grant; raw
+// grants, cookies, IPs, and upstream target details are never persisted here.
+model AppShareRequestLease {
+  leaseTokenHash String   @id @db.VarChar(64)
+  shareLinkId    String
+  visitorIdHash  String   @db.VarChar(64)
+  leaseExpiresAt DateTime
+  createdAt      DateTime @default(now())
+
+  shareLink AppShareLink @relation(fields: [shareLinkId], references: [id], onDelete: Cascade)
+
+  @@index([shareLinkId, leaseExpiresAt], map: "AppShareRequestLease_link_expiry_idx")
+  @@index([shareLinkId, visitorIdHash, leaseExpiresAt], map: "AppShareRequestLease_link_visitor_expiry_idx")
 }
 
 model ActivityLog {
@@ -548,6 +608,8 @@ enum AgentProviderType {
   GEMINI
   OLLAMA
   GROK_BUILD
+  HERMES
+  OPENCODE
 }
 
 enum OllamaBackendBindingState {
@@ -615,6 +677,7 @@ model ProjectIdentity {
   // (especially a hidden CREATING root). Project retirement has to remove the
   // identity deliberately before the owning account can be deleted.
   workspaceOwner                User                                  @relation("ProjectIdentityOwner", fields: [workspaceOwnerId], references: [id], onDelete: Restrict)
+  workCards                     ProjectWorkCard[]
   chatStates                    ProjectChatState[]
   chatTurns                     ProjectChatTurn[]
   nameReservations              ProjectNameReservation[]
@@ -807,9 +870,11 @@ model ProjectRuntimeCleanupActor {
   createdAt         DateTime @default(now())
 
   projectIdentity ProjectIdentity @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
+  actorUser       User            @relation("ProjectRuntimeCleanupActorUser", fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
 
   @@id([projectIdentityId, provider, actorUserId, sessionId])
   @@index([projectIdentityId])
+  @@index([actorUserId], map: "ProjectRuntimeCleanupActor_actorUserId_idx")
 }
 
 // Durable authorization-change journal. Authorization-changing admin
@@ -927,6 +992,7 @@ model ProjectChatMessage {
   sourceFingerprint     String?
   sourceSortKey         String?
   legacyImportStatus    String?
+  logicalBytes          BigInt?  @default(dbgenerated())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -935,7 +1001,7 @@ model ProjectChatMessage {
   @@index([userId, projectId, provider])
   @@index([sessionKey])
   @@index([timestamp])
-  @@index([userId, projectId, timestamp, sourceSortKey])
+  @@index([userId, projectId, timestamp(sort: Desc), sourceSortKey(sort: Desc), id(sort: Desc)], map: "ProjectChatMessage_history_keyset_idx")
 }
 
 model ProjectChatSession {
@@ -1197,4 +1263,35 @@ model ProjectChatTurnEvent {
 
   @@unique([turnId, seq])
   @@index([turnId, createdAt])
+}
+
+// Assignment and UI receipt for existing HOST_OPERATOR execution. No queue or scheduler.
+model ProjectWorkCard {
+  actorAuthorizationVersion Int
+  id                String   @id @default(uuid())
+  actorUserId       String
+  originProvider    String
+  originSessionKey  String
+  projectIdentityId String
+  projectGeneration Int
+  projectName       String
+  provider          String
+  model             String?
+  requestId         String   @unique
+  prompt            String   @db.Text
+  parentCardId      String?
+  sessionId         String?
+  status            String   @default("DRAFT")
+  portalInstanceId  String?
+  response          String   @default("") @db.Text
+  events            Json?
+  error             String?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime @default(now())
+  actor             User @relation(fields: [actorUserId], references: [id], onDelete: Cascade)
+  projectIdentity   ProjectIdentity @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
+
+  @@index([actorUserId, originProvider, originSessionKey, createdAt], map: "ProjectWorkCard_origin_idx")
+  @@index([actorUserId, projectIdentityId])
 }

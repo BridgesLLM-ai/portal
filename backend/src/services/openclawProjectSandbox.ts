@@ -21,6 +21,20 @@ import {
 import { PROJECT_EGRESS_POLICY_VERSION } from './projectEgressPolicy';
 import { OPENCLAW_PROJECT_EMBEDDED_RUNTIME_MODEL_KEYS } from './openclawProjectModel';
 import {
+  collectOpenClawConfigArrayPaths,
+  exactOpenClawAgent,
+  persistedOpenClawAgentEntry,
+  readOpenClawAgentConfigContract,
+  type OpenClawAgentConfigContract,
+} from './openclawAgentConfigContract';
+import {
+  computeOpenClaw92SandboxConfigHash,
+  formatOpenClawManagedWorkspaceBind,
+  formatOpenClawReadOnlySkillMountHashState,
+  resolveOpenClawReadOnlySkillMounts,
+  resolveOpenClawWorkspaceQualifiedRuntime,
+} from './openclawWorkspaceQualifiedIdentity';
+import {
   PROJECT_RUNTIME_APPARMOR_PROFILE,
   PROJECT_RUNTIME_APPARMOR_SECCOMP_POLICY,
   PROJECT_RUNTIME_SECCOMP_PROFILE_PATH,
@@ -44,6 +58,16 @@ export const OPENCLAW_PROJECT_IDENTITY_LABEL = 'com.bridgesllm.openclaw-project.
 export const OPENCLAW_PROJECT_AGENT_LABEL = 'com.bridgesllm.openclaw-project.agent';
 
 const OPENCLAW_SANDBOX_MOUNT_FORMAT_VERSION = 3;
+const OPENCLAW_CURRENT_CREATE_ARGS_EPOCH = '2026-08-25-container-env-file';
+// 3: OpenClaw 2026.7.x agent-slug runtime, workdir /workspace/project.
+// 4: OpenClaw 2026.8/9.1 (--init, create-args epoch), workdir /workspace.
+// 5: OpenClaw 2026.9.2+ workspace-qualified identity: the Gateway keys the
+//    runtime by session key + agent workspace path, mounts the sandbox
+//    workspace rw plus a read-only skills overlay, and adopts a pre-created
+//    container only when name and configHash match its own derivation.
+type SandboxMountVersion = 3 | 4 | 5;
+const OPENCLAW_WORKSPACE_QUALIFIED_RUNTIME_MIN_VERSION = [2026, 9, 2] as const;
+const OPENCLAW_INSTALLED_PACKAGE_JSON = '/usr/lib/node_modules/openclaw/package.json';
 const OPENCLAW_PROJECT_WORKDIR = '/workspace';
 const OPENCLAW_PROJECT_MOUNT = '/workspace/project';
 // The agent's working directory is the project itself, not the ro skeleton.
@@ -65,7 +89,8 @@ const OPENCLAW_PROJECT_TOOL_ALLOW = Object.freeze([
   // Provider-neutral clarification without widening the Project sandbox to
   // arbitrary plugin tools. OpenClaw optional tools require an exact name in
   // the allowlist; deny entries still take precedence over exact allows.
-  'ask_user_question',
+  'ask_user',
+  'request_user_input',
 ]);
 
 // Explicit direct names accompany groups because OpenClaw automatically adds
@@ -155,6 +180,7 @@ export interface OpenClawProjectSandboxDependencies {
     executor?: ProjectEgressCommandExecutor;
   }): Promise<void>;
   assertConfinementReady(): void;
+  readRuntimeVersion(): readonly [number, number, number] | null;
   now(): Date;
 }
 
@@ -168,6 +194,8 @@ export interface OpenClawProjectSandboxPlan {
   projectIdentityId: string;
   agentId: string;
   sessionKey: string;
+  /** Value of the openclaw.sessionKey label: the workspace-qualified scope key for v5, else sessionKey. */
+  runtimeScopeKey: string;
   agentWorkspaceDir: string;
   sandboxWorkspaceRoot: string;
   sandboxWorkspaceDir: string;
@@ -177,6 +205,7 @@ export interface OpenClawProjectSandboxPlan {
   containerName: string;
   configHash: string;
   runtimeFingerprint: string;
+  mountFormatVersion: SandboxMountVersion;
   expectedBinds: readonly string[];
   expectedEnvironment: Readonly<Record<string, string>>;
   internalNetworkId: string | null;
@@ -202,6 +231,7 @@ interface DockerContainerInspect {
   AppArmorProfile?: string;
   HostConfig?: {
     ReadonlyRootfs?: boolean;
+    Init?: boolean;
     CapAdd?: string[] | null;
     CapDrop?: string[] | null;
     SecurityOpt?: string[] | null;
@@ -408,6 +438,29 @@ function valuesEqual(left: unknown, right: unknown): boolean {
   return stableSerialize(left) === stableSerialize(right);
 }
 
+function createConfigMergePatch(base: unknown, target: unknown): unknown {
+  if (!isRecord(base) || !isRecord(target)) return structuredClone(target);
+  const patch: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(base), ...Object.keys(target)])) {
+    if (!Object.prototype.hasOwnProperty.call(target, key)) {
+      patch[key] = null;
+      continue;
+    }
+    if (!Object.prototype.hasOwnProperty.call(base, key)) {
+      patch[key] = structuredClone(target[key]);
+      continue;
+    }
+    if (isRecord(base[key]) && isRecord(target[key])) {
+      const child = createConfigMergePatch(base[key], target[key]);
+      if (isRecord(child) && Object.keys(child).length === 0) continue;
+      patch[key] = child;
+      continue;
+    }
+    if (!valuesEqual(base[key], target[key])) patch[key] = structuredClone(target[key]);
+  }
+  return patch;
+}
+
 function requirePinnedImageDigest(value: string): string {
   const normalized = String(value || '').trim().toLowerCase();
   if (!/^sha256:[a-f0-9]{64}$/.test(normalized)) {
@@ -589,12 +642,16 @@ function buildDesiredDocker(input: {
   network: string;
   projectRoot: string;
   proxyEnvironment: Readonly<Record<string, string>>;
+  mountFormatVersion?: SandboxMountVersion;
 }): Record<string, any> {
   const confinementPolicy = resolveProjectRuntimeConfinementPolicy();
   return {
     image: input.image,
     containerPrefix: input.containerPrefix,
-    workdir: OPENCLAW_PROJECT_CWD,
+    // OpenClaw mounts its private workspace at docker.workdir. The explicit
+    // project bind must be a child, never the same destination. The actual
+    // attested container still starts commands in /workspace/project.
+    workdir: (input.mountFormatVersion || OPENCLAW_SANDBOX_MOUNT_FORMAT_VERSION) >= 4 ? OPENCLAW_PROJECT_WORKDIR : OPENCLAW_PROJECT_CWD,
     readOnlyRoot: true,
     tmpfs: [
       '/tmp:rw,noexec,nosuid,nodev,size=67108864',
@@ -750,13 +807,31 @@ export function computeOpenClawProjectConfigHash(input: {
   docker: Record<string, any>;
   sandboxWorkspaceDir: string;
   agentWorkspaceDir: string;
+  mountFormatVersion?: SandboxMountVersion;
 }): string {
+  if (input.mountFormatVersion === 5) {
+    // Exact 9.2 Gateway derivation; anything else makes the Gateway discard the
+    // pre-created runtime and provision an unattested one at turn start.
+    return computeOpenClaw92SandboxConfigHash({
+      docker: input.docker,
+      workspaceAccess: 'none',
+      workspaceDir: input.sandboxWorkspaceDir,
+      agentWorkspaceDir: input.agentWorkspaceDir,
+      readOnlyWorkspaceSkillMounts: formatOpenClawReadOnlySkillMountHashState(
+        resolveOpenClawReadOnlySkillMounts({
+          sandboxWorkspaceDir: input.sandboxWorkspaceDir,
+          workdir: OPENCLAW_PROJECT_WORKDIR,
+        }),
+      ),
+    });
+  }
   return stableHash({
     docker: input.docker,
     workspaceAccess: 'none',
     workspaceDir: input.sandboxWorkspaceDir,
     agentWorkspaceDir: input.agentWorkspaceDir,
-    mountFormatVersion: OPENCLAW_SANDBOX_MOUNT_FORMAT_VERSION,
+    mountFormatVersion: input.mountFormatVersion || OPENCLAW_SANDBOX_MOUNT_FORMAT_VERSION,
+    ...(input.mountFormatVersion === 4 ? { createArgsEpoch: OPENCLAW_CURRENT_CREATE_ARGS_EPOCH } : {}),
     readOnlyWorkspaceSkillMounts: [],
   });
 }
@@ -791,10 +866,14 @@ function buildRuntimePaths(input: {
   agentId: string;
   sessionKey: string;
   openClawHome?: string;
+  mountFormatVersion: SandboxMountVersion;
+  containerPrefix: string;
 }): {
   agentWorkspaceDir: string;
   sandboxWorkspaceRoot: string;
   sandboxWorkspaceDir: string;
+  runtimeScopeKey: string;
+  containerName: string;
 } {
   const requestedHome = requireAbsoluteSafePath(
     input.openClawHome || process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw'),
@@ -818,14 +897,35 @@ function buildRuntimePaths(input: {
   const sandboxWorkspaceRoot = ensurePrivateDirectory(path.join(
     home, 'sandboxes', 'portal-project', actor, project, input.agentId,
   ));
-  const sandboxWorkspaceDir = ensureTraversableDirectory(path.join(
-    sandboxWorkspaceRoot, slugifyOpenClawProjectSessionKey(input.sessionKey),
-  ));
+  let runtimeScopeKey = input.sessionKey;
+  let containerName = `${input.containerPrefix}${slugifyOpenClawProjectSessionKey(input.sessionKey)}`.slice(0, 63);
+  let sandboxWorkspaceDir: string;
+  if (input.mountFormatVersion === 5) {
+    const identity = resolveOpenClawWorkspaceQualifiedRuntime({
+      sessionKey: input.sessionKey,
+      agentWorkspaceDir,
+      sandboxWorkspaceRoot,
+      containerPrefix: input.containerPrefix,
+    });
+    runtimeScopeKey = identity.scopeKey;
+    containerName = identity.containerName;
+    sandboxWorkspaceDir = ensureTraversableDirectory(identity.sandboxWorkspaceDir);
+    // The 9.2 Gateway materializes <workspace>/skills before it ensures the
+    // container and binds it read-only below the workdir; that mount is part
+    // of its configHash, so the directory must exist before the plan hashes.
+    const skills = path.join(sandboxWorkspaceDir, 'skills');
+    if (!fs.existsSync(skills)) fs.mkdirSync(skills, { mode: 0o755 });
+    if (!fs.lstatSync(skills).isDirectory()) fail('RUNTIME_WORKSPACE_DIR', 'OpenClaw sandbox skills overlay path is not a directory');
+  } else {
+    sandboxWorkspaceDir = ensureTraversableDirectory(path.join(
+      sandboxWorkspaceRoot, slugifyOpenClawProjectSessionKey(input.sessionKey),
+    ));
+  }
   // The project bind mounts at <workspace>/project inside the workspace bind;
   // the mountpoint must exist and be traversable so the sandbox uid can enter
   // it (the rw project bind overlays it with the project's own perms).
   ensureTraversableDirectory(path.join(sandboxWorkspaceDir, 'project'));
-  return { agentWorkspaceDir, sandboxWorkspaceRoot, sandboxWorkspaceDir };
+  return { agentWorkspaceDir, sandboxWorkspaceRoot, sandboxWorkspaceDir, runtimeScopeKey, containerName };
 }
 
 export function buildOpenClawProjectSandboxPlan(input: {
@@ -836,6 +936,7 @@ export function buildOpenClawProjectSandboxPlan(input: {
   egressSpec: ProjectEgressPlaneSpec;
   egressHandle: ProjectEgressPlaneHandle;
   useHistoricalNetworkMode?: boolean;
+  mountFormatVersion?: SandboxMountVersion;
 }): OpenClawProjectSandboxPlan {
   assertProjectContext(input.context);
   const { agentId, sessionKey } = assertServerOwnedRuntimeIdentity(
@@ -843,15 +944,18 @@ export function buildOpenClawProjectSandboxPlan(input: {
     input.agentId,
     input.sessionKey,
   );
+  const mountFormatVersion = input.mountFormatVersion || OPENCLAW_SANDBOX_MOUNT_FORMAT_VERSION;
   const image = requirePinnedImageDigest(input.context.runtimeImageDigest);
   const projectRoot = requireAbsoluteSafePath(input.context.canonicalRoot, 'Project root');
-  const paths = buildRuntimePaths({
+  const containerPrefix = `p4oc-${input.context.policyFingerprint.slice(0, 16)}-`;
+  const { runtimeScopeKey, containerName, ...paths } = buildRuntimePaths({
     context: input.context,
     agentId,
     sessionKey,
     openClawHome: input.openClawHome,
+    mountFormatVersion,
+    containerPrefix,
   });
-  const containerPrefix = `p4oc-${input.context.policyFingerprint.slice(0, 16)}-`;
   const internalNetworkId = String(input.egressHandle.internalNetworkId || '').toLowerCase();
   if (internalNetworkId && !/^[a-f0-9]{64}$/.test(internalNetworkId)) {
     fail('RUNTIME_NETWORK_MODE', 'OpenClaw Project internal network ID is invalid');
@@ -865,6 +969,7 @@ export function buildOpenClawProjectSandboxPlan(input: {
     network: input.egressSpec.internalNetworkName,
     projectRoot,
     proxyEnvironment: input.egressHandle.proxyEnvironment,
+    mountFormatVersion,
   });
   const desiredAgent = buildDesiredAgent({
     agentId,
@@ -876,8 +981,8 @@ export function buildOpenClawProjectSandboxPlan(input: {
     docker: desiredDocker,
     sandboxWorkspaceDir: paths.sandboxWorkspaceDir,
     agentWorkspaceDir: paths.agentWorkspaceDir,
+    mountFormatVersion,
   });
-  const containerName = `${containerPrefix}${slugifyOpenClawProjectSessionKey(sessionKey)}`.slice(0, 63);
   const runtimeGeneration = buildOpenClawRuntimeFingerprint({
     context: input.context,
     egressPolicyFingerprint: input.egressSpec.policyFingerprint,
@@ -896,6 +1001,7 @@ export function buildOpenClawProjectSandboxPlan(input: {
     projectIdentityId: input.context.projectId,
     agentId,
     sessionKey,
+    runtimeScopeKey,
     ...paths,
     projectRoot,
     desiredAgent,
@@ -903,10 +1009,18 @@ export function buildOpenClawProjectSandboxPlan(input: {
     containerName,
     configHash,
     runtimeFingerprint,
-    expectedBinds: Object.freeze([
-      `${paths.sandboxWorkspaceDir}:${OPENCLAW_PROJECT_WORKDIR}:ro,z`,
-      `${projectRoot}:${OPENCLAW_PROJECT_MOUNT}:rw`,
-    ]),
+    mountFormatVersion,
+    expectedBinds: Object.freeze(mountFormatVersion === 5
+      ? [
+        formatOpenClawManagedWorkspaceBind(paths.sandboxWorkspaceDir, OPENCLAW_PROJECT_WORKDIR, false),
+        `${projectRoot}:${OPENCLAW_PROJECT_MOUNT}:rw`,
+        ...resolveOpenClawReadOnlySkillMounts({ sandboxWorkspaceDir: paths.sandboxWorkspaceDir, workdir: OPENCLAW_PROJECT_WORKDIR })
+          .map((mount) => formatOpenClawManagedWorkspaceBind(mount.hostPath, mount.containerPath, true)),
+      ]
+      : [
+        `${paths.sandboxWorkspaceDir}:${OPENCLAW_PROJECT_WORKDIR}:ro,z`,
+        `${projectRoot}:${OPENCLAW_PROJECT_MOUNT}:rw`,
+      ]),
     expectedEnvironment: Object.freeze({
       ...desiredDocker.env,
       OPENCLAW_CLI: '1',
@@ -914,6 +1028,22 @@ export function buildOpenClawProjectSandboxPlan(input: {
     internalNetworkId: internalNetworkId || null,
     networkMode,
   };
+}
+
+
+/** Reconstruct only the exact recipe already attested by ensureSandbox. Never
+ * derive the policy version from browser input or unverified container labels. */
+export function buildOpenClawProjectSandboxPlanForRuntime(
+  input: Omit<Parameters<typeof buildOpenClawProjectSandboxPlan>[0], 'mountFormatVersion'> & {
+    runtime: Pick<OpenClawProjectSandboxResult, 'configHash' | 'runtimeFingerprint'>;
+  },
+): OpenClawProjectSandboxPlan {
+  for (const mountFormatVersion of [5, 4, 3] as const) {
+    const plan = buildOpenClawProjectSandboxPlan({ ...input, mountFormatVersion });
+    if (plan.configHash === input.runtime.configHash
+      && plan.runtimeFingerprint === input.runtime.runtimeFingerprint) return plan;
+  }
+  fail('RUNTIME_FINGERPRINT', 'OpenClaw Project runtime does not match a supported attested sandbox recipe');
 }
 
 async function readOpenClawConfig(
@@ -931,43 +1061,89 @@ async function readOpenClawConfig(
   return { config, hash };
 }
 
-function findAgent(config: Record<string, any>, agentId: string): Record<string, any> | null {
-  const agents = config?.agents?.list;
-  if (!Array.isArray(agents)) return null;
-  const matches = agents.filter((entry) => isRecord(entry) && entry.id === agentId);
-  if (matches.length > 1) fail('DUPLICATE_AGENT', 'OpenClaw Project agent identity is duplicated');
-  return matches[0] || null;
+function readAgentContract(config: Record<string, any>): OpenClawAgentConfigContract {
+  try {
+    return readOpenClawAgentConfigContract(config);
+  } catch (error) {
+    fail('CONFIG_AGENT_ENTRIES_INVALID', String((error as Error)?.message || error));
+  }
 }
 
 /**
- * OpenClaw resolves the default agent as `agents.list[].default`, else the
- * FIRST list entry (fallback `main`). Project agents joining the list can
- * therefore silently capture default routing — auth probes and agent-unscoped
- * CLI operations then execute inside a project docker sandbox instead of the
- * host `main` agent. Pin `default: true` on `main` whenever it is present.
+ * OpenClaw 2026.7.1 resolves the default agent from agents.list[].default and
+ * otherwise falls through to the first list member. Keep main explicit before
+ * a Project entry is added so unscoped work can never fall into its sandbox.
  */
-function withMainAgentDefaultRouting(agents: unknown[]): unknown[] {
-  const hasMain = agents.some((entry) => isRecord(entry) && entry.id === 'main');
-  // An empty explicit list still resolves to the implicit `main` agent. Keep
-  // that host agent explicit before adding the first Portal Project agent;
-  // otherwise the new p4oc entry becomes first and silently captures default
-  // routing on a clean installation.
-  if (!hasMain) return agents.length === 0 ? [{ id: 'main', default: true }] : agents;
-  return agents.map((entry) => (
-    isRecord(entry) && entry.id === 'main' && entry.default !== true
-      ? { ...entry, default: true }
-      : entry
-  ));
+function desiredLegacyAgentList(
+  contract: Extract<OpenClawAgentConfigContract, { storage: 'list' }>,
+  desiredAgent: Record<string, any>,
+): Record<string, any>[] {
+  const withoutProject = contract.list.filter((entry) => entry.id !== desiredAgent.id);
+  const mainIndex = withoutProject.findIndex((entry) => entry.id === 'main');
+  if (mainIndex >= 0) {
+    withoutProject[mainIndex] = { ...withoutProject[mainIndex], default: true };
+  } else if (withoutProject.length === 0) {
+    withoutProject.push({ id: 'main', default: true });
+  }
+  return [...withoutProject, desiredAgent];
 }
 
-function mainAgentDefaultRoutingMissing(config: Record<string, any>): boolean {
-  const agents = config?.agents?.list;
-  if (!Array.isArray(agents)) return false;
-  const main = agents.find((entry: unknown) => isRecord(entry) && (entry as Record<string, unknown>).id === 'main') as Record<string, unknown> | undefined;
-  if (main) return main.default !== true;
-  return agents.length === 1
-    && isRecord(agents[0])
-    && /^p4oc-[a-f0-9]{40}$/u.test(String(agents[0].id || ''));
+/**
+ * OpenClaw 2026.9.1 retains the keyed `agents.entries` roster introduced in
+ * 2026.8.1, with ownership
+ * separate from each keyed entry. Before a Project entry expands an implicit
+ * or sole-agent roster, retain that prior owner explicitly so unscoped system
+ * work can never fall into the Project sandbox.
+ */
+function desiredCurrentAgentsConfig(
+  contract: Extract<OpenClawAgentConfigContract, { storage: 'entries' }>,
+  desiredAgent: Record<string, any>,
+): Record<string, any> {
+  const currentAgents = contract.agentsConfig;
+  const currentEntries = contract.entries;
+  const nextEntries: Record<string, Record<string, any>> = Object.fromEntries(
+    Object.entries(currentEntries).map(([id, entry]) => [id, structuredClone(entry)]),
+  );
+  nextEntries[String(desiredAgent.id)] = persistedOpenClawAgentEntry(desiredAgent);
+
+  if (currentAgents.ownership === 'explicit') {
+    return { ...currentAgents, entries: nextEntries };
+  }
+
+  const legacyOwners = Object.entries(currentEntries)
+    .filter(([, entry]) => entry.default === true)
+    .map(([id]) => id);
+  if (legacyOwners.length > 1) {
+    fail('CONFIG_AGENT_OWNERSHIP_INVALID', 'OpenClaw agent ownership was ambiguous before Project registration');
+  }
+  const currentIds = Object.keys(currentEntries);
+  let ownerId = legacyOwners[0];
+  if (!ownerId && currentIds.length === 1 && currentIds[0] !== desiredAgent.id) {
+    ownerId = currentIds[0];
+  }
+  if (!ownerId && (currentIds.length === 0 || currentIds[0] === desiredAgent.id)) {
+    ownerId = 'main';
+    nextEntries.main = {};
+  }
+  if (!ownerId) {
+    fail('CONFIG_AGENT_OWNERSHIP_INVALID', 'OpenClaw agent ownership was not explicit before Project registration');
+  }
+  for (const [id, entry] of Object.entries(nextEntries)) {
+    if (!Object.prototype.hasOwnProperty.call(entry, 'default')) continue;
+    const { default: _default, ...rest } = entry;
+    nextEntries[id] = rest;
+  }
+  const defaults = isRecord(currentAgents.defaults) ? currentAgents.defaults : {};
+  const systemAgent = isRecord(defaults.systemAgent) ? defaults.systemAgent : {};
+  return {
+    ...currentAgents,
+    ownership: 'explicit',
+    defaults: {
+      ...defaults,
+      systemAgent: { ...systemAgent, agentId: ownerId },
+    },
+    entries: nextEntries,
+  };
 }
 
 async function ensureExactOpenClawAgentConfig(
@@ -975,37 +1151,48 @@ async function ensureExactOpenClawAgentConfig(
   rpc: OpenClawProjectSandboxDependencies['rpc'],
 ): Promise<void> {
   let snapshot = await readOpenClawConfig(rpc);
-  let current = findAgent(snapshot.config, plan.agentId);
-  if (
-    !current
-    || !valuesEqual(current, plan.desiredAgent)
-    || mainAgentDefaultRoutingMissing(snapshot.config)
-  ) {
-    const agents = Array.isArray(snapshot.config?.agents?.list)
-      ? snapshot.config.agents.list.filter((entry: unknown) => !isRecord(entry) || entry.id !== plan.agentId)
-      : [];
+  let contract = readAgentContract(snapshot.config);
+  let current = exactOpenClawAgent(contract, plan.agentId);
+  const desiredAgents = contract.storage === 'list'
+    ? { ...contract.agentsConfig, list: desiredLegacyAgentList(contract, plan.desiredAgent) }
+    : desiredCurrentAgentsConfig(contract, plan.desiredAgent);
+  if (!current || !valuesEqual(current, plan.desiredAgent) || !valuesEqual(contract.agentsConfig, desiredAgents)) {
+    const currentEntry = current
+      ? contract.storage === 'list'
+        ? current
+        : persistedOpenClawAgentEntry(current)
+      : null;
+    const agentsPatch = contract.storage === 'list'
+      ? { list: desiredAgents.list }
+      : createConfigMergePatch(contract.agentsConfig, desiredAgents);
     const response = await rpc('config.patch', {
-      raw: JSON.stringify({
-        agents: { list: [...withMainAgentDefaultRouting(agents), plan.desiredAgent] },
-      }),
+      raw: JSON.stringify({ agents: agentsPatch }),
       baseHash: snapshot.hash,
-      // Replacing the canonical Project agent intentionally removes stale deny
-      // entries from these two nested arrays. OpenClaw 2026.7.1 requires each
-      // exact destructive array path; naming the parent agents.list is not an
-      // authorization for nested entry-array removal.
-      replacePaths: [
-        'agents.list[].tools.deny',
-        'agents.list[].tools.sandbox.tools.deny',
-      ],
+      // 7.1 owns identity in one canonical list, so replacing that exact array
+      // is the explicit destructive intent. 9.1 owns one keyed entry and only
+      // authorizes nested array replacement below that server-derived key.
+      replacePaths: contract.storage === 'list'
+        ? ['agents.list']
+        : currentEntry
+          ? collectOpenClawConfigArrayPaths(currentEntry, `agents.entries.${plan.agentId}`)
+          : [],
     }, CONFIG_RPC_TIMEOUT_MS);
     if (!response.ok) {
       failGateway('CONFIG_PATCH_FAILED', 'OpenClaw Project config could not be patched', response);
     }
     snapshot = await readOpenClawConfig(rpc);
-    current = findAgent(snapshot.config, plan.agentId);
+    contract = readAgentContract(snapshot.config);
+    current = exactOpenClawAgent(contract, plan.agentId);
   }
   if (!current || !valuesEqual(current, plan.desiredAgent)) {
     fail('CONFIG_REREAD_MISMATCH', 'OpenClaw Project agent config did not match after synchronous re-read');
+  }
+  if (contract.storage === 'list') {
+    if (!valuesEqual(contract.agentsConfig.list, desiredAgents.list)) {
+      fail('CONFIG_REREAD_MISMATCH', 'OpenClaw 2026.7.1 agent list changed during synchronous re-read');
+    }
+  } else if (!valuesEqual(contract.agentsConfig, desiredAgents)) {
+    fail('CONFIG_REREAD_MISMATCH', 'OpenClaw 2026.9.1 agent entries changed during synchronous re-read');
   }
   const effectiveDocker = resolveEffectiveDocker(snapshot.config, current);
   if (!valuesEqual(effectiveDocker, plan.desiredDocker)) {
@@ -1015,6 +1202,7 @@ async function ensureExactOpenClawAgentConfig(
     docker: effectiveDocker,
     sandboxWorkspaceDir: plan.sandboxWorkspaceDir,
     agentWorkspaceDir: plan.agentWorkspaceDir,
+    mountFormatVersion: plan.mountFormatVersion,
   });
   if (rereadHash !== plan.configHash) {
     fail('CONFIG_HASH_MISMATCH', 'OpenClaw Project sandbox config hash did not match the desired policy');
@@ -1159,11 +1347,12 @@ function attestOpenClawProjectContainerForGeneration(input: {
   const labels = inspect.Config?.Labels || {};
   const expectedLabels: Record<string, string> = {
     'openclaw.sandbox': '1',
-    'openclaw.sessionKey': plan.sessionKey,
+    'openclaw.sessionKey': plan.runtimeScopeKey,
     [OPENCLAW_PROJECT_ACTOR_LABEL]: hashOpenClawProjectLabelIdentity(plan.actorUserId),
     [OPENCLAW_PROJECT_IDENTITY_LABEL]: hashOpenClawProjectLabelIdentity(plan.projectIdentityId),
     [OPENCLAW_PROJECT_AGENT_LABEL]: plan.agentId,
-    'openclaw.mountFormatVersion': String(OPENCLAW_SANDBOX_MOUNT_FORMAT_VERSION),
+    'openclaw.mountFormatVersion': String(plan.mountFormatVersion === 5 ? 4 : plan.mountFormatVersion),
+    ...(plan.mountFormatVersion >= 4 ? { 'openclaw.createArgsEpoch': OPENCLAW_CURRENT_CREATE_ARGS_EPOCH } : {}),
     'openclaw.configHash': plan.configHash,
     [PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]: plan.runtimeFingerprint,
   };
@@ -1184,7 +1373,7 @@ function attestOpenClawProjectContainerForGeneration(input: {
   if (inspect.Config?.User !== OPENCLAW_CONTAINER_USER) {
     fail('RUNTIME_USER', 'OpenClaw Project runtime must run as a non-root numeric user');
   }
-  if (inspect.Config?.WorkingDir !== OPENCLAW_PROJECT_CWD) {
+  if (inspect.Config?.WorkingDir !== (plan.mountFormatVersion === 5 ? OPENCLAW_PROJECT_WORKDIR : OPENCLAW_PROJECT_CWD)) {
     fail('RUNTIME_WORKDIR', 'OpenClaw Project runtime working directory did not match');
   }
   if (!valuesEqual(inspect.Config?.Cmd, ['sleep', 'infinity'])) {
@@ -1197,6 +1386,7 @@ function attestOpenClawProjectContainerForGeneration(input: {
   requireEmpty(inspect.Config?.Volumes, 'RUNTIME_IMAGE_VOLUMES', 'OpenClaw Project runtime image declares writable volumes');
 
   const host = inspect.HostConfig || {};
+  if (plan.mountFormatVersion >= 4 && host.Init !== true) fail('RUNTIME_INIT', 'OpenClaw Project runtime init policy did not match');
   if (host.ReadonlyRootfs !== true) fail('RUNTIME_ROOTFS', 'OpenClaw Project runtime root filesystem is writable');
   if (!valuesEqual((host.CapDrop || []).map((cap) => cap.toUpperCase()).sort(), ['ALL'])) {
     fail('RUNTIME_CAP_DROP', 'OpenClaw Project runtime capability drop did not match');
@@ -1285,16 +1475,28 @@ function attestOpenClawProjectContainerForGeneration(input: {
     fail('RUNTIME_BINDS', 'OpenClaw Project runtime bind configuration did not match');
   }
   const mounts = inspect.Mounts || [];
-  if (mounts.length !== 2) fail('RUNTIME_MOUNTS', 'OpenClaw Project runtime mount count did not match');
+  const workspaceQualified = plan.mountFormatVersion === 5;
+  const expectedSkillMounts = workspaceQualified
+    ? resolveOpenClawReadOnlySkillMounts({ sandboxWorkspaceDir: plan.sandboxWorkspaceDir, workdir: OPENCLAW_PROJECT_WORKDIR })
+    : [];
+  if (mounts.length !== 2 + expectedSkillMounts.length) fail('RUNTIME_MOUNTS', 'OpenClaw Project runtime mount count did not match');
   const byDestination = new Map(mounts.map((mount) => [mount.Destination, mount]));
   const workspaceMount = byDestination.get(OPENCLAW_PROJECT_WORKDIR);
   const projectMount = byDestination.get(OPENCLAW_PROJECT_MOUNT);
   if (
     workspaceMount?.Type !== 'bind'
     || workspaceMount.Source !== plan.sandboxWorkspaceDir
-    || workspaceMount.RW !== false
+    // The 9.2 Gateway mounts its private sandbox workspace rw (the host
+    // directory stays root-owned, so uid 1000 cannot write outside /project).
+    || workspaceMount.RW !== workspaceQualified
   ) {
     fail('RUNTIME_WORKSPACE_MOUNT', 'OpenClaw Project sandbox workspace mount did not match');
+  }
+  for (const skill of expectedSkillMounts) {
+    const mount = byDestination.get(skill.containerPath);
+    if (mount?.Type !== 'bind' || mount.Source !== skill.hostPath || mount.RW !== false) {
+      fail('RUNTIME_SKILL_MOUNT', 'OpenClaw Project read-only skills overlay mount did not match');
+    }
   }
   if (
     projectMount?.Type !== 'bind'
@@ -1327,16 +1529,20 @@ function buildContainerCreateArgs(
   const args = ['container', 'create', '--name', plan.containerName];
   const labels: Record<string, string> = {
     'openclaw.sandbox': '1',
-    'openclaw.sessionKey': plan.sessionKey,
+    'openclaw.sessionKey': plan.runtimeScopeKey,
     [OPENCLAW_PROJECT_ACTOR_LABEL]: hashOpenClawProjectLabelIdentity(plan.actorUserId),
     [OPENCLAW_PROJECT_IDENTITY_LABEL]: hashOpenClawProjectLabelIdentity(plan.projectIdentityId),
     [OPENCLAW_PROJECT_AGENT_LABEL]: plan.agentId,
     'openclaw.createdAtMs': String(createdAtMs),
-    'openclaw.mountFormatVersion': String(OPENCLAW_SANDBOX_MOUNT_FORMAT_VERSION),
+    // The Gateway itself labels 9.2 runtimes mountFormatVersion=4; v5 is
+    // Portal's name for the workspace-qualified identity of that format.
+    'openclaw.mountFormatVersion': String(plan.mountFormatVersion === 5 ? 4 : plan.mountFormatVersion),
+    ...(plan.mountFormatVersion >= 4 ? { 'openclaw.createArgsEpoch': OPENCLAW_CURRENT_CREATE_ARGS_EPOCH } : {}),
     'openclaw.configHash': plan.configHash,
     [PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]: plan.runtimeFingerprint,
   };
   for (const [key, value] of Object.entries(labels)) args.push('--label', `${key}=${value}`);
+  if (plan.mountFormatVersion >= 4) args.push('--init');
   args.push('--read-only');
   for (const tmpfs of docker.tmpfs) args.push('--tmpfs', tmpfs);
   args.push('--network', plan.networkMode);
@@ -1353,7 +1559,7 @@ function buildContainerCreateArgs(
     args.push('--ulimit', `${name}=${value.soft}:${value.hard}`);
   }
   for (const bind of plan.expectedBinds) args.push('-v', bind);
-  args.push('--workdir', OPENCLAW_PROJECT_CWD);
+  args.push('--workdir', plan.mountFormatVersion === 5 ? OPENCLAW_PROJECT_WORKDIR : OPENCLAW_PROJECT_CWD);
   args.push(docker.image, 'sleep', 'infinity');
   return args;
 }
@@ -1466,6 +1672,23 @@ async function ensureExactRuntime(input: {
   let containerId: string | null = null;
   try {
     let inspect = await strictInspectContainer(executor, plan.containerName);
+    if (inspect && isUnadoptedGatewayProvisionedRuntime(plan, inspect)) {
+      // The 9.2 Gateway provisioned this runtime itself (workspace-qualified
+      // scope key of this exact server-owned Project agent, none of Portal's
+      // identity labels) because no attested container existed under that
+      // name. It never carried Portal's attestation, so it is retired and
+      // replaced by an attested one; this is the documented
+      // `openclaw sandbox recreate` for that scope key. Any other occupant of
+      // the deterministic name is left untouched and fails attestation below.
+      const unadoptedId = String(inspect.Id || '').toLowerCase();
+      if (inspect.State?.Running === true) {
+        await executor.run('docker', ['container', 'stop', '--time', '1', unadoptedId]);
+      }
+      await executor.run('docker', ['container', 'rm', unadoptedId]);
+      const remaining = await strictInspectContainer(executor, plan.containerName);
+      if (remaining) fail('RUNTIME_NAME_OCCUPIED', 'OpenClaw Project runtime name is still occupied after retiring the Gateway-provisioned runtime');
+      inspect = null;
+    }
     if (!inspect) {
       const created = await executor.run('docker', buildContainerCreateArgs(plan, input.now.getTime()));
       const createdContainerId = created.stdout.trim();
@@ -1550,6 +1773,46 @@ async function ensureExactRuntime(input: {
   }
 }
 
+function isUnadoptedGatewayProvisionedRuntime(
+  plan: OpenClawProjectSandboxPlan,
+  inspect: DockerContainerInspect,
+): boolean {
+  if (plan.mountFormatVersion !== 5) return false;
+  const labels = inspect.Config?.Labels || {};
+  const portalLabels = [
+    OPENCLAW_PROJECT_ACTOR_LABEL,
+    OPENCLAW_PROJECT_IDENTITY_LABEL,
+    OPENCLAW_PROJECT_AGENT_LABEL,
+    PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL,
+  ];
+  return (inspect.Name === `/${plan.containerName}` || inspect.Name === plan.containerName)
+    && labels['openclaw.sandbox'] === '1'
+    && labels['openclaw.sessionKey'] === plan.runtimeScopeKey
+    && plan.runtimeScopeKey.startsWith(`agent:${plan.agentId}:`)
+    && portalLabels.every((label) => !Object.prototype.hasOwnProperty.call(labels, label));
+}
+
+/** Installed OpenClaw core version as [major, minor, patch]; null when unreadable. */
+function readInstalledOpenClawRuntimeVersion(): readonly [number, number, number] | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(OPENCLAW_INSTALLED_PACKAGE_JSON, 'utf8'));
+    const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(parsed?.version || '').trim());
+    if (!match) return null;
+    return [Number(match[1]), Number(match[2]), Number(match[3])];
+  } catch {
+    return null;
+  }
+}
+
+function usesWorkspaceQualifiedRuntime(version: readonly [number, number, number] | null): boolean {
+  if (!version) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (version[index] > OPENCLAW_WORKSPACE_QUALIFIED_RUNTIME_MIN_VERSION[index]) return true;
+    if (version[index] < OPENCLAW_WORKSPACE_QUALIFIED_RUNTIME_MIN_VERSION[index]) return false;
+  }
+  return true;
+}
+
 const commandExecutor: ProjectEgressCommandExecutor = {
   run(command, args, options = {}) {
     return new Promise((resolve, reject) => {
@@ -1623,6 +1886,7 @@ const defaultDependencies: OpenClawProjectSandboxDependencies = {
   resolveInternalNetworkBinding: resolveRecognizedProjectEgressInternalNetworkBinding,
   constrainRuntime: constrainProjectRuntimeToEgressPlane,
   assertConfinementReady: () => { assertProjectRuntimeConfinementReadyForExecution(); },
+  readRuntimeVersion: readInstalledOpenClawRuntimeVersion,
   now: () => new Date(),
 };
 
@@ -1728,9 +1992,22 @@ function staleRuntimeAttestationPlan(input: {
     }),
   });
   const containerPrefix = `p4oc-${candidateContext.policyFingerprint.slice(0, 16)}-`;
-  if (containerName !== `${containerPrefix}${slugifyOpenClawProjectSessionKey(input.plan.sessionKey)}`.slice(0, 63)) {
+  const agentSlugName = `${containerPrefix}${slugifyOpenClawProjectSessionKey(input.plan.sessionKey)}`.slice(0, 63);
+  const workspaceQualified = resolveOpenClawWorkspaceQualifiedRuntime({
+    sessionKey: input.plan.sessionKey,
+    agentWorkspaceDir: input.plan.agentWorkspaceDir,
+    sandboxWorkspaceRoot: input.plan.sandboxWorkspaceRoot,
+    containerPrefix,
+  });
+  if (containerName !== agentSlugName && containerName !== workspaceQualified.containerName) {
     fail('STALE_RUNTIME_NAME', 'Managed OpenClaw Project stale runtime name did not match');
   }
+  const staleRuntimeScopeKey = containerName === workspaceQualified.containerName
+    ? workspaceQualified.scopeKey
+    : input.plan.sessionKey;
+  const staleSandboxWorkspaceDir = containerName === workspaceQualified.containerName
+    ? workspaceQualified.sandboxWorkspaceDir
+    : path.join(input.plan.sandboxWorkspaceRoot, slugifyOpenClawProjectSessionKey(input.plan.sessionKey));
 
   const environment = parseEnvironment(input.inspect.Config?.Env);
   const proxyEnvironment: Record<string, string> = {};
@@ -1806,9 +2083,16 @@ function staleRuntimeAttestationPlan(input: {
     projectRoot: input.plan.projectRoot,
     proxyEnvironment,
   });
+  // Formats 3 and 4 keyed their sandbox workspace by the agent slug; a
+  // format-5 plan carries the workspace-qualified directory, so prior
+  // generations must be hashed against the directory they were created with.
+  const agentSlugWorkspaceDir = path.join(
+    input.plan.sandboxWorkspaceRoot,
+    slugifyOpenClawProjectSessionKey(input.plan.sessionKey),
+  );
   const legacyConfigHash = computeOpenClawProjectConfigHash({
     docker: legacyDesiredDocker,
-    sandboxWorkspaceDir: input.plan.sandboxWorkspaceDir,
+    sandboxWorkspaceDir: agentSlugWorkspaceDir,
     agentWorkspaceDir: input.plan.agentWorkspaceDir,
   });
   const legacyFingerprint = buildOpenClawRuntimeFingerprint({
@@ -1819,11 +2103,33 @@ function staleRuntimeAttestationPlan(input: {
     sessionKey: input.plan.sessionKey,
     configHash: legacyConfigHash,
   }).fingerprint;
+  const currentV4Docker = buildDesiredDocker({ image, containerPrefix,
+    network: input.spec.internalNetworkName, projectRoot: input.plan.projectRoot,
+    proxyEnvironment, mountFormatVersion: 4 });
+  const currentV4Hash = computeOpenClawProjectConfigHash({ docker: currentV4Docker,
+    sandboxWorkspaceDir: agentSlugWorkspaceDir, agentWorkspaceDir: input.plan.agentWorkspaceDir,
+    mountFormatVersion: 4 });
+  const currentV4Fingerprint = buildOpenClawRuntimeFingerprint({ context: candidateContext,
+    egressPolicyFingerprint: input.spec.policyFingerprint, image, agentId: input.plan.agentId,
+    sessionKey: input.plan.sessionKey, configHash: currentV4Hash }).fingerprint;
+  const currentV5Docker = buildDesiredDocker({ image, containerPrefix,
+    network: input.spec.internalNetworkName, projectRoot: input.plan.projectRoot,
+    proxyEnvironment, mountFormatVersion: 5 });
+  const currentV5Hash = computeOpenClawProjectConfigHash({ docker: currentV5Docker,
+    sandboxWorkspaceDir: workspaceQualified.sandboxWorkspaceDir, agentWorkspaceDir: input.plan.agentWorkspaceDir,
+    mountFormatVersion: 5 });
+  const currentV5Fingerprint = buildOpenClawRuntimeFingerprint({ context: candidateContext,
+    egressPolicyFingerprint: input.spec.policyFingerprint, image, agentId: input.plan.agentId,
+    sessionKey: input.plan.sessionKey, configHash: currentV5Hash }).fingerprint;
   const candidate = runtimeFingerprint === legacyFingerprint && configHash === legacyConfigHash
     ? {
       desiredDocker: legacyDesiredDocker,
       confinementGeneration: 'LEGACY_PRE_CONFINEMENT' as const,
     }
+    : runtimeFingerprint === currentV4Fingerprint && configHash === currentV4Hash
+      ? { desiredDocker: currentV4Docker, confinementGeneration: 'CURRENT' as const }
+    : runtimeFingerprint === currentV5Fingerprint && configHash === currentV5Hash
+      ? { desiredDocker: currentV5Docker, confinementGeneration: 'CURRENT' as const }
     : runtimeFingerprint === currentFingerprint && configHash === currentConfigHash
       ? {
         desiredDocker: currentDesiredDocker,
@@ -1846,12 +2152,31 @@ function staleRuntimeAttestationPlan(input: {
         'STALE_RUNTIME_NETWORK',
         'Managed OpenClaw Project stale runtime network mode is not a recognized generation',
       );
+  const staleMountFormatVersion: SandboxMountVersion = configHash === currentV5Hash ? 5
+    : configHash === currentV4Hash ? 4 : 3;
+  if ((staleMountFormatVersion === 5) !== (containerName === workspaceQualified.containerName)) {
+    fail('STALE_RUNTIME_GENERATION', 'Managed OpenClaw Project stale runtime name and recipe generation disagree');
+  }
   const stalePlan = Object.freeze({
     ...input.plan,
     containerName,
+    runtimeScopeKey: staleRuntimeScopeKey,
+    sandboxWorkspaceDir: staleSandboxWorkspaceDir,
     configHash,
     runtimeFingerprint,
     desiredDocker: candidate.desiredDocker,
+    mountFormatVersion: staleMountFormatVersion,
+    expectedBinds: Object.freeze(staleMountFormatVersion === 5
+      ? [
+        formatOpenClawManagedWorkspaceBind(staleSandboxWorkspaceDir, OPENCLAW_PROJECT_WORKDIR, false),
+        `${input.plan.projectRoot}:${OPENCLAW_PROJECT_MOUNT}:rw`,
+        ...resolveOpenClawReadOnlySkillMounts({ sandboxWorkspaceDir: staleSandboxWorkspaceDir, workdir: OPENCLAW_PROJECT_WORKDIR })
+          .map((mount) => formatOpenClawManagedWorkspaceBind(mount.hostPath, mount.containerPath, true)),
+      ]
+      : [
+        `${staleSandboxWorkspaceDir}:${OPENCLAW_PROJECT_WORKDIR}:ro,z`,
+        `${input.plan.projectRoot}:${OPENCLAW_PROJECT_MOUNT}:rw`,
+      ]),
     expectedEnvironment: Object.freeze({
       ...candidate.desiredDocker.env,
       OPENCLAW_CLI: '1',
@@ -2085,6 +2410,11 @@ export async function ensureOpenClawProjectSandbox(
   dependencies.assertConfinementReady();
   const spec = dependencies.buildEgressSpec(input.egress);
   const result = await withRuntimeEnsureLock(spec.identityFingerprint, async () => {
+    const configFamily = readAgentContract((await readOpenClawConfig(dependencies.rpc)).config);
+    // Keyed agent entries arrived with 2026.9.1 (format 4); 2026.9.2 keys the
+    // runtime by workspace as well (format 5). Older runtimes keep format 3.
+    const mountFormatVersion: SandboxMountVersion = configFamily.storage !== 'entries' ? 3
+      : usesWorkspaceQualifiedRuntime(dependencies.readRuntimeVersion()) ? 5 : 4;
     const preflightNetworkBinding = await dependencies.resolveInternalNetworkBinding(
       dependencies.executor,
       spec,
@@ -2107,6 +2437,7 @@ export async function ensureOpenClawProjectSandbox(
         input.context.egressPolicyVersion,
         preflightNetworkBinding?.networkId,
       ),
+      mountFormatVersion,
       useHistoricalNetworkMode: preflightNetworkBinding?.generation === 'LEGACY_PRE_CONFINEMENT',
     });
     await retireExactManagedStaleRuntimes({
@@ -2209,6 +2540,7 @@ export async function ensureOpenClawProjectSandbox(
       openClawHome: input.openClawHome,
       egressSpec: spec,
       egressHandle: handle,
+      mountFormatVersion,
     });
     await retireExactManagedStaleRuntimes({
       executor: dependencies.executor,
@@ -2281,6 +2613,8 @@ export async function ensureOpenClawProjectSandbox(
 
 export const __openClawProjectSandboxTest = {
   buildContainerCreateArgs,
+  usesWorkspaceQualifiedRuntime,
+  isUnadoptedGatewayProvisionedRuntime,
   ensureExactOpenClawAgentConfig,
   ensureExactRuntime,
   resolveEffectiveDocker,

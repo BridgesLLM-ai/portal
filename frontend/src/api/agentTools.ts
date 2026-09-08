@@ -19,6 +19,9 @@ export type ToolAdapterStatus = {
   version: string | null;
   missing: boolean;
   checkedAt: string;
+  state?: 'verified' | 'absent' | 'unsupported' | 'status_only' | 'drifted' | 'busy' | 'recovering' | 'recovery-required' | 'indeterminate';
+  installAvailable?: boolean;
+  installUnavailableCode?: string;
 };
 
 export type ToolCommandPreset = {
@@ -32,6 +35,7 @@ export type AgentTool = {
   id: string;
   name: string;
   description: string;
+  managedInstall?: 'npm-cli';
   detect?: { command: string };
   install: Array<{ label: string; command: string; description?: string }>;
   commands: ToolCommandPreset[];

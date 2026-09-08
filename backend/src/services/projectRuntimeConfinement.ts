@@ -31,7 +31,7 @@ export const CODEX_PROJECT_RUNTIME_APPARMOR_PROFILE_SHA256 =
 export const CODEX_PROJECT_RUNTIME_SECCOMP_PROFILE_PATH =
   '/etc/bridgesllm/project-runtime/bridgesllm-codex-project-runtime-v1.seccomp.json';
 export const CODEX_PROJECT_RUNTIME_SECCOMP_PROFILE_SHA256 =
-  'e83f93eaf5b476dfd401d0482210217c5ff1484d1655ba9ca77de59435193c02';
+  '73ffea84f592faa30cd8eebba9980cbeac76026f4f06574cc7699ecc8af49a3a';
 
 const APPARMOR_ENABLED_PATH = '/sys/module/apparmor/parameters/enabled';
 const APPARMOR_LOADED_PROFILES_PATH = '/sys/kernel/security/apparmor/profiles';
@@ -389,7 +389,7 @@ export function assertProjectRuntimeConfinementReady(input: {
   } catch {
     appArmorEnabled = '';
   }
-  const dockerHasAppArmor = dockerOptions.some((entry) => entry === 'name=apparmor');
+  const dockerHasAppArmor = dockerOptions.some((entry) => /^name=apparmor(?:,|$)/.test(entry));
 
   if (policy === PROJECT_RUNTIME_APPARMOR_SECCOMP_POLICY) {
     assertRootOwnedRegularFile(

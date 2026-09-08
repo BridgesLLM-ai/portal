@@ -2,9 +2,7 @@ import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, ChevronRight, ClipboardPaste, Copy, ExternalLink, Loader2, X } from 'lucide-react';
 import client from '../../api/client';
 import ViewportModal from '../ViewportModal';
-import ModelSelector, { type SelectableModel } from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
-import { getModelFamilyKey, mergeModelCatalog, pickPreferredModel } from './modelCatalog';
 import { getOAuthProviderPresentation, getOAuthStartRecoveryDisposition, isOAuthFlowCancelled, isOAuthFlowExpired, isOAuthFlowReadyForModel, readStructuredOAuthFlowState, readStructuredOAuthStartFailure } from './oauthFlowContract';
 import { cancelOAuthSession } from './oauthCancellation';
 
@@ -22,15 +20,13 @@ function nativeCliBridgeNote(providerId: string): { title: string; body: string;
   switch (providerId) {
     case 'openai-codex':
       return {
-        title: 'Codex login powers both paths',
-        body: 'This signs in the server Codex CLI, then links OpenClaw to that same credential store for Agent Chat.',
-        command: 'codex login',
+        title: 'Codex host sign-in is unavailable',
+        body: 'Portal preserves existing credentials but does not start interactive Codex host login. Supervised Agent Chat can use an existing attested host credential.',
       };
     case 'google-gemini-cli':
       return {
-        title: 'Native Antigravity login is separate',
-        body: 'This flow links OpenClaw only. The native Google adapter used by Agent Chat now runs Antigravity, so it still needs its own server-side Google login.',
-        command: 'agy',
+        title: 'Native Antigravity is unavailable',
+        body: 'This flow links Google through OpenClaw only. Portal does not offer native Antigravity login or execution until its sandbox and transaction are qualified.',
       };
     default:
       return null;
@@ -51,12 +47,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
   const [popupBlocked, setPopupBlocked] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fatalError, setFatalError] = useState<string | null>(null);
-  const [existingDefault, setExistingDefault] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string | null>(null);
-  const [availableModels, setAvailableModels] = useState<SelectableModel[]>(provider.defaultModels);
-  const [loadingModels, setLoadingModels] = useState(false);
   const [googleProjectId, setGoogleProjectId] = useState('');
-  const [credentialProfileId, setCredentialProfileId] = useState<string | null>(null);
   const [sessionOwned, setSessionOwned] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancellationError, setCancellationError] = useState<string | null>(null);
@@ -87,66 +78,6 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
     operationRef.current = null;
     setOperation(null);
   }, []);
-
-  // Check if a default model is already configured; only auto-select if not
-  React.useEffect(() => {
-    setAvailableModels(provider.defaultModels);
-    client.get(`${apiBase}/status`).then(({ data }) => {
-      const current = data?.defaultModel || null;
-      setExistingDefault(current);
-      if (!current) {
-        setSelectedModel(pickPreferredModel(provider.defaultModels));
-      }
-      // Otherwise leave selectedModel as null so the user has to explicitly choose
-    }).catch(() => {
-      setSelectedModel((current) => current || pickPreferredModel(provider.defaultModels));
-    });
-  }, [apiBase, provider]);
-
-  React.useEffect(() => {
-    if (step !== 'model') return;
-
-    let cancelled = false;
-    setLoadingModels(true);
-
-    client.get(`${apiBase}/models`, { params: { provider: provider.id } }).then(({ data }) => {
-      if (cancelled) return;
-      const discovered = Array.isArray(data?.models)
-        ? data.models.map((model: any) => ({
-            id: String(model?.id || '').trim(),
-            name: String(model?.name || model?.id || '').trim() || String(model?.id || '').trim(),
-            description: typeof model?.description === 'string' ? model.description : undefined,
-          })).filter((model: SelectableModel) => Boolean(model.id))
-        : [];
-
-      const merged = mergeModelCatalog(discovered, provider.defaultModels);
-      const nextModels = merged.length ? merged : provider.defaultModels;
-      setAvailableModels(nextModels);
-      setSelectedModel((current) => {
-        const currentFamily = getModelFamilyKey(current || '');
-        const currentMatch = currentFamily
-          ? nextModels.find((model) => getModelFamilyKey(model.id) === currentFamily)
-          : null;
-        if (currentMatch) return currentMatch.id;
-        if (existingDefault) return current;
-        return pickPreferredModel(nextModels);
-      });
-    }).catch(() => {
-      if (cancelled) return;
-      setAvailableModels(provider.defaultModels);
-      setSelectedModel((current) => {
-        if (current) return current;
-        if (existingDefault) return current;
-        return pickPreferredModel(provider.defaultModels);
-      });
-    }).finally(() => {
-      if (!cancelled) setLoadingModels(false);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [apiBase, existingDefault, provider.defaultModels, provider.id, step]);
 
   const isOpenAI = provider.id === 'openai-codex';
   const isGoogle = provider.id === 'google-gemini-cli';
@@ -232,7 +163,6 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
               setStep('error');
               return;
             }
-            if (structured.createdProfileId) setCredentialProfileId(structured.createdProfileId);
             setFinalizationWarning(structured.finalizationWarning);
             setSessionOwned(false);
             stopPolling();
@@ -314,65 +244,12 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
     setError(null);
     setLifecycleConflict(false);
     setCancellationError(null);
-    setCredentialProfileId(null);
     setRecoverySession(false);
     try {
       if (isOpenAI) {
-        setFlowKind('native-cli');
-        const { data } = await client.post(`${apiBase}/native-cli/start`, {
-          provider: 'codex',
-          ...(forceReauth ? { forceReauth: true } : {}),
-        });
-        if (data.success === false) {
-          const startFailure = readStructuredOAuthStartFailure(data);
-          if (startFailure.code === 'CODEX_REAUTHENTICATION_REQUIRED') {
-            setError(startFailure.error || 'Portal stopped before replacing the existing Codex sign-in.');
-            setStep('start');
-            return;
-          }
-          const disposition = getOAuthStartRecoveryDisposition(startFailure);
-          if (disposition === 'cleanup_required' && startFailure.sessionId) {
-            setSessionId(startFailure.sessionId);
-            setSessionOwned(true);
-            setRecoverySession(true);
-          } else if (disposition === 'committed' || disposition === 'review_required') {
-            setSessionId(null);
-            setSessionOwned(false);
-            setReviewState(disposition);
-          }
-          setFatalError(startFailure.error || 'Failed to start Codex login.');
-          setStep('error');
-          return;
-        }
-        const nextSessionId = typeof data?.sessionId === 'string' ? data.sessionId.trim() : '';
-        if (!nextSessionId) {
-          setSessionOwned(false);
-          setReviewState('review_required');
-          setFatalError('Portal received an incomplete Codex start response and cannot prove whether authentication began. Review Codex before starting another login.');
-          setStep('error');
-          return;
-        }
-        setFlowKind('native-cli');
-        setSessionId(nextSessionId);
-        setSessionOwned(data.status !== 'complete');
-        if (data.status === 'complete') {
-          const structured = readStructuredOAuthFlowState(data);
-          setStep(structured.finalized === true ? 'model' : 'finalizing');
-          return;
-        }
-        const url = data.verificationUrl || 'https://auth.openai.com/codex/device';
-        setVerificationUrl(url);
-        setDeviceCode(data.deviceCode || null);
-        setAuthUrl(url);
-        if (url) {
-          try {
-            const win = window.open(url, '_blank', 'noopener,noreferrer');
-            if (!win) setPopupBlocked(true);
-          } catch {
-            setPopupBlocked(true);
-          }
-        }
-        setStep('device');
+        void forceReauth;
+        setFatalError('Interactive Codex host sign-in is unavailable from Portal. Existing credentials are preserved for supervised Agent Chat.');
+        setStep('error');
         return;
       }
 
@@ -415,7 +292,6 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
         }
         setSessionId(nextSessionId);
         setSessionOwned(false);
-        if (structured.createdProfileId) setCredentialProfileId(structured.createdProfileId);
         setFinalizationWarning(structured.finalizationWarning);
         setStep('model');
         return;
@@ -563,7 +439,6 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
     setError(null);
     setFatalError(null);
     setCancellationError(null);
-    setCredentialProfileId(null);
     setStep('prereqs');
   };
 
@@ -584,7 +459,6 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
       }
       const structured = readStructuredOAuthFlowState(data);
       if (isOAuthFlowReadyForModel(structured, true)) {
-        if (structured.createdProfileId) setCredentialProfileId(structured.createdProfileId);
         setFinalizationWarning(structured.finalizationWarning);
         setSessionOwned(false);
         setStep('model');
@@ -602,25 +476,11 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
   const finish = async () => {
     if (!claimOperation('model')) return;
-    setLoading(true);
     setError(null);
     try {
-      if (selectedModel) {
-        const { data } = await client.post(`${apiBase}/set-default-model`, {
-          model: selectedModel,
-          provider: provider.id,
-          ...(isXai ? { profileId: credentialProfileId } : {}),
-        });
-        if (typeof data?.warning === 'string' && data.warning.trim()) {
-          setFinalizationWarning(data.warning.trim());
-        }
-      }
       setStep('done');
       onComplete();
-    } catch (err: any) {
-      setError(err?.response?.data?.error || err?.message || 'Signed in, but failed to set default model');
     } finally {
-      setLoading(false);
       releaseOperation('model');
     }
   };
@@ -804,7 +664,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                 <div className="rounded-lg border border-slate-700/50 bg-slate-800/30 px-4 py-3 text-sm text-slate-300">
                   {provider.id === 'openai-codex'
                     ? 'This signs in Codex on the server and links that credential to OpenClaw.'
-                    : 'This connects Gemini through OpenClaw. To use it as a native agent, set it up from its own card in the AI Providers page.'}
+                    : 'This connects Gemini through OpenClaw. Native Antigravity login and execution remain unavailable in this release.'}
                 </div>
               ) : null}
 
@@ -1070,8 +930,8 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
 
               <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
                 {isXai
-                  ? 'These are OpenClaw-compatible xAI chat models. Portal will live-test the exact signed-in credential and selected model before saving it as the default.'
-                  : 'Models discovered for this connection have been registered. When live discovery is unavailable, the portal shows tested compatibility defaults instead.'}
+                  ? 'The exact signed-in xAI credential was saved. Portal did not live-test a host model turn or change the default route.'
+                  : 'The provider credential was saved. Portal did not register models, change the default route, restart the gateway, or probe a host model turn.'}
               </div>
 
               {finalizationWarning ? (
@@ -1084,15 +944,8 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
               ) : null}
 
               <p className="text-sm text-slate-300">
-                Optionally, choose a default model. You can change this anytime in Settings.
+                Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.
               </p>
-              {loadingModels ? (
-                <div className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-300">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Loading available models…
-                </div>
-              ) : null}
-              <ModelSelector models={availableModels.length ? availableModels : provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
 
               {error ? (
                 <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</div>
@@ -1105,7 +958,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-slate-900 shadow transition hover:bg-slate-100 disabled:opacity-50"
               >
                 {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                {selectedModel ? 'Save and Finish' : 'Finish without setting a default'}
+                Finish
               </button>
             </div>
           ) : null}
@@ -1211,8 +1064,8 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
           {step === 'done' ? (
             <div className="space-y-4 py-4 text-center">
               <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-400" />
-              <h3 className="text-lg font-semibold text-white">{provider.name} connected</h3>
-              <p className="text-sm text-slate-400">You're ready to use AI in the portal.</p>
+              <h3 className="text-lg font-semibold text-white">{provider.name} credential saved</h3>
+              <p className="text-sm text-slate-400">Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.</p>
               {finalizationWarning ? (
                 <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-left text-sm text-amber-100">
                   <div className="flex items-start gap-2">

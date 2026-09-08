@@ -46,6 +46,9 @@ describe('OWNER system settings registry', () => {
 
   test('accepts only explicit provider avatar and Ollama tier patterns', () => {
     expect(isAdminEditableSettingKey('appearance.agentAvatar.GROK')).toBe(true);
+    expect(isAdminEditableSettingKey('appearance.agentAvatar.HERMES')).toBe(true);
+    expect(isAdminEditableSettingKey('appearance.agentAvatar.OPENCODE')).toBe(true);
+    expect(isAdminEditableSettingKey('appearance.agentAvatar.DEEPSEEK_HARNESS')).toBe(false);
     expect(isAdminEditableSettingKey('appearance.agentAvatar.UNKNOWN')).toBe(false);
     expect(isAdminEditableSettingKey('ollama.local.tier.best')).toBe(true);
     expect(isAdminEditableSettingKey('ollama.local.tier.unbounded')).toBe(false);

@@ -1,6 +1,28 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+
+jest.mock('./projectRuntimeOwnership', () => {
+  const actual = jest.requireActual<typeof import('./projectRuntimeOwnership')>(
+    './projectRuntimeOwnership',
+  );
+  if (typeof process.getuid !== 'function' || process.getuid() === 0) return actual;
+  const { writeContainedFileAtomic } = jest.requireActual<typeof import('./containedPath')>(
+    './containedPath',
+  );
+  return {
+    ...actual,
+    // Projection behavior is ordinary-user coverage; exact uid-1000 ownership
+    // remains exercised whenever this suite runs as root.
+    writeProjectRuntimeOwnedFileAtomic: (
+      projectRoot: string,
+      relativePath: string,
+      content: string | Buffer,
+      options: { encoding?: BufferEncoding; exclusive?: boolean; maxBytes?: number } = {},
+    ) => writeContainedFileAtomic(projectRoot, relativePath, content, options),
+  };
+});
+
 import {
   __projectSessionProjectionTest,
   writeProjectSessionProjectionBestEffort,

@@ -82,6 +82,28 @@ describe('ExecApprovalModal', () => {
     expect(onResolve).toHaveBeenCalledWith('approval-1', 'deny');
   });
 
+  it('keeps deny available while positive host approvals are fenced', async () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    render(
+      <ExecApprovalModal
+        approval={approval()}
+        onResolve={onResolve}
+        onDismiss={vi.fn()}
+        allowDisabled
+        allowDisabledReason="Portal host supervision is unavailable."
+      />,
+    );
+
+    expect(await screen.findByRole('button', { name: 'Approve' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Always Allow' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Deny' })).toBeEnabled();
+    expect(screen.getByRole('alert')).toHaveTextContent('Portal host supervision is unavailable.');
+
+    await user.click(screen.getByRole('button', { name: 'Deny' }));
+    expect(onResolve).toHaveBeenCalledWith('approval-1', 'deny');
+  });
+
   it('emits only one dismissal when an approval expires', async () => {
     const expired = approval();
     expired.expiresAtMs = Date.now() - 1;

@@ -541,6 +541,66 @@ describe('systemdHostRunBoundary reservation and launch', () => {
   });
 });
 
+describe('systemdHostRunBoundary active attachment attestation', () => {
+  test('requires stable exact unit identity and a populated cgroup', async () => {
+    const { boundary, systemctl, readCgroupEvents, readBootId } = fixture({
+      shows: [show(), show()],
+      cgroupEvents: ['populated 1\nfrozen 0\n'],
+      bootIds: [BOOT_ID, BOOT_ID],
+    });
+
+    await expect(boundary.attestActive(identity())).resolves.toMatchObject({
+      installed: true,
+      activeState: 'active',
+      subState: 'running',
+      description: DESCRIPTION,
+      invocationId: INVOCATION_ID,
+      controlGroup: CONTROL_GROUP,
+    });
+    expect(systemctl).toHaveBeenCalledTimes(2);
+    expect(readCgroupEvents).toHaveBeenCalledTimes(1);
+    expect(readBootId).toHaveBeenCalledTimes(2);
+  });
+
+  test('rejects an inactive scope even when its persisted identity still matches', async () => {
+    const { boundary } = fixture({
+      shows: [show({ activeState: 'inactive', subState: 'dead' })],
+      cgroupEvents: ['populated 0\nfrozen 0\n'],
+    });
+
+    await expect(boundary.attestActive(identity())).rejects.toMatchObject({
+      code: 'HOST_RUN_SCOPE_IDENTITY_MISMATCH',
+      quarantine: true,
+    });
+  });
+
+  test('rejects an empty cgroup and does not trust one active systemctl snapshot', async () => {
+    const { boundary, systemctl } = fixture({
+      shows: [show()],
+      cgroupEvents: ['populated 0\nfrozen 0\n'],
+    });
+
+    await expect(boundary.attestActive(identity())).rejects.toMatchObject({
+      code: 'HOST_RUN_SCOPE_IDENTITY_MISMATCH',
+      quarantine: true,
+    });
+    expect(systemctl).toHaveBeenCalledTimes(1);
+  });
+
+  test('rejects identity drift after the cgroup read', async () => {
+    const { boundary } = fixture({
+      shows: [show(), show({ invocationId: 'f'.repeat(32) })],
+      cgroupEvents: ['populated 1\nfrozen 0\n'],
+      bootIds: [BOOT_ID, BOOT_ID],
+    });
+
+    await expect(boundary.attestActive(identity())).rejects.toMatchObject({
+      code: 'HOST_RUN_SCOPE_IDENTITY_MISMATCH',
+      quarantine: true,
+    });
+  });
+});
+
 describe('systemdHostRunBoundary termination and settlement', () => {
   test('stops only an exactly attested scope and proves its cgroup disappeared', async () => {
     const { boundary, systemctl, readCgroupEvents } = fixture({

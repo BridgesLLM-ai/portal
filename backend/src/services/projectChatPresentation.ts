@@ -124,7 +124,7 @@ function mergeStreamText(
   return combined.slice(0, MAX_SEGMENT_CHARS);
 }
 
-type ReasoningSnapshotLane = 'raw' | 'preamble' | 'status';
+type ReasoningSnapshotLane = 'raw' | 'preamble';
 
 interface ReasoningSnapshotTracker {
   latest: Partial<Record<ReasoningSnapshotLane, string>>;
@@ -387,13 +387,7 @@ export function buildProjectChatMessagePresentation(
 
   const mergeSegment = (event: ProjectNativeRunEvent, kind: 'text' | 'thinking') => {
     const reasoningLane: ReasoningSnapshotLane | null = kind === 'thinking'
-      ? (
-          event.preambleProgress === true
-            ? 'preamble'
-            : event.assistantStatus === true
-              ? 'status'
-              : 'raw'
-        )
+      ? (event.preambleProgress === true ? 'preamble' : 'raw')
       : null;
     const subject = kind === 'thinking' ? sanitizeThinkingSubject(event.subject) : '';
     const changedKind = Boolean(currentKind && currentKind !== kind);
@@ -441,10 +435,7 @@ export function buildProjectChatMessagePresentation(
     if (event.transient === true) continue;
     if (
       event.type === 'thinking'
-      || (
-        event.type === 'status'
-        && (event.preambleProgress === true || event.assistantStatus === true)
-      )
+      || (event.type === 'status' && event.preambleProgress === true)
     ) {
       mergeSegment(event, 'thinking');
       continue;

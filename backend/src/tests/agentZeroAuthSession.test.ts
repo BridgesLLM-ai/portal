@@ -21,7 +21,7 @@ function capabilities(overrides: Record<string, unknown> = {}): Record<string, u
   return {
     protocol: 'a0-connector.v1',
     version: '0.1.0',
-    agent_zero_version: 'v2.5',
+    agent_zero_version: 'v2.10',
     auth: ['session'],
     auth_required: true,
     transports: ['http', 'websocket'],

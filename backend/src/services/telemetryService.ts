@@ -10,6 +10,7 @@ import {
   type VerifiedReleaseDetails,
 } from './releaseUpdateDetails';
 import { requestConfiguredOllamaJson } from './ollamaBackendAuthority';
+import { getNativeHostCliStatus } from './nativeHostCliStatus';
 
 function describeTelemetryError(error: any): { level: 'warn' | 'info'; message: string } {
   const status = Number(error?.response?.status || 0);
@@ -70,6 +71,7 @@ function detectCommandVersion(command: string, regex: RegExp): string | undefine
 export interface DependencyVersionDetectionDependencies {
   requestConfiguredImpl?: typeof requestConfiguredOllamaJson;
   detectCommandVersionImpl?: typeof detectCommandVersion;
+  getNativeHostCliStatusImpl?: typeof getNativeHostCliStatus;
 }
 
 export async function detectDependencyVersions(
@@ -78,6 +80,7 @@ export async function detectDependencyVersions(
   const deps: DependencyVersions = {};
   const detectVersion = overrides.detectCommandVersionImpl ?? detectCommandVersion;
   const requestConfiguredImpl = overrides.requestConfiguredImpl ?? requestConfiguredOllamaJson;
+  const getNativeHostStatus = overrides.getNativeHostCliStatusImpl ?? getNativeHostCliStatus;
 
   const openclaw = detectVersion('openclaw --version 2>/dev/null', /(\d{4}\.\d+\.\d+)/);
   if (openclaw) deps.openclaw = openclaw;
@@ -105,14 +108,16 @@ export async function detectDependencyVersions(
   const docker = detectVersion('docker --version 2>/dev/null', /(\d+\.\d+\.\d+)/);
   if (docker) deps.docker = docker;
 
-  const codexCli = detectVersion('codex --version 2>/dev/null', /(\d+\.\d+\.\d+)/);
-  if (codexCli) deps.codexCli = codexCli;
-
-  const claudeCode = detectVersion('claude --version 2>/dev/null', /(\d+\.\d+\.\d+)/);
-  if (claudeCode) deps.claudeCode = claudeCode;
-
-  const geminiCli = detectVersion('agy --version 2>/dev/null', /(\d+\.\d+\.\d+)/);
-  if (geminiCli) deps.geminiCli = geminiCli;
+  const [codexStatus, claudeStatus] = await Promise.all([
+    getNativeHostStatus('codex'),
+    getNativeHostStatus('claude-code'),
+  ]);
+  if (codexStatus.executionEligible && codexStatus.observedVersion) {
+    deps.codexCli = codexStatus.observedVersion;
+  }
+  if (claudeStatus.executionEligible && claudeStatus.observedVersion) {
+    deps.claudeCode = claudeStatus.observedVersion;
+  }
 
   return deps;
 }

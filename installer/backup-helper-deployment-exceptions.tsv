@@ -1,0 +1,10 @@
+# BridgesLLM Portal backup helper deployment compatibility exceptions v1
+#
+# This is intentionally not the release ledger. A compatibility identity belongs
+# here only when two independently built, signed deployments carried the same
+# release version and their helper bytes differ. The normal release ledger stays
+# append-only; this file is fixed-hash by the successor gate so it cannot become
+# a broad admission path.
+#
+# version<TAB>size<TAB>sha256<TAB>git-blob-oid
+4.1.0	371144	8be1c4f53250389bc09dbd9168779823f4578a666ab34bbb63c992bd93596079	4f13c7adab88953f137f01f496f998c52df39635

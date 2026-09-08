@@ -1,5 +1,6 @@
 import { buildTranscriptPrompt, nativeSessionMessageCount } from '../../NativeSessionStore';
-import type { NativeCliProviderAdapter, NativeCliTurnContext } from '../types';
+import { validateNativeHostSessionId, type NativeCliProviderAdapter, type NativeCliTurnContext } from '../types';
+import { handleAntigravityStreamLine } from './AntigravityStream';
 import { NativeProviderDiagnosticError } from '../NativeProviderDiagnostics';
 import { firstAbsolutePathDir, looksLikeFilesystemOrToolRequest } from '../approvalScope';
 import {
@@ -31,83 +32,6 @@ function normalizeAntigravityModel(model?: string | null): string | null {
     default:
       return modelName;
   }
-}
-
-function parseAntigravityActionLine(line: string): { toolName: string; action: string } | null {
-  const clean = line.trim().replace(/\s+/g, ' ');
-  const match = clean.match(/^(?:[-*]\s*)?(?:I(?:'ll| will| am going to| need to| should| can)|I'm going to)\s+(.+?)[.!?]?$/i);
-  const action = match?.[1]?.trim();
-  if (!action) return null;
-
-  if (!/^(list|run|read|inspect|check|search|open|create|write|update|modify|delete|edit|look|view|analy[sz]e|examine|use|confirm)\b/i.test(action)) {
-    return null;
-  }
-
-  let toolName = 'antigravity';
-  if (/^(run|execute)\b/i.test(action)) toolName = 'shell';
-  else if (/^(list|inspect|check|look|view|examine|confirm)\b/i.test(action)) toolName = 'inspect';
-  else if (/^(read|open)\b/i.test(action)) toolName = 'read';
-  else if (/^search\b/i.test(action)) toolName = 'search';
-  else if (/^(create|write|update|modify|delete|edit)\b/i.test(action)) toolName = 'edit';
-
-  return { toolName, action };
-}
-
-function emitAntigravityToolEvent(ctx: NativeCliTurnContext, actionLine: string): boolean {
-  const parsed = parseAntigravityActionLine(actionLine);
-  if (!parsed) return false;
-
-  const counter = Number(ctx.state.antigravityToolEventCounter || 0) + 1;
-  ctx.state.antigravityToolEventCounter = counter;
-  const toolCallId = `antigravity-tool-${Date.now()}-${counter}`;
-
-  ctx.emitStatus(`Antigravity: ${parsed.action}`, {
-    type: 'tool_start',
-    toolName: parsed.toolName,
-    toolCallId,
-    toolArgs: { action: parsed.action },
-    content: parsed.action,
-  });
-  ctx.emitStatus(parsed.action, {
-    type: 'tool_end',
-    toolName: parsed.toolName,
-    toolCallId,
-    toolResult: parsed.action,
-    content: parsed.action,
-  });
-  return true;
-}
-
-function startAntigravityWorkspaceTool(ctx: NativeCliTurnContext): void {
-  if (ctx.state.antigravityWorkspaceToolCallId) return;
-  const toolCallId = `antigravity-workspace-${Date.now()}`;
-  ctx.state.antigravityWorkspaceToolCallId = toolCallId;
-  ctx.emitStatus('Antigravity workspace tools approved', {
-    type: 'tool_start',
-    toolName: 'antigravity',
-    toolCallId,
-    toolArgs: { mode: 'trusted workspace execution' },
-    content: 'Antigravity workspace tools approved',
-  });
-}
-
-function finishAntigravityWorkspaceTool(ctx: NativeCliTurnContext, failed = false): void {
-  const toolCallId = typeof ctx.state.antigravityWorkspaceToolCallId === 'string'
-    ? ctx.state.antigravityWorkspaceToolCallId
-    : '';
-  if (!toolCallId || ctx.state.antigravityWorkspaceToolFinished) return;
-  ctx.state.antigravityWorkspaceToolFinished = true;
-  const content = failed
-    ? 'Antigravity workspace execution ended without a completed response'
-    : 'Antigravity workspace turn completed';
-  ctx.emitStatus(content, {
-    type: 'tool_end',
-    toolName: 'antigravity',
-    toolCallId,
-    toolResult: content,
-    content,
-    isError: failed,
-  });
 }
 
 function getAntigravityToolApprovalMode(ctx: NativeCliTurnContext): AntigravityApprovalMode {
@@ -170,13 +94,14 @@ export const geminiAdapter: NativeCliProviderAdapter = {
         turnId: `${ctx.originalSessionId}:${String(ctx.state.turnAttempt || 1)}:${nativeSessionMessageCount(ctx.session)}`,
       });
     }
-    const prompt = buildTranscriptPrompt(ctx.session.messages.slice(0, -1), ctx.message);
-    const approvalMode = await prepareAntigravityApprovalMode(ctx, prompt);
-    const args = ['--print-timeout', '5m', '--add-dir', ctx.session.cwd];
+    const nativeSessionId = validateNativeHostSessionId(ctx.session.metadata?.nativeSessionId, false);
+    const prompt = nativeSessionId ? ctx.message : buildTranscriptPrompt(ctx.session.messages.slice(0, -1), ctx.message);
+    const approvalMode = await prepareAntigravityApprovalMode(ctx, ctx.state.originalUserMessage ?? ctx.message);
+    const args = ['--output-format', 'stream-json', '--print-timeout', '5m', '--add-dir', ctx.session.cwd];
+    if (nativeSessionId) args.push('--conversation', nativeSessionId);
     const model = normalizeAntigravityModel(ctx.session.model);
     if (model) args.push('--model', model);
     if (approvalMode === 'trusted') {
-      startAntigravityWorkspaceTool(ctx);
       args.push('--dangerously-skip-permissions');
     } else {
       args.push('--sandbox');
@@ -256,22 +181,11 @@ export const geminiAdapter: NativeCliProviderAdapter = {
           return;
       }
     }
-    const clean = ctx.stripAnsi(line).trimEnd();
-    if (!clean) return;
-    if (emitAntigravityToolEvent(ctx, clean)) return;
-    ctx.appendFullText(`${clean}\n`);
-    ctx.emitChunk(`${clean}\n`);
+    handleAntigravityStreamLine(line, ctx);
   },
   handleStdoutRemainder: (text, ctx) => {
-    if (ctx.session.executionContext?.scope === 'PROJECT_SANDBOX') {
-      const clean = text.trim();
-      if (clean) geminiAdapter.handleStdoutLine(clean, ctx);
-      return;
-    }
-    const clean = ctx.stripAnsi(text).trimEnd();
-    if (!clean) return;
-    ctx.appendFullText(clean);
-    ctx.emitChunk(clean);
+    const clean = text.trim();
+    if (clean) geminiAdapter.handleStdoutLine(clean, ctx);
   },
   handleStderrChunk: (chunk, ctx) => {
     const clean = ctx.stripAnsi(chunk);
@@ -282,7 +196,6 @@ export const geminiAdapter: NativeCliProviderAdapter = {
   finalizeTurn: async (ctx) => {
     if (ctx.session.executionContext?.scope === 'PROJECT_SANDBOX') return;
     if (/please sign in|authentication required|paste the authorization code|accounts\.google\.com/i.test(ctx.stderr)) {
-      finishAntigravityWorkspaceTool(ctx, true);
       throw new NativeProviderDiagnosticError(
         'AUTH_REQUIRED',
         'Google Antigravity authentication is unavailable. Reconnect it in AI Settings and retry.',
@@ -292,14 +205,17 @@ export const geminiAdapter: NativeCliProviderAdapter = {
     // stderr and exit status. Never launch a second provider process here:
     // the first invocation may already have performed tools or side effects.
     if (typeof ctx.exitCode === 'number' && ctx.exitCode !== 0) {
-      finishAntigravityWorkspaceTool(ctx, true);
       return;
     }
-    if (ctx.fullText) {
-      finishAntigravityWorkspaceTool(ctx);
+    if (ctx.state.antigravityDeniedActions?.length) {
+      throw new NativeProviderDiagnosticError('PERMISSION_DENIED', 'Antigravity could not finish because a native tool permission was denied. No work was retried.');
+    }
+    if (ctx.state.antigravityResultStatus && ctx.state.antigravityResultStatus !== 'SUCCESS') {
+      throw new NativeProviderDiagnosticError('PROVIDER_FAILED', 'Antigravity reported an unsuccessful turn. No work was retried.');
+    }
+    if (ctx.fullText && ctx.state.antigravityResultStatus === 'SUCCESS') {
       return;
     }
-    finishAntigravityWorkspaceTool(ctx, true);
     throw new NativeProviderDiagnosticError(
       'PROVIDER_FAILED',
       'Google Antigravity completed without an assistant response. The turn was not retried to prevent duplicate work.',
@@ -316,7 +232,7 @@ export const geminiAdapter: NativeCliProviderAdapter = {
   getErrorMessage: (ctx) => {
     const stderr = ctx.stripAnsi(ctx.stderr).trim();
     if (/please sign in|authentication required|paste the authorization code|accounts\.google\.com/i.test(stderr)) {
-      return 'Google Antigravity is installed but not signed in on this server. Open AI Setup, run the Antigravity native login, and paste the Google authorization code.';
+      return 'Google Antigravity is installed but not signed in on this server. Reconnect Antigravity in AI Settings.';
     }
     return stderr || `Antigravity CLI exited with code ${ctx.exitCode}`;
   },

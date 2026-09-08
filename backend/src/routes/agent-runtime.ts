@@ -5,13 +5,22 @@ import rateLimit from 'express-rate-limit';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
 import { getOpenClawApiUrl } from '../config/openclaw';
-import { TOOL_ADAPTERS } from '../config/toolAdapters';
+import {
+  HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE,
+  TOOL_ADAPTERS,
+} from '../config/toolAdapters';
+import {
+  getNativeHostCliStatus,
+  NATIVE_HOST_CLI_EXECUTION_CONTRACT,
+} from '../services/nativeHostCliStatus';
+import {
+  isUnqualifiedNativeBinaryToolId,
+  NATIVE_BINARY_QUALIFICATION_CODE,
+} from '../config/unqualifiedNativeBinaryLane';
 import {
   AGENT_ZERO_CREDENTIAL_CONFIRMATION,
-  AGENT_ZERO_RUNTIME_CONFIRMATION,
   collectAgentZeroSetupStatus,
   provisionAgentZeroCredentials,
-  reconcileAgentZeroRuntime,
 } from '../agents/providers/agentZero/AgentZeroSetupControl';
 import { isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
 import {
@@ -48,6 +57,15 @@ import {
 
 const router = Router();
 const GATEWAY_URL = getOpenClawApiUrl();
+
+function sendHostNativeRuntimeMutationUnavailable(_req: Request, res: Response): void {
+  res.status(HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.status).json({
+    code: HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.code,
+    error: HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.error,
+    retryable: HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.retryable,
+    remediation: HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.remediation,
+  });
+}
 
 const agentZeroOAuthReadLimiter = rateLimit({
   windowMs: 60_000,
@@ -443,6 +461,8 @@ type AdapterStatus = {
   name: string;
   available: boolean;
   version: string | null;
+  state?: string;
+  executionContract?: string | null;
 };
 
 const DEFAULT_ADAPTER_DETECTION_TIMEOUT_MS = 2_500;
@@ -478,6 +498,35 @@ router.get('/status', authenticateToken, requireAdmin, async (_req: Request, res
 
   const adapterStatuses: AdapterStatus[] = await Promise.all(
     TOOL_ADAPTERS.map(async (adapter) => {
+      if (adapter.id === 'codex' || adapter.id === 'claude-code') {
+        const status = await getNativeHostCliStatus(adapter.id);
+        return {
+          id: adapter.id,
+          name: adapter.name,
+          available: status.executionEligible,
+          version: status.observedVersion,
+          state: status.state,
+          executionContract: status.executionEligible
+            ? NATIVE_HOST_CLI_EXECUTION_CONTRACT
+            : null,
+        };
+      }
+      if (isUnqualifiedNativeBinaryToolId(adapter.id)) {
+        if (adapter.detect?.command) {
+          await checkCommand(
+            adapter.detect.command,
+            adapter.detect.timeoutMs ?? DEFAULT_ADAPTER_DETECTION_TIMEOUT_MS,
+          );
+        }
+        return {
+          id: adapter.id,
+          name: adapter.name,
+          available: false,
+          version: null,
+          state: NATIVE_BINARY_QUALIFICATION_CODE,
+          executionContract: null,
+        };
+      }
       if (!adapter.detect?.command) {
         return { id: adapter.id, name: adapter.name, available: true, version: null };
       }
@@ -582,34 +631,12 @@ router.post('/agent-zero/credentials', authenticateToken, requireOwner, async (r
   }
 });
 
-router.post('/agent-zero/runtime/reconcile', authenticateToken, requireOwner, async (req: Request, res: Response) => {
-  if (!isTypedConfirmationMatch(AGENT_ZERO_RUNTIME_CONFIRMATION, req.body?.confirmation)) {
-    res.status(400).json({
-      error: `Type ${AGENT_ZERO_RUNTIME_CONFIRMATION} to install or repair the pinned Agent Zero runtime and host bridge.`,
-      confirmationPhrase: AGENT_ZERO_RUNTIME_CONFIRMATION,
-    });
-    return;
-  }
-
-  try {
-    const status = await reconcileAgentZeroRuntime();
-    const localContractReady = status.mainAgentChat.contractReady;
-    res.status(localContractReady ? 200 : 409).json({
-      ok: localContractReady,
-      message: localContractReady
-        ? 'Agent Zero host-operator components are ready. Portal exposes the provider only while every live local gate remains verified; Project Chat remains separately qualified.'
-        : 'Agent Zero reconciliation finished, but one or more local readiness checks still need attention.',
-      status,
-    });
-  } catch (error) {
-    // Log the real failure server-side; the response stays generic so
-    // lifecycle internals never leak, but operators are no longer blind.
-    console.error('[agent-zero] Managed runtime reconciliation failed:', error);
-    res.status(500).json({
-      error: 'Managed Agent Zero reconciliation failed. No provider execution scope was enabled. Check the Portal service log for the underlying lifecycle error.',
-    });
-  }
-});
+router.post(
+  '/agent-zero/runtime/reconcile',
+  authenticateToken,
+  requireOwner,
+  sendHostNativeRuntimeMutationUnavailable,
+);
 
 router.get(
   '/agent-zero/oauth/status',

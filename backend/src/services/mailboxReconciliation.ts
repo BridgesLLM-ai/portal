@@ -8,6 +8,7 @@ import {
   assertPortalFeatureAvailable,
   getPortalFeatureCapabilities,
 } from '../utils/portalFeatureCapabilities';
+import { acquireGlobalWorkspaceAuthorizationMutationLease } from './workspaceAuthorizationBarrier';
 
 const STALWART_ADMIN_USER = 'admin';
 const STALWART_REQUEST_TIMEOUT_MS = 10_000;
@@ -200,6 +201,43 @@ async function deleteStalwartPrincipal(username: string): Promise<void> {
     );
   }
 }
+
+/**
+ * Independent post-delete proof for privacy-sensitive account retirement.
+ * A successful DELETE response is not absence evidence: an intermediary can
+ * acknowledge before the principal disappears, and an ambiguous retry can
+ * race a recreated principal. Require a fresh authenticated read to return
+ * exactly 404. Any other status, including another 2xx, fails closed.
+ */
+export async function assertStalwartPrincipalAbsent(username: string): Promise<void> {
+  const canonicalUsername = normalizeMailboxUsername(username);
+  if (!canonicalUsername || canonicalUsername !== String(username || '').trim().toLowerCase()) {
+    throw new SafeReconciliationError(
+      'invalid_mailbox_username',
+      'Mailbox absence verification requires a canonical username',
+    );
+  }
+  if (isReservedSystemMailboxUsername(canonicalUsername)) {
+    throw new SafeReconciliationError(
+      'reserved_mailbox_username',
+      'Reserved system mailbox cannot be verified through user retirement',
+    );
+  }
+  const response = await requestStalwart(
+    `/api/principal/${encodeURIComponent(canonicalUsername)}`,
+    'verify mailbox account absence',
+    { method: 'GET' },
+  );
+  if (response.status !== 404) {
+    throw new SafeReconciliationError(
+      response.ok ? 'stalwart_principal_still_present' : `stalwart_http_${response.status}`,
+      response.ok
+        ? 'Mail server still reports the retired mailbox account'
+        : `Mail server could not verify mailbox account absence (HTTP ${response.status})`,
+    );
+  }
+}
+
 
 function backoffMs(attempts: number): number {
   return Math.min(15 * 60_000, 5_000 * (2 ** Math.max(0, attempts - 1)));
@@ -474,10 +512,17 @@ export async function drainMailboxReconciliation(options: {
 
 function runPeriodicDrain(): Promise<MailboxReconciliationOutcome[]> {
   if (periodicDrain) return periodicDrain;
+  let releaseAdmission: (() => void) | null = null;
+  try {
+    releaseAdmission = acquireGlobalWorkspaceAuthorizationMutationLease();
+  } catch {
+    return Promise.resolve([]);
+  }
   periodicDrain = drainMailboxReconciliation({
     maxTasks: PERIODIC_MAX_TASKS,
     timeBudgetMs: PERIODIC_TIME_BUDGET_MS,
   }).finally(() => {
+    releaseAdmission?.();
     periodicDrain = null;
   });
   return periodicDrain;

@@ -108,8 +108,7 @@ describe('Automations editor contract', () => {
     vi.restoreAllMocks();
   });
 
-  it('keeps non-agent cron payloads read-only and clears optional overrides explicitly', async () => {
-    const user = userEvent.setup();
+  it('keeps positive automation mutations unavailable while preserving disable and delete controls', async () => {
     render(<AutomationsContent showHeader />);
 
     expect(await screen.findByText('OpenClaw command job')).toBeVisible();
@@ -118,93 +117,36 @@ describe('Automations editor contract', () => {
     expect(screen.getByRole('button', { name: 'OpenClaw command job must be managed in OpenClaw' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'OpenClaw command job cannot be deleted from the Portal' })).toBeDisabled();
 
-    await user.click(screen.getByRole('button', { name: 'Edit Agent job' }));
-    expect(await screen.findByRole('dialog', { name: 'Edit Automation' })).toBeVisible();
-    await user.selectOptions(screen.getByLabelText('Automation model'), '');
-    await user.selectOptions(screen.getByLabelText('Automation thinking level'), 'off');
-    const editDialog = screen.getByRole('dialog', { name: 'Edit Automation' });
-    const saveButton = within(editDialog).getByRole('button', { name: 'Save Changes' });
-    const editForm = document.getElementById('automation-editor-form');
-    act(() => {
-      saveButton.click();
-      editForm!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-      saveButton.click();
-    });
-
-    await waitFor(() => {
-      expect(mocks.update).toHaveBeenCalledTimes(1);
-      expect(mocks.update).toHaveBeenCalledWith('agent-job', expect.objectContaining({
-        model: null,
-        thinking: null,
-        schedule: undefined,
-        scheduleType: 'daily',
-        time: '09:00',
-        tz: 'UTC',
-      }));
-    });
+    expect(screen.getByRole('button', { name: 'New Automation' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Edit Agent job' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Run Agent job now' })).toBeDisabled();
+    expect(screen.getByRole('switch', { name: 'Disable Agent job' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Delete Agent job' })).toBeEnabled();
+    expect(mocks.update).not.toHaveBeenCalled();
   });
 
-  it('owns create progress synchronously and blocks duplicate submits or dismissal until it settles', async () => {
-    const user = userEvent.setup();
-    const pendingCreate = deferred<{ ok: boolean }>();
-    mocks.create.mockReturnValueOnce(pendingCreate.promise);
-    const { container } = render(<AutomationsContent showHeader />);
-
-    const trigger = await screen.findByRole('button', { name: 'New Automation' });
-    await user.click(trigger);
-
-    const dialog = await screen.findByRole('dialog', { name: 'New Automation' });
-    await waitFor(() => expect(screen.getByLabelText('Automation name')).toHaveFocus());
-    expect(container).toHaveAttribute('inert');
-    expect(container).toHaveAttribute('aria-hidden', 'true');
-
-    await user.type(screen.getByLabelText('Automation name'), 'Morning report');
-    await user.type(screen.getByLabelText('Automation prompt or task'), 'Prepare the morning report');
-
-    const form = document.getElementById('automation-editor-form');
-    expect(form).not.toBeNull();
-    const createButton = within(dialog).getByRole('button', { name: 'Create' });
-    act(() => {
-      createButton.click();
-      form!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-      createButton.click();
-    });
-
-    expect(mocks.create).toHaveBeenCalledTimes(1);
-    const busyButton = await screen.findByRole('button', { name: 'Creating…' });
-    expect(busyButton).toBeDisabled();
-    expect(busyButton).toHaveAttribute('aria-busy', 'true');
-
-    fireEvent.keyDown(document, { key: 'Escape' });
-    fireEvent.click(dialog.closest('[data-viewport-modal-layer="true"]')!);
-    expect(screen.getByRole('dialog', { name: 'New Automation' })).toBeVisible();
-
-    await act(async () => {
-      pendingCreate.resolve({ ok: true });
-      await pendingCreate.promise;
-    });
-
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New Automation' })).not.toBeInTheDocument());
-    await waitFor(() => expect(trigger).toHaveFocus());
-  });
-
-  it('keeps create failures in the editor and restores a usable primary action', async () => {
-    const user = userEvent.setup();
-    vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    mocks.create.mockRejectedValueOnce({ response: { data: { error: 'Schedule could not be saved' } } });
+  it('does not open or submit the disabled new-automation entry point', async () => {
     render(<AutomationsContent showHeader />);
 
-    await user.click(await screen.findByRole('button', { name: 'New Automation' }));
-    const dialog = await screen.findByRole('dialog', { name: 'New Automation' });
-    await user.type(screen.getByLabelText('Automation name'), 'Broken schedule');
-    await user.type(screen.getByLabelText('Automation prompt or task'), 'Try the failing schedule');
-    await user.click(screen.getByRole('button', { name: 'Create' }));
+    const trigger = await screen.findByRole('button', { name: 'New Automation' });
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveAttribute('title', expect.stringContaining('unavailable until Portal can supervise'));
+    fireEvent.click(trigger);
+    expect(screen.queryByRole('dialog', { name: 'New Automation' })).not.toBeInTheDocument();
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
 
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Schedule could not be saved');
-    const retryButton = within(dialog).getByRole('button', { name: 'Create' });
-    expect(retryButton).toBeEnabled();
-    expect(retryButton).toHaveAttribute('aria-busy', 'false');
-    expect(screen.getAllByText('Schedule could not be saved')).toHaveLength(1);
+  it('keeps the empty-state create entry point disabled without posting', async () => {
+    mocks.list.mockResolvedValue({ jobs: [] });
+    render(<AutomationsContent showHeader />);
+
+    expect(await screen.findByText('No Automations Yet')).toBeVisible();
+    const trigger = screen.getByRole('button', { name: 'Create Your First Automation' });
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveAttribute('title', expect.stringContaining('unavailable until Portal can supervise'));
+    fireEvent.click(trigger);
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog', { name: 'New Automation' })).not.toBeInTheDocument();
   });
 
   it('keeps delete progress and errors in its dialog with a same-frame single-flight guard', async () => {
@@ -247,7 +189,7 @@ describe('Automations editor contract', () => {
     expect(mocks.remove).toHaveBeenCalledTimes(2);
   });
 
-  it('gives the run-history drawer modal focus ownership and dismisses nested surfaces in LIFO order', async () => {
+  it('gives run history modal focus ownership while edit remains unavailable', async () => {
     const user = userEvent.setup();
     const { container } = render(<AutomationsContent showHeader />);
 
@@ -260,13 +202,10 @@ describe('Automations editor contract', () => {
     expect(container).toHaveAttribute('inert');
 
     fireEvent.click(editTrigger);
-    expect(await screen.findByRole('dialog', { name: 'Edit Automation' })).toBeVisible();
-    expect(screen.getAllByRole('dialog', { hidden: true })).toHaveLength(2);
-
-    fireEvent.keyDown(document, { key: 'Escape' });
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Edit Automation' })).not.toBeInTheDocument());
+    expect(editTrigger).toBeDisabled();
+    expect(screen.queryByRole('dialog', { name: 'Edit Automation' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('dialog', { hidden: true })).toHaveLength(1);
     expect(screen.getByRole('dialog', { name: 'Run History' })).toBeVisible();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Close run history' })).toHaveFocus());
 
     fireEvent.keyDown(document, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Run History' })).not.toBeInTheDocument());
@@ -275,44 +214,29 @@ describe('Automations editor contract', () => {
     expect(container).not.toHaveAttribute('aria-hidden');
   });
 
-  it('single-flights run-now and blocks same-frame cross-row or toggle mutations', async () => {
-    const pendingRun = deferred<{ ok: boolean; runId: string }>();
+  it('keeps run-now, enable, and create starts disabled across rows', async () => {
     mocks.list.mockResolvedValue({ jobs: [agentJob, secondAgentJob] });
-    mocks.runNow.mockReturnValueOnce(pendingRun.promise);
     render(<AutomationsContent showHeader />);
 
     const firstRun = await screen.findByRole('button', { name: 'Run Agent job now' });
     const secondRun = screen.getByRole('button', { name: 'Run Second agent job now' });
-    const firstToggle = screen.getByRole('switch', { name: 'Disable Agent job' });
+    const secondToggle = screen.getByRole('switch', { name: 'Enable Second agent job' });
     const create = screen.getByRole('button', { name: 'New Automation' });
-    act(() => {
-      firstRun.click();
-      firstRun.click();
-      secondRun.click();
-      firstToggle.click();
-      create.click();
-    });
-
-    expect(mocks.runNow).toHaveBeenCalledTimes(1);
-    expect(mocks.runNow).toHaveBeenCalledWith('agent-job');
-    expect(mocks.toggle).not.toHaveBeenCalled();
-    expect(screen.queryByRole('dialog', { name: 'New Automation' })).not.toBeInTheDocument();
-    expect(await screen.findByRole('button', { name: 'Running Agent job…' })).toHaveAttribute('aria-busy', 'true');
+    expect(firstRun).toBeDisabled();
     expect(secondRun).toBeDisabled();
-    expect(firstToggle).toBeDisabled();
+    expect(secondToggle).toBeDisabled();
     expect(create).toBeDisabled();
-
-    await act(async () => {
-      pendingRun.resolve({ ok: true, runId: 'run-1' });
-      await pendingRun.promise;
-    });
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Run Agent job now' })).toBeEnabled());
-    expect(secondRun).toBeEnabled();
-    expect(firstToggle).toBeEnabled();
-    expect(create).toBeEnabled();
+    fireEvent.click(firstRun);
+    fireEvent.click(secondRun);
+    fireEvent.click(secondToggle);
+    fireEvent.click(create);
+    expect(mocks.runNow).not.toHaveBeenCalled();
+    expect(mocks.toggle).not.toHaveBeenCalled();
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog', { name: 'New Automation' })).not.toBeInTheDocument();
   });
 
-  it('single-flights toggle, owns its error, and restores all card actions for retry', async () => {
+  it('single-flights permitted disable, owns its error, and keeps positive run fenced', async () => {
     const pendingToggle = deferred<{ ok: boolean }>();
     mocks.list.mockResolvedValue({ jobs: [agentJob, secondAgentJob] });
     mocks.toggle.mockReturnValueOnce(pendingToggle.promise);
@@ -338,7 +262,7 @@ describe('Automations editor contract', () => {
     });
     expect(await screen.findByText('Gateway refused the toggle')).toBeVisible();
     expect(screen.getByRole('switch', { name: 'Disable Agent job' })).toBeEnabled();
-    expect(secondRun).toBeEnabled();
+    expect(secondRun).toBeDisabled();
 
     mocks.toggle.mockResolvedValueOnce({ ok: true });
     await userEvent.click(screen.getByRole('switch', { name: 'Disable Agent job' }));

@@ -1,5 +1,20 @@
 import { requestConfiguredOllamaJson } from './ollamaBackendAuthority';
 import { detectDependencyVersions } from './telemetryService';
+import type { NativeHostCliStatusTool } from './nativeHostCliStatus';
+
+const absentNativeHostStatus = async (toolId: NativeHostCliStatusTool) => ({
+  toolId,
+  executablePath: toolId === 'codex'
+    ? '/usr/bin/codex'
+    : toolId === 'claude-code' ? '/usr/bin/claude' : '/usr/bin/clawhub',
+  state: 'absent' as const,
+  installed: false,
+  executionEligible: false,
+  observedVersion: null,
+  checkedAt: '2026-08-21T00:00:00.000Z',
+  fingerprint: null,
+  reasonCode: 'ABSENT',
+});
 
 describe('telemetry dependency detection', () => {
   test('reads the Ollama version through the configured Tailnet authority', async () => {
@@ -23,6 +38,7 @@ describe('telemetry dependency detection', () => {
     await expect(detectDependencyVersions({
       requestConfiguredImpl: requestConfiguredImpl as unknown as typeof requestConfiguredOllamaJson,
       detectCommandVersionImpl,
+      getNativeHostCliStatusImpl: absentNativeHostStatus,
     })).resolves.toEqual({ ollama: '0.32.1' });
 
     expect(requestConfiguredImpl).toHaveBeenCalledWith({
@@ -32,7 +48,7 @@ describe('telemetry dependency detection', () => {
       maxResponseBytes: 64 * 1024,
     });
     expect(detectCommandVersionImpl.mock.calls.some(([command]) => (
-      String(command).includes('ollama')
+      /ollama|codex|claude/i.test(String(command))
     ))).toBe(false);
   });
 
@@ -47,11 +63,34 @@ describe('telemetry dependency detection', () => {
     await expect(detectDependencyVersions({
       requestConfiguredImpl: requestConfiguredImpl as unknown as typeof requestConfiguredOllamaJson,
       detectCommandVersionImpl,
+      getNativeHostCliStatusImpl: absentNativeHostStatus,
     })).resolves.toEqual({});
 
     expect(requestConfiguredImpl).toHaveBeenCalledTimes(1);
     expect(detectCommandVersionImpl.mock.calls.some(([command]) => (
-      String(command).includes('ollama')
+      /ollama|codex|claude/i.test(String(command))
     ))).toBe(false);
+  });
+
+  test('uses only native host admission evidence for Codex and Claude versions', async () => {
+    const detectCommandVersionImpl = jest.fn(() => undefined);
+    const getNativeHostCliStatusImpl = jest.fn(async (toolId: NativeHostCliStatusTool) => ({
+      ...(await absentNativeHostStatus(toolId)),
+      state: 'verified' as const,
+      installed: true,
+      executionEligible: true,
+      observedVersion: toolId === 'codex'
+        ? '0.153.2'
+        : toolId === 'claude-code' ? '2.1.260' : '0.23.3',
+      fingerprint: 'a'.repeat(64),
+      reasonCode: null,
+    }));
+
+    await expect(detectDependencyVersions({
+      requestConfiguredImpl: jest.fn().mockRejectedValue(new Error('disabled')),
+      detectCommandVersionImpl,
+      getNativeHostCliStatusImpl,
+    })).resolves.toMatchObject({ codexCli: '0.153.2', claudeCode: '2.1.260' });
+    expect(detectCommandVersionImpl.mock.calls.flat().join('\n')).not.toMatch(/codex|claude/i);
   });
 });

@@ -3,6 +3,7 @@ import { execFile } from 'child_process';
 import fs from 'fs/promises';
 import path from 'path';
 import type { AgentProviderName } from './AgentProvider.interface';
+import { requireHarnessDefinition } from './harnessCatalog';
 import {
   getNativeCliAuthStatusAsync,
   invalidateNativeCliAuthStatus,
@@ -13,9 +14,26 @@ import {
   resolveNativeCliCredentialPaths,
 } from './providers/native/NativeCliEnvironment';
 import {
+  buildAcpHarnessEnvironment,
+  resolveAcpHarnessReadinessPaths,
+} from './providers/native/acp/AcpHarnessEnvironment';
+import {
+  HERMES_ACP_PROFILE,
+  OPENCODE_ACP_PROFILE,
+} from './providers/native/acp/AcpHarnessProfiles';
+import { AcpStdioBroker } from './providers/native/acp/AcpStdioBroker';
+import {
   isNativeProviderAuthFailure,
   redactNativeProviderText,
 } from './providers/native/NativeProviderDiagnostics';
+import {
+  attestNativeHostCli,
+  type NativeHostCliId,
+} from '../services/nativeHostCliAdmission';
+import {
+  isUnqualifiedNativeBinaryProvider,
+  unqualifiedNativeBinaryReason,
+} from '../config/unqualifiedNativeBinaryLane';
 
 export type NativeProviderReadinessState =
   | 'login_present'
@@ -33,6 +51,9 @@ export interface NativeProviderReadiness {
   expiresAt: string;
   credentialFingerprint: string;
   runtimeFingerprint: string;
+  runtimeVersion?: string;
+  runtimeInstalled?: boolean;
+  runtimeAdmissionCode?: string;
 }
 
 type LiveProbeResult = {
@@ -42,14 +63,23 @@ type LiveProbeResult = {
 
 type LiveProbe = (provider: AgentProviderName) => Promise<LiveProbeResult>;
 
-const COMMANDS: Partial<Record<AgentProviderName, { command: string; versionArgs: string[] }>> = {
-  CLAUDE_CODE: { command: 'claude', versionArgs: ['--version'] },
-  CODEX: { command: 'codex', versionArgs: ['--version'] },
-  GEMINI: { command: 'agy', versionArgs: ['--version'] },
-  GROK: { command: 'grok', versionArgs: ['--no-auto-update', '--version'] },
-};
+const EXECUTABLE_READINESS_PROVIDERS = [
+  'HERMES',
+  'OPENCODE',
+] as const satisfies readonly AgentProviderName[];
+
+const COMMANDS: Partial<Record<AgentProviderName, { command: string; versionArgs: string[] }>> =
+  Object.freeze(Object.fromEntries(EXECUTABLE_READINESS_PROVIDERS.map((provider) => {
+    const command = requireHarnessDefinition(provider).command;
+    if (!command.executable) throw new Error(`Missing native readiness command for ${provider}`);
+    return [provider, {
+      command: command.executable,
+      versionArgs: [...command.versionArgs],
+    }];
+  })));
 
 const cache = new Map<AgentProviderName, NativeProviderReadiness>();
+const hostAdmissionCache = new Map<AgentProviderName, NativeProviderReadiness>();
 const pending = new Map<string, Promise<NativeProviderReadiness>>();
 const testProbes = new Map<AgentProviderName, LiveProbe>();
 const rejectedCredentialGenerations = new Map<AgentProviderName, {
@@ -59,6 +89,40 @@ const rejectedCredentialGenerations = new Map<AgentProviderName, {
 }>();
 const invalidationListeners = new Set<(provider: AgentProviderName) => void>();
 let readinessEpoch = 0;
+
+const HOST_CLI_ADMISSION = Object.freeze({
+  CODEX: Object.freeze({ toolId: 'codex', executablePath: '/usr/bin/codex' }),
+  CLAUDE_CODE: Object.freeze({ toolId: 'claude-code', executablePath: '/usr/bin/claude' }),
+} satisfies Readonly<Record<'CODEX' | 'CLAUDE_CODE', Readonly<{
+  toolId: NativeHostCliId;
+  executablePath: string;
+}>>>);
+
+function admissionFailureCode(error: unknown): string {
+  if (error && typeof error === 'object' && 'code' in error) {
+    const code = String((error as { code?: unknown }).code || '');
+    if (/^[A-Z0-9_]{1,80}$/.test(code)) return code;
+  }
+  return 'NATIVE_HOST_CLI_ADMISSION_FAILED';
+}
+
+function admissionObservedVersion(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('observedVersion' in error)) return undefined;
+  const version = (error as { observedVersion?: unknown }).observedVersion;
+  return typeof version === 'string' && /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)
+    ? version
+    : undefined;
+}
+
+function admissionInstalledEvidence(code: string): boolean | undefined {
+  if (code === 'ABSENT') return false;
+  if (code === 'UNSUPPORTED_VERSION'
+    || code === 'STATUS_ONLY_VERSION'
+    || code === 'DRIFT_DETECTED'
+    || code === 'RACE_DETECTED'
+    || code === 'BOUND_EXCEEDED') return true;
+  return undefined;
+}
 
 function notifyInvalidation(provider: AgentProviderName): void {
   for (const listener of invalidationListeners) {
@@ -79,6 +143,9 @@ function result(
   message: string,
   credentialFingerprint: string,
   runtimeFingerprint: string,
+  runtimeVersion?: string,
+  runtimeInstalled?: boolean,
+  runtimeAdmissionCode?: string,
 ): NativeProviderReadiness {
   const now = Date.now();
   return {
@@ -90,6 +157,9 @@ function result(
     expiresAt: new Date(now + ttlFor(state)).toISOString(),
     credentialFingerprint,
     runtimeFingerprint,
+    ...(runtimeVersion ? { runtimeVersion } : {}),
+    ...(runtimeInstalled !== undefined ? { runtimeInstalled } : {}),
+    ...(runtimeAdmissionCode ? { runtimeAdmissionCode } : {}),
   };
 }
 
@@ -167,7 +237,9 @@ async function hashPath(targetPath: string): Promise<string> {
 }
 
 async function credentialFingerprint(provider: AgentProviderName): Promise<string> {
-  const paths = resolveNativeCliCredentialPaths(provider);
+  const paths = provider === 'HERMES' || provider === 'OPENCODE'
+    ? resolveAcpHarnessReadinessPaths(provider)
+    : resolveNativeCliCredentialPaths(provider);
   const pathHashes = await Promise.all(paths.map(hashPath));
   const envCredentialMaterial = provider === 'CLAUDE_CODE'
     ? [
@@ -195,11 +267,18 @@ async function credentialFingerprint(provider: AgentProviderName): Promise<strin
     .digest('hex');
 }
 
-function execFileBounded(command: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; output: string }> {
+function execFileBounded(
+  provider: AgentProviderName,
+  command: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<{ ok: boolean; output: string }> {
   return new Promise((resolve) => {
     const child = execFile(command, args, {
       encoding: 'utf8',
-      env: buildNativeCliEnvironment(command === 'agy' ? 'GEMINI' : command === 'claude' ? 'CLAUDE_CODE' : command === 'codex' ? 'CODEX' : 'GROK'),
+      env: provider === 'HERMES' || provider === 'OPENCODE'
+        ? buildAcpHarnessEnvironment(provider)
+        : buildNativeCliEnvironment(provider),
       timeout: timeoutMs,
       maxBuffer: 256 * 1024,
     }, (error, stdout, stderr) => {
@@ -212,10 +291,18 @@ function execFileBounded(command: string, args: string[], timeoutMs: number): Pr
   });
 }
 
-async function runtimeFingerprint(provider: AgentProviderName): Promise<string> {
+async function runtimeFingerprint(
+  provider: AgentProviderName,
+  scope: 'HOST_OPERATOR' | 'PROJECT_SANDBOX',
+): Promise<string> {
+  if (scope === 'PROJECT_SANDBOX' && (provider === 'CODEX' || provider === 'CLAUDE_CODE')) {
+    // Project providers execute their independently pinned container runtime;
+    // host CLI identity is neither launch authority nor a Project prerequisite.
+    return createHash('sha256').update(`project-sandbox:${provider}`).digest('hex');
+  }
   const definition = COMMANDS[provider];
   if (!definition) return 'not-applicable';
-  const probe = await execFileBounded(definition.command, definition.versionArgs, 5_000);
+  const probe = await execFileBounded(provider, definition.command, definition.versionArgs, 5_000);
   if (!probe.ok) return 'missing';
   return createHash('sha256').update(probe.output).digest('hex');
 }
@@ -223,12 +310,42 @@ async function runtimeFingerprint(provider: AgentProviderName): Promise<string> 
 async function defaultLiveProbe(provider: AgentProviderName): Promise<LiveProbeResult> {
   // Claude and Codex do not expose a supported, non-billable auth verification
   // command. Their local login can be reported honestly, but not called live.
-  if (provider === 'CLAUDE_CODE' || provider === 'CODEX' || provider === 'GROK') {
+  if (provider === 'CLAUDE_CODE'
+    || provider === 'CODEX'
+    || provider === 'GROK') {
     return { state: 'unknown' };
+  }
+  if (provider === 'HERMES' || provider === 'OPENCODE') {
+    const broker = new AcpStdioBroker({
+      profile: provider === 'HERMES' ? HERMES_ACP_PROFILE : OPENCODE_ACP_PROFILE,
+      cwd: process.cwd(),
+      environment: buildAcpHarnessEnvironment(provider),
+      controlTimeoutMs: 10_000,
+      closeGraceMs: 1_000,
+    });
+    try {
+      await broker.attest();
+      // Hermes' agent-managed auth method is advertised only after it resolves
+      // a usable provider credential. OpenCode's fixed method merely opens its
+      // own login flow, so local auth evidence remains the honest maximum.
+      return { state: provider === 'HERMES' ? 'live_verified' : 'unknown' };
+    } catch (error) {
+      const diagnostic = redactNativeProviderText(
+        error instanceof Error ? error.message : String(error),
+        16 * 1024,
+      );
+      if (provider === 'HERMES'
+        && /(?:authenticated runtime method|confirm its advertised authentication method|ACP authenticate failed)/i.test(diagnostic)) {
+        return { state: 'needs_login', diagnostic };
+      }
+      return { state: 'runtime_unavailable', diagnostic };
+    } finally {
+      try { await broker.dispose(); } catch {}
+    }
   }
   if (provider !== 'GEMINI') return { state: 'unknown' };
 
-  const probe = await execFileBounded('agy', ['models'], 8_000);
+  const probe = await execFileBounded('GEMINI', 'agy', ['models'], 8_000);
   if (probe.ok) return { state: 'live_verified' };
   if (isNativeProviderAuthFailure(probe.output)) {
     return { state: 'needs_login', diagnostic: probe.output };
@@ -240,11 +357,7 @@ async function defaultLiveProbe(provider: AgentProviderName): Promise<LiveProbeR
 }
 
 function messageFor(provider: AgentProviderName, state: NativeProviderReadinessState, local: NativeCliAuthStatus): string {
-  const name = provider === 'CLAUDE_CODE' ? 'Claude Code'
-    : provider === 'CODEX' ? 'Codex'
-      : provider === 'GEMINI' ? 'Google Antigravity'
-        : provider === 'GROK' ? 'Grok Build'
-          : provider;
+  const name = requireHarnessDefinition(provider).displayName;
   if (state === 'live_verified') return `${name} login was verified against its local provider runtime.`;
   if (state === 'login_present') return `${name} login is present locally. This CLI has no supported non-billable live auth probe, so upstream revocation is checked on the next turn.`;
   if (state === 'needs_login') return local.message || `${name} needs to be signed in on this server.`;
@@ -266,9 +379,7 @@ async function refresh(provider: AgentProviderName, credential: string, runtime:
 
   if (provider === 'GEMINI'
     && local.status === 'authenticated'
-    && !testProbes.has(provider)
-    && !process.env.GEMINI_API_KEY
-    && !process.env.GOOGLE_API_KEY) {
+    && !testProbes.has(provider)) {
     // getNativeCliAuthStatusAsync reached this state only after its bounded
     // `agy models` probe succeeded; do not execute the same live probe twice.
     return result(provider, 'live_verified', messageFor(provider, 'live_verified', local), credential, runtime);
@@ -288,8 +399,151 @@ async function refresh(provider: AgentProviderName, credential: string, runtime:
 
 export async function getNativeProviderReadiness(
   provider: AgentProviderName,
-  options: { force?: boolean } = {},
+  options: {
+    force?: boolean;
+    executionScope?: 'HOST_OPERATOR' | 'PROJECT_SANDBOX';
+  } = {},
 ): Promise<NativeProviderReadiness> {
+  const executionScope = options.executionScope || 'HOST_OPERATOR';
+  if ((provider === 'GROK' || provider === 'GEMINI')
+    && (isUnqualifiedNativeBinaryProvider(provider) || executionScope === 'PROJECT_SANDBOX')) {
+    return result(
+      provider,
+      'runtime_unavailable',
+      unqualifiedNativeBinaryReason(provider),
+      'not-inspected',
+      'unqualified-native-binary-lane',
+    );
+  }
+  if (
+    executionScope === 'HOST_OPERATOR'
+    && (provider === 'CODEX' || provider === 'CLAUDE_CODE')
+  ) {
+    const admissionContract = HOST_CLI_ADMISSION[provider];
+    const credential = await credentialFingerprint(provider);
+    const cached = hostAdmissionCache.get(provider);
+    if (!options.force
+      && cached
+      && cached.credentialFingerprint === credential
+      && Date.parse(cached.expiresAt) > Date.now()) {
+      return cached;
+    }
+    const key = `${provider}:host:${credential}`;
+    const inFlight = pending.get(key);
+    if (inFlight) return inFlight;
+    let taskEpoch = readinessEpoch;
+    const task = (async () => {
+      const [local, admission] = await Promise.all([
+        getNativeCliAuthStatusAsync(provider),
+        attestNativeHostCli(admissionContract.toolId, admissionContract.executablePath).then(
+          (identity) => ({ ok: true as const, identity }),
+          (error: unknown) => ({ ok: false as const, error }),
+        ),
+      ]);
+      const admissionCode = admission.ok ? null : admissionFailureCode(admission.error);
+      const runtime = admission.ok
+        ? admission.identity.fingerprint
+        : createHash('sha256')
+          .update(`unavailable\u0000${admissionCode}`)
+          .digest('hex');
+      const finish = (value: NativeProviderReadiness): NativeProviderReadiness => {
+        if (taskEpoch === readinessEpoch) {
+          hostAdmissionCache.set(provider, value);
+          return value;
+        }
+        const replacement = hostAdmissionCache.get(provider);
+        if (replacement && Date.parse(replacement.expiresAt) > Date.now()) return replacement;
+        return result(
+          provider,
+          'unknown',
+          'Provider readiness changed while native host admission was being checked. Retry before starting a turn.',
+          credential,
+          runtime,
+        );
+      };
+
+      // Package admission is independent of authentication. A retained auth
+      // rejection must never relabel an absent or drifted executable as a
+      // login problem, nor imply that Portal can mutate the host package.
+      if (!admission.ok) {
+        return finish(result(
+          provider,
+          'runtime_unavailable',
+          `${requireHarnessDefinition(provider).displayName} host CLI admission failed (${admissionCode}). The package was not changed; Portal does not currently provide host CLI package maintenance.`,
+          credential,
+          runtime,
+          admissionObservedVersion(admission.error),
+          admissionInstalledEvidence(admissionCode || ''),
+          admissionCode || undefined,
+        ));
+      }
+
+      const rejection = rejectedCredentialGenerations.get(provider);
+      if (rejection && (
+        rejection.credentialFingerprint === 'unknown'
+        || rejection.credentialFingerprint === credential
+      )) {
+        return finish(result(
+          provider,
+          'needs_login',
+          rejection.message,
+          credential,
+          runtime,
+          admission.identity.version,
+          true,
+        ));
+      }
+      if (rejection) {
+        rejectedCredentialGenerations.delete(provider);
+        invalidateNativeCliAuthStatus(provider, 'state_changed');
+        readinessEpoch += 1;
+        taskEpoch = readinessEpoch;
+        cache.delete(provider);
+        hostAdmissionCache.delete(provider);
+        for (const pendingKey of pending.keys()) {
+          if (pendingKey.startsWith(`${provider}:`) && pendingKey !== key) pending.delete(pendingKey);
+        }
+        notifyInvalidation(provider);
+      }
+      if (local.status === 'needs_login') {
+        return finish(result(
+          provider,
+          'needs_login',
+          messageFor(provider, 'needs_login', local),
+          credential,
+          runtime,
+          admission.identity.version,
+          true,
+        ));
+      }
+      if (local.status !== 'authenticated') {
+        return finish(result(
+          provider,
+          'unknown',
+          messageFor(provider, 'unknown', local),
+          credential,
+          runtime,
+          admission.identity.version,
+          true,
+        ));
+      }
+      // Advisory only. NativeCliAdapterProvider performs the same filesystem
+      // admission again immediately before every Host Operator attempt.
+      return finish(result(
+        provider,
+        'login_present',
+        messageFor(provider, 'login_present', local),
+        credential,
+        runtime,
+        admission.identity.version,
+        true,
+      ));
+    })().finally(() => {
+      if (pending.get(key) === task) pending.delete(key);
+    });
+    pending.set(key, task);
+    return task;
+  }
   const credential = await credentialFingerprint(provider);
   const rejection = rejectedCredentialGenerations.get(provider);
   if (rejection) {
@@ -336,7 +590,7 @@ export async function getNativeProviderReadiness(
   const task = (async () => {
     // Version probes spawn provider CLIs. Keep them behind the cheap credential
     // and TTL cache boundary so ordinary status reads do not execute every CLI.
-    const runtime = await runtimeFingerprint(provider);
+    const runtime = await runtimeFingerprint(provider, executionScope);
     const next = await refresh(provider, credential, runtime);
     if (taskEpoch === readinessEpoch) {
       cache.set(provider, next);
@@ -359,13 +613,16 @@ export async function getNativeProviderReadiness(
 }
 
 export function getCachedNativeProviderReadiness(provider: AgentProviderName): NativeProviderReadiness | null {
-  const current = cache.get(provider);
+  const current = provider === 'CODEX' || provider === 'CLAUDE_CODE'
+    ? hostAdmissionCache.get(provider)
+    : cache.get(provider);
   return current && Date.parse(current.expiresAt) > Date.now() ? current : null;
 }
 
 export function invalidateNativeProviderReadiness(provider: AgentProviderName): void {
   readinessEpoch += 1;
   cache.delete(provider);
+  hostAdmissionCache.delete(provider);
   rejectedCredentialGenerations.delete(provider);
   for (const key of pending.keys()) {
     if (key.startsWith(`${provider}:`)) pending.delete(key);
@@ -376,7 +633,14 @@ export function invalidateNativeProviderReadiness(provider: AgentProviderName): 
 export function recordNativeProviderAuthFailure(
   provider: AgentProviderName,
   rawDiagnostic: string,
-  admission?: Pick<NativeProviderReadiness, 'credentialFingerprint' | 'runtimeFingerprint'>,
+  admission?: Pick<
+    NativeProviderReadiness,
+    | 'credentialFingerprint'
+    | 'runtimeFingerprint'
+    | 'runtimeVersion'
+    | 'runtimeInstalled'
+    | 'runtimeAdmissionCode'
+  >,
   options: { confirmed?: boolean } = {},
 ): void {
   if (options.confirmed !== true && !isNativeProviderAuthFailure(rawDiagnostic)) return;
@@ -385,14 +649,20 @@ export function recordNativeProviderAuthFailure(
   for (const key of pending.keys()) {
     if (key.startsWith(`${provider}:`)) pending.delete(key);
   }
-  const current = cache.get(provider);
-  const message = `${provider === 'CLAUDE_CODE' ? 'Claude Code' : provider === 'GEMINI' ? 'Google Antigravity' : provider} authentication was rejected. Reconnect it in AI Settings and retry.`;
+  const current = provider === 'CODEX' || provider === 'CLAUDE_CODE'
+    ? hostAdmissionCache.get(provider)
+    : cache.get(provider);
+  const message = `${requireHarnessDefinition(provider).displayName} authentication was rejected. Reconnect it in AI Settings and retry.`;
   const rejectedCredentialFingerprint = admission?.credentialFingerprint
     || current?.credentialFingerprint
     || 'unknown';
   const rejectedRuntimeFingerprint = admission?.runtimeFingerprint
     || current?.runtimeFingerprint
     || 'unknown';
+  const rejectedRuntimeVersion = admission?.runtimeVersion ?? current?.runtimeVersion;
+  const rejectedRuntimeInstalled = admission?.runtimeInstalled ?? current?.runtimeInstalled;
+  const rejectedRuntimeAdmissionCode = admission?.runtimeAdmissionCode
+    ?? current?.runtimeAdmissionCode;
   rejectedCredentialGenerations.set(provider, {
     credentialFingerprint: rejectedCredentialFingerprint,
     runtimeFingerprint: rejectedRuntimeFingerprint,
@@ -404,8 +674,19 @@ export function recordNativeProviderAuthFailure(
     message,
     rejectedCredentialFingerprint,
     rejectedRuntimeFingerprint,
+    rejectedRuntimeVersion,
+    rejectedRuntimeInstalled,
+    rejectedRuntimeAdmissionCode,
   );
-  cache.set(provider, next);
+  if (provider === 'CODEX' || provider === 'CLAUDE_CODE') {
+    // Authentication evidence is shared by the independently admitted host and
+    // Project runtimes. Publish the exact-generation rejection into both cache
+    // domains so an older in-flight probe in either scope cannot overwrite it.
+    hostAdmissionCache.set(provider, next);
+    cache.set(provider, next);
+  } else {
+    cache.set(provider, next);
+  }
   notifyInvalidation(provider);
 }
 
@@ -425,6 +706,7 @@ export function __setNativeReadinessProbeForTests(provider: AgentProviderName, p
 export function __resetNativeReadinessForTests(): void {
   readinessEpoch += 1;
   cache.clear();
+  hostAdmissionCache.clear();
   pending.clear();
   testProbes.clear();
   rejectedCredentialGenerations.clear();

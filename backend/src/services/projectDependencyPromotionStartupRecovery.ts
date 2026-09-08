@@ -72,8 +72,15 @@ export interface ProjectDependencyPromotionStartupRecoveryResult {
   quiescentRepairInspection: ProjectDependencyRepairStartupInspection;
   finalInspection: ProjectDependencyPromotionStartupEvidenceInspection;
   finalRepairInspection: ProjectDependencyRepairStartupInspection;
-  preDrainTargets: ProjectDependencyPromotionStartupTargetQuiescence;
-  postDrainTargets: ProjectDependencyPromotionStartupTargetQuiescence;
+  /**
+   * `drained` means the global writer fence quiesced every Portal-tracked
+   * writer (including OpenClaw provider sessions) before recovery. An ordinary
+   * restart with an empty promotion/repair inventory reports `not_required`
+   * and leaves both target quiescence phases null.
+   */
+  writerQuiescence: 'drained' | 'not_required';
+  preDrainTargets: ProjectDependencyPromotionStartupTargetQuiescence | null;
+  postDrainTargets: ProjectDependencyPromotionStartupTargetQuiescence | null;
   recovery: {
     rolledBack: number;
     committed: number;
@@ -477,9 +484,24 @@ export async function runProjectDependencyPromotionStartupRecovery(
     inspectRepairs({ projectsRoot, database: dependencies.database as any }),
   ]);
   const initialTargets = combinedStartupTargets(initialInspection, initialRepairInspection);
-  const preDrainTargets = await quiesceTargets(initialTargets, 'pre_drain');
-  await fence.proveQuiescent();
-  const postDrainTargets = await quiesceTargets(initialTargets, 'post_drain');
+  // Proving the writer fence quiescent resets every OpenClaw session that
+  // still owns an unresolved provider-authority row (sessions.reset), which
+  // moves the visible conversation history behind a new lifecycle boundary.
+  // That reset is only warranted when startup actually holds interrupted
+  // promotion or repair evidence whose recovery must not race a live writer.
+  // An ordinary restart with an empty inventory keeps admission closed until
+  // release below, but leaves live provider sessions and their history intact.
+  const writerQuiescence: ProjectDependencyPromotionStartupRecoveryResult['writerQuiescence'] =
+    startupWriterQuiescenceRequired(initialInspection, initialRepairInspection, initialTargets)
+      ? 'drained'
+      : 'not_required';
+  let preDrainTargets: ProjectDependencyPromotionStartupTargetQuiescence | null = null;
+  let postDrainTargets: ProjectDependencyPromotionStartupTargetQuiescence | null = null;
+  if (writerQuiescence === 'drained') {
+    preDrainTargets = await quiesceTargets(initialTargets, 'pre_drain');
+    await fence.proveQuiescent();
+    postDrainTargets = await quiesceTargets(initialTargets, 'post_drain');
+  }
   const [quiescentInspection, quiescentRepairInspection] = await Promise.all([
     inspect(projectsRoot),
     inspectRepairs({ projectsRoot, database: dependencies.database as any }),
@@ -562,6 +584,7 @@ export async function runProjectDependencyPromotionStartupRecovery(
       quiescentRepairInspection,
       finalInspection,
       finalRepairInspection,
+      writerQuiescence,
       preDrainTargets,
       postDrainTargets,
       recovery,
@@ -573,9 +596,33 @@ export async function runProjectDependencyPromotionStartupRecovery(
   }
 }
 
+/**
+ * Startup drains (and thereby resets) provider writers only when the durable
+ * inventory shows something to recover. Any promotion target, contained
+ * quarantine, repair operation, or unbound/uncertain evidence keeps the full
+ * fence drain; a completely empty inventory does not.
+ */
+function startupWriterQuiescenceRequired(
+  promotion: ProjectDependencyPromotionStartupEvidenceInspection,
+  repair: ProjectDependencyRepairStartupInspection,
+  targets: readonly ProjectDependencyPromotionStartupTarget[],
+): boolean {
+  return promotion.hasEvidence
+    || repair.hasEvidence
+    || targets.length > 0
+    || promotion.targets.length > 0
+    || promotion.containedQuarantines.length > 0
+    || promotion.unboundEvidence.length > 0
+    || promotion.uncertainEvidence.length > 0
+    || repair.targets.length > 0
+    || repair.operationIds.length > 0
+    || repair.unboundEvidence.length > 0;
+}
+
 export const __projectDependencyPromotionStartupRecoveryTest = {
   assertComparableStableInspection,
   assertComparableStableRepairInspection,
+  startupWriterQuiescenceRequired,
   combinedStartupTargets,
   defaultQuiesceTargets,
   exactContainedTargets,

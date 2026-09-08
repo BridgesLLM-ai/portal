@@ -120,6 +120,7 @@ function SessionControlsHarness() {
       <output data-testid="provider">{chat.provider}</output>
       <output data-testid="model">{chat.selectedModel}</output>
       <output data-testid="history-error">{chat.historyError || ''}</output>
+      <output data-testid="history-retryable">{String(chat.historyErrorRetryable)}</output>
       <output data-testid="history-loading">{chat.isLoadingHistory ? 'loading' : 'idle'}</output>
       <output data-testid="message-count">{chat.messages.length}</output>
       <output data-testid="messages">{JSON.stringify(chat.messages)}</output>
@@ -137,6 +138,7 @@ function SessionControlsHarness() {
       <output data-testid="activity-titles">{JSON.stringify(chat.activityTitles)}</output>
       <output data-testid="pending-questions">{chat.pendingUserQuestions.length}</output>
       <output data-testid="status-text">{chat.statusText || ''}</output>
+      <output data-testid="operational-banner">{chat.operationalBanner?.message || ''}</output>
       <output data-testid="ws-connected">{chat.wsConnected ? 'connected' : 'disconnected'}</output>
       <output data-testid="is-running">{chat.isRunning ? 'running' : 'idle'}</output>
       <output data-testid="stream-stale">{chat.isRunning && !chat.wsConnected ? 'stale' : 'clear'}</output>
@@ -175,6 +177,9 @@ function SessionControlsHarness() {
       </button>
       <button type="button" onClick={() => chat.reconnectSocket()}>
         Reconnect socket
+      </button>
+      <button type="button" onClick={chat.dismissOperationalBanner}>
+        Dismiss operational alert
       </button>
       <button type="button" onClick={() => void chat.sendMessage('Yes')}>
         Answer pending with Yes
@@ -307,6 +312,14 @@ describe('ChatStateProvider session-control ownership', () => {
       }),
     ));
     expect(chatMocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it.each(['legacy', 'scoped'])('does not adopt another native harness session from %s storage', async (kind) => {
+    localStorage.setItem(kind === 'legacy' ? 'agent-chat-session' : 'agent-chat-session:CODEX', 'claude_code-owner-private-session');
+    await renderReadyHarness();
+    await userEvent.click(screen.getByRole('button', { name: 'Switch to Codex' }));
+    await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent(/^main$/));
+    expect(localStorage.getItem('agent-chat-session:CODEX')).toBe('main');
   });
 
   it('restores the last provider-scoped session when the provider changes', async () => {
@@ -683,6 +696,69 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(screen.getByTestId('activity-titles')).toHaveTextContent('{}');
   });
 
+  it('keeps idle id-less maintenance on the composer rail without creating a fake turn', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+      socket.emit({
+        type: 'status',
+        sessionKey: 'agent:main:first',
+        content: 'Memory flush started',
+        maintenanceKind: 'maintenance',
+      });
+    });
+
+    await waitFor(() => expect(screen.getByTestId('status-text')).toHaveTextContent('Memory flush started'));
+    expect(screen.getByTestId('message-count')).toHaveTextContent('0');
+    expect(screen.getByTestId('streaming-assistant-id')).toBeEmptyDOMElement();
+    expect(screen.getByTestId('is-running')).toHaveTextContent('idle');
+
+    act(() => {
+      socket.emit({
+        type: 'status',
+        sessionKey: 'agent:main:first',
+        content: 'Memory flush completed',
+        maintenanceKind: 'maintenance',
+      });
+    });
+
+    await waitFor(() => expect(screen.getByTestId('status-text')).toHaveTextContent('Memory flush completed'));
+    expect(screen.getByTestId('message-count')).toHaveTextContent('0');
+    expect(screen.getByTestId('streaming-assistant-id')).toBeEmptyDOMElement();
+    expect(screen.getByTestId('is-running')).toHaveTextContent('idle');
+  });
+
+  it('projects actionable runtime status into a dismissible banner without creating a turn', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+      socket.emit({
+        type: 'status',
+        sessionKey: 'agent:main:first',
+        content: 'Authentication expired. Reconnect this harness account.',
+        presentation: 'banner',
+        durability: 'transient',
+      });
+    });
+
+    await waitFor(() => expect(screen.getByTestId('operational-banner')).toHaveTextContent(
+      'Authentication expired. Reconnect this harness account.',
+    ));
+    expect(screen.getByTestId('message-count')).toHaveTextContent('0');
+    expect(screen.getByTestId('streaming-assistant-id')).toBeEmptyDOMElement();
+    expect(screen.getByTestId('is-running')).toHaveTextContent('idle');
+    expect(screen.getByTestId('status-text')).toBeEmptyDOMElement();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss operational alert' }));
+    expect(screen.getByTestId('operational-banner')).toBeEmptyDOMElement();
+  });
+
   it('renders a foreign user message and live reasoning before the turn finishes', async () => {
     await renderReadyHarness();
     const socket = PendingWebSocket.instances[0];
@@ -784,6 +860,8 @@ describe('ChatStateProvider session-control ownership', () => {
     await waitFor(() => expect(screen.getByTestId('status-text')).toHaveTextContent(
       'Thinking… (~37 tokens)',
     ));
+    expect(screen.getByTestId('message-count')).toHaveTextContent('0');
+    expect(screen.getByTestId('is-running')).toHaveTextContent('idle');
     expect(screen.getByTestId('thinking')).not.toHaveTextContent('37 tokens');
 
     act(() => {
@@ -1186,18 +1264,18 @@ describe('ChatStateProvider session-control ownership', () => {
                   source: { eventType: 'text' },
                 },
                 {
-                  type: 'assistant_status', runId: 'snapshot-tail-run', seq: 3,
+                  type: 'assistant_reasoning', runId: 'snapshot-tail-run', seq: 3,
                   text: `${phaseA}\n\n${phaseB}`, replace: true, visible: true,
-                  source: { eventType: 'status' },
+                  source: { eventType: 'status', preambleProgress: true },
                 },
                 {
                   type: 'tool_output', runId: 'snapshot-tail-run', seq: 4, ts: 4_000,
                   tool: { id: 'legacy-output-only', name: 'exec', result: 'ok', status: 'done' },
                 },
                 {
-                  type: 'assistant_status', runId: 'snapshot-tail-run', seq: 5,
+                  type: 'assistant_reasoning', runId: 'snapshot-tail-run', seq: 5,
                   text: `${phaseA}\n\n${phaseB}\n\n${phaseC}`, replace: true, visible: true,
-                  source: { eventType: 'status' },
+                  source: { eventType: 'status', preambleProgress: true },
                 },
               ],
               toolCalls: [{
@@ -1217,7 +1295,7 @@ describe('ChatStateProvider session-control ownership', () => {
               provenance: 'runtime-turn-event-history',
               segments: [{
                 kind: 'thinking',
-                source: 'status',
+                source: 'preamble',
                 text: phaseA,
                 order: 0,
                 ts: 1_000,
@@ -1226,7 +1304,7 @@ describe('ChatStateProvider session-control ownership', () => {
                 kind: 'runtime-turn-event-history',
                 runId: 'snapshot-tail-run',
                 lastEventSeq: 1,
-                thinkingCursors: { status: phaseA },
+                thinkingCursors: { preamble: phaseA },
               },
             }],
             pagination: { beforeCursor: null, hasMoreBefore: false },
@@ -1328,7 +1406,7 @@ describe('ChatStateProvider session-control ownership', () => {
     ]);
   });
 
-  it('keeps raw and status cumulative cursors independent across a restored snapshot', async () => {
+  it('keeps raw and preamble cumulative cursors independent across a restored snapshot', async () => {
     const rawPhaseA = 'Raw reasoning before the status update';
     const statusSignal = 'Waiting for the next provider phase';
     const rawPhaseB = 'Raw reasoning after the status update';
@@ -1347,9 +1425,9 @@ describe('ChatStateProvider session-control ownership', () => {
                   source: { eventType: 'thinking' },
                 },
                 {
-                  type: 'assistant_status', runId: 'independent-lanes-run', seq: 2,
+                  type: 'assistant_reasoning', runId: 'independent-lanes-run', seq: 2,
                   text: statusSignal, replace: true, visible: true,
-                  source: { eventType: 'status' },
+                  source: { eventType: 'status', preambleProgress: true },
                 },
                 {
                   type: 'assistant_reasoning', runId: 'independent-lanes-run', seq: 3,
@@ -1366,13 +1444,13 @@ describe('ChatStateProvider session-control ownership', () => {
               provenance: 'runtime-turn-event-history',
               segments: [
                 { kind: 'thinking', source: 'reasoning', text: rawPhaseA, order: 0, ts: 1_000 },
-                { kind: 'thinking', source: 'status', text: statusSignal, order: 1, ts: 2_000 },
+                { kind: 'thinking', source: 'preamble', text: statusSignal, order: 1, ts: 2_000 },
               ],
               __portal: {
                 kind: 'runtime-turn-event-history',
                 runId: 'independent-lanes-run',
                 lastEventSeq: 2,
-                thinkingCursors: { raw: rawPhaseA, status: statusSignal },
+                thinkingCursors: { raw: rawPhaseA, preamble: statusSignal },
               },
             }],
             pagination: { beforeCursor: null, hasMoreBefore: false },
@@ -1389,7 +1467,7 @@ describe('ChatStateProvider session-control ownership', () => {
     const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
     expect(thinking.segments).toEqual([
       expect.objectContaining({ text: rawPhaseA, lane: 'raw', order: 0 }),
-      expect.objectContaining({ text: statusSignal, lane: 'status', order: 1 }),
+      expect.objectContaining({ text: statusSignal, lane: 'preamble', order: 1 }),
     ]);
     expect(thinking.content).toBe(rawPhaseB);
     expect(thinking.content).not.toContain(rawPhaseA);
@@ -3283,7 +3361,7 @@ describe('ChatStateProvider session-control ownership', () => {
     });
   });
 
-  it('dedupes a persisted status-source thought after the live status graduates at a tool boundary', async () => {
+  it('keeps ordinary harness status rail-only live and after a legacy history replay', async () => {
     let overlayReady = false;
     chatMocks.clientGet.mockImplementation(async (url: string) => {
       if (url === '/gateway/history') {
@@ -3346,9 +3424,10 @@ describe('ChatStateProvider session-control ownership', () => {
     const liveThinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
     expect(liveThinking.segments.filter((segment: { text: string }) => (
       segment.text === 'Exact status reasoning before tool'
-    ))).toEqual([
-      expect.objectContaining({ lane: 'status' }),
-    ]);
+    ))).toEqual([]);
+    const historyReadsBeforeReplay = chatMocks.clientGet.mock.calls.filter(
+      ([url]) => url === '/gateway/history',
+    ).length;
     overlayReady = true;
     act(() => {
       socket.emit({
@@ -3358,14 +3437,15 @@ describe('ChatStateProvider session-control ownership', () => {
       });
     });
 
-    await waitFor(() => expect(screen.getByTestId('messages')).toHaveTextContent(
-      '"runtimeRunId":"same-run-status"',
-    ));
+    await waitFor(() => expect(chatMocks.clientGet.mock.calls.filter(
+      ([url]) => url === '/gateway/history',
+    ).length).toBeGreaterThan(historyReadsBeforeReplay));
+    expect(screen.getByTestId('messages')).not.toHaveTextContent('"runtimeRunId":"same-run-status"');
     await waitFor(() => {
       const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
       expect(thinking.segments.filter((segment: { text: string }) => (
         segment.text === 'Exact status reasoning before tool'
-      ))).toHaveLength(1);
+      ))).toHaveLength(0);
     });
   });
 
@@ -3918,7 +3998,7 @@ describe('ChatStateProvider session-control ownership', () => {
     ]);
   });
 
-  it('graduates live text before visible status and raw reasoning phases', async () => {
+  it('keeps ordinary provider status on the rail while preserving text and raw reasoning order', async () => {
     await renderReadyHarness();
     const socket = PendingWebSocket.instances[0];
     const emit = (payload: Record<string, unknown>) => act(() => socket.emit({
@@ -3943,6 +4023,10 @@ describe('ChatStateProvider session-control ownership', () => {
         source: { eventType: 'status' },
       },
     });
+    await waitFor(() => expect(screen.getByTestId('status-text')).toHaveTextContent(
+      'Visible provider status after text',
+    ));
+    expect(screen.getByTestId('thinking')).not.toHaveTextContent('Visible provider status after text');
     emit({ type: 'tool_start', toolCallId: 'status-boundary-tool', toolName: 'read' });
     emit({ type: 'tool_end', toolCallId: 'status-boundary-tool', toolName: 'read', toolResult: 'ok' });
     emit({ type: 'text', content: 'Visible text before raw reasoning.' });
@@ -3951,14 +4035,13 @@ describe('ChatStateProvider session-control ownership', () => {
     const thinking = JSON.parse(screen.getByTestId('thinking').textContent || '{}');
     expect(thinking.segments).toEqual([
       expect.objectContaining({ kind: 'text', text: 'Visible text before status.', order: 0 }),
-      expect.objectContaining({ kind: 'thinking', lane: 'status', text: 'Visible provider status after text', order: 1 }),
-      expect.objectContaining({ kind: 'text', text: 'Visible text before raw reasoning.', order: 3 }),
+      expect.objectContaining({ kind: 'text', text: 'Visible text before raw reasoning.', order: 2 }),
     ]);
     expect(thinking.content).toBe('Raw reasoning after text');
     const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
       .find((message: { role: string }) => message.role === 'assistant');
     expect(assistant.toolCalls).toEqual([
-      expect.objectContaining({ id: 'status-boundary-tool', order: 2, status: 'done' }),
+      expect.objectContaining({ id: 'status-boundary-tool', order: 1, status: 'done' }),
     ]);
   });
 
@@ -4619,6 +4702,21 @@ describe('ChatStateProvider session-control ownership', () => {
         message: 'Yes',
       }),
     ));
+  });
+
+  it.each([403, 404])('offers another conversation instead of retrying permanent history error %s', async (status) => {
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') throw { response: { status } };
+      return { data: {} };
+    });
+    await user.click(screen.getByRole('button', { name: 'Retry history' }));
+    await waitFor(() => expect(screen.getByTestId('history-retryable')).toHaveTextContent('false'));
+    expect(screen.getByTestId('history-error')).toHaveTextContent('Choose');
+    expect(screen.getByTestId('session')).toHaveTextContent('agent:main:first');
+    expect(chatMocks.createSession).not.toHaveBeenCalled();
+    expect(chatMocks.clientPost).not.toHaveBeenCalled();
   });
 
   it('ignores a delayed inactive R1 history snapshot after a new local R2 turn starts', async () => {

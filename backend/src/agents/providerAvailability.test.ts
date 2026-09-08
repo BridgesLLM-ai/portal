@@ -3,8 +3,12 @@ jest.mock('child_process', () => {
   return { ...actual, execFileSync: jest.fn(actual.execFileSync) };
 });
 
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { execFileSync } from 'child_process';
 import * as nativeProviderReadiness from './nativeProviderReadiness';
+import * as openClawExecutionAdmission from '../services/openClawExecutionAdmission';
 import * as agentZeroAuthSession from './providers/agentZero/AgentZeroAuthSession';
 import * as agentZeroModelCatalog from './providers/agentZero/AgentZeroOAuthModelCatalog';
 import * as agentZeroRuntime from './providers/agentZero/AgentZeroRuntime';
@@ -21,21 +25,56 @@ import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
 describe('providerAvailability', () => {
   const mockedExecFileSync = jest.mocked(execFileSync);
 
-  test('OpenClaw exposes live in-turn steering semantics', () => {
-    const provider = getProviderAvailability('OPENCLAW');
-    expect(provider.capabilities.adapterFamily).toBe('openclaw-gateway');
-    expect(provider.capabilities.adapterKey).toBe('openclaw');
-    expect(provider.capabilities.supportsInTurnSteering).toBe(true);
-    expect(provider.capabilities.supportsQueuedFollowUps).toBe(false);
-    expect(provider.capabilities.followUpMode).toBe('interrupt_and_send');
-    expect(provider.capabilities.supportedExecutionScopes).toEqual(['HOST_OPERATOR']);
+  test('OpenClaw availability fails closed without a current admission while preserving its full scope contract', () => {
+    const actualExecFileSync = jest.requireActual<typeof import('child_process')>('child_process').execFileSync;
+    mockedExecFileSync.mockImplementation(((command: string, args: string[]) => {
+      if (command === 'bash' && args[1]?.includes('command -v openclaw')) return '/usr/bin/openclaw';
+      if (command === 'openclaw' && args.includes('--version')) {
+        return `openclaw ${PORTAL_TOOL_VERSIONS.openClaw}`;
+      }
+      return '';
+    }) as any);
+    const admissionSpy = jest.spyOn(
+      openClawExecutionAdmission,
+      'getCachedOpenClawExecutionAdmission',
+    ).mockReturnValue({
+      state: 'unavailable',
+      ready: false,
+      reason: 'A current OpenClaw tested-runtime readiness attestation is not cached.',
+      checkedAt: '2026-08-28T12:00:00.000Z',
+      evidence: {
+        authorizationFence: 'absent',
+        maintenanceMarker: 'absent',
+        hostMutationJournal: 'absent',
+      },
+      readinessBlockers: [],
+    });
+
+    try {
+      __resetProviderAvailabilityForTests();
+      const provider = getProviderAvailability('OPENCLAW');
+      expect(provider).toMatchObject({
+        installed: true,
+        usable: false,
+        reason: 'A current OpenClaw tested-runtime readiness attestation is not cached.',
+      });
+      expect(provider.capabilities.adapterFamily).toBe('openclaw-gateway');
+      expect(provider.capabilities.adapterKey).toBe('openclaw');
+      expect(provider.capabilities.supportsInTurnSteering).toBe(true);
+      expect(provider.capabilities.supportsQueuedFollowUps).toBe(false);
+      expect(provider.capabilities.followUpMode).toBe('interrupt_and_send');
+      expect(provider.capabilities.supportedExecutionScopes).toEqual(['HOST_OPERATOR', 'PROJECT_SANDBOX']);
+    } finally {
+      admissionSpy.mockRestore();
+      mockedExecFileSync.mockImplementation(actualExecFileSync as any);
+      __resetProviderAvailabilityForTests();
+    }
   });
 
   test.each([
     ['CLAUDE_CODE', ['HOST_OPERATOR', 'PROJECT_SANDBOX']],
     ['CODEX', ['HOST_OPERATOR', 'PROJECT_SANDBOX']],
-    ['GROK', ['HOST_OPERATOR']],
-    ['GEMINI', ['HOST_OPERATOR', 'PROJECT_SANDBOX']],
+    ['OPENCODE', ['HOST_OPERATOR']],
   ] as const)('%s exposes queued native-cli follow-up semantics', (name, executionScopes) => {
     const provider = getProviderAvailability(name);
     expect(provider.capabilities.adapterFamily).toBe('native-cli');
@@ -66,13 +105,18 @@ describe('providerAvailability', () => {
   });
 
   test('every declared provider exposes adapter + follow-up metadata', () => {
-    for (const name of ['OPENCLAW', 'CLAUDE_CODE', 'CODEX', 'GROK', 'AGENT_ZERO', 'GEMINI', 'OLLAMA'] as const) {
+    for (const name of ['OPENCLAW', 'CLAUDE_CODE', 'CODEX', 'GROK', 'AGENT_ZERO', 'GEMINI', 'OLLAMA', 'HERMES', 'OPENCODE'] as const) {
       const provider = getProviderAvailability(name);
       expect(provider.capabilities.adapterFamily).toBeTruthy();
       expect(provider.capabilities.adapterKey).toBeTruthy();
       expect(provider.capabilities.followUpMode).toBeTruthy();
       expect(typeof provider.capabilities.supportsInTurnSteering).toBe('boolean');
       expect(typeof provider.capabilities.supportsQueuedFollowUps).toBe('boolean');
+      expect(typeof provider.capabilities.supportsSessionResume).toBe('boolean');
+      expect(typeof provider.capabilities.supportsSessionFork).toBe('boolean');
+      expect(typeof provider.capabilities.supportsCancellation).toBe('boolean');
+      expect(provider.capabilities.cancellationMode).toBeTruthy();
+      expect(typeof provider.capabilities.supportsLiveToolEvents).toBe('boolean');
       expect(Array.isArray(provider.capabilities.supportedExecutionScopes)).toBe(true);
     }
   });
@@ -91,7 +135,7 @@ describe('providerAvailability', () => {
       if (command === 'ollama' && args[0] === '--version') {
         expect(options?.env?.OLLAMA_HOST).toBe('http://127.0.0.1:11434');
         expect(options?.env?.OLLAMA_API_URL).toBeUndefined();
-        return 'ollama version 0.11.0';
+        return `ollama version ${PORTAL_TOOL_VERSIONS.ollama}`;
       }
       return '';
     }) as any);
@@ -122,8 +166,8 @@ describe('providerAvailability', () => {
     expect(provider.usable).toBe(false);
     expect(provider.capabilities).toMatchObject({
       adapterFamily: 'agent-zero-connector',
-      adapterKey: 'agent-zero-v2.5-connector',
-      supportedExecutionScopes: ['HOST_OPERATOR'],
+      adapterKey: 'agent-zero-v2.10-connector',
+      supportedExecutionScopes: ['HOST_OPERATOR', 'PROJECT_SANDBOX'],
     });
     expect(provider.reason).toMatch(/stays disabled until the managed runtime is ready/);
   });
@@ -133,15 +177,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'unchecked',
@@ -194,15 +238,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'authenticated',
@@ -231,15 +275,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'unchecked',
@@ -315,15 +359,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'authenticated',
@@ -374,15 +418,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'error',
@@ -427,15 +471,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'error',
@@ -469,15 +513,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'needs_login',
@@ -507,15 +551,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'error',
@@ -569,15 +613,15 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.5',
-      expectedVersion: '2.5',
+      version: '2.10',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
       protectedAuth: true,
       restartPolicy: true,
       protocolCompatible: true,
-      reason: 'Managed Agent Zero v2.5 runtime is protocol-ready.',
+      reason: 'Managed Agent Zero v2.10 runtime is protocol-ready.',
     });
     const snapshotSpy = jest.spyOn(agentZeroAuthSession, 'getAgentZeroAuthReadinessSnapshot').mockReturnValue({
       state: 'authenticated',
@@ -604,12 +648,34 @@ describe('providerAvailability', () => {
     }
   });
 
-  test('Grok Build exposes only the privileged Agent Chat contract', () => {
-    const provider = getProviderAvailability('GROK');
-    expect(provider.capabilities).toMatchObject({
-      adapterKey: 'grok-build',
+  test.each(['GROK', 'GEMINI'] as const)('%s exposes its host-only contract while retaining live readiness gating', (name) => {
+    const provider = getProviderAvailability(name);
+    expect(provider).toMatchObject({ name, implemented: true,
+      capabilities: { implemented: true, supportsExecApproval: true, supportedExecutionScopes: ['HOST_OPERATOR'] },
+    });
+    expect(provider.nativeAuthStatus).not.toBe('not_applicable');
+  });
+
+  test('Hermes and OpenCode expose exact-pinned dynamic ACP contracts', () => {
+    expect(getProviderAvailability('HERMES').capabilities).toMatchObject({
+      adapterKey: 'hermes-acp',
       modelCatalogKind: 'dynamic',
+      modelSelectionMode: 'session',
+      supportsModelReadback: true,
       supportsExecApproval: true,
+      supportsSessionResume: true,
+      supportsSessionFork: true,
+      supportedExecutionScopes: ['HOST_OPERATOR'],
+    });
+    expect(getProviderAvailability('OPENCODE').capabilities).toMatchObject({
+      adapterKey: 'opencode-acp',
+      modelCatalogKind: 'dynamic',
+      modelSelectionMode: 'session',
+      supportsModelReadback: true,
+      supportsExecApproval: true,
+      supportsSessionClose: true,
+      supportsSessionResume: true,
+      supportsSessionFork: true,
       supportedExecutionScopes: ['HOST_OPERATOR'],
     });
   });
@@ -644,71 +710,63 @@ describe('providerAvailability', () => {
     })).toBe(false);
   });
 
-  test('Google Antigravity async availability follows exact turn-admission readiness', async () => {
-    const actualExecFileSync = jest.requireActual<typeof import('child_process')>('child_process').execFileSync;
-    mockedExecFileSync.mockImplementation(((command: string, args: string[]) => {
-      if (command === 'bash' && args[1]?.includes('command -v agy')) return '/usr/local/bin/agy';
-      if (command === 'agy' && args[0] === '--version') return PORTAL_TOOL_VERSIONS.antigravity;
-      return '';
-    }) as any);
-    const readinessSpy = jest.spyOn(nativeProviderReadiness, 'getNativeProviderReadiness');
-    const baseReadiness = {
-      provider: 'GEMINI' as const,
-      checkedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
-      credentialFingerprint: 'credential-test',
-      runtimeFingerprint: 'runtime-test',
-    };
+  test.each(['HERMES', 'OPENCODE'] as const)('%s fails closed when its dedicated login is ambiguous', (provider) => {
+    expect(nativeAuthBlocksProviderUsage(provider, {
+      provider,
+      status: 'unknown',
+      message: 'dedicated profile could not be verified',
+      requiresSeparateLogin: true,
+    })).toBe(true);
+    expect(nativeAuthBlocksProviderUsage(provider, {
+      provider,
+      status: 'authenticated',
+      message: 'dedicated profile has credential material',
+      requiresSeparateLogin: true,
+    })).toBe(false);
+  });
 
+  test('Google Antigravity async availability still requires usable native readiness', async () => {
+    const readinessSpy = jest.spyOn(nativeProviderReadiness, 'getNativeProviderReadiness').mockResolvedValue({
+      provider: 'GEMINI', state: 'needs_login', usable: false, message: 'Native subscription login required',
+    } as any);
     try {
-      __resetProviderAvailabilityForTests();
-      readinessSpy.mockResolvedValueOnce({
-        ...baseReadiness,
-        state: 'live_verified',
-        usable: true,
-        message: 'Antigravity live authentication verified.',
-      });
       await expect(getProviderAvailabilityAsync('GEMINI')).resolves.toMatchObject({
-        installed: true,
-        usable: true,
-        nativeAuthStatus: 'authenticated',
-        nativeAuthMessage: 'Antigravity live authentication verified.',
+        implemented: true, usable: false,
       });
-
-      readinessSpy.mockResolvedValueOnce({
-        ...baseReadiness,
-        state: 'needs_login',
-        usable: false,
-        message: 'Antigravity authentication was rejected.',
-      });
-      await expect(getProviderAvailabilityAsync('GEMINI')).resolves.toMatchObject({
-        installed: true,
-        usable: false,
-        nativeAuthStatus: 'needs_login',
-        nativeAuthMessage: 'Antigravity authentication was rejected.',
-      });
-      expect(readinessSpy).toHaveBeenCalledTimes(2);
-    } finally {
-      readinessSpy.mockRestore();
-      mockedExecFileSync.mockImplementation(actualExecFileSync as any);
-      __resetProviderAvailabilityForTests();
-    }
+      expect(readinessSpy).toHaveBeenCalledWith('GEMINI');
+    } finally { readinessSpy.mockRestore(); }
   });
 
   test.each([
     ['CLAUDE_CODE', 'claude', 'Claude Code local login is present; upstream revocation is checked on the next turn.'],
     ['CODEX', 'codex', 'Codex local login is present; upstream revocation is checked on the next turn.'],
-    ['GROK', 'grok', 'Grok Build local login is present; upstream revocation is checked on the next turn.'],
+    ['HERMES', 'hermes', 'Hermes local login is present; upstream revocation is checked on the next turn.'],
+    ['OPENCODE', 'opencode', 'OpenCode local login is present; upstream revocation is checked on the next turn.'],
   ] as const)('%s async availability consumes native readiness instead of raw credential shape', async (
     provider,
     command,
     readinessMessage,
   ) => {
     const actualExecFileSync = jest.requireActual<typeof import('child_process')>('child_process').execFileSync;
+    const profileEnvironmentKey = provider === 'HERMES'
+      ? 'PORTAL_HERMES_HOME'
+      : provider === 'OPENCODE'
+        ? 'PORTAL_OPENCODE_HOME'
+        : undefined;
+    const previousProfileRoot = profileEnvironmentKey
+      ? process.env[profileEnvironmentKey]
+      : undefined;
+    const profileRoot = profileEnvironmentKey
+      ? fs.mkdtempSync(path.join(os.tmpdir(), 'portal-provider-availability-'))
+      : undefined;
+    if (profileEnvironmentKey && profileRoot) {
+      process.env[profileEnvironmentKey] = profileRoot;
+    }
     mockedExecFileSync.mockImplementation(((invokedCommand: string, args: string[]) => {
       if (invokedCommand === 'bash' && args[1]?.includes(`command -v ${command}`)) return `/usr/local/bin/${command}`;
-      if (invokedCommand === command && args.includes('--version')) {
-        if (provider === 'GROK') return `grok ${PORTAL_TOOL_VERSIONS.grokBuild}`;
+      if (path.basename(invokedCommand) === command && args.includes('--version')) {
+        if (provider === 'HERMES') return 'hermes 0.20.4';
+        if (provider === 'OPENCODE') return 'opencode 1.18.19';
         if (provider === 'CLAUDE_CODE') return `claude ${PORTAL_TOOL_VERSIONS.claudeCode}`;
         return `codex ${PORTAL_TOOL_VERSIONS.codexCli}`;
       }
@@ -724,8 +782,12 @@ describe('providerAvailability', () => {
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         credentialFingerprint: `${provider}-credential`,
         runtimeFingerprint: `${provider}-runtime`,
+        ...(provider === 'CODEX'
+          ? { runtimeVersion: PORTAL_TOOL_VERSIONS.codexCli, runtimeInstalled: true }
+          : provider === 'CLAUDE_CODE'
+            ? { runtimeVersion: PORTAL_TOOL_VERSIONS.claudeCode, runtimeInstalled: true }
+            : {}),
       });
-
     try {
       await expect(getProviderAvailabilityAsync(provider)).resolves.toMatchObject({
         name: provider,
@@ -735,7 +797,11 @@ describe('providerAvailability', () => {
         nativeAuthMessage: readinessMessage,
         reason: expect.stringContaining(readinessMessage),
       });
-      expect(readinessSpy).toHaveBeenCalledWith(provider);
+      if (provider === 'CLAUDE_CODE' || provider === 'CODEX') {
+        expect(readinessSpy).toHaveBeenCalledWith(provider, { executionScope: 'HOST_OPERATOR' });
+      } else {
+        expect(readinessSpy).toHaveBeenCalledWith(provider);
+      }
 
       readinessSpy.mockResolvedValueOnce({
         provider,
@@ -746,6 +812,11 @@ describe('providerAvailability', () => {
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         credentialFingerprint: `${provider}-credential`,
         runtimeFingerprint: `${provider}-runtime`,
+        ...(provider === 'CODEX'
+          ? { runtimeVersion: PORTAL_TOOL_VERSIONS.codexCli, runtimeInstalled: true }
+          : provider === 'CLAUDE_CODE'
+            ? { runtimeVersion: PORTAL_TOOL_VERSIONS.claudeCode, runtimeInstalled: true }
+            : {}),
       });
       await expect(getProviderAvailabilityAsync(provider)).resolves.toMatchObject({
         name: provider,
@@ -757,6 +828,11 @@ describe('providerAvailability', () => {
       readinessSpy.mockRestore();
       mockedExecFileSync.mockImplementation(actualExecFileSync as any);
       __resetProviderAvailabilityForTests();
+      if (profileEnvironmentKey) {
+        if (previousProfileRoot === undefined) delete process.env[profileEnvironmentKey];
+        else process.env[profileEnvironmentKey] = previousProfileRoot;
+      }
+      if (profileRoot) fs.rmSync(profileRoot, { recursive: true, force: true });
     }
   });
 
@@ -767,7 +843,44 @@ describe('providerAvailability', () => {
     expect(cliVersionMatchesExact('grok 0.2.1031', '0.2.103')).toBe(false);
   });
 
-  test('soft-pinned CLI drift stays usable but is truthfully reported', async () => {
+  test.each([
+    ['HERMES', 'hermes', '0.20.5', '0.20.4'],
+    ['OPENCODE', 'opencode', '1.18.20', '1.18.19'],
+  ] as const)('%s availability rejects an installed version outside its exact pin', (
+    provider,
+    command,
+    installedVersion,
+    testedVersion,
+  ) => {
+    const actualExecFileSync = jest.requireActual<typeof import('child_process')>('child_process').execFileSync;
+    mockedExecFileSync.mockImplementation(((invokedCommand: string, args: string[]) => {
+      if (invokedCommand === 'bash' && args[1]?.includes(`command -v ${command}`)) return `/usr/local/bin/${command}`;
+      if (path.basename(invokedCommand) === command && args.includes('--version')) {
+        return `${command} ${installedVersion}`;
+      }
+      return '';
+    }) as any);
+    try {
+      __resetProviderAvailabilityForTests();
+      const availability = getProviderAvailability(provider);
+      expect(availability).toMatchObject({
+        installed: true,
+        implemented: true,
+        usable: false,
+      });
+      expect(availability.reason).toContain(testedVersion);
+      expect(availability.reason).toContain(
+        "Use this runtime's dedicated Portal setup or maintenance path",
+      );
+      expect(availability.reason).toContain('do not update it independently');
+      expect(availability.reason).not.toMatch(/reinstall|npm install|npm update|--maintain-tools/i);
+    } finally {
+      mockedExecFileSync.mockImplementation(actualExecFileSync as any);
+      __resetProviderAvailabilityForTests();
+    }
+  });
+
+  test('Claude filesystem admission drift remains fail-closed', async () => {
     const actualExecFileSync = jest.requireActual<typeof import('child_process')>('child_process').execFileSync;
     mockedExecFileSync.mockImplementation(((invokedCommand: string, args: string[]) => {
       if (invokedCommand === 'bash' && args[1]?.includes('command -v claude')) return '/usr/local/bin/claude';
@@ -777,27 +890,25 @@ describe('providerAvailability', () => {
     const readinessSpy = jest.spyOn(nativeProviderReadiness, 'getNativeProviderReadiness')
       .mockResolvedValue({
         provider: 'CLAUDE_CODE',
-        state: 'login_present',
-        usable: true,
-        message: 'Claude Code local login is present; upstream revocation is checked on the next turn.',
+        state: 'runtime_unavailable',
+        usable: false,
+        message: 'Claude Code host CLI admission failed (DRIFT_DETECTED).',
         checkedAt: new Date().toISOString(),
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         credentialFingerprint: 'claude-credential',
         runtimeFingerprint: 'claude-runtime',
+        runtimeVersion: '2.1.220',
+        runtimeInstalled: true,
+        runtimeAdmissionCode: 'DRIFT_DETECTED',
       });
 
     try {
       await expect(getProviderAvailabilityAsync('CLAUDE_CODE')).resolves.toMatchObject({
         name: 'CLAUDE_CODE',
         installed: true,
-        usable: true,
-        versionDrift: {
-          tested: PORTAL_TOOL_VERSIONS.claudeCode,
-          installed: '9.9.9',
-        },
-        reason: expect.stringContaining(
-          `Installed claude 9.9.9 has drifted from the Portal-tested ${PORTAL_TOOL_VERSIONS.claudeCode}`,
-        ),
+        usable: false,
+        version: '2.1.220',
+        reason: expect.stringContaining('DRIFT_DETECTED'),
       });
     } finally {
       readinessSpy.mockRestore();
@@ -806,7 +917,7 @@ describe('providerAvailability', () => {
     }
   });
 
-  test('matching soft pins report no drift', async () => {
+  test('an admitted Codex host CLI advertises advisory host readiness with its observed version', async () => {
     const actualExecFileSync = jest.requireActual<typeof import('child_process')>('child_process').execFileSync;
     mockedExecFileSync.mockImplementation(((invokedCommand: string, args: string[]) => {
       if (invokedCommand === 'bash' && args[1]?.includes('command -v codex')) return '/usr/local/bin/codex';
@@ -823,13 +934,16 @@ describe('providerAvailability', () => {
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         credentialFingerprint: 'codex-credential',
         runtimeFingerprint: 'codex-runtime',
+        runtimeVersion: '0.145.0',
+        runtimeInstalled: true,
       });
-
     try {
       const availability = await getProviderAvailabilityAsync('CODEX');
+      expect(availability.installed).toBe(true);
       expect(availability.usable).toBe(true);
+      expect(availability.version).toBe('0.145.0');
       expect(availability.versionDrift).toBeUndefined();
-      expect(availability.reason).not.toContain('drifted');
+      expect(availability.reason).toContain('Codex local login is present');
     } finally {
       readinessSpy.mockRestore();
       mockedExecFileSync.mockImplementation(actualExecFileSync as any);

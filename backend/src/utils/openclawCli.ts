@@ -1,5 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import {
+  readOpenClawAgentConfigContract,
+  type OpenClawAgentConfigFamily,
+} from '../services/openclawAgentConfigContract';
 
 const HOME_DIR = process.env.HOME || '/root';
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || path.join(HOME_DIR, '.openclaw');
@@ -21,6 +25,10 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'anthropic/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'anthropic/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+  'anthropic/fable-5.1': 'anthropic/claude-fable-5-1',
+  'anthropic/fable-5-1': 'anthropic/claude-fable-5-1',
+  'anthropic/claude-fable-5.1': 'anthropic/claude-fable-5-1',
+  'anthropic/claude-fable-5-1': 'anthropic/claude-fable-5-1',
   'anthropic/fable-5': 'anthropic/claude-fable-5',
   'anthropic/claude-fable-5': 'anthropic/claude-fable-5',
   'claude-cli/sonnet-4.6': 'anthropic/claude-sonnet-4-6',
@@ -37,6 +45,10 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'claude-cli/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+  'claude-cli/fable-5.1': 'anthropic/claude-fable-5-1',
+  'claude-cli/fable-5-1': 'anthropic/claude-fable-5-1',
+  'claude-cli/claude-fable-5.1': 'anthropic/claude-fable-5-1',
+  'claude-cli/claude-fable-5-1': 'anthropic/claude-fable-5-1',
   'claude-cli/fable-5': 'anthropic/claude-fable-5',
   'claude-cli/claude-fable-5': 'anthropic/claude-fable-5',
 };
@@ -72,10 +84,16 @@ const GOOGLE_MODEL_MAP: Record<string, string> = {
   'google-antigravity/gemini-3.1-flash-lite-preview': 'google-antigravity/gemini-3.5-flash',
 };
 
-// OpenClaw 2026.7.1 makes `openai/*` the canonical Codex-runtime route;
-// `codex/*` and `openai-codex/*` are legacy refs that still resolve upstream
-// but should normalize to the canonical ids everywhere in the portal.
+// OpenClaw 2026.9.1 uses `openai/*` as the canonical model namespace.
+// `codex/*` and `openai-codex/*` are retired refs; Codex execution intent is
+// represented separately by model-scoped agentRuntime.id="codex" metadata.
 const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
+  // Astra is an exact, entitlement-sensitive model id. Do not map generic
+  // `gpt-6` to it: account rollout and surface availability remain external.
+  'gpt-6-astra': 'openai/gpt-6-astra',
+  'openai/gpt-6-astra': 'openai/gpt-6-astra',
+  'codex/gpt-6-astra': 'openai/gpt-6-astra',
+  'openai-codex/gpt-6-astra': 'openai/gpt-6-astra',
   // Bare GPT-5.6 resolves to Sol, matching OpenClaw's fresh-setup default.
   'gpt-5.6': 'openai/gpt-5.6-sol',
   'openai/gpt-5.6': 'openai/gpt-5.6-sol',
@@ -112,6 +130,7 @@ const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
 };
 
 const CURRENT_CODEX_RUNTIME_MODELS = new Set([
+  'gpt-6-astra',
   'gpt-5.5',
   'gpt-5.5-pro',
   'gpt-5.6-sol',
@@ -227,14 +246,112 @@ function collectConfiguredMaintenanceModelCandidates(config: any): string[] {
   return uniqueStrings(candidates.filter(Boolean));
 }
 
-function hasCodexAuthProfile(config: any): boolean {
-  const openAiOrder = Array.isArray(config?.auth?.order?.openai) ? config.auth.order.openai : [];
-  if (openAiOrder.some((profileId: unknown) => String(profileId || '').includes('codex'))) return true;
-  const profiles = config?.auth?.profiles && typeof config.auth.profiles === 'object' ? config.auth.profiles : {};
-  return Object.entries<any>(profiles).some(([profileId, profile]) => {
-    const provider = String(profile?.provider || '').trim();
-    return profileId.includes('codex') || provider === 'codex' || provider === 'openai-codex';
-  });
+function isLegacyCodexModelRef(rawModel: string | null | undefined): boolean {
+  const normalized = String(rawModel || '').trim().toLowerCase();
+  return normalized.startsWith('codex/') || normalized.startsWith('openai-codex/');
+}
+
+function authProfileSelectsCodexRuntime(profileId: string, profile: any): boolean {
+  const normalizedProfileId = String(profileId || '').trim().toLowerCase();
+  const provider = String(profile?.provider || '').trim().toLowerCase();
+  const mode = String(profile?.mode || profile?.type || '').trim().toLowerCase();
+  if (normalizedProfileId.includes('codex')) return true;
+  if (provider === 'codex' || provider === 'codex-cli' || provider === 'openai-codex') return true;
+  // OpenClaw 2026.9.1 migrates Codex CLI credentials to the canonical
+  // openai:default OAuth profile. API-key profiles must not imply Codex.
+  return provider === 'openai' && mode === 'oauth';
+}
+
+function authProfileBelongsToOpenAI(profileId: string, profile: any): boolean {
+  const normalizedProfileId = String(profileId || '').trim().toLowerCase();
+  const provider = String(profile?.provider || '').trim().toLowerCase();
+  return normalizedProfileId.startsWith('openai:')
+    || normalizedProfileId.startsWith('openai-codex:')
+    || normalizedProfileId.startsWith('codex:')
+    || ['openai', 'openai-codex', 'codex', 'codex-cli'].includes(provider);
+}
+
+function collectAuthProfiles(config: any, authProfiles?: any): Record<string, any> {
+  const configProfiles = config?.auth?.profiles && typeof config.auth.profiles === 'object'
+    ? config.auth.profiles
+    : {};
+  const storedProfiles = authProfiles?.profiles && typeof authProfiles.profiles === 'object'
+    ? authProfiles.profiles
+    : {};
+  return { ...configProfiles, ...storedProfiles };
+}
+
+function hasCodexAuthProfile(config: any, authProfiles?: any): boolean {
+  const profiles = collectAuthProfiles(config, authProfiles);
+  const configuredOpenAiOrder = config?.auth?.order?.openai;
+  if (Array.isArray(configuredOpenAiOrder)) {
+    return configuredOpenAiOrder.some((profileId: unknown) => {
+      const id = String(profileId || '').trim();
+      return Boolean(id) && authProfileSelectsCodexRuntime(id, profiles[id]);
+    });
+  }
+  return Object.entries<any>(profiles).some(([profileId, profile]) => authProfileSelectsCodexRuntime(profileId, profile));
+}
+
+function authSelectionUnambiguouslyUsesCodex(config: any, authProfiles?: any): boolean {
+  const profiles = collectAuthProfiles(config, authProfiles);
+  const configuredOpenAiOrder = config?.auth?.order?.openai;
+  if (Array.isArray(configuredOpenAiOrder)) {
+    const openAiOrder = configuredOpenAiOrder
+      .map((profileId: unknown) => String(profileId || '').trim())
+      .filter(Boolean);
+    if (openAiOrder.length === 0) return false;
+    return openAiOrder.every((profileId: string) => authProfileSelectsCodexRuntime(profileId, profiles[profileId]));
+  }
+
+  const openAiProfiles = Object.entries<any>(profiles)
+    .filter(([profileId, profile]) => authProfileBelongsToOpenAI(profileId, profile));
+  return openAiProfiles.length > 0
+    && openAiProfiles.every(([profileId, profile]) => authProfileSelectsCodexRuntime(profileId, profile));
+}
+
+function ensureCodexModelRuntimePolicy(
+  entry: any,
+  family: OpenClawAgentConfigFamily,
+): boolean {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const currentRuntimeId = String(entry.agentRuntime?.id || '').trim().toLowerCase();
+  if (family === '2026.7.1') {
+    if (currentRuntimeId === 'codex' || currentRuntimeId === 'codex-cli') {
+      delete entry.agentRuntime;
+      return true;
+    }
+    return false;
+  }
+  // Match OpenClaw's route migration: explicit non-default policy wins.
+  if (currentRuntimeId && !['auto', 'default', 'codex', 'codex-cli'].includes(currentRuntimeId)) {
+    return false;
+  }
+  if (currentRuntimeId === 'codex') return false;
+  entry.agentRuntime = {
+    ...(entry.agentRuntime && typeof entry.agentRuntime === 'object' ? entry.agentRuntime : {}),
+    id: 'codex',
+  };
+  return true;
+}
+
+function ensureAstraSubscriptionTransport(config: any): boolean {
+  const entry = config?.agents?.defaults?.models?.['openai/gpt-6-astra'];
+  if (entry?.agentRuntime?.id !== 'codex') return false;
+  // OpenClaw 9.1 predates Astra's ChatGPT route mapping. Scope this override to
+  // Astra; ordinary OpenAI API-key models and credentials stay untouched.
+  config.models ||= {};
+  config.models.providers ||= {};
+  const provider = config.models.providers.openai ||= { baseUrl: 'https://api.openai.com/v1', models: [] };
+  provider.models = Array.isArray(provider.models) ? provider.models : [];
+  let model = provider.models.find((row: any) => row?.id === 'gpt-6-astra');
+  if (model?.api === 'openai-chatgpt-responses') return false;
+  if (!model) {
+    model = { id: 'gpt-6-astra', name: 'GPT-6 Astra' };
+    provider.models.push(model);
+  }
+  model.api = 'openai-chatgpt-responses';
+  return true;
 }
 
 function resolveSafeMaintenanceModel(config: any): string | null {
@@ -499,14 +616,17 @@ function modelForCurrentCodexRuntime(normalized: string): string {
 }
 
 export function modelForOpenClawSessionPatch(sessionInfo: any, portalModel: string): string {
-  const normalized = modelForCurrentCodexRuntime(normalizePortalModelId(portalModel));
+  const normalizedPortalModel = normalizePortalModelId(portalModel);
+  const runtimeHint = getOpenClawRuntimeHint(sessionInfo);
+  const codexRuntime = /\bcodex\b/.test(runtimeHint) || isLegacyCodexModelRef(portalModel);
+  const normalized = codexRuntime
+    ? modelForCurrentCodexRuntime(normalizedPortalModel)
+    : normalizedPortalModel;
   if (!normalized) return '';
 
-  // OpenClaw 2026.7.1 makes openai/* the canonical Codex-runtime route.
-  // Older Portal settings may still say codex/* or openai-codex/*, so keep
-  // those readable but send canonical openai/* ids back to OpenClaw.
-  const runtimeHint = getOpenClawRuntimeHint(sessionInfo);
-  const codexRuntime = /\bcodex\b/.test(runtimeHint) || normalized.startsWith('codex/') || normalized.startsWith('openai/');
+  // Model namespace and runtime are separate in OpenClaw 2026.9.1. Legacy
+  // Codex refs still become openai/*, but an ordinary OpenAI API session does
+  // not become a Codex session merely because its model has that prefix.
   if (codexRuntime) {
     if (normalized.startsWith('openai/')) return normalized;
     if (normalized.startsWith('codex/')) return `openai/${normalized.slice('codex/'.length)}`;
@@ -565,7 +685,7 @@ export function normalizePortalModelList(models: string[] | null | undefined): s
 }
 
 // Recommended model declarations for already-authenticated providers. OpenClaw
-// 2026.7.1 rejects sessions.patch for models missing from the
+// 2026.9.1 rejects sessions.patch for models missing from the
 // agents.defaults.models allowlist, so installs that authenticated before a
 // release must have new recommended models seeded during update repair.
 // Claude Sonnet 5 is deliberately NOT recommended or seeded: on the claude-cli
@@ -590,6 +710,15 @@ const RECOMMENDED_CODEX_SUBSCRIPTION_MODELS = [
   'openai/gpt-5.5',
 ];
 
+// Astra is hidden by Codex model/list until the exact model is declared. Keep
+// it separate from the cross-version recommendations so retained 7.1 hosts do
+// not advertise a model their runtime cannot serve. This is declaration-only:
+// account entitlement is established by an authenticated turn, never by the
+// model/list row, and Astra is never inserted into primary or fallbacks.
+const QUALIFIED_CODEX_2026_9_1_MODELS = [
+  'openai/gpt-6-astra',
+];
+
 /**
  * Declare a model in agents.defaults.models so OpenClaw allows selecting it.
  * Declaration-only self-heal: it never touches the primary/fallback chain.
@@ -599,7 +728,20 @@ export function ensureOpenClawModelDeclaration(rawModel: string): { changed: boo
   if (!normalized || !normalized.includes('/')) return { changed: false, model: normalized };
 
   const config = readJson<any>(CONFIG_PATH, {});
+  if (normalized === 'anthropic/claude-fable-5-1'
+    && readOpenClawAgentConfigContract(config).family !== '2026.9.1') {
+    return { changed: false, model: normalized };
+  }
   const authProfiles = readJson<any>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
+  const routesThroughCodex = normalized.startsWith('openai/')
+    && (isLegacyCodexModelRef(rawModel) || authSelectionUnambiguouslyUsesCodex(config, authProfiles));
+  const codexFamily = routesThroughCodex
+    ? readOpenClawAgentConfigContract(config).family
+    : null;
+  if (normalized === 'openai/gpt-6-astra'
+    && (!routesThroughCodex || codexFamily !== '2026.9.1')) {
+    return { changed: false, model: normalized };
+  }
   config.agents = config.agents && typeof config.agents === 'object' ? config.agents : {};
   config.agents.defaults = config.agents.defaults && typeof config.agents.defaults === 'object' ? config.agents.defaults : {};
   const defaults = config.agents.defaults;
@@ -618,7 +760,13 @@ export function ensureOpenClawModelDeclaration(rawModel: string): { changed: boo
       changed = true;
     }
   }
+  if (routesThroughCodex && codexFamily) {
+    if (ensureCodexModelRuntimePolicy(entry, codexFamily)) changed = true;
+  }
 
+  if (routesThroughCodex && codexFamily === '2026.9.1' && normalized === 'openai/gpt-6-astra') {
+    if (ensureAstraSubscriptionTransport(config)) changed = true;
+  }
   if (changed) writeJson(CONFIG_PATH, config);
   return { changed, model: normalized };
 }
@@ -628,9 +776,28 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
   const authProfiles = readJson<any>(AUTH_PROFILES_PATH, { version: 2, profiles: {} });
   let changed = false;
   const useClaudeCliRuntime = usesClaudeCliAuthProfile(config, authProfiles);
+  const hasCodexSubscriptionProfile = hasCodexAuthProfile(config, authProfiles);
+  const inferCodexRuntimeFromProfile = authSelectionUnambiguouslyUsesCodex(config, authProfiles);
 
-  const currentDefault = normalizeOpenClawConfigModelId(config?.agents?.defaults?.model?.primary || '');
-  let desiredDefault = normalizeOpenClawConfigModelId(preferredModel || currentDefault);
+  const rawCurrentDefault = String(config?.agents?.defaults?.model?.primary || '');
+  const rawDesiredDefault = String(preferredModel || rawCurrentDefault);
+  const existingModels = config?.agents?.defaults?.models || {};
+  const requiresCodexContract = hasCodexSubscriptionProfile
+    || isLegacyCodexModelRef(rawCurrentDefault)
+    || isLegacyCodexModelRef(rawDesiredDefault)
+    || Object.entries<any>(existingModels).some(([modelId, meta]) => (
+      isLegacyCodexModelRef(modelId)
+      || ['codex', 'codex-cli'].includes(String(meta?.agentRuntime?.id || '').trim().toLowerCase())
+    ));
+  const codexFamily = requiresCodexContract
+    ? readOpenClawAgentConfigContract(config).family
+    : (() => {
+      if (!useClaudeCliRuntime) return undefined;
+      try { return readOpenClawAgentConfigContract(config).family; }
+      catch { return undefined; } // Unknown legacy layouts never seed 9.1-only models.
+    })();
+  const currentDefault = normalizeOpenClawConfigModelId(rawCurrentDefault);
+  let desiredDefault = normalizeOpenClawConfigModelId(rawDesiredDefault || currentDefault);
   // A sonnet-5/mythos-5 default on the claude-cli runtime breaks every session:
   // thinking patches validate against the default model's off-only profile and
   // the CLI returns empty turns. Demote to Fable 5, which is proven working.
@@ -645,7 +812,6 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
     changed = true;
   }
 
-  const existingModels = config?.agents?.defaults?.models || {};
   const repairedModels: Record<string, any> = {};
   for (const [modelId, meta] of Object.entries<any>(existingModels)) {
     const normalizedModelId = normalizeOpenClawConfigModelId(modelId);
@@ -670,12 +836,32 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
         changed = true;
       }
     }
+    const originalRuntimeId = String(meta?.agentRuntime?.id || '').trim().toLowerCase();
+    if (normalizedModelId.startsWith('openai/')
+      && (inferCodexRuntimeFromProfile
+        || isLegacyCodexModelRef(modelId)
+        || originalRuntimeId === 'codex'
+        || originalRuntimeId === 'codex-cli')
+      && codexFamily
+      && ensureCodexModelRuntimePolicy(repairedModels[normalizedModelId], codexFamily)) {
+      changed = true;
+    }
     if (normalizedModelId !== modelId) changed = true;
   }
   if (desiredDefault && !repairedModels[desiredDefault]) {
-    repairedModels[desiredDefault] = useClaudeCliRuntime && desiredDefault.startsWith('anthropic/')
-      ? { agentRuntime: { id: 'claude-cli' } }
-      : {};
+    repairedModels[desiredDefault] = {};
+    if (useClaudeCliRuntime && desiredDefault.startsWith('anthropic/')) {
+      repairedModels[desiredDefault].agentRuntime = { id: 'claude-cli' };
+    } else if (desiredDefault.startsWith('openai/')
+      && (inferCodexRuntimeFromProfile || isLegacyCodexModelRef(rawDesiredDefault))
+      && codexFamily === '2026.9.1') {
+      repairedModels[desiredDefault].agentRuntime = { id: 'codex' };
+    }
+    changed = true;
+  } else if (desiredDefault?.startsWith('openai/')
+    && (inferCodexRuntimeFromProfile || isLegacyCodexModelRef(rawDesiredDefault))
+    && codexFamily
+    && ensureCodexModelRuntimePolicy(repairedModels[desiredDefault], codexFamily)) {
     changed = true;
   }
 
@@ -684,17 +870,29 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
   // requiring the user to redo provider setup. Declarations only allow
   // selection; they never change the primary/fallback chain.
   if (useClaudeCliRuntime) {
-    for (const modelId of RECOMMENDED_CLAUDE_SUBSCRIPTION_MODELS) {
+    const claudeModels = codexFamily === '2026.9.1'
+      ? ['anthropic/claude-fable-5-1', ...RECOMMENDED_CLAUDE_SUBSCRIPTION_MODELS]
+      : RECOMMENDED_CLAUDE_SUBSCRIPTION_MODELS;
+    for (const modelId of claudeModels) {
       if (!repairedModels[modelId]) {
         repairedModels[modelId] = { agentRuntime: { id: 'claude-cli' } };
         changed = true;
       }
     }
   }
-  if (hasCodexAuthProfile(config)) {
-    for (const modelId of RECOMMENDED_CODEX_SUBSCRIPTION_MODELS) {
+  if (hasCodexSubscriptionProfile) {
+    const subscriptionModels = codexFamily === '2026.9.1' && inferCodexRuntimeFromProfile
+      ? [...QUALIFIED_CODEX_2026_9_1_MODELS, ...RECOMMENDED_CODEX_SUBSCRIPTION_MODELS]
+      : RECOMMENDED_CODEX_SUBSCRIPTION_MODELS;
+    for (const modelId of subscriptionModels) {
       if (!repairedModels[modelId]) {
-        repairedModels[modelId] = {};
+        repairedModels[modelId] = inferCodexRuntimeFromProfile && codexFamily === '2026.9.1'
+          ? { agentRuntime: { id: 'codex' } }
+          : {};
+        changed = true;
+      } else if (inferCodexRuntimeFromProfile
+        && codexFamily
+        && ensureCodexModelRuntimePolicy(repairedModels[modelId], codexFamily)) {
         changed = true;
       }
     }
@@ -718,6 +916,8 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
     config.agents.defaults.model.fallbacks = repairedFallbacks;
     changed = true;
   }
+
+  if (codexFamily === '2026.9.1' && ensureAstraSubscriptionTransport(config)) changed = true;
 
   const memoryFlushRepair = ensureMemoryFlushMaintenanceModel(config);
   if (memoryFlushRepair.changed) changed = true;

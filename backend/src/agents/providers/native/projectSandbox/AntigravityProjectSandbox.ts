@@ -44,7 +44,7 @@ export const ANTIGRAVITY_PROJECT_RUNTIME_PROFILE: NativeCliProjectRuntimeProfile
   cliPath: '/usr/local/bin/node',
   allowLoopback: true,
   environment: Object.freeze({
-    AGY_CLI_DISABLE_AUTO_UPDATE: '1',
+    AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
     GOOGLE_CLOUD_TELEMETRY_DISABLED: '1',
   }),
 });

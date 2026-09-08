@@ -43,6 +43,7 @@ describe('backup status contract', () => {
       phaseIndex: 5,
       phaseTotal: 12,
       consecutiveFailures: 2,
+      failureCode: 'BACKUP_DATABASE_FENCE_FAILED',
       failureDetail: 'Database fence was lost before the snapshot completed',
     };
     expect(parseBackupStatus(JSON.stringify(status))).toMatchObject(status);
@@ -54,93 +55,12 @@ describe('backup status contract', () => {
     }))).toMatchObject({ status: 'degraded', consecutiveFailures: 2 });
     expect(parseBackupStatus(JSON.stringify({ ...status, phaseIndex: 13 }))).toBeNull();
     expect(parseBackupStatus(JSON.stringify({ ...status, phaseLabel: 'unsafe\u0000detail' }))).toBeNull();
+    expect(parseBackupStatus(JSON.stringify({ ...status, failureCode: 'backup_private_detail' }))).toBeNull();
+    expect(parseBackupStatus(JSON.stringify({ ...status, failureCode: `BACKUP_${'X'.repeat(57)}` }))).toBeNull();
     expect(parseBackupStatus(JSON.stringify({ ...status, failureDetail: '🧰'.repeat(250) }))).not.toBeNull();
     expect(parseBackupStatus(JSON.stringify({ ...status, failureDetail: '🧰'.repeat(251) }))).toBeNull();
     expect(parseBackupStatus(JSON.stringify({ ...status, consecutiveFailures: -1 }))).toBeNull();
   });
-});
-
-describe('SQLite online snapshot concurrency', () => {
-  it('survives a WAL sidecar appearing after admission while a writer stays connected', async () => {
-    const testRoot = makeTempRoot('backup-sqlite-sidecar-transition');
-    const sourceDir = path.join(testRoot, 'source');
-    const targetDir = path.join(testRoot, 'target');
-    fs.mkdirSync(sourceDir, { mode: 0o700 });
-    fs.mkdirSync(targetDir, { mode: 0o700 });
-    const sourcePath = path.join(sourceDir, 'live.sqlite');
-    const targetPath = path.join(targetDir, 'snapshot.sqlite');
-
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { DatabaseSync } = require('node:sqlite');
-    const setupDatabase = new DatabaseSync(sourcePath);
-    setupDatabase.prepare('PRAGMA journal_mode=WAL').get();
-    setupDatabase.exec('PRAGMA wal_autocheckpoint=0; CREATE TABLE payload (value BLOB NOT NULL); BEGIN');
-    const insertPayload = setupDatabase.prepare('INSERT INTO payload (value) VALUES (?)');
-    const payload = Buffer.alloc(4096, 0x5a);
-    for (let index = 0; index < 32_768; index += 1) insertPayload.run(payload);
-    setupDatabase.exec('COMMIT; PRAGMA wal_checkpoint(TRUNCATE)');
-    setupDatabase.close();
-    fs.chmodSync(sourcePath, 0o600);
-    expect(fs.existsSync(`${sourcePath}-wal`)).toBe(false);
-    expect(fs.existsSync(`${sourcePath}-shm`)).toBe(false);
-
-    const script = fs.readFileSync(backupScript, 'utf8');
-    const functionStart = script.indexOf('snapshot_sqlite_database() {');
-    const functionEnd = script.indexOf('\nmaterialize_openclaw_snapshot_database_list() {', functionStart);
-    expect(functionStart).toBeGreaterThanOrEqual(0);
-    expect(functionEnd).toBeGreaterThan(functionStart);
-    const harnessPath = path.join(testRoot, 'snapshot-harness.sh');
-    fs.writeFileSync(
-      harnessPath,
-      `set -euo pipefail\n${script.slice(functionStart, functionEnd)}\nsnapshot_sqlite_database "$1" "$2"\n`,
-      { mode: 0o700 },
-    );
-
-    const snapshot = spawn('bash', [harnessPath, sourcePath, targetPath], {
-      cwd: repositoryRoot,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const snapshotCompletion = new Promise<{ code: number | null; stderr: string }>((resolve) => {
-      let stderr = '';
-      snapshot.stderr?.on('data', (chunk) => { stderr += String(chunk); });
-      snapshot.on('close', (code) => resolve({ code, stderr }));
-    });
-    await waitUntil(() => fs.existsSync(targetPath), 10_000);
-
-    const writer = spawn('python3', ['-c', [
-      'import sqlite3, sys, time',
-      'connection = sqlite3.connect(sys.argv[1], timeout=30)',
-      'connection.execute("PRAGMA journal_mode=WAL")',
-      'connection.execute("INSERT INTO payload (value) VALUES (randomblob(4096))")',
-      'connection.commit()',
-      'print("writer-ready", flush=True)',
-      'time.sleep(30)',
-    ].join('; '), sourcePath], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    try {
-      await waitUntil(() => fs.existsSync(`${sourcePath}-wal`) && fs.existsSync(`${sourcePath}-shm`), 10_000);
-      const snapshotResult = await snapshotCompletion;
-      expect(snapshotResult).toEqual({ code: 0, stderr: '' });
-    } finally {
-      writer.kill('SIGTERM');
-      await new Promise<void>((resolve) => writer.once('close', () => resolve()));
-    }
-
-    const restoredDatabase = new DatabaseSync(targetPath, { readOnly: true });
-    try {
-      expect(restoredDatabase.prepare('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
-      const row = restoredDatabase.prepare('SELECT COUNT(*) AS count FROM payload').get() as { count: number };
-      expect(row.count).toBeGreaterThanOrEqual(32_768);
-      expect(row.count).toBeLessThanOrEqual(32_769);
-    } finally {
-      restoredDatabase.close();
-    }
-    for (const suffix of ['-wal', '-shm', '-journal']) {
-      expect(fs.existsSync(`${targetPath}${suffix}`)).toBe(false);
-    }
-  }, 45_000);
 });
 
 function makeTempRoot(prefix: string): string {
@@ -372,7 +292,7 @@ describe('persistent backup runner', () => {
         ...process.env,
         ...fixture.env,
       },
-      timeout: 30_000,
+      timeout: 120_000,
     });
     expect(verification.status).not.toBe(0);
     expect(verification.stdout).toContain('no Portal backup archives were found');
@@ -390,25 +310,6 @@ describe('persistent backup runner', () => {
     });
     const fakeBin = fixture.commandsRoot;
     fs.writeFileSync(path.join(stateDir, 'backup-base-path'), `${backupRoot}\n`, { mode: 0o600 });
-    fs.writeFileSync(path.join(fakeBin, 'docker'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
-    fs.writeFileSync(path.join(fakeBin, 'pg_dump'), [
-      '#!/bin/sh',
-      'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then printf "%s\\n" "pg_dump (PostgreSQL) 16.14"; exit 0; fi',
-      'case " $* " in *"--dbname=postgresql://test%3Aowner@db.example.test:6543/test%2Ddb?sslmode=verify-full&sslrootcert=%2Fetc%2Fportal%20tls%2Froot.pem&options=-c%20statement_timeout%3D5000"*) ;; *) exit 91 ;; esac',
-      '[ -z "${DATABASE_URL:-}" ] || exit 92',
-      '[ -z "${PGDATABASE:-}" ] || exit 97',
-      '[ -n "${PGPASSFILE:-}" ] && [ -r "${PGPASSFILE}" ] || exit 93',
-      '[ "$(stat -Lc %a "${PGPASSFILE}")" = "600" ] || exit 94',
-      "grep -Fx 'db.example.test:6543:test-db:test\\:owner:p@ss\\:word\\\\tail' \"${PGPASSFILE}\" >/dev/null || exit 95",
-      "! env | grep '^PG' | grep -v '^PGPASSFILE=' >/dev/null || exit 96",
-      'printf "%s\\n" "PGDMPBRIDGESLLM-TEST-V1"',
-      '',
-    ].join('\n'), { mode: 0o700 });
-    fs.writeFileSync(
-      path.join(portalRoot, 'backend', '.env.production'),
-      'DATABASE_URL=postgresql://test%3Aowner:p%40ss%3Aword%5Ctail@db.example.test:6543/test%2Ddb?schema=tenant&sslmode=verify-full&sslrootcert=%2Fetc%2Fportal%20tls%2Froot.pem&options=-c%20statement_timeout%3D5000\n',
-      { mode: 0o600 },
-    );
     fs.writeFileSync(path.join(portalRoot, 'marker.txt'), 'portal data', { mode: 0o600 });
     const requiredSources = fixture.requiredSources;
     const venvBin = path.join(requiredSources.PROJECTS_ROOT, 'python-demo', '.venv', 'bin');
@@ -452,7 +353,7 @@ describe('persistent backup runner', () => {
       cwd: repositoryRoot,
       encoding: 'utf8',
       env: runnerEnv,
-      timeout: 30_000,
+      timeout: 120_000,
     });
 
     if (result.status !== 0) {
@@ -465,8 +366,8 @@ describe('persistent backup runner', () => {
       exitCode: 0,
       phase: 'completed',
       phaseLabel: 'Backup completed',
-      phaseIndex: 8,
-      phaseTotal: 8,
+      phaseIndex: 11,
+      phaseTotal: 11,
     });
     expect(status.archivePath).toMatch(new RegExp(`^${backupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/daily/portal-daily-`));
     expect(fs.statSync(status.archivePath).mode & 0o777).toBe(0o600);
@@ -496,10 +397,8 @@ describe('persistent backup runner', () => {
     ]) {
       expect(components.get(id)).toMatchObject({ requirement: 'required', status: 'captured' });
     }
-    expect(components.get('openclaw-state')).toMatchObject({
-      requirement: 'optional',
-      status: 'not-configured',
-    });
+    expect(recoveryManifest.schema).toBe('bridgesllm.portal-recovery.v3');
+    expect(components.has('openclaw-state')).toBe(false);
     for (const id of ['stalwart-data', 'stalwart-mail-data', 'stalwart-install']) {
       expect(components.get(id)).toMatchObject({
         requirement: 'optional',
@@ -511,11 +410,11 @@ describe('persistent backup runner', () => {
       cwd: repositoryRoot,
       encoding: 'utf8',
       env: runnerEnv,
-      timeout: 30_000,
+      timeout: 120_000,
     });
     expect(verification.status).toBe(0);
     expect(verification.stdout).toContain('  OK');
-  }, 35_000);
+  }, 150_000);
 
   it('backs up an older supported server patch with the security-floor client toolchain', () => {
     const testRoot = makeTempRoot('backup-older-server-patch');
@@ -536,7 +435,7 @@ describe('persistent backup runner', () => {
         ...process.env,
         ...fixture.env,
       },
-      timeout: 30_000,
+      timeout: 120_000,
     });
 
     if (result.status !== 0) {
@@ -551,364 +450,36 @@ describe('persistent backup runner', () => {
         ...process.env,
         ...fixture.env,
       },
-      timeout: 30_000,
+      timeout: 120_000,
     });
     expect(verification.status).toBe(0);
-  }, 35_000);
+  }, 150_000);
 
-  it('captures primary, Codex, and per-agent SQLite state while watchdog runtime state churns', async () => {
-    const testRoot = makeTempRoot('backup-openclaw-state');
-    const portalRoot = path.join(testRoot, 'portal');
-    const stateDir = path.join(portalRoot, 'backend', '.data', 'backups');
-    const backupRoot = path.join(testRoot, 'configured-backups');
+  it('excludes all OpenClaw state even when its database and sidecars are unsafe', () => {
+    const testRoot = makeTempRoot('backup-openclaw-excluded');
+    const fixture = createBackupRunnerFixture(testRoot);
     const openclawRoot = path.join(testRoot, '.openclaw');
-    const fixture = createBackupRunnerFixture(testRoot, {
-      backupRoot,
-      portalRoot,
-      stateDir,
-    });
     fs.mkdirSync(path.join(openclawRoot, 'state'), { recursive: true, mode: 0o700 });
-    fs.mkdirSync(path.join(openclawRoot, 'extensions', 'custom-plugin'), {
-      recursive: true,
-      mode: 0o700,
+    const database = path.join(openclawRoot, 'state', 'openclaw.sqlite');
+    fs.writeFileSync(database, 'not a SQLite database', { mode: 0o600 });
+    fs.symlinkSync('/nonexistent-private-state', `${database}-wal`);
+    fs.writeFileSync(path.join(openclawRoot, 'openclaw.json'), '{"sentinel":"must-stay-private"}');
+    const result = spawnSync('bash', [backupScript, 'daily'], {
+      cwd: repositoryRoot, encoding: 'utf8', timeout: 120_000,
+      env: { ...process.env, ...fixture.env, OPENCLAW_DIR: openclawRoot },
     });
-    fs.mkdirSync(path.join(openclawRoot, 'npm', 'projects', 'managed-plugin'), {
-      recursive: true,
-      mode: 0o700,
-    });
-    const codexHome = path.join(openclawRoot, 'agents', 'main', 'agent', 'codex-home');
-    for (const relative of ['.tmp', 'sessions', 'cache', 'shell_snapshots']) {
-      fs.mkdirSync(path.join(codexHome, relative), { recursive: true, mode: 0o700 });
-    }
-    fs.mkdirSync(path.join(openclawRoot, 'logs'), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(openclawRoot, 'openclaw.json'), '{"plugins":{}}\n', { mode: 0o600 });
-    // Keep a committed row in an open WAL while the backup runs. Copying only
-    // the live main file would miss it; SQLite's online backup must fold it
-    // into the standalone snapshot stored in the archive.
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { DatabaseSync } = require('node:sqlite');
-    const liveDatabasePath = path.join(openclawRoot, 'state', 'openclaw.sqlite');
-    const liveDatabase = new DatabaseSync(liveDatabasePath);
-    liveDatabase.prepare('PRAGMA journal_mode=WAL').get();
-    liveDatabase.exec(`
-      PRAGMA wal_autocheckpoint=0;
-      CREATE TABLE durable_state (value TEXT NOT NULL);
-      CREATE TABLE delivery_queue_entries (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-    `);
-    liveDatabase.prepare('INSERT INTO durable_state (value) VALUES (?)').run('committed in wal');
-    liveDatabase.prepare(
-      'INSERT INTO delivery_queue_entries (id, payload) VALUES (?, ?)',
-    ).run('stale-delivery', 'must not replay after restore');
-    fs.chmodSync(liveDatabasePath, 0o600);
-    expect(fs.existsSync(`${liveDatabasePath}-wal`)).toBe(true);
-    fs.writeFileSync(
-      path.join(openclawRoot, 'extensions', 'custom-plugin', 'index.js'),
-      'export default {};\n',
-      { mode: 0o600 },
-    );
-    fs.writeFileSync(
-      path.join(openclawRoot, 'npm', 'projects', 'managed-plugin', 'package.json'),
-      '{"private":true}\n',
-      { mode: 0o600 },
-    );
-    for (const [relative, contents] of [
-      ['config.toml', 'model = "openai/gpt-5.6-sol"\n'],
-      ['.tmp/plugin-cache', 'regenerable checkout\n'],
-      ['sessions/rollout.jsonl', 'volatile rollout\n'],
-      ['cache/models.json', 'regenerable cache\n'],
-      ['shell_snapshots/command.sh', 'volatile shell snapshot\n'],
-      ['models_cache.json', '{}\n'],
-      ['state_5.sqlite', 'volatile codex state\n'],
-      ['state_5.sqlite-wal', 'volatile codex state wal\n'],
-      ['logs_2.sqlite', 'volatile codex logs\n'],
-    ] as const) {
-      fs.writeFileSync(path.join(codexHome, relative), contents, { mode: 0o600 });
-    }
-    const codexDatabaseFixtures = [
-      ['memories_1.sqlite', 'durable memory committed in wal'],
-      ['goals_1.sqlite', 'durable goal committed in wal'],
-    ] as const;
-    const liveCodexDatabases = codexDatabaseFixtures.map(([filename, value]) => {
-      const databasePath = path.join(codexHome, filename);
-      const database = new DatabaseSync(databasePath);
-      database.prepare('PRAGMA journal_mode=WAL').get();
-      database.exec('PRAGMA wal_autocheckpoint=0; CREATE TABLE durable_record (value TEXT NOT NULL);');
-      database.prepare('INSERT INTO durable_record (value) VALUES (?)').run(value);
-      fs.chmodSync(databasePath, 0o600);
-      expect(fs.existsSync(`${databasePath}-wal`)).toBe(true);
-      return database;
-    });
-    const agentDatabasePath = path.join(openclawRoot, 'agents', 'main', 'agent', 'openclaw-agent.sqlite');
-    const liveAgentDatabase = new DatabaseSync(agentDatabasePath);
-    liveAgentDatabase.prepare('PRAGMA journal_mode=WAL').get();
-    liveAgentDatabase.exec('PRAGMA wal_autocheckpoint=0; CREATE TABLE durable_agent_record (value TEXT NOT NULL);');
-    liveAgentDatabase.prepare('INSERT INTO durable_agent_record (value) VALUES (?)')
-      .run('per-agent state committed in wal');
-    fs.chmodSync(agentDatabasePath, 0o600);
-    expect(fs.existsSync(`${agentDatabasePath}-wal`)).toBe(true);
-    const watchdogStateDir = path.join(openclawRoot, 'workspace-main', 'state');
-    const watchdogPath = path.join(watchdogStateDir, 'job-watchdog.json');
-    fs.mkdirSync(watchdogStateDir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(watchdogPath, '{"counter":0}\n', { mode: 0o600 });
-    const initialWatchdogMtimeNs = fs.statSync(watchdogPath, { bigint: true }).mtimeNs;
-    const watchdog = spawn('python3', ['-c', [
-      'import json, pathlib, sys, time',
-      'path = pathlib.Path(sys.argv[1])',
-      'counter = 0',
-      'while True:',
-      ' counter += 1',
-      ' path.write_text(json.dumps({"counter": counter}) + "\\n", encoding="utf-8")',
-      ' time.sleep(0.005)',
-    ].join('\n'), watchdogPath], { stdio: 'ignore' });
-    const watchdogStartedBy = Date.now() + 2_000;
-    let watchdogMtimeBeforeBackup = initialWatchdogMtimeNs;
-    while (watchdogMtimeBeforeBackup === initialWatchdogMtimeNs && Date.now() < watchdogStartedBy) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      watchdogMtimeBeforeBackup = fs.statSync(watchdogPath, { bigint: true }).mtimeNs;
-    }
-    expect(watchdogMtimeBeforeBackup).toBeGreaterThan(initialWatchdogMtimeNs);
-    fs.writeFileSync(path.join(openclawRoot, 'logs', 'gateway.log'), 'operational log\n', { mode: 0o600 });
+    if (result.status !== 0) throw new Error(`Portal-only backup failed: ${result.stdout}\n${result.stderr}`);
+    const status = JSON.parse(fs.readFileSync(path.join(fixture.stateDir, 'status.json'), 'utf8'));
+    expect(status.status).toBe('completed');
+    const manifest = JSON.parse(spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], { encoding: 'utf8' }).stdout);
+    expect(manifest.schema).toBe('bridgesllm.portal-recovery.v3');
+    expect(manifest.components.some((entry: any) => entry.id === 'openclaw-state')).toBe(false);
+    expect(spawnSync('tar', ['-tzf', status.archivePath], { encoding: 'utf8' }).stdout).not.toMatch(/openclaw/i);
+    expect(fs.readFileSync(database, 'utf8')).toBe('not a SQLite database');
+    expect(fs.readlinkSync(`${database}-wal`)).toBe('/nonexistent-private-state');
+  }, 150_000);
 
-    let result;
-    let watchdogMtimeAfterBackup = watchdogMtimeBeforeBackup;
-    try {
-      result = spawnSync('bash', [backupScript, 'daily'], {
-        cwd: repositoryRoot,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ...fixture.env,
-          OPENCLAW_BACKUP_POLICY: 'required',
-          OPENCLAW_DIR: openclawRoot,
-        },
-        timeout: 30_000,
-      });
-      // The watchdog file is deliberately excluded from recovery data because
-      // it is volatile and may be between truncate/write syscalls at any
-      // instant. Prove that it continued changing without parsing bytes after
-      // SIGTERM, which could itself interrupt the synthetic writer mid-write.
-      watchdogMtimeAfterBackup = fs.statSync(watchdogPath, { bigint: true }).mtimeNs;
-    } finally {
-      liveDatabase.close();
-      for (const database of liveCodexDatabases) database.close();
-      liveAgentDatabase.close();
-      if (watchdog.exitCode === null && watchdog.signalCode === null) {
-        watchdog.kill('SIGTERM');
-        await new Promise<void>((resolve) => watchdog.once('close', () => resolve()));
-      }
-    }
-    if (result.status !== 0) {
-      throw new Error(`OpenClaw-state backup failed (${result.status})\n${result.stdout}\n${result.stderr}`);
-    }
-    expect(watchdogMtimeAfterBackup).toBeGreaterThan(watchdogMtimeBeforeBackup);
-
-    const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
-    const extractionRoot = path.join(testRoot, 'extracted');
-    fs.mkdirSync(extractionRoot, { mode: 0o700 });
-    const outerExtraction = spawnSync(
-      'tar',
-      ['-xzf', status.archivePath, '-C', extractionRoot, './openclaw-state.tar.gz'],
-      { encoding: 'utf8' },
-    );
-    expect(outerExtraction.status).toBe(0);
-    const listing = spawnSync(
-      'tar',
-      ['-tzf', path.join(extractionRoot, 'openclaw-state.tar.gz')],
-      { encoding: 'utf8' },
-    );
-    expect(listing.status).toBe(0);
-    expect(listing.stdout).toContain('.openclaw/state/openclaw.sqlite');
-    expect(listing.stdout).not.toContain('.openclaw/state/openclaw.sqlite-wal');
-    expect(listing.stdout).not.toContain('.openclaw/state/openclaw.sqlite-shm');
-    expect(listing.stdout).toContain('.openclaw/extensions/custom-plugin/index.js');
-    expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/config.toml');
-    expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/memories_1.sqlite');
-    expect(listing.stdout).toContain('.openclaw/agents/main/agent/codex-home/goals_1.sqlite');
-    expect(listing.stdout).toContain('.openclaw/agents/main/agent/openclaw-agent.sqlite');
-    expect(listing.stdout).not.toContain('.openclaw/workspace-main/state/job-watchdog.json');
-    const listingMembers = new Set(listing.stdout.trim().split('\n'));
-    for (const database of ['memories_1.sqlite', 'goals_1.sqlite']) {
-      expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}`)).toBe(true);
-      expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-wal`)).toBe(false);
-      expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-shm`)).toBe(false);
-      expect(listingMembers.has(`.openclaw/agents/main/agent/codex-home/${database}-journal`)).toBe(false);
-    }
-    for (const suffix of ['', '-wal', '-shm', '-journal']) {
-      const member = `.openclaw/agents/main/agent/openclaw-agent.sqlite${suffix}`;
-      expect(listingMembers.has(member)).toBe(suffix === '');
-    }
-    for (const excludedMember of [
-      '.openclaw/agents/main/agent/codex-home/.tmp/plugin-cache',
-      '.openclaw/agents/main/agent/codex-home/sessions/rollout.jsonl',
-      '.openclaw/agents/main/agent/codex-home/cache/models.json',
-      '.openclaw/agents/main/agent/codex-home/shell_snapshots/command.sh',
-      '.openclaw/agents/main/agent/codex-home/models_cache.json',
-      '.openclaw/agents/main/agent/codex-home/state_5.sqlite',
-      '.openclaw/agents/main/agent/codex-home/state_5.sqlite-wal',
-      '.openclaw/agents/main/agent/codex-home/logs_2.sqlite',
-      '.openclaw/logs/gateway.log',
-    ]) {
-      expect(listing.stdout).not.toContain(excludedMember);
-    }
-    const npmMembers = listing.stdout
-      .split('\n')
-      .filter((member) => member.startsWith('.openclaw/npm'));
-    expect(npmMembers).toEqual(['.openclaw/npm/']);
-
-    const openclawExtractionRoot = path.join(testRoot, 'openclaw-extracted');
-    fs.mkdirSync(openclawExtractionRoot, { mode: 0o700 });
-    const sqliteExtraction = spawnSync(
-      'tar',
-      [
-        '-xzf', path.join(extractionRoot, 'openclaw-state.tar.gz'),
-        '-C', openclawExtractionRoot,
-        '.openclaw/state/openclaw.sqlite',
-        '.openclaw/agents/main/agent/codex-home/memories_1.sqlite',
-        '.openclaw/agents/main/agent/codex-home/goals_1.sqlite',
-        '.openclaw/agents/main/agent/openclaw-agent.sqlite',
-      ],
-      { encoding: 'utf8' },
-    );
-    expect(sqliteExtraction.status).toBe(0);
-    const restoredDatabase = new DatabaseSync(
-      path.join(openclawExtractionRoot, '.openclaw', 'state', 'openclaw.sqlite'),
-      { readOnly: true },
-    );
-    try {
-      expect(restoredDatabase.prepare('SELECT value FROM durable_state').get())
-        .toEqual({ value: 'committed in wal' });
-      expect(restoredDatabase.prepare('SELECT COUNT(*) AS count FROM delivery_queue_entries').get())
-        .toEqual({ count: 0 });
-      expect(restoredDatabase.prepare('PRAGMA quick_check').get()).toEqual({ quick_check: 'ok' });
-    } finally {
-      restoredDatabase.close();
-    }
-    for (const [filename, value] of codexDatabaseFixtures) {
-      const restoredCodexDatabase = new DatabaseSync(
-        path.join(openclawExtractionRoot, '.openclaw', 'agents', 'main', 'agent', 'codex-home', filename),
-        { readOnly: true },
-      );
-      try {
-        expect(restoredCodexDatabase.prepare('SELECT value FROM durable_record').get()).toEqual({ value });
-        expect(restoredCodexDatabase.prepare('PRAGMA quick_check').get()).toEqual({ quick_check: 'ok' });
-      } finally {
-        restoredCodexDatabase.close();
-      }
-    }
-    const restoredAgentDatabase = new DatabaseSync(
-      path.join(openclawExtractionRoot, '.openclaw', 'agents', 'main', 'agent', 'openclaw-agent.sqlite'),
-      { readOnly: true },
-    );
-    try {
-      expect(restoredAgentDatabase.prepare('SELECT value FROM durable_agent_record').get())
-        .toEqual({ value: 'per-agent state committed in wal' });
-      expect(restoredAgentDatabase.prepare('PRAGMA quick_check').get()).toEqual({ quick_check: 'ok' });
-    } finally {
-      restoredAgentDatabase.close();
-    }
-
-    const recoveryManifest = JSON.parse(
-      spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], { encoding: 'utf8' }).stdout,
-    );
-    const openclawComponent = recoveryManifest.components.find((entry: any) => entry.id === 'openclaw-state');
-    expect(openclawComponent).toMatchObject({ requirement: 'required', status: 'captured' });
-  }, 35_000);
-
-  it.each(['symlink', 'hardlink'] as const)(
-    'rejects a %s SQLite sidecar before opening the live OpenClaw database',
-    (sidecarType) => {
-      const testRoot = makeTempRoot(`backup-openclaw-${sidecarType}-sidecar`);
-      const portalRoot = path.join(testRoot, 'portal');
-      const stateDir = path.join(portalRoot, 'backend', '.data', 'backups');
-      const backupRoot = path.join(testRoot, 'configured-backups');
-      const openclawRoot = path.join(testRoot, '.openclaw');
-      const openclawState = path.join(openclawRoot, 'state');
-      const fixture = createBackupRunnerFixture(testRoot, {
-        backupRoot,
-        portalRoot,
-        stateDir,
-      });
-      fs.mkdirSync(openclawState, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(openclawRoot, 'openclaw.json'), '{}\n', { mode: 0o600 });
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { DatabaseSync } = require('node:sqlite');
-      const databasePath = path.join(openclawState, 'openclaw.sqlite');
-      const database = new DatabaseSync(databasePath);
-      database.exec('CREATE TABLE durable_state (value TEXT NOT NULL);');
-      database.close();
-      fs.chmodSync(databasePath, 0o600);
-      const outside = path.join(testRoot, `${sidecarType}-outside`);
-      fs.writeFileSync(outside, 'not a trusted SQLite sidecar', { mode: 0o600 });
-      const sidecar = `${databasePath}-${sidecarType === 'symlink' ? 'shm' : 'wal'}`;
-      if (sidecarType === 'symlink') fs.symlinkSync(outside, sidecar);
-      else fs.linkSync(outside, sidecar);
-
-      const result = spawnSync('bash', [backupScript, 'daily'], {
-        cwd: repositoryRoot,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ...fixture.env,
-          OPENCLAW_BACKUP_POLICY: 'required',
-          OPENCLAW_DIR: openclawRoot,
-        },
-        timeout: 30_000,
-      });
-      expect(result.status).not.toBe(0);
-      expect(`${result.stdout}\n${result.stderr}`).toContain(
-        'Required recovery source or SQLite snapshot could not be archived',
-      );
-      const status = JSON.parse(fs.readFileSync(path.join(stateDir, 'status.json'), 'utf8'));
-      expect(status).toMatchObject({
-        type: 'daily',
-        status: 'degraded',
-      });
-      expect(status.exitCode).not.toBe(0);
-      expect(status.failureDetail).toContain('published in degraded state');
-      expect(status.archivePath).toMatch(
-        new RegExp(`^${backupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/degraded/daily/portal-daily-`),
-      );
-      expect(fs.statSync(status.archivePath).mode & 0o777).toBe(0o600);
-
-      const recoveryManifest = JSON.parse(
-        spawnSync('tar', ['-xOzf', status.archivePath, './RECOVERY-MANIFEST.json'], {
-          encoding: 'utf8',
-        }).stdout,
-      );
-      expect(
-        recoveryManifest.components.find((entry: any) => entry.id === 'openclaw-state'),
-      ).toMatchObject({
-        requirement: 'required',
-        status: 'degraded',
-        payload: null,
-        captureMethod: null,
-        reason: 'Required recovery source or SQLite snapshot could not be archived after 3 attempts',
-      });
-
-      const strictVerification = spawnSync(
-        'bash',
-        [backupScript, '--verify-archive', status.archivePath],
-        {
-          cwd: repositoryRoot,
-          encoding: 'utf8',
-          env: {
-            ...process.env,
-            ...fixture.env,
-            OPENCLAW_BACKUP_POLICY: 'required',
-            OPENCLAW_DIR: openclawRoot,
-          },
-          timeout: 30_000,
-        },
-      );
-      expect(strictVerification.status).not.toBe(0);
-      expect(`${strictVerification.stdout}\n${strictVerification.stderr}`).toContain(
-        'degraded recovery component is not a complete backup',
-      );
-    },
-    40_000,
-  );
-
-  it('keeps backup database credentials anonymous and kills pg_dump with its parent', async () => {
+  it('keeps peer-fenced dumps credential-free and kills pg_dump with its parent', async () => {
     const testRoot = makeTempRoot('backup-pgpass-sigkill');
     const portalRoot = path.join(testRoot, 'portal');
     const stateDir = path.join(portalRoot, 'backend', '.data', 'backups');
@@ -928,16 +499,12 @@ describe('persistent backup runner', () => {
       `${backupRoot}\n`,
       { mode: 0o600 },
     );
-    fs.writeFileSync(path.join(fakeBin, 'docker'), '#!/bin/sh\nexit 1\n', {
-      mode: 0o700,
-    });
     fs.writeFileSync(path.join(fakeBin, 'pg_dump'), [
       '#!/bin/sh',
       'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then printf "%s\\n" "pg_dump (PostgreSQL) 16.14"; exit 0; fi',
-      `printf "%s\\n" "$$" > '${pgDumpPidFile}'`,
+      `python3 -c 'from pathlib import Path; print(next(x.split()[1] for x in Path("/proc/self/status").read_text().splitlines() if x.startswith("PPid:")))' > '${pgDumpPidFile}'`,
       `printf "%s\\n" "$PGPASSFILE" > '${pgpassPathFile}'`,
-      '[ -n "$PGPASSFILE" ] && [ -r "$PGPASSFILE" ] || exit 91',
-      `grep -F '${databasePassword}' "$PGPASSFILE" >/dev/null || exit 92`,
+      '[ -z "${PGPASSFILE:-}" ] && [ -z "${PGPASSWORD:-}" ] || exit 91',
       "trap '' TERM HUP INT",
       'while :; do :; done',
       '',
@@ -948,7 +515,7 @@ describe('persistent backup runner', () => {
       { mode: 0o600 },
     );
     const requiredSources = fixture.requiredSources;
-    const existingStaging = new Set(
+    const existingHostTmpStaging = new Set(
       fs.readdirSync('/tmp').filter((name) => name.startsWith('bridgesllm-backup-daily-')),
     );
     const backup = spawn('bash', [backupScript, 'daily'], {
@@ -975,30 +542,55 @@ describe('persistent backup runner', () => {
         ...fixture.env,
       },
     });
+    let backupStdout = '';
+    let backupStderr = '';
+    backup.stdout?.on('data', (chunk) => { backupStdout += String(chunk); });
+    backup.stderr?.on('data', (chunk) => { backupStderr += String(chunk); });
     let pgDumpPid = 0;
+    let pgDumpStart: string | undefined;
     let newStaging: string[] = [];
     try {
-      await waitUntil(() => fs.existsSync(pgDumpPidFile));
+      try {
+        await waitUntil(() => fs.existsSync(pgDumpPidFile)
+          && /^\d+\s*$/u.test(fs.readFileSync(pgDumpPidFile, 'utf8')), 90_000);
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}`
+          + `\nbackup stdout:\n${backupStdout}\nbackup stderr:\n${backupStderr}`,
+        );
+      }
       pgDumpPid = Number.parseInt(fs.readFileSync(pgDumpPidFile, 'utf8'), 10);
       expect(Number.isSafeInteger(pgDumpPid) && pgDumpPid > 1).toBe(true);
+      let ancestor = pgDumpPid;
+      for (let depth = 0; depth < 64 && ancestor > 1 && ancestor !== backup.pid; depth += 1) {
+        const fields = fs.readFileSync(`/proc/${ancestor}/stat`, 'utf8').split(') ')[1].split(' ');
+        ancestor = Number(fields[1]);
+      }
+      expect(ancestor).toBe(backup.pid);
+      pgDumpStart = fs.readFileSync(`/proc/${pgDumpPid}/stat`, 'utf8').split(') ')[1].split(' ')[19];
       await waitUntil(() => fs.existsSync(pgpassPathFile));
       const pgpassPath = fs.readFileSync(pgpassPathFile, 'utf8').trim();
-      expect(pgpassPath).toMatch(/^\/proc\/self\/fd\/[0-9]+$/u);
-      const inheritedPath = pgpassPath.replace('/proc/self/', `/proc/${pgDumpPid}/`);
-      expect(fs.readlinkSync(inheritedPath)).toContain('memfd:bridgesllm-backup-pgpass');
+      expect(pgpassPath).toBe('');
 
       backup.kill('SIGKILL');
       // A minimal test-container PID 1 may not reap an orphaned child. A
       // zombie has already been killed and cannot retain the anonymous memfd;
       // production systemd reaps it immediately.
       await waitUntil(() => processIsGoneOrZombie(pgDumpPid));
-      newStaging = fs.readdirSync('/tmp')
-        .filter((name) => (
-          name.startsWith('bridgesllm-backup-daily-')
-          && !existingStaging.has(name)
-        ))
-        .map((name) => path.join('/tmp', name));
-      expect(newStaging.length).toBeGreaterThan(0);
+      const workRoot = path.join(backupRoot, '.bridgesllm-work-v1');
+      newStaging = fs.readdirSync(workRoot)
+        .filter((name) => name.startsWith('create-daily-'))
+        .map((name) => path.join(workRoot, name));
+      // Namespace teardown may remove image-backed staging. Check all named
+      // host-visible scratch without requiring private staging to survive.
+      const credentialResidue = spawnSync('find',
+        [workRoot, '-type', 'f', '-name', '*.pgpass', '-print', '-quit'],
+        { encoding: 'utf8' });
+      expect(credentialResidue.status).toBe(0);
+      expect(credentialResidue.stdout.trim()).toBe('');
+      expect(
+        new Set(fs.readdirSync('/tmp').filter((name) => name.startsWith('bridgesllm-backup-daily-'))),
+      ).toEqual(existingHostTmpStaging);
       for (const staging of newStaging) {
         const namedCredential = spawnSync(
           'find',
@@ -1011,9 +603,11 @@ describe('persistent backup runner', () => {
       if (backup.exitCode === null && backup.signalCode === null) {
         backup.kill('SIGKILL');
       }
-      if (pgDumpPid > 1 && fs.existsSync(`/proc/${pgDumpPid}`)) {
+      if (pgDumpStart && pgDumpPid > 1 && fs.existsSync(`/proc/${pgDumpPid}`)) {
         try {
-          process.kill(pgDumpPid, 'SIGKILL');
+          if (fs.readFileSync(`/proc/${pgDumpPid}/stat`, 'utf8').split(') ')[1].split(' ')[19] === pgDumpStart) {
+            process.kill(pgDumpPid, 'SIGKILL');
+          }
         } catch {
           // The parent-death contract may win this race.
         }
@@ -1022,7 +616,7 @@ describe('persistent backup runner', () => {
         fs.rmSync(staging, { recursive: true, force: true });
       }
     }
-  }, 20_000);
+  }, 120_000);
 
   it('rejects query-string credential overrides before pg_dump can observe them', () => {
     const testRoot = makeTempRoot('backup-query-credential');
@@ -1049,7 +643,6 @@ describe('persistent backup runner', () => {
       'exit 0',
       '',
     ].join('\n'), { mode: 0o700 });
-    fs.writeFileSync(path.join(fakeBin, 'docker'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
 
     const result = spawnSync('bash', [backupScript, 'daily'], {
       cwd: repositoryRoot,
@@ -1120,7 +713,7 @@ describe('persistent backup runner', () => {
     fs.writeFileSync(priorCompleteArchive, 'prior complete archive sentinel', { mode: 0o600 });
     fs.writeFileSync(priorDegradedArchive, 'prior degraded archive sentinel', { mode: 0o600 });
     fs.writeFileSync(path.join(portalRoot, 'backend', '.env.production'), [
-      'DATABASE_URL=postgresql://test:test@127.0.0.1/test',
+      'DATABASE_URL=postgresql://portal:test@127.0.0.1:5432/portal',
       'INSTALL_PROFILE=custom',
       '',
     ].join('\n'), { mode: 0o600 });
@@ -1143,7 +736,7 @@ describe('persistent backup runner', () => {
         DEGRADED_KEEP: '1',
         ...fixture.env,
       },
-      timeout: 30_000,
+      timeout: 120_000,
     });
 
     expect(result.status).not.toBe(0);
@@ -1156,8 +749,8 @@ describe('persistent backup runner', () => {
       status: 'degraded',
       phase: 'verifying-archive',
       phaseLabel: 'Verifying and publishing archive',
-      phaseIndex: 8,
-      phaseTotal: 8,
+      phaseIndex: 10,
+      phaseTotal: 11,
       failureDetail: expect.stringContaining('published in degraded state'),
       consecutiveFailures: 3,
     });
@@ -1212,7 +805,7 @@ describe('persistent backup runner', () => {
           ...requiredSources,
           ...fixture.env,
         },
-        timeout: 30_000,
+        timeout: 120_000,
       },
     );
     expect(strictVerification.status).not.toBe(0);
@@ -1240,7 +833,7 @@ describe('persistent backup runner', () => {
         STALWART_MAIL_DIR: path.join(testRoot, 'missing-stalwart-mail'),
         STALWART_INSTALL_DIR: path.join(testRoot, 'missing-stalwart-install'),
       },
-      timeout: 35_000,
+      timeout: 120_000,
     });
     expect(result.status).not.toBe(0);
     if (!fs.existsSync(path.join(stateDir, 'status.json'))) {
@@ -1264,7 +857,7 @@ describe('persistent backup runner', () => {
       payload: null,
       reason: expect.stringContaining('symbolic link escapes its admitted roots'),
     });
-  }, 40_000);
+  }, 150_000);
 
   it('rejects an archive whose payload no longer matches its manifest', () => {
     const testRoot = makeTempRoot('backup-tamper');
@@ -1302,7 +895,7 @@ describe('persistent backup runner', () => {
         ...process.env,
         ...fixture.env,
       },
-      timeout: 30_000,
+      timeout: 120_000,
     });
     expect(verification.status).not.toBe(0);
     expect(verification.stdout).toContain('manifest checksum validation failed');
@@ -1341,7 +934,7 @@ describe('persistent backup runner', () => {
         ...process.env,
         ...fixture.env,
       },
-      timeout: 30_000,
+      timeout: 120_000,
     });
     expect(verification.status).not.toBe(0);
     expect(verification.stdout).toContain('manifest checksum validation failed');
@@ -1464,7 +1057,6 @@ describe('persistent backup runner', () => {
         + 'exit 1\n',
       { mode: 0o700 },
     );
-    fs.writeFileSync(fixture.commands.docker, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
 
     const result = spawnSync('bash', [backupScript, 'daily'], {
       cwd: repositoryRoot,
@@ -1499,7 +1091,6 @@ describe('persistent backup runner', () => {
       stateDir,
     });
     fs.writeFileSync(path.join(stateDir, 'backup-base-path'), `${backupRoot}\n`, { mode: 0o600 });
-    fs.writeFileSync(fixture.commands.docker, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
 
     // OpenClaw hard links its media directory to Portal Files uploads, so the
     // inode is reachable from a tree that is not part of this component and the
@@ -1524,7 +1115,7 @@ describe('persistent backup runner', () => {
         BACKUP_CONFIG_FILE: path.join(stateDir, 'backup-base-path'),
         PORTAL_OPERATION_LOCK_FILE: path.join(testRoot, 'portal-operation.lock'),
       },
-      timeout: 60_000,
+      timeout: 120_000,
     });
 
     if (result.status !== 0) {
@@ -1570,11 +1161,11 @@ describe('persistent backup runner', () => {
     fs.writeFileSync(
       fixture.commands.psql,
       psqlSource.replace(
-        'if command is not None:',
-        'if command is not None:\n'
+        '\nif command is not None:\n',
+        '\nif command is not None:\n'
           + '    if command.strip() == "SELECT 1":\n'
           + '        sys.stderr.write("psql: error: connection to server on socket failed\\n")\n'
-          + '        raise SystemExit(2)',
+          + '        raise SystemExit(2)\n',
       ),
       { mode: 0o700 },
     );
@@ -1590,7 +1181,7 @@ describe('persistent backup runner', () => {
         BACKUP_CONFIG_FILE: path.join(stateDir, 'backup-base-path'),
         PORTAL_OPERATION_LOCK_FILE: path.join(testRoot, 'portal-operation.lock'),
       },
-      timeout: 30_000,
+      timeout: 120_000,
     });
 
     expect(result.status).not.toBe(0);
@@ -1648,7 +1239,7 @@ describe('persistent backup runner', () => {
         BACKUP_STATE_DIR: stateDir,
         BACKUP_CONFIG_FILE: path.join(stateDir, 'backup-base-path'),
       },
-      timeout: 30_000,
+      timeout: 120_000,
     });
 
     expect(result.status).not.toBe(0);

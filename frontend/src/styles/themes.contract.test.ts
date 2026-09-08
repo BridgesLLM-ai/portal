@@ -91,6 +91,6 @@ describe('cross-product theme contract', () => {
     expect(avatarSource).toContain("assistant ? 'accent-avatar' : ringColor");
     expect(overflowMenuSource).toContain("if (active) return 'accent-active'");
     expect(overflowMenuSource).toContain("case 'success': return 'text-emerald-400 hover:bg-emerald-500/10'");
-    expect(avatarSource).toContain("gatewayStatus === 'connected' ? 'bg-emerald-500'");
+    expect(avatarSource).toContain("harnessIndicator.state === 'ready' ? 'bg-emerald-500'");
   });
 });

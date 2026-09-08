@@ -638,11 +638,11 @@
 			"args": [
 				{
 					"index": 0,
-					"value": 805437457,
+					"value": 939655185,
 					"op": "SCMP_CMP_EQ"
 				}
 			],
-			"comment": "Codex 0.144.6 bubblewrap: SIGCHLD|CLONE_NEWNS|CLONE_NEWUSER|CLONE_NEWPID",
+			"comment": "Codex 0.153.2 bubblewrap: SIGCHLD|CLONE_NEWNS|CLONE_NEWIPC|CLONE_NEWUSER|CLONE_NEWPID",
 			"excludes": {
 				"arches": [
 					"s390",
@@ -658,11 +658,11 @@
 			"args": [
 				{
 					"index": 1,
-					"value": 805437457,
+					"value": 939655185,
 					"op": "SCMP_CMP_EQ"
 				}
 			],
-			"comment": "Codex 0.144.6 bubblewrap: s390 clone flags parameter ordering",
+			"comment": "Codex 0.153.2 bubblewrap: s390 clone flags parameter ordering",
 			"includes": {
 				"arches": [
 					"s390",

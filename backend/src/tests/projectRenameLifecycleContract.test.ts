@@ -205,7 +205,7 @@ describe('Project rename lifecycle route contract', () => {
     const completionStart = routes.indexOf('async function completeAdmittedProjectDeletion');
     const completionBlock = routes.slice(
       completionStart,
-      routes.indexOf("router.delete('/:name'", completionStart),
+      routes.indexOf('export type AdminUserRetirementOwnedProjectTarget', completionStart),
     );
     const quiesce = completionBlock.indexOf('quiesceProjectChatBrokerCallbacksForDestructiveReset');
     const cleanup = completionBlock.indexOf('cleanupProjectRuntime');

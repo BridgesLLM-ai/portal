@@ -5,7 +5,6 @@ import type {
   OnStatusCallback,
 } from '../agents/AgentProvider.interface';
 import { AgentAbortError } from '../agents/AgentProvider.interface';
-import { AgentRegistry } from '../agents';
 import { streamEventBus } from './StreamEventBus';
 import * as projectProviderRegistry from './projectChatProviderRegistry';
 import {
@@ -61,7 +60,9 @@ beforeEach(() => {
     terminateSession: jest.fn(),
     abortActiveRun,
   };
-  jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider);
+  jest.spyOn(projectProviderRegistry, 'getProjectChatProviderAdapter').mockReturnValue(provider);
+  jest.spyOn(projectProviderRegistry, 'getProjectChatProviderCleanupController')
+    .mockReturnValue(provider as any);
   jest.spyOn(streamEventBus, 'startStream').mockImplementation(() => true);
   jest.spyOn(streamEventBus, 'publish').mockImplementation(() => undefined);
   jest.spyOn(streamEventBus, 'updateStreamPhase').mockImplementation(() => true);
@@ -234,7 +235,7 @@ test('uses the same bounded durable broker for an OpenClaw Project turn', async 
   });
 });
 
-test('preserves attested OpenClaw preamble reasoning and transient rail semantics', async () => {
+test('preserves attested OpenClaw preamble reasoning and keeps ordinary status rail-only', async () => {
   const onEvent = jest.fn();
   startProjectNativeRun({
     userId: USER_ID,
@@ -362,9 +363,7 @@ test('preserves attested OpenClaw preamble reasoning and transient rail semantic
     }),
     expect.objectContaining({
       type: 'status',
-      content: 'Reviewing the verified test output.',
-      replace: true,
-      assistantStatus: true,
+      content: 'untrusted wrapper text',
     }),
   ]));
   expect(snapshot?.events.find((event) => event.content === 'unattested preamble text'))
@@ -373,6 +372,10 @@ test('preserves attested OpenClaw preamble reasoning and transient rail semantic
     .not.toHaveProperty('preambleProgress');
   expect(snapshot?.events.find((event) => event.content === 'Thinking…'))
     .not.toHaveProperty('assistantStatus');
+  expect(snapshot?.events.find((event) => event.content === 'untrusted wrapper text'))
+    .not.toHaveProperty('assistantStatus');
+  expect(snapshot?.events.find((event) => event.content === 'untrusted wrapper text'))
+    .not.toHaveProperty('replace');
   expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
     type: 'thinking',
     preambleProgress: true,
@@ -468,7 +471,7 @@ test.each([
     message: 'Inspect safely',
   });
 
-  expect(AgentRegistry.get).toHaveBeenCalledWith(providerName);
+  expect(projectProviderRegistry.getProjectChatProviderAdapter).toHaveBeenCalledWith(providerName);
   expect(getProjectNativeRunSnapshot({
     userId: USER_ID,
     projectId: PROJECT_ID,
@@ -501,9 +504,9 @@ test('uses the dedicated Agent Zero Project adapter and retains correlated lifec
     terminateSession: jest.fn(),
     abortActiveRun,
   };
-  const resolveProjectAdapter = jest.spyOn(projectProviderRegistry, 'getProjectChatProviderAdapter')
+  const resolveProjectAdapter = jest.mocked(projectProviderRegistry.getProjectChatProviderAdapter)
     .mockReturnValue(dedicated);
-  jest.mocked(AgentRegistry.get).mockClear();
+  resolveProjectAdapter.mockClear();
 
   startProjectNativeRun({
     userId: USER_ID,
@@ -515,7 +518,6 @@ test('uses the dedicated Agent Zero Project adapter and retains correlated lifec
     model: 'codex_oauth/gpt-5.2-codex',
   });
   expect(resolveProjectAdapter).toHaveBeenCalledWith('AGENT_ZERO');
-  expect(AgentRegistry.get).not.toHaveBeenCalled();
   onStatus?.({
     type: 'thinking',
     content: 'Planning',

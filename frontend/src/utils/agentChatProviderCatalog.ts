@@ -2,9 +2,42 @@ import client from '../api/client';
 
 export type AgentChatProviderAvailabilityState = 'checking' | 'ready' | 'stale' | 'error';
 
-export interface AgentChatProviderCatalogEntry {
+export type AgentChatHarnessTransport =
+  | 'gateway'
+  | 'native-cli'
+  | 'acp-stdio'
+  | 'json-rpc-stdio'
+  | 'connector';
+
+export type AgentChatHarnessReleaseStage = 'stable' | 'planned' | 'developer-preview';
+export type AgentChatHarnessCancellationMode = 'none' | 'protocol' | 'process-kill';
+
+export interface AgentChatHarnessAuthMetadata {
+  owner?: 'model-provider-account' | 'harness-local-login' | 'none';
+  requiresSeparateLogin?: boolean;
+  modelProviderIds?: readonly string[];
+}
+
+export interface AgentChatHarnessModelMetadata {
+  catalogOwner?: 'portal-declared' | 'harness' | 'model-provider-account' | 'local-runtime' | 'none';
+  catalogKind?: 'none' | 'dynamic' | 'declared';
+  selectionMode?: 'none' | 'session' | 'launch' | 'prompt-command';
+  canEnumerate?: boolean;
+  supportsCustomInput?: boolean;
+}
+
+export interface AgentChatHarnessCatalogEntry {
+  /** Stable 4.1 runtime identity. */
+  harnessId?: string;
+  /** Legacy provider compatibility field retained for existing callers/storage. */
   name: string;
   displayName: string;
+  transport?: AgentChatHarnessTransport;
+  releaseStage?: AgentChatHarnessReleaseStage;
+  provenanceLabel?: string;
+  hostStreamOwnership?: 'provider' | 'route' | 'none';
+  selectable?: boolean;
+  compatibilityProviderId?: string | null;
   installed?: boolean | null;
   implemented?: boolean;
   usable?: boolean;
@@ -20,6 +53,10 @@ export interface AgentChatProviderCatalogEntry {
   stale?: boolean;
   checkedAt?: string;
   lastKnownUsable?: boolean;
+  unavailableReason?: string;
+  documentationUrl?: string;
+  auth?: AgentChatHarnessAuthMetadata;
+  models?: AgentChatHarnessModelMetadata;
   capabilities?: {
     implemented?: boolean;
     requiresGateway?: boolean;
@@ -30,14 +67,32 @@ export interface AgentChatProviderCatalogEntry {
     modelSelectionMode?: string;
     supportsCustomModelInput?: boolean;
     canEnumerateModels?: boolean;
+    supportsNewSession?: boolean;
+    supportsSessionClose?: boolean;
+    supportsModelReadback?: boolean;
     supportsSessionList?: boolean;
+    supportsSessionResume?: boolean;
+    supportsSessionFork?: boolean;
+    supportsLiveText?: boolean;
+    supportsReasoning?: boolean;
+    supportsAskUser?: boolean;
+    supportsAttachments?: boolean;
+    supportsCancellation?: boolean;
+    cancellationMode?: AgentChatHarnessCancellationMode;
     supportsExecApproval?: boolean;
+    supportsLiveToolEvents?: boolean;
     modelCatalogKind?: string;
     supportsInTurnSteering?: boolean;
     supportsQueuedFollowUps?: boolean;
     followUpMode?: string;
+    supportsPromptCausalCompletion?: boolean;
+    supportsProcessRestartResume?: boolean;
+    supportedExecutionScopes?: readonly ('HOST_OPERATOR' | 'PROJECT_SANDBOX')[];
   };
 }
+
+/** @deprecated Use AgentChatHarnessCatalogEntry. Retained for 4.0 callers. */
+export type AgentChatProviderCatalogEntry = AgentChatHarnessCatalogEntry;
 
 interface CachedProviderCatalog {
   providers: AgentChatProviderCatalogEntry[];
@@ -145,6 +200,7 @@ const PROVIDER_CATALOG_POLL_INTERVAL_MS = 750;
 const PROVIDER_CATALOG_REQUEST_TIMEOUT_MS = 5_000;
 let cachedCatalog: CachedProviderCatalog | null = null;
 let activeCatalogFlight: ProviderCatalogFlight | null = null;
+let useLegacyProvidersEndpoint = false;
 
 function providerCatalogKey(provider: unknown): string {
   return String(provider || '').trim().toUpperCase();
@@ -156,7 +212,10 @@ function findProviderCatalogEntry(
 ): AgentChatProviderCatalogEntry | undefined {
   const key = providerCatalogKey(provider);
   if (!key) return undefined;
-  return providers.find((entry) => providerCatalogKey(entry?.name) === key);
+  return providers.find((entry) => (
+    providerCatalogKey(entry?.harnessId) === key
+    || providerCatalogKey(entry?.name) === key
+  ));
 }
 
 function cachedSnapshotMetadata(
@@ -172,21 +231,74 @@ function cachedSnapshotMetadata(
 
 function validateCatalog(value: unknown): AgentChatProviderCatalogEntry[] {
   if (!Array.isArray(value)) {
-    throw new Error('Provider catalog response did not include a providers array');
+    throw new Error('Harness catalog response did not include a harnesses or providers array');
   }
   return value.map((entry) => {
     if (!entry || typeof entry !== 'object') {
-      throw new Error('Provider catalog included an invalid provider row');
+      throw new Error('Harness catalog included an invalid row');
     }
-    const candidate = entry as Partial<AgentChatProviderCatalogEntry>;
-    if (typeof candidate.name !== 'string' || !candidate.name.trim()) {
-      throw new Error('Provider catalog included a provider without a name');
+    const candidate = entry as Partial<AgentChatProviderCatalogEntry> & {
+      id?: unknown;
+      availability?: unknown;
+    };
+    const availability = candidate.availability && typeof candidate.availability === 'object'
+      ? candidate.availability as Partial<AgentChatProviderCatalogEntry>
+      : {};
+    const harnessId = [candidate.harnessId, candidate.id, candidate.name]
+      .find((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+      ?.trim();
+    if (!harnessId) {
+      throw new Error('Harness catalog included a row without a harness id');
     }
     if (typeof candidate.displayName !== 'string' || !candidate.displayName.trim()) {
-      throw new Error(`Provider catalog included ${candidate.name} without a display name`);
+      throw new Error(`Harness catalog included ${harnessId} without a display name`);
     }
-    return candidate as AgentChatProviderCatalogEntry;
+    const compatibilityName = typeof candidate.name === 'string' && candidate.name.trim()
+      ? candidate.name.trim()
+      : typeof candidate.compatibilityProviderId === 'string' && candidate.compatibilityProviderId.trim()
+        ? candidate.compatibilityProviderId.trim()
+        : harnessId;
+    return {
+      ...candidate,
+      ...availability,
+      harnessId,
+      name: compatibilityName,
+      displayName: candidate.displayName.trim(),
+    } as AgentChatProviderCatalogEntry;
   });
+}
+
+function isMissingHarnessCatalogEndpoint(error: unknown): boolean {
+  return Boolean(
+    error
+    && typeof error === 'object'
+    && (error as { response?: { status?: unknown } }).response?.status === 404,
+  );
+}
+
+async function requestHarnessCatalog(
+  signal: AbortSignal,
+  timeout: number,
+): Promise<AgentChatProviderCatalogEntry[]> {
+  const request = async (url: '/gateway/harnesses' | '/gateway/providers') => {
+    const { data } = await client.get(url, {
+      signal,
+      timeout,
+      _silent: true,
+    } as any);
+    return validateCatalog(data?.harnesses ?? data?.providers);
+  };
+
+  if (useLegacyProvidersEndpoint) return request('/gateway/providers');
+  try {
+    return await request('/gateway/harnesses');
+  } catch (error) {
+    if (!isMissingHarnessCatalogEndpoint(error)) throw error;
+    // 4.0.x compatibility only. Server failures from a real /harnesses route
+    // must remain visible instead of being masked by a second authority.
+    useLegacyProvidersEndpoint = true;
+    return request('/gateway/providers');
+  }
 }
 
 function normalizePositiveDuration(value: number | undefined, fallback: number): number {
@@ -269,12 +381,10 @@ async function runCatalogFlight(
 
     try {
       const remainingMs = Math.max(1, flight.timeoutMs - elapsedBeforeRequest);
-      const { data } = await client.get('/gateway/providers', {
-        signal: flight.controller.signal,
-        timeout: Math.max(1, Math.min(flight.requestTimeoutMs, remainingMs)),
-        _silent: true,
-      } as any);
-      const providers = validateCatalog(data?.providers);
+      const providers = await requestHarnessCatalog(
+        flight.controller.signal,
+        Math.max(1, Math.min(flight.requestTimeoutMs, remainingMs)),
+      );
       cachedCatalog = {
         providers,
         fetchedAt: Date.now(),
@@ -430,9 +540,9 @@ export function invalidateAgentChatProviderCatalog(): void {
 
 export function formatAgentChatProviderCatalogLoadError(error: unknown): string {
   if (error instanceof AgentChatProviderCatalogLoadError && error.code === 'TIMEOUT') {
-    return 'Provider availability checks timed out. Retry to check again.';
+    return 'Harness availability checks timed out. Retry to check again.';
   }
-  return 'Provider availability could not be loaded. Retry to check again.';
+  return 'Harness availability could not be loaded. Retry to check again.';
 }
 
 export function assessAgentChatProviderAvailability(
@@ -440,10 +550,6 @@ export function assessAgentChatProviderAvailability(
   entry: AgentChatProviderCatalogEntry | undefined,
   options: { loading?: boolean; loadError?: string | null } = {},
 ): AgentChatProviderAvailabilityAssessment {
-  if (providerName === 'OPENCLAW') {
-    return { status: 'ready', canSend: true, message: null, retryable: false };
-  }
-
   const displayName = entry?.displayName || providerName;
   if (options.loadError) {
     return {
@@ -470,7 +576,7 @@ export function assessAgentChatProviderAvailability(
     };
   }
 
-  const detail = entry.nativeAuthMessage || entry.reason;
+  const detail = entry.nativeAuthMessage || entry.reason || entry.unavailableReason;
   if (isAgentChatProviderCatalogEntryChecking(entry)) {
     return {
       status: 'checking',
@@ -495,6 +601,14 @@ export function assessAgentChatProviderAvailability(
       retryable: true,
     };
   }
+  if (entry.selectable === false) {
+    return {
+      status: 'unusable',
+      canSend: false,
+      message: detail || `${displayName} is not selectable in Agent Chat.`,
+      retryable: false,
+    };
+  }
   if (entry.installed === null) {
     return {
       status: 'error',
@@ -515,7 +629,7 @@ export function assessAgentChatProviderAvailability(
     return {
       status: 'unusable',
       canSend: false,
-      message: detail || `${displayName} is not installed. Configure it in AI Providers before sending.`,
+      message: detail || `${displayName} is not installed. Configure its model account under Model Providers before sending.`,
       retryable: true,
     };
   }
@@ -553,7 +667,7 @@ export function reduceAgentChatSelectedProviderRevalidation(
       provider,
       generation: action.generation,
       requestVersion: action.requestVersion,
-      pending: provider !== 'OPENCLAW',
+      pending: true,
       loadError: null,
     };
   }
@@ -595,7 +709,6 @@ export function isAgentChatSelectedProviderRevalidationPending(
   requestVersion: number,
 ): boolean {
   const key = providerCatalogKey(provider);
-  if (key === 'OPENCLAW') return false;
   return !key
     || !state
     || state.provider !== key
@@ -607,4 +720,5 @@ export function __resetAgentChatProviderCatalogForTests(): void {
   activeCatalogFlight?.controller.abort();
   cachedCatalog = null;
   activeCatalogFlight = null;
+  useLegacyProvidersEndpoint = false;
 }

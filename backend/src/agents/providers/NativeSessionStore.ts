@@ -18,7 +18,7 @@ import {
   writeFileSync,
 } from 'fs';
 import path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type {
   AgentExecutionContext,
   AgentMessage,
@@ -81,6 +81,8 @@ const NATIVE_SESSION_PROVIDER_NAMES = new Set<AgentProviderName>([
   'AGENT_ZERO',
   'GEMINI',
   'OLLAMA',
+  'HERMES',
+  'OPENCODE',
 ]);
 
 export interface NativeSessionHistoryPage {
@@ -92,6 +94,12 @@ export interface NativeSessionHistoryPage {
   hasMore: boolean;
   beforeOffset: number | null;
   fileIdentity: string;
+}
+
+export interface PersistedNativeAcpModelDescriptor {
+  id: string;
+  name: string;
+  description?: string;
 }
 
 function providerDir(provider: AgentProviderName): string {
@@ -641,18 +649,32 @@ export function createNativeSession(provider: AgentProviderName, userId: string,
   assertExecutionContextBinding(config.executionContext, userId);
   ensureProviderDir(provider);
   const now = new Date().toISOString();
-  const sessionId = `${provider.toLowerCase()}-${userId}-${Date.now()}`;
+  // Wall-clock time is useful when reading an identifier, but it is not a
+  // uniqueness boundary. Two requests can be admitted in the same millisecond
+  // (including in different workers), so bind every new identity to fresh
+  // cryptographic entropy and refuse the astronomically unlikely collision.
+  const sessionId = `${provider.toLowerCase()}-${userId}-${Date.now()}-${randomUUID()}`;
+  if (
+    pathEntryExists(sessionPath(provider, sessionId))
+    || pathEntryExists(sessionHistoryPath(provider, sessionId))
+  ) {
+    throw new Error('Native agent session identity collision');
+  }
+  const defaultWorkingDirectory = path.join(process.env.HOME || '/root', '.openclaw', 'workspace-main');
+  const cwd = String(config?.metadata?.cwd || process.env.OPENCLAW_WORKSPACE || defaultWorkingDirectory);
+  if (config.executionContext.scope === 'HOST_OPERATOR'
+    && !config?.metadata?.cwd && !process.env.OPENCLAW_WORKSPACE) {
+    // A standalone native harness must work before OpenClaw has created a
+    // workspace. Only provision our default; never invent an explicit/project path.
+    mkdirSync(defaultWorkingDirectory, { recursive: true, mode: 0o700 });
+  }
   const data: NativeSessionData = {
     sessionId,
     provider,
     userId,
     createdAt: now,
     lastActivityAt: now,
-    cwd: String(
-      config?.metadata?.cwd
-      || process.env.OPENCLAW_WORKSPACE
-      || path.join(process.env.HOME || '/root', '.openclaw', 'workspace-main'),
-    ),
+    cwd,
     model: typeof config?.model === 'string'
       ? config.model
       : typeof config?.metadata?.model === 'string'
@@ -927,6 +949,8 @@ function providerLabel(provider: AgentProviderName): string {
     case 'AGENT_ZERO': return 'Agent Zero';
     case 'GEMINI': return 'Antigravity';
     case 'OLLAMA': return 'Ollama';
+    case 'HERMES': return 'Hermes';
+    case 'OPENCODE': return 'OpenCode';
     default: return 'Agent';
   }
 }
@@ -955,20 +979,52 @@ export function listNativeSessions(provider: AgentProviderName, userId: string):
 }
 
 /**
- * Strict immutable-context scanner used by Project deletion. Unlike the UI
- * summary API, this reads every provider-owned record and rejects malformed,
- * symlinked, or identity-drifted state. A session whose UUID matches the
- * project but whose root identity differs is an integrity failure, never a
- * candidate for best-effort deletion.
+ * Recover the last server-attested ACP model options after a Portal restart.
+ * These values came from session/new or session/load and are presentation
+ * metadata only; they never choose a provider or executable.
  */
-export function listNativeProjectSessions(
+export function readPersistedNativeAcpModelCatalog(
+  provider: Extract<AgentProviderName, 'HERMES' | 'OPENCODE'>,
+): PersistedNativeAcpModelDescriptor[] {
+  ensureProviderDir(provider);
+  const sessions = readdirSync(providerDir(provider))
+    .filter((name) => name.endsWith('.json') && !name.includes('.tmp-'))
+    .flatMap((name) => {
+      const session = loadNativeSessionMetadata(provider, name.replace(/\.json$/u, ''));
+      return session ? [session] : [];
+    })
+    .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
+  const deduped = new Map<string, PersistedNativeAcpModelDescriptor>();
+  for (const session of sessions) {
+    const rows = Array.isArray(session.metadata?.acpAvailableModels)
+      ? session.metadata.acpAvailableModels.slice(0, 2_000)
+      : [];
+    for (const row of rows) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+      const record = row as Record<string, unknown>;
+      const id = typeof record.id === 'string' ? record.id.trim() : '';
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:/+@=-]{0,511}$/u.test(id) || deduped.has(id)) continue;
+      const rawName = typeof record.name === 'string' ? record.name.trim() : '';
+      const rawDescription = typeof record.description === 'string'
+        ? record.description.trim()
+        : '';
+      deduped.set(id, {
+        id,
+        name: rawName.slice(0, 512) || id,
+        ...(rawDescription ? { description: rawDescription.slice(0, 2_048) } : {}),
+      });
+      if (deduped.size >= 2_000) return [...deduped.values()];
+    }
+  }
+  return [...deduped.values()];
+}
+
+function listNativeSessionIdentitiesStrict(
   provider: AgentProviderName,
-  query: NativeProjectSessionQuery,
 ): NativeSessionData[] {
   ensureProviderDir(provider);
   const directory = providerDir(provider);
-  const expectedRoot = path.resolve(query.canonicalRoot);
-  const matches: NativeSessionData[] = [];
+  const sessions: NativeSessionData[] = [];
   const entries = readdirSync(directory, { withFileTypes: true });
   const entryNames = new Set(entries.map((entry) => entry.name));
   const temporaryArtifacts = listNativeSessionTemporaryArtifacts(provider);
@@ -1062,8 +1118,48 @@ export function listNativeProjectSessions(
     }
 
     const session = identities[0];
+    if (session.executionContext) {
+      assertExecutionContextBinding(session.executionContext, session.userId);
+    }
+    sessions.push(Object.freeze({
+      ...session,
+      ...(session.executionContext
+        ? { executionContext: Object.freeze({ ...session.executionContext }) }
+        : {}),
+    }) as NativeSessionData);
+  }
+  return sessions;
+}
+
+/**
+ * Strict user-identity scanner used by account retirement. Unlike the UI
+ * summary API, this reads every provider-owned identity (including interrupted
+ * atomic writes) and rejects malformed, symlinked, orphaned, or conflicting
+ * state before returning a target user's sessions.
+ */
+export function listNativeUserSessions(
+  provider: AgentProviderName,
+  userId: string,
+): NativeSessionData[] {
+  const expectedUserId = String(userId || '').trim();
+  if (!expectedUserId) throw new Error('Native agent session user identity is invalid');
+  return listNativeSessionIdentitiesStrict(provider)
+    .filter((session) => session.userId === expectedUserId);
+}
+
+/**
+ * Strict immutable-context scanner used by Project deletion. A session whose
+ * UUID matches the project but whose root identity differs is an integrity
+ * failure, never a candidate for best-effort deletion.
+ */
+export function listNativeProjectSessions(
+  provider: AgentProviderName,
+  query: NativeProjectSessionQuery,
+): NativeSessionData[] {
+  const expectedRoot = path.resolve(query.canonicalRoot);
+  const matches: NativeSessionData[] = [];
+  for (const session of listNativeSessionIdentitiesStrict(provider)) {
     if (!session.executionContext || session.executionContext.scope !== 'PROJECT_SANDBOX') continue;
-    assertExecutionContextBinding(session.executionContext, session.userId);
     if (session.executionContext.projectId !== query.projectIdentityId) continue;
     if (
       path.resolve(session.executionContext.canonicalRoot) !== expectedRoot
@@ -1073,10 +1169,7 @@ export function listNativeProjectSessions(
     ) {
       throw new Error(`Native ${provider} Project session root identity drifted`);
     }
-    matches.push(Object.freeze({
-      ...session,
-      executionContext: Object.freeze({ ...session.executionContext }),
-    }) as NativeSessionData);
+    matches.push(session);
   }
   return matches;
 }

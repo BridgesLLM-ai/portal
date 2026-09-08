@@ -139,8 +139,13 @@ run_as_rd XDG_RUNTIME_DIR="$XDG_DIR" LOG_DIR="$LOG_DIR" /bin/bash -c '
     sleep 2
   done
   sleep 1
-  # Configure for audio streaming
+  # Configure audio only after the server actually answers. Optional audio
+  # failure must not be reported as a successful initialization.
   export PULSE_SERVER="unix:$XDG_RUNTIME_DIR/pulse/native"
+  if ! pactl info >/dev/null 2>&1; then
+    echo "PulseAudio is unavailable; the desktop remains usable" >&2
+    exit 1
+  fi
   pactl set-default-sink auto_null 2>/dev/null || true
   # CRITICAL: Unload suspend-on-idle so the monitor source always streams
   # Without this, parec blocks when no audio is playing and the browser gets no data
@@ -148,8 +153,9 @@ run_as_rd XDG_RUNTIME_DIR="$XDG_DIR" LOG_DIR="$LOG_DIR" /bin/bash -c '
   echo "PulseAudio started (suspend-on-idle disabled)"
 ' &
 PA_PID=$!
-wait $PA_PID 2>/dev/null || true
-echo "PulseAudio initialized"
+# Audio is optional and can take longer than desktop startup on a cold host.
+# Keep it in this service cgroup, but never gate XFCE/READY on its daemonization.
+echo "PulseAudio initialization running in background (PID=$PA_PID)"
 
 # Start XFCE as bridgesrd user on display :1
 # Redirect inside the unprivileged shell to keep every log write user-owned.
@@ -169,8 +175,9 @@ echo "Xtigervnc PID=$VNC_PID, XFCE PID=$XFCE_PID"
 # delayed autostart phase settles.
 SESSION_READY=false
 for i in $(seq 1 40); do
-  "$SESSION_GUARD" repair >/dev/null 2>&1 || true
-  if "$SESSION_GUARD" check >/dev/null 2>&1; then
+  # repair already runs the complete semantic check; do not run that
+  # expensive check twice before notifying systemd of the same readiness.
+  if "$SESSION_GUARD" repair >/dev/null 2>&1; then
     SESSION_READY=true
     echo "XFCE session is ready (attempt $i)"
     break

@@ -5,6 +5,12 @@ const stateSource = readFileSync(new URL('./ChatStateProvider.tsx', import.meta.
 const interfaceSource = readFileSync(new URL('../components/chat/ChatInterface.tsx', import.meta.url), 'utf8');
 
 describe('Agent Chat transport and cancellation contract', () => {
+  it('requires the authorization broker in addition to build or public direct-gateway settings', () => {
+    expect(stateSource).toContain('const DIRECT_GATEWAY_AUTHORIZATION_BROKER_READY = false;');
+    expect(stateSource).toContain('const configuredDirectGateway = publicSettings?.useDirectGateway ?? BUILD_TIME_USE_DIRECT_GATEWAY;');
+    expect(stateSource).toContain('const useDirectGateway = configuredDirectGateway && DIRECT_GATEWAY_AUTHORIZATION_BROKER_READY;');
+  });
+
   it('owns SSE as a distinct abortable transport and performs token-scoped WS handoff', () => {
     expect(stateSource).toContain("type ChatStreamTransport = 'portal' | 'direct' | 'sse'");
     expect(stateSource).toContain('signal: activeSse.controller.signal');
@@ -69,5 +75,22 @@ describe('Agent Chat transport and cancellation contract', () => {
     expect(stateSource).toContain('if (providerUsesPortalStreamBus(targetProvider))');
     expect(stateSource).toContain('const shouldReloadHistoryIfIdle = Boolean(streamingAssistantIdRef.current)');
     expect(stateSource).toContain('if (providerUsesPortalStreamBus(providerRef.current)');
+  });
+
+  it('keeps direct Codex lifecycle status rail-only and direct errors banner-only', () => {
+    const progressStart = stateSource.indexOf('if (codexProgressStatus) {');
+    const progressEnd = stateSource.indexOf("if (payload.stream === 'assistant')", progressStart);
+    const progressSource = stateSource.slice(progressStart, progressEnd);
+    expect(progressSource).toContain("setLiveRunPhase('thinking', codexProgressStatus)");
+    expect(progressSource).not.toContain('ensureStreamingAssistantBubble');
+    expect(progressSource).not.toContain('appendThinkingChunk');
+    expect(progressSource).not.toContain('setIsRunning(true)');
+
+    const directHandlerStart = stateSource.indexOf('const handleDirectGatewayEvent = useCallback');
+    const directErrorStart = stateSource.indexOf("case 'error': {", directHandlerStart);
+    const directErrorEnd = stateSource.indexOf("} else if (evt.event === 'agent')", directErrorStart);
+    const directErrorSource = stateSource.slice(directErrorStart, directErrorEnd);
+    expect(directErrorSource).toContain('setOperationalBanner({');
+    expect(directErrorSource).not.toContain("content: '⚠️ '");
   });
 });

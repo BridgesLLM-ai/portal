@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { execFile, spawn } from 'child_process';
+import { execFile, execFileSync, spawn } from 'child_process';
 import { promisify } from 'util';
 import { prisma } from '../config/database';
 
@@ -34,6 +34,7 @@ export interface BackupStatus {
   exitCode?: number;
   archivePath?: string;
   error?: string;
+  failureCode?: string;
   failureDetail?: string;
   phase?: string;
   phaseLabel?: string;
@@ -70,6 +71,40 @@ const MAX_OUTPUT_BYTES = 16 * 1024;
 const MAX_PATH_BYTES = 1024;
 const MAX_RECEIPT_BYTES = 16 * 1024;
 const BACKUP_RECEIPT_SCHEMA = 'bridgesllm.backup-publication.v1';
+export const BACKUP_REQUEST_RECEIPT_SCHEMA = 'bridgesllm.backup-request.v1';
+const BACKUP_REQUEST_ID_PATTERN = /^request-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const BACKUP_TIMER_ID_PATTERN = /^timer-(daily|weekly|monthly|comprehensive)-[0-9]{8}T[0-9]{6}-[1-9][0-9]*$/;
+const MAX_BACKUP_REQUEST_RECEIPTS = 32;
+
+export interface BackupRequestReceipt {
+  schema: typeof BACKUP_REQUEST_RECEIPT_SCHEMA;
+  id: string;
+  type: BackupType;
+  requestedAt: string;
+}
+
+export interface CreatedBackupRequestReceipt {
+  receipt: BackupRequestReceipt;
+  fullPath: string;
+  dev: string;
+  ino: string;
+}
+
+interface AttestedBackupRequestReceipt extends CreatedBackupRequestReceipt {
+  state: 'pending' | 'claimed';
+}
+
+export class BackupRequestPublicError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'BackupRequestPublicError';
+    if (cause !== undefined) (this as Error & { cause?: unknown }).cause = cause;
+  }
+}
 
 const TIMER_UNITS: Array<{
   type: Exclude<BackupType, 'weekly'>;
@@ -647,11 +682,345 @@ function atomicWrite(filePath: string, content: string, mode = 0o600): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const tempPath = `${filePath}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
   try {
-    fs.writeFileSync(tempPath, content, { encoding: 'utf8', mode, flag: 'wx' });
+    const descriptor = fs.openSync(
+      tempPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+        | (fs.constants.O_NOFOLLOW || 0),
+      mode,
+    );
+    try {
+      fs.fchmodSync(descriptor, mode);
+      fs.writeFileSync(descriptor, content, { encoding: 'utf8' });
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
     fs.renameSync(tempPath, filePath);
     fs.chmodSync(filePath, mode);
+    const published = fs.openSync(
+      filePath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0),
+    );
+    try { fs.fsyncSync(published); } finally { fs.closeSync(published); }
+    fsyncDirectory(path.dirname(filePath));
   } finally {
     try { fs.unlinkSync(tempPath); } catch {}
+  }
+}
+
+function fsyncDirectory(directory: string): void {
+  const descriptor = fs.openSync(
+    directory,
+    fs.constants.O_RDONLY
+      | (fs.constants.O_DIRECTORY || 0)
+      | (fs.constants.O_NOFOLLOW || 0),
+  );
+  try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+}
+
+function ensureBackupRequestDirectory(stateDirectory = BACKUP_STATE_DIR): string {
+  const normalizedState = path.resolve(stateDirectory);
+  if (!path.isAbsolute(stateDirectory)
+    || normalizedState !== stateDirectory
+    || normalizedState === path.parse(normalizedState).root
+    || Buffer.byteLength(normalizedState, 'utf8') > MAX_PATH_BYTES
+    || /[\x00-\x1f\x7f]/.test(normalizedState)) {
+    throw new Error('Backup request state directory is not canonical and bounded');
+  }
+  assertSecureExistingPrefix(normalizedState);
+  fs.mkdirSync(normalizedState, { recursive: true, mode: 0o700 });
+  fs.chmodSync(normalizedState, 0o700);
+  assertSecureDirectoryChain(normalizedState);
+  const stateStat = fs.lstatSync(normalizedState);
+  if ((stateStat.mode & 0o777) !== 0o700 || fs.realpathSync(normalizedState) !== normalizedState) {
+    throw new Error('Backup request state directory is unsafe');
+  }
+
+  const requestDirectory = path.join(normalizedState, 'requests');
+  try {
+    const existing = fs.lstatSync(requestDirectory);
+    if (!existing.isDirectory() || existing.isSymbolicLink()) {
+      throw new Error('Backup request receipt directory is unsafe');
+    }
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+    fs.mkdirSync(requestDirectory, { mode: 0o700 });
+  }
+  fs.chmodSync(requestDirectory, 0o700);
+  const requestStat = fs.lstatSync(requestDirectory);
+  if (!requestStat.isDirectory()
+    || requestStat.isSymbolicLink()
+    || requestStat.uid !== expectedOwnerUid()
+    || requestStat.gid !== expectedOwnerGid()
+    || (requestStat.mode & 0o777) !== 0o700
+    || fs.realpathSync(requestDirectory) !== requestDirectory) {
+    throw new Error('Backup request receipt directory is unsafe');
+  }
+  return requestDirectory;
+}
+
+function backupRequestReceiptPath(
+  type: BackupType,
+  id: string,
+  stateDirectory = BACKUP_STATE_DIR,
+): string {
+  if (!BACKUP_TYPES.includes(type) || !BACKUP_REQUEST_ID_PATTERN.test(id)) {
+    throw new Error('Backup request receipt identity is invalid');
+  }
+  const requestDirectory = ensureBackupRequestDirectory(stateDirectory);
+  const fullPath = path.join(requestDirectory, `${type}.${id}.pending.json`);
+  if (path.dirname(fullPath) !== requestDirectory || !isWithin(fullPath, requestDirectory)) {
+    throw new Error('Backup request receipt escaped its state directory');
+  }
+  return fullPath;
+}
+
+/**
+ * Publish the exact UI request identity before systemd is started. The shell
+ * claims this root-owned O_EXCL receipt under the backup lock; no environment
+ * expansion or mutable unit property carries authority across that boundary.
+ */
+export function createBackupRequestReceipt(
+  type: BackupType,
+  options: { id?: string; requestedAt?: string; stateDirectory?: string } = {},
+): CreatedBackupRequestReceipt {
+  const id = options.id || `request-${crypto.randomUUID()}`;
+  const requestedAt = options.requestedAt || new Date().toISOString();
+  const parsedRequestedAt = Date.parse(requestedAt);
+  if (!Number.isFinite(parsedRequestedAt)
+    || new Date(parsedRequestedAt).toISOString() !== requestedAt) {
+    throw new Error('Backup request receipt timestamp is invalid');
+  }
+  const stateDirectory = options.stateDirectory || BACKUP_STATE_DIR;
+  const fullPath = backupRequestReceiptPath(type, id, stateDirectory);
+  const receipt: BackupRequestReceipt = {
+    schema: BACKUP_REQUEST_RECEIPT_SCHEMA,
+    id,
+    type,
+    requestedAt,
+  };
+  const payload = `${JSON.stringify(receipt)}\n`;
+  if (Buffer.byteLength(payload, 'utf8') > 4096) {
+    throw new Error('Backup request receipt is unexpectedly large');
+  }
+
+  let descriptor: number | null = null;
+  let created = false;
+  try {
+    descriptor = fs.openSync(
+      fullPath,
+      fs.constants.O_WRONLY
+        | fs.constants.O_CREAT
+        | fs.constants.O_EXCL
+        | (fs.constants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    created = true;
+    fs.fchmodSync(descriptor, 0o600);
+    fs.writeFileSync(descriptor, payload, { encoding: 'utf8' });
+    fs.fsyncSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile()
+      || opened.nlink !== 1n
+      || opened.uid !== BigInt(expectedOwnerUid())
+      || opened.gid !== BigInt(expectedOwnerGid())
+      || (opened.mode & 0o777n) !== 0o600n) {
+      throw new Error('Backup request receipt did not retain its file contract');
+    }
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fsyncDirectory(path.dirname(fullPath));
+    return {
+      receipt,
+      fullPath,
+      dev: opened.dev.toString(),
+      ino: opened.ino.toString(),
+    };
+  } catch (error) {
+    if (descriptor !== null) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+    if (created) {
+      try { fs.unlinkSync(fullPath); } catch {}
+      try { fsyncDirectory(path.dirname(fullPath)); } catch {}
+    }
+    throw error;
+  }
+}
+
+function attestBackupRequestReceipt(
+  requestDirectory: string,
+  filename: string,
+): AttestedBackupRequestReceipt {
+  const match = /^(daily|weekly|monthly|comprehensive)\.(request-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(pending|claimed)\.json$/
+    .exec(filename);
+  if (!match) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'Backup request authority is unsafe or ambiguous and requires administrator recovery',
+    );
+  }
+  const [, rawType, id, rawState] = match;
+  const type = rawType as BackupType;
+  const state = rawState as 'pending' | 'claimed';
+  const fullPath = path.join(requestDirectory, filename);
+  if (path.dirname(fullPath) !== requestDirectory || !isWithin(fullPath, requestDirectory)) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'Backup request authority escaped its protected state directory',
+    );
+  }
+  const before = fs.lstatSync(fullPath, { bigint: true });
+  if (!before.isFile()
+    || before.isSymbolicLink()
+    || before.nlink !== 1n
+    || before.uid !== BigInt(expectedOwnerUid())
+    || before.gid !== BigInt(expectedOwnerGid())
+    || (before.mode & 0o777n) !== 0o600n
+    || before.size <= 0n
+    || before.size > 4096n) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'Backup request authority has unsafe ownership, permissions, or size',
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+  } catch (cause) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'Backup request authority is unreadable and requires administrator recovery',
+      cause,
+    );
+  }
+  const receipt = parsed as Partial<BackupRequestReceipt>;
+  const keys = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? Object.keys(parsed as Record<string, unknown>).sort()
+    : [];
+  const requestedAtMs = typeof receipt.requestedAt === 'string'
+    ? Date.parse(receipt.requestedAt)
+    : Number.NaN;
+  const after = fs.lstatSync(fullPath, { bigint: true });
+  if (keys.join(',') !== 'id,requestedAt,schema,type'
+    || receipt.schema !== BACKUP_REQUEST_RECEIPT_SCHEMA
+    || receipt.id !== id
+    || receipt.type !== type
+    || typeof receipt.requestedAt !== 'string'
+    || !Number.isFinite(requestedAtMs)
+    || new Date(requestedAtMs).toISOString() !== receipt.requestedAt
+    || requestedAtMs > Date.now() + 60_000
+    || requestedAtMs < Date.now() - 30 * 24 * 60 * 60 * 1000
+    || after.dev !== before.dev
+    || after.ino !== before.ino
+    || after.size !== before.size
+    || after.mtimeNs !== before.mtimeNs) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'Backup request authority changed or is malformed and requires administrator recovery',
+    );
+  }
+  return {
+    receipt: receipt as BackupRequestReceipt,
+    fullPath,
+    dev: before.dev.toString(),
+    ino: before.ino.toString(),
+    state,
+  };
+}
+
+function enumerateBackupRequestReceipts(
+  lease: BackupMutationLockLease,
+): AttestedBackupRequestReceipt[] {
+  assertBackupMutationLockLease(lease);
+  const requestDirectory = ensureBackupRequestDirectory();
+  const directory = fs.opendirSync(requestDirectory);
+  const names: string[] = [];
+  try {
+    for (;;) {
+      const entry = directory.readSync();
+      if (!entry) break;
+      names.push(entry.name);
+      if (names.length > MAX_BACKUP_REQUEST_RECEIPTS) {
+        throw new BackupRequestPublicError(
+          'BACKUP_REQUEST_RECOVERY_REQUIRED',
+          'Backup request authority contains too many recovery candidates',
+        );
+      }
+    }
+  } finally {
+    directory.closeSync();
+  }
+  const receipts = names.sort().map((name) => attestBackupRequestReceipt(requestDirectory, name));
+  if (receipts.length > 1) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'Multiple backup request authorities require administrator recovery before dispatch',
+    );
+  }
+  assertBackupMutationLockLease(lease);
+  return receipts;
+}
+
+function removeAttestedBackupRequestReceipt(
+  attested: AttestedBackupRequestReceipt,
+  lease: BackupMutationLockLease,
+): boolean {
+  assertBackupMutationLockLease(lease);
+  try {
+    const current = attestBackupRequestReceipt(
+      path.dirname(attested.fullPath),
+      path.basename(attested.fullPath),
+    );
+    if (current.dev !== attested.dev
+      || current.ino !== attested.ino
+      || current.state !== attested.state
+      || current.receipt.requestedAt !== attested.receipt.requestedAt) {
+      throw new BackupRequestPublicError(
+        'BACKUP_REQUEST_RECOVERY_REQUIRED',
+        'Backup request authority changed before exact retirement',
+      );
+    }
+    assertBackupMutationLockLease(lease);
+    fs.unlinkSync(attested.fullPath);
+    fsyncDirectory(path.dirname(attested.fullPath));
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+/** Remove only the still-pending inode published by createBackupRequestReceipt. */
+export function removeExactBackupRequestReceipt(
+  created: CreatedBackupRequestReceipt,
+): boolean {
+  const expectedPath = backupRequestReceiptPath(
+    created.receipt.type,
+    created.receipt.id,
+    path.dirname(path.dirname(created.fullPath)),
+  );
+  if (expectedPath !== created.fullPath) {
+    throw new Error('Backup request receipt path changed before retirement');
+  }
+  try {
+    const stat = fs.lstatSync(created.fullPath, { bigint: true });
+    if (!stat.isFile()
+      || stat.isSymbolicLink()
+      || stat.nlink !== 1n
+      || stat.uid !== BigInt(expectedOwnerUid())
+      || stat.gid !== BigInt(expectedOwnerGid())
+      || (stat.mode & 0o777n) !== 0o600n
+      || stat.dev.toString() !== created.dev
+      || stat.ino.toString() !== created.ino) {
+      throw new Error('Backup request receipt changed before retirement');
+    }
+    fs.unlinkSync(created.fullPath);
+    fsyncDirectory(path.dirname(created.fullPath));
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
   }
 }
 
@@ -826,7 +1195,7 @@ function isBackupProcess(status: BackupStatus): boolean {
   if (!status.pid || !Number.isSafeInteger(status.pid) || status.pid <= 1) return false;
   try {
     const cmdline = fs.readFileSync(`/proc/${status.pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
-    return cmdline.includes('backup-full.sh') && cmdline.includes(status.type);
+    return (cmdline.includes('backup-full.sh') || cmdline.includes('backup-data.py')) && cmdline.includes(status.type);
   } catch {
     return false;
   }
@@ -863,6 +1232,10 @@ export function parseBackupStatus(raw: string): BackupStatus | null {
       && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)
     );
     if (parsed.error !== undefined && !boundedText(parsed.error, 1000)) return null;
+    if (parsed.failureCode !== undefined && (
+      typeof parsed.failureCode !== 'string'
+      || !/^BACKUP_[A-Z0-9_]{1,56}$/.test(parsed.failureCode)
+    )) return null;
     if (parsed.failureDetail !== undefined && !boundedText(parsed.failureDetail, 1000)) return null;
     if (parsed.consecutiveFailures !== undefined && (
       !Number.isSafeInteger(parsed.consecutiveFailures)
@@ -905,6 +1278,10 @@ function boundedStatusText(value: string, maximumBytes: number): string {
 export function writeBackupStatus(status: BackupStatus): void {
   const normalized = { ...status };
   if (typeof normalized.error === 'string') normalized.error = boundedStatusText(normalized.error, 1000);
+  if (typeof normalized.failureCode === 'string'
+    && !/^BACKUP_[A-Z0-9_]{1,56}$/.test(normalized.failureCode)) {
+    throw new Error('Backup failure code is invalid');
+  }
   if (typeof normalized.failureDetail === 'string') {
     normalized.failureDetail = boundedStatusText(normalized.failureDetail, 1000);
   }
@@ -914,79 +1291,521 @@ export function writeBackupStatus(status: BackupStatus): void {
   atomicWrite(BACKUP_STATUS_FILE, `${JSON.stringify(normalized)}\n`);
 }
 
-export function readBackupStatus(): BackupStatus | null {
-  const raw = readSmallFile(BACKUP_STATUS_FILE, MAX_STATUS_BYTES);
-  if (!raw) return null;
+interface BackupStatusSnapshot {
+  status: BackupStatus | null;
+  identity: null | {
+    dev: bigint;
+    ino: bigint;
+    size: bigint;
+    mtimeNs: bigint;
+  };
+}
+
+function readPersistedBackupStatusSnapshot(): BackupStatusSnapshot {
+  let before: fs.BigIntStats;
+  try {
+    before = fs.lstatSync(BACKUP_STATUS_FILE, { bigint: true });
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return { status: null, identity: null };
+    throw error;
+  }
+  if (!before.isFile()
+    || before.isSymbolicLink()
+    || before.nlink !== 1n
+    || before.uid !== BigInt(expectedOwnerUid())
+    || before.gid !== BigInt(expectedOwnerGid())
+    || (before.mode & 0o777n) !== 0o600n
+    || before.size <= 0n
+    || before.size > BigInt(MAX_STATUS_BYTES)) {
+    throw new BackupRequestPublicError(
+      'BACKUP_STATUS_RECOVERY_REQUIRED',
+      'Persistent backup status is unsafe and requires administrator recovery',
+    );
+  }
+  const raw = fs.readFileSync(BACKUP_STATUS_FILE, 'utf8');
+  const after = fs.lstatSync(BACKUP_STATUS_FILE, { bigint: true });
   const status = parseBackupStatus(raw);
+  if (!status
+    || after.dev !== before.dev
+    || after.ino !== before.ino
+    || after.size !== before.size
+    || after.mtimeNs !== before.mtimeNs) {
+    throw new BackupRequestPublicError(
+      'BACKUP_STATUS_RECOVERY_REQUIRED',
+      'Persistent backup status changed or is malformed and requires administrator recovery',
+    );
+  }
+  return {
+    status,
+    identity: {
+      dev: before.dev,
+      ino: before.ino,
+      size: before.size,
+      mtimeNs: before.mtimeNs,
+    },
+  };
+}
+
+function readPersistedBackupStatus(): BackupStatus | null {
+  return readPersistedBackupStatusSnapshot().status;
+}
+
+function statusSnapshotIsCurrent(snapshot: BackupStatusSnapshot): boolean {
+  try {
+    const current = fs.lstatSync(BACKUP_STATUS_FILE, { bigint: true });
+    return snapshot.identity !== null
+      && current.isFile()
+      && !current.isSymbolicLink()
+      && current.nlink === 1n
+      && current.dev === snapshot.identity.dev
+      && current.ino === snapshot.identity.ino
+      && current.size === snapshot.identity.size
+      && current.mtimeNs === snapshot.identity.mtimeNs;
+  } catch (error: any) {
+    return error?.code === 'ENOENT' && snapshot.identity === null;
+  }
+}
+
+function writeBackupStatusCas(
+  snapshot: BackupStatusSnapshot,
+  status: BackupStatus,
+  lease: BackupMutationLockLease,
+): BackupStatusSnapshot {
+  assertBackupMutationLockLease(lease);
+  if (!statusSnapshotIsCurrent(snapshot)) {
+    throw new BackupRequestPublicError(
+      'BACKUP_STATUS_RECOVERY_REQUIRED',
+      'Persistent backup status changed during exact reconciliation',
+    );
+  }
+  writeBackupStatus(status);
+  assertBackupMutationLockLease(lease);
+  return readPersistedBackupStatusSnapshot();
+}
+
+export interface QueuedBackupFailure {
+  failureCode: string;
+  failureDetail: string;
+}
+
+export function queuedBackupFailureFromSystemdProperties(
+  properties: Record<string, string>,
+): QueuedBackupFailure {
+  const loadState = properties.LoadState || 'unknown';
+  const activeState = properties.ActiveState || 'unknown';
+  const rawResult = properties.Result || 'unknown';
+  const result = /^(?:success|exit-code|signal|core-dump|timeout|watchdog|start-limit-hit|resources|protocol)$/
+    .test(rawResult) ? rawResult : 'unknown';
+  const status = /^\d{1,5}$/.test(properties.ExecMainStatus || '')
+    ? properties.ExecMainStatus
+    : 'unknown';
+  if (loadState !== 'loaded') {
+    return {
+      failureCode: 'BACKUP_SERVICE_UNAVAILABLE',
+      failureDetail: 'The installed backup service unit is unavailable',
+    };
+  }
+  if (activeState === 'failed' || !['unknown', 'success'].includes(result)) {
+    return {
+      failureCode: 'BACKUP_SERVICE_EXITED_BEFORE_CLAIM',
+      failureDetail: `The backup service exited before claiming its request (result=${result}, status=${status})`,
+    };
+  }
+  if (['active', 'activating', 'reloading'].includes(activeState)) {
+    return {
+      failureCode: 'BACKUP_REQUEST_CLAIM_DELAYED',
+      failureDetail: 'The backup service is active but has not yet claimed its durable request',
+    };
+  }
+  return {
+    failureCode: 'BACKUP_SERVICE_STOPPED_BEFORE_CLAIM',
+    failureDetail: 'The backup service stopped before claiming its durable request',
+  };
+}
+
+function inspectQueuedBackupFailure(type: BackupType): QueuedBackupFailure {
+  try {
+    const raw = execFileSync('/usr/bin/systemctl', [
+      'show', `bridgesllm-backup@${type}.service`, '--no-pager',
+      '--property=LoadState', '--property=ActiveState', '--property=SubState',
+      '--property=Result', '--property=ExecMainCode', '--property=ExecMainStatus',
+    ], {
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return queuedBackupFailureFromSystemdProperties(parseSystemctlProperties(raw));
+  } catch {
+    return {
+      failureCode: 'BACKUP_SERVICE_STATE_UNAVAILABLE',
+      failureDetail: 'The backup service did not claim its request and its unit state could not be inspected',
+    };
+  }
+}
+
+export function readBackupStatus(): BackupStatus | null {
+  const status = readPersistedBackupStatus();
   if (!status) return null;
 
   const queuedTooLong = status.status === 'queued'
     && Date.now() - Date.parse(status.startedAt) > 2 * 60 * 1000;
-  if ((status.status === 'running' && !isBackupProcess(status)) || queuedTooLong) {
-    const reconciled: BackupStatus = {
+  if (queuedTooLong) {
+    const advisory = inspectQueuedBackupFailure(status.type);
+    // A type-scoped unit state has no request or invocation provenance. It may
+    // explain why a request is delayed, but can never turn the exact durable
+    // request authority into a terminal result.
+    return {
+      ...status,
+      failureCode: advisory.failureCode,
+      failureDetail: advisory.failureDetail,
+      output: readOutputTail(),
+    };
+  }
+  if (status.status === 'running' && !isBackupProcess(status)) {
+    const failure = {
+      failureCode: 'BACKUP_PROCESS_EXITED',
+      failureDetail: 'The backup process stopped before recording completion',
+    };
+    const observed: BackupStatus = {
       ...status,
       status: 'failed',
-      completedAt: new Date().toISOString(),
-      error: status.status === 'queued'
-        ? 'Backup service did not start within two minutes'
-        : 'Backup process stopped before recording completion',
+      completedAt: new Date(Date.parse(status.startedAt) + 2 * 60 * 1000).toISOString(),
+      error: failure.failureDetail,
+      failureCode: failure.failureCode,
+      failureDetail: failure.failureDetail,
     };
-    reconciled.failureDetail = reconciled.error;
-    writeBackupStatus(reconciled);
-    return { ...reconciled, output: readOutputTail() };
+    // Status reads are deliberately non-mutating. Only the lock-owning shell
+    // or the exact start call may retire request authority and publish a
+    // terminal receipt; a delayed unit can still claim this request safely.
+    return { ...observed, output: readOutputTail() };
   }
   return { ...status, output: readOutputTail() };
+}
+
+interface PreparedBackupDispatch {
+  authority: AttestedBackupRequestReceipt;
+  status: BackupStatus;
+}
+
+function backupBusy(message: string): never {
+  const error = new BackupRequestPublicError('EBUSY', message);
+  throw error;
+}
+
+function receiptOwnsStatus(
+  receipt: AttestedBackupRequestReceipt,
+  status: BackupStatus | null,
+): status is BackupStatus {
+  return status?.id === receipt.receipt.id
+    && status.type === receipt.receipt.type
+    && status.startedAt === receipt.receipt.requestedAt;
+}
+
+function failedBackupStatus(
+  status: BackupStatus,
+  failure: QueuedBackupFailure,
+): BackupStatus {
+  return {
+    ...status,
+    status: 'failed',
+    completedAt: new Date().toISOString(),
+    error: failure.failureDetail,
+    failureCode: failure.failureCode,
+    failureDetail: failure.failureDetail,
+  };
+}
+
+function reconcileStatusWithoutReceipt(
+  snapshot: BackupStatusSnapshot,
+  lease: BackupMutationLockLease,
+): BackupStatusSnapshot {
+  const status = snapshot.status;
+  if (!status || ['completed', 'degraded', 'failed'].includes(status.status)) return snapshot;
+  if (status.status === 'running') {
+    if (isBackupProcess(status)) backupBusy('A backup is already in progress');
+    const failure: QueuedBackupFailure = {
+      failureCode: 'BACKUP_PROCESS_EXITED',
+      failureDetail: 'The backup process stopped before recording completion',
+    };
+    return writeBackupStatusCas(snapshot, failedBackupStatus(status, failure), lease);
+  }
+
+  const age = Date.now() - Date.parse(status.startedAt);
+  if (age <= 2 * 60 * 1000) {
+    backupBusy('A backup request is still awaiting its exact service claim');
+  }
+  const failure = inspectQueuedBackupFailure(status.type);
+  if ([
+    'BACKUP_REQUEST_CLAIM_DELAYED',
+    'BACKUP_SERVICE_STATE_UNAVAILABLE',
+  ].includes(failure.failureCode)) {
+    backupBusy('A backup request remains active or its service state is indeterminate');
+  }
+  if (BACKUP_TIMER_ID_PATTERN.test(status.id)) {
+    const timerMatch = BACKUP_TIMER_ID_PATTERN.exec(status.id);
+    if (timerMatch?.[1] !== status.type) {
+      throw new BackupRequestPublicError(
+        'BACKUP_REQUEST_RECOVERY_REQUIRED',
+        'A stale timer backup status has inconsistent ownership and requires administrator recovery',
+      );
+    }
+    return writeBackupStatusCas(snapshot, failedBackupStatus(status, {
+      failureCode: 'BACKUP_TIMER_REQUEST_STALE',
+      failureDetail: 'A prior timer-owned backup request stopped before establishing process ownership',
+    }), lease);
+  }
+  if (BACKUP_REQUEST_ID_PATTERN.test(status.id)) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'A queued backup status has lost its exact request receipt and requires administrator recovery',
+    );
+  }
+  throw new BackupRequestPublicError(
+    'BACKUP_STATUS_RECOVERY_REQUIRED',
+    'Persistent queued backup status has unknown ownership and requires administrator recovery',
+  );
+}
+
+function prepareBackupDispatch(
+  type: BackupType,
+  lease: BackupMutationLockLease,
+): PreparedBackupDispatch {
+  let receipts = enumerateBackupRequestReceipts(lease);
+  let authority: AttestedBackupRequestReceipt | null = receipts.length === 1
+    ? receipts[0]
+    : null;
+  let snapshot = readPersistedBackupStatusSnapshot();
+
+  if (authority?.state === 'claimed') {
+    if (!receiptOwnsStatus(authority, snapshot.status)) {
+      throw new BackupRequestPublicError(
+        'BACKUP_REQUEST_RECOVERY_REQUIRED',
+        'A claimed backup request has no exact persistent status owner',
+      );
+    }
+    if (['completed', 'degraded', 'failed'].includes(snapshot.status.status)) {
+      if (!removeAttestedBackupRequestReceipt(authority, lease)) {
+        throw new BackupRequestPublicError(
+          'BACKUP_REQUEST_RECOVERY_REQUIRED',
+          'A terminal backup request claim disappeared before exact retirement',
+        );
+      }
+    } else if (snapshot.status.status === 'running' && isBackupProcess(snapshot.status)) {
+      backupBusy('A backup is already in progress');
+    } else {
+      // A claimed receipt plus its exact id/type/startedAt status is request-
+      // scoped authority. Reaching this branch while holding both canonical
+      // mutation locks proves the prior shell no longer owns those locks; the
+      // live-process check above is an additional fail-closed fence. Recover
+      // that exact claim before admitting the user's manual retry. Never use
+      // type-scoped systemd history for this terminal decision.
+      const failure: QueuedBackupFailure = {
+        failureCode: 'BACKUP_PROCESS_EXITED',
+        failureDetail: 'The backup process stopped before recording completion',
+      };
+      snapshot = writeBackupStatusCas(snapshot, failedBackupStatus(snapshot.status, failure), lease);
+      if (!removeAttestedBackupRequestReceipt(authority, lease)) {
+        throw new BackupRequestPublicError(
+          'BACKUP_REQUEST_RECOVERY_REQUIRED',
+          'A recovered backup request claim disappeared before exact retirement',
+        );
+      }
+    }
+    authority = null;
+    receipts = [];
+    snapshot = readPersistedBackupStatusSnapshot();
+  }
+
+  if (authority?.state === 'pending') {
+    if (receiptOwnsStatus(authority, snapshot.status)) {
+      if (snapshot.status.status === 'failed'
+        && snapshot.status.failureCode === 'BACKUP_SERVICE_START_FAILED') {
+        if (!removeAttestedBackupRequestReceipt(authority, lease)) {
+          throw new BackupRequestPublicError(
+            'BACKUP_REQUEST_RECOVERY_REQUIRED',
+            'A terminal backup request receipt disappeared before exact retirement',
+          );
+        }
+        authority = null;
+        receipts = [];
+        snapshot = readPersistedBackupStatusSnapshot();
+      } else if (['completed', 'degraded', 'failed'].includes(snapshot.status.status)) {
+        throw new BackupRequestPublicError(
+          'BACKUP_REQUEST_RECOVERY_REQUIRED',
+          'A terminal status still has pending request authority and requires locked shell recovery',
+        );
+      } else if (snapshot.status.status === 'running') {
+        if (isBackupProcess(snapshot.status)) backupBusy('A backup is already in progress');
+        throw new BackupRequestPublicError(
+          'BACKUP_REQUEST_RECOVERY_REQUIRED',
+          'A running backup status still owns an unclaimed request receipt',
+        );
+      } else {
+        const age = Date.now() - Date.parse(snapshot.status.startedAt);
+        if (age <= 2 * 60 * 1000) {
+          backupBusy('A backup request is still awaiting its exact service claim');
+        }
+        const failure = inspectQueuedBackupFailure(snapshot.status.type);
+        if ([
+          'BACKUP_REQUEST_CLAIM_DELAYED',
+          'BACKUP_SERVICE_STATE_UNAVAILABLE',
+        ].includes(failure.failureCode)) {
+          backupBusy('A backup request remains active or its service state is indeterminate');
+        }
+        // The unit is definitely not active, but its historical result has no
+        // request identity. Re-dispatch the same durable receipt; do not
+        // terminalize it or mint a replacement request.
+        return { authority, status: snapshot.status };
+      }
+    } else {
+      snapshot = reconcileStatusWithoutReceipt(snapshot, lease);
+      const adoptedStatus: BackupStatus = {
+        id: authority.receipt.id,
+        type: authority.receipt.type,
+        status: 'queued',
+        startedAt: authority.receipt.requestedAt,
+      };
+      snapshot = writeBackupStatusCas(snapshot, adoptedStatus, lease);
+      return { authority, status: snapshot.status! };
+    }
+  }
+
+  if (!authority) snapshot = reconcileStatusWithoutReceipt(snapshot, lease);
+  if (receipts.length !== 0) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'Backup request authority did not converge before dispatch',
+    );
+  }
+
+  const created = createBackupRequestReceipt(type);
+  const createdAuthority: AttestedBackupRequestReceipt = { ...created, state: 'pending' };
+  const exactInventory = enumerateBackupRequestReceipts(lease);
+  if (exactInventory.length !== 1
+    || exactInventory[0].fullPath !== createdAuthority.fullPath
+    || exactInventory[0].dev !== createdAuthority.dev
+    || exactInventory[0].ino !== createdAuthority.ino) {
+    throw new BackupRequestPublicError(
+      'BACKUP_REQUEST_RECOVERY_REQUIRED',
+      'New backup request authority did not become the sole durable candidate',
+    );
+  }
+  const dispatchedStatus: BackupStatus = {
+    id: created.receipt.id,
+    type,
+    status: 'queued',
+    startedAt: created.receipt.requestedAt,
+  };
+  try {
+    snapshot = writeBackupStatusCas(snapshot, dispatchedStatus, lease);
+  } catch (cause) {
+    try { removeAttestedBackupRequestReceipt(exactInventory[0], lease); } catch {}
+    throw new BackupRequestPublicError(
+      'BACKUP_STATUS_PUBLISH_FAILED',
+      'Backup request status could not be committed before service dispatch',
+      cause,
+    );
+  }
+  return { authority: exactInventory[0], status: snapshot.status! };
+}
+
+async function terminalizeDefiniteDispatchFailure(
+  prepared: PreparedBackupDispatch,
+  cause: unknown,
+): Promise<never> {
+  try {
+    await withBackupMutationLock(async (lease) => {
+      const receipts = enumerateBackupRequestReceipts(lease);
+      const current = readPersistedBackupStatusSnapshot();
+      const authority = receipts[0];
+      if (!authority
+        || authority.state !== 'pending'
+        || authority.fullPath !== prepared.authority.fullPath
+        || authority.dev !== prepared.authority.dev
+        || authority.ino !== prepared.authority.ino
+        || !receiptOwnsStatus(authority, current.status)
+        || current.status.status !== 'queued') {
+        throw new BackupRequestPublicError(
+          'BACKUP_SERVICE_DISPATCH_INDETERMINATE',
+          'Backup service dispatch changed ownership before rejection could be reconciled',
+          cause,
+        );
+      }
+      const failure: QueuedBackupFailure = {
+        failureCode: 'BACKUP_SERVICE_START_FAILED',
+        failureDetail: 'The installed backup service rejected the backup request before it started',
+      };
+      writeBackupStatusCas(current, failedBackupStatus(current.status, failure), lease);
+      if (!removeAttestedBackupRequestReceipt(authority, lease)) {
+        throw new BackupRequestPublicError(
+          'BACKUP_SERVICE_DISPATCH_INDETERMINATE',
+          'Backup service rejection was recorded but request retirement requires recovery',
+          cause,
+        );
+      }
+    });
+  } catch (reconcileCause) {
+    if (reconcileCause instanceof BackupRequestPublicError
+      && reconcileCause.code === 'BACKUP_SERVICE_DISPATCH_INDETERMINATE') {
+      throw reconcileCause;
+    }
+    throw new BackupRequestPublicError(
+      'BACKUP_SERVICE_DISPATCH_INDETERMINATE',
+      'Backup service dispatch could not be reconciled; its request authority was preserved',
+      reconcileCause,
+    );
+  }
+  throw new BackupRequestPublicError(
+    'BACKUP_SERVICE_START_FAILED',
+    'The installed backup service rejected the backup request before it started',
+    cause,
+  );
 }
 
 export async function startBackupUnit(type: BackupType): Promise<BackupStatus | null> {
   if (!BACKUP_TYPES.includes(type)) throw new Error('Invalid backup type');
   await getConfiguredBackupRoot({ syncFile: true });
-
-  const existing = readBackupStatus();
-  if (existing && ['queued', 'running'].includes(existing.status)) {
-    const error = new Error('A backup is already in progress');
-    (error as NodeJS.ErrnoException).code = 'EBUSY';
-    throw error;
-  }
-
-  const requestStatus: BackupStatus = {
-    id: `request-${crypto.randomUUID()}`,
-    type,
-    status: 'queued',
-    startedAt: new Date().toISOString(),
-  };
-  writeBackupStatus(requestStatus);
-  const unit = `bridgesllm-backup@${type}.service`;
+  let prepared: PreparedBackupDispatch;
   try {
-    await execFileAsync('systemctl', ['start', '--no-block', unit], {
-      timeout: 5_000,
-      maxBuffer: 64 * 1024,
-      encoding: 'utf8',
-    });
+    // Publish/recover authority under both canonical locks, then release them
+    // before systemd starts the unit that must acquire those same locks.
+    prepared = await withBackupMutationLock(async (lease) => prepareBackupDispatch(type, lease));
   } catch (error: any) {
-    const current = readBackupStatus();
-    if (current?.id === requestStatus.id) {
-      const failureDetail = boundedStatusText(
-        String(error?.message || 'The installed backup service could not be started'),
-        1000,
-      );
-      writeBackupStatus({
-        ...requestStatus,
-        status: 'failed',
-        completedAt: new Date().toISOString(),
-        error: failureDetail,
-        failureDetail,
-      });
+    if (error?.code === 'BACKUP_MUTATION_LOCK_CONTENDED') {
+      backupBusy('A backup or Portal operation is already in progress');
     }
     throw error;
   }
 
+  const unit = `bridgesllm-backup@${prepared.status.type}.service`;
+  try {
+    await execFileAsync('/usr/bin/systemctl', ['start', '--no-block', unit], {
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+      encoding: 'utf8',
+    });
+  } catch (cause: any) {
+    const dispatchIsIndeterminate = cause?.killed === true
+      || cause?.code === 'ETIMEDOUT'
+      || typeof cause?.signal === 'string';
+    if (dispatchIsIndeterminate) {
+      throw new BackupRequestPublicError(
+        'BACKUP_SERVICE_DISPATCH_INDETERMINATE',
+        'Backup service dispatch could not be confirmed; its exact request remains queued',
+        cause,
+      );
+    }
+    return terminalizeDefiniteDispatchFailure(prepared, cause);
+  }
+
+  const requestStatus = prepared.status;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));
-    const status = readBackupStatus();
+    const status = readPersistedBackupStatus();
     if (status && status.id !== requestStatus.id) return status;
   }
-  return readBackupStatus() || requestStatus;
+  return readPersistedBackupStatus() || requestStatus;
 }
 
 export function parseSystemctlProperties(raw: string): Record<string, string> {

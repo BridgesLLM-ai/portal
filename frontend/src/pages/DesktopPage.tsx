@@ -901,7 +901,7 @@ export default function DesktopPage() {
       className={`flex min-h-0 flex-col ${fullscreen ? 'fixed inset-0 z-50 bg-[#0A0E27]' : 'h-full'}`}
     >
       <div className="flex flex-col gap-2 border-b border-white/5 bg-[#0D1130]/80 px-2 py-2 backdrop-blur-xl sm:px-4 sm:py-3 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex items-center gap-3 min-w-0 flex-1">
+        <div className="flex shrink-0 items-center gap-3 min-w-[200px]">
           <Monitor size={16} className="text-emerald-400 flex-shrink-0" />
           <div className="min-w-0">
             <div className="text-sm font-semibold text-white">Remote Desktop</div>
@@ -909,7 +909,7 @@ export default function DesktopPage() {
           </div>
         </div>
 
-        <div className="flex max-w-full flex-wrap items-center gap-1 sm:gap-2 lg:justify-end">
+        <div className="flex max-w-full flex-wrap items-center gap-1 sm:gap-2 lg:min-w-0 lg:flex-1 lg:justify-end">
           <div className="flex items-center gap-1.5 sm:gap-3 min-w-0">
             <span className={`inline-flex items-center gap-1 px-1.5 sm:px-2 py-0.5 rounded-full text-[10px] font-medium flex-shrink-0 ${connectionStatus === 'connected' ? 'bg-emerald-500/10 text-emerald-400' : connectionStatus === 'external' ? 'bg-blue-500/10 text-blue-300' : connectionStatus === 'error' ? 'bg-red-500/10 text-red-400' : 'bg-amber-500/10 text-amber-400'}`} role="status">
               {connectionStatus === 'connected' || connectionStatus === 'external' ? <Wifi size={10} /> : connectionStatus === 'error' ? <WifiOff size={10} /> : <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />}

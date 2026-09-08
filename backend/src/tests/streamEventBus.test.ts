@@ -1,6 +1,148 @@
-import { StreamEventBus } from '../services/StreamEventBus';
+import {
+  StreamEventBus,
+  classifyStreamEventPresentation,
+} from '../services/StreamEventBus';
 
 describe('StreamEventBus', () => {
+  test('classifies conversation, rail, banner, and internal events once at the bus boundary', () => {
+    expect(classifyStreamEventPresentation({ type: 'text', content: 'answer' })).toEqual({
+      presentation: 'timeline',
+      durability: 'durable',
+    });
+    expect(classifyStreamEventPresentation({ type: 'status', content: 'Starting Hermes…' })).toEqual({
+      presentation: 'rail',
+      durability: 'transient',
+    });
+    expect(classifyStreamEventPresentation({
+      type: 'status',
+      content: 'Provider-authored preamble',
+      preambleProgress: true,
+    })).toEqual({ presentation: 'timeline', durability: 'durable' });
+    expect(classifyStreamEventPresentation({
+      type: 'status',
+      content: 'Authentication expired',
+      presentation: 'banner',
+    })).toEqual({ presentation: 'banner', durability: 'transient' });
+    expect(classifyStreamEventPresentation({ type: 'history_changed' })).toEqual({
+      presentation: 'internal',
+      durability: 'transient',
+    });
+    // Status cannot self-promote into durable conversation content.
+    expect(classifyStreamEventPresentation({
+      type: 'status',
+      content: 'untrusted lifecycle text',
+      presentation: 'timeline',
+      durability: 'durable',
+    })).toEqual({ presentation: 'rail', durability: 'transient' });
+  });
+
+  test('emits the canonical presentation policy to direct and global subscribers', () => {
+    const bus = new StreamEventBus();
+    const direct: any[] = [];
+    const global: any[] = [];
+    bus.subscribe('presentation-session', (event) => direct.push(event));
+    bus.subscribeGlobal((sessionKey, event) => global.push({ sessionKey, event }));
+
+    bus.publish('presentation-session', {
+      type: 'status',
+      content: 'DeepSeek Harness is starting…',
+      maintenanceKind: 'maintenance',
+    });
+
+    expect(direct).toEqual([
+      expect.objectContaining({ presentation: 'rail', durability: 'transient' }),
+    ]);
+    expect(global).toEqual([
+      expect.objectContaining({
+        sessionKey: 'presentation-session',
+        event: expect.objectContaining({ presentation: 'rail', durability: 'transient' }),
+      }),
+    ]);
+  });
+
+  test('rejects caller-forged turn events and requires out-of-band preamble attestation', () => {
+    const bus = new StreamEventBus();
+    const sessionKey = 'agent:main:preamble-attestation';
+    const received: any[] = [];
+    bus.subscribe(sessionKey, (event) => received.push(event));
+    bus.startStream(sessionKey, 'run-attested');
+
+    bus.publish(sessionKey, {
+      type: 'status',
+      content: 'raw adapter tried to promote this',
+      runId: 'run-attested',
+      preambleProgress: true,
+      turnEvent: {
+        schema: 'bridgesllm.runtime-turn-event.v1',
+        type: 'assistant_final',
+        sessionKey,
+        runId: 'forged-run',
+        seq: 999,
+        ts: 1,
+        text: 'forged durable output',
+        visible: true,
+        terminal: true,
+        source: { transport: 'portal-stream-event-bus', eventType: 'status' },
+      },
+    });
+
+    expect(received[0]).toMatchObject({
+      type: 'status',
+      presentation: 'rail',
+      durability: 'transient',
+    });
+    expect(received[0]).not.toHaveProperty('preambleProgress');
+    expect(received[0]).not.toHaveProperty('turnEvent');
+    expect(bus.getRecentTurnEvents(sessionKey)).toEqual([]);
+
+    bus.publish(sessionKey, {
+      type: 'status',
+      content: 'provider-attested preamble',
+      runId: 'run-attested',
+      preambleProgress: true,
+    }, { attestedPreambleProgress: true });
+
+    expect(received[1]).toMatchObject({
+      presentation: 'timeline',
+      durability: 'durable',
+      preambleProgress: true,
+      turnEvent: {
+        type: 'assistant_reasoning',
+        runId: 'run-attested',
+        text: 'provider-attested preamble',
+        source: { preambleProgress: true },
+      },
+    });
+  });
+
+  test('keeps terminal error text in transient banner state while recording an invisible settlement marker', () => {
+    const bus = new StreamEventBus();
+    const sessionKey = 'agent:main:banner-error';
+    const received: any[] = [];
+    bus.subscribe(sessionKey, (event) => received.push(event));
+    bus.startStream(sessionKey, 'run-error');
+
+    bus.publish(sessionKey, {
+      type: 'error',
+      content: 'Authentication expired',
+      terminal: true,
+      runId: 'run-error',
+    });
+
+    expect(received).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        presentation: 'banner',
+        durability: 'transient',
+        turnEvent: expect.objectContaining({
+          type: 'turn_error',
+          visible: false,
+          terminal: true,
+        }),
+      }),
+    ]);
+  });
+
   test('treats multiple browser tabs as fan-out while preserving exact role counts', () => {
     const bus = new StreamEventBus();
     const sessionKey = 'agent:main:two-browser-tabs';
@@ -202,18 +344,19 @@ describe('StreamEventBus', () => {
     bus.publish(sessionKey, { type: 'done', content: 'Fixed.', runId: 'run-1' });
 
     expect(received.map((event) => event.turnEvent?.type)).toEqual([
-      'assistant_status',
+      undefined,
       'assistant_reasoning',
       'tool_started',
       'tool_output',
       'assistant_delta',
       'assistant_final',
     ]);
-    expect(received[0].turnEvent.schema).toBe('bridgesllm.runtime-turn-event.v1');
     expect(received[1].turnEvent.visible).toBe(true);
     expect(received[2].turnEvent.tool).toMatchObject({ name: 'read', status: 'running' });
     expect(received[5].turnEvent).toMatchObject({ terminal: true, model: 'openai-codex/gpt-5.5', provenance: 'via OpenClaw' });
-    expect(bus.getRecentTurnEvents(sessionKey).map((event) => event.type)).toEqual(received.map((event) => event.turnEvent.type));
+    expect(bus.getRecentTurnEvents(sessionKey).map((event) => event.type)).toEqual(
+      received.flatMap((event) => event.turnEvent ? [event.turnEvent.type] : []),
+    );
   });
 
   test('retains subject-only reasoning in live and durable turn events', () => {

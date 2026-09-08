@@ -4,6 +4,10 @@ import { access, mkdtemp, readdir, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import path from 'path';
 import { promisify } from 'util';
+import {
+  getNativeHostCliStatus,
+  type NativeHostCliStatusTool,
+} from './nativeHostCliStatus';
 
 const execFileAsync = promisify(execFile);
 const PROBE_TIMEOUT_MS = 2_500;
@@ -56,6 +60,8 @@ export interface TerminalToolCapability {
   label: string;
   category: string;
   installed: boolean;
+  /** Whether Terminal may offer this package as a directly runnable host command. */
+  executionAvailable: boolean;
   executable: string | null;
   version: string | null;
   helpCommand: string;
@@ -118,10 +124,6 @@ interface TerminalServiceSpec {
 const TOOL_SPECS: TerminalToolSpec[] = [
   { id: 'bash', label: 'Bash', category: 'shell', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://www.gnu.org/software/bash/manual/' },
   { id: 'openclaw', label: 'OpenClaw', category: 'openclaw', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://docs.openclaw.ai/' },
-  { id: 'claude', label: 'Claude Code', category: 'agents', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://docs.anthropic.com/en/docs/claude-code/overview' },
-  { id: 'codex', label: 'Codex CLI', category: 'agents', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://developers.openai.com/codex/cli/' },
-  { id: 'grok', label: 'Grok Build', category: 'agents', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://x.ai/grok-code-fast-1' },
-  { id: 'agy', label: 'Antigravity', category: 'agents', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://antigravity.google/' },
   { id: 'ollama', label: 'Ollama', category: 'ollama', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://docs.ollama.com/' },
   { id: 'docker', label: 'Docker', category: 'docker', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://docs.docker.com/reference/cli/docker/' },
   { id: 'git', label: 'Git', category: 'git', versionArgs: ['--version'], helpArgs: ['--help'], sourceUrl: 'https://git-scm.com/docs' },
@@ -396,15 +398,23 @@ export function rankTerminalSuggestions(
 
   const candidates = new Map<string, TerminalSuggestion>();
   for (const action of availableActions) candidates.set(action.command, actionToSuggestion(action));
-  for (const tool of tools.filter((entry) => entry.installed)) {
-    candidates.set(tool.helpCommand, {
-      command: tool.helpCommand,
-      description: `${tool.label} help from the installed CLI`,
-      category: tool.category,
-      source: 'tool-help',
-      risk: 'read_only',
-      confirmation: 'none',
-    });
+  for (const tool of tools.filter((entry) => (
+    entry.installed
+    && entry.executionAvailable !== false
+    && entry.id !== 'codex'
+    && entry.id !== 'claude'
+    && entry.id !== 'claude-code'
+  ))) {
+    if (tool.helpCommand.trim()) {
+      candidates.set(tool.helpCommand, {
+        command: tool.helpCommand,
+        description: `${tool.label} help from the installed CLI`,
+        category: tool.category,
+        source: 'tool-help',
+        risk: 'read_only',
+        confirmation: 'none',
+      });
+    }
     for (const command of tool.commands) {
       const classification = classifyTerminalCommand(command);
       candidates.set(command, {
@@ -592,7 +602,10 @@ export function resolveTerminalActions(
 ): TerminalAction[] {
   const available = new Set(executableNames);
   for (const tool of tools) {
-    if (tool.installed) available.add(tool.id);
+    if (tool.installed && tool.executionAvailable !== false
+      && tool.id !== 'codex' && tool.id !== 'claude' && tool.id !== 'claude-code') {
+      available.add(tool.id);
+    }
   }
   for (const service of services) {
     if (service.installed) available.add(`service:${service.id}`);
@@ -623,6 +636,7 @@ async function probeTool(spec: TerminalToolSpec, probeEnv: NodeJS.ProcessEnv): P
     label: spec.label,
     category: spec.category,
     installed: Boolean(executable),
+    executionAvailable: true,
     executable,
     version: null,
     helpCommand: `${spec.id} --help`,
@@ -648,6 +662,30 @@ async function probeTool(spec: TerminalToolSpec, probeEnv: NodeJS.ProcessEnv): P
   return base;
 }
 
+async function admittedNativeHostCliCapability(
+  toolId: NativeHostCliStatusTool,
+  id: 'codex' | 'claude',
+  label: string,
+  sourceUrl: string,
+): Promise<TerminalToolCapability> {
+  const status = await getNativeHostCliStatus(toolId);
+  return {
+    id,
+    label,
+    category: 'agents',
+    installed: status.installed === true,
+    executionAvailable: false,
+    executable: null,
+    version: status.observedVersion,
+    helpCommand: '',
+    sourceUrl,
+    commands: [],
+    probeError: status.executionEligible
+      ? 'Package admitted for supervised Portal Agent Chat; no Portal Terminal launcher is exposed'
+      : `Native host package status: ${status.state}; no Portal Terminal launcher is exposed`,
+  };
+}
+
 let cached: { expiresAt: number; capabilities: TerminalCapabilities; executableNames: string[] } | null = null;
 let inFlight: Promise<{ capabilities: TerminalCapabilities; executableNames: string[] }> | null = null;
 
@@ -655,10 +693,27 @@ async function collectTerminalCapabilities(): Promise<{ capabilities: TerminalCa
   const probeHome = await mkdtemp(path.join(tmpdir(), 'bridges-terminal-probe-'));
   try {
     const probeEnv = buildTerminalProbeEnv(probeHome);
-    const [tools, executableNames] = await Promise.all([
-      Promise.all(TOOL_SPECS.map((spec) => probeTool(spec, probeEnv))),
+    const [tools, discoveredExecutableNames] = await Promise.all([
+      Promise.all([
+        ...TOOL_SPECS.map((spec) => probeTool(spec, probeEnv)),
+        admittedNativeHostCliCapability(
+          'codex',
+          'codex',
+          'Codex CLI',
+          'https://developers.openai.com/codex/cli/',
+        ),
+        admittedNativeHostCliCapability(
+          'claude-code',
+          'claude',
+          'Claude Code',
+          'https://docs.anthropic.com/en/docs/claude-code/overview',
+        ),
+      ]),
       readPathExecutables(),
     ]);
+    const executableNames = discoveredExecutableNames.filter((name) => (
+      name !== 'codex' && name !== 'claude'
+    ));
     const systemctlExecutable = tools.find((tool) => tool.id === 'systemctl')?.executable || null;
     const services = await Promise.all(SERVICE_SPECS.map((spec) => probeService(spec, systemctlExecutable, probeEnv)));
     const actions = resolveTerminalActions(TERMINAL_ACTIONS, tools, services, executableNames);

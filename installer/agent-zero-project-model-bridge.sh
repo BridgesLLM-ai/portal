@@ -12,7 +12,8 @@ readonly BRIDGE_SERVICE='bridgesllm-agent-zero-project-model-bridge.service'
 readonly BRIDGE_USER='bridgesllm-a0-bridge'
 readonly BRIDGE_GROUP='bridgesllm-a0-bridge'
 readonly BRIDGE_PORT='18991'
-readonly BRIDGE_STATE_ROOT='/var/lib/bridgesllm/agent-zero-project-model-bridge'
+readonly BRIDGE_PRIVATE_PARENT='/var/lib/bridgesllm'
+readonly BRIDGE_STATE_ROOT="${BRIDGE_PRIVATE_PARENT}/agent-zero-project-model-bridge"
 readonly BRIDGE_CREDENTIAL_ROOT="${BRIDGE_STATE_ROOT}/credentials"
 readonly BRIDGE_RUNTIME_ROOT="${BRIDGE_STATE_ROOT}/runtime"
 readonly BRIDGE_ENV_FILE='/etc/bridgesllm/agent-zero-project-model-bridge.env'
@@ -34,8 +35,9 @@ readonly BRIDGE_RUNTIME_SOURCE_GID='0'
 readonly A0_CONTAINER='bridgesllm-agent-zero'
 readonly A0_LOOPBACK_PORT='50001'
 # Keep in lockstep with Portal's tested Codex CLI pin and the managed Agent Zero
-# runtime lifecycle. Agent Zero v2.5 has no Codex binary from which to infer it.
-readonly A0_CODEX_CLIENT_VERSION='0.145.0'
+# runtime lifecycle. The managed Agent Zero image has no compatible Codex
+# binary from which to infer the Portal-qualified client version.
+readonly A0_CODEX_CLIENT_VERSION='0.153.2'
 
 log() { printf '[Agent Zero Project model bridge] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -440,14 +442,18 @@ publish_bridge_runtime() {
   [[ "$active_root" == "$staged_root" ]]
 }
 
+# Match the real service's private mount namespace. No credentials are loaded
+# into these syntax probes. The parent is hidden, not chmodded for traversal.
 bridge_runtime_service_user_check() {
-  local staged_root="$1"
-  runuser --user "$BRIDGE_USER" -- \
-    /usr/bin/node --check "${staged_root}/${BRIDGE_RUNTIME_ENTRYPOINT_NAME}" >/dev/null \
-    || return 1
-  runuser --user "$BRIDGE_USER" -- \
-    /usr/bin/node --check "${staged_root}/${BRIDGE_RUNTIME_CREDENTIAL_MODULE_NAME}" >/dev/null \
-    || return 1
+  local staged_root="$1" leaf
+  for leaf in "$BRIDGE_RUNTIME_ENTRYPOINT_NAME" "$BRIDGE_RUNTIME_CREDENTIAL_MODULE_NAME"; do
+    systemd-run --quiet --wait --pipe --collect \
+      --property="User=${BRIDGE_USER}" --property="Group=${BRIDGE_GROUP}" \
+      --property="TemporaryFileSystem=${BRIDGE_PRIVATE_PARENT}:ro" \
+      --property="BindReadOnlyPaths=${BRIDGE_STATE_ROOT}" \
+      --property=NoNewPrivileges=true --property=ProtectSystem=strict \
+      /usr/bin/node --check "${staged_root}/${leaf}" >/dev/null || return 1
+  done
 }
 
 bridge_runtime_active_root() {
@@ -469,10 +475,34 @@ ensure_identity_and_directories() {
   fi
   [[ "$(id -gn "$BRIDGE_USER")" == "$BRIDGE_GROUP" ]] \
     || die 'Managed bridge user has an unexpected primary group.'
+  ensure_managed_directory "$BRIDGE_PRIVATE_PARENT" 0700 root root
   ensure_managed_directory "$BRIDGE_STATE_ROOT" 0750 root "$BRIDGE_GROUP"
   ensure_managed_directory "$BRIDGE_CREDENTIAL_ROOT" 2750 root "$BRIDGE_GROUP"
   ensure_managed_directory "$BRIDGE_RUNTIME_ROOT" 0750 root "$BRIDGE_GROUP"
   ensure_managed_directory /etc/bridgesllm 0750 root root
+}
+
+verify_bridge_directories() {
+  [[ "$(id -gn "$BRIDGE_USER")" == "$BRIDGE_GROUP" ]] || return 1
+  # Public 4.0.19 created the shared root-owned parent implicitly (0755).
+  # Preserve either exact protected predecessor shape during ordinary Update:
+  # never widen 0700, and never chmod 0755 here because the predecessor bridge
+  # still needs traversal if the surrounding Portal transaction rolls back.
+  # Both modes prohibit non-root writes; the private mount view hides siblings
+  # from the refreshed service, and credential/runtime leaf checks stay exact.
+  [[ -d "$BRIDGE_PRIVATE_PARENT" && ! -L "$BRIDGE_PRIVATE_PARENT" ]] || return 1
+  case "$(stat -c '%U:%G:%a' "$BRIDGE_PRIVATE_PARENT")" in
+    root:root:700|root:root:755) ;;
+    *) return 1 ;;
+  esac
+  local spec directory expected
+  for spec in "$BRIDGE_STATE_ROOT|root:${BRIDGE_GROUP}:750" \
+    "$BRIDGE_RUNTIME_ROOT|root:${BRIDGE_GROUP}:750" \
+    "$BRIDGE_CREDENTIAL_ROOT|root:${BRIDGE_GROUP}:2750"; do
+    directory="${spec%|*}"; expected="${spec##*|}"
+    [[ -d "$directory" && ! -L "$directory" \
+      && "$(stat -c '%U:%G:%a' "$directory")" == "$expected" ]] || return 1
+  done
 }
 
 generate_upstream_token() {
@@ -516,9 +546,9 @@ ensure_bridge_environment() {
 
 assert_agent_zero_upstream() {
   docker container inspect "$A0_CONTAINER" >/dev/null 2>&1 \
-    || die 'Managed Agent Zero v2.5 container is unavailable.'
+    || die 'Managed Agent Zero v2.10 container is unavailable.'
   [[ "$(docker inspect --format '{{.State.Running}}' "$A0_CONTAINER")" == 'true' ]] \
-    || die 'Managed Agent Zero v2.5 container is not running.'
+    || die 'Managed Agent Zero v2.10 container is not running.'
   local binding bindings
   bindings="$(docker inspect --format '{{len .HostConfig.PortBindings}}' "$A0_CONTAINER")"
   binding="$(docker inspect --format '{{with (index .HostConfig.PortBindings "80/tcp")}}{{(index . 0).HostIp}}|{{(index . 0).HostPort}}|{{len .}}{{end}}' "$A0_CONTAINER")"
@@ -607,6 +637,10 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
+# Hide every private sibling while exposing only the canonical bridge tree.
+# systemd resolves the bind source as root before applying the private tmpfs.
+TemporaryFileSystem=${BRIDGE_PRIVATE_PARENT}:ro
+BindReadOnlyPaths=${BRIDGE_STATE_ROOT}
 RestrictAddressFamilies=AF_INET AF_UNIX
 RestrictNamespaces=true
 RestrictRealtime=true
@@ -621,7 +655,18 @@ WantedBy=multi-user.target
 EOF
   chown root:root "$temporary"
   chmod 0644 "$temporary"
-  mv -f "$temporary" "$BRIDGE_UNIT_FILE"
+  python3 - "$temporary" "$BRIDGE_UNIT_FILE" <<'PY_UNIT'
+import os, sys
+source, target = sys.argv[1:]
+with open(source, 'rb') as stream:
+    os.fsync(stream.fileno())
+os.replace(source, target)
+parent = os.open(os.path.dirname(target), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY_UNIT
 }
 
 bridge_unit_runtime_ready() {
@@ -629,7 +674,9 @@ bridge_unit_runtime_ready() {
   root_protected_file "$BRIDGE_UNIT_FILE" 644 || return 1
   active_root="$(bridge_runtime_active_root)" || return 1
   expected="ExecStart=/usr/bin/node ${active_root}/${BRIDGE_RUNTIME_ENTRYPOINT_NAME}"
-  [[ "$(grep -Fxc -- "$expected" "$BRIDGE_UNIT_FILE")" == '1' ]]
+  [[ "$(grep -Fxc -- "$expected" "$BRIDGE_UNIT_FILE")" == '1' \
+    && "$(grep -Fxc -- "TemporaryFileSystem=${BRIDGE_PRIVATE_PARENT}:ro" "$BRIDGE_UNIT_FILE")" == '1' \
+    && "$(grep -Fxc -- "BindReadOnlyPaths=${BRIDGE_STATE_ROOT}" "$BRIDGE_UNIT_FILE")" == '1' ]]
 }
 
 bridge_http_ready() {
@@ -652,12 +699,14 @@ wait_bridge_http_ready() {
 
 install_bridge_service() {
   require_root
-  for command in curl getent groupadd id install node python3 runuser seq sleep stat systemctl useradd; do
+  for command in curl getent groupadd id install node python3 seq sleep stat systemctl systemd-run useradd; do
     require_command "$command"
   done
-  ensure_identity_and_directories
   bridge_runtime_sources_ready \
     || die 'Compiled Agent Zero Project model bridge runtime is missing or unsafe.'
+  /usr/bin/node --check "$BRIDGE_SOURCE_ENTRYPOINT" >/dev/null || die 'Invalid bridge entrypoint.'
+  /usr/bin/node --check "$BRIDGE_SOURCE_CREDENTIAL_MODULE" >/dev/null || die 'Invalid bridge credential module.'
+  ensure_identity_and_directories
   publish_bridge_runtime \
     || die 'Compiled Agent Zero Project model bridge runtime could not be published safely.'
   bridge_runtime_ready \
@@ -674,12 +723,43 @@ install_bridge_service() {
   log 'Installed the managed Agent Zero Project model bridge in fail-closed mode.'
 }
 
+# Ordinary Portal Update refreshes only an already installed Portal-owned
+# bridge. No account creation, credential mutation, Docker upstream changes,
+# or enablement changes. This runs after the durable forward-only decision.
+refresh_bridge_runtime() {
+  require_root
+  for command in getent id node python3 stat systemctl systemd-run; do require_command "$command"; done
+  if [[ ! -e "$BRIDGE_UNIT_FILE" && ! -L "$BRIDGE_UNIT_FILE" \
+    && ! -e "$BRIDGE_ENV_FILE" && ! -L "$BRIDGE_ENV_FILE" \
+    && ! -e "$BRIDGE_STATE_ROOT" && ! -L "$BRIDGE_STATE_ROOT" ]]; then
+    return 0
+  fi
+  root_protected_file "$BRIDGE_UNIT_FILE" 644 || die 'Installed bridge unit is unsafe.'
+  verify_bridge_directories || die 'Installed bridge directory contract is unsafe.'
+  read_env_token >/dev/null
+  local active_state
+  active_state="$(systemctl show --property=ActiveState --value "$BRIDGE_SERVICE")"
+  case "$active_state" in active|inactive|failed) ;; *) die 'Bridge service state is unsettled.' ;; esac
+  bridge_runtime_sources_ready || die 'Bridge runtime sources are unsafe.'
+  publish_bridge_runtime || die 'Bridge runtime publication failed.'
+  bridge_runtime_ready || die 'Published bridge runtime is unsafe.'
+  write_systemd_unit
+  bridge_unit_runtime_ready || die 'Bridge unit does not bind the current runtime and namespace.'
+  systemctl daemon-reload
+  # try-restart preserves disabled/inactive intent and is safe to repeat after
+  # any interruption. Content-addressed old generations are never removed.
+  systemctl try-restart "$BRIDGE_SERVICE"
+  if [[ "$active_state" == active ]]; then
+    wait_bridge_http_ready || die 'Refreshed bridge failed readiness.'
+  fi
+}
+
 status_bridge() {
   require_root
   for command in curl docker getent groupadd id install python3 stat systemctl useradd; do
     require_command "$command"
   done
-  ensure_identity_and_directories
+  verify_bridge_directories || die 'Bridge directory contract is unsafe.'
   read_env_token >/dev/null
   assert_agent_zero_upstream
   bridge_runtime_ready \
@@ -863,6 +943,7 @@ usage() {
 Usage: agent-zero-project-model-bridge.sh <command>
 
 Commands:
+  refresh-runtime    Refresh installed Portal bridge after committed Update
   install            Install/start the bridge in fail-closed mode (no Agent Zero required)
   status             Verify service, upstream, protected state, and fail-closed HTTP
   reconcile          Install or converge the managed bridge
@@ -875,6 +956,7 @@ EOF
 }
 
 case "${1:-}" in
+  refresh-runtime) refresh_bridge_runtime ;;
   install) install_bridge_service ;;
   status) status_bridge ;;
   reconcile) reconcile_bridge ;;

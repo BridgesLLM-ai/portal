@@ -19,6 +19,62 @@ import { quiesceTerminalSystemdScopesForProjectDependencyPromotion } from './ter
 import type { WorkspaceAuthorizationFenceController } from './workspaceAuthorizationBarrier';
 
 const DEFAULT_DRAIN_TIMEOUT_MS = 60_000;
+const SAFE_DIAGNOSTIC_CODE = /^[A-Za-z0-9_-]{1,128}$/;
+const SAFE_OPENCLAW_SESSION_KEY = /^agent:[A-Za-z0-9_-]+:[^\u0000-\u001f\u007f]{1,1980}$/;
+
+const WRITER_SUBSYSTEMS = [
+  'terminalScopes',
+  'agentJobs',
+  'hostAgentRuns',
+  'openClawHostRuns',
+  'projectNativeRuns',
+  'durableProjectChat',
+  'mutationDrain',
+] as const;
+
+export type ProjectDependencyPromotionWriterSubsystem = typeof WRITER_SUBSYSTEMS[number];
+
+export interface ProjectDependencyPromotionWriterFenceDiagnostic {
+  subsystem?: ProjectDependencyPromotionWriterSubsystem | null;
+  causeCode?: string | null;
+  causeMessage?: string | null;
+  sessionKey?: string | null;
+}
+
+export interface ProjectDependencyPromotionStartupDiagnostic {
+  code: string;
+  message: string;
+  subsystem: ProjectDependencyPromotionWriterSubsystem | null;
+  causeCode: string | null;
+  causeMessage: string | null;
+  sessionKey: string | null;
+}
+
+function boundedDiagnosticText(value: unknown, fallback: string): string {
+  return String(value || fallback)
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .trim()
+    .slice(0, 1_024) || fallback;
+}
+
+function boundedDiagnosticCode(value: unknown, fallback: string): string {
+  const candidate = String(value || '').trim();
+  return SAFE_DIAGNOSTIC_CODE.test(candidate) ? candidate : fallback;
+}
+
+function writerSubsystem(value: unknown): ProjectDependencyPromotionWriterSubsystem | null {
+  return (WRITER_SUBSYSTEMS as readonly unknown[]).includes(value)
+    ? value as ProjectDependencyPromotionWriterSubsystem
+    : null;
+}
+
+function diagnosticSessionKey(value: unknown): string | null {
+  return typeof value === 'string'
+    && value.length <= 2_048
+    && SAFE_OPENCLAW_SESSION_KEY.test(value)
+    ? value
+    : null;
+}
 
 export const PROJECT_DEPENDENCY_PROMOTION_WRITER_FENCE_CODE =
   'PROJECT_DEPENDENCY_PROMOTION_WRITER_FENCE_UNPROVEN';
@@ -33,16 +89,88 @@ export type ProjectDependencyPromotionWriterFenceErrorCode =
   | typeof PROJECT_DEPENDENCY_PROMOTION_FENCE_BUSY_CODE;
 
 export class ProjectDependencyPromotionWriterFenceError extends Error {
+  public readonly subsystem: ProjectDependencyPromotionWriterSubsystem | null;
+  public readonly causeCode: string | null;
+  public readonly causeMessage: string | null;
+  public readonly sessionKey: string | null;
+
   constructor(
     message: string,
     public readonly fenceRetained = true,
     public readonly code: ProjectDependencyPromotionWriterFenceErrorCode =
       PROJECT_DEPENDENCY_PROMOTION_WRITER_FENCE_CODE,
     public readonly statusCode = 503,
+    diagnostic: ProjectDependencyPromotionWriterFenceDiagnostic = {},
   ) {
     super(message);
     this.name = 'ProjectDependencyPromotionWriterFenceError';
     this.fenceRetained = fenceRetained;
+    this.subsystem = writerSubsystem(diagnostic.subsystem);
+    this.causeCode = diagnostic.causeCode
+      ? boundedDiagnosticCode(diagnostic.causeCode, 'UnknownError')
+      : null;
+    this.causeMessage = diagnostic.causeMessage
+      ? boundedDiagnosticText(diagnostic.causeMessage, 'Writer quiescence failed')
+      : null;
+    this.sessionKey = diagnosticSessionKey(diagnostic.sessionKey);
+  }
+}
+
+export function describeProjectDependencyPromotionStartupFailure(
+  error: unknown,
+): ProjectDependencyPromotionStartupDiagnostic {
+  const candidate = error && typeof error === 'object'
+    ? error as Record<string, unknown>
+    : {};
+  return Object.freeze({
+    code: boundedDiagnosticCode(
+      candidate.code || candidate.name,
+      'UnknownError',
+    ),
+    message: boundedDiagnosticText(candidate.message, 'Promotion recovery failed'),
+    subsystem: writerSubsystem(candidate.subsystem),
+    causeCode: candidate.causeCode
+      ? boundedDiagnosticCode(candidate.causeCode, 'UnknownError')
+      : null,
+    causeMessage: candidate.causeMessage
+      ? boundedDiagnosticText(candidate.causeMessage, 'Writer quiescence failed')
+      : null,
+    sessionKey: diagnosticSessionKey(candidate.sessionKey),
+  });
+}
+
+function wrapWriterSubsystemFailure(
+  subsystem: ProjectDependencyPromotionWriterSubsystem,
+  error: unknown,
+): ProjectDependencyPromotionWriterFenceError {
+  const candidate = error && typeof error === 'object'
+    ? error as Record<string, unknown>
+    : {};
+  return new ProjectDependencyPromotionWriterFenceError(
+    'A Portal-tracked workspace writer could not be proven quiescent before dependency promotion.',
+    true,
+    PROJECT_DEPENDENCY_PROMOTION_WRITER_FENCE_CODE,
+    503,
+    {
+      subsystem,
+      causeCode: boundedDiagnosticCode(candidate.code || candidate.name, 'UnknownError'),
+      causeMessage: boundedDiagnosticText(
+        candidate.causeMessage || candidate.message,
+        'Writer quiescence failed',
+      ),
+      sessionKey: diagnosticSessionKey(candidate.sessionKey),
+    },
+  );
+}
+
+async function runWriterSubsystem<T>(
+  subsystem: ProjectDependencyPromotionWriterSubsystem,
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    throw wrapWriterSubsystemFailure(subsystem, error);
   }
 }
 
@@ -178,15 +306,18 @@ export function closeProjectDependencyPromotionWriterFence(input: {
   };
   const quiesceAttempt = async (): Promise<ProjectDependencyPromotionWriterQuiescenceAttempt> => {
     assertStillHeld();
-    const terminalScopes = await quiesceTerminalScopes();
-    const agentJobs = await quiesceAgentJobs();
-    const hostAgentRuns = await quiesceHostAgentRuns();
-    const openClawHostRuns = await quiesceOpenClawHostRuns();
-    const projectNativeRuns = await quiesceProjectNativeRuns();
+    const terminalScopes = await runWriterSubsystem('terminalScopes', quiesceTerminalScopes);
+    const agentJobs = await runWriterSubsystem('agentJobs', quiesceAgentJobs);
+    const hostAgentRuns = await runWriterSubsystem('hostAgentRuns', quiesceHostAgentRuns);
+    const openClawHostRuns = await runWriterSubsystem('openClawHostRuns', quiesceOpenClawHostRuns);
+    const projectNativeRuns = await runWriterSubsystem('projectNativeRuns', quiesceProjectNativeRuns);
     // Broker quiescence waits through provider settlement callbacks. Only then
     // can the durable scan prove there is no orphan RUNNING/ABORTING turn or
     // stale activeTurnId that escaped process-local broker inventory.
-    const durableProjectChat = await attestDurableProjectChat();
+    const durableProjectChat = await runWriterSubsystem(
+      'durableProjectChat',
+      attestDurableProjectChat,
+    );
     assertStillHeld();
     return {
       terminalScopes,
@@ -205,7 +336,12 @@ export function closeProjectDependencyPromotionWriterFence(input: {
       if (proof) return proof;
       try {
         const preDrain = await quiesceAttempt();
-        await waitWithDeadline(admission.waitForMutationDrain(), drainTimeoutMs, setTimer, clearTimer);
+        await runWriterSubsystem('mutationDrain', () => waitWithDeadline(
+          admission.waitForMutationDrain(),
+          drainTimeoutMs,
+          setTimer,
+          clearTimer,
+        ));
         const postDrain = await quiesceAttempt();
         proof = Object.freeze({ preDrain, postDrain });
         issuedProofs.set(proof, fence);

@@ -457,3 +457,37 @@ test('seccomp-only policy is accepted only when AppArmor is genuinely unsupporte
     expect.objectContaining({ code: 'CONFINEMENT_POLICY_DOWNGRADE' }),
   );
 });
+
+
+test.each(['name=apparmor', 'name=apparmor,profile=default'])(
+  'accepts Docker AppArmor capability metadata without weakening profile checks: %s',
+  (option) => {
+    const value = fixture();
+    value.probe.dockerSecurityOptions = () => JSON.stringify([option, 'name=seccomp,profile=builtin']);
+    expect(assertProjectRuntimeConfinementReady(value)).toBe(PROJECT_RUNTIME_APPARMOR_SECCOMP_POLICY);
+    expect(assertCodexProjectRuntimeConfinementReady(value)).toBe(PROJECT_RUNTIME_APPARMOR_SECCOMP_POLICY);
+    value.files.set('/sys/kernel/security/apparmor/profiles', Buffer.from('docker-default (enforce)\n'));
+    expect(() => assertProjectRuntimeConfinementReady(value)).toThrow(
+      expect.objectContaining({ code: 'CONFINEMENT_APPARMOR_UNLOADED' }),
+    );
+  },
+);
+
+test.each(['name=apparmor-fake', 'name=apparmor_disabled', 'other=name=apparmor', 'name=apparmor profile=default'])(
+  'does not accept AppArmor capability lookalikes: %s',
+  (option) => {
+    const value = fixture();
+    value.probe.dockerSecurityOptions = () => JSON.stringify([option, 'name=seccomp,profile=builtin']);
+    expect(() => assertProjectRuntimeConfinementReady(value)).toThrow(
+      expect.objectContaining({ code: 'CONFINEMENT_APPARMOR_UNAVAILABLE' }),
+    );
+  },
+);
+
+test('Docker AppArmor metadata still blocks a seccomp-only policy downgrade', () => {
+  const value = fixture(PROJECT_RUNTIME_SECCOMP_ONLY_POLICY);
+  value.probe.dockerSecurityOptions = () => JSON.stringify(['name=apparmor,profile=default', 'name=seccomp,profile=builtin']);
+  expect(() => assertProjectRuntimeConfinementReady(value)).toThrow(
+    expect.objectContaining({ code: 'CONFINEMENT_POLICY_DOWNGRADE' }),
+  );
+});

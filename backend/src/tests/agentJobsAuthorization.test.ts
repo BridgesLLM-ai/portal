@@ -130,6 +130,33 @@ describe('Agent Job host-operator authorization', () => {
   });
 
   test.each([
+    ['openclaw', 'openclaw gateway status'],
+    ['codex', 'codex exec "hello"'],
+    ['claude-code', 'claude -p "hello"'],
+    ['claude', '/usr/bin/claude -p "hello"'],
+  ])('rejects provider runtime job identity %s before generic AgentJob admission', async (toolId, command) => {
+    const response = await request(server, 'POST', '/agent-jobs', 'OWNER', { toolId, command });
+
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({
+      error: expect.stringMatching(/not accepted as Agent Jobs tool IDs/i),
+      code: 'HOST_NATIVE_AGENT_JOB_UNAVAILABLE',
+      retryable: false,
+    });
+    expect(startAgentJobMock).not.toHaveBeenCalled();
+  });
+
+  test('keeps explicitly user-authored generic shell execution outside provider runtime identity', async () => {
+    const response = await request(server, 'POST', '/agent-jobs', 'OWNER', {
+      toolId: 'shell',
+      command: '/usr/bin/codex --version',
+    });
+
+    expect(response.status).toBe(201);
+    expect(startAgentJobMock).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
     ['GET', '/agent-jobs', undefined],
     ['POST', '/agent-jobs/job-1/kill', undefined],
   ])('rejects a pending host operator before job access: %s %s', async (method, route, body) => {

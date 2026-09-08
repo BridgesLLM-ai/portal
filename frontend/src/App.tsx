@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, lazy, Suspense } from 'react';
+import { useCallback, useEffect, useRef, useState, lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from './contexts/AuthContext';
 import { canUseInteractivePortal, isElevated } from './utils/authz';
@@ -28,7 +28,7 @@ function getReloadMarker(key: string) {
   return `${MODULE_RELOAD_PREFIX}${key}`;
 }
 
-function lazyWithModuleRetry<T extends { default: React.ComponentType<unknown> }>(
+function lazyWithModuleRetry<T extends { default: React.ComponentType<any> }>(
   key: string,
   loader: () => Promise<T>
 ) {
@@ -146,7 +146,6 @@ export function SessionRestoreFallback({
   const [signingOut, setSigningOut] = useState(false);
   if (updateRecovery.operationId) {
     const progress = updateRecovery.checkpoint;
-    const percent = progress?.percent ?? null;
     const phase = progress?.label || 'Restarting the Portal';
     return (
       <div className="flex min-h-dvh items-center justify-center bg-theme-bg px-6 text-theme-text">
@@ -160,28 +159,19 @@ export function SessionRestoreFallback({
             The server-owned update is still running. This screen will reconnect automatically; no second update will be started.
           </p>
 
-          {percent !== null ? (
+          {progress ? (
             <div className="mt-6">
-              <div className="mb-2 flex items-end justify-between gap-4">
-                <div>
-                  <p className="text-sm font-semibold text-theme-text">{phase}</p>
-                  <p className="mt-1 text-xs text-theme-muted">Last confirmed server checkpoint</p>
-                </div>
-                <span className="text-2xl font-semibold tabular-nums text-emerald-400">{percent}%</span>
+              <div className="mb-2">
+                <p className="text-sm font-semibold text-theme-text">{phase}</p>
+                <p className="mt-1 text-xs text-theme-muted">Last confirmed server checkpoint</p>
               </div>
               <div
                 className="h-2.5 overflow-hidden rounded-full bg-theme-bg"
                 role="progressbar"
                 aria-label="Portal update progress"
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={percent}
-                aria-valuetext={`${percent}% complete. ${phase}. Portal is restarting and will reconnect automatically.`}
+                aria-valuetext={`${phase}. Portal is restarting and will reconnect automatically.`}
               >
-                <div
-                  className="h-full rounded-full bg-emerald-500 transition-[width] duration-500 motion-reduce:transition-none"
-                  style={{ width: `${percent}%` }}
-                />
+                <div className="typed-confirmation-progress-sweep h-full w-1/3 rounded-full bg-emerald-500" />
               </div>
               {progress?.detail ? (
                 <p className="mt-3 text-xs leading-5 text-theme-muted">{progress.detail}</p>
@@ -311,6 +301,12 @@ export default function App() {
   const [isReinstall, setIsReinstall] = useState<boolean>(false);
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
   const setupModeActive = needsSetup || isReinstall;
+  const handleSetupResolved = useCallback(() => {
+    // The wizard has confirmed the durable setup result. Clear the outer route
+    // gate before its navigation; otherwise login/dashboard bounce back to setup.
+    setNeedsSetup(false);
+    setIsReinstall(false);
+  }, []);
   const updateSessionRecovery = usePortalUpdateSessionRecovery({
     enabled: sessionRestoreError && sessionRestoreRetryable,
     restoreSession,
@@ -501,7 +497,7 @@ export default function App() {
         </Route>
         <Route
           path="/setup"
-          element={setupModeActive ? <LazyRoute><SetupWizardPage /></LazyRoute> : <Navigate to={isAuthenticated ? '/dashboard' : '/login'} replace />}
+          element={setupModeActive ? <LazyRoute><SetupWizardPage onSetupResolved={handleSetupResolved} /></LazyRoute> : <Navigate to={isAuthenticated ? '/dashboard' : '/login'} replace />}
         />
         <Route path="*" element={setupModeActive ? <Navigate to="/setup" replace /> : isAuthenticated ? <Navigate to="/dashboard" replace /> : <LoginRedirect />} />
         </Routes>

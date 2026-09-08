@@ -37,6 +37,9 @@ describe('Rust-free Prisma runtime contract', () => {
     expect(dependencies['@prisma/adapter-pg']).toBe('6.19.3');
     expect(dependencies.prisma).toBe('6.19.3');
     expect(dependencies.pg).toBe('8.22.0');
+    expect(packageJson.overrides?.['@prisma/config@6.19.3']).toEqual({
+      'deepmerge-ts': '8.0.2',
+    });
   });
 
   it('generates the client engine and centralizes the sole PrismaClient', () => {

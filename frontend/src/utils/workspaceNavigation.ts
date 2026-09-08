@@ -10,7 +10,7 @@ export interface WorkspaceNavigationBinding {
   authorizationVersion: number;
 }
 
-type WorkspaceNavigationKind = 'project' | 'file';
+type WorkspaceNavigationKind = 'project' | 'file' | 'project-work';
 
 interface StoredWorkspaceNavigationEntry {
   token: string;
@@ -46,7 +46,7 @@ function isStoredEntry(value: unknown): value is StoredWorkspaceNavigationEntry 
   const entry = value as Partial<StoredWorkspaceNavigationEntry>;
   return typeof entry.token === 'string'
     && OPAQUE_TOKEN_PATTERN.test(entry.token)
-    && (entry.kind === 'project' || entry.kind === 'file')
+    && (entry.kind === 'project' || entry.kind === 'file' || entry.kind === 'project-work')
     && typeof entry.actorUserId === 'string'
     && entry.actorUserId.length > 0
     && entry.actorUserId.length <= 255
@@ -153,7 +153,7 @@ function resolveWorkspaceNavigationTarget<T>(
 }
 
 function buildWorkspaceNavigationUrl(
-  route: '/projects' | '/files',
+  route: '/projects' | '/files' | '/agent-chats',
   kind: WorkspaceNavigationKind,
   target: unknown,
   binding: WorkspaceNavigationBinding,

@@ -21,7 +21,7 @@ import {
   sendTwoFactorDisabledEmail,
   sendTwoFactorCodeEmail,
 } from '../services/notificationService';
-import { provisionUserMailbox } from '../services/userMailService';
+import { isMailProvisioningConfigured, provisionUserMailbox } from '../services/userMailService';
 import {
   extractTrackingMetadata,
   formatLoginMessage,
@@ -49,6 +49,11 @@ import {
   assertNoProjectAuthorizationTransitionActive,
   projectAuthorizationTransitionCoordinator,
 } from '../services/projectAuthorizationTransition';
+import {
+  ADMIN_USER_RETIREMENT_PARTICIPANT_ACTIVE_CODE,
+  findUnfinishedAdminUserRetirementTarget,
+} from '../services/adminUserRetirementParticipation';
+import { settleWorkspaceAuthorizationRequest } from '../services/workspaceAuthorizationBarrier';
 import { effectiveRequestOrigin } from '../utils/appContentSecurity';
 import { publishAuthorizationChanged } from '../services/authorizationChangeBus';
 import {
@@ -214,13 +219,16 @@ async function mapAuthorizationArtifactAdmissionConflicts<T>(
   } catch (error) {
     if (
       !isAuthorizationTransitionActiveError(error)
+      && !isUnfinishedAdminUserRetirementError(error)
       && !isSerializableTransactionConflict(error)
     ) {
       throw error;
     }
     const code = isAuthorizationTransitionActiveError(error)
       ? 'PROJECT_AUTHORIZATION_TRANSITION_ACTIVE'
-      : AUTHORIZATION_ARTIFACT_CONFLICT_CODE;
+      : isUnfinishedAdminUserRetirementError(error)
+        ? ADMIN_USER_RETIREMENT_PARTICIPANT_ACTIVE_CODE
+        : AUTHORIZATION_ARTIFACT_CONFLICT_CODE;
     throw Object.assign(
       new AppError(409, 'Authentication is temporarily paused while account access is being updated. Please try again.'),
       { code },
@@ -268,14 +276,37 @@ function isSerializableTransactionConflict(error: unknown): boolean {
     && error.code === 'P2034';
 }
 
+function isUnfinishedAdminUserRetirementError(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === ADMIN_USER_RETIREMENT_PARTICIPANT_ACTIVE_CODE;
+}
+
 function isAuthorizationArtifactAdmissionConflict(error: unknown): boolean {
   return isAuthorizationTransitionActiveError(error)
+    || isUnfinishedAdminUserRetirementError(error)
     || (
       typeof error === 'object'
       && error !== null
       && 'code' in error
       && error.code === AUTHORIZATION_ARTIFACT_CONFLICT_CODE
     );
+}
+
+async function assertNoUnfinishedAdminUserRetirementTarget(
+  tx: Prisma.TransactionClient,
+  userId: string,
+): Promise<void> {
+  const retirement = await findUnfinishedAdminUserRetirementTarget(tx, [userId]);
+  if (!retirement) return;
+  throw Object.assign(
+    new AppError(
+      409,
+      'Authentication is temporarily paused while account retirement is being completed. Please try again.',
+    ),
+    { code: ADMIN_USER_RETIREMENT_PARTICIPANT_ACTIVE_CODE },
+  );
 }
 
 function respondAuthorizationArtifactAdmissionConflict(
@@ -415,6 +446,10 @@ async function generate2FAPendingToken(user: any): Promise<{ id: string; token: 
   const tokenHash = digestAuthToken('2fa-challenge', token);
   const challenge = await withAuthorizationArtifactAdmission(async (tx) => {
     await assertAuthorizationCredentialSnapshotCurrent(tx, user);
+    await assertNoUnfinishedAdminUserRetirementTarget(tx, user.id);
+    await tx.twoFactorChallenge.deleteMany({
+      where: { userId: user.id, expiresAt: { lt: new Date() } },
+    });
     return tx.twoFactorChallenge.create({
       data: {
         userId: user.id,
@@ -424,9 +459,6 @@ async function generate2FAPendingToken(user: any): Promise<{ id: string; token: 
       select: { id: true },
     });
   });
-  void prisma.twoFactorChallenge.deleteMany({
-    where: { expiresAt: { lt: new Date() } },
-  }).catch(() => {});
   return { id: challenge.id, token };
 }
 
@@ -1215,6 +1247,7 @@ router.post('/forgot-password', forgotPasswordLimiter, async (req: Request, res:
       let resetToken: { id: string } | null;
       try {
         resetToken = await withAuthorizationArtifactAdmission(async (tx) => {
+          await assertNoUnfinishedAdminUserRetirementTarget(tx, user.id);
           const current = await tx.user.findFirst({
             where: authorizationCredentialSnapshotCas(user),
             select: { id: true },
@@ -1321,6 +1354,7 @@ router.post('/reset-password', authLimiter, async (req: Request, res: Response, 
 
     const newHash = await hashPassword(newPassword);
     const resetAuthorizationVersion = await withAuthorizationArtifactAdmission(async (tx) => {
+      await assertNoUnfinishedAdminUserRetirementTarget(tx, matchedToken.userId);
       const consumed = await tx.passwordResetToken.updateMany({
         where: {
           id: matchedToken.id,
@@ -1542,9 +1576,9 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable })
       ));
 
-      if (getPortalFeatureCapabilities().mail.available) {
-        // Provision personal mailbox (non-blocking, but immediate if possible)
-        provisionUserMailbox(user.username, user.id, { makePrimary: true }).catch((err) => {
+      if (getPortalFeatureCapabilities().mail.available && isMailProvisioningConfigured()) {
+        // Keep mutation admission until desired and external mailbox state settle.
+        await provisionUserMailbox(user.username, user.id, { makePrimary: true }).catch((err) => {
           console.error('[auth] Failed to auto-provision mailbox on open registration:', err);
         });
 
@@ -1840,6 +1874,7 @@ router.put('/me', authenticateToken, async (req: Request, res: Response, next: N
       data.username
       && data.username !== currentUser.username
       && getPortalFeatureCapabilities().mail.available
+      && isMailProvisioningConfigured()
     ) {
       try {
         await provisionUserMailbox(data.username, req.user.userId, { makePrimary: true });
@@ -2315,8 +2350,13 @@ router.post('/2fa/recover-email', twoFactorEmailRecoveryIpLimiter, twoFactorEmai
     if (
       !user.twoFactorEnabled
       || user.twoFactorMethod !== 'email'
-      || !canAccessPortal((user as any).accountStatus, user.isActive)
     ) {
+      throw new AppError(401, 'Recovery is unavailable or the verification session is invalid');
+    }
+    if (!canAccessPortal((user as any).accountStatus, user.isActive)) {
+      await withAuthorizationArtifactAdmission(async (tx) => {
+        await assertNoUnfinishedAdminUserRetirementTarget(tx, user.id);
+      });
       throw new AppError(401, 'Recovery is unavailable or the verification session is invalid');
     }
     if (!await comparePassword(currentPassword, user.passwordHash)) {
@@ -2327,6 +2367,7 @@ router.post('/2fa/recover-email', twoFactorEmailRecoveryIpLimiter, twoFactorEmai
     }
 
     const tracking = extractTrackingMetadata(req);
+    settleWorkspaceAuthorizationRequest(req);
     await projectAuthorizationTransitionCoordinator.recoverEmailTwoFactor({
       targetUserId: user.id,
       challengeId: pending.id,
@@ -2345,6 +2386,7 @@ router.post('/2fa/recover-email', twoFactorEmailRecoveryIpLimiter, twoFactorEmai
       message: 'Email Code 2FA was disabled and all sessions were signed out. Sign in again, then enable Authenticator App 2FA.',
     });
   } catch (error) {
+    if (respondAuthorizationArtifactAdmissionConflict(res, error)) return;
     next(error);
   }
 });

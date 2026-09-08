@@ -20,20 +20,20 @@ vi.mock('../api/agentTools', () => ({
 }));
 
 const tool: AgentTool = {
-  id: 'codex',
-  name: 'OpenAI Codex',
-  description: 'Portal-tested coding runtime.',
-  detect: { command: 'codex --version' },
-  install: [{ label: 'Install Codex', command: 'reviewed-command' }],
+  id: 'ffmpeg',
+  name: 'Media Processing (FFmpeg)',
+  description: 'Separately supported host maintenance recipe.',
+  detect: { command: 'ffmpeg -version' },
+  install: [{ label: 'Install FFmpeg', command: 'reviewed-command' }],
   commands: [],
-  authRequired: true,
-  authHint: 'Sign in before use.',
+  authRequired: false,
   tier: 1 as const,
   status: {
     installed: false,
     version: null,
     missing: true,
     checkedAt: '2026-07-19T12:00:00.000Z',
+    installAvailable: true,
   },
 };
 
@@ -67,7 +67,7 @@ describe('Tools host inventory and durable installation', () => {
         tools: [installedTool()],
         cachedForMs: 60_000,
       });
-    mocks.install.mockReset().mockResolvedValue({ jobId: 'job-1', room: 'job:job-1', toolId: 'codex' });
+    mocks.install.mockReset().mockResolvedValue({ jobId: 'job-1', room: 'job:job-1', toolId: 'ffmpeg' });
     mocks.waitForJob.mockReset().mockResolvedValue({ id: 'job-1', status: 'completed' });
   });
 
@@ -79,11 +79,11 @@ describe('Tools host inventory and durable installation', () => {
     await user.click(screen.getByRole('button', { name: 'Install' }));
     const confirm = screen.getByRole('button', { name: 'Start install' });
     expect(confirm).toBeDisabled();
-    await user.type(screen.getByLabelText(/Type .*INSTALL CODEX.* to continue/i), 'INSTALL CODEX');
+    await user.type(screen.getByLabelText(/Type .*INSTALL FFMPEG.* to continue/i), 'INSTALL FFMPEG');
     await user.click(confirm);
 
     await waitFor(() => {
-      expect(mocks.install).toHaveBeenCalledWith('codex', 'INSTALL CODEX', { timeoutMs: 15_000 });
+      expect(mocks.install).toHaveBeenCalledWith('ffmpeg', 'INSTALL FFMPEG', { timeoutMs: 15_000 });
       expect(mocks.waitForJob).toHaveBeenCalledWith('job-1', {
         timeoutMs: 30 * 60 * 1000,
         requestTimeoutMs: 10_000,
@@ -91,7 +91,7 @@ describe('Tools host inventory and durable installation', () => {
       expect(mocks.list).toHaveBeenLastCalledWith(true, { timeoutMs: 10_000 });
     });
     expect(await screen.findByText('Ready · 1.2.3')).toBeVisible();
-    expect(screen.queryByRole('dialog', { name: 'Install OpenAI Codex' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Install Media Processing (FFmpeg)' })).not.toBeInTheDocument();
   });
 
   it('keeps verification failures distinct from a confirmed missing tool', async () => {
@@ -104,6 +104,65 @@ describe('Tools host inventory and durable installation', () => {
     expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
   });
 
+  it('keeps managed Codex package status maintenance-only and fail-closed', async () => {
+    mocks.list.mockReset().mockResolvedValue({
+      tools: [{
+        ...tool,
+        id: 'codex',
+        name: 'OpenAI Codex',
+        managedInstall: 'npm-cli',
+        install: [],
+        authRequired: false,
+        authHint: undefined,
+        status: {
+          ...tool.status,
+          state: 'verified',
+          installed: true,
+          missing: false,
+          version: '1.0.0',
+          installAvailable: false,
+          installUnavailableCode: 'HOST_TOOL_INSTALL_AFTER_SETUP',
+        },
+      }],
+      cachedForMs: 60_000,
+    });
+
+    render(<ToolsContent />);
+
+    expect(await screen.findByText('Package verified · 1.0.0 · supervised Agent Chat only')).toBeVisible();
+    expect(screen.getByText(/Read-only here · Owner updates the bundle in Admin > Maintenance/i)).toBeVisible();
+    expect(screen.queryByRole('button', { name: /Install|Update/i })).not.toBeInTheDocument();
+    expect(mocks.install).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['gemini', 'Google Antigravity'],
+    ['grok-build', 'Grok Build'],
+    ['hermes', 'Hermes'],
+    ['opencode', 'OpenCode'],
+    ['agent-zero', 'Agent Zero'],
+  ])('never renders a Portal acquisition control for native runtime %s', async (id, name) => {
+    mocks.list.mockReset().mockResolvedValue({
+      tools: [{
+        ...tool,
+        id,
+        name,
+        status: {
+          ...tool.status,
+          installAvailable: true,
+        },
+      }],
+      cachedForMs: 60_000,
+    });
+
+    render(<ToolsContent />);
+
+    expect(await screen.findByText(name)).toBeVisible();
+    expect(screen.getByText(/Read-only here · use this runtime's dedicated setup/i)).toBeVisible();
+    expect(screen.queryByRole('button', { name: /Install|Update/i })).not.toBeInTheDocument();
+    expect(mocks.install).not.toHaveBeenCalled();
+  });
+
   it('admits one typed-confirm installation in the same frame and keeps startup failure in the dialog', async () => {
     const user = userEvent.setup();
     let rejectInstall!: (reason?: unknown) => void;
@@ -112,8 +171,8 @@ describe('Tools host inventory and durable installation', () => {
     render(<ToolsContent />);
 
     await user.click(await screen.findByRole('button', { name: 'Install' }));
-    const dialog = screen.getByRole('dialog', { name: 'Install OpenAI Codex' });
-    await user.type(within(dialog).getByLabelText(/INSTALL CODEX/i), 'INSTALL CODEX');
+    const dialog = screen.getByRole('dialog', { name: 'Install Media Processing (FFmpeg)' });
+    await user.type(within(dialog).getByLabelText(/INSTALL FFMPEG/i), 'INSTALL FFMPEG');
     const confirm = within(dialog).getByRole('button', { name: 'Start install' });
     act(() => {
       confirm.click();
@@ -122,9 +181,9 @@ describe('Tools host inventory and durable installation', () => {
     });
 
     expect(mocks.install).toHaveBeenCalledTimes(1);
-    expect(mocks.install).toHaveBeenCalledWith('codex', 'INSTALL CODEX', { timeoutMs: 15_000 });
+    expect(mocks.install).toHaveBeenCalledWith('ffmpeg', 'INSTALL FFMPEG', { timeoutMs: 15_000 });
     expect(await within(dialog).findByRole('button', { name: 'Starting install…' })).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByRole('dialog', { name: 'Install OpenAI Codex' })).toBeVisible();
+    expect(screen.getByRole('dialog', { name: 'Install Media Processing (FFmpeg)' })).toBeVisible();
 
     await act(async () => {
       rejectInstall({ response: { data: { error: 'Package mirror is unavailable' } } });
@@ -140,8 +199,8 @@ describe('Tools host inventory and durable installation', () => {
     const first = render(<ToolsContent />);
 
     await user.click(await screen.findByRole('button', { name: 'Install' }));
-    const confirmation = screen.getByRole('dialog', { name: 'Install OpenAI Codex' });
-    await user.type(within(confirmation).getByLabelText(/INSTALL CODEX/i), 'INSTALL CODEX');
+    const confirmation = screen.getByRole('dialog', { name: 'Install Media Processing (FFmpeg)' });
+    await user.type(within(confirmation).getByLabelText(/INSTALL FFMPEG/i), 'INSTALL FFMPEG');
     await user.click(within(confirmation).getByRole('button', { name: 'Start install' }));
 
     const unresolved = await screen.findByRole('dialog', { name: /install admission is unresolved/i });
@@ -171,12 +230,12 @@ describe('Tools host inventory and durable installation', () => {
     const { container } = render(<ToolsContent />);
 
     await user.click(await screen.findByRole('button', { name: 'Install' }));
-    const dialog = screen.getByRole('dialog', { name: 'Install OpenAI Codex' });
-    await user.type(within(dialog).getByLabelText(/INSTALL CODEX/i), 'INSTALL CODEX');
+    const dialog = screen.getByRole('dialog', { name: 'Install Media Processing (FFmpeg)' });
+    await user.type(within(dialog).getByLabelText(/INSTALL FFMPEG/i), 'INSTALL FFMPEG');
     await user.click(within(dialog).getByRole('button', { name: 'Start install' }));
 
     expect(await within(dialog).findByRole('button', { name: 'Verifying fresh inventory…' })).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByRole('dialog', { name: 'Install OpenAI Codex' })).toBeVisible();
+    expect(screen.getByRole('dialog', { name: 'Install Media Processing (FFmpeg)' })).toBeVisible();
     const backgroundInstall = container.querySelector<HTMLButtonElement>('button[aria-busy="false"]');
     expect(backgroundInstall).toBeDisabled();
     expect(backgroundInstall).not.toHaveAttribute('aria-busy', 'true');
@@ -186,7 +245,7 @@ describe('Tools host inventory and durable installation', () => {
       await verification.promise;
     });
     expect(await screen.findByText('Ready · 1.2.3')).toBeVisible();
-    expect(screen.queryByRole('dialog', { name: 'Install OpenAI Codex' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Install Media Processing (FFmpeg)' })).not.toBeInTheDocument();
   });
 
   it('fails closed on stale inventory and retries proof without launching a second job', async () => {
@@ -198,8 +257,8 @@ describe('Tools host inventory and durable installation', () => {
     render(<ToolsContent />);
 
     await user.click(await screen.findByRole('button', { name: 'Install' }));
-    const dialog = screen.getByRole('dialog', { name: 'Install OpenAI Codex' });
-    await user.type(within(dialog).getByLabelText(/INSTALL CODEX/i), 'INSTALL CODEX');
+    const dialog = screen.getByRole('dialog', { name: 'Install Media Processing (FFmpeg)' });
+    await user.type(within(dialog).getByLabelText(/INSTALL FFMPEG/i), 'INSTALL FFMPEG');
     await user.click(within(dialog).getByRole('button', { name: 'Start install' }));
 
     expect(await within(dialog).findByRole('alert')).toHaveTextContent(/stale tool inventory/i);
@@ -221,8 +280,8 @@ describe('Tools host inventory and durable installation', () => {
     render(<ToolsContent />);
 
     await user.click(await screen.findByRole('button', { name: 'Install' }));
-    const dialog = screen.getByRole('dialog', { name: 'Install OpenAI Codex' });
-    await user.type(within(dialog).getByLabelText(/INSTALL CODEX/i), 'INSTALL CODEX');
+    const dialog = screen.getByRole('dialog', { name: 'Install Media Processing (FFmpeg)' });
+    await user.type(within(dialog).getByLabelText(/INSTALL FFMPEG/i), 'INSTALL FFMPEG');
     await user.click(within(dialog).getByRole('button', { name: 'Start install' }));
     expect(await within(dialog).findByRole('alert')).toHaveTextContent(/status check timed out/i);
     await user.click(within(dialog).getByRole('button', { name: 'Retry verification' }));
@@ -240,14 +299,14 @@ describe('Tools host inventory and durable installation', () => {
       }))
       .mockResolvedValueOnce({ id: 'job-2', status: 'completed' });
     mocks.install
-      .mockResolvedValueOnce({ jobId: 'job-1', room: 'job:job-1', toolId: 'codex' })
-      .mockResolvedValueOnce({ jobId: 'job-2', room: 'job:job-2', toolId: 'codex' });
+      .mockResolvedValueOnce({ jobId: 'job-1', room: 'job:job-1', toolId: 'ffmpeg' })
+      .mockResolvedValueOnce({ jobId: 'job-2', room: 'job:job-2', toolId: 'ffmpeg' });
     const user = userEvent.setup();
     render(<ToolsContent />);
 
     await user.click(await screen.findByRole('button', { name: 'Install' }));
-    const dialog = screen.getByRole('dialog', { name: 'Install OpenAI Codex' });
-    await user.type(within(dialog).getByLabelText(/INSTALL CODEX/i), 'INSTALL CODEX');
+    const dialog = screen.getByRole('dialog', { name: 'Install Media Processing (FFmpeg)' });
+    await user.type(within(dialog).getByLabelText(/INSTALL FFMPEG/i), 'INSTALL FFMPEG');
     await user.click(within(dialog).getByRole('button', { name: 'Start install' }));
     expect(await within(dialog).findByRole('alert')).toHaveTextContent('Tool installation failed');
 

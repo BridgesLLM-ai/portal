@@ -28,6 +28,12 @@ type SessionInfoResult = {
   error?: string;
 };
 
+function isValidOpenClawSessionKey(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length <= 2_048
+    && SESSION_KEY_PATTERN.test(value);
+}
+
 export interface OpenClawHostRunHandle {
   id: string;
   actorUserId: string;
@@ -56,6 +62,7 @@ export interface OpenClawSessionResetProof {
   resetSessionId: string;
   readbackSessionId: string;
   reattestedSessionId: string;
+  resetBoundary?: { lifecycleRevision: string; beforeUpdatedAt: number; updatedAt: number };
   rowCount: number;
   rowIdentitySha256: string;
   resetAt: string;
@@ -70,13 +77,22 @@ export interface OpenClawHostRunQuiescence {
 }
 
 export class OpenClawHostRunJournalError extends Error {
+  public readonly sessionKey: string | null;
+  public readonly causeMessage: string | null;
+
   constructor(
     message: string,
     public readonly statusCode: number,
     public readonly code: string,
+    sessionKey: string | null = null,
+    cause: unknown = null,
   ) {
     super(message);
     this.name = 'OpenClawHostRunJournalError';
+    this.sessionKey = isValidOpenClawSessionKey(sessionKey)
+      ? sessionKey
+      : null;
+    this.causeMessage = cause === null ? null : errorSummary(cause);
   }
 }
 
@@ -155,7 +171,7 @@ function validateHandle(input: OpenClawHostRunHandle): void {
       'OPENCLAW_HOST_RUN_INVALID',
     );
   }
-  if (!SESSION_KEY_PATTERN.test(input.sessionKey)) {
+  if (!isValidOpenClawSessionKey(input.sessionKey)) {
     throw new OpenClawHostRunJournalError(
       'OpenClaw host run session identity is invalid',
       400,
@@ -208,6 +224,7 @@ function sessionIdFromInfo(
       `OpenClaw session ${sessionKey} could not be authoritatively read`,
       503,
       'OPENCLAW_SESSION_READ_FAILED',
+      sessionKey,
     );
   }
   if (!result.data || result.data.stale === true) {
@@ -215,6 +232,7 @@ function sessionIdFromInfo(
       `OpenClaw session ${sessionKey} returned stale metadata`,
       503,
       'OPENCLAW_SESSION_READ_FAILED',
+      sessionKey,
     );
   }
   const returnedKey = typeof result.data.key === 'string' ? result.data.key : '';
@@ -223,9 +241,20 @@ function sessionIdFromInfo(
       'OpenClaw session readback changed identity',
       503,
       'OPENCLAW_SESSION_IDENTITY_DRIFT',
+      sessionKey,
     );
   }
-  return exactIdentifier(result.data.sessionId, 'OpenClaw session generation', 255);
+  try {
+    return exactIdentifier(result.data.sessionId, 'OpenClaw session generation', 255);
+  } catch (error) {
+    throw new OpenClawHostRunJournalError(
+      'OpenClaw session readback returned an invalid generation identity',
+      503,
+      'OPENCLAW_SESSION_IDENTITY_DRIFT',
+      sessionKey,
+      error,
+    );
+  }
 }
 
 function resetProofDigest(rows: readonly OpenClawHostRunRow[]): string {
@@ -495,63 +524,129 @@ export function createOpenClawHostRunJournal(
     sessionKey: string,
     rows: readonly OpenClawHostRunRow[],
   ): Promise<OpenClawSessionResetProof> => {
-    const before = sessionIdFromInfo(
-      await dependencies.getSessionInfo(sessionKey),
-      sessionKey,
-      true,
-    );
-    const reset = await dependencies.gatewayRpcCall(
-      'sessions.reset',
-      { key: sessionKey, reason: 'reset' },
-      RESET_TIMEOUT_MS,
-    );
+    const readSessionGeneration = async (allowMissing: boolean): Promise<{
+      sessionId: string | null;
+      updatedAt: number | null;
+    }> => {
+      let info: SessionInfoResult;
+      try {
+        info = await dependencies.getSessionInfo(sessionKey);
+      } catch (error) {
+        throw new OpenClawHostRunJournalError(
+          `OpenClaw session ${sessionKey} could not be authoritatively read`,
+          503,
+          'OPENCLAW_SESSION_READ_FAILED',
+          sessionKey,
+          error,
+        );
+      }
+      return {
+        sessionId: sessionIdFromInfo(info, sessionKey, allowMissing),
+        updatedAt: Number.isSafeInteger(info.data?.updatedAt) && info.data.updatedAt > 0
+          ? info.data.updatedAt : null,
+      };
+    };
+
+    const before = await readSessionGeneration(true);
+    let reset: GatewayRpcResult;
+    try {
+      reset = await dependencies.gatewayRpcCall(
+        'sessions.reset',
+        { key: sessionKey, reason: 'reset' },
+        RESET_TIMEOUT_MS,
+      );
+    } catch (error) {
+      throw new OpenClawHostRunJournalError(
+        `OpenClaw session ${sessionKey} reset request failed`,
+        503,
+        'OPENCLAW_SESSION_RESET_FAILED',
+        sessionKey,
+        error,
+      );
+    }
     if (!reset.ok || reset.data?.ok !== true) {
       throw new OpenClawHostRunJournalError(
         `OpenClaw session ${sessionKey} did not reset authoritatively`,
         503,
         'OPENCLAW_SESSION_RESET_FAILED',
+        sessionKey,
       );
     }
-    const resetKey = exactIdentifier(reset.data?.key, 'reset session key', 2_048);
-    const resetSessionId = exactIdentifier(
-      reset.data?.entry?.sessionId,
-      'reset session generation',
-      255,
-    );
-    if (resetKey !== sessionKey || (before && resetSessionId === before)) {
+    let resetKey: string;
+    let resetSessionId: string;
+    try {
+      resetKey = exactIdentifier(reset.data?.key, 'reset session key', 2_048);
+      resetSessionId = exactIdentifier(
+        reset.data?.entry?.sessionId,
+        'reset session generation',
+        255,
+      );
+    } catch (error) {
       throw new OpenClawHostRunJournalError(
-        'OpenClaw session reset did not rotate the exact session identity',
+        'OpenClaw session reset returned an invalid identity',
         503,
         'OPENCLAW_SESSION_IDENTITY_DRIFT',
+        sessionKey,
+        error,
       );
     }
-    const readbackSessionId = sessionIdFromInfo(
-      await dependencies.getSessionInfo(sessionKey),
-      sessionKey,
-      false,
-    );
-    const reattestedSessionId = sessionIdFromInfo(
-      await dependencies.getSessionInfo(sessionKey),
-      sessionKey,
-      false,
-    );
+    // OpenClaw 9.1 preserves the conversation ID and commits a new lifecycle
+    // revision instead. sessions.describe exposes its updatedAt, not the
+    // revision: require the reset acknowledgement's fresh boundary and exact
+    // readback of that boundary. Older runtimes still rotate the session ID.
+    let resetBoundary: OpenClawSessionResetProof['resetBoundary'];
+    if (before.sessionId === resetSessionId) {
+      const entry = reset.data.entry;
+      if (
+        typeof entry.lifecycleRevision !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(entry.lifecycleRevision)
+        || before.updatedAt === null
+        || !Number.isSafeInteger(entry.updatedAt)
+        || entry.updatedAt <= before.updatedAt
+        || entry.sessionStartedAt !== entry.updatedAt
+      ) {
+        throw new OpenClawHostRunJournalError(
+          'OpenClaw session reset did not establish a fresh lifecycle boundary',
+          503,
+          'OPENCLAW_SESSION_IDENTITY_DRIFT',
+          sessionKey,
+        );
+      }
+      resetBoundary = { lifecycleRevision: entry.lifecycleRevision, beforeUpdatedAt: before.updatedAt, updatedAt: entry.updatedAt };
+    }
+    if (resetKey !== sessionKey) {
+      throw new OpenClawHostRunJournalError(
+        'OpenClaw session reset changed the exact session key',
+        503,
+        'OPENCLAW_SESSION_IDENTITY_DRIFT',
+        sessionKey,
+      );
+    }
+    const readback = await readSessionGeneration(false);
+    const reattested = await readSessionGeneration(false);
     if (
-      readbackSessionId !== resetSessionId
-      || reattestedSessionId !== resetSessionId
+      readback.sessionId !== resetSessionId
+      || reattested.sessionId !== resetSessionId
+      || (resetBoundary && (
+        readback.updatedAt !== resetBoundary.updatedAt
+        || reattested.updatedAt !== resetBoundary.updatedAt
+      ))
     ) {
       throw new OpenClawHostRunJournalError(
         'OpenClaw session generation changed after reset',
         503,
         'OPENCLAW_SESSION_IDENTITY_DRIFT',
+        sessionKey,
       );
     }
     return Object.freeze({
       schemaVersion: 1,
       sessionKey,
-      beforeSessionId: before,
+      beforeSessionId: before.sessionId,
       resetSessionId,
-      readbackSessionId,
-      reattestedSessionId,
+      readbackSessionId: readback.sessionId,
+      reattestedSessionId: reattested.sessionId,
+      ...(resetBoundary ? { resetBoundary } : {}),
       rowCount: rows.length,
       rowIdentitySha256: resetProofDigest(rows),
       resetAt: dependencies.now().toISOString(),
@@ -572,18 +667,24 @@ export function createOpenClawHostRunJournal(
         },
         orderBy: [{ sessionKey: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
       }),
-      dependencies.database.agentSession.findMany({
-        where: {
-          userId: { in: actorUserIds },
-          provider: 'OPENCLAW',
-        },
-        select: {
-          id: true,
-          userId: true,
-          externalId: true,
-        },
-        orderBy: [{ externalId: 'asc' }, { id: 'asc' }],
-      }),
+      // Authorization revocation must still rotate pre-upgrade sessions that
+      // predate this journal. Dependency promotion has a narrower writer
+      // boundary: only sessions named by unresolved durable run rows can own a
+      // relevant writer, so unrelated conversation history is not reset.
+      reason === 'authorization_transition'
+        ? dependencies.database.agentSession.findMany({
+          where: {
+            userId: { in: actorUserIds },
+            provider: 'OPENCLAW',
+          },
+          select: {
+            id: true,
+            userId: true,
+            externalId: true,
+          },
+          orderBy: [{ externalId: 'asc' }, { id: 'asc' }],
+        })
+        : Promise.resolve([]),
     ]) as [OpenClawHostRunRow[], Array<{
       id: string;
       userId: string;
@@ -599,7 +700,7 @@ export function createOpenClawHostRunJournal(
         2_048,
       );
       if (
-        !SESSION_KEY_PATTERN.test(sessionKey)
+        !isValidOpenClawSessionKey(sessionKey)
         || !actorUserIds.includes(exactIdentifier(session.userId, 'session owner', 255))
         || grouped.has(sessionKey)
       ) {
@@ -612,12 +713,17 @@ export function createOpenClawHostRunJournal(
       grouped.set(sessionKey, []);
     }
     for (const row of rows) {
-      const sessionRows = grouped.get(row.sessionKey);
+      let sessionRows = grouped.get(row.sessionKey);
+      if (!sessionRows && reason === 'project_dependency_promotion') {
+        sessionRows = [];
+        grouped.set(row.sessionKey, sessionRows);
+      }
       if (!sessionRows) {
         throw new OpenClawHostRunJournalError(
           'OpenClaw host-run journal has no durable session owner',
           503,
           'OPENCLAW_SESSION_OWNERSHIP_CONFLICT',
+          row.sessionKey,
         );
       }
       sessionRows.push(row);
@@ -640,15 +746,17 @@ export function createOpenClawHostRunJournal(
         select: { id: true, userId: true, externalId: true },
       }) as Array<{ id: string; userId: string; externalId: string }>;
       everyUnresolvedSessionRow.forEach(assertRowShape);
+      const exactSessionOwner = String(everySessionOwner[0]?.userId || '');
       if (
         everySessionOwner.length !== 1
-        || !actorUserIds.includes(String(everySessionOwner[0]?.userId || ''))
-        || everyUnresolvedSessionRow.some((row) => !actorUserIds.includes(row.actorUserId))
+        || !actorUserIds.includes(exactSessionOwner)
+        || everyUnresolvedSessionRow.some((row) => row.actorUserId !== exactSessionOwner)
       ) {
         throw new OpenClawHostRunJournalError(
           'An OpenClaw host session is shared across authorization boundaries',
           503,
           'OPENCLAW_SESSION_OWNERSHIP_CONFLICT',
+          sessionKey,
         );
       }
       if (
@@ -659,6 +767,7 @@ export function createOpenClawHostRunJournal(
           'OpenClaw host-run journal changed before provider reset',
           503,
           'OPENCLAW_HOST_RUN_IDENTITY_DRIFT',
+          sessionKey,
         );
       }
 
@@ -682,6 +791,7 @@ export function createOpenClawHostRunJournal(
             'OpenClaw host-run journal changed during provider reset',
             503,
             'OPENCLAW_HOST_RUN_IDENTITY_DRIFT',
+            sessionKey,
           );
         }
         const committedProof: OpenClawSessionResetProof = Object.freeze({
@@ -716,6 +826,7 @@ export function createOpenClawHostRunJournal(
             'OpenClaw session reset proof could not be committed',
             503,
             'OPENCLAW_SESSION_RESET_PROOF_FAILED',
+            sessionKey,
           );
         }
         return committedProof;

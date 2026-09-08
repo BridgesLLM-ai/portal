@@ -23,7 +23,9 @@ describe('system maintenance admission gate', () => {
   let lockPath: string;
 
   beforeEach(() => {
-    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-maintenance-admission-'));
+    // The real data verifier requires a protected root-owned parent chain.
+    const parent = process.getuid?.() === 0 ? os.homedir() : os.tmpdir();
+    tempRoot = fs.mkdtempSync(path.join(parent, 'portal-maintenance-admission-'));
     lockPath = path.join(tempRoot, 'locks', 'maintenance.lock');
   });
 
@@ -183,6 +185,59 @@ describe('system maintenance admission gate', () => {
       else process.env.RESTORE_SCRIPT_PATH = previousRestoreScriptPath;
     }
   });
+
+  (process.getuid?.() === 0 ? test : test.skip).each(['valid', 'missing-receipt', 'tampered-receipt', 'tampered-archive', 'incomplete'])(
+    'authenticates the real Portal data format before admission: %s', async (scenario) => {
+      // Use the shipped Python producer/authenticator with fixture-local trust.
+      // No installed trust key, database, services, or project data are touched.
+      const helperRoot = path.join(tempRoot, 'helper');
+      fs.mkdirSync(helperRoot);
+      const archivePath = path.join(tempRoot, 'portal-comprehensive-20260908-120000-data-1234abcd.tar.gz');
+      execFileSync('/usr/bin/python3', ['-c', `
+import importlib.util, pathlib, sys, tarfile, io, json, hashlib
+source, root, archive, scenario = map(str, sys.argv[1:])
+spec = importlib.util.spec_from_file_location('data_backup', source)
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.TRUST = pathlib.Path(root) / 'trust'
+p = pathlib.Path(archive)
+dump = b'fixture database snapshot'
+with tarfile.open(p, 'w:gz') as out:
+    items = {'database.dump': dump, 'portal-keys.json': b'{}', 'portal-data.json': json.dumps({'schema': m.SCHEMA, 'type': 'comprehensive', 'databaseSha256': hashlib.sha256(dump).hexdigest()}).encode()}
+    for name, payload in items.items():
+        info = tarfile.TarInfo(name); info.size = len(payload); info.mode = 0o600
+        out.addfile(info, io.BytesIO(payload))
+    if scenario != 'incomplete':
+        info = tarfile.TarInfo('data/projects'); info.type = tarfile.DIRTYPE; info.mode = 0o700
+        out.addfile(info)
+p.chmod(0o600)
+m.publish_receipt(p, 'comprehensive')
+receipt = pathlib.Path(str(p)+'.receipt.json')
+if scenario == 'missing-receipt': receipt.unlink()
+if scenario == 'tampered-receipt':
+    r = json.loads(receipt.read_text()); r['signature'] = '0'*64; m.write_json(receipt, r)
+if scenario == 'tampered-archive':
+    with p.open('ab') as out: out.write(b'tamper')
+wrapper = '''import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("data_backup", __SOURCE__)
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.TRUST = pathlib.Path(__TRUST__)
+assert sys.argv[1] == "verify" and sys.argv[3:] == ["--require-receipt"]
+p = pathlib.Path(sys.argv[2]); m.verify_local_receipt(p); m.verify(p)
+'''.replace('__SOURCE__', repr(source)).replace('__TRUST__', repr(str(m.TRUST)))
+(pathlib.Path(root) / 'backup-data.py').write_text(wrapper)
+`, path.join(repositoryRoot, 'backup-data.py'), helperRoot, archivePath, scenario]);
+      const stat = fs.lstatSync(archivePath, { bigint: true });
+      const candidate = {
+        filename: path.basename(archivePath), fullPath: archivePath,
+        size: Number(stat.size), mtimeMs: Number(stat.mtimeMs), mtimeNs: stat.mtimeNs.toString(),
+        dev: stat.dev.toString(), ino: stat.ino.toString(), type: 'comprehensive' as const,
+        completeness: 'complete' as const, degradedComponents: [], classificationAuthenticated: true,
+      };
+      await expect(verifyMaintenanceBackupArchive(candidate, {
+        restoreScriptPath: path.join(helperRoot, 'restore-full.sh'),
+      })).resolves.toBe(scenario === 'valid');
+    },
+  );
 
   test('rejects daily, degraded, and unauthenticated candidates before invoking a verifier', async () => {
     const archivePath = path.join(tempRoot, 'portal-comprehensive-classification.tar.gz');

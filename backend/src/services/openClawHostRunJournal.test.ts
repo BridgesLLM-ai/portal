@@ -1,7 +1,9 @@
 import {
   createOpenClawHostRunJournal,
+  OpenClawHostRunJournalError,
   type OpenClawHostRunHandle,
 } from './openClawHostRunJournal';
+import { closeProjectDependencyPromotionWriterFence } from './projectDependencyPromotionWriterFence';
 
 const HANDLE: OpenClawHostRunHandle = Object.freeze({
   id: 'portal-route-1',
@@ -178,20 +180,20 @@ function createTestDatabase() {
 function dependencies(overrides: Record<string, any> = {}) {
   const test = createTestDatabase();
   let nowTick = 0;
-  const getSessionInfo = jest.fn(async () => ({
+  const getSessionInfo = jest.fn(async (sessionKey: string) => ({
     ok: true,
     data: {
-      key: HANDLE.sessionKey,
+      key: sessionKey,
       sessionId: nowTick === 0 ? 'session-before' : 'session-after',
     },
   }));
-  const gatewayRpcCall = jest.fn(async () => {
+  const gatewayRpcCall = jest.fn(async (_method: string, params: Record<string, unknown>) => {
     nowTick = 1;
     return {
       ok: true,
       data: {
         ok: true,
-        key: HANDLE.sessionKey,
+        key: params.key,
         entry: { sessionId: 'session-after' },
       },
     };
@@ -324,6 +326,49 @@ describe('OpenClaw host-run journal', () => {
     });
   });
 
+  test.each([
+    ['valid stable-ID reset', {}, 2000, true],
+    ['missing lifecycle revision', { lifecycleRevision: undefined }, 2000, false],
+    ['unchanged boundary', { updatedAt: 1000, sessionStartedAt: 1000 }, 1000, false],
+    ['ordinary metadata update', { sessionStartedAt: 1000 }, 2000, false],
+    ['readback drift', {}, 2001, false],
+  ])('9.1 reset: %s', async (_label, overrides, readbackTime, accepted) => {
+    let resetDone = false;
+    const entry = {
+      sessionId: 'stable-conversation',
+      lifecycleRevision: '7283cd2d-6e89-4e88-9fbf-edc0878d845f',
+      updatedAt: 2000,
+      sessionStartedAt: 2000,
+      ...overrides as Record<string, unknown>,
+    };
+    const test = dependencies({
+      getSessionInfo: jest.fn(async () => ({
+        ok: true,
+        data: {
+          key: HANDLE.sessionKey,
+          sessionId: entry.sessionId,
+          updatedAt: resetDone ? readbackTime : 1000,
+        },
+      })),
+      gatewayRpcCall: jest.fn(async () => {
+        resetDone = true;
+        return { ok: true, data: { ok: true, key: HANDLE.sessionKey, entry } };
+      }),
+    });
+    await beginDispatchedVisible(test);
+    const result = test.journal.quiesceForAuthorizationTransition(['user-1']);
+    if (accepted) {
+      await expect(result).resolves.toMatchObject({ rowCount: 1 });
+      expect(test.rows[0]).toMatchObject({
+        status: 'QUIESCED',
+        evidence: { resetBoundary: { lifecycleRevision: entry.lifecycleRevision, updatedAt: 2000 } },
+      });
+    } else {
+      await expect(result).rejects.toMatchObject({ code: 'OPENCLAW_SESSION_IDENTITY_DRIFT' });
+      expect(test.rows[0].status).toBe('VISIBLE_DONE');
+    }
+  });
+
   test('global dependency-promotion quiescence discovers unresolved actors and retires late callbacks', async () => {
     const test = dependencies();
     await test.journal.begin(HANDLE);
@@ -384,6 +429,127 @@ describe('OpenClaw host-run journal', () => {
     expect(test.gatewayRpcCall).toHaveBeenCalledTimes(1);
   });
 
+  test('dependency-promotion startup fence skips historical zero-row sessions', async () => {
+    let resetCommitted = false;
+    const getSessionInfo = jest.fn(async (sessionKey: string) => ({
+      ok: true,
+      data: {
+        key: sessionKey,
+        sessionId: resetCommitted ? 'session-after' : 'session-before',
+      },
+    }));
+    const gatewayRpcCall = jest.fn(async (_method: string, params: Record<string, unknown>) => {
+      if (params.key !== HANDLE.sessionKey) {
+        throw new Error(`historical session reset must fail: ${String(params.key)}`);
+      }
+      resetCommitted = true;
+      return {
+        ok: true,
+        data: {
+          ok: true,
+          key: HANDLE.sessionKey,
+          entry: { sessionId: 'session-after' },
+        },
+      };
+    });
+    const test = dependencies({ getSessionInfo, gatewayRpcCall });
+    for (let index = 0; index < 150; index += 1) {
+      test.agentSessions.push({
+        id: `agent-session-history-${index}`,
+        userId: 'user-1',
+        provider: 'OPENCLAW',
+        externalId: `agent:main:portal-user-1-history-${index}`,
+      });
+    }
+    await test.journal.begin(HANDLE);
+
+    const releaseAdmission = jest.fn();
+    const fence = closeProjectDependencyPromotionWriterFence({
+      closeAdmissionAndSettleInstaller: () => ({
+        waitForMutationDrain: async () => {},
+        release: releaseAdmission,
+      }),
+      releaseProjectLease: jest.fn(),
+    }, {
+      quiesceTerminalScopes: jest.fn(async () => ({
+        preparationCount: 0,
+        sessionCount: 0,
+        recoveredCount: 0,
+      })),
+      quiesceAgentJobs: jest.fn(async () => ({
+        jobCount: 0,
+        liveRuntimeCount: 0,
+        persistedRuntimeSignalCount: 0,
+      })),
+      quiesceHostAgentRuns: jest.fn(async () => ({
+        runCount: 0,
+        inMemoryAbortCount: 0,
+        persistedRuntimeSignalCount: 0,
+        recoveredCount: 0,
+      })),
+      quiesceOpenClawHostRuns: test.journal.quiesceForProjectDependencyPromotion,
+      quiesceProjectNativeRuns: jest.fn(async () => ({ runCount: 0 })),
+      attestDurableProjectChat: jest.fn(async () => ({
+        activeTurnCount: 0,
+        activeStateCount: 0,
+      })),
+    });
+
+    const proof = await fence.proveQuiescent();
+
+    expect(proof.preDrain.openClawHostRuns).toMatchObject({
+      rowCount: 1,
+      sessionCount: 1,
+      sessions: [expect.objectContaining({
+        sessionKey: HANDLE.sessionKey,
+        rowCount: 1,
+      })],
+    });
+    expect(proof.postDrain.openClawHostRuns).toMatchObject({
+      rowCount: 0,
+      sessionCount: 0,
+      sessions: [],
+    });
+    expect(gatewayRpcCall).toHaveBeenCalledTimes(1);
+    expect(gatewayRpcCall).toHaveBeenCalledWith(
+      'sessions.reset',
+      { key: HANDLE.sessionKey, reason: 'reset' },
+      45_000,
+    );
+    await fence.releaseAfterSafeState(async () => {});
+    expect(releaseAdmission).toHaveBeenCalledTimes(1);
+  });
+
+  test('dependency promotion does no provider work when no unresolved receipt exists', async () => {
+    const test = dependencies();
+
+    await expect(test.journal.quiesceForProjectDependencyPromotion()).resolves.toMatchObject({
+      rowCount: 0,
+      sessionCount: 0,
+      sessions: [],
+    });
+    expect(test.gatewayRpcCall).not.toHaveBeenCalled();
+    expect(test.getSessionInfo).not.toHaveBeenCalled();
+  });
+
+  test('rejects cross-actor unresolved rows for one session before provider reset', async () => {
+    const test = dependencies();
+    await test.journal.begin(HANDLE);
+    test.rows.push({
+      ...test.rows[0],
+      id: 'portal-route-cross-actor',
+      actorUserId: 'user-2',
+      actorAuthorizationVersion: 3,
+    });
+
+    await expect(test.journal.quiesceForProjectDependencyPromotion()).rejects.toMatchObject({
+      code: 'OPENCLAW_SESSION_OWNERSHIP_CONFLICT',
+      sessionKey: HANDLE.sessionKey,
+    });
+    expect(test.gatewayRpcCall).not.toHaveBeenCalled();
+    expect(test.getSessionInfo).not.toHaveBeenCalled();
+  });
+
   test('rejects a reset that does not rotate or cannot be read back exactly', async () => {
     const noRotation = dependencies({
       getSessionInfo: jest.fn(async () => ({
@@ -431,6 +597,121 @@ describe('OpenClaw host-run journal', () => {
     ).rejects.toMatchObject({ code: 'OPENCLAW_SESSION_IDENTITY_DRIFT' });
     expect(test.gatewayRpcCall).not.toHaveBeenCalled();
     expect(test.rows[0].status).toBe('PREPARED');
+  });
+
+  test('wraps a rejected session read with stable journal diagnostics', async () => {
+    const test = dependencies({
+      getSessionInfo: jest.fn(async () => {
+        throw new Error('gateway\nread\u0000failed');
+      }),
+    });
+    await test.journal.begin(HANDLE);
+
+    await expect(test.journal.quiesceForProjectDependencyPromotion()).rejects.toMatchObject({
+      code: 'OPENCLAW_SESSION_READ_FAILED',
+      sessionKey: HANDLE.sessionKey,
+      causeMessage: 'gateway read failed',
+    });
+    expect(test.gatewayRpcCall).not.toHaveBeenCalled();
+    expect(test.rows[0].status).toBe('PREPARED');
+  });
+
+  test('wraps a rejected reset RPC through the journal and writer fence', async () => {
+    const gatewayRpcCall = jest.fn(async () => {
+      throw new Error('reset transport\nclosed');
+    });
+    const test = dependencies({ gatewayRpcCall });
+    await test.journal.begin(HANDLE);
+    const fence = closeProjectDependencyPromotionWriterFence({
+      closeAdmissionAndSettleInstaller: () => ({
+        waitForMutationDrain: async () => {},
+        release: jest.fn(),
+      }),
+      releaseProjectLease: jest.fn(),
+    }, {
+      quiesceTerminalScopes: jest.fn(async () => ({
+        preparationCount: 0,
+        sessionCount: 0,
+        recoveredCount: 0,
+      })),
+      quiesceAgentJobs: jest.fn(async () => ({
+        jobCount: 0,
+        liveRuntimeCount: 0,
+        persistedRuntimeSignalCount: 0,
+      })),
+      quiesceHostAgentRuns: jest.fn(async () => ({
+        runCount: 0,
+        inMemoryAbortCount: 0,
+        persistedRuntimeSignalCount: 0,
+        recoveredCount: 0,
+      })),
+      quiesceOpenClawHostRuns: test.journal.quiesceForProjectDependencyPromotion,
+      quiesceProjectNativeRuns: jest.fn(async () => ({ runCount: 0 })),
+      attestDurableProjectChat: jest.fn(async () => ({
+        activeTurnCount: 0,
+        activeStateCount: 0,
+      })),
+    });
+
+    await expect(fence.proveQuiescent()).rejects.toMatchObject({
+      code: 'PROJECT_DEPENDENCY_PROMOTION_WRITER_FENCE_UNPROVEN',
+      subsystem: 'openClawHostRuns',
+      causeCode: 'OPENCLAW_SESSION_RESET_FAILED',
+      causeMessage: 'reset transport closed',
+      sessionKey: HANDLE.sessionKey,
+    });
+    expect(gatewayRpcCall).toHaveBeenCalledTimes(1);
+    expect(test.rows[0].status).toBe('PREPARED');
+  });
+
+  test('wraps invalid provider identities with stable codes and the requested session', async () => {
+    const invalidRead = dependencies({
+      getSessionInfo: jest.fn(async () => ({
+        ok: true,
+        data: { key: HANDLE.sessionKey, sessionId: '' },
+      })),
+    });
+    await invalidRead.journal.begin(HANDLE);
+    await expect(
+      invalidRead.journal.quiesceForProjectDependencyPromotion(),
+    ).rejects.toMatchObject({
+      code: 'OPENCLAW_SESSION_IDENTITY_DRIFT',
+      sessionKey: HANDLE.sessionKey,
+      causeMessage: 'Invalid OpenClaw session generation',
+    });
+
+    const invalidReset = dependencies({
+      gatewayRpcCall: jest.fn(async () => ({
+        ok: true,
+        data: { ok: true, key: '', entry: { sessionId: 'session-after' } },
+      })),
+    });
+    await invalidReset.journal.begin(HANDLE);
+    await expect(
+      invalidReset.journal.quiesceForProjectDependencyPromotion(),
+    ).rejects.toMatchObject({
+      code: 'OPENCLAW_SESSION_IDENTITY_DRIFT',
+      sessionKey: HANDLE.sessionKey,
+      causeMessage: 'Invalid reset session key',
+    });
+  });
+
+  test('rejects and never diagnoses a session key with an oversized agent id', async () => {
+    const oversizedSessionKey = `agent:${'a'.repeat(2_048)}:x`;
+    const test = dependencies();
+
+    await expect(test.journal.begin({
+      ...HANDLE,
+      sessionKey: oversizedSessionKey,
+    })).rejects.toMatchObject({ code: 'OPENCLAW_HOST_RUN_INVALID' });
+    const diagnostic = new OpenClawHostRunJournalError(
+      'invalid session',
+      503,
+      'OPENCLAW_SESSION_READ_FAILED',
+      oversizedSessionKey,
+    );
+    expect(diagnostic.sessionKey).toBeNull();
+    expect(test.rows).toHaveLength(0);
   });
 
   test.each([

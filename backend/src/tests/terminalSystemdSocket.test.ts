@@ -83,6 +83,7 @@ class FakeSocket {
   };
 
   readonly conn = {
+    readyState: 'open',
     once: jest.fn(),
     removeListener: jest.fn(),
   };
@@ -90,12 +91,16 @@ class FakeSocket {
   readonly outbound: Array<{ event: string; payload: unknown }> = [];
   readonly disconnect = jest.fn((force?: boolean) => {
     void force;
-    if (this.disconnected) return;
+    if (this.conn.readyState === 'closed') return;
+    this.conn.readyState = 'closed';
     this.disconnected = true;
     this.trigger('disconnect');
   });
 
-  disconnected = false;
+  // Socket.IO has not called Namespace._onconnect() while middleware runs, so
+  // a real socket begins admission as disconnected even though its engine is
+  // open. The helper below flips this only after middleware accepts it.
+  disconnected = true;
   user?: unknown;
   authorizationUnsubscribe?: () => void;
   terminalAuthorizationControl?: {
@@ -267,6 +272,7 @@ describe('privileged terminal systemd-scope authorization boundary', () => {
         else resolve();
       });
     });
+    socket.disconnected = false;
     namespace.connection!(socket);
     await flushPromises();
     return socket;

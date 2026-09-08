@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { createHash, randomBytes } from 'crypto';
-import { execFileSync, execSync, spawnSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import {
   AUTH_PROFILES_PATH,
   invalidateOpenClawAuthStoreProfilesCache,
@@ -20,7 +20,12 @@ import {
   getNativeCliAuthStatusAsync,
   invalidateNativeCliAuthStatus,
 } from '../agents/nativeCliAuth';
+import { invalidateNativeProviderReadiness } from '../agents/nativeProviderReadiness';
 import { buildNativeCliEnvironment, resolveNativeCliCredentialPaths } from '../agents/providers/native/NativeCliEnvironment';
+import {
+  buildAcpHarnessEnvironment,
+  resolveAcpHarnessCredentialPaths,
+} from '../agents/providers/native/acp/AcpHarnessEnvironment';
 import {
   __clearProviderCredentialLifecycleLedgerForTests,
   bindProviderCredentialLifecycle,
@@ -30,17 +35,20 @@ import {
   releaseProviderCredentialLifecycle,
   type ClaimedProviderCredentialLifecycle,
 } from './providerCredentialLifecycleLedger';
+import {
+  assertOpenClawHostMutationAvailable,
+  NativeHostCredentialFlowUnavailableError,
+} from './hostRuntimeMaintenancePolicy';
+import { NativeBinaryRuntimeUnqualifiedError, isUnqualifiedNativeBinaryProvider } from '../config/unqualifiedNativeBinaryLane';
 
 export type OAuthFlowStatus = 'starting' | 'awaiting_callback' | 'polling_device' | 'processing' | 'complete' | 'cancelled' | 'expired' | 'error';
 export type OAuthCompletionResult = { success: boolean; error?: string };
-type NativeCredentialProvider = 'CLAUDE_CODE' | 'CODEX' | 'GEMINI' | 'GROK';
-export type CodexLoginStatus = 'authenticated' | 'signed_out' | 'indeterminate';
+type NativeCredentialProvider = 'CLAUDE_CODE' | 'CODEX' | 'GEMINI' | 'GROK' | 'HERMES' | 'OPENCODE';
+export type NativeCliSetupProvider = 'claude-code' | 'codex' | 'gemini' | 'grok' | 'hermes' | 'opencode';
 
 export interface NativeCliStartOptions {
   forceReauth?: boolean;
   ownerId?: string;
-  /** Test seam for the local, read-only `codex login status` probe. */
-  codexLoginStatusProbe?: () => CodexLoginStatus;
 }
 
 export interface NativeCliCompletionDependencies {
@@ -411,10 +419,20 @@ const ANSI_REGEX = /\x1B\[[0-9;?]*[ -\/]*[@-~]|\x1B[@-_]/g;
 const SCREEN_CONTROL_FRAGMENT_REGEX = /\[[0-9;?]*[ -\/]*[@-~]/g;
 const MAX_NATIVE_CREDENTIAL_FILES = 1_024;
 const MAX_NATIVE_CREDENTIAL_BYTES = 16 * 1024 * 1024;
+const MAX_INTERACTIVE_NATIVE_OUTPUT_BYTES = 512 * 1024;
 const NATIVE_CLAUDE_TOKEN_EXCHANGE_TIMEOUT_MS = 30_000;
 
-function createSessionId() {
-  return `oauth_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+export function createOAuthSessionId(): string {
+  // Keep the ID compatible with the bounded Socket.IO admission regex while
+  // making collisions infeasible even when many flows start in one tick.
+  return `oauth_${Date.now().toString(36)}_${randomBytes(8).toString('hex')}`;
+}
+
+function resolveCredentialPathsForNativeProvider(provider: NativeCredentialProvider): string[] {
+  if (provider === 'HERMES' || provider === 'OPENCODE') {
+    return resolveAcpHarnessCredentialPaths(provider);
+  }
+  return resolveNativeCliCredentialPaths(provider);
 }
 
 function base64Url(input: Buffer): string {
@@ -523,7 +541,7 @@ export function captureNativeCredentialSnapshot(paths: string[]): NativeCredenti
 function configureNativeCredentialAttestation(
   session: OAuthSession,
   provider: NativeCredentialProvider,
-  paths = resolveNativeCliCredentialPaths(provider),
+  paths = resolveCredentialPathsForNativeProvider(provider),
 ): void {
   session.nativeCredentialProvider = provider;
   session.nativeCredentialPaths = [...paths];
@@ -755,16 +773,6 @@ export function authProfileStateFingerprint(profile: any): string {
   return `${hasCredentialMaterial ? 'complete' : 'opaque'}:${digest}`;
 }
 
-function readProviderProfileState(provider: string): Record<string, string> {
-  const authProfiles = readAuthProfilesStrict();
-  const aliases = getOAuthProfileProviderAliases(provider);
-  return Object.fromEntries(
-    Object.entries(authProfiles.profiles || {})
-      .filter(([, profile]) => aliases.has(profile?.provider))
-      .map(([profileId, profile]) => [profileId, authProfileStateFingerprint(profile)]),
-  );
-}
-
 async function readProviderProfileStateAsync(provider: string): Promise<Record<string, string>> {
   const authProfiles = await readAuthProfilesStrictAsync();
   const aliases = getOAuthProfileProviderAliases(provider);
@@ -786,11 +794,11 @@ function profileStateLifecycleFingerprint(profileState: Record<string, string>):
  * tool the operator actually has to install rather than talking about an
  * "inventory" nobody outside this file has heard of.
  */
-const NATIVE_PROVIDER_CLI: Record<NativeCredentialProvider, { command: string; label: string }> = {
-  CLAUDE_CODE: { command: 'claude', label: 'Claude Code' },
-  CODEX: { command: 'codex', label: 'the Codex CLI' },
+const NATIVE_PROVIDER_CLI: Partial<Record<NativeCredentialProvider, { command: string; label: string }>> = {
   GEMINI: { command: 'agy', label: 'the Antigravity CLI' },
   GROK: { command: 'grok', label: 'the Grok CLI' },
+  HERMES: { command: 'hermes', label: 'the Hermes CLI' },
+  OPENCODE: { command: 'opencode', label: 'the OpenCode CLI' },
 };
 
 function nativeCliIsInstalled(command: string): boolean {
@@ -808,13 +816,16 @@ function nativeCliIsInstalled(command: string): boolean {
  * opaque attestation error with no hint that anything needed installing.
  */
 function describeNativeCredentialAttestationFailure(provider: NativeCredentialProvider): string {
+  if (provider === 'CODEX' || provider === 'CLAUDE_CODE') {
+    return 'HOST_CREDENTIAL_FLOW_UNAVAILABLE: Interactive host login and ad hoc CLI probing require a bounded credential-process boundary. Portal Agent Chat can use an existing admitted credential; Project Sandbox credentials remain separate.';
+  }
   const cli = NATIVE_PROVIDER_CLI[provider];
   if (cli && !nativeCliIsInstalled(cli.command)) {
     return `${cli.label} is not installed on this server, so its sign-in cannot run. Install it from Setup → AI tools (or run \`${cli.command}\` on the server), then connect this provider again.`;
   }
 
   const unreadable: string[] = [];
-  for (const credentialPath of resolveNativeCliCredentialPaths(provider)) {
+  for (const credentialPath of resolveCredentialPathsForNativeProvider(provider)) {
     if (captureNativeCredentialSnapshot([credentialPath]).state !== 'verified') {
       unreadable.push(credentialPath);
     }
@@ -831,7 +842,7 @@ async function readNativeCredentialLifecycleProof(
 ): Promise<{ fingerprint: string; absent: boolean }> {
   invalidateNativeCliAuthStatus(provider);
   const [snapshot, status] = await Promise.all([
-    Promise.resolve(captureNativeCredentialSnapshot(resolveNativeCliCredentialPaths(provider))),
+    Promise.resolve(captureNativeCredentialSnapshot(resolveCredentialPathsForNativeProvider(provider))),
     getNativeCliAuthStatusAsync(provider),
   ]);
   if (snapshot.state !== 'verified' || !snapshot.fingerprint) {
@@ -867,7 +878,7 @@ function credentialLifecycleDomainForOpenClaw(provider: string): CredentialLifec
 }
 
 function credentialLifecycleDomainForNative(
-  provider: 'claude-code' | 'codex' | 'gemini' | 'grok',
+  provider: NativeCliSetupProvider,
 ): CredentialLifecycleDomain {
   if (provider === 'claude-code') {
     return { key: 'anthropic', openClawProvider: 'anthropic', nativeProvider: 'CLAUDE_CODE' };
@@ -878,6 +889,12 @@ function credentialLifecycleDomainForNative(
   if (provider === 'gemini') {
     return { key: 'google', openClawProvider: 'google-gemini-cli', nativeProvider: 'GEMINI' };
   }
+  if (provider === 'hermes') {
+    return { key: 'hermes', openClawProvider: null, nativeProvider: 'HERMES' };
+  }
+  if (provider === 'opencode') {
+    return { key: 'opencode', openClawProvider: null, nativeProvider: 'OPENCODE' };
+  }
   return { key: 'xai', openClawProvider: 'xai', nativeProvider: 'GROK' };
 }
 
@@ -886,7 +903,7 @@ export function getCredentialLifecycleNamespaceForOpenClawProvider(provider: str
 }
 
 export function getCredentialLifecycleNamespaceForNativeProvider(
-  provider: 'claude-code' | 'codex' | 'gemini' | 'grok',
+  provider: NativeCliSetupProvider,
 ): string {
   return `credential-domain:${credentialLifecycleDomainForNative(provider).key}`;
 }
@@ -1159,17 +1176,6 @@ function rewriteStoredAuthProfileProvider(profileId: string | null | undefined, 
   fs.writeFileSync(AUTH_PROFILES_PATH, JSON.stringify(authProfiles, null, 2));
 }
 
-function buildPortalOAuthEnv(extraEnv?: Record<string, string>) {
-  return {
-    ...buildOpenClawCliEnv(),
-    ...extraEnv,
-    BROWSER: '/bin/false',
-    DISPLAY: '',
-    WAYLAND_DISPLAY: '',
-    SSH_CONNECTION: extraEnv?.SSH_CONNECTION || process.env.SSH_CONNECTION || 'bridgesllm-portal-oauth 127.0.0.1 127.0.0.1 0',
-  } as Record<string, string>;
-}
-
 export function buildXaiOAuthProfileId(sessionId: string): string {
   const safeSessionId = String(sessionId || '')
     .toLowerCase()
@@ -1347,42 +1353,6 @@ function releaseCredentialGate(processHandle: pty.IPty | null | undefined): void
     throw new Error('Credential-mutating child is missing its durable execution gate.');
   }
   gated.releaseCredentialGate();
-}
-
-function spawnGatedOpenClawPty(
-  args: string[],
-  lifecycleMarker: string,
-  extraEnv?: Record<string, string>,
-) {
-  return spawnCredentialGatedPty(OPENCLAW_BIN, args, {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 40,
-    cwd: process.cwd(),
-    env: {
-      ...buildOpenClawCliEnv(),
-      SSH_CONNECTION: process.env.SSH_CONNECTION || 'portal-oauth 0 0 0',
-      PORTAL_CREDENTIAL_LIFECYCLE_MARKER: lifecycleMarker,
-      ...extraEnv,
-    } as Record<string, string>,
-  });
-}
-
-function spawnPortalOAuthPty(
-  args: string[],
-  lifecycleMarker: string,
-  extraEnv?: Record<string, string>,
-) {
-  return spawnCredentialGatedPty(OPENCLAW_BIN, args, {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 40,
-    cwd: process.cwd(),
-    env: {
-      ...buildPortalOAuthEnv(extraEnv),
-      PORTAL_CREDENTIAL_LIFECYCLE_MARKER: lifecycleMarker,
-    },
-  });
 }
 
 function shellEscape(arg: string): string {
@@ -1907,48 +1877,6 @@ function waitForInitialOutput(session: OAuthSession, timeoutMs: number) {
   });
 }
 
-function attachPtyParsing(session: OAuthSession) {
-  session.process.onData((chunk: string) => {
-    session.output += chunk;
-    session.cleanOutput += stripAnsi(chunk);
-    session.lastOutputAt = Date.now();
-    session.processExited = false;
-    maybeCaptureClaudeSetupToken(session);
-    updateSessionFromOutput(session);
-  });
-
-  session.process.onExit(({ exitCode }) => {
-    session.processExited = true;
-    session.processExitCode = exitCode;
-    session.processExitedAt = Date.now();
-    console.log(`[OAuth] PTY exited: provider=${session.provider} code=${exitCode} status=${session.status} hasAuthUrl=${Boolean(session.authUrl)} outputLen=${session.cleanOutput.length}`);
-    invalidateOpenClawAuthStoreProfilesCache();
-    if (session.provider === 'xai') {
-      scheduleXaiExitProfileReconciliation(session, exitCode);
-      return;
-    }
-    if (session.status === 'cancelled' || session.status === 'expired') return;
-    if (session.status === 'complete') return;
-    if (checkForNewProviderProfile(session)) return;
-    if (session.authUrl && session.status === 'awaiting_callback') {
-      console.log('[OAuth] Process exited after delivering auth URL; portal may respawn a fresh PTY when the callback arrives.');
-      return;
-    }
-    if (exitCode === 0) {
-      session.status = 'error';
-      session.error = 'Provider login process exited before authentication finished. Start the sign-in again.';
-      return;
-    }
-    if (!session.error) {
-      session.status = 'error';
-      const cliReason = extractProviderCliErrorText(session.cleanOutput);
-      session.error = cliReason
-        ? `Provider login failed: ${cliReason}`
-        : `Provider login process exited with code ${exitCode}`;
-    }
-  });
-}
-
 async function failOAuthSessionStart(session: OAuthSession, cause: unknown): Promise<never> {
   const detail = cause instanceof Error && cause.message
     ? cause.message
@@ -2078,181 +2006,27 @@ async function failOAuthSessionStart(session: OAuthSession, cause: unknown): Pro
   throw startError;
 }
 
-async function startOAuthFlowCore(
-  provider: string,
-  options: { googleProjectId?: string; ownerId?: string } | undefined,
-  bindSession: CredentialLifecycleSessionBinder,
-) {
-  const extraEnv: Record<string, string> = {};
-  if (provider === 'google-gemini-cli' && options?.googleProjectId) {
-    extraEnv.GOOGLE_CLOUD_PROJECT = options.googleProjectId;
-    console.log(`[OAuth] Setting GOOGLE_CLOUD_PROJECT=${options.googleProjectId}`);
-  }
-
-  const id = createSessionId();
-  const expectedProfileId = provider === 'xai' ? buildXaiOAuthProfileId(id) : null;
-  invalidateOpenClawAuthStoreProfilesCache();
-  // Fail before spawning a credential-mutating PTY if the authoritative xAI
-  // store cannot be read or the unique target id already exists.
-  const profileStateBefore = expectedProfileId
-    ? await readXaiOAuthPreflightStateAsync(expectedProfileId)
-    : readProviderProfileState(provider);
-  const loginArgs = buildOAuthLoginArgs(provider, expectedProfileId);
-  const session: OAuthSession = {
-    id,
-    provider,
-    mode: provider === 'xai' ? 'device_code' : 'oauth',
-    ownerId: options?.ownerId,
-    process: spawnPortalOAuthPty(loginArgs, bindSession.leaseId, extraEnv),
-    authUrl: null,
-    callbackHintUrl: null,
-    deviceCode: null,
-    verificationUrl: null,
-    localPort: null,
-    oauthState: null,
-    status: 'starting',
-    error: null,
-    output: '',
-    cleanOutput: '',
-    createdAt: Date.now(),
-    expiresAt: null,
-    completedAt: null,
-    profileKeyBefore: Object.keys(profileStateBefore),
-    profileStateBefore,
-    expectedProfileId,
-    persistedProfileId: null,
-    sentInitialConfirm: false,
-    extraEnv: Object.keys(extraEnv).length ? extraEnv : undefined,
-    capturedToken: null,
-    lastOutputAt: Date.now(),
-  };
-
-  sessions.set(id, session);
-  bindSession(session);
-  attachPtyParsing(session);
-  releaseCredentialGate(session.process);
-  // Google needs extra time for the auto-confirm step
-  const timeout = provider === 'google-gemini-cli' ? 30000 : 20000;
-  try {
-    await waitForInitialOutput(session, timeout);
-  } catch (error: any) {
-    await failOAuthSessionStart(session, error);
-  }
-  return {
-    sessionId: session.id,
-    mode: session.mode,
-    status: session.status,
-    authUrl: session.authUrl,
-    callbackHintUrl: session.callbackHintUrl,
-    verificationUrl: session.verificationUrl,
-    deviceCode: session.deviceCode,
-    expiresAt: session.expiresAt || null,
-  };
-}
-
 export async function startOAuthFlow(provider: string, options?: { googleProjectId?: string; ownerId?: string }) {
-  // OpenClaw's Google flow extracts its OAuth client credentials from the
-  // Gemini CLI binary, so without it the login dies after the confirmation
-  // prompt with an error the person never saw. Refuse up front, with the fix
-  // in hand, before any lifecycle bookkeeping is created for a doomed start.
-  if (provider === 'google-gemini-cli'
-    && !process.env.GEMINI_CLI_OAUTH_CLIENT_ID
-    && !nativeCliIsInstalled('gemini')) {
-    throw new Error(
-      'Google sign-in needs the Gemini CLI on this server. Install it with '
-      + '`npm install -g @google/gemini-cli` (as root), then start the sign-in again.',
-    );
+  // Codex interactive host login remains
+  // unavailable. Refuse before lifecycle-domain reads, claims, session
+  // creation, or PTY admission. Host Operator Agent Chat and Project Sandbox use
+  // their separate, already-attested execution and credential boundaries.
+  if (provider === 'openai-codex' || provider === 'codex') {
+    throw new NativeHostCredentialFlowUnavailableError('codex');
   }
-  const domain = credentialLifecycleDomainForOpenClaw(provider);
-  const namespace = `credential-domain:${domain.key}`;
-  const readFingerprint = () => readCredentialLifecycleDomainProof(domain);
-  return runCredentialLifecycleStart(
-    namespace,
-    options?.ownerId,
-    { provider, googleProjectId: options?.googleProjectId || null },
-    (bindSession) => startOAuthFlowCore(provider, options, bindSession),
-    {
-      reviewAfterMs: 15 * 60 * 1000,
-      lifecycleKind: 'openclaw-oauth',
-      prepare: async () => {
-        await reconcileProviderCredentialLifecycleBeforeAdmission(namespace, readFingerprint);
-        return { baselineFingerprint: (await readFingerprint()).fingerprint };
-      },
-    },
-  );
-}
-
-async function startDeviceCodeFlowCore(
-  provider: 'github-copilot',
-  ownerId: string | undefined,
-  bindSession: CredentialLifecycleSessionBinder,
-) {
-  const id = createSessionId();
-  const profileStateBefore = readProviderProfileState('github-copilot');
-  const session: OAuthSession = {
-    id,
-    provider,
-    mode: 'device_code',
-    ownerId,
-    process: spawnGatedOpenClawPty(
-      ['models', 'auth', 'login-github-copilot', '--yes'],
-      bindSession.leaseId,
-    ),
-    authUrl: null,
-    callbackHintUrl: null,
-    deviceCode: null,
-    verificationUrl: null,
-    localPort: null,
-    oauthState: null,
-    status: 'starting',
-    error: null,
-    output: '',
-    cleanOutput: '',
-    createdAt: Date.now(),
-    expiresAt: null,
-    completedAt: null,
-    profileKeyBefore: Object.keys(profileStateBefore),
-    profileStateBefore,
-    sentInitialConfirm: false,
-    capturedToken: null,
-    lastOutputAt: Date.now(),
-  };
-
-  sessions.set(id, session);
-  bindSession(session);
-  attachPtyParsing(session);
-  releaseCredentialGate(session.process);
-  try {
-    await waitForInitialOutput(session, 20000);
-  } catch (error) {
-    await failOAuthSessionStart(session, error);
-  }
-  return {
-    sessionId: session.id,
-    verificationUrl: session.verificationUrl || session.authUrl,
-    deviceCode: session.deviceCode,
-    expiresAt: session.expiresAt || null,
-  };
+  void options;
+  // Every remaining provider starts an interactive `openclaw models auth`
+  // process. Refuse at the service boundary before credential-domain reads,
+  // lifecycle admission, session creation, or PTY spawn.
+  assertOpenClawHostMutationAvailable('oauth-device');
 }
 
 export async function startDeviceCodeFlow(provider: 'github-copilot', ownerId?: string) {
-  const domain = credentialLifecycleDomainForOpenClaw(provider);
-  const namespace = `credential-domain:${domain.key}`;
-  const readFingerprint = () => readCredentialLifecycleDomainProof(domain);
-  return runCredentialLifecycleStart(
-    namespace,
-    ownerId,
-    { provider },
-    (bindSession) => startDeviceCodeFlowCore(provider, ownerId, bindSession),
-    {
-      reviewAfterMs: 20 * 60 * 1000,
-      lifecycleKind: 'openclaw-device',
-      prepare: async () => {
-        await reconcileProviderCredentialLifecycleBeforeAdmission(namespace, readFingerprint);
-        return { baselineFingerprint: (await readFingerprint()).fingerprint };
-      },
-    },
-  );
+  // GitHub Copilot device login is an interactive OpenClaw PTY flow. Keep the
+  // service entry fail-closed even when a caller bypasses the HTTP route.
+  void provider;
+  void ownerId;
+  assertOpenClawHostMutationAvailable('oauth-device');
 }
 
 export async function importClaudeCliAuthProfile(timeoutMs = 30000) {
@@ -2836,6 +2610,56 @@ export function getOAuthFlowStatus(sessionId: string, ownerId?: string) {
   return buildOAuthFlowStatusPayload(session, createdProfileId);
 }
 
+export interface NativeCliInteractiveTerminalAttachment {
+  provider: Extract<NativeCliSetupProvider, 'hermes' | 'opencode'>;
+  output: string;
+  status: OAuthFlowStatus;
+  processExited: boolean;
+  write(data: string): void;
+  resize(cols: number, rows: number): void;
+  onData(listener: (data: string) => void): () => void;
+  onExit(listener: (event: { exitCode: number }) => void): () => void;
+}
+
+/**
+ * Attach a browser terminal only to an already-admitted, fixed-command setup
+ * session owned by that exact Portal user. Callers cannot select argv, cwd,
+ * environment, or credential paths through this boundary.
+ */
+export function attachNativeCliInteractiveTerminal(
+  sessionId: string,
+  ownerId: string,
+): NativeCliInteractiveTerminalAttachment | null {
+  const session = sessions.get(sessionId);
+  if (!session || session.ownerId !== ownerId) return null;
+  if (session.provider !== 'hermes' && session.provider !== 'opencode') return null;
+  if (!session.process) return null;
+
+  return {
+    provider: session.provider,
+    output: session.output,
+    status: session.status,
+    processExited: Boolean(session.processExited),
+    write(data: string) {
+      const mutationError = terminalOAuthMutationError(session, 'sending terminal input');
+      if (mutationError) throw new Error(mutationError);
+      session.process.write(data);
+    },
+    resize(cols: number, rows: number) {
+      if (session.processExited || isTerminalOAuthStop(session)) return;
+      session.process.resize(cols, rows);
+    },
+    onData(listener) {
+      const subscription = session.process.onData(listener);
+      return () => { try { subscription?.dispose(); } catch {} };
+    },
+    onExit(listener) {
+      const subscription = session.process.onExit(({ exitCode }) => listener({ exitCode }));
+      return () => { try { subscription?.dispose(); } catch {} };
+    },
+  };
+}
+
 /**
  * A Claude setup start owns the provider until its PTY is gone and credential
  * outcome is authoritative. The route uses this to resume the same live
@@ -3005,15 +2829,6 @@ export function buildOAuthFlowStatusPayload(session: OAuthSession, createdProfil
 // ── Claude setup-token flow ──────────────────────────────────────────
 // Runs `claude setup-token` in a PTY, captures the auth URL and waits
 // for the token to be printed after the user completes browser sign-in.
-
-function findClaudeBin(): string {
-  
-  try {
-    return execSync('which claude', { encoding: 'utf-8' }).trim() || 'claude';
-  } catch {
-    return 'claude';
-  }
-}
 
 interface ClaudeSetupTokenProcessIdentity {
   pid: number;
@@ -3215,121 +3030,6 @@ export async function cleanupStaleClaudeSetupTokenProcesses(
   return processes.length;
 }
 
-async function startClaudeSetupTokenFlowCore(
-  ownerId: string | undefined,
-  bindSession: CredentialLifecycleSessionBinder,
-) {
-  const id = createSessionId();
-  const claudeBin = findClaudeBin();
-  const profileStateBefore = readProviderProfileState('anthropic');
-  const nativeCredentialPaths = resolveNativeCliCredentialPaths('CLAUDE_CODE');
-  const nativeCredentialSnapshotBefore = captureNativeCredentialSnapshot(nativeCredentialPaths);
-  console.log(`[Claude] Starting setup-token flow, binary=${claudeBin}`);
-
-  const proc = spawnCredentialGatedPty(claudeBin, ['setup-token'], {
-    name: 'xterm-256color',
-    cols: 500,  // Wide enough to prevent URL line-wrapping
-    rows: 40,
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      PORTAL_CREDENTIAL_LIFECYCLE_MARKER: bindSession.leaseId,
-    } as Record<string, string>,
-  });
-
-  const session: OAuthSession = {
-    id,
-    provider: 'anthropic',
-    mode: 'oauth',
-    ownerId,
-    process: proc,
-    authUrl: null,
-    callbackHintUrl: null,
-    deviceCode: null,
-    verificationUrl: null,
-    localPort: null,
-    oauthState: null,
-    status: 'starting',
-    error: null,
-    output: '',
-    cleanOutput: '',
-    createdAt: Date.now(),
-    completedAt: null,
-    profileKeyBefore: Object.keys(profileStateBefore),
-    profileStateBefore,
-    sentInitialConfirm: false,
-    capturedToken: null,
-    lastOutputAt: Date.now(),
-    nativeCredentialProvider: 'CLAUDE_CODE',
-    nativeCredentialPaths,
-    nativeCredentialSnapshotBefore,
-  };
-
-  sessions.set(id, session);
-  bindSession(session);
-
-  // Attach parsing — look for the Claude OAuth URL specifically
-  proc.onData((chunk: string) => {
-    session.output += chunk;
-    session.cleanOutput += stripAnsi(chunk);
-    session.lastOutputAt = Date.now();
-    session.processExited = false;
-    maybeCaptureClaudeSetupToken(session);
-    detectClaudeSetupCodeRejection(session);
-
-    // Check for Claude auth URL
-    const firstUrl = extractClaudeAuthUrl(session.cleanOutput);
-    if (firstUrl && !session.authUrl) {
-      session.authUrl = firstUrl;
-      session.status = 'awaiting_callback';
-      console.log('[Claude] Auth URL captured (value redacted)');
-    }
-  });
-
-  const tokenPromise = new Promise<string | null>((resolve) => {
-    proc.onExit(({ exitCode }) => {
-      console.log(`[Claude] PTY exited: code=${exitCode} status=${session.status} outputLen=${session.cleanOutput.length}`);
-      const setupToken = completeClaudeSetupTokenProcessExit(session, exitCode);
-      if (setupToken) console.log(`[Claude] Setup token captured on exit (${setupToken.length} chars; value redacted)`);
-      resolve(setupToken);
-    });
-  });
-
-  // Store the token promise on the session for later retrieval
-  (session as any)._tokenPromise = tokenPromise;
-  releaseCredentialGate(proc);
-
-  // Wait for the auth URL to appear (up to 30s)
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const started = Date.now();
-      const timer = setInterval(() => {
-        if (session.authUrl) {
-          clearInterval(timer);
-          resolve();
-          return;
-        }
-        if (session.error || session.status === 'error') {
-          clearInterval(timer);
-          reject(new Error(session.error || 'Claude setup-token failed'));
-          return;
-        }
-        if (Date.now() - started > 30000) {
-          clearInterval(timer);
-          reject(new Error('Timed out waiting for Claude auth URL. Is Claude Code installed?'));
-        }
-      }, 200);
-    });
-  } catch (error) {
-    await failOAuthSessionStart(session, error);
-  }
-
-  return {
-    sessionId: session.id,
-    authUrl: session.authUrl,
-  };
-}
-
 export interface ClaudeSetupTokenStartDependencies {
   cleanupOrphans?: () => Promise<number>;
   readInventoryFingerprint?: () => Promise<string>;
@@ -3338,65 +3038,10 @@ export interface ClaudeSetupTokenStartDependencies {
 export async function startClaudeSetupTokenFlow(
   ownerId?: string,
   dependencies: ClaudeSetupTokenStartDependencies = {},
-) {
-  const namespace = getCredentialLifecycleNamespaceForOpenClawProvider('anthropic');
-  const request = { provider: 'anthropic', method: 'setup-token' };
-  const normalizedOwner = ownerId || 'setup:pending';
-  const readInventoryProof = dependencies.readInventoryFingerprint
-    ? async () => ({
-      fingerprint: await dependencies.readInventoryFingerprint!(),
-      // Test/custom readers that supply only a fingerprint cannot establish
-      // the stronger, provider-specific absence contract.
-      absent: false,
-    })
-    : readClaudeCredentialAbsenceProof;
-  return runCredentialLifecycleStart(
-    namespace,
-    ownerId,
-    request,
-    (bindSession) => startClaudeSetupTokenFlowCore(ownerId, bindSession),
-    {
-      reviewAfterMs: 15 * 60 * 1000,
-      lifecycleKind: 'claude-setup-token',
-      prepare: async () => {
-        // Durable ownership is authoritative. In particular, do not let the
-        // orphan scanner signal an old but still-live PTY recorded by another
-        // backend process merely because it crossed the stale-age threshold.
-        await reconcileProviderCredentialLifecycleBeforeAdmission(namespace, readInventoryProof);
-        try {
-          await (dependencies.cleanupOrphans || cleanupStaleClaudeSetupTokenProcesses)();
-        } catch (error: any) {
-          if (error instanceof ClaudeOrphanLifecycleError) {
-            try {
-              const quarantine = claimProviderCredentialLifecycle(
-                namespace,
-                normalizedOwner,
-                credentialStartFingerprint(request),
-                {
-                  lifecycleKind: 'claude-setup-token-orphan',
-                  reviewAfterMs: 15 * 60 * 1000,
-                  // A process discovered after restart has no trustworthy
-                  // pre-start baseline. It may be released only by the
-                  // explicit combined-store removal proof below.
-                  baselineFingerprint: null,
-                },
-              );
-              markProviderCredentialLifecycle(
-                quarantine,
-                error.credentialState,
-              );
-            } catch {
-              // A concurrent process may have established ownership first.
-              // Its durable record already prevents replacement; never
-              // rewrite ownership that this request did not claim.
-            }
-          }
-          throw error;
-        }
-        return { baselineFingerprint: (await readInventoryProof()).fingerprint };
-      },
-    },
-  );
+): Promise<{ sessionId: string; status: OAuthFlowStatus; authUrl: string | null }> {
+  void ownerId;
+  void dependencies;
+  throw new NativeHostCredentialFlowUnavailableError('claude-code');
 }
 
 export async function pasteCodeToClaudeSession(sessionId: string, code: string, ownerId?: string): Promise<{ success: boolean; error?: string; retryable?: boolean }> {
@@ -3589,7 +3234,6 @@ export class CodexReauthenticationRequiredError extends Error {
   readonly code = 'CODEX_REAUTHENTICATION_REQUIRED';
 }
 
-const CODEX_FILE_AUTH_CONFIG = 'cli_auth_credentials_store="file"';
 const CODEX_OAUTH_NETWORK_ENV_KEYS = [
   'HTTP_PROXY',
   'HTTPS_PROXY',
@@ -3604,14 +3248,6 @@ const CODEX_OAUTH_NETWORK_ENV_KEYS = [
   'NODE_EXTRA_CA_CERTS',
   'CODEX_CA_CERTIFICATE',
 ] as const;
-
-interface CodexLoginStatusCommandResult {
-  status: number | null;
-  signal?: string | null;
-  stdout?: string | Buffer | null;
-  stderr?: string | Buffer | null;
-  error?: Error;
-}
 
 export function buildCodexOAuthEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env = buildNativeCliEnvironment('CODEX', source);
@@ -3634,40 +3270,6 @@ function findCliBin(command: string): string {
     return execSync(`which ${command}`, { encoding: 'utf-8' }).trim() || command;
   } catch {
     return command;
-  }
-}
-
-export function probeCodexLoginStatus(
-  codexBin = findCliBin('codex'),
-  runner: (file: string, args: string[], options: Record<string, unknown>) => CodexLoginStatusCommandResult = (
-    file,
-    args,
-    options,
-  ) => spawnSync(file, args, options as any),
-): CodexLoginStatus {
-  const env = buildCodexOAuthEnvironment();
-  // This probe must attest auth.json itself. An inherited API key or an
-  // automatic keyring lookup would make "authenticated" refer to a different
-  // credential than the one Portal can bridge into OpenClaw.
-  try {
-    const result = runner(codexBin, ['login', '-c', CODEX_FILE_AUTH_CONFIG, 'status'], {
-      encoding: 'utf8',
-      env,
-      timeout: 8_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const output = `${String(result?.stdout || '')}\n${String(result?.stderr || '')}`.trim();
-    if (!result?.error && !result?.signal && result?.status === 0 && output === 'Logged in using ChatGPT') {
-      return 'authenticated';
-    }
-    // Codex also exits 1 for keyring/config/storage failures. Only its exact,
-    // non-secret signed-out response is absence proof.
-    if (!result?.error && !result?.signal && result?.status === 1 && output === 'Not logged in') {
-      return 'signed_out';
-    }
-    return 'indeterminate';
-  } catch {
-    return 'indeterminate';
   }
 }
 
@@ -3783,12 +3385,21 @@ function checkGrokCredentials(): boolean {
   return getNativeCliAuthStatus('GROK').status === 'authenticated';
 }
 
+function appendBoundedInteractiveOutput(current: string, chunk: string): string {
+  const combined = Buffer.from(`${current}${chunk}`, 'utf8');
+  if (combined.length <= MAX_INTERACTIVE_NATIVE_OUTPUT_BYTES) return combined.toString('utf8');
+  return combined
+    .subarray(combined.length - MAX_INTERACTIVE_NATIVE_OUTPUT_BYTES)
+    .toString('utf8')
+    .replace(/^\uFFFD/u, '');
+}
+
 async function startNativeCliFlowCore(
-  provider: 'claude-code' | 'codex' | 'gemini' | 'grok',
+  provider: NativeCliSetupProvider,
   bindSession: CredentialLifecycleSessionBinder,
   options: NativeCliStartOptions = {},
 ) {
-  const id = createSessionId();
+  const id = createOAuthSessionId();
   let session: OAuthSession;
 
   switch (provider) {
@@ -3849,193 +3460,7 @@ async function startNativeCliFlowCore(
     }
 
     case 'codex': {
-      const codexBin = findCliBin('codex');
-      const nativeCredentialPaths = resolveNativeCliCredentialPaths('CODEX');
-      const credentialSnapshotBeforeProbe = captureNativeCredentialSnapshot(nativeCredentialPaths);
-      const codexAuthPath = nativeCredentialPaths[0];
-      const loginStatus = (options.codexLoginStatusProbe || (() => probeCodexLoginStatus(codexBin)))();
-      const nativeCredentialSnapshotBefore = captureNativeCredentialSnapshot(nativeCredentialPaths);
-      const credentialPathStable = credentialSnapshotBeforeProbe.state === 'verified'
-        && nativeCredentialSnapshotBefore.state === 'verified'
-        && credentialSnapshotBeforeProbe.fingerprint === nativeCredentialSnapshotBefore.fingerprint;
-      const fileCredentialState = credentialPathStable && codexAuthPath
-        ? attestCodexCredentialFile(codexAuthPath)
-        : 'indeterminate';
-      const alreadyAuthenticated = loginStatus === 'authenticated'
-        || fileCredentialState === 'committed';
-
-      if (!options.forceReauth && loginStatus === 'authenticated' && fileCredentialState === 'committed') {
-        session = {
-          id,
-          provider: 'codex',
-          mode: 'device_code',
-          ownerId: options.ownerId,
-          process: null as any,
-          authUrl: null,
-          callbackHintUrl: null,
-          deviceCode: null,
-          verificationUrl: null,
-          localPort: null,
-          oauthState: null,
-          status: 'complete',
-          error: null,
-          output: '',
-          cleanOutput: '',
-          createdAt: Date.now(),
-          completedAt: Date.now(),
-          profileKeyBefore: [],
-          sentInitialConfirm: false,
-          processExited: true,
-          processExitCode: 0,
-          processExitedAt: Date.now(),
-          nativeCredentialProvider: 'CODEX',
-          nativeCredentialPaths,
-          nativeCredentialSnapshotBefore,
-          credentialResolution: 'committed',
-          alreadyAuthenticated: true,
-          reauthSupported: true,
-        };
-        sessions.set(id, session);
-        bindSession(session);
-        console.log('[NativeCLI] Reusing an attested existing Codex login');
-        break;
-      }
-
-      if (!options.forceReauth && (
-        loginStatus === 'authenticated'
-        || loginStatus === 'indeterminate'
-        || fileCredentialState === 'committed'
-        || fileCredentialState === 'indeterminate'
-      )) {
-        if (loginStatus === 'authenticated' && fileCredentialState !== 'committed') {
-          throw new CodexReauthenticationRequiredError(
-            'Codex is already authenticated, but Portal cannot bridge its current credential to OpenClaw because no usable file-backed auth.json was attested. Configure Codex credential storage to file, then use the explicit replacement action.',
-          );
-        }
-        if (fileCredentialState === 'committed') {
-          throw new CodexReauthenticationRequiredError(
-            'Portal found an existing Codex credential that the Codex CLI did not confirm. Ordinary setup stopped before it could delete that credential. Review it or use the explicit replacement action.',
-          );
-        }
-        if (loginStatus === 'indeterminate') {
-          throw new CodexReauthenticationRequiredError(
-            'Portal could not verify whether Codex is already signed in. Ordinary setup stopped before running destructive reauthentication. Repair the Codex CLI status check or use the explicit replacement action.',
-          );
-        }
-        throw new CodexReauthenticationRequiredError(
-          'Portal could not safely inspect the existing Codex credential path. Ordinary setup stopped before running Codex reauthentication. Review the credential path before replacing it.',
-        );
-      }
-      console.log(`[NativeCLI] Starting Codex login, binary=${codexBin}`);
-      const codexLoginEnv = buildCodexOAuthEnvironment();
-      const proc = spawnCredentialGatedPty(codexBin, ['login', '-c', CODEX_FILE_AUTH_CONFIG, '--device-auth'], {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 40,
-        cwd: process.cwd(),
-        env: {
-          ...codexLoginEnv,
-          BROWSER: '/bin/false',
-          PORTAL_CREDENTIAL_LIFECYCLE_MARKER: bindSession.leaseId,
-        } as Record<string, string>,
-      });
-
-      session = {
-        id,
-        provider: 'codex',
-        mode: 'device_code',
-        ownerId: options.ownerId,
-        process: proc,
-        authUrl: null,
-        callbackHintUrl: null,
-        deviceCode: null,
-        verificationUrl: null,
-        localPort: null,
-        oauthState: null,
-        status: 'starting',
-        error: null,
-        output: '',
-        cleanOutput: '',
-        createdAt: Date.now(),
-        completedAt: null,
-        profileKeyBefore: [],
-        sentInitialConfirm: false,
-        nativeCredentialProvider: 'CODEX',
-        nativeCredentialPaths,
-        nativeCredentialSnapshotBefore,
-        alreadyAuthenticated,
-        reauthSupported: true,
-      };
-
-      sessions.set(id, session);
-      bindSession(session);
-
-      proc.onData((chunk: string) => {
-        session.output += chunk;
-        session.cleanOutput += stripAnsi(chunk);
-        updateSessionFromOutput(session);
-      });
-
-      proc.onExit(({ exitCode }) => {
-        recordOAuthProcessExit(session, exitCode);
-        console.log(`[NativeCLI] Codex PTY exited: code=${exitCode} status=${session.status}`);
-        if (isTerminalOAuthStop(session)) return;
-        const codexAuthPath = session.nativeCredentialPaths?.[0]
-          || resolveNativeCliCredentialPaths('CODEX')[0];
-        const credentialState = codexAuthPath
-          ? attestCodexCredentialFile(codexAuthPath)
-          : 'indeterminate';
-        const mutationState = nativeCredentialMutationState(session);
-        const credentialCommitted = exitCode === 0
-          && mutationState === 'committed'
-          && credentialState === 'committed';
-        if (credentialCommitted) {
-          session.credentialResolution = 'committed';
-          session.status = 'complete';
-          session.error = null;
-          session.completedAt = Date.now();
-          clearOAuthSessionExpiryTimer(session);
-          console.log('[NativeCLI] Codex credentials verified');
-        } else {
-          const changedUsableCredential = mutationState === 'committed'
-            && credentialState === 'committed';
-          const proofIndeterminate = mutationState === 'indeterminate'
-            || mutationState === 'not_applicable'
-            || credentialState === 'indeterminate';
-          session.credentialResolution = changedUsableCredential
-            ? 'committed'
-            : proofIndeterminate
-              ? 'indeterminate'
-              : 'absent';
-          session.status = 'error';
-          session.error = classifyCodexDeviceLoginError(session.cleanOutput)
-            || (changedUsableCredential
-              ? `Codex wrote a usable credential, but the CLI exited with code ${exitCode}. Review or remove that credential before retrying.`
-              : proofIndeterminate
-              ? 'Portal could not safely attest the Codex credential file after login.'
-              : 'Codex login ended without committing a new usable file-backed credential. OpenClaw requires Codex file credential storage; configure Codex to store credentials in auth.json, then retry.');
-          session.completedAt = Date.now();
-          clearOAuthSessionExpiryTimer(session);
-          if (session.credentialResolution === 'committed') {
-            // The credential mutation is authoritative even though the CLI
-            // did not exit cleanly. Commit and release the operation lease so
-            // the user gets an honest review state instead of a hidden 409 on
-            // every future repair attempt.
-            releaseCredentialLifecycleLease(session, true);
-          } else if (session.credentialResolution === 'absent') {
-            releaseCredentialLifecycleLease(session);
-          }
-        }
-      });
-
-      releaseCredentialGate(proc);
-
-      try {
-        await waitForInitialOutput(session, 20000);
-      } catch (error) {
-        await failOAuthSessionStart(session, error);
-      }
-      break;
+      throw new NativeHostCredentialFlowUnavailableError('codex');
     }
 
     case 'grok': {
@@ -4268,6 +3693,132 @@ async function startNativeCliFlowCore(
       }
       break;
     }
+
+    case 'hermes':
+    case 'opencode': {
+      const nativeProvider = provider === 'hermes' ? 'HERMES' : 'OPENCODE';
+      const definition = NATIVE_PROVIDER_CLI[nativeProvider];
+      if (!definition) {
+        throw new Error(`Missing native CLI definition for ${nativeProvider}`);
+      }
+      const executable = findCliBin(definition.command);
+      const environment = buildAcpHarnessEnvironment(nativeProvider);
+      const nativeCredentialPaths = resolveAcpHarnessCredentialPaths(nativeProvider);
+      const nativeCredentialSnapshotBefore = captureNativeCredentialSnapshot(nativeCredentialPaths);
+      const alreadyAuthenticated = getNativeCliAuthStatus(nativeProvider).status === 'authenticated';
+      const args = provider === 'hermes' ? ['model'] : ['auth', 'login'];
+      const cwd = String(environment.HOME || process.cwd());
+      console.log(`[NativeCLI] Starting ${definition.label} setup in its dedicated Portal profile`);
+
+      const proc = spawnCredentialGatedPty(executable, args, {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 40,
+        cwd,
+        env: {
+          ...environment,
+          TERM: 'xterm-256color',
+          BROWSER: '/bin/false',
+          NO_BROWSER: 'true',
+          PORTAL_CREDENTIAL_LIFECYCLE_MARKER: bindSession.leaseId,
+        } as Record<string, string>,
+      });
+
+      session = {
+        id,
+        provider,
+        mode: 'oauth',
+        ownerId: options.ownerId,
+        process: proc,
+        authUrl: null,
+        callbackHintUrl: null,
+        deviceCode: null,
+        verificationUrl: null,
+        localPort: null,
+        oauthState: null,
+        status: 'starting',
+        error: null,
+        output: '',
+        cleanOutput: '',
+        createdAt: Date.now(),
+        completedAt: null,
+        profileKeyBefore: [],
+        sentInitialConfirm: false,
+        alreadyAuthenticated,
+        reauthSupported: true,
+        nativeCredentialProvider: nativeProvider,
+        nativeCredentialPaths,
+        nativeCredentialSnapshotBefore,
+      };
+
+      sessions.set(id, session);
+      bindSession(session);
+
+      proc.onData((chunk: string) => {
+        session.output = appendBoundedInteractiveOutput(session.output, chunk);
+        session.cleanOutput = appendBoundedInteractiveOutput(session.cleanOutput, stripAnsi(chunk));
+        if (session.status === 'starting') session.status = 'processing';
+      });
+
+      proc.onExit(({ exitCode }) => {
+        recordOAuthProcessExit(session, exitCode);
+        console.log(`[NativeCLI] ${definition.label} setup PTY exited: code=${exitCode} status=${session.status}`);
+        if (isTerminalOAuthStop(session)) {
+          settleExitedNativeSessionResolution(session);
+          return;
+        }
+        void (async () => {
+          invalidateNativeCliAuthStatus(nativeProvider);
+          const [auth, mutationState] = await Promise.all([
+            getNativeCliAuthStatusAsync(nativeProvider),
+            Promise.resolve(nativeCredentialMutationState(session)),
+          ]);
+          const credentialUsable = auth.status === 'authenticated';
+          const changedCredential = mutationState === 'committed';
+          if (exitCode === 0 && (credentialUsable || changedCredential)) {
+            session.credentialResolution = 'committed';
+            session.status = 'complete';
+            session.error = null;
+            session.completedAt = Date.now();
+            clearOAuthSessionExpiryTimer(session);
+            return;
+          }
+
+          const proofIndeterminate = mutationState === 'indeterminate'
+            || mutationState === 'not_applicable'
+            || auth.status === 'unknown';
+          session.credentialResolution = changedCredential
+            ? 'committed'
+            : proofIndeterminate
+              ? 'indeterminate'
+              : 'absent';
+          session.status = 'error';
+          const cliReason = extractProviderCliErrorText(session.cleanOutput);
+          session.error = cliReason
+            ? `${definition.label} setup failed: ${cliReason}`
+            : changedCredential
+              ? `${definition.label} changed its Portal profile, but setup exited with code ${exitCode}. Review the saved profile before retrying.`
+              : proofIndeterminate
+                ? `Portal could not safely attest the ${definition.label} profile after setup.`
+                : `${definition.label} setup exited with code ${exitCode} without a usable Portal-profile credential.`;
+          session.completedAt = Date.now();
+          clearOAuthSessionExpiryTimer(session);
+          if (session.credentialResolution === 'committed') {
+            releaseCredentialLifecycleLease(session, true);
+          } else if (session.credentialResolution === 'absent') {
+            releaseCredentialLifecycleLease(session);
+          }
+        })().catch((error: any) => {
+          session.credentialResolution = 'indeterminate';
+          session.status = 'error';
+          session.error = `Portal could not verify ${definition.label} setup: ${error?.message || error}`;
+          session.completedAt = Date.now();
+        });
+      });
+
+      releaseCredentialGate(proc);
+      break;
+    }
   }
 
   return {
@@ -4283,9 +3834,16 @@ async function startNativeCliFlowCore(
 }
 
 export async function startNativeCliFlow(
-  provider: 'claude-code' | 'codex' | 'gemini' | 'grok',
+  provider: NativeCliSetupProvider,
   options: NativeCliStartOptions = {},
 ) {
+  if ((provider === 'gemini' || provider === 'grok')
+    && isUnqualifiedNativeBinaryProvider(provider === 'gemini' ? 'GEMINI' : 'GROK')) {
+    throw new NativeBinaryRuntimeUnqualifiedError(provider === 'gemini' ? 'GEMINI' : 'GROK');
+  }
+  if (provider === 'codex') {
+    throw new NativeHostCredentialFlowUnavailableError('codex');
+  }
   const domain = credentialLifecycleDomainForNative(provider);
   const namespace = `credential-domain:${domain.key}`;
   const readFingerprint = () => readCredentialLifecycleDomainProof(domain);
@@ -4427,6 +3985,8 @@ async function runNativeCliCallbackCompletion(
       }
 
       (dependencies.persistClaudeCredentials || persistNativeClaudeCredentials)(data);
+      invalidateNativeCliAuthStatus('CLAUDE_CODE');
+      invalidateNativeProviderReadiness('CLAUDE_CODE');
       console.log('[NativeCLI] Claude OAuth tokens written to credentials file');
     } catch (err: any) {
       if (isTerminalOAuthStop(session)) {

@@ -1,6 +1,10 @@
 import {
+  chmodSync,
+  chownSync,
+  copyFileSync,
   lstatSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -9,7 +13,6 @@ import os from 'os';
 import path from 'path';
 import {
   AGENT_ZERO_CREDENTIAL_CONFIRMATION,
-  AGENT_ZERO_RUNTIME_CONFIRMATION,
   buildAgentZeroSetupStatus,
   runAgentZeroLifecycle,
   runAgentZeroProjectModelBridgeLifecycle,
@@ -25,8 +28,8 @@ function runtimeReady(overrides: Partial<AgentZeroRuntimeStatus> = {}): AgentZer
     installed: true,
     running: true,
     ready: true,
-    version: '2.5',
-    expectedVersion: '2.5',
+    version: '2.10',
+    expectedVersion: '2.10',
     pinnedImage: true,
     loopbackOnly: true,
     persistentData: true,
@@ -44,8 +47,8 @@ function hostBridgeInstalled(overrides: Partial<AgentZeroHostGatewayStatus> = {}
     installed: true,
     running: false,
     ready: false,
-    cliVersion: '2.5',
-    expectedCliVersion: '2.5',
+    cliVersion: '2.10',
+    expectedCliVersion: '2.10',
     gatewayId: 'bridgesllm-portal-host',
     capabilities: {
       scope: 'HOST_OPERATOR',
@@ -82,7 +85,7 @@ describe('Agent Zero owner setup control plane', () => {
     });
 
     expect(value).toMatchObject({
-      testedVersions: { agentZero: '2.5', connector: '0.1.0', hostBridge: '2.5' },
+      testedVersions: { agentZero: '2.10', connector: '0.1.0', hostBridge: '2.10' },
       mainAgentChat: {
         scope: 'HOST_OPERATOR',
         available: true,
@@ -98,7 +101,10 @@ describe('Agent Zero owner setup control plane', () => {
       provider: { implemented: true, usable: true, supportedExecutionScopes: ['HOST_OPERATOR'] },
       actions: {
         provisionCredentials: { confirmationPhrase: AGENT_ZERO_CREDENTIAL_CONFIRMATION },
-        reconcileRuntime: { confirmationPhrase: AGENT_ZERO_RUNTIME_CONFIRMATION },
+        reconcileRuntime: {
+          available: false,
+          unavailableCode: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
+        },
       },
     });
     // The duplicate derived-status row is gone. The owner sees only steps
@@ -175,27 +181,36 @@ describe('Agent Zero owner setup control plane', () => {
   });
 
   test('invokes only the fixed lifecycle script and supported control commands', async () => {
+    const portalRoot = mkdtempSync('/root/portal-agent-zero-lifecycle-');
+    temporaryRoots.push(portalRoot);
+    const installerRoot = path.join(portalRoot, 'installer');
+    mkdirSync(installerRoot, { mode: 0o700 });
+    const sourceRoot = path.resolve(process.cwd(), '..');
+    for (const name of ['agent-zero-runtime.sh', 'agent-zero-project-model-bridge.sh']) {
+      const destination = path.join(installerRoot, name);
+      copyFileSync(path.join(sourceRoot, 'installer', name), destination);
+      chownSync(destination, 0, 0);
+      chmodSync(destination, 0o700);
+    }
+
     const calls: Array<{ scriptPath: string; command: string }> = [];
     await runAgentZeroLifecycle('credentials-reload', {
-      portalRoot: path.resolve(process.cwd(), '..'),
+      portalRoot,
       run: async (scriptPath, command) => { calls.push({ scriptPath, command }); },
     });
     await runAgentZeroLifecycle('reconcile', {
-      portalRoot: path.resolve(process.cwd(), '..'),
+      portalRoot,
       run: async (scriptPath, command) => { calls.push({ scriptPath, command }); },
     });
     await runAgentZeroProjectModelBridgeLifecycle({
-      portalRoot: path.resolve(process.cwd(), '..'),
+      portalRoot,
       run: async (scriptPath, command) => { calls.push({ scriptPath, command }); },
     });
     expect(calls).toEqual([
-      { scriptPath: path.resolve(process.cwd(), '../installer/agent-zero-runtime.sh'), command: 'credentials-reload' },
-      { scriptPath: path.resolve(process.cwd(), '../installer/agent-zero-runtime.sh'), command: 'reconcile' },
+      { scriptPath: path.join(installerRoot, 'agent-zero-runtime.sh'), command: 'credentials-reload' },
+      { scriptPath: path.join(installerRoot, 'agent-zero-runtime.sh'), command: 'reconcile' },
       {
-        scriptPath: path.resolve(
-          process.cwd(),
-          '../installer/agent-zero-project-model-bridge.sh',
-        ),
+        scriptPath: path.join(installerRoot, 'agent-zero-project-model-bridge.sh'),
         command: 'reconcile',
       },
     ]);

@@ -1,5 +1,3 @@
-import { promises as fs } from 'fs';
-import path from 'path';
 import {
   normalizeUsageCronJobsPayload,
   normalizeUsageSessionsPayload,
@@ -13,9 +11,6 @@ interface GatewayResult {
 export interface UsageStatsSourceDependencies {
   gatewayCall: (method: string, params: Record<string, unknown>, timeoutMs: number) => Promise<GatewayResult>;
   runOpenClaw: (args: string[], timeoutMs: number) => Promise<string>;
-  agentsDir: string;
-  readDir?: (directory: string) => Promise<string[]>;
-  readFile?: (file: string) => Promise<string>;
 }
 
 export interface UsageStatsSources {
@@ -74,51 +69,6 @@ async function loadGatewaySessions(
   return null;
 }
 
-function normalizeStoredSessions(payload: unknown, agentId: string): any[] | null {
-  if (!payload || typeof payload !== 'object') return null;
-  const source = Array.isArray((payload as any).sessions) ? (payload as any).sessions : payload;
-  const rows = Array.isArray(source) ? source : Object.values(source);
-  return rows.flatMap((session) => {
-    if (!session || typeof session !== 'object' || Array.isArray(session)) return [];
-    return [{ ...(session as Record<string, unknown>), agentId: (session as any).agentId || agentId }];
-  });
-}
-
-async function loadStoredSessions(
-  selectedAgent: string,
-  dependencies: UsageStatsSourceDependencies,
-): Promise<any[] | null> {
-  const readDir = dependencies.readDir || ((directory: string) => fs.readdir(directory));
-  const readFile = dependencies.readFile || ((file: string) => fs.readFile(file, 'utf8'));
-  let agentIds: string[];
-  try {
-    agentIds = await readDir(dependencies.agentsDir);
-  } catch {
-    return null;
-  }
-
-  const relevantAgentIds = selectedAgent ? agentIds.filter((agentId) => agentId === selectedAgent) : agentIds;
-  const sessions: any[] = [];
-  for (const agentId of relevantAgentIds) {
-    const sessionsFile = path.join(dependencies.agentsDir, agentId, 'sessions', 'sessions.json');
-    let raw: string;
-    try {
-      raw = await readFile(sessionsFile);
-    } catch (error: any) {
-      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') continue;
-      return null;
-    }
-    try {
-      const rows = normalizeStoredSessions(JSON.parse(raw), agentId);
-      if (rows === null) return null;
-      sessions.push(...rows);
-    } catch {
-      return null;
-    }
-  }
-  return sessions;
-}
-
 async function loadCliSessions(
   selectedAgent: string,
   runOpenClaw: UsageStatsSourceDependencies['runOpenClaw'],
@@ -139,9 +89,6 @@ async function loadSessions(
 ): Promise<any[]> {
   const gatewaySessions = await loadGatewaySessions(selectedAgent, dependencies.gatewayCall);
   if (gatewaySessions !== null) return gatewaySessions;
-
-  const storedSessions = await loadStoredSessions(selectedAgent, dependencies);
-  if (storedSessions !== null) return storedSessions;
 
   const cliSessions = await loadCliSessions(selectedAgent, dependencies.runOpenClaw);
   if (cliSessions !== null) return cliSessions;

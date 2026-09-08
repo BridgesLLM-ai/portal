@@ -30,6 +30,8 @@ export interface BuildExactNativeCliProjectInvocationInput {
   readonly hostCwd?: string;
   readonly hostEnvironment: NodeJS.ProcessEnv;
   readonly containerEnvironment?: Readonly<Record<string, string>>;
+  /** Opt-in bidirectional stdin for long-lived JSON-RPC transports such as ACP. */
+  readonly interactiveStdio?: boolean;
 }
 
 interface ExactRuntimeInspect {
@@ -129,9 +131,9 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const MARKER_ROOT = ${JSON.stringify(markerRoot)};
 const SCHEMA = ${RUN_MARKER_SCHEMA};
-const [markerPath, runHash, runToken, command, ...args] = process.argv.slice(1);
+const [markerPath, runHash, runToken, stdioMode, command, ...args] = process.argv.slice(1);
 const markerPattern = new RegExp('^' + MARKER_ROOT.replace(/[.*+?^\${}()|[\]\\]/g, '\\$&') + '/portal-project-run-[a-z0-9][a-z0-9-]{0,31}-[a-f0-9]{32}\\.json$');
-if (!markerPattern.test(markerPath || '') || !/^[a-f0-9]{64}$/.test(runHash || '') || !/^[a-f0-9]{64}$/.test(runToken || '') || !/^\/[^\0\r\n]+$/.test(command || '') || args.some((entry) => /\0/.test(entry))) process.exit(125);
+if (!markerPattern.test(markerPath || '') || !/^[a-f0-9]{64}$/.test(runHash || '') || !/^[a-f0-9]{64}$/.test(runToken || '') || !['ignore', 'pipe'].includes(stdioMode || '') || !/^\/[^\0\r\n]+$/.test(command || '') || args.some((entry) => /\0/.test(entry))) process.exit(125);
 if (!markerPath.endsWith('-' + runHash.slice(0, 32) + '.json')) process.exit(125);
 
 const markerMatches = (value) => value && value.schema === SCHEMA && value.runHash === runHash && value.runToken === runToken;
@@ -239,10 +241,14 @@ for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => f
 try {
   child = spawn(command, args, {
     cwd: process.cwd(),
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: [stdioMode, 'pipe', 'pipe'],
     detached: true,
     env: { ...process.env, PORTAL_PROJECT_RUN_HASH: runHash, PORTAL_PROJECT_RUN_TOKEN: runToken },
   });
+  if (stdioMode === 'pipe') {
+    process.stdin.pipe(child.stdin);
+    process.stdin.once('error', () => { try { child.stdin.end(); } catch {} });
+  }
   child.stdout.pipe(process.stdout);
   child.stderr.pipe(process.stderr);
   child.once('error', () => { void finish(125, null); });
@@ -498,6 +504,7 @@ export function buildExactNativeCliProjectInvocation(
   const identity = markerIdentity(PRODUCTION_MARKER_ROOT, namespace, runId);
   const args = [
     'container', 'exec',
+    ...(input.interactiveStdio ? ['--interactive'] : []),
     '--user', input.containerUser,
     '--workdir', input.containerRoot,
   ];
@@ -510,6 +517,7 @@ export function buildExactNativeCliProjectInvocation(
     identity.markerPath,
     identity.runHash,
     identity.runToken,
+    input.interactiveStdio ? 'pipe' : 'ignore',
     input.command,
     ...input.args,
   );

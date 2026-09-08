@@ -2,7 +2,7 @@
 #
 # BridgesLLM Portal — One-Command Installer
 # ==========================================
-# Zero questions. Installs everything. Prints a URL.
+# Choose Install, Update, or Repair. Configuration continues in the browser.
 #
 # Usage:
 #   curl -fsSL https://bridgesllm.ai/install.sh | sudo bash
@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="4.0.19"
+readonly VERSION="5.0.0"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -48,6 +48,17 @@ readonly RESTORE_ACTIVE_JOURNAL="/var/lib/bridgesllm-restore/active-restore.json
 readonly UPDATE_STATE_HELPER="${UPDATE_STATE_ROOT}/update-transaction-state.py"
 readonly UPDATE_CADDY_RECOVERY_HELPER="${UPDATE_STATE_ROOT}/caddy-managed-config.py"
 readonly DASHBOARD_UPDATE_PROGRESS_HELPER="${UPDATE_STATE_ROOT}/dashboard-update-progress.py"
+readonly OPENCLAW_MIGRATION_TRANSACTION_ROOT="${UPDATE_STATE_ROOT}/openclaw-2026.9.1-migration-v2"
+readonly OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE="${UPDATE_STATE_ROOT}/openclaw-2026.9.1-migration-v2.terminal"
+readonly OPENCLAW_MIGRATION_TRANSACTION_LEDGER="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/transaction.json"
+readonly OPENCLAW_MIGRATION_UPGRADE_STATE_MANIFEST="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/upgrade-state.json"
+readonly OPENCLAW_MIGRATION_2026_9_1_MANIFEST="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/migration.json"
+readonly OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE="${PORTAL_DIR}/installer/openclaw-migration-transaction.py"
+readonly NATIVE_CLI_BUNDLE_TRANSACTION_ROOT="${UPDATE_STATE_ROOT}/native-cli-bundle-v1"
+readonly NATIVE_CLI_BUNDLE_TRANSACTION_TOMBSTONE="${UPDATE_STATE_ROOT}/native-cli-bundle-v1.terminal"
+readonly NATIVE_CLI_BUNDLE_TRANSACTION_INTENT="${UPDATE_STATE_ROOT}/native-cli-bundle-v1.terminal-intent.json"
+readonly NATIVE_CLI_BUNDLE_TRANSACTION_HELPER_SOURCE="${PORTAL_DIR}/installer/native-cli-bundle-transaction.py"
+readonly NATIVE_CLI_BUNDLE_ADMISSION_CATALOG="${PORTAL_DIR}/backend/dist/config/nativeHostCliAdmissionCatalog.v1.json"
 readonly UPDATE_BACKUP_ROOT="${INSTALL_ROOT}/backups/update-transactions"
 readonly UPDATE_STAGE_ROOT="${INSTALL_ROOT}/update-staging"
 readonly UPDATE_BOOT_FENCE_DROPIN_DIR="/etc/systemd/system/bridgesllm-product.service.d"
@@ -55,8 +66,11 @@ readonly UPDATE_BOOT_FENCE_DROPIN="${UPDATE_BOOT_FENCE_DROPIN_DIR}/20-update-tra
 readonly LEGACY_DOCKER_PRUNE_CRON_PATH="/etc/cron.d/docker-image-prune"
 readonly LEGACY_DOCKER_PRUNE_QUARANTINE_PATH="/etc/bridgesllm/quarantine/docker-image-prune.legacy"
 readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER="/var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1"
+readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT="/run/bridgesllm/openclaw-gateway-migration-permit.v1"
 readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR="/etc/systemd/system/openclaw-gateway.service.d"
 readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
+readonly OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR}/30-bridgesllm-migration-permit.conf"
+readonly LEGACY_OPENCLAW_GATEWAY_PERMIT_DRIFT_HELPER_SHA256="16a86a2144f0d2c36e3353af4a44e2eb0c953af6a8e54fb3410d7f671fd148d1"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR="/root/.config/systemd/user/openclaw-gateway.service.d"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
 readonly RETAINED_INSTALL_MARKER="${INSTALL_ROOT}/.retained-install-v1.json"
@@ -67,7 +81,14 @@ readonly UNINSTALL_ACTIVE_JOURNAL="${UNINSTALL_STATE_ROOT}/active-uninstall.json
 readonly UNINSTALL_BOOT_FENCE_DROPIN="${UPDATE_BOOT_FENCE_DROPIN_DIR}/30-uninstall-transaction-fence.conf"
 readonly PORTAL_OPERATION_LOCK_PATH="/run/lock/bridgesllm-portal-installer.lock"
 readonly UPDATE_CANDIDATE_PORT="4199"
-readonly LOG_DIR="${INSTALL_ROOT}/logs"
+LOG_DIR="${INSTALL_ROOT}/logs"
+if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+  && "${BRIDGESLLM_TERMINAL_TEST_LOG_DIR:-}" == /tmp/bridgesllm-installer-terminal-ux.* \
+  && "${BRIDGESLLM_TERMINAL_TEST_LOG_DIR}" != *'/../'* \
+  && "${BRIDGESLLM_TERMINAL_TEST_LOG_DIR}" != *'/..' ]]; then
+  LOG_DIR="${BRIDGESLLM_TERMINAL_TEST_LOG_DIR}"
+fi
+readonly LOG_DIR
 readonly TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 readonly LOG_FILE="${LOG_DIR}/install-${TIMESTAMP}.log"
 readonly RELEASE_ORIGIN="${BRIDGESLLM_RELEASE_ORIGIN:-https://bridgesllm.ai}"
@@ -85,16 +106,48 @@ readonly MIN_DISK_GB=35
 # Tested compatibility matrix. Package revisions are deliberately independent:
 # the CLI/gateway reports the normalized runtime version, while npm retains the
 # exact stable package revision used to build it.
-readonly PIN_OPENCLAW_RUNTIME_VERSION="2026.7.1"
-readonly PIN_OPENCLAW_CORE_PACKAGE_VERSION="2026.7.1-2"
-readonly PIN_OPENCLAW_CODEX_PLUGIN_VERSION="2026.7.1-1"
-readonly PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION="3.3.0"
-readonly PIN_CODEX_CLI_VERSION="0.145.0"
-readonly PIN_CLAUDE_CODE_VERSION="2.1.220"
-readonly PIN_CLAWHUB_VERSION="0.23.1"
-readonly PIN_ANTIGRAVITY_VERSION="1.1.7"
-readonly PIN_GROK_BUILD_VERSION="0.2.112"
-readonly OLLAMA_INSTALLER_URL="https://ollama.com/install.sh"
+readonly PIN_OPENCLAW_RUNTIME_VERSION="2026.9.1"
+readonly PIN_OPENCLAW_CORE_PACKAGE_VERSION="2026.9.1"
+readonly PIN_OPENCLAW_CORE_PACKAGE_INTEGRITY="sha512-0Ve0631CdgkJDwd4NNG1BawIdF5yCL2sO+Tts8amStw+H6vKURTj0K4rOa4+hFpJk1Dnw5LyKl5twzwX1VtA2w=="
+readonly PIN_OPENCLAW_CORE_COMMIT="ad6fe23aecb9b833d68139b0ddc9f239b894d2f1"
+readonly OPENCLAW_2026_9_1_RUNS_STOCK_SHA256="407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359"
+readonly OPENCLAW_2026_9_1_RUNS_BRIDGED_SHA256="407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359"
+readonly OPENCLAW_2026_9_1_DELETE_SCHEMA_STOCK_SHA256="c3a060a7deb79384ec1294f6e551cb21c3e3c423ab9ac19ea1985a08334c41a0"
+readonly OPENCLAW_2026_9_1_DELETE_SCHEMA_BRIDGED_SHA256="3d1bcd9a9343e3ea3193998f1cb4863470e3dbd19c6d5a89282ff78d9e585cc4"
+readonly OPENCLAW_2026_9_1_DELETE_HANDLER_STOCK_SHA256="7f60601501c1fe5e018e84c7ef1de2b4522b09f46eaaec98a7076356cde9a352"
+readonly OPENCLAW_2026_9_1_DELETE_HANDLER_BRIDGED_SHA256="58b1845f613261c0451cdbb1ff26c8b9e8f58f96d493183f82920a7cb51dc536"
+readonly PIN_OPENCLAW_CODEX_PLUGIN_VERSION="2026.9.1"
+readonly PIN_OPENCLAW_CODEX_PLUGIN_INTEGRITY="sha512-O+HzImle5txYh93pa5CqeFQUA4XHqCpC4bFo7GKrb3WiyPppXtM0JZQ/sVC8E4aeGPGiy3Yx3rI8sl6ceSDH9g=="
+readonly PIN_OPENCLAW_ACPX_PLUGIN_VERSION="2026.9.1"
+readonly PIN_OPENCLAW_BRAVE_PLUGIN_VERSION="2026.9.1"
+readonly PIN_OPENCLAW_DISCORD_PLUGIN_VERSION="2026.9.1"
+readonly PIN_OPENCLAW_VOICE_CALL_PLUGIN_VERSION="2026.9.1"
+readonly OPENCLAW_PACKAGE_MAX_ARCHIVE_BYTES=$((192 * 1024 * 1024))
+readonly OPENCLAW_PACKAGE_MAX_EXPANDED_BYTES=$((768 * 1024 * 1024))
+readonly PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION="4.0.0"
+readonly PIN_CODEX_CLI_VERSION="0.153.2"
+readonly PIN_CLAUDE_CODE_VERSION="2.1.260"
+readonly PIN_CLAWHUB_VERSION="0.23.3"
+readonly PIN_ANTIGRAVITY_VERSION="1.1.17"
+readonly PIN_GROK_BUILD_VERSION="1.0.5"
+readonly PIN_OPENCODE_VERSION="1.18.19"
+readonly PIN_HERMES_VERSION="0.20.4"
+readonly PIN_HERMES_UV_VERSION="0.12.5"
+readonly PIN_HERMES_PYTHON_VERSION="3.11.15"
+readonly PIN_OLLAMA_VERSION="0.32.15"
+readonly OLLAMA_ASSET_AMD64_URL="https://github.com/ollama/ollama/releases/download/v${PIN_OLLAMA_VERSION}/ollama-linux-amd64.tar.zst"
+readonly OLLAMA_ASSET_AMD64_SHA256="50539c5fe9bf85887733355098dcdb266b433cb8c73fa180713417e9ed6e42bb"
+readonly OLLAMA_ASSET_AMD64_SIZE="1422416084"
+readonly OLLAMA_ASSET_ARM64_URL="https://github.com/ollama/ollama/releases/download/v${PIN_OLLAMA_VERSION}/ollama-linux-arm64.tar.zst"
+readonly OLLAMA_ASSET_ARM64_SHA256="c898270b1690eab0f51aa9e9197686b7b4c6a7d88b83967763818f3127e477e9"
+readonly OLLAMA_ASSET_ARM64_SIZE="1543177713"
+readonly OLLAMA_ARCHIVE_MAX_MEMBERS="20000"
+readonly OLLAMA_ARCHIVE_MAX_FILE_SIZE="4294967296"
+readonly OLLAMA_ARCHIVE_MAX_EXPANDED_SIZE="12884901888"
+readonly OLLAMA_MANAGED_BIN_PATH="/usr/local/bin/ollama"
+readonly OLLAMA_MANAGED_LIB_PATH="/usr/local/lib/ollama"
+readonly OLLAMA_MANAGED_UNIT_PATH="/etc/systemd/system/ollama.service"
+readonly OLLAMA_TRANSACTION_PATH="/usr/local/.bridgesllm-ollama-transaction-v1"
 readonly PIN_NODE_MAJOR="22"
 readonly PIN_NODE_22_MIN_VERSION="22.22.3"
 readonly PIN_NODE_24_MIN_VERSION="24.15.0"
@@ -122,7 +175,7 @@ readonly CODEX_PROJECT_RUNTIME_APPARMOR_PROFILE_PATH="/etc/apparmor.d/bridgesllm
 readonly CODEX_PROJECT_RUNTIME_APPARMOR_PROFILE_SHA256="8c4e7db070bb7d6be3ef167e17dcc0949992c8fa6b6c58b47b758e2a939f8b24"
 readonly CODEX_PROJECT_RUNTIME_SECCOMP_PROFILE_SOURCE="${PORTAL_DIR}/installer/bridgesllm-codex-project-runtime-v1.seccomp.json"
 readonly CODEX_PROJECT_RUNTIME_SECCOMP_PROFILE_PATH="/etc/bridgesllm/project-runtime/bridgesllm-codex-project-runtime-v1.seccomp.json"
-readonly CODEX_PROJECT_RUNTIME_SECCOMP_PROFILE_SHA256="e83f93eaf5b476dfd401d0482210217c5ff1484d1655ba9ca77de59435193c02"
+readonly CODEX_PROJECT_RUNTIME_SECCOMP_PROFILE_SHA256="73ffea84f592faa30cd8eebba9980cbeac76026f4f06574cc7699ecc8af49a3a"
 readonly PROJECT_RUNTIME_APPARMOR_SECCOMP_POLICY="apparmor-seccomp-v1"
 readonly PROJECT_RUNTIME_SECCOMP_ONLY_POLICY="seccomp-only-apparmor-unsupported-v1"
 # Operator-selected degraded mode (--skip-project-runtimes): the Portal installs
@@ -148,9 +201,9 @@ readonly AGENT_ZERO_PROJECT_SOURCE_COMMIT_LABEL="com.bridgesllm.agent-zero-proje
 readonly AGENT_ZERO_PROJECT_UPSTREAM_DIGEST_LABEL="com.bridgesllm.agent-zero-project.upstream-digest"
 readonly AGENT_ZERO_PROJECT_RUNTIME_USER_LABEL="com.bridgesllm.agent-zero-project.runtime-user"
 readonly AGENT_ZERO_PROJECT_RUNTIME_USER="1000:1000"
-readonly AGENT_ZERO_PROJECT_SOURCE_COMMIT="d1d48bc9c0e6e253e87c354ce757c518820c6e25"
-readonly AGENT_ZERO_PROJECT_AMD64_UPSTREAM_DIGEST="sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb"
-readonly AGENT_ZERO_PROJECT_ARM64_UPSTREAM_DIGEST="sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c"
+readonly AGENT_ZERO_PROJECT_SOURCE_COMMIT="b22a144bf59f15b1516084c9e7b88133ba92c8a9"
+readonly AGENT_ZERO_PROJECT_AMD64_UPSTREAM_DIGEST="sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0"
+readonly AGENT_ZERO_PROJECT_ARM64_UPSTREAM_DIGEST="sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8"
 readonly PROJECT_EGRESS_RECIPE_LABEL="com.bridgesllm.project-egress.recipe-sha256"
 readonly PROJECT_EGRESS_ARTIFACTS_LABEL="com.bridgesllm.project-egress.artifacts-sha256"
 readonly PROJECT_EGRESS_POLICY_LABEL="com.bridgesllm.project-egress.policy"
@@ -180,7 +233,14 @@ TS_AUTHKEY=""
 TS_HOSTNAME="bridgesllm-portal"
 TAILNET_DNS_NAME=""
 DRY_RUN=false
+PLAIN_OUTPUT=false
+VERBOSE=false
+INSTALL_MODE=false
 UPDATE_MODE=false
+# Existing-install updates are a Portal transaction, not a general host
+# maintenance operation. Failure and signal handlers use this scope to avoid
+# settling or rolling back unrelated OpenClaw/Ollama state.
+PORTAL_ONLY_UPDATE=false
 UNINSTALL_MODE=false
 REPAIR_PROJECT_RUNTIME_IMAGE=false
 RESIDUE_POLICY=""
@@ -200,12 +260,22 @@ OPENCLAW_PACKAGE_PREEXISTED=false
 OPENCLAW_PREUPDATE_PACKAGE_VERSION=""
 OPENCLAW_PREUPDATE_RUNTIME_VERSION=""
 OPENCLAW_STATE_EXISTED_BEFORE_UPDATE=false
+OPENCLAW_STATE_ROOT_PREEXISTED=false
+OPENCLAW_STATE_CONFIG_PREEXISTED=false
 OPENCLAW_GATEWAY_WAS_ENABLED=false
 OPENCLAW_GATEWAY_WAS_ACTIVE=false
+# Live state-layout proof, taken while the gateway is still up. It cannot be
+# retaken later: this transaction stops the gateway before
+# prepare_openclaw_upgrade_state runs, and that gate's live branch requires an
+# active, HTTP-ready gateway.
+OPENCLAW_LAYOUT_CONFIRMED_LIVE=false
 OPENCLAW_BASELINE_PID=""
 OPENCLAW_BASELINE_RESTARTS=""
 OPENCLAW_ROLLBACK_PACKAGE_TARBALL=""
 OPENCLAW_UPGRADE_STATE_MANIFEST=""
+OPENCLAW_2026_9_1_MIGRATION_MANIFEST=""
+OPENCLAW_MIGRATION_TRANSACTION_GENERATION=""
+OPENCLAW_MIGRATION_TRANSACTION_PHASE=""
 OPENCLAW_ROLLBACK_IN_PROGRESS=false
 OPENCLAW_UPGRADE_COMMITTED=false
 OPENCLAW_RESCUE_MODE=false
@@ -230,7 +300,8 @@ OPENCLAW_ASK_USER_GATEWAY_WAS_ACTIVE=false
 OPENCLAW_ASK_USER_BASE_ATTESTED=false
 OPENCLAW_ASK_USER_LIVE_ATTESTED=false
 OPENCLAW_COMPAT_HOTFIX_PID=""
-OPENCLAW_TESTED_PAIR_COMMIT_RECORD="/root/.openclaw/.bridgesllm-tested-pair-commit-v3.json"
+OPENCLAW_TESTED_PAIR_COMMIT_RECORD="/root/.openclaw/.bridgesllm-tested-pair-commit-v5.json"
+NATIVE_CLI_BUNDLE_PREPARED=false
 
 # Generated during install
 DB_PASSWORD=""
@@ -274,8 +345,6 @@ TELEMETRY_INSTALL_ID=""
 
 # State
 CURRENT_STEP="startup"
-TOTAL_STEPS=9
-CURRENT_STEP_NUM=0
 INSTALL_START_TIME=""
 PACKAGE_MANAGER_REPAIR_ACTIVE=false
 PACKAGE_MANAGER_LONG_WAIT_SECONDS=1800
@@ -313,6 +382,59 @@ DASHBOARD_UPDATE_FAILURE_MESSAGE=""
 DASHBOARD_UPDATE_FAILURE_PHASE=""
 UNINSTALL_TRANSACTION_ID=""
 UNINSTALL_RECOVERED_THIS_RUN=false
+FRESH_INSTALL_IN_PROGRESS=false
+
+# The three legacy progress helpers run host-mutating commands asynchronously
+# so the presentation layer can observe them.  Their containment identity is
+# global because ERR and signal traps can run from any stack frame while the
+# mutator is active.  Ownership is cleared only by tracked_mutator_wait() after
+# a normal wait, or by settle_active_tracked_mutator() after verified group
+# quiescence.
+TRACKED_MUTATOR_PID=""
+TRACKED_MUTATOR_STARTTIME=""
+TRACKED_MUTATOR_PGID=""
+TRACKED_MUTATOR_KIND=""
+TRACKED_MUTATOR_LAUNCHING=false
+TRACKED_MUTATOR_SETTLING=false
+TRACKED_MUTATOR_DEFERRED_HANDLER=""
+TRACKED_MUTATOR_DEFERRED_EXIT_CODE=""
+TRACKED_MUTATOR_DEFERRED_MESSAGE=""
+
+# Presentation is an observer, never installer authority.  The fresh-install
+# plan is the sole owner of phase cardinality; the renderer may fail or degrade
+# without changing a handler, receipt, recovery path, or exit status.
+FRESH_INSTALL_PLAN_IDS=()
+FRESH_INSTALL_PLAN_LABELS=()
+FRESH_INSTALL_PLAN_HANDLERS=()
+TERMINAL_RENDER_MODE="plain"
+TERMINAL_RENDER_ACTIVE=false
+TERMINAL_RENDER_SUSPENDED=false
+TERMINAL_RENDER_HAS_FRAME=false
+TERMINAL_RENDER_FAILED=false
+TERMINAL_RENDER_LAYOUT="plain"
+TERMINAL_RENDER_WIDTH=80
+TERMINAL_SURFACE_LINES=8
+TERMINAL_PHASE_ID="startup"
+TERMINAL_PHASE_LABEL="Preparing installer"
+TERMINAL_PHASE_INDEX=0
+TERMINAL_PHASE_TOTAL=0
+TERMINAL_PHASE_COMPLETE=false
+TERMINAL_ACTIVITY="Waiting to begin"
+TERMINAL_ACTIVITY_DETAIL=""
+TERMINAL_ACTIVITY_KIND="indeterminate"
+TERMINAL_ACTIVITY_VALUE=""
+TERMINAL_ACTIVITY_TOTAL=""
+TERMINAL_LAST_WARNING="None"
+TERMINAL_OUTCOME="In progress"
+TERMINAL_NEXT_ACTION="Installer is preparing the next operation."
+TERMINAL_VERBOSE_LOG_OFFSET=0
+TERMINAL_VERBOSE_LOG_READY=false
+TERMINAL_PRESENTATION_FD=""
+TERMINAL_HANDLER_OUTPUT_CAPTURED=false
+TERMINAL_PANEL_OUTPUT_ACTIVE=false
+TERMINAL_PANEL_STDOUT_FD=""
+TERMINAL_PANEL_STDERR_FD=""
+TERMINAL_PRESENTATION_WAS_TTY=false
 
 # OS detection
 OS_ID=""
@@ -322,9 +444,14 @@ IS_WSL=false
 
 
 node_version_meets_minimum() {
-  command -v node &>/dev/null || return 1
+  local node_binary="${1:-node}"
+  if [[ "${node_binary}" == */* ]]; then
+    [[ -x "${node_binary}" ]] || return 1
+  else
+    command -v "${node_binary}" &>/dev/null || return 1
+  fi
   local version major minor patch
-  version="$(node -v 2>/dev/null | sed 's/^v//' || true)"
+  version="$("${node_binary}" -v 2>/dev/null | sed 's/^v//' || true)"
   major="${version%%.*}"
   minor="${version#*.}"
   minor="${minor%%.*}"
@@ -360,28 +487,760 @@ ensure_supported_node_runtime() {
   ok "Node.js $(node --version 2>/dev/null || echo compatible) (OpenClaw-compatible)"
 }
 
+admit_existing_node_runtime_for_compatible_ai_tools() {
+  # Existing-host compatibility maintenance must not repair Node outside the
+  # combined OpenClaw/native rollback transaction. Admit the already-installed
+  # interpreter read-only before any archive staging or package mutation.
+  local node_path="" node_metadata="" node_version=""
+  node_path="$(command -v node 2>/dev/null || true)"
+  node_metadata="$(stat -c '%u:%a' /usr/bin/node 2>/dev/null || true)"
+  node_version="$(/usr/bin/node --version 2>/dev/null || printf 'missing')"
+  if [[ "${node_path}" != "/usr/bin/node" \
+    || ! -f /usr/bin/node || ! -x /usr/bin/node \
+    || -L /usr/bin/node \
+    || ! "${node_metadata}" =~ ^0:[0-7][0145][0145]$ \
+    || ! -x /usr/bin/npm \
+    || "$(command -v npm 2>/dev/null || true)" != "/usr/bin/npm" ]] \
+    || ! node_version_meets_minimum /usr/bin/node; then
+    printf 'Compatible AI Tools maintenance requires the existing root-owned /usr/bin/node and /usr/bin/npm runtime in %s (found Node %s). No host package changes were started. Repair Node through a separately reviewed host-maintenance operation, then retry.\n' \
+      "${OPENCLAW_NODE_ENGINE_RANGE}" "${node_version}" >&2
+    return 1
+  fi
+  ok "Node.js ${node_version} admitted read-only for compatibility maintenance"
+}
+
+classify_openclaw_for_portal_only_update() {
+  local package_version="" binary=""
+  binary="$(command -v openclaw 2>/dev/null || true)"
+  if [[ -x /usr/bin/python3 ]]; then
+    package_version="$(/usr/bin/python3 -I - \
+      /usr/lib/node_modules/openclaw/package.json \
+      /usr/local/lib/node_modules/openclaw/package.json <<'PY' 2>/dev/null || true
+import json
+import os
+import stat
+import sys
+
+matches = []
+for candidate in sys.argv[1:]:
+    try:
+        details = os.lstat(candidate)
+        if (
+            stat.S_ISREG(details.st_mode)
+            and not stat.S_ISLNK(details.st_mode)
+            and details.st_uid == 0
+            and details.st_gid == 0
+            and details.st_mode & 0o022 == 0
+        ):
+            with open(candidate, "r", encoding="utf-8") as handle:
+                record = json.load(handle)
+            if record.get("name") == "openclaw" and isinstance(record.get("version"), str):
+                matches.append(record["version"])
+    except (OSError, UnicodeError, ValueError, TypeError):
+        pass
+if len(matches) == 1:
+    print(matches[0])
+PY
+    )"
+  fi
+  if [[ -z "${package_version}" && -z "${binary}" ]]; then
+    printf '%s\n' "  OpenClaw: absent (unchanged by Portal update)"
+  elif [[ "${package_version}" == "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" \
+    && "${binary}" == "/usr/bin/openclaw" ]]; then
+    printf '%s\n' \
+      "  OpenClaw: exact ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} pin (unchanged by Portal update)"
+  else
+    printf '%s\n' \
+      "  OpenClaw: drifted or unavailable (unchanged; use separate reviewed host maintenance)"
+  fi
+}
+
+admit_portal_only_update_host_compatibility() {
+  # Admission only: every probe below is read-only. Existing-install update
+  # must fail before staging instead of repairing the host under an unrelated
+  # rollback journal.
+  local node_path="" node_metadata="" systemd_version="" command_name
+  local -a missing=()
+
+  node_path="$(command -v node 2>/dev/null || true)"
+  node_metadata="$(stat -c '%u:%a' /usr/bin/node 2>/dev/null || true)"
+  if [[ "${node_path}" != "/usr/bin/node" \
+    || ! -f /usr/bin/node || ! -x /usr/bin/node \
+    || -L /usr/bin/node \
+    || ! "${node_metadata}" =~ ^0:[0-7][0145][0145]$ ]] \
+    || ! node_version_meets_minimum /usr/bin/node; then
+    printf '%s\n' \
+      "Portal-only update requires the root-owned exact /usr/bin/node runtime in ${OPENCLAW_NODE_ENGINE_RANGE}. Repair Node in a separate host-maintenance operation, then retry." \
+      >&2
+    return 1
+  fi
+
+  for command_name in \
+    npm npx bash python3 make g++ gcc systemctl systemd-run systemd \
+    psql pg_dump pg_restore pg_isready ffmpeg ffprobe curl tar rsync \
+    openssl sha256sum stat install; do
+    command -v "${command_name}" >/dev/null 2>&1 \
+      || missing+=("${command_name}")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    printf 'Portal-only update is missing required host executables: %s. Install them through a separate host-maintenance operation, then retry.\n' \
+      "${missing[*]}" >&2
+    return 1
+  fi
+
+  systemd_version="$(systemd --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+  if [[ ! "${systemd_version}" =~ ^[0-9]+$ ]] \
+    || (( systemd_version < 249 )); then
+    printf '%s\n' \
+      'Portal-only update requires systemd 249 or newer with systemctl and systemd-run. Upgrade systemd through a separate host-maintenance operation, then retry.' \
+      >&2
+    return 1
+  fi
+
+  if use_tailnet_profile; then
+    command -v tailscale >/dev/null 2>&1 || {
+      printf '%s\n' \
+        'This Tailnet Portal requires the existing tailscale executable. Repair Tailscale separately, then retry.' >&2
+      return 1
+    }
+  elif ! use_local_profile; then
+    command -v caddy >/dev/null 2>&1 || {
+      printf '%s\n' \
+        'This Portal profile requires the existing caddy executable. Repair Caddy separately, then retry.' >&2
+      return 1
+    }
+  fi
+
+  classify_openclaw_for_portal_only_update
+}
+
 # ═══════════════════════════════════════════════════════════════
 # Terminal styling
 # ═══════════════════════════════════════════════════════════════
 
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[0;33m'
-readonly BLUE='\033[0;34m'
-readonly MAGENTA='\033[0;35m'
-readonly CYAN='\033[0;36m'
-readonly WHITE='\033[1;37m'
-readonly BOLD='\033[1m'
-readonly DIM='\033[2m'
-readonly ITALIC='\033[3m'
-readonly NC='\033[0m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+ITALIC='\033[3m'
+NC='\033[0m'
 
 readonly BULLET='•'
 
-ok()       { echo -e "  ${GREEN}✓${NC} $*"; }
-warn()     { echo -e "  ${YELLOW}⚠${NC} $*"; }
-info()     { echo -e "  ${DIM}→${NC} $*"; }
-progress() { echo -e "  ${BLUE}${BULLET}${NC} $*"; }
+terminal_disable_sgr() {
+  RED=""
+  GREEN=""
+  YELLOW=""
+  BLUE=""
+  MAGENTA=""
+  CYAN=""
+  WHITE=""
+  BOLD=""
+  DIM=""
+  ITALIC=""
+  NC=""
+}
+
+terminal_prescan_display_mode() {
+  # Argument validation can fail before the full renderer is initialized.
+  # Prescan only the presentation flags (without consuming or validating any
+  # argument) so malformed --plain/--verbose, TERM=dumb, and non-TTY calls are
+  # still guaranteed to emit no ANSI control sequences.
+  local argument
+  for argument in "$@"; do
+    case "${argument}" in
+      --plain) PLAIN_OUTPUT=true ;;
+      --verbose) VERBOSE=true; PLAIN_OUTPUT=true ;;
+    esac
+  done
+  if ${PLAIN_OUTPUT:-false} || ${VERBOSE:-false} \
+    || [[ ! -t 1 || "${TERM:-}" == "dumb" ]]; then
+    TERMINAL_RENDER_MODE="plain"
+    terminal_disable_sgr
+  elif [[ -n "${NO_COLOR:-}" ]]; then
+    # NO_COLOR retains the stable TTY layout, but argument failures can occur
+    # before renderer initialization and must already be SGR-free.
+    terminal_disable_sgr
+  fi
+  return 0
+}
+
+terminal_sanitize_text() {
+  local value="${1:-}"
+  # Existing presentation call sites sometimes embed the installer's legacy
+  # echo -e style tokens in their message.  The observer uses printf %s, so
+  # strip both their literal form and any already-expanded ESC byte.
+  value="${value//'\033[0;31m'/}"
+  value="${value//'\033[0;32m'/}"
+  value="${value//'\033[0;33m'/}"
+  value="${value//'\033[0;34m'/}"
+  value="${value//'\033[0;35m'/}"
+  value="${value//'\033[0;36m'/}"
+  value="${value//'\033[1;37m'/}"
+  value="${value//'\033[1m'/}"
+  value="${value//'\033[2m'/}"
+  value="${value//'\033[3m'/}"
+  value="${value//'\033[0m'/}"
+  value="${value//$'\033'/}"
+  value="${value//$'\r'/ }"
+  value="${value//$'\n'/ }"
+  LC_ALL=C printf '%s' "${value}" | tr -d '\000-\010\013\014\016-\037\177' || true
+}
+
+terminal_detect_width() {
+  local width="${COLUMNS:-}"
+  if [[ ! "${width}" =~ ^[0-9]+$ ]] && command -v tput >/dev/null 2>&1; then
+    width="$(tput cols 2>/dev/null || true)"
+  fi
+  [[ "${width}" =~ ^[0-9]+$ ]] || width=80
+  (( width > 240 )) && width=240
+  (( width < 20 )) && width=20
+  printf '%s\n' "${width}"
+}
+
+terminal_truncate_row() {
+  local value="${1:-}" width="${2:-80}"
+  value="$(terminal_sanitize_text "${value}")"
+  if (( ${#value} > width )); then
+    if (( width >= 4 )); then
+      printf '%s...\n' "${value:0:$((width - 3))}"
+    else
+      printf '%s\n' "${value:0:${width}}"
+    fi
+  else
+    printf '%s\n' "${value}"
+  fi
+}
+
+terminal_renderer_init() {
+  # Test-only forcing is accepted only when the installer itself was sourced;
+  # production execution always derives presentation from the real terminal.
+  local forced_mode=""
+  TERMINAL_PRESENTATION_WAS_TTY=false
+  [[ -t 1 ]] && TERMINAL_PRESENTATION_WAS_TTY=true
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" ]]; then
+    forced_mode="${BRIDGESLLM_TERMINAL_TEST_MODE:-}"
+  fi
+  if [[ "${forced_mode}" == "tty" ]]; then
+    TERMINAL_RENDER_MODE="tty"
+  elif [[ "${forced_mode}" == "plain" ]]; then
+    TERMINAL_RENDER_MODE="plain"
+  elif ${PLAIN_OUTPUT:-false} || ${VERBOSE:-false} \
+    || [[ ! -t 1 || "${TERM:-}" == "dumb" ]]; then
+    TERMINAL_RENDER_MODE="plain"
+  else
+    TERMINAL_RENDER_MODE="tty"
+  fi
+  TERMINAL_PRESENTATION_FD=""
+  if [[ "${TERMINAL_RENDER_MODE}" == "tty" ]]; then
+    # Keep presentation on the caller's original terminal while phase handlers
+    # have their ordinary stdout/stderr redirected directly to the root-only
+    # log. This is a descriptor-only boundary: no pipeline, subshell, or PID
+    # wrapper can alter command/ERR/signal semantics.
+    if ! exec {TERMINAL_PRESENTATION_FD}>&1; then
+      TERMINAL_RENDER_MODE="plain"
+      TERMINAL_PRESENTATION_FD=""
+    fi
+  fi
+  if [[ "${TERMINAL_RENDER_MODE}" == "plain" || -n "${NO_COLOR:-}" ]]; then
+    terminal_disable_sgr
+  fi
+  TERMINAL_RENDER_ACTIVE=false
+  TERMINAL_RENDER_SUSPENDED=false
+  TERMINAL_RENDER_HAS_FRAME=false
+  TERMINAL_RENDER_FAILED=false
+  TERMINAL_RENDER_LAYOUT="plain"
+  TERMINAL_RENDER_WIDTH="$(terminal_detect_width)"
+  TERMINAL_PHASE_INDEX=0
+  TERMINAL_PHASE_TOTAL=0
+  TERMINAL_PHASE_COMPLETE=false
+  TERMINAL_VERBOSE_LOG_OFFSET=0
+  TERMINAL_VERBOSE_LOG_READY=false
+  TERMINAL_HANDLER_OUTPUT_CAPTURED=false
+  TERMINAL_PANEL_OUTPUT_ACTIVE=false
+  TERMINAL_PANEL_STDOUT_FD=""
+  TERMINAL_PANEL_STDERR_FD=""
+  return 0
+}
+
+terminal_periodic_observation_enabled() {
+  # Phase handlers in TTY mode have fd 1 redirected directly to the log, so
+  # testing fd 1 inside spin helpers would incorrectly disable observation.
+  # Renderer initialization records the original presentation terminal before
+  # that boundary is applied. Explicit --verbose is the only plain/non-TTY
+  # mode that opts into periodic log/progress observation.
+  if [[ "${TERMINAL_RENDER_MODE}" == "tty" \
+    && "${TERMINAL_PRESENTATION_WAS_TTY}" == "true" ]]; then
+    return 0
+  fi
+  [[ "${TERMINAL_RENDER_MODE}" == "plain" \
+    && "${VERBOSE:-false}" == "true" ]]
+}
+
+terminal_present_printf() {
+  local format="$1"
+  shift
+  if [[ "${TERMINAL_RENDER_MODE}" == "tty" \
+    && "${TERMINAL_PRESENTATION_FD:-}" =~ ^[0-9]+$ ]]; then
+    printf "${format}" "$@" >&"${TERMINAL_PRESENTATION_FD}" || return 1
+  else
+    printf "${format}" "$@" || return 1
+  fi
+}
+
+terminal_verbose_log_start() {
+  [[ "${VERBOSE:-false}" == "true" ]] || return 0
+  local size=0
+  if [[ -f "${LOG_FILE}" && ! -L "${LOG_FILE}" ]]; then
+    size="$(stat -c '%s' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  fi
+  [[ "${size}" =~ ^[0-9]+$ ]] || size=0
+  TERMINAL_VERBOSE_LOG_OFFSET="${size}"
+  TERMINAL_VERBOSE_LOG_READY=true
+  return 0
+}
+
+terminal_verbose_drain_log() {
+  [[ "${VERBOSE:-false}" == "true" \
+    && "${TERMINAL_RENDER_MODE}" == "plain" ]] || return 0
+  if [[ "${TERMINAL_VERBOSE_LOG_READY}" != "true" ]]; then
+    terminal_verbose_log_start
+    return 0
+  fi
+  [[ -f "${LOG_FILE}" && ! -L "${LOG_FILE}" ]] || return 0
+
+  local size start delta chunk line omitted=false
+  size="$(stat -c '%s' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  [[ "${size}" =~ ^[0-9]+$ ]] || return 0
+  [[ "${TERMINAL_VERBOSE_LOG_OFFSET}" =~ ^[0-9]+$ ]] \
+    || TERMINAL_VERBOSE_LOG_OFFSET=0
+  (( size < TERMINAL_VERBOSE_LOG_OFFSET )) && TERMINAL_VERBOSE_LOG_OFFSET=0
+  (( size > TERMINAL_VERBOSE_LOG_OFFSET )) || return 0
+
+  start="${TERMINAL_VERBOSE_LOG_OFFSET}"
+  delta=$(( size - start ))
+  if (( delta > 65536 )); then
+    start=$(( size - 65536 ))
+    delta=65536
+    omitted=true
+  fi
+  chunk="$(dd if="${LOG_FILE}" bs=1 skip="${start}" count="${delta}" status=none 2>/dev/null || true)"
+  TERMINAL_VERBOSE_LOG_OFFSET="${size}"
+  if [[ "${omitted}" == "true" ]]; then
+    terminal_plain_event '[log]' \
+      'Earlier verbose log bytes were omitted from this bounded display.' || true
+  fi
+  [[ -n "${chunk}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    terminal_plain_event '[log]' "${line}" || true
+  done <<<"${chunk}"
+  return 0
+}
+
+terminal_plain_event() {
+  local marker="$1" message="${2:-}" detail="${3:-}"
+  message="$(terminal_sanitize_text "${message}")"
+  detail="$(terminal_sanitize_text "${detail}")"
+  if [[ -n "${detail}" ]]; then
+    terminal_present_printf '  %s %s — %s\n' \
+      "${marker}" "${message}" "${detail}" || return 1
+  else
+    terminal_present_printf '  %s %s\n' "${marker}" "${message}" || return 1
+  fi
+}
+
+terminal_activity_text() {
+  local text="${TERMINAL_ACTIVITY}"
+  case "${TERMINAL_ACTIVITY_KIND}" in
+    measured)
+      if [[ "${TERMINAL_ACTIVITY_VALUE}" =~ ^[0-9]+$ \
+        && "${TERMINAL_ACTIVITY_TOTAL}" =~ ^[1-9][0-9]*$ ]]; then
+        local pct=$(( TERMINAL_ACTIVITY_VALUE * 100 / TERMINAL_ACTIVITY_TOTAL ))
+        (( pct > 100 )) && pct=100
+        text+=" (${pct}% measured"
+        [[ -n "${TERMINAL_ACTIVITY_DETAIL}" ]] \
+          && text+=", ${TERMINAL_ACTIVITY_DETAIL}"
+        text+=")"
+      fi
+      ;;
+    package-count)
+      if [[ "${TERMINAL_ACTIVITY_VALUE}" =~ ^[0-9]+$ \
+        && "${TERMINAL_ACTIVITY_TOTAL}" =~ ^[0-9]+$ ]]; then
+        text+=" (${TERMINAL_ACTIVITY_VALUE}/${TERMINAL_ACTIVITY_TOTAL} requested packages present"
+        [[ -n "${TERMINAL_ACTIVITY_DETAIL}" ]] \
+          && text+=", ${TERMINAL_ACTIVITY_DETAIL}"
+        text+=")"
+      fi
+      ;;
+    *)
+      [[ -n "${TERMINAL_ACTIVITY_DETAIL}" ]] \
+        && text+=" (${TERMINAL_ACTIVITY_DETAIL})"
+      ;;
+  esac
+  terminal_sanitize_text "${text}"
+}
+
+terminal_render_impl() {
+  [[ "${TERMINAL_RENDER_ACTIVE}" == "true" \
+    && "${TERMINAL_RENDER_SUSPENDED}" != "true" ]] || return 0
+  [[ "${TERMINAL_RENDER_MODE}" == "tty" ]] || return 0
+
+  local width previous_width layout elapsed phase_text activity_text rail="" rail_index
+  previous_width="${TERMINAL_RENDER_WIDTH}"
+  width="$(terminal_detect_width)"
+  # A terminal resize can reflow the previous rows, so its old physical height
+  # is unknowable. Never cursor-up across a width change: abandon that frame
+  # and start a new bounded surface below it.
+  if [[ "${TERMINAL_RENDER_HAS_FRAME}" == "true" \
+    && "${width}" != "${previous_width}" ]]; then
+    terminal_present_printf '\n' || return 1
+    TERMINAL_RENDER_HAS_FRAME=false
+  fi
+  TERMINAL_RENDER_WIDTH="${width}"
+  if (( width < 44 )); then
+    layout="narrow"
+  elif (( width < 80 )); then
+    layout="compact"
+  else
+    layout="full"
+  fi
+  TERMINAL_RENDER_LAYOUT="${layout}"
+
+  if [[ "${layout}" == "narrow" ]]; then
+    if [[ "${TERMINAL_RENDER_HAS_FRAME}" == "true" ]]; then
+      terminal_present_printf '\n' || return 1
+      TERMINAL_RENDER_HAS_FRAME=false
+    fi
+    phase_text="Phase ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL}: ${TERMINAL_PHASE_LABEL}"
+    terminal_plain_event '[phase]' "$(terminal_truncate_row "${phase_text}" "${width}")" \
+      || return 1
+    if [[ "${TERMINAL_OUTCOME}" != "In progress" ]]; then
+      terminal_plain_event '[final]' "${TERMINAL_OUTCOME}" \
+        "phase: ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}; ${TERMINAL_ACTIVITY}; next: ${TERMINAL_NEXT_ACTION}; log: ${LOG_FILE}" \
+        || return 1
+    fi
+    return 0
+  fi
+
+  elapsed="$(elapsed_since_start)"
+  [[ -n "${elapsed}" ]] || elapsed="0s"
+  activity_text="$(terminal_activity_text)"
+  if [[ "${TERMINAL_PHASE_TOTAL}" =~ ^[1-9][0-9]*$ ]]; then
+    for ((rail_index = 1; rail_index <= TERMINAL_PHASE_TOTAL; rail_index++)); do
+      if (( rail_index < TERMINAL_PHASE_INDEX )) \
+        || [[ "${TERMINAL_PHASE_COMPLETE}" == "true" \
+          && "${rail_index}" -eq "${TERMINAL_PHASE_INDEX}" ]]; then
+        rail+="#"
+      elif (( rail_index == TERMINAL_PHASE_INDEX )); then
+        rail+=">"
+      else
+        rail+="."
+      fi
+    done
+  fi
+  if [[ "${layout}" == "compact" ]]; then
+    phase_text="Phase ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL}  ${TERMINAL_PHASE_LABEL}"
+  else
+    phase_text="Phase ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} | ${TERMINAL_PHASE_ID} | ${TERMINAL_PHASE_LABEL}"
+  fi
+
+  local -a rows=(
+    "BRIDGESLLM PORTAL INSTALLER v${VERSION}"
+    "Plan: [${rail}] phase ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL}"
+    "${phase_text}"
+    "Current: ${activity_text}"
+    "Elapsed: ${elapsed}"
+    "Last warning: ${TERMINAL_LAST_WARNING}"
+    "Log: ${LOG_FILE}"
+    "Status: ${TERMINAL_OUTCOME} | Next: ${TERMINAL_NEXT_ACTION}"
+  )
+  # Style only the fixed presentation rows, after width/sanitization. Never
+  # interpret activity/log text as ANSI; NO_COLOR clears these trusted tokens.
+  local row row_index=0 row_style=""
+  if [[ "${TERMINAL_RENDER_HAS_FRAME}" == "true" ]]; then
+    terminal_present_printf '\033[%dA' "${TERMINAL_SURFACE_LINES}" || return 1
+  fi
+  for row in "${rows[@]}"; do
+    row="$(terminal_truncate_row "${row}" "${width}")"
+    case "${row_index}" in
+      0) row_style="${BOLD}${CYAN}" ;;
+      2) row_style="${BOLD}${WHITE}" ;;
+      3) row_style="${CYAN}" ;;
+      5) row_style="${YELLOW}" ;;
+      7) row_style="${BOLD}" ;;
+      *) row_style="${DIM}" ;;
+    esac
+    terminal_present_printf '\r\033[2K%b%s%b\n' "${row_style}" "${row}" "${NC}" || return 1
+    row_index=$((row_index + 1))
+  done
+  TERMINAL_RENDER_HAS_FRAME=true
+  return 0
+}
+
+terminal_render() {
+  if ! terminal_render_impl; then
+    TERMINAL_RENDER_FAILED=true
+    TERMINAL_RENDER_MODE="plain"
+    TERMINAL_RENDER_HAS_FRAME=false
+    terminal_disable_sgr
+  fi
+  return 0
+}
+
+terminal_observe() {
+  local kind="${1:-info}" message="${2:-}" detail="${3:-}"
+  local value="${4:-}" total="${5:-}"
+  message="$(terminal_sanitize_text "${message}")"
+  detail="$(terminal_sanitize_text "${detail}")"
+  case "${kind}" in
+    warn)
+      TERMINAL_LAST_WARNING="${message}"
+      TERMINAL_ACTIVITY="${message}"
+      TERMINAL_ACTIVITY_DETAIL="${detail}"
+      TERMINAL_ACTIVITY_KIND="indeterminate"
+      ;;
+    measured)
+      TERMINAL_ACTIVITY="${message}"
+      TERMINAL_ACTIVITY_DETAIL="${detail}"
+      TERMINAL_ACTIVITY_KIND="measured"
+      TERMINAL_ACTIVITY_VALUE="${value}"
+      TERMINAL_ACTIVITY_TOTAL="${total}"
+      ;;
+    package-count)
+      TERMINAL_ACTIVITY="${message}"
+      TERMINAL_ACTIVITY_DETAIL="${detail}"
+      TERMINAL_ACTIVITY_KIND="package-count"
+      TERMINAL_ACTIVITY_VALUE="${value}"
+      TERMINAL_ACTIVITY_TOTAL="${total}"
+      ;;
+    *)
+      TERMINAL_ACTIVITY="${message}"
+      TERMINAL_ACTIVITY_DETAIL="${detail}"
+      TERMINAL_ACTIVITY_KIND="indeterminate"
+      TERMINAL_ACTIVITY_VALUE=""
+      TERMINAL_ACTIVITY_TOTAL=""
+      ;;
+  esac
+
+  terminal_verbose_drain_log
+  if [[ "${TERMINAL_RENDER_ACTIVE}" == "true" \
+    && "${TERMINAL_RENDER_SUSPENDED}" != "true" \
+    && "${TERMINAL_RENDER_MODE}" == "tty" ]]; then
+    terminal_render
+  elif [[ "${kind}" != "measured" && "${kind}" != "package-count" \
+    && "${kind}" != "tick" ]]; then
+    local marker='->'
+    [[ "${kind}" == "ok" ]] && marker='OK'
+    [[ "${kind}" == "warn" ]] && marker='WARN'
+    [[ "${kind}" == "progress" ]] && marker='..'
+    terminal_plain_event "${marker}" "${message}" "${detail}" || true
+  fi
+  return 0
+}
+
+terminal_operation_begin() {
+  local phase_id="${1:-unknown}" label="${2:-Operation}" index="${3:-0}" total="${4:-0}"
+  if [[ ! "${phase_id}" =~ ^[a-z0-9][a-z0-9-]{0,47}$ \
+    || ! "${index}" =~ ^[1-9][0-9]*$ \
+    || ! "${total}" =~ ^[1-9][0-9]*$ ]] \
+    || (( index > total )) \
+    || (( TERMINAL_PHASE_INDEX > 0 && index != TERMINAL_PHASE_INDEX + 1 )); then
+    TERMINAL_LAST_WARNING="An invalid or out-of-order presentation event was ignored."
+    terminal_render
+    return 0
+  fi
+  TERMINAL_PHASE_ID="${phase_id}"
+  TERMINAL_PHASE_LABEL="$(terminal_sanitize_text "${label}")"
+  TERMINAL_PHASE_INDEX="${index}"
+  TERMINAL_PHASE_TOTAL="${total}"
+  TERMINAL_PHASE_COMPLETE=false
+  TERMINAL_ACTIVITY="Starting ${TERMINAL_PHASE_LABEL}"
+  TERMINAL_ACTIVITY_DETAIL=""
+  TERMINAL_ACTIVITY_KIND="indeterminate"
+  TERMINAL_OUTCOME="In progress"
+  TERMINAL_NEXT_ACTION="Complete the current phase."
+  TERMINAL_RENDER_ACTIVE=true
+  terminal_verbose_log_start
+  if [[ "${TERMINAL_RENDER_MODE}" == "plain" ]]; then
+    terminal_plain_event '[phase]' \
+      "${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}" \
+      "${TERMINAL_PHASE_ID}" || true
+  else
+    terminal_render
+  fi
+  return 0
+}
+
+terminal_operation_update() {
+  terminal_observe "$@"
+  return 0
+}
+
+terminal_operation_end() {
+  local outcome="${1:-completed}" detail="${2:-}"
+  TERMINAL_ACTIVITY="${TERMINAL_PHASE_LABEL} ${outcome}"
+  TERMINAL_ACTIVITY_DETAIL="$(terminal_sanitize_text "${detail}")"
+  TERMINAL_ACTIVITY_KIND="indeterminate"
+  TERMINAL_PHASE_COMPLETE=true
+  terminal_verbose_drain_log
+  if [[ "${TERMINAL_RENDER_MODE}" == "plain" ]]; then
+    terminal_plain_event '[done]' \
+      "${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}" \
+      "${outcome}${detail:+ — ${detail}}" || true
+  else
+    terminal_render
+  fi
+  return 0
+}
+
+terminal_suspend() {
+  TERMINAL_RENDER_SUSPENDED=true
+  if [[ "${TERMINAL_RENDER_MODE}" == "tty" \
+    && "${TERMINAL_RENDER_HAS_FRAME}" == "true" ]]; then
+    terminal_present_printf '\n' 2>/dev/null || true
+  fi
+  TERMINAL_RENDER_HAS_FRAME=false
+  # A captured handler's raw panel/prompt is intentional terminal output.
+  # Temporarily restore its stdout/stderr to the original presentation FD;
+  # terminal_resume returns both descriptors to their direct log boundary.
+  if [[ "${TERMINAL_HANDLER_OUTPUT_CAPTURED}" == "true" \
+    && "${TERMINAL_PANEL_OUTPUT_ACTIVE}" != "true" \
+    && "${TERMINAL_PRESENTATION_FD:-}" =~ ^[0-9]+$ ]]; then
+    if exec {TERMINAL_PANEL_STDOUT_FD}>&1 \
+      && exec {TERMINAL_PANEL_STDERR_FD}>&2 \
+      && exec 1>&"${TERMINAL_PRESENTATION_FD}" 2>&"${TERMINAL_PRESENTATION_FD}"; then
+      TERMINAL_PANEL_OUTPUT_ACTIVE=true
+    else
+      TERMINAL_RENDER_FAILED=true
+      TERMINAL_RENDER_MODE="plain"
+    fi
+  fi
+  return 0
+}
+
+terminal_resume() {
+  if [[ "${TERMINAL_PANEL_OUTPUT_ACTIVE}" == "true" ]]; then
+    if [[ "${TERMINAL_PANEL_STDOUT_FD:-}" =~ ^[0-9]+$ \
+      && "${TERMINAL_PANEL_STDERR_FD:-}" =~ ^[0-9]+$ ]]; then
+      if ! exec 1>&"${TERMINAL_PANEL_STDOUT_FD}" 2>&"${TERMINAL_PANEL_STDERR_FD}"; then
+        TERMINAL_RENDER_FAILED=true
+        TERMINAL_RENDER_MODE="plain"
+        TERMINAL_HANDLER_OUTPUT_CAPTURED=false
+      fi
+      exec {TERMINAL_PANEL_STDOUT_FD}>&- 2>/dev/null || true
+      exec {TERMINAL_PANEL_STDERR_FD}>&- 2>/dev/null || true
+    fi
+    TERMINAL_PANEL_OUTPUT_ACTIVE=false
+    TERMINAL_PANEL_STDOUT_FD=""
+    TERMINAL_PANEL_STDERR_FD=""
+  fi
+  TERMINAL_RENDER_SUSPENDED=false
+  terminal_render
+  return 0
+}
+
+terminal_renderer_cleanup() {
+  if [[ "${TERMINAL_RENDER_MODE}" == "tty" \
+    && "${TERMINAL_RENDER_HAS_FRAME}" == "true" ]]; then
+    terminal_present_printf '\n' 2>/dev/null || true
+  fi
+  TERMINAL_RENDER_HAS_FRAME=false
+  TERMINAL_RENDER_ACTIVE=false
+  TERMINAL_RENDER_SUSPENDED=false
+  if [[ "${TERMINAL_PRESENTATION_FD:-}" =~ ^[0-9]+$ ]]; then
+    exec {TERMINAL_PRESENTATION_FD}>&- 2>/dev/null || true
+  fi
+  TERMINAL_PRESENTATION_FD=""
+  return 0
+}
+
+terminal_final_field() {
+  local label="$1" value="$2" width="$3"
+  local available chunk remainder
+  value="$(terminal_sanitize_text "${value}")"
+  [[ -n "${value}" ]] || value="Not available"
+  available=$(( width - 2 ))
+  (( available >= 8 )) || available=8
+  terminal_present_printf '%s:\n' "${label}" || return 1
+  remainder="${value}"
+  while [[ -n "${remainder}" ]]; do
+    if (( ${#remainder} <= available )); then
+      chunk="${remainder}"
+      remainder=""
+    else
+      chunk="${remainder:0:${available}}"
+      if [[ "${chunk}" == *' '* ]]; then
+        chunk="${chunk% *}"
+      fi
+      [[ -n "${chunk}" ]] || chunk="${remainder:0:${available}}"
+      remainder="${remainder:${#chunk}}"
+      remainder="${remainder#"${remainder%%[![:space:]]*}"}"
+    fi
+    terminal_present_printf '  %s\n' "${chunk}" || return 1
+  done
+  return 0
+}
+
+terminal_render_final_block() {
+  local width phase
+  width="$(terminal_detect_width)"
+  if [[ "${TERMINAL_RENDER_HAS_FRAME}" == "true" ]]; then
+    # The fixed-height surface ends here. The final record is append-only so
+    # complete safety text can span bounded rows without being truncated or
+    # later overwritten by a cursor-up refresh.
+    terminal_present_printf '\n' || return 1
+    TERMINAL_RENDER_HAS_FRAME=false
+  fi
+  phase="${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}"
+  terminal_present_printf '%s\n' 'Installer result' || return 1
+  terminal_final_field 'Phase' "${phase}" "${width}" || return 1
+  terminal_final_field 'Outcome' "${TERMINAL_OUTCOME}" "${width}" || return 1
+  terminal_final_field 'Reason' "${TERMINAL_ACTIVITY}" "${width}" || return 1
+  terminal_final_field 'Next action' "${TERMINAL_NEXT_ACTION}" "${width}" || return 1
+  terminal_final_field 'Log' "${LOG_FILE}" "${width}" || return 1
+  return 0
+}
+
+terminal_final_state() {
+  local outcome="${1:-finished}" reason="${2:-}" next_action="${3:-Review the installer log.}"
+  TERMINAL_OUTCOME="$(terminal_sanitize_text "${outcome}")"
+  TERMINAL_ACTIVITY="$(terminal_sanitize_text "${reason}")"
+  TERMINAL_ACTIVITY_DETAIL=""
+  TERMINAL_ACTIVITY_KIND="indeterminate"
+  TERMINAL_NEXT_ACTION="$(terminal_sanitize_text "${next_action}")"
+  TERMINAL_RENDER_SUSPENDED=false
+  terminal_verbose_drain_log
+  if [[ "${TERMINAL_RENDER_MODE}" == "tty" ]]; then
+    if [[ "${TERMINAL_RENDER_ACTIVE}" != "true" ]]; then
+      TERMINAL_RENDER_ACTIVE=true
+      TERMINAL_PHASE_ID="terminal"
+      TERMINAL_PHASE_LABEL="Installer result"
+      TERMINAL_PHASE_INDEX=1
+      TERMINAL_PHASE_TOTAL=1
+      TERMINAL_PHASE_COMPLETE=true
+    fi
+    if ! terminal_render_final_block; then
+      TERMINAL_RENDER_FAILED=true
+      TERMINAL_RENDER_MODE="plain"
+    fi
+    terminal_renderer_cleanup
+  else
+    terminal_plain_event '[final]' "${TERMINAL_OUTCOME}" \
+      "phase: ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}; ${TERMINAL_ACTIVITY}; next: ${TERMINAL_NEXT_ACTION}; log: ${LOG_FILE}" || true
+    TERMINAL_RENDER_ACTIVE=false
+  fi
+  return 0
+}
+
+ok()       { terminal_observe ok "$*"; }
+warn()     { terminal_observe warn "$*"; }
+info()     { terminal_observe info "$*"; }
+progress() { terminal_observe progress "$*"; }
 
 # The Dashboard updater redirects this installer's stdout into a durable,
 # root-only outer log that survives the Portal restart. Emit a small,
@@ -392,8 +1251,6 @@ dashboard_update_progress() {
   local status="$1" percent="$2" phase="$3" label="$4" detail="${5:-}"
   local operation_id="${BRIDGESLLM_DASHBOARD_UPDATE_ID:-}"
   local helper="${DASHBOARD_UPDATE_PROGRESS_HELPER}"
-  [[ "${UPDATE_MODE:-false}" == "true" \
-    && "${operation_id}" =~ ^[a-f0-9]{32}$ ]] || return 0
   [[ "${status}" =~ ^(running|recovering|rolled_back|updated_with_errors|recovery_required)$ \
     && "${percent}" =~ ^[0-9]+$ \
     && "${phase}" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || return 0
@@ -410,6 +1267,12 @@ dashboard_update_progress() {
   label="${label:0:160}"
   detail="${detail:0:800}"
   [[ -n "${label}" ]] || label="Update in progress"
+  # The helper's percentage is a compatibility ordinal owned by the installed
+  # 4.0.19 updater, not a measured estimate.  Preserve it byte-for-byte on the
+  # Dashboard wire while the terminal observer reports only semantic state.
+  terminal_observe update "${label}" "${detail:+${phase}: ${detail}}" || true
+  [[ "${UPDATE_MODE:-false}" == "true" \
+    && "${operation_id}" =~ ^[a-f0-9]{32}$ ]] || return 0
   DASHBOARD_UPDATE_PROGRESS_PERCENT="${percent}"
   DASHBOARD_UPDATE_PROGRESS_PHASE="${phase}"
   if [[ ! -f "${helper}" || -L "${helper}" ]] \
@@ -442,17 +1305,30 @@ fail() {
   trap - ERR
   trap '' SIGINT TERM HUP
   set +e
+  terminal_suspend
+  if ! settle_active_tracked_mutator; then
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
+      "Automatic recovery needs attention" \
+      "The active ${TRACKED_MUTATOR_KIND:-installer} operation could not be proven stopped. Recovery was not started."
+    terminal_final_state "Recovery required" \
+      "The active ${TRACKED_MUTATOR_KIND:-installer} operation could not be proven stopped; recovery was not started." \
+      "Do not start another installer run. Review the root-only installer log."
+    exit 1
+  fi
   if [[ "${REPAIR_PROJECT_RUNTIME_IMAGE:-false}" == "true" ]]; then
     echo "" >&2
     echo -e "  ${RED}${BOLD}Project runtime image repair failed:${NC} $1" >&2
     [[ -f "${LOG_FILE}" ]] \
       && echo -e "  ${DIM}Log: ${LOG_FILE}${NC}" >&2
+    terminal_final_state "Repair failed" "$1" \
+      "Review the installer log; no successful repair was reported."
     exit 1
   fi
   if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     dashboard_update_progress updated_with_errors \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
-      "Portal updated; follow-up work failed" "$1"
+      "Portal updated; final verification failed" "$1"
   elif [[ "${UPDATE_RECOVERY_ARMED:-false}" == "true" ]]; then
     dashboard_update_progress recovering \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
@@ -476,9 +1352,15 @@ fail() {
     tail -5 "$LOG_FILE" 2>/dev/null | sed 's/^/    /'
   fi
   echo ""
-  if declare -F settle_openclaw_compatibility_hotfix_process >/dev/null 2>&1; then
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && declare -F settle_openclaw_compatibility_hotfix_process >/dev/null 2>&1; then
     settle_openclaw_compatibility_hotfix_process \
       || warn "The OpenClaw compatibility patch process could not be proven stopped before recovery."
+  fi
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && declare -F recover_pending_ollama_transaction >/dev/null 2>&1; then
+    recover_pending_ollama_transaction \
+      || warn "The sealed Ollama transaction could not be restored automatically; its private journal was preserved and Ollama remains stopped."
   fi
   local database_operation_settled=true
   if declare -F settle_active_update_database_operation >/dev/null 2>&1; then
@@ -490,6 +1372,9 @@ fail() {
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
       "Automatic recovery needs attention" \
       "The active database operation could not be proven stopped. Do not start another update."
+    terminal_final_state "Recovery required" \
+      "The active database operation could not be proven stopped; Portal remains fenced." \
+      "Do not start another update. Review the root-only transaction journal and log."
     exit 1
   fi
   local update_recovery_attempted=false
@@ -502,7 +1387,8 @@ fail() {
     else
       update_recovery_succeeded=true
     fi
-  elif declare -F rollback_openclaw_tested_pair >/dev/null 2>&1; then
+  elif [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && declare -F rollback_openclaw_tested_pair >/dev/null 2>&1; then
     rollback_openclaw_tested_pair || warn "The OpenClaw core/plugin pair needs manual recovery; see ${LOG_FILE}."
   fi
   local preserve_transaction_stage=false
@@ -521,7 +1407,8 @@ fail() {
       preserve_transaction_stage=true
     fi
   fi
-  if [[ "${preserve_transaction_stage}" == "false" \
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" \
+    && "${preserve_transaction_stage}" == "false" \
     && "${UPDATE_TRANSACTION_ID:-}" =~ ^[a-f0-9]{32}$ ]] \
     && declare -F cleanup_prepared_update_project_runtime_tags \
       >/dev/null 2>&1; then
@@ -556,52 +1443,116 @@ fail() {
   if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     dashboard_update_progress updated_with_errors \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
-      "Portal updated; follow-up work failed" \
+      "Portal updated; final verification failed" \
       "${DASHBOARD_UPDATE_FAILURE_MESSAGE}"
+    terminal_final_state "Portal updated with verification errors" \
+      "${DASHBOARD_UPDATE_FAILURE_MESSAGE}" \
+      "Review the installer log before starting another update."
   elif [[ "${update_recovery_attempted}" == "true" \
     && "${update_recovery_succeeded}" == "true" ]]; then
     dashboard_update_progress rolled_back \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" rolled-back \
       "Previous Portal restored" \
       "The update failed, and the previous Portal was restored and verified. ${DASHBOARD_UPDATE_FAILURE_MESSAGE}"
+    terminal_final_state "Previous Portal restored" \
+      "${DASHBOARD_UPDATE_FAILURE_MESSAGE}" \
+      "The previous Portal is verified; review the log before retrying."
   elif [[ "${update_recovery_attempted}" == "true" ]]; then
     dashboard_update_progress recovery_required \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${DASHBOARD_UPDATE_FAILURE_PHASE}" \
       "Automatic recovery needs attention" \
       "Recovery did not complete. Do not start another update; review the root-only transaction journal and installer log."
+    terminal_final_state "Recovery required" \
+      "Recovery did not reach a verified terminal state." \
+      "Do not start another update. Review the root-only transaction journal and log."
+  else
+    terminal_final_state "Installation failed" \
+      "${DASHBOARD_UPDATE_FAILURE_MESSAGE}" \
+      "Review the installer log, correct the reported condition, and retry."
   fi
   exit 1
 }
 
-draw_progress_bar() {
-  local current=$1
-  local total=$2
-  local label="${3:-}"
-  local bar_width=24
-  local filled=$(( (current * bar_width) / total ))
-  local empty=$(( bar_width - filled ))
-  local pct=$(( (current * 100) / total ))
-
-  local bar=""
-  local i
-  for ((i = 0; i < filled; i++)); do bar+="█"; done
-  for ((i = 0; i < empty; i++)); do bar+="░"; done
-
-  echo -e "  ${CYAN}│${NC} ${CYAN}[${bar}]${NC} ${DIM}${pct}%${NC}  ${DIM}·${NC} ${WHITE}${BOLD}${label}${NC} ${DIM}(${current}/${total})${NC}"
+fresh_install_plan_add() {
+  local phase_id="$1" label="$2" handler="$3" existing
+  [[ "${phase_id}" =~ ^[a-z0-9][a-z0-9-]{0,47}$ \
+    && -n "${label}" \
+    && "${handler}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+  for existing in "${FRESH_INSTALL_PLAN_IDS[@]}"; do
+    [[ "${existing}" != "${phase_id}" ]] || return 1
+  done
+  FRESH_INSTALL_PLAN_IDS+=("${phase_id}")
+  FRESH_INSTALL_PLAN_LABELS+=("${label}")
+  FRESH_INSTALL_PLAN_HANDLERS+=("${handler}")
 }
 
-step_header() {
-  CURRENT_STEP_NUM=$((CURRENT_STEP_NUM + 1))
-  local label="$1"
+build_fresh_install_plan() {
+  FRESH_INSTALL_PLAN_IDS=()
+  FRESH_INSTALL_PLAN_LABELS=()
+  FRESH_INSTALL_PLAN_HANDLERS=()
 
-  echo ""
-  echo -e "  ${CYAN}┌────────────────────────────────────────────────────${NC}"
-  draw_progress_bar "$CURRENT_STEP_NUM" "$TOTAL_STEPS" "$label"
-  echo -e "  ${CYAN}└────────────────────────────────────────────────────${NC}"
+  fresh_install_plan_add preflight "Checking system requirements" fresh_install_preflight_phase
+  if use_tailnet_profile; then
+    fresh_install_plan_add tailnet-origin "Joining your private Tailscale network" setup_tailnet_origin
+  fi
+  fresh_install_plan_add system-packages "Installing system packages" install_system_packages
+  fresh_install_plan_add database "Setting up database" setup_database
+  fresh_install_plan_add portal-runtime "Installing Portal runtime" build_portal
+  # Publish the signed migration helpers before any global OpenClaw package
+  # replacement. This is the durable recovery boundary when a fresh Portal
+  # install inherits a retained 7.1 OpenClaw runtime.
+  fresh_install_plan_add ai-tools "Installing AI tools" install_ai_tools
+  fresh_install_plan_add native-providers "Installing native provider runtimes" install_native_provider_tools
+  fresh_install_plan_add services "Configuring services" configure_services
+  fresh_install_plan_add backups "Configuring backup automation" configure_backup_timers
+  fresh_install_plan_add remote-desktop "Setting up Remote Desktop" setup_remote_desktop
+  fresh_install_plan_add activation "Starting and verifying Portal" start_portal
+
+  local expected=10
+  use_tailnet_profile && expected=11
+  (( ${#FRESH_INSTALL_PLAN_IDS[@]} == expected \
+    && ${#FRESH_INSTALL_PLAN_LABELS[@]} == expected \
+    && ${#FRESH_INSTALL_PLAN_HANDLERS[@]} == expected ))
+}
+
+terminal_run_captured_handler() {
+  local handler="$1"
+  shift
+  local status=0
+  if [[ "${TERMINAL_RENDER_MODE}" == "tty" ]]; then
+    TERMINAL_HANDLER_OUTPUT_CAPTURED=true
+    # Direct redirection on the shell function preserves the existing shell,
+    # PID, ERR trap, and signal behavior. Observer writes use the separately
+    # saved presentation FD; every other byte is bounded to the root-only log.
+    "${handler}" "$@" >>"${LOG_FILE}" 2>&1
+    status=$?
+    TERMINAL_HANDLER_OUTPUT_CAPTURED=false
+    return "${status}"
+  fi
+  "${handler}" "$@"
+}
+
+run_fresh_install_plan() {
+  local total="${#FRESH_INSTALL_PLAN_IDS[@]}" index handler
+  (( total == 10 || total == 11 )) \
+    || fail "Fresh-install phase plan is invalid; no host changes were started."
+  TERMINAL_PHASE_INDEX=0
+  TERMINAL_PHASE_TOTAL="${total}"
+  for ((index = 0; index < total; index++)); do
+    handler="${FRESH_INSTALL_PLAN_HANDLERS[$index]}"
+    declare -F "${handler}" >/dev/null 2>&1 \
+      || fail "Fresh-install phase ${FRESH_INSTALL_PLAN_IDS[$index]} has no handler."
+    terminal_operation_begin \
+      "${FRESH_INSTALL_PLAN_IDS[$index]}" \
+      "${FRESH_INSTALL_PLAN_LABELS[$index]}" \
+      "$((index + 1))" "${total}"
+    terminal_run_captured_handler "${handler}"
+    terminal_operation_end completed
+  done
 }
 
 banner() {
-  clear 2>/dev/null || true
+  [[ "${TERMINAL_RENDER_MODE}" != "tty" ]] || clear 2>/dev/null || true
   echo ""
   echo -e "  ${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo -e "  ${WHITE}${BOLD}  B R I D G E S  L L M   Portal${NC}"
@@ -610,9 +1561,8 @@ banner() {
 }
 
 print_kv() {
-  # Print a key-value pair aligned nicely
-  local key="$1" val="$2" color="${3:-$NC}"
-  printf "  ${DIM}%-16s${NC} ${color}%s${NC}\n" "${key}" "${val}"
+  local key="$1" val="$2"
+  terminal_observe info "${key}" "${val}"
 }
 
 elapsed_since_start() {
@@ -743,57 +1693,31 @@ safe_package_manager_repair() {
 wait_for_package_manager_ready() {
   local reason="${1:-package manager work}"
   local timeout_seconds="${2:-$PACKAGE_MANAGER_LONG_WAIT_SECONDS}"
-  local start_ts now elapsed holder last_notice=-1 tick=0
+  local start_ts now elapsed holder last_notice=-1
   start_ts=$(date +%s)
 
   if ! package_manager_is_busy; then
     return 0
   fi
 
-  echo ""
-  echo -e "  ${CYAN}┌────────────────────────────────────────────────────${NC}"
   if cloud_init_pending; then
-    echo -e "  ${CYAN}│${NC}  ${YELLOW}⚠${NC}  ${WHITE}${BOLD}Fresh VPS — waiting for system updates${NC}"
-    echo -e "  ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  ${DIM}Your server is installing security patches. This is${NC}"
-    echo -e "  ${CYAN}│${NC}  ${DIM}normal on a new VPS and usually takes 2–5 minutes.${NC}"
-    echo -e "  ${CYAN}│${NC}  ${DIM}The installer will continue automatically.${NC}"
+    warn "Fresh VPS — waiting for system security updates to finish automatically"
   else
-    echo -e "  ${CYAN}│${NC}  ${YELLOW}⚠${NC}  ${WHITE}${BOLD}Waiting for package manager${NC}"
-    echo -e "  ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  ${DIM}Another package task is running.${NC}"
-    echo -e "  ${CYAN}│${NC}  ${DIM}The installer will continue automatically.${NC}"
+    warn "Waiting for another package-manager task to finish automatically"
   fi
-  echo -e "  ${CYAN}│${NC}"
 
   while package_manager_is_busy; do
     now=$(date +%s)
     elapsed=$(( now - start_ts ))
     holder="$(package_manager_holder_name)"
 
-    if [[ -t 1 ]]; then
-      # draw_pulse_bar does \r itself, prefix with box line
-      local _pw=24 _pframes=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-      local _pf="${_pframes[$(( tick % ${#_pframes[@]} ))]}"
-      local _pc=$(( _pw * 2 )) _pp=$(( tick % (_pw * 2) ))
-      (( _pp >= _pw )) && _pp=$(( _pc - _pp ))
-      local _pb="" _pi
-      for ((_pi = 0; _pi < _pw; _pi++)); do
-        local _pd=$(( _pi - _pp )); (( _pd < 0 )) && _pd=$(( -_pd ))
-        if (( _pd == 0 )); then _pb+="█"; elif (( _pd == 1 )); then _pb+="▓"
-        elif (( _pd == 2 )); then _pb+="▒"; else _pb+="░"; fi
-      done
-      printf "\r  ${CYAN}│${NC}  ${CYAN}${_pf}${NC} ${CYAN}[${_pb}]${NC} ${DIM}$(format_elapsed $elapsed) · ${holder}${NC}                    "
-    elif (( elapsed / 30 != last_notice )); then
-      echo -e "  ${CYAN}│${NC}  ${DIM}Still waiting ($(format_elapsed $elapsed)) — ${holder}${NC}"
-      last_notice=$(( elapsed / 30 ))
+    if (( elapsed != last_notice )); then
+      terminal_operation_update tick "Waiting for package manager" \
+        "$(format_elapsed "${elapsed}") · ${holder}"
+      last_notice="${elapsed}"
     fi
-    tick=$(( tick + 1 ))
 
     if (( elapsed >= timeout_seconds )); then
-      if [[ -t 1 ]]; then printf "\r%-120s\r" ""; fi
-      echo -e "  ${CYAN}│${NC}"
-      echo -e "  ${CYAN}└────────────────────────────────────────────────────${NC}"
       warn "Package manager wait exceeded $((timeout_seconds / 60)) minutes. Checking for a safe recovery..."
       if package_manager_is_busy; then
         fail "Package manager is still actively busy (${holder}). First-boot updates may still be running. Wait a few more minutes and rerun: curl -fsSL https://bridgesllm.ai/install.sh | sudo bash"
@@ -808,11 +1732,7 @@ wait_for_package_manager_ready() {
     sleep 0.2
   done
 
-  if [[ -t 1 ]]; then printf "\r%-120s\r" ""; fi
-  echo -e "  ${CYAN}│${NC}"
-  echo -e "  ${CYAN}│${NC}  ${GREEN}✓${NC}  ${WHITE}Package manager ready${NC}"
-  echo -e "  ${CYAN}└────────────────────────────────────────────────────${NC}"
-  echo ""
+  ok "Package manager ready"
 }
 
 run() {
@@ -829,7 +1749,7 @@ run() {
 telemetry_event() {
   local event="$1"
   case "${event}" in
-    install_start|install_complete|deps_updated|update_complete) ;;
+    install_start|install_complete) ;;
     *) return 0 ;;
   esac
   local os_name; os_name="$(lsb_release -si 2>/dev/null || echo unknown)"
@@ -1158,6 +2078,10 @@ NODE
 prepare_staged_backend_runtime_dependencies() {
   local staged_portal="$1"
   local backend_dir="${staged_portal}/backend"
+  local preparation_root="$(dirname "${staged_portal}")/dependency-preparation"
+  local preparation_cache="${preparation_root}/npm-cache"
+  local preparation_devdir="${preparation_root}/node-gyp"
+  local preparation_xdg_cache="${preparation_root}/xdg-cache"
   [[ -d "${backend_dir}" && -f "${backend_dir}/package-lock.json" \
     && -f "${backend_dir}/package.json" ]] || return 1
   local required_tool
@@ -1168,9 +2092,19 @@ prepare_staged_backend_runtime_dependencies() {
       return 1
     }
   done
+  install -d -m 0700 \
+    "${preparation_root}" "${preparation_cache}" \
+    "${preparation_devdir}" "${preparation_xdg_cache}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
 
   info "Preparing candidate dependencies before Portal downtime..."
   (
+    export XDG_CACHE_HOME="${preparation_xdg_cache}"
+    export npm_config_cache="${preparation_cache}"
+    export npm_config_devdir="${preparation_devdir}"
+    export npm_config_audit=false
+    export npm_config_fund=false
+    export npm_config_update_notifier=false
     cd "${backend_dir}"
     npm ci --omit=dev --ignore-scripts
   ) >> "${LOG_FILE}" 2>&1 || return 1
@@ -1185,6 +2119,12 @@ prepare_staged_backend_runtime_dependencies() {
   fi
 
   (
+    export XDG_CACHE_HOME="${preparation_xdg_cache}"
+    export npm_config_cache="${preparation_cache}"
+    export npm_config_devdir="${preparation_devdir}"
+    export npm_config_audit=false
+    export npm_config_fund=false
+    export npm_config_update_notifier=false
     cd "${backend_dir}"
     npm rebuild bcrypt sharp
     run_without_database_authority npx prisma generate
@@ -1595,7 +2535,17 @@ except (IndexError, ValueError):
 libc = ctypes.CDLL(None, use_errno=True)
 if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
     raise SystemExit(1)
-if os.getppid() != parent_pid:
+status_rows = open("/proc/self/status", "r", encoding="ascii").read().splitlines()
+parent_rows = [
+    row.partition(":")[2].strip()
+    for row in status_rows
+    if row.startswith("PPid:")
+]
+if (
+    len(parent_rows) != 1
+    or re.fullmatch(r"[1-9][0-9]*", parent_rows[0]) is None
+    or int(parent_rows[0]) != parent_pid
+):
     os.kill(os.getpid(), signal.SIGKILL)
 from urllib.parse import unquote, urlsplit
 
@@ -1712,8 +2662,30 @@ run_with_update_pgpass() {
   shift
   [[ "$#" -gt 0 ]] || return 1
   pg_url_uses_supported_prisma_adapter_options "${db_url}" || return 1
-  local runner_source
+  local runner_source proc_self_pid="" proc_self_parent_pid=""
+  local proc_self_pid_rows=0 proc_self_parent_pid_rows=0
+  local status_key status_value
   runner_source="$(update_pgpass_runner_python)" || return 1
+  # The backup process may run in a private PID namespace while retaining the
+  # host-mounted procfs. Shell PIDs are then namespace-local, whereas
+  # /proc/<pid> uses the procfs mount's PID coordinate system. Read both sides
+  # of the parent check from that one procfs view so the exact relationship is
+  # preserved without confusing the two number spaces.
+  while IFS=$' \t' read -r status_key status_value _; do
+    case "${status_key}" in
+      Pid:)
+        proc_self_pid="${status_value}"
+        proc_self_pid_rows=$((proc_self_pid_rows + 1))
+        ;;
+      PPid:)
+        proc_self_parent_pid="${status_value}"
+        proc_self_parent_pid_rows=$((proc_self_parent_pid_rows + 1))
+        ;;
+    esac
+  done < /proc/self/status
+  [[ "${proc_self_pid_rows}" -eq 1 \
+    && "${proc_self_parent_pid_rows}" -eq 1 \
+    && "${proc_self_pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   local -a clean_environment=(
     env -u DATABASE_URL -u PGHOST -u PGHOSTADDR -u PGPORT
     -u PGDATABASE -u PGUSER -u PGPASSWORD -u PGPASSFILE
@@ -1725,18 +2697,13 @@ run_with_update_pgpass() {
     -u PGGSSLIB -u PGSYSCONFDIR -u PGLOCALEDIR
   )
   if [[ "${BRIDGESLLM_UPDATE_PGPASS_EXEC:-0}" == "1" ]]; then
-    local expected_parent="" current_runner_pid="${BASHPID}"
-    expected_parent="$(
-      awk '/^PPid:[[:space:]]/ { print $2; exit }' \
-        "/proc/${current_runner_pid}/status" 2>/dev/null
-    )"
-    [[ "${expected_parent}" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "${proc_self_parent_pid}" =~ ^[1-9][0-9]*$ ]] || return 1
     exec "${clean_environment[@]}" \
-      python3 -c "${runner_source}" "${expected_parent}" "$@" \
+      python3 -c "${runner_source}" "${proc_self_parent_pid}" "$@" \
         3< <(printf '%s' "${db_url}")
   else
     "${clean_environment[@]}" \
-      python3 -c "${runner_source}" "${BASHPID}" "$@" \
+      python3 -c "${runner_source}" "${proc_self_pid}" "$@" \
         3< <(printf '%s' "${db_url}")
   fi
 }
@@ -2111,8 +3078,12 @@ canonical_update_database_topology() {
         kill -0 "${psql_pid}" 2>/dev/null || break
         sleep 0.05
       done
-      [[ -n "${raw}" && "${#raw}" -le 65536 \
-        && -n "${psql_pid}" && -d "/proc/${psql_pid}" ]] || status=1
+      if [[ -n "${raw}" && "${#raw}" -le 65536 \
+        && -n "${psql_pid}" ]]; then
+        kill -0 "${psql_pid}" 2>/dev/null || status=1
+      else
+        status=1
+      fi
       if [[ "${status}" -eq 0 ]]; then
         backend_identity="$(
           python3 - "${raw}" <<'PY2'
@@ -2472,8 +3443,13 @@ else:
                 matches.append(record)
         return matches
 
-    self_namespaces = tuple(
-        os.stat(f"/proc/self/ns/{name}").st_ino
+    # This function is also called by restore-full.sh after that process has
+    # deliberately entered a private mount namespace. Comparing PostgreSQL to
+    # the caller therefore misclassifies a native host postmaster as a
+    # container. PID 1 is the stable host-namespace authority: a native
+    # postmaster shares its pid/mount/net tuple, while Docker containers do not.
+    host_namespaces = tuple(
+        os.stat(f"/proc/1/ns/{name}").st_ino
         for name in ("pid", "mnt", "net")
     )
     candidates = []
@@ -2494,7 +3470,7 @@ else:
             continue
 
         container = None
-        if backend["namespaces"] == self_namespaces:
+        if backend["namespaces"] == host_namespaces:
             if (
                 not address.is_loopback
                 or address != host_address
@@ -7147,24 +8123,19 @@ verify_portal_service_health() {
   local service_name="${1:-bridgesllm-product}"
   local health_url="${2:-http://127.0.0.1:4001/health}"
   local timeout_secs="${3:-60}"
-  local waited=0 tick=0
+  local waited=0
 
   while (( waited < timeout_secs )); do
     if systemctl is-active --quiet "${service_name}" && curl -fsS --max-time 2 "${health_url}" >> "$LOG_FILE" 2>&1; then
-      if [[ -t 1 ]]; then printf "\r%-120s\r" ""; fi
       ok "Portal is healthy"
       return 0
     fi
 
-    if [[ -t 1 ]]; then
-      draw_pulse_bar "$tick" "Waiting for portal" "$(format_elapsed $waited)"
-    fi
-    tick=$(( tick + 3 ))
+    terminal_operation_update tick "Waiting for Portal" "$(format_elapsed "${waited}")"
     sleep 2
     waited=$((waited + 2))
   done
 
-  if [[ -t 1 ]]; then printf "\r%-120s\r" ""; fi
   journalctl -u "${service_name}" -n 50 --no-pager >> "$LOG_FILE" 2>&1 || true
   return 1
 }
@@ -7346,13 +8317,1795 @@ openclaw_standard_state_is_confirmed() {
   return 0
 }
 
+openclaw_2026_9_1_migration_needed() {
+  [[ "$(openclaw_core_package_version || true)" == "2026.9.1" ]] || return 1
+  if [[ -d "/root/.openclaw/agents" ]] \
+    && find /root/.openclaw/agents -path '*/sessions/sessions.json' -type f -print -quit \
+      | grep -q .; then
+    return 0
+  fi
+  [[ -f "/root/.openclaw/openclaw.json" \
+    && ! -L "/root/.openclaw/openclaw.json" ]] || return 1
+  node - /root/.openclaw/openclaw.json <<'NODE'
+const fs = require('fs');
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+} catch {
+  process.exit(1);
+}
+const agents = config?.agents;
+const legacyShape = Object.prototype.hasOwnProperty.call(agents || {}, 'list')
+  || Object.prototype.hasOwnProperty.call(agents?.defaults || {}, 'cliBackends')
+  || Object.prototype.hasOwnProperty.call(config?.meta || {}, 'lastTouchedAt');
+const hasLegacyCodexRef = (value) => {
+  if (typeof value === 'string') return /^(?:codex|openai-codex)\//i.test(value.trim());
+  if (Array.isArray(value)) return value.some(hasLegacyCodexRef);
+  if (!value || typeof value !== 'object') return false;
+  return Object.entries(value).some(([key, entry]) => (
+    /^(?:codex|openai-codex)\//i.test(key.trim()) || hasLegacyCodexRef(entry)
+  ));
+};
+process.exit(legacyShape || hasLegacyCodexRef(config) ? 0 : 1);
+NODE
+}
+
+native_cli_bundle_transaction_present() {
+  [[ -e "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+    || -L "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+    || -e "${NATIVE_CLI_BUNDLE_TRANSACTION_TOMBSTONE}" \
+    || -L "${NATIVE_CLI_BUNDLE_TRANSACTION_TOMBSTONE}" \
+    || -e "${NATIVE_CLI_BUNDLE_TRANSACTION_INTENT}" \
+    || -L "${NATIVE_CLI_BUNDLE_TRANSACTION_INTENT}" ]]
+}
+
+native_cli_bundle_outer_commit_authority_exists() {
+  [[ -d "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]
+}
+
+native_cli_bundle_transaction_helper() {
+  local selected="${NATIVE_CLI_BUNDLE_TRANSACTION_HELPER_SOURCE}"
+  if [[ -d "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+    && ! -L "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" ]]; then
+    selected="${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}/native-cli-bundle-transaction.py"
+  fi
+  [[ -f "${selected}" && ! -L "${selected}" ]] || return 1
+  [[ "$(stat -c '%u:%g' -- "${selected}" 2>/dev/null)" == "0:0" ]] || return 1
+  local mode=""
+  mode="$(stat -c '%a' -- "${selected}" 2>/dev/null)" || return 1
+  [[ "${mode}" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#${mode} & 0022) == 0 )) || return 1
+  printf '%s\n' "${selected}"
+}
+
+run_native_cli_bundle_transaction_tool() {
+  local helper=""
+  local durable=false
+  helper="$(native_cli_bundle_transaction_helper)" || return 1
+  [[ "${helper}" == "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}/native-cli-bundle-transaction.py" ]] \
+    && durable=true
+  python3 -I - \
+    "${helper}" \
+    "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+    "${durable}" \
+    --root "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+    --decision "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+    --tombstone "${NATIVE_CLI_BUNDLE_TRANSACTION_TOMBSTONE}" \
+    --intent "${NATIVE_CLI_BUNDLE_TRANSACTION_INTENT}" \
+    "$@" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+selected = Path(sys.argv[1])
+transaction_root = Path(sys.argv[2])
+durable = sys.argv[3] == "true"
+arguments = sys.argv[4:]
+
+def reject(message):
+    raise SystemExit(message)
+
+if os.geteuid() != 0:
+    reject("native CLI bundle transaction helper requires root")
+if not selected.is_absolute() or Path(os.path.normpath(selected)) != selected:
+    reject("native CLI bundle transaction helper path is not canonical")
+
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+root_fd = None
+if durable:
+    parent_info = os.lstat(transaction_root.parent)
+    root_info = os.lstat(transaction_root)
+    if (
+        transaction_root.resolve() != transaction_root
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_gid != 0
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+        or not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != 0
+        or root_info.st_gid != 0
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+        or selected.parent != transaction_root
+        or selected.name != "native-cli-bundle-transaction.py"
+    ):
+        reject("native CLI bundle transaction root is unsafe")
+    root_fd = os.open(
+        transaction_root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptor = os.open(selected.name, flags, dir_fd=root_fd)
+else:
+    current = Path("/")
+    for component in selected.parent.parts[1:]:
+        current /= component
+        info = os.lstat(current)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_mode & 0o022
+        ):
+            reject("native CLI bundle transaction source boundary is unsafe")
+    descriptor = os.open(selected, flags)
+try:
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or before.st_nlink != 1
+        or before.st_mode & 0o022
+        or (durable and stat.S_IMODE(before.st_mode) != 0o600)
+        or before.st_size <= 0
+        or before.st_size > 4 * 1024 * 1024
+    ):
+        reject("native CLI bundle transaction helper inode is unsafe")
+    payload = bytearray()
+    while len(payload) < before.st_size:
+        chunk = os.read(descriptor, min(1024 * 1024, before.st_size - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    after = os.fstat(descriptor)
+    if len(payload) != before.st_size or (
+        before.st_dev, before.st_ino, before.st_ctime_ns, before.st_size
+    ) != (after.st_dev, after.st_ino, after.st_ctime_ns, after.st_size):
+        reject("native CLI bundle transaction helper changed during read")
+finally:
+    os.close(descriptor)
+
+if durable:
+    ledger_fd = os.open("transaction.json", flags, dir_fd=root_fd)
+    try:
+        ledger_info = os.fstat(ledger_fd)
+        if (
+            not stat.S_ISREG(ledger_info.st_mode)
+            or ledger_info.st_uid != 0
+            or ledger_info.st_gid != 0
+            or ledger_info.st_nlink != 1
+            or stat.S_IMODE(ledger_info.st_mode) != 0o600
+            or ledger_info.st_size <= 0
+            or ledger_info.st_size > 4 * 1024 * 1024
+        ):
+            reject("native CLI bundle transaction ledger inode is unsafe")
+        raw_ledger = b""
+        while len(raw_ledger) < ledger_info.st_size:
+            chunk = os.read(ledger_fd, min(1024 * 1024, ledger_info.st_size - len(raw_ledger)))
+            if not chunk:
+                break
+            raw_ledger += chunk
+        if len(raw_ledger) != ledger_info.st_size:
+            reject("native CLI bundle transaction ledger changed during read")
+    finally:
+        os.close(ledger_fd)
+        os.close(root_fd)
+
+    def reject_duplicates(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                reject("native CLI bundle transaction ledger has duplicate keys")
+            value[key] = item
+        return value
+
+    try:
+        ledger = json.loads(raw_ledger.decode("utf-8"), object_pairs_hook=reject_duplicates)
+    except (UnicodeError, json.JSONDecodeError):
+        reject("native CLI bundle transaction ledger is invalid")
+    if (
+        ledger.get("schema") != "bridgesllm-native-cli-bundle-transaction-v1"
+        or ledger.get("root") != str(transaction_root)
+        or ledger.get("binding", {}).get("root") != str(transaction_root)
+        or ledger.get("helperSha256") != hashlib.sha256(payload).hexdigest()
+        or ledger.get("binding", {}).get("helperSha256") != ledger.get("helperSha256")
+    ):
+        reject("native CLI bundle transaction helper does not match its sealed ledger identity")
+
+sys.argv = [str(selected), *arguments]
+namespace = {
+    "__name__": "__main__",
+    "__file__": str(selected),
+    "__package__": None,
+    "__cached__": None,
+}
+exec(compile(bytes(payload), str(selected), "exec"), namespace, namespace)
+PY
+}
+
+reconcile_native_cli_bundle_transaction() {
+  native_cli_bundle_transaction_present || return 0
+  run_native_cli_bundle_transaction_tool reconcile
+}
+
+native_cli_bundle_transaction_phase() {
+  native_cli_bundle_transaction_present || { printf 'absent\n'; return 0; }
+  run_native_cli_bundle_transaction_tool status
+}
+
+reconcile_ownerless_nonmutating_native_cli_bundle_transaction() {
+  local phase=""
+  phase="$(native_cli_bundle_transaction_phase)" || return 1
+  case "${phase}" in
+    absent) return 0 ;;
+    prepared|committed-cleanup|rolled-back)
+      reconcile_native_cli_bundle_transaction
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+stage_native_cli_bundle_transaction() {
+  native_cli_bundle_transaction_present && return 1
+  [[ -f "${NATIVE_CLI_BUNDLE_ADMISSION_CATALOG}" \
+    && ! -L "${NATIVE_CLI_BUNDLE_ADMISSION_CATALOG}" ]] || return 1
+  run_native_cli_bundle_transaction_tool prepare \
+    --catalog "${NATIVE_CLI_BUNDLE_ADMISSION_CATALOG}" \
+    --codex-version "${PIN_CODEX_CLI_VERSION}" \
+    --claude-version "${PIN_CLAUDE_CODE_VERSION}" \
+    --clawhub-version "${PIN_CLAWHUB_VERSION}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  NATIVE_CLI_BUNDLE_PREPARED=true
+}
+
+prepare_native_cli_bundle_transaction() {
+  if ! native_cli_bundle_transaction_present; then
+    stage_native_cli_bundle_transaction || return 1
+  fi
+  run_native_cli_bundle_transaction_tool apply \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  NATIVE_CLI_BUNDLE_PREPARED=true
+}
+
+native_cli_bundle_binding() {
+  run_native_cli_bundle_transaction_tool binding
+}
+
+native_cli_bundle_matches_tested_pair_decision() {
+  run_native_cli_bundle_transaction_tool matches-decision
+}
+
+commit_native_cli_bundle_transaction() {
+  run_native_cli_bundle_transaction_tool commit
+}
+
+cleanup_native_cli_bundle_transaction() {
+  native_cli_bundle_transaction_present || return 0
+  run_native_cli_bundle_transaction_tool cleanup
+}
+
+run_openclaw_migration_transaction_tool() {
+  local selected="${OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE}"
+  local durable=false
+  if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]; then
+    selected="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-migration-transaction.py"
+    durable=true
+  fi
+  python3 -I - \
+    "${selected}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    "${durable}" \
+    "$@" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+selected = Path(sys.argv[1])
+transaction_root = Path(sys.argv[2])
+durable = sys.argv[3] == "true"
+arguments = sys.argv[4:]
+
+def reject(message):
+    raise SystemExit(message)
+
+if os.geteuid() != 0:
+    reject("OpenClaw migration transaction helper requires root")
+if not selected.is_absolute() or Path(os.path.normpath(selected)) != selected:
+    reject("OpenClaw migration transaction helper path is not canonical")
+
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+root_fd = None
+if durable:
+    parent = transaction_root.parent
+    parent_info = os.lstat(parent)
+    root_info = os.lstat(transaction_root)
+    if (
+        transaction_root.resolve() != transaction_root
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_gid != 0
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+        or not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != 0
+        or root_info.st_gid != 0
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+        or selected.parent != transaction_root
+        or selected.name != "openclaw-migration-transaction.py"
+    ):
+        reject("OpenClaw migration transaction root is unsafe")
+    root_fd = os.open(
+        transaction_root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptor = os.open(selected.name, flags, dir_fd=root_fd)
+else:
+    current = Path("/")
+    for component in selected.parent.parts[1:]:
+        current /= component
+        info = os.lstat(current)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_mode & 0o022
+        ):
+            reject("OpenClaw migration transaction source boundary is unsafe")
+    descriptor = os.open(selected, flags)
+try:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or info.st_mode & 0o022
+        or (durable and stat.S_IMODE(info.st_mode) != 0o600)
+        or info.st_size <= 0
+        or info.st_size > 1024 * 1024
+    ):
+        reject("OpenClaw migration transaction helper inode is unsafe")
+    payload = bytearray()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        payload.extend(chunk)
+    after = os.fstat(descriptor)
+    if (info.st_dev, info.st_ino, info.st_ctime_ns, info.st_size) != (
+        after.st_dev, after.st_ino, after.st_ctime_ns, after.st_size
+    ):
+        reject("OpenClaw migration transaction helper changed during read")
+finally:
+    os.close(descriptor)
+
+if durable:
+    ledger_fd = os.open("transaction.json", flags, dir_fd=root_fd)
+    try:
+        ledger_info = os.fstat(ledger_fd)
+        if (
+            not stat.S_ISREG(ledger_info.st_mode)
+            or ledger_info.st_uid != 0
+            or ledger_info.st_gid != 0
+            or ledger_info.st_nlink != 1
+            or stat.S_IMODE(ledger_info.st_mode) != 0o600
+            or ledger_info.st_size <= 0
+            or ledger_info.st_size > 1024 * 1024
+        ):
+            reject("OpenClaw migration transaction ledger inode is unsafe")
+        raw_ledger = b""
+        while True:
+            chunk = os.read(ledger_fd, 1024 * 1024)
+            if not chunk:
+                break
+            raw_ledger += chunk
+    finally:
+        os.close(ledger_fd)
+        os.close(root_fd)
+    def reject_duplicates(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                reject("OpenClaw migration transaction ledger has duplicate keys")
+            value[key] = item
+        return value
+    try:
+        ledger = json.loads(raw_ledger.decode("utf-8"), object_pairs_hook=reject_duplicates)
+    except (UnicodeError, json.JSONDecodeError):
+        reject("OpenClaw migration transaction ledger is invalid")
+    expected_digest = ledger.get("prepared", {}).get("transactionHelperSha256")
+    if (
+        ledger.get("schema") != "bridgesllm-openclaw-2026.9.1-migration-transaction-v2"
+        or ledger.get("paths", {}).get("root") != str(transaction_root)
+        or ledger.get("paths", {}).get("ledger") != str(transaction_root / "transaction.json")
+        or ledger.get("paths", {}).get("transactionHelper") != str(selected)
+        or not isinstance(expected_digest, str)
+        or hashlib.sha256(payload).hexdigest() != expected_digest
+    ):
+        reject("OpenClaw migration transaction helper does not match its sealed ledger identity")
+
+sys.argv = [str(selected), *arguments]
+namespace = {
+    "__name__": "__main__",
+    "__file__": str(selected),
+    "__package__": None,
+    "__cached__": None,
+}
+
+exec(compile(bytes(payload), str(selected), "exec"), namespace, namespace)
+PY
+}
+
+run_durable_openclaw_codex_plugin_helper() {
+  local action="$1" details helper expected_digest helper_fd status=0 catalog=codex commit_config=""
+  case "${action}" in
+    prepare-held|apply-held|held-binding|commit-held|rollback-held) ;;
+    *) return 1 ;;
+  esac
+  details="$(run_openclaw_migration_transaction_tool codex-helper \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    2>> "${LOG_FILE}")" || return 1
+  IFS=$'\t' read -r helper expected_digest catalog <<< "${details}"
+  catalog="${catalog:-codex}"
+  [[ "${catalog}" == "codex" || "${catalog}" == "portal" ]] || return 1
+  if [[ "${action}" == "commit-held" && "${catalog}" == "portal" ]]; then
+    openclaw_migration_transaction_matches_decision || return 1
+    commit_config="$(run_openclaw_migration_transaction_tool codex-commit-config \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      --decision-record "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" 2>> "${LOG_FILE}")" || return 1
+    [[ "${commit_config}" =~ ^[0-9a-f]{128}$ ]] || return 1
+  fi
+  [[ "${helper}" == "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-stable-plugins.sh" \
+    && "${expected_digest}" =~ ^[a-f0-9]{64}$ \
+    && -f "${helper}" && ! -L "${helper}" ]] || return 1
+  exec {helper_fd}<"${helper}" || return 1
+  python3 -I - "${helper_fd}" "${expected_digest}" "${helper}" <<'PY' \
+    || { exec {helper_fd}<&-; return 1; }
+import hashlib
+import os
+import pathlib
+import stat
+import sys
+
+descriptor = int(sys.argv[1])
+expected = sys.argv[2]
+path = pathlib.Path(sys.argv[3])
+metadata = os.fstat(descriptor)
+path_metadata = os.lstat(path)
+if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(path_metadata.st_mode)
+        or metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino)
+        or metadata.st_size <= 0 or metadata.st_size > 4 * 1024 * 1024):
+    raise SystemExit(1)
+digest = hashlib.sha256()
+offset = 0
+while offset < metadata.st_size:
+    chunk = os.pread(descriptor, min(1024 * 1024, metadata.st_size - offset), offset)
+    if not chunk:
+        raise SystemExit(1)
+    digest.update(chunk)
+    offset += len(chunk)
+if digest.hexdigest() != expected:
+    raise SystemExit(1)
+PY
+  OPENCLAW_PLUGIN_TRANSACTION_ROOT="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/codex-plugin" \
+    OPENCLAW_STABLE_PLUGIN_CATALOG="${catalog}" \
+    OPENCLAW_STABLE_PLUGINS_CONFIG_MODE="${catalog}-projection" \
+    OPENCLAW_STABLE_PLUGINS_COMMIT_CONFIG_SHA512="${commit_config}" \
+    OPENCLAW_STABLE_PLUGINS_QUIESCED=1 \
+    bash "/proc/self/fd/${helper_fd}" "${action}" || status=$?
+  exec {helper_fd}<&-
+  return "${status}"
+}
+
+openclaw_codex_transaction_phase() {
+  run_openclaw_migration_transaction_tool codex-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}" \
+    | node -e '
+let raw = "";
+process.stdin.on("data", chunk => raw += chunk);
+process.stdin.on("end", () => {
+  try {
+    const value = JSON.parse(raw);
+    if (!value || typeof value.phase !== "string") process.exit(1);
+    process.stdout.write(value.phase);
+  } catch (_) { process.exit(1); }
+});
+'
+}
+
+advance_openclaw_codex_transaction() {
+  local expected="$1" next="$2"
+  shift 2
+  run_openclaw_migration_transaction_tool codex-transition \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --expected "${expected}" --to "${next}" "$@" \
+    >> "${LOG_FILE}" 2>&1
+}
+
+openclaw_codex_transaction_fault_inject() {
+  local point="$1"
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && "${PORTAL_OPENCLAW_CODEX_TRANSACTION_FAULT:-}" == "${point}" ]]; then
+    kill -KILL "$$"
+  fi
+}
+
+openclaw_core_gateway_action_fault_inject() {
+  local point="$1"
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && "${PORTAL_OPENCLAW_CORE_GATEWAY_ACTION_FAULT:-}" == "${point}" ]]; then
+    kill -KILL "$$"
+  fi
+}
+
+openclaw_core_gateway_authority() {
+  run_openclaw_migration_transaction_tool core-gateway-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}"
+}
+
+reconcile_openclaw_core_gateway_action() {
+  local authority pending action before current_identity
+  authority="$(openclaw_core_gateway_authority)" || return 1
+  pending="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); process.stdout.write(value.pending == null ? "-" : JSON.stringify(value.pending)); }
+  catch (_) { process.exit(1); }
+});
+')" || return 1
+  [[ "${pending}" != "-" ]] || return 0
+  IFS=$'\t' read -r action before < <(printf '%s' "${pending}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (!value || !["start","stop"].includes(value.action) || !value.before) process.exit(1);
+    process.stdout.write(`${value.action}\t${JSON.stringify(value.before)}\n`); }
+  catch (_) { process.exit(1); }
+});
+') || return 1
+  current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if json_documents_equal "${before}" "${current_identity}"; then
+    openclaw_core_gateway_action_fault_inject "before-${action}"
+    if [[ "${action}" == "stop" ]]; then
+      stop_openclaw_gateway_if_identity_matches "${before}" || return 1
+    else
+      authorized_systemctl_openclaw_gateway \
+        start "${before}" durable-action >> "${LOG_FILE}" 2>&1 || return 1
+    fi
+    openclaw_core_gateway_action_fault_inject "after-${action}"
+    current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  fi
+  run_openclaw_migration_transaction_tool record-core-gateway-result \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --identity-json "${current_identity}" >> "${LOG_FILE}" 2>&1 || return 1
+  openclaw_core_gateway_action_fault_inject "after-${action}-result"
+}
+
+reconcile_openclaw_core_gateway_action_without_start() {
+  local authority pending action before current_identity
+  authority="$(openclaw_core_gateway_authority)" || return 1
+  pending="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); process.stdout.write(value.pending == null ? "-" : JSON.stringify(value.pending)); }
+  catch (_) { process.exit(1); }
+});
+')" || return 1
+  [[ "${pending}" != "-" ]] || { printf 'clear\n'; return 0; }
+  IFS=$'\t' read -r action before < <(printf '%s' "${pending}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (!value || !["start","stop"].includes(value.action) || !value.before) process.exit(1);
+    process.stdout.write(`${value.action}\t${JSON.stringify(value.before)}\n`); }
+  catch (_) { process.exit(1); }
+});
+') || return 1
+  current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if [[ "${action}" == "start" ]] \
+    && json_documents_equal "${before}" "${current_identity}"; then
+    openclaw_gateway_require_inactive_unit_definition \
+      "${before}" >/dev/null || return 1
+    printf 'start-deferred\n'
+    return 0
+  fi
+  reconcile_openclaw_core_gateway_action || return 1
+  printf 'clear\n'
+}
+
+run_durable_openclaw_gateway_action() {
+  local action="$1" expected_identity="$2" purpose="$3"
+  [[ "${action}" == "start" || "${action}" == "stop" ]] || return 1
+  [[ "${purpose}" == "forward" || "${purpose}" == "baseline-restore" ]] \
+    || return 1
+  reconcile_openclaw_core_gateway_action || return 1
+  openclaw_gateway_require_exact_identity \
+    "${expected_identity}" >/dev/null || return 1
+  run_openclaw_migration_transaction_tool arm-core-gateway-action \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --action "${action}" --purpose "${purpose}" \
+    --identity-json "${expected_identity}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  openclaw_core_gateway_action_fault_inject "after-${action}-authority"
+  if [[ "${action}" == "start" && "${purpose}" == "baseline-restore" ]]; then
+    prepare_legacy_openclaw_gateway_permit_recovery_start || return 1
+  fi
+  reconcile_openclaw_core_gateway_action
+}
+
+adopt_durable_openclaw_gateway_identity() {
+  local identity="$1"
+  reconcile_openclaw_core_gateway_action || return 1
+  openclaw_gateway_require_exact_identity "${identity}" >/dev/null || return 1
+  run_openclaw_migration_transaction_tool adopt-core-gateway-identity \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --fence-marker "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
+    --identity-json "${identity}" >> "${LOG_FILE}" 2>&1
+}
+
+ensure_durable_openclaw_gateway_stopped() {
+  local purpose="$1" current_identity=""
+  [[ "${purpose}" == "forward" || "${purpose}" == "baseline-restore" ]] \
+    || return 1
+  reconcile_openclaw_core_gateway_action || return 1
+  current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if openclaw_gateway_identity_is_active "${current_identity}"; then
+    run_durable_openclaw_gateway_action \
+      stop "${current_identity}" "${purpose}"
+  else
+    adopt_durable_openclaw_gateway_identity "${current_identity}"
+  fi
+}
+
+sweep_openclaw_migration_terminal_tombstone() {
+  run_openclaw_migration_transaction_tool sweep-terminal \
+    --root "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    --tombstone "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}"
+}
+
+run_durable_openclaw_migration_helper() {
+  local helper="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/migrate-openclaw-2026.9.1.mjs"
+  local helper_fd
+  exec {helper_fd}<"${helper}" || return 1
+  if ! python3 -I - \
+      "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+      "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      "${helper_fd}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+ledger_path = Path(sys.argv[2])
+descriptor = int(sys.argv[3])
+root_info = os.lstat(root)
+parent_info = os.lstat(root.parent)
+helper_info = os.fstat(descriptor)
+if (
+    root.resolve() != root
+    or not stat.S_ISDIR(root_info.st_mode)
+    or stat.S_ISLNK(root_info.st_mode)
+    or root_info.st_uid != 0
+    or root_info.st_gid != 0
+    or stat.S_IMODE(root_info.st_mode) != 0o700
+    or not stat.S_ISDIR(parent_info.st_mode)
+    or stat.S_ISLNK(parent_info.st_mode)
+    or parent_info.st_uid != 0
+    or parent_info.st_gid != 0
+    or stat.S_IMODE(parent_info.st_mode) != 0o700
+    or not stat.S_ISREG(helper_info.st_mode)
+    or helper_info.st_uid != 0
+    or helper_info.st_gid != 0
+    or helper_info.st_nlink != 1
+    or stat.S_IMODE(helper_info.st_mode) != 0o600
+    or helper_info.st_size <= 0
+    or helper_info.st_size > 4 * 1024 * 1024
+):
+    raise SystemExit(1)
+ledger_info = os.lstat(ledger_path)
+if (
+    not stat.S_ISREG(ledger_info.st_mode)
+    or stat.S_ISLNK(ledger_info.st_mode)
+    or ledger_info.st_uid != 0
+    or ledger_info.st_gid != 0
+    or ledger_info.st_nlink != 1
+    or stat.S_IMODE(ledger_info.st_mode) != 0o600
+):
+    raise SystemExit(1)
+ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+payload = b""
+offset = 0
+while offset < helper_info.st_size:
+    chunk = os.pread(descriptor, min(1024 * 1024, helper_info.st_size - offset), offset)
+    if not chunk:
+        raise SystemExit(1)
+    payload += chunk
+    offset += len(chunk)
+if (
+    ledger.get("schema") != "bridgesllm-openclaw-2026.9.1-migration-transaction-v2"
+    or ledger.get("paths", {}).get("root") != str(root)
+    or ledger.get("paths", {}).get("migrationHelper") != str(root / "migrate-openclaw-2026.9.1.mjs")
+    or hashlib.sha256(payload).hexdigest() != ledger.get("prepared", {}).get("migrationHelperSha256")
+):
+    raise SystemExit(1)
+PY
+  then
+    exec {helper_fd}<&-
+    return 1
+  fi
+  node --input-type=module - "$@" <&${helper_fd}
+  local result=$?
+  exec {helper_fd}<&-
+  return "${result}"
+}
+
+load_openclaw_migration_transaction() {
+  local output recovery_from
+  output="$(run_openclaw_migration_transaction_tool inspect \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")" \
+    || return 1
+  IFS=$'\t' read -r \
+    OPENCLAW_MIGRATION_TRANSACTION_GENERATION \
+    OPENCLAW_MIGRATION_TRANSACTION_PHASE \
+    recovery_from <<< "${output}"
+  [[ "${OPENCLAW_MIGRATION_TRANSACTION_GENERATION}" =~ ^[a-f0-9]{32}$ \
+    && -n "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" ]] || return 1
+  OPENCLAW_UPGRADE_STATE_MANIFEST="${OPENCLAW_MIGRATION_UPGRADE_STATE_MANIFEST}"
+  OPENCLAW_2026_9_1_MIGRATION_MANIFEST="${OPENCLAW_MIGRATION_2026_9_1_MANIFEST}"
+}
+
+advance_openclaw_migration_transaction() {
+  local expected="$1" next="$2" decision_record="${3:-}"
+  local -a command=(
+    run_openclaw_migration_transaction_tool advance
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}"
+    --expected "${expected}"
+    --to "${next}"
+  )
+  [[ -z "${decision_record}" ]] \
+    || command+=(--decision-record "${decision_record}")
+  "${command[@]}" >> "${LOG_FILE}" 2>&1 || return 1
+  load_openclaw_migration_transaction
+}
+
+create_openclaw_migration_transaction() {
+  local terminal_intent="${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}.intent"
+  if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" ]] \
+    || { [[ ! -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+      && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] \
+      && [[ -e "${terminal_intent}" || -L "${terminal_intent}" ]]; }; then
+    sweep_openclaw_migration_terminal_tombstone \
+      >> "${LOG_FILE}" 2>&1 || return 1
+  fi
+  [[ ! -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] || return 1
+  [[ -f "${OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE}" \
+    && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE}" ]] || return 1
+  local migration_helper_source="${PORTAL_DIR}/installer/migrate-openclaw-2026.9.1.mjs"
+  local stable_plugins_helper_source="${PORTAL_DIR}/installer/openclaw-stable-plugins.sh"
+  local gateway_identity="null" gateway_identity_active="false"
+  local gateway_unit_preexisted=false
+  local gateway_committed_active=true gateway_committed_enabled=true
+  [[ -f "${migration_helper_source}" && ! -L "${migration_helper_source}" \
+    && -f "${stable_plugins_helper_source}" \
+    && ! -L "${stable_plugins_helper_source}" ]] \
+    || return 1
+  install -d -o root -g root -m 0700 -- "${UPDATE_STATE_ROOT}" || return 1
+  [[ "$(stat -c '%u:%g:%a' -- "${UPDATE_STATE_ROOT}" 2>/dev/null || true)" == "0:0:700" \
+    && ! -L "${UPDATE_STATE_ROOT}" ]] || return 1
+  if ! $OPENCLAW_PACKAGE_PREEXISTED; then
+    openclaw_gateway_systemd_unit_absent || return 1
+    gateway_identity="null"
+    [[ "${OPENCLAW_GATEWAY_WAS_ACTIVE}" == "false" \
+      && "${OPENCLAW_GATEWAY_WAS_ENABLED}" == "false" ]] || return 1
+  elif gateway_identity="$(openclaw_gateway_systemd_identity)"; then
+    # The migration-permit drop-in is part of the durable unit definition.
+    # Publish and reload it before the transaction snapshots its baseline;
+    # otherwise arming the fence changes DropInPaths/definitionSha256 behind
+    # the ledger and the first exact-identity stop correctly refuses to run.
+    install_openclaw_gateway_authorization_fence_dropin || return 1
+    gateway_identity="$(openclaw_gateway_systemd_identity)" || return 1
+    gateway_unit_preexisted=true
+    gateway_identity_active="$(printf '%s' "${gateway_identity}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (typeof value.active !== "boolean") process.exit(1);
+    process.stdout.write(value.active ? "true" : "false");
+  } catch (_) { process.exit(1); }
+});
+')" || return 1
+    gateway_committed_active="${OPENCLAW_GATEWAY_WAS_ACTIVE}"
+    gateway_committed_enabled="${OPENCLAW_GATEWAY_WAS_ENABLED}"
+  else
+    openclaw_gateway_systemd_unit_absent || return 1
+    gateway_identity="null"
+    [[ "${OPENCLAW_GATEWAY_WAS_ACTIVE}" == "false" \
+      && "${OPENCLAW_GATEWAY_WAS_ENABLED}" == "false" ]] || return 1
+  fi
+  [[ "${gateway_identity_active}" == "${OPENCLAW_GATEWAY_WAS_ACTIVE}" ]] || return 1
+  run_openclaw_migration_transaction_tool create \
+    --root "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --migration-helper-source "${migration_helper_source}" \
+    --transaction-helper-source "${OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE}" \
+    --stable-plugins-helper-source "${stable_plugins_helper_source}" \
+    --gateway-was-active "${OPENCLAW_GATEWAY_WAS_ACTIVE}" \
+    --gateway-unit-identity-json "${gateway_identity}" \
+    --gateway-was-enabled "${OPENCLAW_GATEWAY_WAS_ENABLED}" \
+    --gateway-unit-preexisted "${gateway_unit_preexisted}" \
+    --gateway-committed-active "${gateway_committed_active}" \
+    --gateway-committed-enabled "${gateway_committed_enabled}" \
+    --package-preexisted "${OPENCLAW_PACKAGE_PREEXISTED}" \
+    --state-root-preexisted "${OPENCLAW_STATE_ROOT_PREEXISTED}" \
+    --state-preexisted "${OPENCLAW_STATE_EXISTED_BEFORE_UPDATE}" \
+    --state-config-preexisted "${OPENCLAW_STATE_CONFIG_PREEXISTED}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  load_openclaw_migration_transaction
+}
+
+arm_openclaw_fresh_core_convergence_transaction() {
+  run_openclaw_migration_transaction_tool arm-fresh-core \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  load_openclaw_migration_transaction
+}
+
+adopt_openclaw_current_core_transaction() {
+  local package_version="$1" runtime_version="$2"
+  run_openclaw_migration_transaction_tool adopt-current-core \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --package-version "${package_version}" \
+    --runtime-version "${runtime_version}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  load_openclaw_migration_transaction
+}
+
+render_openclaw_gateway_unit() {
+  local openclaw_binary="$1"
+  [[ "${openclaw_binary}" == /* && -x "${openclaw_binary}" ]] || return 1
+  cat <<OCSVCEOF
+[Unit]
+Description=OpenClaw AI Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${openclaw_binary} gateway --port 18789
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+TimeoutStartSec=30
+SuccessExitStatus=0 143
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+OCSVCEOF
+}
+
+openclaw_gateway_provision_fault_inject() {
+  local point="$1"
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && "${PORTAL_OPENCLAW_GATEWAY_PROVISION_FAULT:-}" == "${point}" ]]; then
+    kill -KILL "$$"
+  fi
+}
+
+openclaw_gateway_provision_authority() {
+  run_openclaw_migration_transaction_tool gateway-provision-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}"
+}
+
+openclaw_gateway_transaction_unit_preexisted() {
+  openclaw_gateway_provision_authority | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (typeof value?.unitPreexisted !== "boolean") process.exit(1);
+    process.stdout.write(value.unitPreexisted ? "true" : "false"); }
+  catch (_) { process.exit(1); }
+});
+'
+}
+
+reconcile_openclaw_gateway_provision() {
+  local authority pending pending_phase identity
+  authority="$(openclaw_gateway_provision_authority)" || return 1
+  pending="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); process.stdout.write(value.pending == null ? "-" : JSON.stringify(value.pending)); }
+  catch (_) { process.exit(1); }
+});
+')" || return 1
+  [[ "${pending}" != "-" ]] || return 0
+  pending_phase="$(printf '%s' "${pending}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (typeof value.phase !== "string") process.exit(1); process.stdout.write(value.phase); }
+  catch (_) { process.exit(1); }
+});
+')" || return 1
+  if [[ "${pending_phase}" == "armed" || "${pending_phase}" == "unit-published" ]]; then
+    run_openclaw_migration_transaction_tool publish-gateway-unit \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      >> "${LOG_FILE}" 2>&1 || return 1
+    openclaw_gateway_provision_fault_inject after-unit-publication
+    openclaw_gateway_provision_fault_inject before-daemon-reload
+    systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || return 1
+    openclaw_gateway_provision_fault_inject after-daemon-reload
+    identity="$(openclaw_gateway_systemd_identity)" || return 1
+    ! openclaw_gateway_identity_is_active "${identity}" || return 1
+    run_openclaw_migration_transaction_tool record-gateway-daemon-reload \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      --identity-json "${identity}" >> "${LOG_FILE}" 2>&1 || return 1
+    pending_phase=daemon-reloaded
+  fi
+  [[ "${pending_phase}" == "daemon-reloaded" ]] || return 1
+  authority="$(openclaw_gateway_provision_authority)" || return 1
+  local enablement_path=""
+  IFS=$'\t' read -r identity enablement_path \
+    < <(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); const identity=value?.pending?.reloadedUnitIdentity;
+    if (!identity || typeof value?.enablementPath !== "string") process.exit(1);
+    process.stdout.write(`${JSON.stringify(identity)}\t${value.enablementPath}\n`); }
+  catch (_) { process.exit(1); }
+});
+') || return 1
+  [[ "${enablement_path}" == /* \
+    && "$(readlink -m -- "${enablement_path}")" == "${enablement_path}" ]] \
+    || return 1
+  local current_identity=""
+  current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if json_documents_equal "${identity}" "${current_identity}"; then
+    openclaw_gateway_provision_fault_inject before-enable
+    systemctl enable openclaw-gateway.service >> "${LOG_FILE}" 2>&1 \
+      || return 1
+    openclaw_gateway_provision_fault_inject after-enable
+    current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  else
+    # A process death after enablement but before the durable result write may
+    # leave only UnitFileState ahead of the journal. Admit exactly that shape;
+    # process, path, byte, and drop-in drift still fail closed.
+    openclaw_gateway_unit_definition_equal_ignoring_enablement \
+      "${identity}" "${current_identity}" || return 1
+    ! openclaw_gateway_identity_is_active "${current_identity}" || return 1
+    openclaw_gateway_identity_is_enabled "${current_identity}" || return 1
+  fi
+  identity="${current_identity}"
+  ! openclaw_gateway_identity_is_active "${identity}" || return 1
+  openclaw_gateway_identity_is_enabled "${identity}" || return 1
+  sync -f "$(dirname -- "${enablement_path}")" 2>/dev/null || return 1
+  openclaw_gateway_provision_fault_inject after-enable-fsync
+  openclaw_gateway_provision_fault_inject before-result-record
+  run_openclaw_migration_transaction_tool record-gateway-provision \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --identity-json "${identity}" >> "${LOG_FILE}" 2>&1 || return 1
+  openclaw_gateway_provision_fault_inject after-result-record
+  load_openclaw_migration_transaction
+}
+
+provision_openclaw_gateway_service() {
+  local openclaw_binary="$1" unit_source="" authority="" unit_preexisted=""
+  local current_identity=""
+  load_openclaw_migration_transaction || return 1
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "gateway-provision-pending" ]]; then
+    reconcile_openclaw_gateway_provision
+    return
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "gateway-provisioned" ]]; then
+    reconcile_openclaw_gateway_provision
+    return
+  fi
+  [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "core-converged" ]] || return 1
+  authority="$(openclaw_gateway_provision_authority)" || return 1
+  unit_preexisted="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (typeof value.unitPreexisted !== "boolean") process.exit(1); process.stdout.write(value.unitPreexisted ? "true" : "false"); }
+  catch (_) { process.exit(1); }
+});
+')" || return 1
+  if [[ "${unit_preexisted}" == "true" ]]; then
+    current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+    adopt_durable_openclaw_gateway_identity "${current_identity}"
+    return 0
+  fi
+  [[ "${unit_preexisted}" == "false" ]] || return 1
+  openclaw_gateway_systemd_unit_absent || return 1
+  unit_source="$(mktemp /tmp/bridgesllm-openclaw-gateway-unit.XXXXXX)" \
+    || return 1
+  chmod 600 "${unit_source}" || { rm -f -- "${unit_source}"; return 1; }
+  if ! render_openclaw_gateway_unit "${openclaw_binary}" > "${unit_source}" \
+    || ! run_openclaw_migration_transaction_tool arm-gateway-provision \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      --unit-source "${unit_source}" >> "${LOG_FILE}" 2>&1; then
+    rm -f -- "${unit_source}"
+    return 1
+  fi
+  rm -f -- "${unit_source}" || return 1
+  load_openclaw_migration_transaction || return 1
+  [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "gateway-provision-pending" ]] \
+    || return 1
+  reconcile_openclaw_gateway_provision
+}
+
+seal_openclaw_core_convergence_transaction() {
+  local rollback_package="$1" package_version="$2" runtime_version="$3"
+  local gateway_was_active="$4" gateway_was_enabled="$5"
+  run_openclaw_migration_transaction_tool seal-core \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --rollback-package "${rollback_package}" \
+    --package-version "${package_version}" \
+    --runtime-version "${runtime_version}" \
+    --gateway-was-active "${gateway_was_active}" \
+    --gateway-was-enabled "${gateway_was_enabled}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  load_openclaw_migration_transaction
+}
+
+openclaw_migration_transaction_has_core_rollback() {
+  run_openclaw_migration_transaction_tool core-present \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    >> "${LOG_FILE}" 2>&1
+}
+
+openclaw_migration_transaction_requires_core_removal() {
+  run_openclaw_migration_transaction_tool core-removal-required \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    >> "${LOG_FILE}" 2>&1
+}
+
+openclaw_migration_transaction_gateway_status() {
+  local purpose="$1"
+  [[ "${purpose}" == "forward" || "${purpose}" == "baseline-restore" ]] \
+    || return 1
+  run_openclaw_migration_transaction_tool gateway-status \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --purpose "${purpose}" \
+    2>> "${LOG_FILE}"
+}
+
+restore_openclaw_gateway_activation() {
+  local expected_runtime="$1" purpose="$2" details target_active target_enabled
+  local current_identity=""
+  [[ "${purpose}" == "forward" || "${purpose}" == "baseline-restore" ]] \
+    || return 1
+  reconcile_openclaw_core_gateway_action || return 1
+  details="$(openclaw_migration_transaction_gateway_status "${purpose}")" \
+    || return 1
+  IFS=$'\t' read -r target_active target_enabled <<< "${details}"
+  [[ "${target_active}" =~ ^(true|false)$ \
+    && "${target_enabled}" =~ ^(true|false)$ ]] || return 1
+  current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if [[ "$(openclaw_gateway_identity_is_enabled "${current_identity}" \
+      && printf true || printf false)" != "${target_enabled}" ]]; then
+    return 1
+  fi
+  if [[ "${target_active}" != "true" ]]; then
+    openclaw_gateway_identity_is_active "${current_identity}" && return 1
+    adopt_durable_openclaw_gateway_identity "${current_identity}" || return 1
+    return 0
+  fi
+  if openclaw_gateway_identity_is_active "${current_identity}"; then
+    adopt_durable_openclaw_gateway_identity "${current_identity}" || return 1
+  else
+    # A reboot behind the durable fence legitimately replaces the old active
+    # PID/invocation tuple with an exact inactive unit.  Publish that narrowly
+    # scoped postboot identity before arming the purpose-bound start.
+    adopt_durable_openclaw_gateway_identity "${current_identity}" || return 1
+    run_durable_openclaw_gateway_action \
+      start "${current_identity}" "${purpose}" || return 1
+  fi
+  verify_openclaw_gateway_stable "${expected_runtime}" 18
+}
+
+restore_durable_openclaw_core_package() {
+  local details rollback_package package_version runtime_version
+  local gateway_was_active gateway_was_enabled
+  details="$(run_openclaw_migration_transaction_tool core-rollback \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    2>> "${LOG_FILE}")" || return 1
+  IFS=$'\t' read -r rollback_package package_version runtime_version \
+    gateway_was_active gateway_was_enabled <<< "${details}"
+  [[ -f "${rollback_package}" && ! -L "${rollback_package}" \
+    && "${package_version}" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$ \
+    && "${runtime_version}" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$ \
+    && "${gateway_was_active}" =~ ^(true|false)$ \
+    && "${gateway_was_enabled}" =~ ^(true|false)$ ]] || return 1
+  local current_identity="" pending_disposition=""
+  pending_disposition="$(reconcile_openclaw_core_gateway_action_without_start)" \
+    || return 1
+  current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if [[ "${pending_disposition}" == "start-deferred" ]]; then
+    openclaw_gateway_require_inactive_unit_definition \
+      "${current_identity}" >/dev/null || return 1
+  elif [[ "${pending_disposition}" != "clear" ]]; then
+    return 1
+  elif openclaw_gateway_identity_is_active "${current_identity}"; then
+    run_durable_openclaw_gateway_action \
+      stop "${current_identity}" baseline-restore || return 1
+  else
+    adopt_durable_openclaw_gateway_identity "${current_identity}" || return 1
+  fi
+  install_openclaw_npm_package "${rollback_package}" >> "${LOG_FILE}" 2>&1 || return 1
+  [[ "$(openclaw_core_package_version || true)" == "${package_version}" \
+    && "$(openclaw_cli_version || true)" == "${runtime_version}" ]] || return 1
+  run_openclaw_migration_transaction_tool restore-state-absence \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  advance_openclaw_migration_transaction \
+    core-rollback-pending core-restored
+}
+
+restore_durable_openclaw_gateway_unit_absence() {
+  local authority="" unit_path="" enablement_path="" unit_preexisted="" unit_sha256=""
+  local current_identity="-" pending_identity="-" provisioned_identity="-"
+  local absence_restored="" reference_identity="-" observed_identity=""
+  install_openclaw_gateway_authorization_fence_dropin || return 1
+  reconcile_openclaw_core_gateway_action || return 1
+  authority="$(openclaw_gateway_provision_authority)" || return 1
+  IFS=$'\t' read -r unit_path enablement_path unit_preexisted unit_sha256 \
+    current_identity pending_identity provisioned_identity absence_restored \
+    < <(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try {
+    const value=JSON.parse(raw); const encode=item => item == null ? "-" : JSON.stringify(item);
+    if (typeof value?.unitPath !== "string" || typeof value?.enablementPath !== "string"
+        || typeof value?.unitPreexisted !== "boolean"
+        || typeof value?.absenceRestored !== "boolean") process.exit(1);
+    const pending=value.pending?.reloadedUnitIdentity ?? null;
+    process.stdout.write([value.unitPath, value.enablementPath, value.unitPreexisted,
+      value.unitSha256 ?? "-", encode(value.current), encode(pending),
+      encode(value.provisioned), value.absenceRestored].join("\t") + "\n");
+  } catch (_) { process.exit(1); }
+});
+') || return 1
+  if [[ "${unit_path}" != /etc/systemd/system/openclaw-gateway.service ]]; then
+    [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+      && -n "${PORTAL_OPENCLAW_MIGRATION_TEST_ROOT:-}" \
+      && "${unit_path}" == "$(readlink -m -- \
+        "${PORTAL_OPENCLAW_MIGRATION_TEST_ROOT}/systemd/openclaw-gateway.service")" ]] \
+      || return 1
+  fi
+  if [[ "${enablement_path}" != "/etc/systemd/system/multi-user.target.wants/openclaw-gateway.service" ]]; then
+    [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+      && -n "${PORTAL_OPENCLAW_MIGRATION_TEST_ROOT:-}" \
+      && "${enablement_path}" == "$(readlink -m -- \
+        "${PORTAL_OPENCLAW_MIGRATION_TEST_ROOT}/systemd/multi-user.target.wants/openclaw-gateway.service")" ]] \
+      || return 1
+  fi
+  [[ "${unit_preexisted}" =~ ^(true|false)$ \
+    && "${absence_restored}" =~ ^(true|false)$ ]] || return 1
+  [[ "${unit_sha256}" == "-" \
+    || "${unit_sha256}" =~ ^[a-f0-9]{64}$ ]] || return 1
+  if [[ "${unit_preexisted}" == "true" ]]; then
+    return 0
+  fi
+  if [[ "${absence_restored}" == "true" ]]; then
+    openclaw_gateway_systemd_unit_absent true
+    return
+  fi
+
+  if [[ "${current_identity}" != "-" ]]; then
+    reference_identity="${current_identity}"
+  elif [[ "${pending_identity}" != "-" ]]; then
+    reference_identity="${pending_identity}"
+  elif [[ "${provisioned_identity}" != "-" ]]; then
+    reference_identity="${provisioned_identity}"
+  fi
+
+  if [[ -e "${unit_path}" || -L "${unit_path}" ]]; then
+    [[ "${unit_sha256}" =~ ^[a-f0-9]{64}$ ]] || return 1
+    observed_identity="$(openclaw_gateway_systemd_identity 2>/dev/null || true)"
+    if [[ -n "${observed_identity}" ]]; then
+      [[ "${reference_identity}" != "-" ]] || return 1
+      openclaw_gateway_unit_definition_equal_ignoring_enablement \
+        "${reference_identity}" "${observed_identity}" || return 1
+      if openclaw_gateway_identity_is_active "${observed_identity}"; then
+        run_durable_openclaw_gateway_action \
+          stop "${observed_identity}" baseline-restore || return 1
+        observed_identity="$(openclaw_gateway_systemd_identity)" || return 1
+      fi
+      ! openclaw_gateway_identity_is_active "${observed_identity}" || return 1
+      openclaw_gateway_unit_definition_equal_ignoring_enablement \
+        "${reference_identity}" "${observed_identity}" || return 1
+      adopt_durable_openclaw_gateway_identity "${observed_identity}" || return 1
+      if openclaw_gateway_identity_is_enabled "${observed_identity}"; then
+        openclaw_gateway_require_exact_identity \
+          "${observed_identity}" >/dev/null || return 1
+        openclaw_gateway_provision_fault_inject before-disable
+        systemctl disable openclaw-gateway.service \
+          >> "${LOG_FILE}" 2>&1 || return 1
+        openclaw_gateway_provision_fault_inject after-disable
+        sync -f "$(dirname -- "${enablement_path}")" 2>/dev/null || return 1
+        openclaw_gateway_provision_fault_inject after-disable-fsync
+        observed_identity="$(openclaw_gateway_systemd_identity)" || return 1
+        ! openclaw_gateway_identity_is_active "${observed_identity}" || return 1
+        openclaw_gateway_unit_definition_equal_ignoring_enablement \
+          "${reference_identity}" "${observed_identity}" || return 1
+      fi
+      openclaw_gateway_identity_is_disabled "${observed_identity}" || return 1
+    elif systemctl is-active --quiet openclaw-gateway.service; then
+      return 1
+    fi
+    openclaw_gateway_provision_fault_inject before-unit-remove
+    run_openclaw_migration_transaction_tool remove-gateway-unit \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      >> "${LOG_FILE}" 2>&1 || return 1
+    openclaw_gateway_provision_fault_inject after-unit-remove
+  fi
+
+  openclaw_gateway_provision_fault_inject before-removal-daemon-reload
+  systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || return 1
+  openclaw_gateway_provision_fault_inject after-removal-daemon-reload
+  openclaw_gateway_systemd_unit_absent true || return 1
+  openclaw_gateway_provision_fault_inject before-absence-record
+  run_openclaw_migration_transaction_tool record-gateway-absence \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  openclaw_gateway_provision_fault_inject after-absence-record
+}
+
+restore_durable_openclaw_fresh_core_absence() {
+  local details package_preexisted state_root_preexisted state_preexisted
+  local state_config_preexisted
+  local global_root=""
+  details="$(run_openclaw_migration_transaction_tool fresh-core-removal \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    2>> "${LOG_FILE}")" || return 1
+  IFS=$'\t' read -r package_preexisted state_root_preexisted \
+    state_preexisted state_config_preexisted <<< "${details}"
+  [[ "${package_preexisted}" == "false" \
+    && "${state_root_preexisted}" =~ ^(true|false)$ \
+    && "${state_preexisted}" =~ ^(true|false)$ \
+    && "${state_config_preexisted}" =~ ^(true|false)$ ]] || return 1
+
+  restore_durable_openclaw_gateway_unit_absence || return 1
+  # npm uninstall is replay-safe: a crash after package removal but before the
+  # phase write retries the same operation, then proves both the package root
+  # and CLI are absent before installer-owned state can be retired.
+  npm uninstall -g openclaw >> "${LOG_FILE}" 2>&1 || true
+  global_root="$(npm root -g 2>> "${LOG_FILE}" || true)"
+  [[ -n "${global_root}" \
+    && ! -e "${global_root}/openclaw" \
+    && ! -L "${global_root}/openclaw" \
+    && -z "$(command -v openclaw 2>/dev/null || true)" ]] || return 1
+  run_openclaw_migration_transaction_tool restore-state-absence \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  advance_openclaw_migration_transaction \
+    core-remove-pending core-removed || return 1
+}
+
+restore_durable_openclaw_upgrade_state() {
+  run_openclaw_migration_transaction_tool restore-upgrade \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    >> "${LOG_FILE}" 2>&1
+}
+
+cleanup_openclaw_migration_transaction() {
+  local expected="$1"
+  run_openclaw_migration_transaction_tool cleanup \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --expected "${expected}" \
+    --tombstone "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  OPENCLAW_MIGRATION_TRANSACTION_GENERATION=""
+  OPENCLAW_MIGRATION_TRANSACTION_PHASE=""
+  OPENCLAW_UPGRADE_STATE_MANIFEST=""
+  OPENCLAW_2026_9_1_MIGRATION_MANIFEST=""
+}
+
+openclaw_migration_transaction_matches_decision() {
+  run_openclaw_migration_transaction_tool matches-decision \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --decision-record "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+    >> "${LOG_FILE}" 2>&1
+}
+
+reconcile_openclaw_codex_transaction() {
+  local authority phase was_active mutation_required baseline baseline_identity
+  local forward_start_identity forward_identity rollback_start_identity
+  local rollback_identity current_identity proof tuple_pid tuple_invocation
+  local tuple_started proof_digest matched=false
+  authority="$(run_openclaw_migration_transaction_tool codex-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")" \
+    || return 1
+  phase="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (!value || typeof value.phase !== "string") process.exit(1);
+    process.stdout.write(value.phase);
+  } catch (_) { process.exit(1); }
+});
+')" || return 1
+  [[ "${phase}" =~ ^(unarmed|preparing|rollback-ready|install-pending|forward-record-installed|forward-attested|recovery-pending|rollback-tree-restored|rollback-attested)$ ]] \
+    || return 1
+  case "${phase}" in
+    unarmed|rollback-attested) return 0 ;;
+    *) ;;
+  esac
+  IFS=$'\t' read -r was_active mutation_required baseline baseline_identity \
+    forward_start_identity forward_identity rollback_start_identity rollback_identity \
+    < <(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); const gateway=value?.gateway;
+    if (!gateway || typeof gateway.wasActive !== "boolean") process.exit(1);
+    const encode = item => item == null ? "-" : JSON.stringify(item);
+    if (typeof value.mutationRequired !== "boolean") process.exit(1);
+    process.stdout.write([gateway.wasActive, value.mutationRequired,
+      encode(value.baseline), encode(gateway.baselineUnitIdentity),
+      encode(gateway.forwardStartUnitIdentity), encode(gateway.forwardUnitIdentity),
+      encode(gateway.rollbackStartUnitIdentity), encode(gateway.rollbackUnitIdentity)
+    ].join("\t") + "\n");
+  } catch (_) { process.exit(1); }
+});
+') || return 1
+  [[ "${was_active}" =~ ^(true|false)$ \
+    && "${mutation_required}" =~ ^(true|false)$ \
+    && "${baseline}" != "-" && "${baseline_identity}" != "-" ]] || return 1
+
+  # A hard kill after an authorized start but before result publication leaves
+  # a live generation whose exact inactive predecessor is already journaled.
+  # Admit that generation through the durable validator before any stop or
+  # phase advance; a foreign unit/process is refused untouched.
+  current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if openclaw_gateway_identity_is_active "${current_identity}"; then
+    if [[ "${phase}" == "forward-record-installed" \
+      && "${forward_identity}" == "-" && "${forward_start_identity}" != "-" ]]; then
+      run_openclaw_migration_transaction_tool record-codex-gateway \
+        --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+        --role forward --identity-json "${current_identity}" \
+        >> "${LOG_FILE}" 2>&1 || return 1
+      forward_identity="${current_identity}"
+    elif [[ "${phase}" == "rollback-tree-restored" \
+      && "${rollback_identity}" == "-" && "${rollback_start_identity}" != "-" ]]; then
+      run_openclaw_migration_transaction_tool record-codex-gateway \
+        --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+        --role rollback --identity-json "${current_identity}" \
+        >> "${LOG_FILE}" 2>&1 || return 1
+      rollback_identity="${current_identity}"
+    fi
+  fi
+
+  # Prove the currently loaded unit definition before publishing any recovery
+  # phase. A replacement unit therefore causes a no-op refusal: no stop, no
+  # held-journal mutation, and no phase advance.
+  if openclaw_gateway_identity_is_active "${current_identity}"; then
+    if [[ "${phase}" == "rollback-tree-restored" ]]; then
+      [[ "${rollback_identity}" != "-" ]] \
+        && json_documents_equal "${rollback_identity}" "${current_identity}" \
+        || return 1
+    else
+      [[ "${was_active}" == "true" ]] || return 1
+      if json_documents_equal "${baseline_identity}" "${current_identity}"; then
+        matched=true
+      elif [[ "${forward_identity}" != "-" ]] \
+        && json_documents_equal "${forward_identity}" "${current_identity}"; then
+        matched=true
+      fi
+      ${matched} || return 1
+    fi
+  else
+    if [[ "${phase}" == "forward-record-installed" \
+      && "${forward_identity}" == "-" && "${forward_start_identity}" != "-" ]]; then
+      json_documents_equal "${forward_start_identity}" "${current_identity}" \
+        || return 1
+    elif [[ "${phase}" == "rollback-tree-restored" \
+      && "${rollback_identity}" == "-" && "${rollback_start_identity}" != "-" ]]; then
+      json_documents_equal "${rollback_start_identity}" "${current_identity}" \
+        || return 1
+    else
+      openclaw_gateway_unit_definition_equal \
+        "${baseline_identity}" "${current_identity}" || return 1
+    fi
+  fi
+
+  case "${phase}" in
+    recovery-pending|rollback-tree-restored) ;;
+    *)
+      # Re-attest again at the phase-publication boundary. A replacement that
+      # already exists is refused without even advancing to recovery-pending;
+      # a later replacement is still refused by the exact pre-stop fence.
+      openclaw_gateway_require_exact_identity \
+        "${current_identity}" >/dev/null || return 1
+      advance_openclaw_codex_transaction \
+        "${phase}" recovery-pending || return 1
+      phase=recovery-pending
+      ;;
+  esac
+  if [[ "${phase}" == "recovery-pending" ]]; then
+    current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+    if openclaw_gateway_identity_is_active "${current_identity}"; then
+      [[ "${was_active}" == "true" ]] || return 1
+      if [[ "${forward_identity}" == "-" ]]; then
+        stop_openclaw_gateway_if_identity_matches \
+          "${baseline_identity}" || return 1
+      else
+        stop_openclaw_gateway_if_identity_matches \
+          "${baseline_identity}" "${forward_identity}" || return 1
+      fi
+    else
+      openclaw_gateway_require_inactive_unit_definition \
+        "${baseline_identity}" >/dev/null || return 1
+    fi
+    if [[ "${mutation_required}" == "true" ]]; then
+      run_durable_openclaw_codex_plugin_helper rollback-held \
+        >> "${LOG_FILE}" 2>&1 || return 1
+    fi
+    advance_openclaw_codex_transaction \
+      recovery-pending rollback-tree-restored || return 1
+    phase=rollback-tree-restored
+  fi
+  if [[ "${phase}" == "rollback-tree-restored" ]]; then
+    if [[ "${was_active}" == "true" ]]; then
+      if [[ "${rollback_identity}" == "-" ]]; then
+        current_identity="$(openclaw_gateway_require_inactive_unit_definition \
+          "${baseline_identity}")" || return 1
+        if [[ "${rollback_start_identity}" == "-" ]]; then
+          openclaw_codex_transaction_fault_inject before-rollback-start-authority
+          run_openclaw_migration_transaction_tool record-codex-gateway-start \
+            --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+            --role rollback --identity-json "${current_identity}" \
+            >> "${LOG_FILE}" 2>&1 || return 1
+          rollback_start_identity="${current_identity}"
+          openclaw_codex_transaction_fault_inject after-rollback-start-authority
+        else
+          json_documents_equal "${rollback_start_identity}" "${current_identity}" \
+            || return 1
+        fi
+        authorized_systemctl_openclaw_gateway \
+          start "${rollback_start_identity}" codex-action >> "${LOG_FILE}" 2>&1 \
+          || return 1
+        openclaw_codex_transaction_fault_inject after-rollback-start
+        verify_openclaw_gateway_stable "${PIN_OPENCLAW_RUNTIME_VERSION}" 18 \
+          || return 1
+        current_identity="$(openclaw_gateway_systemd_identity)" || return 1
+        openclaw_gateway_identity_is_active "${current_identity}" \
+          && openclaw_gateway_unit_definition_equal \
+            "${baseline_identity}" "${current_identity}" || return 1
+        openclaw_codex_transaction_fault_inject before-rollback-result-identity
+        run_openclaw_migration_transaction_tool record-codex-gateway \
+          --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+          --role rollback --identity-json "${current_identity}" \
+          >> "${LOG_FILE}" 2>&1 || return 1
+        rollback_identity="${current_identity}"
+      else
+        openclaw_gateway_require_exact_identity \
+          "${rollback_identity}" >/dev/null || return 1
+      fi
+    else
+      current_identity="$(openclaw_gateway_require_inactive_unit_definition \
+        "${baseline_identity}")" || return 1
+      if [[ "${rollback_identity}" == "-" ]]; then
+        run_openclaw_migration_transaction_tool record-codex-gateway \
+          --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+          --role rollback --identity-json "${current_identity}" \
+          >> "${LOG_FILE}" 2>&1 || return 1
+        rollback_identity="${current_identity}"
+      else
+        json_documents_equal "${rollback_identity}" "${current_identity}" \
+          || return 1
+      fi
+    fi
+    proof="$(write_openclaw_codex_gateway_proof rollback '' "${baseline}")" \
+      || return 1
+    IFS='|' read -r tuple_pid tuple_invocation tuple_started proof_digest \
+      <<< "${proof}"
+    [[ "${tuple_pid}" =~ ^[0-9]+$ && "${tuple_started}" =~ ^[0-9]+$ \
+      && "${proof_digest}" =~ ^[a-f0-9]{64}$ ]] || return 1
+    advance_openclaw_codex_transaction \
+      rollback-tree-restored rollback-attested \
+      --gateway-main-pid "${tuple_pid}" \
+      --gateway-invocation-id "${tuple_invocation}" \
+      --gateway-start-monotonic "${tuple_started}" \
+      --proof-sha256 "${proof_digest}" || return 1
+  fi
+}
+
+reconcile_openclaw_migration_transaction() {
+  local terminal_intent="${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}.intent"
+  local recovery_state_dir="${OPENCLAW_RECOVERY_STATE_DIR:-/root/.openclaw}"
+  if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" ]] \
+    || { [[ ! -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+      && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] \
+      && [[ -e "${terminal_intent}" || -L "${terminal_intent}" ]]; }; then
+    sweep_openclaw_migration_terminal_tombstone \
+      >> "${LOG_FILE}" 2>&1 || return 1
+  fi
+  [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] || return 0
+  load_openclaw_migration_transaction || return 1
+  normalize_legacy_openclaw_gateway_permit_definition || return 1
+  load_openclaw_migration_transaction || return 1
+
+  local native_phase="absent" rollback_quiescence_required=false
+  native_phase="$(native_cli_bundle_transaction_phase)" || return 1
+  if [[ "${native_phase}" != "absent" ]]; then
+    case "${native_phase}" in
+      prepared|committed-cleanup|rolled-back)
+        reconcile_native_cli_bundle_transaction || return 1
+        ;;
+      target-verified|commit-pending)
+        if [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+          && ! -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] \
+          && native_cli_bundle_matches_tested_pair_decision; then
+          reconcile_native_cli_bundle_transaction || return 1
+        else
+          rollback_quiescence_required=true
+        fi
+        ;;
+      applying|rollback-pending)
+        rollback_quiescence_required=true
+        ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  # Without the exact tested-pair decision, mutation-bearing native recovery
+  # and a held plugin/config rollback share this outer owner's stop boundary.
+  # Restore both before any interrupted gateway action or core path can start.
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "committed-cleanup" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "commit-applying" ]] \
+    && { $rollback_quiescence_required \
+      || [[ -e "${recovery_state_dir}/.bridgesllm-ask-user-tested-pair-v1" \
+        || -L "${recovery_state_dir}/.bridgesllm-ask-user-tested-pair-v1" ]]; }; then
+    quiesce_openclaw_tested_pair_rollback || return 1
+    if $rollback_quiescence_required; then
+      reconcile_native_cli_bundle_transaction || return 1
+    fi
+    recover_or_retire_bridgesllm_ask_user_transaction \
+      "${recovery_state_dir}" true || return 1
+  elif $rollback_quiescence_required; then
+    return 1
+  fi
+
+  # A committed generation is cleaned only through the exact v5 decision that
+  # bound it. If that record has already been durably retired, the remaining
+  # root is terminal cleanup residue and can be removed directly.
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "committed-cleanup" ]]; then
+    reconcile_openclaw_core_gateway_action || return 1
+    if [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]]; then
+      openclaw_migration_transaction_matches_decision || return 1
+      local package_dir=""
+      package_dir="$(openclaw_core_package_dir || true)"
+      [[ -n "${package_dir}" ]] || return 1
+      reconcile_openclaw_2026_9_1_bridge_transaction "${package_dir}" || return 1
+      recover_or_retire_bridgesllm_ask_user_transaction /root/.openclaw || return 1
+      retire_openclaw_tested_pair_commit_record_if_clean || return 1
+      [[ ! -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+        && ! -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] || return 1
+      cleanup_native_cli_bundle_transaction || return 1
+    fi
+    # Restore the committed activation while the exact durable generation is
+    # still the only start authority. Only then may the restart inhibitor and
+    # its ledger retire.
+    restore_openclaw_gateway_activation \
+      "${PIN_OPENCLAW_RUNTIME_VERSION}" forward \
+      || return 1
+    disarm_openclaw_gateway_migration_fence || return 1
+    cleanup_openclaw_migration_transaction committed-cleanup
+    return
+  fi
+
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "commit-pending" ]] \
+    && [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] \
+    && openclaw_migration_transaction_matches_decision; then
+    advance_openclaw_migration_transaction \
+      commit-pending commit-applying "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || return 1
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "commit-applying" ]]; then
+    reconcile_openclaw_core_gateway_action || return 1
+    [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      && ! -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] || return 1
+    openclaw_migration_transaction_matches_decision || return 1
+    if [[ -d "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+      && ! -L "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" ]]; then
+      commit_native_cli_bundle_transaction || return 1
+    fi
+    local codex_commit_phase="" codex_mutation_required=""
+    IFS=$'\t' read -r codex_commit_phase codex_mutation_required \
+      < <(run_openclaw_migration_transaction_tool codex-authority \
+        --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}" \
+        | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (typeof value.phase !== "string") process.exit(1);
+    const mutation=value.mutationRequired; if (value.phase !== "unarmed" && typeof mutation !== "boolean") process.exit(1);
+    process.stdout.write(`${value.phase}\t${mutation === true ? "true" : "false"}\n`);
+  } catch (_) { process.exit(1); }
+});
+') || return 1
+    if [[ "${codex_commit_phase}" == "forward-attested" ]]; then
+      if [[ "${codex_mutation_required}" == "true" ]]; then
+        run_durable_openclaw_codex_plugin_helper commit-held \
+          >> "${LOG_FILE}" 2>&1 || return 1
+      fi
+    elif [[ "${codex_commit_phase}" != "unarmed" ]]; then
+      return 1
+    fi
+    commit_openclaw_2026_9_1_migration || return 1
+    advance_openclaw_migration_transaction \
+      commit-applying committed-cleanup "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || return 1
+    reconcile_openclaw_migration_transaction
+    return
+  fi
+
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "recovery-pending" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "migration-restored" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "upgrade-restored" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "core-remove-pending" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "core-removed" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "core-rollback-pending" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "core-restored" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "restored-cleanup" ]]; then
+    advance_openclaw_migration_transaction \
+      "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" recovery-pending || return 1
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "recovery-pending" ]]; then
+    reconcile_openclaw_codex_transaction || return 1
+    if [[ -e "${OPENCLAW_MIGRATION_2026_9_1_MANIFEST}" \
+      || -L "${OPENCLAW_MIGRATION_2026_9_1_MANIFEST}" ]]; then
+      restore_openclaw_2026_9_1_migration || return 1
+    fi
+    advance_openclaw_migration_transaction \
+      recovery-pending migration-restored || return 1
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "migration-restored" ]]; then
+    restore_durable_openclaw_upgrade_state || return 1
+    advance_openclaw_migration_transaction \
+      migration-restored upgrade-restored || return 1
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "upgrade-restored" ]]; then
+    if openclaw_migration_transaction_has_core_rollback; then
+      advance_openclaw_migration_transaction \
+        upgrade-restored core-rollback-pending || return 1
+    elif openclaw_migration_transaction_requires_core_removal; then
+      advance_openclaw_migration_transaction \
+        upgrade-restored core-remove-pending || return 1
+    else
+      run_openclaw_migration_transaction_tool restore-state-absence \
+        --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+        >> "${LOG_FILE}" 2>&1 || return 1
+      local restored_unit_preexisted=""
+      restored_unit_preexisted="$(
+        openclaw_gateway_transaction_unit_preexisted
+      )" || return 1
+      if [[ "${restored_unit_preexisted}" == "true" ]]; then
+        prepare_legacy_openclaw_gateway_permit_recovery_start || return 1
+        reconcile_openclaw_core_gateway_action || return 1
+        restore_openclaw_gateway_activation \
+          "${PIN_OPENCLAW_RUNTIME_VERSION}" baseline-restore \
+          || return 1
+      elif [[ "${restored_unit_preexisted}" == "false" ]]; then
+        restore_durable_openclaw_gateway_unit_absence || return 1
+      else
+        return 1
+      fi
+      advance_openclaw_migration_transaction \
+        upgrade-restored restored-cleanup || return 1
+    fi
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "core-rollback-pending" ]]; then
+    restore_durable_openclaw_core_package || return 1
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "core-remove-pending" ]]; then
+    restore_durable_openclaw_fresh_core_absence || return 1
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "core-restored" ]]; then
+    local restored_core_details="" restored_core_package=""
+    local restored_package_version="" restored_runtime_version=""
+    local restored_gateway_active="" restored_gateway_enabled=""
+    restored_core_details="$(run_openclaw_migration_transaction_tool core-rollback \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      2>> "${LOG_FILE}")" || return 1
+    IFS=$'\t' read -r restored_core_package restored_package_version \
+      restored_runtime_version restored_gateway_active restored_gateway_enabled \
+      <<< "${restored_core_details}"
+    [[ -f "${restored_core_package}" && ! -L "${restored_core_package}" \
+      && "${restored_package_version}" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$ \
+      && "${restored_runtime_version}" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$ \
+      && "${restored_gateway_active}" =~ ^(true|false)$ \
+      && "${restored_gateway_enabled}" =~ ^(true|false)$ \
+      && "$(openclaw_core_package_version || true)" == "${restored_package_version}" \
+      && "$(openclaw_cli_version || true)" == "${restored_runtime_version}" ]] \
+      || return 1
+    local restored_unit_preexisted=""
+    restored_unit_preexisted="$(
+      openclaw_gateway_transaction_unit_preexisted
+    )" || return 1
+    if [[ "${restored_unit_preexisted}" == "true" ]]; then
+      # All native, ask-user, migration, upgrade, and core baselines are now
+      # restored. A sealed legacy pending START may finally be spent.
+      prepare_legacy_openclaw_gateway_permit_recovery_start || return 1
+      reconcile_openclaw_core_gateway_action || return 1
+      restore_openclaw_gateway_activation \
+        "${restored_runtime_version}" baseline-restore \
+        || return 1
+    elif [[ "${restored_unit_preexisted}" == "false" ]]; then
+      restore_durable_openclaw_gateway_unit_absence || return 1
+    else
+      return 1
+    fi
+    advance_openclaw_migration_transaction \
+      core-restored restored-cleanup || return 1
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "core-removed" ]]; then
+    advance_openclaw_migration_transaction \
+      core-removed restored-cleanup || return 1
+  fi
+  [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "restored-cleanup" ]] \
+    || return 1
+  local terminal_unit_preexisted=""
+  terminal_unit_preexisted="$(
+    openclaw_gateway_transaction_unit_preexisted
+  )" || return 1
+  if [[ "${terminal_unit_preexisted}" == "true" ]]; then
+    local terminal_runtime_version="${PIN_OPENCLAW_RUNTIME_VERSION}"
+    if openclaw_migration_transaction_has_core_rollback; then
+      local terminal_core_details="" terminal_core_package=""
+      local terminal_package_version="" terminal_gateway_active=""
+      local terminal_gateway_enabled=""
+      terminal_core_details="$(run_openclaw_migration_transaction_tool \
+        core-rollback --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+        2>> "${LOG_FILE}")" || return 1
+      IFS=$'\t' read -r terminal_core_package terminal_package_version \
+        terminal_runtime_version terminal_gateway_active terminal_gateway_enabled \
+        <<< "${terminal_core_details}"
+    fi
+    restore_openclaw_gateway_activation \
+      "${terminal_runtime_version}" baseline-restore || return 1
+  elif [[ "${terminal_unit_preexisted}" == "false" ]]; then
+    restore_durable_openclaw_gateway_unit_absence || return 1
+  else
+    return 1
+  fi
+  disarm_openclaw_gateway_migration_fence || return 1
+  cleanup_openclaw_migration_transaction restored-cleanup
+}
+
 prepare_openclaw_upgrade_state() {
   if $SKIP_OPENCLAW || ! command -v node >/dev/null 2>&1; then
     return 0
   fi
 
   local needs_preparation=false
-  if $OPENCLAW_PACKAGE_UPDATED && $OPENCLAW_STATE_EXISTED_BEFORE_UPDATE; then
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]] \
+    && { $MAINTAIN_TOOLS || ! $UPDATE_MODE; }; then
+    # Every fresh/reinstall 9.1 compatibility run needs one v5 outer owner,
+    # including a truly new host and an already-current package with no legacy
+    # config. The same owner binds later plugin/config/native-byte mutations.
+    needs_preparation=true
+  elif $OPENCLAW_PACKAGE_UPDATED && $OPENCLAW_STATE_EXISTED_BEFORE_UPDATE; then
+    needs_preparation=true
+  elif openclaw_2026_9_1_migration_needed; then
     needs_preparation=true
   elif ! openclaw_gateway_http_ready \
     && { [[ -e "/root/.clawdbot" ]] || [[ -f "/root/.openclaw/plugins/installs.json" ]]; }; then
@@ -7364,26 +10117,57 @@ prepare_openclaw_upgrade_state() {
   fi
 
   local layout_confirmed=false
-  if $OPENCLAW_PACKAGE_UPDATED && $OPENCLAW_STATE_EXISTED_BEFORE_UPDATE; then
-    if $OPENCLAW_GATEWAY_WAS_ACTIVE; then
-      openclaw_standard_state_is_confirmed && layout_confirmed=true
-    else
-      # A fresh Portal install may inherit a CLI/state directory but no gateway
-      # unit. By this point configure_services has created the standard unit;
-      # prove that static layout before the first new-runtime boot.
-      openclaw_standard_state_static_is_confirmed && layout_confirmed=true
-    fi
+  if $OPENCLAW_LAYOUT_CONFIRMED_LIVE; then
+    # Already proven against the live, HTTP-ready gateway by
+    # converge_openclaw_core_package before this transaction fenced and stopped
+    # it. Re-proving it here is impossible by construction, so demanding a
+    # second live proof failed every host whose gateway was running.
+    layout_confirmed=true
+  elif $OPENCLAW_GATEWAY_WAS_ACTIVE; then
+    openclaw_standard_state_is_confirmed && layout_confirmed=true
   else
-    # Rescue an already-failed 2026.7.1 first start using static unit proof. A
-    # healthy package upgrade requires the stronger live /proc baseline above.
+    # A fresh Portal install may inherit a CLI/state directory but no gateway
+    # unit. By this point configure_services has created the standard unit;
+    # prove that static layout before the first new-runtime boot. The same
+    # proof admits rescue of an already-failed first start.
     openclaw_standard_state_static_is_confirmed && layout_confirmed=true
   fi
   if ! $layout_confirmed; then
     warn "OpenClaw uses a custom or unverified state layout; refusing to alter default-path migration artifacts automatically."
-    if ! openclaw_gateway_http_ready; then
-      systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
-      warn "Stopped the unready gateway to prevent a continuing restart loop; custom-state recovery requires an operator."
-    fi
+    ! openclaw_gateway_http_ready \
+      && warn "The unready custom-layout gateway was left untouched because no durable unit identity owner exists; operator recovery is required."
+    return 1
+  fi
+
+  local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
+  if [[ ! -f "${helper}" ]]; then
+    warn "OpenClaw upgrade-state helper is missing."
+    return 1
+  fi
+
+  # Publish the singleton owner and reboot fence while any previously active
+  # gateway is still running. From this point onward, every process-death and
+  # reboot edge can recover both exact bytes and the prior service activation.
+  if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]; then
+    load_openclaw_migration_transaction || {
+      warn "Could not load the durable OpenClaw package convergence owner."
+      return 1
+    }
+  else
+    create_openclaw_migration_transaction || {
+      warn "Could not create the durable OpenClaw migration owner."
+      return 1
+    }
+  fi
+  local migration_start_phase="${OPENCLAW_MIGRATION_TRANSACTION_PHASE}"
+  if [[ "${migration_start_phase}" != "created" \
+    && "${migration_start_phase}" != "core-converged" \
+    && "${migration_start_phase}" != "gateway-provisioned" ]] \
+    || ! arm_openclaw_gateway_migration_fence \
+    || ! advance_openclaw_migration_transaction \
+      "${migration_start_phase}" upgrade-prepare-pending; then
+    warn "Could not publish the durable OpenClaw migration owner before touching state."
     return 1
   fi
 
@@ -7391,7 +10175,7 @@ prepare_openclaw_upgrade_state() {
     # A failed first 2026.7 start may still be cycling under Restart=always.
     # Stop it before touching warning sources so no new migration owner can
     # race the repair or extend the upstream startup-migration lease.
-    systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+    ensure_durable_openclaw_gateway_stopped forward || return 1
     local stop_waited=0
     while systemctl is-active --quiet openclaw-gateway && (( stop_waited < 30 )); do
       sleep 2
@@ -7404,38 +10188,74 @@ prepare_openclaw_upgrade_state() {
     OPENCLAW_RESCUE_MODE=true
   fi
 
-  local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
-  if [[ ! -f "${helper}" ]]; then
-    warn "OpenClaw upgrade-state helper is missing."
-    return 1
+  # The 9.1 session import and config rewrite are maintenance operations. The
+  # old gateway may still be healthy in memory after npm replaces its package,
+  # so stop it explicitly after proving the live layout and before touching
+  # either store. The durable owner above now preserves the prior activation,
+  # while Portal quiescence prevents another service from racing this stop.
+  if systemctl is-active --quiet openclaw-gateway; then
+    ensure_durable_openclaw_gateway_stopped forward || return 1
+    local migration_stop_waited=0
+    while systemctl is-active --quiet openclaw-gateway \
+      && (( migration_stop_waited < 30 )); do
+      sleep 2
+      migration_stop_waited=$((migration_stop_waited + 2))
+    done
+    if systemctl is-active --quiet openclaw-gateway; then
+      warn "Could not stop the OpenClaw gateway before state migration."
+      return 1
+    fi
   fi
 
-  local manifest_dir="${UPDATE_RECOVERY_BACKUP_DIR:-/tmp}"
-  mkdir -p "${manifest_dir}"
-  OPENCLAW_UPGRADE_STATE_MANIFEST="${manifest_dir}/openclaw-upgrade-state-${TIMESTAMP}.json"
+  OPENCLAW_UPGRADE_STATE_MANIFEST="${OPENCLAW_MIGRATION_UPGRADE_STATE_MANIFEST}"
   if ! PORTAL_OPENCLAW_STANDARD_STATE_CONFIRMED=1 \
+    PORTAL_OPENCLAW_UPGRADE_STATE_JOURNAL="${OPENCLAW_UPGRADE_STATE_MANIFEST}" \
     NODE_PATH="${PORTAL_DIR}/backend/node_modules" \
     node -e '
-const fs = require("fs");
 const helper = require(process.argv[1]);
-const output = process.argv[2];
 const result = helper.prepareOpenClawUpgradeState();
-try {
-  fs.writeFileSync(output, JSON.stringify(result, null, 2) + "\n", { mode: 0o600 });
-  fs.chmodSync(output, 0o600);
-} catch (error) {
-  const restored = helper.restoreOpenClawUpgradeState(result);
-  console.error(JSON.stringify({ manifestWriteFailed: String(error), restored }));
-  process.exit(44);
-}
 console.log(JSON.stringify(result));
 if (!result.readyForGatewayStart) process.exit(42);
-' "${helper}" "${OPENCLAW_UPGRADE_STATE_MANIFEST}" >> "$LOG_FILE" 2>&1; then
+' "${helper}" >> "$LOG_FILE" 2>&1; then
     warn "OpenClaw legacy state could not be reconciled safely; the old runtime will be restored."
+    return 1
+  fi
+  if ! advance_openclaw_migration_transaction \
+      upgrade-prepare-pending upgrade-prepared; then
+    warn "OpenClaw legacy-state preparation completed, but its durable fingerprint could not be sealed."
     return 1
   fi
 
   ok "OpenClaw legacy state checked and recoverably preserved"
+
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+    local openclaw_package_dir=""
+    openclaw_package_dir="$(openclaw_core_package_dir || true)"
+    if [[ -z "${openclaw_package_dir}" ]]; then
+      warn "OpenClaw 2026.9.1 migration helper or exact package directory is missing."
+      return 1
+    fi
+    OPENCLAW_2026_9_1_MIGRATION_MANIFEST="${OPENCLAW_MIGRATION_2026_9_1_MANIFEST}"
+    if ! advance_openclaw_migration_transaction \
+        upgrade-prepared migration-prepare-pending \
+      || ! run_durable_openclaw_migration_helper prepare \
+      --manifest "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST}" \
+      --state-dir /root/.openclaw \
+      --config /root/.openclaw/openclaw.json \
+      --package-dir "${openclaw_package_dir}" >> "$LOG_FILE" 2>&1; then
+      warn "OpenClaw 2026.9.1 config/session migration failed closed; the previous runtime state will be restored."
+      return 1
+    fi
+    if ! advance_openclaw_migration_transaction \
+        migration-prepare-pending migration-prepared; then
+      warn "OpenClaw 2026.9.1 migration completed, but its durable prepared identity could not be sealed."
+      return 1
+    fi
+    ok "OpenClaw 2026.9.1 config and session state migrated transactionally"
+  else
+    warn "The durable OpenClaw migration owner was created without an exact 2026.9.1 state migration; refusing an unbound compatibility transaction."
+    return 1
+  fi
 
   if $OPENCLAW_RESCUE_MODE && ! wait_for_openclaw_startup_migration_lease; then
     warn "OpenClaw's orphaned startup-migration lease did not expire safely within the recovery window."
@@ -7448,18 +10268,210 @@ restore_prepared_openclaw_state() {
   local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
   [[ -f "${helper}" ]] || return 1
 
-  NODE_PATH="${PORTAL_DIR}/backend/node_modules" node -e '
-const fs = require("fs");
+  PORTAL_OPENCLAW_UPGRADE_STATE_JOURNAL="${OPENCLAW_UPGRADE_STATE_MANIFEST}" \
+    NODE_PATH="${PORTAL_DIR}/backend/node_modules" node -e '
 const helper = require(process.argv[1]);
-const preparation = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-const result = helper.restoreOpenClawUpgradeState(preparation);
+const result = helper.restoreOpenClawUpgradeStateFromJournal();
 console.log(JSON.stringify(result));
 if (!result.restored) process.exit(43);
-' "${helper}" "${OPENCLAW_UPGRADE_STATE_MANIFEST}" >> "$LOG_FILE" 2>&1
+' "${helper}" >> "$LOG_FILE" 2>&1
+}
+
+restore_openclaw_2026_9_1_migration() {
+  [[ -n "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST:-}" ]] || return 0
+  [[ -f "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST}" \
+    && ! -L "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST}" ]] || return 1
+  # State rollback uses the sealed standalone helper, not a possibly partial
+  # successor npm tree. Package recovery happens after data has been restored.
+  run_durable_openclaw_migration_helper restore \
+    --manifest "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST}" >> "$LOG_FILE" 2>&1
+}
+
+commit_openclaw_2026_9_1_migration() {
+  [[ -n "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST:-}" ]] || return 0
+  [[ -f "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST}" \
+    && ! -L "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST}" ]] || return 1
+  run_durable_openclaw_migration_helper commit \
+    --manifest "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST}" >> "$LOG_FILE" 2>&1
 }
 
 openclaw_gateway_http_ready() {
   curl -fsS --max-time 5 http://127.0.0.1:18789/readyz >/dev/null 2>&1
+}
+
+read_attested_local_openclaw_gateway_token() {
+  local config_path="${1:-/root/.openclaw/openclaw.json}"
+  python3 - "${config_path}" <<'PY'
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.is_absolute() or path.name != "openclaw.json":
+    raise SystemExit(1)
+parent_path = path.parent
+
+def descriptor_mount_id(fd):
+    try:
+        lines = pathlib.Path(f"/proc/self/fdinfo/{fd}").read_text(
+            encoding="ascii"
+        ).splitlines()
+    except (OSError, UnicodeError):
+        raise SystemExit(1)
+    prefix = "mnt_id:\t"
+    values = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    if len(values) != 1 or not values[0].isdigit() or int(values[0]) <= 0:
+        raise SystemExit(1)
+    return int(values[0])
+
+parent_fd = config_fd = None
+try:
+    parent_fd = os.open(
+        parent_path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    parent_metadata = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_gid != 0
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+    ):
+        raise SystemExit(1)
+    before = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    config_fd = os.open(
+        path.name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_fd,
+    )
+    metadata = os.fstat(config_fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size <= 0
+        or metadata.st_size > 1024 * 1024
+        or (before.st_dev, before.st_ino) != (metadata.st_dev, metadata.st_ino)
+        or metadata.st_dev != parent_metadata.st_dev
+        or descriptor_mount_id(config_fd) != descriptor_mount_id(parent_fd)
+    ):
+        raise SystemExit(1)
+    chunks = []
+    remaining = metadata.st_size
+    while remaining:
+        chunk = os.read(config_fd, min(remaining, 65536))
+        if not chunk:
+            raise SystemExit(1)
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(config_fd, 1):
+        raise SystemExit(1)
+    final_metadata = os.fstat(config_fd)
+    current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    current_parent = os.stat(parent_path, follow_symlinks=False)
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    if (
+        identity
+        != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_mode,
+            final_metadata.st_uid,
+            final_metadata.st_gid,
+            final_metadata.st_nlink,
+            final_metadata.st_size,
+            final_metadata.st_mtime_ns,
+            final_metadata.st_ctime_ns,
+        )
+        or (current.st_dev, current.st_ino)
+        != (metadata.st_dev, metadata.st_ino)
+        or (current_parent.st_dev, current_parent.st_ino)
+        != (parent_metadata.st_dev, parent_metadata.st_ino)
+    ):
+        raise SystemExit(1)
+    value = json.loads(b"".join(chunks).decode("utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+finally:
+    if config_fd is not None:
+        os.close(config_fd)
+    if parent_fd is not None:
+        os.close(parent_fd)
+
+gateway = value.get("gateway") if isinstance(value, dict) else None
+auth = gateway.get("auth") if isinstance(gateway, dict) else None
+token = auth.get("token") if isinstance(auth, dict) else None
+if (
+    not isinstance(gateway, dict)
+    or gateway.get("mode", "local") != "local"
+    or gateway.get("bind", "loopback") != "loopback"
+    or gateway.get("port", 18789) != 18789
+    or not isinstance(auth, dict)
+    or auth.get("mode") != "token"
+    or not isinstance(token, str)
+    or re.fullmatch(r"[\x21-\x7e]{32,4096}", token) is None
+):
+    raise SystemExit(1)
+sys.stdout.write(token)
+PY
+}
+
+run_local_openclaw_gateway_rpc() {
+  local config_path="${1:-}"
+  shift || return 1
+  # Only the generic RPC client honors this process-scoped URL/token authority
+  # without merging service-manager environment.  In particular, the
+  # `gateway status` command reconstructs daemon authority from the installed
+  # unit and can silently probe a configured remote Gateway instead.
+  [[ -n "${config_path}" && "${1:-}" == "call" && $# -ge 2 ]] || return 1
+  local argument gateway_token="" status=0 xtrace_was_enabled=false
+  for argument in "$@"; do
+    case "${argument}" in
+      --url|--url=*|--token|--token=*|--password|--password=*) return 1 ;;
+    esac
+  done
+  if [[ "$-" == *x* ]]; then
+    xtrace_was_enabled=true
+    set +x
+  fi
+  gateway_token="$(
+    read_attested_local_openclaw_gateway_token "${config_path}"
+  )" || status=$?
+  [[ -n "${gateway_token}" ]] || status=1
+  if (( status == 0 )); then
+    (
+      set +x
+      unset OPENCLAW_GATEWAY_PASSWORD
+      unset CLAWDBOT_GATEWAY_URL CLAWDBOT_GATEWAY_TOKEN
+      unset CLAWDBOT_GATEWAY_PASSWORD
+      export HOME=/root
+      export OPENCLAW_HOME=/root
+      export OPENCLAW_STATE_DIR="${config_path%/*}"
+      export OPENCLAW_CONFIG_PATH="${config_path}"
+      export OPENCLAW_ALLOW_ROOT=1
+      export OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789
+      export OPENCLAW_GATEWAY_TOKEN="${gateway_token}"
+      openclaw gateway "$@"
+    ) || status=$?
+  fi
+  gateway_token=""
+  $xtrace_was_enabled && set -x
+  return "${status}"
 }
 
 wait_for_openclaw_gateway_http_ready() {
@@ -7561,7 +10573,6 @@ capture_openclaw_gateway_baseline() {
   local expected_version="$1"
   systemctl is-active --quiet openclaw-gateway || return 1
   openclaw_gateway_http_ready || return 1
-  OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 || return 1
   [[ "$(openclaw_gateway_version)" == "${expected_version}" ]] || return 1
 
   OPENCLAW_BASELINE_PID="$(openclaw_gateway_pid)"
@@ -7580,7 +10591,16 @@ let db;
 try {
   db = new DatabaseSync('/root/.openclaw/state/openclaw.sqlite', { readOnly: true });
   const row = db.prepare("select app_version from schema_meta where meta_key='startup-migrations'").get();
-  if (normalizeStableRuntime(row?.app_version) !== normalizeStableRuntime(expected)) process.exit(1);
+  // OpenClaw 9.1 stores a format-3, newline-separated build/config identity
+  // here. Match its readStartupMigrationVersion contract: only the first
+  // field is the runtime version. The gateway independently validates the
+  // complete checkpoint before reporting ready.
+  const checkpointVersion = typeof row?.app_version === 'string'
+    ? row.app_version.split('\n', 1)[0] : '';
+  if (normalizeStableRuntime(checkpointVersion) !== normalizeStableRuntime(expected)) {
+    console.error('OpenClaw startup checkpoint runtime does not match the admitted runtime.');
+    process.exit(1);
+  }
 } catch (error) {
   console.error(`OpenClaw startup checkpoint check failed: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
@@ -7607,7 +10627,6 @@ verify_openclaw_gateway_stable() {
   cli_version="$(openclaw_cli_version)"
   gateway_version="$(openclaw_gateway_version)"
   [[ -n "${expected_version}" && "${cli_version}" == "${expected_version}" && "${gateway_version}" == "${expected_version}" ]] || return 1
-  OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 || return 1
 
   initial_pid="$(openclaw_gateway_pid)"
   initial_restarts="$(openclaw_gateway_restart_count)"
@@ -7622,7 +10641,7 @@ verify_openclaw_gateway_stable() {
     [[ "$(openclaw_gateway_restart_count)" == "${initial_restarts}" ]] || return 1
   done
 
-  OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 || return 1
+  [[ "$(openclaw_gateway_version)" == "${expected_version}" ]] || return 1
   openclaw_gateway_log_is_clean_since_start || return 1
   if [[ "${expected_version}" == "${PIN_OPENCLAW_RUNTIME_VERSION}" ]]; then
     openclaw_startup_checkpoint_matches "${expected_version}" || return 1
@@ -7656,6 +10675,89 @@ try {
   process.exit(1);
 }
 ' "${package_dir}/package.json" 2>/dev/null
+}
+
+verify_openclaw_npm_package_archive() {
+  local archive="$1" expected_package="$2" expected_version="$3" expected_integrity="$4"
+  local size actual_integrity
+  [[ -f "${archive}" && ! -L "${archive}" ]] || return 1
+  size="$(stat -c '%s' -- "${archive}" 2>/dev/null)" || return 1
+  [[ "${size}" =~ ^[1-9][0-9]*$ ]] || return 1
+  (( size <= OPENCLAW_PACKAGE_MAX_ARCHIVE_BYTES )) || return 1
+  actual_integrity="sha512-$(openssl dgst -sha512 -binary "${archive}" | base64 -w0)" \
+    || return 1
+  [[ "${actual_integrity}" == "${expected_integrity}" ]] || return 1
+  python3 - \
+    "${archive}" \
+    "${expected_package}" \
+    "${expected_version}" \
+    "${OPENCLAW_PACKAGE_MAX_EXPANDED_BYTES}" <<'PY'
+import json
+from pathlib import Path, PurePosixPath
+import posixpath
+import sys
+import tarfile
+
+archive = Path(sys.argv[1])
+expected_name = sys.argv[2]
+expected_version = sys.argv[3]
+expanded_limit = int(sys.argv[4])
+expanded = 0
+package_json = None
+with tarfile.open(archive, "r:gz") as stream:
+    members = stream.getmembers()
+    if not members or len(members) > 30000:
+        raise SystemExit(1)
+    for member in members:
+        normalized = posixpath.normpath(member.name)
+        parts = PurePosixPath(normalized).parts
+        if (
+            not member.name
+            or "\\" in member.name
+            or member.name.startswith("/")
+            or ".." in parts
+            or not parts
+            or parts[0] != "package"
+            or not (member.isfile() or member.isdir())
+        ):
+            raise SystemExit(1)
+        if member.isfile():
+            expanded += member.size
+            if member.size < 0 or expanded > expanded_limit:
+                raise SystemExit(1)
+        if normalized == "package/package.json":
+            if package_json is not None or member.size > 1024 * 1024:
+                raise SystemExit(1)
+            handle = stream.extractfile(member)
+            if handle is None:
+                raise SystemExit(1)
+            package_json = json.loads(handle.read().decode("utf-8"))
+if (
+    not isinstance(package_json, dict)
+    or package_json.get("name") != expected_name
+    or package_json.get("version") != expected_version
+):
+    raise SystemExit(1)
+PY
+}
+
+acquire_openclaw_npm_package_archive() {
+  local package="$1" version="$2" integrity="$3" destination="$4"
+  local packed_name packed_path destination_real packed_real
+  [[ -d "${destination}" && ! -L "${destination}" ]] || return 1
+  destination_real="$(readlink -f -- "${destination}" 2>/dev/null)" || return 1
+  packed_name="$(npm pack --ignore-scripts --silent --pack-destination "${destination}" \
+    "${package}@${version}" 2>> "${LOG_FILE}" | tail -1)" || return 1
+  [[ -n "${packed_name}" && "${packed_name}" != */* ]] || return 1
+  packed_path="${destination}/${packed_name}"
+  packed_real="$(readlink -f -- "${packed_path}" 2>/dev/null)" || return 1
+  [[ "$(dirname -- "${packed_real}")" == "${destination_real}" ]] || return 1
+  if ! verify_openclaw_npm_package_archive \
+    "${packed_real}" "${package}" "${version}" "${integrity}"; then
+    rm -f -- "${packed_real}" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s\n' "${packed_real}"
 }
 
 openclaw_core_package_dir() {
@@ -7735,11 +10837,28 @@ openclaw_installation_state_present() {
   return 1
 }
 
+# npm extracts public package files through the caller's process umask. Keep
+# transaction/config snapshots private in this shell, but preserve the package's
+# normal 0644 files / 0755 executables in a bounded child. This also applies to
+# archived rollback packages; their more restrictive archived modes stay intact.
+install_openclaw_npm_package() {
+  [[ "$#" -eq 1 && -n "$1" ]] || return 1
+  (umask 022; npm install -g "$1")
+}
+
 converge_openclaw_core_package() {
   $SKIP_OPENCLAW && return 0
   command -v npm >/dev/null 2>&1 || fail "npm is required to install the tested OpenClaw runtime."
 
   local current_package_version="" current_runtime_version=""
+  local package_download_dir="" package_archive=""
+  OPENCLAW_STATE_ROOT_PREEXISTED=false
+  OPENCLAW_STATE_CONFIG_PREEXISTED=false
+  [[ -e /root/.openclaw || -L /root/.openclaw ]] \
+    && OPENCLAW_STATE_ROOT_PREEXISTED=true
+  [[ -e /root/.openclaw/openclaw.json \
+    || -L /root/.openclaw/openclaw.json ]] \
+    && OPENCLAW_STATE_CONFIG_PREEXISTED=true
   OPENCLAW_STATE_EXISTED_BEFORE_UPDATE=false
   openclaw_installation_state_present /root/.openclaw \
     && OPENCLAW_STATE_EXISTED_BEFORE_UPDATE=true
@@ -7748,6 +10867,15 @@ converge_openclaw_core_package() {
   settle_openclaw_gateway_before_converge 180 || true
   systemctl is-enabled openclaw-gateway >/dev/null 2>&1 && OPENCLAW_GATEWAY_WAS_ENABLED=true
   systemctl is-active --quiet openclaw-gateway && OPENCLAW_GATEWAY_WAS_ACTIVE=true
+  # Take the live-layout proof here, against the running gateway, because this
+  # is the last point at which it is provable. Convergence below stops the
+  # gateway, and prepare_openclaw_upgrade_state's live branch then requires an
+  # active, HTTP-ready gateway -- unsatisfiable by construction on any host
+  # whose gateway was running, i.e. on every real installation.
+  OPENCLAW_LAYOUT_CONFIRMED_LIVE=false
+  if $OPENCLAW_GATEWAY_WAS_ACTIVE && openclaw_standard_state_is_confirmed; then
+    OPENCLAW_LAYOUT_CONFIRMED_LIVE=true
+  fi
 
   if command -v openclaw >/dev/null 2>&1; then
     OPENCLAW_PACKAGE_PREEXISTED=true
@@ -7755,6 +10883,15 @@ converge_openclaw_core_package() {
     current_runtime_version="$(openclaw_cli_version || true)"
     if [[ "${current_package_version}" == "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" \
       && "${current_runtime_version}" == "${PIN_OPENCLAW_RUNTIME_VERSION}" ]]; then
+      OPENCLAW_PREUPDATE_PACKAGE_VERSION="${current_package_version}"
+      OPENCLAW_PREUPDATE_RUNTIME_VERSION="${current_runtime_version}"
+      if ! create_openclaw_migration_transaction \
+        || [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "created" ]] \
+        || ! adopt_openclaw_current_core_transaction \
+          "${current_package_version}" "${current_runtime_version}" \
+        || [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "core-converged" ]]; then
+        fail "Could not publish package-preserving OpenClaw ownership before service convergence."
+      fi
       ok "OpenClaw ${current_package_version} (tested core revision)"
       return 0
     fi
@@ -7784,11 +10921,42 @@ converge_openclaw_core_package() {
     if ! stage_openclaw_rollback_package "${current_package_version}"; then
       fail "Could not preserve an exact local rollback package for OpenClaw ${current_package_version}."
     fi
-    if ! capture_openclaw_codex_plugin_baseline; then
-      fail "Could not prove and preserve the existing OpenClaw Codex plugin baseline before replacing the core package."
-    fi
+    # Codex plugin custody is armed only after the 9.1 migration has produced
+    # its final config shape. Its dedicated journal snapshots the complete
+    # managed npm generation, installed-index projection, and Codex config
+    # projection before the first plugin CLI mutation.
     OPENCLAW_PREUPDATE_PACKAGE_VERSION="${current_package_version}"
     OPENCLAW_PREUPDATE_RUNTIME_VERSION="${current_runtime_version}"
+    local staged_core_rollback="${OPENCLAW_ROLLBACK_PACKAGE_TARBALL}"
+    if ! create_openclaw_migration_transaction \
+      || [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "created" ]] \
+      || ! seal_openclaw_core_convergence_transaction \
+        "${OPENCLAW_ROLLBACK_PACKAGE_TARBALL}" \
+        "${current_package_version}" "${current_runtime_version}" \
+        "${OPENCLAW_GATEWAY_WAS_ACTIVE}" "${OPENCLAW_GATEWAY_WAS_ENABLED}"; then
+      fail "Could not seal the OpenClaw package rollback owner before runtime convergence."
+    fi
+    rm -f -- "${staged_core_rollback}" \
+      || fail "Could not retire the transient OpenClaw rollback package after durable sealing."
+    OPENCLAW_ROLLBACK_PACKAGE_TARBALL="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-core-rollback.tgz"
+    arm_openclaw_gateway_migration_fence \
+      || fail "Could not arm the durable OpenClaw gateway reboot fence before package convergence."
+    ensure_durable_openclaw_gateway_stopped forward \
+      || fail "The OpenClaw gateway did not stop behind its durable migration fence and exact unit identity."
+    # Snapshot config and all migration-owned SQLite/session authority before
+    # replacing the package or executing any successor CLI. Rollback cannot
+    # undo an automatic schema migration using only an npm package tarball.
+    if $OPENCLAW_STATE_CONFIG_PREEXISTED; then
+      local snapshot_package_dir
+      snapshot_package_dir="$(openclaw_core_package_dir)" \
+        || fail "Could not bind the OpenClaw state snapshot to its package path."
+      OPENCLAW_2026_9_1_MIGRATION_MANIFEST="${OPENCLAW_MIGRATION_2026_9_1_MANIFEST}"
+      run_durable_openclaw_migration_helper snapshot \
+        --manifest "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST}" \
+        --state-dir /root/.openclaw --config /root/.openclaw/openclaw.json \
+        --package-dir "${snapshot_package_dir}" >> "${LOG_FILE}" 2>&1 \
+        || fail "Could not preserve OpenClaw config and state before runtime replacement."
+    fi
   else
     OPENCLAW_PACKAGE_PREEXISTED=false
     if $OPENCLAW_STATE_EXISTED_BEFORE_UPDATE; then
@@ -7801,16 +10969,47 @@ converge_openclaw_core_package() {
     OPENCLAW_CODEX_PLUGIN_PREEXISTED=false
     OPENCLAW_CODEX_PLUGIN_PREUPDATE_VERSION=""
     OPENCLAW_CODEX_PLUGIN_BASELINE_CAPTURED=true
+    if ! create_openclaw_migration_transaction \
+      || [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "created" ]] \
+      || ! arm_openclaw_fresh_core_convergence_transaction \
+      || [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "core-converge-pending" ]]; then
+      fail "Could not publish fresh OpenClaw package-absence ownership before runtime convergence."
+    fi
+    arm_openclaw_gateway_migration_fence \
+      || fail "Could not arm the durable OpenClaw gateway reboot fence before fresh package convergence."
   fi
 
   OPENCLAW_PACKAGE_UPDATE_ATTEMPTED=true
   info "Converging OpenClaw core to ${PIN_OPENCLAW_CORE_PACKAGE_VERSION}..."
-  if ! npm install -g "openclaw@${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" >> "$LOG_FILE" 2>&1; then
+  package_download_dir="$(mktemp -d /tmp/bridgesllm-openclaw-core.XXXXXX)" \
+    || fail "Could not create a private OpenClaw package download directory."
+  chmod 700 "${package_download_dir}" 2>/dev/null || true
+  if ! package_archive="$(acquire_openclaw_npm_package_archive \
+    openclaw \
+    "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" \
+    "${PIN_OPENCLAW_CORE_PACKAGE_INTEGRITY}" \
+    "${package_download_dir}")"; then
+    rmdir -- "${package_download_dir}" 2>/dev/null || true
+    fail "OpenClaw core package download did not match the tested npm package identity and SHA-512 integrity."
+  fi
+  if ! install_openclaw_npm_package "${package_archive}" >> "$LOG_FILE" 2>&1; then
+    rm -f -- "${package_archive}" 2>/dev/null || true
+    rmdir -- "${package_download_dir}" 2>/dev/null || true
     fail "OpenClaw core package installation failed or ended in a partial state; automatic rollback is starting."
   fi
+  rm -f -- "${package_archive}" 2>/dev/null || true
+  rmdir -- "${package_download_dir}" 2>/dev/null || true
   OPENCLAW_PACKAGE_UPDATED=true
-  if ! verify_openclaw_core_package_pin; then
+  # Do not execute the successor until its explicit state preparation has run.
+  # Package identity is checked here; runtime identity is checked immediately
+  # after prepare_openclaw_upgrade_state and again against the live gateway.
+  if [[ "$(openclaw_core_package_version || true)" != "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" ]]; then
     fail "OpenClaw core did not converge to package ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} / runtime ${PIN_OPENCLAW_RUNTIME_VERSION}; automatic rollback is starting."
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE:-}" == "core-converge-pending" ]]; then
+    advance_openclaw_migration_transaction \
+      core-converge-pending core-converged \
+      || fail "OpenClaw core converged, but its durable package transition could not be committed."
   fi
   ok "OpenClaw ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} package staged (gateway restart deferred)"
 }
@@ -7821,9 +11020,53 @@ rollback_openclaw_package_update() {
   local defer_gateway_restart="${1:-false}"
   local rollback_ok=true
   local restart_gateway=false
-  if $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED || $OPENCLAW_PACKAGE_UPDATED || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; then
+  local durable_core_recovered=false
+  if native_cli_bundle_transaction_present; then
+    if ! reconcile_native_cli_bundle_transaction; then
+      warn "Could not reconcile the Portal-qualified native CLI bundle before OpenClaw rollback."
+      OPENCLAW_ROLLBACK_IN_PROGRESS=false
+      return 1
+    fi
+  fi
+  if $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED || $OPENCLAW_PACKAGE_UPDATED \
+    || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]] \
+    || [[ -n "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST:-}" ]]; then
     $OPENCLAW_GATEWAY_WAS_ACTIVE && restart_gateway=true
-    systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+  fi
+
+  # The fixed outer transaction is the only restart-safe authority for both
+  # migration layers. Reconcile it while the exact 9.1 package/helper remains
+  # installed; package rollback below must never destroy that implementation.
+  if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]; then
+    if ! reconcile_openclaw_migration_transaction; then
+      warn "Could not reconcile the durable OpenClaw migration transaction before package rollback."
+      OPENCLAW_ROLLBACK_IN_PROGRESS=false
+      return 1
+    fi
+    durable_core_recovered=true
+  fi
+  if $durable_core_recovered; then
+    OPENCLAW_PACKAGE_UPDATED=false
+    OPENCLAW_PACKAGE_UPDATE_ATTEMPTED=false
+    OPENCLAW_UPGRADE_STATE_MANIFEST=""
+    OPENCLAW_2026_9_1_MIGRATION_MANIFEST=""
+    OPENCLAW_ROLLBACK_IN_PROGRESS=false
+    ok "Previous OpenClaw runtime restored through the durable migration owner"
+    return 0
+  fi
+
+  # Restore 7.1 JSON session/config authority while the exact 9.1 migration
+  # implementation is still installed. The old package is installed only
+  # after the restore and byte/hash checks succeed.
+  if ! restore_openclaw_2026_9_1_migration; then
+    warn "Could not restore the OpenClaw 7.1 config/session authority before package rollback."
+    # The migration helper belongs to the installed 9.1 generation. Replacing
+    # or removing that package after a failed/missing manifest restore would
+    # destroy the only implementation authorized to reconcile its session and
+    # config transaction. Leave 9.1 stopped and intact for a safe retry.
+    OPENCLAW_ROLLBACK_IN_PROGRESS=false
+    return 1
   fi
 
   if $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED || $OPENCLAW_PACKAGE_UPDATED; then
@@ -7834,7 +11077,7 @@ rollback_openclaw_package_update() {
         rollback_source="${OPENCLAW_ROLLBACK_PACKAGE_TARBALL}"
       fi
       if [[ -z "${OPENCLAW_PREUPDATE_PACKAGE_VERSION:-}" ]] \
-        || ! npm install -g "${rollback_source}" >> "$LOG_FILE" 2>&1 \
+        || ! install_openclaw_npm_package "${rollback_source}" >> "$LOG_FILE" 2>&1 \
         || [[ "$(openclaw_core_package_version || true)" != "${OPENCLAW_PREUPDATE_PACKAGE_VERSION}" ]] \
         || [[ "$(openclaw_cli_version || true)" != "${OPENCLAW_PREUPDATE_RUNTIME_VERSION}" ]]; then
         warn "Could not restore the exact OpenClaw package/runtime pair during automatic rollback."
@@ -7855,13 +11098,13 @@ rollback_openclaw_package_update() {
   fi
 
   if $restart_gateway && [[ "${defer_gateway_restart}" != "true" ]]; then
-    systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+    start_openclaw_gateway_with_identity_authority >> "$LOG_FILE" 2>&1 || true
     if [[ -z "${OPENCLAW_PREUPDATE_RUNTIME_VERSION:-}" ]] \
       || ! verify_openclaw_gateway_stable "${OPENCLAW_PREUPDATE_RUNTIME_VERSION}" 18; then
       local restored_version
       restored_version="$(openclaw_cli_version || true)"
       warn "OpenClaw rollback health verification failed (expected ${OPENCLAW_PREUPDATE_RUNTIME_VERSION:-unknown}, found ${restored_version:-unknown})."
-      systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+      stop_openclaw_gateway_with_identity_authority >> "$LOG_FILE" 2>&1 || true
       rollback_ok=false
     fi
   fi
@@ -7886,8 +11129,75 @@ recover_interrupted_update() {
   return 1
 }
 
-ollama_client_version() {
-  command -v ollama >/dev/null 2>&1 || return 1
+ollama_test_root() {
+  local root="${BRIDGESLLM_OLLAMA_TEST_ROOT:-}"
+  [[ -n "${root}" ]] || return 1
+  [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" ]] || return 1
+  python3 - "${root}" <<'PY2'
+import os
+import sys
+
+root = sys.argv[1]
+if (
+    not os.path.isabs(root)
+    or root != os.path.normpath(root)
+    or root == os.path.sep
+    or any(ord(char) < 32 or ord(char) == 127 for char in root)
+):
+    raise SystemExit(1)
+print(root)
+PY2
+}
+
+ollama_managed_path() {
+  local production_path="$1" test_root=""
+  test_root="$(ollama_test_root 2>/dev/null || true)"
+  if [[ -n "${BRIDGESLLM_OLLAMA_TEST_ROOT:-}" && -z "${test_root}" ]]; then
+    return 1
+  fi
+  if [[ -n "${test_root}" ]]; then
+    printf '%s%s\n' "${test_root}" "${production_path}"
+  else
+    printf '%s\n' "${production_path}"
+  fi
+}
+
+ollama_release_arch() {
+  local machine=""
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && -n "${BRIDGESLLM_OLLAMA_TEST_ARCH:-}" ]]; then
+    machine="${BRIDGESLLM_OLLAMA_TEST_ARCH}"
+  else
+    machine="$(uname -m)"
+  fi
+  case "${machine}" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+ollama_release_asset() {
+  case "$1" in
+    amd64)
+      printf '%s\t%s\t%s\n' \
+        "${OLLAMA_ASSET_AMD64_URL}" \
+        "${OLLAMA_ASSET_AMD64_SHA256}" \
+        "${OLLAMA_ASSET_AMD64_SIZE}"
+      ;;
+    arm64)
+      printf '%s\t%s\t%s\n' \
+        "${OLLAMA_ASSET_ARM64_URL}" \
+        "${OLLAMA_ASSET_ARM64_SHA256}" \
+        "${OLLAMA_ASSET_ARM64_SIZE}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+ollama_binary_version() {
+  local binary="$1"
+  [[ -f "${binary}" && ! -L "${binary}" && -x "${binary}" ]] || return 1
   # `ollama --version` can block while querying a stale daemon. Point it at a
   # closed loopback port and discard inherited endpoints/proxies so it reports
   # the embedded client version without consulting operator-controlled routing.
@@ -7897,9 +11207,15 @@ ollama_client_version() {
     LANG=C \
     LC_ALL=C \
     OLLAMA_HOST=http://127.0.0.1:1 \
-    timeout 10s ollama --version 2>&1 \
+    timeout 10s "${binary}" --version 2>&1 \
     | sed -nE 's/.*(client version is|ollama version is) ([0-9]+\.[0-9]+\.[0-9]+).*/\2/p' \
     | head -1 || true
+}
+
+ollama_client_version() {
+  local binary=""
+  binary="$(ollama_managed_path "${OLLAMA_MANAGED_BIN_PATH}")" || return 1
+  ollama_binary_version "${binary}"
 }
 
 ollama_server_version() {
@@ -7913,120 +11229,1231 @@ verify_ollama_client_server_parity() {
     client_version="$(ollama_client_version || true)"
     server_version="$(ollama_server_version || true)"
     if systemctl is-active --quiet ollama \
-      && [[ -n "${client_version}" && "${client_version}" == "${server_version}" ]]; then
-      ok "Ollama ${client_version} client/server parity verified"
+      && [[ "${client_version}" == "${PIN_OLLAMA_VERSION}" \
+        && "${server_version}" == "${PIN_OLLAMA_VERSION}" ]]; then
+      ok "Ollama ${client_version} exact client/server pin verified"
       return 0
     fi
     sleep 2
     waited=$((waited + 2))
   done
-  warn "Ollama client/server mismatch after restart (client: ${client_version:-unknown}, server: ${server_version:-unavailable})."
+  warn "Ollama exact pin mismatch after restart (expected ${PIN_OLLAMA_VERSION}; client: ${client_version:-unknown}, server: ${server_version:-unavailable})."
   return 1
+}
+
+ollama_transaction_action() {
+  local action="$1"
+  shift
+  python3 - "${action}" \
+    "${OLLAMA_ARCHIVE_MAX_MEMBERS}" \
+    "${OLLAMA_ARCHIVE_MAX_FILE_SIZE}" \
+    "${OLLAMA_ARCHIVE_MAX_EXPANDED_SIZE}" \
+    "$@" <<'PY2'
+import hashlib
+import json
+import os
+import posixpath
+import re
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+action = sys.argv[1]
+MAX_MEMBERS = int(sys.argv[2])
+MAX_FILE_SIZE = int(sys.argv[3])
+MAX_EXPANDED_SIZE = int(sys.argv[4])
+args = sys.argv[5:]
+SCHEMA = "bridgesllm-ollama-transaction-v1"
+PREPARE_RE = re.compile(r"\.bridgesllm-ollama-prepare\.[A-Za-z0-9]{6,32}")
+TOKEN_RE = re.compile(r"[a-f0-9]{32}")
+
+
+def die(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def lstat_or_none(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def fsync_directory(path):
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_tree(root):
+    for current, directories, files in os.walk(root, topdown=False, followlinks=False):
+        for name in files:
+            path = os.path.join(current, name)
+            info = os.lstat(path)
+            if stat.S_ISREG(info.st_mode):
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                )
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        fsync_directory(current)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            while True:
+                block = handle.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def identity(info):
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "atime_ns": info.st_atime_ns,
+    }
+
+
+# Keep the journal field names readable while comparing the corresponding stat
+# attributes explicitly; device/inode are not named st_device/st_inode.
+def exact_identity(path, expected, kind):
+    info = lstat_or_none(path)
+    if info is None:
+        return False
+    if kind == "file" and not stat.S_ISREG(info.st_mode):
+        return False
+    if kind == "directory" and not stat.S_ISDIR(info.st_mode):
+        return False
+    return (
+        info.st_dev == expected["device"]
+        and info.st_ino == expected["inode"]
+        and stat.S_IMODE(info.st_mode) == expected["mode"]
+        and info.st_uid == expected["uid"]
+        and info.st_gid == expected["gid"]
+        and info.st_nlink == expected["nlink"]
+        and info.st_size == expected["size"]
+        and info.st_mtime_ns == expected["mtime_ns"]
+    )
+
+
+def safe_parent(path):
+    parent = os.path.dirname(path)
+    info = lstat_or_none(parent)
+    if (
+        info is None
+        or not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or os.path.realpath(parent) != parent
+    ):
+        die("unsafe Ollama target parent")
+    return parent
+
+
+def safe_existing_target(path, kind):
+    info = lstat_or_none(path)
+    if info is None:
+        return None
+    if kind == "file" and not stat.S_ISREG(info.st_mode):
+        die("unsafe existing Ollama file target")
+    if kind == "directory" and not stat.S_ISDIR(info.st_mode):
+        die("unsafe existing Ollama directory target")
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
+        die("unsafe existing Ollama target ownership or type")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        die("existing Ollama target is writable outside its owner")
+    if kind == "file" and info.st_nlink != 1:
+        die("Ollama file target has unexpected hard links")
+    return info
+
+
+def safe_relpath(raw):
+    if not isinstance(raw, str) or not raw or raw.startswith("/"):
+        die("Ollama archive contains an absolute or empty path")
+    if "\\" in raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        die("Ollama archive contains a malformed path")
+    clean = raw
+    while clean.startswith("./"):
+        clean = clean[2:]
+    clean = clean.rstrip("/")
+    if not clean or clean != posixpath.normpath(clean):
+        die("Ollama archive contains a non-canonical path")
+    parts = clean.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        die("Ollama archive path escapes its extraction root")
+    if clean not in {"bin", "bin/ollama", "lib", "lib/ollama"} \
+            and not clean.startswith("lib/ollama/"):
+        die("Ollama archive contains an unexpected path")
+    return clean
+
+
+def extraction_path(root, relative):
+    destination = os.path.join(root, *relative.split("/"))
+    if os.path.commonpath((root, destination)) != root:
+        die("Ollama archive destination escaped its extraction root")
+    return destination
+
+
+def ensure_private_directory(path):
+    info = lstat_or_none(path)
+    if (
+        info is None
+        or not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        die("Ollama transaction directory is not private")
+
+
+def write_atomic_json(path, value):
+    parent = os.path.dirname(path)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".ollama-journal.", dir=parent
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        payload = (
+            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        if len(payload) > 64 * 1024:
+            die("Ollama transaction journal is unexpectedly large")
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        descriptor = -1
+        os.replace(temporary, path)
+        temporary = ""
+        fsync_directory(parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def load_json_no_duplicates(path):
+    info = lstat_or_none(path)
+    if (
+        info is None
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size > 64 * 1024
+    ):
+        die("unsafe Ollama transaction journal")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                die("duplicate key in Ollama transaction journal")
+            result[key] = value
+        return result
+
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        with os.fdopen(descriptor, "r", encoding="ascii", closefd=False) as handle:
+            return json.load(handle, object_pairs_hook=pairs)
+    finally:
+        os.close(descriptor)
+
+
+def validate_record(active, binary, library, unit):
+    ensure_private_directory(active)
+    record = load_json_no_duplicates(os.path.join(active, "journal.json"))
+    required = {
+        "schema", "token", "active_path", "binary_path", "library_path",
+        "unit_path", "unit_temp_path", "service_was_active",
+        "service_was_enabled", "baseline", "staged",
+    }
+    if set(record) != required or record["schema"] != SCHEMA:
+        die("invalid Ollama transaction journal schema")
+    token = record.get("token")
+    if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
+        die("invalid Ollama transaction token")
+    if record["active_path"] != active:
+        retired = os.path.join(
+            os.path.dirname(record["active_path"]),
+            ".bridgesllm-ollama-retired." + token,
+        )
+        if active != retired:
+            die("Ollama transaction journal path mismatch")
+    if (
+        record["binary_path"] != binary
+        or record["library_path"] != library
+        or record["unit_path"] != unit
+        or record["unit_temp_path"] != unit + ".bridgesllm-" + token + ".tmp"
+        or not isinstance(record["service_was_active"], bool)
+        or not isinstance(record["service_was_enabled"], bool)
+    ):
+        die("Ollama transaction authority does not match managed targets")
+    for section in ("baseline", "staged"):
+        if not isinstance(record[section], dict):
+            die("invalid Ollama transaction identity section")
+    return record
+
+
+def extract_archive(prepare, archive, expected_size, expected_hash):
+    if (
+        not PREPARE_RE.fullmatch(os.path.basename(prepare))
+        or os.path.dirname(archive) != prepare
+    ):
+        die("unsafe Ollama preparation path")
+    ensure_private_directory(prepare)
+    archive_info = safe_existing_target(archive, "file")
+    if archive_info is None or stat.S_IMODE(archive_info.st_mode) != 0o600:
+        die("Ollama archive is not a private regular file")
+    if archive_info.st_size != expected_size:
+        die("Ollama archive byte size does not match the frozen release asset")
+    if sha256_file(archive) != expected_hash:
+        die("Ollama archive checksum does not match the frozen release asset")
+
+    stage = os.path.join(prepare, "staged")
+    if os.path.lexists(stage):
+        die("Ollama extraction destination already exists")
+    os.mkdir(stage, 0o700)
+    seen = set()
+    deferred_links = []
+    member_count = 0
+    expanded_size = 0
+    regular_library_payloads = 0
+    process = subprocess.Popen(
+        ["zstd", "-q", "-d", "-c", "--", archive],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.stdout is not None
+        with tarfile.open(fileobj=process.stdout, mode="r|") as bundle:
+            for member in bundle:
+                member_count += 1
+                if member_count > MAX_MEMBERS:
+                    die("Ollama archive contains too many members")
+                relative = safe_relpath(member.name)
+                if relative in seen:
+                    die("Ollama archive contains a duplicate path")
+                seen.add(relative)
+                if member.size < 0 or member.size > MAX_FILE_SIZE:
+                    die("Ollama archive member exceeds its size bound")
+                if member.isdir():
+                    if member.size != 0:
+                        die("Ollama archive directory has a payload")
+                    destination = extraction_path(stage, relative)
+                    if os.path.lexists(destination):
+                        if not os.path.isdir(destination) or os.path.islink(destination):
+                            die("Ollama archive directory collides with another member")
+                    else:
+                        os.makedirs(destination, mode=0o755, exist_ok=False)
+                    current = stage
+                    for component in relative.split("/"):
+                        current = os.path.join(current, component)
+                        info = os.lstat(current)
+                        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                            die("Ollama archive directory chain is unsafe")
+                        os.chmod(current, 0o755)
+                    os.chmod(destination, member.mode & 0o755 or 0o755)
+                    continue
+                if member.issym():
+                    if not relative.startswith("lib/ollama/") or member.size != 0:
+                        die("Ollama archive contains an unsafe symbolic link")
+                    target = member.linkname
+                    if (
+                        not target
+                        or target.startswith("/")
+                        or "\\" in target
+                        or any(ord(char) < 32 or ord(char) == 127 for char in target)
+                    ):
+                        die("Ollama archive contains an unsafe symbolic-link target")
+                    resolved = posixpath.normpath(
+                        posixpath.join(posixpath.dirname(relative), target)
+                    )
+                    if not resolved.startswith("lib/ollama/"):
+                        die("Ollama archive symbolic link escapes the library tree")
+                    deferred_links.append((relative, target, resolved))
+                    continue
+                if not member.isreg():
+                    die("Ollama archive contains an unsupported entry type")
+                expanded_size += member.size
+                if expanded_size > MAX_EXPANDED_SIZE:
+                    die("Ollama archive exceeds its expanded-size bound")
+                destination = extraction_path(stage, relative)
+                parent = os.path.dirname(destination)
+                os.makedirs(parent, mode=0o755, exist_ok=True)
+                current = stage
+                for component in os.path.relpath(parent, stage).split(os.sep):
+                    if component == ".":
+                        continue
+                    current = os.path.join(current, component)
+                    info = os.lstat(current)
+                    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                        die("Ollama archive parent is not a real directory")
+                    os.chmod(current, 0o755)
+                flags = (
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                )
+                descriptor = os.open(destination, flags, 0o600)
+                try:
+                    source = bundle.extractfile(member)
+                    if source is None:
+                        die("Ollama archive member payload is unavailable")
+                    remaining = member.size
+                    while remaining:
+                        block = source.read(min(1024 * 1024, remaining))
+                        if not block:
+                            die("Ollama archive member ended before its declared size")
+                        os.write(descriptor, block)
+                        remaining -= len(block)
+                    mode = 0o755 if relative == "bin/ollama" else (member.mode & 0o755)
+                    os.fchmod(descriptor, mode or 0o644)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                if relative.startswith("lib/ollama/"):
+                    regular_library_payloads += 1
+        process.stdout.close()
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        if process.wait() != 0:
+            die("Ollama archive decompression failed: " + stderr.decode("utf-8", "replace")[:300])
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
+    finally:
+        if process.stderr is not None:
+            process.stderr.close()
+
+    for relative, target, resolved in deferred_links:
+        if resolved not in seen:
+            die("Ollama archive symbolic link has no in-archive target")
+        destination = extraction_path(stage, relative)
+        parent = os.path.dirname(destination)
+        os.makedirs(parent, mode=0o755, exist_ok=True)
+        current = stage
+        for component in os.path.relpath(parent, stage).split(os.sep):
+            if component == ".":
+                continue
+            current = os.path.join(current, component)
+            info = os.lstat(current)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                die("Ollama archive symbolic-link parent is unsafe")
+            os.chmod(current, 0o755)
+        os.symlink(target, destination)
+    library_root = os.path.join(stage, "lib", "ollama")
+    for relative, _target, _resolved in deferred_links:
+        destination = extraction_path(stage, relative)
+        real = os.path.realpath(destination)
+        if (
+            os.path.commonpath((library_root, real)) != library_root
+            or not os.path.exists(real)
+        ):
+            die("Ollama archive symbolic-link chain is unsafe")
+    binary = os.path.join(stage, "bin", "ollama")
+    binary_info = lstat_or_none(binary)
+    library_info = lstat_or_none(library_root)
+    if (
+        seen.isdisjoint({"bin/ollama"})
+        or binary_info is None
+        or not stat.S_ISREG(binary_info.st_mode)
+        or stat.S_ISLNK(binary_info.st_mode)
+        or not (stat.S_IMODE(binary_info.st_mode) & 0o100)
+        or library_info is None
+        or not stat.S_ISDIR(library_info.st_mode)
+        or stat.S_ISLNK(library_info.st_mode)
+        or regular_library_payloads < 1
+    ):
+        die("Ollama archive is missing its executable or library payload")
+    fsync_tree(stage)
+    os.unlink(archive)
+    fsync_directory(prepare)
+
+
+def seal_transaction(prepare, active, binary, library, unit, was_active, was_enabled):
+    if not PREPARE_RE.fullmatch(os.path.basename(prepare)):
+        die("unsafe Ollama preparation directory name")
+    ensure_private_directory(prepare)
+    if os.path.dirname(prepare) != os.path.dirname(active) or os.path.lexists(active):
+        die("unsafe or occupied Ollama transaction path")
+    active_parent = safe_parent(active)
+    binary_parent = safe_parent(binary)
+    library_parent = safe_parent(library)
+    safe_parent(unit)
+    if os.stat(active_parent).st_dev not in {
+        os.stat(binary_parent).st_dev, os.stat(library_parent).st_dev
+    } or not (
+        os.stat(active_parent).st_dev == os.stat(binary_parent).st_dev
+        == os.stat(library_parent).st_dev
+    ):
+        die("Ollama transaction and managed targets are not on one filesystem")
+    staged_binary = os.path.join(prepare, "staged", "bin", "ollama")
+    staged_library = os.path.join(prepare, "staged", "lib", "ollama")
+    staged_unit = os.path.join(prepare, "staged", "ollama.service")
+    new_binary = safe_existing_target(staged_binary, "file")
+    new_library = safe_existing_target(staged_library, "directory")
+    new_unit = safe_existing_target(staged_unit, "file")
+    if new_binary is None or new_library is None or new_unit is None:
+        die("Ollama staged runtime is incomplete")
+    old_binary = safe_existing_target(binary, "file")
+    old_library = safe_existing_target(library, "directory")
+    old_unit = safe_existing_target(unit, "file")
+    baseline = {}
+    for name, path, info in (
+        ("binary", binary, old_binary),
+        ("library", library, old_library),
+        ("unit", unit, old_unit),
+    ):
+        entry = {"present": info is not None}
+        if info is not None:
+            entry["identity"] = identity(info)
+            if name in {"binary", "unit"}:
+                entry["sha256"] = sha256_file(path)
+        baseline[name] = entry
+    if old_unit is not None:
+        backup_unit = os.path.join(prepare, "baseline-unit")
+        source = os.open(unit, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        destination = os.open(
+            backup_unit,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            while True:
+                block = os.read(source, 1024 * 1024)
+                if not block:
+                    break
+                os.write(destination, block)
+            os.fsync(destination)
+        finally:
+            os.close(source)
+            os.close(destination)
+        if sha256_file(backup_unit) != baseline["unit"]["sha256"]:
+            die("Ollama unit backup did not preserve exact bytes")
+    token = os.urandom(16).hex()
+    record = {
+        "schema": SCHEMA,
+        "token": token,
+        "active_path": active,
+        "binary_path": binary,
+        "library_path": library,
+        "unit_path": unit,
+        "unit_temp_path": unit + ".bridgesllm-" + token + ".tmp",
+        "service_was_active": was_active == "true",
+        "service_was_enabled": was_enabled == "true",
+        "baseline": baseline,
+        "staged": {
+            "binary": {
+                "identity": identity(new_binary),
+                "sha256": sha256_file(staged_binary),
+            },
+            "library": {"identity": identity(new_library)},
+            "unit": {"sha256": sha256_file(staged_unit)},
+        },
+    }
+    write_atomic_json(os.path.join(prepare, "journal.json"), record)
+    fsync_tree(prepare)
+    os.rename(prepare, active)
+    fsync_directory(active_parent)
+
+
+def ensure_absent(path):
+    if os.path.lexists(path):
+        die("unexpected Ollama transaction path already exists")
+
+
+def rename_durable(source, destination):
+    source_parent = os.path.dirname(source)
+    destination_parent = os.path.dirname(destination)
+    os.rename(source, destination)
+    fsync_directory(source_parent)
+    if destination_parent != source_parent:
+        fsync_directory(destination_parent)
+
+
+def copy_atomic(source, target, mode, uid, gid, atime_ns=None, mtime_ns=None, temporary=None):
+    parent = safe_parent(target)
+    if temporary is None:
+        temporary = target + ".bridgesllm-recovery.tmp"
+    ensure_absent(temporary)
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    target_fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        while True:
+            block = os.read(source_fd, 1024 * 1024)
+            if not block:
+                break
+            os.write(target_fd, block)
+        os.fchmod(target_fd, mode)
+        os.fchown(target_fd, uid, gid)
+        os.fsync(target_fd)
+    finally:
+        os.close(source_fd)
+        os.close(target_fd)
+    if atime_ns is not None and mtime_ns is not None:
+        os.utime(temporary, ns=(atime_ns, mtime_ns), follow_symlinks=False)
+        metadata_fd = os.open(
+            temporary,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(metadata_fd)
+        finally:
+            os.close(metadata_fd)
+    os.replace(temporary, target)
+    fsync_directory(parent)
+
+
+def cutover(active, binary, library, unit):
+    record = validate_record(active, binary, library, unit)
+    staged_binary = os.path.join(active, "staged", "bin", "ollama")
+    staged_library = os.path.join(active, "staged", "lib", "ollama")
+    staged_unit = os.path.join(active, "staged", "ollama.service")
+    if (
+        not exact_identity(staged_binary, record["staged"]["binary"]["identity"], "file")
+        or sha256_file(staged_binary) != record["staged"]["binary"]["sha256"]
+        or not exact_identity(staged_library, record["staged"]["library"]["identity"], "directory")
+        or sha256_file(staged_unit) != record["staged"]["unit"]["sha256"]
+    ):
+        die("Ollama staged runtime changed after verification")
+    for name, target, staged, kind in (
+        ("binary", binary, staged_binary, "file"),
+        ("library", library, staged_library, "directory"),
+    ):
+        backup = os.path.join(active, "baseline-" + name)
+        baseline = record["baseline"][name]
+        ensure_absent(backup)
+        if baseline["present"]:
+            if not exact_identity(target, baseline["identity"], kind):
+                die("Ollama baseline changed before cutover")
+            rename_durable(target, backup)
+        elif os.path.lexists(target):
+            die("Ollama target appeared before cutover")
+        rename_durable(staged, target)
+    unit_baseline = record["baseline"]["unit"]
+    if unit_baseline["present"]:
+        if (
+            not exact_identity(unit, unit_baseline["identity"], "file")
+            or sha256_file(unit) != unit_baseline["sha256"]
+        ):
+            die("Ollama service unit changed before cutover")
+    elif os.path.lexists(unit):
+        die("Ollama service unit appeared before cutover")
+    staged_info = os.lstat(staged_unit)
+    copy_atomic(
+        staged_unit,
+        unit,
+        0o644,
+        os.geteuid(),
+        staged_info.st_gid,
+        temporary=record["unit_temp_path"],
+    )
+
+
+def safe_known_temporary(path, maximum_size):
+    info = lstat_or_none(path)
+    if info is None:
+        return
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or info.st_size > maximum_size
+    ):
+        die("unsafe Ollama temporary unit file")
+    os.unlink(path)
+    fsync_directory(os.path.dirname(path))
+
+
+def restore_renamed(active, name, target, baseline, staged, kind):
+    backup = os.path.join(active, "baseline-" + name)
+    discard = os.path.join(active, "discarded-" + name)
+    target_is_old = baseline["present"] and exact_identity(
+        target, baseline["identity"], kind
+    )
+    target_is_new = exact_identity(target, staged["identity"], kind)
+    backup_is_old = baseline["present"] and exact_identity(
+        backup, baseline["identity"], kind
+    )
+    discard_is_new = exact_identity(discard, staged["identity"], kind)
+    if os.path.lexists(discard) and not discard_is_new:
+        die("Ollama recovery discard identity mismatch")
+    if baseline["present"]:
+        if target_is_old:
+            if os.path.lexists(backup):
+                die("duplicate Ollama baseline during recovery")
+            return
+        if os.path.lexists(target):
+            if not target_is_new or os.path.lexists(discard):
+                die("unexpected Ollama target during recovery")
+            rename_durable(target, discard)
+        if not backup_is_old:
+            die("Ollama baseline backup is missing or mismatched")
+        rename_durable(backup, target)
+        return
+    if os.path.lexists(backup):
+        die("unexpected Ollama baseline backup")
+    if os.path.lexists(target):
+        if not target_is_new or os.path.lexists(discard):
+            die("unexpected Ollama target while restoring absence")
+        rename_durable(target, discard)
+
+
+def unit_matches(path, entry, expected_new_hash=None):
+    info = lstat_or_none(path)
+    if info is None or not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return False
+    if expected_new_hash is not None:
+        return (
+            info.st_uid == os.geteuid()
+            and info.st_nlink == 1
+            and stat.S_IMODE(info.st_mode) == 0o644
+            and sha256_file(path) == expected_new_hash
+        )
+    expected = entry["identity"]
+    return (
+        info.st_uid == expected["uid"]
+        and info.st_gid == expected["gid"]
+        and stat.S_IMODE(info.st_mode) == expected["mode"]
+        and info.st_nlink == 1
+        and info.st_size == expected["size"]
+        and sha256_file(path) == entry["sha256"]
+    )
+
+
+def recover(active, binary, library, unit):
+    record = validate_record(active, binary, library, unit)
+    restore_renamed(
+        active, "binary", binary, record["baseline"]["binary"],
+        record["staged"]["binary"], "file",
+    )
+    restore_renamed(
+        active, "library", library, record["baseline"]["library"],
+        record["staged"]["library"], "directory",
+    )
+    staged_unit = os.path.join(active, "staged", "ollama.service")
+    new_unit_hash = record["staged"]["unit"]["sha256"]
+    safe_known_temporary(record["unit_temp_path"], os.path.getsize(staged_unit))
+    recovery_temp = unit + ".bridgesllm-recovery.tmp"
+    safe_known_temporary(recovery_temp, max(os.path.getsize(staged_unit), 1024 * 1024))
+    baseline = record["baseline"]["unit"]
+    if baseline["present"]:
+        backup = os.path.join(active, "baseline-unit")
+        backup_info = lstat_or_none(backup)
+        if (
+            backup_info is None
+            or not stat.S_ISREG(backup_info.st_mode)
+            or stat.S_ISLNK(backup_info.st_mode)
+            or backup_info.st_uid != os.geteuid()
+            or backup_info.st_nlink != 1
+            or stat.S_IMODE(backup_info.st_mode) != 0o600
+            or backup_info.st_size != baseline["identity"]["size"]
+            or sha256_file(backup) != baseline["sha256"]
+        ):
+            die("Ollama service-unit backup is missing or mismatched")
+        if not unit_matches(unit, baseline):
+            if os.path.lexists(unit) and not unit_matches(unit, baseline, new_unit_hash):
+                die("unexpected Ollama service unit during recovery")
+            expected = baseline["identity"]
+            copy_atomic(
+                backup,
+                unit,
+                expected["mode"],
+                expected["uid"],
+                expected["gid"],
+                expected["atime_ns"],
+                expected["mtime_ns"],
+                recovery_temp,
+            )
+        if not unit_matches(unit, baseline):
+            die("Ollama service unit did not restore exactly")
+    else:
+        if os.path.lexists(unit):
+            if not unit_matches(unit, baseline, new_unit_hash):
+                die("unexpected Ollama service unit while restoring absence")
+            discarded = os.path.join(active, "discarded-unit")
+            ensure_absent(discarded)
+            rename_durable(unit, discarded)
+    marker = os.path.join(active, "files-recovered")
+    descriptor = os.open(
+        marker,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    ) if not os.path.exists(marker) else -1
+    if descriptor >= 0:
+        try:
+            os.write(descriptor, b"recovered\n")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        fsync_directory(active)
+
+
+def secure_rmtree(path):
+    info = lstat_or_none(path)
+    if info is None:
+        return
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        die("unsafe Ollama retired transaction")
+    for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+        for name in files:
+            if current == path and name == "journal.json":
+                continue
+            os.unlink(os.path.join(current, name))
+        for name in directories:
+            child = os.path.join(current, name)
+            child_info = os.lstat(child)
+            if stat.S_ISLNK(child_info.st_mode):
+                os.unlink(child)
+            elif stat.S_ISDIR(child_info.st_mode):
+                os.rmdir(child)
+            else:
+                die("unsafe entry in Ollama retired transaction")
+        fsync_directory(current)
+    journal = os.path.join(path, "journal.json")
+    if os.path.lexists(journal):
+        os.unlink(journal)
+        fsync_directory(path)
+    os.rmdir(path)
+    fsync_directory(os.path.dirname(path))
+
+
+def retire(active, binary, library, unit):
+    record = validate_record(active, binary, library, unit)
+    retired = os.path.join(
+        os.path.dirname(active), ".bridgesllm-ollama-retired." + record["token"]
+    )
+    ensure_absent(retired)
+    os.rename(active, retired)
+    fsync_directory(os.path.dirname(active))
+    validate_record(retired, binary, library, unit)
+
+
+def cleanup_retired(active, binary, library, unit):
+    parent = safe_parent(active)
+    for name in sorted(os.listdir(parent)):
+        if PREPARE_RE.fullmatch(name):
+            path = os.path.join(parent, name)
+            ensure_private_directory(path)
+            # Mutations begin only after a complete preparation directory is
+            # atomically renamed to the one fixed active-journal name. With
+            # the global installer lock held, a leftover prepare directory is
+            # therefore an uncommitted download/extraction, never a rollback.
+            secure_rmtree(path)
+            continue
+        if not name.startswith(".bridgesllm-ollama-retired."):
+            continue
+        path = os.path.join(parent, name)
+        if not os.path.lexists(os.path.join(path, "journal.json")):
+            ensure_private_directory(path)
+            if os.listdir(path):
+                die("partially retired Ollama transaction lost its journal")
+            os.rmdir(path)
+            fsync_directory(parent)
+            continue
+        record = validate_record(path, binary, library, unit)
+        if name != ".bridgesllm-ollama-retired." + record["token"]:
+            die("Ollama retired transaction name mismatch")
+        secure_rmtree(path)
+
+
+if action == "extract":
+    if len(args) != 4:
+        die("invalid Ollama extract arguments")
+    extract_archive(args[0], args[1], int(args[2]), args[3])
+elif action == "seal":
+    if len(args) != 7 or args[5] not in {"true", "false"} or args[6] not in {"true", "false"}:
+        die("invalid Ollama seal arguments")
+    seal_transaction(*args)
+elif action in {"state", "cutover", "recover", "retire", "cleanup-retired"}:
+    if len(args) != 4:
+        die("invalid Ollama transaction arguments")
+    if action == "state":
+        record = validate_record(*args)
+        print(
+            ("true" if record["service_was_active"] else "false")
+            + "\t"
+            + ("true" if record["service_was_enabled"] else "false")
+        )
+    elif action == "cutover":
+        cutover(*args)
+    elif action == "recover":
+        recover(*args)
+    elif action == "retire":
+        retire(*args)
+    else:
+        cleanup_retired(*args)
+else:
+    die("unknown Ollama transaction action")
+PY2
+}
+
+ollama_transaction_paths() {
+  local binary library unit transaction
+  binary="$(ollama_managed_path "${OLLAMA_MANAGED_BIN_PATH}")" || return 1
+  library="$(ollama_managed_path "${OLLAMA_MANAGED_LIB_PATH}")" || return 1
+  unit="$(ollama_managed_path "${OLLAMA_MANAGED_UNIT_PATH}")" || return 1
+  transaction="$(ollama_managed_path "${OLLAMA_TRANSACTION_PATH}")" || return 1
+  printf '%s\t%s\t%s\t%s\n' "${binary}" "${library}" "${unit}" "${transaction}"
+}
+
+ollama_restore_service_state() {
+  local was_active="$1" was_enabled="$2"
+  systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || return 1
+  if [[ "${was_enabled}" == "true" ]]; then
+    systemctl enable ollama >> "${LOG_FILE}" 2>&1 || return 1
+    systemctl is-enabled --quiet ollama || return 1
+  else
+    systemctl disable ollama >> "${LOG_FILE}" 2>&1 || true
+    ! systemctl is-enabled --quiet ollama || return 1
+  fi
+  if [[ "${was_active}" == "true" ]]; then
+    systemctl start ollama >> "${LOG_FILE}" 2>&1 || return 1
+    systemctl is-active --quiet ollama || return 1
+  else
+    systemctl stop ollama >> "${LOG_FILE}" 2>&1 || true
+    ! systemctl is-active --quiet ollama || return 1
+  fi
+}
+
+recover_pending_ollama_transaction() {
+  local binary library unit transaction state was_active was_enabled
+  IFS=$'\t' read -r binary library unit transaction \
+    < <(ollama_transaction_paths) || return 1
+  if [[ ! -e "${transaction}" && ! -L "${transaction}" ]]; then
+    return 0
+  fi
+  state="$(ollama_transaction_action state \
+    "${transaction}" "${binary}" "${library}" "${unit}")" || return 1
+  IFS=$'\t' read -r was_active was_enabled <<< "${state}"
+  [[ "${was_active}" =~ ^(true|false)$ \
+    && "${was_enabled}" =~ ^(true|false)$ ]] || return 1
+  systemctl stop ollama >> "${LOG_FILE}" 2>&1 || true
+  systemctl disable ollama >> "${LOG_FILE}" 2>&1 || true
+  ! systemctl is-active --quiet ollama || return 1
+  ! systemctl is-enabled --quiet ollama || return 1
+  ollama_transaction_action recover \
+    "${transaction}" "${binary}" "${library}" "${unit}" || return 1
+  ollama_restore_service_state "${was_active}" "${was_enabled}" || return 1
+  ollama_transaction_action retire \
+    "${transaction}" "${binary}" "${library}" "${unit}" || return 1
+  ollama_transaction_action cleanup-retired \
+    "${transaction}" "${binary}" "${library}" "${unit}" \
+    || warn "The completed Ollama rollback is durable, but its retired private files could not be removed safely."
+  return 0
+}
+
+ollama_discard_unsealed_prepare() {
+  local prepare="$1" transaction_parent="${2}"
+  python3 - "${prepare}" "${transaction_parent}" <<'PY2'
+import os
+import re
+import shutil
+import stat
+import sys
+
+path, parent = sys.argv[1:]
+if (
+    os.path.dirname(path) != parent
+    or not re.fullmatch(r"\.bridgesllm-ollama-prepare\.[A-Za-z0-9]{6,32}", os.path.basename(path))
+):
+    raise SystemExit(1)
+try:
+    info = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(0)
+if (
+    not stat.S_ISDIR(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or stat.S_IMODE(info.st_mode) != 0o700
+):
+    raise SystemExit(1)
+shutil.rmtree(path)
+descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY2
+}
+
+ensure_ollama_service_account() {
+  local uid gid model_root="/usr/share/ollama"
+  if ! getent group ollama >/dev/null 2>&1; then
+    groupadd --system ollama >> "${LOG_FILE}" 2>&1 || return 1
+  fi
+  gid="$(getent group ollama | awk -F: 'NR == 1 { print $3 }')"
+  [[ "${gid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  if ! id -u ollama >/dev/null 2>&1; then
+    useradd --system --gid ollama --home-dir /usr/share/ollama \
+      --create-home --shell /usr/sbin/nologin ollama \
+      >> "${LOG_FILE}" 2>&1 || return 1
+  fi
+  uid="$(id -u ollama)"
+  [[ "${uid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  if [[ -L "${model_root}" \
+    || ( -e "${model_root}" && ! -d "${model_root}" ) ]]; then
+    return 1
+  fi
+  install -d -m 0750 -o ollama -g ollama "${model_root}" || return 1
+  local supplemental=() group
+  for group in render video; do
+    getent group "${group}" >/dev/null 2>&1 && supplemental+=("${group}")
+  done
+  if (( ${#supplemental[@]} > 0 )); then
+    local joined
+    joined="$(IFS=,; printf '%s' "${supplemental[*]}")"
+    usermod -a -G "${joined}" ollama >> "${LOG_FILE}" 2>&1 || return 1
+  fi
 }
 
 install_or_update_ollama() {
   $SKIP_OLLAMA && return 0
+
+  local binary library unit transaction transaction_parent nv_tegra
+  local arch asset_url asset_sha256 asset_size asset_record
+  local previous_version prepare archive staged_binary staged_unit
+  local was_active=false was_enabled=false
+  IFS=$'\t' read -r binary library unit transaction \
+    < <(ollama_transaction_paths) \
+    || fail "Could not resolve the managed Ollama transaction paths."
+  transaction_parent="$(dirname "${transaction}")"
+  nv_tegra="$(ollama_managed_path /etc/nv_tegra_release)" \
+    || fail "Could not resolve the JetPack detection path."
+
+  # Recovery authority always wins over a new acquisition. A hard-killed prior
+  # run is rolled back before architecture, network, or service checks proceed.
+  if ! recover_pending_ollama_transaction; then
+    fail "An interrupted Ollama transaction could not be restored exactly. The service remains stopped and the private transaction journal was preserved."
+  fi
+  if [[ -e "${nv_tegra}" || -L "${nv_tegra}" ]]; then
+    fail "Managed Ollama ${PIN_OLLAMA_VERSION} installation is unavailable on NVIDIA JetPack until the release's supplemental JetPack archive hashes are frozen."
+  fi
+  ollama_transaction_action cleanup-retired \
+    "${transaction}" "${binary}" "${library}" "${unit}" \
+    || fail "An abandoned or retired Ollama transaction could not be validated and removed safely."
   if ! command -v zstd >/dev/null 2>&1; then
-    spin "Installing zstd (required by Ollama installer)" "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zstd"
+    spin "Installing zstd (required by the Ollama release archive)" "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zstd"
   fi
 
-  local previous_version
   previous_version="$(ollama_client_version || true)"
-  if ! spin "Installing/updating Ollama (${previous_version:-not installed})" \
-    "curl -fsSL '${OLLAMA_INSTALLER_URL}' | sh >/dev/null 2>&1"; then
-    fail "The official Ollama installer failed."
+  if [[ "${previous_version}" == "${PIN_OLLAMA_VERSION}" ]] \
+    && verify_ollama_client_server_parity 4; then
+    return 0
   fi
-  command -v ollama >/dev/null 2>&1 || fail "Ollama installer exited successfully but no ollama executable was found."
+  if [[ ! -e "${binary}" && ! -L "${binary}" ]] \
+    && command -v ollama >/dev/null 2>&1 \
+    && [[ "$(command -v ollama)" != "${binary}" ]]; then
+    fail "An unmanaged Ollama executable already shadows ${binary}; refusing to replace or hide it."
+  fi
 
-  systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
-  systemctl enable ollama >> "$LOG_FILE" 2>&1 || true
-  if ! systemctl restart ollama >> "$LOG_FILE" 2>&1; then
-    fail "Ollama was installed but its service could not be restarted."
+  arch="$(ollama_release_arch)" \
+    || fail "Ollama ${PIN_OLLAMA_VERSION} has no qualified asset for architecture $(uname -m)."
+  asset_record="$(ollama_release_asset "${arch}")" \
+    || fail "Could not select the frozen Ollama ${PIN_OLLAMA_VERSION} release asset."
+  IFS=$'\t' read -r asset_url asset_sha256 asset_size <<< "${asset_record}"
+  [[ "${asset_sha256}" =~ ^[a-f0-9]{64}$ && "${asset_size}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "The frozen Ollama release metadata is malformed."
+
+  prepare="$(mktemp -d "${transaction_parent}/.bridgesllm-ollama-prepare.XXXXXXXX")" \
+    || fail "Could not create private same-filesystem Ollama staging."
+  chmod 0700 "${prepare}"
+  archive="${prepare}/ollama-linux-${arch}.tar.zst"
+  : > "${archive}"
+  chmod 0600 "${archive}"
+  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+    -fsSL "${asset_url}" -o "${archive}"; then
+    ollama_discard_unsealed_prepare "${prepare}" "${transaction_parent}" || true
+    fail "The frozen Ollama ${PIN_OLLAMA_VERSION} ${arch} archive could not be downloaded."
   fi
-  if ! verify_ollama_client_server_parity 60; then
-    fail "Ollama did not reach client/server version parity after its upgrade restart."
+  if ! ollama_transaction_action extract \
+    "${prepare}" "${archive}" "${asset_size}" "${asset_sha256}"; then
+    ollama_discard_unsealed_prepare "${prepare}" "${transaction_parent}" || true
+    fail "The Ollama ${PIN_OLLAMA_VERSION} archive failed checksum, size, path, type, or expansion validation."
   fi
+  staged_binary="${prepare}/staged/bin/ollama"
+  if [[ "$(ollama_binary_version "${staged_binary}" || true)" != "${PIN_OLLAMA_VERSION}" ]]; then
+    ollama_discard_unsealed_prepare "${prepare}" "${transaction_parent}" || true
+    fail "The authenticated Ollama archive did not contain the exact ${PIN_OLLAMA_VERSION} client."
+  fi
+  staged_unit="${prepare}/staged/ollama.service"
+  {
+    printf '%s\n' \
+      '[Unit]' \
+      'Description=Ollama Service' \
+      'After=network-online.target' \
+      'Wants=network-online.target' \
+      '' \
+      '[Service]' \
+      "ExecStart=${binary} serve" \
+      'User=ollama' \
+      'Group=ollama' \
+      'Restart=always' \
+      'RestartSec=3' \
+      'Environment="HOME=/usr/share/ollama"' \
+      'Environment="OLLAMA_HOST=127.0.0.1:11434"' \
+      'Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+      '' \
+      '[Install]' \
+      'WantedBy=multi-user.target'
+  } > "${staged_unit}"
+  chmod 0600 "${staged_unit}"
+  fsync_update_payload "${staged_unit}" \
+    || { ollama_discard_unsealed_prepare "${prepare}" "${transaction_parent}" || true; fail "Could not durably stage the Ollama service unit."; }
+
+  systemctl is-active --quiet ollama && was_active=true
+  systemctl is-enabled --quiet ollama && was_enabled=true
+  if ! ollama_transaction_action seal \
+    "${prepare}" "${transaction}" "${binary}" "${library}" "${unit}" \
+    "${was_active}" "${was_enabled}"; then
+    ollama_discard_unsealed_prepare "${prepare}" "${transaction_parent}" || true
+    fail "Could not seal the Ollama rollback transaction before cutover."
+  fi
+
+  systemctl stop ollama >> "${LOG_FILE}" 2>&1 || true
+  systemctl disable ollama >> "${LOG_FILE}" 2>&1 || true
+  if systemctl is-active --quiet ollama \
+    || systemctl is-enabled --quiet ollama; then
+    recover_pending_ollama_transaction || true
+    fail "Ollama could not be stopped and boot-disabled before its atomic cutover."
+  fi
+  if ! ensure_ollama_service_account; then
+    recover_pending_ollama_transaction || true
+    fail "The dedicated Ollama service account could not be converged."
+  fi
+  if ! ollama_transaction_action cutover \
+    "${transaction}" "${binary}" "${library}" "${unit}"; then
+    recover_pending_ollama_transaction || true
+    fail "Ollama cutover failed; the previous managed runtime was restored when its sealed identities still matched."
+  fi
+  if ! systemctl daemon-reload >> "${LOG_FILE}" 2>&1 \
+    || ! systemctl enable ollama >> "${LOG_FILE}" 2>&1 \
+    || ! systemctl restart ollama >> "${LOG_FILE}" 2>&1 \
+    || ! verify_ollama_client_server_parity 60; then
+    recover_pending_ollama_transaction || true
+    fail "Ollama ${PIN_OLLAMA_VERSION} did not pass exact client/server verification; the prior runtime was restored when possible."
+  fi
+  if ! ollama_transaction_action retire \
+    "${transaction}" "${binary}" "${library}" "${unit}"; then
+    fail "Ollama ${PIN_OLLAMA_VERSION} is healthy, but its durable transaction commit could not be recorded. If the active journal remains, the next installer run will conservatively restore the previous runtime."
+  fi
+  ollama_transaction_action cleanup-retired \
+    "${transaction}" "${binary}" "${library}" "${unit}" \
+    || warn "Ollama ${PIN_OLLAMA_VERSION} committed successfully, but retired private rollback files could not be removed safely."
 }
 
 converge_grok_build() {
   local helper="${PORTAL_DIR}/installer/grok-build-runtime.sh"
-  [[ -f "${helper}" ]] || {
-    warn "Grok Build runtime helper is missing from the installed Portal artifact."
-    return 1
-  }
-
-  GROK_BIN_DIR=/usr/local/bin bash "${helper}" converge >> "${LOG_FILE}" 2>&1 || return 1
-  GROK_BIN_DIR=/usr/local/bin bash "${helper}" verify >> "${LOG_FILE}" 2>&1
+  [[ -f "${helper}" ]] || return 1
+  bash "${helper}" converge >> "${LOG_FILE}" 2>&1 || return 1
+  bash "${helper}" verify >> "${LOG_FILE}" 2>&1
 }
 
 converge_antigravity() {
   local helper="${PORTAL_DIR}/installer/antigravity-runtime.sh"
+  [[ -f "${helper}" ]] || return 1
+  bash "${helper}" converge >> "${LOG_FILE}" 2>&1 || return 1
+  bash "${helper}" verify >> "${LOG_FILE}" 2>&1
+}
+
+converge_opencode() {
+  local helper="${PORTAL_DIR}/installer/opencode-runtime.sh"
   [[ -f "${helper}" ]] || {
-    warn "Antigravity runtime helper is missing from the installed Portal artifact."
+    warn "OpenCode runtime helper is missing from the installed Portal artifact."
     return 1
   }
 
-  ANTIGRAVITY_BIN_DIR=/usr/local/bin bash "${helper}" converge >> "${LOG_FILE}" 2>&1 || return 1
-  ANTIGRAVITY_BIN_DIR=/usr/local/bin bash "${helper}" verify >> "${LOG_FILE}" 2>&1
+  OPENCODE_RUNTIME_ROOT=/opt/bridgesllm/tools/opencode \
+    OPENCODE_BIN_DIR=/usr/local/bin \
+    OPENCODE_STATE_DIR=/var/lib/bridgesllm/opencode \
+    bash "${helper}" converge >> "${LOG_FILE}" 2>&1 || return 1
+  OPENCODE_RUNTIME_ROOT=/opt/bridgesllm/tools/opencode \
+    OPENCODE_BIN_DIR=/usr/local/bin \
+    OPENCODE_STATE_DIR=/var/lib/bridgesllm/opencode \
+    bash "${helper}" verify >> "${LOG_FILE}" 2>&1
 }
 
-npm_global_package_version() {
-  local package_name="$1" global_root package_json
-  global_root="$(npm root -g 2>/dev/null)" || return 1
-  package_json="${global_root}/${package_name}/package.json"
-  [[ -f "${package_json}" ]] || return 1
-  node - "${package_json}" <<'NODE'
-const fs = require('fs');
-try {
-  const parsed = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-  if (typeof parsed.version !== 'string' || !parsed.version) process.exit(1);
-  process.stdout.write(parsed.version);
-} catch {
-  process.exit(1);
-}
-NODE
-}
-
-verify_pinned_npm_cli() {
-  local package_name="$1" expected_version="$2" command_name="$3" version_arg="$4"
-  local package_version cli_output
-  package_version="$(npm_global_package_version "${package_name}" 2>/dev/null || true)"
-  [[ "${package_version}" == "${expected_version}" ]] || return 1
-  command -v "${command_name}" >/dev/null 2>&1 || return 1
-  cli_output="$(timeout 15 "${command_name}" "${version_arg}" 2>/dev/null || true)"
-  grep -Fq "${expected_version}" <<<"${cli_output}"
-}
-
-converge_pinned_npm_cli() {
-  local label="$1" package_name="$2" expected_version="$3" command_name="$4" version_arg="$5"
-  local baseline_version="" had_package=false
-
-  if verify_pinned_npm_cli "${package_name}" "${expected_version}" "${command_name}" "${version_arg}"; then
-    ok "${label} ${expected_version} (verified)"
-    return 0
-  fi
-
-  baseline_version="$(npm_global_package_version "${package_name}" 2>/dev/null || true)"
-  [[ -z "${baseline_version}" ]] || had_package=true
-  if ! ${had_package} && command -v "${command_name}" >/dev/null 2>&1; then
-    warn "${label} is present but is not owned by the expected global npm package; refusing to overwrite it."
+converge_hermes() {
+  local helper="${PORTAL_DIR}/installer/hermes-runtime.sh"
+  [[ -f "${helper}" ]] || {
+    warn "Hermes runtime helper is missing from the installed Portal artifact."
     return 1
-  fi
+  }
 
-  info "Converging ${label} to Portal-tested version ${expected_version}..."
-  if npm install -g --no-audit --no-fund "${package_name}@${expected_version}" >> "${LOG_FILE}" 2>&1 \
-    && verify_pinned_npm_cli "${package_name}" "${expected_version}" "${command_name}" "${version_arg}"; then
-    ok "${label} ${expected_version} (verified)"
-    return 0
-  fi
+  HERMES_RUNTIME_ROOT=/opt/bridgesllm/tools/hermes \
+    HERMES_BIN_DIR=/usr/local/bin \
+    HERMES_STATE_DIR=/var/lib/bridgesllm/hermes \
+    bash "${helper}" converge >> "${LOG_FILE}" 2>&1 || return 1
+  HERMES_RUNTIME_ROOT=/opt/bridgesllm/tools/hermes \
+    HERMES_BIN_DIR=/usr/local/bin \
+    HERMES_STATE_DIR=/var/lib/bridgesllm/hermes \
+    bash "${helper}" verify >> "${LOG_FILE}" 2>&1
+}
 
-  warn "${label} ${expected_version} failed verification; restoring its previous global package state."
-  if ${had_package}; then
-    npm install -g --no-audit --no-fund "${package_name}@${baseline_version}" >> "${LOG_FILE}" 2>&1 || true
-  else
-    npm uninstall -g "${package_name}" >> "${LOG_FILE}" 2>&1 || true
-  fi
-  return 1
+verify_openclaw_stable_plugins() {
+  local helper="${PORTAL_DIR}/installer/openclaw-stable-plugins.sh"
+  [[ -f "${helper}" ]] || return 1
+  OPENCLAW_PLUGIN_TRANSACTION_ROOT=/var/lib/bridgesllm-installer \
+    bash "${helper}" verify >> "${LOG_FILE}" 2>&1
+}
+
+converge_openclaw_stable_plugins() {
+  local helper="${PORTAL_DIR}/installer/openclaw-stable-plugins.sh"
+  [[ -f "${helper}" ]] || {
+    warn "OpenClaw stable plugin helper is missing from the installed Portal artifact."
+    return 1
+  }
+  OPENCLAW_PLUGIN_TRANSACTION_ROOT=/var/lib/bridgesllm-installer \
+    OPENCLAW_STABLE_PLUGINS_QUIESCED="${OPENCLAW_STABLE_PLUGINS_QUIESCED:-0}" \
+    bash "${helper}" converge >> "${LOG_FILE}" 2>&1 || return 1
+  verify_openclaw_stable_plugins
 }
 
 update_dependencies() {
@@ -8040,23 +12467,13 @@ update_dependencies() {
     ensure_supported_node_runtime
   fi
 
-  # The Portal updater owns only the Portal and its tested OpenClaw runtime
-  # pair. Ollama and coding CLIs are independent operator tools: changing them
-  # during an ordinary Portal update makes rollback non-atomic and previously
-  # caused unrelated provider drift. They move only on fresh install, an
-  # explicit --maintain-tools run, or a deliberate Admin maintenance action.
-
   # OpenClaw core uses the same exact tested package revision on fresh installs
-  # and updates. Its gateway restart remains deferred until state preparation.
+  # and explicit host maintenance. Codex, Claude Code, and ClawHub remain
+  # unchanged here; they require a separately reviewed maintenance operation.
+  # OpenClaw's gateway restart remains deferred until state preparation.
   converge_openclaw_core_package
 
   if $MAINTAIN_TOOLS; then
-    # ClawHub powers Skills marketplace search/install.
-    if ! $SKIP_OPENCLAW; then
-      converge_pinned_npm_cli "ClawHub" "clawhub" "${PIN_CLAWHUB_VERSION}" "clawhub" "--cli-version" \
-        || warn "ClawHub could not be converged; Skills marketplace actions will remain unavailable."
-    fi
-
     # Ollama's installer updates the client before the daemon. Restart and prove
     # the API-reported server version matches before continuing.
     if $SKIP_OLLAMA; then
@@ -8064,11 +12481,6 @@ update_dependencies() {
     else
       install_or_update_ollama
     fi
-
-    converge_pinned_npm_cli "Codex CLI" "@openai/codex" "${PIN_CODEX_CLI_VERSION}" "codex" "--version" \
-      || warn "Codex CLI could not be converged to ${PIN_CODEX_CLI_VERSION}; its provider will remain unavailable."
-    converge_pinned_npm_cli "Claude Code" "@anthropic-ai/claude-code" "${PIN_CLAUDE_CODE_VERSION}" "claude" "--version" \
-      || warn "Claude Code could not be converged to ${PIN_CLAUDE_CODE_VERSION}; its provider will remain unavailable."
 
     if ! converge_antigravity; then
       warn "Antigravity could not be converged to ${PIN_ANTIGRAVITY_VERSION}; its provider will remain unavailable."
@@ -8085,8 +12497,23 @@ update_dependencies() {
       ok "Grok Build ${PIN_GROK_BUILD_VERSION} (verified)"
     fi
 
+    if ! converge_opencode; then
+      warn "OpenCode could not be converged to ${PIN_OPENCODE_VERSION}; its Portal harness will remain unavailable."
+    else
+      ok "OpenCode ${PIN_OPENCODE_VERSION} (verified)"
+    fi
+
+    if ! converge_hermes; then
+      warn "Hermes could not be converged to ${PIN_HERMES_VERSION}; its Portal harness will remain unavailable."
+    else
+      ok "Hermes ${PIN_HERMES_VERSION} with uv ${PIN_HERMES_UV_VERSION} and Python ${PIN_HERMES_PYTHON_VERSION} (verified)"
+    fi
+
   else
-    info "Optional tool maintenance skipped (use --maintain-tools to update Ollama and coding CLIs)"
+    info "Optional tool maintenance skipped (use --maintain-tools to update Ollama and Portal-qualified harnesses)"
+    if ! $SKIP_OPENCLAW && ! verify_openclaw_stable_plugins; then
+      warn "Separately installed OpenClaw plugins are outside the Portal-tested stable set; run a reviewed --maintain-tools update to converge them."
+    fi
   fi
 
   # Caddy terminates HTTPS and may carry local/beta site config. Do not mutate it
@@ -8134,62 +12561,360 @@ format_bytes() {
   fi
 }
 
-# Render a determinate progress bar (0–100%)
-draw_pct_bar() {
-  local pct="$1" msg="$2" detail="${3:-}"
-  local bar_width=24
-  local filled=$(( (pct * bar_width) / 100 ))
-  (( filled > bar_width )) && filled=$bar_width
-  local empty=$(( bar_width - filled ))
+# Long operations report measured facts or elapsed indeterminate state.  There
+# is deliberately no spinner: reduced motion is the default, and presentation
+# never wraps commands in a pipeline.  All asynchronous host mutation crosses
+# one registered setsid boundary so interruption can settle the entire process
+# group before recovery or a terminal result is published.
+#
+# This proof is deliberately process-group scoped.  A command that delegates
+# work to systemd, Docker, or another daemon can outlive that group; ordinary
+# Portal-only update is statically excluded from every spin owner, while fresh
+# install interruption continues to report that partial host state may remain.
 
-  local bar="" i
-  for ((i = 0; i < filled; i++)); do bar+="█"; done
-  for ((i = 0; i < empty; i++)); do bar+="░"; done
-
-  if [[ -n "$detail" ]]; then
-    printf "\r  ${CYAN}[${bar}]${NC} ${DIM}%3d%%${NC}  ${msg} ${DIM}${detail}${NC}          " "$pct"
-  else
-    printf "\r  ${CYAN}[${bar}]${NC} ${DIM}%3d%%${NC}  ${msg}          " "$pct"
+tracked_mutator_read_proc_stat() {
+  local pid="$1" stat_line="" stat_fields=""
+  local -a fields=()
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  if ! IFS= read -r stat_line 2>/dev/null <"/proc/${pid}/stat"; then
+    return 1
   fi
+  [[ "${stat_line}" == *') '* ]] || return 1
+  # /proc comm is parenthesized and may contain spaces.  Everything after its
+  # final ") " has stable field positions: state, ppid, pgrp, session, ...,
+  # starttime (original field 22, array offset 19 here).
+  stat_fields="${stat_line##*) }"
+  read -r -a fields <<<"${stat_fields}"
+  (( ${#fields[@]} >= 20 )) || return 1
+  [[ "${fields[2]}" =~ ^[1-9][0-9]*$ \
+    && "${fields[3]}" =~ ^[1-9][0-9]*$ \
+    && "${fields[19]}" =~ ^[1-9][0-9]*$ ]] || return 1
+  TRACKED_MUTATOR_OBSERVED_STATE="${fields[0]}"
+  TRACKED_MUTATOR_OBSERVED_PGID="${fields[2]}"
+  TRACKED_MUTATOR_OBSERVED_SESSION="${fields[3]}"
+  TRACKED_MUTATOR_OBSERVED_STARTTIME="${fields[19]}"
+  return 0
 }
 
-# Render an indeterminate progress bar (pulsing glow)
-draw_pulse_bar() {
-  local tick="$1" msg="$2" detail="${3:-}"
-  local bar_width=24
-  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-  local frame="${frames[$(( tick % ${#frames[@]} ))]}"
+tracked_mutator_identity_valid() {
+  local pid="${TRACKED_MUTATOR_PID:-}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ \
+    && "${TRACKED_MUTATOR_STARTTIME:-}" =~ ^[1-9][0-9]*$ \
+    && "${TRACKED_MUTATOR_PGID:-}" == "${pid}" ]] || return 1
+  tracked_mutator_read_proc_stat "${pid}" || return 1
+  [[ "${TRACKED_MUTATOR_OBSERVED_STARTTIME}" == "${TRACKED_MUTATOR_STARTTIME}" \
+    && "${TRACKED_MUTATOR_OBSERVED_PGID}" == "${TRACKED_MUTATOR_PGID}" \
+    && "${TRACKED_MUTATOR_OBSERVED_SESSION}" == "${pid}" ]]
+}
 
-  # Pulse: a bright segment that sweeps back and forth
-  local cycle=$(( bar_width * 2 ))
-  local pos=$(( tick % cycle ))
-  if (( pos >= bar_width )); then
-    pos=$(( cycle - pos ))
-  fi
-
-  local bar="" i
-  for ((i = 0; i < bar_width; i++)); do
-    local dist=$(( i - pos ))
-    (( dist < 0 )) && dist=$(( -dist ))
-    if (( dist == 0 )); then
-      bar+="█"
-    elif (( dist == 1 )); then
-      bar+="▓"
-    elif (( dist == 2 )); then
-      bar+="▒"
-    else
-      bar+="░"
+tracked_mutator_group_empty() {
+  local pgid="$1" stat_path stat_line stat_fields process_pid
+  local -a fields=()
+  [[ "${pgid}" =~ ^[1-9][0-9]*$ ]] || return 2
+  for stat_path in /proc/[1-9]*/stat; do
+    [[ -e "${stat_path}" ]] || continue
+    stat_line=""
+    if ! IFS= read -r stat_line 2>/dev/null <"${stat_path}"; then
+      # A process disappearing during the scan is benign.  A stat inode that
+      # remains unreadable means emptiness was not proven.
+      [[ ! -e "${stat_path}" ]] && continue
+      return 2
+    fi
+    [[ "${stat_line}" == *') '* ]] || {
+      [[ ! -e "${stat_path}" ]] && continue
+      return 2
+    }
+    process_pid="${stat_line%% *}"
+    stat_fields="${stat_line##*) }"
+    fields=()
+    read -r -a fields <<<"${stat_fields}"
+    (( ${#fields[@]} >= 4 )) || {
+      [[ ! -e "${stat_path}" ]] && continue
+      return 2
+    }
+    if [[ "${fields[2]}" == "${pgid}" ]]; then
+      TRACKED_MUTATOR_OBSERVED_MEMBER_PID="${process_pid}"
+      TRACKED_MUTATOR_OBSERVED_MEMBER_STATE="${fields[0]}"
+      return 1
     fi
   done
-
-  if [[ -n "$detail" ]]; then
-    printf "\r  ${CYAN}${frame}${NC} ${CYAN}[${bar}]${NC} ${msg} ${DIM}${detail}${NC}          "
-  else
-    printf "\r  ${CYAN}${frame}${NC} ${CYAN}[${bar}]${NC} ${msg}          "
-  fi
+  return 0
 }
 
-# ── Core spin: indeterminate progress with elapsed time ──────
+tracked_mutator_clear_ownership() {
+  TRACKED_MUTATOR_PID=""
+  TRACKED_MUTATOR_STARTTIME=""
+  TRACKED_MUTATOR_PGID=""
+  TRACKED_MUTATOR_KIND=""
+  TRACKED_MUTATOR_LAUNCHING=false
+  TRACKED_MUTATOR_SETTLING=false
+}
+
+tracked_mutator_defer_signal_if_busy() {
+  local handler="$1" exit_code="$2" message="$3"
+  # The first signal remains authoritative from the launch-registration race
+  # through bounded descendant settlement.  A pending deferred handler also
+  # keeps later signals from overtaking it during the one-command transition
+  # from owned settlement to replay.
+  [[ "${TRACKED_MUTATOR_LAUNCHING:-false}" == "true" \
+    || "${TRACKED_MUTATOR_SETTLING:-false}" == "true" \
+    || -n "${TRACKED_MUTATOR_DEFERRED_HANDLER:-}" ]] || return 1
+  if [[ -z "${TRACKED_MUTATOR_DEFERRED_HANDLER:-}" ]]; then
+    TRACKED_MUTATOR_DEFERRED_HANDLER="${handler}"
+    TRACKED_MUTATOR_DEFERRED_EXIT_CODE="${exit_code}"
+    TRACKED_MUTATOR_DEFERRED_MESSAGE="${message}"
+  fi
+  return 0
+}
+
+tracked_mutator_replay_deferred_signal() {
+  local handler="${TRACKED_MUTATOR_DEFERRED_HANDLER:-}"
+  local exit_code="${TRACKED_MUTATOR_DEFERRED_EXIT_CODE:-}"
+  local message="${TRACKED_MUTATOR_DEFERRED_MESSAGE:-}"
+  [[ -n "${handler}" ]] || return 1
+  # This path is terminal: the recorded first signal is replayed into the
+  # installer signal handler, which exits with its exact signal status.  Ignore
+  # later signals before clearing the pending record so none can overtake it.
+  trap '' SIGINT TERM HUP
+  TRACKED_MUTATOR_DEFERRED_HANDLER=""
+  TRACKED_MUTATOR_DEFERRED_EXIT_CODE=""
+  TRACKED_MUTATOR_DEFERRED_MESSAGE=""
+  "${handler}" "${exit_code}" "${message}"
+}
+
+tracked_mutator_finish_settlement() {
+  local outcome="$1"
+  [[ "${outcome}" == "success" || "${outcome}" == "failure" ]] || return 1
+  if [[ "${outcome}" == "success" ]]; then
+    tracked_mutator_clear_ownership
+  else
+    # Retain the exact registered identity when quiescence was not proven.
+    # The replayed signal handler gets one bounded retry, then publishes
+    # recovery-required without beginning rollback if the group remains live.
+    TRACKED_MUTATOR_SETTLING=false
+  fi
+  if [[ -n "${TRACKED_MUTATOR_DEFERRED_HANDLER:-}" ]]; then
+    tracked_mutator_replay_deferred_signal
+  fi
+  return 0
+}
+
+tracked_mutator_launch() {
+  local kind="$1" pid="" registered=false attempt
+  shift
+  [[ "${kind}" =~ ^(spin|spin_download|spin_apt)$ && $# -gt 0 ]] || return 125
+  [[ "${TRACKED_MUTATOR_LAUNCHING:-false}" != "true" \
+    && -z "${TRACKED_MUTATOR_PID:-}" ]] || return 125
+  command -v setsid >/dev/null 2>&1 || return 125
+  # With monitor mode disabled, Bash's asynchronous child inherits the
+  # installer's process group and therefore cannot already be a group leader.
+  # util-linux setsid then stays in that exact PID instead of forking.  The
+  # post-launch PID==PGID==SID proof below is still authoritative.
+  [[ "$-" != *m* ]] || return 125
+
+  TRACKED_MUTATOR_KIND="${kind}"
+  TRACKED_MUTATOR_LAUNCHING=true
+  setsid bash -c 'kill -STOP "$$"; exec "$@"' \
+    bridgesllm-tracked-mutator "$@" >>"${LOG_FILE}" 2>&1 &
+  pid=$!
+  TRACKED_MUTATOR_PID="${pid}"
+
+  # The leader self-stops before exec.  Keep the mutator behind that gate until
+  # its immutable /proc start identity and dedicated process group/session are
+  # globally registered.  A trap during this window records a deferred signal;
+  # every loop command is guarded so the returning trap cannot trigger ERR.
+  for attempt in {1..200}; do
+    if tracked_mutator_read_proc_stat "${pid}" \
+      && [[ "${TRACKED_MUTATOR_OBSERVED_STATE}" == "T" \
+        && "${TRACKED_MUTATOR_OBSERVED_PGID}" == "${pid}" \
+        && "${TRACKED_MUTATOR_OBSERVED_SESSION}" == "${pid}" ]]; then
+      TRACKED_MUTATOR_STARTTIME="${TRACKED_MUTATOR_OBSERVED_STARTTIME}"
+      TRACKED_MUTATOR_PGID="${pid}"
+      registered=true
+      break
+    fi
+    kill -0 "${pid}" 2>/dev/null || break
+    sleep 0.01 || true
+  done
+
+  if [[ "${registered}" != "true" ]]; then
+    # The stopped wrapper has not executed the requested command.  Kill only
+    # the exact Bash child we launched, reap it, and prove its PID is gone.
+    if tracked_mutator_read_proc_stat "${pid}"; then
+      TRACKED_MUTATOR_STARTTIME="${TRACKED_MUTATOR_OBSERVED_STARTTIME}"
+      if [[ "${TRACKED_MUTATOR_OBSERVED_PGID}" == "${pid}" \
+        && "${TRACKED_MUTATOR_OBSERVED_SESSION}" == "${pid}" ]]; then
+        TRACKED_MUTATOR_PGID="${pid}"
+        kill -KILL -- "-${pid}" 2>/dev/null || true
+        kill -CONT -- "-${pid}" 2>/dev/null || true
+      else
+        kill -KILL "${pid}" 2>/dev/null || true
+        kill -CONT "${pid}" 2>/dev/null || true
+      fi
+    fi
+    wait "${pid}" 2>/dev/null || true
+    TRACKED_MUTATOR_LAUNCHING=false
+    if [[ ! -e "/proc/${pid}" ]] \
+      && { [[ -z "${TRACKED_MUTATOR_PGID:-}" ]] \
+        || tracked_mutator_group_empty "${TRACKED_MUTATOR_PGID}"; }; then
+      tracked_mutator_clear_ownership
+    fi
+    if [[ -n "${TRACKED_MUTATOR_DEFERRED_HANDLER:-}" ]]; then
+      tracked_mutator_replay_deferred_signal
+    fi
+    return 125
+  fi
+
+  TRACKED_MUTATOR_LAUNCHING=false
+  if [[ -n "${TRACKED_MUTATOR_DEFERRED_HANDLER:-}" ]]; then
+    tracked_mutator_replay_deferred_signal
+    return 125
+  fi
+  if ! kill -CONT -- "-${TRACKED_MUTATOR_PGID}" 2>/dev/null; then
+    settle_active_tracked_mutator || true
+    return 125
+  fi
+  return 0
+}
+
+tracked_mutator_wait() {
+  local pid="${TRACKED_MUTATOR_PID:-}" pgid="${TRACKED_MUTATOR_PGID:-}" status=0
+  [[ "${TRACKED_MUTATOR_LAUNCHING:-false}" != "true" \
+    && "${pid}" =~ ^[1-9][0-9]*$ \
+    && "${pgid}" == "${pid}" ]] || return 125
+  if wait "${pid}"; then
+    status=0
+  else
+    status=$?
+  fi
+  # Preserve the exact leader status, but do not confuse it with group
+  # quiescence: a shell command can background a descendant and exit.  A
+  # complete /proc scan must prove the PGID empty, or the still-owned group is
+  # settled boundedly before ownership is released.
+  if tracked_mutator_group_empty "${pgid}"; then
+    tracked_mutator_clear_ownership
+  elif ! settle_active_tracked_mutator leader-waited; then
+    return 125
+  fi
+  return "${status}"
+}
+
+settle_active_tracked_mutator() {
+  local pid="${TRACKED_MUTATOR_PID:-}" pgid="${TRACKED_MUTATOR_PGID:-}"
+  local leader_state="${1:-active}" attempt group_state=1
+  if [[ "${TRACKED_MUTATOR_LAUNCHING:-false}" == "true" ]]; then
+    return 1
+  fi
+  [[ -n "${pid}" || -n "${pgid}" ]] || return 0
+  [[ "${TRACKED_MUTATOR_SETTLING:-false}" != "true" ]] || return 1
+  [[ "${pid}" =~ ^[1-9][0-9]*$ \
+    && "${pgid}" == "${pid}" \
+    && "${TRACKED_MUTATOR_STARTTIME:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+
+  if [[ "${leader_state}" == "leader-waited" ]]; then
+    # wait(1)'s retained job status proves this exact registered child reached
+    # a terminal state.  If its group still has members, the PGID is
+    # continuously allocated to that owned session and can be settled without
+    # risking reuse of the already-reaped leader PID.
+    [[ ! -e "/proc/${pid}" ]] || return 1
+    if tracked_mutator_group_empty "${pgid}"; then
+      tracked_mutator_clear_ownership
+      return 0
+    else
+      group_state=$?
+    fi
+    (( group_state == 1 )) || return 1
+  else
+    [[ "${leader_state}" == "active" ]] || return 1
+    # If Bash already reaped a naturally completed leader, emptiness plus
+    # wait's retained job status is still an exact normal terminal state.
+    # Otherwise the recorded starttime/PGID/SID must match before any negative-
+    # PGID signal is sent.
+    if ! tracked_mutator_identity_valid; then
+      if [[ ! -e "/proc/${pid}" ]]; then
+        if tracked_mutator_group_empty "${pgid}"; then
+          wait "${pid}" 2>/dev/null || true
+          tracked_mutator_clear_ownership
+          return 0
+        else
+          group_state=$?
+        fi
+        if (( group_state == 1 )); then
+          # Bash retains the exact status of an asynchronous child until wait.
+          # Reaping that registered PID proves the leader reached a terminal
+          # state; a surviving member continuously owns the same PGID, so the
+          # bounded leader-waited settlement below remains safe from PID/PGID
+          # reuse even in the exit-before-signal race.
+          wait "${pid}" 2>/dev/null || true
+          leader_state="leader-waited"
+        else
+          return 1
+        fi
+      else
+        return 1
+      fi
+    fi
+  fi
+
+  TRACKED_MUTATOR_SETTLING=true
+  kill -TERM -- "-${pgid}" 2>/dev/null || true
+  # A deferred signal can arrive while the leader is held at the registration
+  # gate.  TERM remains pending while stopped; CONT lets the kernel deliver it
+  # before the wrapper can exec the requested mutator.
+  kill -CONT -- "-${pgid}" 2>/dev/null || true
+  for attempt in {1..20}; do
+    if tracked_mutator_group_empty "${pgid}"; then
+      group_state=0
+      break
+    else
+      group_state=$?
+    fi
+    (( group_state == 1 )) || break
+    sleep 0.05 || true
+  done
+
+  if (( group_state != 0 )); then
+    # Identity was validated before TERM, and a surviving member keeps this
+    # process-group ID allocated.  Escalate the same owned group, then require
+    # a fresh complete /proc scan to prove emptiness.
+    (( group_state == 1 )) || {
+      tracked_mutator_finish_settlement failure
+      return 1
+    }
+    kill -KILL -- "-${pgid}" 2>/dev/null || true
+    kill -CONT -- "-${pgid}" 2>/dev/null || true
+    for attempt in {1..40}; do
+      if tracked_mutator_group_empty "${pgid}"; then
+        group_state=0
+        break
+      else
+        group_state=$?
+      fi
+      (( group_state == 1 )) || break
+      sleep 0.05 || true
+    done
+  fi
+
+  if [[ "${leader_state}" != "leader-waited" ]]; then
+    wait "${pid}" 2>/dev/null || true
+  fi
+  if (( group_state != 0 )) \
+    || [[ -e "/proc/${pid}" ]] \
+    || ! tracked_mutator_group_empty "${pgid}"; then
+    tracked_mutator_finish_settlement failure
+    return 1
+  fi
+  tracked_mutator_finish_settlement success
+  return 0
+}
+
+publish_installer_terminal_state() {
+  # Rendering remains an observer.  This separately named authority boundary
+  # proves mutator quiescence before successful/cancelled main-path outcomes;
+  # failure and signal paths perform the same proof before any recovery work.
+  settle_active_tracked_mutator || return 1
+  terminal_final_state "$@"
+}
 
 spin() {
   local msg="$1"; shift
@@ -8200,28 +12925,27 @@ spin() {
   if ! $PACKAGE_MANAGER_REPAIR_ACTIVE && command_needs_package_manager "$*"; then
     wait_for_package_manager_ready "$msg"
   fi
-  bash -c "$*" >> "$LOG_FILE" 2>&1 &
-  local pid=$!
-  local start_ts tick=0
+  tracked_mutator_launch spin bash -c "$*" || return $?
+  local pid="${TRACKED_MUTATOR_PID}"
+  local start_ts
   start_ts=$(date +%s)
 
-  if [[ -t 1 ]]; then
+  progress "${msg}"
+  if terminal_periodic_observation_enabled; then
     while kill -0 "$pid" 2>/dev/null; do
       local now elapsed
       now=$(date +%s)
       elapsed=$(( now - start_ts ))
-      draw_pulse_bar "$tick" "$msg" "$(format_elapsed $elapsed)"
-      tick=$(( tick + 1 ))
-      sleep 0.15
+      terminal_operation_update tick "$msg" "$(format_elapsed "${elapsed}")"
+      sleep 1
     done
-  else
-    echo -e "  ${CYAN}⠿${NC} ${msg}..."
   fi
 
-  wait "$pid"
-  local rc=$?
-  if [[ -t 1 ]]; then
-    printf "\r%-120s\r" ""
+  local rc=0
+  if tracked_mutator_wait; then
+    rc=0
+  else
+    rc=$?
   fi
   if [[ $rc -eq 0 ]]; then
     local end_ts total
@@ -8250,14 +12974,15 @@ spin_download() {
   total_bytes=$(curl -fsSLI "$url" 2>/dev/null | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r' || echo 0)
 
   # Download in background, track file size for real progress
-  curl -fSL "$url" -o "$dest" >> "$LOG_FILE" 2>&1 &
-  local pid=$!
-  local start_ts tick=0
+  tracked_mutator_launch spin_download curl -fSL "$url" -o "$dest" || return $?
+  local pid="${TRACKED_MUTATOR_PID}"
+  local start_ts
   start_ts=$(date +%s)
 
-  if [[ -t 1 ]]; then
+  progress "${msg}"
+  if terminal_periodic_observation_enabled; then
     while kill -0 "$pid" 2>/dev/null; do
-      local now elapsed current_bytes=0 pct=0 speed_str=""
+      local now elapsed current_bytes=0 speed_str=""
       now=$(date +%s)
       elapsed=$(( now - start_ts ))
 
@@ -8266,36 +12991,34 @@ spin_download() {
       fi
 
       if (( total_bytes > 0 && current_bytes > 0 )); then
-        pct=$(( (current_bytes * 100) / total_bytes ))
-        (( pct > 100 )) && pct=100
         if (( elapsed > 0 )); then
           local speed=$(( current_bytes / elapsed ))
           speed_str="$(format_bytes $current_bytes)/$(format_bytes $total_bytes)  $(format_bytes $speed)/s"
         else
           speed_str="$(format_bytes $current_bytes)/$(format_bytes $total_bytes)"
         fi
-        draw_pct_bar "$pct" "$msg" "$speed_str"
+        terminal_operation_update measured "$msg" "$speed_str" \
+          "${current_bytes}" "${total_bytes}"
       else
-        # Indeterminate (no content-length)
+        # Unknown-size work is elapsed/bytes only.  Never invent a percentage.
         if (( current_bytes > 0 )); then
-          draw_pulse_bar "$tick" "$msg" "$(format_bytes $current_bytes)  $(format_elapsed $elapsed)"
+          terminal_operation_update tick "$msg" \
+            "$(format_bytes "${current_bytes}") · $(format_elapsed "${elapsed}")"
         else
-          draw_pulse_bar "$tick" "$msg" "$(format_elapsed $elapsed)"
+          terminal_operation_update tick "$msg" "$(format_elapsed "${elapsed}")"
         fi
       fi
-      tick=$(( tick + 1 ))
-      sleep 0.3
+      sleep 1
     done
+  fi
+
+  local rc=0
+  if tracked_mutator_wait; then
+    rc=0
   else
-    echo -e "  ${CYAN}⠿${NC} ${msg}..."
+    rc=$?
   fi
 
-  wait "$pid"
-  local rc=$?
-
-  if [[ -t 1 ]]; then
-    printf "\r%-120s\r" ""
-  fi
   if [[ $rc -eq 0 ]]; then
     local final_size=0
     [[ -f "$dest" ]] && final_size=$(stat -c%s "$dest" 2>/dev/null || echo 0)
@@ -8313,6 +13036,12 @@ spin_download() {
 
 # ── Apt install with package counting ────────────────────────
 
+package_is_fully_installed() {
+  local package="$1" status=""
+  status="$(dpkg-query -W -f='${db:Status-Abbrev}' "${package}" 2>/dev/null || true)"
+  [[ "${status}" == "ii " ]]
+}
+
 spin_apt() {
   local msg="$1"; shift
   # $@ = list of expected package names
@@ -8327,12 +13056,14 @@ spin_apt() {
     wait_for_package_manager_ready "$msg"
   fi
 
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${expected_pkgs[@]}" >> "$LOG_FILE" 2>&1 &
-  local pid=$!
-  local start_ts tick=0
+  tracked_mutator_launch spin_apt env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends "${expected_pkgs[@]}" || return $?
+  local pid="${TRACKED_MUTATOR_PID}"
+  local start_ts
   start_ts=$(date +%s)
 
-  if [[ -t 1 ]]; then
+  progress "${msg}"
+  if terminal_periodic_observation_enabled; then
     while kill -0 "$pid" 2>/dev/null; do
       local now elapsed installed=0 current_pkg=""
       now=$(date +%s)
@@ -8340,7 +13071,7 @@ spin_apt() {
 
       # Count how many of our target packages are now installed
       for pkg in "${expected_pkgs[@]}"; do
-        if dpkg -s "$pkg" &>/dev/null 2>&1; then
+        if package_is_fully_installed "$pkg"; then
           installed=$(( installed + 1 ))
         fi
       done
@@ -8350,26 +13081,24 @@ spin_apt() {
       current_pkg="${current_pkg%%:*}"  # strip arch suffix
 
       if (( total > 0 && installed > 0 )); then
-        local pct=$(( (installed * 100) / total ))
-        local detail="${installed}/${total}"
+        local detail=""
         [[ -n "$current_pkg" ]] && detail="${detail} · ${current_pkg}"
-        draw_pct_bar "$pct" "$msg" "$detail"
+        terminal_operation_update package-count "$msg" "$detail" \
+          "${installed}" "${total}"
       else
         local detail="$(format_elapsed $elapsed)"
         [[ -n "$current_pkg" ]] && detail="${detail} · ${current_pkg}"
-        draw_pulse_bar "$tick" "$msg" "$detail"
+        terminal_operation_update tick "$msg" "$detail"
       fi
-      tick=$(( tick + 1 ))
-      sleep 0.5
+      sleep 1
     done
-  else
-    echo -e "  ${CYAN}⠿${NC} ${msg}..."
   fi
 
-  wait "$pid"
-  local rc=$?
-  if [[ -t 1 ]]; then
-    printf "\r%-120s\r" ""
+  local rc=0
+  if tracked_mutator_wait; then
+    rc=0
+  else
+    rc=$?
   fi
   if [[ $rc -eq 0 ]]; then
     local end_ts total_t
@@ -8459,6 +13188,7 @@ run_openclaw_compatibility_hotfix() {
 }
 
 recover_uncommitted_openclaw_after_signal() {
+  [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] || return 0
   settle_openclaw_compatibility_hotfix_process || return 1
   if [[ "${UPDATE_RECOVERY_ARMED:-false}" != "true" \
     && "${OPENCLAW_UPGRADE_COMMITTED:-false}" != "true" ]] \
@@ -8503,6 +13233,11 @@ update_transaction_state_path() {
 
 recover_update_after_signal() {
   local active_journal cutover_journal
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && declare -F recover_pending_ollama_transaction >/dev/null 2>&1 \
+    && ! recover_pending_ollama_transaction; then
+    return 1
+  fi
   active_journal="$(update_transaction_state_path "${UPDATE_ACTIVE_JOURNAL}")" || return 1
   cutover_journal="$(update_transaction_state_path "${UPDATE_CUTOVER_JOURNAL}")" || return 1
   if [[ -e "${active_journal}" || -L "${active_journal}" \
@@ -8511,19 +13246,38 @@ recover_update_after_signal() {
       && recover_pending_update_transaction
     return
   fi
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" == "true" ]]; then
+    return 0
+  fi
   recover_uncommitted_openclaw_after_signal
 }
 
 handle_installer_signal() {
   local exit_code="$1" message="$2"
   local interrupted_phase="${DASHBOARD_UPDATE_PROGRESS_PHASE:-failure}"
+  local signal_recovery_succeeded=true
+  if tracked_mutator_defer_signal_if_busy \
+      handle_installer_signal "${exit_code}" "${message}"; then
+    return 0
+  fi
   trap '' SIGINT TERM HUP
   trap - ERR
   set +e
+  terminal_suspend
+  if ! settle_active_tracked_mutator; then
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
+      "Automatic recovery needs attention" \
+      "The active ${TRACKED_MUTATOR_KIND:-installer} operation could not be proven stopped. Recovery was not started."
+    terminal_final_state "Recovery required" \
+      "The active ${TRACKED_MUTATOR_KIND:-installer} operation could not be proven stopped; recovery was not started." \
+      "Do not start another installer run. Review the root-only installer log."
+    exit "${exit_code}"
+  fi
   if [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     dashboard_update_progress updated_with_errors \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
-      "Portal updated; follow-up work was interrupted" "${message}"
+      "Portal updated; final verification was interrupted" "${message}"
   elif [[ "${UPDATE_RECOVERY_ARMED:-false}" == "true" ]]; then
     dashboard_update_progress recovering \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
@@ -8536,13 +13290,30 @@ handle_installer_signal() {
   echo ""
   echo -e "\n  ${YELLOW}⚠  ${message}${NC}"
   echo ""
-  if ! settle_openclaw_compatibility_hotfix_process; then
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && ! settle_openclaw_compatibility_hotfix_process; then
     warn "The OpenClaw compatibility patch process could not be proven stopped. Recovery was not started."
     [[ "${UPDATE_RECOVERY_ARMED:-false}" != "true" ]] \
       || dashboard_update_progress recovery_required \
         "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
         "Automatic recovery needs attention" \
         "A compatibility process could not be proven stopped. Do not start another update."
+    terminal_final_state "Recovery required" \
+      "A compatibility process could not be proven stopped." \
+      "Do not start another update. Review the root-only installer log."
+    exit "${exit_code}"
+  fi
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && declare -F recover_pending_ollama_transaction >/dev/null 2>&1 \
+    && ! recover_pending_ollama_transaction; then
+    warn "The sealed Ollama transaction could not be restored automatically; its private journal was preserved."
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
+      "Automatic recovery needs attention" \
+      "The Ollama transaction stopped without an exact rollback. Do not start another update."
+    terminal_final_state "Recovery required" \
+      "The Ollama transaction did not reach an exact rollback." \
+      "Do not start another update. Review the root-only transaction journal and log."
     exit "${exit_code}"
   fi
   if declare -F settle_active_update_database_operation >/dev/null 2>&1 \
@@ -8552,9 +13323,13 @@ handle_installer_signal() {
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
       "Automatic recovery needs attention" \
       "The database operation could not be proven stopped. Do not start another update."
+    terminal_final_state "Recovery required" \
+      "The active database operation could not be proven stopped; Portal remains fenced." \
+      "Do not start another update. Review the root-only transaction journal and log."
     exit "${exit_code}"
   fi
   if ! recover_update_after_signal; then
+    signal_recovery_succeeded=false
     warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved."
     dashboard_update_progress recovery_required \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
@@ -8567,7 +13342,22 @@ handle_installer_signal() {
     # ordinary pre-commit failure.
     dashboard_update_progress updated_with_errors \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${interrupted_phase}" \
-      "Portal updated; follow-up work was interrupted" "${message}"
+      "Portal updated; final verification was interrupted" "${message}"
+  fi
+  if [[ "${signal_recovery_succeeded}" != "true" ]]; then
+    terminal_final_state "Recovery required" \
+      "Recovery after interruption did not reach a verified terminal state." \
+      "Do not start another update. Review the root-only transaction journal and log."
+  elif [[ "${FRESH_INSTALL_IN_PROGRESS:-false}" == "true" ]]; then
+    terminal_final_state "Installation interrupted" \
+      "${message}. The current fresh-install phase was not transactionally rolled back; partial installation state may remain." \
+      "Review the root-only installer log, then rerun the installer to converge the installation."
+  elif [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
+    terminal_final_state "Portal updated; verification interrupted" "${message}" \
+      "Review the installer log before starting another update."
+  else
+    terminal_final_state "Installer interrupted safely" "${message}" \
+      "Review the installer log, then rerun the installer when ready."
   fi
   exit "${exit_code}"
 }
@@ -8597,16 +13387,44 @@ handle_update_transaction_err() {
   trap - ERR
   trap '' SIGINT TERM HUP
   set +e
+  terminal_suspend
+  if ! settle_active_tracked_mutator; then
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
+      "Automatic recovery needs attention" \
+      "The active ${TRACKED_MUTATOR_KIND:-installer} operation could not be proven stopped. Recovery was not started."
+    terminal_final_state "Recovery required" \
+      "The active ${TRACKED_MUTATOR_KIND:-installer} operation could not be proven stopped; recovery was not started." \
+      "Do not start another installer run. Review the root-only installer log."
+    exit "${exit_code}"
+  fi
   dashboard_update_progress recovering \
     "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" recovery \
     "Unexpected installer error — recovering" \
     "The durable transaction is restoring or completing a verified Portal state."
-  if ! settle_openclaw_compatibility_hotfix_process; then
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && ! settle_openclaw_compatibility_hotfix_process; then
     warn "The OpenClaw compatibility patch process could not be proven stopped. Recovery was not started."
     dashboard_update_progress recovery_required \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
       "Automatic recovery needs attention" \
       "A compatibility process could not be proven stopped. Do not start another update."
+    terminal_final_state "Recovery required" \
+      "A compatibility process could not be proven stopped." \
+      "Do not start another update. Review the root-only installer log."
+    exit "${exit_code}"
+  fi
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && declare -F recover_pending_ollama_transaction >/dev/null 2>&1 \
+    && ! recover_pending_ollama_transaction; then
+    warn "The sealed Ollama transaction could not be restored automatically; its private journal was preserved."
+    dashboard_update_progress recovery_required \
+      "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
+      "Automatic recovery needs attention" \
+      "The Ollama transaction stopped without an exact rollback. Do not start another update."
+    terminal_final_state "Recovery required" \
+      "The Ollama transaction did not reach an exact rollback." \
+      "Do not start another update. Review the root-only transaction journal and log."
     exit "${exit_code}"
   fi
   if declare -F settle_active_update_database_operation >/dev/null 2>&1 \
@@ -8616,9 +13434,14 @@ handle_update_transaction_err() {
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
       "Automatic recovery needs attention" \
       "The database operation could not be proven stopped. Do not start another update."
+    terminal_final_state "Recovery required" \
+      "The active database operation could not be proven stopped; Portal remains fenced." \
+      "Do not start another update. Review the root-only transaction journal and log."
     exit "${exit_code}"
   fi
+  local transaction_recovery_succeeded=true
   if ! recover_pending_update_transaction; then
+    transaction_recovery_succeeded=false
     warn "Update recovery did not complete. Portal remains boot-fenced and recovery artifacts were preserved."
     dashboard_update_progress recovery_required \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
@@ -8627,16 +13450,34 @@ handle_update_transaction_err() {
   elif [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     dashboard_update_progress updated_with_errors \
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" "${failed_phase}" \
-      "Portal updated; follow-up work failed" \
-      "The cutover recovered forward, but the installer exited before completing host integration."
+      "Portal updated; final verification failed" \
+      "The cutover recovered forward, but the installer exited before publishing the final verified completion checkpoint."
+  fi
+  if [[ "${transaction_recovery_succeeded}" != "true" ]]; then
+    terminal_final_state "Recovery required" \
+      "The transaction did not reach a verified terminal state." \
+      "Do not start another update. Review the root-only transaction journal and log."
+  elif [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
+    terminal_final_state "Portal updated with verification errors" \
+      "Cutover recovered forward, but final verification did not finish." \
+      "Review the installer log before starting another update."
+  else
+    terminal_final_state "Previous Portal restored" \
+      "The interrupted update recovered to a verified prior state." \
+      "Review the installer log before retrying."
   fi
   exit "${exit_code}"
 }
 
-trap 'handle_err $LINENO' ERR
-trap handle_sigint SIGINT
-trap handle_sigterm TERM
-trap handle_sighup HUP
+# Sourcing exposes pure helpers to validation and inventory tooling; it must
+# not install production recovery authority into the caller's shell. The real
+# installer entrypoint retains the exact error and signal behavior below.
+if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" != "1" ]]; then
+  trap 'handle_err $LINENO' ERR
+  trap handle_sigint SIGINT
+  trap handle_sigterm TERM
+  trap handle_sighup HUP
+fi
 
 ensure_keyring_from_url() {
   local url="$1"
@@ -9111,6 +13952,15 @@ required_current_migrations = {
     "portal/backend/prisma/migrations/20260809_project_runtime_recovery_replay/migration.sql",
     "portal/backend/prisma/migrations/20260812_project_dependency_promotion_decision/migration.sql",
     "portal/backend/prisma/migrations/20260812_project_dependency_repair_force_forward/migration.sql",
+    "portal/backend/prisma/migrations/20260820_agent_harness_hermes_opencode/migration.sql",
+    "portal/backend/prisma/migrations/20260820_project_chat_history_bytes_keyset/migration.sql",
+    "portal/backend/prisma/migrations/20260820_share_concurrent_request_leases/migration.sql",
+    "portal/backend/prisma/migrations/20260820_share_link_history_keyset/migration.sql",
+    "portal/backend/prisma/migrations/20260820_user_default_agent_harness/migration.sql",
+    "portal/backend/prisma/migrations/20260820_user_retirement_durable/migration.sql",
+    "portal/backend/prisma/migrations/20260822_managed_host_tool_lease/migration.sql",
+    "portal/backend/prisma/migrations/20260827_retire_managed_host_tool_lease/migration.sql",
+    "portal/backend/prisma/migrations/20260907152000_project_work_cards/migration.sql",
 }
 required_current_skill = {
     "portal/skills/bridgesllm-portal/SKILL.md",
@@ -9132,6 +13982,9 @@ required_baseline_members = {
     "portal/CHANGELOG.md",
     "portal/README.md",
     "portal/RELEASE-METADATA.json",
+    "portal/backend/dist/agents/harnessCatalog.js",
+    "portal/backend/dist/agents/providers/HermesProvider.js",
+    "portal/backend/dist/agents/providers/OpenCodeProvider.js",
     "portal/backend/dist/cli/projectRuntimeUninstallPreflight.js",
     "portal/backend/dist/agents/providers/agentZero/AgentZeroProjectCleanup.js",
     "portal/backend/dist/agents/providers/agentZero/AgentZeroProjectEgress.js",
@@ -9140,7 +13993,14 @@ required_baseline_members = {
     "portal/backend/dist/agents/providers/agentZero/AgentZeroProjectImage.js",
     "portal/backend/dist/agents/providers/agentZero/AgentZeroProjectProvider.js",
     "portal/backend/dist/agents/providers/agentZero/AgentZeroProjectSandbox.js",
+    "portal/backend/dist/agents/providers/native/acp/AcpAgentProvider.js",
+    "portal/backend/dist/agents/providers/native/acp/AcpHarnessEnvironment.js",
+    "portal/backend/dist/agents/providers/native/acp/AcpHarnessProfiles.js",
+    "portal/backend/dist/agents/providers/native/acp/AcpModelCatalog.js",
+    "portal/backend/dist/agents/providers/native/acp/AcpStdioBroker.js",
     "portal/backend/dist/agents/providers/native/adapters/gemini.js",
+    "portal/backend/dist/agents/providers/native/adapters/hermes.js",
+    "portal/backend/dist/agents/providers/native/adapters/opencode.js",
     "portal/backend/dist/agents/providers/native/grok/GrokAcpBroker.js",
     "portal/backend/dist/agents/providers/native/projectSandbox/CodexProjectEgressRuntime.js",
     "portal/backend/dist/agents/providers/native/projectSandbox/CodexProjectSandbox.js",
@@ -9149,10 +14009,24 @@ required_baseline_members = {
     "portal/backend/dist/agents/providers/native/projectSandbox/ClaudeCodeProjectSandbox.js",
     "portal/backend/dist/agents/providers/native/projectSandbox/NativeCliProjectEgressRuntime.js",
     "portal/backend/dist/agents/providers/native/projectSandbox/NativeCliProjectManagedState.js",
+    "portal/backend/dist/config/nativeHostCliAdmissionCatalog.v1.json",
     "portal/backend/dist/routes/projects.js",
     "portal/backend/dist/server.js",
+    "portal/backend/dist/services/AgentChatDiagnosticHistory.js",
     "portal/backend/dist/services/app-process.service.js",
     "portal/backend/dist/services/accessTokenAuthorization.js",
+    "portal/backend/dist/services/adminUserRetirementDatabaseCommit.js",
+    "portal/backend/dist/services/adminUserRetirementExternalState.js",
+    "portal/backend/dist/services/adminUserRetirementLedger.js",
+    "portal/backend/dist/services/adminUserRetirementManagedPath.js",
+    "portal/backend/dist/services/adminUserRetirementManifest.js",
+    "portal/backend/dist/services/adminUserRetirementParticipation.js",
+    "portal/backend/dist/services/adminUserRetirementRuntime.js",
+    "portal/backend/dist/services/adminUserRetirementSharedActorState.js",
+    "portal/backend/dist/services/hostRuntimeMaintenancePolicy.js",
+    "portal/backend/dist/services/legacyOpenClawAgentDetach.js",
+    "portal/backend/dist/services/nativeHostCliAdmission.js",
+    "portal/backend/dist/services/nativeHostCliStatus.js",
     "portal/backend/dist/services/openclawProjectSandbox.js",
     "portal/backend/dist/services/openclawProjectQualification.js",
     "portal/backend/dist/services/portalTransportAuthorization.js",
@@ -9165,6 +14039,7 @@ required_baseline_members = {
     "portal/backend/dist/services/projectDependencyPromotionStartupRecovery.js",
     "portal/backend/dist/services/projectDependencyRepair.js",
     "portal/backend/dist/services/projectChatDependencyPromotionQuiescence.js",
+    "portal/backend/dist/services/projectChatHistory.js",
     "portal/backend/dist/services/projectEgressCleanupAdapter.js",
     "portal/backend/dist/services/projectEgressCredentials.js",
     "portal/backend/dist/services/projectEgressPlane.js",
@@ -9182,7 +14057,9 @@ required_baseline_members = {
     "portal/backend/dist/services/projectWorkloadRuntime.js",
     "portal/backend/dist/services/releaseUpdateDetails.js",
     "portal/backend/dist/services/sessionRevocationBus.js",
+    "portal/backend/dist/services/shareConcurrentUse.js",
     "portal/backend/dist/services/startupStatusServer.js",
+    "portal/backend/dist/utils/shareLinkPagination.js",
     "portal/backend/dist/version.js",
     "portal/backend/package-lock.json",
     "portal/backend/package.json",
@@ -9203,7 +14080,13 @@ required_baseline_members = {
     "portal/installer/update-transaction-state.py",
     "portal/installer/update-validation-protocol-v1",
     "portal/installer/grok-build-runtime.sh",
+    "portal/installer/hermes-runtime.sh",
     "portal/installer/install.sh",
+    "portal/installer/migrate-openclaw-2026.9.1.mjs",
+    "portal/installer/patch-openclaw-2026.9.1-portal-contract.mjs",
+    "portal/installer/opencode-runtime.sh",
+    "portal/installer/openclaw-stable-plugins.sh",
+    "portal/installer/verify-openclaw-2026.9.1-stock-contract.mjs",
     "portal/installer/install.sh.sig",
     "portal/installer/Setup-OllamaTailnet.ps1",
     "portal/installer/Start-Here.cmd",
@@ -9219,7 +14102,9 @@ required_baseline_members = {
     "portal/static/icons/bridges-ai-claude-code.svg",
     "portal/static/icons/bridges-ai-codex.svg",
     "portal/static/icons/bridges-ai-grok-build.svg",
+    "portal/static/icons/bridges-ai-hermes.svg",
     "portal/static/icons/bridges-ai-ollama.svg",
+    "portal/static/icons/bridges-ai-opencode.svg",
     "portal/static/scripts/bridges-rd-ai-launchers.sh",
     "portal/static/scripts/bridges-rd-openclaw-ui.sh",
     "portal/static/scripts/bridges-rd-shared-chrome.sh",
@@ -9950,36 +14835,52 @@ stage_verified_release() {
 
 new_release_stage_dir() {
   local transaction_id="${1:-}"
-  if [[ -z "${transaction_id}" ]]; then
-    mktemp -d /tmp/bridgesllm-release-stage.XXXXXX
-    return
-  fi
-  [[ "${transaction_id}" =~ ^[a-f0-9]{32}$ ]] || return 1
-  local stage_root
+  local stage_root stage_dir stage_kind="update"
   stage_root="$(update_transaction_state_path "${UPDATE_STAGE_ROOT}")" || return 1
   install -d -m 0700 -- "${stage_root}" || return 1
   [[ -d "${stage_root}" && ! -L "${stage_root}" \
     && "$(stat -c '%u:%g:%a' "${stage_root}")" == "$(id -u):$(id -g):700" ]] \
     || return 1
-  local stage_dir="${stage_root}/update-${transaction_id}"
+  if [[ -z "${transaction_id}" ]]; then
+    transaction_id="$(openssl rand -hex 16)" || return 1
+    stage_kind="fresh"
+  fi
+  [[ "${transaction_id}" =~ ^[a-f0-9]{32}$ ]] || return 1
+  stage_dir="${stage_root}/${stage_kind}-${transaction_id}"
   mkdir -m 0700 -- "${stage_dir}" || return 1
+  sync -f "${stage_root}" || return 1
   printf '%s\n' "${stage_dir}"
 }
 
 cleanup_release_stage_dir() {
   local stage_dir="${1:-}"
-  local transaction_stage_root=""
+  local transaction_stage_root="" stage_parent="" stage_name=""
   transaction_stage_root="$(
     update_transaction_state_path "${UPDATE_STAGE_ROOT}" 2>/dev/null || true
   )"
-  case "${stage_dir}" in
-    /tmp/bridgesllm-release-stage.*) rm -rf -- "${stage_dir}" ;;
-    "${transaction_stage_root}"/update-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9])
-      rm -rf -- "${stage_dir}"
-      ;;
-    "") return 0 ;;
-    *) warn "Refusing to remove unexpected release staging path: ${stage_dir}"; return 1 ;;
-  esac
+  [[ -n "${stage_dir}" ]] || return 0
+  stage_parent="$(dirname -- "${stage_dir}")"
+  stage_name="$(basename -- "${stage_dir}")"
+  if [[ "${stage_parent}" == "${transaction_stage_root}" \
+    && "${stage_name}" =~ ^(fresh|update)-[a-f0-9]{32}$ ]]; then
+    [[ -d "${stage_dir}" && ! -L "${stage_dir}" \
+      && "$(stat -c '%u:%g:%a' "${stage_dir}")" == "$(id -u):$(id -g):700" ]] \
+      || return 1
+    rm -rf --one-file-system -- "${stage_dir}" || return 1
+    sync -f "${transaction_stage_root}" || return 1
+    return 0
+  fi
+  # Compatibility cleanup for bounded N-1 residue. New installers never stage
+  # signed releases in the shared /tmp namespace.
+  if [[ "${stage_dir}" == /tmp/bridgesllm-release-stage.* ]]; then
+    [[ -d "${stage_dir}" && ! -L "${stage_dir}" \
+      && "$(stat -c '%u:%g:%a' "${stage_dir}")" == "$(id -u):$(id -g):700" ]] \
+      || return 1
+    rm -rf --one-file-system -- "${stage_dir}"
+    return
+  fi
+  warn "Refusing to remove unexpected release staging path: ${stage_dir}"
+  return 1
 }
 
 prepare_portal_operation_lock() {
@@ -10053,6 +14954,34 @@ acquire_portal_operation_lock() {
   [[ "${actual_inode}" == "${expected_inode}" ]] \
     || fail "Portal operation lock changed while it was being opened."
   flock -n 9 || fail "Another BridgesLLM install, update, uninstall, or backup operation is already running."
+  # Ownerless admission may retire only native states proved not to require
+  # live-byte restoration. Mutation-bearing phases are reconciled below by the
+  # durable OpenClaw owner, under its identity-authorized quiescence boundary.
+  local native_phase=""
+  native_phase="$(native_cli_bundle_transaction_phase)" \
+    || fail "The interrupted Portal-qualified native CLI bundle could not be classified safely."
+  if [[ "${native_phase}" == "prepared" \
+    || "${native_phase}" == "committed-cleanup" \
+    || "${native_phase}" == "rolled-back" ]]; then
+    reconcile_ownerless_nonmutating_native_cli_bundle_transaction \
+      || fail "An ownerless non-mutating native CLI bundle could not be retired safely."
+  elif [[ "${native_phase}" != "absent" ]] \
+    && ! openclaw_gateway_migration_authority_exists; then
+    fail "A mutation-bearing native CLI bundle lacks its durable OpenClaw recovery authority. New native launches remain fenced and no native bytes were changed."
+  fi
+  # Recover the fixed OpenClaw singleton before generic update recovery can
+  # replace its exact 9.1 package/helper. Absence is a no-op, so ordinary
+  # Portal-only updates of retained 7.1 installations never mutate OpenClaw.
+  reconcile_openclaw_migration_transaction \
+    || fail "An interrupted OpenClaw 2026.9.1 migration could not be reconciled safely. Its root-only singleton and exact recovery bytes were preserved."
+  if [[ -e "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
+    || -L "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" ]]; then
+    fail "The OpenClaw gateway reboot fence remains armed without an active migration owner. The gateway stays blocked until its exact root-only recovery authority is restored."
+  fi
+  # Portal/update recovery always outranks optional host-tool work.  In
+  # particular, a committed cutover must be allowed to bring the Portal back
+  # online even when a separate npm CLI journal needs manual recovery.  Generic
+  # operation admission therefore never interprets or mutates npm authority.
   active_journal="$(update_transaction_state_path "${UPDATE_ACTIVE_JOURNAL}")" \
     || fail "The update transaction fixture root is invalid."
   cutover_journal="$(update_transaction_state_path "${UPDATE_CUTOVER_JOURNAL}")" \
@@ -10102,7 +15031,9 @@ acquire_project_runtime_image_repair_lock() {
     "${UPDATE_CUTOVER_JOURNAL}" \
     "${UNINSTALL_ACTIVE_JOURNAL}" \
     "${BACKUP_QUIESCENCE_JOURNAL}" \
-    "${RESTORE_ACTIVE_JOURNAL}"; do
+    "${RESTORE_ACTIVE_JOURNAL}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}"; do
     resolved="$(update_transaction_state_path "${journal}")" \
       || fail "A durable Portal operation path is invalid."
     [[ ! -e "${resolved}" && ! -L "${resolved}" ]] \
@@ -10116,9 +15047,13 @@ sweep_stale_release_stage_dirs() {
   # cannot fire on SIGKILL/panic). Observed accumulating one tree per aborted
   # deploy on a long-lived box.
   local stale
-  for stale in /tmp/bridgesllm-release-stage.*; do
-    [[ -e "${stale}" ]] || continue
-    cleanup_release_stage_dir "${stale}" >/dev/null 2>&1 || true
+  local -a legacy_stages=()
+  shopt -s nullglob
+  legacy_stages=(/tmp/bridgesllm-release-stage.*)
+  shopt -u nullglob
+  (( ${#legacy_stages[@]} <= 32 )) || return 1
+  for stale in "${legacy_stages[@]}"; do
+    cleanup_release_stage_dir "${stale}" >/dev/null 2>&1 || return 1
   done
   local active_journal cutover_journal stage_root
   active_journal="$(update_transaction_state_path "${UPDATE_ACTIVE_JOURNAL}")" || return 1
@@ -10128,8 +15063,22 @@ sweep_stale_release_stage_dirs() {
     || return 1
   stage_root="$(update_transaction_state_path "${UPDATE_STAGE_ROOT}")" || return 1
   if [[ -d "${stage_root}" && ! -L "${stage_root}" ]]; then
+    local -a fresh_stages=()
+    shopt -s nullglob
+    fresh_stages=("${stage_root}"/fresh-*)
+    shopt -u nullglob
+    (( ${#fresh_stages[@]} <= 32 )) || return 1
+    for stale in "${fresh_stages[@]}"; do
+      cleanup_release_stage_dir "${stale}" || return 1
+    done
     for stale in "${stage_root}"/update-*; do
       [[ -e "${stale}" ]] || continue
+      # A stale update stage can own transaction-scoped Project runtime tags.
+      # Portal-only update must not inspect Docker, remove tags, or discard the
+      # sealed cleanup policy needed by a later explicit host-maintenance run.
+      # Preserve these trees verbatim; legacy/fresh maintenance retains the
+      # existing exact cleanup behavior below.
+      [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] || continue
       local stale_name transaction_id cleanup_policy
       stale_name="$(basename "${stale}")"
       if [[ "${stale_name}" =~ ^update-([a-f0-9]{32})$ \
@@ -10600,7 +15549,6 @@ except Exception:
 # via Tailscale Serve, TLS included, with zero public ports. Runs early so the
 # operator can approve the machine in their browser while the install proceeds.
 setup_tailnet_origin() {
-  step_header "Joining your private Tailscale network"
   CURRENT_STEP="tailnet-origin"
 
   if ! command -v tailscale &>/dev/null; then
@@ -10644,7 +15592,7 @@ setup_tailnet_origin() {
         waited=$((waited + 2))
       done
       if [[ -n "${auth_url}" ]]; then
-        echo ""
+        terminal_suspend
         print_kv "APPROVE THIS SERVER" "${auth_url}" "$GREEN"
         info "Open that link in any browser, sign in to YOUR Tailscale account (the same one your other devices use), and approve this machine. Waiting up to 10 minutes..."
       fi
@@ -10657,6 +15605,7 @@ setup_tailnet_origin() {
       done
       [[ "$(tailnet_backend_state)" == "Running" ]] \
         || fail "The server did not join the tailnet in time. Approve the link above, then rerun this installer — it resumes safely."
+      terminal_resume
     fi
   fi
 
@@ -10667,6 +15616,7 @@ setup_tailnet_origin() {
 
   # ts.net TLS requires the tailnet-wide HTTPS Certificates toggle (one time).
   if ! tailnet_cert_domains_ready; then
+    terminal_suspend
     warn "HTTPS certificates are not enabled for your tailnet yet."
     info "Enable them once at https://login.tailscale.com/admin/dns → 'HTTPS Certificates' → Enable. Waiting up to 10 minutes..."
     local cert_waited=0
@@ -10677,6 +15627,7 @@ setup_tailnet_origin() {
     done
     tailnet_cert_domains_ready \
       || fail "HTTPS certificates are still disabled for the tailnet. Enable them at https://login.tailscale.com/admin/dns, then rerun this installer."
+    terminal_resume
   fi
   ok "Tailnet HTTPS certificates are enabled"
 
@@ -10736,7 +15687,12 @@ BridgesLLM Portal Installer
 Usage:
   curl -fsSL https://bridgesllm.ai/install.sh | sudo bash
 
+The installer shows Install on a new host, or Update / Repair when Portal
+is detected. Nothing changes until you choose. For unattended use, pass
+an explicit operation, for example: sudo bash install.sh --install
+
 Options:
+  --install         Install Portal on a new host (no operation menu)
   --domain DOMAIN   Pre-set domain (enables HTTPS immediately)
   --tailnet         EXPERIMENTAL. Private mode: serve the portal on your
                     Tailscale network at https://<hostname>.<tailnet>.ts.net —
@@ -10763,13 +15719,13 @@ Options:
                     kernel and Docker AppArmor support disagree (LXC/OpenVZ/nested
                     containers) and confined runtimes cannot be attested. The rest
                     of the Portal installs and runs normally.
-  --maintain-tools  Explicitly update optional AI tools during an update
-                    (Ollama, ClawHub, Codex, Claude Code, Antigravity, Grok Build)
-  --update          Force update of an existing installation
-                    (re-running the installer on an existing install
-                     routes into the signed update flow, so this flag is
-                     usually optional)
-  --reinstall       Force a fresh install over an existing one
+  --maintain-tools  On an existing Portal, run the separate Portal-qualified
+                    AI compatibility-bundle transaction. Installs exact signed
+                    OpenClaw/plugins, Codex, Claude Code, and ClawHub versions;
+                    ordinary --update remains Portal-only.
+  --update          Update Portal, keeping data and the installed AI runtimes
+  --repair          Reinstall Portal files, keeping data and AI runtimes
+  --reinstall       Alias for --repair; never deletes your data
   --uninstall       Remove BridgesLLM portal
   --repair-project-runtime-image
                     Repair only the installed Portal's canonical full-stack
@@ -10784,6 +15740,10 @@ Options:
                     firewall entries after saving a full firewall backup.
   --dry-run         Print a zero-side-effect plan. Never writes, downloads,
                     sends telemetry, changes services/network state, or prompts.
+  --plain           Append-only terminal output with no ANSI control sequences.
+                    Selected automatically for pipes, CI, and TERM=dumb.
+  --verbose         Append-only output plus bounded, sanitized new lines from
+                    this invocation's root-only installer log. Implies --plain.
   -h, --help        Show this help
 
 Requirements:
@@ -10830,8 +15790,9 @@ parse_args() {
       --skip-openclaw)  SKIP_OPENCLAW=true; shift ;;
       --skip-project-runtimes) SKIP_PROJECT_RUNTIMES=true; shift ;;
       --maintain-tools) MAINTAIN_TOOLS=true; shift ;;
+      --install)        INSTALL_MODE=true; shift ;;
       --update)         UPDATE_MODE=true; shift ;;
-      --reinstall)      FORCE_FRESH=true; shift ;;
+      --repair|--reinstall) FORCE_FRESH=true; shift ;;
       --uninstall)      UNINSTALL_MODE=true; shift ;;
       --repair-project-runtime-image) REPAIR_PROJECT_RUNTIME_IMAGE=true; shift ;;
       --residue-policy)
@@ -10841,6 +15802,8 @@ parse_args() {
         shift 2
         ;;
       --dry-run)        DRY_RUN=true; shift ;;
+      --plain)          PLAIN_OUTPUT=true; shift ;;
+      --verbose)        VERBOSE=true; PLAIN_OUTPUT=true; shift ;;
       -h|--help)        usage; exit 0 ;;
       *)                echo "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -10857,12 +15820,111 @@ parse_args() {
   fi
 
   local operation_count=0
+  $INSTALL_MODE && operation_count=$((operation_count + 1))
   $UPDATE_MODE && operation_count=$((operation_count + 1))
   $FORCE_FRESH && operation_count=$((operation_count + 1))
   $UNINSTALL_MODE && operation_count=$((operation_count + 1))
   $REPAIR_PROJECT_RUNTIME_IMAGE && operation_count=$((operation_count + 1))
+  $MAINTAIN_TOOLS && operation_count=$((operation_count + 1))
   (( operation_count <= 1 )) \
-    || fail "--update, --reinstall, --uninstall, and --repair-project-runtime-image are mutually exclusive operations."
+    || fail "Choose one operation: --install, --update, --repair, --uninstall, --maintain-tools, or --repair-project-runtime-image."
+  if $MAINTAIN_TOOLS \
+    && { $SKIP_OPENCLAW || $SKIP_OLLAMA || $SKIP_PROJECT_RUNTIMES \
+      || [[ -n "${DOMAIN}" || -n "${APP_CONTENT_DOMAIN}" || -n "${RESIDUE_POLICY}" ]] \
+      || [[ "${ORIGIN_SELECTION_EXPLICIT}" == "true" ]]; }; then
+    fail "--maintain-tools is a dedicated compatibility-bundle operation; origin, skip-runtime, and uninstall-residue options are not accepted."
+  fi
+}
+
+select_install_operation() {
+  # Routing only, before locks, downloads, or recovery. /dev/tty also works
+  # with curl | bash, without consuming the script's standard input.
+  local existing=false retained=false choice="" menu_fd
+  [[ -e "${PORTAL_DIR}" || -L "${PORTAL_DIR}" ]] && existing=true
+  # A kept data tree is not an installed runtime. This is only a menu hint;
+  # detect_retained_install_reconnect still verifies the exact receipt/tree
+  # before any installation work can begin.
+  if $existing \
+    && [[ ! -e "${PORTAL_DIR}/backend/package.json" && ! -L "${PORTAL_DIR}/backend/package.json" ]] \
+    && [[ -e "${RETAINED_INSTALL_MARKER}" || -L "${RETAINED_INSTALL_MARKER}" \
+      || -e "${RETAINED_INSTALL_MANIFEST}" || -L "${RETAINED_INSTALL_MANIFEST}" ]]; then
+    retained=true
+    existing=false
+  fi
+  if $INSTALL_MODE && $existing; then
+    printf '%s\n' "Portal files already exist at ${PORTAL_DIR}. Choose --update or --repair; --install does not replace an existing installation." >&2
+    exit 2
+  fi
+  if $UPDATE_MODE && $retained; then
+    printf '%s\n' 'Portal data is retained, but its runtime was removed. Choose --install or --repair to reconnect it.' >&2
+    exit 2
+  fi
+  if $FORCE_FRESH && ! $existing && ! $retained && ! $DRY_RUN; then
+    printf '%s\n' 'No Portal installation was found. Use --install to set up Portal.' >&2
+    exit 2
+  fi
+  $DRY_RUN && return 0
+  if $INSTALL_MODE || $UPDATE_MODE || $FORCE_FRESH || $UNINSTALL_MODE \
+    || $MAINTAIN_TOOLS || $REPAIR_PROJECT_RUNTIME_IMAGE; then
+    return 0
+  fi
+  if ! { exec {menu_fd}<>/dev/tty; } 2>/dev/null; then
+    printf '%s\n' 'No interactive terminal. Choose --install, --update, or --repair (use --dry-run to preview).' >&2
+    exit 2
+  fi
+  printf '\nBridgesLLM Portal\n\n' >&"${menu_fd}"
+  if $existing; then
+    printf 'Portal detected at %s\n\n  1) Update Portal\n  2) Repair Portal\n  0) Exit\n\nUpdate and Repair keep your data and leave AI runtimes unchanged.\n' "${PORTAL_DIR}" >&"${menu_fd}"
+  elif $retained; then
+    printf 'Retained Portal data detected at %s\n\n  1) Reinstall Portal (keep data)\n  0) Exit\n\nYour retained data will be verified before reconnecting Portal.\n' "${PORTAL_DIR}" >&"${menu_fd}"
+  else
+    printf 'Portal is not installed.\n\n  1) Install Portal\n  0) Exit\n' >&"${menu_fd}"
+  fi
+  while true; do
+    printf '\nChoose an option [0]: ' >&"${menu_fd}"
+    if ! IFS= read -r choice <&"${menu_fd}"; then choice=0; fi
+    case "${choice}" in
+      0|"") printf 'No changes made.\n' >&"${menu_fd}"; exit 0 ;;
+      1) if $existing; then UPDATE_MODE=true; else INSTALL_MODE=true; fi; break ;;
+      2) if $existing; then FORCE_FRESH=true; break; fi ;;
+    esac
+    printf 'Choose one of the options above.\n' >&"${menu_fd}"
+  done
+  exec {menu_fd}>&-
+}
+
+classify_requested_update_scope() {
+  # Parsing failures run through fail(), whose legacy recovery hooks can touch
+  # OpenClaw and Ollama. main() therefore starts conservatively in Portal-only
+  # mode, parses arguments, then calls this side-effect-free classifier before
+  # any runtime/origin/lock validation. A fresh install or a distinct explicit
+  # operation opts back out; every existing-install update stays isolated.
+  local portal_or_reconnect_footprint=false
+  if [[ -e "${PORTAL_DIR}" || -L "${PORTAL_DIR}" \
+    || -e "${RETAINED_INSTALL_MARKER}" || -L "${RETAINED_INSTALL_MARKER}" \
+    || -e "${RETAINED_INSTALL_MANIFEST}" || -L "${RETAINED_INSTALL_MANIFEST}" ]]; then
+    portal_or_reconnect_footprint=true
+  fi
+  if ${UNINSTALL_MODE} || ${REPAIR_PROJECT_RUNTIME_IMAGE} || ${MAINTAIN_TOOLS}; then
+    PORTAL_ONLY_UPDATE=false
+  elif ${UPDATE_MODE} || ${portal_or_reconnect_footprint}; then
+    PORTAL_ONLY_UPDATE=true
+  else
+    PORTAL_ONLY_UPDATE=false
+  fi
+}
+
+reject_existing_install_host_options() {
+  # This check is intentionally side-effect free and runs immediately after
+  # argument parsing. Do not route it through fail(): fail() owns recovery
+  # behavior that is appropriate only after an operation has begun.
+  ${PORTAL_ONLY_UPDATE} || return 0
+  if ${SKIP_OPENCLAW} || ${SKIP_OLLAMA} || ${SKIP_PROJECT_RUNTIMES}; then
+    printf '%s\n' \
+      'BridgesLLM Portal updates preserve the installed optional-runtime policy. --skip-openclaw, --skip-ollama, and --skip-project-runtimes are fresh-install options; change an existing host only through a separate reviewed maintenance operation.' \
+      >&2
+    exit 2
+  fi
 }
 
 load_existing_origin_for_forced_reinstall() {
@@ -10983,7 +16045,7 @@ validate_selected_origin() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 1: Preflight
+# Fresh-install preflight and host-safety admission
 # ═══════════════════════════════════════════════════════════════
 
 # Retire the one known Portal-created all-images prune job and fail closed on
@@ -10994,13 +16056,16 @@ validate_selected_origin() {
 # The optional root argument is only for isolated installer fixtures.
 converge_unsafe_docker_prune_automation() {
   local host_root="${1:-/}"
+  local mode="${2:-converge}"
+  [[ "${mode}" == "converge" || "${mode}" == "audit" ]] || return 1
   command -v python3 >/dev/null 2>&1 \
     || { warn "Python 3 is required to inspect scheduled Docker cleanup jobs safely."; return 1; }
 
   python3 - \
     "${host_root}" \
     "${LEGACY_DOCKER_PRUNE_CRON_PATH}" \
-    "${LEGACY_DOCKER_PRUNE_QUARANTINE_PATH}" <<'PY2'
+    "${LEGACY_DOCKER_PRUNE_QUARANTINE_PATH}" \
+    "${mode}" <<'PY2'
 import ctypes
 import errno
 import hashlib
@@ -11021,7 +16086,7 @@ SCHEDULER_ENTRY_LIMIT = 16384
 HELPER_CANDIDATE_FILE_LIMIT = 256
 HELPER_CANDIDATE_TOTAL_LIMIT = 4 * 1024 * 1024
 HELPER_CANDIDATE_LINE_LIMIT = 65536
-PORTAL_AUDITED_HELPER_LIMIT = 512 * 1024
+PORTAL_AUDITED_HELPER_LIMIT = 1024 * 1024
 # Exact backup-full.sh payloads retained from installable Portal 4.0 releases.
 # installer/backup-helper-identities.tsv is the append-only, version-labelled
 # source ledger; the release gate validates every historical Git blob and
@@ -11044,6 +16109,20 @@ PORTAL_BACKUP_HELPER_RELEASES = {
     # when this set does not cover the helper the release actually ships.
     (271864, "c68881be5af61d0ba778b37fbea65068f650b74ab96703f15cafe73420b34f6c"),
     (288193, "04309ddec3ab7f2ae5c18d68a6e07b09809924f94a3f77b9694da90aa8c48305"),
+    (371236, "5b0c3e41923833baf5db7606c4fd2fc16fe05cd2d58dddc6af56338c7451e67f"),
+    # A later signed 4.1.0 deployment reached the test lineage with this exact
+    # helper. Keep the collision explicit and narrow; see the fixed-hash
+    # deployment compatibility manifest validated during release builds.
+    (371144, "8be1c4f53250389bc09dbd9168779823f4578a666ab34bbb63c992bd93596079"),
+    (436475, "016be3da966eb544d8209afe432763ebdbb6961fbb09764133b2a4e4f73cc6ee"),
+    (714243, "b1f802b8fef3379d802b3aa9eef5838f9c7cc1dd2b5f69e2ab8c63b78c724713"),
+    (729056, "3d13f0dd64a6de2dd359b9c0714448b28d13c80c19fecab02eb021c4e669f1d6"),
+    (730173, "f996b6a8513654b51958652bd06d5ee6259b5198b5bfaf408ce886cb7df8d63e"),
+    (737779, "a0226d0df19f61e37e672fbff91a3a8256a1c622db238f55de1153bc8af85047"),
+    (738191, "689bdc7842013122f22da4086e233e557500d80b676f0bf14f3823a4a5749888"),
+    (739170, "17a0af67b0c4660a58068de1e6f3b45451e4db062aeb0f7d379cc4ed2704271f"),
+    (739822, "04fa00f98b42c5daf79b7445a964d01d48590d719b45a3e57c6fd606ce52587f"),
+    (733919, "a6a7876adbabbd7b5e6c6c1e7dd42211bc94c31af4eab946ede880983382af34"),
 }
 PORTAL_RUNTIME_REPAIR_LAUNCHER = (
     "/opt/bridgesllm/portal/installer/"
@@ -11064,7 +16143,7 @@ EXEC_KEYS = {
     "ExecStartPre", "ExecStop", "ExecStopPost",
 }
 UNIT_SUFFIXES = {
-    ".automount", ".path", ".scope", ".service", ".slice",
+    ".automount", ".path", ".service", ".slice",
     ".socket", ".swap", ".target", ".timer",
 }
 SHELL_NAMES = {"bash", "dash", "ksh", "sh", "zsh"}
@@ -11083,7 +16162,10 @@ def fail(message):
 
 
 root = os.path.abspath(sys.argv[1])
-source_logical, quarantine_logical = sys.argv[2:4]
+source_logical, quarantine_logical, mode = sys.argv[2:5]
+audit_only = mode == "audit"
+if mode not in {"audit", "converge"}:
+    raise SystemExit(1)
 
 
 def host_path(logical):
@@ -12455,9 +17537,24 @@ def is_unit_name_activation_link(relative, path, metadata):
     return target == f"../{parts[1]}"
 
 
+def is_systemd_scope_artifact(relative):
+    # Scope units only group externally created processes; systemd cannot run
+    # Exec* directives from them. Login scopes disappear during normal SSH
+    # activity. Exclude their definitions/drop-ins before touching metadata,
+    # not by swallowing disappearance errors for executable service units.
+    parts = relative.split(os.sep)
+    return (
+        (len(parts) == 1 and parts[0].endswith(".scope"))
+        or parts[0] == "scope.d"
+        or parts[0].endswith(".scope.d")
+        or (len(parts) == 2 and parts[0].endswith((".wants", ".requires"))
+            and parts[1].endswith(".scope"))
+    )
+
+
 def is_systemd_loadable_directory(relative):
     parts = relative.split(os.sep)
-    return len(parts) == 1 and parts[0].endswith(
+    return not is_systemd_scope_artifact(relative) and len(parts) == 1 and parts[0].endswith(
         (".d", ".wants", ".requires")
     )
 
@@ -12540,6 +17637,8 @@ def collect_systemd_root(logical, resolved_root, entry_budget):
         for entry in entries:
             path = entry.path
             relative = os.path.join(relative_prefix, entry.name) if relative_prefix else entry.name
+            if is_systemd_scope_artifact(relative):
+                continue
             try:
                 entry_metadata = os.lstat(path)
             except OSError as exc:
@@ -14832,7 +19931,14 @@ if source_exists:
             "disable or replace it manually, then retry"
         )
 if quarantine_exists:
-    ensure_quarantine_parent(quarantine)
+    if audit_only:
+        if not attest_secure_directory_chain(os.path.dirname(quarantine)):
+            fail(f"{quarantine_logical} has an unsafe or incomplete parent chain")
+        quarantine_parent = os.lstat(os.path.dirname(quarantine))
+        if stat.S_IMODE(quarantine_parent.st_mode) != 0o700:
+            fail(f"{quarantine_logical} parent must have mode 0700")
+    else:
+        ensure_quarantine_parent(quarantine)
     payload, _ = read_root_file(quarantine, {0o600}, True, True)
     if not is_known_legacy_payload(payload):
         fail(f"{quarantine_logical} is not the known recovery copy; resolve it manually")
@@ -14861,6 +19967,12 @@ if source_exists and quarantine_exists:
         f"both {source_logical} and {quarantine_logical} exist; "
         "verify the recovery copy before removing the active file"
     )
+if audit_only and source_exists:
+    fail(
+        f"{source_logical} is the retired all-images Docker prune job. "
+        "An ordinary Portal update is audit-only and will not move it; run "
+        "a separate reviewed host-maintenance operation, then retry"
+    )
 if source_exists:
     ensure_quarantine_parent(quarantine)
     payload, current = read_root_file(source, {0o644}, True, True)
@@ -14875,18 +19987,19 @@ if source_exists:
 
 if os.path.lexists(source):
     fail(f"{source_logical} still exists after convergence")
-fixture_final_scan_hook(source)
+if not audit_only:
+    fixture_final_scan_hook(source)
 if os.path.lexists(quarantine):
     payload, _ = read_root_file(quarantine, {0o600}, True, True)
     if not is_known_legacy_payload(payload):
         fail(f"{quarantine_logical} failed final attestation")
 if unsafe_jobs(None):
     fail(
-        "an unsafe Docker prune definition appeared during convergence; "
+        "an unsafe Docker prune definition appeared during inspection; "
         "inspect installed scheduler definitions and retry"
     )
 if os.path.lexists(source):
-    fail(f"{source_logical} reappeared during final convergence")
+    fail(f"{source_logical} reappeared during final inspection")
 PY2
 }
 
@@ -14906,7 +20019,6 @@ ensure_media_toolchain() {
 }
 
 preflight() {
-  step_header "Checking system requirements"
   CURRENT_STEP="preflight"
 
   # Root
@@ -14942,7 +20054,6 @@ preflight() {
   local uptime_min
   uptime_min=$(awk '{print int($1/60)}' /proc/uptime 2>/dev/null || echo 9999)
 
-  echo ""
   print_kv "OS" "${OS_ID^} ${OS_VERSION}" "$WHITE"
   print_kv "CPUs" "${cpus}" "$WHITE"
   print_kv "RAM" "${mem_mb} MB" "$WHITE"
@@ -14953,7 +20064,6 @@ preflight() {
     print_kv "Profile" "Server / VPS" "$WHITE"
   fi
   print_kv "Uptime" "${uptime_min} min" "$WHITE"
-  echo ""
 
   if use_local_profile && ! systemd_ready; then
     fail "WSL detected but systemd is not running. Enable systemd for your Ubuntu WSL distro, restart WSL, then rerun the installer. See docs/WINDOWS_WSL_BETA.md"
@@ -15027,7 +20137,7 @@ preflight() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 2: System packages
+# Fresh-install system packages
 # ═══════════════════════════════════════════════════════════════
 
 ensure_remote_desktop_packages() {
@@ -15051,7 +20161,6 @@ ensure_remote_desktop_packages() {
 }
 
 install_system_packages() {
-  step_header "Installing system packages"
   CURRENT_STEP="system packages"
 
   # OpenClaw publishes a disjoint engine range with exact patch floors. Node 23
@@ -15143,12 +20252,15 @@ install_system_packages() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 3: AI tools
+# Fresh-install AI tools and runtimes
 # ═══════════════════════════════════════════════════════════════
 
 install_ai_tools() {
-  step_header "Installing AI tools"
   CURRENT_STEP="AI tools"
+  if ${RETAINED_RECONNECT_MODE}; then
+    info "Keeping the existing AI tools and OpenClaw version during Portal reconnect."
+    return 0
+  fi
 
   # Ollama
   if $SKIP_OLLAMA; then
@@ -15166,16 +20278,7 @@ install_ai_tools() {
     ok "OpenClaw core ${PIN_OPENCLAW_CORE_PACKAGE_VERSION}"
   fi
 
-  # Portal-native provider CLIs are exact-pinned. A failed replacement restores
-  # the previous global npm package rather than leaving a half-updated tool.
-  if ! $SKIP_OPENCLAW && command -v npm &>/dev/null; then
-    converge_pinned_npm_cli "ClawHub" "clawhub" "${PIN_CLAWHUB_VERSION}" "clawhub" "--cli-version" \
-      || warn "ClawHub CLI install failed; Skills marketplace search/install will be unavailable until repaired."
-  fi
-  converge_pinned_npm_cli "Codex CLI" "@openai/codex" "${PIN_CODEX_CLI_VERSION}" "codex" "--version" \
-    || warn "Codex CLI install failed; the native Codex provider will remain unavailable."
-  converge_pinned_npm_cli "Claude Code" "@anthropic-ai/claude-code" "${PIN_CLAUDE_CODE_VERSION}" "claude" "--version" \
-    || warn "Claude Code install failed; the native Claude provider will remain unavailable."
+  info "Codex, Claude Code, and ClawHub will be installed as one exact compatibility bundle during signed runtime admission."
 
   # Configure OpenClaw gateway with the portal's operator token
   if ! $SKIP_OPENCLAW && command -v openclaw &>/dev/null; then
@@ -15232,8 +20335,11 @@ OCEOF
 }
 
 install_native_provider_tools() {
-  step_header "Installing native provider runtimes"
   CURRENT_STEP="native provider runtimes"
+  if ${RETAINED_RECONNECT_MODE}; then
+    info "Keeping the installed native harnesses and their sign-ins during Portal reconnect."
+    return 0
+  fi
 
   if converge_antigravity; then
     ok "Antigravity ${PIN_ANTIGRAVITY_VERSION} (verified)"
@@ -15246,14 +20352,27 @@ install_native_provider_tools() {
   else
     warn "Grok Build could not be installed; its Portal provider will remain unavailable."
   fi
+
+  if converge_opencode; then
+    ok "OpenCode ${PIN_OPENCODE_VERSION} (verified)"
+  else
+    warn "OpenCode could not be installed; its Portal harness will remain unavailable."
+  fi
+
+  if converge_hermes; then
+    ok "Hermes ${PIN_HERMES_VERSION} (verified)"
+  else
+    warn "Hermes could not be installed; its Portal harness will remain unavailable."
+  fi
+
+
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 4: Database
+# Fresh-install database
 # ═══════════════════════════════════════════════════════════════
 
 setup_database() {
-  step_header "Setting up database"
   CURRENT_STEP="database"
   assert_database_process_environment_safe \
     || fail "The installer process environment overrides the attested database runtime. Remove Prisma engine switches, node-postgres PG* fallbacks, NODE_PG_FORCE_NATIVE, and NODE_TLS_REJECT_UNAUTHORIZED before installing."
@@ -15301,7 +20420,7 @@ setup_database() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 5: Build portal
+# Fresh-install Portal runtime
 # ═══════════════════════════════════════════════════════════════
 
 attest_portal_app_sources_root() {
@@ -15387,7 +20506,6 @@ ensure_portal_app_sources_root() {
 }
 
 build_portal() {
-  step_header "Installing portal"
   CURRENT_STEP="portal build"
 
   local pre_overlay_portal_version=""
@@ -15401,7 +20519,9 @@ build_portal() {
   mkdir -p "${INSTALL_ROOT}/assets/avatars" "${INSTALL_ROOT}/assets/branding"
   mkdir -p "${INSTALL_ROOT}/assets/branding"
   mkdir -p "${PORTAL_DIR}/projects" "${PORTAL_DIR}/upload-temp"
-  chmod 755 "${PORTAL_DIR}/projects" "${PORTAL_DIR}/upload-temp"
+  if ! ${RETAINED_RECONNECT_MODE}; then
+    chmod 755 "${PORTAL_DIR}/projects" "${PORTAL_DIR}/upload-temp"
+  fi
 
   # Download or copy portal.
   # Only use the local fallback dir as a SOURCE when it is a different path from
@@ -15480,6 +20600,14 @@ build_portal() {
     SETUP_HANDOFF_TOKEN_HASH="$(read_env_value "${existing_env}" "SETUP_HANDOFF_TOKEN_HASH" || true)"
     SETUP_HANDOFF_ORIGIN="$(read_env_value "${existing_env}" "SETUP_HANDOFF_ORIGIN" || true)"
     SETUP_HANDOFF_EXPIRES_AT="$(read_env_value "${existing_env}" "SETUP_HANDOFF_EXPIRES_AT" || true)"
+  fi
+  # Fresh-install planning now publishes the signed Portal runtime before
+  # host-tool convergence so the durable OpenClaw migration helper exists.
+  # Adopt an existing attested gateway token before sealing Portal's env.
+  if [[ -z "${OPENCLAW_TOKEN}" && -f /root/.openclaw/openclaw.json \
+    && ! -L /root/.openclaw/openclaw.json ]]; then
+    OPENCLAW_TOKEN="$(read_attested_local_openclaw_gateway_token \
+      /root/.openclaw/openclaw.json 2>/dev/null || true)"
   fi
   portal_app_sources_root="$(
     select_portal_app_sources_root "${existing_env}" "${pre_overlay_portal_version}"
@@ -15660,11 +20788,10 @@ ENVEOF
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 6: Configure services
+# Fresh-install service configuration
 # ═══════════════════════════════════════════════════════════════
 
 configure_services() {
-  step_header "Configuring services"
   CURRENT_STEP="service configuration"
 
   $DRY_RUN && { ok "[dry-run] Would create systemd service + Caddy config"; return; }
@@ -15715,38 +20842,37 @@ SVCEOF
   # Install both the system-unit fence and the permanent root user-unit
   # inhibitor even when OpenClaw is deliberately skipped. A later package or
   # legacy user unit must never acquire unfenced gateway authority.
-  install_openclaw_gateway_authorization_fence_dropin \
-    || fail "Could not install the OpenClaw gateway authorization fence."
+  if ! ${RETAINED_RECONNECT_MODE}; then
+    install_openclaw_gateway_authorization_fence_dropin \
+      || fail "Could not install the OpenClaw gateway authorization fence."
+  fi
 
-  # OpenClaw gateway service (if installed)
-  if ! $SKIP_OPENCLAW && command -v openclaw &>/dev/null; then
-    local oc_bin
-    oc_bin="$(which openclaw 2>/dev/null || echo '/usr/bin/openclaw')"
-    cat > /etc/systemd/system/openclaw-gateway.service << OCSVCEOF
-[Unit]
-Description=OpenClaw AI Gateway
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${oc_bin} gateway --port 18789
-Restart=always
-RestartSec=5
-TimeoutStopSec=30
-TimeoutStartSec=30
-SuccessExitStatus=0 143
-KillMode=control-group
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-OCSVCEOF
-    systemctl daemon-reload
-    systemctl enable openclaw-gateway >> "$LOG_FILE" 2>&1 || true
-    ok "OpenClaw gateway service configured"
+  # A kept installation retains its existing gateway service and fences.
+  # Reconnect restores Portal services, not the separately managed AI runtime.
+  if ! ${RETAINED_RECONNECT_MODE} && ! $SKIP_OPENCLAW && command -v openclaw &>/dev/null; then
+    local oc_bin gateway_authority gateway_unit_preexisted
+    oc_bin="$(command -v openclaw 2>/dev/null || true)"
+    [[ "${oc_bin}" == /* && -x "${oc_bin}" ]] \
+      || fail "The exact OpenClaw executable path could not be resolved for its gateway unit."
+    arm_openclaw_gateway_migration_fence \
+      || fail "Could not arm the OpenClaw gateway fence before service publication."
+    provision_openclaw_gateway_service "${oc_bin}" \
+      || fail "The OpenClaw gateway unit could not be transactionally published and attested."
+    gateway_authority="$(openclaw_gateway_provision_authority)" \
+      || fail "The OpenClaw gateway service authority could not be re-read."
+    gateway_unit_preexisted="$(printf '%s' "${gateway_authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (typeof value.unitPreexisted !== "boolean") process.exit(1); process.stdout.write(value.unitPreexisted ? "true" : "false"); }
+  catch (_) { process.exit(1); }
+});
+')" || fail "The OpenClaw gateway service authority is malformed."
+    if [[ "${gateway_unit_preexisted}" == "true" ]]; then
+      ok "Existing OpenClaw gateway service preserved and attested"
+    else
+      [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "gateway-provisioned" ]] \
+        || fail "The new OpenClaw gateway service did not reach its durable provisioned phase."
+      ok "OpenClaw gateway service published and enabled transactionally"
+    fi
   fi
 
   # Firewall
@@ -15770,11 +20896,10 @@ OCSVCEOF
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 7: Remote Desktop
+# Fresh-install Remote Desktop
 # ═══════════════════════════════════════════════════════════════
 
 setup_remote_desktop() {
-  step_header "Setting up Remote Desktop"
   CURRENT_STEP="remote desktop"
 
   $DRY_RUN && { ok "[dry-run] Would configure Remote Desktop"; return; }
@@ -15985,7 +21110,8 @@ ExecStopPost=-/bin/bash -c 'pkill -f "Xtigervnc :1" 2>/dev/null || true'
 Restart=on-failure
 RestartSec=3
 WatchdogSec=45
-TimeoutStartSec=120
+# Cold, loaded hosts must finish the full semantic READY gate before timeout.
+TimeoutStartSec=300
 TimeoutStopSec=20
 KillMode=control-group
 Environment=HOME=/root
@@ -16035,7 +21161,8 @@ After=bridges-rd-xtigervnc.service bridges-rd-websockify.service
 Type=oneshot
 User=root
 ExecStart=${healthcheck}
-TimeoutStartSec=150
+# Includes VNC stop/start and bounded pre/post semantic checks.
+TimeoutStartSec=420
 UMask=0077
 
 HEALTHSVCEOF
@@ -16191,14 +21318,16 @@ PY
   done
 
   local rd_vnc_process
-  rd_vnc_process="$(ps -eo args= | grep '[X]tigervnc :1' | head -n 1 || true)"
+  # procps otherwise truncates args to the terminal width (including COLUMNS
+  # inherited by PTY-driven installers), which can hide trailing policy args.
+  rd_vnc_process="$(ps -eww -o args= | grep '[X]tigervnc :1' | head -n 1 || true)"
   if [[ -z "$rd_vnc_process" || "$rd_vnc_process" != *"-localhost=1"* \
     || "$rd_vnc_process" != *"-auth /home/bridgesrd/.Xauthority"* \
     || " $rd_vnc_process " == *" -ac "* ]]; then
     fail "Remote Desktop VNC process failed the loopback/Xauthority policy check"
   fi
   local rd_websockify_process
-  rd_websockify_process="$(ps -eo user:64=,args= | awk '$1 == "bridgesrd" && $0 ~ /[w]ebsockify 127.0.0.1:6080 127.0.0.1:5901/ { $1=""; sub(/^ +/, ""); print; exit }' || true)"
+  rd_websockify_process="$(ps -eww -o user:64=,args= | awk '$1 == "bridgesrd" && $0 ~ /[w]ebsockify 127.0.0.1:6080 127.0.0.1:5901/ { $1=""; sub(/^ +/, ""); print; exit }' || true)"
   [[ -n "$rd_websockify_process" ]] || fail "Remote Desktop websockify process failed the exact loopback bridge policy check"
 
   local rd_private_state
@@ -16234,7 +21363,7 @@ PY
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 8: Start
+# Portal activation and readiness
 # ═══════════════════════════════════════════════════════════════
 
 ensure_openclaw_gateway_boots_cleanly() {
@@ -16242,16 +21371,14 @@ ensure_openclaw_gateway_boots_cleanly() {
     return 0
   fi
 
-  systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
+  start_openclaw_gateway_with_identity_authority >> "$LOG_FILE" 2>&1 || true
   if wait_for_openclaw_gateway_http_ready 60; then
     return 0
   fi
 
-  warn "OpenClaw gateway did not come up cleanly. Clearing stale gateway processes and retrying once."
-  systemctl stop openclaw-gateway >> "$LOG_FILE" 2>&1 || true
-  pkill -f 'openclaw-gateway|/usr/bin/openclaw gateway|/usr/local/bin/openclaw gateway|openclaw$' >> "$LOG_FILE" 2>&1 || true
+  warn "OpenClaw gateway did not come up cleanly. Restarting the exact admitted unit once."
+  restart_openclaw_gateway_with_identity_authority >> "$LOG_FILE" 2>&1 || true
   sleep 2
-  systemctl start openclaw-gateway >> "$LOG_FILE" 2>&1 || true
   if wait_for_openclaw_gateway_http_ready 60; then
     return 0
   fi
@@ -16266,21 +21393,27 @@ openclaw_cli_version() {
 }
 
 openclaw_gateway_version() {
+  local config_path="${1:-/root/.openclaw/openclaw.json}"
   command -v openclaw >/dev/null 2>&1 || return 1
-  OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --deep --json 2>/dev/null | node -e '
+  run_local_openclaw_gateway_rpc "${config_path}" \
+    call status --json --timeout 10000 \
+    --params '{"includeChannelSummary":false}' 2>/dev/null | node -e '
 let input = "";
 process.stdin.on("data", chunk => input += chunk);
 process.stdin.on("end", () => {
   try {
     const data = JSON.parse(input);
-    const raw = (data.gateway && data.gateway.version) || data.runningVersion || "";
-    const match = String(raw).match(/\d{4}\.\d+\.\d+/);
-    console.log(match ? match[0] : "");
+    if (!data || typeof data !== "object" || Array.isArray(data)) process.exit(1);
+    const raw = data.runtimeVersion;
+    if (typeof raw !== "string") process.exit(1);
+    const match = raw.match(/^([0-9]{4}\.[0-9]+\.[0-9]+)(?:-[0-9]+)?$/);
+    if (!match) process.exit(1);
+    process.stdout.write(`${match[1]}\n`);
   } catch (_) {
-    console.log("");
+    process.exit(1);
   }
-});
-' 2>/dev/null || true
+  });
+' 2>/dev/null
 }
 
 ensure_openclaw_gateway_matches_cli() {
@@ -16296,27 +21429,25 @@ ensure_openclaw_gateway_matches_cli() {
   gateway_version="$(openclaw_gateway_version)"
 
   if [[ -n "${cli_version}" && -n "${gateway_version}" && "${cli_version}" == "${gateway_version}" ]]; then
-    if OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1; then
-      ok "OpenClaw gateway ${gateway_version} matches CLI"
-      return 0
-    fi
-    warn "OpenClaw gateway version matches, but RPC readiness failed. Restarting once."
+    ok "OpenClaw gateway ${gateway_version} matches CLI"
+    return 0
   else
     warn "OpenClaw gateway version mismatch detected (CLI: ${cli_version:-unknown}, gateway: ${gateway_version:-unknown}). Restarting gateway."
   fi
 
-  if ! spin "Restarting OpenClaw gateway for version parity" "systemctl restart openclaw-gateway"; then
+  progress "Restarting OpenClaw gateway for version parity"
+  if ! restart_openclaw_gateway_with_identity_authority >> "$LOG_FILE" 2>&1; then
     warn "OpenClaw gateway restart failed."
     return 1
   fi
+  ok "Restarted OpenClaw gateway for version parity"
 
   local waited=0
   while (( waited < 60 )); do
     if openclaw_gateway_http_ready; then
       cli_version="$(openclaw_cli_version)"
       gateway_version="$(openclaw_gateway_version)"
-      if [[ -n "${cli_version}" && -n "${gateway_version}" && "${cli_version}" == "${gateway_version}" ]] \
-        && OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1; then
+      if [[ -n "${cli_version}" && -n "${gateway_version}" && "${cli_version}" == "${gateway_version}" ]]; then
         ok "OpenClaw gateway ${gateway_version} matches CLI"
         return 0
       fi
@@ -17402,7 +22533,8 @@ provision_project_runtimes() {
   ensure_project_egress_proxy_image "${env_file}"
   ensure_codex_project_sandbox_image "${env_file}"
   ensure_claude_code_project_sandbox_image "${env_file}"
-  ensure_antigravity_project_sandbox_image "${env_file}"
+  # Antigravity Project execution is disabled until native artifact qualification.
+  # Preserve any existing binary/image bytes; backend admission remains fixed closed.
   ensure_ollama_project_sandbox_image "${env_file}"
   ensure_agent_zero_project_sandbox_image "${env_file}"
   ensure_openclaw_sandbox_image "${env_file}"
@@ -17470,7 +22602,10 @@ ensure_project_runtime_confinement_profiles() {
     || fail "Docker does not report seccomp support; Project runtimes remain unavailable."
   [[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true)" == "Y" ]] \
     && apparmor_enabled=true
-  [[ "${docker_security_options}" == *'"name=apparmor"'* ]] \
+  # Docker may append capability metadata, e.g. name=apparmor,profile=default.
+  # Match only the complete capability name, never name=apparmor-like prefixes.
+  [[ "${docker_security_options}" == *'"name=apparmor"'* \
+    || "${docker_security_options}" == *'"name=apparmor,'* ]] \
     && docker_has_apparmor=true
 
   if ${apparmor_enabled} && ${docker_has_apparmor}; then
@@ -17849,11 +22984,11 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 COPY agy /usr/local/bin/agy
 RUN chmod 0755 /usr/local/bin/agy \
-  && AGY_CLI_DISABLE_AUTO_UPDATE=1 agy --version | grep -F "${ANTIGRAVITY_VERSION}" \
+  && AGY_CLI_DISABLE_AUTO_UPDATE=true agy --version | grep -F "${ANTIGRAVITY_VERSION}" \
   && echo "${ANTIGRAVITY_BINARY_SHA256}  /usr/local/bin/agy" | sha256sum --check --status
 RUN mkdir -p /home/project-agent /workspace/project \
   && chown -R 1000:1000 /home/project-agent /workspace
-ENV HOME=/home/project-agent LANG=C.UTF-8 LC_ALL=C.UTF-8 AGY_CLI_DISABLE_AUTO_UPDATE=1 GOOGLE_CLOUD_TELEMETRY_DISABLED=1
+ENV HOME=/home/project-agent LANG=C.UTF-8 LC_ALL=C.UTF-8 AGY_CLI_DISABLE_AUTO_UPDATE=true GOOGLE_CLOUD_TELEMETRY_DISABLED=1
 USER 1000:1000
 WORKDIR /workspace/project
 ENTRYPOINT []
@@ -18071,7 +23206,7 @@ verify_antigravity_project_sandbox_image() {
     --tmpfs /home/project-agent:rw,noexec,nosuid,nodev,size=33554432,uid=1000,gid=1000,mode=0700 \
     --entrypoint sh \
     "${image}" -lc \
-    'test "$(id -u)" = 1000 && test "$(id -g)" = 1000 && test "$(node --version)" = v22.23.1 && AGY_CLI_DISABLE_AUTO_UPDATE=1 agy --version | grep -F "'"${PIN_ANTIGRAVITY_VERSION}"'" >/dev/null && test "$(sha256sum /usr/local/bin/agy | awk '\''{print $1}'\'')" = "'"${binary_fingerprint}"'" && command -v bwrap >/dev/null && command -v socat >/dev/null && command -v python3 >/dev/null && command -v rg >/dev/null && command -v git >/dev/null && command -v curl >/dev/null' \
+    'test "$(id -u)" = 1000 && test "$(id -g)" = 1000 && test "$(node --version)" = v22.23.1 && AGY_CLI_DISABLE_AUTO_UPDATE=true agy --version | grep -F "'"${PIN_ANTIGRAVITY_VERSION}"'" >/dev/null && test "$(sha256sum /usr/local/bin/agy | awk '\''{print $1}'\'')" = "'"${binary_fingerprint}"'" && command -v bwrap >/dev/null && command -v socat >/dev/null && command -v python3 >/dev/null && command -v rg >/dev/null && command -v git >/dev/null && command -v curl >/dev/null' \
     >/dev/null 2>&1
 }
 
@@ -18362,7 +23497,7 @@ ensure_antigravity_project_sandbox_image() {
   [[ -f "${env_file}" && ! -L "${env_file}" ]] \
     || fail "Portal production environment is unavailable for Antigravity Project runtime image attestation."
   if [[ ! -f "${host_binary}" || -L "${host_binary}" || ! -x "${host_binary}" ]] \
-    || [[ "$(AGY_CLI_DISABLE_AUTO_UPDATE=1 "${host_binary}" --version 2>/dev/null | sed -nE 's/.*(^|[^0-9])([0-9]+\.[0-9]+\.[0-9]+)([^0-9].*|$)/\2/p' | head -1)" != "${PIN_ANTIGRAVITY_VERSION}" ]]; then
+    || [[ "$(AGY_CLI_DISABLE_AUTO_UPDATE=true "${host_binary}" --version 2>/dev/null | sed -nE 's/.*(^|[^0-9])([0-9]+\.[0-9]+\.[0-9]+)([^0-9].*|$)/\2/p' | head -1)" != "${PIN_ANTIGRAVITY_VERSION}" ]]; then
     clear_installer_image_id "${env_file}" "ANTIGRAVITY_PROJECT_SANDBOX_IMAGE_ID" \
       || fail "Could not clear the unavailable Antigravity Project runtime image ID."
     warn "Antigravity ${PIN_ANTIGRAVITY_VERSION} is not verified; its Project provider remains unavailable."
@@ -18522,7 +23657,7 @@ ensure_agent_zero_project_sandbox_image() {
     if ! spin "Building Agent Zero Project sandbox image" \
       "docker build --pull --tag '${image}' --network none --build-arg 'PORTAL_RECIPE_SHA256=${recipe_fingerprint}' --build-arg 'A0_BASE_IMAGE=${upstream_ref}' --build-arg 'A0_SOURCE_COMMIT=${AGENT_ZERO_PROJECT_SOURCE_COMMIT}' --build-arg 'A0_UPSTREAM_DIGEST=${upstream_digest}' '${build_dir}'"; then
       rm -rf -- "${build_dir}"
-      fail "Failed to build ${image} from the audited Agent Zero v2.5 source."
+      fail "Failed to build ${image} from the audited Agent Zero v2.10 source."
     fi
     if ! verify_agent_zero_project_sandbox_image \
       "${image}" "${recipe_fingerprint}" "${upstream_digest}" "${AGENT_ZERO_PROJECT_SOURCE_COMMIT}"; then
@@ -19665,6 +24800,14 @@ abort_project_runtime_image_repair_after_commit() {
   trap '' SIGINT TERM HUP
   trap - ERR
   set +e
+  terminal_suspend
+  if ! settle_active_tracked_mutator; then
+    trap - EXIT
+    terminal_final_state "Recovery required" \
+      "The active ${TRACKED_MUTATOR_KIND:-repair} operation could not be proven stopped; repair rollback was not started." \
+      "Do not start another repair. Review the root-only repair log and transaction state."
+    exit 1
+  fi
   if rollback_project_runtime_image_repair; then
     if cleanup_project_runtime_image_repair_transaction; then
       fail "${message} The exact previous environment was restored and Portal is healthy on it."
@@ -19686,6 +24829,14 @@ handle_project_runtime_image_repair_exit() {
   local exit_code="${1:-1}"
   trap - EXIT ERR SIGINT SIGTERM SIGHUP
   set +e
+  terminal_suspend
+  if ! settle_active_tracked_mutator; then
+    terminal_final_state "Recovery required" \
+      "The active ${TRACKED_MUTATOR_KIND:-repair} operation could not be proven stopped; repair rollback was not started." \
+      "Do not start another repair. Review the root-only repair log and transaction state."
+    [[ "${exit_code}" =~ ^[1-9][0-9]*$ ]] || exit_code=1
+    exit "${exit_code}"
+  fi
   settle_project_runtime_image_repair_child >/dev/null 2>&1 || true
   if [[ -n "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR:-}" ]]; then
     if rollback_project_runtime_image_repair; then
@@ -19705,9 +24856,21 @@ handle_project_runtime_image_repair_exit() {
 
 handle_project_runtime_image_repair_signal() {
   local exit_code="$1" label="$2"
+  if tracked_mutator_defer_signal_if_busy \
+      handle_project_runtime_image_repair_signal "${exit_code}" "${label}"; then
+    return 0
+  fi
   trap '' SIGINT TERM HUP
   trap - ERR
   set +e
+  terminal_suspend
+  if ! settle_active_tracked_mutator; then
+    trap - EXIT
+    terminal_final_state "Recovery required" \
+      "The active ${TRACKED_MUTATOR_KIND:-repair} operation could not be proven stopped; repair rollback was not started." \
+      "Do not start another repair. Review the root-only repair log and transaction state."
+    exit "${exit_code}"
+  fi
   settle_project_runtime_image_repair_child >/dev/null 2>&1 || true
   if [[ -n "${PROJECT_RUNTIME_REPAIR_TRANSACTION_DIR:-}" ]] \
     && ! rollback_project_runtime_image_repair; then
@@ -20145,9 +25308,8 @@ prepare_update_project_runtimes() {
     ensure_claude_code_project_sandbox_image \
       "${prepared_env}" \
       "$(update_project_runtime_staging_tag "${transaction_id}" claude)"
-    ensure_antigravity_project_sandbox_image \
-      "${prepared_env}" \
-      "$(update_project_runtime_staging_tag "${transaction_id}" antigravity)"
+    # Antigravity Project execution remains disabled. Do not execute the host
+    # binary or build a candidate image from unqualified bytes.
     ensure_ollama_project_sandbox_image \
       "${prepared_env}" \
       "$(update_project_runtime_staging_tag "${transaction_id}" ollama)"
@@ -20839,8 +26001,499 @@ update_project_runtime_cleanup_policy_for_target() {
     "${stage_dir}" "${transaction_id}"
 }
 
+openclaw_2026_9_1_component_transaction() {
+  local action="$1" component="$2" target="$3"
+  local suffix stock_sha256 bridged_sha256
+  case "${component}" in
+    pendingInput)
+      suffix=".bridgesllm-pending-input-v1.bak"
+      stock_sha256="${OPENCLAW_2026_9_1_RUNS_STOCK_SHA256}"
+      bridged_sha256="${OPENCLAW_2026_9_1_RUNS_BRIDGED_SHA256}"
+      ;;
+    hardDeleteSchema)
+      suffix=".bridgesllm-hard-delete-v1.bak"
+      stock_sha256="${OPENCLAW_2026_9_1_DELETE_SCHEMA_STOCK_SHA256}"
+      bridged_sha256="${OPENCLAW_2026_9_1_DELETE_SCHEMA_BRIDGED_SHA256}"
+      ;;
+    hardDeleteHandler)
+      suffix=".bridgesllm-hard-delete-v1.bak"
+      stock_sha256="${OPENCLAW_2026_9_1_DELETE_HANDLER_STOCK_SHA256}"
+      bridged_sha256="${OPENCLAW_2026_9_1_DELETE_HANDLER_BRIDGED_SHA256}"
+      ;;
+    *) return 1 ;;
+  esac
+  python3 - \
+    "${action}" "${target}" "${suffix}" \
+    "${stock_sha256}" "${bridged_sha256}" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+action = sys.argv[1]
+target = Path(sys.argv[2])
+suffix = sys.argv[3]
+stock_sha256 = sys.argv[4]
+bridged_sha256 = sys.argv[5]
+backup = target.with_name(target.name + suffix)
+
+if action not in {"check", "arm", "rollback", "commit"}:
+    raise SystemExit(1)
+if backup != target.with_name(target.name + suffix):
+    raise SystemExit(1)
+
+def safe_file(path, *, mode=None):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+        and (mode is None or stat.S_IMODE(metadata.st_mode) == mode)
+    )
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def fsync_directory(directory):
+    fd = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def restore_stock_bytes():
+    # Rollback backups are deliberately private 0600 files. Moving one over
+    # the live npm member would silently change the published package mode.
+    # Publish the attested bytes through a same-directory temporary file and
+    # retain the backup until the restored target has been re-verified.
+    backup_fd = os.open(
+        backup,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary = None
+    try:
+        before = os.fstat(backup_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise OSError("unsafe rollback backup descriptor")
+        payload = b""
+        while True:
+            chunk = os.read(backup_fd, 1024 * 1024)
+            if not chunk:
+                break
+            payload += chunk
+        after = os.fstat(backup_fd)
+        if (
+            (before.st_dev, before.st_ino, before.st_ctime_ns, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_ctime_ns, after.st_size)
+            or hashlib.sha256(payload).hexdigest() != stock_sha256
+        ):
+            raise OSError("rollback backup changed during read")
+        temporary_fd, temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.bridgesllm-restore-",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(temporary_fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("short rollback target write")
+                offset += written
+            os.fchmod(temporary_fd, 0o644)
+            os.fchown(temporary_fd, 0, 0)
+            os.fsync(temporary_fd)
+        finally:
+            os.close(temporary_fd)
+        os.replace(temporary, target)
+        temporary = None
+        fsync_directory(target.parent)
+    finally:
+        os.close(backup_fd)
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+try:
+    if not safe_file(target, mode=0o644) or digest(target) != bridged_sha256:
+        raise SystemExit(1)
+    if action == "check":
+        raise SystemExit(0)
+    if not safe_file(backup, mode=0o600) or digest(backup) != stock_sha256:
+        raise SystemExit(1)
+    if action == "arm":
+        raise SystemExit(0)
+    if action == "rollback":
+        restore_stock_bytes()
+        if not safe_file(target, mode=0o644) or digest(target) != stock_sha256:
+            raise SystemExit(1)
+        backup.unlink()
+    else:
+        backup.unlink()
+        if digest(target) != bridged_sha256:
+            raise SystemExit(1)
+    fsync_directory(target.parent)
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+PY
+}
+
+openclaw_2026_9_1_bridge_transaction() {
+  local action="$1" package_dir="$2" target_output=""
+  local -a targets=()
+  target_output="$(
+    resolve_openclaw_2026_9_1_transaction_targets "${package_dir}" 2>/dev/null
+  )" || return 1
+  mapfile -t targets <<< "${target_output}"
+  (( ${#targets[@]} == 3 )) || return 1
+  python3 - \
+    "${action}" \
+    "${package_dir}" \
+    "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+    "${targets[0]}" "${targets[1]}" "${targets[2]}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import sys
+import tempfile
+
+action = sys.argv[1]
+package_root = Path(sys.argv[2]).resolve()
+record = Path(sys.argv[3])
+target_paths = [Path(value).resolve() for value in sys.argv[4:7]]
+journal = package_root / ".bridgesllm-portal-bridge-transaction-v1.json"
+journal_schema = "bridgesllm-openclaw-2026.9.1-portal-bridge-transaction-v1"
+record_schema = "bridgesllm-openclaw-tested-pair-commit-v5"
+specs = [
+    (
+        "pendingInput",
+        "activeRuns",
+        target_paths[0],
+        ".bridgesllm-pending-input-v1.bak",
+        "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359",
+        "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359",
+    ),
+    (
+        "hardDeleteSchema",
+        "deleteSchema",
+        target_paths[1],
+        ".bridgesllm-hard-delete-v1.bak",
+        "c3a060a7deb79384ec1294f6e551cb21c3e3c423ab9ac19ea1985a08334c41a0",
+        "3d1bcd9a9343e3ea3193998f1cb4863470e3dbd19c6d5a89282ff78d9e585cc4",
+    ),
+    (
+        "hardDeleteHandler",
+        "deleteHandler",
+        target_paths[2],
+        ".bridgesllm-hard-delete-v1.bak",
+        "7f60601501c1fe5e018e84c7ef1de2b4522b09f46eaaec98a7076356cde9a352",
+        "58b1845f613261c0451cdbb1ff26c8b9e8f58f96d493183f82920a7cb51dc536",
+    ),
+]
+
+if action not in {"check", "rollback", "commit"}:
+    raise SystemExit(1)
+
+def safe_file(path, *, mode=None):
+    metadata = os.lstat(path)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+        and (mode is None or stat.S_IMODE(metadata.st_mode) == mode)
+    )
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def fsync_directory(directory):
+    fd = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def restore_stock_bytes(target, backup, expected_sha256):
+    backup_fd = os.open(
+        backup,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary = None
+    try:
+        before = os.fstat(backup_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise OSError("unsafe rollback backup descriptor")
+        payload = b""
+        while True:
+            chunk = os.read(backup_fd, 1024 * 1024)
+            if not chunk:
+                break
+            payload += chunk
+        after = os.fstat(backup_fd)
+        if (
+            (before.st_dev, before.st_ino, before.st_ctime_ns, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_ctime_ns, after.st_size)
+            or hashlib.sha256(payload).hexdigest() != expected_sha256
+        ):
+            raise OSError("rollback backup changed during read")
+        temporary_fd, temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.bridgesllm-restore-",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(temporary_fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("short rollback target write")
+                offset += written
+            os.fchmod(temporary_fd, 0o644)
+            os.fchown(temporary_fd, 0, 0)
+            os.fsync(temporary_fd)
+        finally:
+            os.close(temporary_fd)
+        os.replace(temporary, target)
+        temporary = None
+        fsync_directory(target.parent)
+    finally:
+        os.close(backup_fd)
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+def maybe_kill(checkpoint):
+    if (
+        os.environ.get("PORTAL_OPENCLAW_TRANSACTION_TEST_ROOT")
+            == str(package_root)
+        and os.environ.get("PORTAL_OPENCLAW_TRANSACTION_KILL_AT")
+            == checkpoint
+    ):
+        os.kill(os.getpid(), signal.SIGKILL)
+
+def backup_identity(path):
+    metadata = os.lstat(path)
+    return {
+        "path": str(path.resolve()),
+        "sha256": digest(path),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "ctimeNs": metadata.st_ctime_ns,
+        "size": metadata.st_size,
+    }
+
+expected_journal = {
+    "schema": journal_schema,
+    "packageRoot": str(package_root),
+    "targets": [
+        {
+            "id": journal_id,
+            "path": str(target),
+            "stockSha256": stock_hash,
+            "patchedSha256": patched_hash,
+            "backupPath": str(target.with_name(target.name + suffix)),
+            "backupSha256": stock_hash,
+        }
+        for _, journal_id, target, suffix, stock_hash, patched_hash in specs
+    ],
+}
+
+try:
+    package_metadata = os.lstat(package_root)
+    if (
+        not stat.S_ISDIR(package_metadata.st_mode)
+        or stat.S_ISLNK(package_metadata.st_mode)
+        or package_metadata.st_uid != 0
+        or package_metadata.st_gid != 0
+    ):
+        raise OSError("unsafe package root")
+    states = []
+    for component, _, target, suffix, stock_hash, patched_hash in specs:
+        if not safe_file(target, mode=0o644):
+            raise OSError(f"unsafe target: {target}")
+        target_hash = digest(target)
+        if target_hash not in {stock_hash, patched_hash}:
+            raise OSError(f"unattested target bytes: {target}")
+        backup = target.with_name(target.name + suffix)
+        backup_exists = os.path.lexists(backup)
+        if backup_exists and (
+            not safe_file(backup, mode=0o600) or digest(backup) != stock_hash
+        ):
+            raise OSError(f"unsafe rollback backup: {backup}")
+        states.append(
+            (component, target, backup, stock_hash, patched_hash,
+             target_hash, backup_exists)
+        )
+    journal_exists = os.path.lexists(journal)
+    if journal_exists:
+        if not safe_file(journal, mode=0o600):
+            raise OSError("unsafe transaction journal")
+        raw_journal = journal.read_text(encoding="utf-8")
+        journal_value = json.loads(raw_journal)
+        if (
+            journal_value != expected_journal
+            or raw_journal != json.dumps(
+                journal_value, separators=(",", ":")
+            ) + "\n"
+        ):
+            raise OSError("transaction journal binding mismatch")
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+all_stock = all(state[5] == state[3] for state in states)
+all_patched = all(state[5] == state[4] for state in states)
+any_artifact = journal_exists or any(state[6] for state in states)
+
+if action == "check":
+    if not all_patched or not journal_exists or not all(state[6] for state in states):
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+if action == "rollback":
+    # A durable decision must never be second-guessed by byte-state inference.
+    # Its presence requires the commit path, and malformed decisions are left
+    # untouched for operator recovery.
+    if os.path.lexists(record):
+        raise SystemExit(1)
+    if not any_artifact:
+        # A completely artifact-free bridged generation is the retired,
+        # committed steady state. Only a mixed artifact-free generation is
+        # ambiguous.
+        raise SystemExit(0 if (all_stock or all_patched) else 1)
+    for state in states:
+        if state[5] == state[4] and not state[6]:
+            raise SystemExit(1)
+    for component, target, backup, stock_hash, patched_hash, target_hash, _ in reversed(states):
+        if target_hash != patched_hash:
+            continue
+        restore_stock_bytes(target, backup, stock_hash)
+        maybe_kill(f"rollback-{component}")
+        if not safe_file(target, mode=0o644) or digest(target) != stock_hash:
+            raise SystemExit(1)
+    if not all(digest(state[1]) == state[3] for state in states):
+        raise SystemExit(1)
+    for component, _, backup, _, _, _, _ in states:
+        if not os.path.lexists(backup):
+            continue
+        os.unlink(backup)
+        fsync_directory(backup.parent)
+        maybe_kill(f"rollback-cleanup-{component}")
+    if journal_exists:
+        os.unlink(journal)
+        fsync_directory(journal.parent)
+        maybe_kill("rollback-cleanup-journal")
+    raise SystemExit(0)
+
+try:
+    if not all_patched or not safe_file(record, mode=0o600):
+        raise OSError("commit prerequisites are absent")
+    value = json.loads(record.read_text(encoding="utf-8"))
+    if value.get("schema") != record_schema:
+        raise OSError("commit schema mismatch")
+    expected_components = [state[0] for state in states]
+    if value.get("components") != expected_components:
+        raise OSError("commit component set mismatch")
+    for component, target, backup, _, patched_hash, _, backup_exists in states:
+        entry = value.get(component)
+        if (
+            not isinstance(entry, dict)
+            or entry.get("path") != str(target)
+            or entry.get("sha256") != patched_hash
+            or not isinstance(entry.get("backup"), dict)
+        ):
+            raise OSError("commit target binding mismatch")
+        if backup_exists and entry["backup"] != backup_identity(backup):
+            raise OSError("commit backup generation mismatch")
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+for component, _, backup, _, _, _, _ in states:
+    if not os.path.lexists(backup):
+        continue
+    os.unlink(backup)
+    fsync_directory(backup.parent)
+    maybe_kill(f"commit-cleanup-{component}")
+if journal_exists:
+    os.unlink(journal)
+    fsync_directory(journal.parent)
+    maybe_kill("commit-cleanup-journal")
+PY
+}
+
+reconcile_openclaw_2026_9_1_bridge_transaction() {
+  local package_dir="$1"
+  if [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+    || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]]; then
+    openclaw_tested_pair_commit_record_matches_ask_user_transaction "" "" "" \
+      || return 1
+    openclaw_2026_9_1_bridge_transaction commit "${package_dir}"
+  else
+    openclaw_2026_9_1_bridge_transaction rollback "${package_dir}"
+  fi
+}
+
+resolve_openclaw_2026_9_1_pending_contract_group() {
+  local pending_target="$1" package_dir target_output=""
+  local -a targets=()
+  package_dir="$(dirname -- "$(dirname -- "${pending_target}")")"
+  target_output="$(resolve_openclaw_2026_9_1_contract_targets \
+    "${package_dir}" 2>/dev/null)" || return 1
+  mapfile -t targets <<< "${target_output}"
+  (( ${#targets[@]} == 3 )) || return 1
+  [[ "${targets[0]}" == "${pending_target}" \
+    && -n "${targets[1]:-}" && -n "${targets[2]:-}" ]] || return 1
+  printf '%s\n' "${targets[0]}" "${targets[1]}" "${targets[2]}"
+}
+
 resolve_openclaw_pending_input_hotfix_target() {
   local openclaw_dist="$1"
+  if [[ "$(node_package_version_from_dir \
+    "$(dirname -- "${openclaw_dist}")" 2>/dev/null || true)" == "2026.9.1" ]]; then
+    local package_dir target_output=""
+    local -a targets=()
+    package_dir="$(dirname -- "${openclaw_dist}")"
+    target_output="$(resolve_openclaw_2026_9_1_contract_targets \
+      "${package_dir}" 2>/dev/null)" || return 1
+    mapfile -t targets <<< "${target_output}"
+    (( ${#targets[@]} == 3 )) || return 1
+    printf '%s\n' "${targets[0]}"
+    return 0
+  fi
   python3 - "${openclaw_dist}" <<'PY'
 import os
 from pathlib import Path
@@ -20874,6 +26527,10 @@ PY
 
 openclaw_pending_input_hotfix_is_applied() {
   local target="$1"
+  if openclaw_2026_9_1_component_transaction \
+    check pendingInput "${target}" 2>/dev/null; then
+    return 0
+  fi
   python3 - "${target}" <<'PY'
 from pathlib import Path
 import sys
@@ -20890,6 +26547,24 @@ PY
 arm_openclaw_pending_input_hotfix_rollback() {
   local target="$1"
   local backup="${target}.bridgesllm-pending-input-v1.bak"
+  if openclaw_2026_9_1_component_transaction \
+    arm pendingInput "${target}" 2>/dev/null; then
+    local group_output=""
+    local -a group_targets=()
+    group_output="$(resolve_openclaw_2026_9_1_pending_contract_group \
+      "${target}" 2>/dev/null)" || return 1
+    mapfile -t group_targets <<< "${group_output}"
+    (( ${#group_targets[@]} == 3 )) || return 1
+    openclaw_2026_9_1_component_transaction \
+      arm hardDeleteSchema "${group_targets[1]}" 2>/dev/null || return 1
+    openclaw_2026_9_1_component_transaction \
+      arm hardDeleteHandler "${group_targets[2]}" 2>/dev/null || return 1
+    OPENCLAW_PENDING_INPUT_HOTFIX_TARGET="${target}"
+    OPENCLAW_PENDING_INPUT_HOTFIX_BACKUP="${backup}"
+    OPENCLAW_PENDING_INPUT_HOTFIX_APPLIED=true
+    OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED=false
+    return 0
+  fi
   python3 - "${target}" "${backup}" <<'PY'
 import os
 from pathlib import Path
@@ -20955,6 +26630,18 @@ rollback_openclaw_pending_input_hotfix() {
   local target="${OPENCLAW_PENDING_INPUT_HOTFIX_TARGET:-}"
   local backup="${OPENCLAW_PENDING_INPUT_HOTFIX_BACKUP:-}"
   [[ -n "${target}" && -n "${backup}" ]] || return 1
+  if openclaw_2026_9_1_component_transaction \
+    check pendingInput "${target}" 2>/dev/null; then
+    local package_dir
+    package_dir="$(dirname -- "$(dirname -- "${target}")")"
+    openclaw_2026_9_1_bridge_transaction rollback "${package_dir}" \
+      || return 1
+    OPENCLAW_PENDING_INPUT_HOTFIX_APPLIED=false
+    OPENCLAW_PENDING_INPUT_HOTFIX_TARGET=""
+    OPENCLAW_PENDING_INPUT_HOTFIX_BACKUP=""
+    OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED=false
+    return 0
+  fi
   if ! python3 - "${target}" "${backup}" <<'PY'
 import os
 from pathlib import Path
@@ -21031,6 +26718,18 @@ commit_openclaw_pending_input_hotfix() {
   local target="${OPENCLAW_PENDING_INPUT_HOTFIX_TARGET:-}"
   local backup="${OPENCLAW_PENDING_INPUT_HOTFIX_BACKUP:-}"
   [[ -n "${target}" && -n "${backup}" ]] || return 1
+  if openclaw_2026_9_1_component_transaction \
+    check pendingInput "${target}" 2>/dev/null; then
+    local package_dir
+    package_dir="$(dirname -- "$(dirname -- "${target}")")"
+    openclaw_tested_pair_commit_record_matches_ask_user_transaction "" "" "" \
+      || return 1
+    openclaw_2026_9_1_bridge_transaction commit "${package_dir}" \
+      || return 1
+    OPENCLAW_PENDING_INPUT_HOTFIX_BACKUP=""
+    OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED=true
+    return 0
+  fi
   if ! python3 - "${target}" "${backup}" <<'PY'
 import os
 from pathlib import Path
@@ -21099,6 +26798,18 @@ PY
 
 resolve_openclaw_claude_ask_user_hotfix_target() {
   local openclaw_dist="$1"
+  if [[ "$(node_package_version_from_dir \
+    "$(dirname -- "${openclaw_dist}")" 2>/dev/null || true)" == "2026.9.1" ]]; then
+    local package_dir target_output=""
+    local -a targets=()
+    package_dir="$(dirname -- "${openclaw_dist}")"
+    target_output="$(resolve_openclaw_2026_9_1_contract_targets \
+      "${package_dir}" 2>/dev/null)" || return 1
+    mapfile -t targets <<< "${target_output}"
+    # OpenClaw 2026.9.1 uses native question routing and does not mutate its
+    # watchdog defaults. This legacy resolver is intentionally unavailable.
+    return 1
+  fi
   python3 - "${openclaw_dist}" <<'PY'
 import os
 from pathlib import Path
@@ -21143,6 +26854,10 @@ PY
 
 openclaw_claude_ask_user_hotfix_is_applied() {
   local target="$1"
+  if openclaw_2026_9_1_component_transaction \
+    check claudeAskUser "${target}" 2>/dev/null; then
+    return 0
+  fi
   python3 - "${target}" <<'PY'
 from pathlib import Path
 import sys
@@ -21170,6 +26885,15 @@ PY
 prepare_openclaw_claude_ask_user_hotfix_rollback() {
   local target="$1"
   local result backup
+  if openclaw_2026_9_1_component_transaction \
+    arm claudeAskUser "${target}" 2>/dev/null; then
+    backup="${target}.bridgesllm-claude-ask-user-route-v2.bak"
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET="${target}"
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP="${backup}"
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED=true
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=false
+    return 0
+  fi
   if ! result="$(python3 - "${target}" <<'PY'
 import os
 from pathlib import Path
@@ -21337,6 +27061,16 @@ rollback_openclaw_claude_ask_user_hotfix() {
   local target="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET:-}"
   local backup="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP:-}"
   [[ -n "${target}" && -n "${backup}" ]] || return 1
+  if openclaw_2026_9_1_component_transaction \
+    check claudeAskUser "${target}" 2>/dev/null; then
+    openclaw_2026_9_1_component_transaction rollback claudeAskUser "${target}" \
+      || return 1
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_APPLIED=false
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET=""
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP=""
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=false
+    return 0
+  fi
   if ! python3 - "${target}" "${backup}" <<'PY'
 import os
 from pathlib import Path
@@ -21410,6 +27144,14 @@ commit_openclaw_claude_ask_user_hotfix() {
   local backup="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP:-}"
   [[ -n "${target}" && -n "${backup}" ]] || return 1
   openclaw_claude_ask_user_hotfix_is_applied "${target}" || return 1
+  if openclaw_2026_9_1_component_transaction \
+    check claudeAskUser "${target}" 2>/dev/null; then
+    openclaw_2026_9_1_component_transaction commit claudeAskUser "${target}" \
+      || return 1
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_BACKUP=""
+    OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=true
+    return 0
+  fi
   if ! python3 - "${target}" "${backup}" <<'PY'
 import os
 from pathlib import Path
@@ -21463,11 +27205,15 @@ import sys
 record = Path(sys.argv[1])
 component = sys.argv[2]
 target = Path(sys.argv[3])
-if component not in {"claudeAskUser", "pendingInput"}:
+if component not in {
+    "claudeAskUser", "pendingInput", "hardDeleteSchema", "hardDeleteHandler"
+}:
     raise SystemExit(1)
 backup_suffix = {
     "pendingInput": ".bridgesllm-pending-input-v1.bak",
     "claudeAskUser": ".bridgesllm-claude-ask-user-route-v2.bak",
+    "hardDeleteSchema": ".bridgesllm-hard-delete-v1.bak",
+    "hardDeleteHandler": ".bridgesllm-hard-delete-v1.bak",
 }[component]
 backup = target.with_name(target.name + backup_suffix)
 
@@ -21514,7 +27260,8 @@ if not isinstance(value, dict):
     raise SystemExit(1)
 entry = value.get(component)
 if (
-    value.get("schema") != "bridgesllm-openclaw-tested-pair-commit-v3"
+    value.get("schema") != "bridgesllm-openclaw-tested-pair-commit-v5"
+    or component not in value.get("components", [])
     or not isinstance(entry, dict)
     or entry.get("path") != str(target.resolve())
     or entry.get("sha256") != hashlib.sha256(target_bytes).hexdigest()
@@ -21525,9 +27272,10 @@ PY
 }
 
 openclaw_tested_pair_commit_record_matches_ask_user_transaction() {
-  local transaction_dir="$1" target_dir="$2" config_path="$3"
+  local transaction_dir="${1:-}" target_dir="${2:-}" config_path="${3:-}"
   local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"
-  python3 - \
+  local validation_kind="" validation_status=0
+  validation_kind="$(python3 - \
     "${record}" \
     "${transaction_dir}" \
     "${target_dir}" \
@@ -21540,10 +27288,9 @@ import stat
 import sys
 
 record = Path(sys.argv[1]).absolute()
-transaction = Path(sys.argv[2]).absolute()
-target = Path(sys.argv[3]).absolute()
-config = Path(sys.argv[4]).absolute()
-manifest = transaction / "manifest.json"
+requested_transaction = sys.argv[2]
+requested_target = sys.argv[3]
+requested_config = sys.argv[4]
 
 def safe_file(path):
     metadata = os.lstat(path)
@@ -21564,6 +27311,17 @@ def safe_directory(path):
         and metadata.st_gid == 0
     )
 
+def backup_identity(path):
+    metadata = os.lstat(path)
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "ctimeNs": metadata.st_ctime_ns,
+        "size": metadata.st_size,
+    }
+
 def tree_digest(root):
     digest = hashlib.sha256()
     for path in [root, *sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root)))]:
@@ -21581,50 +27339,181 @@ def tree_digest(root):
     return digest.hexdigest()
 
 try:
+    if not safe_file(record) or stat.S_IMODE(os.lstat(record).st_mode) != 0o600:
+        raise OSError("unsafe tested-pair decision")
+    raw_record = record.read_text(encoding="utf-8")
+    value = json.loads(raw_record)
+    if raw_record != json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n":
+        raise OSError("non-canonical tested-pair decision")
+    components = value.get("components")
+    if components not in (
+        ["pendingInput", "claudeAskUser"],
+        ["pendingInput", "hardDeleteSchema", "hardDeleteHandler"],
+    ):
+        raise OSError("unexpected tested-pair component set")
+    suffixes = {
+        "pendingInput": ".bridgesllm-pending-input-v1.bak",
+        "claudeAskUser": ".bridgesllm-claude-ask-user-route-v2.bak",
+        "hardDeleteSchema": ".bridgesllm-hard-delete-v1.bak",
+        "hardDeleteHandler": ".bridgesllm-hard-delete-v1.bak",
+    }
+    exact_9_1 = {
+        "pendingInput": (
+            "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359",
+            "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359",
+        ),
+        "hardDeleteSchema": (
+            "3d1bcd9a9343e3ea3193998f1cb4863470e3dbd19c6d5a89282ff78d9e585cc4",
+            "c3a060a7deb79384ec1294f6e551cb21c3e3c423ab9ac19ea1985a08334c41a0",
+        ),
+        "hardDeleteHandler": (
+            "58b1845f613261c0451cdbb1ff26c8b9e8f58f96d493183f82920a7cb51dc536",
+            "7f60601501c1fe5e018e84c7ef1de2b4522b09f46eaaec98a7076356cde9a352",
+        ),
+    }
+    for component in components:
+        entry = value.get(component)
+        if not isinstance(entry, dict) or not isinstance(entry.get("backup"), dict):
+            raise OSError("missing tested-pair component binding")
+        component_target = Path(entry.get("path", "")).absolute()
+        component_backup = component_target.with_name(
+            component_target.name + suffixes[component]
+        )
+        if (
+            entry.get("path") != str(component_target)
+            or not safe_file(component_target)
+            or entry.get("sha256")
+                != hashlib.sha256(component_target.read_bytes()).hexdigest()
+            or entry["backup"].get("path") != str(component_backup)
+        ):
+            raise OSError("tested-pair target binding mismatch")
+        backup_binding = entry["backup"]
+        if (
+            not isinstance(backup_binding.get("sha256"), str)
+            or len(backup_binding["sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in backup_binding["sha256"])
+            or any(
+                not isinstance(backup_binding.get(field), int)
+                or backup_binding[field] < 0
+                for field in ("device", "inode", "ctimeNs", "size")
+            )
+        ):
+            raise OSError("malformed tested-pair backup binding")
+        if components == [
+            "pendingInput", "hardDeleteSchema", "hardDeleteHandler"
+        ] and (
+            entry.get("sha256") != exact_9_1[component][0]
+            or backup_binding.get("sha256") != exact_9_1[component][1]
+        ):
+            raise OSError("tested-pair 9.1 hash binding mismatch")
+        if os.path.lexists(component_backup):
+            if (
+                not safe_file(component_backup)
+                or stat.S_IMODE(os.lstat(component_backup).st_mode) != 0o600
+                or entry["backup"] != backup_identity(component_backup)
+            ):
+                raise OSError("tested-pair backup generation mismatch")
+    ask_user = value.get("askUser")
+    if not isinstance(ask_user, dict):
+        raise OSError("missing ask-user binding")
+    migration = value.get("migration")
+    if components == [
+        "pendingInput", "hardDeleteSchema", "hardDeleteHandler"
+    ]:
+        if not isinstance(migration, dict):
+            raise OSError("missing migration transaction binding")
+    elif migration is not None:
+        raise OSError("unexpected migration transaction binding")
+    transaction = Path(ask_user.get("transactionPath", "")).absolute()
+    target = Path(ask_user.get("pluginPath", "")).absolute()
+    config = Path(ask_user.get("configPath", "")).absolute()
+    manifest = transaction / "manifest.json"
     if (
-        not safe_file(record)
-        or stat.S_IMODE(os.lstat(record).st_mode) != 0o600
-        or not safe_directory(transaction)
+        (requested_transaction and Path(requested_transaction).absolute() != transaction)
+        or (requested_target and Path(requested_target).absolute() != target)
+        or (requested_config and Path(requested_config).absolute() != config)
         or not safe_directory(target)
         or not safe_file(config)
         or stat.S_IMODE(os.lstat(config).st_mode) != 0o600
-        or not safe_file(manifest)
+        or ask_user.get("pluginTreeSha256") != tree_digest(target)
+        or ask_user.get("configSha256")
+            != hashlib.sha256(config.read_bytes()).hexdigest()
     ):
-        raise OSError("unsafe ask-user commit artifacts")
-    value = json.loads(record.read_text(encoding="utf-8"))
-    ask_user = value.get("askUser")
-    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+        raise OSError("ask-user live binding mismatch")
+    manifest_value = None
+    if os.path.lexists(transaction):
+        if not safe_directory(transaction) or not safe_file(manifest):
+            raise OSError("unsafe ask-user rollback transaction")
+        manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError):
     raise SystemExit(1)
 if (
-    value.get("schema") != "bridgesllm-openclaw-tested-pair-commit-v3"
-    or not isinstance(ask_user, dict)
-    or manifest_value.get("schema") != "bridgesllm-ask-user-tested-pair-v1"
-    or Path(manifest_value.get("targetDir", "")).absolute() != target
-    or Path(manifest_value.get("configPath", "")).absolute() != config
+    value.get("schema") != "bridgesllm-openclaw-tested-pair-commit-v5"
     or ask_user.get("transactionPath") != str(transaction)
-    or ask_user.get("transactionManifestSha256")
-        != hashlib.sha256(manifest.read_bytes()).hexdigest()
     or ask_user.get("pluginPath") != str(target)
-    or ask_user.get("pluginTreeSha256") != tree_digest(target)
     or ask_user.get("configPath") != str(config)
-    or ask_user.get("configSha256") != hashlib.sha256(config.read_bytes()).hexdigest()
 ):
     raise SystemExit(1)
+if manifest_value is not None and (
+    manifest_value.get("schema") != "bridgesllm-ask-user-tested-pair-v1"
+    or Path(manifest_value.get("targetDir", "")).absolute() != target
+    or Path(manifest_value.get("configPath", "")).absolute() != config
+    or ask_user.get("transactionManifestSha256")
+        != hashlib.sha256(manifest.read_bytes()).hexdigest()
+):
+    raise SystemExit(1)
+print("migration" if migration is not None else "legacy")
 PY
+  )" || validation_status=$?
+  (( validation_status == 0 )) || return "${validation_status}"
+  case "${validation_kind}" in
+    legacy) ;;
+    migration) openclaw_migration_transaction_matches_decision || return 1 ;;
+    *) return 1 ;;
+  esac
+  if [[ -d "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+    && ! -L "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" ]]; then
+    native_cli_bundle_matches_tested_pair_decision
+  else
+    python3 - "${record}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+try:
+    value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if value.get("nativeCliBundle") is None else 1)
+PY
+  fi
 }
 
 write_openclaw_tested_pair_commit_record() {
-  local pending_target="$1" claude_target="$2"
-  local ask_user_transaction="$3" ask_user_target="$4" ask_user_config="$5"
-  local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"
+  local pending_target="$1" second_target="$2" third_target="${3:-}"
+  local ask_user_transaction="$4" ask_user_target="$5" ask_user_config="$6"
+  local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" migration_binding="null"
+  local native_cli_binding="null"
+  if [[ -n "${third_target}" ]]; then
+    migration_binding="$(run_openclaw_migration_transaction_tool binding \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      2>> "${LOG_FILE}")" || return 1
+  fi
+  if [[ -d "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+    && ! -L "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" ]]; then
+    native_cli_binding="$(native_cli_bundle_binding 2>> "${LOG_FILE}")" \
+      || return 1
+  fi
   python3 - \
     "${record}" \
     "${pending_target}" \
-    "${claude_target}" \
+    "${second_target}" \
+    "${third_target}" \
     "${ask_user_transaction}" \
     "${ask_user_target}" \
-    "${ask_user_config}" <<'PY'
+    "${ask_user_config}" \
+    "${migration_binding}" \
+    "${native_cli_binding}" <<'PY'
 import hashlib
 import json
 import os
@@ -21635,26 +27524,41 @@ import tempfile
 
 record = Path(sys.argv[1])
 pending_target = Path(sys.argv[2])
-claude_target = Path(sys.argv[3])
-ask_user_transaction = Path(sys.argv[4]).absolute()
-ask_user_target = Path(sys.argv[5]).absolute()
-ask_user_config = Path(sys.argv[6]).absolute()
+second_target = Path(sys.argv[3])
+third_target_value = sys.argv[4]
+ask_user_transaction = Path(sys.argv[5]).absolute()
+ask_user_target = Path(sys.argv[6]).absolute()
+ask_user_config = Path(sys.argv[7]).absolute()
+migration_binding = json.loads(sys.argv[8])
+native_cli_binding = json.loads(sys.argv[9])
 ask_user_manifest = ask_user_transaction / "manifest.json"
 parent = record.parent
-backup_specs = {
-    "pendingInput": (
+backup_specs = [
+    ("pendingInput",
         pending_target,
         pending_target.with_name(
             pending_target.name + ".bridgesllm-pending-input-v1.bak"
         ),
     ),
-    "claudeAskUser": (
-        claude_target,
-        claude_target.with_name(
-            claude_target.name + ".bridgesllm-claude-ask-user-route-v2.bak"
+]
+if third_target_value:
+    third_target = Path(third_target_value)
+    backup_specs.extend([
+        ("hardDeleteSchema", second_target, second_target.with_name(
+            second_target.name + ".bridgesllm-hard-delete-v1.bak"
+        )),
+        ("hardDeleteHandler", third_target, third_target.with_name(
+            third_target.name + ".bridgesllm-hard-delete-v1.bak"
+        )),
+    ])
+else:
+    backup_specs.append((
+        "claudeAskUser",
+        second_target,
+        second_target.with_name(
+            second_target.name + ".bridgesllm-claude-ask-user-route-v2.bak"
         ),
-    ),
-}
+    ))
 
 def safe_file(path):
     metadata = os.lstat(path)
@@ -21692,23 +27596,24 @@ def tree_digest(root):
     return digest.hexdigest()
 
 def component_entry(target, backup):
+    if (
+        not safe_file(backup)
+        or stat.S_IMODE(os.lstat(backup).st_mode) != 0o600
+    ):
+        raise OSError(f"unsafe or absent tested-pair backup: {backup}")
+    metadata = os.lstat(backup)
     entry = {
         "path": str(target.resolve()),
         "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-        "backup": None,
-    }
-    if os.path.lexists(backup):
-        if not safe_file(backup):
-            raise OSError(f"unsafe tested-pair backup: {backup}")
-        metadata = os.lstat(backup)
-        entry["backup"] = {
+        "backup": {
             "path": str(backup.resolve()),
             "sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
             "device": metadata.st_dev,
             "inode": metadata.st_ino,
             "ctimeNs": metadata.st_ctime_ns,
             "size": metadata.st_size,
-        }
+        },
+    }
     return entry
 
 try:
@@ -21720,7 +27625,7 @@ try:
         or parent_stat.st_gid != 0
     ):
         raise SystemExit(1)
-    for target in (pending_target, claude_target):
+    for _, target, _ in backup_specs:
         if not safe_file(target):
             raise SystemExit(1)
     if (
@@ -21743,13 +27648,14 @@ try:
             != ask_user_config
     ):
         raise SystemExit(1)
-    if os.path.lexists(record) and not safe_file(record):
+    if os.path.lexists(record):
         raise SystemExit(1)
     value = {
-        "schema": "bridgesllm-openclaw-tested-pair-commit-v3",
+        "schema": "bridgesllm-openclaw-tested-pair-commit-v5",
+        "components": [component for component, _, _ in backup_specs],
         **{
             component: component_entry(target, backup)
-            for component, (target, backup) in backup_specs.items()
+            for component, target, backup in backup_specs
         },
         "askUser": {
             "transactionPath": str(ask_user_transaction),
@@ -21761,7 +27667,20 @@ try:
             "configPath": str(ask_user_config),
             "configSha256": hashlib.sha256(ask_user_config.read_bytes()).hexdigest(),
         },
+        "migration": migration_binding,
+        "nativeCliBundle": native_cli_binding,
     }
+    if third_target_value:
+        if not isinstance(migration_binding, dict):
+            raise SystemExit(1)
+    elif migration_binding is not None:
+        raise SystemExit(1)
+    if native_cli_binding is not None and (
+        not isinstance(native_cli_binding, dict)
+        or native_cli_binding.get("schema")
+            != "bridgesllm-native-cli-bundle-binding-v1"
+    ):
+        raise SystemExit(1)
 except (OSError, UnicodeError, json.JSONDecodeError):
     raise SystemExit(1)
 
@@ -21798,42 +27717,35 @@ PY
 }
 
 retire_openclaw_tested_pair_commit_record_if_clean() {
-  local pending_target="$1" claude_target="$2" ask_user_transaction="$3"
   local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"
-  python3 - \
-    "${record}" \
-    "${pending_target}" \
-    "${claude_target}" \
-    "${ask_user_transaction}" <<'PY'
+  [[ -e "${record}" || -L "${record}" ]] || return 0
+  openclaw_tested_pair_commit_record_matches_ask_user_transaction "" "" "" \
+    || return 1
+  python3 - "${record}" <<'PY'
+import json
 import os
 from pathlib import Path
 import stat
 import sys
 
 record = Path(sys.argv[1])
-pending_target = Path(sys.argv[2])
-claude_target = Path(sys.argv[3])
-ask_user_transaction = Path(sys.argv[4])
-backups = (
-    pending_target.with_name(
-        pending_target.name + ".bridgesllm-pending-input-v1.bak"
-    ),
-    claude_target.with_name(
-        claude_target.name + ".bridgesllm-claude-ask-user-route-v2.bak"
-    ),
-)
-if any(os.path.lexists(path) for path in backups) or os.path.lexists(ask_user_transaction):
-    raise SystemExit(0)
-if not os.path.lexists(record):
-    raise SystemExit(0)
 try:
+    value = json.loads(record.read_text(encoding="utf-8"))
+    components = value["components"]
+    backups = tuple(Path(value[component]["backup"]["path"]) for component in components)
+    ask_user_transaction = Path(value["askUser"]["transactionPath"])
+    journals = ()
+    if components == ["pendingInput", "hardDeleteSchema", "hardDeleteHandler"]:
+        package_root = Path(value["pendingInput"]["path"]).parent.parent
+        journals = (package_root / ".bridgesllm-portal-bridge-transaction-v1.json",)
+    artifacts = (*backups, ask_user_transaction, *journals)
+    if any(os.path.lexists(path) for path in artifacts):
+        raise SystemExit(0)
     # A cleanup helper can unlink successfully and still fail its directory
     # fsync. Re-prove durable absence in every artifact directory before
     # retiring the only record that authorizes a backup which could reappear
     # after power loss.
-    artifact_parents = {
-        path.parent.resolve() for path in (*backups, ask_user_transaction)
-    }
+    artifact_parents = {path.parent.resolve() for path in artifacts}
     for directory in artifact_parents:
         directory_metadata = os.lstat(directory)
         if (
@@ -21864,40 +27776,183 @@ try:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-except OSError:
+except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
     raise SystemExit(1)
 PY
+}
+
+openclaw_2026_9_1_stock_contract_verifier() {
+  local verifier="${PORTAL_DIR}/installer/verify-openclaw-2026.9.1-stock-contract.mjs"
+  local owner mode
+  [[ -f "${verifier}" && ! -L "${verifier}" ]] || return 1
+  owner="$(stat -c '%u:%g' -- "${verifier}" 2>/dev/null)" || return 1
+  mode="$(stat -c '%a' -- "${verifier}" 2>/dev/null)" || return 1
+  [[ "${owner}" == "0:0" && "${mode}" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#${mode} & 022) == 0 )) || return 1
+  printf '%s\n' "${verifier}"
+}
+
+verify_openclaw_2026_9_1_stock_core_contract() {
+  local core_dir="$1" verifier
+  verifier="$(openclaw_2026_9_1_stock_contract_verifier || true)"
+  [[ -n "${verifier}" ]] || return 1
+  PORTAL_EXPECTED_OPENCLAW_CORE_COMMIT="${PIN_OPENCLAW_CORE_COMMIT}" \
+    node "${verifier}" core "${core_dir}" >> "${LOG_FILE}" 2>&1
+}
+
+verify_openclaw_2026_9_1_stock_pair_contract() {
+  local core_dir="$1" codex_dir="$2" verifier
+  verifier="$(openclaw_2026_9_1_stock_contract_verifier || true)"
+  [[ -n "${verifier}" ]] || return 1
+  PORTAL_EXPECTED_OPENCLAW_CORE_COMMIT="${PIN_OPENCLAW_CORE_COMMIT}" \
+    node "${verifier}" pair "${core_dir}" "${codex_dir}" \
+      >> "${LOG_FILE}" 2>&1
+}
+
+verify_openclaw_2026_9_1_bridged_core_contract() {
+  local core_dir="$1" verifier
+  verifier="$(openclaw_2026_9_1_stock_contract_verifier || true)"
+  [[ -n "${verifier}" ]] || return 1
+  PORTAL_EXPECTED_OPENCLAW_CORE_COMMIT="${PIN_OPENCLAW_CORE_COMMIT}" \
+    node "${verifier}" bridged-core "${core_dir}" >> "${LOG_FILE}" 2>&1
+}
+
+verify_openclaw_2026_9_1_bridged_pair_contract() {
+  local core_dir="$1" codex_dir="$2" verifier
+  verifier="$(openclaw_2026_9_1_stock_contract_verifier || true)"
+  [[ -n "${verifier}" ]] || return 1
+  PORTAL_EXPECTED_OPENCLAW_CORE_COMMIT="${PIN_OPENCLAW_CORE_COMMIT}" \
+    node "${verifier}" bridged-pair "${core_dir}" "${codex_dir}" \
+      >> "${LOG_FILE}" 2>&1
+}
+
+resolve_openclaw_2026_9_1_stock_commit_targets() {
+  local core_dir="$1" verifier
+  verifier="$(openclaw_2026_9_1_stock_contract_verifier || true)"
+  [[ -n "${verifier}" ]] || return 1
+  PORTAL_EXPECTED_OPENCLAW_CORE_COMMIT="${PIN_OPENCLAW_CORE_COMMIT}" \
+    node "${verifier}" commit-targets "${core_dir}"
+}
+
+resolve_openclaw_2026_9_1_contract_targets() {
+  local core_dir="$1" verifier
+  verifier="$(openclaw_2026_9_1_stock_contract_verifier || true)"
+  [[ -n "${verifier}" ]] || return 1
+  if PORTAL_EXPECTED_OPENCLAW_CORE_COMMIT="${PIN_OPENCLAW_CORE_COMMIT}" \
+    node "${verifier}" bridged-targets "${core_dir}" 2>/dev/null; then
+    return 0
+  fi
+  PORTAL_EXPECTED_OPENCLAW_CORE_COMMIT="${PIN_OPENCLAW_CORE_COMMIT}" \
+    node "${verifier}" commit-targets "${core_dir}"
+}
+
+resolve_openclaw_2026_9_1_transaction_targets() {
+  local core_dir="$1" verifier
+  verifier="$(openclaw_2026_9_1_stock_contract_verifier || true)"
+  [[ -n "${verifier}" ]] || return 1
+  PORTAL_EXPECTED_OPENCLAW_CORE_COMMIT="${PIN_OPENCLAW_CORE_COMMIT}" \
+    node "${verifier}" targets "${core_dir}"
 }
 
 auto_apply_openclaw_compatibility_hotfix() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
   fi
-  if ! $OPENCLAW_ASK_USER_BASE_ATTESTED; then
-    fail "Native Claude questions may only be suppressed after the replacement ask-user tool and all settlement methods pass live base probes."
-  fi
 
   local hotfix_script="${PORTAL_DIR}/scripts/patch-openclaw-long-run-relay-hotfix.sh"
   local pending_input_hotfix_script="${PORTAL_DIR}/scripts/patch-openclaw-codex-pending-input-hotfix.sh"
   local openclaw_package_dir openclaw_dist pending_input_target
   local claude_ask_user_target
+  local stock_target_output=""
+  local -a stock_targets=()
   local pending_input_backup pending_input_hotfix_status=0
   local pending_input_hotfix_preexisted=false
+  local openclaw_9_1_stock=false openclaw_9_1_bridged=false
   openclaw_package_dir="$(openclaw_core_package_dir || true)"
   openclaw_dist="${openclaw_package_dir}/dist"
-
-  if [[ ! -f "${hotfix_script}" ]]; then
-    fail "Bundled OpenClaw compatibility hotfix script is missing; refusing to start the tested runtime without its required compatibility markers."
-  fi
-  if [[ ! -f "${pending_input_hotfix_script}" ]]; then
-    fail "Bundled OpenClaw native pending-input hotfix is missing; refusing to start a runtime that cannot attest exact Codex request identity."
-  fi
 
   if [[ -z "${openclaw_package_dir}" \
     || "$(node_package_name_from_dir "${openclaw_package_dir}" || true)" != "openclaw" \
     || "$(node_package_version_from_dir "${openclaw_package_dir}" || true)" != "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" \
     || ! -d "${openclaw_dist}" ]]; then
     fail "Could not resolve the exact OpenClaw ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} package directory for required compatibility preparation."
+  fi
+
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+    if ! stock_target_output="$(resolve_openclaw_2026_9_1_transaction_targets \
+      "${openclaw_package_dir}" 2>> "${LOG_FILE}")"; then
+      fail "Could not resolve the exact OpenClaw 2026.9.1 Portal-bridge transaction targets."
+    fi
+    mapfile -t stock_targets <<< "${stock_target_output}"
+    if (( ${#stock_targets[@]} != 3 )) \
+      || [[ -z "${stock_targets[0]:-}" || -z "${stock_targets[1]:-}" \
+        || -z "${stock_targets[2]:-}" ]]; then
+      fail "OpenClaw 2026.9.1 Portal-bridge target resolution was ambiguous."
+    fi
+    pending_input_target="${stock_targets[0]}"
+
+    # Reconcile before requiring a uniform verifier state. A killed patch or
+    # cleanup may legitimately leave exact mixed bytes. With no decision they
+    # roll back to all-stock; with the one v4 decision they roll forward only
+    # after all three binary bindings and the ask-user binding revalidate.
+    reconcile_openclaw_2026_9_1_bridge_transaction \
+      "${openclaw_package_dir}" \
+      || fail "OpenClaw 2026.9.1 has an ambiguous or malformed Portal-bridge transaction; no recovery artifact was changed."
+
+    if verify_openclaw_2026_9_1_stock_core_contract \
+      "${openclaw_package_dir}"; then
+      openclaw_9_1_stock=true
+    elif verify_openclaw_2026_9_1_bridged_core_contract \
+      "${openclaw_package_dir}"; then
+      openclaw_9_1_bridged=true
+    else
+      fail "OpenClaw 2026.9.1 is neither the attested stock package nor the exact Portal bridge generation."
+    fi
+
+    if ${openclaw_9_1_bridged}; then
+      if ! retire_openclaw_tested_pair_commit_record_if_clean; then
+        fail "Could not safely retire the completed OpenClaw tested-pair commit record."
+      fi
+      ok "OpenClaw 2026.9.1 Portal bridge contracts verified"
+      return 0
+    fi
+
+    if [[ ! -f "${hotfix_script}" || -L "${hotfix_script}" ]]; then
+      fail "Bundled OpenClaw 2026.9.1 Portal-contract patcher is missing or unsafe."
+    fi
+    chmod 755 "${hotfix_script}" 2>/dev/null || true
+    info "Applying the attested OpenClaw 2026.9.1 Portal bridge..."
+    if ! run_openclaw_compatibility_hotfix \
+      "${hotfix_script}" "${openclaw_dist}"; then
+      fail "OpenClaw 2026.9.1 Portal bridge failed closed; package rollback remains armed."
+    fi
+    verify_openclaw_2026_9_1_bridged_core_contract \
+      "${openclaw_package_dir}" \
+      || fail "OpenClaw 2026.9.1 Portal bridge bytes did not match the attested generation."
+    arm_openclaw_pending_input_hotfix_rollback "${pending_input_target}" \
+      || fail "Could not arm exact-run bridge rollback after patching."
+    if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
+      progress "Restarting OpenClaw gateway after 9.1 Portal bridge"
+      if ! restart_openclaw_gateway_with_identity_authority \
+        >> "$LOG_FILE" 2>&1; then
+        fail "OpenClaw gateway restart after 9.1 Portal bridge failed."
+      fi
+      ok "Restarted OpenClaw gateway after 9.1 Portal bridge"
+      sleep 3
+    fi
+    ok "OpenClaw 2026.9.1 Portal bridge applied transactionally"
+    return 0
+  fi
+
+  if ! $OPENCLAW_ASK_USER_BASE_ATTESTED; then
+    fail "Native Claude questions may only be suppressed after the replacement ask-user tool and all settlement methods pass live base probes."
+  fi
+
+  if [[ ! -f "${hotfix_script}" ]]; then
+    fail "Bundled OpenClaw compatibility hotfix script is missing; refusing to start the tested runtime without its required compatibility markers."
+  fi
+  if [[ ! -f "${pending_input_hotfix_script}" ]]; then
+    fail "Bundled OpenClaw native pending-input hotfix is missing; refusing to start a runtime that cannot attest exact Codex request identity."
   fi
 
   claude_ask_user_target="$(
@@ -21994,9 +28049,12 @@ auto_apply_openclaw_compatibility_hotfix() {
   # before this function was allowed to patch native Claude routing. Restart
   # now so no running gateway can retain a half-old compatibility generation.
   if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
-    if ! spin "Restarting OpenClaw gateway after compatibility hotfix" "systemctl restart openclaw-gateway"; then
+    progress "Restarting OpenClaw gateway after compatibility hotfix"
+    if ! restart_openclaw_gateway_with_identity_authority \
+      >> "$LOG_FILE" 2>&1; then
       fail "OpenClaw gateway restart after required compatibility preparation failed."
     fi
+    ok "Restarted OpenClaw gateway after compatibility hotfix"
     sleep 3
   fi
 
@@ -22093,17 +28151,22 @@ openclaw_codex_plugin_package_dir() {
 }
 
 openclaw_codex_plugin_details() {
-  local inspect_json list_json presence
-  inspect_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect codex --json 2>>"${LOG_FILE}" || true)"
-  if [[ -n "${inspect_json}" ]] && printf '%s' "${inspect_json}" | node -e '
+  local inspect_json="" inspect_status=0 list_json="" list_status=0
+  local core_dir database
+  inspect_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect codex --json \
+    2>>"${LOG_FILE}")" || inspect_status=$?
+  if (( inspect_status == 0 )); then
+    [[ -n "${inspect_json}" ]] || return 1
+    printf '%s' "${inspect_json}" | node -e '
 let raw = "";
 process.stdin.on("data", chunk => raw += chunk);
 process.stdin.on("end", () => {
   try {
     const row = JSON.parse(raw);
     const plugin = row && typeof row === "object" ? row.plugin || {} : {};
-    const install = row && typeof row === "object" ? row.install || {} : {};
-    if (plugin.id !== "codex") process.exit(1);
+    const install = row && typeof row === "object" ? row.install : null;
+    if (plugin.id !== "codex" || !install || typeof install !== "object"
+        || Array.isArray(install)) process.exit(1);
     for (const value of [
       plugin.version,
       plugin.source,
@@ -22112,20 +28175,39 @@ process.stdin.on("end", () => {
       install.spec,
       install.installPath,
       install.version,
+      install.resolvedName,
+      install.resolvedVersion,
+      install.resolvedSpec,
+      install.integrity,
+      plugin.rootDir,
+      plugin.packageName,
     ]) console.log(typeof value === "string" ? value : "");
   } catch (_) {
     process.exit(1);
   }
 });
-'; then
+' || return 1
     return 0
   fi
 
-  # `plugins inspect` exits non-zero when codex is absent. Prove absence from
-  # the machine-readable registry rather than treating every CLI failure as an
-  # empty baseline that is safe to overwrite.
-  list_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins list --json 2>>"${LOG_FILE}" || true)"
-  presence="$(printf '%s' "${list_json}" | node -e '
+  # 9.1 removed the bundled Codex row and emits this exact structured error.
+  # Admit neither a generic failure nor a successful empty/malformed inspection.
+  (( inspect_status == 1 )) || return 1
+  if [[ -n "${inspect_json}" ]]; then
+    printf '%s' "${inspect_json}" | python3 -c '
+import json,sys
+expected={"ok":False,"error":{"type":"cli_error","message":"Plugin not found: codex. Run `openclaw plugins list` to see installed plugins, or `openclaw plugins search codex` to look for installable plugins."}}
+if json.load(sys.stdin) != expected: raise SystemExit(1)
+' || return 1
+  fi
+  list_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins list --json \
+    2>>"${LOG_FILE}")" || list_status=$?
+  (( list_status == 0 )) && [[ -n "${list_json}" ]] || return 1
+  core_dir="$(openclaw_core_package_dir || true)"
+  [[ -n "${core_dir}" && -d "${core_dir}" && ! -L "${core_dir}" ]] || return 1
+  if ! printf '%s' "${list_json}" | node -e '
+const fs = require("fs");
+const path = require("path");
 let raw = "";
 process.stdin.on("data", chunk => raw += chunk);
 process.stdin.on("end", () => {
@@ -22133,27 +28215,95 @@ process.stdin.on("end", () => {
     const row = JSON.parse(raw);
     const plugins = Array.isArray(row?.plugins) ? row.plugins : null;
     if (!plugins) process.exit(1);
-    process.stdout.write(plugins.some(plugin => plugin?.id === "codex") ? "present" : "absent");
+    const matches = plugins.filter(plugin => plugin?.id === "codex");
+    const core = fs.realpathSync(process.argv[1]);
+    const identity = JSON.parse(fs.readFileSync(path.join(core, "package.json"), "utf8"));
+    if (matches.length === 0 && identity.name === "openclaw" && identity.version === "2026.9.1") process.exit(0);
+    if (matches.length !== 1) process.exit(1);
+    const plugin = matches[0];
+    const root = fs.realpathSync(plugin.rootDir);
+    const source = fs.realpathSync(plugin.source);
+    const expectedRoot = path.join(core, "extensions", "codex");
+    if (plugin.origin !== "bundled"
+        || plugin.packageName !== "@openclaw/codex"
+        || plugin.install != null
+        || root !== expectedRoot
+        || source !== path.join(expectedRoot, "index.ts")) process.exit(1);
   } catch (_) {
     process.exit(1);
   }
 });
-' 2>/dev/null || true)"
-  [[ "${presence}" == "absent" ]] && return 2
-  return 1
+' "${core_dir}"; then
+    return 1
+  fi
+  database="${OPENCLAW_PLUGIN_STATE_DATABASE:-/root/.openclaw/state/openclaw.sqlite}"
+  python3 - "${database}" <<'PY' || return 1
+import json
+import pathlib
+import sqlite3
+import stat
+import sys
+
+database = pathlib.Path(sys.argv[1])
+if database.is_symlink():
+    raise SystemExit(1)
+if not database.exists():
+    raise SystemExit(0)
+metadata = database.lstat()
+if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+        or metadata.st_gid != 0 or metadata.st_nlink != 1
+        or metadata.st_mode & 0o022):
+    raise SystemExit(1)
+connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=5)
+try:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='config_machine_state'"
+    ).fetchone()
+    if not table:
+        raise SystemExit(0)
+    row = connection.execute(
+        "SELECT value_json FROM config_machine_state "
+        "WHERE state_key='plugins.installedIndex'"
+    ).fetchone()
+    if not row:
+        raise SystemExit(0)
+    value = json.loads(row[0])
+    if not isinstance(value, dict):
+        raise SystemExit(1)
+    index = value.get("index")
+    if index is None:
+        raise SystemExit(0)
+    if not isinstance(index, dict):
+        raise SystemExit(1)
+    records = index.get("installRecords", {})
+    if not isinstance(records, dict) or "codex" in records:
+        raise SystemExit(1)
+    rows = index.get("plugins", [])
+    if not isinstance(rows, list): raise SystemExit(1)
+    for item in rows:
+        if not isinstance(item, dict): raise SystemExit(1)
+        if item.get("pluginId") == "codex" or item.get("installOwner") == "codex":
+            if item.get("pluginId") != "codex" or item.get("origin") != "bundled" or item.get("installOwner") not in {None, ""}:
+                raise SystemExit(1)
+finally:
+    connection.close()
+PY
+  return 2
 }
 
 openclaw_codex_plugin_runtime_details() {
-  local inspect_json list_json presence
-  inspect_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect codex --json --runtime 2>>"${LOG_FILE}" || true)"
-  if [[ -n "${inspect_json}" ]] && printf '%s' "${inspect_json}" | node -e '
+  local inspect_json="" inspect_status=0
+  inspect_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect codex --json --runtime \
+    2>>"${LOG_FILE}")" || inspect_status=$?
+  (( inspect_status == 0 )) && [[ -n "${inspect_json}" ]] || return 1
+  printf '%s' "${inspect_json}" | node -e '
 let raw = "";
 process.stdin.on("data", chunk => raw += chunk);
 process.stdin.on("end", () => {
   try {
     const row = JSON.parse(raw);
     const plugin = row && typeof row === "object" ? row.plugin || {} : {};
-    const install = row && typeof row === "object" ? row.install || {} : {};
+    const install = row && typeof row === "object" ? row.install : null;
     if (
       plugin.id !== "codex"
       || plugin.status !== "loaded"
@@ -22161,6 +28311,7 @@ process.stdin.on("end", () => {
       || plugin.activated !== true
       || !Array.isArray(plugin.agentHarnessIds)
       || !plugin.agentHarnessIds.includes("codex")
+      || !install || typeof install !== "object" || Array.isArray(install)
     ) process.exit(1);
     for (const value of [
       plugin.version,
@@ -22170,33 +28321,18 @@ process.stdin.on("end", () => {
       install.spec,
       install.installPath,
       install.version,
+      install.resolvedName,
+      install.resolvedVersion,
+      install.resolvedSpec,
+      install.integrity,
       plugin.rootDir,
+      plugin.packageName,
     ]) console.log(typeof value === "string" ? value : "");
   } catch (_) {
     process.exit(1);
   }
 });
-'; then
-    return 0
-  fi
-
-  list_json="$(OPENCLAW_ALLOW_ROOT=1 openclaw plugins list --json 2>>"${LOG_FILE}" || true)"
-  presence="$(printf '%s' "${list_json}" | node -e '
-let raw = "";
-process.stdin.on("data", chunk => raw += chunk);
-process.stdin.on("end", () => {
-  try {
-    const row = JSON.parse(raw);
-    const plugins = Array.isArray(row?.plugins) ? row.plugins : null;
-    if (!plugins) process.exit(1);
-    process.stdout.write(plugins.some(plugin => plugin?.id === "codex") ? "present" : "absent");
-  } catch (_) {
-    process.exit(1);
-  }
-});
-' 2>/dev/null || true)"
-  [[ "${presence}" == "absent" ]] && return 2
-  return 1
+'
 }
 
 openclaw_codex_plugin_catalog_package_dir() {
@@ -22222,7 +28358,7 @@ openclaw_codex_plugin_active_package_dir() {
   source_package_dir="$(openclaw_codex_plugin_package_dir \
     "${fields[1]:-}" || true)"
   root_package_dir="$(openclaw_codex_plugin_package_dir \
-    "${fields[7]:-}" || true)"
+    "${fields[11]:-}" || true)"
   [[ -n "${source_package_dir}" \
     && -n "${root_package_dir}" ]] || return 1
   source_real="$(readlink -f -- "${source_package_dir}" 2>/dev/null || true)"
@@ -22256,36 +28392,94 @@ openclaw_codex_plugin_attested_package_dir() {
 
 verify_openclaw_codex_plugin_pin() {
   local expected_version="${1:-${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}}"
+  local expected_integrity="${2:-${PIN_OPENCLAW_CODEX_PLUGIN_INTEGRITY}}"
   local details package_dir package_name package_version
+  local managed_root="${OPENCLAW_PLUGIN_NPM_ROOT:-/root/.openclaw/npm}"
   local -a fields=()
-  if ! details="$(openclaw_codex_plugin_runtime_details)"; then
-    return 1
+  if systemctl is-active --quiet openclaw-gateway; then
+    details="$(openclaw_codex_plugin_runtime_details)" || return 1
+  else
+    details="$(openclaw_codex_plugin_details)" || return 1
   fi
   mapfile -t fields <<< "${details}"
   local plugin_version="${fields[0]:-}"
   local plugin_source="${fields[1]:-}"
   local install_source="${fields[3]:-}"
   local install_spec="${fields[4]:-}"
+  local install_path="${fields[5]:-}"
   local recorded_version="${fields[6]:-}"
+  local resolved_name="${fields[7]:-}"
+  local resolved_version="${fields[8]:-}"
+  local resolved_spec="${fields[9]:-}"
+  local integrity="${fields[10]:-}"
+  local plugin_root="${fields[11]:-}"
+  local plugin_package_name="${fields[12]:-}"
 
   package_dir="$(openclaw_codex_plugin_attested_package_dir \
     "${details}" || true)"
   package_name="$(node_package_name_from_dir "${package_dir}" || true)"
   package_version="$(node_package_version_from_dir "${package_dir}" || true)"
 
-  # Registries upgraded from 3.26-era installs keep their legacy bare
-  # "@openclaw/codex" spec even after an exact pinned reinstall; the exact
-  # version is still enforced through plugin, recorded, and package versions.
   [[ "${plugin_version}" == "${expected_version}" \
+    && "${plugin_package_name}" == "@openclaw/codex" \
+    && "${fields[2]:-}" == "global" \
     && "${install_source}" == "npm" \
-    && ( "${install_spec}" == "@openclaw/codex@${expected_version}" \
-      || "${install_spec}" == "@openclaw/codex" ) \
+    && "${install_spec}" == "@openclaw/codex@${expected_version}" \
     && "${recorded_version}" == "${expected_version}" \
+    && "${resolved_name}" == "@openclaw/codex" \
+    && "${resolved_version}" == "${expected_version}" \
+    && "${resolved_spec}" == "@openclaw/codex@${expected_version}" \
+    && "${integrity}" == "${expected_integrity}" \
     && "${package_name}" == "@openclaw/codex" \
     && "${package_version}" == "${expected_version}" \
-    && -n "${plugin_source}" \
-    && "${plugin_source}" != *"/.openclaw/npm/node_modules/@openclaw/codex/"* \
-    && "${plugin_source}" != "~/.openclaw/npm/node_modules/@openclaw/codex/"* ]]
+    && -n "${plugin_source}" && -n "${plugin_root}" && -n "${install_path}" ]] \
+    || return 1
+  python3 - "${managed_root}" "${plugin_root}" "${plugin_source}" \
+    "${install_path}" "${package_dir}" <<'PY'
+import os
+import pathlib
+import re
+import stat
+import sys
+
+managed, root, source, install, package = map(pathlib.Path, sys.argv[1:])
+if not all(path.is_absolute() for path in (managed, root, source, install, package)):
+    raise SystemExit(1)
+if root != install or root != package or source != root / "dist" / "index.js":
+    raise SystemExit(1)
+try:
+    relative = root.relative_to(managed)
+except ValueError:
+    raise SystemExit(1)
+parts = relative.parts
+if (len(parts) != 5 or parts[0] != "projects"
+        or not re.fullmatch(r"openclaw-codex-8902d781d4(?:__openclaw-generation__g-[a-f0-9]{16})?", parts[1])
+        or parts[2:] != ("node_modules", "@openclaw", "codex")):
+    raise SystemExit(1)
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+fds = []
+try:
+    fd = os.open(managed, directory_flags); fds.append(fd)
+    for component in (*parts, "dist"):
+        fd = os.open(component, directory_flags, dir_fd=fds[-1]); fds.append(fd)
+    entry = os.open("index.js", flags, dir_fd=fds[-1])
+    try:
+        metadata = os.fstat(entry)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+                or metadata.st_gid != 0 or metadata.st_nlink != 1
+                or metadata.st_mode & 0o022):
+            raise SystemExit(1)
+    finally:
+        os.close(entry)
+    for descriptor in fds:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_uid != 0 or metadata.st_gid != 0
+                or metadata.st_mode & 0o022):
+            raise SystemExit(1)
+finally:
+    for descriptor in reversed(fds): os.close(descriptor)
+PY
 }
 
 resolve_openclaw_codex_plugin_pending_input_hotfix_target() {
@@ -22464,6 +28658,15 @@ verify_openclaw_codex_plugin_pending_input_hotfix() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
   fi
+  if [[ "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" ]]; then
+    local stock_core_dir stock_codex_dir
+    stock_core_dir="$(openclaw_core_package_dir || true)"
+    stock_codex_dir="$(openclaw_codex_plugin_attested_package_dir || true)"
+    [[ -n "${stock_core_dir}" && -n "${stock_codex_dir}" ]] || return 1
+    verify_openclaw_2026_9_1_bridged_pair_contract \
+      "${stock_core_dir}" "${stock_codex_dir}"
+    return $?
+  fi
   local target backup
   target="$(resolve_openclaw_codex_plugin_pending_input_hotfix_target || true)"
   [[ -n "${target}" ]] || return 1
@@ -22473,92 +28676,823 @@ verify_openclaw_codex_plugin_pending_input_hotfix() {
     && node --check "${target}" >/dev/null 2>&1
 }
 
-stage_openclaw_codex_plugin_rollback_package() {
-  local expected_version="$1" source_path="$2"
-  local package_dir backup_dir packed_name packed_path packed_version
-  package_dir="$(openclaw_codex_plugin_package_dir "${source_path}" || true)"
-  [[ -n "${package_dir}" && -f "${package_dir}/package.json" ]] || return 1
-  backup_dir="${UPDATE_RECOVERY_BACKUP_DIR:-/tmp}/openclaw-codex-plugin"
-  mkdir -p "${backup_dir}"
-  packed_name="$(cd "${backup_dir}" && npm pack --ignore-scripts --silent "${package_dir}" 2>> "$LOG_FILE" | tail -1)"
-  packed_path="${backup_dir}/${packed_name}"
-  [[ -n "${packed_name}" && -f "${packed_path}" ]] || return 1
-  packed_version="$(tar -xOf "${packed_path}" package/package.json 2>/dev/null \
-    | node -e 'let s=""; process.stdin.on("data", c => s += c); process.stdin.on("end", () => { try { console.log(JSON.parse(s).version || ""); } catch {} });' \
-    | head -1)"
-  if [[ "${packed_version}" != "${expected_version}" ]]; then
-    rm -f "${packed_path}"
-    return 1
+openclaw_codex_plugin_baseline_json() {
+  local details status
+  local -a fields=()
+  if systemctl is-active --quiet openclaw-gateway; then
+    details="$(openclaw_codex_plugin_runtime_details)" || status=$?
+    if [[ ${status:-0} -ne 0 ]]; then
+      details=""
+      status=0
+      details="$(openclaw_codex_plugin_details)" || status=$?
+    fi
+  else
+    details="$(openclaw_codex_plugin_details)" || status=$?
   fi
-  chmod 600 "${packed_path}" 2>/dev/null || true
-  OPENCLAW_CODEX_PLUGIN_ROLLBACK_TARBALL="${packed_path}"
+  if [[ -n "${details:-}" && ${status:-0} -eq 0 ]]; then
+    mapfile -t fields <<< "${details}"
+    [[ ${#fields[@]} -eq 13 ]] || return 1
+    verify_openclaw_codex_plugin_pin "${fields[0]}" "${fields[10]}" || return 1
+    node - \
+      "${fields[12]}" "${fields[0]}" "${fields[1]}" "${fields[11]}" \
+      "${fields[3]}" "${fields[4]}" "${fields[5]}" "${fields[6]}" \
+      "${fields[7]}" "${fields[8]}" "${fields[9]}" "${fields[10]}" <<'NODE'
+const names = [
+  "packageName", "pluginVersion", "pluginSource", "pluginRoot",
+  "installSource", "spec", "installPath", "installVersion",
+  "resolvedName", "resolvedVersion", "resolvedSpec", "integrity",
+];
+const values = process.argv.slice(2);
+if (values.length !== names.length || values.some(value => !value)) process.exit(1);
+const result = Object.fromEntries(names.map((name, index) => [name, values[index]]));
+process.stdout.write(JSON.stringify(result));
+NODE
+    return $?
+  fi
+  [[ ${status:-1} -eq 2 ]] || return 1
+  printf '%s\n' '{"installedIndexAbsent":true,"kind":"bundled-absence","origin":"bundled","packageName":"@openclaw/codex","pluginId":"codex"}'
 }
 
+# Kept as the compatibility entrypoint for the stock-bridge preparation path.
+# It performs no mutation and writes no volatile rollback state.
 capture_openclaw_codex_plugin_baseline() {
-  $OPENCLAW_CODEX_PLUGIN_BASELINE_CAPTURED && return 0
+  openclaw_codex_plugin_baseline_json >/dev/null
+}
 
-  local details status package_source
-  local -a fields=()
-  if details="$(openclaw_codex_plugin_details)"; then
-    mapfile -t fields <<< "${details}"
-    local plugin_version="${fields[0]:-}"
-    [[ -n "${plugin_version}" ]] || return 1
-    # This capture runs before old OpenClaw cores are replaced, so it may not
-    # depend on the new runtime-inspection schema. Prefer the catalog's loaded
-    # source over a stale installPath and prove the packed package/version.
-    package_source="$(openclaw_codex_plugin_catalog_package_dir \
-      "${details}" || true)"
-    [[ -n "${package_source}" ]] || return 1
-    stage_openclaw_codex_plugin_rollback_package "${plugin_version}" "${package_source}" || return 1
-    OPENCLAW_CODEX_PLUGIN_PREEXISTED=true
-    OPENCLAW_CODEX_PLUGIN_PREUPDATE_VERSION="${plugin_version}"
+openclaw_gateway_process_start_ticks() {
+  local pid="$1"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  python3 - "${pid}" <<'PY'
+from pathlib import Path
+import sys
+
+try:
+    raw = Path(f"/proc/{int(sys.argv[1])}/stat").read_text(encoding="ascii")
+    tail = raw.rsplit(")", 1)[1].strip().split()
+    value = int(tail[19])
+    if value <= 0:
+        raise ValueError
+except (IndexError, OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+print(value)
+PY
+}
+
+openclaw_gateway_systemd_snapshot() {
+  systemctl show openclaw-gateway.service --no-pager \
+    -p Id -p Names -p LoadState -p ActiveState -p SubState \
+    -p MainPID -p InvocationID -p ExecMainStartTimestampMonotonic \
+    -p ExecStart -p ControlGroup -p FragmentPath -p SourcePath \
+    -p DropInPaths -p UnitFileState -p NeedDaemonReload 2>/dev/null
+}
+
+openclaw_gateway_systemd_definition() {
+  systemctl cat openclaw-gateway.service --no-pager 2>/dev/null
+}
+
+openclaw_gateway_systemd_unit_absent() {
+  local allow_portal_dropins="${1:-false}"
+  local first_snapshot second_snapshot test_path=""
+  [[ "${allow_portal_dropins}" == "true" \
+    || "${allow_portal_dropins}" == "false" ]] || return 1
+  local -a unit_paths=(
+    /etc/systemd/system/openclaw-gateway.service
+    /run/systemd/system/openclaw-gateway.service
+    /usr/local/lib/systemd/system/openclaw-gateway.service
+    /usr/lib/systemd/system/openclaw-gateway.service
+    /lib/systemd/system/openclaw-gateway.service
+  )
+  local -a enablement_paths=(
+    /etc/systemd/system/multi-user.target.wants/openclaw-gateway.service
+    /run/systemd/system/multi-user.target.wants/openclaw-gateway.service
+  )
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && -n "${PORTAL_OPENCLAW_GATEWAY_UNIT_TEST_PATH:-}" ]]; then
+    test_path="${PORTAL_OPENCLAW_GATEWAY_UNIT_TEST_PATH}"
+    [[ "${test_path}" == /tmp/bridgesllm-installer-terminal-ux.*/* \
+      && "$(readlink -m -- "${test_path}")" == "${test_path}" ]] || return 1
+    unit_paths=("${test_path}")
+    enablement_paths=(
+      "$(dirname -- "${test_path}")/multi-user.target.wants/openclaw-gateway.service"
+    )
+  fi
+  first_snapshot="$(openclaw_gateway_systemd_snapshot)" || return 1
+  second_snapshot="$(openclaw_gateway_systemd_snapshot)" || return 1
+  [[ -n "${first_snapshot}" && "${first_snapshot}" == "${second_snapshot}" \
+    && ${#first_snapshot} -le 262144 ]] || return 1
+  python3 - "${first_snapshot}" "${allow_portal_dropins}" \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN}" \
+    "${OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN}" <<'PY'
+import sys
+
+snapshot, allow_portal_dropins, fence_dropin, permit_dropin = sys.argv[1:]
+values = {}
+for line in snapshot.splitlines():
+    if "=" not in line:
+        raise SystemExit(1)
+    key, value = line.split("=", 1)
+    if key in values:
+        raise SystemExit(1)
+    values[key] = value
+required = {
+    "Id", "Names", "LoadState", "ActiveState", "SubState", "MainPID",
+    "InvocationID", "ExecMainStartTimestampMonotonic", "ExecStart",
+    "ControlGroup", "FragmentPath", "SourcePath", "DropInPaths",
+    "UnitFileState", "NeedDaemonReload",
+}
+if set(values) != required:
+    raise SystemExit(1)
+if values["Id"] != "openclaw-gateway.service" \
+        or values["LoadState"] != "not-found" \
+        or values["ActiveState"] != "inactive" \
+        or values["SubState"] not in {"dead", ""} \
+        or values["MainPID"] != "0" \
+        or values["InvocationID"] \
+        or values["ExecMainStartTimestampMonotonic"] not in {"", "0"} \
+        or values["FragmentPath"] or values["SourcePath"] \
+        or values["ExecStart"] not in {"", "{}"} \
+        or values["ControlGroup"] \
+        or values["UnitFileState"] not in {"", "disabled"} \
+        or values["NeedDaemonReload"] != "no":
+    raise SystemExit(1)
+dropins = set(values["DropInPaths"].split()) if values["DropInPaths"] else set()
+allowed = {fence_dropin, permit_dropin}
+if allow_portal_dropins == "true":
+    if not dropins.issubset(allowed):
+        raise SystemExit(1)
+elif allow_portal_dropins != "false" or dropins:
+    raise SystemExit(1)
+PY
+  if [[ "${allow_portal_dropins}" != "true" ]] \
+    && openclaw_gateway_systemd_definition >/dev/null 2>&1; then
+    return 1
+  fi
+  local unit_path
+  for unit_path in "${unit_paths[@]}"; do
+    [[ ! -e "${unit_path}" && ! -L "${unit_path}" ]] || return 1
+  done
+  for unit_path in "${enablement_paths[@]}"; do
+    [[ ! -e "${unit_path}" && ! -L "${unit_path}" ]] || return 1
+  done
+}
+
+openclaw_gateway_systemd_identity() {
+  local first_snapshot first_definition first_ticks=0
+  local second_snapshot second_definition second_ticks=0
+  local -a active_values=() pid_values=()
+  first_snapshot="$(openclaw_gateway_systemd_snapshot)" || return 1
+  first_definition="$(openclaw_gateway_systemd_definition)" || return 1
+  [[ -n "${first_snapshot}" && -n "${first_definition}" \
+    && ${#first_snapshot} -le 262144 \
+    && ${#first_definition} -le 1048576 ]] || return 1
+  mapfile -t active_values \
+    < <(sed -n 's/^ActiveState=//p' <<< "${first_snapshot}")
+  mapfile -t pid_values \
+    < <(sed -n 's/^MainPID=//p' <<< "${first_snapshot}")
+  [[ ${#active_values[@]} -eq 1 && ${#pid_values[@]} -eq 1 \
+    && "${pid_values[0]}" =~ ^[0-9]+$ ]] || return 1
+  if [[ "${active_values[0]}" == "active" ]]; then
+    first_ticks="$(openclaw_gateway_process_start_ticks \
+      "${pid_values[0]}")" || return 1
+  elif [[ "${pid_values[0]}" != "0" ]]; then
+    return 1
+  fi
+  second_snapshot="$(openclaw_gateway_systemd_snapshot)" || return 1
+  second_definition="$(openclaw_gateway_systemd_definition)" || return 1
+  [[ "${first_snapshot}" == "${second_snapshot}" \
+    && "${first_definition}" == "${second_definition}" ]] || return 1
+  if [[ "${active_values[0]}" == "active" ]]; then
+    second_ticks="$(openclaw_gateway_process_start_ticks \
+      "${pid_values[0]}")" || return 1
+    [[ "${first_ticks}" == "${second_ticks}" ]] || return 1
+  fi
+  python3 - "${first_ticks}" "${first_snapshot}" "${first_definition}" <<'PY'
+import hashlib
+import json
+import os
+import re
+import sys
+
+ticks = int(sys.argv[1])
+snapshot = sys.argv[2]
+definition = sys.argv[3]
+expected = {
+    "Id", "Names", "LoadState", "ActiveState", "SubState", "MainPID",
+    "InvocationID", "ExecMainStartTimestampMonotonic", "ExecStart",
+    "ControlGroup", "FragmentPath", "SourcePath", "DropInPaths",
+    "UnitFileState", "NeedDaemonReload",
+}
+values = {}
+for line in snapshot.splitlines():
+    if "=" not in line:
+        raise SystemExit(1)
+    key, value = line.split("=", 1)
+    if key not in expected or key in values:
+        raise SystemExit(1)
+    values[key] = value
+if set(values) != expected or not definition:
+    raise SystemExit(1)
+try:
+    main_pid = int(values["MainPID"])
+    started = int(values["ExecMainStartTimestampMonotonic"])
+except ValueError:
+    raise SystemExit(1)
+active = values["ActiveState"] == "active"
+if values["Id"] != "openclaw-gateway.service" \
+        or "openclaw-gateway.service" not in values["Names"].split() \
+        or values["LoadState"] != "loaded" \
+        or not values["UnitFileState"] \
+        or values["NeedDaemonReload"] != "no" \
+        or not os.path.isabs(values["FragmentPath"]) \
+        or (values["SourcePath"] and not os.path.isabs(values["SourcePath"])) \
+        or not values["ExecStart"]:
+    raise SystemExit(1)
+if active:
+    if values["SubState"] != "running" or main_pid <= 0 or ticks <= 0 \
+            or started <= 0 \
+            or not re.fullmatch(r"[A-Fa-f0-9]{32}", values["InvocationID"]) \
+            or not values["ControlGroup"].startswith("/"):
+        raise SystemExit(1)
+elif values["ActiveState"] not in {"inactive", "failed"} \
+        or main_pid != 0 or ticks != 0 \
+        or (values["InvocationID"] and not re.fullmatch(
+            r"[A-Fa-f0-9]{32}", values["InvocationID"]
+        )):
+    raise SystemExit(1)
+payload = {
+    "schema": "bridgesllm-openclaw-gateway-unit-identity-v1",
+    "unit": values["Id"],
+    "names": values["Names"],
+    "active": active,
+    "activeState": values["ActiveState"],
+    "subState": values["SubState"],
+    "loadState": values["LoadState"],
+    "unitFileState": values["UnitFileState"],
+    "needDaemonReload": False,
+    "fragmentPath": values["FragmentPath"],
+    "sourcePath": values["SourcePath"],
+    "dropInPaths": values["DropInPaths"],
+    "definitionSha256": hashlib.sha256(definition.encode()).hexdigest(),
+    "execStart": values["ExecStart"],
+    "controlGroup": values["ControlGroup"],
+    "mainPid": main_pid,
+    "processStartTicks": ticks,
+    "invocationId": values["InvocationID"],
+    "execMainStartTimestampMonotonic": started,
+}
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+openclaw_gateway_identity_tuple() {
+  printf '%s' "$1" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (!value || typeof value !== "object") process.exit(1);
+    process.stdout.write([value.active, value.mainPid,
+      value.active ? value.invocationId : "",
+      value.active ? value.execMainStartTimestampMonotonic : 0].join("|") + "\n");
+  } catch (_) { process.exit(1); }
+});
+'
+}
+
+openclaw_gateway_systemd_tuple() {
+  local identity
+  identity="$(openclaw_gateway_systemd_identity)" || return 1
+  openclaw_gateway_identity_tuple "${identity}"
+}
+
+json_documents_equal() {
+  node - "$1" "$2" <<'NODE'
+try {
+  const canonical = value => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+  };
+  const left = JSON.stringify(canonical(JSON.parse(process.argv[2])));
+  const right = JSON.stringify(canonical(JSON.parse(process.argv[3])));
+  process.exit(left === right ? 0 : 1);
+} catch (_) { process.exit(1); }
+NODE
+}
+
+openclaw_gateway_identity_is_active() {
+  printf '%s' "$1" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); process.exit(value?.active === true ? 0 : 1); }
+  catch (_) { process.exit(2); }
+});
+'
+}
+
+openclaw_gateway_identity_is_enabled() {
+  printf '%s' "$1" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try {
+    const value=JSON.parse(raw);
+    const enabled=new Set(["enabled","enabled-runtime","linked","linked-runtime","alias"]);
+    process.exit(enabled.has(value?.unitFileState) ? 0 : 1);
+  } catch (_) { process.exit(2); }
+});
+'
+}
+
+openclaw_gateway_identity_is_disabled() {
+  printf '%s' "$1" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); process.exit(value?.unitFileState === "disabled" ? 0 : 1); }
+  catch (_) { process.exit(2); }
+});
+'
+}
+
+openclaw_gateway_unit_definition_equal() {
+  node - "$1" "$2" <<'NODE'
+try {
+  const left = JSON.parse(process.argv[2]);
+  const right = JSON.parse(process.argv[3]);
+  const fields = [
+    "schema", "unit", "names", "loadState", "unitFileState",
+    "needDaemonReload", "fragmentPath", "sourcePath", "dropInPaths",
+    "definitionSha256",
+  ];
+  process.exit(fields.every(field => left?.[field] === right?.[field]) ? 0 : 1);
+} catch (_) { process.exit(2); }
+NODE
+}
+
+openclaw_gateway_unit_definition_equal_ignoring_enablement() {
+  node - "$1" "$2" <<'NODE'
+try {
+  const left = JSON.parse(process.argv[2]);
+  const right = JSON.parse(process.argv[3]);
+  const fields = [
+    "schema", "unit", "names", "loadState", "needDaemonReload",
+    "fragmentPath", "sourcePath", "dropInPaths", "definitionSha256",
+  ];
+  process.exit(fields.every(field => left?.[field] === right?.[field]) ? 0 : 1);
+} catch (_) { process.exit(2); }
+NODE
+}
+
+openclaw_gateway_require_exact_identity() {
+  local expected="$1" current
+  current="$(openclaw_gateway_systemd_identity)" || return 1
+  json_documents_equal "${expected}" "${current}" || return 1
+  printf '%s\n' "${current}"
+}
+
+openclaw_gateway_require_inactive_unit_definition() {
+  local expected="$1" current
+  current="$(openclaw_gateway_systemd_identity)" || return 1
+  ! openclaw_gateway_identity_is_active "${current}" || return 1
+  openclaw_gateway_unit_definition_equal "${expected}" "${current}" || return 1
+  printf '%s\n' "${current}"
+}
+
+stop_openclaw_gateway_if_identity_matches() {
+  local expected current after matched="" candidate
+  current="$(openclaw_gateway_systemd_identity)" || return 1
+  openclaw_gateway_identity_is_active "${current}" || return 1
+  for candidate in "$@"; do
+    [[ -n "${candidate}" ]] || continue
+    if json_documents_equal "${candidate}" "${current}"; then
+      matched="${candidate}"
+      break
+    fi
+  done
+  [[ -n "${matched}" ]] || return 1
+  # This is the last possible userspace re-attestation before the named
+  # systemd stop. A different PID, process start tick, InvocationID, unit
+  # definition, fragment, cgroup, or ExecStart serialization fails closed.
+  openclaw_gateway_require_exact_identity "${matched}" >/dev/null || return 1
+  systemctl stop openclaw-gateway.service >> "${LOG_FILE}" 2>&1 || return 1
+  after="$(openclaw_gateway_systemd_identity)" || return 1
+  ! openclaw_gateway_identity_is_active "${after}" || return 1
+  openclaw_gateway_unit_definition_equal "${matched}" "${after}"
+}
+
+openclaw_gateway_migration_authority_exists() {
+  [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]
+}
+
+openclaw_gateway_action_purpose_for_current_transaction() {
+  if ! openclaw_gateway_migration_authority_exists; then
+    printf '%s\n' forward
+    return 0
+  fi
+  load_openclaw_migration_transaction || return 1
+  case "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" in
+    recovery-pending|migration-restored|upgrade-restored|core-rollback-pending|core-restored|core-remove-pending|core-removed|restored-cleanup)
+      printf '%s\n' baseline-restore
+      ;;
+    *)
+      printf '%s\n' forward
+      ;;
+  esac
+}
+
+stop_openclaw_gateway_with_identity_authority() {
+  local identity purpose="${1:-}"
+  identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if openclaw_gateway_migration_authority_exists; then
+    [[ -n "${purpose}" ]] \
+      || purpose="$(openclaw_gateway_action_purpose_for_current_transaction)" \
+      || return 1
+    if openclaw_gateway_identity_is_active "${identity}"; then
+      run_durable_openclaw_gateway_action stop "${identity}" "${purpose}"
+    else
+      adopt_durable_openclaw_gateway_identity "${identity}"
+    fi
+    return
+  fi
+  if openclaw_gateway_identity_is_active "${identity}"; then
+    stop_openclaw_gateway_if_identity_matches "${identity}"
   else
-    status=$?
-    [[ ${status} -eq 2 ]] || return 1
-    OPENCLAW_CODEX_PLUGIN_PREEXISTED=false
-    OPENCLAW_CODEX_PLUGIN_PREUPDATE_VERSION=""
+    openclaw_gateway_require_exact_identity "${identity}" >/dev/null
+  fi
+}
+
+start_openclaw_gateway_with_identity_authority() {
+  local identity purpose="${1:-}"
+  identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if openclaw_gateway_identity_is_active "${identity}"; then
+    if openclaw_gateway_migration_authority_exists; then
+      adopt_durable_openclaw_gateway_identity "${identity}"
+    else
+      openclaw_gateway_require_exact_identity "${identity}" >/dev/null
+    fi
+    return
+  fi
+  identity="$(openclaw_gateway_require_inactive_unit_definition "${identity}")" \
+    || return 1
+  if openclaw_gateway_migration_authority_exists; then
+    [[ -n "${purpose}" ]] \
+      || purpose="$(openclaw_gateway_action_purpose_for_current_transaction)" \
+      || return 1
+    run_durable_openclaw_gateway_action start "${identity}" "${purpose}"
+  else
+    authorized_systemctl_openclaw_gateway start "${identity}"
+  fi
+}
+
+restart_openclaw_gateway_with_identity_authority() {
+  local before inactive purpose="${1:-}"
+  before="$(openclaw_gateway_systemd_identity)" || return 1
+  if openclaw_gateway_migration_authority_exists && [[ -z "${purpose}" ]]; then
+    purpose="$(openclaw_gateway_action_purpose_for_current_transaction)" \
+      || return 1
+  fi
+  if openclaw_gateway_identity_is_active "${before}"; then
+    if openclaw_gateway_migration_authority_exists; then
+      run_durable_openclaw_gateway_action \
+        stop "${before}" "${purpose}" || return 1
+    else
+      stop_openclaw_gateway_if_identity_matches "${before}" || return 1
+    fi
+  elif openclaw_gateway_migration_authority_exists; then
+    adopt_durable_openclaw_gateway_identity "${before}" || return 1
+  fi
+  inactive="$(openclaw_gateway_require_inactive_unit_definition "${before}")" \
+    || return 1
+  if openclaw_gateway_migration_authority_exists; then
+    run_durable_openclaw_gateway_action start "${inactive}" "${purpose}"
+  else
+    authorized_systemctl_openclaw_gateway start "${inactive}"
+  fi
+}
+
+validate_openclaw_codex_gateway_rpc_evidence() {
+  python3 - "$1" "$2" "${PIN_OPENCLAW_RUNTIME_VERSION}" <<'PY'
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+
+status_path, health_path = map(Path, sys.argv[1:3])
+expected_runtime = sys.argv[3]
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+def load_exact(path):
+    metadata = os.lstat(path)
+    if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0 or metadata.st_gid != 0
+            or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size <= 0 or metadata.st_size > 16 * 1024 * 1024):
+        raise ValueError("unsafe RPC evidence")
+    raw = path.read_bytes()
+    return raw, json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicates)
+
+try:
+    status_raw, status = load_exact(status_path)
+    health_raw, health = load_exact(health_path)
+    if not isinstance(status, dict) or status.get("runtimeVersion") != expected_runtime:
+        raise ValueError("runtime mismatch")
+    if not isinstance(health, dict) or health.get("ok") is not True:
+        raise ValueError("unhealthy gateway")
+    plugins = health.get("plugins")
+    if not isinstance(plugins, dict):
+        raise ValueError("missing health plugin summary")
+    loaded = plugins.get("loaded")
+    errors = plugins.get("errors")
+    unavailable = plugins.get("unavailable", [])
+    if not isinstance(loaded, list) or not isinstance(errors, list) \
+            or not isinstance(unavailable, list):
+        raise ValueError("malformed health plugin summary")
+    loaded_ids = []
+    for entry in loaded:
+        if isinstance(entry, str):
+            loaded_ids.append(entry)
+        elif isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            loaded_ids.append(entry["id"])
+        else:
+            raise ValueError("malformed loaded plugin row")
+    if loaded_ids.count("codex") != 1:
+        raise ValueError("Codex is not loaded exactly once")
+    for rows in (errors, unavailable):
+        for row in rows:
+            if isinstance(row, str):
+                plugin_id = row
+            elif isinstance(row, dict):
+                plugin_id = row.get("id", row.get("pluginId"))
+            else:
+                raise ValueError("malformed plugin diagnostic row")
+            if plugin_id == "codex":
+                raise ValueError("Codex has a health diagnostic")
+    timestamp = health.get("ts")
+    if isinstance(timestamp, bool):
+        raise ValueError("invalid health timestamp")
+    if isinstance(timestamp, (int, float)):
+        observed = float(timestamp) / (1000 if timestamp > 10_000_000_000 else 1)
+    elif isinstance(timestamp, str):
+        parsed = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone-free health timestamp")
+        observed = parsed.timestamp()
+    else:
+        raise ValueError("missing health timestamp")
+    if abs(time.time() - observed) > 60:
+        raise ValueError("stale health timestamp")
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+print(hashlib.sha256(status_raw).hexdigest() + "|" + hashlib.sha256(health_raw).hexdigest())
+PY
+}
+
+write_openclaw_codex_gateway_proof() {
+  local direction="$1" expected_binding="$2" expected_baseline="$3"
+  local transaction_root="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}"
+  local authority was_active before_pid before_invocation before_started
+  local after_active after_pid after_invocation after_started
+  local baseline_identity recorded_identity after_identity final_identity
+  local status_path health_path proof_path proof_next current_binding current_baseline
+  local proof_digest status_digest="" health_digest="" status=0
+  [[ "${direction}" == "forward" || "${direction}" == "rollback" ]] || return 1
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && -n "${PORTAL_OPENCLAW_CODEX_PROOF_TEST_ROOT:-}" ]]; then
+    transaction_root="${PORTAL_OPENCLAW_CODEX_PROOF_TEST_ROOT}"
+    [[ "${transaction_root}" == /tmp/bridgesllm-installer-terminal-ux.compatibility.*/* \
+      && "$(readlink -m -- "${transaction_root}")" == "${transaction_root}" ]] \
+      || return 1
+  fi
+  authority="$(run_openclaw_migration_transaction_tool codex-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")" \
+    || return 1
+  baseline_identity="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw)?.gateway?.baselineUnitIdentity;
+    if (!value) process.exit(1); process.stdout.write(JSON.stringify(value));
+  } catch (_) { process.exit(1); }
+});
+')" || return 1
+  recorded_identity="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const gateway=JSON.parse(raw)?.gateway;
+    const value=process.argv[1] === "forward"
+      ? gateway?.forwardUnitIdentity : gateway?.rollbackUnitIdentity;
+    if (!value) process.exit(1); process.stdout.write(JSON.stringify(value));
+  } catch (_) { process.exit(1); }
+});
+' "${direction}")" || return 1
+  IFS='|' read -r was_active before_pid before_invocation before_started \
+    < <(openclaw_gateway_identity_tuple "${baseline_identity}") || return 1
+  [[ "${was_active}" =~ ^(true|false)$ && "${before_pid}" =~ ^[0-9]+$ \
+    && "${before_started}" =~ ^[0-9]+$ ]] || return 1
+  after_identity="$(openclaw_gateway_require_exact_identity \
+    "${recorded_identity}")" || return 1
+  IFS='|' read -r after_active after_pid after_invocation after_started \
+    < <(openclaw_gateway_identity_tuple "${after_identity}") || return 1
+  if [[ "${was_active}" == "true" ]]; then
+    [[ "${after_active}" == "true" \
+      && "${after_pid}" != "${before_pid}" \
+      && "${after_invocation}" != "${before_invocation}" \
+      && "${after_started}" -gt "${before_started}" ]] || return 1
+  else
+    [[ "${after_active}" == "false" && "${after_pid}" == "0" \
+      && -z "${after_invocation}" && "${after_started}" == "0" ]] || return 1
   fi
 
-  OPENCLAW_CODEX_PLUGIN_BASELINE_CAPTURED=true
+  if [[ "${direction}" == "forward" ]]; then
+    verify_openclaw_codex_plugin_pin \
+      "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
+      "${PIN_OPENCLAW_CODEX_PLUGIN_INTEGRITY}" || return 1
+    if [[ -n "${expected_binding}" ]]; then
+      current_binding="$(run_durable_openclaw_codex_plugin_helper held-binding \
+        2>> "${LOG_FILE}")" || return 1
+      json_documents_equal "${expected_binding}" "${current_binding}" || return 1
+    fi
+  else
+    current_baseline="$(openclaw_codex_plugin_baseline_json)" || return 1
+    json_documents_equal "${expected_baseline}" "${current_baseline}" || return 1
+  fi
+
+  proof_path="${transaction_root}/codex-${direction}-gateway-proof.json"
+  proof_next="${proof_path}.next"
+  status_path="${transaction_root}/codex-gateway-status.next"
+  health_path="${transaction_root}/codex-gateway-health.next"
+  python3 - "${transaction_root}" \
+    "${proof_next}" "${status_path}" "${health_path}" <<'PY' || return 1
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+root_metadata = root.lstat()
+if (not stat.S_ISDIR(root_metadata.st_mode) or root.is_symlink()
+        or root_metadata.st_uid != 0 or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700):
+    raise SystemExit(1)
+for raw in sys.argv[2:]:
+    path = pathlib.Path(raw)
+    if path.parent != root:
+        raise SystemExit(1)
+    if not os.path.lexists(path):
+        continue
+    metadata = path.lstat()
+    if (not stat.S_ISREG(metadata.st_mode) or path.is_symlink()
+            or metadata.st_uid != 0 or metadata.st_gid != 0
+            or metadata.st_nlink != 1 or metadata.st_mode & 0o022):
+        raise SystemExit(1)
+    path.unlink()
+descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try: os.fsync(descriptor)
+finally: os.close(descriptor)
+PY
+  [[ ! -e "${proof_next}" && ! -L "${proof_next}" \
+    && ! -e "${status_path}" && ! -L "${status_path}" \
+    && ! -e "${health_path}" && ! -L "${health_path}" ]] || return 1
+  if [[ "${was_active}" == "true" ]]; then
+    ( umask 077; : > "${status_path}"; : > "${health_path}" ) || return 1
+    run_local_openclaw_gateway_rpc /root/.openclaw/openclaw.json \
+      call status --json --timeout 10000 \
+      --params '{"includeChannelSummary":false}' \
+      > "${status_path}" 2>> "${LOG_FILE}" || status=$?
+    (( status == 0 )) || return 1
+    run_local_openclaw_gateway_rpc /root/.openclaw/openclaw.json \
+      call health --json --timeout 10000 --params '{"probe":true}' \
+      > "${health_path}" 2>> "${LOG_FILE}" || status=$?
+    (( status == 0 )) || return 1
+    IFS='|' read -r status_digest health_digest \
+      < <(validate_openclaw_codex_gateway_rpc_evidence \
+        "${status_path}" "${health_path}") || return 1
+    [[ "${status_digest}" =~ ^[a-f0-9]{64}$ \
+      && "${health_digest}" =~ ^[a-f0-9]{64}$ ]] || return 1
+  fi
+  python3 - \
+    "${direction}" "${proof_path}" "${proof_next}" "${status_path}" "${health_path}" \
+    "${was_active}" "${before_pid}" "${before_invocation}" "${before_started}" \
+    "${after_pid}" "${after_invocation}" "${after_started}" \
+    "${expected_binding}" "${expected_baseline}" \
+    "${baseline_identity}" "${after_identity}" \
+    "${status_digest}" "${health_digest}" <<'PY' || return 1
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+(direction, proof_raw, next_raw, status_raw, health_raw, was_active_raw,
+ before_pid, before_invocation, before_started, after_pid, after_invocation,
+ after_started, binding_raw, baseline_raw, baseline_identity_raw,
+ observed_identity_raw, status_digest, health_digest) = sys.argv[1:]
+proof = pathlib.Path(proof_raw); temporary = pathlib.Path(next_raw)
+status_path = pathlib.Path(status_raw); health_path = pathlib.Path(health_raw)
+was_active = was_active_raw == "true"
+payload = {
+    "schema": "bridgesllm-codex-gateway-composite-proof-v1",
+    "direction": direction,
+    "evidenceScope": (
+        "gateway-loaded-codex-id-plus-transaction-bound-disk-generation"
+        if was_active else "transaction-bound-disk-generation-deferred-inactive"
+    ),
+    "before": {"mainPid": int(before_pid), "invocationId": before_invocation,
+               "startMonotonic": int(before_started)},
+    "after": {"mainPid": int(after_pid), "invocationId": after_invocation,
+              "startMonotonic": int(after_started)},
+    "baselineUnitIdentity": json.loads(baseline_identity_raw),
+    "observedUnitIdentity": json.loads(observed_identity_raw),
+    "heldBinding": json.loads(binding_raw) if binding_raw else None,
+    "baseline": json.loads(baseline_raw) if baseline_raw else None,
+}
+if was_active:
+    status_raw = status_path.read_bytes()
+    health_raw = health_path.read_bytes()
+    if hashlib.sha256(status_raw).hexdigest() != status_digest \
+            or hashlib.sha256(health_raw).hexdigest() != health_digest:
+        raise SystemExit(1)
+    payload.update(
+        status=json.loads(status_raw.decode("utf-8")),
+        health=json.loads(health_raw.decode("utf-8")),
+    )
+else:
+    if status_digest or health_digest:
+        raise SystemExit(1)
+    payload.update(status=None, health=None)
+if proof.exists() or proof.is_symlink():
+    metadata = proof.lstat()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+            or metadata.st_gid != 0 or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600):
+        raise SystemExit(1)
+if temporary.exists() or temporary.is_symlink():
+    raise SystemExit(1)
+with temporary.open("x", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+os.chown(temporary, 0, 0); os.chmod(temporary, 0o600)
+os.replace(temporary, proof)
+parent_fd = os.open(proof.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try: os.fsync(parent_fd)
+finally: os.close(parent_fd)
+for path in (status_path, health_path):
+    try: path.unlink()
+    except FileNotFoundError: pass
+parent_fd = os.open(proof.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try: os.fsync(parent_fd)
+finally: os.close(parent_fd)
+PY
+  proof_digest="$(sha256sum -- "${proof_path}" | awk '{print $1}')" || return 1
+  [[ "${proof_digest}" =~ ^[a-f0-9]{64}$ ]] || return 1
+  # Re-read the complete service/process identity and exact disk binding after
+  # the RPCs and proof write so a process or unit replacement cannot race the
+  # evidence boundary.
+  local final_binding
+  final_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  json_documents_equal "${after_identity}" "${final_identity}" || return 1
+  if [[ "${direction}" == "forward" ]]; then
+    if [[ -n "${expected_binding}" ]]; then
+      final_binding="$(run_durable_openclaw_codex_plugin_helper held-binding \
+        2>> "${LOG_FILE}")" || return 1
+      json_documents_equal "${expected_binding}" "${final_binding}" || return 1
+    fi
+  else
+    current_baseline="$(openclaw_codex_plugin_baseline_json)" || return 1
+    json_documents_equal "${expected_baseline}" "${current_baseline}" || return 1
+  fi
+  printf '%s|%s|%s|%s\n' \
+    "${after_pid}" "${after_invocation}" "${after_started}" "${proof_digest}"
 }
 
 rollback_openclaw_codex_plugin() {
-  local defer_gateway_restart="${1:-false}"
-  local rollback_ok=true details status package_dir package_version
-  local -a fields=()
-  if $OPENCLAW_CODEX_PLUGIN_PREEXISTED; then
-    if [[ -z "${OPENCLAW_CODEX_PLUGIN_ROLLBACK_TARBALL:-}" \
-      || ! -f "${OPENCLAW_CODEX_PLUGIN_ROLLBACK_TARBALL}" ]] \
-      || ! OPENCLAW_ALLOW_ROOT=1 openclaw plugins install "${OPENCLAW_CODEX_PLUGIN_ROLLBACK_TARBALL}" --force --pin >> "$LOG_FILE" 2>&1; then
-      rollback_ok=false
-    else
-      if details="$(openclaw_codex_plugin_details)"; then
-        mapfile -t fields <<< "${details}"
-        package_dir="$(openclaw_codex_plugin_catalog_package_dir \
-          "${details}" || true)"
-        package_version="$(node_package_version_from_dir "${package_dir}" || true)"
-        [[ "${fields[0]:-}" == "${OPENCLAW_CODEX_PLUGIN_PREUPDATE_VERSION}" \
-          && "${package_version}" == "${OPENCLAW_CODEX_PLUGIN_PREUPDATE_VERSION}" ]] || rollback_ok=false
-      else
-        rollback_ok=false
-      fi
-    fi
-  else
-    if details="$(openclaw_codex_plugin_details)"; then
-      OPENCLAW_ALLOW_ROOT=1 openclaw plugins uninstall codex --force >> "$LOG_FILE" 2>&1 || rollback_ok=false
-    else
-      status=$?
-      [[ ${status} -eq 2 ]] || rollback_ok=false
-    fi
-  fi
+  reconcile_openclaw_codex_transaction
+}
 
-  if [[ "${defer_gateway_restart}" != "true" ]] \
-    && systemctl is-enabled openclaw-gateway >/dev/null 2>&1; then
-    systemctl restart openclaw-gateway >> "$LOG_FILE" 2>&1 || rollback_ok=false
-    verify_openclaw_gateway_stable "${PIN_OPENCLAW_RUNTIME_VERSION}" 18 || rollback_ok=false
+quiesce_openclaw_tested_pair_rollback() {
+  local before inactive pending_disposition
+  openclaw_gateway_migration_authority_exists || return 1
+  pending_disposition="$(reconcile_openclaw_core_gateway_action_without_start)" \
+    || return 1
+  before="$(openclaw_gateway_systemd_identity)" || return 1
+  if [[ "${pending_disposition}" == "start-deferred" ]]; then
+    inactive="$(openclaw_gateway_require_inactive_unit_definition "${before}")" \
+      || return 1
+    openclaw_gateway_require_inactive_unit_definition "${inactive}" >/dev/null
+    return
   fi
-  $rollback_ok && OPENCLAW_CODEX_PLUGIN_UPDATE_ATTEMPTED=false
-  $rollback_ok
+  [[ "${pending_disposition}" == "clear" ]] || return 1
+  stop_openclaw_gateway_with_identity_authority baseline-restore || return 1
+  # Stopping is not the proof boundary. Re-read the complete unit definition
+  # and process identity after the durable action settles; a failed stop or a
+  # replacement unit must leave every paired rollback artifact untouched.
+  inactive="$(openclaw_gateway_require_inactive_unit_definition "${before}")" \
+    || return 1
+  adopt_durable_openclaw_gateway_identity "${inactive}" || return 1
+  openclaw_gateway_require_inactive_unit_definition "${inactive}" >/dev/null
 }
 
 rollback_openclaw_tested_pair() {
@@ -22572,12 +29506,13 @@ rollback_openclaw_tested_pair() {
   local ask_user_transaction_rollback_ok=true
   local plugin_rollback_ok=true
   local defer_plugin_restart=false
-  local plugin_retry_restarted=false
+  local native_rollback_pending=false
 
   if ! $OPENCLAW_UPGRADE_COMMITTED \
     && { $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED \
       || $OPENCLAW_PACKAGE_UPDATED \
-      || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; }; then
+      || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]] \
+      || [[ -n "${OPENCLAW_2026_9_1_MIGRATION_MANIFEST:-}" ]]; }; then
     core_rollback_pending=true
   fi
   if $OPENCLAW_PENDING_INPUT_HOTFIX_APPLIED \
@@ -22592,19 +29527,36 @@ rollback_openclaw_tested_pair() {
     && ! $OPENCLAW_ASK_USER_TRANSACTION_COMMITTED; then
     ask_user_transaction_rollback_pending=true
   fi
+  if native_cli_bundle_transaction_present; then
+    native_rollback_pending=true
+  fi
   if $core_rollback_pending || $hotfix_rollback_pending \
     || $claude_ask_user_rollback_pending \
-    || $ask_user_transaction_rollback_pending; then
+    || $ask_user_transaction_rollback_pending \
+    || $native_rollback_pending; then
     defer_plugin_restart=true
   fi
 
-  # Keep the replacement ask-user bridge and its durable rollback journal in
-  # place until native Claude prompting is restored. If rollback itself loses
-  # power, that ordering guarantees at least one working question path rather
-  # than deleting the replacement while native AskUserQuestion is suppressed.
-  if $OPENCLAW_CODEX_PLUGIN_UPDATE_ATTEMPTED; then
-    rollback_openclaw_codex_plugin "${defer_plugin_restart}" || plugin_rollback_ok=false
+  # No paired byte restoration may begin until the durable migration owner has
+  # authorized the stop and the admitted unit has been proved inactive. Keep
+  # every journal and fence intact when authority, stop, or proof fails.
+  if $defer_plugin_restart \
+    && ! quiesce_openclaw_tested_pair_rollback; then
+    warn "Could not prove the admitted OpenClaw gateway inactive before tested-pair recovery."
+    return 1
   fi
+
+  # The native tuple and OpenClaw share one commit decision. It is now safe to
+  # restore the native roots before OpenClaw restores runtime/configuration.
+  if $native_rollback_pending \
+    && ! reconcile_native_cli_bundle_transaction; then
+    warn "Could not reconcile the Portal-qualified native CLI bundle before tested-pair recovery."
+    return 1
+  fi
+
+  # Codex rollback is owned by the fixed outer migration ledger. The durable
+  # package rollback below reconciles that journal before restoring migration
+  # or core bytes; no volatile shell flag is rollback authority.
 
   # The native pending-input patch has its own byte-exact recovery artifact.
   # Restore it before any package-level rollback so every later preparation
@@ -22617,24 +29569,26 @@ rollback_openclaw_tested_pair() {
       || claude_ask_user_rollback_ok=false
   fi
 
+  # The 9.1 migration restore is hash-bound to the config generation that
+  # existed before the Portal bridge transaction. Restore that bridge/config
+  # layer first, while keeping the gateway stopped, so the migration helper can
+  # then restore the exact 7.1 config and session stores before npm replaces
+  # the 9.1 implementation it needs.
+  if $core_rollback_pending \
+    && $ask_user_transaction_rollback_pending; then
+    if rollback_bridgesllm_ask_user_transaction true; then
+      ask_user_transaction_rollback_pending=false
+    else
+      ask_user_transaction_rollback_ok=false
+      core_rollback_ok=false
+      core_rollback_pending=false
+    fi
+  fi
+
   if $core_rollback_pending; then
     # Do not boot the restored core until the matching plugin/config baseline
     # is back. One final restart below crosses the complete rollback boundary.
     rollback_openclaw_package_update true || core_rollback_ok=false
-  fi
-
-  # If the new-core CLI could not restore the old plugin, retry after the old
-  # core is back. This makes recovery resilient to cross-revision plugin CLI
-  # incompatibility while preserving the original rollback artifacts.
-  if $OPENCLAW_CODEX_PLUGIN_UPDATE_ATTEMPTED; then
-    if rollback_openclaw_codex_plugin "${ask_user_transaction_rollback_pending}"; then
-      plugin_rollback_ok=true
-      if ! $ask_user_transaction_rollback_pending; then
-        plugin_retry_restarted=true
-      fi
-    else
-      plugin_rollback_ok=false
-    fi
   fi
 
   # Native/core bytes are safe now. Restore the previous bridge/config while
@@ -22646,24 +29600,16 @@ rollback_openclaw_tested_pair() {
       || ask_user_transaction_rollback_ok=false
   fi
 
-  # A package rollback performs its own final restart. When only the exact
-  # bundle bytes changed, restart an already-running gateway once after those
-  # bytes and any plugin baseline are back. Never start a gateway that was
-  # intentionally stopped.
-  if { $core_rollback_pending || $hotfix_rollback_pending \
-      || $claude_ask_user_rollback_pending \
+  # Any remaining non-core rollback crosses its service boundary through the
+  # same durable migration owner. Never infer restart authority from a live
+  # named unit: a foreign activation must remain untouched and fail closed.
+  if ! $core_rollback_pending \
+    && { $hotfix_rollback_pending || $claude_ask_user_rollback_pending \
       || $ask_user_transaction_rollback_pending; } \
     && $hotfix_rollback_ok && $claude_ask_user_rollback_ok \
-    && $ask_user_transaction_rollback_ok \
-    && ! $plugin_retry_restarted \
-    && { $OPENCLAW_GATEWAY_WAS_ACTIVE \
-      || systemctl is-active --quiet openclaw-gateway >/dev/null 2>&1; }; then
-    local rollback_gateway_version="${PIN_OPENCLAW_RUNTIME_VERSION}"
-    $core_rollback_pending \
-      && rollback_gateway_version="${OPENCLAW_PREUPDATE_RUNTIME_VERSION:-}"
-    if [[ -z "${rollback_gateway_version}" ]] \
-      || ! systemctl restart openclaw-gateway >> "$LOG_FILE" 2>&1 \
-      || ! verify_openclaw_gateway_stable "${rollback_gateway_version}" 18; then
+    && $ask_user_transaction_rollback_ok; then
+    if ! openclaw_gateway_migration_authority_exists \
+      || ! reconcile_openclaw_migration_transaction; then
       hotfix_rollback_ok=false
       claude_ask_user_rollback_ok=false
       ask_user_transaction_rollback_ok=false
@@ -22681,24 +29627,39 @@ verify_openclaw_tested_pair() {
   # must not unwind an otherwise verified core/plugin migration. Retry the
   # runtime-facing probes over a bounded window and log what was observed.
   local attempt observed_gateway="" openclaw_package_dir=""
+  local codex_package_dir=""
   local claude_ask_user_target=""
   verify_openclaw_core_package_pin || return 1
   openclaw_package_dir="$(openclaw_core_package_dir || true)"
-  claude_ask_user_target="$(
-    resolve_openclaw_claude_ask_user_hotfix_target \
-      "${openclaw_package_dir}/dist" || true
-  )"
-  [[ -n "${claude_ask_user_target}" ]] || return 1
-  openclaw_claude_ask_user_hotfix_is_applied \
-    "${claude_ask_user_target}" || return 1
+  [[ -n "${openclaw_package_dir}" ]] || return 1
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+    verify_openclaw_2026_9_1_bridged_core_contract \
+      "${openclaw_package_dir}" || return 1
+  else
+    claude_ask_user_target="$(
+      resolve_openclaw_claude_ask_user_hotfix_target \
+        "${openclaw_package_dir}/dist" || true
+    )"
+    [[ -n "${claude_ask_user_target}" ]] || return 1
+    openclaw_claude_ask_user_hotfix_is_applied \
+      "${claude_ask_user_target}" || return 1
+  fi
   for attempt in 1 2 3 4 5 6; do
     observed_gateway="$(openclaw_gateway_version || true)"
     if [[ "${observed_gateway}" == "${PIN_OPENCLAW_RUNTIME_VERSION}" ]] \
-      && OPENCLAW_ALLOW_ROOT=1 openclaw gateway status --require-rpc --timeout 10000 >> "$LOG_FILE" 2>&1 \
-      && verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
-      && verify_openclaw_codex_plugin_pending_input_hotfix \
-      && verify_bridgesllm_ask_user_tested_pair; then
-      return 0
+      && verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}"; then
+      if [[ "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" ]]; then
+        codex_package_dir="$(openclaw_codex_plugin_attested_package_dir || true)"
+        if [[ -n "${codex_package_dir}" ]] \
+          && verify_openclaw_2026_9_1_bridged_pair_contract \
+            "${openclaw_package_dir}" "${codex_package_dir}" \
+          && verify_bridgesllm_ask_user_tested_pair; then
+          return 0
+        fi
+      elif verify_openclaw_codex_plugin_pending_input_hotfix \
+        && verify_bridgesllm_ask_user_tested_pair; then
+        return 0
+      fi
     fi
     echo "tested-pair verify attempt ${attempt}: gateway version '${observed_gateway}' (expected '${PIN_OPENCLAW_RUNTIME_VERSION}')" >> "$LOG_FILE"
     sleep 5
@@ -22744,24 +29705,37 @@ if allow is not None and (
     raise SystemExit(1)
 agents = value.get("agents")
 defaults = agents.get("defaults") if isinstance(agents, dict) else None
-cli_backends = defaults.get("cliBackends") if isinstance(defaults, dict) else None
-claude_backend = cli_backends.get("claude-cli") if isinstance(cli_backends, dict) else None
-claude_env = claude_backend.get("env") if isinstance(claude_backend, dict) else None
-if (
-    not isinstance(claude_backend, dict)
-    or not isinstance(claude_backend.get("command"), str)
-    or not claude_backend["command"].strip()
-    or not isinstance(claude_env, dict)
-    or claude_env.get("MCP_TOOL_TIMEOUT") != "660000"
-    or claude_env.get("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT") != "660000"
-):
+# OpenClaw 2026.9.1 removed agents.defaults.cliBackends. The Portal plugin
+# must never recreate the retired override after the bounded config migration.
+if isinstance(defaults, dict) and "cliBackends" in defaults:
     raise SystemExit(1)
 PY
+}
+
+bridgesllm_ask_user_question_authority() {
+  # Portal 4.1 supports exactly the retained 7.1 legacy bridge and the 9.1
+  # native question runtime. Never infer a future runtime's ownership model.
+  case "${PIN_OPENCLAW_RUNTIME_VERSION:-}" in
+    2026.7.1)
+      [[ "${PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION:-}" == "3.3.0" ]] \
+        || return 1
+      printf 'legacy-custom\n'
+      ;;
+    2026.9.1)
+      [[ "${PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION:-}" == "4.0.0" ]] \
+        || return 1
+      printf 'native\n'
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 verify_bridgesllm_ask_user_plugin_runtime() {
   local target_dir="$1"
   local output_path="$2"
+  local question_authority=""
+  question_authority="$(bridgesllm_ask_user_question_authority)" \
+    || return 1
   if ! OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect \
       bridgesllm-ask-user --json --runtime > "${output_path}" \
       2>> "${LOG_FILE}"; then
@@ -22770,7 +29744,8 @@ verify_bridgesllm_ask_user_plugin_runtime() {
   python3 - \
     "${output_path}" \
     "${target_dir}" \
-    "${PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION}" <<'PY'
+    "${PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION}" \
+    "${question_authority}" <<'PY'
 import json
 import os
 import pathlib
@@ -22779,6 +29754,7 @@ import sys
 report_path = pathlib.Path(sys.argv[1])
 target = pathlib.Path(sys.argv[2])
 expected_version = sys.argv[3]
+question_authority = sys.argv[4]
 try:
     report = json.loads(report_path.read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError):
@@ -22788,6 +29764,28 @@ diagnostics = report.get("diagnostics") if isinstance(report, dict) else None
 methods = report.get("gatewayMethods") if isinstance(report, dict) else None
 tool_names = plugin.get("toolNames") if isinstance(plugin, dict) else None
 typed_hooks = report.get("typedHooks") if isinstance(report, dict) else None
+legacy_methods = frozenset((
+    "bridgesllm.ask_user.probe",
+    "bridgesllm.ask_user.pending",
+    "bridgesllm.ask_user.answer",
+    "bridgesllm.ask_user.dismiss",
+    "bridgesllm.ask_user.steer",
+))
+native_methods = frozenset((
+    "bridgesllm.ask_user.steer",
+))
+if question_authority == "legacy-custom":
+    expected_tools = ["ask_user_question"]
+    expected_hook_count = 1
+    expected_hook_names = ["before_tool_call"]
+    expected_methods = legacy_methods
+elif question_authority == "native":
+    expected_tools = []
+    expected_hook_count = 0
+    expected_hook_names = []
+    expected_methods = native_methods
+else:
+    raise SystemExit(1)
 if (
     not isinstance(plugin, dict)
     or plugin.get("id") != "bridgesllm-ask-user"
@@ -22800,21 +29798,15 @@ if (
     or os.path.realpath(plugin.get("source", ""))
         != os.path.realpath(target / "index.js")
     or not isinstance(tool_names, list)
-    or "ask_user_question" not in tool_names
-    or plugin.get("hookCount") != 1
+    or tool_names != expected_tools
+    or plugin.get("hookCount") != expected_hook_count
     or not isinstance(typed_hooks, list)
-    or not any(
-        isinstance(item, dict) and item.get("name") == "before_tool_call"
-        for item in typed_hooks
-    )
+    or [item.get("name") for item in typed_hooks if isinstance(item, dict)]
+        != expected_hook_names
+    or len(typed_hooks) != len(expected_hook_names)
     or not isinstance(methods, list)
-    or not {
-        "bridgesllm.ask_user.probe",
-        "bridgesllm.ask_user.pending",
-        "bridgesllm.ask_user.answer",
-        "bridgesllm.ask_user.dismiss",
-        "bridgesllm.ask_user.steer",
-    }.issubset(set(methods))
+    or len(methods) != len(expected_methods)
+    or set(methods) != expected_methods
     or not isinstance(diagnostics, list)
     or any(
         isinstance(item, dict) and item.get("level") == "error"
@@ -22828,17 +29820,94 @@ PY
 verify_bridgesllm_ask_user_gateway_method() {
   local output_path="$1"
   local mode="${2:-full}"
-  local nonce session_key run_id request_id method params probe_kind
+  local config_path="${3:-/root/.openclaw/openclaw.json}"
+  local nonce session_key run_id request_id question_id question_authority
+  local method params probe_kind rpc_status expect_failure
   case "${mode}" in
     full|bootstrap) ;;
     *) return 1 ;;
   esac
+  question_authority="$(bridgesllm_ask_user_question_authority)" \
+    || return 1
   nonce="$(rand_hex 12)" || return 1
   session_key="agent:main:bridgesllm-install-probe-${nonce}"
   run_id="bridgesllm-install-probe-${nonce}"
   request_id="bridgesllm-install-request-${nonce}"
-  for probe_kind in probe pending answer dismiss steer; do
+  question_id="bridgesllm-native-question-readiness-${nonce}"
+
+  # Bind the semantic probes to an explicitly tested running generation before
+  # testing either authority surface. Never normalize arbitrary package suffixes
+  # into a supported runtime: only the retained 7.1 identities and exact 9.1
+  # identity have compatibility evidence.
+  if ! run_local_openclaw_gateway_rpc "${config_path}" call status \
+      --json --timeout 10000 \
+      --params '{"includeChannelSummary":false}' \
+      > "${output_path}" 2>> "${LOG_FILE}"; then
+    return 1
+  fi
+  if ! python3 - "${output_path}" "${PIN_OPENCLAW_RUNTIME_VERSION}" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    response = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+expected = sys.argv[2]
+raw = response.get("runtimeVersion") if isinstance(response, dict) else None
+allowed = {
+    "2026.7.1": {"2026.7.1", "2026.7.1-2"},
+    "2026.9.1": {"2026.9.1"},
+    }
+if raw not in allowed.get(expected, {expected}):
+    raise SystemExit(1)
+PY
+  then
+    return 1
+  fi
+
+  local -a probe_kinds=()
+  if [[ "${question_authority}" == "legacy-custom" ]]; then
+    probe_kinds=(probe pending answer dismiss steer)
+  else
+    probe_kinds=(
+      tool-catalog question-list question-get question-resolve
+      retired-probe retired-pending retired-answer retired-dismiss
+      steer
+    )
+  fi
+
+  # On 9.1, successful question.list plus authenticated not-found responses
+  # from question.get/question.resolve prove the negotiated operator.questions
+  # scope without creating a question or other user-visible state.
+
+  for probe_kind in "${probe_kinds[@]}"; do
+    expect_failure=false
     case "${probe_kind}" in
+      tool-catalog)
+        method="tools.catalog"
+        params='{"agentId":"main","includePlugins":true}'
+        ;;
+      question-list)
+        method="question.list"
+        params='{}'
+        ;;
+      question-get)
+        method="question.get"
+        params="{\"id\":\"${question_id}\"}"
+        expect_failure=true
+        ;;
+      question-resolve)
+        method="question.resolve"
+        params="{\"id\":\"${question_id}\",\"cancel\":true,\"resolvedBy\":\"bridgesllm-readiness\"}"
+        expect_failure=true
+        ;;
+      retired-probe|retired-pending|retired-answer|retired-dismiss)
+        method="bridgesllm.ask_user.${probe_kind#retired-}"
+        params='{}'
+        expect_failure=true
+        ;;
       probe)
         method="bridgesllm.ask_user.probe"
         params="{\"nonce\":\"${nonce}\"}"
@@ -22860,15 +29929,21 @@ verify_bridgesllm_ask_user_gateway_method() {
         params="{\"sessionKey\":\"${session_key}\",\"expectedRunId\":\"${run_id}\",\"requestId\":\"${request_id}\",\"text\":\"BridgesLLM readiness probe.\"}"
         ;;
     esac
-    if ! OPENCLAW_ALLOW_ROOT=1 openclaw gateway call \
+    rpc_status=0
+    run_local_openclaw_gateway_rpc "${config_path}" call \
         "${method}" \
         --json \
         --timeout 10000 \
-        --params "${params}" > "${output_path}" 2>> "${LOG_FILE}"; then
-      return 1
+        --params "${params}" > "${output_path}" 2>> "${LOG_FILE}" \
+      || rpc_status=$?
+    if $expect_failure; then
+      (( rpc_status != 0 )) || return 1
+    else
+      (( rpc_status == 0 )) || return 1
     fi
     if ! python3 - \
-      "${output_path}" "${probe_kind}" "${request_id}" "${mode}" <<'PY'
+      "${output_path}" "${probe_kind}" "${request_id}" "${mode}" \
+      "${question_id}" "${method}" <<'PY'
 import json
 import pathlib
 import sys
@@ -22880,11 +29955,45 @@ except (OSError, UnicodeError, json.JSONDecodeError):
 kind = sys.argv[2]
 request_id = sys.argv[3]
 mode = sys.argv[4]
+question_id = sys.argv[5]
+method = sys.argv[6]
 if mode not in {"full", "bootstrap"}:
     raise SystemExit(1)
 if not isinstance(response, dict):
     raise SystemExit(1)
-if kind == "probe":
+error = response.get("error") if isinstance(response.get("error"), dict) else None
+error_code = str(error.get("code", "")).lower() if error else ""
+error_message = str(error.get("message", "")) if error else ""
+if kind == "tool-catalog":
+    groups = response.get("groups")
+    tools = [
+        (tool, group)
+        for group in groups if isinstance(group, dict)
+        for tool in group.get("tools", []) if isinstance(tool, dict)
+    ] if isinstance(groups, list) else []
+    native = [(tool, group) for tool, group in tools if tool.get("id") == "ask_user"]
+    valid = (
+        len(native) == 1
+        and native[0][0].get("source") == "core"
+        and native[0][1].get("source") == "core"
+        and not any(tool.get("id") == "ask_user_question" for tool, _ in tools)
+    )
+elif kind == "question-list":
+    valid = isinstance(response.get("questions"), list)
+elif kind in {"question-get", "question-resolve"}:
+    valid = (
+        response.get("ok") is False
+        and error_code == "invalid_request"
+        and question_id.lower() in error_message.lower()
+        and "not found" in error_message.lower()
+    )
+elif kind.startswith("retired-"):
+    valid = (
+        response.get("ok") is False
+        and error_code == "invalid_request"
+        and error_message == f"unknown method: {method}"
+    )
+elif kind == "probe":
     full_valid = (
         response.get("ok") is True
         and response.get("code") == "SEMANTIC_PROBE_OK"
@@ -22936,7 +30045,8 @@ verify_bridgesllm_ask_user_tested_pair() {
   verify_bridgesllm_ask_user_plugin_config "${config_path}" \
     && verify_bridgesllm_ask_user_plugin_runtime \
       "${target_dir}" "${output_path}" \
-    && verify_bridgesllm_ask_user_gateway_method "${output_path}" "${mode}" \
+    && verify_bridgesllm_ask_user_gateway_method \
+      "${output_path}" "${mode}" "${config_path}" \
     || status=$?
   rm -f -- "${output_path}"
   return "${status}"
@@ -23214,7 +30324,7 @@ PY
   fi
   if [[ "${gateway_was_active}" == "true" \
     && "${defer_gateway_restart}" != "true" ]]; then
-    systemctl restart openclaw-gateway >> "${LOG_FILE}" 2>&1 || return 1
+    restart_openclaw_gateway_with_identity_authority >> "${LOG_FILE}" 2>&1 || return 1
     verify_openclaw_gateway_stable \
       "${PIN_OPENCLAW_RUNTIME_VERSION}" 18 || return 1
   fi
@@ -23255,6 +30365,7 @@ commit_bridgesllm_ask_user_transaction() {
 
 recover_or_retire_bridgesllm_ask_user_transaction() {
   local openclaw_state_dir="$1"
+  local defer_gateway_restart="${2:-false}"
   local transaction_dir="${openclaw_state_dir}/.bridgesllm-ask-user-tested-pair-v1"
   [[ -e "${transaction_dir}" || -L "${transaction_dir}" ]] || return 0
   if [[ ! -d "${transaction_dir}" || -L "${transaction_dir}" \
@@ -23277,17 +30388,16 @@ recover_or_retire_bridgesllm_ask_user_transaction() {
     OPENCLAW_ASK_USER_TRANSACTION_COMMITTED=true
     commit_bridgesllm_ask_user_transaction
   else
-    rollback_bridgesllm_ask_user_transaction
+    rollback_bridgesllm_ask_user_transaction "${defer_gateway_restart}"
   fi
 }
 
 install_bridgesllm_ask_user_plugin() {
-  # The ask-user bridge is a required part of the Portal/OpenClaw runtime. It
-  # provides non-Codex providers with a real ask-user tool and registers
-  # gateway methods that settle either that tool or native Codex input only on
-  # the exact attested run. Treat its directory and the shared OpenClaw config
-  # as one local transaction: either the new plugin is loaded and callable, or
-  # both are restored before this function fails.
+  # This plugin is a required part of the Portal/OpenClaw runtime. On retained
+  # 7.1 it is the exact 3.3 legacy question bridge. On 9.1 it is the exact 4.0
+  # steer-only runtime guard while OpenClaw alone owns native questions. Treat
+  # its directory and shared config as one local transaction: either the exact
+  # generation is loaded and callable, or both are restored before failure.
   if $SKIP_OPENCLAW; then
     return 0
   fi
@@ -23452,17 +30562,17 @@ install_bridgesllm_ask_user_plugin() {
   if [[ -z "${failure_reason}" ]] \
     && ! verify_bridgesllm_ask_user_plugin_runtime \
       "${target_dir}" "${inspect_output}"; then
-    failure_reason="OpenClaw could not load the plugin or register its ask-user capabilities"
+    failure_reason="OpenClaw could not load the exact versioned question/steer runtime surface"
   fi
   if [[ -z "${failure_reason}" ]] && $gateway_was_active; then
-    if ! systemctl restart openclaw-gateway >> "${LOG_FILE}" 2>&1; then
+    if ! restart_openclaw_gateway_with_identity_authority >> "${LOG_FILE}" 2>&1; then
       failure_reason="the active OpenClaw gateway could not restart with the plugin"
     elif ! verify_openclaw_gateway_stable \
       "${PIN_OPENCLAW_RUNTIME_VERSION}" 18; then
       failure_reason="the OpenClaw gateway was not stable after plugin activation"
     elif ! verify_bridgesllm_ask_user_gateway_method \
-      "${rpc_output}" bootstrap; then
-      failure_reason="the running OpenClaw gateway failed ask-user execute and settlement semantics"
+      "${rpc_output}" bootstrap "${config_path}"; then
+      failure_reason="the running OpenClaw gateway failed its exact versioned question/steer semantics"
     fi
   fi
   [[ -z "${failure_reason}" ]] && install_succeeded=true
@@ -23482,68 +30592,142 @@ install_bridgesllm_ask_user_plugin() {
   fi
 
   $gateway_was_active && OPENCLAW_ASK_USER_BASE_ATTESTED=true
-  ok "Ask-question answer channel installed and verified; tested-pair rollback remains armed"
+  ok "OpenClaw question/steer runtime contract installed and verified; tested-pair rollback remains armed"
 }
 
 ensure_openclaw_codex_plugin_compatible() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
   fi
+  load_openclaw_migration_transaction || return 1
+  [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "migration-prepared" ]] || return 1
 
-  if verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}"; then
-    ok "OpenClaw Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} checked (exact pinned npm record)"
-    return 0
-  fi
-
-  if ! capture_openclaw_codex_plugin_baseline; then
-    warn "Could not prove and preserve the existing OpenClaw Codex plugin baseline."
+  local baseline preexisted gateway_identity gateway_tuple gateway_was_active gateway_pid
+  local gateway_invocation gateway_started binding proof proof_pid proof_invocation
+  local proof_started proof_digest forward_identity mutation_required=true
+  # Hold the entire official plugin bundle until the composite decision.
+  baseline="$(openclaw_codex_plugin_baseline_json)" || {
+    warn "Could not establish an exact installed or bundled-absence Codex baseline."
     return 1
-  fi
+  }
+  preexisted="$(
+    printf '%s' "${baseline}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); process.stdout.write(value.kind === "bundled-absence" ? "false" : "true"); }
+  catch (_) { process.exit(1); }
+});
+'
+  )" || return 1
+  gateway_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  gateway_tuple="$(openclaw_gateway_identity_tuple \
+    "${gateway_identity}")" || return 1
+  IFS='|' read -r gateway_was_active gateway_pid gateway_invocation gateway_started \
+    <<< "${gateway_tuple}"
+  [[ "${gateway_was_active}" =~ ^(true|false)$ && "${gateway_pid}" =~ ^[0-9]+$ \
+    && "${gateway_started}" =~ ^[0-9]+$ ]] || return 1
+
+  run_openclaw_migration_transaction_tool begin-codex \
+    --plugin-catalog portal \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --preexisted "${preexisted}" \
+    --mutation-required "${mutation_required}" \
+    --baseline-json "${baseline}" \
+    --target-version "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
+    --target-integrity "${PIN_OPENCLAW_CODEX_PLUGIN_INTEGRITY}" \
+    --gateway-was-active "${gateway_was_active}" \
+    --gateway-main-pid "${gateway_pid}" \
+    --gateway-invocation-id "${gateway_invocation}" \
+    --gateway-start-monotonic "${gateway_started}" \
+    --gateway-unit-identity-json "${gateway_identity}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
   OPENCLAW_CODEX_PLUGIN_UPDATE_ATTEMPTED=true
 
-  local helper="${PORTAL_DIR}/backend/dist/services/openclawConfigManager.js"
-  if [[ -f "${helper}" ]] && command -v node &>/dev/null; then
-    info "Repairing stale OpenClaw Codex plugin state..."
-    if ! OPENCLAW_ALLOW_ROOT=1 \
-      PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION="${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" \
-      NODE_PATH="${PORTAL_DIR}/backend/node_modules" \
-      node -e 'const helper = process.argv[1]; const expected = process.argv[2]; const mod = require(helper); const result = mod.repairOpenClawCodexPluginInstallState(expected); console.log(JSON.stringify(result));' \
-        "${helper}" "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" >> "$LOG_FILE" 2>&1; then
-      warn "OpenClaw Codex plugin state repair failed. Continuing with compatibility check."
-    else
-      ok "OpenClaw Codex plugin state repaired"
-    fi
+  if [[ "${gateway_was_active}" == "true" ]]; then
+    stop_openclaw_gateway_if_identity_matches \
+      "${gateway_identity}" || return 1
+  else
+    openclaw_gateway_require_exact_identity \
+      "${gateway_identity}" >/dev/null || return 1
+  fi
+  if [[ "${mutation_required}" == "true" ]]; then
+    run_durable_openclaw_codex_plugin_helper prepare-held \
+      >> "${LOG_FILE}" 2>&1 || return 1
+    binding="$(run_durable_openclaw_codex_plugin_helper held-binding \
+      2>> "${LOG_FILE}")" || return 1
+    advance_openclaw_codex_transaction preparing rollback-ready \
+      --journal-binding "${binding}" || return 1
+    advance_openclaw_codex_transaction rollback-ready install-pending || return 1
+    run_durable_openclaw_codex_plugin_helper apply-held \
+      >> "${LOG_FILE}" 2>&1 || return 1
+    advance_openclaw_codex_transaction \
+      install-pending forward-record-installed || return 1
+  else
+    binding=""
+    advance_openclaw_codex_transaction \
+      preparing forward-record-installed || return 1
   fi
 
-  info "Installing tested OpenClaw Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}..."
-  if ! OPENCLAW_ALLOW_ROOT=1 openclaw plugins install \
-    "@openclaw/codex@${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" --force --pin >> "$LOG_FILE" 2>&1; then
-    warn "OpenClaw Codex plugin install failed; the atomic core/plugin rollback remains armed."
-    return 1
+  if [[ "${gateway_was_active}" == "true" ]]; then
+    forward_identity="$(openclaw_gateway_require_inactive_unit_definition \
+      "${gateway_identity}")" || return 1
+    openclaw_codex_transaction_fault_inject before-forward-start-authority
+    run_openclaw_migration_transaction_tool record-codex-gateway-start \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+      --role forward --identity-json "${forward_identity}" \
+      >> "${LOG_FILE}" 2>&1 || return 1
+    openclaw_codex_transaction_fault_inject after-forward-start-authority
+    authorized_systemctl_openclaw_gateway \
+      start "${forward_identity}" codex-action >> "${LOG_FILE}" 2>&1 || return 1
+    openclaw_codex_transaction_fault_inject after-forward-start
+    verify_openclaw_gateway_stable "${PIN_OPENCLAW_RUNTIME_VERSION}" 18 || return 1
+    forward_identity="$(openclaw_gateway_systemd_identity)" || return 1
+    openclaw_gateway_identity_is_active "${forward_identity}" \
+      && openclaw_gateway_unit_definition_equal \
+        "${gateway_identity}" "${forward_identity}" || return 1
+    openclaw_codex_transaction_fault_inject before-forward-result-identity
+  else
+    forward_identity="$(openclaw_gateway_require_inactive_unit_definition \
+      "${gateway_identity}")" || {
+        warn "The Codex transaction found an active or replaced gateway that it does not own."
+        return 1
+      }
   fi
-  ok "OpenClaw Codex plugin package installed"
+  run_openclaw_migration_transaction_tool record-codex-gateway \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --role forward --identity-json "${forward_identity}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  proof="$(write_openclaw_codex_gateway_proof forward "${binding}" "${baseline}")" \
+    || return 1
+  IFS='|' read -r proof_pid proof_invocation proof_started proof_digest \
+    <<< "${proof}"
+  [[ "${proof_pid}" =~ ^[0-9]+$ && "${proof_started}" =~ ^[0-9]+$ \
+    && "${proof_digest}" =~ ^[a-f0-9]{64}$ ]] || return 1
+  advance_openclaw_codex_transaction \
+    forward-record-installed forward-attested \
+    --gateway-main-pid "${proof_pid}" \
+    --gateway-invocation-id "${proof_invocation}" \
+    --gateway-start-monotonic "${proof_started}" \
+    --proof-sha256 "${proof_digest}" || return 1
 
-  if ! verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}"; then
-    warn "OpenClaw Codex plugin did not produce the exact pinned npm install record and package revision; the atomic rollback remains armed."
-    return 1
+  if [[ "${mutation_required}" == "true" ]]; then
+    ok "OpenClaw Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} installed with durable generation rollback and composite gateway evidence"
+  else
+    ok "OpenClaw Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} exact disk generation re-attested through the durable gateway transaction"
   fi
-
-  if systemctl is-enabled openclaw-gateway >/dev/null 2>&1; then
-    if ! systemctl restart openclaw-gateway >> "$LOG_FILE" 2>&1 \
-      || ! verify_openclaw_gateway_stable "${PIN_OPENCLAW_RUNTIME_VERSION}" 18; then
-      warn "The gateway did not load the tested Codex plugin cleanly; the atomic core/plugin rollback remains armed."
-      return 1
-    fi
-  fi
-
-  # Keep the rollback armed until the exact core + authenticated gateway RPC +
-  # plugin package/install-record pair is verified and committed together.
-  ok "OpenClaw Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} loaded; pair commit pending"
 }
 
 apply_openclaw_codex_plugin_pending_input_hotfix() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
+  fi
+
+  if [[ "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" ]]; then
+    if verify_openclaw_codex_plugin_pending_input_hotfix; then
+      ok "OpenClaw 2026.9.1 native request_user_input and chat.send steer contracts verified"
+      return 0
+    fi
+    warn "OpenClaw 2026.9.1 is missing its required native request_user_input or chat.send steer contract."
+    return 1
   fi
 
   local hotfix_script="${PORTAL_DIR}/scripts/patch-openclaw-codex-pending-input-hotfix.sh"
@@ -23610,28 +30794,50 @@ apply_openclaw_codex_plugin_pending_input_hotfix() {
 
 commit_openclaw_tested_pair() {
   local openclaw_package_dir="" pending_target="" claude_target=""
+  local hard_delete_schema_target="" hard_delete_handler_target=""
+  local decision_second_target=""
+  local stock_target_output=""
+  local -a stock_targets=()
   local ask_user_transaction="" ask_user_state_root=""
   local ask_user_target="" ask_user_config=""
   local sigint_trap="" sigterm_trap="" sighup_trap=""
   verify_openclaw_tested_pair || return 1
   openclaw_package_dir="$(openclaw_core_package_dir || true)"
-  pending_target="${OPENCLAW_PENDING_INPUT_HOTFIX_TARGET:-}"
-  claude_target="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET:-}"
-  if [[ -z "${pending_target}" ]]; then
-    pending_target="$(
-      resolve_openclaw_pending_input_hotfix_target \
-        "${openclaw_package_dir}/dist" || true
-    )"
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+    stock_target_output="$(resolve_openclaw_2026_9_1_contract_targets \
+      "${openclaw_package_dir}" 2>> "${LOG_FILE}")" || return 1
+    mapfile -t stock_targets <<< "${stock_target_output}"
+    (( ${#stock_targets[@]} == 3 )) || return 1
+    pending_target="${stock_targets[0]:-}"
+    hard_delete_schema_target="${stock_targets[1]:-}"
+    hard_delete_handler_target="${stock_targets[2]:-}"
+  else
+    pending_target="${OPENCLAW_PENDING_INPUT_HOTFIX_TARGET:-}"
+    claude_target="${OPENCLAW_CLAUDE_ASK_USER_HOTFIX_TARGET:-}"
+    if [[ -z "${pending_target}" ]]; then
+      pending_target="$(
+        resolve_openclaw_pending_input_hotfix_target \
+          "${openclaw_package_dir}/dist" || true
+      )"
+    fi
+    if [[ -z "${claude_target}" ]]; then
+      claude_target="$(
+        resolve_openclaw_claude_ask_user_hotfix_target \
+          "${openclaw_package_dir}/dist" || true
+      )"
+    fi
+    openclaw_pending_input_hotfix_is_applied "${pending_target}" || return 1
+    openclaw_claude_ask_user_hotfix_is_applied "${claude_target}" || return 1
   fi
-  if [[ -z "${claude_target}" ]]; then
-    claude_target="$(
-      resolve_openclaw_claude_ask_user_hotfix_target \
-        "${openclaw_package_dir}/dist" || true
-    )"
+  [[ -n "${pending_target}" ]] || return 1
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+    [[ -n "${hard_delete_schema_target}" \
+      && -n "${hard_delete_handler_target}" ]] || return 1
+    decision_second_target="${hard_delete_schema_target}"
+  else
+    [[ -n "${claude_target}" ]] || return 1
+    decision_second_target="${claude_target}"
   fi
-  [[ -n "${pending_target}" && -n "${claude_target}" ]] || return 1
-  openclaw_pending_input_hotfix_is_applied "${pending_target}" || return 1
-  openclaw_claude_ask_user_hotfix_is_applied "${claude_target}" || return 1
   $OPENCLAW_ASK_USER_TRANSACTION_ARMED || return 1
   $OPENCLAW_ASK_USER_LIVE_ATTESTED || return 1
   ask_user_transaction="${OPENCLAW_ASK_USER_TRANSACTION_DIR:-}"
@@ -23640,7 +30846,9 @@ commit_openclaw_tested_pair() {
   ask_user_config="${ask_user_state_root}/openclaw.json"
   [[ -n "${ask_user_transaction}" && -n "${ask_user_state_root}" ]] || return 1
 
-  # One fsynced record is the commit decision for both byte-level mutations.
+  # One fsynced record is the commit decision for every byte-level mutation
+  # (three exact 9.1 targets, or the legacy two-target generation) plus the
+  # ask-user plugin/config transaction.
   # Block termination only across that short decision boundary. Once the
   # record and in-memory flag exist, cleanup can be retried without rolling one
   # half of the tested pair back independently.
@@ -23648,9 +30856,25 @@ commit_openclaw_tested_pair() {
   sigterm_trap="$(trap -p TERM || true)"
   sighup_trap="$(trap -p HUP || true)"
   trap '' SIGINT TERM HUP
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+    load_openclaw_migration_transaction \
+      || { [[ -n "${sigint_trap}" ]] && eval "${sigint_trap}" || trap - SIGINT;
+           [[ -n "${sigterm_trap}" ]] && eval "${sigterm_trap}" || trap - SIGTERM;
+           [[ -n "${sighup_trap}" ]] && eval "${sighup_trap}" || trap - SIGHUP;
+           return 1; }
+    if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" != "migration-prepared" ]] \
+      || ! advance_openclaw_migration_transaction \
+        migration-prepared commit-pending; then
+      [[ -n "${sigint_trap}" ]] && eval "${sigint_trap}" || trap - SIGINT
+      [[ -n "${sigterm_trap}" ]] && eval "${sigterm_trap}" || trap - SIGTERM
+      [[ -n "${sighup_trap}" ]] && eval "${sighup_trap}" || trap - SIGHUP
+      return 1
+    fi
+  fi
   if ! write_openclaw_tested_pair_commit_record \
     "${pending_target}" \
-    "${claude_target}" \
+    "${decision_second_target}" \
+    "${hard_delete_handler_target}" \
     "${ask_user_transaction}" \
     "${ask_user_target}" \
     "${ask_user_config}"; then
@@ -23666,10 +30890,35 @@ commit_openclaw_tested_pair() {
   [[ -n "${sigterm_trap}" ]] && eval "${sigterm_trap}" || trap - TERM
   [[ -n "${sighup_trap}" ]] && eval "${sighup_trap}" || trap - HUP
 
+  if [[ -d "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
+    && ! -L "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" ]] \
+    && ! commit_native_cli_bundle_transaction >> "${LOG_FILE}" 2>&1; then
+    warn "The combined tested-pair decision is durable, but the native CLI bundle did not reach committed cleanup. Its exact target and rollback trees remain fenced for restart reconciliation."
+    return 1
+  fi
+
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]] \
+    && { ! advance_openclaw_migration_transaction \
+          commit-pending commit-applying "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || ! run_durable_openclaw_codex_plugin_helper commit-held \
+      || ! commit_openclaw_2026_9_1_migration \
+      || ! advance_openclaw_migration_transaction \
+          commit-applying committed-cleanup "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"; }; then
+    warn "The tested OpenClaw pair committed, but its 9.1 migration transaction did not reach terminal cleanup; its v5-bound root-only evidence remains safe for restart reconciliation."
+    return 1
+  fi
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" \
+    && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE:-}" == "committed-cleanup" ]] \
+    && ! disarm_openclaw_gateway_migration_fence; then
+    warn "The tested OpenClaw pair committed, but its durable gateway reboot fence could not be retired; restart reconciliation is required."
+    return 1
+  fi
+
   if ! commit_openclaw_pending_input_hotfix; then
     warn "The tested pair committed, but the native pending-input backup could not be retired; the durable commit record will reconcile it on the next run."
   fi
-  if ! commit_openclaw_claude_ask_user_hotfix; then
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" != "2026.9.1" ]] \
+    && ! commit_openclaw_claude_ask_user_hotfix; then
     warn "The tested pair committed, but the Claude ask-user backup could not be retired; the durable commit record will reconcile it on the next run."
   fi
   if ! commit_bridgesllm_ask_user_transaction; then
@@ -23677,22 +30926,76 @@ commit_openclaw_tested_pair() {
   fi
   OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED=true
   OPENCLAW_CLAUDE_ASK_USER_HOTFIX_COMMITTED=true
-  if ! retire_openclaw_tested_pair_commit_record_if_clean \
-    "${pending_target}" \
-    "${claude_target}" \
-    "${ask_user_transaction}"; then
+  if ! retire_openclaw_tested_pair_commit_record_if_clean; then
     warn "The tested pair committed, but its completed decision record could not be retired; backup-generation binding prevents stale replay."
+  fi
+  if [[ ! -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+    && ! -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] \
+    && native_cli_bundle_transaction_present \
+    && ! cleanup_native_cli_bundle_transaction >> "${LOG_FILE}" 2>&1; then
+    warn "The native CLI bundle committed, but its terminal root-only rollback generation could not be retired; the next installer run will resume cleanup."
+    return 1
+  fi
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE:-}" == "committed-cleanup" \
+    && ! -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+    && ! -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] \
+    && ! cleanup_openclaw_migration_transaction committed-cleanup; then
+    warn "The committed OpenClaw migration transaction could not be retired; its terminal root-only ledger remains safe for the next run."
   fi
   return 0
 }
 
 configure_openclaw_codex_harness_defaults() {
+  local portal_root="${1:-${PORTAL_DIR}}"
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
   fi
 
   local oc_config="${HOME}/.openclaw/openclaw.json"
   [[ -f "${oc_config}" ]] || return 0
+
+  # OpenClaw 9.1's Codex plugin embeds App Server 0.152.1. Portal qualifies
+  # the newer host App Server only after the signed admission catalog has
+  # attested its complete root-owned package tree, platform artifact, link,
+  # and exact 0.153.2 version. The plugin's own doctor deliberately skips
+  # external-command overrides, so a version string alone is not authority.
+  local admission_helper="${portal_root}/backend/dist/services/nativeHostCliAdmission.js"
+  if [[ ! -f "${admission_helper}" || -L "${admission_helper}" ]]; then
+    warn "Portal's signed native Codex admission helper is missing or unsafe."
+    return 1
+  fi
+  if native_cli_bundle_transaction_present; then
+    # Portal's normal admission path intentionally refuses every launch while
+    # the bundle root exists. The root installer uses the transaction's own
+    # exact full-tree verifier here; ordinary Portal processes get no bypass.
+    if ! run_native_cli_bundle_transaction_tool verify >> "$LOG_FILE" 2>&1; then
+      warn "Codex ${PIN_CODEX_CLI_VERSION} failed the active native bundle's exact target verification."
+      return 1
+    fi
+  elif ! NODE_PATH="${portal_root}/backend/node_modules" node - \
+      "${admission_helper}" "${PIN_CODEX_CLI_VERSION}" >> "$LOG_FILE" 2>&1 <<'NODE'; then
+const helper = require(process.argv[2]);
+const expectedVersion = process.argv[3];
+(async () => {
+  const identity = await helper.attestNativeHostCli('codex', '/usr/bin/codex');
+  if (identity?.version !== expectedVersion || identity?.executablePath !== '/usr/bin/codex') {
+    process.exitCode = 1;
+    return;
+  }
+  process.stdout.write(`${JSON.stringify({
+    toolId: identity.toolId,
+    version: identity.version,
+    executablePath: identity.executablePath,
+    fingerprint: identity.fingerprint,
+  })}\n`);
+})().catch((error) => {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});
+NODE
+    warn "Codex ${PIN_CODEX_CLI_VERSION} failed exact native package admission; refusing to bind OpenClaw to an untrusted host executable."
+    return 1
+  fi
 
   if python3 - "$oc_config" >> "$LOG_FILE" 2>&1 <<'PY'
 import json
@@ -23718,9 +31021,24 @@ if codex.get("enabled") is not True:
 config = codex.setdefault("config", {})
 app_server = config.setdefault("appServer", {})
 
+# These timeout keys existed in the older Portal/OpenClaw contract but are
+# rejected by the strict 9.1 plugin schema. Retire them rather than preserving
+# an invalid configuration that prevents the provider from loading.
+for key in (
+    "turnCompletionIdleTimeoutMs",
+    "postToolRawAssistantCompletionIdleTimeoutMs",
+):
+    if key in app_server:
+        del app_server[key]
+        changed = True
+
+# Keep executable and arguments separate: this is OpenClaw 9.1's supported
+# external App Server contract. Do not set homeScope; the plugin's default
+# agent-isolated security model remains authoritative.
 for key, value in {
-    "turnCompletionIdleTimeoutMs": 180000,
-    "postToolRawAssistantCompletionIdleTimeoutMs": 180000,
+    "transport": "stdio",
+    "command": "/usr/bin/codex",
+    "args": ["app-server", "--listen", "stdio://"],
 }.items():
     if app_server.get(key) != value:
         app_server[key] = value
@@ -23730,13 +31048,119 @@ if changed:
     path.write_text(json.dumps(data, indent=2) + "\n")
 PY
   then
-    ok "OpenClaw Codex harness defaults checked"
+    ok "OpenClaw Codex harness bound to admitted Codex ${PIN_CODEX_CLI_VERSION}"
   else
-    warn "Could not update OpenClaw Codex harness defaults"
+    warn "Could not install the strict OpenClaw 9.1 Codex App Server contract"
+    return 1
   fi
 }
 
+# Every compatibility hotfix this release applies to OpenClaw's own installed
+# files is pinned to exact sha256 digests of the 2026.9.1 package
+# (OPENCLAW_2026_9_1_*_SHA256 above). OpenClaw's startup update campaign can
+# move the runtime off that tuple with nobody asking, which silently retires
+# those digests and every tested-pair attestation built on them.
+#
+# 2026.9.1's own startup gate short-circuits the entire campaign — automatic
+# applies, the 24-hour hint schedule, and update notices — when
+# update.checkOnStart is false or OPENCLAW_NO_AUTO_UPDATE is truthy
+# (dist/update-startup-*.js; docs/gateway/configuration-reference.md). Pin the
+# config form: it needs no change to the Gateway unit definition, so it stays
+# clear of the migration fence's definitionSha256 and drop-in path authority.
+#
+# Deliberately NOT suppressed: an operator running `openclaw update` by hand.
+# Users must still be able to move; they must not be moved without asking.
+# Portal's reactive readiness gate remains the backstop for a runtime that
+# drifted anyway.
+apply_openclaw_update_pin_policy() {
+  local config_path="$1"
+  [[ -n "${config_path}" ]] || return 1
+  [[ -f "${config_path}" && ! -L "${config_path}" ]] || return 1
+
+  if ! python3 - "${config_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    sys.exit(1)
+if not isinstance(data, dict):
+    sys.exit(1)
+
+update = data.get("update")
+if not isinstance(update, dict):
+    update = {}
+    data["update"] = update
+auto = update.get("auto")
+if not isinstance(auto, dict):
+    auto = {}
+    update["auto"] = auto
+
+changed = False
+if update.get("checkOnStart") is not False:
+    update["checkOnStart"] = False
+    changed = True
+if auto.get("enabled") is not False:
+    auto["enabled"] = False
+    changed = True
+
+if changed:
+    path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+  then
+    return 1
+  fi
+
+  # Re-read separately; this same read-only gate runs immediately before the
+  # durable commit, without triggering a post-boot configuration reload.
+  verify_openclaw_update_pin_policy "${config_path}"
+}
+
+verify_openclaw_update_pin_policy() {
+  local config_path="${1:-${HOME}/.openclaw/openclaw.json}"
+  [[ -f "${config_path}" && ! -L "${config_path}" ]] || return 1
+  python3 - "${config_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text())
+except Exception:
+    sys.exit(1)
+update = data.get("update") if isinstance(data, dict) else None
+if not isinstance(update, dict) or update.get("checkOnStart") is not False:
+    sys.exit(1)
+auto = update.get("auto")
+if not isinstance(auto, dict) or auto.get("enabled") is not False:
+    sys.exit(1)
+PY
+}
+
+enforce_openclaw_update_pin_policy() {
+  local config_path="${1:-${HOME}/.openclaw/openclaw.json}"
+  if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
+    return 0
+  fi
+  if [[ ! -f "${config_path}" || -L "${config_path}" ]]; then
+    warn "OpenClaw config is missing or is a symlink; the runtime update pin could not be applied."
+    return 1
+  fi
+  if ! apply_openclaw_update_pin_policy "${config_path}" >> "$LOG_FILE" 2>&1; then
+    warn "Could not pin the OpenClaw runtime against automatic updates."
+    return 1
+  fi
+  ok "OpenClaw runtime pinned to tested ${PIN_OPENCLAW_RUNTIME_VERSION}; automatic self-update disabled"
+}
+
 prepare_openclaw_runtime_for_portal() {
+  if ${RETAINED_RECONNECT_MODE}; then
+    info "Keeping the retained OpenClaw runtime, plugins, and configuration unchanged."
+    return 0
+  fi
   if $SKIP_OPENCLAW; then
     info "Skipping OpenClaw runtime compatibility checks (--skip-openclaw)"
     return 0
@@ -23748,11 +31172,41 @@ prepare_openclaw_runtime_for_portal() {
   if ! verify_openclaw_core_package_pin; then
     fail "OpenClaw core is not the tested ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} package / ${PIN_OPENCLAW_RUNTIME_VERSION} runtime pair. The updater will restore the preserved previous runtime when applicable."
   fi
-  # Publish the replacement tool/config under the same durable rollback
-  # decision as the core and native bundle patches. Native AskUserQuestion is
-  # still available throughout this first boot and live base attestation.
+  if { $MAINTAIN_TOOLS || ! $UPDATE_MODE; }; then
+    native_cli_bundle_outer_commit_authority_exists \
+      || fail "The OpenClaw outer transaction is not active; refusing to mutate the Portal-qualified native CLI tuple without its shared commit owner."
+    info "Staging the exact Portal-qualified Codex, Claude Code, and ClawHub bundle..."
+    if ! prepare_native_cli_bundle_transaction; then
+      fail "The native CLI compatibility bundle could not be staged, checksum-verified, and published under its durable rollback fence. No registry latest tag or package lifecycle script was used."
+    fi
+    ok "Native CLI bundle staged: Codex ${PIN_CODEX_CLI_VERSION}, Claude Code ${PIN_CLAUDE_CODE_VERSION}, ClawHub ${PIN_CLAWHUB_VERSION}"
+  fi
+  # The held Codex/official-plugin bundle below retains one complete npm,
+  # config, and installed-index baseline until the composite decision. Do not
+  # separately converge/commit stable plugins inside this outer transaction.
+  # 9.1 exits during startup if it must change the configured plugin inventory.
+  # Stage Codex while fenced, before the bridge snapshots its config layer.
+  # Inactive disk evidence is provisional; live tested-pair proof gates commit.
+  if ! ensure_openclaw_codex_plugin_compatible; then
+    fail "The tested Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} could not be staged before the first OpenClaw gateway boot. The compatibility-bundle rollback remains armed."
+  fi
+  # The bridge owns later harness config changes, so its rollback restores the
+  # post-Codex baseline before the held Codex transaction unwinds its own layer.
   if ! install_bridgesllm_ask_user_plugin; then
-    fail "OpenClaw is healthy, but the Portal ask-question answer channel could not be installed and verified. The previous plugin/config were restored when possible."
+    fail "The Portal ask-question answer channel could not be installed and verified. The previous plugin/config were restored when possible."
+  fi
+  if ! configure_openclaw_codex_harness_defaults; then
+    fail "OpenClaw could not be bound to the exact admitted Codex ${PIN_CODEX_CLI_VERSION} App Server. The compatibility-bundle rollback remains armed."
+  fi
+  # Complete configuration writes while the gateway is fenced and stopped.
+  # In 9.1 an update-policy reload requests a supervisor restart; after boot
+  # that restart is intentionally denied by this transaction's one-shot fence.
+  # These writers need disk state only. Keep them within the bridge's held
+  # config layer, before either planned boot or any live readiness attestation.
+  repair_openclaw_portal_model_config
+  bridge_openclaw_codex_cli_auth
+  if ! enforce_openclaw_update_pin_policy; then
+    fail "OpenClaw automatic update policy could not be pinned before gateway startup. The compatibility-bundle rollback remains armed."
   fi
   if ! ensure_openclaw_gateway_boots_cleanly; then
     fail "OpenClaw gateway did not boot cleanly with the replacement ask-user bridge. Check: journalctl -u openclaw-gateway -n 100 --no-pager"
@@ -23781,16 +31235,11 @@ prepare_openclaw_runtime_for_portal() {
   fi
   ensure_openclaw_sandbox_image
   run_openclaw_state_repair_notice
-  repair_openclaw_portal_model_config
-  bridge_openclaw_codex_cli_auth
-  # Runtime attestation below intentionally rejects a disabled or inert Codex
-  # provider. Converge the required harness state before inspecting it.
-  configure_openclaw_codex_harness_defaults
-  if ! ensure_openclaw_codex_plugin_compatible; then
-    fail "OpenClaw core is healthy, but the tested Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} could not be installed and loaded. The previous plugin was restored when possible."
-  fi
   if ! apply_openclaw_codex_plugin_pending_input_hotfix; then
     fail "OpenClaw Codex is installed, but its active provider bundle could not be prepared for exact ask-question delivery. The previous plugin was restored when possible."
+  fi
+  if ! verify_openclaw_update_pin_policy; then
+    fail "OpenClaw automatic update policy changed after preparation; refusing to commit the tested runtime. The compatibility-bundle rollback remains armed."
   fi
   if ! commit_openclaw_tested_pair; then
     fail "OpenClaw compatibility verification did not produce the tested core ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} / Codex plugin ${PIN_OPENCLAW_CODEX_PLUGIN_VERSION} / Portal answer-channel runtime."
@@ -23799,8 +31248,22 @@ prepare_openclaw_runtime_for_portal() {
   # core/plugin/hotfix rollback paths and retires the owned byte backup.
 }
 
+# Ordinary updates preserve timer schedules and enablement, but must move the
+# Portal-owned service to the backup implementation in the committed artifact.
+configure_backup_data_entrypoint() {
+  [[ -f "${PORTAL_DIR}/backup-data.py" ]] || return 0
+  local directory="/etc/systemd/system/bridgesllm-backup@.service.d" temporary
+  install -d -m 0755 "${directory}" || return 1
+  temporary="$(mktemp "${directory}/.portal-data.XXXXXX")" || return 1
+  printf '[Service]\nExecStart=\nExecStart=/usr/bin/python3 %s/backup-data.py create %%i\n' \
+    "${PORTAL_DIR}" > "${temporary}"
+  chmod 0644 "${temporary}" \
+    && mv -f -- "${temporary}" "${directory}/40-bridgesllm-portal-data.conf" \
+    || return 1
+  systemctl daemon-reload >> "${LOG_FILE}" 2>&1
+}
+
 configure_backup_timers() {
-  step_header "Configuring backup automation"
   CURRENT_STEP="backup automation"
 
   $DRY_RUN && { ok "[dry-run] Would configure backup timers"; return; }
@@ -23857,8 +31320,8 @@ Environment=PORTAL_ROOT=${PORTAL_DIR}
 Environment=INSTALL_ROOT=${INSTALL_ROOT}
 Environment=BACKUP_CONFIG_FILE=${backup_config_file}
 Environment=BACKUP_STATE_DIR=${backup_state_dir}
-ExecStart=/bin/bash ${backup_script} %i
-ExecStopPost=/bin/bash ${backup_script} --recover-quiescence
+ExecStart=/usr/bin/python3 ${PORTAL_DIR}/backup-data.py create %i
+KillMode=mixed
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
@@ -23951,8 +31414,15 @@ ensure_agent_zero_project_model_bridge() {
   fi
 }
 
+refresh_agent_zero_bridge_for_portal_cutover() {
+  local lifecycle="${PORTAL_DIR}/installer/agent-zero-project-model-bridge.sh"
+  [[ -f "$lifecycle" && ! -L "$lifecycle" \
+    && "$(stat -c '%u' "$lifecycle")" == 0 ]] || return 1
+  (( (8#$(stat -c '%a' "$lifecycle") & 0022) == 0 )) || return 1
+  bash "$lifecycle" refresh-runtime >> "$LOG_FILE" 2>&1
+}
+
 start_portal() {
-  step_header "Starting portal"
   CURRENT_STEP="startup"
 
   local env_file="${PORTAL_DIR}/backend/.env.production"
@@ -23989,8 +31459,8 @@ except: pass
     fi
   fi
 
-  systemctl start bridgesllm-product
   ensure_agent_zero_project_model_bridge
+  systemctl start bridgesllm-product
   if ${RETAINED_RECONNECT_MODE}; then
     # Runtime intent is applied only after signed files, dependencies,
     # configuration, migrations, service units, and Project runtime policy
@@ -24031,12 +31501,10 @@ except: pass
 }
 
 # ═══════════════════════════════════════════════════════════════
-# Step 9: Done
+# Verified installation handoff
 # ═══════════════════════════════════════════════════════════════
 
 print_success() {
-  CURRENT_STEP_NUM=$((CURRENT_STEP_NUM + 1))
-
   local url
   url="$(portal_setup_url)"
 
@@ -24381,8 +31849,13 @@ quiesce_portal_service() {
   done
 
   warn "Portal did not quiesce gracefully (systemctl stop exit ${stop_status}); escalating once to SIGKILL."
+  # systemd can return nonzero after signaling the main process when one
+  # transient auxiliary process rejects the same signal (observed as
+  # "Failed to send signal ... to auxiliary processes: Invalid argument").
+  # The command's aggregate exit status is not settlement proof either way;
+  # retain the bounded fail-closed poll over unit, cgroup, and listener state.
   systemctl kill --kill-who=all --signal=SIGKILL "${service_name}" >> "${LOG_FILE}" 2>&1 \
-    || return 1
+    || true
   waited=0
   while (( waited < kill_timeout )); do
     if portal_service_is_quiesced "${service_name}" && portal_service_port_is_free "${port}"; then
@@ -24457,8 +31930,10 @@ if (
     or not os.path.isabs(destination)
     or os.path.normpath(destination) != destination
     or os.path.dirname(destination) != directory
-    or os.path.basename(destination)
-        != "20-bridgesllm-authorization-fence.conf"
+    or os.path.basename(destination) not in {
+        "20-bridgesllm-authorization-fence.conf",
+        "30-bridgesllm-migration-permit.conf",
+    }
 ):
     raise SystemExit(1)
 
@@ -24629,12 +32104,23 @@ finally:
 PY2
 }
 
+openclaw_gateway_migration_permit_dropin_text() {
+  cat <<'EOF'
+[Unit]
+ConditionPathExists=
+[Service]
+ExecCondition=/bin/sh -c "if [ ! -e /var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1 ]; then exit 0; fi; IFS=' ' read -r pid start boot < /run/bridgesllm/openclaw-gateway-migration-permit.v1 || exit 1; [ -n \"$pid\" ] && [ -n \"$start\" ] || exit 1; case \"$pid:$start\" in *[!0-9:]*) exit 1;; esac; [ \"$boot\" = \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\" ] || exit 1; [ -r \"/proc/$pid/stat\" ] || exit 1; current=$(sed 's/.*) //' \"/proc/$pid/stat\" | cut -d ' ' -f 20); [ \"$current\" = \"$start\" ]"
+EOF
+}
+
 install_openclaw_gateway_authorization_fence_dropin() {
   local expected_system='[Unit]
 ConditionPathExists=!/var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1
 [Service]
 KillMode=control-group
 '
+  local expected_migration_permit
+  expected_migration_permit="$(openclaw_gateway_migration_permit_dropin_text)"$'\n'
   local expected_root_user='[Unit]
 ConditionPathExists=!/var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1
 [Service]
@@ -24647,6 +32133,11 @@ ExecCondition=/usr/bin/false
     "${expected_system}" \
     || return 1
   install_exact_openclaw_gateway_authorization_fence_dropin \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR}" \
+    "${OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN}" \
+    "${expected_migration_permit}" \
+    || return 1
+  install_exact_openclaw_gateway_authorization_fence_dropin \
     "${OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR}" \
     "${OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN}" \
     "${expected_root_user}" \
@@ -24655,8 +32146,867 @@ ExecCondition=/usr/bin/false
   reload_active_root_user_systemd_manager || return 1
 }
 
+legacy_openclaw_gateway_permit_transaction() {
+  local helper authority
+  helper="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-migration-transaction.py"
+  [[ -f "${helper}" && ! -L "${helper}" \
+    && "$(stat -c '%u:%g:%a:%h' -- "${helper}" 2>/dev/null || true)" == "0:0:600:1" \
+    && "$(sha256sum "${helper}" | awk '{print $1}')" \
+      == "${LEGACY_OPENCLAW_GATEWAY_PERMIT_DRIFT_HELPER_SHA256}" ]] \
+    || return 1
+  authority="$(run_openclaw_migration_transaction_tool core-gateway-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")" \
+    || return 1
+  node - "${authority}" \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN}" \
+    "${OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN}" <<'NODE'
+try {
+  const value = JSON.parse(process.argv[2]);
+  const fence = process.argv[3];
+  const permit = process.argv[4];
+  const baseline = value?.baseline;
+  const current = value?.current;
+  // Exactly the transaction helper's GATEWAY_DEFINITION_FIELDS. execStart is
+  // deliberately excluded: systemd's ExecStart property embeds the last
+  // invocation's start_time/stop_time/pid/code/status, so including it makes
+  // this classification volatile — one ordinary stop/start of the gateway
+  // would silently drop a genuinely legacy transaction out of the permitted
+  // start dance. The executed command is already bound by definitionSha256,
+  // fragmentPath, and dropInPaths.
+  const definitionFields = [
+    'schema', 'unit', 'names', 'loadState', 'unitFileState',
+    'needDaemonReload', 'fragmentPath', 'sourcePath', 'dropInPaths',
+    'definitionSha256',
+  ];
+  const paths = identity => new Set(String(identity?.dropInPaths || '').split(/\s+/).filter(Boolean));
+  const baselinePaths = paths(baseline);
+  const currentPaths = paths(current);
+  if (value?.unitPreexisted !== true || value?.provisioned != null
+      || !baseline || !current
+      || baselinePaths.size !== 1 || !baselinePaths.has(fence)
+      || baselinePaths.has(permit)
+      || currentPaths.size !== 1 || !currentPaths.has(fence)
+      || definitionFields.some(field => baseline[field] !== current[field])) process.exit(1);
+} catch (_) {
+  process.exit(1);
+}
+NODE
+}
+
+normalize_legacy_openclaw_gateway_permit_definition() {
+  case "${OPENCLAW_MIGRATION_TRANSACTION_PHASE:-}" in
+    recovery-pending|migration-restored|upgrade-restored|core-rollback-pending|\
+core-restored|core-remove-pending|core-removed|restored-cleanup) ;;
+    *) return 0 ;;
+  esac
+  legacy_openclaw_gateway_permit_transaction || return 0
+
+  local authority observed_identity restored_identity
+  local marker permit permit_dropin expected_migration_permit reload_state
+  marker="$(update_transaction_state_path \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}")" || return 1
+  permit="$(update_transaction_state_path \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}")" || return 1
+  permit_dropin="$(update_transaction_state_path \
+    "${OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN}")" || return 1
+  authority="$(run_openclaw_migration_transaction_tool core-gateway-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")" \
+    || return 1
+
+  # A killed installer can leave its one-start capability behind in /run.
+  # Retire it only after proving its PID/start/boot tuple is no longer live.
+  # A still-live owner is concurrent authority, so recovery must stop.
+  python3 -I - "${permit}" <<'PY' || return 1
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+permit = Path(sys.argv[1])
+if not permit.is_absolute() or permit != Path(os.path.normpath(permit)):
+    raise SystemExit(1)
+if not os.path.lexists(permit):
+    raise SystemExit(0)
+info = os.lstat(permit)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != 0
+    or info.st_gid != 0
+    or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or info.st_size <= 0
+    or info.st_size > 256
+):
+    raise SystemExit(1)
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(permit, flags)
+try:
+    opened = os.fstat(descriptor)
+    payload = os.read(descriptor, 257)
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink)
+        != (info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
+        or opened.st_uid != 0
+        or opened.st_gid != 0
+        or opened.st_size != len(payload)
+    ):
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+try:
+    text = payload.decode("ascii")
+    pid_text, ticks_text, boot = text.removesuffix("\n").split(" ")
+    if (
+        not re.fullmatch(r"[1-9][0-9]*", pid_text)
+        or not re.fullmatch(r"[1-9][0-9]*", ticks_text)
+        or not re.fullmatch(
+            r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
+            boot,
+        )
+    ):
+        raise ValueError
+    pid = int(pid_text)
+    ticks = int(ticks_text)
+except (UnicodeError, ValueError):
+    raise SystemExit(1)
+current_boot = Path("/proc/sys/kernel/random/boot_id").read_text(
+    encoding="ascii",
+).strip()
+live = False
+if boot == current_boot:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        current_ticks = int(raw.rsplit(")", 1)[1].strip().split()[19])
+        live = current_ticks == ticks
+    except (IndexError, OSError, UnicodeError, ValueError):
+        live = False
+if live:
+    raise SystemExit(1)
+parent = permit.parent
+parent_info = os.lstat(parent)
+if (
+    not stat.S_ISDIR(parent_info.st_mode)
+    or stat.S_ISLNK(parent_info.st_mode)
+    or parent_info.st_uid != 0
+    or parent_info.st_gid != 0
+    or stat.S_IMODE(parent_info.st_mode) != 0o700
+):
+    raise SystemExit(1)
+parent_fd = os.open(
+    parent,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    current = os.stat(permit.name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        current.st_dev != info.st_dev
+        or current.st_ino != info.st_ino
+        or current.st_ctime_ns != info.st_ctime_ns
+        or current.st_size != info.st_size
+    ):
+        raise SystemExit(1)
+    os.unlink(permit.name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+  if [[ -e "${permit_dropin}" || -L "${permit_dropin}" ]]; then
+    observed_identity="$(openclaw_gateway_systemd_identity)" || return 1
+    node - "${authority}" "${observed_identity}" \
+      "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN}" \
+      "${OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN}" <<'NODE' \
+      || return 1
+try {
+  const authority = JSON.parse(process.argv[2]);
+  const observed = JSON.parse(process.argv[3]);
+  const fence = process.argv[4];
+  const permit = process.argv[5];
+  const current = authority?.current;
+  const pending = authority?.pending;
+  const definitionFields = [
+    'schema', 'unit', 'names', 'loadState', 'unitFileState',
+    'needDaemonReload', 'fragmentPath', 'sourcePath',
+  ];
+  const paths = identity => new Set(
+    String(identity?.dropInPaths || '').split(/\s+/).filter(Boolean),
+  );
+  const sameShape = (left, right) => JSON.stringify(Object.keys(left || {}).sort())
+    === JSON.stringify(Object.keys(right || {}).sort());
+  const validIdentity = identity => identity
+    && typeof identity.active === 'boolean'
+    && typeof identity.mainPid === 'number' && identity.mainPid >= 0
+    && typeof identity.processStartTicks === 'number' && identity.processStartTicks >= 0
+    && typeof identity.execMainStartTimestampMonotonic === 'number'
+    && identity.execMainStartTimestampMonotonic >= 0
+    && (identity.active
+      ? identity.activeState === 'active' && identity.subState === 'running'
+        && identity.mainPid > 0 && identity.processStartTicks > 0
+        && identity.execMainStartTimestampMonotonic > 0
+        && /^[a-f0-9]{32}$/.test(identity.invocationId)
+        && String(identity.controlGroup || '').startsWith('/')
+      : ['inactive', 'failed'].includes(identity.activeState)
+        && identity.mainPid === 0 && identity.processStartTicks === 0
+        && (identity.invocationId === '' || /^[a-f0-9]{32}$/.test(identity.invocationId)));
+  const sameDefinitionApartFromPermit = (expected, candidate) => {
+    const expectedPaths = paths(expected);
+    const candidatePaths = paths(candidate);
+    return sameShape(expected, candidate)
+      && definitionFields.every(field => expected[field] === candidate[field])
+      && expectedPaths.size === 1 && expectedPaths.has(fence)
+      && candidatePaths.size === 2 && candidatePaths.has(fence) && candidatePaths.has(permit)
+      && expected.definitionSha256 !== candidate.definitionSha256;
+  };
+  const exactGenerationApartFromPermit = (expected, candidate) =>
+    sameDefinitionApartFromPermit(expected, candidate)
+      && Object.keys(expected).filter(key => !['dropInPaths', 'definitionSha256'].includes(key))
+        .every(key => expected[key] === candidate[key]);
+  const validPendingResultApartFromPermit = (action, candidate) => {
+    const before = pending?.before;
+    if (!before || !validIdentity(candidate)
+        || candidate.active !== pending.expectedActive
+        || !sameDefinitionApartFromPermit(before, candidate)) return false;
+    if (action !== 'start') return action === 'stop';
+    return candidate.mainPid !== before.mainPid
+      && candidate.processStartTicks !== before.processStartTicks
+      && candidate.invocationId !== before.invocationId
+      && candidate.execMainStartTimestampMonotonic
+        > before.execMainStartTimestampMonotonic;
+  };
+  let admitted = validIdentity(observed) && exactGenerationApartFromPermit(current, observed);
+  if (!admitted && pending != null) {
+    admitted = ['start', 'stop'].includes(pending.action)
+      && (exactGenerationApartFromPermit(pending.before, observed)
+        || validPendingResultApartFromPermit(pending.action, observed));
+  }
+  if (!admitted && pending == null) {
+    // A reboot behind the durable marker legitimately erases the captured
+    // process generation.  The sealed helper must still adopt this inactive
+    // identity after the definition is restored; a same-boot manual stop will
+    // fail that adoption and remain fenced.
+    admitted = validIdentity(observed) && !observed.active
+      && sameDefinitionApartFromPermit(current, observed);
+  }
+  if (!admitted) process.exit(1);
+} catch (_) {
+  process.exit(1);
+}
+NODE
+    expected_migration_permit="$(openclaw_gateway_migration_permit_dropin_text)"$'\n'
+    python3 -I - "${marker}" "${permit}" "${permit_dropin}" \
+      "${expected_migration_permit}" <<'PY' || return 1
+import os
+import stat
+import sys
+
+marker, permit, dropin, expected_text = sys.argv[1:]
+expected_marker = (
+    b'{"schema":"bridgesllm.openclaw-gateway-authorization-fence.v1",'
+    b'"unit":"openclaw-gateway.service"}\n'
+)
+expected_dropin = expected_text.encode("utf-8")
+
+
+def exact_regular(path, mode, expected):
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != mode
+        or info.st_size != len(expected)
+    ):
+        raise SystemExit(1)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink)
+            != (info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or opened.st_size != len(expected)
+            or os.read(descriptor, len(expected) + 1) != expected
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(descriptor)
+
+
+if os.path.lexists(permit):
+    raise SystemExit(1)
+exact_regular(marker, 0o600, expected_marker)
+exact_regular(dropin, 0o644, expected_dropin)
+parent = os.path.dirname(dropin)
+parent_info = os.lstat(parent)
+if (
+    not stat.S_ISDIR(parent_info.st_mode)
+    or stat.S_ISLNK(parent_info.st_mode)
+    or parent_info.st_uid != 0
+    or parent_info.st_gid != 0
+    or parent_info.st_mode & 0o022
+):
+    raise SystemExit(1)
+parent_fd = os.open(
+    parent,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    exact_regular(dropin, 0o644, expected_dropin)
+    os.unlink(os.path.basename(dropin), dir_fd=parent_fd)
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+    reload_state=yes
+  else
+    reload_state="$(
+      systemctl show openclaw-gateway.service --no-pager --value \
+        --property=NeedDaemonReload 2>> "${LOG_FILE}"
+    )" || return 1
+    [[ "${reload_state}" == "yes" || "${reload_state}" == "no" ]] || return 1
+  fi
+
+  if [[ "${reload_state}" == "yes" ]]; then
+    systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || return 1
+  fi
+  restored_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  local restored_disposition
+  restored_disposition="$(node - "${authority}" \
+    "${restored_identity}" <<'NODE'
+  try {
+    const value=JSON.parse(process.argv[2]);
+    const identity=JSON.parse(process.argv[3]);
+    const current=value?.current;
+    const pending=value?.pending;
+    const equal=(left, right) => left && right
+      && JSON.stringify(Object.keys(left).sort()) === JSON.stringify(Object.keys(right).sort())
+      && Object.keys(left).every(key => left[key] === right[key]);
+    const definitionFields = [
+      'schema', 'unit', 'names', 'loadState', 'unitFileState',
+      'needDaemonReload', 'fragmentPath', 'sourcePath',
+      'dropInPaths', 'definitionSha256',
+    ];
+    const sameDefinition=(left, right) => left && right
+      && definitionFields.every(field => left[field] === right[field]);
+    const validResult=() => {
+      const before=pending?.before;
+      if (!before || identity.active !== pending.expectedActive
+          || !sameDefinition(before, identity)) return false;
+      if (pending.action === 'stop') return true;
+      return pending.action === 'start'
+        && identity.mainPid !== before.mainPid
+        && identity.processStartTicks !== before.processStartTicks
+        && identity.invocationId !== before.invocationId
+        && identity.execMainStartTimestampMonotonic
+          > before.execMainStartTimestampMonotonic;
+    };
+    if (pending == null) process.stdout.write(equal(current, identity) ? 'exact' : 'adopt');
+    else if (equal(pending.before, identity) || validResult()) process.stdout.write('pending');
+    else process.exit(1);
+  } catch (_) { process.exit(1); }
+NODE
+)" || return 1
+  case "${restored_disposition}" in
+    exact|pending) ;;
+    adopt)
+      adopt_durable_openclaw_gateway_identity "${restored_identity}" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' \
+    'legacy OpenClaw gateway permit definition normalized to its sealed transaction baseline' \
+    >> "${LOG_FILE}"
+}
+
+prepare_legacy_openclaw_gateway_permit_recovery_start() {
+  legacy_openclaw_gateway_permit_transaction || return 0
+  [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE:-}" == "core-restored" ]] \
+    || return 0
+
+  local authority pending before current marker permit permit_dropin
+  local rollback_details rollback_package package_version runtime_version
+  local gateway_was_active gateway_was_enabled
+  authority="$(run_openclaw_migration_transaction_tool core-gateway-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")" \
+    || return 1
+  pending="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); const pending=value.pending;
+    if (pending == null) process.stdout.write("-");
+    else if (pending.action === "start" && pending.purpose === "baseline-restore"
+      && pending.expectedActive === true && pending.before?.active === false)
+      process.stdout.write(JSON.stringify(pending.before));
+    else process.exit(1); }
+  catch (_) { process.exit(1); }
+});
+')" || return 1
+  [[ "${pending}" != "-" ]] || return 0
+  before="${pending}"
+  current="$(openclaw_gateway_systemd_identity)" || return 1
+  if ! json_documents_equal "${before}" "${current}"; then
+    # A completed start is reconciled by the sealed helper, which verifies the
+    # new PID/invocation/start-time generation before recording it.
+    return 0
+  fi
+
+  marker="$(update_transaction_state_path \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}")" || return 1
+  permit="$(update_transaction_state_path \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}")" || return 1
+  permit_dropin="$(update_transaction_state_path \
+    "${OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN}")" || return 1
+  [[ ! -e "${permit_dropin}" && ! -L "${permit_dropin}" \
+    && ! -e "${permit}" && ! -L "${permit}" ]] || return 1
+  [[ -e "${marker}" || -L "${marker}" ]] || return 0
+  python3 -I - "${marker}" <<'PY' || return 1
+import os
+from pathlib import Path
+import stat
+import sys
+
+marker = Path(sys.argv[1])
+expected = (
+    b'{"schema":"bridgesllm.openclaw-gateway-authorization-fence.v1",'
+    b'"unit":"openclaw-gateway.service"}\n'
+)
+if not marker.is_absolute() or marker != Path(os.path.normpath(marker)):
+    raise SystemExit(1)
+info = os.lstat(marker)
+if (
+    not stat.S_ISREG(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != 0
+    or info.st_gid != 0
+    or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or info.st_size != len(expected)
+):
+    raise SystemExit(1)
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(marker, flags)
+try:
+    opened = os.fstat(descriptor)
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink)
+        != (info.st_dev, info.st_ino, info.st_mode, info.st_nlink)
+        or opened.st_uid != 0
+        or opened.st_gid != 0
+        or opened.st_size != len(expected)
+        or os.read(descriptor, len(expected) + 1) != expected
+    ):
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+PY
+
+  rollback_details="$(run_openclaw_migration_transaction_tool core-rollback \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")" \
+    || return 1
+  IFS=$'\t' read -r rollback_package package_version runtime_version \
+    gateway_was_active gateway_was_enabled <<< "${rollback_details}"
+  [[ -f "${rollback_package}" && ! -L "${rollback_package}" \
+    && "${gateway_was_active}" == "true" \
+    && "${gateway_was_enabled}" =~ ^(true|false)$ \
+    && "$(openclaw_core_package_version || true)" == "${package_version}" \
+    && "$(openclaw_cli_version || true)" == "${runtime_version}" ]] \
+    || return 1
+
+  # From the moment the permit drop-in lands, every failure path unwinds it.
+  # A recovery that cannot finish must still leave the host retryable.
+  local armed_status=0
+  enter_legacy_openclaw_gateway_permit_recovery_start "${before}" \
+    || armed_status=$?
+  if (( armed_status != 0 )); then
+    retire_legacy_openclaw_gateway_permit_residue \
+      "${permit}" "${permit_dropin}" \
+      || warn "A failed OpenClaw gateway permit recovery left ${permit_dropin} in place. Remove it, then re-run the installer."
+    return "${armed_status}"
+  fi
+}
+
+# Keep the durable marker armed.  Temporarily restore the exact permit
+# drop-in, prove that it changed only the unit definition (not the inactive
+# process generation), and spend a live PID/start/boot permit on the owned
+# start.  Normalize the definition back to the old sealed baseline before
+# the old helper records the result.  Every crash point remains replayable,
+# including an active-but-disabled baseline reboot.  The caller unwinds the
+# permit drop-in and /run capability on every non-zero return from here.
+enter_legacy_openclaw_gateway_permit_recovery_start() {
+  local before="$1"
+  local permitted_identity
+  install_openclaw_gateway_authorization_fence_dropin || return 1
+  permitted_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  node - "${before}" "${permitted_identity}" \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN}" \
+    "${OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN}" <<'NODE' \
+    || return 1
+try {
+  const before=JSON.parse(process.argv[2]);
+  const permitted=JSON.parse(process.argv[3]);
+  const fence=process.argv[4];
+  const permit=process.argv[5];
+  const beforeKeys=Object.keys(before).sort();
+  const permittedKeys=Object.keys(permitted).sort();
+  const beforePaths=new Set(String(before.dropInPaths || '').split(/\s+/).filter(Boolean));
+  const permittedPaths=new Set(String(permitted.dropInPaths || '').split(/\s+/).filter(Boolean));
+  if (JSON.stringify(beforeKeys) !== JSON.stringify(permittedKeys)
+      || !beforeKeys.filter(key => !['dropInPaths', 'definitionSha256'].includes(key))
+        .every(key => before[key] === permitted[key])
+      || beforePaths.size !== 1 || !beforePaths.has(fence)
+      || permittedPaths.size !== 2
+      || !permittedPaths.has(fence) || !permittedPaths.has(permit)
+      || before.definitionSha256 === permitted.definitionSha256) process.exit(1);
+} catch (_) {
+  process.exit(1);
+}
+NODE
+  authorized_systemctl_openclaw_gateway \
+    start "${permitted_identity}" durable-action >> "${LOG_FILE}" 2>&1 \
+    || return 1
+  normalize_legacy_openclaw_gateway_permit_definition || return 1
+  printf '%s\n' \
+    'legacy OpenClaw gateway baseline start completed under its durable one-start permit' \
+    >> "${LOG_FILE}"
+}
+
+# A failed permitted-start recovery must leave the host exactly as it was
+# found: marker armed, one sealed fence drop-in, no permit.  Without this the
+# 30- permit drop-in and the /run capability survive the failure, and the
+# dance's own precondition ([[ ! -e permit_dropin && ! -e permit ]] || return 1)
+# then rejects every later attempt -- converting one recoverable fault into a
+# permanently different wedge that only a hand edit clears.  Removal is
+# content-exact so it can never delete an operator's own file.
+retire_legacy_openclaw_gateway_permit_residue() {
+  local permit="$1" permit_dropin="$2"
+  local expected_migration_permit removed_dropin
+  expected_migration_permit="$(openclaw_gateway_migration_permit_dropin_text)"$'\n'
+  removed_dropin="$(python3 -I - "${permit}" "${permit_dropin}" \
+    "${expected_migration_permit}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+permit, dropin, expected_dropin = sys.argv[1], sys.argv[2], sys.argv[3]
+expected = expected_dropin.encode()
+
+
+def exact_regular(path, mode, payload):
+    target = Path(path)
+    if not target.is_absolute() or target != Path(os.path.normpath(target)):
+        raise SystemExit(1)
+    info = os.lstat(target)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != mode
+        or (payload is not None and info.st_size != len(payload))
+    ):
+        raise SystemExit(1)
+    if payload is None:
+        return
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags)
+    try:
+        if os.read(descriptor, len(payload) + 1) != payload:
+            raise SystemExit(1)
+    finally:
+        os.close(descriptor)
+
+
+def unlink_exact(path):
+    parent_fd = os.open(
+        os.path.dirname(path),
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.unlink(os.path.basename(path), dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+removed = "no"
+if os.path.lexists(dropin):
+    exact_regular(dropin, 0o644, expected)
+    unlink_exact(dropin)
+    removed = "yes"
+
+if os.path.lexists(permit):
+    exact_regular(permit, 0o600, None)
+    unlink_exact(permit)
+
+sys.stdout.write(removed)
+PY
+)" || return 1
+  if [[ "${removed_dropin}" == "yes" ]]; then
+    systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || return 1
+    reload_active_root_user_systemd_manager || return 1
+  fi
+}
+
+arm_openclaw_gateway_migration_fence() {
+  load_openclaw_migration_transaction || return 1
+  install_openclaw_gateway_authorization_fence_dropin || return 1
+  local authority unit_preexisted current_identity live_identity
+  authority="$(openclaw_core_gateway_authority)" || return 1
+  IFS=$'\t' read -r unit_preexisted current_identity \
+    < <(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (typeof value.unitPreexisted !== "boolean") process.exit(1);
+    const current=value.current == null ? "-" : JSON.stringify(value.current);
+    process.stdout.write(`${value.unitPreexisted}\t${current}\n`); }
+  catch (_) { process.exit(1); }
+});
+') || return 1
+  if [[ "${unit_preexisted}" == "true" ]]; then
+    [[ "${current_identity}" != "-" ]] || return 1
+    live_identity="$(openclaw_gateway_systemd_identity)" || return 1
+    json_documents_equal "${current_identity}" "${live_identity}" \
+      || adopt_durable_openclaw_gateway_identity "${live_identity}" || return 1
+  elif [[ "${unit_preexisted}" == "false" ]]; then
+    if [[ "${current_identity}" == "-" ]]; then
+      openclaw_gateway_systemd_unit_absent true || return 1
+    else
+      # Fresh provisioning records the new unit as current while
+      # unitPreexisted stays false, so the later re-arm admitted in phase
+      # gateway-provisioned must attest the exact provisioned definition
+      # instead of demanding unit absence.
+      live_identity="$(openclaw_gateway_systemd_identity)" || return 1
+      json_documents_equal "${current_identity}" "${live_identity}" \
+      || adopt_durable_openclaw_gateway_identity "${live_identity}" || return 1
+    fi
+  else
+    return 1
+  fi
+  python3 -I - \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_GENERATION}" <<'PY' \
+    || return 1
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+marker = Path(sys.argv[1])
+ledger = Path(sys.argv[2])
+generation = sys.argv[3]
+expected = b'{"schema":"bridgesllm.openclaw-gateway-authorization-fence.v1","unit":"openclaw-gateway.service"}\n'
+if os.geteuid() != 0 or not marker.is_absolute() or marker != Path(os.path.normpath(marker)):
+    raise SystemExit(1)
+if not ledger.is_absolute() or ledger != Path(os.path.normpath(ledger)) or ledger.parent.name != 'openclaw-2026.9.1-migration-v2':
+    raise SystemExit(1)
+value = json.loads(ledger.read_text(encoding='utf-8'))
+if value.get('generation') != generation or value.get('paths', {}).get('ledger') != str(ledger):
+    raise SystemExit(1)
+parent = marker.parent
+if not parent.exists():
+    parent.mkdir(mode=0o700, parents=True)
+details = os.lstat(parent)
+if (not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != 0 or details.st_gid != 0 or details.st_mode & 0o022):
+    raise SystemExit(1)
+if os.path.lexists(marker):
+    info = os.lstat(marker)
+    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600 or marker.read_bytes() != expected):
+        raise SystemExit(1)
+    raise SystemExit(0)
+fd, temporary_name = tempfile.mkstemp(prefix='.openclaw-gateway-fence.', dir=parent)
+temporary = Path(temporary_name)
+try:
+    os.fchown(fd, 0, 0)
+    os.fchmod(fd, 0o600)
+    os.write(fd, expected)
+    os.fsync(fd)
+    os.close(fd)
+    fd = -1
+    os.replace(temporary, marker)
+    temporary = None
+    directory_fd = os.open(parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+PY
+}
+
+disarm_openclaw_gateway_migration_fence() {
+  python3 -I - \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}" <<'PY' \
+    || return 1
+import os
+from pathlib import Path
+import stat
+import sys
+
+marker = Path(sys.argv[1])
+permit = Path(sys.argv[2])
+expected = b'{"schema":"bridgesllm.openclaw-gateway-authorization-fence.v1","unit":"openclaw-gateway.service"}\n'
+if any(not path.is_absolute() or path != Path(os.path.normpath(path))
+       for path in (marker, permit)):
+    raise SystemExit(1)
+
+
+def attest_regular(path, *, expected_content=None, maximum=4096):
+    if not os.path.lexists(path):
+        return False
+    info = os.lstat(path)
+    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size <= 0 or info.st_size > maximum):
+        raise SystemExit(1)
+    if expected_content is not None and path.read_bytes() != expected_content:
+        raise SystemExit(1)
+    return True
+
+
+marker_exists = attest_regular(marker, expected_content=expected)
+permit_exists = attest_regular(permit, maximum=256)
+
+# Retire the volatile one-start capability before removing the durable block.
+# A process death between the two unlinks therefore remains fail closed, while
+# a stale /run permit can never poison the next migration generation.
+for path, exists in ((permit, permit_exists), (marker, marker_exists)):
+    if not exists:
+        continue
+    parent = path.parent
+    details = os.lstat(parent)
+    if (not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != 0 or details.st_gid != 0
+            or details.st_mode & 0o022):
+        raise SystemExit(1)
+    path.unlink()
+    fd = os.open(parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+                 | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
+}
+
+authorized_systemctl_openclaw_gateway() {
+  local action="$1" expected_identity="${2:-}" durable_authorization="${3:-}"
+  local fence_marker="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}"
+  [[ "${action}" == "start" || "${action}" == "restart" ]] || return 1
+  [[ -z "${expected_identity}" || "${action}" == "start" ]] || return 1
+  if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]; then
+    [[ "${action}" == "start" && -n "${expected_identity}" \
+      && ( "${durable_authorization}" == "codex-action" \
+        || "${durable_authorization}" == "durable-action" ) ]] || return 1
+  fi
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && -n "${PORTAL_OPENCLAW_GATEWAY_FENCE_TEST_MARKER:-}" ]]; then
+    fence_marker="${PORTAL_OPENCLAW_GATEWAY_FENCE_TEST_MARKER}"
+    [[ "${fence_marker}" == /tmp/bridgesllm-installer-terminal-ux.compatibility.*/* \
+      && "$(readlink -m -- "${fence_marker}")" == "${fence_marker}" ]] \
+      || return 1
+  fi
+  if [[ ! -e "${fence_marker}" && ! -L "${fence_marker}" ]]; then
+    if [[ -n "${expected_identity}" ]]; then
+      openclaw_gateway_require_exact_identity \
+        "${expected_identity}" >/dev/null || return 1
+    fi
+    systemctl "${action}" openclaw-gateway.service
+    return
+  fi
+  load_openclaw_migration_transaction || return 1
+  install -d -o root -g root -m 0700 -- \
+    "$(dirname -- "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}")" \
+    || return 1
+  python3 -I - "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}" "$$" <<'PY' \
+    || return 1
+import os
+from pathlib import Path
+import stat
+import sys
+
+permit = Path(sys.argv[1])
+pid = int(sys.argv[2])
+parent = permit.parent
+details = os.lstat(parent)
+if (not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != 0 or details.st_gid != 0
+        or stat.S_IMODE(details.st_mode) != 0o700 or os.path.lexists(permit)):
+    raise SystemExit(1)
+tail = Path(f'/proc/{pid}/stat').read_text(encoding='ascii').rsplit(')', 1)[1].strip().split()
+if len(tail) < 20:
+    raise SystemExit(1)
+boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
+payload = f'{pid} {tail[19]} {boot}\n'.encode('ascii')
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+fd = os.open(permit, flags, 0o600)
+try:
+    os.fchown(fd, 0, 0)
+    os.fchmod(fd, 0o600)
+    os.write(fd, payload)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+directory_fd = os.open(parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+  local status=0
+  if [[ -n "${expected_identity}" ]] \
+    && ! openclaw_gateway_require_exact_identity \
+      "${expected_identity}" >/dev/null; then
+    status=1
+  else
+    systemctl "${action}" openclaw-gateway.service || status=$?
+  fi
+  python3 -I - "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}" <<'PY' \
+    || status=1
+import os
+from pathlib import Path
+import stat
+import sys
+
+permit = Path(sys.argv[1])
+info = os.lstat(permit)
+if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600):
+    raise SystemExit(1)
+permit.unlink()
+fd = os.open(permit.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+  return "${status}"
+}
+
 remove_openclaw_gateway_authorization_fence_for_clean_uninstall() {
-  local marker_path dropin_dir dropin_path root_user_dropin_dir root_user_dropin_path
+  local marker_path dropin_dir dropin_path migration_dropin_path
+  local root_user_dropin_dir root_user_dropin_path
   marker_path="$(
     update_transaction_state_path \
       "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}"
@@ -24668,6 +33018,10 @@ remove_openclaw_gateway_authorization_fence_for_clean_uninstall() {
   dropin_path="$(
     update_transaction_state_path \
       "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN}"
+  )" || return 1
+  migration_dropin_path="$(
+    update_transaction_state_path \
+      "${OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN}"
   )" || return 1
   root_user_dropin_dir="$(
     update_transaction_state_path \
@@ -24688,12 +33042,19 @@ ConditionPathExists=!/var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1
 KillMode=control-group
 ExecCondition=/usr/bin/false
 '
+  local expected_migration_dropin='[Unit]
+ConditionPathExists=
+[Service]
+ExecCondition=/bin/sh -c "if [ ! -e /var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1 ]; then exit 0; fi; IFS='\'' '\'' read -r pid start boot < /run/bridgesllm/openclaw-gateway-migration-permit.v1 || exit 1; [ -n \"$pid\" ] && [ -n \"$start\" ] || exit 1; case \"$pid:$start\" in *[!0-9:]*) exit 1;; esac; [ \"$boot\" = \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\" ] || exit 1; [ -r \"/proc/$pid/stat\" ] || exit 1; current=$(sed '\''s/.*) //'\'' \"/proc/$pid/stat\" | cut -d '\'' '\'' -f 20); [ \"$current\" = \"$start\" ]"
+'
   local expected_marker='{"schema":"bridgesllm.openclaw-gateway-authorization-fence.v1","unit":"openclaw-gateway.service"}
 '
   python3 - \
     "${marker_path}" "${dropin_dir}" "${dropin_path}" \
+    "${migration_dropin_path}" \
     "${root_user_dropin_dir}" "${root_user_dropin_path}" \
     "${expected_marker}" "${expected_dropin}" \
+    "${expected_migration_dropin}" \
     "${expected_root_user_dropin}" <<'PY2' \
     || return 1
 import os
@@ -24704,14 +33065,17 @@ import sys
     marker,
     dropin_directory,
     dropin,
+    migration_dropin,
     root_user_dropin_directory,
     root_user_dropin,
     marker_text,
     dropin_text,
+    migration_dropin_text,
     root_user_dropin_text,
 ) = sys.argv[1:]
 expected_marker = marker_text.encode("utf-8")
 expected_dropin = dropin_text.encode("utf-8")
+expected_migration_dropin = migration_dropin_text.encode("utf-8")
 expected_root_user_dropin = root_user_dropin_text.encode("utf-8")
 if (
     os.geteuid() != 0
@@ -24720,15 +33084,19 @@ if (
                    marker,
                    dropin_directory,
                    dropin,
+                   migration_dropin,
                    root_user_dropin_directory,
                    root_user_dropin,
                ))
     or os.path.dirname(dropin) != dropin_directory
     or os.path.dirname(root_user_dropin) != root_user_dropin_directory
+    or os.path.dirname(migration_dropin) != dropin_directory
     or os.path.basename(marker)
         != "openclaw-gateway-authorization-fence.v1"
     or os.path.basename(dropin)
         != "20-bridgesllm-authorization-fence.conf"
+    or os.path.basename(migration_dropin)
+        != "30-bridgesllm-migration-permit.conf"
     or os.path.basename(root_user_dropin)
         != "20-bridgesllm-authorization-fence.conf"
 ):
@@ -24838,6 +33206,7 @@ def handle_exact(path, expected, required_mode, remove):
 # conditions remain start inhibitors even though the file entries are gone.
 handle_exact(marker, expected_marker, 0o600, False)
 handle_exact(dropin, expected_dropin, 0o644, False)
+handle_exact(migration_dropin, expected_migration_dropin, 0o644, False)
 handle_exact(
     root_user_dropin,
     expected_root_user_dropin,
@@ -24850,6 +33219,7 @@ handle_exact(
     0o644,
     True,
 )
+handle_exact(migration_dropin, expected_migration_dropin, 0o644, True)
 handle_exact(dropin, expected_dropin, 0o644, True)
 handle_exact(marker, expected_marker, 0o600, True)
 PY2
@@ -25235,7 +33605,9 @@ verify_canonical_portal_routes_for_transaction() {
 }
 
 start_canonical_portal_for_transaction() {
-  if ${UPDATE_TRANSACTION_PORTAL_WAS_ACTIVE:-false}; then
+  local force_active="${1:-false}"
+  [[ "${force_active}" == true || "${force_active}" == false ]] || return 1
+  if ${UPDATE_TRANSACTION_PORTAL_WAS_ACTIVE:-false} || ${force_active}; then
     systemctl start bridgesllm-product >> "${LOG_FILE}" 2>&1
   else
     systemctl stop bridgesllm-product >> "${LOG_FILE}" 2>&1 || true
@@ -25246,8 +33618,9 @@ start_canonical_portal_for_transaction() {
 
 verify_canonical_portal_for_transaction() {
   local expected_version="$1" probe_token="$2"
-  local allow_legacy_validation="${3:-false}"
-  if ${UPDATE_TRANSACTION_PORTAL_WAS_ACTIVE:-false}; then
+  local allow_legacy_validation="${3:-false}" force_active="${4:-false}"
+  [[ "${force_active}" == true || "${force_active}" == false ]] || return 1
+  if ${UPDATE_TRANSACTION_PORTAL_WAS_ACTIVE:-false} || ${force_active}; then
     verify_portal_service_health \
       "bridgesllm-product" "http://127.0.0.1:4001/health" 60 || return 1
     if [[ -n "${probe_token}" ]]; then
@@ -25280,7 +33653,9 @@ verify_canonical_portal_for_transaction() {
         || return 1
     fi
   else
-    portal_service_is_quiesced "bridgesllm-product" \
+    [[ "$(attest_existing_portal_for_update "${PORTAL_DIR}" 2>/dev/null || true)" \
+      == "${expected_version}" ]] \
+      && portal_service_is_quiesced "bridgesllm-product" \
       && portal_service_port_is_free 4001
   fi
 }
@@ -25492,10 +33867,60 @@ PY2
   python3 "${caddy_destination}" --help >/dev/null 2>&1 || return 1
 }
 
+read_update_transaction_operation_contract() {
+  local target="$1"
+  # Recovery runs during operation-lock acquisition, before this installer has
+  # staged or published its v2 helper. A 4.0.x helper can validate and print a
+  # v1 receipt, but its CLI does not know the new field name. Read the complete
+  # integrity-checked record through that helper, then derive only this one
+  # compatibility value in an isolated bounded parser. A v2 receipt is still
+  # validated by the v2 helper that created it.
+  run_update_transaction_state_helper read --target "${target}" \
+    | python3 -I /dev/fd/3 3<<'PY2'
+import json
+import sys
+
+
+def no_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+
+payload = sys.stdin.buffer.read(128 * 1024 + 1)
+if not payload or len(payload) > 128 * 1024 or b"\x00" in payload:
+    raise SystemExit(1)
+try:
+    record = json.loads(payload, object_pairs_hook=no_duplicates)
+except (UnicodeError, ValueError, TypeError):
+    raise SystemExit(1)
+if not isinstance(record, dict):
+    raise SystemExit(1)
+schema = record.get("schema")
+contract = record.get("operation_contract")
+if schema == "bridgesllm-update-transaction-v1" and contract is None:
+    print("legacy-host-integration-v1")
+elif (
+    schema == "bridgesllm-update-transaction-v2"
+    and contract in {"legacy-host-integration-v1", "portal-only-v1"}
+):
+    print(contract)
+else:
+    raise SystemExit(1)
+PY2
+}
+
 read_update_transaction_field() {
   local target="$1" field="$2"
-  run_update_transaction_state_helper read \
-    --target "${target}" --field "${field}"
+  if [[ "${field}" == "operation_contract" ]]; then
+    read_update_transaction_operation_contract "${target}"
+  else
+    run_update_transaction_state_helper read \
+      --target "${target}" --field "${field}"
+  fi
 }
 
 update_artifact_manifest() {
@@ -26878,12 +35303,9 @@ restore_update_provenance_snapshot() {
 }
 
 prepare_updated_environment_candidate() {
-  local backup_dir source candidate manifest env_file stage_dir transaction_id
+  local backup_dir source candidate manifest env_file
   local portal_app_sources_root
   backup_dir="$(read_update_transaction_field active backup_dir)" || return 1
-  stage_dir="$(read_update_transaction_field active stage_dir)" || return 1
-  transaction_id="$(read_update_transaction_field active transaction_id)" \
-    || return 1
   source="${backup_dir}/environment"
   candidate="${backup_dir}/environment.updated"
   manifest="$(update_transaction_manifest_path active environment-updated)" \
@@ -26956,8 +35378,10 @@ prepare_updated_environment_candidate() {
   set_env_value_atomic \
     "${env_file}" "PROJECT_EGRESS_TOKEN_SECRET" "${project_egress_secret}" \
     || return 1
-  apply_prepared_update_project_runtime_environment \
-    "${env_file}" "${stage_dir}" "${transaction_id}" || return 1
+  # Ordinary updates preserve the installed Project-runtime policy and image
+  # identities byte-for-byte. Image builds, pulls, profile loads, Docker
+  # cleanup, and canonical tag convergence belong to an explicit host-runtime
+  # maintenance operation, never the Portal rollback journal.
   chmod --reference="${source}/backend.env.production" "${env_file}" || return 1
   chown --reference="${source}/backend.env.production" "${env_file}" || return 1
   sync -f "${candidate}" || return 1
@@ -27281,6 +35705,7 @@ prepare_update_transaction() {
 
   local node_modules_preexisted=false deploy_stamp_preexisted=false
   local caddy_snapshot_required=false repair_reinstall=false
+  local operation_contract="legacy-host-integration-v1"
   local openclaw_package_preexisted=false openclaw_package_version=""
   local openclaw_runtime_version="" openclaw_state_preexisted=false
   local openclaw_gateway_was_active=false openclaw_gateway_was_enabled=false
@@ -27295,7 +35720,10 @@ prepare_update_transaction() {
     caddy_snapshot_required=true
   fi
   ${REPAIR_REINSTALL:-false} && repair_reinstall=true
-  if command -v openclaw >/dev/null 2>&1; then
+  [[ "${PORTAL_ONLY_UPDATE:-false}" == "true" ]] \
+    && operation_contract="portal-only-v1"
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
+    && command -v openclaw >/dev/null 2>&1; then
     openclaw_package_preexisted=true
     openclaw_package_version="$(openclaw_core_package_version || true)"
     openclaw_runtime_version="$(openclaw_cli_version || true)"
@@ -27311,14 +35739,18 @@ prepare_update_transaction() {
       [[ "${plugin_status}" -eq 2 ]] || return 1
     fi
   fi
-  openclaw_installation_state_present "${HOME}/.openclaw" \
-    && openclaw_state_preexisted=true
-  systemctl is-active --quiet openclaw-gateway && openclaw_gateway_was_active=true
-  systemctl is-enabled openclaw-gateway >/dev/null 2>&1 \
-    && openclaw_gateway_was_enabled=true
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]]; then
+    openclaw_installation_state_present "${HOME}/.openclaw" \
+      && openclaw_state_preexisted=true
+    systemctl is-active --quiet openclaw-gateway \
+      && openclaw_gateway_was_active=true
+    systemctl is-enabled openclaw-gateway >/dev/null 2>&1 \
+      && openclaw_gateway_was_enabled=true
+  fi
 
   local -a command=(
     create
+    --operation-contract "${operation_contract}"
     --transaction-id "${transaction_id}"
     --previous-version "${previous_version}"
     --target-version "${VERSION}"
@@ -27347,17 +35779,19 @@ prepare_update_transaction() {
     || command+=(--openclaw-runtime-version "${openclaw_runtime_version}")
   [[ -z "${openclaw_codex_plugin_version}" ]] \
     || command+=(--openclaw-codex-plugin-version "${openclaw_codex_plugin_version}")
-  # Install both permanent ConditionPathExists boundaries while no receipt
-  # exists. The OpenClaw fence marker is managed only by the Portal's
-  # authorization-transition coordinator; update/repair must never clear it.
-  install_openclaw_gateway_authorization_fence_dropin || return 1
-  # Publishing the active update receipt then becomes the Portal boot-fence
-  # decision.
-  install_portal_update_boot_fence || return 1
+  # Fresh/legacy maintenance transactions retain the permanent OpenClaw
+  # authorization fence. A Portal-only update does not create or change any
+  # OpenClaw/systemd authority.
+  if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]]; then
+    install_openclaw_gateway_authorization_fence_dropin || return 1
+  fi
+  # Receipt publication is the durable recovery decision. Publish and arm it
+  # before touching the Portal's boot policy: a failure or hard kill after
+  # this point is recoverable, while a failed create can never strand a boot
+  # fence with no receipt authority.
   run_update_transaction_state_helper "${command[@]}" >/dev/null || return 1
-  # From receipt publication onward, every failure path must use the durable
-  # recovery engine and must preserve the stage/backup directories it names.
   UPDATE_RECOVERY_ARMED=true
+  install_portal_update_boot_fence || return 1
 
   UPDATE_TRANSACTION_ID="${transaction_id}"
   UPDATE_TRANSACTION_GENERATION="$(
@@ -27450,7 +35884,7 @@ dashboard_update_progress_for_transaction_phase() {
       DASHBOARD_UPDATE_PORTAL_COMMITTED=true
       dashboard_update_progress running 95 portal-committed \
         "Updated Portal is online" \
-        "Step 12 of 13 · The signed Portal is durably committed; transaction cleanup and host integration remain."
+        "Step 12 of 13 · The signed Portal is durably committed; transaction cleanup and final exact-version verification remain."
       ;;
     recovery_pending|recovery_quiesce_pending)
       dashboard_update_progress recovering \
@@ -27871,12 +36305,16 @@ PY2
 complete_update_transaction() {
   local target="$1" terminal_phase="$2"
   local transaction_id backup_dir stage_dir transaction_dir cleanup_policy
+  local operation_contract
   transaction_id="$(read_update_transaction_field "${target}" transaction_id)" \
     || return 1
   backup_dir="$(read_update_transaction_field "${target}" backup_dir)" || return 1
   stage_dir="$(read_update_transaction_field "${target}" stage_dir)" || return 1
   transaction_dir="$(read_update_transaction_field "${target}" transaction_dir)" \
     || return 1
+  operation_contract="$(
+    read_update_transaction_field "${target}" operation_contract
+  )" || return 1
   # Once canonical verification reaches a terminal receipt, the preallocated
   # emergency blocks are no longer needed. Release them while the receipt
   # still exists so a crash leaves an idempotent, authoritative cleanup path.
@@ -27885,15 +36323,24 @@ complete_update_transaction() {
   # the durable replay boundary: the removal below can run only after runtime
   # tags were cleaned successfully. Do not require Docker again on that exact
   # terminal replay; the authoritative receipt and journal still remain.
-  if [[ -e "${backup_dir}" || -L "${backup_dir}" \
-    || -e "${stage_dir}" || -L "${stage_dir}" ]]; then
-    cleanup_policy="$(
-      update_project_runtime_cleanup_policy_for_target "${target}" \
-        2>/dev/null || true
-    )"
-    cleanup_prepared_update_project_runtime_tags \
-      "${transaction_id}" "${cleanup_policy}" || return 1
-  fi
+  case "${operation_contract}" in
+    legacy-host-integration-v1)
+      if [[ -e "${backup_dir}" || -L "${backup_dir}" \
+        || -e "${stage_dir}" || -L "${stage_dir}" ]]; then
+        cleanup_policy="$(
+          update_project_runtime_cleanup_policy_for_target "${target}" \
+            2>/dev/null || true
+        )"
+        cleanup_prepared_update_project_runtime_tags \
+          "${transaction_id}" "${cleanup_policy}" || return 1
+      fi
+      ;;
+    portal-only-v1)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
   release_update_disk_reserves || return 1
   # Order is load-bearing: secret-bearing payload first (receipt retains
   # recovery authority over a crash here), then the receipt, then the
@@ -27914,17 +36361,30 @@ complete_update_transaction() {
     DASHBOARD_UPDATE_PORTAL_COMMITTED=true
     dashboard_update_progress running 95 portal-committed \
       "Updated Portal is online" \
-      "Step 12 of 13 · The signed Portal is committed; final host integration is still running."
+      "Step 12 of 13 · The signed Portal is committed; final authenticated Portal verification is running."
   fi
 }
 
 complete_committed_update_transaction() {
-  # `committed` is the first phase from which rollback to the prior Portal is
-  # impossible. Promote the already pinned immutable IDs now, never while an
-  # old environment might still be restored. Replays are idempotent because
-  # the same receipt and image IDs remain authoritative until cleanup finishes.
-  promote_prepared_update_project_runtime_images cutover \
-    && complete_update_transaction cutover committed
+  local operation_contract
+  operation_contract="$(
+    read_update_transaction_field cutover operation_contract
+  )" || return 1
+  case "${operation_contract}" in
+    portal-only-v1)
+      configure_backup_data_entrypoint \
+        && complete_update_transaction cutover committed
+      ;;
+    legacy-host-integration-v1)
+      # Backward compatibility for a pre-4.1 receipt that may already own
+      # transaction-scoped Project image tags.
+      promote_prepared_update_project_runtime_images cutover \
+        && complete_update_transaction cutover committed
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 refence_cutover_recovery() {
@@ -27937,7 +36397,12 @@ finish_forward_cutover_transaction() {
   load_update_transaction_context cutover || return 1
   load_update_origin_from_environment \
     "${PORTAL_DIR}/backend/.env.production" || return 1
-  local phase probe_token validation_assignment_status
+  local phase probe_token validation_assignment_status repair_reinstall
+  # Repair promises a working Portal even when the starting service was stopped.
+  # Read the durable intent so restart recovery preserves that promise. Ordinary
+  # updates and rollback still restore the original active/inactive state.
+  repair_reinstall="$(read_update_transaction_field cutover repair_reinstall)" || return 1
+  [[ "${repair_reinstall}" == true || "${repair_reinstall}" == false ]] || return 1
   while true; do
     phase="$(read_update_transaction_field cutover phase)" || return 1
     case "${phase}" in
@@ -27948,7 +36413,13 @@ finish_forward_cutover_transaction() {
           cutover cutover_pending canonical_start_pending || return 1
         ;;
       canonical_start_pending)
-        if ! start_canonical_portal_for_transaction; then
+        # Runtime-only, no credential relocation. The durable cutover decision
+        # owns retries; pre-decision rollback never touches the bridge.
+        if ! refresh_agent_zero_bridge_for_portal_cutover; then
+          refence_cutover_recovery || true
+          return 1
+        fi
+        if ! start_canonical_portal_for_transaction "${repair_reinstall}"; then
           refence_cutover_recovery || true
           return 1
         fi
@@ -27971,7 +36442,7 @@ finish_forward_cutover_transaction() {
         if [[ -z "${probe_token}" ]] \
           || [[ "${validation_assignment_status}" -ne 1 ]] \
           || ! verify_canonical_portal_for_transaction \
-            "${UPDATE_TRANSACTION_TARGET_VERSION}" "${probe_token}"; then
+            "${UPDATE_TRANSACTION_TARGET_VERSION}" "${probe_token}" false "${repair_reinstall}"; then
           refence_cutover_recovery || true
           return 1
         fi
@@ -28472,14 +36943,29 @@ recover_pending_update_transaction() {
   trap '' SIGINT TERM HUP
   set +e
 
-  local target phase result=1
+  local target phase result=1 operation_contract=""
+  local requested_portal_only_scope="${PORTAL_ONLY_UPDATE:-false}"
   target="$(current_update_receipt_target 2>/dev/null || true)"
   [[ "${target}" =~ ^(active|cutover)$ ]] || return 1
   phase="$(read_update_transaction_field "${target}" phase 2>/dev/null || true)"
-  # A transaction created by an older installer can resume through this newer
-  # recovery engine. Install and attest the static OpenClaw start inhibitor
-  # before any rollback or forward-cutover path can boot Portal 4.0 code.
-  install_openclaw_gateway_authorization_fence_dropin || return 1
+  operation_contract="$(
+    read_update_transaction_field "${target}" operation_contract 2>/dev/null
+  )" || return 1
+  case "${operation_contract}" in
+    portal-only-v1)
+      PORTAL_ONLY_UPDATE=true
+      ;;
+    legacy-host-integration-v1)
+      PORTAL_ONLY_UPDATE=false
+      # A legacy transaction can resume through this newer recovery engine.
+      # Retain its exact OpenClaw start inhibitor semantics; v2 Portal-only
+      # receipts explicitly exclude this unrelated systemd/OpenClaw mutation.
+      install_openclaw_gateway_authorization_fence_dropin || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
   case "${phase}" in
     committed|recovered)
       # Terminal cleanup owns the full reserve release and can resume a
@@ -28548,6 +37034,7 @@ recover_pending_update_transaction() {
   if [[ "${result}" -eq 0 ]]; then
     set -e
     UPDATE_RECOVERY_IN_PROGRESS=false
+    PORTAL_ONLY_UPDATE="${requested_portal_only_scope}"
     trap 'handle_err $LINENO' ERR
     trap handle_sigint SIGINT
     trap handle_sigterm TERM
@@ -28563,6 +37050,7 @@ recover_pending_update_transaction() {
 }
 
 do_update() {
+  PORTAL_ONLY_UPDATE=true
   banner
   echo ""
   if $REPAIR_REINSTALL; then
@@ -28572,26 +37060,25 @@ do_update() {
   fi
   echo ""
   CURRENT_STEP="update"
+  if $REPAIR_REINSTALL; then
+    terminal_operation_begin repair "Repairing Portal" 1 1
+  else
+    terminal_operation_begin update "Updating Portal" 1 1
+  fi
 
   dashboard_update_progress running 10 host-safety \
     "Checking host safety" \
     "Step 2 of 13 · Inspecting scheduled Docker cleanup without changing unrelated host jobs."
-  converge_unsafe_docker_prune_automation \
-    || fail "Unsafe scheduled Docker cleanup remains active. Review the guard details above, disable the unknown job or repair the legacy-file drift, and retry."
+  converge_unsafe_docker_prune_automation / audit \
+    || fail "Unsafe scheduled Docker cleanup remains active. Ordinary Portal update is audit-only and will not quarantine or rewrite host automation; use a separate reviewed host-maintenance operation, then retry."
 
   local previous_portal_version=""
   previous_portal_version="$(attest_existing_portal_for_update "${PORTAL_DIR}")" \
     || fail "The existing Portal runtime or configuration is incomplete, linked, writable by another account, or version-inconsistent. Repair it explicitly before updating."
 
-  node_version_meets_minimum \
-    || fail "The running Portal uses a Node.js release outside ${OPENCLAW_NODE_ENGINE_RANGE}. Update the shared Node runtime first (Node 22 must be >=22.22.3 and <23), then retry. The updater refused before its boot fence and will not replace Node without a rollback boundary. See docs/PORTAL_NODE_RUNTIME_REMEDIATION.md."
-
   dashboard_update_progress running 16 portal-preflight \
     "Validating current Portal and recovery prerequisites" \
-    "Step 3 of 13 · The installed runtime and shared Node.js boundary are attested."
-
-  load_existing_telemetry_install_id
-  ensure_telemetry_install_id
+    "Step 3 of 13 · The installed Portal runtime and configuration are attested."
 
   local env_file="${PORTAL_DIR}/backend/.env.production"
   # Environment authority must be unambiguous before anything reads it: a key
@@ -28632,6 +37119,29 @@ do_update() {
   fi
   [[ -n "${PORTAL_UPDATE_PROBE_TOKEN}" ]] \
     || PORTAL_UPDATE_PROBE_TOKEN="$(rand_hex 32)"
+
+  local existing_install_profile
+  existing_install_profile="$(read_env_value "${env_file}" "INSTALL_PROFILE" || true)"
+  [[ -n "${existing_install_profile}" ]] && INSTALL_PROFILE="${existing_install_profile}"
+  if [[ -z "${ORIGIN_MODE}" ]]; then
+    ORIGIN_MODE="$(read_env_value "${env_file}" "ORIGIN_MODE" || true)"
+  fi
+  if use_tailnet_profile && [[ -z "${TAILNET_DNS_NAME}" ]]; then
+    TAILNET_DNS_NAME="$(read_env_value "${env_file}" "TAILNET_DNS_NAME" || true)"
+  fi
+  [[ -n "${DOMAIN}" ]] || DOMAIN="$(read_env_value "${env_file}" "DOMAIN" || true)"
+  if [[ -z "${APP_CONTENT_DOMAIN}" ]]; then
+    APP_CONTENT_DOMAIN="$(read_env_value "${env_file}" "APP_CONTENT_DOMAIN" || true)"
+    APP_CONTENT_DNS_MODE="$(read_env_value "${env_file}" "APP_CONTENT_DNS_MODE" || true)"
+    if [[ -z "${APP_CONTENT_DOMAIN}" ]]; then
+      local existing_app_content_origin
+      existing_app_content_origin="$(read_env_value "${env_file}" "APP_CONTENT_ORIGIN" || true)"
+      APP_CONTENT_DOMAIN="$(app_content_domain_from_origin "${existing_app_content_origin}" || true)"
+    fi
+  fi
+  admit_portal_only_update_host_compatibility \
+    || fail "Host compatibility admission failed before release staging or Portal downtime. No host tool was installed, upgraded, repaired, or configured."
+
   DB_PASSWORD="$(pg_url_component "${existing_db_url}" password)" \
     || fail "The existing database password could not be parsed safely."
   # Use one identity for the pre-staging reserves, stage tree, and durable
@@ -28651,34 +37161,13 @@ do_update() {
   elif [[ "${disk_admission_status}" -ne 0 ]]; then
     fail "The update refused to start because this host could not be admitted for a safe, rollback-capable upgrade. This is not a disk-space shortfall. Reason: $(update_disk_admission_last_detail). Details: ${LOG_FILE}."
   fi
-  ensure_media_toolchain \
-    || fail "Animated GIF uploads require ffmpeg and ffprobe, but the updater could not repair the FFmpeg package while the existing Portal was still online. Check ${LOG_FILE}, repair apt, and retry."
-
   dashboard_update_progress running 22 capacity-preflight \
     "Checking database, disk, and recovery capacity" \
     "Step 4 of 13 · Database ownership, disk reserves, and required host tools passed admission."
-
-  local existing_install_profile
-  existing_install_profile="$(read_env_value "${env_file}" "INSTALL_PROFILE" || true)"
-  [[ -n "${existing_install_profile}" ]] && INSTALL_PROFILE="${existing_install_profile}"
-  if [[ -z "${ORIGIN_MODE}" ]]; then
-    ORIGIN_MODE="$(read_env_value "${env_file}" "ORIGIN_MODE" || true)"
-  fi
   if use_tailnet_profile && [[ -z "${TAILNET_DNS_NAME}" ]]; then
-    TAILNET_DNS_NAME="$(read_env_value "${env_file}" "TAILNET_DNS_NAME" || true)"
     local live_tailnet_name
     live_tailnet_name="$(tailnet_dns_name_from_status)"
     [[ -n "${live_tailnet_name}" ]] && TAILNET_DNS_NAME="${live_tailnet_name}"
-  fi
-  [[ -n "${DOMAIN}" ]] || DOMAIN="$(read_env_value "${env_file}" "DOMAIN" || true)"
-  if [[ -z "${APP_CONTENT_DOMAIN}" ]]; then
-    APP_CONTENT_DOMAIN="$(read_env_value "${env_file}" "APP_CONTENT_DOMAIN" || true)"
-    APP_CONTENT_DNS_MODE="$(read_env_value "${env_file}" "APP_CONTENT_DNS_MODE" || true)"
-    if [[ -z "${APP_CONTENT_DOMAIN}" ]]; then
-      local existing_app_content_origin
-      existing_app_content_origin="$(read_env_value "${env_file}" "APP_CONTENT_ORIGIN" || true)"
-      APP_CONTENT_DOMAIN="$(app_content_domain_from_origin "${existing_app_content_origin}" || true)"
-    fi
   fi
 
   # Stage and prepare the candidate while the old Portal remains online.
@@ -28697,24 +37186,14 @@ do_update() {
     "Signed release verified" \
     "Step 5 of 13 · Manifest signature, release version, digest, and archive boundaries passed."
   local staged_update_dir="${UPDATE_RELEASE_STAGE_DIR}/portal"
-  # Public 3.26.x installs never shipped build-essential; candidate native
-  # module verification needs it. Install while the old Portal is still up.
-  ensure_build_tools
   prepare_staged_backend_runtime_dependencies "${staged_update_dir}" \
     || fail "Candidate runtime dependencies could not be prepared and verified before downtime."
-  prepare_update_project_runtimes \
-    "${staged_update_dir}" "${env_file}" "${UPDATE_TRANSACTION_ID}"
+  local continuity_repair_plan=""
   if [[ "${previous_portal_version}" != 3.* ]]; then
-    local continuity_repair_plan="${UPDATE_RELEASE_STAGE_DIR}/portal-continuity-repair-plan.json"
+    continuity_repair_plan="${UPDATE_RELEASE_STAGE_DIR}/portal-continuity-repair-plan.json"
     run_staged_portal_rebootability_preflight \
       "${staged_update_dir}" "${env_file}" "${continuity_repair_plan}" \
       || fail "The signed candidate could not classify persisted App/Project continuity safely. No database mutation, transaction, or downtime was started; repair the reported ambiguity and retry. Details: ${LOG_FILE}."
-    run_staged_portal_continuity_repair \
-      "${staged_update_dir}" "${env_file}" "${continuity_repair_plan}" \
-      || fail "The signed candidate could not apply its exact serializable App continuity repair while the existing Portal was online. No update transaction or downtime was started; the repair refused a race or ambiguous row. Details: ${LOG_FILE}."
-    run_staged_portal_rebootability_preflight \
-      "${staged_update_dir}" "${env_file}" \
-      || fail "The signed candidate could not reattest a clean, rebootable App/Project state after continuity repair. The existing Portal remains online and no update transaction or downtime was started. Details: ${LOG_FILE}."
   else
     info "Legacy 3.x source detected; the 4.x App identity preflight will run after continuity enrollment."
   fi
@@ -28723,14 +37202,14 @@ do_update() {
     "${PORTAL_DIR}" "${existing_db_url}" "${staged_update_dir}" \
     || disk_admission_status=$?
   if [[ "${disk_admission_status}" -eq 2 ]]; then
-    fail "The fully staged candidate and additive Project runtime images do not leave enough disk for runtime promotion, rollback snapshots, the installer journal, and recovery. No receipt or downtime was started; free space and retry. Measured shortfall: $(update_disk_admission_last_detail). Details: ${LOG_FILE}."
+    fail "The fully staged Portal candidate does not leave enough disk for runtime promotion, rollback snapshots, the installer journal, and recovery. No receipt or downtime was started; free space and retry. Measured shortfall: $(update_disk_admission_last_detail). Details: ${LOG_FILE}."
   elif [[ "${disk_admission_status}" -ne 0 ]]; then
     fail "The staged candidate could not be admitted for promotion, and not because of free disk. No receipt or downtime was started. Reason: $(update_disk_admission_last_detail). Details: ${LOG_FILE}."
   fi
 
   dashboard_update_progress running 38 runtime-preparation \
-    "Preparing dependencies and project runtimes" \
-    "Step 6 of 13 · Backend dependencies and additive runtime images are staged and verified."
+    "Preparing signed Portal dependencies" \
+    "Step 6 of 13 · Backend dependencies are staged and verified in the private release directory."
 
   recover_domain_from_caddyfile
   local existing_public_ip detected_public_ip
@@ -28771,9 +37250,6 @@ do_update() {
   advance_update_transaction_phase \
     active portal_quiesce_pending portal_quiesced \
     || fail "Could not commit the Portal quiescence phase."
-  reattest_quiesced_update_project_egress_generation \
-    "${UPDATE_RELEASE_STAGE_DIR}" "${UPDATE_TRANSACTION_ID}" \
-    || fail "Managed Project egress resources changed after candidate preparation. The update was rolled back before runtime or database mutation; retry after Project activity is quiet."
 
   advance_update_transaction_phase \
     active portal_quiesced runtime_snapshot_pending \
@@ -28807,8 +37283,9 @@ do_update() {
   advance_update_transaction_phase \
     active caddy_snapshot_complete openclaw_snapshot_pending \
     || fail "Could not record the ancillary-state snapshot phase."
-  # Global OpenClaw and host-tool convergence is post-commit. These phases are
-  # a proven no-op because a Portal snapshot cannot restore global packages.
+  # Keep these legacy phase tokens so existing recovery ordering remains
+  # stable. They are deliberate no-ops in a Portal-only transaction; global
+  # packages are neither snapshotted nor mutated by ordinary update.
   advance_update_transaction_phase \
     active openclaw_snapshot_pending openclaw_snapshot_complete \
     || fail "Could not commit the ancillary-state snapshot phase."
@@ -28824,8 +37301,6 @@ do_update() {
 
   prepare_updated_environment_candidate \
     || fail "The updated environment candidate could not be prepared without mutating the live installation."
-  seal_update_project_runtime_promotion_manifest active \
-    || fail "Prepared Project runtime identities could not be sealed in the non-secret transaction journal."
 
   advance_update_transaction_phase \
     active node_modules_moved runtime_overlay_pending \
@@ -28868,6 +37343,20 @@ do_update() {
   advance_update_transaction_phase \
     active dependencies_updated database_migration_pending \
     || fail "Could not record the database migration write-ahead phase."
+  # The audit above is mutation-free. Apply its exact serializable repair only
+  # after the database snapshot is durable, Portal is quiesced, and the
+  # database-mutation write-ahead phase is committed. Recovery restores the
+  # snapshot from this phase after any repair, reattestation, or migration
+  # failure. The repair re-reads and hashes the inventory before its first
+  # write, so stale plans still fail closed.
+  if [[ -n "${continuity_repair_plan}" ]]; then
+    run_staged_portal_continuity_repair \
+      "${staged_update_dir}" "${env_file}" "${continuity_repair_plan}" \
+      || fail "The signed candidate could not apply its exact App continuity repair under the protected Portal transaction; recovery is restoring the database snapshot. Details: ${LOG_FILE}."
+    run_staged_portal_rebootability_preflight \
+      "${staged_update_dir}" "${env_file}" \
+      || fail "The signed candidate could not reattest a clean, rebootable App/Project state after protected continuity repair; recovery is restoring the database snapshot. Details: ${LOG_FILE}."
+  fi
   run_migrations_safe "${existing_db_url}"
   advance_update_transaction_phase \
     active database_migration_pending database_migrated \
@@ -28875,13 +37364,11 @@ do_update() {
 
   advance_update_transaction_phase \
     active database_migrated openclaw_update_pending \
-    || fail "Could not record the post-Portal dependency phase."
+    || fail "Could not record the legacy ancillary no-op phase."
   advance_update_transaction_phase \
     active openclaw_update_pending openclaw_updated \
-    || fail "Could not commit the post-Portal dependency phase."
+    || fail "Could not commit the legacy ancillary no-op phase."
 
-  assert_prepared_update_project_runtime_images_available active \
-    || fail "Prepared Project runtime images disappeared before candidate validation."
   advance_update_transaction_phase \
     active openclaw_updated candidate_start_pending \
     || fail "Could not record the private candidate start phase."
@@ -28925,53 +37412,21 @@ do_update() {
   finish_forward_cutover_transaction \
     || fail "Canonical Portal cutover did not complete; recovery was re-fenced."
 
+  # Repeat the exact canonical proof after durable cutover. Repair requires a
+  # running Portal; ordinary updates preserve an intentionally inactive service.
+  DASHBOARD_UPDATE_PORTAL_COMMITTED=true
   UPDATE_RELEASE_STAGE_DIR=""
   trap 'handle_err $LINENO' ERR
   trap handle_sigint SIGINT
   trap handle_sigterm TERM
   trap handle_sighup HUP
-
-  # Host-wide tools and optional runtimes stay outside the Portal transaction.
-  # The new Portal is already loaded, schema-ready, and provenance-attested.
-  DASHBOARD_UPDATE_PORTAL_COMMITTED=true
-  dashboard_update_progress running 97 postflight \
-    "Completing host services and cleanup" \
-    "Step 13 of 13 · Portal is online while host integration and optional runtimes converge."
-  update_dependencies
-  telemetry_event "deps_updated"
-  info "Checking Remote Desktop..."
-  setup_remote_desktop
-  configure_backup_timers
-  ensure_project_egress_token_secret "${env_file}"
-  ensure_docker_address_pools
-  provision_project_runtimes "${env_file}"
-  ensure_agent_zero_project_model_bridge
-  if systemctl is-enabled openclaw-gateway &>/dev/null 2>&1; then
-    prepare_openclaw_runtime_for_portal
-  fi
-  if command -v openclaw &>/dev/null; then
-    openclaw devices approve --latest >> "$LOG_FILE" 2>&1 || true
-  fi
-
-  # This proof belongs after every post-commit host mutation. The outer
-  # systemd finalizer accepts the 99% checkpoint as its success prerequisite,
-  # so do not publish that checkpoint from a generic, spoofable health body.
-  # Reuse the authenticated update-ready contract, systemd activity/PID proof,
-  # exact version, schema, and canonical-route checks that guarded cutover.
   verify_canonical_portal_for_transaction \
-    "${VERSION}" "${PORTAL_UPDATE_PROBE_TOKEN}" \
-    || fail "Final authenticated Portal readiness verification failed after host integration."
+    "${VERSION}" "${PORTAL_UPDATE_PROBE_TOKEN}" false "${REPAIR_REINSTALL}" \
+    || fail "Final exact Portal readiness or inactive-service verification failed."
 
   dashboard_update_progress running 99 postflight \
-    "Finalizing update receipt" \
-    "Step 13 of 13 · Host integration and authenticated exact-version health verification passed."
-
-  echo ""
-  echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "  ${GREEN}${BOLD}  Update complete!${NC}"
-  telemetry_event "update_complete"
-  echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo ""
+    "Portal verification complete" \
+    "Step 13 of 13 · Exact-version Portal verification passed; unrelated host tools and services were left unchanged."
 }
 
 write_retained_install_receipt() {
@@ -29289,6 +37744,14 @@ detect_retained_install_reconnect() {
   fi
   verify_retained_install_receipt \
     || fail "A retained Portal tree exists, but its root-only reconnect receipt or exact tree manifest no longer matches. Refusing to overlay it."
+  # Exact receipt verification is the authority boundary between an
+  # ambiguous existing-host footprint and intentional fresh provisioning.
+  # Until this succeeds, fail() must remain Portal-only and must not settle or
+  # roll back unrelated host tools. An explicit --update remains Portal-only;
+  # a retained tree cannot turn that operation into host maintenance.
+  if ! ${UPDATE_MODE}; then
+    PORTAL_ONLY_UPDATE=false
+  fi
   RETAINED_RECONNECT_MODE=true
   FORCE_FRESH=true
   info "Verified the exact retained Portal data tree; reconnecting it to the signed runtime."
@@ -29432,6 +37895,7 @@ remove_portal_backup_automation() {
 
   rm -f -- \
     /etc/systemd/system/bridgesllm-backup@.service \
+    /etc/systemd/system/bridgesllm-backup@.service.d/40-bridgesllm-portal-data.conf \
     /etc/systemd/system/bridgesllm-backup-daily.timer \
     /etc/systemd/system/bridgesllm-backup-comprehensive.timer \
     /etc/systemd/system/bridgesllm-backup-monthly.timer \
@@ -30483,7 +38947,7 @@ run_project_runtime_clean_slate_preflight() {
   /usr/bin/timeout --foreground --kill-after=15s 1800s \
     /usr/bin/node "${preflight}" \
       --env-file "${env_file}" \
-      --max-runtime-seconds 1740 \
+      --max-runtime-seconds 1740 2>&1 | tee -a "${LOG_FILE}" \
     || fail "Managed project resources could not be removed safely; clean-slate uninstall was aborted."
 }
 
@@ -30895,8 +39359,8 @@ AGENT_ZERO_CONTAINER_RES = [
 ]
 AGENT_ZERO_VOLUME = "bridgesllm-agent-zero-usr"
 AGENT_ZERO_IMAGES = {
-    "agent0ai/agent-zero@sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb",
-    "agent0ai/agent-zero@sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c",
+    "agent0ai/agent-zero@sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0",
+    "agent0ai/agent-zero@sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8",
 }
 AGENT_ZERO_PATHS = [
     mapped_path("/etc/bridgesllm/agent-zero.env"),
@@ -31136,7 +39600,7 @@ def agent_zero_container_contract(record):
     managed_label = labels.get("io.bridgesllm.agent-zero.managed")
     if (
         config.get("Image") not in AGENT_ZERO_IMAGES
-        or labels.get("io.bridgesllm.agent-zero.version") != "2.5"
+        or labels.get("io.bridgesllm.agent-zero.version") != "2.10"
         or managed_label not in {None, "true"}
         or ((host.get("RestartPolicy") or {}).get("Name")) != "unless-stopped"
         or len(host.get("PortBindings") or {}) != 1
@@ -31989,15 +40453,49 @@ def load_sealed_plan():
 
 
 sealed_plan = load_sealed_plan()
+transaction_directory = os.path.dirname(plan_path)
+transaction_id = os.path.basename(transaction_directory)
+sealed_plan_digest = plan_digest(sealed_plan)
+path_receipt_directory = os.path.join(
+    transaction_directory, "residue-path-deletions")
+docker_receipt_directory = os.path.join(
+    transaction_directory, "residue-docker-deletions")
+
+
+def record_digest(record):
+    return hashlib.sha256(
+        canonical_plan(record).encode("utf-8")
+    ).hexdigest()
+
+
+def safe_deletion_receipt_file(path, *, allow_empty=False):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == 0
+        and info.st_gid == 0
+        and info.st_nlink == 1
+        and stat.S_IMODE(info.st_mode) == 0o600
+        and (allow_empty or info.st_size > 0)
+        and info.st_size <= 65536
+    )
+
+
 global_identities_by_kind = {
     kind: docker_identities(kind)
     for kind in ("container", "network", "volume")
 }
+all_planned_by_kind = {}
 planned_by_kind = {}
 for kind in ("container", "network", "volume"):
     planned = sealed_plan["docker"].get(kind)
     if not isinstance(planned, list) or len(planned) > MAX_RESOURCES:
         raise SystemExit("the uninstall residue plan exceeds its Docker limit")
+    all_selected = {}
     selected = {}
     for record in planned:
         if (
@@ -32036,12 +40534,93 @@ for kind in ("container", "network", "volume"):
         ):
             raise SystemExit(
                 "the uninstall residue plan has an invalid Docker identity")
+        if key in all_selected:
+            raise SystemExit(
+                "the uninstall residue plan has duplicate Docker identities")
+        all_selected[key] = record
         if scope == "all" or scope in record["scopes"]:
-            if key in selected:
-                raise SystemExit(
-                    "the uninstall residue plan has duplicate Docker identities")
             selected[key] = record
+    all_planned_by_kind[kind] = all_selected
     planned_by_kind[kind] = selected
+
+
+def docker_receipt_paths(kind, record):
+    name = hashlib.sha256(
+        (kind + "\0" + record["identity"]).encode("utf-8")
+    ).hexdigest() + ".json"
+    path = os.path.join(docker_receipt_directory, name)
+    return path, os.path.join(docker_receipt_directory, f".{name}.tmp")
+
+
+def expected_docker_receipt(kind, record):
+    return {
+        "schema": "bridgesllm.uninstall-docker-deletion.v1",
+        "transactionId": transaction_id,
+        "planDigest": sealed_plan_digest,
+        "kind": kind,
+        "identity": record["identity"],
+        "name": record["name"],
+        "attestation": record["attestation"],
+        "recordDigest": record_digest(record),
+    }
+
+
+def docker_receipt_state(kind, record):
+    receipt, temporary = docker_receipt_paths(kind, record)
+    temporary_exists = os.path.lexists(temporary)
+    if temporary_exists and not safe_deletion_receipt_file(
+            temporary, allow_empty=True):
+        raise SystemExit("the Docker deletion receipt temporary is unsafe")
+    if not os.path.lexists(receipt):
+        return False, temporary_exists
+    if not safe_deletion_receipt_file(receipt):
+        raise SystemExit("the Docker deletion receipt is unsafe")
+    try:
+        with open(receipt, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        raise SystemExit("the Docker deletion receipt is invalid")
+    if document != expected_docker_receipt(kind, record):
+        raise SystemExit(
+            "the Docker deletion receipt does not match the sealed identity")
+    return True, temporary_exists
+
+
+def validate_docker_receipt_directory():
+    if not os.path.lexists(docker_receipt_directory):
+        return False
+    info = os.lstat(docker_receipt_directory)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or os.path.realpath(docker_receipt_directory)
+            != docker_receipt_directory
+    ):
+        raise SystemExit("the Docker deletion receipt directory is unsafe")
+    allowed = set()
+    for kind, records in all_planned_by_kind.items():
+        for record in records.values():
+            allowed.update(docker_receipt_paths(kind, record))
+    for name in os.listdir(docker_receipt_directory):
+        candidate = os.path.join(docker_receipt_directory, name)
+        if candidate not in allowed:
+            raise SystemExit(
+                "the Docker deletion receipt directory contains an unknown entry")
+    # Validate every present receipt against the full sealed plan, not only the
+    # current scope. A later scope-specific recovery must not carry a forged
+    # sibling receipt forward to terminal proof.
+    for kind, records in all_planned_by_kind.items():
+        for record in records.values():
+            receipt, temporary = docker_receipt_paths(kind, record)
+            if os.path.lexists(receipt) or os.path.lexists(temporary):
+                docker_receipt_state(kind, record)
+    return True
+
+
+docker_receipt_directory_exists = validate_docker_receipt_directory()
 
 for kind, current_records in (
     ("container", container_records),
@@ -32062,6 +40641,15 @@ for kind, current_records in (
                 raise SystemExit(
                     f"a user-confirmed Docker {kind} still exists at "
                     "terminal cleanup")
+            has_receipt, has_temporary = (
+                docker_receipt_state(kind, planned)
+                if docker_receipt_directory_exists
+                else (False, False)
+            )
+            if not has_receipt or has_temporary:
+                raise SystemExit(
+                    f"a sealed Docker {kind} lacks its exact durable "
+                    "deletion receipt at terminal cleanup")
             continue
         if inspected is None:
             if identity in listed_identities:
@@ -32072,8 +40660,18 @@ for kind, current_records in (
                 raise SystemExit(
                     f"a user-confirmed Docker {kind} disappeared before "
                     "Safe cleanup")
-            # A wipe can resume after an earlier invocation durably removed
-            # an object but crashed before advancing the uninstall phase.
+            has_receipt, has_temporary = (
+                docker_receipt_state(kind, planned)
+                if docker_receipt_directory_exists
+                else (False, False)
+            )
+            if not has_receipt or has_temporary:
+                raise SystemExit(
+                    f"a sealed Docker {kind} disappeared without its exact "
+                    "durable deletion receipt")
+            # A wipe can resume after an earlier invocation removed the exact
+            # receipted identity but crashed before advancing the uninstall
+            # phase. Lexical or discovery absence alone is never authority.
             continue
         if (
             identity not in listed_identities
@@ -32085,6 +40683,14 @@ for kind, current_records in (
                 f"a user-confirmed Docker {kind} changed identity, name, "
                 "labels, or topology after confirmation")
         present[identity] = planned
+        has_receipt, has_temporary = (
+            docker_receipt_state(kind, planned)
+            if docker_receipt_directory_exists
+            else (False, False)
+        )
+        if mode == "quiesce" and (has_receipt or has_temporary):
+            raise SystemExit(
+                "Safe cleanup encountered an in-progress Docker deletion")
     current = {record["identity"]: record for record in current_records}
     if (
         len(current) != len(current_records)
@@ -32101,11 +40707,7 @@ for kind, current_records in (
             raise SystemExit(
                 "managed Docker residue changed after the user's confirmation")
 
-transaction_directory = os.path.dirname(plan_path)
-transaction_id = os.path.basename(transaction_directory)
-sealed_plan_digest = plan_digest(sealed_plan)
-receipt_directory = os.path.join(
-    transaction_directory, "residue-path-deletions")
+receipt_directory = path_receipt_directory
 
 
 def integer_field(record, name, *, positive=False):
@@ -32169,12 +40771,6 @@ if (
         "the current and user-confirmed managed filesystem inventories differ")
 
 
-def record_digest(record):
-    return hashlib.sha256(
-        canonical_plan(record).encode("utf-8")
-    ).hexdigest()
-
-
 def quarantine_path(record):
     path = record["path"]
     name = (
@@ -32193,20 +40789,7 @@ def receipt_paths(record):
 
 
 def safe_receipt_file(path, *, allow_empty=False):
-    try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return False
-    return (
-        stat.S_ISREG(info.st_mode)
-        and not stat.S_ISLNK(info.st_mode)
-        and info.st_uid == 0
-        and info.st_gid == 0
-        and info.st_nlink == 1
-        and stat.S_IMODE(info.st_mode) == 0o600
-        and (allow_empty or info.st_size > 0)
-        and info.st_size <= 65536
-    )
+    return safe_deletion_receipt_file(path, allow_empty=allow_empty)
 
 
 def expected_receipt(record):
@@ -32356,13 +40939,17 @@ def validate_receipt_directory():
     ):
         raise SystemExit("the path-deletion receipt directory is unsafe")
     allowed = set()
-    for record in planned_paths.values():
+    for record in all_planned_paths.values():
         allowed.update(receipt_paths(record))
     for name in os.listdir(receipt_directory):
         candidate = os.path.join(receipt_directory, name)
         if candidate not in allowed:
             raise SystemExit(
                 "the path-deletion receipt directory contains an unknown entry")
+    for record in all_planned_paths.values():
+        receipt, temporary = receipt_paths(record)
+        if os.path.lexists(receipt) or os.path.lexists(temporary):
+            receipt_state(record)
     return True
 
 
@@ -32410,24 +40997,15 @@ for path, record in planned_paths.items():
         }
         continue
     if mode == "prove-absent":
-        # A receipt proves *this* step deleted the path. It is not the only
-        # honest route to absence: the residue plan is sealed before the
-        # ordinary uninstall steps run, and those steps legitimately remove
-        # some of the same paths (the Agent Zero runtime, its env file, and
-        # its backups). Demanding a receipt for a path an attested earlier
-        # step already removed made Complete wipe unable to converge in the
-        # normal case, leaving a boot fence and a half-uninstalled host.
-        #
-        # Absence with no quarantine and no temporary is still absence: a
-        # partially-moved deletion would have left one of those behind, and
-        # both are still refused below.
         if (
             original_exists
             or quarantine_exists
+            or not has_receipt
             or has_temporary
         ):
             raise SystemExit(
-                "sealed managed filesystem residue is not durably absent")
+                "sealed managed filesystem residue lacks its exact durable "
+                "deletion receipt or is not absent")
         durably_confirm_path_absence(record, quarantine)
         planned_path_states[path] = {
             "record": record,
@@ -32448,13 +41026,17 @@ for path, record in planned_paths.items():
     elif quarantine_exists:
         assert_quarantine_identity(record, quarantine)
         state = "quarantine"
-    elif not has_temporary:
-        # Either this step already deleted it (receipt present), or an earlier
-        # attested uninstall step did. Both end at the same verified absence;
-        # only an interrupted move leaves a quarantine or temporary, and those
-        # are handled above and below.
+    elif has_receipt and not has_temporary:
+        # Recovery may observe both names absent only after this exact sealed
+        # inode was quarantined and its identity-bound receipt was committed.
+        # An unreceipted absence is indistinguishable from an out-of-band move
+        # and is therefore never adopted as a successful wipe.
         durably_confirm_path_absence(record, quarantine)
         state = "deleted"
+    elif not has_temporary:
+        raise SystemExit(
+            "sealed managed filesystem residue disappeared without its exact "
+            "durable deletion receipt")
     else:
         raise SystemExit(
             "sealed managed filesystem residue disappeared while a deletion "
@@ -32473,6 +41055,19 @@ if mode == "prove-absent":
     print("The sealed managed-residue inventory is absent.")
     raise SystemExit(0)
 
+# Docker deletion authority is committed only after BOTH firewall frontends
+# reached their sealed terminal state. Docker then legitimately removes its
+# own bridge rules. On recovery, that exact identity-bound receipt proves the
+# firewall phase finished; do not replay or roll back unrelated host rules.
+# Only a project-only resource proves this order; an agent-zero-only scope
+# may delete its own resources without executing the firewall phase.
+# A recreated Portal chain/reference still fails closed below.
+firewall_phase_committed = any(
+    docker_receipt_state(kind, record) == (True, False)
+    for kind, records in all_planned_by_kind.items()
+    for record in records.values()
+    if record['scopes'] == ['project']
+)
 firewall_positions = {}
 if want_project:
     for tool in ("iptables", "ip6tables"):
@@ -32498,6 +41093,14 @@ if want_project:
             ):
                 raise SystemExit("the uninstall residue plan has an invalid firewall mutation")
             states.append(mutation["after"])
+        if firewall_phase_committed:
+            terminal = parse_managed_firewall(
+                tool, firewall[tool]["binary"], current)
+            if terminal["chains"] or terminal["references"]:
+                raise SystemExit(
+                    "Portal firewall state reappeared after receipted Docker deletion")
+            firewall_positions[tool] = len(planned["mutations"])
+            continue
         matches = [index for index, state in enumerate(states) if state == current]
         if len(matches) != 1:
             raise SystemExit(
@@ -32727,6 +41330,63 @@ def ensure_receipt_directory():
         raise SystemExit("the path-deletion receipt directory could not be sealed")
 
 
+def ensure_docker_receipt_directory():
+    info = os.lstat(transaction_directory)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or os.path.realpath(transaction_directory) != transaction_directory
+    ):
+        raise SystemExit(
+            "the uninstall transaction directory is unsafe for Docker receipts")
+    if not os.path.lexists(docker_receipt_directory):
+        os.mkdir(docker_receipt_directory, 0o700)
+        fsync_dir(transaction_directory)
+    if not validate_docker_receipt_directory():
+        raise SystemExit("the Docker deletion receipt directory could not be sealed")
+
+
+def write_docker_receipt(kind, record):
+    receipt, temporary = docker_receipt_paths(kind, record)
+    has_receipt, has_temporary = docker_receipt_state(kind, record)
+    if has_receipt:
+        if has_temporary:
+            os.unlink(temporary)
+            fsync_dir(docker_receipt_directory)
+        return
+    if has_temporary:
+        os.unlink(temporary)
+        fsync_dir(docker_receipt_directory)
+    payload = json.dumps(
+        expected_docker_receipt(kind, record), indent=2, sort_keys=True
+    ) + "\n"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if os.path.lexists(receipt):
+        raise SystemExit("the Docker deletion receipt raced its atomic publish")
+    os.replace(temporary, receipt)
+    fsync_dir(docker_receipt_directory)
+    has_receipt, has_temporary = docker_receipt_state(kind, record)
+    if not has_receipt or has_temporary:
+        raise SystemExit("the Docker deletion receipt was not committed durably")
+
+
 def write_path_receipt(record):
     receipt, temporary = receipt_paths(record)
     has_receipt, has_temporary = receipt_state(record)
@@ -32852,6 +41512,9 @@ def prepare_path_quarantine(state):
     fixture_path_crash("receipt")
 
 
+if any(planned_by_kind[kind] for kind in ("container", "network", "volume")):
+    ensure_docker_receipt_directory()
+
 if planned_paths:
     ensure_receipt_directory()
     for path in sorted(planned_path_states):
@@ -32938,9 +41601,33 @@ for kind, records in (
     ("volume", volume_records),
 ):
     for record in records:
+        planned = planned_by_kind[kind].get(record["identity"])
+        if planned is None:
+            raise SystemExit(
+                f"Docker {kind} was not bound to the sealed deletion plan")
         current = inspect_resource(kind, record["identity"], tolerate_missing=True)
-        if current is None or current["attestation"] != record["attestation"]:
+        if (
+            current is None
+            or current["identity"] != planned["identity"]
+            or current["name"] != planned["name"]
+            or current["attestation"] != planned["attestation"]
+        ):
             raise SystemExit(f"Docker {kind} changed immediately before deletion")
+        # Commit authority for this exact full identity before invoking Docker.
+        # If the process dies after publication, recovery may retry deletion;
+        # if the identity disappears without this receipt, terminal proof stays
+        # fenced instead of inferring a deletion from absence.
+        write_docker_receipt(kind, planned)
+        fixture_path_crash(f"docker-{kind}-receipt")
+        current = inspect_resource(kind, record["identity"], tolerate_missing=True)
+        if (
+            current is None
+            or current["identity"] != planned["identity"]
+            or current["name"] != planned["name"]
+            or current["attestation"] != planned["attestation"]
+        ):
+            raise SystemExit(
+                f"Docker {kind} changed after its deletion receipt was sealed")
         if kind == "container":
             run([DOCKER, "container", "rm", "--force", record["identity"]])
         elif kind == "network":
@@ -33194,6 +41881,39 @@ handle_helperless_clean_slate_residue() {
     tail -n +2 <<<"${report}" | sed 's/^/      /'
     warn "Re-run the installer with --uninstall and choose Complete wipe to remove it later."
   fi
+}
+
+# Complete wipe owns every deletion in the sealed managed-residue inventory
+# before any provider-specific helper runs. Those helpers are intentionally
+# idempotent and may still retire database/configuration state afterward, but
+# they never get the chance to make a sealed Docker identity or filesystem root
+# disappear without the transaction's exact durable receipt.
+converge_receipted_complete_wipe_inventory() {
+  local policy transaction_id transaction_dir plan_path backup_dir
+  policy="$(resolve_uninstall_residue_policy)"
+  [[ "${policy}" == "wipe" ]] || return 0
+  transaction_id="$(read_uninstall_transaction_field transactionId)" \
+    || fail "The uninstall transaction id could not be read before Complete wipe."
+  transaction_dir="$(read_uninstall_transaction_field transactionDir)" \
+    || fail "The uninstall transaction directory could not be read before Complete wipe."
+  plan_path="$(read_uninstall_transaction_field residuePlan)" \
+    || fail "The Complete wipe residue plan could not be read."
+  [[ "${transaction_id}" =~ ^[a-f0-9]{32}$ \
+    && "${transaction_dir}" == "${UNINSTALL_TRANSACTIONS_ROOT}/${transaction_id}" \
+    && "${plan_path}" == "${transaction_dir}/residue-plan.json" ]] \
+    || fail "The Complete wipe residue plan escaped its exact transaction boundary."
+  backup_dir="/var/backups/bridgesllm/firewall-wipe-${transaction_id}"
+  info "Complete wipe: deleting the exact sealed managed inventory with durable identity receipts..."
+  managed_runtime_residue_tool wipe all "${backup_dir}" "${plan_path}" \
+    || fail "The exact sealed managed inventory could not be deleted with durable receipts; uninstall remains fenced."
+  assert_no_managed_project_runtime_residuals
+  assert_no_managed_agent_zero_runtime_residuals
+  if [[ -d "${backup_dir}" && ! -L "${backup_dir}" ]]; then
+    UNINSTALL_RESIDUE_WIPE_BACKUP_DIR="${backup_dir}"
+  fi
+  ok "Complete wipe sealed exact deletion receipts for every recorded managed identity and root"
+  info "This proves deletion only for the exact Portal-managed identities and recorded roots in this transaction."
+  info "It does not claim that an out-of-band copy exists nowhere else on the host."
 }
 
 attest_clean_slate_tree() {
@@ -35415,6 +44135,7 @@ resume_active_uninstall_transaction() {
         ;;
       backup_automation_removed)
         if [[ "${mode}" == "clean" ]]; then
+          converge_receipted_complete_wipe_inventory
           run_project_runtime_clean_slate_preflight
         else
           record_retained_runtime_intent
@@ -35540,6 +44261,8 @@ stop_portal_service_for_uninstall() {
 }
 
 do_uninstall() {
+  # Consent text must never be hidden inside the fixed-height surface.
+  terminal_suspend
   banner
   echo ""
   echo -e "  ${BOLD}${RED}Uninstalling BridgesLLM Portal${NC}"
@@ -35631,7 +44354,14 @@ do_uninstall() {
 
   echo ""
   read -rp "  Type 'yes' to confirm uninstall: " yn
-  [[ "$yn" == "yes" ]] || { echo "  Cancelled."; exit 0; }
+  if [[ "$yn" != "yes" ]]; then
+    echo "  Cancelled."
+    publish_installer_terminal_state "Uninstall cancelled" \
+      "No uninstall transaction was created." \
+      "No action is required."
+    exit 0
+  fi
+  terminal_resume
 
   local uninstall_mode="keep"
   [[ "${data_choice}" == "2" ]] && uninstall_mode="clean"
@@ -35666,6 +44396,7 @@ do_uninstall() {
     echo -e "  ${DIM}Not removed (clean up manually if needed):${NC}"
     echo "    ${BULLET} Caddy (/etc/caddy/Caddyfile)"
     echo "    ${BULLET} Node.js, Docker, ClamAV, Ollama, OpenClaw"
+    echo "    ${BULLET} Global ClawHub, Codex CLI, and Claude Code packages"
     echo "    ${BULLET} Backup archives stored outside ${INSTALL_ROOT}"
     echo "    ${BULLET} Tailscale, including this machine's tailnet membership"
     echo ""
@@ -35684,12 +44415,84 @@ do_uninstall() {
       echo -e "  ${DIM}(Restore with iptables-restore / ip6tables-restore if networking misbehaves.)${NC}"
     fi
   fi
+  echo -e "  ${DIM}Retained for safe npm CLI recovery: unsettled transaction journals/prestate,${NC}"
+  echo -e "  ${DIM}immutable helper runtime receipts/generations, and required rollback/cache authority.${NC}"
   echo ""
 }
 
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
+
+verify_portal_qualified_native_cli_bundle() {
+  local admission_helper="${PORTAL_DIR}/backend/dist/services/nativeHostCliAdmission.js"
+  [[ -f "${admission_helper}" && ! -L "${admission_helper}" ]] || return 1
+  NODE_PATH="${PORTAL_DIR}/backend/node_modules" node - \
+    "${admission_helper}" \
+    "${PIN_CODEX_CLI_VERSION}" \
+    "${PIN_CLAUDE_CODE_VERSION}" \
+    "${PIN_CLAWHUB_VERSION}" <<'NODE'
+const helper = require(process.argv[2]);
+const expected = [
+  ['codex', '/usr/bin/codex', process.argv[3]],
+  ['claude-code', '/usr/bin/claude', process.argv[4]],
+  ['clawhub', '/usr/bin/clawhub', process.argv[5]],
+];
+(async () => {
+  for (const [toolId, executable, version] of expected) {
+    const identity = await helper.attestNativeHostCli(toolId, executable);
+    if (identity?.toolId !== toolId || identity?.executablePath !== executable || identity?.version !== version) {
+      throw new Error(`unexpected admitted identity for ${toolId}`);
+    }
+  }
+})().catch((error) => {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});
+NODE
+}
+
+do_maintain_compatible_ai_tools() {
+  PORTAL_ONLY_UPDATE=false
+  CURRENT_STEP="compatible AI tools"
+  banner
+  echo ""
+  echo -e "  ${BOLD}${WHITE}Updating Portal-compatible AI tools${NC}"
+  echo ""
+
+  attest_existing_portal_for_update "${PORTAL_DIR}" >/dev/null \
+    || fail "The installed Portal runtime is incomplete, linked, or unsafe; compatibility maintenance was not started."
+  admit_existing_node_runtime_for_compatible_ai_tools \
+    || fail "The existing Node.js runtime is outside the Portal-qualified compatibility contract; nothing was changed."
+
+  terminal_operation_update progress \
+    "Opening the native runtime safety fence" \
+    "Staging exact signed catalog archives before any package root changes."
+  stage_native_cli_bundle_transaction \
+    || fail "The exact Codex, Claude Code, and ClawHub archives could not be staged and sealed before runtime maintenance."
+
+  terminal_operation_update progress \
+    "Converging the Portal-qualified OpenClaw runtime" \
+    "The gateway is durably fenced while its exact package, plugins, and state migrate."
+  converge_openclaw_core_package
+  prepare_openclaw_runtime_for_portal
+
+  terminal_operation_update progress \
+    "Verifying the complete compatibility tuple" \
+    "Re-attesting all three native package trees after the combined commit."
+  if native_cli_bundle_transaction_present \
+    || [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] \
+    || [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+      || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]; then
+    fail "The compatibility tuple verified, but one or more durable transaction owners did not reach terminal cleanup. The next run will reconcile them before any new mutation."
+  fi
+  verify_portal_qualified_native_cli_bundle >> "${LOG_FILE}" 2>&1 \
+    || fail "The committed Codex, Claude Code, or ClawHub package no longer matches the signed Portal admission catalog."
+  verify_openclaw_tested_pair \
+    || fail "The committed OpenClaw runtime and Portal bridge did not pass final tested-pair verification."
+  ok "Compatible AI tools verified: OpenClaw ${PIN_OPENCLAW_RUNTIME_VERSION}, Codex ${PIN_CODEX_CLI_VERSION}, Claude Code ${PIN_CLAUDE_CODE_VERSION}, ClawHub ${PIN_CLAWHUB_VERSION}"
+}
 
 print_dry_run_plan() {
   local existing_install=false action="install"
@@ -35698,7 +44501,9 @@ print_dry_run_plan() {
     existing_install=true
   fi
 
-  if $UNINSTALL_MODE; then
+  if $MAINTAIN_TOOLS; then
+    action="maintain-tools"
+  elif $UNINSTALL_MODE; then
     action="uninstall"
   elif $UPDATE_MODE; then
     action="update"
@@ -35731,6 +44536,13 @@ print_dry_run_plan() {
   echo ""
 
   case "${action}" in
+    maintain-tools)
+      echo "  A real run would:"
+      echo "    ${BULLET} Verify the installed signed Portal and exact compatibility catalog"
+      echo "    ${BULLET} Stage checksum- and SRI-bound Codex, Claude Code, and ClawHub trees"
+      echo "    ${BULLET} Fence new native launches and migrate OpenClaw under one combined decision"
+      echo "    ${BULLET} Commit the complete tested tuple or restore the complete prior tuple"
+      ;;
     uninstall)
       echo "  A real run would:"
       echo "    ${BULLET} Ask whether to keep Portal data or remove the local clean slate"
@@ -35743,17 +44555,15 @@ print_dry_run_plan() {
       echo "  A real run would:"
       echo "    ${BULLET} Stage and cryptographically verify the signed ${VERSION} release"
       echo "    ${BULLET} Stop Portal and capture runtime, database, dependency, config, and provenance recovery state"
-      echo "    ${BULLET} Replace the runtime, migrate the database, and converge managed services"
-      echo "    ${BULLET} Verify readiness before committing release provenance; recover on failure"
-      if $MAINTAIN_TOOLS; then
-        echo "    ${BULLET} Explicitly maintain optional AI tools"
-      fi
+      echo "    ${BULLET} Replace only the signed Portal runtime and migrate its database under the rollback journal"
+      echo "    ${BULLET} Preserve OpenClaw, global tools, Docker runtimes, Remote Desktop, and unrelated services unchanged"
+      echo "    ${BULLET} Verify exact-version readiness before publishing completion; recover on failure"
       ;;
     reinstall)
       echo "  A real run would repair the existing Portal through the protected update transaction:"
       echo "    ${BULLET} Preserve its database, secrets, origin identities, projects, apps, uploads, and runtime data"
       echo "    ${BULLET} Quiesce Portal, snapshot every rollback layer, then reinstall the signed runtime"
-      echo "    ${BULLET} Run migrations and converge managed services with durable interruption recovery"
+      echo "    ${BULLET} Run Portal migrations with durable interruption recovery while leaving host tools unchanged"
       echo "    ${BULLET} Verify the new process and exact version before committing"
       ;;
     install)
@@ -35774,16 +44584,35 @@ print_dry_run_plan() {
 }
 
 main() {
+  # Conservative until argument parsing and the existing-install shape are
+  # known: malformed invocations must never trigger unrelated host recovery.
+  PORTAL_ONLY_UPDATE=true
+  terminal_prescan_display_mode "$@"
   parse_args "$@"
+  select_install_operation
+  terminal_renderer_init
+  classify_requested_update_scope
   if ${REPAIR_PROJECT_RUNTIME_IMAGE}; then
     [[ "${EUID:-$(id -u)}" -eq 0 ]] \
       || fail "Must run Project runtime image repair as root."
-    acquire_project_runtime_image_repair_lock
-    repair_project_runtime_image
+    mkdir -p "$LOG_DIR"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+    terminal_operation_begin repair "Repairing Project runtime image" 1 1
+    terminal_run_captured_handler acquire_project_runtime_image_repair_lock
+    terminal_run_captured_handler repair_project_runtime_image
+    terminal_operation_end completed
+    publish_installer_terminal_state "Repair complete" \
+      "The Project runtime image was repaired and verified." \
+      "Return to the Portal and retry the affected Project operation."
     exit 0
   fi
-  detect_runtime_profile
+  # A retained reconnect is the only non-absent fresh target. Verify its exact
+  # root-only receipt while failure handling is still Portal-only; only a
+  # verified reconnect may admit fresh-install host options.
   detect_retained_install_reconnect
+  reject_existing_install_host_options
+  detect_runtime_profile
   load_existing_origin_for_forced_reinstall
   validate_selected_origin
 
@@ -35799,12 +44628,37 @@ main() {
   acquire_portal_operation_lock
   if ${UNINSTALL_RECOVERED_THIS_RUN}; then
     info "The interrupted uninstall is complete. Run the installer again only if you now want to install Portal."
+    publish_installer_terminal_state "Recovery complete" \
+      "The interrupted uninstall reached its verified terminal state." \
+      "Run the installer again only if you want to reinstall Portal."
+    exit 0
+  fi
+
+  if $MAINTAIN_TOOLS; then
+    mkdir -p "$LOG_DIR"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+    terminal_operation_begin compatible-ai-tools \
+      "Updating compatible AI tools" 1 1
+    terminal_run_captured_handler do_maintain_compatible_ai_tools
+    terminal_operation_end completed
+    publish_installer_terminal_state "Compatible AI tools verified" \
+      "The exact Portal-qualified OpenClaw, Codex, Claude Code, and ClawHub tuple committed successfully." \
+      "Return to the Dashboard and test your provider accounts and models."
     exit 0
   fi
 
   # Uninstall mode
   if $UNINSTALL_MODE; then
-    do_uninstall
+    mkdir -p "$LOG_DIR"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+    terminal_operation_begin uninstall "Uninstalling Portal" 1 1
+    terminal_run_captured_handler do_uninstall
+    terminal_operation_end completed
+    publish_installer_terminal_state "Uninstall complete" \
+      "The selected Portal uninstall operation reached its durable terminal state." \
+      "Keep the installer log with your recovery records."
     exit 0
   fi
 
@@ -35813,7 +44667,11 @@ main() {
     mkdir -p "$LOG_DIR"
     touch "$LOG_FILE"
     chmod 600 "$LOG_FILE"
-    do_update
+    terminal_run_captured_handler do_update
+    terminal_operation_end completed
+    publish_installer_terminal_state "Portal update verified" \
+      "Exact-version Portal verification and the final receipt completed." \
+      "Return to the Dashboard."
     exit 0
   fi
 
@@ -35828,7 +44686,11 @@ main() {
     chmod 600 "$LOG_FILE"
     REPAIR_REINSTALL=true
     UPDATE_MODE=true
-    do_update
+    terminal_run_captured_handler do_update
+    terminal_operation_end completed
+    publish_installer_terminal_state "Portal repair verified" \
+      "Exact-version Portal verification and the final receipt completed." \
+      "Return to the Dashboard."
     exit 0
   fi
 
@@ -35847,9 +44709,13 @@ main() {
     touch "$LOG_FILE"
     chmod 600 "$LOG_FILE"
     info "Existing installation detected at ${PORTAL_DIR} — updating instead of reinstalling."
-    info "(Use --reinstall to force a fresh install.)"
+    info "(Use --repair to reinstall Portal files while keeping your data.)"
     UPDATE_MODE=true
-    do_update
+    terminal_run_captured_handler do_update
+    terminal_operation_end completed
+    publish_installer_terminal_state "Portal update verified" \
+      "Exact-version Portal verification and the final receipt completed." \
+      "Return to the Dashboard."
     exit 0
   fi
 
@@ -35863,24 +44729,24 @@ main() {
   INSTALL_START_TIME=$(date +%s)
 
   banner
-
-  preflight
-  converge_unsafe_docker_prune_automation \
-    || fail "Unsafe scheduled Docker cleanup remains active. Review the guard details above, disable the unknown job or repair the legacy-file drift, and retry."
-  ensure_telemetry_install_id
-  telemetry_event "install_start"
-  if use_tailnet_profile; then
-    setup_tailnet_origin
-  fi
-  install_system_packages
-  install_ai_tools
-  setup_database
-  build_portal
-  install_native_provider_tools
-  configure_services
-  configure_backup_timers
-  setup_remote_desktop
-  start_portal
+  # Keep the safety admission inside the semantic preflight handler. Defining
+  # it here also leaves the full fresh-install call graph visible to legacy
+  # source gates while run_fresh_install_plan remains the only phase executor.
+  fresh_install_preflight_phase() {
+    preflight
+    converge_unsafe_docker_prune_automation \
+      || fail "Unsafe scheduled Docker cleanup remains active. Review the guard details above, disable the unknown job or repair the legacy-file drift, and retry."
+    ensure_telemetry_install_id
+    telemetry_event "install_start"
+  }
+  build_fresh_install_plan \
+    || fail "Fresh-install phase plan is invalid; no host changes were started."
+  FRESH_INSTALL_IN_PROGRESS=true
+  run_fresh_install_plan
+  FRESH_INSTALL_IN_PROGRESS=false
+  publish_installer_terminal_state "Installation verified" \
+    "Portal started and passed exact-version readiness checks." \
+    "Open the setup URL printed below."
   print_success
 }
 

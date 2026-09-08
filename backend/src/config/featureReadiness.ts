@@ -12,6 +12,10 @@ import {
   type ResolvedOllamaBackendAuthority,
 } from '../services/ollamaBackendAuthority';
 import { PROJECT_RUNTIME_AUTHORIZATION_POLICY } from '../services/projectRuntimeAuthorizationPolicy';
+import {
+  getNativeHostCliStatus,
+  type NativeHostCliStatusTool,
+} from '../services/nativeHostCliStatus';
 
 export type ReadinessStatus = 'ready' | 'partial' | 'missing' | 'not_configured';
 export type ReadinessCheckType = 'command' | 'path' | 'http' | 'config';
@@ -26,6 +30,7 @@ export interface FeatureReadinessCheckDef {
   path?: string;
   url?: string;
   timeoutMs?: number;
+  nativeHostCliTool?: NativeHostCliStatusTool;
   // Portal-tested pin verification: the check fails when the
   // installed binary's version has drifted from the pin, so a self-updated
   // CLI can never silently falsify the tested-version claim.
@@ -146,7 +151,7 @@ export const FEATURE_READINESS_MATRIX: FeatureReadinessDef[] = [
         type: 'command',
         required: true,
         command: 'test -x /usr/local/bin/bridges-rd-ai-launchers.sh && /usr/local/bin/bridges-rd-ai-launchers.sh verify',
-        remediation: 'Re-run Remote Desktop setup to provision truthful Claude Code, Codex, Grok Build, Antigravity, Ollama, and Agent Zero (web UI) runtime launchers. The Agent Zero icon opens its web UI signed in through a click-time backend session exchange; it appears once the managed Agent Zero runtime is installed.',
+        remediation: 'Re-run Remote Desktop setup to provision truthful Claude Code, Codex, Ollama, and Agent Zero (web UI) runtime launchers. The Agent Zero icon opens its web UI signed in through a click-time backend session exchange; it appears once the managed Agent Zero runtime is installed.',
       },
       {
         id: 'openclawUiDashboardUrl',
@@ -180,50 +185,19 @@ export const FEATURE_READINESS_MATRIX: FeatureReadinessDef[] = [
       { id: 'openclaw', label: 'OpenClaw CLI', type: 'command', required: true, command: 'openclaw --version', remediation: 'Install OpenClaw CLI to enable built-in agent runner features.' },
       {
         id: 'codex',
-        label: 'Codex CLI (Portal-tested pin)',
+        label: 'Codex CLI (Portal-admitted versions)',
         type: 'command',
         required: false,
-        command: 'codex --version',
-        pinnedCli: { binary: 'codex', args: ['--version'], tested: PORTAL_TOOL_VERSIONS.codexCli },
-        remediation: 'Run the Portal update (or the installer with --maintain-tools) to converge Codex CLI to the Portal-tested version, or configure another runner in Settings → Agent Runners.',
+        nativeHostCliTool: 'codex',
+        remediation: 'Codex host package status is read-only here. Owner can restore the exact compatible bundle under Admin > Maintenance > Update Compatible AI Tools. Project Sandbox stays on its separate confined runtime.',
       },
       {
         id: 'claude',
-        label: 'Claude Code CLI (Portal-tested pin)',
+        label: 'Claude Code CLI (Portal-admitted versions)',
         type: 'command',
         required: false,
-        command: 'claude --version',
-        pinnedCli: { binary: 'claude', args: ['--version'], tested: PORTAL_TOOL_VERSIONS.claudeCode },
-        remediation: 'Run the Portal update (or the installer with --maintain-tools) to converge Claude Code to the Portal-tested version, or configure another runner in Settings → Agent Runners.',
-      },
-      {
-        id: 'antigravity',
-        label: 'Antigravity CLI (Portal-tested pin)',
-        type: 'command',
-        required: false,
-        command: 'agy --version',
-        pinnedCli: {
-          binary: 'agy',
-          args: ['--version'],
-          tested: PORTAL_TOOL_VERSIONS.antigravity,
-          // The probe itself must never trigger the vendor self-updater.
-          env: { AGY_CLI_DISABLE_AUTO_UPDATE: '1' },
-        },
-        remediation: 'Run the Portal update (or the installer with --maintain-tools) to reconverge the checksum-verified Antigravity release; the vendor CLI self-updates outside installer control.',
-      },
-      {
-        id: 'grokBuild',
-        label: 'Grok Build CLI (Portal-tested pin)',
-        type: 'command',
-        required: false,
-        command: 'grok --no-auto-update --version',
-        pinnedCli: {
-          binary: 'grok',
-          args: ['--no-auto-update', '--version'],
-          tested: PORTAL_TOOL_VERSIONS.grokBuild,
-          env: { GROK_DISABLE_AUTOUPDATER: '1' },
-        },
-        remediation: 'Run the Portal update (or the installer with --maintain-tools) to reconverge the checksum-verified Grok Build release; drifted versions are refused by the ACP transport.',
+        nativeHostCliTool: 'claude-code',
+        remediation: 'Claude Code host package status is read-only here. Owner can restore the exact compatible bundle under Admin > Maintenance > Update Compatible AI Tools. Project Sandbox stays on its separate confined runtime.',
       },
     ],
   },
@@ -244,7 +218,7 @@ export const FEATURE_READINESS_MATRIX: FeatureReadinessDef[] = [
     id: 'ollamaLocal',
     label: 'Ollama (Local)',
     checks: [
-      { id: 'ollamaBinary', label: 'Ollama binary', type: 'command', required: true, command: 'ollama --version', remediation: 'Install Ollama for local model execution.' },
+      { id: 'ollamaBinary', label: 'Ollama binary', type: 'command', required: true, command: 'ollama --version', remediation: 'Ollama package installation is unavailable until the durable Ollama adapter ships. Runtime status and service troubleshooting remain available.' },
       { id: 'ollamaLocalApi', label: 'Local Ollama API', type: 'http', required: true, url: 'http://127.0.0.1:11434/api/tags', timeoutMs: 2000, remediation: 'Start Ollama service (`ollama serve`) and verify local access.' },
     ],
   },
@@ -289,10 +263,58 @@ export interface FeatureReadinessResult {
     method?: 'POST';
     ownerOnly: true;
     confirmationPhrase?: string;
-    /** Shown when the operator must run something outside the Portal. */
-    manualCommand?: string;
     impact: string;
   };
+}
+
+export function withRemoteDesktopRemediation(
+  result: FeatureReadinessResult,
+): FeatureReadinessResult {
+  if (result.id !== 'remoteDesktop' || result.status === 'ready') return result;
+
+  // A launcher blocked by a drifted native runtime cannot be repaired by
+  // Remote Desktop setup. Preserve the failed check's truthful explanation
+  // and route compatible-bundle repair to its one owner-gated surface.
+  const isNativeRuntimeDrift = (check: ReadinessCheckResult) => (
+    check.ok === false && /runtime binary .* failed its Portal/i.test(String(check.message || ''))
+  );
+  if (result.checks.some(isNativeRuntimeDrift)) {
+    return {
+      ...result,
+      checks: result.checks.map((check) => isNativeRuntimeDrift(check)
+        ? {
+            ...check,
+            remediation: 'Remote Desktop setup cannot change native packages. For OpenClaw, Codex, Claude Code, and ClawHub, Owner can run Admin > Maintenance > Update Compatible AI Tools; other runtimes keep their dedicated setup path.',
+          }
+        : check),
+      remediationAction: undefined,
+    };
+  }
+
+  return {
+    ...result,
+    remediationAction: {
+      id: 'remote-desktop-auto-setup',
+      label: 'Set up Remote Desktop',
+      endpoint: '/remote-desktop/auto-setup',
+      method: 'POST',
+      ownerOnly: true,
+      confirmationPhrase: PRIVILEGED_CONFIRMATION.remoteDesktopSetup,
+      impact: 'Installs host packages, writes systemd services and desktop launchers, and restarts Remote Desktop services.',
+    },
+  };
+}
+
+export function buildSuggestedNextActions(
+  features: FeatureReadinessResult[],
+): string[] {
+  return features
+    .filter((feature) => feature.applicable)
+    .flatMap((feature) => feature.checks
+      .filter((check) => check.required && !check.ok)
+      .slice(0, 2)
+      .map((check) => `${feature.label}: ${check.remediation}`))
+    .slice(0, 8);
 }
 
 function runCommand(command: string): Promise<{ ok: boolean; message: string }> {
@@ -325,7 +347,20 @@ export function probeLocalOllamaVersion(): Promise<{ ok: boolean; message: strin
         resolve({ ok: false, message: (stderr || error.message || 'Command failed').trim() || 'Command failed' });
         return;
       }
-      resolve({ ok: true, message: (stdout || stderr || 'Command ok').trim().split('\n')[0] || 'Command ok' });
+      const output = String(stdout || stderr || '').trim();
+      const installed = output.match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/)?.[0] || '';
+      if (!installed) {
+        resolve({ ok: false, message: `No Ollama version reported (Portal-tested ${PORTAL_TOOL_VERSIONS.ollama}).` });
+        return;
+      }
+      if (installed !== PORTAL_TOOL_VERSIONS.ollama) {
+        resolve({
+          ok: false,
+          message: `Installed Ollama ${installed} has drifted from the Portal-tested ${PORTAL_TOOL_VERSIONS.ollama}.`,
+        });
+        return;
+      }
+      resolve({ ok: true, message: `Portal-tested Ollama ${installed} (verified)` });
     });
   });
 }
@@ -372,6 +407,17 @@ export async function evaluateFeatureReadinessCheck(check: FeatureReadinessCheck
       ...check,
       ok: PROJECT_RUNTIME_AUTHORIZATION_POLICY.ready,
       message: PROJECT_RUNTIME_AUTHORIZATION_POLICY.message,
+    };
+  }
+  if (check.nativeHostCliTool) {
+    const status = await getNativeHostCliStatus(check.nativeHostCliTool);
+    const ok = status.executionEligible;
+    return {
+      ...check,
+      ok,
+      message: ok
+        ? `Root-owned package ${status.observedVersion || 'version unknown'} passed native host admission for supervised Portal Agent Chat. Owner updates the exact compatible bundle under Admin > Maintenance.`
+        : `Native host package status: ${status.state}${status.reasonCode ? ` (${status.reasonCode})` : ''}. Agent Chat requires an admitted package; Owner can restore the exact bundle under Admin > Maintenance > Update Compatible AI Tools.`,
     };
   }
   if (check.type === 'command' && check.pinnedCli) {
@@ -688,36 +734,7 @@ export async function buildFeatureReadinessReport(
       applicable: true,
       checks,
     };
-    if (feature.id === 'remoteDesktop' && status !== 'ready') {
-      // A launcher blocked by a drifted runtime binary is not fixable by
-      // re-running setup: tool versions converge only on a fresh install, an
-      // installer --maintain-tools run, or an explicit maintenance action.
-      // Offering setup here sent operators through sixty-one steps that ended
-      // in the same warning and changed nothing.
-      const driftBlocked = checks.some((check) => (
-        check.ok === false && /runtime binary .* failed its Portal/i.test(String(check.message || ''))
-      ));
-      if (driftBlocked) {
-        result.remediationAction = {
-          id: 'converge-portal-tested-tools',
-          label: 'Reconverge Portal-tested runtimes',
-          ownerOnly: true,
-          manualCommand: 'bash install.sh --update --maintain-tools',
-          impact: 'A runtime binary drifted from the version this Portal pins. Re-running Remote Desktop setup cannot change it; converge the tools, then Remote Desktop becomes ready on its own.',
-        };
-      } else {
-        result.remediationAction = {
-          id: 'remote-desktop-auto-setup',
-          label: 'Set up Remote Desktop',
-          endpoint: '/remote-desktop/auto-setup',
-          method: 'POST',
-          ownerOnly: true,
-          confirmationPhrase: PRIVILEGED_CONFIRMATION.remoteDesktopSetup,
-          impact: 'Installs host packages, writes systemd services and desktop launchers, and restarts Remote Desktop services.',
-        };
-      }
-    }
-    return result;
+    return withRemoteDesktopRemediation(result);
   }));
 
   const applicableFeatures = features.filter((feature) => feature.applicable);
@@ -727,13 +744,7 @@ export async function buildFeatureReadinessReport(
       ? 'partial'
       : 'missing';
 
-  const suggestedNextActions = features
-    .filter((feature) => feature.applicable)
-    .flatMap((feature) => feature.checks
-      .filter((check) => check.required && !check.ok)
-      .slice(0, 2)
-      .map((check) => `${feature.label}: ${check.remediation}`))
-    .slice(0, 8);
+  const suggestedNextActions = buildSuggestedNextActions(features);
 
   return { overall, features, suggestedNextActions };
 }

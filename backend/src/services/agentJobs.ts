@@ -443,7 +443,10 @@ async function prepareHostAgentJobSystemdScope(
   );
   let launched: Awaited<ReturnType<typeof systemdHostRunBoundary.launch>> | null = null;
   try {
-    gate.prepareTargetEnvironment(input.env);
+    // Agent Jobs uses the wrapper's inherited pipe as a live transport. Native
+    // host CLI turns instead provide a fixed sensitive stdin payload through
+    // the same gate before activation.
+    gate.prepareTarget({ environment: input.env });
     launched = await systemdHostRunBoundary.launch({
       reservation,
       wrapperCommand: process.execPath,

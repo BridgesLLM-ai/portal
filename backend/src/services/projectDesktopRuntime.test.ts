@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { managedDesktopSystemdRunArgs } from '../utils/desktopEnv';
+import { __desktopEnvTest, managedDesktopSystemdRunArgs } from '../utils/desktopEnv';
 import {
   LEGACY_PROJECT_DESKTOP_RUNTIME_ROOT,
   PROJECT_DESKTOP_RUNTIME_ROOT,
@@ -28,18 +28,20 @@ describe('Project desktop runtime identity', () => {
       '11111111-1111-4111-8111-111111111111',
       'Demo',
     );
-    const args = managedDesktopSystemdRunArgs(identity.systemdUnit, 'xterm -e true');
+    const args = managedDesktopSystemdRunArgs(identity.systemdUnit, 'xterm -e true', 252);
     expect(args).toEqual(expect.arrayContaining([
       '--property=User=bridgesrd',
       '--property=KillMode=control-group',
       '--service-type=exec',
       '--collect',
     ]));
-    expect(args.slice(-3)).toEqual([
+    expect(__desktopEnvTest.decodeDesktopArgv(args.at(-1)!)).toEqual([
       '/bin/bash',
       '-c',
       expect.stringContaining('xterm -e true'),
     ]);
+    expect(args).not.toContain('--expand-environment=no');
+    expect(args.every((value) => !value.includes('$') && !value.includes('%'))).toBe(true);
     expect(args).toContain('--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin');
   });
 

@@ -11,13 +11,21 @@ const OPENCLAW_GATEWAY_UNIT_PATH =
   '/etc/systemd/system/openclaw-gateway.service';
 const OPENCLAW_GATEWAY_DROP_IN =
   '/etc/systemd/system/openclaw-gateway.service.d/20-bridgesllm-authorization-fence.conf';
+const OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN =
+  '/etc/systemd/system/openclaw-gateway.service.d/30-bridgesllm-migration-permit.conf';
+const OPENCLAW_GATEWAY_MIGRATION_PERMIT =
+  '/run/bridgesllm/openclaw-gateway-migration-permit.v1';
+// Must match the installer's bounded migration gate. It replaces the marker
+// condition only while a live installer holds its explicit one-start permit.
+const OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN_CONTENT =
+  "[Unit]\nConditionPathExists=\n[Service]\nExecCondition=/bin/sh -c \"if [ ! -e /var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1 ]; then exit 0; fi; IFS=' ' read -r pid start boot < /run/bridgesllm/openclaw-gateway-migration-permit.v1 || exit 1; [ -n \\\"$pid\\\" ] && [ -n \\\"$start\\\" ] || exit 1; case \\\"$pid:$start\\\" in *[!0-9:]*) exit 1;; esac; [ \\\"$boot\\\" = \\\"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\\\" ] || exit 1; [ -r \\\"/proc/$pid/stat\\\" ] || exit 1; current=$(sed 's/.*) //' \\\"/proc/$pid/stat\\\" | cut -d ' ' -f 20); [ \\\"$current\\\" = \\\"$start\\\" ]\"\n";
 const OPENCLAW_GATEWAY_ROOT_USER_UNIT_PATH =
   '/root/.config/systemd/user/openclaw-gateway.service';
 const OPENCLAW_GATEWAY_ROOT_USER_DROP_IN =
   '/root/.config/systemd/user/openclaw-gateway.service.d/20-bridgesllm-authorization-fence.conf';
-const OPENCLAW_GATEWAY_FENCE_MARKER =
+export const OPENCLAW_GATEWAY_FENCE_MARKER =
   '/var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1';
-const OPENCLAW_GATEWAY_FENCE_MARKER_CONTENT =
+export const OPENCLAW_GATEWAY_FENCE_MARKER_CONTENT =
   '{"schema":"bridgesllm.openclaw-gateway-authorization-fence.v1","unit":"openclaw-gateway.service"}\n';
 const OPENCLAW_GATEWAY_DROP_IN_CONTENT =
   `[Unit]\nConditionPathExists=!${OPENCLAW_GATEWAY_FENCE_MARKER}\n`
@@ -106,6 +114,7 @@ export interface OpenClawGatewayAuthorizationFenceDependencies {
   removeMarker(): void;
   attestDropIn(): void;
   attestRootUserDropIn(): void;
+  attestMigrationPermitDropIn(): void;
   attestRootUserMask(): void;
   listListeningPids(port: number): Promise<readonly number[]>;
   readProcessControlGroup(pid: number): string | null;
@@ -168,6 +177,7 @@ interface SystemdUnitIdentity {
   controlGroup: string;
   label: string;
   allowExactMask?: boolean;
+  migrationPermitDropIn?: string;
 }
 
 const SYSTEM_GATEWAY_IDENTITY: SystemdUnitIdentity = Object.freeze({
@@ -175,6 +185,7 @@ const SYSTEM_GATEWAY_IDENTITY: SystemdUnitIdentity = Object.freeze({
   dropInPath: OPENCLAW_GATEWAY_DROP_IN,
   controlGroup: OPENCLAW_GATEWAY_CONTROL_GROUP,
   label: 'system',
+  migrationPermitDropIn: OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN,
 });
 
 const ROOT_USER_GATEWAY_IDENTITY: SystemdUnitIdentity = Object.freeze({
@@ -241,6 +252,11 @@ function parseSystemctlShow(
     !masked
     && (installed || dropInPaths.length > 0)
     && dropInPaths[dropInPaths.length - 1] !== identity.dropInPath
+    && !(
+      identity.migrationPermitDropIn
+      && dropInPaths[dropInPaths.length - 2] === identity.dropInPath
+      && dropInPaths[dropInPaths.length - 1] === identity.migrationPermitDropIn
+    )
   ) {
     throw new Error(
       `OpenClaw gateway ${identity.label} systemd authorization fence is not the final effective drop-in`,
@@ -649,6 +665,26 @@ function attestDropInFile(): void {
   });
 }
 
+function attestMigrationPermitDropInFile(
+  dropInPath = OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN,
+  permitPath = OPENCLAW_GATEWAY_MIGRATION_PERMIT,
+): void {
+  // A Portal authorization change must never overlap an installer permit.
+  // Do not consume or remove a permit owned by another operation.
+  try {
+    fs.lstatSync(permitPath);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+    assertSafeRootDirectory(path.dirname(dropInPath));
+    inspectExactRootFile({
+      filePath: dropInPath,
+      expectedContent: OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN_CONTENT,
+    });
+    return;
+  }
+  throw new Error('OpenClaw migration still owns gateway startup permission');
+}
+
 function attestRootUserDropInFile(): void {
   for (const directory of [
     '/root',
@@ -795,6 +831,7 @@ const defaultDependencies: OpenClawGatewayAuthorizationFenceDependencies = {
   removeMarker: removeMarkerFile,
   attestDropIn: attestDropInFile,
   attestRootUserDropIn: attestRootUserDropInFile,
+  attestMigrationPermitDropIn: attestMigrationPermitDropInFile,
   attestRootUserMask: attestRootUserMaskFile,
   async listListeningPids(port) {
     try {
@@ -899,7 +936,11 @@ export function createOpenClawGatewayAuthorizationFence(
         '--property=NeedDaemonReload',
         '--no-pager',
       ]);
-      return parseSystemctlShow(output);
+      const snapshot = parseSystemctlShow(output);
+      if (snapshot.dropInPaths.includes(OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN)) {
+        dependencies.attestMigrationPermitDropIn();
+      }
+      return snapshot;
     } catch (error) {
       if (error instanceof OpenClawGatewayAuthorizationFenceError) throw error;
       throw new OpenClawGatewayAuthorizationFenceError(
@@ -1385,6 +1426,9 @@ export const __openClawGatewayAuthorizationFenceTest = {
   OPENCLAW_GATEWAY_ROOT_USER_CONTROL_GROUP,
   ROOT_USER_MANAGER_CONTROL_GROUP,
   OPENCLAW_GATEWAY_PORT: DEFAULT_OPENCLAW_GATEWAY_PORT,
+  OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN,
+  OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROP_IN_CONTENT,
+  attestMigrationPermitDropInFile,
   parseConfiguredGatewayEndpoint,
   parseSystemctlShow,
   parseRootUserSystemctlShow,

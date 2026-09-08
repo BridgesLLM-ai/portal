@@ -24,6 +24,7 @@ import {
   buildUnqualifiedOllamaProjectSandboxExecutionContext,
   ensureProjectChatProviderBinding,
   listProjectChatProviderCapabilities,
+  normalizeProjectChatProvider,
   planProjectChatProviderSwitch,
   resolveProjectChatQualificationMatrix,
 } from '../services/projectChatKernel';
@@ -31,12 +32,10 @@ import { config } from '../config/env';
 import {
   CLAUDE_CODE_PROJECT_RUNTIME_POLICY_VERSION,
 } from '../agents/providers/native/projectSandbox/ClaudeCodeProjectSandbox';
-import {
-  ANTIGRAVITY_PROJECT_RUNTIME_POLICY_VERSION,
-} from '../agents/providers/native/projectSandbox/AntigravityProjectSandbox';
 import { OLLAMA_PROJECT_RUNTIME_POLICY_VERSION } from '../agents/providers/ollama/OllamaProjectToolRuntime';
 import {
   ProjectChatProviderRuntimeUnavailableError,
+  getProjectChatProviderRuntimeDescriptor,
   isQualifiableProjectProvider,
   projectChatProviderDisplayName,
 } from '../services/projectChatProviderRegistry';
@@ -145,7 +144,7 @@ describe('Project Chat provider capabilities', () => {
       expect(() => assertProjectChatProviderSelectable(capability.provider))
         .toThrow(UnsupportedProjectChatProviderError);
     }
-    for (const provider of ['OPENCLAW', 'CODEX', 'CLAUDE_CODE', 'GEMINI', 'OLLAMA'] as const) {
+    for (const provider of ['OPENCLAW', 'CODEX', 'CLAUDE_CODE', 'OLLAMA'] as const) {
       expect(unsupportedProviders.find((entry) => entry.provider === provider)).toMatchObject({
         supportsAttachments: true,
         supportsModelSelection: true,
@@ -153,6 +152,14 @@ describe('Project Chat provider capabilities', () => {
         supportsReset: true,
       });
     }
+    expect(unsupportedProviders.find((entry) => entry.provider === 'GEMINI')).toMatchObject({
+      supportsAttachments: false,
+      supportsModelSelection: false,
+      supportsAbort: false,
+      supportsReset: false,
+      requiresOAuth: false,
+      reason: expect.stringContaining('detection-only'),
+    });
     expect(unsupportedProviders.find((entry) => entry.provider === 'GROK')).toMatchObject({
       supportsAttachments: false,
       supportsModelSelection: false,
@@ -170,6 +177,16 @@ describe('Project Chat provider capabilities', () => {
       requiresOAuth: true,
     });
   });
+
+  test.each(['HERMES', 'OPENCODE'] as const)(
+    'rejects host-only %s before it can enter any Project Chat state',
+    (provider) => {
+      expect(() => normalizeProjectChatProvider(provider))
+        .toThrow(UnsupportedProjectChatProviderError);
+      expect(isQualifiableProjectProvider(provider)).toBe(false);
+      expect(() => getProjectChatProviderRuntimeDescriptor(provider as never)).toThrow();
+    },
+  );
 
   test('keeps usable provider capability discovery alive when one optional runtime image is unavailable', () => {
     const previousOpenClawImage = config.openclawProjectSandboxImageId;
@@ -217,7 +234,7 @@ describe('Project Chat provider capabilities', () => {
         expiresAt: null,
         evidenceFingerprint: null,
       });
-      expect(matrix.GEMINI.reason).toMatch(/not installed and attested/i);
+      expect(matrix.GEMINI.reason).toMatch(/detection-only/i);
     } finally {
       config.openclawProjectSandboxImageId = previousOpenClawImage;
       config.antigravityProjectSandboxImageId = previousAntigravityImage;
@@ -312,7 +329,7 @@ describe('Project Chat provider capabilities', () => {
 });
 
 describe('Project Chat sandbox binding', () => {
-  test.each<AgentProviderName>(['OPENCLAW', 'AGENT_ZERO', 'GROK', 'CLAUDE_CODE', 'CODEX', 'GEMINI', 'OLLAMA'])(
+  test.each<AgentProviderName>(['OPENCLAW', 'AGENT_ZERO', 'GROK', 'CLAUDE_CODE', 'CODEX', 'GEMINI', 'OLLAMA', 'HERMES', 'OPENCODE'])(
     'refuses to mint a %s sandbox context before that runtime is qualified',
     (provider) => {
       const identity = projectIdentity();
@@ -339,7 +356,7 @@ describe('Project Chat sandbox binding', () => {
     })).toThrow('Server-owned project identity does not match the requested workspace project');
   });
 
-  test('binds native and Agent Zero qualification contexts to their exact immutable image and policy', () => {
+  test('binds qualified native foundations while Antigravity remains detection-only', () => {
     const previousClaudeImage = config.claudeCodeProjectSandboxImageId;
     const previousAntigravityImage = config.antigravityProjectSandboxImageId;
     const previousAgentZeroImage = config.agentZeroProjectSandboxImageId;
@@ -358,17 +375,14 @@ describe('Project Chat sandbox binding', () => {
         projectsRoot,
       };
       const claude = buildUnqualifiedClaudeCodeProjectSandboxExecutionContext(input);
-      const antigravity = buildUnqualifiedAntigravityProjectSandboxExecutionContext(input);
       const agentZero = buildUnqualifiedAgentZeroProjectSandboxExecutionContext(input);
       const ollama = buildUnqualifiedOllamaProjectSandboxExecutionContext(input);
       expect(claude).toMatchObject({
         runtimePolicyVersion: CLAUDE_CODE_PROJECT_RUNTIME_POLICY_VERSION,
         runtimeImageDigest: config.claudeCodeProjectSandboxImageId,
       });
-      expect(antigravity).toMatchObject({
-        runtimePolicyVersion: ANTIGRAVITY_PROJECT_RUNTIME_POLICY_VERSION,
-        runtimeImageDigest: config.antigravityProjectSandboxImageId,
-      });
+      expect(() => buildUnqualifiedAntigravityProjectSandboxExecutionContext(input))
+        .toThrow(/detection-only/i);
       expect(agentZero).toMatchObject({
         runtimePolicyVersion: AGENT_ZERO_PROJECT_POLICY_VERSION,
         runtimeImageDigest: config.agentZeroProjectSandboxImageId,
@@ -377,7 +391,6 @@ describe('Project Chat sandbox binding', () => {
         runtimePolicyVersion: OLLAMA_PROJECT_RUNTIME_POLICY_VERSION,
         runtimeImageDigest: config.ollamaProjectSandboxImageId,
       });
-      expect(claude.policyFingerprint).not.toBe(antigravity.policyFingerprint);
       expect(agentZero.policyFingerprint).not.toBe(claude.policyFingerprint);
       expect(ollama.policyFingerprint).not.toBe(agentZero.policyFingerprint);
     } finally {
@@ -390,7 +403,7 @@ describe('Project Chat sandbox binding', () => {
 });
 
 describe('Project Chat provider bindings', () => {
-  test.each<AgentProviderName>(['OPENCLAW', 'AGENT_ZERO', 'GROK', 'CLAUDE_CODE', 'CODEX', 'GEMINI', 'OLLAMA'])(
+  test.each<AgentProviderName>(['OPENCLAW', 'AGENT_ZERO', 'GROK', 'CLAUDE_CODE', 'CODEX', 'GEMINI', 'OLLAMA', 'HERMES', 'OPENCODE'])(
     'rejects an unqualified %s binding before database access',
     async (provider) => {
       const executionContext = buildUnqualifiedContext();
@@ -481,6 +494,52 @@ describe('Project Chat provider bindings', () => {
     expect(pollRoute).not.toContain('chat.history');
     expect(panelSource).toContain('/assistant/send`');
     expect(panelSource).not.toMatch(/manager\.send\(\{\s*type:\s*['"]send['"]/);
+  });
+
+  test('admits OpenClaw before Project Chat acquires a turn or mutates runtime state', () => {
+    const routeSource = fs.readFileSync(path.resolve(__dirname, '../routes/projects.ts'), 'utf8');
+    const sendRouteStart = routeSource.indexOf("router.post('/:name/assistant/send'");
+    const nextRouteStart = routeSource.indexOf("router.post('/:name/assistant/read-file'", sendRouteStart);
+    const sendRoute = routeSource.slice(sendRouteStart, nextRouteStart);
+    const admission = sendRoute.indexOf('await assertOpenClawExecutionAdmitted()');
+    const runtimeLease = sendRoute.indexOf('runtimeAdmission = await acquireProjectChatRuntimeAdmission');
+    const workspaceMutation = sendRoute.indexOf('await repairTerminalProjectChatPresentations');
+    const openClawPreparation = sendRoute.indexOf('const catalogScope = await ensureOpenClawProjectAgentCatalogScope');
+    const finalFence = sendRoute.indexOf('assertCachedOpenClawExecutionAdmitted()');
+    const openClawDispatch = sendRoute.lastIndexOf('run = startProjectNativeRun({');
+    const errorPresenterStart = routeSource.indexOf('function sendProjectChatProviderError');
+    const nextPresenterStart = routeSource.indexOf('function sendProjectChatQualificationError', errorPresenterStart);
+    const errorPresenter = routeSource.slice(errorPresenterStart, nextPresenterStart);
+
+    expect(admission).toBeGreaterThan(-1);
+    expect(sendRoute.match(/await assertOpenClawExecutionAdmitted\(\)/g)).toHaveLength(1);
+    expect(admission).toBeLessThan(runtimeLease);
+    expect(admission).toBeLessThan(workspaceMutation);
+    expect(admission).toBeLessThan(openClawPreparation);
+    expect(finalFence).toBeGreaterThan(openClawPreparation);
+    expect(finalFence).toBeLessThan(openClawDispatch);
+    expect(sendRoute.match(/assertCachedOpenClawExecutionAdmitted\(\)/g)).toHaveLength(1);
+    expect(errorPresenter).toContain('error instanceof OpenClawExecutionAdmissionError');
+    expect(errorPresenter).toContain('res.status(error.statusCode)');
+    expect(errorPresenter).toContain('code: error.code');
+    expect(errorPresenter).toContain('retryable: error.retryable');
+  });
+
+  test('re-attests OpenClaw before steering a live Project input request', () => {
+    const routeSource = fs.readFileSync(path.resolve(__dirname, '../routes/projects.ts'), 'utf8');
+    const answerStart = routeSource.indexOf("router.post('/:name/assistant/answer-input'");
+    const sendStart = routeSource.indexOf("router.post('/:name/assistant/send'", answerStart);
+    const answerRoute = routeSource.slice(answerStart, sendStart);
+    const admission = answerRoute.indexOf('await assertOpenClawExecutionAdmitted()');
+    const authority = answerRoute.indexOf('const authority = await resolveAskUserQuestionRunOwner');
+    const finalFence = answerRoute.indexOf('assertCachedOpenClawExecutionAdmitted()');
+    const steer = answerRoute.indexOf('const accepted = await steerActiveRun');
+
+    expect(admission).toBeGreaterThan(-1);
+    expect(answerRoute.match(/await assertOpenClawExecutionAdmitted\(\)/g)).toHaveLength(1);
+    expect(admission).toBeLessThan(authority);
+    expect(authority).toBeLessThan(finalFence);
+    expect(finalFence).toBeLessThan(steer);
   });
 
   test('serializes initial replay persistence after the provider dispatch acceptance fence', () => {
@@ -650,9 +709,16 @@ describe('Project Chat provider bindings', () => {
     expect(send).not.toContain('acquireProjectChatTurn');
 
     for (const block of [ensureSession, providerSwitch]) {
+      const openClawAdmission = block.indexOf('await assertOpenClawExecutionAdmitted()');
       expect(block.indexOf('withProjectChatRuntimeAdmission')).toBeGreaterThan(-1);
+      expect(openClawAdmission).toBeGreaterThan(-1);
+      expect(openClawAdmission).toBeLessThan(block.indexOf('withProjectChatRuntimeAdmission'));
       expect(block.indexOf('withProjectChatRuntimeAdmission')).toBeLessThan(block.indexOf('ensureOpenClawProjectRuntime'));
     }
+    expect(qualification.indexOf('await assertOpenClawExecutionAdmitted()')).toBeGreaterThan(-1);
+    expect(qualification.indexOf('await assertOpenClawExecutionAdmitted()')).toBeLessThan(
+      qualification.indexOf('await migrateLegacyProjectChatState({'),
+    );
     expect(qualification.indexOf('withProjectChatRuntimeAdmission')).toBeLessThan(
       qualification.indexOf('qualifyProjectProvider'),
     );
@@ -784,10 +850,17 @@ describe('Project Chat provider bindings', () => {
     }
     expect(capabilityRoute.indexOf('await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);'))
       .toBeLessThan(capabilityRoute.indexOf('resolveProjectChatQualificationMatrix('));
-    expect(qualificationRoute.slice(
-      0,
+    const openClawAdmission = qualificationRoute.indexOf(
+      'await assertOpenClawExecutionAdmitted();',
+    );
+    const legacyGate = qualificationRoute.indexOf(
+      'await assertLegacyOpenClawProjectMigrationInactive(projectIdentity.id);',
+    );
+    expect(openClawAdmission).toBeGreaterThan(-1);
+    expect(openClawAdmission).toBeLessThan(legacyGate);
+    expect(legacyGate).toBeLessThan(
       qualificationRoute.indexOf('await migrateLegacyProjectChatState({'),
-    )).not.toContain("if (provider === 'OPENCLAW')");
+    );
   });
 
   test('routes Ollama only through its dedicated Project adapter and exact live digest admission', () => {
@@ -800,6 +873,8 @@ describe('Project Chat provider bindings', () => {
     const abort = routeSource.slice(abortStart, sendStart);
 
     expect(routeSource).toContain("'OLLAMA',\n] as const");
+    expect(routeSource).not.toContain('/chat/providers/hermes/qualify');
+    expect(routeSource).not.toContain('/chat/providers/opencode/qualify');
     expect(binding).toContain("if (input.provider === 'OLLAMA')");
     expect(binding.indexOf('withOllamaAuthorityRunLease')).toBeLessThan(
       binding.indexOf('ensureNativeProjectChatBindingWithAuthorityLease'),
@@ -810,7 +885,7 @@ describe('Project Chat provider bindings', () => {
     expect(binding).toContain('getProjectChatProviderAdapter(input.provider).startSession');
     expect(binding).toContain('ollamaModelSelection');
     expect(binding).not.toContain('AgentRegistry.get');
-    expect(abort).toContain('getProjectChatProviderAdapter(provider).abortActiveRun');
+    expect(abort).toContain('getProjectChatProviderCleanupController(provider).abortActiveRun');
     expect(abort).toContain('activeUserTurn.id');
     expect(abort).not.toContain('AgentRegistry.get');
   });
@@ -970,7 +1045,7 @@ describe('Project Chat provider switching', () => {
     expect(handoff).toContain('[END PORTAL TRANSCRIPT HANDOFF]');
   });
 
-  test.each<AgentProviderName>(['OPENCLAW', 'AGENT_ZERO', 'GROK', 'CLAUDE_CODE', 'CODEX', 'GEMINI', 'OLLAMA'])(
+  test.each<AgentProviderName>(['OPENCLAW', 'AGENT_ZERO', 'GROK', 'CLAUDE_CODE', 'CODEX', 'GEMINI', 'OLLAMA', 'HERMES', 'OPENCODE'])(
     'rejects an unsupported switch to %s before a binding can be created',
     (provider) => {
       expect(() => planProjectChatProviderSwitch({

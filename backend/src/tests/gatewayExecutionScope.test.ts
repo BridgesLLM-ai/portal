@@ -1,10 +1,14 @@
 import { EventEmitter } from 'events';
+import * as unqualifiedNativeBinaryLane from '../config/unqualifiedNativeBinaryLane';
 import gatewayRouter, { __gatewayExecutionScopeTest } from '../routes/gateway';
 import { AgentRegistry } from '../agents';
 import { __persistentGatewayWsTest } from '../agents/providers/PersistentGatewayWs';
 import { streamEventBus, type StreamEvent } from '../services/StreamEventBus';
 import * as openclawGatewayRpc from '../utils/openclawGatewayRpc';
 import * as openClawHostRunJournal from '../services/openClawHostRunJournal';
+import * as openClawExecutionAdmission from '../services/openClawExecutionAdmission';
+import * as hostAgentRunJournal from '../services/hostAgentRunJournal';
+import * as nativeSessionStore from '../agents/providers/NativeSessionStore';
 import * as agentZeroOAuthModels from '../agents/providers/agentZero/AgentZeroOAuthModelCatalog';
 import {
   publishSessionRevoked,
@@ -18,6 +22,7 @@ import {
   buildPortalOpenClawIdempotencyKey,
   portalClientMessageIdFromIdempotencyKey,
 } from '../agents/providers/PortalMessageIdentity';
+import { requestNativeCliApproval } from '../agents/nativeCliApprovals';
 
 function sendRouteHandler(): (req: any, res: any) => Promise<void> {
   const layer = (gatewayRouter as any).stack.find((entry: any) => entry.route?.path === '/send');
@@ -134,6 +139,19 @@ function mockDurableAccessIdentity(input: {
 }
 
 describe('Agent Chat execution boundary', () => {
+  test('searches every persisted native harness namespace when proving session ownership', () => {
+    expect(__gatewayExecutionScopeTest.nativeAgentSessionProviders).toEqual([
+      'CLAUDE_CODE',
+      'CODEX',
+      'GEMINI',
+      'GROK',
+      'AGENT_ZERO',
+      'OLLAMA',
+      'HERMES',
+      'OPENCODE',
+    ]);
+  });
+
   test('names only Portal-owned sessions from their first prompt', () => {
     const userId = '00000000-0000-4000-8000-000000000001';
     const key = `agent:main:portal-${userId}-new-1785680000000`;
@@ -151,6 +169,27 @@ describe('Agent Chat execution boundary', () => {
     );
   });
   beforeEach(() => {
+    // Route tests supply providers through the registry seam, not the host's
+    // installed CLI inventory. getAsync is the current HTTP admission entry.
+    jest.spyOn(AgentRegistry, 'getAsync').mockImplementation(async (name) => AgentRegistry.get(name));
+    jest.spyOn(prisma.projectWorkCard, 'updateMany').mockResolvedValue({ count: 0 });
+    jest.spyOn(openClawHostRunJournal, 'markOpenClawHostRunDispatchAccepted').mockResolvedValue();
+    const readyAdmission = {
+      state: 'ready',
+      ready: true,
+      reason: 'ready for route testing',
+      checkedAt: '2026-08-22T21:00:00.000Z',
+      evidence: {
+        authorizationFence: 'absent',
+        maintenanceMarker: 'absent',
+        hostMutationJournal: 'absent',
+      },
+      readinessBlockers: [],
+    } as const;
+    jest.spyOn(openClawExecutionAdmission, 'assertOpenClawExecutionAdmitted')
+      .mockResolvedValue(readyAdmission);
+    jest.spyOn(openClawExecutionAdmission, 'assertCachedOpenClawExecutionAdmitted')
+      .mockReturnValue(readyAdmission);
     const claims = new Map<string, { id: string; userId: string; externalId: string }>();
     const agentSessionDelegate = prisma.agentSession as any;
     jest.spyOn(agentSessionDelegate, 'findFirst').mockImplementation(async (args: any) => {
@@ -188,6 +227,9 @@ describe('Agent Chat execution boundary', () => {
   afterEach(() => {
     streamEventBus.clearStream('native-bus-session');
     streamEventBus.clearStream('native-reconnect-session');
+    streamEventBus.clearStream('host-http-history');
+    streamEventBus.clearStream('host-ws-history');
+    streamEventBus.clearStream('project-native-reconnect');
     streamEventBus.clearStream('route-bus-session');
     streamEventBus.clearStream('grok-route-bus-session');
     streamEventBus.clearStream('route-sse-session');
@@ -202,6 +244,24 @@ describe('Agent Chat execution boundary', () => {
     streamEventBus.clearStream('terminal-global-fanout-error');
     streamEventBus.clearStream('native-reconnect-completed');
     jest.restoreAllMocks();
+  });
+
+  test('native conversation creation persists an owner-scoped parent without model dispatch and rejects a non-operator', async () => {
+    const provider = { providerName: 'CODEX', displayName: 'Codex',
+      startSession: jest.fn().mockResolvedValue('codex-project-parent'), sendMessage: jest.fn() };
+    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+    const handler = gatewayRouteHandler('/session-create');
+    const req = { body: { provider: 'CODEX', session: 'main', model: 'chosen-model' }, user: { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' } };
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() };
+    await handler(req, res);
+    expect(provider.startSession).toHaveBeenCalledWith('owner-1', expect.objectContaining({ model: 'chosen-model',
+      executionContext: expect.objectContaining({ scope: 'HOST_OPERATOR', userId: 'owner-1' }) }));
+    expect(res.json).toHaveBeenCalledWith({ ok: true, key: 'codex-project-parent' });
+    expect(provider.sendMessage).not.toHaveBeenCalled();
+    provider.startSession.mockClear();
+    await handler({ ...req, user: { ...req.user, role: 'USER' } }, res);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(provider.startSession).not.toHaveBeenCalled();
   });
 
   test('preserves alias-looking Ollama tags while OpenClaw keeps canonical ids', () => {
@@ -451,7 +511,7 @@ describe('Agent Chat execution boundary', () => {
     )).rejects.toThrow('Admin access required');
   });
 
-  test('read-only session authorization requires an existing owner and never touches the claim', async () => {
+  test('read-only authorization accepts actor-namespaced Portal keys without touching the claim', async () => {
     const actorId = 'abababab-abab-4bab-8bab-abababababab';
     const ownedKey = `agent:main:portal-${actorId}-owned`;
     const unclaimedKey = `agent:main:portal-${actorId}-unclaimed`;
@@ -470,7 +530,7 @@ describe('Agent Chat execution boundary', () => {
       unclaimedKey,
       { userId: actorId, role: 'OWNER' } as any,
       { database },
-    )).rejects.toThrow('Admin access required');
+    )).resolves.toBeUndefined();
     expect(agentSession.update).not.toHaveBeenCalled();
     expect(agentSession.create).not.toHaveBeenCalled();
   });
@@ -498,6 +558,16 @@ describe('Agent Chat execution boundary', () => {
     )).toBe('GEMINI');
   });
 
+  test('accepts the additive harness request field while preserving provider fallback', () => {
+    expect(__gatewayExecutionScopeTest.harnessOrProviderInput({ harness: 'CODEX' })).toBe('CODEX');
+    expect(__gatewayExecutionScopeTest.harnessOrProviderInput({ provider: 'CLAUDE_CODE' })).toBe('CLAUDE_CODE');
+    expect(__gatewayExecutionScopeTest.harnessOrProviderInput({
+      harness: 'GROK',
+      provider: 'OPENCLAW',
+    })).toBe('GROK');
+    expect(__gatewayExecutionScopeTest.harnessOrProviderInput(null)).toBeUndefined();
+  });
+
   test('normalizes Default/reset aliases without treating ordinary model ids as resets', () => {
     expect(__gatewayExecutionScopeTest.isProviderModelResetAlias(' default ')).toBe(true);
     expect(__gatewayExecutionScopeTest.isProviderModelResetAlias('RESET')).toBe(true);
@@ -520,6 +590,21 @@ describe('Agent Chat execution boundary', () => {
       'AGENT_ZERO',
       `Agent Zero run failed: ${agentZeroOAuthModels.AGENT_ZERO_MODEL_PROTOCOL_INCOMPATIBLE_MESSAGE}`,
     )).toBe(agentZeroOAuthModels.AGENT_ZERO_MODEL_PROTOCOL_INCOMPATIBLE_MESSAGE);
+  });
+
+  test('directs managed auth failures to Project credentials without suggesting host CLI login', () => {
+    const claude = __gatewayExecutionScopeTest.humanizeProviderError('CLAUDE_CODE', 'Please run /login');
+    expect(claude).toMatch(/process-free sign-in/i);
+    expect(claude).toMatch(/Interactive host Claude login remains unavailable/i);
+    expect(claude).toMatch(/supervised Agent Chat can use an existing attested host credential/i);
+    expect(claude).not.toMatch(/Run \/login/i);
+
+    const codex = __gatewayExecutionScopeTest.humanizeProviderError(
+      'CODEX',
+      'failed to connect to websocket: HTTP error: 500 Internal Server Error, url: wss://api.openai.com/v1/responses',
+    );
+    expect(codex).toMatch(/Project credential and network policy/i);
+    expect(codex).toMatch(/supervised host Agent Chat is a separate execution boundary/i);
   });
 
   test('REST rejects ordinary users before provider lookup or session creation', async () => {
@@ -606,6 +691,90 @@ describe('Agent Chat execution boundary', () => {
     expect(payloads).toContainEqual(expect.objectContaining({ type: 'error', content: 'Admin access required' }));
   });
 
+  test('HTTP managed approval allow resolves only the active native provider continuation', async () => {
+    let approval: any;
+    const decisionPromise = requestNativeCliApproval({
+      providerName: 'CODEX',
+      sessionId: 'managed-approval-http',
+      command: 'read-only fixture',
+      onRequest: (value) => { approval = value; },
+    });
+    const handler = gatewayRouteHandler('/exec-approval/resolve');
+
+    const positiveRes = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() };
+    await handler({ body: { approvalId: approval.id, decision: 'allow-once' } }, positiveRes);
+    expect(positiveRes.status).not.toHaveBeenCalled();
+    expect(positiveRes.json).toHaveBeenCalledWith({ ok: true, approvalId: approval.id, decision: 'allow-once' });
+    await expect(decisionPromise).resolves.toBe('allow-once');
+  });
+
+  test('WebSocket managed approval allow resolves only the active native provider continuation', async () => {
+    let approval: any;
+    const decisionPromise = requestNativeCliApproval({
+      providerName: 'CLAUDE_CODE',
+      sessionId: 'managed-approval-ws',
+      command: 'read-only fixture',
+      onRequest: (value) => { approval = value; },
+    });
+    const ws = { readyState: 1, send: jest.fn() } as any;
+    const user = { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' } as any;
+
+    await __gatewayExecutionScopeTest.handleWsExecApproval(ws, {
+      approvalId: approval.id,
+      decision: 'allow-always',
+    }, user);
+    expect(JSON.parse(String(ws.send.mock.calls[0][0]))).toMatchObject({
+      type: 'approval_result',
+      ok: true,
+      approvalId: approval.id,
+      decision: 'allow-always',
+    });
+    await expect(decisionPromise).resolves.toBe('allow-always');
+  });
+
+  test('HTTP managed approval denial remains available without starting a new provider attempt', async () => {
+    let approval: any;
+    const decisionPromise = requestNativeCliApproval({
+      providerName: 'CODEX',
+      sessionId: 'managed-denial-http',
+      command: 'read-only fixture',
+      onRequest: (value) => { approval = value; },
+    });
+    const handler = gatewayRouteHandler('/exec-approval/resolve');
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() };
+
+    await handler({ body: { approvalId: approval.id, decision: 'deny' } }, res);
+
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith({ ok: true, approvalId: approval.id, decision: 'deny' });
+    await expect(decisionPromise).resolves.toBe('deny');
+  });
+
+  test('WebSocket managed approval denial remains available without starting a new provider attempt', async () => {
+    let approval: any;
+    const decisionPromise = requestNativeCliApproval({
+      providerName: 'CLAUDE_CODE',
+      sessionId: 'managed-denial-ws',
+      command: 'read-only fixture',
+      onRequest: (value) => { approval = value; },
+    });
+    const ws = { readyState: 1, send: jest.fn() } as any;
+    const user = { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' } as any;
+
+    await __gatewayExecutionScopeTest.handleWsExecApproval(ws, {
+      approvalId: approval.id,
+      decision: 'deny',
+    }, user);
+
+    expect(JSON.parse(String(ws.send.mock.calls[0][0]))).toMatchObject({
+      type: 'approval_result',
+      ok: true,
+      approvalId: approval.id,
+      decision: 'deny',
+    });
+    await expect(decisionPromise).resolves.toBe('deny');
+  });
+
   test.each(['OWNER', 'SUB_ADMIN'])('%s receives a server-owned HOST_OPERATOR context', (role) => {
     const context = __gatewayExecutionScopeTest.requireHostOperatorExecutionContext({
       userId: `${role.toLowerCase()}-1`,
@@ -655,8 +824,8 @@ describe('Agent Chat execution boundary', () => {
 
   test('WebSocket abort replies correlate requestId and keep state when cancellation is unconfirmed', async () => {
     const provider = {
-      providerName: 'OLLAMA',
-      displayName: 'Ollama',
+      providerName: 'HERMES',
+      displayName: 'Hermes',
       abortActiveRun: jest.fn().mockResolvedValue(false),
     };
     jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
@@ -666,7 +835,7 @@ describe('Agent Chat execution boundary', () => {
     socket.send = jest.fn();
 
     await __gatewayExecutionScopeTest.handleWsAbort(socket as any, {
-      provider: 'OLLAMA',
+      harness: 'OLLAMA',
       session: 'abort-route-session',
       runId: 'run-active',
       requestId: 'abort-request-1',
@@ -677,6 +846,8 @@ describe('Agent Chat execution boundary', () => {
       type: 'abort_result',
       ok: false,
       sessionKey: 'abort-route-session',
+      harness: 'OLLAMA',
+      provider: 'OLLAMA',
       runId: 'run-active',
       requestId: 'abort-request-1',
     });
@@ -684,6 +855,69 @@ describe('Agent Chat execution boundary', () => {
       active: true,
       runId: 'run-active',
     });
+  });
+
+  test('OpenClaw abort confirmation requires a strict non-empty run list containing the requested run', () => {
+    const confirm = __gatewayExecutionScopeTest.confirmedOpenClawAbortRunIds;
+    expect(confirm({ aborted: true, runIds: ['run-active'] }, 'run-active'))
+      .toEqual(['run-active']);
+    for (const response of [
+      undefined,
+      {},
+      { aborted: true },
+      { aborted: 'true', runIds: ['run-active'] },
+      { aborted: true, runIds: [] },
+      { aborted: true, runIds: ['run-other'] },
+      { aborted: true, runIds: ['run-active', 'run-active'] },
+      { aborted: true, runIds: [' run-active '] },
+      { aborted: true, runIds: [true] },
+    ]) {
+      expect(confirm(response, 'run-active')).toBeNull();
+    }
+  });
+
+  test('an unconfirmed OpenClaw WebSocket abort keeps the active stream and subscription', async () => {
+    const actorUserId = '33333333-3333-4333-8333-333333333333';
+    const sessionId = `agent:main:portal-${actorUserId}-abort-unconfirmed`;
+    jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockResolvedValue({
+      ok: true,
+      data: { aborted: true },
+    } as any);
+    streamEventBus.startStream(sessionId, 'run-active');
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+    __gatewayExecutionScopeTest.attachBrowserWsToSessionStream({
+      ws: socket as any,
+      sessionKey: sessionId,
+      providerName: 'OPENCLAW',
+      streamInfo: __gatewayExecutionScopeTest.getProviderOwnedBusStreamSnapshot(sessionId),
+      keepSubscriptionAfterDone: true,
+    });
+
+    await __gatewayExecutionScopeTest.handleWsAbort(socket as any, {
+      provider: 'OPENCLAW',
+      session: sessionId,
+      runId: 'run-active',
+      requestId: 'abort-unconfirmed-request',
+    }, { userId: actorUserId, email: 'owner@example.com', role: 'OWNER' } as any);
+
+    expect(streamEventBus.getTrackedStream(sessionId)).toMatchObject({
+      active: true,
+      runId: 'run-active',
+    });
+    expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(socket as any, sessionId))
+      .toBe(true);
+    const payload = socket.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)))
+      .find((item) => item.type === 'abort_result');
+    expect(payload).toMatchObject({
+      ok: false,
+      runIds: [],
+      requestId: 'abort-unconfirmed-request',
+    });
+    socket.emit('close');
+    streamEventBus.clearStream(sessionId, 'run-active');
   });
 
   test('ordinary users retain access to their exact Project Chat sandbox binding', async () => {
@@ -1317,10 +1551,14 @@ describe('Agent Chat execution boundary', () => {
     jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun')
       .mockImplementation(async (handle) => handle);
     jest.spyOn(openClawHostRunJournal, 'quarantineOpenClawHostRun').mockResolvedValue();
+    // Label hydration precedes the conflict probe. Mock its public boundary
+    // explicitly: getSessionInfo() otherwise uses its module-local RPC binding,
+    // which bypasses the gatewayRpcCall spy below and dials the real gateway.
+    const getSessionInfoSpy = jest.spyOn(openclawGatewayRpc, 'getSessionInfo').mockResolvedValue({
+      ok: true,
+      data: { displayName: 'Existing chat' },
+    });
     jest.spyOn(openclawGatewayRpc, 'gatewayRpcCall').mockImplementation(async (method: string) => {
-      if (method === 'sessions.describe') {
-        return { ok: true, data: { session: { key: sessionKey, displayName: 'Existing chat' } } };
-      }
       if (method === 'sessions.list') {
         return {
           ok: true,
@@ -1361,6 +1599,7 @@ describe('Agent Chat execution boundary', () => {
         { userId, email: 'owner@example.com', role: 'OWNER' } as any,
       );
 
+      expect(getSessionInfoSpy).toHaveBeenCalledWith(sessionKey);
       const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
       expect(payloads).toContainEqual(expect.objectContaining({
         type: 'active_turn_conflict',
@@ -1501,33 +1740,9 @@ describe('Agent Chat execution boundary', () => {
     }
   });
 
-  test('host-native CLI output reaches the browser only through StreamEventBus', async () => {
-    const provider = {
-      providerName: 'CODEX',
-      displayName: 'Codex',
-      startSession: jest.fn().mockResolvedValue('native-bus-session'),
-      sendMessage: jest.fn(async (
-        sessionId: string,
-        _message: string,
-        onChunk?: (chunk: string) => void,
-        onStatus?: (event: { type: string; content?: string }) => void,
-        _onExecApproval?: unknown,
-        sender?: { requestId?: string },
-      ) => {
-        // A legacy callback copy must be ignored by the gateway when the
-        // provider owns the StreamEventBus transport.
-        onStatus?.({ type: 'status', content: 'callback status copy' });
-        onChunk?.('callback text copy');
-        const runId = String(sender?.requestId || 'missing-run-id');
-        streamEventBus.startStream(sessionId, runId, { provenance: 'via Codex CLI' });
-        streamEventBus.publish(sessionId, { type: 'status', content: 'bus status', runId });
-        streamEventBus.publish(sessionId, { type: 'text', content: 'bus text', runId });
-        streamEventBus.publish(sessionId, { type: 'done', content: 'bus text', runId });
-        streamEventBus.softClearStream(sessionId);
-        return { fullText: 'bus text', metadata: { provider: 'codex' } };
-      }),
-    };
-    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+  test('rejects unqualified Antigravity WebSocket sends before provider lookup or session creation', async () => {
+    jest.spyOn(unqualifiedNativeBinaryLane, 'isUnqualifiedNativeBinaryProvider').mockReturnValue(true);
+    const getProvider = jest.spyOn(AgentRegistry, 'get');
 
     const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
     socket.readyState = 1;
@@ -1535,54 +1750,32 @@ describe('Agent Chat execution boundary', () => {
 
     await __gatewayExecutionScopeTest.handleWsSend(
       socket as any,
-      { type: 'send', message: 'hello', provider: 'CODEX', session: 'new-test' },
+      { type: 'send', message: 'hello', harness: 'GEMINI', session: 'new-test' },
       { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' } as any,
     );
 
     const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
-    expect(payloads.filter((payload) => payload.type === 'text')).toEqual([
-      expect.objectContaining({ content: 'bus text', runId: expect.any(String) }),
+    expect(getProvider).not.toHaveBeenCalled();
+    expect(payloads).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        code: 'NATIVE_BINARY_RUNTIME_UNQUALIFIED',
+        retryable: false,
+        content: expect.stringContaining('supported on Linux x86-64'),
+      }),
     ]);
-    expect(payloads.filter((payload) => payload.type === 'status' && payload.content === 'bus status')).toHaveLength(1);
-    expect(payloads.filter((payload) => payload.type === 'done')).toHaveLength(1);
-    expect(payloads).not.toContainEqual(expect.objectContaining({ content: 'callback text copy' }));
-    expect(payloads).not.toContainEqual(expect.objectContaining({ content: 'callback status copy' }));
-    expect(provider.sendMessage.mock.calls[0][5]).toMatchObject({
-      requestId: payloads.find((payload) => payload.type === 'text')?.runId,
-    });
   });
 
-  test('host-native CLI SSE does not republish callback copies into the bus', async () => {
+  test('rejects unqualified Antigravity REST sends before provider lookup or session creation', async () => {
+    jest.spyOn(unqualifiedNativeBinaryLane, 'isUnqualifiedNativeBinaryProvider').mockReturnValue(true);
     const access = mockDurableAccessIdentity({
       userId: 'owner-1',
       sessionId: 'durable-codex-sse-session',
     });
-    const provider = {
-      providerName: 'CODEX',
-      displayName: 'Codex',
-      startSession: jest.fn().mockResolvedValue('native-bus-session'),
-      sendMessage: jest.fn(async (
-        sessionId: string,
-        _message: string,
-        onChunk?: (chunk: string) => void,
-        onStatus?: (event: { type: string; content?: string }) => void,
-        _onExecApproval?: unknown,
-        sender?: { requestId?: string },
-      ) => {
-        onStatus?.({ type: 'status', content: 'callback status copy' });
-        onChunk?.('callback text copy');
-        const runId = String(sender?.requestId || 'missing-run-id');
-        streamEventBus.startStream(sessionId, runId, { provenance: 'via Codex CLI' });
-        streamEventBus.publish(sessionId, { type: 'text', content: 'bus SSE text', runId });
-        streamEventBus.publish(sessionId, { type: 'done', content: 'bus SSE text', runId });
-        streamEventBus.softClearStream(sessionId);
-        return { fullText: 'bus SSE text', metadata: { provider: 'codex' } };
-      }),
-    };
-    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+    const getProvider = jest.spyOn(AgentRegistry, 'get');
 
     const req = Object.assign(new EventEmitter(), {
-      body: { message: 'hello', provider: 'CODEX', session: 'new-test' },
+      body: { message: 'hello', harness: 'GEMINI', session: 'new-test' },
       query: { stream: '1' },
       headers: { accept: 'text/event-stream' },
       user: access.payload,
@@ -1599,22 +1792,16 @@ describe('Agent Chat execution boundary', () => {
 
     await sendRouteHandler()(req as any, res as any);
 
-    const payloads = res.write.mock.calls
-      .map(([raw]) => String(raw))
-      .flatMap((raw) => raw.split('\n'))
-      .filter((line) => line.startsWith('data: {'))
-      .map((line) => JSON.parse(line.slice('data: '.length)));
-    expect(payloads.filter((payload) => payload.type === 'text')).toEqual([
-      expect.objectContaining({ content: 'bus SSE text', runId: expect.any(String) }),
-    ]);
-    expect(payloads.filter((payload) => payload.type === 'done')).toHaveLength(1);
-    expect(payloads).not.toContainEqual(expect.objectContaining({ content: 'callback text copy' }));
-    expect(payloads).not.toContainEqual(expect.objectContaining({ content: 'callback status copy' }));
-    expect(provider.sendMessage.mock.calls[0][5]).toMatchObject({
-      requestId: payloads.find((payload) => payload.type === 'text')?.runId,
-    });
-    expect(res.end).toHaveBeenCalledTimes(1);
-    access.expectDurableLookup();
+    expect(getProvider).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'NATIVE_BINARY_RUNTIME_UNQUALIFIED',
+      retryable: false,
+      error: expect.stringContaining('supported on Linux x86-64'),
+    }));
+    expect(res.write).not.toHaveBeenCalled();
+    expect(res.end).not.toHaveBeenCalled();
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
   });
 
   test('exact durable-session revocation retires an active Agent Chat SSE', async () => {
@@ -1633,8 +1820,11 @@ describe('Agent Chat execution boundary', () => {
       },
     );
     const provider = {
-      providerName: 'CODEX',
-      displayName: 'Codex',
+      // Revocation is transport/provider-neutral. Use a currently qualified
+      // runtime so this test does not depend on the separate native-binary
+      // qualification gate for Antigravity/Grok.
+      providerName: 'OLLAMA',
+      displayName: 'Ollama',
       startSession: jest.fn().mockResolvedValue(sessionId),
       abortActiveRun: jest.fn().mockResolvedValue(true),
       sendMessage: jest.fn(async () => {
@@ -1645,7 +1835,7 @@ describe('Agent Chat execution boundary', () => {
     jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
 
     const req = Object.assign(new EventEmitter(), {
-      body: { message: 'keep running', provider: 'CODEX', session: 'new-test' },
+      body: { message: 'keep running', provider: 'HERMES', session: 'new-test' },
       query: { stream: '1' },
       headers: { accept: 'text/event-stream' },
       user: access.payload,
@@ -1739,39 +1929,9 @@ describe('Agent Chat execution boundary', () => {
     }));
   });
 
-  test('Grok WebSocket forwards thinking, tool lifecycle, text, and terminal exactly once', async () => {
-    const provider = {
-      providerName: 'GROK',
-      displayName: 'Grok Build',
-      startSession: jest.fn().mockResolvedValue('grok-route-bus-session'),
-      sendMessage: jest.fn(async (
-        _sessionId: string,
-        _message: string,
-        onChunk?: (chunk: string) => void,
-        onStatus?: (event: { type: string; content?: string; [key: string]: unknown }) => void,
-      ) => {
-        onStatus?.({ type: 'thinking', content: 'I will inspect the working directory.' });
-        onStatus?.({
-          type: 'tool_start',
-          content: 'Running pwd',
-          toolName: 'shell',
-          toolCallId: 'grok-tool-1',
-          toolArgs: { command: 'pwd' },
-        });
-        onChunk?.('The exact output is ');
-        onStatus?.({
-          type: 'tool_end',
-          content: '/root/workspace',
-          toolName: 'shell',
-          toolCallId: 'grok-tool-1',
-          toolResult: '/root/workspace',
-          status: 'completed',
-        });
-        onChunk?.('`/root/workspace`.');
-        return { fullText: 'The exact output is `/root/workspace`.', metadata: { model: 'grok-code' } };
-      }),
-    };
-    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+  test('rejects unqualified Grok WebSocket sends before provider lookup or callbacks', async () => {
+    jest.spyOn(unqualifiedNativeBinaryLane, 'isUnqualifiedNativeBinaryProvider').mockReturnValue(true);
+    const getProvider = jest.spyOn(AgentRegistry, 'get');
 
     const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
     socket.readyState = 1;
@@ -1784,22 +1944,13 @@ describe('Agent Chat execution boundary', () => {
     );
 
     const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
-    expect(payloads.filter((payload) => payload.type === 'thinking')).toEqual([
-      expect.objectContaining({ content: 'I will inspect the working directory.' }),
-    ]);
-    expect(payloads.filter((payload) => payload.type === 'tool_start')).toEqual([
-      expect.objectContaining({ toolName: 'shell', toolCallId: 'grok-tool-1' }),
-    ]);
-    expect(payloads.filter((payload) => payload.type === 'tool_end')).toEqual([
-      expect.objectContaining({ toolName: 'shell', toolResult: '/root/workspace' }),
-    ]);
-    expect(payloads.filter((payload) => payload.type === 'text').map((payload) => payload.content))
-      .toEqual(['The exact output is ', '`/root/workspace`.']);
-    expect(payloads.filter((payload) => payload.type === 'done')).toEqual([
+    expect(getProvider).not.toHaveBeenCalled();
+    expect(payloads).toEqual([
       expect.objectContaining({
-        content: 'The exact output is `/root/workspace`.',
-        sessionKey: 'grok-route-bus-session',
-        runId: expect.any(String),
+        type: 'error',
+        code: 'NATIVE_BINARY_RUNTIME_UNQUALIFIED',
+        retryable: false,
+        content: expect.stringContaining('supported on Linux x86-64'),
       }),
     ]);
   });
@@ -1913,12 +2064,12 @@ describe('Agent Chat execution boundary', () => {
     );
     expect(publishedWithDirectOwner).toBe(false);
 
-    // Maintenance deliberately travels both lanes so the rail and durable
-    // marker survive a subscription transition.
+    // Maintenance uses the direct lane too; the global subscription is only a
+    // fallback for sockets that do not own this session.
     expect(__gatewayExecutionScopeTest.shouldSendGlobalStreamCopy(
       true,
       { type: 'compaction_start', maintenanceKind: 'maintenance' } as any,
-    )).toBe(true);
+    )).toBe(false);
   });
 
   test('requires explicit active truth before adopting a sessions.list run identity', () => {
@@ -2258,7 +2409,151 @@ describe('Agent Chat execution boundary', () => {
     expect(JSON.stringify(errors)).not.toContain('password=');
   });
 
+  test('native WebSocket active-turn conflict refuses a replacement after durable scope proof', async () => {
+    const sessionId = 'native-bus-session';
+    const provider = {
+      providerName: 'CODEX',
+      displayName: 'Codex',
+      startSession: jest.fn().mockResolvedValue(sessionId),
+      sendMessage: jest.fn(),
+    };
+    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+    streamEventBus.startStream(sessionId, 'run-conflict-original', { provenance: 'via Codex CLI' });
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockImplementation(async () => {
+        streamEventBus.clearStream(sessionId, 'run-conflict-original');
+        streamEventBus.startStream(sessionId, 'run-conflict-replacement', { provenance: 'via Codex CLI' });
+        return {} as any;
+      });
+
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+    await __gatewayExecutionScopeTest.handleWsSend(
+      socket as any,
+      { type: 'send', message: 'queue this', provider: 'CODEX', session: 'new-test' },
+      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER', authorizationVersion: 7 } as any,
+    );
+
+    streamEventBus.publish(sessionId, {
+      type: 'text',
+      content: 'replacement must remain detached',
+      runId: 'run-conflict-replacement',
+    });
+    const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+    expect(payloads).toContainEqual(expect.objectContaining({
+      type: 'active_turn_conflict',
+      sessionKey: sessionId,
+    }));
+    expect(payloads).toContainEqual({
+      type: 'stream_status',
+      sessionKey: sessionId,
+      active: false,
+      inactiveReason: 'unknown',
+      safeToClear: false,
+    });
+    expect(payloads).not.toContainEqual(expect.objectContaining({ type: 'stream_resume' }));
+    expect(payloads).not.toContainEqual(expect.objectContaining({ content: 'replacement must remain detached' }));
+    expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(socket as any, sessionId)).toBe(false);
+    expect(provider.sendMessage).not.toHaveBeenCalled();
+    expect(attachable).toHaveBeenCalledWith({
+      actorUserId: 'owner-1',
+      actorAuthorizationVersion: 7,
+      provider: 'CODEX',
+      sessionId,
+      runId: 'run-conflict-original',
+    });
+  });
+
+  test('native SSE active-turn conflict refuses a replacement after durable scope proof', async () => {
+    const sessionId = 'route-sse-session';
+    const access = mockDurableAccessIdentity({
+      userId: 'owner-1',
+      sessionId: 'durable-native-sse-conflict-session',
+      authorizationVersion: 7,
+    });
+    const provider = {
+      providerName: 'CLAUDE_CODE',
+      displayName: 'Claude Code',
+      startSession: jest.fn().mockResolvedValue(sessionId),
+      sendMessage: jest.fn(),
+      abortActiveRun: jest.fn(),
+    };
+    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+    streamEventBus.startStream(sessionId, 'run-sse-original', { provenance: 'via Claude Code CLI' });
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockImplementation(async () => {
+        streamEventBus.clearStream(sessionId, 'run-sse-original');
+        streamEventBus.startStream(sessionId, 'run-sse-replacement', { provenance: 'via Claude Code CLI' });
+        return {} as any;
+      });
+    const req = Object.assign(new EventEmitter(), {
+      body: {
+        message: 'queue this SSE turn',
+        provider: 'CLAUDE_CODE',
+        session: 'new-test',
+      },
+      query: { stream: '1' },
+      headers: { accept: 'text/event-stream' },
+      user: access.payload,
+    });
+    const res = {
+      socket: { setNoDelay: jest.fn() },
+      setHeader: jest.fn(),
+      flushHeaders: jest.fn(),
+      write: jest.fn(),
+      end: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+
+    try {
+      await sendRouteHandler()(req as any, res as any);
+      streamEventBus.publish(sessionId, {
+        type: 'text',
+        content: 'replacement must remain off SSE',
+        runId: 'run-sse-replacement',
+      });
+      const payloads = res.write.mock.calls
+        .map(([raw]) => String(raw))
+        .flatMap((raw) => raw.split('\n'))
+        .filter((line) => line.startsWith('data: {'))
+        .map((line) => JSON.parse(line.slice('data: '.length)));
+      expect(payloads).toContainEqual(expect.objectContaining({
+        type: 'active_turn_conflict',
+        sessionKey: sessionId,
+      }));
+      expect(payloads).toContainEqual({
+        type: 'stream_status',
+        sessionKey: sessionId,
+        active: false,
+        inactiveReason: 'unknown',
+        safeToClear: false,
+      });
+      expect(payloads).not.toContainEqual(expect.objectContaining({ type: 'stream_resume' }));
+      expect(payloads).not.toContainEqual(expect.objectContaining({ content: 'replacement must remain off SSE' }));
+      expect(streamEventBus.getSubscriberDiagnostics(sessionId).roles['browser-sse'] || 0).toBe(0);
+      expect(res.end).not.toHaveBeenCalled();
+      expect(provider.sendMessage).not.toHaveBeenCalled();
+      expect(attachable).toHaveBeenCalledWith({
+        actorUserId: 'owner-1',
+        actorAuthorizationVersion: 7,
+        provider: 'CLAUDE_CODE',
+        sessionId,
+        runId: 'run-sse-original',
+      });
+      access.expectDurableLookup();
+    } finally {
+      req.emit('close');
+    }
+  });
+
   test('host-native CLI reconnect resumes the exact bus snapshot and live run', async () => {
+    jest.spyOn(nativeSessionStore, 'loadNativeSession').mockReturnValue({
+      executionContext: { scope: 'HOST_OPERATOR' },
+    } as any);
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockResolvedValue({} as any);
     const sessionId = 'native-reconnect-session';
     streamEventBus.startStream(sessionId, 'run-native-reconnect', { provenance: 'via Codex CLI' });
     streamEventBus.updateStreamPhase(sessionId, { phase: 'streaming', runId: 'run-native-reconnect' });
@@ -2271,7 +2566,7 @@ describe('Agent Chat execution boundary', () => {
     await __gatewayExecutionScopeTest.handleWsReconnect(
       socket as any,
       { session: sessionId, provider: 'CODEX' },
-      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' } as any,
+      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER', authorizationVersion: 7 } as any,
     );
 
     streamEventBus.publish(sessionId, { type: 'text', content: 'continued', runId: 'run-native-reconnect' });
@@ -2287,6 +2582,346 @@ describe('Agent Chat execution boundary', () => {
     }));
     expect(payloads.filter((payload) => payload.type === 'text' && payload.content === 'continued')).toHaveLength(1);
     expect(payloads.filter((payload) => payload.type === 'done')).toHaveLength(1);
+    expect(attachable).toHaveBeenCalledWith({
+      actorUserId: 'owner-1',
+      actorAuthorizationVersion: 7,
+      provider: 'CODEX',
+      sessionId,
+      runId: 'run-native-reconnect',
+    });
+  });
+
+  test('host-native CLI reconnect refuses a replacement run after attesting the original scope', async () => {
+    jest.spyOn(nativeSessionStore, 'loadNativeSession').mockReturnValue({
+      executionContext: { scope: 'HOST_OPERATOR' },
+    } as any);
+    const sessionId = 'native-reconnect-session';
+    streamEventBus.startStream(sessionId, 'run-native-original', { provenance: 'via Claude Code CLI' });
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockImplementation(async () => {
+        streamEventBus.clearStream(sessionId, 'run-native-original');
+        streamEventBus.startStream(sessionId, 'run-native-replacement', {
+          provenance: 'via Claude Code CLI',
+        });
+        return {} as any;
+      });
+
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+    await __gatewayExecutionScopeTest.handleWsReconnect(
+      socket as any,
+      { session: sessionId, provider: 'CLAUDE_CODE' },
+      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER', authorizationVersion: 7 } as any,
+    );
+
+    streamEventBus.publish(sessionId, {
+      type: 'text',
+      content: 'replacement must not be forwarded',
+      runId: 'run-native-replacement',
+    });
+    const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+    expect(payloads).toEqual([
+      {
+        type: 'error',
+        content: 'Reconnect failed: active host run changed during attachment',
+      },
+    ]);
+    expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(socket as any, sessionId)).toBe(false);
+    expect(streamEventBus.getTrackedStream(sessionId)).toMatchObject({
+      active: true,
+      runId: 'run-native-replacement',
+    });
+    expect(attachable).toHaveBeenCalledWith({
+      actorUserId: 'owner-1',
+      actorAuthorizationVersion: 7,
+      provider: 'CLAUDE_CODE',
+      sessionId,
+      runId: 'run-native-original',
+    });
+  });
+
+  test('host-native CLI reconnect cannot revive a stream without its exact active scope', async () => {
+    jest.spyOn(nativeSessionStore, 'loadNativeSession').mockReturnValue({
+      executionContext: { scope: 'HOST_OPERATOR' },
+    } as any);
+    jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockRejectedValue(new Error('Host run scope is unavailable'));
+    const sessionId = 'native-reconnect-session';
+    streamEventBus.startStream(sessionId, 'run-native-reconnect', { provenance: 'via Codex CLI' });
+
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+    await __gatewayExecutionScopeTest.handleWsReconnect(
+      socket as any,
+      { session: sessionId, provider: 'CODEX' },
+      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER', authorizationVersion: 7 } as any,
+    );
+
+    const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+    expect(payloads).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        content: expect.stringContaining('Host run scope is unavailable'),
+      }),
+    ]);
+    expect(payloads).not.toContainEqual(expect.objectContaining({ type: 'stream_resume' }));
+  });
+
+  test.each([
+    ['CODEX', 'codex-history-attach'],
+    ['CLAUDE_CODE', 'claude-history-attach'],
+  ] as const)('%s HTTP/WS history and conflict attachments require the exact active scope', async (
+    provider,
+    sessionId,
+  ) => {
+    const runId = `run-${sessionId}`;
+    const snapshot = { active: true, runId, phase: 'streaming' as const };
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockResolvedValueOnce({} as any)
+      .mockRejectedValueOnce(new Error('host scope was not attested'));
+
+    await expect(
+      __gatewayExecutionScopeTest.attestHostAgentRunBrowserStreamSnapshot(
+        provider,
+        sessionId,
+        snapshot,
+        'HOST_OPERATOR',
+        { userId: 'owner-1', authorizationVersion: 7 },
+      ),
+    ).resolves.toBe(snapshot);
+    await expect(
+      __gatewayExecutionScopeTest.attestHostAgentRunBrowserStreamSnapshot(
+        provider,
+        sessionId,
+        snapshot,
+        'HOST_OPERATOR',
+        { userId: 'owner-1', authorizationVersion: 7 },
+      ),
+    ).resolves.toEqual({
+      active: false,
+      inactiveReason: 'unknown',
+      safeToClear: false,
+    });
+
+    const expected = {
+      actorUserId: 'owner-1',
+      actorAuthorizationVersion: 7,
+      provider,
+      sessionId,
+      runId,
+    };
+    expect(attachable).toHaveBeenNthCalledWith(1, expected);
+    expect(attachable).toHaveBeenNthCalledWith(2, expected);
+  });
+
+  test('host stream projection rejects missing or stale actor generations before attachment', async () => {
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable');
+    const snapshot = { active: true, runId: 'run-owner-bound', phase: 'streaming' as const };
+
+    await expect(__gatewayExecutionScopeTest.attestHostAgentRunBrowserStreamSnapshot(
+      'CODEX',
+      'owner-bound-session',
+      snapshot,
+      'HOST_OPERATOR',
+      undefined,
+    )).resolves.toEqual({
+      active: false,
+      inactiveReason: 'unknown',
+      safeToClear: false,
+    });
+    await expect(__gatewayExecutionScopeTest.attestHostAgentRunBrowserStreamSnapshot(
+      'CODEX',
+      'owner-bound-session',
+      snapshot,
+      'HOST_OPERATOR',
+      { userId: 'owner-1', authorizationVersion: 0 },
+    )).resolves.toEqual({
+      active: false,
+      inactiveReason: 'unknown',
+      safeToClear: false,
+    });
+    expect(attachable).not.toHaveBeenCalled();
+  });
+
+  test('HTTP native history keeps messages readable but refuses live Codex continuity without its scope', async () => {
+    const sessionId = 'host-http-history';
+    const runId = 'run-host-http-history';
+    jest.spyOn(nativeSessionStore, 'loadNativeSessionMetadata').mockReturnValue({
+      userId: 'owner-1',
+      sessionId,
+      executionContext: { scope: 'HOST_OPERATOR' },
+    } as any);
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockRejectedValue(new Error('host scope was not attested'));
+    streamEventBus.startStream(sessionId, runId, { provenance: 'via Codex CLI' });
+
+    const handler = gatewayRouteHandler('/history');
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() };
+    await handler({
+      query: { provider: 'CODEX', session: sessionId },
+      user: { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER', authorizationVersion: 7 },
+    }, res);
+
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId,
+      activeStream: {
+        active: false,
+        inactiveReason: 'unknown',
+        safeToClear: false,
+      },
+    }));
+    expect(attachable).toHaveBeenCalledWith({
+      actorUserId: 'owner-1',
+      actorAuthorizationVersion: 7,
+      provider: 'CODEX',
+      sessionId,
+      runId,
+    });
+  });
+
+  test('WebSocket native history never subscribes to a live Claude stream without its scope', async () => {
+    const sessionId = 'host-ws-history';
+    const runId = 'run-host-ws-history';
+    jest.spyOn(nativeSessionStore, 'loadNativeSessionMetadata').mockReturnValue({
+      userId: 'owner-1',
+      sessionId,
+      executionContext: { scope: 'HOST_OPERATOR' },
+    } as any);
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockRejectedValue(new Error('host scope was not attested'));
+    streamEventBus.startStream(sessionId, runId, { provenance: 'via Claude Code CLI' });
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+
+    await __gatewayExecutionScopeTest.handleWsHistory(
+      socket as any,
+      { type: 'history', provider: 'CLAUDE_CODE', session: sessionId, requestId: 'history-request' },
+      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER', authorizationVersion: 7 } as any,
+    );
+
+    const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+    expect(payloads).toContainEqual(expect.objectContaining({
+      type: 'history',
+      sessionId,
+      requestId: 'history-request',
+      activeStream: {
+        active: false,
+        inactiveReason: 'unknown',
+        safeToClear: false,
+      },
+    }));
+    expect(payloads).not.toContainEqual(expect.objectContaining({ type: 'stream_resume' }));
+    expect(attachable).toHaveBeenCalledWith({
+      actorUserId: 'owner-1',
+      actorAuthorizationVersion: 7,
+      provider: 'CLAUDE_CODE',
+      sessionId,
+      runId,
+    });
+  });
+
+  test('WebSocket native history refuses a replacement after attesting the original scope', async () => {
+    const sessionId = 'host-ws-history';
+    jest.spyOn(nativeSessionStore, 'loadNativeSessionMetadata').mockReturnValue({
+      userId: 'owner-1',
+      sessionId,
+      executionContext: { scope: 'HOST_OPERATOR' },
+    } as any);
+    streamEventBus.startStream(sessionId, 'run-history-original', { provenance: 'via Codex CLI' });
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable')
+      .mockImplementation(async () => {
+        streamEventBus.clearStream(sessionId, 'run-history-original');
+        streamEventBus.startStream(sessionId, 'run-history-replacement', { provenance: 'via Codex CLI' });
+        return {} as any;
+      });
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+
+    await __gatewayExecutionScopeTest.handleWsHistory(
+      socket as any,
+      { type: 'history', provider: 'CODEX', session: sessionId, requestId: 'history-replacement' },
+      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER', authorizationVersion: 7 } as any,
+    );
+
+    streamEventBus.publish(sessionId, {
+      type: 'text',
+      content: 'replacement history event must remain detached',
+      runId: 'run-history-replacement',
+    });
+    const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+    expect(payloads).toContainEqual(expect.objectContaining({
+      type: 'history',
+      sessionId,
+      requestId: 'history-replacement',
+      activeStream: expect.objectContaining({ active: true, runId: 'run-history-original' }),
+    }));
+    expect(payloads).toContainEqual({
+      type: 'stream_status',
+      sessionKey: sessionId,
+      active: false,
+      inactiveReason: 'unknown',
+      safeToClear: false,
+    });
+    expect(payloads).not.toContainEqual(expect.objectContaining({ type: 'stream_resume' }));
+    expect(payloads).not.toContainEqual(expect.objectContaining({
+      content: 'replacement history event must remain detached',
+    }));
+    expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(socket as any, sessionId)).toBe(false);
+    expect(attachable).toHaveBeenCalledWith({
+      actorUserId: 'owner-1',
+      actorAuthorizationVersion: 7,
+      provider: 'CODEX',
+      sessionId,
+      runId: 'run-history-original',
+    });
+  });
+
+  test('Project Sandbox reconnect projection never acquires host-run attachment authority', async () => {
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable');
+    const snapshot = { active: true, runId: 'project-codex-run', phase: 'streaming' as const };
+
+    await expect(
+      __gatewayExecutionScopeTest.attestHostAgentRunBrowserStreamSnapshot(
+        'CODEX',
+        'project-codex-session',
+        snapshot,
+        'PROJECT_SANDBOX',
+        undefined,
+      ),
+    ).resolves.toBe(snapshot);
+    expect(attachable).not.toHaveBeenCalled();
+  });
+
+  test('Project Sandbox WebSocket reconnect remains on its independent stream authority', async () => {
+    jest.spyOn(nativeSessionStore, 'loadNativeSession').mockReturnValue({
+      executionContext: { scope: 'PROJECT_SANDBOX' },
+    } as any);
+    const attachable = jest.spyOn(hostAgentRunJournal, 'assertHostAgentRunAttachable');
+    const sessionId = 'project-native-reconnect';
+    streamEventBus.startStream(sessionId, 'project-native-run', { provenance: 'via Project Codex' });
+
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+    await __gatewayExecutionScopeTest.handleWsReconnect(
+      socket as any,
+      { session: sessionId, provider: 'CODEX' },
+      { userId: 'owner-1', email: 'owner@example.com', role: 'OWNER' } as any,
+    );
+
+    expect(socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)))).toContainEqual(
+      expect.objectContaining({
+        type: 'stream_resume',
+        sessionKey: sessionId,
+        runId: 'project-native-run',
+      }),
+    );
+    expect(attachable).not.toHaveBeenCalled();
   });
 
   test('host-native CLI reconnect reports a completed run as safe to clear', async () => {
@@ -2382,7 +3017,7 @@ describe('Agent Chat execution boundary', () => {
     socket.emit('close');
   });
 
-  test('stream attachment revalidates a stale snapshot to the replacement run', () => {
+  test('OpenClaw stream attachment revalidates a stale snapshot to the replacement run', () => {
     const sessionId = 'stale-snapshot-attach';
     streamEventBus.startStream(sessionId, 'run-old');
     const staleSnapshot = __gatewayExecutionScopeTest.getProviderOwnedBusStreamSnapshot(sessionId);
@@ -2396,7 +3031,7 @@ describe('Agent Chat execution boundary', () => {
     expect(__gatewayExecutionScopeTest.attachBrowserWsToSessionStream({
       ws: socket as any,
       sessionKey: sessionId,
-      providerName: 'CODEX',
+      providerName: 'OPENCLAW',
       streamInfo: staleSnapshot,
       sendResume: true,
       keepSubscriptionAfterDone: false,
@@ -2407,6 +3042,115 @@ describe('Agent Chat execution boundary', () => {
       .find((payload) => payload.type === 'stream_resume');
     expect(resume).toMatchObject({ runId: 'run-new', content: 'new partial' });
     socket.emit('close');
+  });
+
+  test('native stream attachment implicitly rejects a replacement instead of adopting it', () => {
+    const sessionId = 'stale-snapshot-attach';
+    streamEventBus.startStream(sessionId, 'run-old');
+    const staleSnapshot = __gatewayExecutionScopeTest.getProviderOwnedBusStreamSnapshot(sessionId);
+    streamEventBus.clearStream(sessionId, 'run-old');
+    streamEventBus.startStream(sessionId, 'run-new');
+
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+    expect(__gatewayExecutionScopeTest.attachBrowserWsToSessionStream({
+      ws: socket as any,
+      sessionKey: sessionId,
+      providerName: 'CODEX',
+      streamInfo: staleSnapshot,
+      sendResume: true,
+      keepSubscriptionAfterDone: false,
+    })).toBe(false);
+
+    expect(socket.send).not.toHaveBeenCalled();
+    expect(__gatewayExecutionScopeTest.wsHasSessionStreamSubscription(socket as any, sessionId)).toBe(false);
+    expect(streamEventBus.getTrackedStream(sessionId)).toMatchObject({ active: true, runId: 'run-new' });
+  });
+
+  test('native WebSocket attachment rejects untagged session events after exact-run validation', () => {
+    const sessionId = 'native-ws-untagged-event';
+    const runId = 'run-native-ws';
+    streamEventBus.startStream(sessionId, runId, { provenance: 'via Codex CLI' });
+    const snapshot = __gatewayExecutionScopeTest.getProviderOwnedBusStreamSnapshot(sessionId);
+    const socket = new EventEmitter() as EventEmitter & { readyState: number; send: jest.Mock };
+    socket.readyState = 1;
+    socket.send = jest.fn();
+
+    expect(__gatewayExecutionScopeTest.attachBrowserWsToSessionStream({
+      ws: socket as any,
+      sessionKey: sessionId,
+      providerName: 'CODEX',
+      streamInfo: snapshot,
+      keepSubscriptionAfterDone: false,
+    })).toBe(true);
+
+    streamEventBus.publish(sessionId, {
+      type: 'status',
+      content: 'untagged maintenance must stay detached',
+      maintenanceKind: 'maintenance',
+    });
+    streamEventBus.publish(sessionId, { type: 'text', content: 'tagged event', runId });
+
+    const payloads = socket.send.mock.calls.map(([raw]) => JSON.parse(String(raw)));
+    expect(payloads).not.toContainEqual(expect.objectContaining({
+      content: 'untagged maintenance must stay detached',
+    }));
+    expect(payloads).toContainEqual(expect.objectContaining({
+      type: 'text',
+      content: 'tagged event',
+      runId,
+    }));
+    socket.emit('close');
+  });
+
+  test('native SSE attachment resumes and forwards the same revalidated run', () => {
+    const sessionId = 'route-sse-session';
+    const runId = 'run-native-sse';
+    streamEventBus.startStream(sessionId, runId, { provenance: 'via Claude Code CLI' });
+    streamEventBus.publish(sessionId, { type: 'text', content: 'partial SSE', runId });
+    const snapshot = __gatewayExecutionScopeTest.getProviderOwnedBusStreamSnapshot(sessionId);
+    const write = jest.fn();
+    const finish = jest.fn();
+
+    const cleanup = __gatewayExecutionScopeTest.attachSseToSessionStream({
+      sessionKey: sessionId,
+      providerName: 'CLAUDE_CODE',
+      streamInfo: snapshot,
+      user: { userId: 'owner-1', role: 'OWNER' } as any,
+      write,
+      finish,
+    });
+    expect(cleanup).toEqual(expect.any(Function));
+
+    streamEventBus.publish(sessionId, {
+      type: 'status',
+      content: 'untagged SSE maintenance must stay detached',
+      maintenanceKind: 'maintenance',
+    });
+    streamEventBus.publish(sessionId, { type: 'text', content: 'continued SSE', runId });
+    const payloads = write.mock.calls
+      .map(([raw]) => String(raw))
+      .filter((raw) => raw.startsWith('data: {'))
+      .map((raw) => JSON.parse(raw.slice('data: '.length)));
+    expect(payloads).toContainEqual(expect.objectContaining({
+      type: 'stream_resume',
+      sessionKey: sessionId,
+      runId,
+      content: 'partial SSE',
+    }));
+    expect(payloads).toContainEqual(expect.objectContaining({
+      type: 'text',
+      content: 'continued SSE',
+      runId,
+    }));
+    expect(payloads).not.toContainEqual(expect.objectContaining({
+      content: 'untagged SSE maintenance must stay detached',
+    }));
+    expect(finish).not.toHaveBeenCalled();
+
+    cleanup?.();
+    expect(streamEventBus.getSubscriberDiagnostics(sessionId).roles['browser-sse'] || 0).toBe(0);
   });
 
   test('a delayed OpenClaw abort cannot clear a replacement run or its subscription', async () => {
@@ -2440,7 +3184,7 @@ describe('Agent Chat execution boundary', () => {
     streamEventBus.clearStream(sessionId, 'run-old');
     streamEventBus.startStream(sessionId, 'run-new');
     streamEventBus.publish(sessionId, { type: 'run_resumed', content: '', runId: 'run-new' });
-    resolveAbort({ ok: true, data: { aborted: true } });
+    resolveAbort({ ok: true, data: { aborted: true, runIds: ['run-old'] } });
     await abortPromise;
     streamEventBus.publish(sessionId, { type: 'text', content: 'replacement survived', runId: 'run-new' });
 
@@ -2653,32 +3397,62 @@ describe('Agent Chat execution boundary', () => {
     }, actor, database)).resolves.toBe(false);
   });
 
-  test('journals an OpenClaw host send before dispatch and settles only after the ACK callback', async () => {
+  test('final host dispatch seam rechecks cached admission before journal and provider I/O', async () => {
+    const providerName = 'OPENCLAW';
+    const displayName = 'OpenClaw';
     const begin = jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun')
       .mockImplementation(async (handle) => handle);
-    const markDispatch = jest.spyOn(
-      openClawHostRunJournal,
-      'markOpenClawHostRunDispatchAccepted',
-    ).mockResolvedValue();
-    const markVisible = jest.spyOn(
-      openClawHostRunJournal,
-      'markOpenClawHostRunVisibleSettled',
-    ).mockResolvedValue();
-    const quarantine = jest.spyOn(openClawHostRunJournal, 'quarantineOpenClawHostRun')
+    const accepted = jest.spyOn(openClawHostRunJournal, 'markOpenClawHostRunDispatchAccepted')
       .mockResolvedValue();
+    const settled = jest.spyOn(openClawHostRunJournal, 'markOpenClawHostRunVisibleSettled')
+      .mockResolvedValue();
+    const startSession = jest.fn();
     const sendMessage = jest.fn(async (...args: any[]) => {
-      await args[5].onProviderDispatchAccepted('upstream-exact-1');
-      return { fullText: 'complete' };
+      const sender = args[5] as { onProviderDispatchAccepted(id: string): Promise<void> };
+      await sender.onProviderDispatchAccepted('upstream-run-1');
+      return { fullText: 'OpenClaw result', metadata: {} };
     });
     const provider = {
-      providerName: 'OPENCLAW',
-      displayName: 'OpenClaw',
+      providerName,
+      displayName,
+      startSession,
+      sendMessage,
+    } as any;
+
+    await expect(__gatewayExecutionScopeTest.sendHostOperatorProviderMessage({
+        provider,
+        sessionId: 'agent:main:portal-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        message: 'hello',
+        sender: {
+          label: 'owner@example.com',
+          userId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          authorizationVersion: 9,
+          requestId: 'route-request-1',
+        },
+      })).resolves.toEqual({ fullText: 'OpenClaw result', metadata: {} });
+
+    expect(openClawExecutionAdmission.assertCachedOpenClawExecutionAdmitted).toHaveBeenCalledTimes(1);
+    expect(begin).toHaveBeenCalledTimes(1);
+    expect(accepted).toHaveBeenCalledWith(expect.anything(), 'upstream-run-1');
+    expect(settled).toHaveBeenCalledWith(expect.anything(), 'completed');
+    expect(startSession).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    ['CODEX', 'Codex'],
+    ['CLAUDE_CODE', 'Claude Code'],
+  ] as const)('final host dispatch delegates %s to its provider-owned lease boundary', async (providerName, displayName) => {
+    const sendMessage = jest.fn().mockResolvedValue({ fullText: `${displayName} result` });
+    const provider = {
+      providerName,
+      displayName,
       sendMessage,
     } as any;
 
     await expect(__gatewayExecutionScopeTest.sendHostOperatorProviderMessage({
       provider,
-      sessionId: 'agent:main:portal-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      sessionId: 'native-managed-session',
       message: 'hello',
       sender: {
         label: 'owner@example.com',
@@ -2686,93 +3460,16 @@ describe('Agent Chat execution boundary', () => {
         authorizationVersion: 9,
         requestId: 'route-request-1',
       },
-    })).resolves.toEqual({ fullText: 'complete' });
+    })).resolves.toEqual({ fullText: `${displayName} result` });
 
-    const handle = {
-      id: 'route-request-1',
-      actorUserId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-      actorAuthorizationVersion: 9,
-      provider: 'OPENCLAW',
-      executionScope: 'HOST_OPERATOR',
-      sessionKey: 'agent:main:portal-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-    };
-    expect(begin).toHaveBeenCalledWith(handle);
-    expect(markDispatch).toHaveBeenCalledWith(handle, 'upstream-exact-1');
-    expect(markVisible).toHaveBeenCalledWith(handle, 'completed');
-    expect(quarantine).not.toHaveBeenCalled();
-    expect(begin.mock.invocationCallOrder[0]).toBeLessThan(sendMessage.mock.invocationCallOrder[0]);
-    expect(markDispatch.mock.invocationCallOrder[0]).toBeLessThan(markVisible.mock.invocationCallOrder[0]);
-  });
-
-  test('quarantines an ambiguous OpenClaw send before surfacing its error', async () => {
-    jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun')
-      .mockImplementation(async (handle) => handle);
-    jest.spyOn(openClawHostRunJournal, 'markOpenClawHostRunDispatchAccepted')
-      .mockResolvedValue();
-    const markVisible = jest.spyOn(
-      openClawHostRunJournal,
-      'markOpenClawHostRunVisibleSettled',
-    ).mockResolvedValue();
-    const quarantine = jest.spyOn(openClawHostRunJournal, 'quarantineOpenClawHostRun')
-      .mockResolvedValue();
-    const providerError = new Error('provider outcome ambiguous');
-    const sendMessage = jest.fn(async (...args: any[]) => {
-      await args[5].onProviderDispatchAccepted('upstream-exact-2');
-      throw providerError;
-    });
-
-    await expect(__gatewayExecutionScopeTest.sendHostOperatorProviderMessage({
-      provider: {
-        providerName: 'OPENCLAW',
-        displayName: 'OpenClaw',
-        sendMessage,
-      } as any,
-      sessionId: 'agent:main:portal-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-      message: 'hello',
-      sender: {
-        label: 'owner@example.com',
-        userId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-        authorizationVersion: 3,
-        requestId: 'route-request-2',
-      },
-    })).rejects.toBe(providerError);
-
-    expect(markVisible).not.toHaveBeenCalled();
-    expect(quarantine).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'route-request-2' }),
-      providerError,
+    expect(sendMessage).toHaveBeenCalledWith(
+      'native-managed-session',
+      'hello',
+      undefined,
+      undefined,
+      undefined,
+      expect.objectContaining({ requestId: 'route-request-1' }),
     );
-    expect(sendMessage.mock.invocationCallOrder[0])
-      .toBeLessThan(quarantine.mock.invocationCallOrder[0]);
-  });
-
-  test('retains the mutation lease when OpenClaw ambiguity cannot be durably quarantined', async () => {
-    jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun')
-      .mockImplementation(async (handle) => handle);
-    jest.spyOn(openClawHostRunJournal, 'quarantineOpenClawHostRun')
-      .mockRejectedValue(new Error('database unavailable'));
-    const retainLease = jest.fn();
-
-    await expect(__gatewayExecutionScopeTest.sendHostOperatorProviderMessage({
-      provider: {
-        providerName: 'OPENCLAW',
-        displayName: 'OpenClaw',
-        sendMessage: jest.fn(async () => {
-          throw new Error('transport closed');
-        }),
-      } as any,
-      sessionId: 'agent:main:portal-cccccccc-cccc-4ccc-8ccc-cccccccccccc',
-      message: 'hello',
-      sender: {
-        label: 'owner@example.com',
-        userId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
-        authorizationVersion: 6,
-        requestId: 'route-request-3',
-      },
-      onQuarantinePersistenceFailure: retainLease,
-    })).rejects.toThrow('could not be durably quarantined');
-
-    expect(retainLease).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2850,6 +3547,26 @@ describe('host-created OpenClaw sessions stay reachable', () => {
       'SUB_ADMIN',
     )).rejects.toThrow('Admin access required');
     expect(refused.agentSession.create).not.toHaveBeenCalled();
+  });
+
+  test('the Owner can read listed host transcripts without claiming them; other users remain isolated', async () => {
+    const key = 'agent:main:dashboard:0b3a4512-f580-4f3e-a573-f9363e26f5a5';
+    const { database, agentSession } = createOwnershipDatabase();
+    await expect(__gatewayExecutionScopeTest.assertExistingGatewaySessionAccess(
+      key, { userId: OWNER, role: 'OWNER' } as any, { database },
+    )).resolves.toBeUndefined();
+    await expect(__gatewayExecutionScopeTest.assertExistingGatewaySessionAccess(
+      key, { userId: OTHER, role: 'SUB_ADMIN' } as any, { database },
+    )).rejects.toThrow('Admin access required');
+    await expect(__gatewayExecutionScopeTest.assertExistingGatewaySessionAccess(
+      `agent:main:portal-${OTHER}-private`, { userId: OWNER, role: 'OWNER' } as any, { database },
+    )).rejects.toThrow('Admin access required');
+    const claimed = createOwnershipDatabase([{ id: 'other-claim', userId: OTHER, externalId: key }]);
+    await expect(__gatewayExecutionScopeTest.assertExistingGatewaySessionAccess(
+      key, { userId: OWNER, role: 'OWNER' } as any, { database: claimed.database },
+    )).rejects.toThrow('Admin access required');
+    expect(agentSession.create).not.toHaveBeenCalled();
+    expect(agentSession.update).not.toHaveBeenCalled();
   });
 
   test('not even the Owner may claim a session scoped to another Portal user', async () => {

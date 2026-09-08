@@ -1,7 +1,7 @@
 import fs from 'fs';
 import {
   ContainedPathError,
-  resolveContainedPath,
+  openContainedRegularFile,
   writeContainedFileAtomic,
 } from './containedPath';
 import { writeProjectRuntimeOwnedFileAtomic } from './projectRuntimeOwnership';
@@ -29,40 +29,35 @@ export function statProjectRegularFile(
   relativePath: string,
   options: ReadProjectTextOptions = {},
 ): fs.Stats | null {
-  let candidate: string;
-  try {
-    candidate = resolveContainedPath(projectRoot, relativePath, { mustExist: false });
-  } catch (error) {
-    if (error instanceof ContainedPathError) {
-      throw new ProjectFilePolicyError('INVALID_PATH', error.message);
-    }
-    throw error;
-  }
+  const opened = openProjectRegularFile(projectRoot, relativePath, options);
+  if (!opened) return null;
+  try { return opened.stat; } finally { fs.closeSync(opened.fd); }
+}
 
-  let entry: fs.Stats;
+/** The caller owns the returned descriptor and must never reopen its pathname. */
+export function openProjectRegularFile(
+  projectRoot: string,
+  relativePath: string,
+  options: ReadProjectTextOptions = {},
+): { fd: number; stat: fs.Stats } | null {
+  if (options.maxBytes !== undefined && (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0)) {
+    throw new ProjectFilePolicyError('TOO_LARGE', `${relativePath} has an invalid metadata limit`);
+  }
+  let opened: { fd: number; stat: fs.Stats };
   try {
-    entry = fs.lstatSync(candidate);
+    opened = openContainedRegularFile(projectRoot, relativePath);
   } catch (error: any) {
     if (error?.code === 'ENOENT' && options.optional) return null;
-    throw error;
-  }
-  if (entry.isSymbolicLink() || !entry.isFile()) {
-    throw new ProjectFilePolicyError('NOT_REGULAR', `${relativePath} must be a regular project file`);
-  }
-  if (options.maxBytes !== undefined && entry.size > options.maxBytes) {
-    throw new ProjectFilePolicyError('TOO_LARGE', `${relativePath} exceeds the ${options.maxBytes}-byte metadata limit`);
-  }
-  // Revalidate containment after the stat so a link swap cannot be consumed by
-  // the caller as a trusted project file.
-  try {
-    resolveContainedPath(projectRoot, relativePath, { mustExist: true, kind: 'file' });
-  } catch (error) {
-    if (error instanceof ContainedPathError) {
-      throw new ProjectFilePolicyError('INVALID_PATH', error.message);
+    if (error instanceof ContainedPathError || error?.code === 'ELOOP' || error?.code === 'ENOTDIR') {
+      throw new ProjectFilePolicyError('INVALID_PATH', 'A regular, contained project file is required');
     }
     throw error;
   }
-  return entry;
+  if (options.maxBytes !== undefined && opened.stat.size > options.maxBytes) {
+    fs.closeSync(opened.fd);
+    throw new ProjectFilePolicyError('TOO_LARGE', `${relativePath} exceeds the ${options.maxBytes}-byte metadata limit`);
+  }
+  return opened;
 }
 
 /**
@@ -80,30 +75,10 @@ export function readProjectTextFile(
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
     throw new ProjectFilePolicyError('TOO_LARGE', `${relativePath} has an invalid metadata limit`);
   }
-  const entry = statProjectRegularFile(projectRoot, relativePath, { ...options, maxBytes });
+  const entry = openProjectRegularFile(projectRoot, relativePath, { ...options, maxBytes });
   if (!entry) return null;
-
-  let resolved: string;
+  const { fd, stat: opened } = entry;
   try {
-    resolved = resolveContainedPath(projectRoot, relativePath, { mustExist: true, kind: 'file' });
-  } catch (error) {
-    if (error instanceof ContainedPathError) {
-      throw new ProjectFilePolicyError('INVALID_PATH', error.message);
-    }
-    throw error;
-  }
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
-  let fd: number | undefined;
-  try {
-    fd = fs.openSync(resolved, flags);
-    const opened = fs.fstatSync(fd);
-    if (!opened.isFile() || opened.dev !== entry.dev || opened.ino !== entry.ino) {
-      throw new ProjectFilePolicyError('NOT_REGULAR', `${relativePath} changed while it was being opened`);
-    }
-    if (opened.size > maxBytes) {
-      throw new ProjectFilePolicyError('TOO_LARGE', `${relativePath} exceeds the ${maxBytes}-byte metadata limit`);
-    }
-
     // Bound the read itself as well as the preflight stat. A repository process
     // may still append to a regular file after it has been opened.
     const buffer = Buffer.alloc(Math.min(opened.size, maxBytes) + 1);
@@ -118,7 +93,7 @@ export function readProjectTextFile(
     }
     return buffer.subarray(0, offset).toString('utf8');
   } finally {
-    if (fd !== undefined) fs.closeSync(fd);
+    fs.closeSync(fd);
   }
 }
 

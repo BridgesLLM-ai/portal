@@ -9,6 +9,8 @@ const shareFindFirstMock = jest.fn();
 const shareFindManyMock = jest.fn();
 const shareUpdateMock = jest.fn();
 const shareDeleteManyMock = jest.fn();
+const leaseDeleteManyMock = jest.fn();
+const transactionMock = jest.fn();
 const activityCreateMock = jest.fn();
 
 jest.mock('../config/database', () => ({
@@ -28,6 +30,8 @@ jest.mock('../config/database', () => ({
       deleteMany: shareDeleteManyMock,
     },
     activityLog: { create: activityCreateMock },
+    appShareRequestLease: { deleteMany: leaseDeleteManyMock },
+    $transaction: transactionMock,
   },
 }));
 
@@ -93,6 +97,11 @@ describe('packaged app share lifecycle', () => {
       maxUses: 25, currentUses: 0, createdAt: new Date(),
     });
     shareDeleteManyMock.mockResolvedValue({ count: 1 });
+    leaseDeleteManyMock.mockResolvedValue({ count: 0 });
+    transactionMock.mockImplementation(async (callback: any) => callback({
+      appShareLink: { update: shareUpdateMock },
+      appShareRequestLease: { deleteMany: leaseDeleteManyMock },
+    }));
 
     const app = express();
     app.use(express.json());
@@ -117,6 +126,7 @@ describe('packaged app share lifecycle', () => {
       maxUses: 25,
       rateLimitMaxRequests: 50,
       rateLimitWindowSeconds: 300,
+      maxConcurrentVisitors: 4,
     });
     expect(created.status).toBe(201);
     expect(created.body.shareLink.passwordHash).toBeUndefined();
@@ -127,6 +137,7 @@ describe('packaged app share lifecycle', () => {
       maxUses: 25,
       rateLimitMaxRequests: 50,
       rateLimitWindowSeconds: 300,
+      maxConcurrentVisitors: 4,
       isPublic: true,
       passwordHash: null,
     }) });
@@ -176,6 +187,49 @@ describe('packaged app share lifecycle', () => {
     });
     expect((await request(server, 'PATCH', '/apps/app-1/share/link-1', { isActive: true })).status).toBe(409);
     expect(shareUpdateMock).not.toHaveBeenCalled();
+  });
+
+  test('edits existing limits atomically, resets rate state, and clears obsolete leases', async () => {
+    const expiresAt = new Date(Date.now() + 60_000);
+    shareFindFirstMock.mockResolvedValue({
+      id: 'link-1', appId: 'app-1', userId: 'user-1', isActive: true,
+      isPublic: true, passwordHash: null,
+      expiresAt: null, maxUses: 25, currentUses: 2,
+      rateLimitMaxRequests: 50, rateLimitWindowSeconds: 60,
+      rateLimitRequestCount: 7, rateLimitWindowStartedAt: new Date(),
+      maxConcurrentVisitors: 4,
+    });
+    shareUpdateMock.mockResolvedValue({
+      id: 'link-1', appId: 'app-1', userId: 'user-1', isActive: true,
+      isPublic: true, passwordHash: null,
+      expiresAt, maxUses: 10, currentUses: 2,
+      rateLimitMaxRequests: null, rateLimitWindowSeconds: null,
+      maxConcurrentVisitors: null,
+    });
+
+    const response = await request(server, 'PATCH', '/apps/app-1/share/link-1', {
+      expiresAt: expiresAt.toISOString(),
+      maxUses: 10,
+      maxConcurrentVisitors: null,
+      rateLimitMaxRequests: null,
+      rateLimitWindowSeconds: null,
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.shareLink.passwordHash).toBeUndefined();
+    expect(shareUpdateMock).toHaveBeenCalledWith({
+      where: { id: 'link-1' },
+      data: expect.objectContaining({
+        expiresAt,
+        maxUses: 10,
+        maxConcurrentVisitors: null,
+        rateLimitMaxRequests: null,
+        rateLimitWindowSeconds: null,
+        rateLimitRequestCount: 0,
+        rateLimitWindowStartedAt: null,
+      }),
+    });
+    expect(leaseDeleteManyMock).toHaveBeenCalledWith({ where: { shareLinkId: 'link-1' } });
   });
 
   test.each([

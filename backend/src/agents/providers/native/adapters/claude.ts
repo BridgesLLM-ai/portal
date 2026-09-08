@@ -1,7 +1,14 @@
 import { randomUUID } from 'crypto';
 import path from 'path';
 import type { AgentSessionConfig } from '../../../AgentProvider.interface';
-import type { NativeCliProviderAdapter, NativeCliTurnContext } from '../types';
+import {
+  validateClaudeHostGrants,
+  validateNativeHostModel,
+  validateNativeHostPrompt,
+  validateNativeHostSessionId,
+  type NativeCliProviderAdapter,
+  type NativeCliTurnContext,
+} from '../types';
 import { nativeSessionMessageCount } from '../../NativeSessionStore';
 import { asRecord, extractAbsolutePathDirs } from '../approvalScope';
 import { redactNativeProviderText } from '../NativeProviderDiagnostics';
@@ -179,7 +186,7 @@ async function requestApprovalsForDenials(ctx: NativeCliTurnContext, denials: an
 export const claudeCodeAdapter: NativeCliProviderAdapter = {
   providerName: 'CLAUDE_CODE',
   displayName: 'Claude',
-  cliCommand: 'claude',
+  cliCommand: '/usr/bin/claude',
   messageIdPrefix: 'claude-msg',
   initialStatus: 'Claude is thinking…',
   spawnErrorPrefix: 'Failed to spawn claude CLI',
@@ -214,20 +221,39 @@ export const claudeCodeAdapter: NativeCliProviderAdapter = {
       ctx.updateSessionMetadata({ nativeSessionId: invocation.nativeSessionId });
       return invocation;
     }
-    const args = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages'];
-    const allowedTools = Array.isArray(ctx.state.approvedAllowedTools) ? ctx.state.approvedAllowedTools.filter(Boolean) : [];
-    const addDirs = Array.isArray(ctx.state.approvedAddDirs) ? ctx.state.approvedAddDirs.filter(Boolean) : [];
+    const hostSessionId = validateNativeHostSessionId(nativeSessionId, true)!;
+    const hostModel = validateNativeHostModel(ctx.session.model);
+    const hostPrompt = validateNativeHostPrompt(ctx.message);
+    const { allowedTools, addDirs } = validateClaudeHostGrants(
+      ctx.state.approvedAllowedTools,
+      ctx.state.approvedAddDirs,
+    );
+    const args = [
+      '-p',
+      '--verbose',
+      '--output-format', 'stream-json',
+      '--include-partial-messages',
+      // Never inherit host CLAUDE.md, skills, hooks, plugins, MCP servers,
+      // permission allowlists, additional directories, or default mode.
+      // `dontAsk` denies ungranted tools so the structured denial can cross
+      // the Portal approval broker and an exact grant can be retried.
+      '--safe-mode',
+      '--disable-slash-commands',
+      '--strict-mcp-config',
+      '--mcp-config', '{"mcpServers":{}}',
+      '--setting-sources', '',
+      '--permission-mode', 'dontAsk',
+    ];
     if (allowedTools.length > 0) args.push('--allowedTools', allowedTools.join(' '));
     for (const dir of addDirs) args.push('--add-dir', dir);
     if (ctx.session.metadata?.nativeSessionEstablished === true) {
-      args.push('--resume', nativeSessionId);
+      args.push('--resume', hostSessionId);
     } else {
-      args.push('--session-id', nativeSessionId);
+      args.push('--session-id', hostSessionId);
     }
-    if (ctx.session.model) args.push('--model', ctx.session.model);
-    args.push(ctx.message);
-    ctx.state.nativeSessionId = nativeSessionId;
-    return { command: 'claude', args };
+    if (hostModel) args.push('--model', hostModel);
+    ctx.state.nativeSessionId = hostSessionId;
+    return { command: '/usr/bin/claude', args, stdinText: hostPrompt };
   },
   handleStdoutLine: (line, ctx) => {
     let parsed: any;
@@ -246,7 +272,7 @@ export const claudeCodeAdapter: NativeCliProviderAdapter = {
         [previous, structuredError].filter(Boolean).join('\n'),
         CLAUDE_STRUCTURED_ERROR_MAX_BYTES,
       );
-      // Claude Code (observed 2.1.214 through 2.1.220) emits provider API
+      // Claude Code (observed 2.1.214 through 2.1.228) emits provider API
       // failures as an `assistant` record.
       // Treating that record as an answer leaks an implementation diagnostic
       // into chat and masks the authoritative authentication failure.

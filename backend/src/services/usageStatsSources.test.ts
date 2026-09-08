@@ -8,11 +8,8 @@ function dependencies(
   overrides: Partial<UsageStatsSourceDependencies> = {},
 ): UsageStatsSourceDependencies {
   return {
-    agentsDir: '/agents',
     gatewayCall: async () => ({ ok: false }),
     runOpenClaw: async () => { throw new Error('CLI unavailable'); },
-    readDir: async () => { throw new Error('store unavailable'); },
-    readFile: async () => { throw new Error('store unavailable'); },
     ...overrides,
   };
 }
@@ -51,22 +48,22 @@ describe('usage statistics sources', () => {
     expect(runOpenClaw).not.toHaveBeenCalled();
   });
 
-  it('uses asynchronous stored sessions and requests complete CLI cron data', async () => {
+  it('uses supported CLI fallbacks for sessions and cron data', async () => {
     const runOpenClaw = jest.fn(async (args: string[]) => {
+      if (args[0] === 'sessions') {
+        expect(args).toEqual(['sessions', '--json', '--limit', 'all', '--all-agents']);
+        return JSON.stringify({ sessions: [{ key: 'stored', agentId: 'main', model: 'model-a' }] });
+      }
       expect(args).toEqual(['cron', 'list', '--json', '--all']);
       return JSON.stringify({ jobs: [{ id: 'disabled', enabled: false }] });
     });
-    const result = await loadUsageStatsSources('', dependencies({
-      runOpenClaw,
-      readDir: async () => ['main'],
-      readFile: async () => JSON.stringify({ stored: { key: 'stored', model: 'model-a' } }),
-    }));
+    const result = await loadUsageStatsSources('', dependencies({ runOpenClaw }));
 
-    expect(result.sessions).toEqual([expect.objectContaining({ key: 'stored', agentId: 'main' })]);
+    expect(result.sessions).toEqual([{ key: 'stored', agentId: 'main', model: 'model-a' }]);
     expect(result.cronJobs).toEqual([{ id: 'disabled', enabled: false }]);
   });
 
-  it('requests the unbounded CLI session list when Gateway and disk are unavailable', async () => {
+  it('requests the unbounded CLI session list when Gateway is unavailable', async () => {
     const runOpenClaw = jest.fn(async (args: string[]) => {
       if (args[0] === 'sessions') {
         expect(args).toEqual(['sessions', '--json', '--limit', 'all', '--agent', 'work']);

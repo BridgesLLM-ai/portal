@@ -24,6 +24,7 @@ export interface RuntimeTurnEvent {
   schema: typeof RUNTIME_TURN_EVENT_SCHEMA;
   type: RuntimeTurnEventType;
   seq?: number;
+  ts?: number;
   text?: string;
   subject?: string;
   replace?: boolean;

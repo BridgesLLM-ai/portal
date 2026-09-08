@@ -5,6 +5,7 @@ import { AgentRegistry } from '../agents';
 import { createProjectSandboxExecutionContext } from '../agents/executionScope';
 import * as openClawGatewayRpc from '../utils/openclawGatewayRpc';
 import { buildProjectEgressPlaneSpec } from './projectEgressPlane';
+import * as openClawExecutionAdmission from './openClawExecutionAdmission';
 import {
   __openClawProjectQualificationTest,
   OpenClawProjectQualificationError,
@@ -281,6 +282,19 @@ describe('OpenClaw Project qualification evidence', () => {
     const runtimeContainerStartedAt = NOW.toISOString();
     let privateMarker = '';
     let prompt = '';
+    jest.spyOn(openClawExecutionAdmission, 'assertCachedOpenClawExecutionAdmitted')
+      .mockReturnValue({
+        state: 'ready',
+        ready: true,
+        reason: 'ready for qualification marker testing',
+        checkedAt: NOW.toISOString(),
+        evidence: {
+          authorizationFence: 'absent',
+          maintenanceMarker: 'absent',
+          hostMutationJournal: 'absent',
+        },
+        readinessBlockers: [],
+      });
     const executor = {
       run: jest.fn(async (_command: string, args: readonly string[]) => {
         if (args[2] === 'container' && args[3] === 'inspect') {
@@ -356,7 +370,7 @@ describe('OpenClaw Project qualification evidence', () => {
       }),
       abortActiveRun: jest.fn(async () => true),
     };
-    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider as any);
+    jest.spyOn(AgentRegistry, 'getSharedProjectSandboxProvider').mockReturnValue(provider as any);
 
     await expect(__openClawProjectQualificationTest.runDefaultModelProbe({
       sessionKey: 'agent:p4oc-runtime-marker:portal-project',

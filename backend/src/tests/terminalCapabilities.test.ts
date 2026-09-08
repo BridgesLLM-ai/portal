@@ -133,6 +133,7 @@ Options:
       label: 'OpenClaw',
       category: 'openclaw',
       installed: true,
+      executionAvailable: true,
       executable: '/usr/bin/openclaw',
       version: '2026.7.1',
       helpCommand: 'openclaw --help',
@@ -154,11 +155,13 @@ Options:
     const tools: TerminalToolCapability[] = [
       {
         id: 'systemctl', label: 'systemd', category: 'system', installed: true,
+        executionAvailable: true,
         executable: '/usr/bin/systemctl', version: 'systemd 255', helpCommand: 'systemctl --help',
         sourceUrl: 'https://example.invalid/systemd', commands: [],
       },
       {
         id: 'curl', label: 'curl', category: 'network', installed: true,
+        executionAvailable: true,
         executable: '/usr/bin/curl', version: 'curl 8', helpCommand: 'curl --help',
         sourceUrl: 'https://example.invalid/curl', commands: [],
       },
@@ -181,6 +184,28 @@ Options:
       available: false, unmetRequirements: ['service:openclaw-gateway'],
     });
     expect(rankTerminalSuggestions('', tools, ['journalctl'], 20, actions).some((entry) => entry.command.includes('openclaw-gateway'))).toBe(false);
+  });
+
+  test.each(['codex', 'claude', 'claude-code'])('never promotes admitted Agent Chat runtime %s into a Terminal command', (id) => {
+    const tool: TerminalToolCapability = {
+      id,
+      label: id,
+      category: 'agents',
+      installed: true,
+      executionAvailable: false,
+      executable: null,
+      version: '1.2.3',
+      helpCommand: `${id} --help`,
+      sourceUrl: 'https://example.invalid/admitted-host-runtime',
+      commands: [`${id} run`],
+    };
+    expect(rankTerminalSuggestions(id, [tool], [], 10)).toEqual([]);
+    expect(resolveTerminalActions([{
+      id: 'provider-runtime', title: 'provider runtime', description: 'provider runtime', command: `${id} run`,
+      category: 'agents', risk: 'read_only', confirmation: 'none', requirements: [id],
+    }], [tool], [], [])).toEqual([
+      expect.objectContaining({ available: false, unmetRequirements: [id] }),
+    ]);
   });
 
   test('parses systemd service state without treating missing units as installed', () => {

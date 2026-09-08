@@ -23,6 +23,13 @@ const CONTAINER_ID = 'a'.repeat(64);
 const retireLegacyOpenClawProjectAgentsAtStartup =
   inspectLegacyOpenClawProjectAgentsAtStartup;
 
+function persistedAgentEntries(agents: Record<string, any>[]) {
+  return Object.fromEntries(agents.map((agent) => {
+    const { id, ...entry } = agent;
+    return [id, entry];
+  }));
+}
+
 interface SessionRow {
   key: string;
   sessionId?: string;
@@ -234,7 +241,7 @@ class RetirementFixture {
   readonly dependencies: LegacyOpenClawProjectRetirementDependencies = {
     readConfig: async () => this.localConfigAgents === null
       ? null
-      : { agents: { list: this.localConfigAgents ?? this.configAgents } },
+      : { agents: { entries: persistedAgentEntries(this.localConfigAgents ?? this.configAgents) } },
     rpc: async (method, params, timeoutMs) => {
       this.calls.push({ kind: 'rpc', name: method, params: { ...params, timeoutMs } });
       if (method === 'config.get') {
@@ -249,7 +256,10 @@ class RetirementFixture {
             }
           }
         }
-        return { ok: true, data: { config: { agents: { list: this.configAgents } } } };
+        return {
+          ok: true,
+          data: { config: { agents: { entries: persistedAgentEntries(this.configAgents) } } },
+        };
       }
       if (method === 'sessions.list') {
         const sourceRows = typeof params.agentId === 'string'
@@ -761,6 +771,21 @@ describe('Portal 4.0 legacy OpenClaw Project retirement', () => {
       && ['container stop', 'container rm'].includes(call.name))).toBe(false);
   });
 
+  test('accepts the real defaults-only roster without skipping scoped runtime collision checks', async () => {
+    const config = { agents: { defaults: { workspace: path.join(openClawHome, 'workspace') } } };
+    const dependencies = { ...fixture.dependencies, readConfig: async () => config };
+    await expect(assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: USER_ID, projectName: 'Demo', projectRoot: projectSource,
+    }, { ...options(), dependencies })).resolves.toBeUndefined();
+    expect(fixture.calls.some((call) => call.kind === 'docker')).toBe(true);
+    expect(fixture.calls.some((call) => ['sessions.delete', 'agents.delete'].includes(call.name))).toBe(false);
+    for (const agents of [{ defaults: {}, list: null }, { defaults: {}, entries: null }, { defaults: {}, roster: {} }]) {
+      expect(() => discoverLegacyOpenClawProjectAgents({ agents }, {
+        portalProjectsRoot: projectsRoot, openClawHome,
+      })).toThrow(expect.objectContaining({ code: 'CONFIG_SHAPE' }));
+    }
+  });
+
   test('serializes concurrent Project creation runtime inventories', async () => {
     let activeInventories = 0;
     let maxActiveInventories = 0;
@@ -800,8 +825,65 @@ describe('Portal 4.0 legacy OpenClaw Project retirement', () => {
       workspaceOwnerId: USER_ID,
       projectName: 'Demo',
       projectRoot: projectSource,
-    }, options())).rejects.toBeInstanceOf(LegacyOpenClawProjectCreationCollisionError);
+    }, options())).rejects.toMatchObject({
+      code: 'LEGACY_OPENCLAW_PROJECT_NAME_COLLISION',
+      legacyAgentIds: [AGENT_ID],
+      evidence: ['legacy-runtime'],
+      recoveryPath: '/admin?tab=maintenance',
+      message: expect.stringContaining(AGENT_ID),
+    });
     expect(fixture.configAgents).toHaveLength(1);
+    expect(fixture.calls.some((call) => ['sessions.delete', 'agents.delete'].includes(call.name))).toBe(false);
+  });
+
+  test('ignores an unrelated bind-less exact legacy agent during Project creation', async () => {
+    const unrelatedAgentId = 'portal-11111111-unrelated';
+    const unrelated = legacyAgent();
+    unrelated.id = unrelatedAgentId;
+    unrelated.workspace = path.join(openClawHome, 'sandboxes', `${unrelatedAgentId}-workspace`);
+    unrelated.sandbox.docker.binds = [];
+    fixture.configAgents = [unrelated];
+
+    await expect(assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: USER_ID,
+      projectName: 'Demo',
+      projectRoot: projectSource,
+    }, options())).resolves.toBeUndefined();
+    expect(fixture.configAgents).toEqual([unrelated]);
+    expect(fixture.calls.some((call) => ['sessions.delete', 'agents.delete'].includes(call.name))).toBe(false);
+  });
+
+  test('skips an unrelated bind-less agent but still rejects the real colliding candidate', async () => {
+    const unrelatedAgentId = 'portal-11111111-unrelated';
+    const unrelated = legacyAgent();
+    unrelated.id = unrelatedAgentId;
+    unrelated.workspace = path.join(openClawHome, 'sandboxes', `${unrelatedAgentId}-workspace`);
+    unrelated.sandbox.docker.binds = [];
+    fixture.configAgents = [unrelated, legacyAgent()];
+
+    await expect(assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: USER_ID,
+      projectName: 'Demo',
+      projectRoot: projectSource,
+    }, options())).rejects.toBeInstanceOf(LegacyOpenClawProjectCreationCollisionError);
+    expect(fixture.configAgents).toEqual([unrelated, expect.objectContaining({ id: AGENT_ID })]);
+    expect(fixture.calls.some((call) => ['sessions.delete', 'agents.delete'].includes(call.name))).toBe(false);
+  });
+
+  test('fails closed when a candidate bound to this Project is malformed', async () => {
+    const malformed = legacyAgent();
+    malformed.sandbox.docker.binds = [
+      `${projectSource}:/home/user/project:rw`,
+      `${projectSource}:/workspace/project:rw`,
+    ];
+    fixture.configAgents = [malformed];
+
+    await expect(assertNoLegacyOpenClawProjectCreationCollision({
+      workspaceOwnerId: USER_ID,
+      projectName: 'Demo',
+      projectRoot: projectSource,
+    }, options())).rejects.toMatchObject({ code: 'AGENT_BIND' });
+    expect(fixture.configAgents).toEqual([malformed]);
     expect(fixture.calls.some((call) => ['sessions.delete', 'agents.delete'].includes(call.name))).toBe(false);
   });
 
@@ -1088,16 +1170,31 @@ describe('Portal 4.0 legacy OpenClaw Project retirement', () => {
 
   test('attests both historical configured-agent generations', () => {
     for (const generation of ['work', 'workspace'] as const) {
-      const discovered = discoverLegacyOpenClawProjectAgents(
-        { agents: { list: [legacyAgent(generation)] } },
-        { portalProjectsRoot: projectsRoot, openClawHome },
-      );
-      expect(discovered).toEqual([expect.objectContaining({
-        agentId: AGENT_ID,
-        projectSource,
-        generation: generation === 'work' ? 'legacy-work' : 'legacy-workspace',
-      })]);
+      const agent = legacyAgent(generation);
+      for (const roster of [
+        { list: [agent] },
+        { entries: persistedAgentEntries([agent]) },
+      ]) {
+        const discovered = discoverLegacyOpenClawProjectAgents(
+          { agents: roster },
+          { portalProjectsRoot: projectsRoot, openClawHome },
+        );
+        expect(discovered).toEqual([expect.objectContaining({
+          agentId: AGENT_ID,
+          projectSource,
+          generation: generation === 'work' ? 'legacy-work' : 'legacy-workspace',
+        })]);
+      }
     }
+  });
+
+  test('keeps retirement discovery strict for a bind-less exact legacy agent', () => {
+    const bindless = legacyAgent();
+    bindless.sandbox.docker.binds = [];
+    expect(() => discoverLegacyOpenClawProjectAgents(
+      { agents: { entries: persistedAgentEntries([bindless]) } },
+      { portalProjectsRoot: projectsRoot, openClawHome },
+    )).toThrow(expect.objectContaining({ code: 'AGENT_BIND' }));
   });
 
 
@@ -1145,7 +1242,7 @@ describe('Portal 4.0 legacy OpenClaw Project retirement', () => {
       updatedAt: new Date(),
     });
     const [discovered] = discoverLegacyOpenClawProjectAgents(
-      { agents: { list: [legacyAgent()] } },
+      { agents: { entries: persistedAgentEntries([legacyAgent()]) } },
       { portalProjectsRoot: projectsRoot, openClawHome },
     );
     const candidate = { ...discovered, ...rootIdentity };
@@ -1269,7 +1366,7 @@ describe('Portal 4.0 legacy OpenClaw Project retirement', () => {
       'await assertLegacyOpenClawProjectMigrationInactive(executionContext.projectId);',
       context,
     );
-    const history = projectsSource.indexOf('const historyPage = await prisma.projectChatMessage.findMany', gate);
+    const history = projectsSource.indexOf('historyPage = await readProjectChatHistoryPage({', gate);
     expect(route).toBeGreaterThan(-1);
     expect(context).toBeGreaterThan(route);
     expect(gate).toBeGreaterThan(context);

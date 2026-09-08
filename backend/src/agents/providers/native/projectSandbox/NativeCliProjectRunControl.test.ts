@@ -96,6 +96,7 @@ describe('exact Native CLI Project in-container run control', () => {
       runIdentity.markerPath,
       runIdentity.runHash,
       runIdentity.runToken,
+      'ignore',
       process.execPath,
       '-e', childScript,
       ...childArgs,

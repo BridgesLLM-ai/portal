@@ -24,14 +24,14 @@ export type AgentZeroSetupSurface = {
 };
 
 export type AgentZeroSetupStatus = {
-  testedVersions: { agentZero: '2.5'; connector: '0.1.0'; hostBridge: '2.5' };
+  testedVersions: { agentZero: '2.10'; connector: '0.1.0'; hostBridge: '2.10' };
   credentials: { configured: boolean; protected: boolean; reason: string };
   runtime: {
     installed: boolean;
     running: boolean;
     protocolReady: boolean;
     version?: string;
-    expectedVersion: '2.5';
+    expectedVersion: '2.10';
     pinnedImage: boolean;
     loopbackOnly: boolean;
     persistentData: boolean;
@@ -51,7 +51,7 @@ export type AgentZeroSetupStatus = {
     running: boolean;
     ready: boolean;
     cliVersion?: string;
-    expectedCliVersion: '2.5';
+    expectedCliVersion: '2.10';
     gatewayId: string;
     capabilities: {
       scope: 'HOST_OPERATOR';
@@ -67,7 +67,11 @@ export type AgentZeroSetupStatus = {
   projectSandbox: AgentZeroSetupSurface;
   actions: {
     provisionCredentials: { ownerOnly: true; confirmationPhrase: string };
-    reconcileRuntime: { ownerOnly: true; confirmationPhrase: string };
+    reconcileRuntime: {
+      ownerOnly: true;
+      available: false;
+      unavailableCode: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE';
+    };
     verifyAuthentication: { ownerOnly: true; available: boolean };
   };
   provider: {
@@ -188,14 +192,6 @@ export const agentRuntimeAPI = {
     confirmation: string;
   }): Promise<{ ok: boolean; saved: boolean; verified: boolean; status: AgentZeroSetupStatus }> {
     const { data } = await client.post('/agent-runtime/agent-zero/credentials', input);
-    return data;
-  },
-  async reconcileAgentZeroRuntime(confirmation: string): Promise<{
-    ok: boolean;
-    message: string;
-    status: AgentZeroSetupStatus;
-  }> {
-    const { data } = await client.post('/agent-runtime/agent-zero/runtime/reconcile', { confirmation });
     return data;
   },
   async agentZeroOAuthStatus(): Promise<AgentZeroOAuthStatus> {

@@ -916,7 +916,7 @@ router.patch('/:id/rename', authenticateToken, requireApproved, async (req: Requ
       throw error;
     }
 
-    res.json(updated);
+    res.json({ ...updated, size: updated.size.toString() });
   } catch (error) {
     console.error('Rename error:', error);
     res.status(500).json({ error: 'Failed to rename file' });

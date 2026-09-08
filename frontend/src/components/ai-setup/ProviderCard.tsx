@@ -265,7 +265,7 @@ export default function ProviderCard({ provider, status, onConfigure, onRemove, 
           {status.nativeCliAuthMessage ? (
             <div className="mt-2 text-sm text-slate-300">{status.nativeCliAuthMessage}</div>
           ) : null}
-          {status.nativeCliAuthStatus === 'needs_login' && onNativeCliLogin ? (
+          {status.nativeCliAuthStatus === 'needs_login' && status.nativeCliLoginCommand && onNativeCliLogin ? (
             <button
               type="button"
               onClick={() => onNativeCliLogin(status.nativeProvider!)}

@@ -6,6 +6,7 @@ import {
   getStaleProviderProfileIds,
   hasAnthropicClaudeCliReferences,
   isClaudeCliModelId,
+  LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION,
   mergeProviderRuntimeCatalog,
   OPENCLAW_CODEX_PLUGIN_VERSION,
   parseOpenClawAuthStoreProfiles,
@@ -15,7 +16,8 @@ import {
 
 describe('openclawConfigManager Claude CLI helpers', () => {
   test('defaults to the exact Portal-tested Codex plugin package revision', () => {
-    expect(OPENCLAW_CODEX_PLUGIN_VERSION).toBe('2026.7.1-1');
+    expect(OPENCLAW_CODEX_PLUGIN_VERSION).toBe('2026.9.1');
+    expect(LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION).toBe('2026.7.1-1');
   });
 
   test('detects claude-cli model ids', () => {

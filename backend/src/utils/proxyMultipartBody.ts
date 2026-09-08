@@ -3,6 +3,13 @@ import type { Request, Response } from 'express';
 const DEFAULT_PROXY_MULTIPART_LIMIT_BYTES = 64 * 1024 * 1024;
 const MIN_PROXY_MULTIPART_LIMIT_BYTES = 1024 * 1024;
 const MAX_PROXY_MULTIPART_LIMIT_BYTES = 500 * 1024 * 1024;
+const PROXY_MULTIPART_IDLE_TIMEOUT_MS = 30_000;
+const PROXY_MULTIPART_TOTAL_TIMEOUT_MS = 180_000;
+
+function rejectStalledBody(res: Response): void {
+  if (res.headersSent) return;
+  res.status(408).json({ error: 'Upload stalled' });
+}
 
 function configuredLimitBytes(): number {
   const configured = Number(process.env.HOSTED_PROXY_MAX_BODY_BYTES);
@@ -53,8 +60,35 @@ export async function captureBoundedMultipartBody(
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     let settled = false;
+    let idleTimer: NodeJS.Timeout | null = null;
+
+    const clearTimers = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
+      clearTimeout(totalTimer);
+    };
+
+    const onStalled = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      chunks.length = 0;
+      rejectStalledBody(res);
+      req.destroy();
+      resolve(false);
+    };
+
+    const totalTimer = setTimeout(onStalled, PROXY_MULTIPART_TOTAL_TIMEOUT_MS);
+    if (typeof totalTimer.unref === 'function') totalTimer.unref();
+
+    const armIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(onStalled, PROXY_MULTIPART_IDLE_TIMEOUT_MS);
+      if (typeof idleTimer.unref === 'function') idleTimer.unref();
+    };
 
     const cleanup = () => {
+      clearTimers();
       req.off('data', onData);
       req.off('end', onEnd);
       req.off('error', onError);
@@ -69,6 +103,7 @@ export async function captureBoundedMultipartBody(
     };
 
     const onData = (chunk: Buffer | string) => {
+      armIdleTimer();
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       totalBytes += buffer.length;
       if (totalBytes > limitBytes) {
@@ -97,6 +132,7 @@ export async function captureBoundedMultipartBody(
 
     const onAborted = () => onError(new Error('Multipart upload aborted by client'));
 
+    armIdleTimer();
     req.on('data', onData);
     req.on('end', onEnd);
     req.on('error', onError);

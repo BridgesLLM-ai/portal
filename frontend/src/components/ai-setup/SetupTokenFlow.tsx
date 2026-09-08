@@ -2,13 +2,12 @@ import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, ClipboardPaste, ExternalLink, Loader2, X } from 'lucide-react';
 import client from '../../api/client';
 import ViewportModal from '../ViewportModal';
-import ModelSelector, { type SelectableModel } from './ModelSelector';
+import type { SelectableModel } from './ModelSelector';
 import type { ProviderUIConfig } from './providerConfig';
 import type { ProviderStatus } from './ProviderCard';
 import { canonicalizePortalModelId } from '../../utils/modelId';
 import { getModelFamilyKey, mergeModelCatalog, pickPreferredModel } from './modelCatalog';
 import { cancelOAuthSession } from './oauthCancellation';
-import { getOAuthStartRecoveryDisposition, readStructuredOAuthStartFailure } from './oauthFlowContract';
 import { useAuthStore } from '../../contexts/AuthContext';
 import {
   isAuthoritativeCredentialWriteRejection,
@@ -54,19 +53,20 @@ function isStuckLifecycleRejection(err: any): boolean {
       || /currently owns this credential domain|retained provider-removal lifecycle|Reset stuck sign-in|remains locked for review|already owns this provider credential|recovered an unfinished authorization lifecycle/i.test(msg));
 }
 
-export default function SetupTokenFlow({ provider, status, apiBase, onComplete, onCancel, onNativeCliLogin: _onNativeCliLogin }: SetupTokenFlowProps) {
+export default function SetupTokenFlow({ provider, status: _status, apiBase, onComplete, onCancel, onNativeCliLogin: _onNativeCliLogin }: SetupTokenFlowProps) {
   const actorScope = useAuthStore((state) => state.user?.id ? `user:${state.user.id}` : 'setup:pending');
   const [step, setStep] = useState<Step>('prereqs');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [authUrl, setAuthUrl] = useState<string | null>(null);
-  const [popupBlocked, setPopupBlocked] = useState(false);
+  const [popupBlocked] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pasteCode, setPasteCode] = useState('');
   const [manualToken, setManualToken] = useState('');
-  const [selectedModel, setSelectedModel] = useState<string | null>(null);
-  const [availableModels, setAvailableModels] = useState<SelectableModel[]>(provider.defaultModels);
+  const [, setSelectedModel] = useState<string | null>(null);
+  const [, setAvailableModels] = useState<SelectableModel[]>(provider.defaultModels);
   const [loadingModels, setLoadingModels] = useState(false);
+  const [credentialWarning, setCredentialWarning] = useState<string | null>(null);
   const [statusOutput, setStatusOutput] = useState<string | null>(null);
   const [completingStartedAt, setCompletingStartedAt] = useState<number | null>(null);
   const [cancelling, setCancelling] = useState(false);
@@ -108,11 +108,6 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
   }, [step]);
 
   const normalizeModelForSelector = React.useCallback((modelId: string | null | undefined) => {
-    const normalized = canonicalizePortalModelId(modelId || '');
-    return normalized || null;
-  }, []);
-
-  const mapSelectorModelToRuntime = React.useCallback((modelId: string | null | undefined) => {
     const normalized = canonicalizePortalModelId(modelId || '');
     return normalized || null;
   }, []);
@@ -176,7 +171,8 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
         'Timed out while Portal verified the Claude credential. Keep this dialog open and retry verification.',
       );
       if (data.success) {
-        setStep('model');
+        setCredentialWarning(typeof data?.warning === 'string' ? data.warning : null);
+        setStep('done');
         setCompletingStartedAt(null);
       } else if (data.retryable) {
         // The CLI rejected the pasted code but the session is still alive.
@@ -310,93 +306,6 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
     });
   }, [finalizeClaudeSetup, sessionId, step]);
 
-  const startAutomated = async () => {
-    if (activeSession || reviewState || !claimOperation('start')) return;
-    finalizationAttemptedSessionRef.current = null;
-    setLoading(true);
-    setError(null);
-    setCancellationError(null);
-    setPopupBlocked(false);
-    setRecoverySession(false);
-    setLifecycleConflict(false);
-    setStep('starting');
-    try {
-      const { data } = await client.post(`${apiBase}/claude/start`);
-      if (!data.success) {
-        const startFailure = readStructuredOAuthStartFailure(data);
-        const disposition = getOAuthStartRecoveryDisposition(startFailure);
-        if (disposition === 'cleanup_required' && startFailure.sessionId) {
-          setSessionId(startFailure.sessionId);
-          setRecoverySession(true);
-        } else if (disposition === 'committed' || disposition === 'review_required') {
-          setSessionId(null);
-          setRecoverySession(false);
-          setReviewState(disposition);
-        }
-        setError(startFailure.error || 'Failed to start automated Claude setup');
-        setStep('error');
-        return;
-      }
-      if (data.instantComplete) {
-        setStatusOutput(data.method === 'cli-reuse' ? 'Claude CLI auth detected on the server. Reused it for OpenClaw automatically.' : null);
-        setCompletingStartedAt(null);
-        setStep('model');
-        return;
-      }
-      const nextSessionId = typeof data?.sessionId === 'string' ? data.sessionId.trim() : '';
-      if (!nextSessionId) {
-        setReviewState('review_required');
-        setError('Portal received an incomplete Claude start response and cannot prove whether authentication began. Review Claude before starting another setup.');
-        setStep('error');
-        return;
-      }
-      setSessionId(nextSessionId);
-      setAuthUrl(data.authUrl || null);
-      setStatusOutput(null);
-      setCompletingStartedAt(null);
-      if (data.authUrl) {
-        try {
-          const win = window.open(data.authUrl, '_blank', 'noopener,noreferrer');
-          if (!win) setPopupBlocked(true);
-        } catch {
-          setPopupBlocked(true);
-        }
-      }
-      setStep('waiting');
-    } catch (err: any) {
-      const startFailure = readStructuredOAuthStartFailure(err?.response?.data);
-      const msg = startFailure.error || err?.message || 'Failed to start Claude setup';
-      if (isStuckLifecycleRejection(err)) {
-        // A previous failed attempt still owns the credential domain. Offer
-        // the explicit reset instead of a dead-end failure.
-        setLifecycleConflict(true);
-        setError(msg);
-        setStep('error');
-        return;
-      }
-      const disposition = getOAuthStartRecoveryDisposition(startFailure);
-      if (disposition === 'cleanup_required' && startFailure.sessionId) {
-        setSessionId(startFailure.sessionId);
-        setRecoverySession(true);
-      } else if (disposition === 'committed' || disposition === 'review_required') {
-        setSessionId(null);
-        setRecoverySession(false);
-        setReviewState(disposition);
-      }
-      if (msg.includes('Is Claude Code installed') || msg.includes('not found') || msg.includes('ENOENT')) {
-        // Claude Code not on server — show manual fallback
-        setError('Claude Code is not installed on the server. You can paste a setup-token manually instead.');
-        setStep('error');
-      } else {
-        setError(msg);
-        setStep('error');
-      }
-    } finally {
-      setLoading(false);
-      releaseOperation('start');
-    }
-  };
-
   const submitCode = async () => {
     if (!sessionId || !pasteCode.trim() || !claimOperation('submit-code')) return;
     setLoading(true);
@@ -425,13 +334,13 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
       const operation = loadOrCreateCredentialOperation(actorScope, 'setup-token', provider.id);
       manualTokenOperationRef.current = operation;
       verifyCredentialOperation(operation);
-      await client.post(`${apiBase}/save-setup-token`, {
+      const { data } = await client.post(`${apiBase}/save-setup-token`, {
         provider: provider.id,
         token: manualToken,
-        setDefault: Boolean(selectedModel),
-        model: selectedModel,
+        setDefault: false,
         operationId: operation.operationId,
       });
+      setCredentialWarning(typeof data?.warning === 'string' ? data.warning : null);
       retireCredentialOperation(operation);
       manualTokenOperationRef.current = null;
       setStep('done');
@@ -482,19 +391,11 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
 
   const finish = async () => {
     if (!claimOperation('model')) return;
-    setLoading(true);
     setError(null);
     try {
-      const runtimeModel = mapSelectorModelToRuntime(selectedModel);
-      if (runtimeModel) {
-        await client.post(`${apiBase}/set-default-model`, { model: runtimeModel, provider: provider.id });
-      }
       setStep('done');
       onComplete();
-    } catch (err: any) {
-      setError(err?.response?.data?.error || err?.message || 'Signed in, but failed to set default model');
     } finally {
-      setLoading(false);
       releaseOperation('model');
     }
   };
@@ -551,14 +452,13 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
     onCancel();
   };
 
-  const primaryButtonLabel = status?.status === 'configured' ? 'Reconnect Claude' : 'Connect Claude';
   const stepAnnouncement: Record<Step, string> = {
     prereqs: 'Claude setup is ready to begin.',
     starting: 'Starting Claude sign-in.',
     waiting: 'Claude sign-in is waiting for browser authorization.',
     'paste-code': 'Paste the Claude authorization code.',
     completing: 'Claude sign-in was detected. Finishing setup.',
-    model: 'Claude is connected. Choose an optional default model.',
+    model: 'Claude credential saved. Host routing activation is unavailable in this release until a separately supported maintenance operation ships.',
     'manual-paste': 'Paste a Claude setup token manually.',
     done: 'Claude setup is complete.',
     error: 'Claude setup needs attention.',
@@ -644,33 +544,33 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
               {dangerNote}
 
               <p className="text-sm leading-relaxed text-theme-text-subtle">
-                OpenClaw first checks for an authenticated <strong className="text-theme-text">Claude CLI login on this server</strong> and reuses it automatically. If none is available, the portal opens the setup-token fallback.
+                This flow accepts an existing Claude setup-token. Portal does not launch, probe, or reuse Claude Code on the host in this release.
               </p>
 
               <div className="rounded-xl border border-theme-border bg-theme-surface-raised p-4">
-                <div className="text-sm font-medium text-theme-text">How the connection works</div>
+                <div className="text-sm font-medium text-theme-text">Credential boundary</div>
                 <ul className="mt-3 space-y-2.5 text-sm text-theme-text-subtle">
                   <li className="flex items-start gap-2">
                     <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
                     <span>
-                      Sign in to Claude Code on this server. The portal can reuse that authenticated session without requiring a separate API key.
+                      Generate or receive the setup-token in a separately managed environment, then paste the existing token here.
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
                     <span>
-                      Click Connect Claude. The portal will import reusable CLI credentials before attempting any setup-token flow.
+                      Portal saves only the supplied credential and never starts a Claude host process from this dialog.
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
-                    <span>Fable 5 is supported through the Claude CLI path and appears in the model picker alongside the other supported Claude models.</span>
+                    <span>Claude Project Sandbox authorization remains available through its separate process-free PKCE flow.</span>
                   </li>
                 </ul>
               </div>
 
               <div className="rounded-lg border border-theme-border bg-theme-surface-raised px-4 py-3 text-sm text-theme-text-subtle">
-                Setup-token remains available as a fallback if the server does not already have a reusable Claude CLI login.
+                You can also return and choose the Anthropic API-key option instead.
               </div>
 
               {error ? (
@@ -680,21 +580,11 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
               <button
                 ref={initialFocusRef}
                 type="button"
-                onClick={startAutomated}
-                disabled={loading}
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-theme-text px-5 py-3 text-sm font-semibold text-theme-surface shadow transition hover:opacity-90 disabled:opacity-50"
-              >
-                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                {primaryButtonLabel}
-              </button>
-
-              <button
-                type="button"
                 onClick={() => { void cancelAndMove('manual-paste'); }}
                 disabled={Boolean(operation)}
                 className="w-full rounded-xl border border-theme-border-strong bg-theme-surface-raised px-5 py-3 text-sm font-medium text-theme-text transition hover:bg-theme-surface-hover"
               >
-                Paste a setup-token manually
+                Paste an existing setup-token
               </button>
 
             </div>
@@ -831,25 +721,18 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
             <div className="space-y-4">
               <div className="flex items-center gap-2 text-emerald-400">
                 <CheckCircle2 className="h-5 w-5" />
-                <span className="text-sm font-semibold">Claude connected successfully!</span>
+                <span className="text-sm font-semibold">Claude credential saved</span>
               </div>
 
               {dangerNote}
 
               <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
-                Claude models discovered for this connection have been registered. When live discovery is unavailable, the portal shows tested compatibility defaults instead.
+                Portal did not register models, change the default route, restart the gateway, or probe a host model turn.
               </div>
 
               <p className="text-sm text-theme-text-subtle">
-                Optionally, choose a default model. You can change this anytime in Settings.
+                Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.
               </p>
-              {loadingModels ? (
-                <div className="flex items-center gap-2 rounded-lg border border-theme-border bg-theme-surface-raised px-4 py-3 text-sm text-theme-text-subtle">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Loading available models…
-                </div>
-              ) : null}
-              <ModelSelector models={availableModels.length ? availableModels : provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
 
               {error ? (
                 <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</div>
@@ -862,7 +745,7 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-theme-text px-5 py-3 text-sm font-semibold text-theme-surface shadow transition hover:opacity-90 disabled:opacity-50"
               >
                 {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                {selectedModel ? 'Save and Finish' : 'Finish without setting a default'}
+                Finish
               </button>
             </div>
           ) : null}
@@ -873,17 +756,14 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
               {dangerNote}
 
               <p className="text-sm text-theme-text-subtle">
-                If you already have a Claude <code className="rounded bg-theme-surface-strong px-1.5 py-0.5 text-xs text-theme-text">setup-token</code>, paste it below. This is the fallback path when automatic Claude CLI credential reuse is unavailable.
+                If you already have a Claude <code className="rounded bg-theme-surface-strong px-1.5 py-0.5 text-xs text-theme-text">setup-token</code>, paste it below. Portal will not run Claude Code to create or inspect one.
               </p>
 
               <div className="rounded-xl border border-theme-border bg-theme-surface-raised px-4 py-4">
-                <div className="text-sm font-semibold text-theme-text">How to generate a setup-token:</div>
-                <ol className="mt-2 list-inside space-y-1.5 text-sm text-theme-text-subtle">
-                  <li>Open a terminal (the portal's Terminal page works too)</li>
-                  <li>Run: <code className="rounded bg-theme-surface-strong px-1.5 py-0.5 text-emerald-300">claude setup-token</code></li>
-                  <li>Complete the browser sign-in</li>
-                  <li>Copy the token that's printed</li>
-                </ol>
+                <div className="text-sm font-semibold text-theme-text">Existing token only</div>
+                <p className="mt-2 text-sm text-theme-text-subtle">
+                  Obtain the token outside this Portal host under your organization&apos;s credential procedure. This screen only validates and saves what you paste.
+                </p>
               </div>
 
               <textarea
@@ -904,17 +784,8 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
               ) : null}
 
               <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
-                Claude models discovered for this connection will be registered after the credential is saved; tested compatibility defaults are used when discovery is unavailable.
+                Portal will save only the supplied credential. It will not register models, change the default route, restart the gateway, or probe a host model turn.
               </div>
-
-              <div className="text-sm font-medium text-theme-text">Optionally choose a default Claude model:</div>
-              {loadingModels ? (
-                <div className="flex items-center gap-2 rounded-lg border border-theme-border bg-theme-surface-raised px-4 py-3 text-sm text-theme-text-subtle">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Loading available models…
-                </div>
-              ) : null}
-              <ModelSelector models={availableModels.length ? availableModels : provider.defaultModels} selectedModel={selectedModel} onSelect={setSelectedModel} />
 
               <button
                 type="button"
@@ -923,7 +794,7 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-theme-text px-5 py-3.5 text-sm font-semibold text-theme-surface shadow transition hover:opacity-90 disabled:opacity-50"
               >
                 {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                {selectedModel ? 'Save Token' : 'Save Token without default'}
+                Save Token
               </button>
 
               <button type="button" onClick={() => { void cancelAndMove('prereqs'); }} disabled={Boolean(operation)} className="w-full text-center text-sm text-theme-text-muted transition hover:text-theme-text disabled:cursor-wait disabled:opacity-50">
@@ -985,9 +856,10 @@ export default function SetupTokenFlow({ provider, status, apiBase, onComplete, 
           {step === 'done' ? (
             <div className="space-y-4 py-4 text-center">
               <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-400" />
-              <h3 className="text-lg font-semibold text-theme-text">Claude connected</h3>
+              <h3 className="text-lg font-semibold text-theme-text">Claude credential saved</h3>
               {dangerNote}
-              <p className="text-sm text-theme-text-subtle">You're ready to use Claude in the portal. Choose any supported model available to the connected account, including Fable 5.</p>
+              <p className="text-sm text-theme-text-subtle">Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.</p>
+              {credentialWarning ? <p className="text-sm text-amber-200">{credentialWarning}</p> : null}
               <button type="button" onClick={() => { void cancelAndClose(); }} className="rounded-xl border border-theme-border-strong bg-theme-surface-raised px-5 py-2.5 text-sm font-medium text-theme-text transition hover:bg-theme-surface-hover">
                 Close
               </button>

@@ -13,6 +13,10 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'anthropic/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'anthropic/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+  'anthropic/fable-5.1': 'anthropic/claude-fable-5-1',
+  'anthropic/fable-5-1': 'anthropic/claude-fable-5-1',
+  'anthropic/claude-fable-5.1': 'anthropic/claude-fable-5-1',
+  'anthropic/claude-fable-5-1': 'anthropic/claude-fable-5-1',
   'anthropic/fable-5': 'anthropic/claude-fable-5',
   'anthropic/claude-fable-5': 'anthropic/claude-fable-5',
   'claude-cli/sonnet-4.6': 'anthropic/claude-sonnet-4-6',
@@ -29,6 +33,10 @@ const CLAUDE_MODEL_MAP: Record<string, string> = {
   'claude-cli/haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4.5': 'anthropic/claude-haiku-4-5',
   'claude-cli/claude-haiku-4-5': 'anthropic/claude-haiku-4-5',
+  'claude-cli/fable-5.1': 'anthropic/claude-fable-5-1',
+  'claude-cli/fable-5-1': 'anthropic/claude-fable-5-1',
+  'claude-cli/claude-fable-5.1': 'anthropic/claude-fable-5-1',
+  'claude-cli/claude-fable-5-1': 'anthropic/claude-fable-5-1',
   'claude-cli/fable-5': 'anthropic/claude-fable-5',
   'claude-cli/claude-fable-5': 'anthropic/claude-fable-5',
 };
@@ -63,9 +71,16 @@ const GOOGLE_MODEL_MAP: Record<string, string> = {
   'google-antigravity/gemini-3.1-flash-lite-preview': 'google-antigravity/gemini-3.5-flash',
 };
 
-// OpenClaw 2026.7.1 makes openai/* the canonical Codex-runtime route;
-// codex/* and openai-codex/* are legacy refs that normalize forward.
+// OpenClaw 2026.7.1 persists OpenAI account models as openai/*.
+// codex/* and openai-codex/* are legacy model-provider aliases that normalize
+// forward; none of these prefixes identifies the harness executing a turn.
 const OPENAI_CODEX_MODEL_MAP: Record<string, string> = {
+  // Astra is an exact account-dependent model. Generic `gpt-6` must remain
+  // untouched rather than silently selecting a rollout-gated model.
+  'gpt-6-astra': 'openai/gpt-6-astra',
+  'openai/gpt-6-astra': 'openai/gpt-6-astra',
+  'codex/gpt-6-astra': 'openai/gpt-6-astra',
+  'openai-codex/gpt-6-astra': 'openai/gpt-6-astra',
   'gpt-5.6': 'openai/gpt-5.6-sol',
   'openai/gpt-5.6': 'openai/gpt-5.6-sol',
   'codex/gpt-5.6': 'openai/gpt-5.6-sol',
@@ -234,6 +249,7 @@ export function getShortModelLabel(rawModel: unknown, fallback = ''): string {
 export function getModelDisplayName(rawModel: unknown, fallback = 'Default model'): string {
   const modelId = normalizeModelId(rawModel);
   if (!modelId) return fallback;
+  if (modelId === 'openai/gpt-6-astra') return 'GPT-6 Astra';
   const parts = modelId.split('/');
   const slug = parts.length >= 2 ? parts.slice(1).join('/') : parts[0];
   return slug
@@ -273,27 +289,38 @@ export function getModelProviderLabel(rawModel: unknown): string {
     case 'google-antigravity': return 'Antigravity';
     case 'openrouter': return 'OpenRouter';
     case 'xai': return 'xAI';
+    case 'deepseek': return 'DeepSeek';
     case 'ollama': return 'Ollama';
     default: return provider ? titleCase(provider) : 'Model';
   }
 }
 
-export function getModelRuntimeLabel(rawModel: unknown): string | null {
-  const modelId = normalizeModelId(rawModel);
-  const provider = modelId.split('/')[0] || '';
-  switch (provider) {
-    case 'anthropic': return 'API/OAuth';
-    case 'claude-cli': return 'CLI';
-    case 'openai': return 'Codex';
-    case 'openai-codex': return 'CLI OAuth';
-    case 'codex': return 'CLI OAuth';
-    case 'google-gemini-cli': return 'CLI OAuth';
-    case 'google-antigravity': return 'CLI OAuth';
-    case 'ollama': return 'Local';
-    case 'openrouter': return 'Router';
-    case 'xai': return 'OAuth/API';
-    default: return null;
-  }
+/**
+ * @deprecated A model-provider prefix cannot attest the harness or transport
+ * that executed a turn. Read harness identity from server session/turn
+ * provenance and pass it to getAgentHarnessLabel instead.
+ */
+export function getModelRuntimeLabel(_rawModel: unknown): null {
+  return null;
+}
+
+const AGENT_HARNESS_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  OPENCLAW: 'OpenClaw',
+  CLAUDE_CODE: 'Claude Code',
+  CODEX: 'Codex',
+  GROK: 'Grok Build',
+  AGENT_ZERO: 'Agent Zero',
+  GEMINI: 'Google Antigravity',
+  OLLAMA: 'Ollama',
+  HERMES: 'Hermes',
+  DEEPSEEK_HARNESS: 'DeepSeek Harness',
+});
+
+/** Display an explicit, server-attested harness id without consulting model ids. */
+export function getAgentHarnessLabel(rawHarnessId: unknown): string | null {
+  if (typeof rawHarnessId !== 'string') return null;
+  const harnessId = rawHarnessId.trim().toUpperCase();
+  return AGENT_HARNESS_LABELS[harnessId] || null;
 }
 
 export function isKnownOpenClawCatalogModelId(rawModel: unknown): boolean {

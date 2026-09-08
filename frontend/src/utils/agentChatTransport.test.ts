@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 import { providerUsesPortalStreamBus } from './agentChatTransport';
 
 describe('agentChatTransport', () => {
-  test.each(['OPENCLAW', 'CLAUDE_CODE', 'CODEX', 'GROK', 'AGENT_ZERO', 'GEMINI', 'OLLAMA'])(
+  test.each(['OPENCLAW', 'CLAUDE_CODE', 'CODEX', 'GROK', 'AGENT_ZERO', 'GEMINI', 'OLLAMA', 'HERMES', 'OPENCODE'])(
     '%s hydrates live turns through the Portal stream bus',
     (provider) => {
       expect(providerUsesPortalStreamBus(provider)).toBe(true);

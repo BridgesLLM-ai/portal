@@ -148,9 +148,11 @@ PENDING_OUTCOMES = frozenset(
 UPDATE_STATUSES = frozenset({"running", "recovering", *PENDING_OUTCOMES})
 EVENT_STATUSES = UPDATE_STATUSES
 
-# These are protocol identifiers, not console prose.  Adding a new installer
-# checkpoint requires an explicit review here, so an untrusted caller cannot
-# make the owner UI invent arbitrary phases.
+# These are protocol identifiers, not console prose.  In particular,
+# ``postflight`` is the 4.0.19-compatible wire token for final exact-version
+# Portal verification; it does not imply unrelated host maintenance.  Adding a
+# new installer checkpoint requires an explicit review here, so an untrusted
+# caller cannot make the owner UI invent arbitrary phases.
 FORWARD_PHASES = frozenset(
     {
         "admitted",
@@ -1644,7 +1646,8 @@ class ProgressStore:
             or record["percent"] != 99
         ):
             raise ProgressStateError(
-                "Success requires the completed postflight checkpoint at 99 percent."
+                "Success requires the completed final Portal verification "
+                "checkpoint (postflight) at 99 percent."
             )
         now = _utc_now(record["updatedAt"])
         if result == "succeeded":
@@ -1657,7 +1660,7 @@ class ProgressStore:
                 "label": "Update complete",
                 "detail": (
                     f"Portal v{record['expectedVersion']} finished the signed update, "
-                    "exact-version health proof, and postflight work."
+                    "exact-version Portal verification, and final receipt."
                 ),
                 "updatedAt": now,
                 "finishedAt": now,
@@ -1751,15 +1754,22 @@ class ProgressStore:
                     pending_label = "Automatic recovery needs attention"
                     pending_detail = (
                         "The updater service exited cleanly without the exact final "
-                        "postflight checkpoint."
+                        "Portal verification checkpoint (postflight)."
                     )
                 elif wrapper_result != "succeeded":
                     pending_status = "updated_with_errors"
-                    pending_label = "Portal updated with follow-up errors"
-                    pending_detail = (
-                        "The target Portal is installed, but the updater service did "
-                        "not complete all follow-up work."
-                    )
+                    if record["phase"] == "postflight" and record["percent"] == 99:
+                        pending_label = "Portal verified; updater exit needs attention"
+                        pending_detail = (
+                            "Exact final Portal verification passed, but the updater "
+                            "service did not exit cleanly."
+                        )
+                    else:
+                        pending_label = "Portal updated; final verification incomplete"
+                        pending_detail = (
+                            "The target Portal is installed, but the updater service did "
+                            "not complete exact final Portal verification."
+                        )
             elif installed_version == record["previousVersion"]:
                 pending_status = None
                 wrapper_result = "failed"

@@ -5,13 +5,9 @@
 # Portal runtime intent, interaction mode, authentication boundary, and exact
 # resolved target. Consumer websites are not substitutes for Portal CLIs.
 #
-# Agent Zero is deliberately fail-closed. Its loopback login page cannot be
-# handed to the Remote Desktop user with static credentials, and Portal CLI
-# OAuth state must never be converted into browser cookies. A future backend
-# integration must mint a short-lived, single-use, current-user-bound browser
-# exchange at click time. Until that contract exists, an installed Agent Zero
-# runtime makes `verify` report a precise readiness blocker and no shortcut is
-# emitted.
+# Agent Zero uses a click-time, backend-minted browser session. Hermes and
+# OpenCode remain normal CLI runtimes: their desktop setup actions invoke each
+# CLI's own fixed authentication/model command, never a Portal credential copy.
 set -Eeuo pipefail
 
 readonly RD_USER="${BRIDGES_RD_USER:-bridgesrd}"
@@ -44,7 +40,7 @@ verify_manifest_temporary=''
 verify_manifest_temporary_identity=''
 
 usage() {
-  printf 'Usage: %s catalog | install --assets-dir DIR | verify | launch RUNTIME | terminal RUNTIME | remove [--purge-profiles]\n' "$0" >&2
+  printf 'Usage: %s catalog | install --assets-dir DIR | verify | launch RUNTIME | setup RUNTIME | terminal RUNTIME | terminal-setup RUNTIME | remove [--purge-profiles]\n' "$0" >&2
   exit 64
 }
 
@@ -283,10 +279,10 @@ cleanup_verify_manifest_temporary() {
 # desktop-file, icon-file, debug-port, auth-policy, icon-sha256, comment
 runtime_catalog() {
   cat <<'CATALOG'
-claude-code	Claude Code (Terminal Runtime)	portal-runtime	terminal-tui	claude	-	-	interactive	AI - Claude Code (Terminal Runtime).desktop	bridges-ai-claude-code.svg	-	separate-cli-sign-in	8c8c765d69721d27307a298635243e67189570d3180bf3fa3ff6c70ce05ad8cc	Launch the Portal-tested Claude Code CLI in a terminal; this desktop account signs in separately.
+claude-code	Claude Code (Terminal Runtime)	portal-runtime	terminal-tui	claude	-	DISABLE_AUTOUPDATER=1	interactive	AI - Claude Code (Terminal Runtime).desktop	bridges-ai-claude-code.svg	-	separate-cli-sign-in	8c8c765d69721d27307a298635243e67189570d3180bf3fa3ff6c70ce05ad8cc	Launch the Portal-tested Claude Code CLI in a terminal; this desktop account signs in separately.
 codex	OpenAI Codex (Terminal Runtime)	portal-runtime	terminal-tui	codex	-	-	interactive	AI - OpenAI Codex (Terminal Runtime).desktop	bridges-ai-codex.svg	-	separate-cli-sign-in	220dcafe29c54634a031837ade54f56c800b9d0ec4df8393af455da9d895b127	Launch the Portal-tested Codex CLI in a terminal; this desktop account signs in separately.
-grok-build	Grok Build (Terminal Runtime)	portal-runtime	terminal-tui	grok	--no-auto-update	GROK_DISABLE_AUTOUPDATER=1	interactive	AI - Grok Build (Terminal Runtime).desktop	bridges-ai-grok-build.svg	-	separate-cli-sign-in	0ee119300f955f87c36e31f65cba40320f1f467609ca92925c64f956f44efcc6	Launch the Portal-tested Grok Build CLI in a terminal; this desktop account signs in separately.
-antigravity	Google Antigravity (Terminal Runtime)	portal-runtime	terminal-tui	agy	-	AGY_CLI_DISABLE_AUTO_UPDATE=1	interactive	AI - Google Antigravity (Terminal Runtime).desktop	bridges-ai-antigravity.svg	-	separate-cli-sign-in	8ef70288b94d1edfd0bb2698af4d445fd6422bf1419d5aa2da51618d4309b004	Launch the Portal-tested Antigravity CLI in a terminal; this desktop account signs in separately.
+hermes	Hermes Agent (Terminal Runtime)	portal-runtime	terminal-tui	hermes	-	HERMES_DISABLE_LAZY_INSTALLS=1	interactive	AI - Hermes Agent (Terminal Runtime).desktop	bridges-ai-hermes.svg	-	separate-cli-sign-in	bad20ae4c482386fc8d433e715c5a7ac407e118d0737c5faabf0ba2e55b6b34e	Launch Hermes in the Remote Desktop profile. Its Setup action does not configure Portal; use Settings → Model Providers for the Portal harness profile.
+opencode	OpenCode (Terminal Runtime)	portal-runtime	terminal-tui	opencode	-	OPENCODE_DISABLE_AUTOUPDATE=1	interactive	AI - OpenCode (Terminal Runtime).desktop	bridges-ai-opencode.svg	-	separate-cli-sign-in	63de2ce3e717e722d539e7e6408b1642e941d4d701341b9a355ef748ffc9455c	Launch OpenCode in the Remote Desktop profile. Its Setup action does not configure Portal; use Settings → Model Providers for the Portal harness profile.
 agent-zero	Agent Zero (Web UI)	portal-runtime	local-web	backend-session-exchange-v2	-	-	backend-session-exchange	AI - Agent Zero (Web UI).desktop	bridges-ai-agent-zero.svg	18815	backend-session-exchange	0e0b4dcf2cb6fecf8083202e79144f6a0dccae9b3b17258fdd72c4391fd9724a	Open the Agent Zero web UI, signed in through a click-time backend session exchange; no credentials touch this desktop.
 ollama	Ollama (Local Runtime Terminal)	portal-runtime	terminal-tui	ollama	list	-	status-shell	AI - Ollama (Local Runtime Terminal).desktop	bridges-ai-ollama.svg	-	none	4d01b7f24701b566feebb9a866210a214fc7af681af31089e93ea8169c0e47d1	Inspect the installed local Ollama runtime and continue in a terminal shell.
 CATALOG
@@ -407,10 +403,12 @@ find_runtime_binary() {
 
 runtime_expected_version() {
   case "$1" in
-    claude-code) printf '%s\n' '2.1.220' ;;
-    codex) printf '%s\n' '0.145.0' ;;
-    grok-build) printf '%s\n' '0.2.112' ;;
-    antigravity) printf '%s\n' '1.1.7' ;;
+    claude-code) printf '%s\n' '2.1.260' ;;
+    codex) printf '%s\n' '0.153.2' ;;
+    grok-build) printf '%s\n' '1.0.5' ;;
+    antigravity) printf '%s\n' '1.1.17' ;;
+    hermes) printf '%s\n' '0.20.4' ;;
+    opencode) printf '%s\n' '1.18.19' ;;
     ollama) printf '%s\n' 'semver' ;;
     *) return 1 ;;
   esac
@@ -554,6 +552,22 @@ desktop_categories() {
   esac
 }
 
+runtime_setup_args() {
+  case "$1" in
+    hermes) printf '%s\n' 'model' ;;
+    opencode) printf '%s\n' 'auth login' ;;
+    *) return 1 ;;
+  esac
+}
+
+runtime_setup_label() {
+  case "$1" in
+    hermes) printf '%s\n' 'Configure Hermes (Remote Desktop profile only)' ;;
+    opencode) printf '%s\n' 'Sign in to OpenCode (Remote Desktop profile only)' ;;
+    *) return 1 ;;
+  esac
+}
+
 desktop_entry_content() {
   local runtime_id="$1" label="$2" intent="$3" mode="$4" desktop_file="$5" icon_file="$6" auth_policy="$7" comment="$8"
   printf '%s' "[Desktop Entry]
@@ -566,11 +580,23 @@ Icon=${PIXMAP_DIR}/${icon_file}
 Terminal=false
 Categories=$(desktop_categories "$mode")
 StartupNotify=true
-X-BridgesLLM-Runtime=${runtime_id}
+"
+  if runtime_setup_args "$runtime_id" >/dev/null; then
+    printf '%s' "Actions=Setup;
+"
+  fi
+  printf '%s' "X-BridgesLLM-Runtime=${runtime_id}
 X-BridgesLLM-Intent=${intent}
 X-BridgesLLM-Mode=${mode}
 X-BridgesLLM-Auth=${auth_policy}
 "
+  if runtime_setup_args "$runtime_id" >/dev/null; then
+    printf '%s' "
+[Desktop Action Setup]
+Name=$(runtime_setup_label "$runtime_id")
+Exec=${SELF_PATH} setup ${runtime_id}
+"
+  fi
 }
 
 manifest_line() {
@@ -661,8 +687,10 @@ current_manifest_is_attested() {
       codex) rank=2 ;;
       grok-build) rank=3 ;;
       antigravity) rank=4 ;;
-      agent-zero) rank=5 ;;
-      ollama) rank=6 ;;
+      hermes) rank=5 ;;
+      opencode) rank=6 ;;
+      agent-zero) rank=7 ;;
+      ollama) rank=8 ;;
       *) return 1 ;;
     esac
     (( rank > last_rank )) || return 1
@@ -1406,6 +1434,28 @@ launch_runtime() {
   esac
 }
 
+setup_runtime() {
+  local requested="${1:-}" row label terminal_bin
+  validate_managed_paths
+  catalog_row "$requested" >/dev/null || usage
+  runtime_setup_args "$requested" >/dev/null \
+    || { printf '%s has no Remote Desktop setup action\n' "$requested" >&2; exit 1; }
+  if [[ "$(id -u)" == '0' && "$(id -un)" != "$RD_USER" ]]; then
+    id "$RD_USER" >/dev/null 2>&1 || { printf 'Remote Desktop user is missing\n' >&2; exit 1; }
+    exec /usr/bin/setpriv --reuid="$RD_USER" --regid="$RD_USER" --init-groups -- /usr/bin/env -i \
+      HOME="$RD_HOME" USER="$RD_USER" LOGNAME="$RD_USER" SHELL=/bin/bash \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG="${LANG:-C.UTF-8}" \
+      "$SELF_PATH" setup "$requested"
+  fi
+  [[ "$(id -un)" == "$RD_USER" ]] || { printf 'AI runtime setup must run as %s\n' "$RD_USER" >&2; exit 1; }
+  row="$(validated_runtime_row "$requested")" || exit 1
+  label="$(awk -F '\t' '{ print $2 }' <<< "$row")"
+  load_desktop_environment
+  terminal_bin="$(find_runtime_binary xfce4-terminal || true)"
+  [[ -n "$terminal_bin" ]] || { printf 'XFCE terminal is unavailable\n' >&2; exit 1; }
+  exec "$terminal_bin" --disable-server "--title=Configure ${label}" --execute "$SELF_PATH" terminal-setup "$requested"
+}
+
 terminal_runtime() {
   local requested="${1:-}" row
   local runtime_id label intent mode resolved_target args_spec env_spec launch_policy desktop_file icon_file debug_port auth_policy icon_sha comment
@@ -1451,6 +1501,38 @@ terminal_runtime() {
       ;;
     *) printf 'Terminal launch policy is invalid\n' >&2; exit 1 ;;
   esac
+}
+
+terminal_setup_runtime() {
+  local requested="${1:-}" row setup_spec
+  local runtime_id label intent mode resolved_target args_spec env_spec launch_policy desktop_file icon_file debug_port auth_policy icon_sha comment
+  local -a setup_args=() clean_env=()
+  validate_managed_paths
+  [[ "$(id -un)" == "$RD_USER" ]] || { printf 'AI runtime terminal setup must run as %s\n' "$RD_USER" >&2; exit 1; }
+  setup_spec="$(runtime_setup_args "$requested")" \
+    || { printf '%s has no Remote Desktop setup action\n' "$requested" >&2; exit 1; }
+  read -r -a setup_args <<< "$setup_spec"
+  row="$(validated_runtime_row "$requested")" || exit 1
+  IFS=$'\t' read -r runtime_id label intent mode resolved_target args_spec env_spec launch_policy desktop_file icon_file debug_port auth_policy icon_sha comment <<< "$row"
+  [[ "$mode" == 'terminal-tui' ]] || { printf '%s is not a terminal runtime\n' "$requested" >&2; exit 1; }
+  umask 077
+  load_desktop_environment
+  clean_env=(
+    "HOME=$RD_HOME"
+    "USER=$RD_USER"
+    "LOGNAME=$RD_USER"
+    "SHELL=/bin/bash"
+    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    "LANG=${LANG:-C.UTF-8}"
+    "TERM=${TERM:-xterm-256color}"
+    "DISPLAY=$DISPLAY"
+    "XAUTHORITY=$XAUTHORITY"
+    "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+    "PULSE_SERVER=$PULSE_SERVER"
+  )
+  [[ "$env_spec" == '-' ]] || clean_env+=("$env_spec")
+  printf '\n%s setup\nThis configures only the Remote Desktop CLI profile. Configure the Portal harness in Settings → Model Providers.\n\n' "$label"
+  exec /usr/bin/env -i "${clean_env[@]}" "$resolved_target" "${setup_args[@]}"
 }
 
 verify_legacy_assets_absent() {
@@ -1583,7 +1665,9 @@ case "${1:-}" in
   install) install_launchers "$@" ;;
   verify) [[ $# -eq 1 ]] || usage; verify_launchers ;;
   launch) [[ $# -eq 2 ]] || usage; launch_runtime "$2" ;;
+  setup) [[ $# -eq 2 ]] || usage; setup_runtime "$2" ;;
   terminal) [[ $# -eq 2 ]] || usage; terminal_runtime "$2" ;;
+  terminal-setup) [[ $# -eq 2 ]] || usage; terminal_setup_runtime "$2" ;;
   remove) remove_launchers "$@" ;;
   *) usage ;;
 esac

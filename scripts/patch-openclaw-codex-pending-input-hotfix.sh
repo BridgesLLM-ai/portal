@@ -24,6 +24,15 @@ case "${strict_mode}" in
     ;;
 esac
 
+case "${expected_package_name}@${expected_package_version}" in
+  openclaw@2026.7.1-2|@openclaw/codex@2026.7.1-1) ;;
+  *)
+    printf 'unsupported OpenClaw pending-input hotfix package: %s@%s; this binary hotfix is fenced to the 2026.7.1 tested pair\n' \
+      "${expected_package_name}" "${expected_package_version}" >&2
+    exit 2
+    ;;
+esac
+
 [[ -d "${dist_root}" ]] || {
   printf 'OpenClaw dist directory not found: %s\n' "${dist_root}" >&2
   exit 1

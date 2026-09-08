@@ -42,8 +42,14 @@ import {
   AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL,
   AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL,
   AGENT_ZERO_PROJECT_SANDBOX_IMAGE_ENV,
+  AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
+  AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
+  AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS,
+  AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS,
   AGENT_ZERO_PROJECT_SOURCE_COMMITS,
   AGENT_ZERO_PROJECT_UPSTREAM_IMAGE_DIGESTS,
+  getAgentZeroProjectLegacyV25SourceCommit,
+  getAgentZeroProjectLegacyV25UpstreamImageRef,
   getAgentZeroProjectSandboxImageId,
   getAgentZeroProjectSourceCommit,
   getAgentZeroProjectUpstreamImageRef,
@@ -53,8 +59,10 @@ import {
   AGENT_ZERO_PROJECT_MODEL_BRIDGE_POLICY_VERSION,
   AGENT_ZERO_PROJECT_MODEL_BRIDGE_PORT,
   agentZeroProjectModelBridgeApiKeyEnvironmentName,
+  agentZeroProjectModelBridgeCredentialPath,
   buildAgentZeroProjectModelBridgeBaseUrl,
   issueAgentZeroProjectModelBridgeCredential,
+  readAgentZeroProjectModelBridgeCredentialRecord,
   type AgentZeroProjectModelSelection,
 } from '../agents/providers/agentZero/AgentZeroProjectModelBridgeCredential';
 import {
@@ -86,12 +94,17 @@ const MODEL_SELECTION: AgentZeroProjectModelSelection = {
   providerId: 'codex_oauth',
   model: 'gpt-5.2-codex',
 };
+const TEST_OWNER_UID = typeof process.getuid === 'function' ? process.getuid() : 0;
 
 let root: string;
 let projectRoot: string;
 let stateRoot: string;
 
 beforeEach(() => {
+  // Model-bridge credentials are part of the protected runtime identity. Keep
+  // their expiry check on the same deterministic clock as the qualification
+  // evidence so this fixture cannot silently age out as wall time advances.
+  jest.spyOn(Date, 'now').mockReturnValue(NOW);
   process.env[AGENT_ZERO_PROJECT_SANDBOX_IMAGE_ENV] = PROJECT_IMAGE_ID;
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-zero-project-sandbox-'));
   projectRoot = path.join(root, 'projects', 'owner', 'project-a');
@@ -176,6 +189,7 @@ function fixture() {
     now: () => NOW,
     tokenFactory: () => 'T'.repeat(43),
     generationFactory: () => '22222222-2222-4222-8222-222222222222',
+    expectedOwnerUid: TEST_OWNER_UID,
   });
   fs.writeFileSync(
     descriptor.modelBridgeEnvFile,
@@ -521,6 +535,9 @@ function fixture() {
       container.AppArmorProfile = appArmorOption?.slice('apparmor='.length) || '';
       container.HostConfig.NetworkMode = args[networkIndex + 1];
       container.Id = 'a'.repeat(64);
+      container.Image = imageRef;
+      container.Config.Image = imageRef;
+      Object.assign(container.Config.Labels, derivedImageLabels);
       container.State.Running = false;
       container.State.StartedAt = '0001-01-01T00:00:00Z';
       container.Config.Labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]
@@ -648,7 +665,7 @@ function qualification(input: ReturnType<typeof fixture>): AgentZeroProjectQuali
     dataVolumeMountpoint: input.volume.Mountpoint,
     protocol: 'a0-connector.v1',
     connectorVersion: '0.1.0',
-    agentZeroVersion: '2.5',
+    agentZeroVersion: '2.10',
     modelBridgePolicyVersion: AGENT_ZERO_PROJECT_MODEL_BRIDGE_POLICY_VERSION,
     modelBridgePort: AGENT_ZERO_PROJECT_MODEL_BRIDGE_PORT,
     modelBridgeGatewayIpv4: BRIDGE_GATEWAY_IPV4,
@@ -802,6 +819,50 @@ function installExactLegacyPreConfinementRuntime(input: ReturnType<typeof fixtur
   input.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
 }
 
+function installExactLegacyV25Image(input: ReturnType<typeof fixture>): {
+  imageRef: string;
+  image: Record<string, any>;
+  runCommand: AgentZeroProjectCommandRunner;
+} {
+  const legacyImageRef = `sha256:${'7'.repeat(64)}`;
+  const legacyLabels = {
+    [AGENT_ZERO_PROJECT_IMAGE_RECIPE_LABEL]: '8'.repeat(64),
+    [AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL]: AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS.amd64,
+    [AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL]: AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS.amd64,
+    [AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER_LABEL]: AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER,
+  };
+  const legacyImage = {
+    Id: legacyImageRef,
+    Os: 'linux',
+    Architecture: 'amd64',
+    Config: { Labels: { ...legacyLabels } },
+  };
+  input.container.Image = legacyImageRef;
+  input.container.Config.Image = legacyImageRef;
+  Object.assign(input.container.Config.Labels, legacyLabels);
+  input.container.Config.Labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]
+    = buildAgentZeroProjectRuntimeFingerprint({
+      context: input.executionContext,
+      descriptor: input.descriptor,
+      imageRef: legacyImageRef,
+      spec: input.spec,
+      bridgeGatewayIpv4: BRIDGE_GATEWAY_IPV4,
+      runtimeIpv4: RUNTIME_IPV4,
+      modelBridgeCredential: input.modelBridgeCredential,
+    });
+  const runCommand: AgentZeroProjectCommandRunner = (command, args) => {
+    if (command === 'docker'
+      && args[0] === 'image'
+      && args[1] === 'inspect'
+      && args[2] === legacyImageRef) {
+      input.calls.push({ command, args: [...args] });
+      return JSON.stringify([legacyImage]);
+    }
+    return input.runCommand(command, args);
+  };
+  return { imageRef: legacyImageRef, image: legacyImage, runCommand };
+}
+
 function installExactSharedV1CurrentNameModeRuntime(
   input: ReturnType<typeof fixture>,
   options: {
@@ -840,7 +901,7 @@ function qualificationClient(overrides: {
     getCapabilities: jest.fn(async () => ({
       protocol: 'a0-connector.v1',
       connectorVersion: '0.1.0',
-      agentZeroVersion: '2.5',
+      agentZeroVersion: '2.10',
       auth: ['session'],
       authRequired: true,
       transports: ['http', 'websocket'],
@@ -911,21 +972,61 @@ function authenticatedSession() {
 }
 
 describe('Agent Zero Project Sandbox controlled-egress v2', () => {
-  test('pins both upstream architectures to the same audited v2.5 source commit', () => {
+  test('rejects a model-bridge credential record whose uid drifts from root ownership', () => {
+    const projectKey = 'f'.repeat(64);
+    const credentialRoot = path.join(root, 'credential-owner-attestation');
+    issueAgentZeroProjectModelBridgeCredential({
+      projectKey,
+      actorUserId: 'owner-user-id',
+      projectIdentityId: 'immutable-project-uuid',
+    }, MODEL_SELECTION, {
+      credentialRoot,
+      now: () => NOW,
+      tokenFactory: () => 'R'.repeat(43),
+      generationFactory: () => '44444444-4444-4444-8444-444444444444',
+    });
+    fs.chownSync(
+      agentZeroProjectModelBridgeCredentialPath(projectKey, credentialRoot),
+      1001,
+      0,
+    );
+
+    expect(() => readAgentZeroProjectModelBridgeCredentialRecord(projectKey, {
+      credentialRoot,
+    })).toThrow(/not protected/i);
+  });
+
+  test('pins both upstream architectures to the same audited v2.10 source commit', () => {
     expect(AGENT_ZERO_PROJECT_UPSTREAM_IMAGE_DIGESTS).toEqual({
+      amd64: 'sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0',
+      arm64: 'sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8',
+    });
+    expect(AGENT_ZERO_PROJECT_SOURCE_COMMITS).toEqual({
+      amd64: 'b22a144bf59f15b1516084c9e7b88133ba92c8a9',
+      arm64: 'b22a144bf59f15b1516084c9e7b88133ba92c8a9',
+    });
+    expect(AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION).toBe('agent-zero-v2.10');
+    expect(AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION).toBe('agent-zero-v2.5');
+    expect(AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS).toEqual({
       amd64: 'sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb',
       arm64: 'sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c',
     });
-    expect(AGENT_ZERO_PROJECT_SOURCE_COMMITS).toEqual({
+    expect(AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS).toEqual({
       amd64: 'd1d48bc9c0e6e253e87c354ce757c518820c6e25',
       arm64: 'd1d48bc9c0e6e253e87c354ce757c518820c6e25',
     });
-    expect(getAgentZeroProjectUpstreamImageRef('amd64')).toContain('@sha256:9b48534');
+    expect(getAgentZeroProjectUpstreamImageRef('amd64')).toContain('@sha256:892c60c');
     expect(getAgentZeroProjectSourceCommit('aarch64')).toBe(AGENT_ZERO_PROJECT_SOURCE_COMMITS.arm64);
+    expect(getAgentZeroProjectLegacyV25UpstreamImageRef('arm64')).toContain('@sha256:da107b6');
+    expect(getAgentZeroProjectLegacyV25SourceCommit('x86_64'))
+      .toBe(AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS.amd64);
     expect(getAgentZeroProjectUpstreamImageRef('riscv64')).toBeNull();
     expect(normalizeAgentZeroProjectSandboxImageId(PROJECT_IMAGE_ID)).toBe(PROJECT_IMAGE_ID);
     expect(normalizeAgentZeroProjectSandboxImageId(
       AGENT_ZERO_PROJECT_UPSTREAM_IMAGE_DIGESTS.amd64,
+    )).toBeNull();
+    expect(normalizeAgentZeroProjectSandboxImageId(
+      AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS.amd64,
     )).toBeNull();
     expect(getAgentZeroProjectSandboxImageId(undefined, {
       [AGENT_ZERO_PROJECT_SANDBOX_IMAGE_ENV]: PROJECT_IMAGE_ID,
@@ -1591,6 +1692,90 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
     ))).toBe(false);
     expect(value.calls.some(({ args }) => (
       args[0] === 'volume' && args[1] === 'create'
+    ))).toBe(false);
+  });
+
+  test('recognizes exact Agent Zero v2.5 only as a predecessor and migrates it to required v2.10', async () => {
+    const value = fixture();
+    const predecessor = installExactLegacyV25Image(value);
+    const originalVolume = JSON.parse(JSON.stringify(value.volume));
+
+    const before = probeAgentZeroProjectSandboxRuntime(value.executionContext, {
+      stateRoot,
+      architecture: 'amd64',
+      egress: value.egress,
+      runCommand: predecessor.runCommand,
+      now: () => NOW,
+      assertConfinementReady: () => undefined,
+    });
+    expect(before.selectable).toBe(false);
+    expect(before.structuralIsolation).toBe(false);
+
+    await expect(convergeAgentZeroProjectSandboxRuntime(value.executionContext, {
+      stateRoot,
+      architecture: 'amd64',
+      egress: value.egress,
+      runCommand: predecessor.runCommand,
+      resolveInternalNetworkBinding: recognizedInternalNetworkBinding(value),
+      ensureEgressPlane: jest.fn(async () => exactEgressHandle(value)),
+      constrainRuntime: jest.fn(async () => undefined),
+      egressExecutor: { run: jest.fn() },
+    })).resolves.toMatchObject({
+      ready: true,
+      // A migrated runtime still requires a fresh v2.10 live qualification.
+      selectable: false,
+      imageRef: value.imageRef,
+      containerId: 'a'.repeat(64),
+    });
+
+    expect(value.calls).toContainEqual({
+      command: 'docker',
+      args: ['image', 'inspect', predecessor.imageRef],
+    });
+    expect(value.calls).toContainEqual({
+      command: 'docker',
+      args: ['container', 'stop', '--time', '10', value.containerId],
+    });
+    expect(value.calls).toContainEqual({
+      command: 'docker',
+      args: ['container', 'rm', value.containerId],
+    });
+    expect(value.container.Image).toBe(value.imageRef);
+    expect(value.container.Config.Image).toBe(value.imageRef);
+    expect(value.container.Config.Labels[AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL])
+      .toBe(AGENT_ZERO_PROJECT_SOURCE_COMMITS.amd64);
+    expect(value.volume).toEqual(originalVolume);
+    expect(value.calls.some(({ args }) => args[0] === 'volume' && args[1] === 'rm')).toBe(false);
+    expect(value.calls.some(({ args }) => args[0] === 'image' && args[1] === 'rm')).toBe(false);
+  });
+
+  test.each([
+    ['container labels', (value: ReturnType<typeof fixture>) => {
+      value.container.Config.Labels[AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL] = '6'.repeat(40);
+    }],
+    ['immutable image labels', (_value: ReturnType<typeof fixture>, predecessor: ReturnType<typeof installExactLegacyV25Image>) => {
+      predecessor.image.Config.Labels[AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL]
+        = `sha256:${'6'.repeat(64)}`;
+    }],
+  ] as const)('rejects a v2.5-looking predecessor with drifted %s without mutation', async (_label, drift) => {
+    const value = fixture();
+    const predecessor = installExactLegacyV25Image(value);
+    drift(value, predecessor);
+    const ensureEgressPlane = jest.fn(async () => exactEgressHandle(value));
+
+    await expect(convergeAgentZeroProjectSandboxRuntime(value.executionContext, {
+      stateRoot,
+      architecture: 'amd64',
+      egress: value.egress,
+      runCommand: predecessor.runCommand,
+      resolveInternalNetworkBinding: recognizedInternalNetworkBinding(value),
+      ensureEgressPlane,
+      constrainRuntime: jest.fn(async () => undefined),
+      egressExecutor: { run: jest.fn() },
+    })).rejects.toThrow(/recognized legacy|predecessor image identity/i);
+    expect(ensureEgressPlane).not.toHaveBeenCalled();
+    expect(value.calls.some(({ args }) => (
+      args[0] === 'container' && (args[1] === 'stop' || args[1] === 'rm')
     ))).toBe(false);
   });
 

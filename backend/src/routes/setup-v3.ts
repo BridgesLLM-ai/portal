@@ -28,10 +28,10 @@ import {
   configureDomainAndHttps,
   getCodingToolsStatus,
   getPublicIp,
-  installCodingTool,
   removePortalSetupIpAccess,
   updateEnvFile,
 } from '../utils/serverSetup';
+import { sendHostNativeRuntimeMutationUnavailable } from './agent-tools';
 import { getOllamaRecommendationsByRam, isValidOllamaModelName, readAvailableMemoryBytes } from '../utils/ollamaRecommendations';
 import { isReservedSystemMailboxUsername } from '../utils/reservedMailboxUsernames';
 import crypto from 'crypto';
@@ -1649,7 +1649,8 @@ router.post('/install-rd', requireSetupPending, requireSetupToken, async (_req: 
   try {
     const { runRemoteDesktopAutoSetup } = await import('./remote-desktop');
     const result = await runRemoteDesktopAutoSetup();
-    res.status(result.ok ? 200 : 500).json(result);
+    const busy = result.steps.some((step) => step.step === 'Remote Desktop operation busy');
+    res.status(result.ok ? 200 : busy ? 409 : result.maintenanceRequired ? 503 : 500).json(result);
   } catch (err: any) {
     res.status(500).json({ ok: false, steps: [], message: err?.message || 'Remote Desktop setup failed' });
   }
@@ -1663,16 +1664,12 @@ router.get('/coding-tools-status', requireSetupPending, requireSetupToken, async
   }
 });
 
-router.post('/install-coding-tool', requireSetupPending, requireSetupToken, async (req: Request, res: Response) => {
-  try {
-    const toolId = z.object({ toolId: z.string().min(1) }).parse(req.body).toolId;
-    installCodingTool(toolId);
-    res.json({ success: true, toolId });
-  } catch (err: any) {
-    const status = err instanceof AppError ? err.statusCode : 500;
-    res.status(status).json({ error: err?.message ? `Failed to install: ${String(err.message).substring(0, 200)}` : 'Failed to install coding tool' });
-  }
-});
+router.post(
+  '/install-coding-tool',
+  requireSetupPending,
+  requireSetupToken,
+  sendHostNativeRuntimeMutationUnavailable,
+);
 
 /**
  * POST /api/setup/complete

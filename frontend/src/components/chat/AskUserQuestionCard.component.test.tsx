@@ -37,6 +37,22 @@ function makeRequest(overrides: Partial<AskUserQuestionRequest> = {}): AskUserQu
 }
 
 describe('AskUserQuestionCard', () => {
+  it('renders an existing host question read-only without answering or dismissing it', async () => {
+    render(
+      <AskUserQuestionCard
+        request={makeRequest()}
+        onSettled={vi.fn()}
+        responseDisabled
+        disabledReason="Portal host supervision is unavailable."
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Send answer' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Skip' })).toBeDisabled();
+    expect(screen.getByRole('alert')).toHaveTextContent('Portal host supervision is unavailable.');
+    expect(mocks.answerQuestion).not.toHaveBeenCalled();
+    expect(mocks.dismissQuestion).not.toHaveBeenCalled();
+  });
   beforeEach(() => {
     mocks.answerQuestion.mockReset().mockImplementation(async (id: string) => ({
       ok: true,
@@ -61,8 +77,9 @@ describe('AskUserQuestionCard', () => {
     expect(onSettled).toHaveBeenCalledWith('askq_1');
   });
 
-  it('fails closed instead of inventing a protocol for native multi-select', async () => {
+  it('sends native multi-select as an ordered answer array', async () => {
     const user = userEvent.setup();
+    const onSettled = vi.fn();
     render(
       <AskUserQuestionCard
         request={makeRequest({
@@ -74,15 +91,18 @@ describe('AskUserQuestionCard', () => {
             options: [{ label: 'Search' }, { label: 'Export' }],
           }],
         })}
-        onSettled={vi.fn()}
+        onSettled={onSettled}
       />,
     );
 
-    expect(screen.getByRole('alert')).toHaveTextContent(/unsupported multiple-selection answer/i);
-    expect(screen.queryByRole('button', { name: 'Search' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Send answer' })).toBeDisabled();
+    expect(screen.getByText('Choose one or more.')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Search' }));
+    await user.click(screen.getByRole('button', { name: 'Export' }));
     await user.click(screen.getByRole('button', { name: 'Send answer' }));
-    expect(mocks.answerQuestion).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.answerQuestion).toHaveBeenCalledWith('askq_1', {
+      'question-features': ['Search', 'Export'],
+    }));
+    expect(onSettled).toHaveBeenCalledWith('askq_1');
   });
 
   it('refuses to send an empty answer', async () => {

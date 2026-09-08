@@ -18,6 +18,10 @@ function routeBlock(signature: string): string {
 }
 
 describe('Project Chat authenticated-actor workspace isolation', () => {
+  it('uses the official Astra label for canonical project checkpoint attribution', () => {
+    expect(projectsRoute).toContain("'openai/gpt-6-astra': 'GPT-6 Astra'");
+  });
+
   it('keeps the sandbox principal separate from shared SUB_ADMIN workspace mapping', () => {
     const start = projectsRoute.indexOf('function resolveActorProjectChatWorkspace');
     const end = projectsRoute.indexOf('\nfunction sendProjectFileMutationError', start);
@@ -138,12 +142,13 @@ describe('Project Chat authenticated-actor workspace isolation', () => {
   it('pages Project Chat history with an actor/project-bound stable cursor', () => {
     const block = routeBlock("router.get('/:name/chat/history'");
     expect(block).toContain('requestedLimit < 1 || requestedLimit > 100');
-    expect(block).toContain('where: { id: beforeId, userId, projectId: executionContext.projectId }');
-    expect(block).toContain(
-      "orderBy: [{ timestamp: 'desc' }, { sourceSortKey: 'desc' }, { id: 'desc' }]",
-    );
-    expect(block).toContain('take: requestedLimit + 1');
-    expect(block).toContain('nextCursor: hasMore ? messages[0]?.id || null : null');
+    expect(block).toContain('readProjectChatHistoryPage({');
+    expect(block).toContain('actorUserId: userId');
+    expect(block).toContain('projectIdentityId: executionContext.projectId');
+    expect(block).toContain('beforeId');
+    expect(block).toContain('limit: requestedLimit');
+    expect(block).toContain('nextCursor: historyPage.nextCursor');
+    expect(block).toContain('responseLogicalByteLimit: historyPage.responseLogicalByteLimit');
     expect(frontendEndpoints).toContain("page?: { limit?: number; before?: string | null }");
   });
 

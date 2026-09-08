@@ -12,7 +12,6 @@ import {
   RefreshCw,
   ServerCog,
   ShieldAlert,
-  Wrench,
   X,
 } from 'lucide-react';
 import {
@@ -34,7 +33,7 @@ import {
 import AgentZeroOAuthPanel from './AgentZeroOAuthPanel';
 import { useSettingsMutationCoordinator } from './SettingsMutationContext';
 
-type PendingAction = 'credentials' | 'runtime' | null;
+type PendingAction = 'credentials' | null;
 
 type Props = {
   view?: 'runtime' | 'providers';
@@ -189,30 +188,24 @@ export default function AgentZeroSetupPanel({
     setBusy(true);
     setNotice(null);
     try {
-      if (snapshot.action === 'credentials') {
-        const result = await agentRuntimeAPI.provisionAgentZeroCredentials({
-          username: snapshot.username,
-          password: snapshot.password,
-          confirmation: snapshot.confirmation,
-        });
-        setStatus(result.status);
-        setUsername('');
-        setPassword('');
-        setShowPassword(false);
-        setNotice(result.verified
-          ? 'Credentials saved in the protected server file and authentication verified.'
-          : 'Credentials saved. Reconcile the managed runtime before authentication can be verified.');
-      } else {
-        const result = await agentRuntimeAPI.reconcileAgentZeroRuntime(snapshot.confirmation);
-        setStatus(result.status);
-        setNotice(result.message);
-      }
+      const result = await agentRuntimeAPI.provisionAgentZeroCredentials({
+        username: snapshot.username,
+        password: snapshot.password,
+        confirmation: snapshot.confirmation,
+      });
+      setStatus(result.status);
+      setUsername('');
+      setPassword('');
+      setShowPassword(false);
+      setNotice(result.verified
+        ? 'Credentials saved in the protected server file and authentication verified.'
+        : 'Credentials saved. Runtime package changes remain unavailable until the Agent Zero host transaction ships.');
       setError(null);
       setPendingAction(null);
     } catch (requestError: any) {
       const next = responseStatus(requestError);
       if (next) setStatus(next);
-      setError(errorMessage(requestError, `Agent Zero ${snapshot.action === 'credentials' ? 'credential save' : 'runtime setup'} failed.`));
+      setError(errorMessage(requestError, 'Agent Zero credential save failed.'));
     } finally {
       setBusy(false);
       finishRuntimeMutation(settingsOwner);
@@ -362,7 +355,7 @@ export default function AgentZeroSetupPanel({
               {!oauthReady && (
                 <div className="flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-amber-100">
                   <AlertTriangle size={15} className="mt-0.5 shrink-0" aria-hidden="true" />
-                  Finish the protected Agent Zero runtime and authentication checks under Agents before connecting a model account.
+                  Finish the protected Agent Zero runtime and authentication checks under Harnesses before connecting a model account.
                 </div>
               )}
               <AgentZeroOAuthPanel
@@ -375,7 +368,7 @@ export default function AgentZeroSetupPanel({
             </div>
 
             <div className="flex shrink-0 items-center justify-between gap-3 border-t border-theme-border bg-theme-bg px-4 py-3 sm:px-5">
-              <span className="text-[11px] text-theme-text-muted">Runtime controls stay under Agents.</span>
+              <span className="text-[11px] text-theme-text-muted">Runtime controls stay under Harnesses.</span>
               {onOpenRuntimeSettings ? (
                 <button
                   type="button"
@@ -409,17 +402,17 @@ export default function AgentZeroSetupPanel({
   }
 
   return (
-    <section className="space-y-4 rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-5" aria-labelledby="agent-zero-setup-title">
+    <section className="space-y-4 rounded-xl border border-white/[0.06] bg-white/[0.025] p-5" aria-labelledby="agent-zero-setup-title">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <h3 id="agent-zero-setup-title" className="text-sm font-semibold text-white">Agent Zero 2.5</h3>
+            <h3 id="agent-zero-setup-title" className="text-sm font-semibold text-white">Agent Zero 2.10</h3>
             <span className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-2 py-1 text-[11px] font-semibold uppercase text-amber-200">
               {agentZeroSurfaceLabel(status)}
             </span>
           </div>
           <p className="mt-2 max-w-3xl text-xs leading-5 text-slate-400">
-            Portal manages the pinned Agent Zero {status.testedVersions.agentZero} runtime, connector {status.testedVersions.connector}, and official A0 {status.testedVersions.hostBridge} bridge. Host availability is derived from live protected component checks, never a blind enable flag.
+            Portal inspects the pinned Agent Zero {status.testedVersions.agentZero} runtime, connector {status.testedVersions.connector}, and official A0 {status.testedVersions.hostBridge} bridge. Host availability is derived from live protected component checks, never a blind enable flag.
           </p>
         </div>
         <button type="button" onClick={() => { void load(); }} disabled={loading || busy} className="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-200 transition hover:bg-white/10 disabled:opacity-50">
@@ -430,12 +423,16 @@ export default function AgentZeroSetupPanel({
       {error && <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200" role="alert">{error}</div>}
       {notice && <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200" role="status">{notice}</div>}
 
+      <div className="rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2 text-[11px] leading-5 text-amber-100">
+        Runtime package changes remain unavailable until the Agent Zero host transaction ships. Runtime, authentication, and Project qualification status remain read-only here.
+      </div>
+
       <div className="rounded-lg border border-sky-500/25 bg-sky-500/[0.06] px-3 py-2 text-[11px] leading-5 text-sky-100">
         <span className="font-semibold">Where to use Agent Zero.</span> Agent Zero runs inside Agent Chat (and qualified Project Chat), authenticated per Portal user. Its full web UI is also available from the Remote Desktop: the &ldquo;Agent Zero (Web UI)&rdquo; icon opens it already signed in through a click-time backend session exchange, so no Agent Zero credential is ever stored on the desktop.
       </div>
 
       <div className="rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2 text-[11px] leading-5 text-amber-100">
-        <span className="font-semibold">Models in the Agent Zero web UI.</span> The web UI keeps its own model configuration and ships with an OpenRouter default, so it shows a &ldquo;Missing API Key for model presets&rdquo; notice until you give it a model. Connecting Codex or another provider under <span className="font-medium">AI Providers</span> powers <span className="font-medium">Agent Chat and qualified Project Chat</span> — that is where a Portal-connected model runs, and it intentionally does not change the standalone web UI&rsquo;s own presets. To use the web UI directly, open its Settings and point the Default/Main preset at a provider you hold a key for (for example an OpenRouter or OpenAI key).
+        <span className="font-semibold">Models in the Agent Zero web UI.</span> The web UI keeps its own model configuration and ships with an OpenRouter default, so it shows a &ldquo;Missing API Key for model presets&rdquo; notice until you give it a model. Connecting an account under <span className="font-medium">Model Providers</span> powers <span className="font-medium">Agent Chat and qualified Project Chat</span> — that is where a Portal-connected model runs, and it intentionally does not change the standalone web UI&rsquo;s own presets. To use the web UI directly, open its Settings and point the Default/Main preset at a provider you hold a key for (for example an OpenRouter or OpenAI key).
       </div>
 
       <div className="rounded-xl border border-red-500/20 bg-red-500/[0.06] p-4">
@@ -512,14 +509,10 @@ export default function AgentZeroSetupPanel({
           <div className="text-sm font-semibold text-white">Next safe action</div>
           <div className="text-xs leading-5 text-slate-500">
             {nextAction === 'credentials' && 'Save protected credentials first.'}
-            {nextAction === 'reconcile' && 'Install or repair the exact managed runtime and host bridge.'}
             {nextAction === 'verify' && 'Verify the protected connector session.'}
             {nextAction === 'unavailable' && `Host Agent Chat is unavailable: ${status.mainAgentChat.reason}`}
-            {nextAction === 'ready' && 'Host Agent Chat is ready. OAuth model accounts can now be connected under AI Providers.'}
+            {nextAction === 'ready' && 'Host Agent Chat is ready. OAuth model accounts can now be connected under Model Providers.'}
           </div>
-          <button type="button" onClick={() => setPendingAction('runtime')} disabled={!owner || busy || !status.credentials.configured} className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-blue-500/25 bg-blue-500/10 px-4 py-2 text-sm font-medium text-blue-100 transition hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:opacity-45">
-            <Wrench size={15} /> Reconcile runtime
-          </button>
           <button type="button" onClick={() => { void verifyAuthentication(); }} disabled={!owner || busy || !status.actions.verifyAuthentication.available} className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-4 py-2 text-sm font-medium text-emerald-100 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-45">
             {busy && !pendingAction ? <Loader2 size={15} className="animate-spin" /> : <CheckCircle2 size={15} />}
             Verify authentication
@@ -530,15 +523,15 @@ export default function AgentZeroSetupPanel({
       <div className="flex flex-col gap-3 rounded-xl border border-violet-500/20 bg-violet-500/[0.035] p-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <div className="text-sm font-semibold text-violet-100">Agent Zero model accounts</div>
-          <p className="mt-1 text-xs leading-5 text-slate-400">OAuth connections and model discovery live in the canonical AI Providers settings.</p>
+          <p className="mt-1 text-xs leading-5 text-slate-400">OAuth connections and model discovery live in the canonical Model Providers settings.</p>
         </div>
         {onOpenProviderSettings ? (
           <button type="button" onClick={onOpenProviderSettings} className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-2 rounded-lg border border-violet-500/25 bg-violet-500/10 px-3 py-2 text-xs font-medium text-violet-100 transition hover:bg-violet-500/20">
-            Open AI Providers
+            Open Model Providers
           </button>
         ) : (
           <a href="/settings?tab=ai-providers" className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-2 rounded-lg border border-violet-500/25 bg-violet-500/10 px-3 py-2 text-xs font-medium text-violet-100 transition hover:bg-violet-500/20">
-            Open AI Providers
+            Open Model Providers
           </a>
         )}
       </div>
@@ -554,16 +547,6 @@ export default function AgentZeroSetupPanel({
         description="This replaces the root-only login file and reloads the managed Agent Zero container when it is installed. A failed verification restores the previous file."
         confirmationPhrase={status.actions.provisionCredentials.confirmationPhrase}
         confirmLabel="Save and verify"
-        busy={busy}
-        onCancel={() => { if (!busy) setPendingAction(null); }}
-        onConfirm={(confirmation) => { void confirmAction(confirmation); }}
-      />
-      <TypedConfirmationDialog
-        open={pendingAction === 'runtime'}
-        title="Install or repair Agent Zero?"
-        description="Portal will converge the pinned Agent Zero 2.5 container, connector, persistent volume, and official A0 2.5 host bridge. The provider stays disabled afterward."
-        confirmationPhrase={status.actions.reconcileRuntime.confirmationPhrase}
-        confirmLabel="Reconcile runtime"
         busy={busy}
         onCancel={() => { if (!busy) setPendingAction(null); }}
         onConfirm={(confirmation) => { void confirmAction(confirmation); }}

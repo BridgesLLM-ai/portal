@@ -15,6 +15,8 @@ import {
   enqueueMailboxReconciliation,
   requireMailboxReconciled,
 } from './mailboxReconciliation';
+import { AppError } from '../middleware/errorHandler';
+import { findUnfinishedAdminUserRetirementTarget } from './adminUserRetirementParticipation';
 
 function getMailDomain() { return process.env.MAIL_DOMAIN || 'localhost'; }
 
@@ -64,6 +66,10 @@ async function ensureLegacyMailboxMigrated(userId: string): Promise<void> {
   await prisma.$transaction(async (tx) => {
     await lockMailboxUsername(tx, normalized);
     await lockUserMailboxRows(tx, userId);
+    const retirement = await findUnfinishedAdminUserRetirementTarget(tx, [userId]);
+    if (retirement) {
+      throw new AppError(409, 'Mailbox migration is paused while this user retirement is unfinished');
+    }
     const existingMailboxOwner = await tx.mailboxAccount.findUnique({
       where: { username: normalized },
       select: { userId: true },
@@ -83,6 +89,12 @@ async function ensureLegacyMailboxMigrated(userId: string): Promise<void> {
   await requireMailboxReconciled(normalized);
 }
 
+export function isMailProvisioningConfigured(): boolean {
+  // Domain support alone does not mean the optional Mail service was set up.
+  // A configured-but-offline service still uses the durable retry path.
+  return Boolean(process.env.STALWART_ADMIN_PASS?.trim() && process.env.MAIL_DOMAIN?.trim());
+}
+
 export async function provisionUserMailbox(
   username: string,
   userId: string,
@@ -92,6 +104,9 @@ export async function provisionUserMailbox(
   // operate mail. Keep this assertion ahead of the Prisma transaction so
   // Tailnet/local mode cannot leave stale rows for the reconciler to process.
   assertPortalFeatureAvailable('mail');
+  if (!isMailProvisioningConfigured()) {
+    throw new AppError(409, 'Set up Mail before creating mailboxes.');
+  }
 
   const stalwartName = normalizeMailboxUsername(username);
   if (!stalwartName) throw new Error('Mailbox username is required');
@@ -105,6 +120,10 @@ export async function provisionUserMailbox(
       // the user-row lock serializes primary selection for this account.
       await lockMailboxUsername(tx, stalwartName);
       await lockUserMailboxRows(tx, userId);
+      const retirement = await findUnfinishedAdminUserRetirementTarget(tx, [userId]);
+      if (retirement) {
+        throw new AppError(409, 'Mailbox provisioning is paused while this user retirement is unfinished');
+      }
       const existingMailbox = await tx.mailboxAccount.findUnique({
         where: { username: stalwartName },
         select: { mailPassword: true, userId: true },
@@ -240,6 +259,8 @@ export async function getUserMailAccounts(userId: string): Promise<Array<{
   password: string;
   isPrimary: boolean;
 }>> {
+  // Unconfigured optional Mail is an empty inbox, not an external-service failure.
+  if (!isMailProvisioningConfigured()) return [];
   await ensureLegacyMailboxMigrated(userId);
 
   let user = await prisma.user.findUnique({

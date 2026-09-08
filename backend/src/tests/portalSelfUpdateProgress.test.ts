@@ -159,7 +159,8 @@ describe('atomic Portal self-update progress', () => {
   test('marks a resolved attention receipt as historical and no longer admission-blocking', async () => {
     writeState(state({
       status: 'updated_with_errors', phase: 'updated-with-errors', percent: 99,
-      label: 'Portal updated with follow-up errors', detail: 'Host repair is required.',
+      label: 'Portal updated; final verification incomplete',
+      detail: 'Exact final Portal verification is required.',
       updatedAt: '2026-08-10T06:10:00Z', finishedAt: '2026-08-10T06:10:00Z',
       pendingOutcome: 'updated_with_errors',
     }));
@@ -266,7 +267,7 @@ describe('atomic Portal self-update progress', () => {
       readUnitActivity: async () => {
         writeState(state({
           status: 'succeeded', phase: 'complete', percent: 100,
-          label: 'Update complete', detail: 'Authenticated postflight passed.',
+          label: 'Update complete', detail: 'Exact final Portal verification passed.',
           updatedAt: '2026-08-10T06:01:00Z', finishedAt: '2026-08-10T06:01:00Z',
         }));
         return 'inactive';

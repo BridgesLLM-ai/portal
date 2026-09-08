@@ -72,6 +72,27 @@ describe('public settings privacy boundary', () => {
     );
   });
 
+  it('publishes only the fixed Hermes and OpenCode harness-avatar keys', async () => {
+    mockFindMany.mockResolvedValue([
+      { key: 'appearance.agentAvatar.HERMES', value: '/avatars/hermes.png' },
+      { key: 'appearance.agentAvatar.OPENCODE', value: '/avatars/opencode.png' },
+      { key: 'appearance.agentAvatar.DEEPSEEK_HARNESS', value: '/avatars/preview.png' },
+    ]);
+
+    const { payload } = await invokeHandler('/public');
+    expect(payload.agentAvatars).toMatchObject({
+      HERMES: '/avatars/hermes.png',
+      OPENCODE: '/avatars/opencode.png',
+    });
+    expect(payload.agentAvatars).not.toHaveProperty('DEEPSEEK_HARNESS');
+    const queriedKeys = mockFindMany.mock.calls[0][0].where.key.in;
+    expect(queriedKeys).toEqual(expect.arrayContaining([
+      'appearance.agentAvatar.HERMES',
+      'appearance.agentAvatar.OPENCODE',
+    ]));
+    expect(queriedKeys).not.toContain('appearance.agentAvatar.DEEPSEEK_HARNESS');
+  });
+
   it('normalizes legacy logo and accent rows before they reach public HTML consumers', async () => {
     mockFindMany.mockResolvedValue([
       { key: 'appearance.logoUrl', value: 'javascript:alert(1)' },

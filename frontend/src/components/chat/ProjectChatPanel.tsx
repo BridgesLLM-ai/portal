@@ -16,6 +16,7 @@ import MarkdownRenderer from './MarkdownRenderer';
 import SlashCommandMenu from './SlashCommandMenu';
 import { ExecApprovalModal } from './ExecApprovalModal';
 import client from '../../api/client';
+import { authoredHistoryText, isInternalHistoryUser } from '../../utils/historyProvenance';
 import { gatewayAPI, projectsAPI } from '../../api/endpoints';
 import { workspaceAuthorizedFetch } from '../../utils/workspaceAuthorizedFetch';
 import type {
@@ -61,7 +62,6 @@ import {
 } from '../../utils/liveTurnProjector';
 import { normalizePortalStreamEventFromTurnEvent } from '../../utils/runtimeTurnEvents';
 import ComposerStatusBadge from './ComposerStatusBadge';
-import CompactionNoticeBlock from './CompactionNoticeBlock';
 import ToolGlyph from './ToolGlyph';
 import ProjectProviderMenu, {
   normalizeProjectQualificationRetryAt,
@@ -888,15 +888,30 @@ function nextId() {
   return 'pmsg-' + Date.now() + '-' + (++msgCounter);
 }
 
+function isCanonicalUntrustedMetadataPrefix(value: string): boolean {
+  let remaining = String(value || '').trim();
+  let matched = false;
+  while (remaining) {
+    const block = remaining.match(/^(?:Conversation info|Sender) \(untrusted metadata\):\s*```json\s*\n?([\s\S]*?)\n?```\s*/i);
+    if (!block) return false;
+    try {
+      const parsed = JSON.parse(block[1]);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    } catch {
+      return false;
+    }
+    matched = true;
+    remaining = remaining.slice(block[0].length).trim();
+  }
+  return matched;
+}
+
 function stripHistoryEnvelope(text: string): string {
   if (!text) return text;
   const match = text.match(HISTORY_ENVELOPE_TIMESTAMP_RE);
   if (match && match.index !== undefined) {
     const beforeTimestamp = text.substring(0, match.index);
-    if (
-      beforeTimestamp.includes('Conversation info (untrusted metadata)')
-      || beforeTimestamp.includes('Sender (untrusted metadata)')
-    ) {
+    if (isCanonicalUntrustedMetadataPrefix(beforeTimestamp)) {
       return text.substring(match.index + match[0].length).trim();
     }
   }
@@ -909,58 +924,58 @@ function sanitizeHistoryMessageText(text: string): string {
     .trim();
 }
 
+function isCanonicalOpenClawInternalContextEnvelope(text: string): boolean {
+  const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  const lines = normalized.split('\n');
+  if (
+    lines.length < 3
+    || lines[0] !== '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>'
+    || lines.at(-1) !== '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>'
+  ) return false;
+  return lines[1] === 'OpenClaw runtime context (internal):'
+    || lines[1] === '[Internal task completion event]';
+}
+
+function isCanonicalUntrustedMetadataEnvelope(text: string): boolean {
+  const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  const match = normalized.match(/^(?:Sender|Conversation info) \(untrusted metadata\):\n```json\n([\s\S]+)\n```$/);
+  if (!match) return false;
+  try {
+    const parsed = JSON.parse(match[1]);
+    return Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed));
+  } catch {
+    return false;
+  }
+}
+
 function isHiddenHistoryArtifactText(text: string): boolean {
   const normalized = String(text || '').trim();
   if (!normalized) return false;
 
+  if (
+    isCanonicalOpenClawInternalContextEnvelope(normalized)
+    || isCanonicalUntrustedMetadataEnvelope(normalized)
+  ) return true;
+
   return [
     /^System \(untrusted\):/i,
     /^An async command you ran earlier has completed\./i,
-    /^Read HEARTBEAT\.md if it exists/i,
+    /^Read HEARTBEAT\.md if it exists\.?$/i,
+    /^Read HEARTBEAT\.md if it exists \(workspace context\)\. Follow it strictly\. Do not infer or repeat old tasks from prior chats\. If nothing needs attention, reply HEARTBEAT_OK\.$/i,
     /^HEARTBEAT_OK$/i,
     /^Heartbeat check complete(?:d)?\.?$/i,
-    /^Pre-compaction memory flush\./i,
+    /^Pre-compaction memory flush\.$/i,
     /^Memory flush complete(?:d)?\.?$/i,
-    /<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i,
-    /Handle the result internally\./i,
-    /Sender \(untrusted metadata\):/i,
-    /Conversation info \(untrusted metadata\):/i,
+    /^\[System\]\s+Your previous turn was interrupted by a gateway restart/i,
   ].some((pattern) => pattern.test(normalized));
 }
 
-function summarizeHiddenHistoryArtifactText(text: string): string | null {
+function isRoutineMaintenancePromptText(text: string): boolean {
   const normalized = String(text || '').trim();
-  if (!normalized) return null;
-
-  if (/<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>/i.test(normalized) && /\[Internal task completion event\]/i.test(normalized)) {
-    const sourceMatch = normalized.match(/^source:\s*(.+)$/im);
-    const source = sourceMatch?.[1]?.trim().toLowerCase() || '';
-    if (source === 'subagent') return 'Delegated task completed';
-    if (source) return 'Background task completed';
-    return 'Background work completed';
-  }
-
-  if (/^An async command you ran earlier has completed\./i.test(normalized)) {
-    return 'Earlier async command completed';
-  }
-
-  if (/^Read HEARTBEAT\.md if it exists/i.test(normalized)) {
-    return 'Heartbeat check started';
-  }
-
-  if (/^HEARTBEAT_OK$/i.test(normalized) || /^Heartbeat check complete(?:d)?\.?$/i.test(normalized)) {
-    return 'Heartbeat check completed';
-  }
-
-  if (/^Pre-compaction memory flush\./i.test(normalized)) {
-    return 'Memory flush started';
-  }
-
-  if (/^Memory flush complete(?:d)?\.?$/i.test(normalized)) {
-    return 'Memory flush completed';
-  }
-
-  return null;
+  return /^\[[^\]\n]*heartbeat[^\]\n]*\]$/i.test(normalized)
+    || /^Read HEARTBEAT\.md if it exists\.?$/i.test(normalized)
+    || /^Read HEARTBEAT\.md if it exists \(workspace context\)\. Follow it strictly\. Do not infer or repeat old tasks from prior chats\. If nothing needs attention, reply HEARTBEAT_OK\.$/i.test(normalized)
+    || /^Pre-compaction memory flush\.$/i.test(normalized);
 }
 
 function isStandaloneMaintenanceNoticeContent(text: string): boolean {
@@ -985,25 +1000,228 @@ function isControlOrMaintenanceAssistantContent(text: string): boolean {
   return isControlOnlyAssistantContent(text || '') || isStandaloneMaintenanceNoticeContent(text || '');
 }
 
+function isOpenClawProjectHistoryMessage(
+  message: ProjectChatPersistedMessage,
+  fallbackProvider: ProjectChatProviderName,
+): boolean {
+  return (message.provider || fallbackProvider) === 'OPENCLAW';
+}
+
+function isProjectChatAuthoredUserBoundary(
+  message: ProjectChatPersistedMessage,
+  fallbackProvider: ProjectChatProviderName,
+): boolean {
+  if (message?.role !== 'user') return false;
+  if (!isOpenClawProjectHistoryMessage(message, fallbackProvider) || !isInternalHistoryUser(message)) return true;
+  const text = sanitizeHistoryMessageText(typeof message.content === 'string' ? message.content : '');
+  return isRoutineMaintenancePromptText(text) || !isHiddenHistoryArtifactText(text);
+}
+
+function routineMaintenanceStateAfterProjectRows(
+  messages: ProjectChatPersistedMessage[],
+  initialState = false,
+  fallbackProvider: ProjectChatProviderName = 'OPENCLAW',
+): boolean {
+  let inRoutineMaintenanceTurn = initialState;
+  for (const message of messages) {
+    const role = message?.role;
+    const text = sanitizeHistoryMessageText(typeof message?.content === 'string' ? message.content : '');
+    const openClawMessage = isOpenClawProjectHistoryMessage(message, fallbackProvider);
+    if (openClawMessage && isInternalHistoryUser(message) && isRoutineMaintenancePromptText(text)) {
+      inRoutineMaintenanceTurn = true;
+    } else if (openClawMessage && isInternalHistoryUser(message) && isHiddenHistoryArtifactText(text)) {
+      continue;
+    } else if (role === 'user') {
+      inRoutineMaintenanceTurn = false;
+    }
+  }
+  return inRoutineMaintenanceTurn;
+}
+
+export function filterProjectChatRoutineMaintenanceMessages(
+  messages: ProjectChatPersistedMessage[],
+  initialState = false,
+  fallbackProvider: ProjectChatProviderName = 'OPENCLAW',
+): ProjectChatPersistedMessage[] {
+  const projected: ProjectChatPersistedMessage[] = [];
+  let inRoutineMaintenanceTurn = initialState;
+
+  for (const message of messages) {
+    const role = message?.role;
+    const text = sanitizeHistoryMessageText(typeof message?.content === 'string' ? message.content : '');
+    const openClawMessage = isOpenClawProjectHistoryMessage(message, fallbackProvider);
+    if (openClawMessage && isInternalHistoryUser(message) && isRoutineMaintenancePromptText(text)) {
+      inRoutineMaintenanceTurn = true;
+      continue;
+    }
+    if (openClawMessage && (role !== 'user' || isInternalHistoryUser(message)) && isHiddenHistoryArtifactText(text)) continue;
+    if (openClawMessage && role === 'system' && isStandaloneMaintenanceNoticeContent(text)) continue;
+    if (openClawMessage && role === 'assistant' && isControlOrMaintenanceAssistantContent(text)) continue;
+    if (role === 'user') {
+      inRoutineMaintenanceTurn = false;
+      projected.push(message);
+      continue;
+    }
+    if (inRoutineMaintenanceTurn) continue;
+    projected.push(message);
+  }
+
+  return projected;
+}
+
+const MAX_PROJECT_CHAT_MAINTENANCE_CONTEXT_ROWS = 50_000;
+const MAX_PROJECT_CHAT_MAINTENANCE_CONTEXT_PAGES = 64;
+const MAX_PROJECT_CHAT_EXPORT_ROWS = 50_000;
+const MAX_PROJECT_CHAT_EXPORT_PAGES = 512;
+const MAX_PROJECT_CHAT_EXPORT_BYTES = 64 * 1024 * 1024;
+
+function projectChatMaintenanceContextLookupRequired(
+  messages: ProjectChatPersistedMessage[],
+  pagination: ProjectChatHistoryPage['pagination'] | undefined,
+  provider: ProjectChatProviderName,
+): boolean {
+  return pagination?.maintenanceBoundaryVerified !== true
+    && messages.length > 0
+    && !isProjectChatAuthoredUserBoundary(messages[0], provider)
+    && pagination?.hasMore === true
+    && typeof pagination?.nextCursor === 'string';
+}
+
+export async function resolveProjectChatMaintenanceStateAtPageStart(input: {
+  messages: ProjectChatPersistedMessage[];
+  pagination: ProjectChatHistoryPage['pagination'] | undefined;
+  provider: ProjectChatProviderName;
+  readOlderPage: (before: string) => Promise<ProjectChatHistoryPage>;
+  shouldContinue?: () => boolean;
+}): Promise<boolean> {
+  if (!projectChatMaintenanceContextLookupRequired(input.messages, input.pagination, input.provider)) return false;
+
+  let cursor: string | null = input.pagination?.nextCursor || null;
+  let scannedRows = 0;
+  let scannedPages = 0;
+  const visitedCursors = new Set<string>();
+
+  while (
+    cursor
+    && scannedRows < MAX_PROJECT_CHAT_MAINTENANCE_CONTEXT_ROWS
+    && scannedPages < MAX_PROJECT_CHAT_MAINTENANCE_CONTEXT_PAGES
+  ) {
+    if (input.shouldContinue && !input.shouldContinue()) {
+      throw new Error('Project Chat changed while maintenance context was being resolved.');
+    }
+    if (visitedCursors.has(cursor)) {
+      throw new Error('Project Chat maintenance context received a repeated history cursor.');
+    }
+    visitedCursors.add(cursor);
+    const page = await input.readOlderPage(cursor);
+    scannedPages += 1;
+    if (input.shouldContinue && !input.shouldContinue()) {
+      throw new Error('Project Chat changed while maintenance context was being resolved.');
+    }
+    const rows = Array.isArray(page?.messages) ? page.messages : [];
+    scannedRows += rows.length;
+
+    // The nearest user row is an authoritative turn boundary. Earlier rows
+    // cannot change whether the target page begins inside maintenance.
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      if (!isProjectChatAuthoredUserBoundary(rows[index], input.provider)) continue;
+      return routineMaintenanceStateAfterProjectRows(rows.slice(index), false, input.provider);
+    }
+
+    if (page?.pagination?.hasMore !== true || typeof page?.pagination?.nextCursor !== 'string') {
+      return false;
+    }
+    cursor = page.pagination.nextCursor;
+  }
+
+  // A corrupt/pathological transcript cannot make an unbounded, boundary-less
+  // assistant tail public. The new backend filters before pagination; this is
+  // the fail-closed compatibility path for older servers.
+  return true;
+}
+
+export async function collectBoundedProjectChatExport(input: {
+  readPage: (before: string | null) => Promise<ProjectChatHistoryPage>;
+  shouldContinue: () => boolean;
+  maxRows?: number;
+  maxPages?: number;
+  maxBytes?: number;
+}): Promise<ProjectChatPersistedMessage[]> {
+  const maxRows = Math.max(1, input.maxRows ?? MAX_PROJECT_CHAT_EXPORT_ROWS);
+  const maxPages = Math.max(1, input.maxPages ?? MAX_PROJECT_CHAT_EXPORT_PAGES);
+  const maxBytes = Math.max(1, input.maxBytes ?? MAX_PROJECT_CHAT_EXPORT_BYTES);
+  const utf8Encoder = new TextEncoder();
+  const exported: ProjectChatPersistedMessage[] = [];
+  const seenMessageIds = new Set<string>();
+  const seenCursors = new Set<string>();
+  let before: string | null = null;
+  let scannedRows = 0;
+  let scannedPages = 0;
+  let scannedBytes = 0;
+
+  while (true) {
+    if (!input.shouldContinue()) {
+      throw new Error('Project Chat changed while the transcript was being exported.');
+    }
+    if (scannedPages >= maxPages) {
+      throw new Error('Project Chat export exceeded its bounded page limit.');
+    }
+    const page = await input.readPage(before);
+    scannedPages += 1;
+    if (!input.shouldContinue()) {
+      throw new Error('Project Chat changed while the transcript was being exported.');
+    }
+
+    const pageMessages = Array.isArray(page?.messages) ? page.messages : [];
+    scannedRows += pageMessages.length;
+    if (scannedRows > maxRows) {
+      throw new Error('Project Chat export exceeded its bounded row limit.');
+    }
+    for (const message of pageMessages) {
+      let serialized: string;
+      try {
+        serialized = JSON.stringify(message);
+      } catch {
+        throw new Error('Project Chat export contained an invalid transcript row.');
+      }
+      scannedBytes += utf8Encoder.encode(serialized).byteLength;
+      if (scannedBytes > maxBytes) {
+        throw new Error('Project Chat export exceeded its bounded byte limit.');
+      }
+      const id = String(message.id || '');
+      if (id && seenMessageIds.has(id)) continue;
+      if (id) seenMessageIds.add(id);
+      exported.push(message);
+    }
+
+    const nextCursor = typeof page?.pagination?.nextCursor === 'string'
+      ? page.pagination.nextCursor
+      : null;
+    if (page?.pagination?.hasMore !== true || !nextCursor) return exported;
+    if (seenCursors.has(nextCursor)) {
+      throw new Error('Project Chat export received a repeated history cursor.');
+    }
+    seenCursors.add(nextCursor);
+    before = nextCursor;
+  }
+}
+
 function parseHistoryMessage(m: any): ChatMessage | null {
   const rawContent = typeof m.content === 'string' ? m.content : '';
-  const sanitizedHistoryText = sanitizeHistoryMessageText(rawContent);
+  const sanitizedHistoryText = m.role === 'user' && !isInternalHistoryUser(m)
+    ? authoredHistoryText(rawContent) : sanitizeHistoryMessageText(rawContent);
   const rawThinkingContent = typeof m.thinkingContent === 'string' ? sanitizeAssistantContent(m.thinkingContent) : '';
   const rawThinkingSubject = sanitizeThinkingSubject(m.thinkingSubject);
   const isTruncationPlaceholder = m.role === 'assistant' && rawContent === CHAT_HISTORY_OMITTED_PLACEHOLDER;
-  if (m.role === 'assistant' && !isTruncationPlaceholder && isControlOrMaintenanceAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
+  const openClawMessage = m.provider === 'OPENCLAW';
+  if (m?.__openclaw?.kind === 'compaction') return null;
+  if (openClawMessage && isInternalHistoryUser(m) && isRoutineMaintenancePromptText(sanitizedHistoryText)) return null;
+  if (openClawMessage && m.role === 'system' && isStandaloneMaintenanceNoticeContent(sanitizedHistoryText)) return null;
+  if (openClawMessage && m.role === 'assistant' && !isTruncationPlaceholder && isControlOrMaintenanceAssistantContent(rawContent) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
     return null;
   }
-  if (!isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
-    const summary = summarizeHiddenHistoryArtifactText(sanitizedHistoryText);
-    if (!summary) return null;
-    return {
-      id: m.id || nextId(),
-      role: 'system',
-      content: summary,
-      createdAt: new Date(m.timestamp || Date.now()),
-      provenance: 'hidden-history-artifact',
-    };
+  if (openClawMessage && (m.role !== 'user' || isInternalHistoryUser(m)) && !isTruncationPlaceholder && isHiddenHistoryArtifactText(sanitizedHistoryText) && !rawThinkingContent && !(Array.isArray(m.toolCalls) && m.toolCalls.length > 0)) {
+    return null;
   }
 
   const msg: ChatMessage = {
@@ -1013,7 +1231,7 @@ function parseHistoryMessage(m: any): ChatMessage | null {
       ? 'Earlier assistant output was omitted from history because the message was too large.'
       : (m.role === 'assistant' ? sanitizeAssistantContent(rawContent) : sanitizedHistoryText),
     createdAt: new Date(m.timestamp || Date.now()),
-    provenance: m.provenance || ((m.__openclaw?.kind === 'compaction' || isCompactionNotice(sanitizedHistoryText)) ? 'compaction' : undefined),
+    provenance: typeof m.provenance === 'string' ? m.provenance : undefined,
     model: typeof m.model === 'string' ? m.model : undefined,
     thinkingContent: rawThinkingContent || undefined,
     thinkingSubject: rawThinkingSubject || undefined,
@@ -1109,13 +1327,34 @@ function parseProjectChatHistoryMessages(
   messages: ProjectChatPersistedMessage[],
   provider: ProjectChatProviderName,
   runtime: string,
+  initialRoutineMaintenanceState = false,
 ): ChatMessage[] {
-  return dedupeHistoryMessages(messages
-    .map((message) => parseHistoryMessage({
+  const parsed: ChatMessage[] = [];
+
+  for (const message of filterProjectChatRoutineMaintenanceMessages(
+    messages,
+    initialRoutineMaintenanceState,
+    provider,
+  )) {
+    const role = message?.role;
+    const text = sanitizeHistoryMessageText(typeof message?.content === 'string' ? message.content : '');
+    if (
+      isOpenClawProjectHistoryMessage(message, provider)
+      && role === 'assistant'
+      && (isHiddenHistoryArtifactText(text) || isControlOnlyAssistantContent(text))
+    ) {
+      continue;
+    }
+
+    const projected = parseHistoryMessage({
       ...message,
+      provider: message.provider || provider,
       provenance: `${getProjectProviderLabel(message.provider || provider)} • ${message.runtime || runtime}`,
-    }))
-    .filter(Boolean) as ChatMessage[]);
+    });
+    if (projected) parsed.push(projected);
+  }
+
+  return dedupeHistoryMessages(parsed);
 }
 
 export function mergeProjectChatHistoryPages(
@@ -2097,6 +2336,8 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   const sessionControlActivityTokenRef = useRef(0);
   const runtimeRef = useRef(selectedRuntime);
   const historyGenRef = useRef(0);
+  const exportGenerationRef = useRef(0);
+  const exportInFlightRef = useRef(false);
   const olderHistoryLoadInFlightRef = useRef(false);
   const loadOlderHistoryRef = useRef<() => void>(() => {});
   const modelRef = useRef(selectedModel);
@@ -2135,6 +2376,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     content: string;
     generation: number;
   } | null>(null);
+
+  useEffect(() => () => {
+    exportGenerationRef.current += 1;
+    exportInFlightRef.current = false;
+  }, []);
 
   const replacePendingQuestions = useCallback((questions: AskUserQuestionRequest[]) => {
     pendingQuestionsRef.current = questions;
@@ -2597,7 +2843,6 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       compactionPhaseRef.current = 'compacted';
       setCompactionPhase('compacted');
       setStatusText(noticeText);
-      appendSystemNotice(noticeText, 'compaction');
       if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
       compactionTimerRef.current = setTimeout(() => {
         compactionPhaseRef.current = 'idle';
@@ -2612,13 +2857,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     compactionPhaseRef.current = 'idle';
     setCompactionPhase('idle');
     setStatusText(noticeText);
-    appendSystemNotice(noticeText, 'hidden-history-artifact');
     if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
     compactionTimerRef.current = setTimeout(() => {
       setStatusText((prev) => (prev === noticeText ? null : prev));
       compactionTimerRef.current = null;
     }, 3000);
-  }, [appendSystemNotice, clearPendingLiveRenders]);
+  }, [clearPendingLiveRenders]);
 
   const applyCompactionSnapshotState = useCallback((phase?: unknown) => {
     if (phase !== 'idle' && phase !== 'compacting' && phase !== 'compacted') return;
@@ -2626,20 +2870,13 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       clearTimeout(compactionTimerRef.current);
       compactionTimerRef.current = null;
     }
-    compactionPhaseRef.current = phase;
-    setCompactionPhase(phase);
-    if (phase === 'compacting') {
+    const effectivePhase = phase === 'compacted' ? 'idle' : phase;
+    compactionPhaseRef.current = effectivePhase;
+    setCompactionPhase(effectivePhase);
+    if (effectivePhase === 'compacting') {
       setStatusText('Compacting context…');
-    }
-    if (phase === 'compacted') {
-      const noticeText = 'Context compacted';
-      setStatusText(noticeText);
-      compactionTimerRef.current = setTimeout(() => {
-        compactionPhaseRef.current = 'idle';
-        setCompactionPhase('idle');
-        setStatusText((prev) => (prev === noticeText ? null : prev));
-        compactionTimerRef.current = null;
-      }, 3000);
+    } else {
+      setStatusText(null);
     }
   }, []);
 
@@ -3253,10 +3490,35 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     if (pending && await historyConfirmsPendingProjectChatSend(pending, portalMessages)) {
       await confirmPendingSend(pending.messageId);
     }
+    const initialMaintenanceState = projectChatMaintenanceContextLookupRequired(
+      portalMessages,
+      portalData?.pagination,
+      provider,
+    )
+      ? await resolveProjectChatMaintenanceStateAtPageStart({
+          messages: portalMessages,
+          pagination: portalData?.pagination,
+          provider,
+          readOlderPage: (before) => projectsAPI.chatHistory(projectName, provider, {
+            limit: PROJECT_CHAT_HISTORY_PAGE_SIZE,
+            before,
+          }),
+          shouldContinue: () => (
+            historyGenRef.current === expectedGen
+            && providerRef.current === provider
+          ),
+        })
+      : false;
+    if (
+      isStaleSessionLoad(session, expectedGen)
+      || providerRef.current !== provider
+      || projectIdentityIdRef.current !== expectedProjectId
+    ) return null;
     const loaded = parseProjectChatHistoryMessages(
       portalMessages,
       provider,
       runtimeRef.current,
+      initialMaintenanceState,
     );
     const pagination = portalData?.pagination;
     setHistoryPagination({
@@ -3353,10 +3615,36 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       if (pending && await historyConfirmsPendingProjectChatSend(pending, olderPortalMessages)) {
         await confirmPendingSend(pending.messageId);
       }
+      const initialMaintenanceState = projectChatMaintenanceContextLookupRequired(
+        olderPortalMessages,
+        page?.pagination,
+        expectedProvider,
+      )
+        ? await resolveProjectChatMaintenanceStateAtPageStart({
+            messages: olderPortalMessages,
+            pagination: page?.pagination,
+            provider: expectedProvider,
+            readOlderPage: (before) => projectsAPI.chatHistory(projectName, expectedProvider, {
+              limit: PROJECT_CHAT_HISTORY_PAGE_SIZE,
+              before,
+            }),
+            shouldContinue: () => (
+              historyGenRef.current === expectedGen
+              && providerRef.current === expectedProvider
+            ),
+          })
+        : false;
+      if (
+        historyGenRef.current !== expectedGen
+        || (sessionKeyRef.current || '') !== expectedSession
+        || providerRef.current !== expectedProvider
+        || projectIdentityIdRef.current !== expectedProjectId
+      ) return;
       const older = parseProjectChatHistoryMessages(
         olderPortalMessages,
         expectedProvider,
         runtimeRef.current,
+        initialMaintenanceState,
       );
       setMessages((current) => mergeProjectChatHistoryPages(older, current));
       if (older.length > 0) {
@@ -3715,14 +4003,13 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         if (!assistantId && !isStreamActiveRef.current) break;
         acceptResumeSeededContent();
         const runningToolName = activeToolNameRef.current;
+        const isPreambleThinking = data.preambleProgress === true
+          || data?.turnEvent?.source?.preambleProgress === true;
         if (
-          data.transient !== true
-          && data.assistantStatus === true
+          isPreambleThinking
           && !maintenanceRail.isMaintenanceStatus
           && !runningToolName
         ) {
-          const isPreambleThinking = data.preambleProgress === true
-            || data?.turnEvent?.source?.preambleProgress === true;
           const statusThinking = extractThinkingChunk(
             isPreambleThinking ? 'thinking' : 'status',
             data.content,
@@ -3773,26 +4060,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
         break;
       }
       case 'compaction_end': {
-        const completed = data.completed !== false;
-        const noticeText = typeof data.content === 'string' && data.content.trim()
-          ? data.content
-          : (completed ? 'Context compacted' : 'Context maintenance finished.');
-        if (compactionTimerRef.current) clearTimeout(compactionTimerRef.current);
-        if (completed) {
-          compactionPhaseRef.current = 'compacted';
-          setCompactionPhase('compacted');
-          appendSystemNotice(noticeText, 'compaction');
-        } else {
-          compactionPhaseRef.current = 'idle';
-          setCompactionPhase('idle');
-        }
-        setStatusText(noticeText);
-        compactionTimerRef.current = setTimeout(() => {
-          compactionPhaseRef.current = 'idle';
-          setCompactionPhase('idle');
-          setStatusText((prev) => (prev === noticeText ? null : prev));
-          compactionTimerRef.current = null;
-        }, 3000);
+        applyMaintenanceState({
+          phase: 'end',
+          content: typeof data.content === 'string' ? data.content : null,
+          completed: data.completed !== false,
+          maintenanceKind: data.completed === false ? 'maintenance' : 'compaction',
+        });
         break;
       }
       case 'tool_start': {
@@ -4182,7 +4455,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       case 'keepalive':
         break;
     }
-  }, [acceptResumeSeededContent, appendSystemNotice, applyActiveStreamSnapshot, applyLiveThinkingSubject, applyMaintenanceState, resetWatchdog, clearWatchdog, appendThinkingChunk, ensureStreamingAssistant, finalizeStreamingAssistant, flushPendingLiveRenders, graduateLiveTextPhase, graduateLiveThinkingPhase, resolveLiveActivityOrder, scheduleTextRender]);
+  }, [acceptResumeSeededContent, applyActiveStreamSnapshot, applyLiveThinkingSubject, applyMaintenanceState, resetWatchdog, clearWatchdog, appendThinkingChunk, ensureStreamingAssistant, finalizeStreamingAssistant, flushPendingLiveRenders, graduateLiveTextPhase, graduateLiveThinkingPhase, resolveLiveActivityOrder, scheduleTextRender]);
 
   const handleReplayEventRef = useRef(handleReplayEvent);
   useEffect(() => { handleReplayEventRef.current = handleReplayEvent; }, [handleReplayEvent]);
@@ -5396,7 +5669,15 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       activeReplayTurnIdRef.current = null;
     } catch (error: any) {
       const reason = error?.response?.data?.error || error?.message || 'Failed to stop the Project response';
-      if (error instanceof ProjectReplayContractError || isProjectProviderReverificationError(error)) {
+      // TURN_ACTIVE is authoritative evidence that cancellation was not
+      // confirmed. Keep the exact run visible and stoppable; hiding it would
+      // falsely present an active provider process as idle. Identity, CAS,
+      // provider, and turn-integrity failures still invalidate verification.
+      const abortErrorCode = error?.response?.data?.code;
+      if (
+        error instanceof ProjectReplayContractError
+        || (abortErrorCode !== 'PROJECT_CHAT_TURN_ACTIVE' && isProjectProviderReverificationError(error))
+      ) {
         failClosed(reason);
       } else {
         console.warn('[ProjectChat] Project turn abort failed:', error);
@@ -5735,49 +6016,37 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   }, []);
 
   const exportChatMarkdown = useCallback(async () => {
-    if (isExportingChat) return;
+    if (isExportingChat || exportInFlightRef.current) return;
     const expectedGen = historyGenRef.current;
     const provider = providerRef.current;
+    const expectedProjectId = projectIdentityIdRef.current;
+    const expectedSession = sessionKeyRef.current;
+    const exportGeneration = ++exportGenerationRef.current;
+    exportInFlightRef.current = true;
     setIsExportingChat(true);
     try {
-      const exported: ProjectChatPersistedMessage[] = [];
-      const seenMessageIds = new Set<string>();
-      const seenCursors = new Set<string>();
-      let before: string | null = null;
-
-      while (true) {
-        const page = await projectsAPI.chatHistory(projectName, provider, {
+      const exportStillCurrent = () => (
+        exportGenerationRef.current === exportGeneration
+        && historyGenRef.current === expectedGen
+        && providerRef.current === provider
+        && projectIdentityIdRef.current === expectedProjectId
+        && sessionKeyRef.current === expectedSession
+      );
+      const exported = await collectBoundedProjectChatExport({
+        readPage: (before) => projectsAPI.chatHistory(projectName, provider, {
           limit: PROJECT_CHAT_HISTORY_PAGE_SIZE,
           before,
-        });
-        if (historyGenRef.current !== expectedGen || providerRef.current !== provider) {
-          throw new Error('Project Chat changed while the transcript was being exported.');
-        }
-        const pageMessages = Array.isArray(page?.messages) ? page.messages : [];
-        for (const message of pageMessages) {
-          const id = String(message.id || '');
-          if (id && seenMessageIds.has(id)) continue;
-          if (id) seenMessageIds.add(id);
-          exported.push(message);
-        }
-
-        const nextCursor = typeof page?.pagination?.nextCursor === 'string'
-          ? page.pagination.nextCursor
-          : null;
-        if (page?.pagination?.hasMore !== true || !nextCursor) break;
-        if (seenCursors.has(nextCursor)) {
-          throw new Error('Project Chat export received a repeated history cursor.');
-        }
-        seenCursors.add(nextCursor);
-        before = nextCursor;
-      }
+        }),
+        shouldContinue: exportStillCurrent,
+      });
 
       exported.sort((left, right) => {
         const time = Date.parse(String(left.timestamp || '')) - Date.parse(String(right.timestamp || ''));
         if (Number.isFinite(time) && time !== 0) return time;
         return String(left.id || '').localeCompare(String(right.id || ''));
       });
-      const lines = exported.map((msg) => {
+      const projectedExport = filterProjectChatRoutineMaintenanceMessages(exported, false, provider);
+      const lines = projectedExport.map((msg) => {
         const heading = msg.role === 'user'
         ? '## User'
         : msg.role === 'assistant'
@@ -5796,13 +6065,16 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       anchor.click();
       anchor.remove();
       URL.revokeObjectURL(url);
-      appendSystemMessage(`Exported ${exported.length} transcript messages as markdown.`);
+      appendSystemMessage(`Exported ${projectedExport.length} transcript messages as markdown.`);
     } catch (error: any) {
       appendSystemMessage(
         String(error?.response?.data?.error || error?.message || 'Project Chat export failed.'),
       );
     } finally {
-      setIsExportingChat(false);
+      if (exportGenerationRef.current === exportGeneration) {
+        exportInFlightRef.current = false;
+        setIsExportingChat(false);
+      }
     }
   }, [appendSystemMessage, isExportingChat, projectName]);
 
@@ -7640,9 +7912,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
               }
 
               if (msg.role === 'system') {
-                return isCompactionNotice(msg.content) ? (
-                  <CompactionNoticeBlock key={msg.id} content={msg.content} size="compact" />
-                ) : (
+                return isCompactionNotice(msg.content) ? null : (
                   <div key={msg.id} className="px-3 py-1.5">
                     <div className="mx-auto max-w-[90%] rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-center text-[10px] tracking-wide text-slate-400">
                       {msg.content}

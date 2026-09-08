@@ -1,7 +1,6 @@
 import { execFile } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
-import path from 'path';
 import { AI_PROVIDER_MAP } from '../config/aiProviders';
+import { getOpenClawSetupReadiness, type OpenClawSetupReadiness } from '../services/openclawSetupReadiness';
 import { readOpenClawConfig } from '../services/openclawConfigManager';
 import {
   requestResolvedOllamaJson,
@@ -11,11 +10,11 @@ import {
 import type { AgentProviderName } from './AgentProvider.interface';
 import { buildOpenClawCliEnv, normalizePortalModelId } from '../utils/openclawCli';
 import { listGatewayModels } from '../utils/openclawGatewayRpc';
-import { listAntigravityModelsFromCli } from './antigravityModels';
 import {
   loadSelectableAgentZeroOAuthModels,
   type AgentZeroSelectableOAuthModel,
 } from './providers/agentZero/AgentZeroOAuthModelCatalog';
+import { readAcpModelCatalog } from './providers/native/acp/AcpModelCatalog';
 
 export interface ProviderModelDescriptor {
   id: string;
@@ -59,6 +58,7 @@ const OPENCLAW_VISIBLE_MODEL_IDS = [
   'google/gemini-3.1-pro-preview',
   'google/gemini-3-flash-preview',
   'google/gemini-3.1-flash-lite',
+  'anthropic/claude-fable-5-1',
   'anthropic/claude-fable-5',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-8',
@@ -103,6 +103,19 @@ export function filterOpenClawSessionModelCatalog(models: ProviderModelDescripto
   return models.filter((model) => isOpenClawSessionSelectableModelId(model.id));
 }
 
+// These models need the current Portal-tested runtime bundle. A provider
+// catalog advertising them is not proof that a retained gateway can run them.
+const CURRENT_RUNTIME_MODEL_IDS = new Set(['openai/gpt-6-astra', 'anthropic/claude-fable-5-1']);
+
+export function filterOpenClawModelsForRuntime(
+  models: ProviderModelDescriptor[],
+  readiness: Pick<OpenClawSetupReadiness, 'testedPairReady' | 'testedRuntimeFamily'> | null,
+): ProviderModelDescriptor[] {
+  const currentReady = readiness?.testedPairReady === true
+    && readiness.testedRuntimeFamily === 'current-2026.9.1';
+  return models.filter(model => currentReady || !CURRENT_RUNTIME_MODEL_IDS.has(normalizePortalModelId(model.id)));
+}
+
 const DECLARED_MODELS: Partial<Record<AgentProviderName, ProviderModelDescriptor[]>> = {
   OPENCLAW: declaredModels(OPENCLAW_VISIBLE_MODEL_IDS, 'openclaw'),
   CLAUDE_CODE: declaredCatalogProviderModels('anthropic', 'claude-code'),
@@ -144,30 +157,6 @@ async function listAgentZeroModels(): Promise<ProviderModelDescriptor[]> {
   // Intentionally no declared/preset fallback: an unvalidated fallback would
   // recreate the silent OpenRouter/default-provider authentication failure.
   return mapAgentZeroOAuthModels(await loadSelectableAgentZeroOAuthModels());
-}
-
-let grokModelCache: { at: number; models: ProviderModelDescriptor[] } | null = null;
-
-async function listGrokModels(): Promise<ProviderModelDescriptor[]> {
-  if (grokModelCache && Date.now() - grokModelCache.at < 60_000) return grokModelCache.models;
-  const dynamic = await new Promise<ProviderModelDescriptor[]>((resolve) => {
-    execFile('grok', [...GROK_BUILD_MODEL_ARGS], {
-      encoding: 'utf8',
-      timeout: 8000,
-      env: { ...process.env, NO_COLOR: '1', GROK_DISABLE_AUTOUPDATER: '1' },
-      maxBuffer: 1024 * 1024 * 2,
-    }, (error, stdout) => {
-      if (error) return resolve([]);
-      resolve(parseGrokModelsOutput(String(stdout || '')));
-    });
-  });
-  const deduped = new Map<string, ProviderModelDescriptor>();
-  for (const model of [...dynamic, ...DECLARED_MODELS.GROK!]) {
-    if (!deduped.has(model.id)) deduped.set(model.id, model);
-  }
-  const models = Array.from(deduped.values());
-  grokModelCache = { at: Date.now(), models };
-  return models;
 }
 
 const OPENCLAW_MODEL_CACHE_TTL_MS = 60_000;
@@ -388,58 +377,6 @@ async function resolveOpenClawModels(): Promise<ProviderModelDescriptor[]> {
   return openClawModelCache.models;
 }
 
-async function listGeminiDeclaredModels(): Promise<ProviderModelDescriptor[]> {
-  const ids = new Map<string, ProviderModelDescriptor>();
-  const add = (id: string, alias?: string | null, source: 'dynamic' | 'declared' = 'declared') => {
-    const clean = String(id || '').trim();
-    if (!clean) return;
-    if (!ids.has(clean)) {
-      ids.set(clean, {
-        id: clean,
-        alias: alias || null,
-        provider: 'gemini',
-        displayName: displayNameFromId(clean),
-        source,
-      });
-    } else if (alias && !ids.get(clean)?.alias) {
-      ids.get(clean)!.alias = alias;
-    }
-  };
-
-  const liveAntigravityModels = listAntigravityModelsFromCli();
-  for (const model of liveAntigravityModels) {
-    add(model.id, model.displayName, 'dynamic');
-  }
-
-  for (const model of GEMINI_DECLARED_FALLBACK) add(model);
-
-  if (liveAntigravityModels.length === 0) {
-    for (const model of await listOpenClawModels()) {
-      if (model.id.startsWith('google-antigravity/')) {
-        add(model.id.slice('google-antigravity/'.length), model.alias || null);
-      }
-    }
-
-    const openclawConfig = path.join(process.env.HOME || '/root', '.openclaw', 'openclaw.json');
-    if (existsSync(openclawConfig)) {
-      try {
-        const raw = JSON.parse(readFileSync(openclawConfig, 'utf8'));
-        const configured = raw?.agents?.defaults?.models || {};
-        for (const [key, value] of Object.entries(configured)) {
-          if (!key.startsWith('google-antigravity/')) continue;
-          const id = key.slice('google-antigravity/'.length);
-          const alias = value && typeof value === 'object' && 'alias' in value ? String((value as any).alias || '') : '';
-          add(id, alias || null);
-        }
-      } catch {
-        // Ignore malformed config; fallback models still apply.
-      }
-    }
-  }
-
-  return Array.from(ids.values());
-}
-
 export async function getOllamaRuntimeCandidates(): Promise<Array<{
   authority: OllamaBackendAuthority;
   source: string;
@@ -501,16 +438,33 @@ async function listOllamaModels(): Promise<ProviderModelDescriptor[]> {
 
 export async function listProviderModels(name: AgentProviderName): Promise<ProviderModelDescriptor[]> {
   switch (name) {
-    case 'OPENCLAW':
-      return listOpenClawModels();
+    case 'OPENCLAW': {
+      const models = await listOpenClawModels();
+      if (!models.some(model => CURRENT_RUNTIME_MODEL_IDS.has(normalizePortalModelId(model.id)))) return models;
+      const readiness = await getOpenClawSetupReadiness().catch(() => null);
+      // Apply after the cache, including a preserved live catalog after runtime
+      // rollback. A stale 9.1 catalog must not re-admit models on 7.1.
+      const admitted = filterOpenClawModelsForRuntime(models, readiness);
+      const retainedIds = new Set(admitted.map(model => model.id));
+      lastOpenClawUnavailableModelIds = [...new Set([
+        ...lastOpenClawUnavailableModelIds.filter(id => !retainedIds.has(id)),
+        ...models.filter(model => !retainedIds.has(model.id)).map(model => model.id),
+      ])];
+      return admitted;
+    }
     case 'GEMINI':
-      return listGeminiDeclaredModels();
     case 'GROK':
-      return listGrokModels();
+      return [];
     case 'AGENT_ZERO':
       return listAgentZeroModels();
     case 'OLLAMA':
       return listOllamaModels();
+    case 'HERMES':
+    case 'OPENCODE':
+      // ACP is authoritative for these catalogs. The cache is populated only
+      // by an attested session/new or session/load response, never by a stale
+      // hard-coded model list or model-id prefix inference.
+      return readAcpModelCatalog(name);
     default:
       return DECLARED_MODELS[name] ? [...DECLARED_MODELS[name]!] : [];
   }

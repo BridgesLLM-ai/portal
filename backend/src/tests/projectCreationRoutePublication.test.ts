@@ -2,6 +2,28 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+jest.mock('../services/projectRuntimeOwnership', () => {
+  const actual = jest.requireActual<typeof import('../services/projectRuntimeOwnership')>(
+    '../services/projectRuntimeOwnership',
+  );
+  if (typeof process.getuid !== 'function' || process.getuid() === 0) return actual;
+  const { writeContainedFileAtomic } = jest.requireActual<typeof import('../services/containedPath')>(
+    '../services/containedPath',
+  );
+  return {
+    ...actual,
+    // This publication test exercises the post-CAS lifecycle, not foreign-uid
+    // assignment. Preserve production's contained atomic write semantics on a
+    // non-root test runner without requiring CAP_CHOWN.
+    writeProjectRuntimeOwnedFileAtomic: (
+      projectRoot: string,
+      relativePath: string,
+      content: string | Buffer,
+      options: { encoding?: BufferEncoding; exclusive?: boolean; maxBytes?: number } = {},
+    ) => writeContainedFileAtomic(projectRoot, relativePath, content, options),
+  };
+});
+
 const mockTempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-project-route-publication-'));
 const mockProjectsRoot = path.join(mockTempRoot, 'projects');
 fs.mkdirSync(mockProjectsRoot, { recursive: true });

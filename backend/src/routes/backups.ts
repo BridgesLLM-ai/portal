@@ -40,6 +40,7 @@ function humanSize(bytes: number): string {
 export function publicBackup(file: BackupFile) {
   return {
     filename: file.filename,
+    format: /-data-[a-f0-9]{8}\.tar\.gz$/.test(file.filename) ? 'portal-data' : 'legacy',
     size: file.size,
     sizeHuman: humanSize(file.size),
     created: new Date(file.mtimeMs).toISOString(),

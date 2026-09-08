@@ -45,7 +45,7 @@ async function reachValidatedModelStep(user: ReturnType<typeof userEvent.setup>,
   await user.click(screen.getByRole('button', { name: 'I have my key ready' }));
   await user.type(screen.getByLabelText('OpenAI API API key'), secret);
   await user.click(screen.getByRole('button', { name: 'Validate Key' }));
-  await screen.findByRole('button', { name: 'Save & Activate' });
+  await screen.findByRole('button', { name: 'Save Key' });
 }
 
 describe('ApiKeySetupFlow credential operation identity', () => {
@@ -74,7 +74,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
       <ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
     );
     await reachValidatedModelStep(user, 'sk-first-secret');
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     await waitFor(() => expect(saveRequests).toHaveLength(1));
     expect(await screen.findByText('simulated lost response 1')).toBeInTheDocument();
 
@@ -93,7 +93,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
       <ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
     );
     await reachValidatedModelStep(user, 'sk-first-secret');
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     await waitFor(() => expect(saveRequests).toHaveLength(2));
     expect(saveRequests[1].operationId).toBe(firstId);
   }, 10_000);
@@ -127,7 +127,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
       <ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
     );
     await reachValidatedModelStep(user, 'sk-original-secret');
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     expect(await screen.findByText('simulated lost response')).toBeInTheDocument();
 
     const storageKey = credentialOperationStorageKey('setup:pending', 'api-key', 'openai');
@@ -140,7 +140,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
       <ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={onComplete} onCancel={vi.fn()} />,
     );
     await reachValidatedModelStep(user, 'sk-replacement-secret');
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     expect(await screen.findByText('operation UUID belongs to the earlier secret')).toBeInTheDocument();
 
     expect(saveRequests).toHaveLength(2);
@@ -151,14 +151,14 @@ describe('ApiKeySetupFlow credential operation identity', () => {
     expect(window.localStorage.getItem(storageKey)).toBeNull();
     expect(onComplete).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     await waitFor(() => expect(saveRequests).toHaveLength(3));
     expect(saveRequests[2]).toMatchObject({ apiKey: 'sk-replacement-secret' });
     expect(saveRequests[2].operationId).not.toBe(retainedId);
     await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
   }, 15_000);
 
-  it('retires a closed-tab UUID after default-state drift and does not retry until the user asks', async () => {
+  it('retires a closed-tab UUID after authoritative request drift and does not retry until the user asks', async () => {
     const user = userEvent.setup();
     const saveRequests: Array<Record<string, unknown>> = [];
     let currentDefault: string | null = null;
@@ -189,13 +189,12 @@ describe('ApiKeySetupFlow credential operation identity', () => {
       <ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
     );
     await reachValidatedModelStep(user, 'sk-stable-secret');
-    expect(screen.getByRole('checkbox', { name: 'Set this as the default AI model' })).toBeChecked();
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     expect(await screen.findByText('simulated lost response after setting the default')).toBeInTheDocument();
 
     const storageKey = credentialOperationStorageKey('setup:pending', 'api-key', 'openai');
     const retainedId = window.localStorage.getItem(storageKey);
-    expect(saveRequests[0]).toMatchObject({ operationId: retainedId, setDefault: true });
+    expect(saveRequests[0]).toMatchObject({ operationId: retainedId, setDefault: false });
 
     firstTab.unmount();
     currentDefault = 'openai/gpt-test';
@@ -204,8 +203,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
       <ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={onComplete} onCancel={vi.fn()} />,
     );
     await reachValidatedModelStep(user, 'sk-stable-secret');
-    expect(screen.getByRole('checkbox', { name: 'Set this as the default AI model' })).not.toBeChecked();
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     expect(await screen.findByText('operation UUID belongs to the earlier default selection')).toBeInTheDocument();
 
     expect(saveRequests).toHaveLength(2);
@@ -217,7 +215,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
     expect(window.localStorage.getItem(storageKey)).toBeNull();
     expect(onComplete).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     await waitFor(() => expect(saveRequests).toHaveLength(3));
     expect(saveRequests[2].operationId).not.toBe(retainedId);
     expect(saveRequests[2]).toMatchObject({ apiKey: 'sk-stable-secret', setDefault: false });
@@ -235,7 +233,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
 
     render(<ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
     await reachValidatedModelStep(user, 'sk-never-posted');
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     expect(await screen.findByText(/malformed durable credential-operation record/i)).toBeInTheDocument();
     expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/save-key'))).toHaveLength(0);
   }, 10_000);
@@ -255,7 +253,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
 
     render(<ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
     await reachValidatedModelStep(user, 'sk-still-never-posted');
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     expect(await screen.findByText(/cannot verify durable credential-operation storage/i)).toBeInTheDocument();
     expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/save-key'))).toHaveLength(0);
     unavailable.mockRestore();
@@ -282,7 +280,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
 
     render(<ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
     await reachValidatedModelStep(user, 'sk-readback-must-fail');
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     expect(await screen.findByText(/cannot verify durable credential-operation storage/i)).toBeInTheDocument();
     expect(mocks.post.mock.calls.filter(([url]) => String(url).endsWith('/save-key'))).toHaveLength(0);
     droppedWrite.mockRestore();
@@ -300,7 +298,7 @@ describe('ApiKeySetupFlow credential operation identity', () => {
     });
     render(<ApiKeySetupFlow provider={provider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />);
     await reachValidatedModelStep(user, 'sk-authoritatively-rejected');
-    await user.click(screen.getByRole('button', { name: 'Save & Activate' }));
+    await user.click(screen.getByRole('button', { name: 'Save Key' }));
     expect(await screen.findByText('rejected before admission')).toBeInTheDocument();
     expect(window.localStorage.getItem(storageKey)).toBeNull();
   }, 10_000);

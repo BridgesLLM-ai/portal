@@ -1,15 +1,19 @@
 jest.mock('./providerAvailability', () => ({
   getProviderAvailability: jest.fn(),
+  getProviderAvailabilityAsync: jest.fn(),
   getProviderCatalogAvailabilityAsync: jest.fn(),
   getProviderCapabilities: jest.fn(),
 }));
 
 import {
+  getProviderAvailability,
+  getProviderAvailabilityAsync,
   getProviderCatalogAvailabilityAsync,
   getProviderCapabilities,
 } from './providerAvailability';
 import { AgentRegistry } from './AgentRegistry';
 import type { AgentProviderName } from './AgentProvider.interface';
+import { GeminiProvider } from './providers/GeminiProvider';
 import {
   __resetNativeReadinessForTests,
   recordNativeProviderAuthFailure,
@@ -18,6 +22,7 @@ import {
 const mockedGetProviderCatalogAvailabilityAsync = jest.mocked(
   getProviderCatalogAvailabilityAsync,
 );
+const mockedGetProviderAvailability = jest.mocked(getProviderAvailability);
 const mockedGetProviderCapabilities = jest.mocked(getProviderCapabilities);
 
 function availability(name: AgentProviderName) {
@@ -32,17 +37,31 @@ function availability(name: AgentProviderName) {
       requiresGateway: name === 'OPENCLAW',
       adapterFamily: name === 'OPENCLAW' ? 'openclaw-gateway' as const : 'native-cli' as const,
       adapterKey: name.toLowerCase(),
+      supportsNewSession: true,
       supportsHistory: true,
+      supportsSessionClose: true,
       supportsModelSelection: true,
+      supportsModelReadback: true,
       modelSelectionMode: 'session' as const,
       supportsCustomModelInput: true,
       canEnumerateModels: true,
       modelCatalogKind: 'dynamic' as const,
       supportsSessionList: true,
+      supportsSessionResume: true,
+      supportsSessionFork: false,
+      supportsLiveText: true,
+      supportsReasoning: true,
+      supportsAskUser: false,
+      supportsAttachments: true,
+      supportsCancellation: true,
+      cancellationMode: 'protocol' as const,
       supportsExecApproval: false,
       supportsInTurnSteering: false,
+      supportsLiveToolEvents: true,
       supportsQueuedFollowUps: true,
       followUpMode: 'queued_follow_up' as const,
+      supportsPromptCausalCompletion: true,
+      supportsProcessRestartResume: true,
       supportedExecutionScopes: ['HOST_OPERATOR'] as const,
     },
   };
@@ -64,6 +83,8 @@ describe('AgentRegistry fail-soft provider catalog', () => {
     AgentRegistry.__resetProviderCatalogForTests();
     __resetNativeReadinessForTests();
     mockedGetProviderCatalogAvailabilityAsync.mockReset();
+    mockedGetProviderAvailability.mockReset();
+    jest.mocked(getProviderAvailabilityAsync).mockReset();
     mockedGetProviderCapabilities.mockImplementation((name) => availability(name).capabilities);
   });
 
@@ -71,6 +92,190 @@ describe('AgentRegistry fail-soft provider catalog', () => {
     AgentRegistry.__resetProviderCatalogForTests();
     __resetNativeReadinessForTests();
     jest.useRealTimers();
+  });
+
+  test('publishes executable Hermes/OpenCode metadata while keeping DeepSeek disabled', () => {
+    const harnesses = AgentRegistry.listHarnesses();
+    expect(harnesses.map((harness) => harness.id)).toEqual([
+      'OPENCLAW',
+      'CLAUDE_CODE',
+      'CODEX',
+      'GROK',
+      'AGENT_ZERO',
+      'GEMINI',
+      'OLLAMA',
+      'HERMES',
+      'OPENCODE',
+      'DEEPSEEK_HARNESS',
+    ]);
+    expect(AgentRegistry.getHarnessMetadata('HERMES')).toMatchObject({
+      implemented: true,
+      selectable: true,
+      compatibilityProviderId: 'HERMES',
+    });
+    expect(AgentRegistry.getHarnessMetadata('OPENCODE')).toMatchObject({
+      implemented: true,
+      selectable: true,
+      compatibilityProviderId: 'OPENCODE',
+    });
+    expect(AgentRegistry.getHarnessMetadata('DEEPSEEK_HARNESS')).toMatchObject({
+      implemented: false,
+      selectable: false,
+      releaseStage: 'developer-preview',
+      compatibilityProviderId: null,
+    });
+  });
+
+  test('instantiates concrete Hermes and OpenCode providers from the explicit registry', () => {
+    mockedGetProviderAvailability.mockImplementation((name) => availability(name));
+    expect(AgentRegistry.getProvider('HERMES')).toMatchObject({
+      providerName: 'HERMES',
+      displayName: 'Hermes',
+    });
+    expect(AgentRegistry.getProvider('OPENCODE')).toMatchObject({
+      providerName: 'OPENCODE',
+      displayName: 'OpenCode',
+    });
+  });
+
+  test.each(['CODEX', 'CLAUDE_CODE'] as const)('%s requests refresh an expired catalog before resolving the adapter', async (name) => {
+    mockedGetProviderAvailability.mockImplementation(() => ({
+      ...availability(name), installed: false, usable: false,
+      reason: 'Native host CLI admission has not been checked asynchronously.',
+    }));
+    jest.mocked(getProviderAvailabilityAsync).mockResolvedValue(availability(name));
+    await expect(AgentRegistry.getAsync(name)).resolves.toMatchObject({ providerName: name });
+    expect(getProviderAvailabilityAsync).toHaveBeenCalledWith(name);
+    expect(mockedGetProviderAvailability).not.toHaveBeenCalled();
+    jest.mocked(getProviderAvailabilityAsync).mockResolvedValue({
+      ...availability(name), installed: false, usable: false, reason: 'Native runtime absent',
+    });
+    await expect(AgentRegistry.getAsync(name)).rejects.toThrow('Native runtime absent');
+  });
+
+  test('keeps host readiness fail-closed while Project Sandbox and cleanup use narrow explicit lanes', () => {
+    mockedGetProviderAvailability.mockImplementation((name) => ({
+      ...availability(name),
+      installed: false,
+      usable: false,
+      reason: `${name} is not installed`,
+    }));
+
+    expect(() => AgentRegistry.getProvider('CODEX')).toThrow(/not installed/i);
+    mockedGetProviderAvailability.mockClear();
+    expect(AgentRegistry.getSharedProjectSandboxProvider('CODEX')).toMatchObject({
+      providerName: 'CODEX',
+    });
+    expect(mockedGetProviderAvailability).not.toHaveBeenCalled();
+
+    const cleanup = AgentRegistry.getProviderCleanupController('CODEX');
+    expect(Object.isFrozen(cleanup)).toBe(true);
+    expect(cleanup).toMatchObject({ providerName: 'CODEX' });
+    expect(typeof cleanup.abortActiveRun).toBe('function');
+    expect((cleanup as any).startSession).toBeUndefined();
+    expect((cleanup as any).sendMessage).toBeUndefined();
+    expect((cleanup as any).getHistory).toBeUndefined();
+
+    for (const provider of ['AGENT_ZERO', 'OLLAMA', 'GROK', 'HERMES', 'OPENCODE'] as const) {
+      expect(() => AgentRegistry.getSharedProjectSandboxProvider(provider as any))
+        .toThrow(/no shared Project Sandbox adapter/i);
+    }
+  });
+
+  test('keeps detection-only Antigravity cleanup callable without exposing positive authority', async () => {
+    mockedGetProviderAvailability.mockImplementation((name) => ({
+      ...availability(name),
+      installed: false,
+      implemented: false,
+      usable: false,
+    }));
+    const abort = jest.spyOn(GeminiProvider.prototype, 'abortActiveRun')
+      .mockResolvedValue(true);
+    const terminate = jest.spyOn(GeminiProvider.prototype, 'terminateSession')
+      .mockResolvedValue(undefined);
+    try {
+      expect(() => AgentRegistry.getProvider('GEMINI')).toThrow(/not implemented yet/i);
+      const cleanup = AgentRegistry.getProviderCleanupController('GEMINI');
+
+      expect(Object.isFrozen(cleanup)).toBe(true);
+      expect(cleanup.providerName).toBe('GEMINI');
+      expect((cleanup as any).startSession).toBeUndefined();
+      expect((cleanup as any).sendMessage).toBeUndefined();
+      expect((cleanup as any).getHistory).toBeUndefined();
+      await expect(cleanup.abortActiveRun?.('legacy-antigravity-session', 'legacy-run'))
+        .resolves.toBe(true);
+      await expect(cleanup.terminateSession('legacy-antigravity-session'))
+        .resolves.toBeUndefined();
+      expect(abort).toHaveBeenCalledWith('legacy-antigravity-session', 'legacy-run');
+      expect(terminate).toHaveBeenCalledWith('legacy-antigravity-session');
+    } finally {
+      abort.mockRestore();
+      terminate.mockRestore();
+    }
+  });
+
+  test('combines registered readiness with the non-selectable DeepSeek preview row', async () => {
+    mockedGetProviderCatalogAvailabilityAsync.mockImplementation(async (name) => availability(name));
+
+    const harnesses = await AgentRegistry.listHarnessesAsync();
+
+    expect(harnesses).toHaveLength(10);
+    expect(harnesses.find((harness) => harness.harnessId === 'CODEX')).toMatchObject({
+      name: 'CODEX',
+      compatibilityProviderId: 'CODEX',
+      transport: 'native-cli',
+      provenanceLabel: 'via Codex CLI',
+      hostStreamOwnership: 'provider',
+      availabilityState: 'ready',
+      installed: true,
+      implemented: true,
+      selectable: true,
+      usable: true,
+      capabilities: expect.objectContaining({
+        supportedExecutionScopes: ['HOST_OPERATOR', 'PROJECT_SANDBOX'],
+      }),
+    });
+    expect(harnesses.find((harness) => harness.harnessId === 'HERMES')).toMatchObject({
+      name: 'HERMES',
+      compatibilityProviderId: 'HERMES',
+      transport: 'acp-stdio',
+      provenanceLabel: 'via Hermes',
+      hostStreamOwnership: 'route',
+      releaseStage: 'stable',
+      availabilityState: 'ready',
+      installed: true,
+      implemented: true,
+      selectable: true,
+      usable: true,
+      capabilities: expect.objectContaining({
+        supportedExecutionScopes: ['HOST_OPERATOR'],
+      }),
+    });
+    expect(harnesses.find((harness) => harness.harnessId === 'OPENCODE')).toMatchObject({
+      compatibilityProviderId: 'OPENCODE',
+      transport: 'acp-stdio',
+      releaseStage: 'stable',
+      availabilityState: 'ready',
+      installed: true,
+      implemented: true,
+      selectable: true,
+      usable: true,
+      capabilities: expect.objectContaining({
+        supportedExecutionScopes: ['HOST_OPERATOR'],
+      }),
+    });
+    expect(harnesses.find((harness) => harness.harnessId === 'DEEPSEEK_HARNESS')).toMatchObject({
+      name: 'DEEPSEEK_HARNESS',
+      compatibilityProviderId: null,
+      transport: 'json-rpc-stdio',
+      releaseStage: 'developer-preview',
+      selectable: false,
+      usable: false,
+      capabilities: expect.objectContaining({
+        supportsSessionResume: false,
+        cancellationMode: 'process-kill',
+      }),
+    });
   });
 
   test('returns fast rows while one probe hangs and another fails', async () => {
@@ -97,6 +302,8 @@ describe('AgentRegistry fail-soft provider catalog', () => {
       'AGENT_ZERO',
       'GEMINI',
       'OLLAMA',
+      'HERMES',
+      'OPENCODE',
     ]);
     expect(providers.find((provider) => provider.name === 'CODEX')).toMatchObject({
       availabilityState: 'ready',
@@ -142,14 +349,14 @@ describe('AgentRegistry fail-soft provider catalog', () => {
     const second = AgentRegistry.listProvidersAsync();
     await Promise.resolve();
 
-    expect(mockedGetProviderCatalogAvailabilityAsync).toHaveBeenCalledTimes(7);
+    expect(mockedGetProviderCatalogAvailabilityAsync).toHaveBeenCalledTimes(9);
     resolveCodex(availability('CODEX'));
     await jest.runAllTimersAsync();
     await expect(Promise.all([first, second])).resolves.toEqual([
       expect.any(Array),
       expect.any(Array),
     ]);
-    expect(mockedGetProviderCatalogAvailabilityAsync).toHaveBeenCalledTimes(7);
+    expect(mockedGetProviderCatalogAvailabilityAsync).toHaveBeenCalledTimes(9);
   });
 
   test('converts a permanently hung background probe into a fail-closed row', async () => {

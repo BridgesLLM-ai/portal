@@ -141,6 +141,24 @@ describe('native provider adapters', () => {
     expect(ctx.state.approvedAllowedTools).toContain('Bash');
     expect(ctx.state.approvedAddDirs).toContain('/tmp');
     expect(ctx.emitStatus).toHaveBeenCalledWith(expect.stringMatching(/Retrying Claude/i));
+
+    const approvedRetry = await claudeCodeAdapter.buildInvocation(ctx);
+    expect(approvedRetry.args).toEqual(expect.arrayContaining([
+      '--safe-mode',
+      '--disable-slash-commands',
+      '--strict-mcp-config',
+      '--mcp-config',
+      '{"mcpServers":{}}',
+      '--setting-sources',
+      '',
+      '--permission-mode',
+      'dontAsk',
+      '--allowedTools',
+      'Bash',
+      '--add-dir',
+      '/tmp',
+    ]));
+    expect(approvedRetry.args.join(' ')).not.toMatch(/bypassPermissions/i);
   });
 
   test('Claude pre-spawn retries retain session-id until init or result establishes resume state', async () => {
@@ -150,11 +168,28 @@ describe('native provider adapters', () => {
     ctx.state.turnAttempt = 2;
 
     const retryBeforeSpawn = await claudeCodeAdapter.buildInvocation(ctx);
-    expect(retryBeforeSpawn.args).toEqual(expect.arrayContaining([
-      '--session-id',
-      '11111111-1111-4111-8111-111111111111',
-    ]));
-    expect(retryBeforeSpawn.args).not.toContain('--resume');
+    expect(retryBeforeSpawn).toEqual({
+      command: '/usr/bin/claude',
+      args: [
+        '-p',
+        '--verbose',
+        '--output-format',
+        'stream-json',
+        '--include-partial-messages',
+        '--safe-mode',
+        '--disable-slash-commands',
+        '--strict-mcp-config',
+        '--mcp-config',
+        '{"mcpServers":{}}',
+        '--setting-sources',
+        '',
+        '--permission-mode',
+        'dontAsk',
+        '--session-id',
+        '11111111-1111-4111-8111-111111111111',
+      ],
+      stdinText: 'hello',
+    });
 
     claudeCodeAdapter.handleStdoutLine(JSON.stringify({
       type: 'system',
@@ -165,28 +200,123 @@ describe('native provider adapters', () => {
       nativeSessionEstablished: true,
     }));
     const establishedRetry = await claudeCodeAdapter.buildInvocation(ctx);
-    expect(establishedRetry.args).toEqual(expect.arrayContaining([
-      '--resume',
-      '11111111-1111-4111-8111-111111111111',
-    ]));
+    expect(establishedRetry).toEqual({
+      command: '/usr/bin/claude',
+      args: [
+        '-p',
+        '--verbose',
+        '--output-format',
+        'stream-json',
+        '--include-partial-messages',
+        '--safe-mode',
+        '--disable-slash-commands',
+        '--strict-mcp-config',
+        '--mcp-config',
+        '{"mcpServers":{}}',
+        '--setting-sources',
+        '',
+        '--permission-mode',
+        'dontAsk',
+        '--resume',
+        '11111111-1111-4111-8111-111111111111',
+      ],
+      stdinText: 'hello',
+    });
   });
 
-  test('Codex host-operator turns request a reasoning effort and a readable summary', () => {
-    // without these Codex ran with `reasoning_effort: null` and
-    // returned reasoning items whose summary was empty, so Agent Chat had
-    // nothing to render while advertising "Stream when supported".
+  test('Codex host-operator turns use the exact absolute executable and bounded argv', async () => {
     const ctx = makeContext();
-    const invocation = codexAdapter.buildInvocation(ctx) as any;
+    const input = await codexAdapter.buildInvocation(ctx);
 
-    expect(invocation.command).toBe('codex');
-    expect(invocation.args).toEqual(expect.arrayContaining([
-      '-c',
-      'model_reasoning_effort="medium"',
-      '-c',
-      'model_reasoning_summary="auto"',
-    ]));
-    // The prompt must remain the final positional argument.
-    expect(invocation.args[invocation.args.length - 1]).toBe(ctx.message);
+    expect(input).toEqual({
+      command: '/usr/bin/codex',
+      args: [
+        'exec',
+        '--skip-git-repo-check',
+        '--color',
+        'never',
+        '--json',
+        '--sandbox',
+        'workspace-write',
+        '-c',
+        'model_reasoning_effort="medium"',
+        '-c',
+        'model_reasoning_summary="auto"',
+        '-',
+      ],
+      stdinText: 'hello',
+    });
+  });
+
+  test('Codex unapproved resume pins workspace-write instead of inheriting local config', async () => {
+    const ctx = makeContext();
+    ctx.session.metadata = { nativeSessionId: 'thread-unapproved-resume' };
+
+    const input = await codexAdapter.buildInvocation(ctx);
+
+    expect(input).toEqual({
+      command: '/usr/bin/codex',
+      args: [
+        'exec',
+        'resume',
+        'thread-unapproved-resume',
+        '--skip-git-repo-check',
+        '--json',
+        '-c',
+        'sandbox_mode="workspace-write"',
+        '-c',
+        'model_reasoning_effort="medium"',
+        '-c',
+        'model_reasoning_summary="auto"',
+        '-',
+      ],
+      stdinText: 'hello',
+    });
+  });
+
+  test.each([
+    '--last',
+    'thread id with spaces',
+    `thread-${'a'.repeat(512)}`,
+  ])('Codex host resume rejects unsafe native session identity %p', async (nativeSessionId) => {
+    const ctx = makeContext();
+    ctx.session.metadata = { nativeSessionId };
+
+    await expect(codexAdapter.buildInvocation(ctx)).rejects.toThrow(/session identity is invalid/i);
+  });
+
+  test.each([
+    '',
+    'contains\0nul',
+    'a'.repeat((256 * 1024) + 1),
+  ])('Codex host invocation rejects invalid private prompt bytes', async (message) => {
+    const ctx = makeContext();
+    ctx.message = message;
+
+    await expect(codexAdapter.buildInvocation(ctx)).rejects.toThrow(/prompt is invalid/i);
+  });
+
+  test('host adapters reject unsafe models and Claude capability grants', async () => {
+    const codex = makeContext();
+    codex.session.model = '--dangerous-option';
+    await expect(codexAdapter.buildInvocation(codex)).rejects.toThrow(/model is invalid/i);
+
+    const claude = makeContext();
+    claude.session.provider = 'CLAUDE_CODE';
+    claude.session.metadata = { nativeSessionId: 'claude-session-safe' };
+    claude.state.approvedAllowedTools = ['Bash', 'Bash'];
+    await expect(claudeCodeAdapter.buildInvocation(claude)).rejects.toThrow(/duplicates/i);
+
+    claude.state.approvedAllowedTools = ['Bash'];
+    claude.state.approvedAddDirs = ['/'];
+    await expect(claudeCodeAdapter.buildInvocation(claude)).rejects.toThrow(/add-directory grant is invalid/i);
+
+    claude.state.approvedAddDirs = ['relative/path'];
+    await expect(claudeCodeAdapter.buildInvocation(claude)).rejects.toThrow(/add-directory grant is invalid/i);
+
+    claude.state.approvedAddDirs = [];
+    claude.state.approvedAllowedTools = ['--bad-tool'];
+    await expect(claudeCodeAdapter.buildInvocation(claude)).rejects.toThrow(/allowed-tool grant is invalid/i);
   });
 
   test('Codex reasoning summaries render as thinking, not just plain text items', () => {
@@ -287,8 +417,24 @@ describe('native provider adapters', () => {
     expect(ctx.state.retryRequested).toBe(true);
     expect(ctx.state.codexApprovedExecution).toBe(true);
 
-    const invocation = await codexAdapter.buildInvocation(ctx);
-    expect(invocation.args).toContain('--dangerously-bypass-approvals-and-sandbox');
+    const input = await codexAdapter.buildInvocation(ctx);
+    expect(input).toEqual({
+      command: '/usr/bin/codex',
+      args: [
+        'exec',
+        'resume',
+        'thread-approval',
+        '--skip-git-repo-check',
+        '--json',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '-c',
+        'model_reasoning_effort="medium"',
+        '-c',
+        'model_reasoning_summary="auto"',
+        '-',
+      ],
+      stdinText: 'hello',
+    });
   });
 
   test('Grok Build legacy headless adapter fails closed in favor of the ACP broker', async () => {
@@ -298,40 +444,54 @@ describe('native provider adapters', () => {
       .rejects.toThrow(/pinned ACP stdio broker/i);
   });
 
-  test('Antigravity adapter uses transcript prompts and accumulates plain text output', () => {
-    const prompt = buildTranscriptPrompt([
-      { id: '1', role: 'user', content: 'Earlier question', timestamp: new Date().toISOString() },
-      { id: '2', role: 'assistant', content: 'Earlier answer', timestamp: new Date().toISOString() },
-    ], 'Latest question');
-    expect(prompt).toMatch(/Earlier question/);
-    expect(prompt).toMatch(/Latest question/);
-
+  test('Antigravity streams native deltas once and persists the resumable conversation', async () => {
     const ctx = makeContext();
-    geminiAdapter.handleStdoutLine('Hel', ctx);
-    geminiAdapter.handleStdoutRemainder?.('lo', ctx);
-
-    expect(ctx.emitChunk).toHaveBeenNthCalledWith(1, 'Hel\n');
-    expect(ctx.emitChunk).toHaveBeenNthCalledWith(2, 'lo');
-    expect(ctx.fullText).toBe('Hel\nlo');
+    geminiAdapter.handleStdoutLine(JSON.stringify({ event: 'init', conversation_id: 'native-conversation-1' }), ctx);
+    geminiAdapter.handleStdoutLine(JSON.stringify({ event: 'step_update', step_update: {
+      conversation_id: 'native-conversation-1', step_index: 1, state: 'DONE', step_type: 'agent_response', text_delta: '43\n',
+    } }), ctx);
+    geminiAdapter.handleStdoutRemainder?.(JSON.stringify({ event: 'result', result: {
+      conversation_id: 'native-conversation-1', status: 'SUCCESS', response: '43\n',
+    } }), ctx);
+    await geminiAdapter.finalizeTurn?.(ctx);
+    expect(ctx.fullText).toBe('43\n');
+    expect(ctx.emitChunk).toHaveBeenCalledTimes(1);
+    expect(ctx.session.metadata?.nativeSessionId).toBe('native-conversation-1');
+    ctx.message = 'Add 9 to your last answer.';
+    ctx.session.messages = [{ id: 'old', role: 'assistant', content: '43', timestamp: new Date().toISOString() }];
+    const invocation = await geminiAdapter.buildInvocation(ctx);
+    expect(invocation.args).toEqual(expect.arrayContaining(['--output-format', 'stream-json', '--conversation', 'native-conversation-1']));
+    expect(invocation.args.at(-1)).toBe(ctx.message);
   });
 
-  test('Antigravity adapter surfaces printed action lines as tool events', () => {
+  test('Antigravity reports actual native tool failures, never tools inferred from prose', async () => {
     const ctx = makeContext();
-
     geminiAdapter.handleStdoutLine('I will list the current directory.', ctx);
-    geminiAdapter.handleStdoutLine('DONE', ctx);
+    expect(ctx.emitStatus).not.toHaveBeenCalled();
+    const step = { conversation_id: 'native-tools', step_index: 4, step_type: 'tool', tool_name: 'view_file',
+      tool_info: { name: 'view_file', parameters: { AbsolutePath: '/tmp/fact.txt' } } };
+    geminiAdapter.handleStdoutLine(JSON.stringify({ event: 'step_update', step_update: { ...step, state: 'ACTIVE' } }), ctx);
+    const failed = JSON.stringify({ event: 'step_update', step_update: { ...step, state: 'ERROR',
+      tool_info: { ...step.tool_info, error: { type: 'TOOL_ERROR', message: 'user denied permission' } } } });
+    geminiAdapter.handleStdoutLine(failed, ctx);
+    geminiAdapter.handleStdoutLine(failed, ctx);
+    expect(ctx.emitStatus).toHaveBeenCalledTimes(2);
+    expect(ctx.emitStatus).toHaveBeenNthCalledWith(1, expect.any(String), expect.objectContaining({
+      type: 'tool_start', toolName: 'view_file', toolCallId: 'antigravity:native-tools:4',
+    }));
+    expect(ctx.emitStatus).toHaveBeenNthCalledWith(2, expect.any(String), expect.objectContaining({
+      type: 'tool_end', toolCallId: 'antigravity:native-tools:4', isError: true, toolResult: 'user denied permission',
+    }));
+    geminiAdapter.handleStdoutLine(JSON.stringify({ event: 'result', result: {
+      status: 'SUCCESS', response: '', denied_actions: [{ action: 'read_file', display_name: 'ViewFile' }],
+    } }), ctx);
+    await expect(geminiAdapter.finalizeTurn?.(ctx)).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+  });
 
-    expect(ctx.emitStatus).toHaveBeenCalledWith(
-      expect.stringMatching(/Antigravity: list the current directory/i),
-      expect.objectContaining({ type: 'tool_start', toolName: 'inspect' }),
-    );
-    expect(ctx.emitStatus).toHaveBeenCalledWith(
-      'list the current directory',
-      expect.objectContaining({ type: 'tool_end', toolName: 'inspect' }),
-    );
-    expect(ctx.emitChunk).toHaveBeenCalledTimes(1);
-    expect(ctx.emitChunk).toHaveBeenCalledWith('DONE\n');
-    expect(ctx.fullText).toBe('DONE\n');
+  test('Antigravity requires successful native settlement even when partial text exists', async () => {
+    const ctx = makeContext();
+    geminiAdapter.handleStdoutLine(JSON.stringify({ event: 'result', result: { status: 'ERROR', response: 'Partial' } }), ctx);
+    await expect(geminiAdapter.finalizeTurn?.(ctx)).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
   });
 
   test('Antigravity adapter asks before enabling trusted tool execution', async () => {
@@ -340,7 +500,7 @@ describe('native provider adapters', () => {
     (ctx.requestApproval as jest.Mock).mockResolvedValueOnce('allow-once');
 
     const invocation = await geminiAdapter.buildInvocation(ctx);
-    ctx.setFullText('done');
+    geminiAdapter.handleStdoutLine(JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response: 'done' } }), ctx);
     await geminiAdapter.finalizeTurn?.(ctx);
 
     expect(ctx.requestApproval).toHaveBeenCalledWith(expect.objectContaining({
@@ -350,14 +510,8 @@ describe('native provider adapters', () => {
     }));
     expect(invocation.command).toBe('agy');
     expect(invocation.args).toContain('--dangerously-skip-permissions');
-    expect(ctx.emitStatus).toHaveBeenCalledWith(
-      'Antigravity workspace tools approved',
-      expect.objectContaining({ type: 'tool_start', toolName: 'antigravity' }),
-    );
-    expect(ctx.emitStatus).toHaveBeenCalledWith(
-      'Antigravity workspace turn completed',
-      expect.objectContaining({ type: 'tool_end', toolName: 'antigravity' }),
-    );
+    // Approval is permission, not evidence that any particular tool ran.
+    expect((ctx.emitStatus as jest.Mock).mock.calls.some((call) => call[1]?.type === 'tool_start')).toBe(false);
   });
 
   test('Antigravity host-operator turns do not attach a raw process environment', async () => {
@@ -374,7 +528,7 @@ describe('native provider adapters', () => {
     // `invocation.options?.env || buildNativeCliEnvironment(...)`, so the guard
     // has to survive in that fallback, and the secrets must not.
     const spawnEnv = buildNativeCliEnvironment('GEMINI');
-    expect(spawnEnv.AGY_CLI_DISABLE_AUTO_UPDATE).toBe('1');
+    expect(spawnEnv.AGY_CLI_DISABLE_AUTO_UPDATE).toBe('true');
     expect(spawnEnv.DATABASE_URL).toBeUndefined();
     expect(spawnEnv.JWT_SECRET).toBeUndefined();
   });

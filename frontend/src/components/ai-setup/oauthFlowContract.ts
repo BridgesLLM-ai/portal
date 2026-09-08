@@ -134,6 +134,7 @@ export function readStructuredOAuthFlowState(payload: unknown): StructuredOAuthF
 export function readStructuredOAuthStartFailure(payload: unknown): StructuredOAuthStartFailure {
   const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
   const code = data.code === 'CODEX_REAUTHENTICATION_REQUIRED'
+    || data.code === 'PROVIDER_CREDENTIAL_LIFECYCLE_CONFLICT'
     ? data.code
     : null;
   const credentialState = data.credentialState === 'absent'

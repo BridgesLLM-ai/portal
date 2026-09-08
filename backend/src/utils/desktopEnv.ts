@@ -27,6 +27,27 @@ import fs from 'fs';
 
 export const RD_USER = 'bridgesrd';
 export const DESKTOP_ENV_FILE = `/home/${RD_USER}/.bridges-rd-env`;
+const SYSTEMD_RUN = '/usr/bin/systemd-run';
+const SYSTEMCTL = '/usr/bin/systemctl';
+const SYSTEMD_RUN_MIN_VERSION = 249;
+const SYSTEMD_RUN_NO_EXPAND_MIN_VERSION = 254;
+const SYSTEMD_OUTPUT_MAX_BYTES = 64 * 1024;
+const SYSTEMD_ENV = Object.freeze({
+  PATH: '/usr/bin:/bin',
+  LANG: 'C.UTF-8',
+  LC_ALL: 'C.UTF-8',
+});
+const DESKTOP_ARGV_WRAPPER_SOURCE = [
+  'const c=require("child_process");let a;',
+  'try{a=JSON.parse(Buffer.from(process.argv[1],"base64url").toString("utf8"))}',
+  'catch(e){process.exit(126)}',
+  'if(!Array.isArray(a)||a.length<1||a.some(v=>typeof v!=="string"||v.indexOf(String.fromCharCode(0))!==-1)){process.exit(126)}',
+  'const p=c.spawn(a[0],a.slice(1),{stdio:"inherit",env:process.env});',
+  'p.once("error",()=>process.exit(126));',
+  'p.once("exit",(n,s)=>{if(s){process.kill(process.pid,s)}else{process.exit(Number.isInteger(n)?n:126)}});',
+].join('');
+
+let cachedSystemdRunVersion: number | null = null;
 
 const DISPLAY = ':1';
 const XDG_RUNTIME_DIR = '/tmp/bridges-rd-runtime';
@@ -46,6 +67,61 @@ export function getDesktopEnvVars(): Record<string, string> {
     SDL_AUDIODRIVER: 'pulseaudio',
     // Prevent apt/dpkg noise when projects install system deps
     DEBIAN_FRONTEND: 'noninteractive',
+  };
+}
+
+function desktopLang(): string {
+  const candidate = String(process.env.LANG || '').trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/.test(candidate)
+    ? candidate
+    : 'C.UTF-8';
+}
+
+function parseSystemdRunVersion(output: string): number {
+  const match = String(output || '').match(/^systemd\s+([0-9]+)(?:\s|$)/m);
+  const version = match ? Number(match[1]) : Number.NaN;
+  if (!Number.isSafeInteger(version) || version < SYSTEMD_RUN_MIN_VERSION) {
+    throw new Error(`Remote Desktop requires an attested systemd-run ${SYSTEMD_RUN_MIN_VERSION} or newer`);
+  }
+  return version;
+}
+
+function readSystemdRunVersion(): number {
+  if (cachedSystemdRunVersion !== null) return cachedSystemdRunVersion;
+  const output = execFileSync(SYSTEMD_RUN, ['--version'], {
+    timeout: 5_000,
+    encoding: 'utf8',
+    maxBuffer: SYSTEMD_OUTPUT_MAX_BYTES,
+    env: SYSTEMD_ENV,
+  });
+  cachedSystemdRunVersion = parseSystemdRunVersion(output);
+  return cachedSystemdRunVersion;
+}
+
+function encodeDesktopArgv(argv: readonly string[]): string {
+  return Buffer.from(JSON.stringify(argv), 'utf8').toString('base64url');
+}
+
+function decodeDesktopArgv(payload: string): string[] {
+  const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  if (!Array.isArray(decoded) || decoded.some((value) => typeof value !== 'string')) {
+    throw new Error('Managed Remote Desktop argv payload is invalid');
+  }
+  return decoded;
+}
+
+function expansionSafeDesktopExecArgv(argv: readonly string[]): string[] {
+  return [process.execPath, '-e', DESKTOP_ARGV_WRAPPER_SOURCE, encodeDesktopArgv(argv)];
+}
+
+function managedDesktopEnvironment(includeDesktopVariables: boolean): Record<string, string> {
+  return {
+    HOME: `/home/${RD_USER}`,
+    USER: RD_USER,
+    LOGNAME: RD_USER,
+    PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    LANG: desktopLang(),
+    ...(includeDesktopVariables ? getDesktopEnvVars() : {}),
   };
 }
 
@@ -118,17 +194,17 @@ export function desktopExec(
 export function desktopExecDetached(cmd: string, unitName: string): void {
   const runArgs = managedDesktopSystemdRunArgs(unitName, cmd);
   resetManagedDesktopUnit(unitName);
-  execFileSync('systemd-run', runArgs, { timeout: 5000, encoding: 'utf8' });
+  execFileSync(SYSTEMD_RUN, runArgs, { timeout: 5000, encoding: 'utf8', env: SYSTEMD_ENV });
 }
 
 function resetManagedDesktopUnit(unitName: string): void {
   try {
-    execFileSync('systemctl', ['stop', unitName], { timeout: 15_000, encoding: 'utf8' });
+    execFileSync(SYSTEMCTL, ['stop', unitName], { timeout: 15_000, encoding: 'utf8', env: SYSTEMD_ENV });
   } catch {
     // An absent/inactive transient unit is the normal first-launch state.
   }
   try {
-    execFileSync('systemctl', ['reset-failed', unitName], { timeout: 5000, encoding: 'utf8' });
+    execFileSync(SYSTEMCTL, ['reset-failed', unitName], { timeout: 5000, encoding: 'utf8', env: SYSTEMD_ENV });
   } catch {
     // --collect units may already be unloaded after stop.
   }
@@ -147,7 +223,7 @@ function desktopPrivilegeDropArgs(innerCmd: string): string[] {
     `LOGNAME=${RD_USER}`,
     'SHELL=/bin/bash',
     'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-    `LANG=${process.env.LANG || 'C.UTF-8'}`,
+    `LANG=${desktopLang()}`,
     '/bin/bash',
     '-c',
     innerCmd,
@@ -159,28 +235,65 @@ function desktopPrivilegeDropArgs(innerCmd: string): string[] {
  * complete cgroup. A child cannot escape by daemonizing or creating a new
  * process session; lifecycle cleanup stops and reads back this exact unit.
  */
-export function managedDesktopSystemdRunArgs(unitName: string, cmd: string): string[] {
+export function managedDesktopSystemdRunArgs(
+  unitName: string,
+  cmd: string,
+  systemdRunVersion = readSystemdRunVersion(),
+): string[] {
   if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\.service$/.test(unitName)) {
     throw new Error('Managed Remote Desktop unit name is invalid');
   }
-  return [
+  if (typeof cmd !== 'string' || cmd.includes('\u0000')) {
+    throw new Error('Managed Remote Desktop command is invalid');
+  }
+  return buildManagedDesktopSystemdRunArgs(
+    unitName,
+    expansionSafeDesktopExecArgv(['/bin/bash', '-c', withDesktopEnv(cmd)]),
+    systemdRunVersion,
+    managedDesktopEnvironment(false),
+  );
+}
+
+function buildManagedDesktopSystemdRunArgs(
+  unitName: string,
+  commandArgv: readonly string[],
+  systemdRunVersion: number,
+  environment: Readonly<Record<string, string>>,
+): string[] {
+  if (!Number.isSafeInteger(systemdRunVersion) || systemdRunVersion < SYSTEMD_RUN_MIN_VERSION) {
+    throw new Error(`Remote Desktop requires systemd-run ${SYSTEMD_RUN_MIN_VERSION} or newer`);
+  }
+  const runArgs = [
+    '--system',
+    '--quiet',
+    '--no-ask-password',
+    ...(systemdRunVersion >= SYSTEMD_RUN_NO_EXPAND_MIN_VERSION
+      ? ['--expand-environment=no']
+      : []),
     '--unit', unitName,
     '--property=User=bridgesrd',
     '--property=Group=bridgesrd',
     '--property=KillMode=control-group',
     '--property=TimeoutStopSec=15s',
     '--property=WorkingDirectory=/home/bridgesrd',
-    '--setenv=HOME=/home/bridgesrd',
-    '--setenv=USER=bridgesrd',
-    '--setenv=LOGNAME=bridgesrd',
-    '--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-    '--service-type=exec',
-    '--collect',
-    '--no-block',
-    '/bin/bash',
-    '-c',
-    withDesktopEnv(cmd),
   ];
+  for (const [key, value] of Object.entries(environment)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || /[\u0000-\u001f\u007f]/.test(value)) {
+      throw new Error('Managed Remote Desktop environment is invalid');
+    }
+    runArgs.push(`--setenv=${key}=${value}`);
+  }
+  runArgs.push('--service-type=exec', '--collect', '--no-block', '--', ...commandArgv);
+  // systemd 249-253 have no --expand-environment switch in service mode.
+  // Every post-encoding argument is deliberately drawn from an alphabet that
+  // contains neither environment ('$') nor unit-specifier ('%') syntax.
+  if (
+    systemdRunVersion < SYSTEMD_RUN_NO_EXPAND_MIN_VERSION
+    && runArgs.some((value) => value.includes('$') || value.includes('%'))
+  ) {
+    throw new Error('Managed Remote Desktop launch arguments are not expansion-safe');
+  }
+  return runArgs;
 }
 
 /**
@@ -193,6 +306,7 @@ export function managedDesktopSystemdRunArgv(
   unitName: string,
   executable: string,
   args: readonly string[] = [],
+  systemdRunVersion = readSystemdRunVersion(),
 ): string[] {
   if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\.service$/.test(unitName)) {
     throw new Error('Managed Remote Desktop unit name is invalid');
@@ -204,34 +318,13 @@ export function managedDesktopSystemdRunArgv(
     throw new Error('Managed Remote Desktop argv is invalid');
   }
 
-  const env = {
-    HOME: `/home/${RD_USER}`,
-    USER: RD_USER,
-    LOGNAME: RD_USER,
-    PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-    LANG: process.env.LANG || 'C.UTF-8',
-    ...getDesktopEnvVars(),
-  };
-  const runArgs = [
-    '--unit', unitName,
-    `--property=User=${RD_USER}`,
-    `--property=Group=${RD_USER}`,
-    '--property=KillMode=control-group',
-    '--property=TimeoutStopSec=15s',
-    `--property=WorkingDirectory=/home/${RD_USER}`,
-  ];
-  for (const [key, value] of Object.entries(env)) {
-    runArgs.push(`--setenv=${key}=${value}`);
-  }
-  runArgs.push(
-    '--service-type=exec',
-    '--collect',
-    '--no-block',
-    '--',
-    executable,
-    ...args,
+  const commandArgv = expansionSafeDesktopExecArgv([executable, ...args]);
+  return buildManagedDesktopSystemdRunArgs(
+    unitName,
+    commandArgv,
+    systemdRunVersion,
+    managedDesktopEnvironment(true),
   );
-  return runArgs;
 }
 
 /** Launch a GUI command with literal argv as the unprivileged desktop user. */
@@ -242,15 +335,24 @@ export function desktopExecDetachedArgv(
 ): void {
   const runArgs = managedDesktopSystemdRunArgv(unitName, executable, args);
   resetManagedDesktopUnit(unitName);
-  execFileSync('systemd-run', runArgs, { timeout: 5000, encoding: 'utf8' });
+  execFileSync(SYSTEMD_RUN, runArgs, { timeout: 5000, encoding: 'utf8', env: SYSTEMD_ENV });
 }
 
 export function desktopExecManaged(unitName: string, cmd: string): void {
-  execFileSync('systemd-run', managedDesktopSystemdRunArgs(unitName, cmd), {
-    timeout: 5000,
-    encoding: 'utf8',
+  execFileSync(SYSTEMD_RUN, managedDesktopSystemdRunArgs(unitName, cmd), {
+    timeout: 5000, encoding: 'utf8', env: SYSTEMD_ENV,
   });
 }
+
+export const __desktopEnvTest = Object.freeze({
+  DESKTOP_ARGV_WRAPPER_SOURCE,
+  SYSTEMD_RUN,
+  SYSTEMCTL,
+  SYSTEMD_RUN_MIN_VERSION,
+  SYSTEMD_RUN_NO_EXPAND_MIN_VERSION,
+  decodeDesktopArgv,
+  parseSystemdRunVersion,
+});
 
 /** Shell-quote a string (single-quote wrapping with proper escaping). */
 function shellQuote(s: string): string {

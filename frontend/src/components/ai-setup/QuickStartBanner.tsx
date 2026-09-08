@@ -4,11 +4,12 @@ import type { ProviderStatus } from './ProviderCard';
 
 interface QuickStartBannerProps {
   onChoose: (providerId: string) => void;
-  onNativeCliLogin?: (nativeProvider: 'claude-code' | 'codex' | 'gemini' | 'grok') => void;
+  onNativeCliLogin?: (nativeProvider: 'claude-code' | 'codex' | 'gemini' | 'grok' | 'hermes' | 'opencode') => void;
   statusMap?: Map<string, ProviderStatus>;
   compact?: boolean;
   additionalCards?: ReactNode;
   showBuiltInCards?: boolean;
+  showHarnessNativeCards?: boolean;
 }
 
 const cards = [
@@ -22,21 +23,12 @@ const cards = [
   },
   {
     id: 'native-claude-code',
-    title: 'Claude Code',
-    subtitle: 'Native CLI agent',
-    description: 'Log in the Claude Code CLI directly for use as a native agent in Agent Chat.',
+    title: 'Claude Project Sandbox',
+    subtitle: 'Process-free project credential',
+    description: 'Authorize Claude for confined Project Sandbox sessions without launching Claude Code on the host.',
     color: 'bg-amber-500',
     isNativeCli: true,
     nativeCliProvider: 'claude-code' as const,
-  },
-  {
-    id: 'native-codex',
-    title: 'Codex',
-    subtitle: 'Native CLI agent',
-    description: 'Log in the Codex CLI directly for use as a native agent in Agent Chat.',
-    color: 'bg-sky-500',
-    isNativeCli: true,
-    nativeCliProvider: 'codex' as const,
   },
   {
     id: 'native-grok',
@@ -56,14 +48,33 @@ const cards = [
     isNativeCli: true,
     nativeCliProvider: 'gemini' as const,
   },
+  {
+    id: 'native-hermes',
+    title: 'Hermes',
+    subtitle: 'Native ACP harness',
+    description: 'Run the fixed Hermes provider/model wizard in the dedicated Portal profile, then discover the models that Hermes exposes for that account.',
+    color: 'bg-emerald-500',
+    isNativeCli: true,
+    nativeCliProvider: 'hermes' as const,
+  },
+  {
+    id: 'native-opencode',
+    title: 'OpenCode',
+    subtitle: 'Native ACP harness',
+    description: 'Run OpenCode’s own provider login wizard in the dedicated Portal profile, then discover its account-specific model catalog.',
+    color: 'bg-cyan-500',
+    isNativeCli: true,
+    nativeCliProvider: 'opencode' as const,
+  },
 ];
 
 // Map native CLI card IDs to the OpenClaw provider that tracks their auth status
 const NATIVE_CLI_PROVIDER_MAP: Record<string, string> = {
   'native-claude-code': 'anthropic',
-  'native-codex': 'openai-codex',
   'native-grok': 'xai',
   'native-gemini': 'google-antigravity',
+  'native-hermes': 'portal-hermes',
+  'native-opencode': 'portal-opencode',
 };
 
 function isConfigured(statusMap: Map<string, ProviderStatus> | undefined, id: string): boolean {
@@ -114,11 +125,16 @@ export default function QuickStartBanner({
   compact = false,
   additionalCards,
   showBuiltInCards = true,
+  showHarnessNativeCards = true,
 }: QuickStartBannerProps) {
+  const qualifiedCards = cards;
+  const visibleCards = showHarnessNativeCards
+    ? qualifiedCards
+    : qualifiedCards.filter((card) => card.id !== 'native-hermes' && card.id !== 'native-opencode');
   if (compact) {
     return (
       <div className="space-y-1.5">
-        {showBuiltInCards ? cards.map((card) => {
+        {showBuiltInCards ? visibleCards.map((card) => {
           const configured = isConfigured(statusMap, card.id);
           const expiry = getExpiryInfo(statusMap, card.id);
           return (
@@ -165,7 +181,7 @@ export default function QuickStartBanner({
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
-        {showBuiltInCards ? cards.map((card) => {
+        {showBuiltInCards ? visibleCards.map((card) => {
           const configured = isConfigured(statusMap, card.id);
           const expiry = getExpiryInfo(statusMap, card.id);
           return (

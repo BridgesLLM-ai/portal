@@ -1,12 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
+import {
+  isNativeBinaryProvider,
+  isUnqualifiedNativeBinaryProvider,
+  unqualifiedNativeBinaryReason,
+} from '../config/unqualifiedNativeBinaryLane';
 import type { AgentProviderName } from './AgentProvider.interface';
 import { getAgentZeroAuthReadinessSnapshot } from './providers/agentZero/AgentZeroAuthSession';
-import {
-  buildNativeCliEnvironment,
-  resolveNativeCliCredentialPaths,
-} from './providers/native/NativeCliEnvironment';
+import { buildNativeCliEnvironment, resolveNativeCliCredentialPaths } from './providers/native/NativeCliEnvironment';
 
 export type NativeCliAuthState = 'not_applicable' | 'authenticated' | 'needs_login' | 'unknown';
 
@@ -28,6 +30,8 @@ const NATIVE_TO_OPENCLAW_PROVIDER_IDS: Record<AgentProviderName, string[]> = {
   // OAuth provider has a separate credential store and setup flow.
   GEMINI: ['google-antigravity'],
   OLLAMA: [],
+  HERMES: [],
+  OPENCODE: [],
 };
 
 const OPENCLAW_TO_NATIVE_PROVIDER: Record<string, AgentProviderName> = {
@@ -36,10 +40,6 @@ const OPENCLAW_TO_NATIVE_PROVIDER: Record<string, AgentProviderName> = {
   xai: 'GROK',
   'google-antigravity': 'GEMINI',
 };
-
-let cachedGeminiAuth: { expiresAt: number; status: NativeCliAuthStatus } | null = null;
-let pendingGeminiAuth: Promise<NativeCliAuthStatus> | null = null;
-let geminiAuthEpoch = 0;
 
 function safeReadJson(targetPath: string): any | null {
   try {
@@ -50,6 +50,188 @@ function safeReadJson(targetPath: string): any | null {
   }
 }
 
+function detectClaudeAuth(): NativeCliAuthStatus {
+  const [credentialsPath] = resolveNativeCliCredentialPaths('CLAUDE_CODE');
+  const creds = safeReadJson(credentialsPath);
+  const oauth = creds?.claudeAiOauth;
+  const hasAccessToken = Boolean(oauth?.accessToken);
+  const hasRefreshToken = Boolean(oauth?.refreshToken);
+  const expiresAt = typeof oauth?.expiresAt === 'number' ? oauth.expiresAt : null;
+
+  // Claude Code refreshes an expired access token itself when a refresh token
+  // is present. Treating expiresAt alone as terminal disabled a credential
+  // that the exact confined CLI could use successfully.
+  if (hasRefreshToken || (hasAccessToken && (!expiresAt || expiresAt > Date.now()))) {
+    return {
+      provider: 'CLAUDE_CODE',
+      status: 'authenticated',
+      message: 'Claude credential material is present. Project Sandbox and Host Operator execution apply their own independent runtime admission checks.',
+      requiresSeparateLogin: true,
+    };
+  }
+
+  if (hasAccessToken && expiresAt && expiresAt <= Date.now()) {
+    return {
+      provider: 'CLAUDE_CODE',
+      status: 'needs_login',
+      message: 'Claude credential material has expired. Reconnect Claude before using Project Sandbox or Host Operator execution.',
+      requiresSeparateLogin: true,
+    };
+  }
+
+  return {
+    provider: 'CLAUDE_CODE',
+    status: 'needs_login',
+    message: 'No usable Claude credential material is available. Reconnect Claude before using Project Sandbox or Host Operator execution.',
+    requiresSeparateLogin: true,
+  };
+}
+
+function detectCodexAuth(): NativeCliAuthStatus {
+  const [authPath] = resolveNativeCliCredentialPaths('CODEX');
+  const auth = safeReadJson(authPath);
+  const apiKey = typeof auth?.OPENAI_API_KEY === 'string' ? auth.OPENAI_API_KEY.trim() : '';
+  const tokenSet = auth?.tokens;
+  const hasOauthTokens = Boolean(tokenSet?.access_token || tokenSet?.refresh_token || tokenSet?.id_token);
+
+  if (apiKey || hasOauthTokens) {
+    return {
+      provider: 'CODEX',
+      status: 'authenticated',
+      message: 'Codex credential material is present. Project Sandbox and Host Operator execution apply their own independent runtime admission checks.',
+      requiresSeparateLogin: true,
+    };
+  }
+
+  return {
+    provider: 'CODEX',
+    status: 'needs_login',
+    message: 'No usable Codex credential material is available. Reconnect Codex before using Project Sandbox or Host Operator execution.',
+    requiresSeparateLogin: true,
+  };
+}
+
+type GrokAuthClassification = 'authenticated' | 'needs_login' | 'unknown';
+
+function asRecord(value: unknown): Record<string, any> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, any>
+    : null;
+}
+
+function parseExpiryMs(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 10_000_000_000 ? value : value * 1000;
+  }
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Pure classifier exported for credential-shape regression tests. */
+export function classifyGrokAuthStore(raw: unknown, now = Date.now()): GrokAuthClassification {
+  const store = asRecord(raw);
+  if (!store) return 'unknown';
+
+  const directCredential = typeof store.key === 'string' || typeof store.refresh_token === 'string';
+  const candidates = directCredential
+    ? [['direct', store] as const]
+    : Object.entries(store).map(([scope, value]) => [scope, asRecord(value)] as const);
+
+  if (candidates.length === 0) return 'needs_login';
+  let sawCredentialShape = false;
+  let sawExpiredCredential = false;
+
+  for (const [scope, credential] of candidates) {
+    if (!credential) continue;
+    const key = typeof credential.key === 'string' ? credential.key.trim() : '';
+    const refreshToken = typeof credential.refresh_token === 'string' ? credential.refresh_token.trim() : '';
+    const authMode = String(credential.auth_mode || '').trim().toLowerCase();
+    const expiresAt = parseExpiryMs(credential.expires_at);
+    if (!key && !refreshToken) continue;
+    sawCredentialShape = true;
+
+    // API keys do not expire locally. OAuth/OIDC credentials remain usable
+    // when a refresh token is available even if the current access token aged out.
+    if (scope === 'xai::api_key' || authMode === 'api_key' || refreshToken) return 'authenticated';
+    if (key && (!expiresAt || expiresAt > now)) return 'authenticated';
+    if (key && expiresAt !== null && expiresAt <= now) sawExpiredCredential = true;
+  }
+
+  if (sawExpiredCredential || sawCredentialShape) return 'needs_login';
+  return 'unknown';
+}
+
+function objectHasCredentialMaterial(value: unknown, depth = 0): boolean {
+  if (depth > 5 || value === null || value === undefined) return false;
+  if (Array.isArray(value)) return value.some((entry) => objectHasCredentialMaterial(entry, depth + 1));
+  const record = asRecord(value);
+  if (!record) return false;
+  return Object.entries(record).some(([key, child]) => {
+    if (typeof child === 'string'
+      && child.trim()
+      && /(?:key|token|secret|credential|auth|password|access|refresh)/i.test(key)) return true;
+    return objectHasCredentialMaterial(child, depth + 1);
+  });
+}
+
+function envFileHasCredentialMaterial(targetPath: string): boolean {
+  try {
+    return fs.readFileSync(targetPath, 'utf8').split(/\r?\n/u).some((line) => (
+      /^\s*(?:export\s+)?[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*[^#\s].*$/u.test(line)
+    ));
+  } catch {
+    return false;
+  }
+}
+
+function detectHermesAuth(): NativeCliAuthStatus {
+  const [authPath, envPath] = resolveNativeCliCredentialPaths('HERMES');
+  const auth = safeReadJson(authPath);
+  if (objectHasCredentialMaterial(auth) || envFileHasCredentialMaterial(envPath)) {
+    return {
+      provider: 'HERMES',
+      status: 'authenticated',
+      message: 'Hermes has credentials in its dedicated server-side profile.',
+      loginCommand: 'hermes model',
+      requiresSeparateLogin: true,
+    };
+  }
+  return {
+    provider: 'HERMES',
+    status: 'needs_login',
+    message: 'Hermes is installed, but its dedicated profile has no usable model-provider credential. Run `hermes model` on the server.',
+    loginCommand: 'hermes model',
+    requiresSeparateLogin: true,
+  };
+}
+
+function detectOpenCodeAuth(): NativeCliAuthStatus {
+  const [authPath] = resolveNativeCliCredentialPaths('OPENCODE');
+  const auth = safeReadJson(authPath);
+  if (objectHasCredentialMaterial(auth)) {
+    return {
+      provider: 'OPENCODE',
+      status: 'authenticated',
+      message: 'OpenCode has credentials in its dedicated server-side profile.',
+      loginCommand: 'opencode auth login',
+      requiresSeparateLogin: true,
+    };
+  }
+  return {
+    provider: 'OPENCODE',
+    status: 'needs_login',
+    message: 'OpenCode is installed, but its dedicated profile has no usable provider login. Run `opencode auth login` on the server.',
+    loginCommand: 'opencode auth login',
+    requiresSeparateLogin: true,
+  };
+}
+
+let cachedGeminiAuth: { expiresAt: number; status: NativeCliAuthStatus } | null = null;
+let pendingGeminiAuth: Promise<NativeCliAuthStatus> | null = null;
+let geminiAuthEpoch = 0;
+
+
 function directoryHasEntries(targetPath: string): boolean {
   try {
     return fs.readdirSync(targetPath).length > 0;
@@ -58,11 +240,6 @@ function directoryHasEntries(targetPath: string): boolean {
   }
 }
 
-/**
- * The Antigravity CLI's whole state directory. Credential attestation
- * deliberately covers only specific files inside it, so "does the CLI have
- * any local state at all" needs its own anchor.
- */
 function antigravityStateDir(): string {
   return path.join(String(process.env.HOME || '/root'), '.gemini', 'antigravity-cli');
 }
@@ -143,123 +320,6 @@ function classifyGeminiAuthProbe(
   }, 5_000, expectedEpoch);
 }
 
-function detectClaudeAuth(): NativeCliAuthStatus {
-  const [credentialsPath] = resolveNativeCliCredentialPaths('CLAUDE_CODE');
-  const creds = safeReadJson(credentialsPath);
-  const oauth = creds?.claudeAiOauth;
-  const hasAccessToken = Boolean(oauth?.accessToken);
-  const hasRefreshToken = Boolean(oauth?.refreshToken);
-  const expiresAt = typeof oauth?.expiresAt === 'number' ? oauth.expiresAt : null;
-
-  // Claude Code refreshes an expired access token itself when a refresh token
-  // is present. Treating expiresAt alone as terminal disabled a credential
-  // that the exact confined CLI could use successfully.
-  if (hasRefreshToken || (hasAccessToken && (!expiresAt || expiresAt > Date.now()))) {
-    return {
-      provider: 'CLAUDE_CODE',
-      status: 'authenticated',
-      message: 'Claude Code CLI is logged in on this server.',
-      loginCommand: 'claude',
-      requiresSeparateLogin: true,
-    };
-  }
-
-  if (hasAccessToken && expiresAt && expiresAt <= Date.now()) {
-    return {
-      provider: 'CLAUDE_CODE',
-      status: 'needs_login',
-      message: 'Claude Code CLI credentials on this server have expired. OpenClaw auth is separate.',
-      loginCommand: 'claude',
-      requiresSeparateLogin: true,
-    };
-  }
-
-  return {
-    provider: 'CLAUDE_CODE',
-    status: 'needs_login',
-    message: 'Claude Code is installed, but the local Claude CLI is not logged in. Start `claude`, then run `/login` on the server.',
-    loginCommand: 'claude',
-    requiresSeparateLogin: true,
-  };
-}
-
-function detectCodexAuth(): NativeCliAuthStatus {
-  const [authPath] = resolveNativeCliCredentialPaths('CODEX');
-  const auth = safeReadJson(authPath);
-  const apiKey = typeof auth?.OPENAI_API_KEY === 'string' ? auth.OPENAI_API_KEY.trim() : '';
-  const tokenSet = auth?.tokens;
-  const hasOauthTokens = Boolean(tokenSet?.access_token || tokenSet?.refresh_token || tokenSet?.id_token);
-
-  if (apiKey || hasOauthTokens) {
-    return {
-      provider: 'CODEX',
-      status: 'authenticated',
-      message: 'Codex CLI is authenticated on this server.',
-      loginCommand: 'codex login',
-      requiresSeparateLogin: true,
-    };
-  }
-
-  return {
-    provider: 'CODEX',
-    status: 'needs_login',
-    message: 'Codex is installed, but the local Codex CLI is not authenticated. Run `codex login` on the server. OpenClaw OAuth is separate.',
-    loginCommand: 'codex login',
-    requiresSeparateLogin: true,
-  };
-}
-
-type GrokAuthClassification = 'authenticated' | 'needs_login' | 'unknown';
-
-function asRecord(value: unknown): Record<string, any> | null {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, any>
-    : null;
-}
-
-function parseExpiryMs(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value > 10_000_000_000 ? value : value * 1000;
-  }
-  if (typeof value !== 'string' || !value.trim()) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-/** Pure classifier exported for credential-shape regression tests. */
-export function classifyGrokAuthStore(raw: unknown, now = Date.now()): GrokAuthClassification {
-  const store = asRecord(raw);
-  if (!store) return 'unknown';
-
-  const directCredential = typeof store.key === 'string' || typeof store.refresh_token === 'string';
-  const candidates = directCredential
-    ? [['direct', store] as const]
-    : Object.entries(store).map(([scope, value]) => [scope, asRecord(value)] as const);
-
-  if (candidates.length === 0) return 'needs_login';
-  let sawCredentialShape = false;
-  let sawExpiredCredential = false;
-
-  for (const [scope, credential] of candidates) {
-    if (!credential) continue;
-    const key = typeof credential.key === 'string' ? credential.key.trim() : '';
-    const refreshToken = typeof credential.refresh_token === 'string' ? credential.refresh_token.trim() : '';
-    const authMode = String(credential.auth_mode || '').trim().toLowerCase();
-    const expiresAt = parseExpiryMs(credential.expires_at);
-    if (!key && !refreshToken) continue;
-    sawCredentialShape = true;
-
-    // API keys do not expire locally. OAuth/OIDC credentials remain usable
-    // when a refresh token is available even if the current access token aged out.
-    if (scope === 'xai::api_key' || authMode === 'api_key' || refreshToken) return 'authenticated';
-    if (key && (!expiresAt || expiresAt > now)) return 'authenticated';
-    if (key && expiresAt !== null && expiresAt <= now) sawExpiredCredential = true;
-  }
-
-  if (sawExpiredCredential || sawCredentialShape) return 'needs_login';
-  return 'unknown';
-}
-
 function resolveGrokAuthPath(): string {
   return resolveNativeCliCredentialPaths('GROK')[0];
 }
@@ -327,16 +387,6 @@ function detectGeminiAuth(): NativeCliAuthStatus {
     return cachedGeminiAuth.status;
   }
 
-  if (hasEnvValue('GEMINI_API_KEY') || hasEnvValue('GOOGLE_API_KEY')) {
-    return cacheGeminiAuthStatus({
-      provider: 'GEMINI',
-      status: 'authenticated',
-      message: 'Google environment credentials are present, but the preferred native Google agent is Antigravity.',
-      loginCommand: 'agy',
-      requiresSeparateLogin: true,
-    }, 60_000);
-  }
-
   if (directoryHasEntries(antigravityStateDir())) {
     return {
       provider: 'GEMINI',
@@ -359,16 +409,6 @@ function detectGeminiAuth(): NativeCliAuthStatus {
 async function detectGeminiAuthAsync(): Promise<NativeCliAuthStatus> {
   if (cachedGeminiAuth && cachedGeminiAuth.expiresAt > Date.now()) {
     return cachedGeminiAuth.status;
-  }
-
-  if (hasEnvValue('GEMINI_API_KEY') || hasEnvValue('GOOGLE_API_KEY')) {
-    return cacheGeminiAuthStatus({
-      provider: 'GEMINI',
-      status: 'authenticated',
-      message: 'Google environment credentials are present, but the preferred native Google agent is Antigravity.',
-      loginCommand: 'agy',
-      requiresSeparateLogin: true,
-    }, 60_000);
   }
 
   if (!pendingGeminiAuth) {
@@ -394,15 +434,27 @@ async function detectGeminiAuthAsync(): Promise<NativeCliAuthStatus> {
 }
 
 export function getNativeCliAuthStatus(provider: AgentProviderName): NativeCliAuthStatus {
+  if (isNativeBinaryProvider(provider) && isUnqualifiedNativeBinaryProvider(provider)) {
+    return {
+      provider,
+      status: 'not_applicable',
+      message: unqualifiedNativeBinaryReason(provider),
+      requiresSeparateLogin: false,
+    };
+  }
   switch (provider) {
-    case 'CLAUDE_CODE':
-      return detectClaudeAuth();
-    case 'CODEX':
-      return detectCodexAuth();
     case 'GROK':
       return detectGrokAuth();
     case 'GEMINI':
       return detectGeminiAuth();
+    case 'CLAUDE_CODE':
+      return detectClaudeAuth();
+    case 'CODEX':
+      return detectCodexAuth();
+    case 'HERMES':
+      return detectHermesAuth();
+    case 'OPENCODE':
+      return detectOpenCodeAuth();
     case 'OLLAMA':
       return {
         provider,
@@ -443,34 +495,17 @@ export function getNativeCliAuthStatus(provider: AgentProviderName): NativeCliAu
 }
 
 export async function getNativeCliAuthStatusAsync(provider: AgentProviderName): Promise<NativeCliAuthStatus> {
-  if (provider === 'GEMINI') return detectGeminiAuthAsync();
+  if (provider === 'GEMINI' && !isUnqualifiedNativeBinaryProvider(provider)) return detectGeminiAuthAsync();
   return getNativeCliAuthStatus(provider);
 }
 
-/**
- * Clear provider-local auth evidence after an explicit login transition or a
- * real provider rejection. Epoching prevents an older in-flight Antigravity
- * probe from repopulating the cache after invalidation.
- */
 export function invalidateNativeCliAuthStatus(
-  provider: AgentProviderName,
-  reason: 'state_changed' | 'auth_rejected' = 'state_changed',
+  _provider: AgentProviderName,
+  _reason: 'state_changed' | 'auth_rejected' = 'state_changed',
 ): void {
-  if (provider !== 'GEMINI') return;
-  geminiAuthEpoch += 1;
+  cachedGeminiAuth = null;
   pendingGeminiAuth = null;
-  cachedGeminiAuth = reason === 'auth_rejected'
-    ? {
-        expiresAt: Date.now() + 20_000,
-        status: {
-          provider: 'GEMINI',
-          status: 'needs_login',
-          message: 'Google Antigravity authentication was rejected. Reconnect it in AI Settings and retry.',
-          loginCommand: 'agy',
-          requiresSeparateLogin: true,
-        },
-      }
-    : null;
+  geminiAuthEpoch += 1;
 }
 
 export function getLinkedOpenClawProviderIds(nativeProvider: AgentProviderName): string[] {
@@ -486,7 +521,7 @@ export function nativeCliAuthBlocksUsage(status: NativeCliAuthStatus | null | un
 }
 
 export function __resetNativeCliAuthForTests(): void {
-  geminiAuthEpoch += 1;
   cachedGeminiAuth = null;
   pendingGeminiAuth = null;
+  geminiAuthEpoch += 1;
 }

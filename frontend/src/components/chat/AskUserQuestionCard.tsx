@@ -25,9 +25,13 @@ export type AskUserQuestionRequest = GatewayPendingQuestion;
 export default function AskUserQuestionCard({
   request,
   onSettled,
+  responseDisabled = false,
+  disabledReason,
 }: {
   request: AskUserQuestionRequest;
   onSettled: (id: string) => void;
+  responseDisabled?: boolean;
+  disabledReason?: string;
 }) {
   // Keep editable state by prompt position, not by model-supplied question
   // text. JavaScript object prototype names (`constructor`, `__proto__`, …)
@@ -50,11 +54,15 @@ export default function AskUserQuestionCard({
     if (remainingMs <= 0) onSettled(request.id);
   }, [remainingMs, onSettled, request.id]);
 
-  const toggleOption = useCallback((promptIndex: number, label: string) => {
+  const toggleOption = useCallback((promptIndex: number, label: string, multiSelect: boolean) => {
     setSelections((previous) => {
       const current = previous[promptIndex] || [];
       const next = previous.slice();
-      next[promptIndex] = current.includes(label) ? [] : [label];
+      next[promptIndex] = multiSelect
+        ? current.includes(label)
+          ? current.filter((value) => value !== label)
+          : [...current, label]
+        : current.includes(label) ? [] : [label];
       return next;
     });
   }, []);
@@ -64,23 +72,26 @@ export default function AskUserQuestionCard({
     ? 'This agent prompt did not include an answerable question.'
     : new Set(questionIds).size !== questionIds.length
       ? 'This agent prompt reused a question identity, so Portal cannot safely answer it.'
-      : request.questions.some((prompt) => prompt.multiSelect)
-        ? 'This agent prompt requested an unsupported multiple-selection answer. Portal will not guess how to encode it.'
-        : null;
+      : null;
 
   const answers = useMemo(() => {
-    const composed = Object.create(null) as Record<string, string>;
+    const composed = Object.create(null) as Record<string, string | string[]>;
     request.questions.forEach((prompt, promptIndex) => {
       const chosen = selections[promptIndex] || [];
       const typed = (freeText[promptIndex] || '').trim();
-      const selected = chosen[0] || '';
-      const answer = typed || selected;
-      if (answer) composed[prompt.id] = answer;
+      if (prompt.multiSelect) {
+        const values = [...new Set([...chosen, ...(typed ? [typed] : [])])];
+        if (values.length > 0) composed[prompt.id] = values;
+      } else {
+        const answer = typed || chosen[0] || '';
+        if (answer) composed[prompt.id] = answer;
+      }
     });
     return composed;
   }, [request.questions, selections, freeText]);
 
   const canSubmit = !protocolError
+    && !responseDisabled
     && questionIds.every((id) => Object.prototype.hasOwnProperty.call(answers, id))
     && !submitting;
   const answerFingerprint = JSON.stringify(questionIds.map((id) => [id, answers[id] || '']));
@@ -169,14 +180,17 @@ export default function AskUserQuestionCard({
           <p className="text-sm leading-6 text-slate-100">{prompt.question}</p>
           {prompt.options.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-2">
+              {prompt.multiSelect ? (
+                <span className="basis-full text-[10px] text-slate-400">Choose one or more.</span>
+              ) : null}
               {prompt.options.map((option) => {
                 const active = (selections[promptIndex] || []).includes(option.label);
                 return (
                   <button
                     key={option.label}
                     type="button"
-                    onClick={() => toggleOption(promptIndex, option.label)}
-                    disabled={submitting || uncertainAnswerFingerprint !== null}
+                    onClick={() => toggleOption(promptIndex, option.label, prompt.multiSelect)}
+                    disabled={responseDisabled || submitting || uncertainAnswerFingerprint !== null}
                     title={option.description || undefined}
                     aria-pressed={active}
                     className={`inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border px-3 text-xs font-medium transition ${
@@ -211,7 +225,7 @@ export default function AskUserQuestionCard({
                   return next;
                 })}
                 onKeyDown={(pressed) => { if (pressed.key === 'Enter') void submit(); }}
-                disabled={submitting || uncertainAnswerFingerprint !== null}
+                disabled={responseDisabled || submitting || uncertainAnswerFingerprint !== null}
                 placeholder={prompt.options.length > 0 ? 'Or type your own answer…' : 'Type your answer…'}
                 className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-xs text-white placeholder-slate-500 focus:border-violet-500/50 focus:outline-none disabled:opacity-50"
               />
@@ -221,6 +235,11 @@ export default function AskUserQuestionCard({
       ))}
 
       {error ? <p role="alert" className="mt-3 text-xs text-red-300">{error}</p> : null}
+      {responseDisabled ? (
+        <p role="alert" className="mt-3 text-xs text-amber-200">
+          {disabledReason || 'This waiting host turn cannot be continued until Portal host supervision is available.'}
+        </p>
+      ) : null}
 
       <div className="mt-4 flex items-center gap-2">
         <button
@@ -235,7 +254,7 @@ export default function AskUserQuestionCard({
         <button
           type="button"
           onClick={() => void dismiss()}
-          disabled={submitting || uncertainAnswerFingerprint !== null}
+          disabled={responseDisabled || submitting || uncertainAnswerFingerprint !== null}
           className="inline-flex min-h-[36px] items-center gap-1.5 rounded-xl border border-slate-700 px-3 text-xs font-medium text-slate-300 hover:bg-slate-900/60 disabled:opacity-50"
         >
           <X size={12} aria-hidden="true" />

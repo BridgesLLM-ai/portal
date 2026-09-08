@@ -14,8 +14,18 @@ import {
   PROJECT_RUNTIME_IMAGE_REPAIR_CONFIRMATION,
   ProjectRuntimeImageRepairLaunchError,
 } from '../services/projectRuntimeImageRepair';
+import {
+  getNativeHostCliStatus,
+  type NativeHostCliStatus,
+} from '../services/nativeHostCliStatus';
 
 type StepResult = { step: string; ok: boolean; message: string };
+
+export function nativeHostCliRemediationStateOk(state: NativeHostCliStatus['state']): boolean {
+  // These packages are optional, so authoritative absence is healthy. Every
+  // transitional, damaged, or ambiguous state requires operator attention.
+  return state === 'verified' || state === 'absent';
+}
 
 type SystemRemediationContract = {
   feature: 'terminal' | 'fileManager' | 'agentTools' | 'projectRuntimeImage';
@@ -154,19 +164,24 @@ async function remediateFileManager(): Promise<{ ok: boolean; message: string; s
 async function remediateAgentTools(): Promise<{ ok: boolean; message: string; steps: StepResult[] }> {
   const steps: StepResult[] = [];
 
-  const checks: Array<{ name: string; cmd: string; required: boolean }> = [
-    { name: 'OpenClaw CLI', cmd: 'openclaw --version', required: true },
-    { name: 'Codex CLI', cmd: 'codex --version', required: false },
-    { name: 'Claude CLI', cmd: 'claude --version', required: false },
-  ];
+  const openclaw = await runShell('openclaw --version');
+  steps.push({
+    step: 'OpenClaw CLI',
+    ok: openclaw.ok,
+    message: openclaw.ok ? (openclaw.stdout || 'available') : 'Missing (required)',
+  });
 
-  for (const check of checks) {
-    const result = await runShell(check.cmd);
-    const ok = result.ok || !check.required;
+  const [codex, claude] = await Promise.all([
+    getNativeHostCliStatus('codex', { force: true }),
+    getNativeHostCliStatus('claude-code', { force: true }),
+  ]);
+  for (const [name, status] of [['Codex CLI', codex], ['Claude CLI', claude]] as const) {
     steps.push({
-      step: check.name,
-      ok,
-      message: result.ok ? (result.stdout || 'available') : (check.required ? 'Missing (required)' : 'Not installed (optional)'),
+      step: name,
+      ok: nativeHostCliRemediationStateOk(status.state),
+      message: status.executionEligible
+        ? `Root-owned package ${status.observedVersion || 'version unknown'} admitted for supervised Portal Agent Chat; package changes remain unavailable here`
+        : `Native host package status: ${status.state}; supervised Portal Agent Chat requires an admitted package`,
     });
   }
 

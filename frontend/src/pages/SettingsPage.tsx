@@ -13,12 +13,20 @@ import { useTheme } from '../contexts/ThemeContext';
 import { settingsAPI } from '../api/settings';
 import client from '../api/client';
 import { gatewayAPI, type CompatibilityHotfixStatus } from '../api/endpoints';
-import { agentRuntimeAPI, AgentRuntimeStatus } from '../api/agentRuntime';
 import { authAPI, TwoFactorSetupResponse, TwoFactorStatusResponse } from '../api/auth';
+import {
+  loadAndApplyDefaultAgentHarness,
+  saveAndApplyDefaultAgentHarness,
+} from '../api/agentHarnessPreference';
+import {
+  loadAgentChatProviderCatalog,
+  type AgentChatHarnessCatalogEntry,
+} from '../utils/agentChatProviderCatalog';
 import type { OllamaTailnetStatus } from '../api/ollamaTailnet';
 import sounds from '../utils/sounds';
 import { DEFAULT_REGISTRATION_MODE } from '../utils/securityDefaults';
 import ViewportOverlay from '../components/ViewportOverlay';
+import ViewportModal from '../components/ViewportModal';
 import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 import FeatureReadinessPanel from '../components/settings/FeatureReadinessPanel';
 import EmbedSecurityPolicyManager from '../components/settings/EmbedSecurityPolicyManager';
@@ -29,6 +37,7 @@ import {
 } from '../hooks/usePublicSettings';
 import {
   SettingsMutationProvider,
+  useSettingsMutationCoordinator,
   type SettingsMutationClaim,
   type SettingsMutationRelease,
 } from '../components/settings/SettingsMutationContext';
@@ -112,9 +121,9 @@ const allTabs: TabDef[] = [
   { id: 'general', label: 'General', icon: Palette, access: SETTINGS_TAB_ACCESS.general },
   { id: 'email', label: 'Email', icon: Mail, access: SETTINGS_TAB_ACCESS.email },
   { id: 'security', label: 'Security', icon: ShieldCheck, access: SETTINGS_TAB_ACCESS.security },
-  { id: 'agents', label: 'Agents', icon: Bot, access: SETTINGS_TAB_ACCESS.agents },
+  { id: 'agents', label: 'Harnesses', icon: Bot, access: SETTINGS_TAB_ACCESS.agents },
   { id: 'system', label: 'System', icon: Server, access: SETTINGS_TAB_ACCESS.system },
-  { id: 'ai-providers', label: 'AI Providers', icon: Cpu, access: SETTINGS_TAB_ACCESS['ai-providers'] },
+  { id: 'ai-providers', label: 'Model Providers', icon: Cpu, access: SETTINGS_TAB_ACCESS['ai-providers'] },
   { id: 'readiness', label: 'Feature Readiness', icon: Wrench, access: SETTINGS_TAB_ACCESS.readiness },
   { id: 'backups', label: 'Backups', icon: Database, access: SETTINGS_TAB_ACCESS.backups },
   { id: 'profile', label: 'Profile', icon: User, access: SETTINGS_TAB_ACCESS.profile },
@@ -641,6 +650,8 @@ function GeneralTab({ settings, draftSettings, updateSetting, setSettingValue, s
                 { key: 'AGENT_ZERO', label: 'Agent Zero' },
                 { key: 'GEMINI', label: 'Antigravity' },
                 { key: 'OLLAMA', label: 'Ollama' },
+                { key: 'HERMES', label: 'Hermes' },
+                { key: 'OPENCODE', label: 'OpenCode' },
               ].map((a) => (
                 <button type="button" key={a.key} onClick={() => setAgentEditorOpen(a.key)} className="min-h-[44px] p-2 rounded-lg bg-white/[0.03] border border-white/[0.08] hover:bg-white/[0.06] text-left" aria-label={`Edit ${a.label} avatar`}>
                   <div className="flex items-center gap-2">
@@ -1367,9 +1378,17 @@ function SecurityTab({ mailCapability, settings, updateSetting, onSave, isDirty,
 
 function AgentsTab({ addToast, onOpenProviders, claimMutation, releaseMutation }: {
   addToast: (type: 'success' | 'error', msg: string) => void;
-  onOpenProviders: () => void;
+  onOpenProviders: (nativeProvider?: 'hermes' | 'opencode') => void;
 } & SettingsMutationProps) {
-  const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
+  const userId = useAuthStore((state) => state.user?.id || '');
+  const [agentZeroRuntimeOpen, setAgentZeroRuntimeOpen] = useState(false);
+  const settingsMutation = useSettingsMutationCoordinator();
+  const [harnessCatalog, setHarnessCatalog] = useState<AgentChatHarnessCatalogEntry[]>([]);
+  const [harnessCatalogLoading, setHarnessCatalogLoading] = useState(true);
+  const [defaultHarness, setDefaultHarness] = useState('OPENCLAW');
+  const [defaultHarnessLoading, setDefaultHarnessLoading] = useState(true);
+  const [defaultHarnessSaving, setDefaultHarnessSaving] = useState(false);
+  const [defaultHarnessError, setDefaultHarnessError] = useState<string | null>(null);
   const [compactionNoticeEnabled, setCompactionNoticeEnabled] = useState(false);
   const [compactionNoticeLoading, setCompactionNoticeLoading] = useState(true);
   const [compactionNoticeSaving, setCompactionNoticeSaving] = useState(false);
@@ -1380,16 +1399,87 @@ function AgentsTab({ addToast, onOpenProviders, claimMutation, releaseMutation }
     let cancelled = false;
     const loadStatus = async () => {
       try {
-        const status = await agentRuntimeAPI.status();
-        if (!cancelled) setRuntimeStatus(status);
+        const catalog = await loadAgentChatProviderCatalog({
+          force: true,
+          timeoutMs: 10_000,
+          requestTimeoutMs: 5_000,
+        });
+        if (!cancelled) setHarnessCatalog(catalog);
       } catch {
-        if (!cancelled) setRuntimeStatus(null);
+        if (!cancelled) setHarnessCatalog([]);
+      } finally {
+        if (!cancelled) setHarnessCatalogLoading(false);
       }
     };
-    loadStatus();
+    void loadStatus();
     const interval = setInterval(loadStatus, 15000);
     return () => { cancelled = true; clearInterval(interval); };
   }, []);
+
+  useEffect(() => {
+    if (!userId) return undefined;
+    let cancelled = false;
+    setDefaultHarnessLoading(true);
+    setDefaultHarnessError(null);
+    void loadAndApplyDefaultAgentHarness(userId)
+      .then((preference) => {
+        if (!cancelled) setDefaultHarness(preference.defaultHarness);
+      })
+      .catch((error: any) => {
+        if (!cancelled) {
+          setDefaultHarnessError(error?.response?.data?.error || 'Failed to load your default harness');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDefaultHarnessLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [userId]);
+
+  const defaultHarnessOptions = harnessCatalog.filter((entry) => (
+    entry.implemented === true
+    && entry.selectable === true
+    && entry.harnessId !== 'OPENCLAW'
+    && typeof entry.compatibilityProviderId === 'string'
+    && entry.compatibilityProviderId === entry.harnessId
+  ));
+  const currentDefaultHarnessEntry = harnessCatalog.find((entry) => entry.harnessId === defaultHarness);
+  const defaultHarnessSelectOptions = currentDefaultHarnessEntry
+    && !defaultHarnessOptions.some((entry) => entry.harnessId === currentDefaultHarnessEntry.harnessId)
+    ? [currentDefaultHarnessEntry, ...defaultHarnessOptions]
+    : defaultHarnessOptions;
+  const readyHarnessCount = harnessCatalog.filter((entry) => (
+    entry.implemented === true
+    && entry.selectable === true
+    && entry.usable === true
+    && entry.checking !== true
+    && entry.availabilityState !== 'checking'
+    && entry.availabilityState !== 'stale'
+    && entry.availabilityState !== 'error'
+  )).length;
+
+  const handleDefaultHarnessChange = useCallback(async (harnessId: string) => {
+    const owner = 'settings:agents:default-harness';
+    if (!defaultHarnessOptions.some((entry) => entry.harnessId === harnessId)) {
+      setDefaultHarnessError('That harness is not currently available for new sessions.');
+      return;
+    }
+    if (!userId || defaultHarnessSaving || !claimMutation(owner)) return;
+    setDefaultHarnessSaving(true);
+    setDefaultHarnessError(null);
+    try {
+      const preference = await saveAndApplyDefaultAgentHarness(userId, harnessId);
+      setDefaultHarness(preference.defaultHarness);
+      addToast('success', `${preference.defaultHarness} is now your default Assistant harness`);
+    } catch (error: any) {
+      const message = error?.response?.data?.error || 'Failed to update your default harness';
+      setDefaultHarnessError(message);
+      addToast('error', message);
+    } finally {
+      setDefaultHarnessSaving(false);
+      releaseMutation(owner);
+    }
+  }, [addToast, claimMutation, defaultHarnessOptions, defaultHarnessSaving, releaseMutation, userId]);
 
   const loadCompactionNoticeSetting = useCallback(async () => {
     setCompactionNoticeLoading(true);
@@ -1436,43 +1526,174 @@ function AgentsTab({ addToast, onOpenProviders, claimMutation, releaseMutation }
 
   return (
     <div>
-      {/* Gateway Status Bar */}
+      {/* Harness Status Bar */}
       <div className="mb-4 flex items-center gap-2 text-xs">
-        <span className={`px-2 py-1 rounded ${runtimeStatus?.gateway.connected ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400'}`}>
-          Gateway {runtimeStatus?.gateway.connected ? 'Connected' : 'Offline'}
+        <span className={`px-2 py-1 rounded ${harnessCatalog.find((entry) => entry.harnessId === 'OPENCLAW')?.usable ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-300'}`}>
+          OpenClaw {harnessCatalogLoading
+            ? 'Checking'
+            : harnessCatalog.find((entry) => entry.harnessId === 'OPENCLAW')?.usable
+              ? 'Ready'
+              : 'Unavailable'}
         </span>
-        <span className={`px-2 py-1 rounded ${(runtimeStatus?.adapters.filter((a) => a.available && a.id !== 'shell').length || 0) > 0 ? 'bg-blue-500/10 text-blue-300' : 'bg-amber-500/10 text-amber-300'}`}>
-          Agents {(runtimeStatus?.adapters.filter((a) => a.available && a.id !== 'shell').length || 0) > 0
-            ? `${runtimeStatus?.adapters.filter((a) => a.available && a.id !== 'shell').length} ready`
-            : 'Unavailable'}
+        <span className={`px-2 py-1 rounded ${readyHarnessCount > 0 ? 'bg-blue-500/10 text-blue-300' : 'bg-amber-500/10 text-amber-300'}`}>
+          Harnesses {harnessCatalogLoading
+            ? 'Checking'
+            : readyHarnessCount > 0
+              ? `${readyHarnessCount} ready`
+              : 'Unavailable'}
         </span>
       </div>
 
-      <SectionCard title="Provider Connections">
+      <SectionCard title="Model Accounts & Auth">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-sm leading-6 text-slate-400">
-            Authentication, OAuth, API keys, model discovery, and local Ollama configuration now live in one canonical place: AI Providers.
+            Authentication, OAuth, API keys, model discovery, and local Ollama configuration live under Model Providers. These accounts supply models; they are separate from the harness that runs the agent session.
           </p>
-          <button type="button" onClick={onOpenProviders} disabled={compactionNoticeSaving} className="min-h-[44px] shrink-0 rounded-xl border border-blue-500/25 bg-blue-500/10 px-4 py-2 text-sm font-medium text-blue-200 transition hover:bg-blue-500/20 disabled:opacity-50">
-            Open AI Providers
+          <button type="button" onClick={() => onOpenProviders()} disabled={compactionNoticeSaving} className="min-h-[44px] shrink-0 rounded-xl border border-blue-500/25 bg-blue-500/10 px-4 py-2 text-sm font-medium text-blue-200 transition hover:bg-blue-500/20 disabled:opacity-50">
+            Open Model Providers
           </button>
         </div>
       </SectionCard>
 
-      <SectionCard title="Runtime ownership">
-        <div className="space-y-3 text-sm leading-6 text-slate-400">
-          <p>
-            Provider availability is derived from the installed, authenticated runtime and its tested capabilities. There is no separate enable switch or binary override in Portal Settings.
+      <SectionCard title="Default Assistant Harness">
+        <div className="space-y-3">
+          <p className="text-sm leading-6 text-slate-400">
+            Choose the harness you want to use by default. Assistant Status always follows its connection and readiness, even when you switch to another harness in a chat. Your existing sessions stay with the harness that created them.
           </p>
-          <p>
-            Main Agent Chats run with intentional host-operator access for the Owner and Sub Admins. Project Chat uses a separate provider capability gate and an enforced project workspace.
-          </p>
+          <label className="block max-w-xl">
+            <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-400">Harness</span>
+            <select
+              value={defaultHarness}
+              onChange={(event) => { void handleDefaultHarnessChange(event.target.value); }}
+              disabled={defaultHarnessLoading || defaultHarnessSaving || harnessCatalogLoading || defaultHarnessOptions.length === 0}
+              aria-label="Default Assistant harness"
+              aria-busy={defaultHarnessLoading || defaultHarnessSaving}
+              className="min-h-[44px] w-full rounded-xl border border-white/[0.1] bg-[#11162f] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-blue-400 disabled:cursor-wait disabled:opacity-50"
+            >
+              {defaultHarnessSelectOptions.length === 0 && (
+                <option value={defaultHarness}>{defaultHarness}</option>
+              )}
+              {defaultHarnessSelectOptions.map((entry) => {
+                const availableForSelection = defaultHarnessOptions.some((available) => available.harnessId === entry.harnessId);
+                return (
+                  <option key={entry.harnessId} value={entry.harnessId} disabled={!availableForSelection}>
+                    {entry.displayName}{entry.usable === true ? '' : availableForSelection ? ' — setup required' : ' — unavailable (current default only)'}
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            {(defaultHarnessLoading || defaultHarnessSaving) && <Loader2 size={12} className="animate-spin" />}
+            {defaultHarnessLoading
+              ? 'Loading your default harness…'
+              : defaultHarnessSaving
+                ? 'Saving and applying your default harness…'
+                : `Current default: ${currentDefaultHarnessEntry?.displayName || defaultHarness}`}
+          </div>
+          {defaultHarnessError && <p role="alert" className="text-xs text-red-300">{defaultHarnessError}</p>}
         </div>
       </SectionCard>
 
-      <Suspense fallback={<div className="mb-4 rounded-xl border border-white/[0.06] bg-white/[0.03] p-5 text-sm text-slate-400"><Loader2 size={16} className="mr-2 inline animate-spin" />Loading Agent Zero setup controls…</div>}>
-        <LazyAgentZeroSetupPanel onOpenProviderSettings={onOpenProviders} />
-      </Suspense>
+      <SectionCard title="Harnesses & Runtime Ownership">
+        <div className="space-y-3 text-sm leading-6 text-slate-400">
+          <p>
+            Harness availability is derived from the installed, authenticated runtime and its tested capabilities. There is no separate enable switch or binary override in Portal Settings.
+          </p>
+          <p>
+            Main Agent Chats run with intentional host-operator access for the Owner and Sub Admins. Project Chat uses a separate harness capability gate and an enforced project workspace.
+          </p>
+          {harnessCatalog.length > 0 && (
+            <div className="grid gap-2 pt-1 sm:grid-cols-2">
+              {harnessCatalog.map((entry) => {
+                const ready = entry.implemented === true && entry.selectable === true && entry.usable === true;
+                const supportsProjectChat = entry.capabilities?.supportedExecutionScopes?.includes('PROJECT_SANDBOX') === true;
+                const portalProfileSetupProvider = entry.harnessId === 'HERMES'
+                  ? 'hermes'
+                  : entry.harnessId === 'OPENCODE'
+                    ? 'opencode'
+                    : null;
+                const managedProjectOnlyHarness = entry.harnessId === 'CODEX' || entry.harnessId === 'CLAUDE_CODE';
+                const authenticationLabel = managedProjectOnlyHarness
+                  ? 'Project Sandbox credential; host login unavailable'
+                  : entry.auth?.owner === 'harness-local-login'
+                  ? entry.nativeAuthLoginCommand
+                    ? `Harness login: ${entry.nativeAuthLoginCommand}`
+                    : 'Harness-local CLI login'
+                  : entry.auth?.owner === 'model-provider-account'
+                    ? 'Authentication: Model Providers account'
+                    : 'Authentication: None';
+                const modelLabel = entry.models?.catalogOwner === 'harness'
+                  ? 'Models: discovered from the harness after login'
+                  : entry.models?.catalogOwner === 'model-provider-account'
+                    ? 'Models: supplied by the connected model-provider account'
+                    : entry.models?.catalogOwner === 'local-runtime'
+                      ? 'Models: discovered from the local runtime'
+                      : null;
+                return (
+                  <div key={entry.harnessId} className="rounded-lg border border-white/[0.06] bg-white/[0.025] px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-medium text-slate-200">{entry.displayName}</span>
+                      <span className={`text-[10px] font-semibold uppercase tracking-wide ${ready ? 'text-emerald-400' : entry.releaseStage === 'developer-preview' ? 'text-blue-300' : 'text-slate-500'}`}>
+                        {ready ? 'Ready' : entry.releaseStage === 'developer-preview' ? 'Preview' : entry.implemented ? 'Setup required' : 'Planned'}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">
+                      {entry.provenanceLabel || `via ${entry.displayName}`}
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">{authenticationLabel}</p>
+                    {modelLabel && <p className="text-xs leading-5 text-slate-500">{modelLabel}</p>}
+                    <p className="text-xs leading-5 text-slate-500">
+                      Project Chat: {supportsProjectChat ? 'Supported in an isolated project workspace' : 'Not supported'}
+                    </p>
+                    {entry.nativeAuthMessage && (
+                      <p className="mt-1 text-xs leading-5 text-slate-500">{entry.nativeAuthMessage}</p>
+                    )}
+                    {entry.harnessId === 'AGENT_ZERO' && (
+                      <button type="button" onClick={() => setAgentZeroRuntimeOpen(true)}
+                        aria-haspopup="dialog"
+                        className="mt-2 min-h-[36px] rounded-lg border border-blue-500/25 bg-blue-500/10 px-3 py-1.5 text-xs font-medium text-blue-200 transition hover:bg-blue-500/20">
+                        Configure Agent Zero
+                      </button>
+                    )}
+                    {portalProfileSetupProvider && (
+                      <div className="mt-2 border-t border-white/[0.06] pt-2">
+                        <p className="mb-2 text-xs leading-5 text-slate-500">
+                          Configures only this harness’s dedicated Portal profile. The Remote Desktop CLI profile and the OpenCode Zen model-provider account remain separate; credentials are never copied between them.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => onOpenProviders(portalProfileSetupProvider)}
+                          className="min-h-[36px] rounded-lg border border-blue-500/25 bg-blue-500/10 px-3 py-1.5 text-xs font-medium text-blue-200 transition hover:bg-blue-500/20"
+                        >
+                          Configure {entry.displayName} Portal profile
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </SectionCard>
+
+      <ViewportModal open={agentZeroRuntimeOpen} dismissible={!settingsMutation?.owner}
+        onDismiss={() => setAgentZeroRuntimeOpen(false)} className="bg-black/70 p-3 backdrop-blur-sm sm:p-5">
+        <div role="dialog" aria-modal="true" aria-labelledby="agent-zero-runtime-dialog-title"
+          className="flex max-h-full w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-theme-border bg-theme-surface text-theme-text shadow-2xl">
+          <div className="flex shrink-0 items-center justify-between border-b border-theme-border px-5 py-4">
+            <h2 id="agent-zero-runtime-dialog-title" className="font-semibold">Configure Agent Zero</h2>
+            <button type="button" aria-label="Close Agent Zero settings" disabled={Boolean(settingsMutation?.owner)}
+              onClick={() => setAgentZeroRuntimeOpen(false)} className="grid min-h-[40px] min-w-[40px] place-items-center rounded-lg hover:bg-theme-surface-hover disabled:opacity-40"><X size={18} /></button>
+          </div>
+          <div className="min-h-0 overflow-y-auto overscroll-contain p-4">
+            <Suspense fallback={<div role="status" className="p-5 text-sm text-slate-400">Loading Agent Zero settings…</div>}>
+              <LazyAgentZeroSetupPanel onOpenProviderSettings={() => { setAgentZeroRuntimeOpen(false); onOpenProviders(); }} />
+            </Suspense>
+          </div>
+        </div>
+      </ViewportModal>
 
       <SectionCard title="OpenClaw Runtime">
         <div className="space-y-3">
@@ -1512,6 +1733,40 @@ function AgentsTab({ addToast, onOpenProviders, claimMutation, releaseMutation }
 
 // ── System Tab ────────────────────────────────────────────────────────
 
+type CodingToolStatus = Readonly<{
+  id: string;
+  name: string;
+  description: string;
+  installed: boolean;
+  version: string;
+  state?: 'verified' | 'absent' | 'unsupported' | 'status_only' | 'drifted' | 'busy' | 'recovering' | 'recovery-required' | 'indeterminate';
+  installAvailable: boolean;
+  installUnavailableCode?: string;
+}>;
+
+const COMPATIBILITY_BUNDLE_CODING_TOOL_IDS = new Set(['codex', 'claude-code']);
+
+function codingToolMaintenanceCopy(tool: CodingToolStatus): string {
+  return COMPATIBILITY_BUNDLE_CODING_TOOL_IDS.has(tool.id)
+    ? 'Owner updates the exact bundle under Admin > Maintenance > Update Compatible AI Tools'
+    : 'use this runtime\'s dedicated Portal setup or maintenance path';
+}
+
+function codingToolReadOnlyCopy(tool: CodingToolStatus): string {
+  const maintenance = codingToolMaintenanceCopy(tool);
+  switch (tool.state) {
+    case 'unsupported': return `Read-only status · installed version is not admitted · ${maintenance}`;
+    case 'status_only': return `Read-only status · installed version is observable but not executable · ${maintenance}`;
+    case 'drifted': return `Read-only status · managed runtime drift detected · ${maintenance}`;
+    case 'busy': return `Read-only status · host package transaction is busy · ${maintenance}`;
+    case 'recovering': return `Read-only status · managed runtime is recovering · ${maintenance}`;
+    case 'recovery-required': return `Read-only status · managed runtime recovery is required · ${maintenance}`;
+    case 'indeterminate': return `Read-only status · managed runtime verification is unavailable · ${maintenance}`;
+    case 'absent': return `Read-only status · managed runtime is not installed · ${maintenance}`;
+    default: return `Read-only status · per-tool controls are disabled · ${maintenance}`;
+  }
+}
+
 function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, addToast, claimMutation, releaseMutation }: {
   mailCapability?: PortalFeatureAvailability;
   settings: Record<string, string>;
@@ -1528,30 +1783,18 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
   const [pendingMailboxDelete, setPendingMailboxDelete] = useState<string | null>(null);
   const { user } = useAuthStore();
   const isAdmin = isElevated(user);
-  const canApplyCompatibilityHotfix = isOwnerRole(user?.role);
-  const [codingTools, setCodingTools] = useState<Array<{ id: string; name: string; description: string; installed: boolean; version: string }>>([]);
+  const [codingTools, setCodingTools] = useState<CodingToolStatus[]>([]);
   const [codingToolsLoading, setCodingToolsLoading] = useState(false);
   const [codingToolsError, setCodingToolsError] = useState<string | null>(null);
-  const [installingToolId, setInstallingToolId] = useState('');
-  const [pendingToolInstall, setPendingToolInstall] = useState<{ id: string; name: string } | null>(null);
   const [compatHotfixStatus, setCompatHotfixStatus] = useState<CompatibilityHotfixStatus | null>(null);
   const [compatHotfixLoading, setCompatHotfixLoading] = useState(false);
-  const [compatHotfixApplying, setCompatHotfixApplying] = useState(false);
-  const [compatHotfixOutput, setCompatHotfixOutput] = useState('');
-  const [compatHotfixConfirmOpen, setCompatHotfixConfirmOpen] = useState(false);
-  const [toolInstallError, setToolInstallError] = useState<string | null>(null);
-  const [toolInstallVerificationPending, setToolInstallVerificationPending] = useState(false);
   const [mailboxDeleteError, setMailboxDeleteError] = useState<string | null>(null);
-  const [compatHotfixError, setCompatHotfixError] = useState<string | null>(null);
-  const systemDialogRef = useRef<'mailbox-delete' | 'tool-install' | 'compat-hotfix' | null>(null);
+  const systemDialogRef = useRef<'mailbox-delete' | null>(null);
   const systemActionRef = useRef<
-    | { owner: 'settings:system:tool-install'; toolId: string; toolName: string; confirmation: string }
     | { owner: 'settings:system:mailbox-delete'; username: string; confirmation: string }
-    | { owner: 'settings:system:compat-hotfix'; confirmation: string }
     | null
   >(null);
   const [systemActionOwner, setSystemActionOwner] = useState<string | null>(null);
-  const committedToolInstallRef = useRef<{ toolId: string; toolName: string } | null>(null);
 
   const loadMailboxes = useCallback(async () => {
     setMailboxLoading(true);
@@ -1577,7 +1820,7 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
 
   const readCodingTools = useCallback(async (signal?: AbortSignal) => {
     const res = await client.get('/admin/coding-tools-status', { signal });
-    const tools = (res.data.tools || []) as Array<{ id: string; name: string; description: string; installed: boolean; version: string }>;
+    const tools = (res.data.tools || []) as CodingToolStatus[];
     setCodingTools(tools);
     setCodingToolsError(null);
     return tools;
@@ -1624,7 +1867,7 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
   }, [isAdmin, loadCompatibilityHotfixStatus]);
 
   const openSystemDialog = (
-    kind: 'mailbox-delete' | 'tool-install' | 'compat-hotfix',
+    kind: 'mailbox-delete',
     open: () => void,
   ) => {
     if (systemDialogRef.current || systemActionRef.current) return;
@@ -1632,56 +1875,10 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
     open();
   };
 
-  const closeSystemDialog = (kind: 'mailbox-delete' | 'tool-install' | 'compat-hotfix', close: () => void) => {
+  const closeSystemDialog = (kind: 'mailbox-delete', close: () => void) => {
     if (systemActionRef.current || systemDialogRef.current !== kind) return;
     systemDialogRef.current = null;
     close();
-  };
-
-  const handleInstallTool = async (toolId: string, toolName: string, confirmation: string) => {
-    const snapshot = Object.freeze({
-      owner: 'settings:system:tool-install' as const,
-      toolId,
-      toolName,
-      confirmation,
-    });
-    if (systemActionRef.current || !claimMutation(snapshot.owner)) return;
-    systemActionRef.current = snapshot;
-    setSystemActionOwner(snapshot.owner);
-    setToolInstallError(null);
-    setInstallingToolId(snapshot.toolId);
-    let installationAccepted = committedToolInstallRef.current?.toolId === snapshot.toolId;
-    try {
-      if (!installationAccepted) {
-        await client.post('/admin/install-coding-tool', { toolId: snapshot.toolId, confirmation: snapshot.confirmation });
-        installationAccepted = true;
-        committedToolInstallRef.current = { toolId: snapshot.toolId, toolName: snapshot.toolName };
-        setToolInstallVerificationPending(true);
-      }
-      const verifiedTools = await waitForSettingsConvergence({
-        label: `${snapshot.toolName} installation status`,
-        read: (signal) => readCodingTools(signal),
-        accepts: (tools) => tools.some((tool) => tool.id === snapshot.toolId && tool.installed),
-      });
-      setCodingTools(verifiedTools);
-      setCodingToolsError(null);
-      committedToolInstallRef.current = null;
-      setToolInstallVerificationPending(false);
-      addToast('success', 'Tool installed successfully');
-      setPendingToolInstall(null);
-      systemDialogRef.current = null;
-    } catch (err: any) {
-      const message = installationAccepted
-        ? `${snapshot.toolName} installation finished, but Portal could not verify the installed tool. Retry verification; the install request will not be repeated.`
-        : err?.response?.data?.error || `Failed to install ${snapshot.toolName}`;
-      setToolInstallError(message);
-      addToast('error', message);
-    } finally {
-      if (systemActionRef.current === snapshot) systemActionRef.current = null;
-      setSystemActionOwner(null);
-      setInstallingToolId('');
-      releaseMutation(snapshot.owner);
-    }
   };
 
   const handleDeleteMailbox = async (username: string, confirmation: string) => {
@@ -1710,35 +1907,6 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
       if (systemActionRef.current === snapshot) systemActionRef.current = null;
       setSystemActionOwner(null);
       setDeletingMailbox(null);
-      releaseMutation(snapshot.owner);
-    }
-  };
-
-  const handleApplyCompatibilityHotfix = async (confirmation: string) => {
-    if (!canApplyCompatibilityHotfix) return;
-    const snapshot = Object.freeze({ owner: 'settings:system:compat-hotfix' as const, confirmation });
-    if (systemActionRef.current || !claimMutation(snapshot.owner)) return;
-    systemActionRef.current = snapshot;
-    setSystemActionOwner(snapshot.owner);
-    setCompatHotfixError(null);
-    setCompatHotfixApplying(true);
-    try {
-      const result = await gatewayAPI.applyCompatibilityHotfix(snapshot.confirmation);
-      const combinedOutput = [result.patchOutput, result.restartOutput].filter(Boolean).join('\n\n');
-      setCompatHotfixOutput(combinedOutput);
-      setCompatHotfixStatus(result.status);
-      addToast('success', result.message || 'Compatibility hotfix applied');
-      setCompatHotfixConfirmOpen(false);
-      systemDialogRef.current = null;
-    } catch (err: any) {
-      const detail = err?.response?.data?.detail || err?.response?.data?.error || 'Failed to apply compatibility hotfix';
-      setCompatHotfixError(detail);
-      addToast('error', detail);
-    } finally {
-      if (systemActionRef.current === snapshot) systemActionRef.current = null;
-      setSystemActionOwner(null);
-      setCompatHotfixApplying(false);
-      void loadCompatibilityHotfixStatus();
       releaseMutation(snapshot.owner);
     }
   };
@@ -1844,7 +2012,7 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
             label="Help improve BridgesLLM"
           />
           <p className="text-sm text-slate-400">
-            Sends a limited operational report shortly after startup and then about every 24 hours while Portal remains running: a random install ID, Portal and dependency versions, Portal user count, uptime, Node version, operating system, and architecture. It excludes messages, prompts, project and app content, files, credentials, usernames, and email addresses. Turning this off stops this report only. Owner Dashboard version checks and manual refreshes still work without this operational payload. Installer lifecycle tracking is separate: install and update milestones include the event type, Portal version, operating system name and version, and the random install ID. This switch controls Portal operational telemetry, not those installer events.
+            Sends a limited operational report shortly after startup and then about every 24 hours while Portal remains running: a random install ID, Portal and dependency versions, Portal user count, uptime, Node version, operating system, and architecture. It excludes messages, prompts, project and app content, files, credentials, usernames, and email addresses. Turning this off stops this report only. Owner Dashboard version checks and manual refreshes still work without this operational payload. Fresh-install lifecycle tracking is separate: its start and completion events include the event type, Portal version, operating system name and version, and the random install ID. Ordinary Portal updates do not send installer lifecycle events. This switch controls Portal operational telemetry, not those installer events.
           </p>
           {settings['system.allowTelemetry'] !== 'true' && (
             <p className="text-xs text-amber-300/90">Portal operational reports are off. Dashboard version checks and manual refreshes still work.</p>
@@ -1876,7 +2044,7 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
       </SectionCard>
 
       <SectionCard title="AI Coding Tools">
-        <p className="text-sm text-slate-400 mb-4">Optional CLI tools for AI-powered coding agents.</p>
+        <p className="text-sm text-slate-400 mb-4">Read-only package status for optional host coding runtimes. Portal does not install or update these packages.</p>
         {codingToolsError && (
           <div className="mb-3 space-y-2">
             <p role="alert" className="text-sm text-red-300">{codingToolsError}</p>
@@ -1899,14 +2067,13 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
                   {tool.installed && tool.version && <p className="text-xs text-emerald-400 mt-1">v{tool.version}</p>}
                 </div>
                 {tool.installed ? (
-                  <span className="text-xs text-emerald-400 flex items-center gap-1"><CheckCircle2 size={14} /> Installed</span>
+                  <span className="max-w-[15rem] text-right text-xs leading-5 text-amber-200">
+                    Package detected · availability still requires the runtime's independent execution and credential checks · {codingToolMaintenanceCopy(tool)}
+                  </span>
                 ) : (
-                  <button onClick={() => openSystemDialog('tool-install', () => {
-                    setToolInstallError(null);
-                    setPendingToolInstall({ id: tool.id, name: tool.name });
-                  })} disabled={Boolean(systemDialogRef.current || systemActionOwner)} className="min-h-[40px] rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-50">
-                    {installingToolId === tool.id ? 'Installing...' : 'Install'}
-                  </button>
+                  <span className="max-w-[15rem] text-right text-xs leading-5 text-amber-200">
+                    {codingToolReadOnlyCopy(tool)}
+                  </span>
                 )}
               </div>
             ))}
@@ -1918,7 +2085,7 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
         <SectionCard title="OpenClaw Compatibility Hotfix">
           <div className="space-y-3">
             <p className="text-sm text-slate-400">
-              Installer and updater runs usually auto-apply this temporary OpenClaw patch now. Use this fallback if OpenClaw was upgraded separately or this install is still missing the relay, Gemini, or Claude ask-question compatibility markers. Applying it patches the installed OpenClaw runtime files and restarts the OpenClaw gateway.
+              This read-only surface reports the installed compatibility markers. Owner updates the exact OpenClaw and native-tool bundle under Admin &gt; Maintenance; no patch or restart occurs from this card.
             </p>
 
             {compatHotfixLoading ? (
@@ -1931,18 +2098,33 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
                   <div className="flex items-center gap-2 text-sm font-medium">
                     {compatHotfixStatus.applied ? <CheckCircle2 size={16} className="text-emerald-400" /> : <AlertCircle size={16} className="text-amber-300" />}
                     <span className={compatHotfixStatus.applied ? 'text-emerald-300' : 'text-amber-200'}>
-                      {compatHotfixStatus.applied ? 'Compatibility patches present in the installed OpenClaw bundle' : 'Compatibility patches not applied'}
+                      {compatHotfixStatus.applied
+                        ? compatHotfixStatus.contractKind === 'openclaw-2026.9.1-native'
+                          ? 'OpenClaw 2026.9.1 native contract and Portal bridge verified'
+                          : 'Compatibility patches present in the installed OpenClaw bundle'
+                        : 'Compatibility bridge not ready'}
                     </span>
                   </div>
                   <div className="mt-2 space-y-1 text-xs text-slate-300">
-                    <div>Heartbeat bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.heartbeatRunner || 'missing'}</span></div>
-                    <div>Reply bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.replyBundle || 'missing'}</span></div>
-                    <div>Execute runtime: <span className="font-mono text-slate-400">{compatHotfixStatus.executeRuntime || 'missing'}</span></div>
-                    <div>Gemini CLI backend: <span className="font-mono text-slate-400">{compatHotfixStatus.geminiCliBackend || 'missing'}</span></div>
-                    <div>Claude CLI shared bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.claudeCliShared || 'missing'}</span></div>
-                    <div>Relay patches: <span className="text-slate-400">detector {compatHotfixStatus.detectorPatched ? '✓' : '✗'}, relay {compatHotfixStatus.relayPatched ? '✓' : '✗'}, reply {compatHotfixStatus.replyPatched ? '✓' : '✗'}</span></div>
-                    <div>Gemini patches: <span className="text-slate-400">cli {compatHotfixStatus.geminiCliPatched ? '✓' : '✗'}, yolo {compatHotfixStatus.geminiCliYoloPatched ? '✓' : '✗'}, runtime {compatHotfixStatus.geminiRuntimePatched ? '✓' : '✗'}</span></div>
-                    <div>Claude questions: <span className="text-slate-400">route {compatHotfixStatus.claudeAskUserPatched ? '✓' : '✗'}, bridge {compatHotfixStatus.claudeAskUserBridgeReady ? '✓' : '✗'}, timers {compatHotfixStatus.claudeAskUserTimeoutsReady ? '✓' : '✗'}</span></div>
+                    {compatHotfixStatus.contractKind === 'openclaw-2026.9.1-native' ? (
+                      <>
+                        <div>Native question RPC: <span className="text-slate-400">verified</span></div>
+                        <div>Exact-run steer bridge: <span className="text-slate-400">{compatHotfixStatus.relayPatched ? 'verified' : 'missing'}</span></div>
+                        <div>Ask-user plugin: <span className="text-slate-400">{compatHotfixStatus.claudeAskUserBridgeReady ? 'verified' : 'missing'}</span></div>
+                        <div>Retired 7.1 bundle patches: <span className="text-slate-400">not required</span></div>
+                      </>
+                    ) : (
+                      <>
+                        <div>Heartbeat bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.heartbeatRunner || 'missing'}</span></div>
+                        <div>Reply bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.replyBundle || 'missing'}</span></div>
+                        <div>Execute runtime: <span className="font-mono text-slate-400">{compatHotfixStatus.executeRuntime || 'missing'}</span></div>
+                        <div>Gemini CLI backend: <span className="font-mono text-slate-400">{compatHotfixStatus.geminiCliBackend || 'missing'}</span></div>
+                        <div>Claude CLI shared bundle: <span className="font-mono text-slate-400">{compatHotfixStatus.claudeCliShared || 'missing'}</span></div>
+                        <div>Relay patches: <span className="text-slate-400">detector {compatHotfixStatus.detectorPatched ? '✓' : '✗'}, relay {compatHotfixStatus.relayPatched ? '✓' : '✗'}, reply {compatHotfixStatus.replyPatched ? '✓' : '✗'}</span></div>
+                        <div>Gemini patches: <span className="text-slate-400">cli {compatHotfixStatus.geminiCliPatched ? '✓' : '✗'}, yolo {compatHotfixStatus.geminiCliYoloPatched ? '✓' : '✗'}, runtime {compatHotfixStatus.geminiRuntimePatched ? '✓' : '✗'}</span></div>
+                        <div>Claude questions: <span className="text-slate-400">route {compatHotfixStatus.claudeAskUserPatched ? '✓' : '✗'}, bridge {compatHotfixStatus.claudeAskUserBridgeReady ? '✓' : '✗'}, timers {compatHotfixStatus.claudeAskUserTimeoutsReady ? '✓' : '✗'}</span></div>
+                      </>
+                    )}
                     {compatHotfixStatus.note && <div className="text-slate-400">{compatHotfixStatus.note}</div>}
                   </div>
                 </div>
@@ -1955,13 +2137,6 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
                   </div>
                 )}
 
-                {compatHotfixOutput && (
-                  <details className="rounded-lg border border-white/[0.08] bg-black/20 px-3 py-2">
-                    <summary className="cursor-pointer text-xs font-medium text-slate-300">Last hotfix output</summary>
-                    <pre className="mt-2 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-400">{compatHotfixOutput}</pre>
-                  </details>
-                )}
-
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <button
                     onClick={() => { void loadCompatibilityHotfixStatus(); }}
@@ -1970,17 +2145,9 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
                   >
                     <RefreshCw size={12} /> Refresh status
                   </button>
-                  <button
-                    onClick={() => openSystemDialog('compat-hotfix', () => {
-                      setCompatHotfixError(null);
-                      setCompatHotfixConfirmOpen(true);
-                    })}
-                    disabled={Boolean(systemDialogRef.current || systemActionOwner) || !compatHotfixStatus.supported || !canApplyCompatibilityHotfix}
-                    className="inline-flex min-h-[40px] items-center gap-2 rounded-xl border border-amber-200/70 bg-gradient-to-r from-amber-300 via-amber-400 to-amber-500 px-4 py-2 text-sm font-semibold text-slate-950 shadow-[0_10px_24px_rgba(245,158,11,0.28)] transition-all hover:-translate-y-0.5 hover:from-amber-200 hover:via-amber-300 hover:to-amber-400 hover:shadow-[0_14px_28px_rgba(245,158,11,0.36)] focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-200/90 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0E27] disabled:translate-y-0 disabled:cursor-not-allowed disabled:border-white/[0.08] disabled:bg-white/[0.06] disabled:bg-none disabled:text-slate-500 disabled:shadow-none"
-                  >
-                    {compatHotfixApplying ? <Loader2 size={15} className="animate-spin" /> : <Wrench size={15} />}
-                    <span>{compatHotfixApplying ? 'Applying and restarting…' : compatHotfixStatus.applied ? 'Reapply compatibility patches and restart' : 'Apply compatibility patches and restart'}</span>
-                  </button>
+                  <span className="inline-flex min-h-[40px] items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-2 text-sm text-amber-200">
+                    <Wrench size={15} /> Update via Admin &gt; Maintenance
+                  </span>
                 </div>
               </>
             ) : (
@@ -2002,36 +2169,6 @@ function SystemTab({ mailCapability, settings, updateSetting, onSave, isDirty, a
         details={mailboxDeleteError ? <p role="alert" className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-200">{mailboxDeleteError}</p> : undefined}
         onCancel={() => closeSystemDialog('mailbox-delete', () => setPendingMailboxDelete(null))}
         onConfirm={(confirmation) => { if (pendingMailboxDelete) void handleDeleteMailbox(pendingMailboxDelete, confirmation); }}
-      />
-
-      <TypedConfirmationDialog
-        open={!!pendingToolInstall}
-        title={`Install ${pendingToolInstall?.name || 'coding tool'}?`}
-        description="This installs a host-level executable used by operator Agent Chats. Package installation can change system files and may download third-party dependencies."
-        confirmationPhrase={pendingToolInstall ? `INSTALL ${pendingToolInstall.id.trim().toUpperCase()}` : null}
-        confirmLabel={toolInstallVerificationPending ? 'Verify installed tool' : 'Install host tool'}
-        busyLabel={toolInstallVerificationPending ? 'Verifying installed tool…' : 'Installing host tool…'}
-        busy={!!pendingToolInstall && installingToolId === pendingToolInstall.id}
-        details={toolInstallError ? <p role="alert" className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-200">{toolInstallError}</p> : undefined}
-        onCancel={() => {
-          if (committedToolInstallRef.current) return;
-          closeSystemDialog('tool-install', () => setPendingToolInstall(null));
-        }}
-        onConfirm={(confirmation) => { if (pendingToolInstall) void handleInstallTool(pendingToolInstall.id, pendingToolInstall.name, confirmation); }}
-      />
-
-      <TypedConfirmationDialog
-        open={compatHotfixConfirmOpen}
-        title="Apply OpenClaw compatibility hotfix?"
-        description="This updates the installed OpenClaw compatibility bundle and restarts the gateway. Active agent turns may be interrupted."
-        confirmationPhrase={compatHotfixStatus?.confirmationPhrase || null}
-        confirmLabel="Apply hotfix + restart"
-        busyLabel="Applying hotfix and restarting…"
-        busy={compatHotfixApplying}
-        tone="warning"
-        details={compatHotfixError ? <p role="alert" className="rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-200">{compatHotfixError}</p> : undefined}
-        onCancel={() => closeSystemDialog('compat-hotfix', () => setCompatHotfixConfirmOpen(false))}
-        onConfirm={(confirmation) => { void handleApplyCompatibilityHotfix(confirmation); }}
       />
 
       <div className="flex justify-end">
@@ -3614,6 +3751,8 @@ export default function SettingsPage() {
   const { toasts, add: addToast } = useToasts();
   const settingsMutationOwnerRef = useRef<string | null>(null);
   const [settingsMutationOwner, setSettingsMutationOwner] = useState<string | null>(null);
+  const [requestedNativeCliProvider, setRequestedNativeCliProvider] = useState<'hermes' | 'opencode' | null>(null);
+  const [agentZeroProvidersOpen, setAgentZeroProvidersOpen] = useState(false);
   const embedPolicyDirtyRef = useRef(false);
   const [embedPolicyDirty, setEmbedPolicyDirty] = useState(false);
   const [embedPolicyNavigationAttemptVersion, setEmbedPolicyNavigationAttemptVersion] = useState(0);
@@ -4013,7 +4152,7 @@ export default function SettingsPage() {
             <p className="mt-1 text-sm text-slate-300">
               {tailnetSetupRequested
                 ? 'Choose the Windows PC, run the one-time setup, and acknowledge the narrow Tailscale Grant below. You can pull or select a model after the private route connects.'
-                : 'OpenClaw is online at this stage, so OAuth and token flows can persist and verify their credentials before you enter Agent Chat.'}
+                : 'Connect a model-provider account below, or use a local Ollama model. You can change providers at any time.'}
             </p>
           </div>
           <button type="button" onClick={() => setShowSetupHandoff(false)} className="rounded-lg p-1 text-slate-400 transition hover:bg-white/5 hover:text-white" aria-label="Dismiss setup handoff">
@@ -4107,6 +4246,7 @@ export default function SettingsPage() {
                     'appearance.portalName', 'appearance.logoUrl', 'appearance.assistantName',
                     'appearance.agentAvatar.OPENCLAW', 'appearance.agentAvatar.CLAUDE_CODE', 'appearance.agentAvatar.CODEX',
                     'appearance.agentAvatar.GROK', 'appearance.agentAvatar.AGENT_ZERO', 'appearance.agentAvatar.GEMINI', 'appearance.agentAvatar.OLLAMA',
+                    'appearance.agentAvatar.HERMES', 'appearance.agentAvatar.OPENCODE',
                     'appearance.theme', 'appearance.accentColor'
                   ], 'general')}
                   isDirty={dirtyTabs.has('general')}
@@ -4152,7 +4292,8 @@ export default function SettingsPage() {
               {activeTab === 'agents' && (
                 <AgentsTab
                   addToast={addToast}
-                  onOpenProviders={() => {
+                  onOpenProviders={(nativeProvider) => {
+                    setRequestedNativeCliProvider(nativeProvider || null);
                     selectTab('ai-providers');
                   }}
                   claimMutation={claimMutation}
@@ -4179,15 +4320,15 @@ export default function SettingsPage() {
                     <LazyAiProviderSetup
                       mode="settings"
                       apiBase="/ai-setup"
+                      initialNativeCliProvider={requestedNativeCliProvider}
+                      onInitialNativeCliProviderConsumed={() => setRequestedNativeCliProvider(null)}
                       additionalProviderCards={(
-                        <Suspense fallback={<div role="status" className="rounded-xl border border-slate-800 bg-slate-950/60 p-5 text-sm text-slate-400"><Loader2 size={16} className="mr-2 inline animate-spin" />Loading Agent Zero model accounts…</div>}>
-                          <LazyAgentZeroSetupPanel
-                            view="providers"
-                            onOpenRuntimeSettings={() => {
-                              selectTab('agents');
-                            }}
-                          />
-                        </Suspense>
+                        <button type="button" aria-haspopup="dialog" onClick={() => setAgentZeroProvidersOpen(true)}
+                          className="group flex flex-col rounded-xl border border-slate-800 bg-slate-950/60 p-5 text-left transition hover:border-slate-600 hover:bg-slate-900/80">
+                          <div className="flex items-center gap-3"><span aria-hidden="true" className="h-3 w-3 rounded-full bg-blue-500/50" /><span className="text-base font-semibold text-white">Agent Zero</span></div>
+                          <p className="mt-2 text-sm leading-relaxed text-slate-400">Connect model accounts for Agent Zero’s managed runtime.</p>
+                          <span className="mt-3 text-sm font-medium text-slate-300 group-hover:text-white">Configure Agent Zero →</span>
+                        </button>
                       )}
                     />
                   </Suspense>
@@ -4196,6 +4337,11 @@ export default function SettingsPage() {
                     ref={tailnetSetupRef}
                     className="scroll-mt-6"
                   >
+                    <details open={tailnetSetupRequested} className="rounded-xl border border-white/[0.08] bg-white/[0.02]">
+                      <summary className="cursor-pointer px-5 py-4 text-sm font-medium text-theme-text">
+                        Remote GPU <span className="ml-2 text-xs font-normal text-theme-text-muted">Optional · run models on a Windows PC</span>
+                      </summary>
+                      <div className="border-t border-white/[0.06] p-3 sm:p-4">
                     <Suspense fallback={<div role="status" className="rounded-xl border border-white/[0.06] bg-white/[0.03] p-4 text-sm text-slate-400">Loading Remote GPU…</div>}>
                       <LazyOllamaTailnetSetup
                         className={tailnetSetupRequested
@@ -4204,6 +4350,8 @@ export default function SettingsPage() {
                         onStatusChange={handleTailnetStatus}
                       />
                     </Suspense>
+                      </div>
+                    </details>
                   </div>
                   <LocalCpuPreferences
                     settings={settings}
@@ -4244,6 +4392,23 @@ export default function SettingsPage() {
           )}
         </div>
       </div>
+
+      <ViewportModal open={agentZeroProvidersOpen} dismissible={!settingsMutationOwner}
+        onDismiss={() => setAgentZeroProvidersOpen(false)} className="bg-black/70 p-3 backdrop-blur-sm sm:p-5">
+        <div role="dialog" aria-modal="true" aria-labelledby="agent-zero-providers-title"
+          className="flex max-h-full w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-theme-border bg-theme-surface text-theme-text shadow-2xl">
+          <div className="flex shrink-0 items-center justify-between border-b border-theme-border px-5 py-4">
+            <h2 id="agent-zero-providers-title" className="font-semibold">Agent Zero model accounts</h2>
+            <button type="button" aria-label="Close Agent Zero model accounts" disabled={Boolean(settingsMutationOwner)}
+              onClick={() => setAgentZeroProvidersOpen(false)} className="grid min-h-[40px] min-w-[40px] place-items-center rounded-lg hover:bg-theme-surface-hover disabled:opacity-40"><X size={18} /></button>
+          </div>
+          <div className="min-h-0 overflow-y-auto overscroll-contain p-4">
+            <Suspense fallback={<div role="status" className="p-5 text-sm text-slate-400">Loading Agent Zero model accounts…</div>}>
+              <LazyAgentZeroSetupPanel view="providers" onOpenRuntimeSettings={() => { setAgentZeroProvidersOpen(false); selectTab('agents'); }} />
+            </Suspense>
+          </div>
+        </div>
+      </ViewportModal>
 
       <SettingsToasts toasts={toasts} />
     </div>

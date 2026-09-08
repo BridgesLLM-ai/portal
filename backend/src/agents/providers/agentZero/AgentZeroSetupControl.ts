@@ -16,6 +16,7 @@ import {
 } from 'fs';
 import path from 'path';
 import { promisify } from 'util';
+import { HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE } from '../../../config/toolAdapters';
 import { ensureRuntimeDirectory } from '../../../utils/runtimeDirectory';
 import {
   getAgentZeroAuthReadinessSnapshot,
@@ -35,7 +36,6 @@ import {
   type AgentZeroRuntimeStatus,
 } from './AgentZeroRuntime';
 
-export const AGENT_ZERO_RUNTIME_CONFIRMATION = 'SET UP AGENT ZERO';
 export const AGENT_ZERO_CREDENTIAL_CONFIRMATION = 'SAVE AGENT ZERO CREDENTIALS';
 
 const MAX_USERNAME_LENGTH = 256;
@@ -81,9 +81,9 @@ export interface AgentZeroSetupSurface {
 
 export interface AgentZeroSetupStatus {
   testedVersions: {
-    agentZero: '2.5';
+    agentZero: '2.10';
     connector: '0.1.0';
-    hostBridge: '2.5';
+    hostBridge: '2.10';
   };
   credentials: {
     configured: boolean;
@@ -95,7 +95,7 @@ export interface AgentZeroSetupStatus {
     running: boolean;
     protocolReady: boolean;
     version?: string;
-    expectedVersion: '2.5';
+    expectedVersion: '2.10';
     pinnedImage: boolean;
     loopbackOnly: boolean;
     persistentData: boolean;
@@ -114,7 +114,8 @@ export interface AgentZeroSetupStatus {
     };
     reconcileRuntime: {
       ownerOnly: true;
-      confirmationPhrase: typeof AGENT_ZERO_RUNTIME_CONFIRMATION;
+      available: false;
+      unavailableCode: typeof HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.code;
     };
     verifyAuthentication: {
       ownerOnly: true;
@@ -332,7 +333,7 @@ export function buildAgentZeroSetupStatus(input: {
     setupStep('protected_credentials', 'Protected credentials', credentials.configured, credentials.reason),
     setupStep(
       'managed_runtime',
-      'Pinned Agent Zero 2.5 runtime',
+      'Pinned Agent Zero 2.10 runtime',
       runtime.installed && runtime.pinnedImage && runtime.loopbackOnly && runtime.persistentData,
       runtime.reason,
     ),
@@ -342,7 +343,7 @@ export function buildAgentZeroSetupStatus(input: {
       runtime.ready && runtime.protocolCompatible,
       runtime.protocolCompatible
         ? 'The loopback connector advertises the tested authenticated HTTP/WebSocket contract.'
-        : 'Reconcile the runtime so the tested loopback connector contract can be verified.',
+        : 'Portal cannot change the Agent Zero runtime until its multi-family host transaction ships.',
     ),
     setupStep(
       'connector_authentication',
@@ -352,7 +353,7 @@ export function buildAgentZeroSetupStatus(input: {
     ),
     setupStep(
       'host_operator_bridge',
-      'Official A0 2.5 host bridge',
+      'Official A0 2.10 host bridge',
       hostGateway.installed,
       hostGateway.reason,
     ),
@@ -366,7 +367,7 @@ export function buildAgentZeroSetupStatus(input: {
       'project_sandbox_adapter',
       'Project-confined Agent Zero adapter',
       true,
-      'A deterministic per-project v2.5 container, volume, credentials, authenticated connector, loopback port, read-only host baseline, and no-egress firewall are implemented. The unrestricted host bridge is never reused for Projects.',
+      'A deterministic per-project v2.10 container, volume, credentials, authenticated connector, loopback port, read-only host baseline, and no-egress firewall are implemented. The unrestricted host bridge is never reused for Projects.',
     ),
     setupStep(
       'project_escape_validation',
@@ -377,7 +378,7 @@ export function buildAgentZeroSetupStatus(input: {
   ];
 
   return {
-    testedVersions: { agentZero: '2.5', connector: '0.1.0', hostBridge: '2.5' },
+    testedVersions: { agentZero: '2.10', connector: '0.1.0', hostBridge: '2.10' },
     credentials,
     runtime: {
       installed: runtime.installed,
@@ -421,7 +422,8 @@ export function buildAgentZeroSetupStatus(input: {
       },
       reconcileRuntime: {
         ownerOnly: true,
-        confirmationPhrase: AGENT_ZERO_RUNTIME_CONFIRMATION,
+        available: false,
+        unavailableCode: HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.code,
       },
       verifyAuthentication: {
         ownerOnly: true,

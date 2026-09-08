@@ -7,8 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '../../contexts/AuthContext';
 import { gatewayAPI } from '../../api/endpoints';
 import {
+  AGENT_CHAT_ASK_USER_SUPERVISOR_REASON,
   AgentSettingsDrawer,
-  CompatibilityHotfixConfirmationDialog,
+  isAskUserResponseDisabled,
+  isAgentChatPositiveApprovalBlocked,
+  ModelPicker,
   SessionControls,
   StreamReconnectButton,
   useAgentChatHeartbeatModel,
@@ -36,10 +39,10 @@ vi.mock('../ai-setup/AiProviderSetup', () => ({
 const originalInnerWidth = window.innerWidth;
 
 const installableTool = {
-  id: 'codex',
-  name: 'OpenAI Codex',
-  description: 'Portal-tested coding runtime.',
-  install: [{ label: 'Install Codex', command: 'reviewed-command' }],
+  id: 'ffmpeg',
+  name: 'FFmpeg',
+  description: 'Media runtime.',
+  install: [{ label: 'Install FFmpeg', command: 'reviewed-command' }],
   commands: [],
   authRequired: false,
   tier: 1 as const,
@@ -47,6 +50,7 @@ const installableTool = {
     installed: false,
     version: null,
     missing: true,
+    installAvailable: true,
     checkedAt: '2026-07-21T12:00:00.000Z',
   },
 };
@@ -120,6 +124,58 @@ describe('Agent Chat viewport-owned controls', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
   });
 
+  it('allows exact native-run approvals while persistent OpenClaw remains blocked', () => {
+    expect(isAgentChatPositiveApprovalBlocked('approval-openclaw-1')).toBe(true);
+    expect(isAgentChatPositiveApprovalBlocked('native-codex-1')).toBe(false);
+    expect(isAgentChatPositiveApprovalBlocked('native-claude_code-1')).toBe(false);
+    expect(isAgentChatPositiveApprovalBlocked('native-gemini-1')).toBe(false);
+    expect(isAgentChatPositiveApprovalBlocked('native-grok-1')).toBe(false);
+    expect(isAgentChatPositiveApprovalBlocked('native-hermes-1')).toBe(false);
+    expect(isAgentChatPositiveApprovalBlocked('native-opencode-1')).toBe(false);
+  });
+
+  it('keeps every Agent Chat ask-user response read-only across provider switches', () => {
+    expect(isAskUserResponseDisabled('agent-chat', true)).toBe(true);
+    expect(isAskUserResponseDisabled('agent-chat', false)).toBe(true);
+    expect(isAskUserResponseDisabled('project-chat', true)).toBe(false);
+    expect(isAskUserResponseDisabled('project-chat', false)).toBe(true);
+    expect(AGENT_CHAT_ASK_USER_SUPERVISOR_REASON).toMatch(/not bound to a supervised native provider run/i);
+  });
+
+  it('keeps fenced model and session controls inert in the browser', async () => {
+    const onModelChange = vi.fn();
+    render(
+      <>
+        <ModelPicker
+          value="openai/gpt-5.6-sol"
+          onChange={onModelChange}
+          models={['openai/gpt-5.6-sol']}
+          disabled
+        />
+        <SessionControls
+          thinkingLevel="high"
+          reasoningVisibility="stream"
+          fastModeEnabled={false}
+          compactionModelOverride=""
+          heartbeatModel="openai/gpt-5.6-sol"
+          showHeartbeatModel
+          onSetThinkingLevel={vi.fn()}
+          onSetReasoningVisibility={vi.fn()}
+          onToggleFastMode={vi.fn()}
+          onSetCompactionModelOverride={vi.fn()}
+          onSetHeartbeatModel={vi.fn()}
+          availableModels={['openai/gpt-5.6-sol']}
+          sessionControlsSupported
+          disabled
+        />
+      </>,
+    );
+
+    expect(screen.getByRole('button', { name: 'Chat model' })).toBeDisabled();
+    expect(screen.getByTitle('Session Controls')).toBeDisabled();
+    expect(onModelChange).not.toHaveBeenCalled();
+  });
+
   it('renders the real stale-stream rail and invokes its reconnect path', async () => {
     const user = userEvent.setup();
     const onReconnect = vi.fn();
@@ -171,7 +227,7 @@ describe('Agent Chat viewport-owned controls', () => {
     expect(opener).toHaveFocus();
   });
 
-  it('retires Session Controls before handing ownership to a confirmation modal', async () => {
+  it('keeps compatibility repair read-only inside Session Controls', async () => {
     const onApply = vi.fn();
     const user = userEvent.setup();
     render(
@@ -195,10 +251,10 @@ describe('Agent Chat viewport-owned controls', () => {
     );
 
     await user.click(screen.getByTitle('Session Controls'));
-    await user.click(await screen.findByRole('button', { name: 'Apply + restart' }));
-
-    expect(onApply).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole('dialog', { name: 'Session controls' })).not.toBeInTheDocument();
+    expect(await screen.findByText('Update via Admin > Maintenance')).toBeVisible();
+    expect(screen.getByText(/Owner applies the exact OpenClaw and native-tool bundle under Admin > Maintenance/i)).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Apply + restart' })).not.toBeInTheDocument();
+    expect(onApply).not.toHaveBeenCalled();
   });
 
   it('keeps the owning Session Controls surface visible while a mutation is unresolved', async () => {
@@ -391,9 +447,9 @@ describe('Agent Chat viewport-owned controls', () => {
     render(<AgentSettingsDrawer open onClose={vi.fn()} />);
 
     await user.click(await screen.findByText('Coding Tools'));
-    await user.click(await screen.findByRole('button', { name: 'Install OpenAI Codex' }));
-    const dialog = screen.getByRole('dialog', { name: 'Install OpenAI Codex' });
-    await user.type(within(dialog).getByLabelText(/INSTALL codex/i), 'INSTALL codex');
+    await user.click(await screen.findByRole('button', { name: 'Install FFmpeg' }));
+    const dialog = screen.getByRole('dialog', { name: 'Install FFmpeg' });
+    await user.type(within(dialog).getByLabelText(/INSTALL ffmpeg/i), 'INSTALL ffmpeg');
     const confirm = within(dialog).getByRole('button', { name: 'Start install' });
     act(() => {
       confirm.click();
@@ -402,7 +458,7 @@ describe('Agent Chat viewport-owned controls', () => {
     });
 
     expect(mocks.installTool).toHaveBeenCalledTimes(1);
-    expect(mocks.installTool).toHaveBeenCalledWith('codex', 'INSTALL codex');
+    expect(mocks.installTool).toHaveBeenCalledWith('ffmpeg', 'INSTALL ffmpeg');
     expect(await within(dialog).findByRole('button', { name: 'Starting install…' })).toHaveAttribute('aria-busy', 'true');
 
     await act(async () => {
@@ -413,48 +469,53 @@ describe('Agent Chat viewport-owned controls', () => {
     expect(within(dialog).getByRole('button', { name: 'Start install' })).toBeEnabled();
   });
 
-  it('single-flights compatibility hotfix application and closes only after verified server success', async () => {
-    const user = userEvent.setup();
-    let rejectFirst!: (reason?: unknown) => void;
-    const firstAttempt = new Promise<never>((_resolve, reject) => { rejectFirst = reject; });
-    const applySpy = vi.spyOn(gatewayAPI, 'applyCompatibilityHotfix').mockReturnValueOnce(firstAttempt);
-    const onClose = vi.fn();
-    const onVerified = vi.fn();
-    render(
-      <CompatibilityHotfixConfirmationDialog
-        open
-        status={{ supported: true, applied: false, confirmationPhrase: 'APPLY HOTFIX', issues: [] } as any}
-        onClose={onClose}
-        onVerified={onVerified}
-      />,
-    );
+  it('renders managed Codex package status without an install action', async () => {
+    mocks.listTools.mockResolvedValue({ tools: [{
+      ...installableTool,
+      id: 'codex',
+      name: 'OpenAI Codex',
+      managedInstall: 'npm-cli',
+      install: [],
+      status: {
+        ...installableTool.status,
+        state: 'verified',
+        installed: true,
+        missing: false,
+        version: '1.0.0',
+        installAvailable: false,
+        installUnavailableCode: 'HOST_TOOL_INSTALL_AFTER_SETUP',
+      },
+    }] });
+    render(<AgentSettingsDrawer open onClose={vi.fn()} />);
 
-    const dialog = screen.getByRole('dialog', { name: 'Apply OpenClaw compatibility hotfix?' });
-    await user.type(within(dialog).getByRole('textbox'), 'APPLY HOTFIX');
-    const confirm = within(dialog).getByRole('button', { name: 'Apply hotfix + restart' });
-    act(() => {
-      confirm.click();
-      confirm.click();
-      fireEvent.keyDown(document, { key: 'Escape' });
-    });
-
-    expect(applySpy).toHaveBeenCalledTimes(1);
-    expect(applySpy).toHaveBeenCalledWith('APPLY HOTFIX');
-    expect(within(dialog).getByRole('button', { name: 'Applying hotfix + restarting…' })).toHaveAttribute('aria-busy', 'true');
-    expect(onClose).not.toHaveBeenCalled();
-
-    await act(async () => {
-      rejectFirst({ response: { data: { detail: 'Gateway restart was refused' } } });
-      await firstAttempt.catch(() => undefined);
-    });
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Gateway restart was refused');
-    expect(dialog).toBeVisible();
-    expect(onClose).not.toHaveBeenCalled();
-
-    const verifiedStatus = { supported: true, applied: true, issues: [] } as any;
-    applySpy.mockResolvedValueOnce({ ok: true, alreadyApplied: false, status: verifiedStatus, message: 'Verified after restart' });
-    await user.click(within(dialog).getByRole('button', { name: 'Apply hotfix + restart' }));
-    await waitFor(() => expect(onVerified).toHaveBeenCalledWith(verifiedStatus, 'Verified after restart'));
-    expect(onClose).toHaveBeenCalledTimes(1);
+    await userEvent.click(await screen.findByText('Coding Tools'));
+    expect(await screen.findByText('OpenAI Codex')).toBeVisible();
+    expect(screen.getByText(/Package detected for Agent Chat.*Owner updates the exact bundle in Admin > Maintenance/i)).toBeVisible();
+    expect(screen.queryByRole('button', { name: /Install OpenAI Codex/i })).not.toBeInTheDocument();
+    expect(mocks.installTool).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['agent-zero', 'Agent Zero'],
+    ['antigravity', 'Antigravity'],
+    ['gemini', 'Antigravity CLI'],
+    ['grok-build', 'Grok Build'],
+    ['hermes', 'Hermes'],
+    ['opencode', 'OpenCode'],
+  ])('never offers Portal acquisition for native runtime %s even when a stale row claims it is installable', async (id, name) => {
+    mocks.listTools.mockResolvedValue({ tools: [{
+      ...installableTool,
+      id,
+      name,
+      install: [{ label: `Install ${name}`, command: 'stale-native-command' }],
+      status: { ...installableTool.status, installAvailable: true },
+    }] });
+    render(<AgentSettingsDrawer open onClose={vi.fn()} />);
+
+    await userEvent.click(await screen.findByText('Coding Tools'));
+    expect(await screen.findByText(/use this runtime's dedicated setup/i)).toBeVisible();
+    expect(screen.queryByRole('button', { name: `Install ${name}` })).not.toBeInTheDocument();
+    expect(mocks.installTool).not.toHaveBeenCalled();
+  });
+
 });

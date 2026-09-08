@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
+import { parseProjectNumstat, projectFileDetails } from '../services/projectFileDetails';
 import os from 'os';
 import { execFileSync, execSync } from 'child_process';
 import multer from 'multer';
@@ -25,6 +26,7 @@ import {
   startApp,
   restartApp,
   stopApp,
+  quiesceAppForDeployment,
   forgetAppRuntime,
   getAppStatus,
   ProjectRuntimeStateAttestationError,
@@ -83,6 +85,11 @@ import {
   runProjectGitCommand,
 } from '../services/project-git.service';
 import { getDefaultModel, getProviderStatusesAsync } from '../services/openclawConfigManager';
+import {
+  assertCachedOpenClawExecutionAdmitted,
+  assertOpenClawExecutionAdmitted,
+  OpenClawExecutionAdmissionError,
+} from '../services/openClawExecutionAdmission';
 import { canonicalizeProviderModelId, normalizePortalModelId } from '../utils/openclawCli';
 import { scanFile } from '../services/virusScan';
 import { PROJECT_ZIP_LIMITS, safeExtractZipToNewDirectory } from '../services/safeZipExtraction';
@@ -93,11 +100,19 @@ import {
 } from '../services/containedPath';
 import { removeToolMirror, resolveFilePath } from './files';
 import {
+  MAX_SHARE_LINKS_PER_APP,
   parseShareLinkOptions,
+  parseShareLinkPolicyPatch,
   shareCredentialStateIsValid,
   shareLinkAvailability,
   validateSharePassword,
 } from '../utils/shareAccessSecurity';
+import {
+  ShareLinkPaginationError,
+  buildShareLinkPage,
+  parseShareLinkPagination,
+  shareLinkCursorWhere,
+} from '../utils/shareLinkPagination';
 import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
 import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
 import {
@@ -106,6 +121,7 @@ import {
   ProjectFilePolicyError,
   ProjectRangeError,
   parseProjectByteRange,
+  openProjectRegularFile,
   readProjectTextFile,
   safeProjectDownloadName,
   statProjectRegularFile,
@@ -366,6 +382,7 @@ import {
 import {
   ProjectChatProviderRuntimeUnavailableError,
   getProjectChatProviderAdapter,
+  getProjectChatProviderCleanupController,
   getProjectChatProviderRuntimeDescriptor,
   isQualifiableProjectProvider,
   projectChatProviderDisplayName,
@@ -427,6 +444,10 @@ import {
   requireConfirmedProjectChatAbortForReset,
 } from '../services/projectChatDestructiveReset';
 import { readProjectChatProviderHandoffSuffix } from '../services/projectChatHandoff';
+import {
+  ProjectChatHistoryCursorError,
+  readProjectChatHistoryPage,
+} from '../services/projectChatHistory';
 import {
   isProjectNativeSettlementFailure,
   matchingProjectNativeSnapshot,
@@ -3197,7 +3218,7 @@ async function ensureNativeProjectChatBindingWithAuthorityLease(input: {
           // record. A binding CAS failure must prove that remote context was
           // deleted; deleting only the Portal record would orphan an
           // independently runnable project context.
-          await getProjectChatProviderAdapter('AGENT_ZERO').terminateSession(sessionKey);
+          await getProjectChatProviderCleanupController('AGENT_ZERO').terminateSession(sessionKey);
         } catch (cleanupError) {
           const cleanupFailure = new Error(
             'Agent Zero Project binding failed and remote context cleanup could not be verified; the project remains quarantined.',
@@ -3431,6 +3452,17 @@ function sendProjectChatProviderError(
   error: unknown,
   extra: Record<string, unknown> = {},
 ): boolean {
+  if (error instanceof OpenClawExecutionAdmissionError) {
+    res.status(error.statusCode).json({
+      error: error.admission.reason,
+      code: error.code,
+      retryable: error.retryable,
+      state: error.state,
+      provider: 'OPENCLAW',
+      ...extra,
+    });
+    return true;
+  }
   if (error instanceof ProjectRuntimeOwnershipError) {
     res.status(503).json({
       error: 'Project storage is temporarily unavailable. Try again.',
@@ -3587,7 +3619,14 @@ function sendProjectChatQualificationError(
 }
 
 function toPersistedProjectChatProvider(provider: AgentProviderName): ProjectChatPersistedProvider {
-  return provider === 'GROK' ? 'GROK_BUILD' : provider;
+  if (provider === 'GROK') return 'GROK_BUILD';
+  if (!PROJECT_CHAT_ROUTE_PROVIDER_SET.has(provider)) {
+    throw new UnsupportedProjectChatProviderError(
+      provider,
+      'This harness is host-only and cannot be persisted in Project Chat.',
+    );
+  }
+  return provider as ProjectChatPersistedProvider;
 }
 
 function fromPersistedProjectChatProvider(provider: ProjectChatPersistedProvider): AgentProviderName {
@@ -4602,11 +4641,13 @@ router.get('/:name/tree', authenticateToken, requireApproved, projectPathSandbox
           if (hasChanges) gitStatus = 'modified';
         }
 
+        const fileStat = e.isFile() ? statProjectRegularFile(projectDir, entryPath, { optional: true }) : null;
         return {
           name: e.name,
           type: e.isDirectory() ? 'directory' as const : 'file' as const,
           path: entryPath,
-          size: e.isFile() ? fs.lstatSync(path.join(resolved, e.name)).size : undefined,
+          size: fileStat?.size,
+          modifiedAt: fileStat?.mtime.toISOString(),
           gitStatus,
         };
       })
@@ -4642,30 +4683,18 @@ router.get('/:name/raw', browserAuthRedirect, requireApproved, projectPathSandbo
     const filePath = req.query.path as string;
     if (!filePath) { res.status(400).json({ error: 'path required' }); return; }
 
-    let resolved: string;
+    let stat: fs.Stats;
     try {
-      resolved = resolveExistingProjectEntry(projectDir, filePath, 'file');
-    } catch {
+      const opened = openProjectRegularFile(projectDir, filePath, { maxBytes: PROJECT_RAW_MAX_BYTES });
+      if (!opened) throw new Error('File not found');
+      rawFd = opened.fd;
+      stat = opened.stat;
+    } catch (error) {
+      if (error instanceof ProjectFilePolicyError && error.code === 'TOO_LARGE') {
+        res.status(413).json({ error: 'File too large (max 100MB)' });
+        return;
+      }
       res.status(404).json({ error: 'File not found' });
-      return;
-    }
-
-    const expectedStat = fs.lstatSync(resolved);
-    try {
-      rawFd = fs.openSync(resolved, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    } catch {
-      res.status(404).json({ error: 'File not found' });
-      return;
-    }
-    const stat = fs.fstatSync(rawFd);
-    if (!stat.isFile() || stat.dev !== expectedStat.dev || stat.ino !== expectedStat.ino) {
-      closeRawFile();
-      res.status(404).json({ error: 'File changed while it was being opened' });
-      return;
-    }
-    if (stat.size > PROJECT_RAW_MAX_BYTES) {
-      closeRawFile();
-      res.status(413).json({ error: 'File too large (max 100MB)' });
       return;
     }
 
@@ -4731,8 +4760,13 @@ router.get('/:name/raw', browserAuthRedirect, requireApproved, projectPathSandbo
       res.status(206);
       res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${stat.size}`);
     }
-    const stream = fs.createReadStream(resolved, {
-      ...(range || {}),
+    if (stat.size === 0) {
+      closeRawFile();
+      res.end();
+      return;
+    }
+    const stream = fs.createReadStream('', {
+      ...(range || { start: 0, end: stat.size - 1 }),
       fd: rawFd,
       autoClose: true,
     });
@@ -4742,6 +4776,7 @@ router.get('/:name/raw', browserAuthRedirect, requireApproved, projectPathSandbo
       if (!res.headersSent) res.status(500).json({ error: 'Failed to serve file' });
       else res.destroy(streamError);
     });
+    res.once('close', () => stream.destroy());
     stream.pipe(res);
   } catch (error) {
     closeRawFile();
@@ -4756,6 +4791,7 @@ router.get('/:name/file', authenticateToken, requireApproved, projectPathSandbox
   try {
     const ownerId = await getScopedOwnerId(req);
     const projectDir = getProjectPath(ownerId, req.params.name);
+    await ensureProjectIdentity({ workspaceOwnerId: ownerId, projectName: req.params.name, projectRoot: projectDir });
     const filePath = req.query.path as string;
     if (!filePath) { res.status(400).json({ error: 'path required' }); return; }
 
@@ -4965,7 +5001,23 @@ router.post('/:name/git', authenticateToken, requireApproved, async (req: Reques
             else if (xy.includes('R')) status = 'renamed';
             return { path: entry.path, status, raw: xy };
           });
-        res.json({ branch: currentBranch, ahead, behind, files, clean: files.length === 0 });
+        let detailsUnavailable = false;
+        let detailedFiles = files;
+        if (req.body.details === true) {
+          let hasHead = false;
+          try { await git(['rev-parse', '--verify', 'HEAD']); hasHead = true; } catch { /* unborn branch */ }
+          let stats = new Map<string, import('../services/projectFileDetails').ProjectLineChanges>();
+          if (hasHead) {
+            try {
+              stats = parseProjectNumstat(await git(['diff', '--numstat', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', 'HEAD', '--']));
+            } catch { detailsUnavailable = true; }
+          }
+          const budget = { bytes: 8 * 1024 * 1024 };
+          detailedFiles = files.map(entry => ({ ...entry,
+            ...projectFileDetails(projectDir, entry.path, stats.get(entry.path), entry.raw === '??' || !hasHead, budget),
+          }));
+        }
+        res.json({ branch: currentBranch, ahead, behind, files: detailedFiles, clean: files.length === 0, ...(detailsUnavailable ? { detailsUnavailable: true } : {}) });
         return;
       }
 
@@ -5088,9 +5140,8 @@ router.post('/:name/git', authenticateToken, requireApproved, async (req: Reques
           if (!output.trim()) output = await git(['diff', '--cached', '--no-ext-diff', '--no-textconv', '--', file]);
           if (!output.trim()) {
             try {
-              const entry = fs.lstatSync(resolvedFile);
-              if (!entry.isSymbolicLink() && entry.isFile() && entry.size <= 1024 * 1024) {
-                const content = fs.readFileSync(resolvedFile, 'utf8');
+              const content = readProjectTextFile(projectDir, file, { optional: true, maxBytes: 1024 * 1024 });
+              if (content !== null) {
                 output = `--- /dev/null\n+++ b/${file}\n${content.split('\n').map((line) => `+${line}`).join('\n')}`;
               }
             } catch {}
@@ -6130,6 +6181,147 @@ async function completeAdmittedProjectDeletion(input: {
   });
   return runtimeCleanup;
 }
+
+export type AdminUserRetirementOwnedProjectTarget = {
+  id: string;
+  projectName: string;
+  canonicalRoot: string;
+  generation: number;
+  lifecycleStatus: string;
+  rootDevice: string;
+  rootInode: string;
+  rootBirthtimeNs: string;
+  rootPresent: boolean;
+};
+
+function assertAdminUserRetirementOwnedProjectIdentity(
+  expected: AdminUserRetirementOwnedProjectTarget,
+  current: ProjectIdentityRecord,
+  targetUserId: string,
+): void {
+  if (
+    current.id !== expected.id
+    || current.workspaceOwnerId !== targetUserId
+    || current.projectName !== expected.projectName
+    || current.canonicalRoot !== expected.canonicalRoot
+    || current.generation !== expected.generation
+    || current.rootDevice !== expected.rootDevice
+    || current.rootInode !== expected.rootInode
+    || current.rootBirthtimeNs !== expected.rootBirthtimeNs
+    || current.legacyOpenClawMigrationStatus !== 'CURRENT'
+    || !['ACTIVE', 'DELETING'].includes(String(current.lifecycleStatus || ''))
+  ) {
+    throw new ProjectIdentityLifecycleError(
+      'Owned Project identity changed after the user-retirement manifest was sealed',
+    );
+  }
+}
+
+/** Internal entry into the same durable, identity-bound Project deletion path. */
+export async function retireOwnedProjectForAdminUserRetirement(input: {
+  targetUserId: string;
+  requestedByOwnerId: string;
+  project: AdminUserRetirementOwnedProjectTarget;
+}): Promise<void> {
+  const targetUserId = String(input.targetUserId || '').trim();
+  const requestedByOwnerId = String(input.requestedByOwnerId || '').trim();
+  if (!targetUserId || !requestedByOwnerId || targetUserId === requestedByOwnerId) {
+    throw new ProjectIdentityLifecycleError('User-retirement Project principals are invalid');
+  }
+  const expected = input.project;
+  if (
+    !expected
+    || !expected.id
+    || !expected.projectName
+    || !path.isAbsolute(expected.canonicalRoot)
+    || path.resolve(expected.canonicalRoot) !== expected.canonicalRoot
+    || !Number.isSafeInteger(expected.generation)
+    || expected.generation < 1
+    || !['ACTIVE', 'DELETING'].includes(expected.lifecycleStatus)
+    || typeof expected.rootPresent !== 'boolean'
+  ) {
+    throw new ProjectIdentityLifecycleError('User-retirement Project attestation is invalid');
+  }
+
+  const release = await acquireProjectDeletionLock(
+    projectDeletionLockKey(targetUserId, expected.projectName),
+  );
+  try {
+    let current = await prisma.projectIdentity.findUnique({ where: { id: expected.id } });
+    if (!current) {
+      if (fs.existsSync(expected.canonicalRoot)) {
+        throw new ProjectIdentityLifecycleError(
+          'Owned Project root remains after its immutable identity disappeared',
+        );
+      }
+      return;
+    }
+    assertAdminUserRetirementOwnedProjectIdentity(
+      expected,
+      current as unknown as ProjectIdentityRecord,
+      targetUserId,
+    );
+    if (!expected.rootPresent && fs.existsSync(expected.canonicalRoot)) {
+      throw new ProjectIdentityLifecycleError(
+        'Owned Project root appeared after the user-retirement manifest was sealed',
+      );
+    }
+    await assertLegacyOpenClawProjectMigrationInactive(expected.id);
+    await assertProjectChatDestructiveResetInactive(expected.id);
+
+    let deleting = current as unknown as ProjectIdentityRecord;
+    if (current.lifecycleStatus === 'ACTIVE') {
+      const actorIdsBeforeBarrier = await listProjectLifecycleActorIds({
+        projectIdentityId: current.id,
+        workspaceOwnerId: targetUserId,
+        authenticatedActorId: requestedByOwnerId,
+      });
+      deleting = fs.existsSync(expected.canonicalRoot)
+        ? await beginProjectIdentityDeletion({
+            workspaceOwnerId: targetUserId,
+            projectName: expected.projectName,
+            projectRoot: expected.canonicalRoot,
+          })
+        : (await beginOrphanedProjectIdentityDeletion({
+            workspaceOwnerId: targetUserId,
+            projectName: expected.projectName,
+          }))!;
+      if (!deleting || deleting.id !== expected.id) {
+        throw new ProjectIdentityLifecycleError(
+          'Owned Project deletion admitted a different immutable identity',
+        );
+      }
+      assertAdminUserRetirementOwnedProjectIdentity(expected, deleting, targetUserId);
+      await completeAdmittedProjectDeletion({
+        actorUserId: requestedByOwnerId,
+        ownerId: targetUserId,
+        projectName: expected.projectName,
+        projectDir: expected.canonicalRoot,
+        projectIdentity: deleting,
+        actorIdsBeforeBarrier,
+      });
+    } else {
+      await completeAdmittedProjectDeletion({
+        actorUserId: requestedByOwnerId,
+        ownerId: targetUserId,
+        projectName: expected.projectName,
+        projectDir: expected.canonicalRoot,
+        projectIdentity: deleting,
+      });
+    }
+
+    current = await prisma.projectIdentity.findUnique({ where: { id: expected.id } });
+    if (current || fs.existsSync(expected.canonicalRoot)) {
+      throw new ProjectIdentityLifecycleError(
+        'Owned Project deletion could not prove identity and root absence',
+      );
+    }
+  } finally {
+    release();
+  }
+}
+
+
 
 // DELETE /api/projects/:name - delete project
 router.delete('/:name', authenticateToken, requireApproved, async (req: Request, res: Response) => {
@@ -9094,6 +9286,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
   let fullstackAppRecordMutated = false;
   let fullstackAppIdForRecovery: string | null = null;
   let fullstackStartAttempted = false;
+  let fullstackPriorRuntimeStopped = false;
   let deployIdForRecovery: string | null = null;
   let deployPathForRecovery: string | null = null;
   let lifecycleScopeForRecovery: ProjectAppStartIdentity | null = null;
@@ -9357,6 +9550,22 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
           expectedDeploymentRevision: originalDeploymentRevision!,
         });
       }
+      // The exact Portal-managed runtime must be quiescent before the
+      // deployment transaction snapshots its allowlisted top-level `data`
+      // directory. Otherwise a final write from the old container could land
+      // after the snapshot and disappear during the directory swap.
+      fullstackPriorRuntimeStopped = Boolean(
+        previousFullstackApp?.isActive
+        && ['running', 'starting'].includes(previousFullstackApp.processStatus),
+      );
+      await quiesceAppForDeployment(
+        deployId,
+        previousFullstackApp ? {
+          actorId: ownerId,
+          projectId: projectIdentity.id,
+          workloadId: previousFullstackApp.id,
+        } : undefined,
+      );
       fullstackPromotion.promote();
     }
     
@@ -9694,7 +9903,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
         ].filter(Boolean).join('; '));
       }
 
-      if (deploymentRestored && fullstackAppRecordMutated) {
+      if (deploymentRestored && (fullstackAppRecordMutated || fullstackPriorRuntimeStopped)) {
         try {
           if (previousFullstackApp) {
             await prisma.app.update({
@@ -9720,7 +9929,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       }
 
       const shouldRestartPriorApp = deploymentRestored
-        && fullstackStartAttempted
+        && (fullstackStartAttempted || fullstackPriorRuntimeStopped)
         && !isProjectRuntimeImageUnavailable(error)
         && previousFullstackApp?.deployType === 'fullstack'
         && previousFullstackApp.isActive
@@ -10728,6 +10937,16 @@ router.post('/:name/share', authenticateToken, requireApproved, async (req: Requ
       });
     }
 
+    const existingShareCount = await prisma.appShareLink.count({
+      where: { appId: app.id, userId: ownerId },
+    });
+    if (existingShareCount >= MAX_SHARE_LINKS_PER_APP) {
+      res.status(409).json({
+        error: 'This project reached the retained share-link limit; delete an old link before creating another',
+      });
+      return;
+    }
+
     const token = nanoid(21);
     const isPublic = req.body.isPublic !== false; // default true
     const password = typeof req.body.password === 'string' ? req.body.password : '';
@@ -10769,6 +10988,7 @@ router.post('/:name/share', authenticateToken, requireApproved, async (req: Requ
         maxUses: shareOptions.maxUses,
         rateLimitMaxRequests: shareOptions.rateLimitMaxRequests,
         rateLimitWindowSeconds: shareOptions.rateLimitWindowSeconds,
+        maxConcurrentVisitors: shareOptions.maxConcurrentVisitors,
         isPublic,
         passwordHash,
       },
@@ -10791,16 +11011,38 @@ router.post('/:name/share', authenticateToken, requireApproved, async (req: Requ
 // GET /api/projects/:name/shares - list share links
 router.get('/:name/shares', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
+    const paginationRequest = parseShareLinkPagination(req.query);
     const ownerId = await getScopedOwnerId(req);
     const app = await prisma.app.findFirst({
       where: { userId: ownerId, name: req.params.name },
-      include: { shareLinks: { orderBy: { createdAt: 'desc' } } },
+      select: { id: true },
     });
 
-    // Strip passwordHash from response
-    const shares = (app?.shareLinks || []).map(({ passwordHash: _passwordHash, ...rest }) => rest);
-    res.json({ shares });
-  } catch {
+    if (!app) {
+      res.json({
+        shares: [],
+        pagination: { hasMore: false, nextCursor: null, limit: paginationRequest.limit },
+      });
+      return;
+    }
+    const shareLinks = await prisma.appShareLink.findMany({
+      where: {
+        appId: app.id,
+        userId: ownerId,
+        ...shareLinkCursorWhere(paginationRequest.cursor),
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: paginationRequest.limit + 1,
+    });
+    const page = buildShareLinkPage(shareLinks, paginationRequest.limit);
+    // Strip passwordHash from response.
+    const shares = page.rows.map(({ passwordHash: _passwordHash, ...rest }) => rest);
+    res.json({ shares, pagination: page.pagination });
+  } catch (error) {
+    if (error instanceof ShareLinkPaginationError) {
+      res.status(400).json({ error: error.message, code: 'SHARE_LINK_PAGINATION_INVALID' });
+      return;
+    }
     res.status(500).json({ error: 'Failed to list shares' });
   }
 });
@@ -10818,10 +11060,29 @@ async function findOwnedShareLink(ownerId: string, projectName: string, linkId: 
   });
 }
 
-// PATCH /api/projects/:name/share/:linkId - update share link (public ↔ secure, active toggle)
+// PATCH /api/projects/:name/share/:linkId - update access mode, lifecycle, or limits
 router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    const { isPublic, password, isActive } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+    const { isPublic, password, isActive } = body;
+    const policyFields = [
+      'expiresAt',
+      'maxUses',
+      'rateLimitMaxRequests',
+      'rateLimitWindowSeconds',
+      'maxConcurrentVisitors',
+    ] as const;
+    const hasPolicyUpdate = policyFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+    const hasAccessUpdate = ['isPublic', 'password', 'isActive']
+      .some((field) => Object.prototype.hasOwnProperty.call(body, field));
+    if (!hasPolicyUpdate && !hasAccessUpdate) {
+      res.status(400).json({ error: 'A share access or policy field is required' });
+      return;
+    }
+    if (isPublic !== undefined && typeof isPublic !== 'boolean') {
+      res.status(400).json({ error: 'isPublic must be a boolean' });
+      return;
+    }
     if (password !== undefined && isPublic !== false) {
       res.status(400).json({
         error: 'A share password requires a private link. Send isPublic: false with the password.',
@@ -10829,7 +11090,14 @@ router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (
       });
       return;
     }
-    const cleanupOnly = isActive === false && isPublic === undefined && password === undefined;
+    if (isActive !== undefined && typeof isActive !== 'boolean') {
+      res.status(400).json({ error: 'isActive must be a boolean' });
+      return;
+    }
+    const cleanupOnly = isActive === false
+      && isPublic === undefined
+      && password === undefined
+      && !hasPolicyUpdate;
     if (!cleanupOnly) {
       const unavailable = portalFeatureUnavailableResponse('appHosting');
       if (unavailable) {
@@ -10854,14 +11122,47 @@ router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (
       updateData.isPublic = true;
       updateData.passwordHash = null;
     } else if (isPublic === false) {
+      let validatedPassword: string;
       try {
-        validateSharePassword(password);
+        validatedPassword = validateSharePassword(password);
       } catch (error: any) {
         res.status(400).json({ error: error.message });
         return;
       }
       updateData.isPublic = false;
-      updateData.passwordHash = await bcrypt.hash(password, 12);
+      updateData.passwordHash = await bcrypt.hash(validatedPassword, 12);
+    }
+
+    let policyPatch;
+    try {
+      policyPatch = parseShareLinkPolicyPatch(body, {
+        expiresAt: existingLink.expiresAt,
+        maxUses: existingLink.maxUses,
+        rateLimitMaxRequests: existingLink.rateLimitMaxRequests,
+        rateLimitWindowSeconds: existingLink.rateLimitWindowSeconds,
+        maxConcurrentVisitors: existingLink.maxConcurrentVisitors,
+      });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    Object.assign(updateData, policyPatch);
+
+    const prospectiveExpiresAt = policyPatch.expiresAt !== undefined
+      ? policyPatch.expiresAt
+      : existingLink.expiresAt;
+    const prospectiveMaxUses = policyPatch.maxUses !== undefined
+      ? policyPatch.maxUses
+      : existingLink.maxUses;
+    if (isActive === true) {
+      if (prospectiveExpiresAt && prospectiveExpiresAt.getTime() <= Date.now()) {
+        res.status(409).json({ error: 'Expired links cannot be reactivated; create a new link' });
+        return;
+      }
+      if (prospectiveMaxUses !== null && existingLink.currentUses >= prospectiveMaxUses) {
+        res.status(409).json({ error: 'Links that reached their visit limit cannot be reactivated; create a new link' });
+        return;
+      }
     }
 
     const prospectiveCredentialState = {
@@ -10878,9 +11179,17 @@ router.patch('/:name/share/:linkId', authenticateToken, requireApproved, async (
       return;
     }
 
-    const link = await prisma.appShareLink.update({
-      where: { id: existingLink.id },
-      data: updateData,
+    const link = await prisma.$transaction(async (tx) => {
+      const updated = await tx.appShareLink.update({
+        where: { id: existingLink.id },
+        data: updateData,
+      });
+      if (isActive === false
+        || (Object.prototype.hasOwnProperty.call(body, 'maxConcurrentVisitors')
+          && policyPatch.maxConcurrentVisitors === null)) {
+        await tx.appShareRequestLease.deleteMany({ where: { shareLinkId: existingLink.id } });
+      }
+      return updated;
     });
 
     const { passwordHash: _, ...safeLink } = link;
@@ -11112,10 +11421,6 @@ router.post('/:name/app/rebind-current', authenticateToken, requireApproved, asy
       || sourceIdentity.lifecycleStatus !== 'ACTIVE'
     ) throw new ProjectAppIdentityRebindError('The source was not the exact active legacy Project.');
     const sourceProjectRoot = sourceIdentity.canonicalRoot;
-    const sourceDeployPath = path.join(
-      DEPLOY_DIR,
-      `${workspaceOwnerId}-${sourceIdentity.projectName}`,
-    );
     const targetDeployPath = path.join(DEPLOY_DIR, `${workspaceOwnerId}-${targetName}`);
     const journal = readProjectAppRebindOperation({
       workspaceOwnerId,
@@ -12160,6 +12465,12 @@ function qualifyProjectChatProviderRoute(provider: ProjectChatRouteProvider) {
           'Project identity changed after qualification rate-limit admission',
         );
       }
+      if (provider === 'OPENCLAW') {
+        // Qualification can create coordination state, converge the dedicated
+        // agent, patch its model, and finally spend a live Gateway turn. Refuse
+        // the entire mutation lane while an installer transaction is armed.
+        await assertOpenClawExecutionAdmitted();
+      }
       // Every provider shares one transcript and may bridge name-keyed 3.x
       // state. Gate all qualification lanes before that migration, not just
       // the OpenClaw lane that owns the preserved Gateway history.
@@ -12369,6 +12680,9 @@ router.post('/:name/chat/provider', authenticateToken, requireApproved, async (r
       projectDir,
       req.body?.provider,
     );
+    if (provider === 'OPENCLAW') {
+      await assertOpenClawExecutionAdmitted();
+    }
     const currentBindings = await listProjectChatBindings(actorId, executionContext.projectId);
     const portalSession = await prisma.projectChatSession.findFirst({
       where: { userId: actorId, projectId: executionContext.projectId },
@@ -12952,22 +13266,22 @@ router.get('/:name/chat/history', authenticateToken, requireApproved, async (req
       return;
     }
     const beforeId = String(req.query.before || '').trim() || null;
-    if (beforeId) {
-      const cursor = await prisma.projectChatMessage.findFirst({
-        where: { id: beforeId, userId, projectId: executionContext.projectId },
-        select: { id: true },
+    let historyPage: Awaited<ReturnType<typeof readProjectChatHistoryPage>>;
+    try {
+      historyPage = await readProjectChatHistoryPage({
+        actorUserId: userId,
+        projectIdentityId: executionContext.projectId,
+        beforeId,
+        limit: requestedLimit,
       });
-      if (!cursor) { res.status(400).json({ error: 'Project Chat history cursor is invalid' }); return; }
+    } catch (error) {
+      if (error instanceof ProjectChatHistoryCursorError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      throw error;
     }
-
-    const historyPage = await prisma.projectChatMessage.findMany({
-      where: { userId, projectId: executionContext.projectId },
-      orderBy: [{ timestamp: 'desc' }, { sourceSortKey: 'desc' }, { id: 'desc' }],
-      take: requestedLimit + 1,
-      ...(beforeId ? { cursor: { id: beforeId }, skip: 1 } : {}),
-    });
-    const hasMore = historyPage.length > requestedLimit;
-    const messages = historyPage.slice(0, requestedLimit).reverse();
+    const messages = historyPage.messages.slice().reverse();
 
     // Get session status
     const session = bindingRead.portalSession;
@@ -12993,12 +13307,21 @@ router.get('/:name/chat/history', authenticateToken, requireApproved, async (req
           ...(presentation?.toolCalls ? { toolCalls: presentation.toolCalls } : {}),
           ...(presentation?.segments ? { segments: presentation.segments } : {}),
           ...(presentation?.truncated ? { presentationTruncated: true } : {}),
+          ...(m.contentTruncated ? {
+            contentTruncated: true,
+            truncationReason: m.truncationReason,
+            originalLogicalBytes: m.originalLogicalBytes,
+          } : {}),
         };
       }),
       pagination: {
-        hasMore,
-        nextCursor: hasMore ? messages[0]?.id || null : null,
+        hasMore: historyPage.hasMore,
+        nextCursor: historyPage.nextCursor,
         limit: requestedLimit,
+        responseLogicalBytes: historyPage.responseLogicalBytes,
+        responseLogicalByteLimit: historyPage.responseLogicalByteLimit,
+        byteLimited: historyPage.byteLimited,
+        rowTruncationCount: historyPage.rowTruncationCount,
       },
       session: staleBinding ? {
         status: 'stale',
@@ -13300,7 +13623,7 @@ async function convergeProjectChatTurnForDestructiveReset(input: {
         });
         return true;
       }
-      return await getProjectChatProviderAdapter(provider).abortActiveRun?.(
+      return await getProjectChatProviderCleanupController(provider).abortActiveRun?.(
         activeProviderSessionId,
         activeTurn.id,
       ) === true;
@@ -13907,6 +14230,7 @@ function detectProjectType(projectDir: string): string {
 // Auto-commit helper: commits any changes in project dir after assistant edits files
 function getModelDisplayName(model: string): string {
   const names: Record<string, string> = {
+    'anthropic/claude-fable-5-1': 'Claude Fable 5.1',
     'anthropic/claude-fable-5': 'Claude Fable 5',
     'anthropic/claude-opus-5': 'Claude Opus 5',
     'anthropic/claude-opus-4-8': 'Claude Opus 4.8',
@@ -13931,6 +14255,7 @@ function getModelDisplayName(model: string): string {
     'ollama/gemma4:e2b': 'Gemma 4 E2B',
     'ollama/gemma4:e4b': 'Gemma 4 E4B',
     'ollama/gemma4:12b': 'Gemma 4 12B',
+    'openai/gpt-6-astra': 'GPT-6 Astra',
     'openai/gpt-5.6-sol': 'GPT-5.6 Sol',
     'openai/gpt-5.6-terra': 'GPT-5.6 Terra',
     'openai/gpt-5.6-luna': 'GPT-5.6 Luna',
@@ -14314,6 +14639,9 @@ router.post('/:name/assistant/ensure-session', authenticateToken, async (req: Re
       projectDir,
       req.body?.provider,
     );
+    if (provider === 'OPENCLAW') {
+      await assertOpenClawExecutionAdmitted();
+    }
     const coordination = await requireSelectedProjectChatState({
       actorUserId,
       projectIdentityId: executionContext.projectId,
@@ -15060,6 +15388,7 @@ router.post('/:name/assistant/abort', authenticateToken, async (req: Request, re
       return;
     }
     const activeUserTurn = visibleProjectChatActiveTurn(coordination.activeTurn);
+
     const runtime = activeUserTurn?.runtime
       || getProjectChatProviderRuntimeDescriptor(provider).runtime;
     if (!activeUserTurn) {
@@ -15134,7 +15463,7 @@ router.post('/:name/assistant/abort', authenticateToken, async (req: Request, re
       abortProvider: async () => (
         exactSnapshot?.complete && !exactSnapshot.active
           ? true
-          : await getProjectChatProviderAdapter(provider).abortActiveRun?.(
+          : await getProjectChatProviderCleanupController(provider).abortActiveRun?.(
               activeUserTurn.providerSessionId!,
               activeUserTurn.id,
             ) === true
@@ -15360,6 +15689,7 @@ router.post('/:name/assistant/answer-input', authenticateToken, async (req: Requ
       );
     }
 
+    await assertOpenClawExecutionAdmitted();
     const authority = await resolveAskUserQuestionRunOwner({
       sessionKey: activeTurn.providerSessionId,
       runId: `portal-${activeTurn.id}`,
@@ -15417,6 +15747,10 @@ router.post('/:name/assistant/answer-input', authenticateToken, async (req: Requ
       return;
     }
 
+    // The authority lookup and durable replay checks above can take long
+    // enough for maintenance to arm after route admission. Recheck the
+    // marker/WAL fence synchronously at the final live-run boundary.
+    assertCachedOpenClawExecutionAdmitted();
     const accepted = await steerActiveRun(
       activeTurn.providerSessionId,
       `portal-${activeTurn.id}`,
@@ -15629,6 +15963,12 @@ router.post('/:name/assistant/send', authenticateToken, async (req: Request, res
         });
         return;
       }
+    }
+    if (provider === 'OPENCLAW') {
+      // Project Chat must cross the same durable host/runtime/question
+      // attestation as Agent Chat before acquiring a turn or mutating the
+      // workspace. A mixed installer transaction is not an executable lane.
+      await assertOpenClawExecutionAdmitted();
     }
     runtimeAdmission = await acquireProjectChatRuntimeAdmission({
       actorUserId: req.user!.userId,
@@ -16161,6 +16501,10 @@ ${message}`
       releaseWorkspaceMutationLease = null;
     };
     try {
+      // Mandatory final fence: runtime/model preparation may be long-running,
+      // so a maintenance transaction can arm after the async route admission.
+      // Never dispatch the prepared OpenClaw turn across that boundary.
+      assertCachedOpenClawExecutionAdmitted();
       run = startProjectNativeRun({
         userId: req.user!.userId,
         projectId: executionContext.projectId,

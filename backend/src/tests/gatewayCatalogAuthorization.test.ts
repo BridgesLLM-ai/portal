@@ -21,7 +21,7 @@ function elevatedCatalogMiddleware(path: string) {
 }
 
 describe('Agent Chat catalog authorization', () => {
-  test.each(['/providers', '/commands'])(
+  test.each(['/harnesses', '/providers', '/commands'])(
     '%s applies the elevated-role gate before host metadata discovery',
     (path) => {
       const route = elevatedCatalogMiddleware(path);
@@ -30,7 +30,7 @@ describe('Agent Chat catalog authorization', () => {
     },
   );
 
-  test.each(['/providers', '/commands'])(
+  test.each(['/harnesses', '/providers', '/commands'])(
     '%s rejects ordinary users at the elevated-role boundary',
     (path) => {
       const { middleware } = elevatedCatalogMiddleware(path);
@@ -51,7 +51,7 @@ describe('Agent Chat catalog authorization', () => {
   test.each(['OWNER', 'SUB_ADMIN'])(
     'allows %s through all host catalog boundaries',
     (role) => {
-      for (const path of ['/providers', '/commands']) {
+      for (const path of ['/harnesses', '/providers', '/commands']) {
         const { middleware } = elevatedCatalogMiddleware(path);
         const next = jest.fn();
         middleware(
@@ -91,5 +91,28 @@ describe('Agent Chat catalog authorization', () => {
     expect(res.vary).toHaveBeenCalledWith('Authorization');
     expect(res.vary).toHaveBeenCalledWith('Cookie');
     expect(res.json).toHaveBeenCalledWith({ providers: [] });
+  });
+
+  test('serves the additive harness catalog through the same private host boundary', async () => {
+    const handlers = routeHandlers('/harnesses');
+    const terminalHandler = handlers[handlers.length - 1];
+    const listSpy = jest.spyOn(AgentRegistry, 'listHarnessesAsync').mockResolvedValue([]);
+    const res = {
+      setHeader: jest.fn().mockReturnThis(),
+      vary: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+      status: jest.fn().mockReturnThis(),
+    };
+
+    await terminalHandler({} as any, res as any);
+
+    expect(listSpy).toHaveBeenCalledTimes(1);
+    expect(res.setHeader).toHaveBeenCalledWith(
+      'Cache-Control',
+      'private, no-store, max-age=0',
+    );
+    expect(res.vary).toHaveBeenCalledWith('Authorization');
+    expect(res.vary).toHaveBeenCalledWith('Cookie');
+    expect(res.json).toHaveBeenCalledWith({ harnesses: [] });
   });
 });

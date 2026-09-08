@@ -28,6 +28,27 @@ describe('NativeCliEnvironment credential paths', () => {
       HOME: '/home/portal',
       GROK_AUTH_PATH: '/run/secrets/grok-auth.json',
     })).toEqual(['/run/secrets/grok-auth.json']);
+    expect(resolveNativeCliCredentialPaths('HERMES', {
+      PORTAL_HERMES_HOME: '/srv/hermes-profile',
+    })).toEqual([
+      '/srv/hermes-profile/auth.json',
+      '/srv/hermes-profile/.env',
+      '/srv/hermes-profile/config.yaml',
+    ]);
+    expect(resolveNativeCliCredentialPaths('OPENCODE', {
+      PORTAL_OPENCODE_HOME: '/srv/opencode-profile',
+    })).toEqual(['/srv/opencode-profile/data/opencode/auth.json']);
+  });
+
+  test('matches the installer-owned default state roots for ACP harness auth', () => {
+    expect(resolveNativeCliCredentialPaths('HERMES', {})).toEqual([
+      '/var/lib/bridgesllm/hermes/auth.json',
+      '/var/lib/bridgesllm/hermes/.env',
+      '/var/lib/bridgesllm/hermes/config.yaml',
+    ]);
+    expect(resolveNativeCliCredentialPaths('OPENCODE', {})).toEqual([
+      '/var/lib/bridgesllm/opencode/data/opencode/auth.json',
+    ]);
   });
 
   test('custom Claude OAuth suppresses inherited Anthropic API credentials', () => {
@@ -48,5 +69,14 @@ describe('NativeCliEnvironment credential paths', () => {
     expect(env.CLAUDE_CONFIG_DIR).toBe(configDir);
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.DISABLE_AUTOUPDATER).toBe('1');
+  });
+
+  test('host Codex and Claude never inherit an ambient interpreter search path', () => {
+    const hostilePath = '/tmp/attacker-bin:/usr/local/bin:/usr/bin';
+
+    expect(buildNativeCliEnvironment('CODEX', { PATH: hostilePath }).PATH).toBe('/usr/bin:/bin');
+    expect(buildNativeCliEnvironment('CLAUDE_CODE', { PATH: hostilePath }).PATH).toBe('/usr/bin:/bin');
+    expect(buildNativeCliEnvironment('GEMINI', { PATH: hostilePath }).PATH).toBe(hostilePath);
   });
 });

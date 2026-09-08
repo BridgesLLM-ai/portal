@@ -38,6 +38,7 @@ import fileRoutes, { initializeFileStorage } from './routes/files';
 import appsRoutes, { initializeAppsStorage, shareRouter } from './routes/apps';
 import activityRoutes from './routes/activity';
 import chunkedUploadRoutes, { initializeChunkedUploadRuntime, shutdownChunkedUploadRuntime } from './routes/chunked-upload';
+import { createProjectWorkRouter } from './routes/project-work';
 import projectsRoutes, {
   initializeProjectStorage,
   PROJECTS_DIR,
@@ -46,6 +47,9 @@ import projectsRoutes, {
 import {
   runProjectDependencyPromotionStartupRecovery,
 } from './services/projectDependencyPromotionStartupRecovery';
+import {
+  describeProjectDependencyPromotionStartupFailure,
+} from './services/projectDependencyPromotionWriterFence';
 import {
   retireConvergedProjectDependencyRepairBackupPins,
 } from './services/projectDependencyRepair';
@@ -65,12 +69,11 @@ import { createAiSetupRouter } from './routes/ai-setup';
 import systemControlRoutes from './routes/system-control';
 import settingsPublicRoutes from './routes/settings-public';
 import agentJobsRoutes from './routes/agent-jobs';
-import agentToolsRoutes from './routes/agent-tools';
+import agentToolsRoutes, { mountHostNativeRuntimeMutationFence } from './routes/agent-tools';
 import agentRuntimeRoutes from './routes/agent-runtime';
 import ollamaRoutes from './routes/ollama';
 import askUserPluginRoutes from './routes/askUserPlugin';
 import remoteDesktopRoutes, {
-  reconcilePortalManagedSkill,
   reconcilePortalVisibleBrowserDefaults,
   reconcileRemoteDesktopLauncherAssets,
 } from './routes/remote-desktop';
@@ -84,10 +87,10 @@ import agentBrowserRoutes, { attachAgentBrowserWebSocket } from './routes/agentB
 import systemRemediationRoutes from './routes/system-remediation';
 import mailRoutes from './routes/mail';
 import automationsRoutes from './routes/automations';
-import skillsRoutes from './routes/skills';
+import skillsRoutes, { mountHostExtensionMutationFence } from './routes/skills';
 import { requireSetupComplete } from './middleware/requireSetupComplete';
 import { initializeCronJobs, shutdownCronJobs } from './cron-jobs';
-import { setupTerminalNamespace } from './routes/exec';
+import { setupHarnessSetupNamespace, setupTerminalNamespace } from './routes/exec';
 import { startLogWatcher, stopLogWatcher, onAlert } from './utils/logWatcher';
 import { startStatusWatcher, stopStatusWatcher, onAgentStatus } from './utils/openclawStatusWatcher';
 import { blockedIPs, extractIP, loadBlockedIPs } from './utils/auth-tracking';
@@ -111,6 +114,7 @@ import {
 } from './services/terminalSystemdScopeBoundary';
 import { initializeOpenClawHostRunJournal } from './services/openClawHostRunJournal';
 import { initializeProjectAuthorizationTransitionRuntime } from './services/projectAuthorizationTransition';
+import { recoverAdminUserRetirementsAtStartup } from './services/adminUserRetirementRuntime';
 import {
   getAppTarget,
   initializeAppProcessRuntime,
@@ -161,6 +165,7 @@ import {
   shutdownProjectChatRestartRecoveryRuntime,
 } from './services/projectChatRestartRecovery';
 import {
+  requireGlobalWorkspaceAuthorizationAdmission,
   admitWorkspaceAuthorizationMutation,
   admitWorkspaceAuthorizationRead,
   settleWorkspaceAuthorizationRequest,
@@ -232,6 +237,7 @@ app.set('io', io);
 
 // Setup terminal namespace
 setupTerminalNamespace(io);
+setupHarnessSetupNamespace(io);
 
 // Shared Socket.IO admission binds every namespace to the exact durable browser
 // Session as well as the user's authorization generation.
@@ -515,11 +521,6 @@ function handleRemoteDesktopWebSocketUpgrade(
 // Cookie parsing — must be before any auth middleware that reads req.cookies
 app.use(cookieParser());
 
-// Body parsing. Multipart proxy bodies are captured only inside the specific
-// hosted/share route after its access check has passed.
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
-
 // Cookie-authenticated Portal mutations are same-origin only. App content may
 // be hosted on a sibling domain, which is still "same-site" to cookies; Origin
 // and Fetch Metadata therefore form the CSRF boundary.
@@ -584,6 +585,24 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// These exact extension write endpoints are intentionally disabled before any
+// body parser sees caller-controlled bytes. The fence retains setup, auth,
+// approval, admin, CSRF, app-content-host, rate-limit, and IP-blocking policy,
+// then returns one bounded response without parsing or echoing a package spec.
+mountHostExtensionMutationFence(app);
+mountHostNativeRuntimeMutationFence(app, {
+  requireSetupComplete,
+  requireSetupPending,
+  requireSetupToken,
+});
+
+// Body parsing. Multipart proxy bodies are captured only inside the specific
+// hosted/share route after its access check has passed. Security and the exact
+// disabled-extension fence above run before parsers so rejected request bodies
+// cannot become unauthenticated parser diagnostics.
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Share routes (NO PORTAL AUTH) execute only on the isolated app-content
 // origin. Requests to the Portal origin are method-preserving redirects; an
@@ -1446,7 +1465,7 @@ app.get('/health/update-ready', async (req, res) => {
 app.use('/api/setup/ai', requireSetupPending, requireSetupToken, createAiSetupRouter());
 app.use('/api/setup', setupRoutes);
 app.use('/api', requireSetupComplete);
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', requireGlobalWorkspaceAuthorizationAdmission, authRoutes);
 app.use('/api/ai-setup', authenticateToken, requireAdmin, createAiSetupRouter());
 app.use('/api/files', fileRoutes);
 if (metricsModule) app.use('/api/metrics', metricsModule.default);
@@ -1454,6 +1473,7 @@ app.use('/api/apps', appsRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/upload', chunkedUploadRoutes);
 import { projectPathSandbox, aiPathSandbox } from './middleware/pathSandbox';
+app.use('/api/project-work', createProjectWorkRouter(projectsRoutes, gatewayRoutes));
 app.use('/api/projects', projectPathSandbox, projectsRoutes);
 app.use('/api/ai', aiPathSandbox, aiRoutes);
 app.use('/api/terminal', terminalRoutes);
@@ -1881,15 +1901,32 @@ export const startServer = async () => {
       // the real Express/WS listener never opens.
       projectDependencyPromotionFailureHold = true;
       holdStartupStatusServerForProjectDependencyPromotionQuarantine();
-      const localCode = String(error?.code || error?.name || 'UnknownError')
-        .replace(/[^A-Za-z0-9_-]/g, '')
-        .slice(0, 64);
-      const localMessage = String(error?.message || 'Promotion recovery failed')
-        .replace(/[\u0000-\u001f\u007f]/g, ' ')
-        .slice(0, 1024);
+      const diagnostic = describeProjectDependencyPromotionStartupFailure(error);
       console.error(
-        `[Project Dependencies] Startup quarantined (${localCode}): ${localMessage}`,
+        '[Project Dependencies] Startup quarantined:',
+        diagnostic,
       );
+      try {
+        // ActivityLog is the existing bounded, operator-visible audit channel.
+        // The public bootstrap listener continues to expose only its fixed
+        // sanitized quarantine contract; exact internal failure identity lives
+        // only in the service log and this durable diagnostic receipt.
+        await prisma.activityLog.create({
+          data: {
+            action: 'PROJECT_DEPENDENCY_PROMOTION_STARTUP_QUARANTINE',
+            resource: 'project-dependency-promotion',
+            severity: 'ERROR',
+            translatedMessage: 'Portal startup retained the Project dependency-promotion fence',
+            metadata: { ...diagnostic },
+          },
+        });
+      } catch (diagnosticError) {
+        const receiptFailure = describeProjectDependencyPromotionStartupFailure(diagnosticError);
+        console.error(
+          `[Project Dependencies] Durable startup diagnostic failed (${receiptFailure.code}):`
+            + ` ${receiptFailure.message}`,
+        );
+      }
       return;
     }
     if (
@@ -1941,6 +1978,32 @@ export const startServer = async () => {
       console.warn(
         `[OpenClaw Host Run] Preserving ${openClawHostRunRecovery.unresolved}`
           + ' unresolved provider-authority row(s) for a future authorization transition',
+      );
+    }
+
+    const retirementRecovery = await recoverAdminUserRetirementsAtStartup();
+    if (retirementRecovery.recovered.length > 0) {
+      console.warn(
+        `[Admin User Retirement] Recovered ${retirementRecovery.recovered.length}`
+          + ' interrupted identity retirement(s)',
+      );
+    }
+    if (retirementRecovery.blocked.length > 0) {
+      console.warn(
+        `[Admin User Retirement] Preserved ${retirementRecovery.blocked.length}`
+          + ' blocked identity retirement(s) for exact manual retry:',
+        retirementRecovery.blocked.map((entry) => ({
+          retirementId: entry.retirementId,
+          targetUserId: entry.targetUserId,
+          errorCode: entry.errorCode,
+        })),
+      );
+    }
+    if (retirementRecovery.busy.length > 0) {
+      console.warn(
+        `[Admin User Retirement] Deferred ${retirementRecovery.busy.length}`
+          + ' identity retirement(s) already leased by another recovery worker:',
+        retirementRecovery.busy,
       );
     }
 
@@ -2065,6 +2128,7 @@ export const startServer = async () => {
       console.log(`🎯 Apps: /api/apps/*`);
       console.log(`📋 Activity: /api/activity/*`);
       console.log(`💻 Terminal: ws /terminal`);
+      console.log(`🔐 Harness setup: ws /harness-setup`);
       console.log(`\nEnvironment: ${config.nodeEnv}`);
       console.log('Press Ctrl+C to stop\n');
       // Start only after the real listener and persistent Gateway client are
@@ -2074,7 +2138,6 @@ export const startServer = async () => {
       if (process.env.PORTAL_DISABLE_OPENCLAW_BACKGROUND !== '1') {
         initializeProjectChatRestartRecoveryRuntime();
       }
-      reconcilePortalManagedSkill();
       void reconcilePortalVisibleBrowserDefaults();
       void reconcileRemoteDesktopLauncherAssets();
       // Per-boot capability secret the Remote Desktop Agent Zero launcher reads

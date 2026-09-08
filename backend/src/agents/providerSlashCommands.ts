@@ -73,6 +73,8 @@ const PROVIDER_COMMANDS: Record<AgentProviderName, ProviderSlashCommand[]> = {
   AGENT_ZERO: [],
   GEMINI: [],
   OLLAMA: [],
+  HERMES: [],
+  OPENCODE: [],
 };
 
 export function getProviderSlashCommands(provider: AgentProviderName): ProviderSlashCommand[] {

@@ -4,6 +4,8 @@ type SocketScript = 'refuse' | 'serve' | 'drop-after-dispatch' | 'reject';
 
 const socketScripts: SocketScript[] = [];
 const socketsOpened: string[] = [];
+const sentFrames: Array<Record<string, any>> = [];
+let grantedScopes = ['operator.admin', 'operator.read'];
 
 class FakeGatewaySocket extends EventEmitter {
   private readonly script: SocketScript;
@@ -30,9 +32,13 @@ class FakeGatewaySocket extends EventEmitter {
 
   send(raw: string): void {
     const frame = JSON.parse(raw);
+    sentFrames.push(frame);
     if (frame.method === 'connect') {
       setImmediate(() => this.emit('message', Buffer.from(JSON.stringify({
-        type: 'res', id: frame.id, ok: true, payload: {},
+        type: 'res',
+        id: frame.id,
+        ok: true,
+        payload: { auth: { role: 'operator', scopes: [...grantedScopes] } },
       }))));
       return;
     }
@@ -85,6 +91,8 @@ describe('gateway RPC tolerance for a restarting gateway', () => {
   beforeEach(() => {
     socketScripts.length = 0;
     socketsOpened.length = 0;
+    sentFrames.length = 0;
+    grantedScopes = ['operator.admin', 'operator.read'];
     jest.useRealTimers();
   });
 
@@ -128,5 +136,45 @@ describe('gateway RPC tolerance for a restarting gateway', () => {
       errorMessage: 'config.patch rejected agents.list',
     });
     expect(socketsOpened).toHaveLength(1);
+  }, 20000);
+
+  test('2026.7.1 may drop the unknown question scope while ordinary RPC still connects', async () => {
+    socketScripts.push('serve');
+    grantedScopes = ['operator.admin', 'operator.read'];
+
+    const result = await gatewayRpcCall('sessions.list', { agentId: 'main' });
+
+    expect(result.ok).toBe(true);
+    const connect = sentFrames.find((frame) => frame.method === 'connect');
+    expect(connect?.params?.scopes).toEqual(expect.arrayContaining([
+      'operator.admin',
+      'operator.read',
+      'operator.questions',
+    ]));
+    expect(sentFrames.some((frame) => frame.method === 'sessions.list')).toBe(true);
+  }, 20000);
+
+  test('refuses native question RPC when the Gateway did not grant operator.questions', async () => {
+    socketScripts.push('serve');
+    grantedScopes = ['operator.admin', 'operator.read'];
+
+    const result = await gatewayRpcCall('question.list', {});
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'FORBIDDEN',
+    });
+    expect(String(result.error)).toContain('operator.questions');
+    expect(sentFrames.some((frame) => frame.method === 'question.list')).toBe(false);
+  }, 20000);
+
+  test('dispatches native question RPC only after 2026.9.1 grants operator.questions', async () => {
+    socketScripts.push('serve');
+    grantedScopes = ['operator.admin', 'operator.read', 'operator.questions'];
+
+    const result = await gatewayRpcCall('question.list', {});
+
+    expect(result.ok).toBe(true);
+    expect(sentFrames.some((frame) => frame.method === 'question.list')).toBe(true);
   }, 20000);
 });

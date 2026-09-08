@@ -1,4 +1,8 @@
-import type { AgentProvider, AgentProviderName } from './AgentProvider.interface';
+import type {
+  AgentHarnessId,
+  AgentProvider,
+  AgentProviderName,
+} from './AgentProvider.interface';
 import { OpenClawProvider } from './providers/OpenClawProvider';
 import { ClaudeCodeProvider } from './providers/ClaudeCodeProvider';
 import { CodexProvider } from './providers/CodexProvider';
@@ -6,16 +10,27 @@ import { GrokProvider } from './providers/GrokProvider';
 import { AgentZeroProvider } from './providers/AgentZeroProvider';
 import { GeminiProvider } from './providers/GeminiProvider';
 import { OllamaProvider } from './providers/OllamaProvider';
+import { HermesProvider } from './providers/HermesProvider';
+import { OpenCodeProvider } from './providers/OpenCodeProvider';
 import {
   getProviderAvailability,
+  getProviderAvailabilityAsync,
   getProviderCatalogAvailabilityAsync,
   getProviderCapabilities,
   type ProviderAvailability,
   type ProviderCapabilitySummary,
 } from './providerAvailability';
 import { subscribeNativeProviderReadinessInvalidation } from './nativeProviderReadiness';
+import {
+  AGENT_HARNESS_CATALOG,
+  REGISTERED_AGENT_HARNESS_IDS,
+  requireHarnessDefinition,
+  type HarnessDefinition,
+} from './harnessCatalog';
 
 export interface RegisteredProviderInfo {
+  /** Additive 4.1 name; `name` remains the compatibility API field. */
+  harnessId: AgentProviderName;
   name: AgentProviderName;
   displayName: string;
   installed: boolean;
@@ -46,6 +61,25 @@ export interface CatalogProviderInfo extends Omit<RegisteredProviderInfo, 'insta
   lastKnownUsable?: boolean;
 }
 
+export interface HarnessCatalogInfo extends Omit<CatalogProviderInfo, 'harnessId' | 'name'> {
+  /** Stable runtime identity. This is never inferred from a model id. */
+  harnessId: AgentHarnessId;
+  /** Compatibility display field; request routing still accepts only persisted ids. */
+  name: AgentHarnessId;
+  /** Legacy provider value, or null until a concrete persisted adapter ships. */
+  compatibilityProviderId: AgentProviderName | null;
+  transport: HarnessDefinition['transport'];
+  selectable: boolean;
+  releaseStage: HarnessDefinition['releaseStage'];
+  auth: HarnessDefinition['auth'];
+  models: HarnessDefinition['models'];
+  documentationUrl?: string;
+  unavailableReason?: string;
+  versionPolicy: HarnessDefinition['command']['versionPolicy'];
+  provenanceLabel: string;
+  hostStreamOwnership: HarnessDefinition['hostStreamOwnership'];
+}
+
 const providerConstructors: Record<AgentProviderName, new () => AgentProvider> = {
   OPENCLAW: OpenClawProvider,
   CLAUDE_CODE: ClaudeCodeProvider,
@@ -54,17 +88,27 @@ const providerConstructors: Record<AgentProviderName, new () => AgentProvider> =
   AGENT_ZERO: AgentZeroProvider,
   GEMINI: GeminiProvider,
   OLLAMA: OllamaProvider,
+  HERMES: HermesProvider,
+  OPENCODE: OpenCodeProvider,
 };
 
-const providerDisplayNames: Record<AgentProviderName, string> = {
-  OPENCLAW: 'OpenClaw',
-  CLAUDE_CODE: 'Claude Code',
-  CODEX: 'Codex',
-  GROK: 'Grok Build',
-  AGENT_ZERO: 'Agent Zero',
-  GEMINI: 'Google Antigravity',
-  OLLAMA: 'Ollama',
-};
+export type SharedProjectSandboxProviderName = Extract<
+  AgentProviderName,
+  'OPENCLAW' | 'CLAUDE_CODE' | 'CODEX' | 'GEMINI'
+>;
+
+export interface AgentProviderCleanupController {
+  readonly providerName: AgentProviderName;
+  abortActiveRun?(sessionId: string, expectedRunId?: string): Promise<boolean>;
+  terminateSession(sessionId: string): Promise<void>;
+}
+
+const SHARED_PROJECT_SANDBOX_PROVIDERS = new Set<AgentProviderName>([
+  'OPENCLAW',
+  'CLAUDE_CODE',
+  'CODEX',
+  'GEMINI',
+]);
 
 const PROVIDER_CATALOG_TTL_MS = 60_000;
 const PROVIDER_CATALOG_FAILURE_RETRY_MS = 10_000;
@@ -95,8 +139,9 @@ function registeredProviderInfo(
   availability: ProviderAvailability,
 ): RegisteredProviderInfo {
   return {
+    harnessId: name,
     name,
-    displayName: providerDisplayNames[name],
+    displayName: requireHarnessDefinition(name).displayName,
     installed: availability.installed,
     implemented: availability.implemented,
     usable: availability.usable,
@@ -113,7 +158,7 @@ function registeredProviderInfo(
 }
 
 function providerIsNative(name: AgentProviderName): boolean {
-  return name !== 'OPENCLAW' && name !== 'AGENT_ZERO';
+  return requireHarnessDefinition(name).native;
 }
 
 function catalogInfo(
@@ -163,8 +208,9 @@ function catalogInfo(
   }
   const failedAt = cached?.failedAt;
   return {
+    harnessId: name,
     name,
-    displayName: providerDisplayNames[name],
+    displayName: requireHarnessDefinition(name).displayName,
     installed: null,
     implemented: capabilities.implemented,
     usable: false,
@@ -264,20 +310,73 @@ export class AgentRegistry {
   private static providers = new Map<AgentProviderName, AgentProvider>();
   private static defaultProvider: AgentProviderName = 'OPENCLAW';
 
-  static getProvider(name: AgentProviderName): AgentProvider {
-    const availability = getProviderAvailability(name);
-    if (!availability.implemented) {
-      throw new Error(`${providerDisplayNames[name]} is not implemented yet`);
-    }
-    if (!availability.installed) {
-      throw new Error(`${providerDisplayNames[name]} is not installed on this machine`);
-    }
-
+  private static getOrCreateRegisteredProvider(name: AgentProviderName): AgentProvider {
     if (!this.providers.has(name)) {
       const ProviderCtor = providerConstructors[name];
       this.providers.set(name, new ProviderCtor());
     }
     return this.providers.get(name)!;
+  }
+
+  static getProvider(name: AgentProviderName): AgentProvider {
+    const definition = requireHarnessDefinition(name);
+    const availability = getProviderAvailability(name);
+    if (!availability.implemented) {
+      throw new Error(`${definition.displayName} is not implemented yet`);
+    }
+    if (!availability.installed) {
+      throw new Error(`${definition.displayName} is not installed on this machine`);
+    }
+    return this.getOrCreateRegisteredProvider(name);
+  }
+
+  /**
+   * Resolve a positively admitted shared dual-scope adapter for Project Sandbox.
+   * Agent Zero and Ollama deliberately use dedicated confined providers and
+   * cannot enter this registry lane. Static release metadata—not a host CLI
+   * probe—owns implementation admission here; the Project runtime/image is
+   * independently attested by the Project broker.
+   */
+  static getSharedProjectSandboxProvider(
+    name: SharedProjectSandboxProviderName,
+  ): AgentProvider {
+    const definition = requireHarnessDefinition(name);
+    if (
+      !SHARED_PROJECT_SANDBOX_PROVIDERS.has(name)
+      || !definition.implemented
+      || !definition.capabilities.supportedExecutionScopes.includes('PROJECT_SANDBOX')
+    ) {
+      throw new Error(`${definition.displayName} has no shared Project Sandbox adapter`);
+    }
+    return this.getOrCreateRegisteredProvider(name);
+  }
+
+  /**
+   * Negative lifecycle operations must remain possible after a host package
+   * disappears or a registered harness is demoted to detection-only. Return a
+   * frozen cleanup-only facade rather than the full provider, so this exception
+   * cannot become positive execution authority.
+   */
+  static getProviderCleanupController(name: AgentProviderName): AgentProviderCleanupController {
+    requireHarnessDefinition(name);
+    const provider = this.getOrCreateRegisteredProvider(name);
+    const abortActiveRun = provider.abortActiveRun?.bind(provider);
+    return Object.freeze({
+      providerName: provider.providerName,
+      ...(abortActiveRun ? { abortActiveRun } : {}),
+      terminateSession: provider.terminateSession.bind(provider),
+    });
+  }
+
+  static async getAsync(name: AgentProviderName): Promise<AgentProvider> {
+    if (name !== 'CODEX' && name !== 'CLAUDE_CODE') return this.getProvider(name);
+    // A cold/expired advisory cache means unchecked, not uninstalled. Refresh
+    // at the request boundary; the adapter still re-attests before every exec.
+    const availability = await getProviderAvailabilityAsync(name);
+    if (!availability.installed) {
+      throw new Error(availability.reason || `${requireHarnessDefinition(name).displayName} is not installed on this machine`);
+    }
+    return this.getOrCreateRegisteredProvider(name);
   }
 
   static get(name: AgentProviderName): AgentProvider {
@@ -300,14 +399,14 @@ export class AgentRegistry {
   }
 
   static listProviders(): RegisteredProviderInfo[] {
-    return (Object.keys(providerConstructors) as AgentProviderName[]).map((name) => {
+    return REGISTERED_AGENT_HARNESS_IDS.map((name) => {
       const availability = getProviderAvailability(name);
       return registeredProviderInfo(name, availability);
     });
   }
 
   static async listProvidersAsync(): Promise<CatalogProviderInfo[]> {
-    const names = Object.keys(providerConstructors) as AgentProviderName[];
+    const names = REGISTERED_AGENT_HARNESS_IDS;
     const now = Date.now();
     const probes = names
       .map((name) => {
@@ -318,6 +417,73 @@ export class AgentRegistry {
     await waitForCatalogBudget(probes);
     const snapshotAt = Date.now();
     return names.map((name) => catalogInfo(name, snapshotAt));
+  }
+
+  /**
+   * Additive 4.1 catalog. Registered harnesses retain the exact readiness
+   * evidence used by `/providers`; planned rows are metadata-only and remain
+   * non-selectable until a trusted adapter and persistence contract exist.
+   */
+  static async listHarnessesAsync(): Promise<HarnessCatalogInfo[]> {
+    const providers = await this.listProvidersAsync();
+    const availabilityById = new Map<AgentProviderName, CatalogProviderInfo>(
+      providers.map((provider) => [provider.name, provider]),
+    );
+
+    return AGENT_HARNESS_CATALOG.map((definition) => {
+      const compatibilityId = definition.compatibilityProviderId;
+      const availability = compatibilityId
+        ? availabilityById.get(compatibilityId)
+        : undefined;
+      const base = availability ?? {
+        harnessId: definition.id,
+        // `name` is kept only so 4.0 consumers can display a row. Provider
+        // routes still reject this id until a concrete constructor exists.
+        name: definition.id,
+        displayName: definition.displayName,
+        installed: null,
+        implemented: definition.implemented,
+        usable: false,
+        native: definition.native,
+        reason: definition.unavailableReason,
+        capabilities: definition.capabilities,
+        availabilityState: 'ready',
+        checking: false,
+        stale: false,
+      };
+
+      return {
+        ...base,
+        harnessId: definition.id,
+        name: definition.id,
+        compatibilityProviderId: compatibilityId,
+        displayName: definition.displayName,
+        transport: definition.transport,
+        implemented: definition.implemented,
+        selectable: definition.selectable,
+        releaseStage: definition.releaseStage,
+        auth: definition.auth,
+        models: definition.models,
+        capabilities: definition.capabilities,
+        documentationUrl: definition.documentationUrl,
+        unavailableReason: definition.unavailableReason,
+        versionPolicy: definition.command.versionPolicy,
+        provenanceLabel: definition.provenanceLabel,
+        hostStreamOwnership: definition.hostStreamOwnership,
+      };
+    });
+  }
+
+  /**
+   * Read-only harness metadata for the future `/harnesses` API. Planned rows
+   * are visible here but cannot be instantiated by the explicit provider map.
+   */
+  static listHarnesses(): readonly HarnessDefinition[] {
+    return AGENT_HARNESS_CATALOG;
+  }
+
+  static getHarnessMetadata(id: AgentHarnessId): HarnessDefinition {
+    return requireHarnessDefinition(id);
   }
 
   static __resetProviderCatalogForTests(): void {

@@ -25,6 +25,7 @@ import {
   promoteProjectChatRuntimeAdmissionToTurn,
   projectChatBindingNeedsHandoff,
   projectChatTurnDispatchStage,
+  reattachExpiredOpenClawProjectChatTurnAfterRestart,
   reconcileLegacyProjectChatTerminalHandoff,
   readProjectChatCoordinationState,
   readProjectChatTurnReplay,
@@ -35,6 +36,7 @@ import {
   withProjectChatRuntimeAdmission,
   type ProjectChatLeaseDatabase,
 } from './projectChatTurnLease';
+import { deriveOpenClawProjectSessionKey } from './openclawProjectSandbox';
 
 const ACTOR = 'actor-uuid';
 const PROJECT = 'project-identity-uuid';
@@ -1340,6 +1342,198 @@ test('restart recovery keeps an expired turn quarantined when the provider bindi
   }, db)).rejects.toMatchObject({ code: 'STATE_CORRUPT', httpStatus: 500 });
   expect(finalize).not.toHaveBeenCalled();
   expect(detach).not.toHaveBeenCalled();
+});
+
+test('restart reattachment rotates only the exact expired OpenClaw Project lease through one durable CAS', async () => {
+  const sessionKey = deriveOpenClawProjectSessionKey({ userId: ACTOR, projectId: PROJECT });
+  const interrupted = turn({
+    provider: AgentProviderType.OPENCLAW,
+    runtime: 'openclaw-dedicated-project-agent',
+    providerSessionId: sessionKey,
+    startedAt: new Date(NOW.getTime() - 180_000),
+    leaseExpiresAt: new Date(NOW.getTime() - 60_000),
+    resultMetadata: {
+      providerDispatchStage: PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED,
+      dispatchMetadataVersion: 1,
+    },
+  });
+  let persisted = interrupted;
+  const updateMany = jest.fn(async ({ data }: {
+    where: Record<string, unknown>;
+    data: Record<string, unknown>;
+  }) => {
+    persisted = turn({ ...interrupted, ...data });
+    return { count: 1 };
+  });
+  const findUnique = jest.fn()
+    .mockResolvedValueOnce(interrupted)
+    .mockImplementation(async () => persisted);
+  const db = database({
+    projectIdentity: {
+      findUnique: jest.fn().mockResolvedValue({
+        lifecycleStatus: 'ACTIVE',
+        legacyOpenClawMigrationStatus: 'COMPLETE',
+      }),
+    },
+    projectChatState: {
+      findUnique: jest.fn().mockResolvedValue(state({
+        activeTurnId: interrupted.id,
+        selectedProvider: AgentProviderType.OPENCLAW,
+      })),
+    },
+    projectChatTurn: { findUnique, updateMany },
+    projectChatProviderBinding: {
+      findUnique: jest.fn().mockResolvedValue({
+        userId: ACTOR,
+        projectId: PROJECT,
+        provider: AgentProviderType.OPENCLAW,
+        runtime: interrupted.runtime,
+        sessionKey,
+        externalSessionId: sessionKey,
+        status: 'active',
+        handoffCursor: 12,
+        handoffVersion: 4,
+      }),
+    },
+    projectChatSession: {
+      findUnique: jest.fn().mockResolvedValue({
+        userId: ACTOR,
+        projectId: PROJECT,
+        sessionKey,
+        status: 'active',
+        activeProvider: AgentProviderType.OPENCLAW,
+        runtime: interrupted.runtime,
+      }),
+    },
+  });
+
+  const grant = await reattachExpiredOpenClawProjectChatTurnAfterRestart({
+    actorUserId: ACTOR,
+    actorAuthorizationVersion: AUTHORIZATION_VERSION,
+    projectIdentityId: PROJECT,
+    turnId: interrupted.id,
+    expectedRuntime: interrupted.runtime,
+    expectedLeaseOwner: interrupted.leaseOwner,
+    newLeaseOwner: 'portal-process-after-restart',
+    providerSessionId: sessionKey,
+    runtimeEvidence: {
+      kind: 'pending-question',
+      runId: `portal-${interrupted.id}`,
+      requestId: 'question-request-uuid',
+    },
+    leaseDurationMs: 300_000,
+    now: NOW,
+  }, db);
+
+  expect(grant).toMatchObject({
+    idempotentReplay: false,
+    expectedHandoffCursor: 12,
+    expectedHandoffVersion: 4,
+    turn: {
+      id: interrupted.id,
+      leaseOwner: 'portal-process-after-restart',
+      leaseExpiresAt: new Date(NOW.getTime() + 300_000),
+    },
+  });
+  expect(grant.leaseToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  const rotation = updateMany.mock.calls[0][0];
+  expect(rotation.where).toEqual(expect.objectContaining({
+    id: interrupted.id,
+    actorUserId: ACTOR,
+    actorAuthorizationVersion: AUTHORIZATION_VERSION,
+    projectIdentityId: PROJECT,
+    activeProjectKey: PROJECT,
+    provider: AgentProviderType.OPENCLAW,
+    runtime: interrupted.runtime,
+    status: ProjectChatTurnStatus.RUNNING,
+    leaseTokenHash: interrupted.leaseTokenHash,
+    leaseOwner: interrupted.leaseOwner,
+    leaseExpiresAt: { lte: NOW },
+    providerSessionId: sessionKey,
+  }));
+  expect(rotation.data).toEqual(expect.objectContaining({
+    leaseTokenHash: crypto.createHash('sha256').update(grant.leaseToken).digest('hex'),
+    leaseOwner: 'portal-process-after-restart',
+    heartbeatAt: NOW,
+    leaseExpiresAt: new Date(NOW.getTime() + 300_000),
+    resultMetadata: expect.objectContaining({
+      providerDispatchStage: PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED,
+      openClawRestartReattachment: expect.objectContaining({
+        version: 1,
+        kind: 'pending-question',
+        runId: `portal-${interrupted.id}`,
+        requestId: 'question-request-uuid',
+        providerSessionId: sessionKey,
+        previousLeaseOwner: interrupted.leaseOwner,
+        reattachedAt: NOW.toISOString(),
+      }),
+    }),
+  }));
+});
+
+test.each([
+  {
+    name: 'a foreign provider run',
+    input: { runtimeEvidence: { kind: 'active-run', runId: 'portal-foreign-turn' } },
+    expectedCode: 'PROVIDER_MISMATCH',
+  },
+  {
+    name: 'the prior process owner',
+    input: { newLeaseOwner: 'portal-process-a' },
+    expectedCode: 'LEASE_REJECTED',
+  },
+  {
+    name: 'a cross-project session',
+    input: { providerSessionId: 'agent:p4oc-foreign:portal-project' },
+    expectedCode: 'TURN_NOT_ACTIVE',
+  },
+  {
+    name: 'an unexpired turn',
+    turn: { leaseExpiresAt: new Date(NOW.getTime() + 1) },
+    expectedCode: 'TURN_NOT_ACTIVE',
+  },
+  {
+    name: 'an unaccepted dispatch',
+    turn: { resultMetadata: { providerDispatchStage: PROJECT_CHAT_DISPATCH_STAGE_UNCONFIRMED } },
+    expectedCode: 'TURN_NOT_ACTIVE',
+  },
+  {
+    name: 'terminal session evidence without a bounded interval',
+    input: {
+      runtimeEvidence: { kind: 'terminal-session', runId: 'portal-turn-uuid' },
+    },
+    expectedCode: 'INVALID_INPUT',
+  },
+] as const)('restart reattachment rejects $name without rotating the lease', async ({ input, turn: turnOverride, expectedCode }) => {
+  const sessionKey = deriveOpenClawProjectSessionKey({ userId: ACTOR, projectId: PROJECT });
+  const interrupted = turn({
+    provider: AgentProviderType.OPENCLAW,
+    runtime: 'openclaw-dedicated-project-agent',
+    providerSessionId: sessionKey,
+    startedAt: new Date(NOW.getTime() - 180_000),
+    leaseExpiresAt: new Date(NOW.getTime() - 60_000),
+    resultMetadata: { providerDispatchStage: PROJECT_CHAT_DISPATCH_STAGE_ACCEPTED },
+    ...(turnOverride || {}),
+  });
+  const updateMany = jest.fn();
+  const db = database({
+    projectChatTurn: { findUnique: jest.fn().mockResolvedValue(interrupted), updateMany },
+  });
+
+  await expect(reattachExpiredOpenClawProjectChatTurnAfterRestart({
+    actorUserId: ACTOR,
+    actorAuthorizationVersion: AUTHORIZATION_VERSION,
+    projectIdentityId: PROJECT,
+    turnId: interrupted.id,
+    expectedRuntime: interrupted.runtime,
+    expectedLeaseOwner: interrupted.leaseOwner,
+    newLeaseOwner: 'portal-process-after-restart',
+    providerSessionId: sessionKey,
+    runtimeEvidence: { kind: 'active-run', runId: `portal-${interrupted.id}` },
+    now: NOW,
+    ...(input || {}),
+  }, db)).rejects.toMatchObject({ code: expectedCode });
+  expect(updateMany).not.toHaveBeenCalled();
 });
 
 test('native restart recovery expires an exact quiescent turn and releases its CAS row', async () => {

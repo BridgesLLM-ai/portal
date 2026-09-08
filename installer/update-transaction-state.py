@@ -37,7 +37,15 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 
 
-SCHEMA = "bridgesllm-update-transaction-v1"
+V1_SCHEMA = "bridgesllm-update-transaction-v1"
+V2_SCHEMA = "bridgesllm-update-transaction-v2"
+SCHEMA = V2_SCHEMA
+LEGACY_OPERATION_CONTRACT = "legacy-host-integration-v1"
+PORTAL_ONLY_OPERATION_CONTRACT = "portal-only-v1"
+OPERATION_CONTRACTS = (
+    LEGACY_OPERATION_CONTRACT,
+    PORTAL_ONLY_OPERATION_CONTRACT,
+)
 PRODUCTION_METADATA_ROOT = "/var/lib/bridgesllm-installer"
 PRODUCTION_TRANSACTION_ROOT = "/var/lib/bridgesllm-installer/transactions"
 PRODUCTION_BACKUP_ROOT = "/opt/bridgesllm/backups/update-transactions"
@@ -162,7 +170,7 @@ RECOVERY_REFENCE_PHASES = tuple(
     if phase != "recovered"
 )
 
-FIELD_ORDER = (
+V1_FIELD_ORDER = (
     "schema",
     "transaction_id",
     "generation",
@@ -198,6 +206,12 @@ FIELD_ORDER = (
     "openclaw_codex_plugin_version",
     "integrity_sha256",
 )
+FIELD_ORDER = (
+    V1_FIELD_ORDER[0],
+    "operation_contract",
+    *V1_FIELD_ORDER[1:],
+)
+V1_FIELD_SET = frozenset(V1_FIELD_ORDER)
 FIELD_SET = frozenset(FIELD_ORDER)
 
 BOOLEAN_FIELDS = frozenset(
@@ -226,6 +240,7 @@ NULLABLE_VERSION_FIELDS = frozenset(
 CREATE_INPUT_FIELDS = frozenset(
     {
         "transaction_id",
+        "operation_contract",
         "previous_version",
         "target_version",
         "release_artifact_sha256",
@@ -601,10 +616,25 @@ def _validate_record(
     config: StoreConfig,
     expected_raw: Optional[bytes] = None,
 ) -> dict[str, Any]:
-    if not isinstance(record, dict) or set(record) != FIELD_SET:
+    if not isinstance(record, dict):
         raise TransactionStateError("Journal schema fields do not match the fixed contract.")
-    if record["schema"] != SCHEMA:
+    schema = record.get("schema")
+    if schema == V1_SCHEMA:
+        expected_fields = V1_FIELD_SET
+    elif schema == V2_SCHEMA:
+        expected_fields = FIELD_SET
+    else:
         raise TransactionStateError("Journal schema is unsupported.")
+    if set(record) != expected_fields:
+        raise TransactionStateError("Journal schema fields do not match the fixed contract.")
+    if schema == V2_SCHEMA:
+        operation_contract = _validate_bounded_text(
+            record["operation_contract"],
+            field="operation_contract",
+            maximum=32,
+        )
+        if operation_contract not in OPERATION_CONTRACTS:
+            raise TransactionStateError("Journal operation contract is unsupported.")
 
     transaction_id = _validate_bounded_text(
         record["transaction_id"], field="transaction_id", maximum=32
@@ -1212,6 +1242,7 @@ class TransactionStateStore:
             or recovery_record["generation"] != old_record["generation"] + 1
             or recovery_record["created_at"] != old_record["created_at"]
             or recovery_record["updated_at"] < old_record["updated_at"]
+            or set(old_record) != set(recovery_record)
         ):
             return False
         ignored = {
@@ -1223,7 +1254,11 @@ class TransactionStateStore:
         }
         return all(
             old_record[field] == recovery_record[field]
-            for field in FIELD_ORDER
+            for field in (
+                V1_FIELD_ORDER
+                if old_record["schema"] == V1_SCHEMA
+                else FIELD_ORDER
+            )
             if field not in ignored
         )
 
@@ -1418,6 +1453,7 @@ class TransactionStateStore:
         timestamp = _now()
         record = {
             "schema": SCHEMA,
+            "operation_contract": fields.get("operation_contract"),
             "transaction_id": transaction_id,
             "generation": 1,
             "phase": "prepared",
@@ -1904,7 +1940,7 @@ class TransactionStateStore:
                 raise
         return {
             "removed": True,
-            "schema": SCHEMA,
+            "schema": current["schema"],
             "transaction_id": transaction_id,
             "generation": expected_generation,
             "phase": expected_phase,
@@ -1965,6 +2001,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     create = subparsers.add_parser("create")
     create.add_argument("--transaction-id", required=True)
+    create.add_argument(
+        "--operation-contract",
+        choices=OPERATION_CONTRACTS,
+        required=True,
+    )
     create.add_argument("--previous-version", required=True)
     create.add_argument("--target-version", required=True)
     create.add_argument("--release-artifact-sha256", required=True)
@@ -2040,6 +2081,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _creation_fields(arguments: argparse.Namespace) -> dict[str, Any]:
     return {
         "transaction_id": arguments.transaction_id,
+        "operation_contract": arguments.operation_contract,
         "previous_version": arguments.previous_version,
         "target_version": arguments.target_version,
         "release_artifact_sha256": arguments.release_artifact_sha256,
@@ -2075,14 +2117,24 @@ def _print_record(
     field: Optional[str] = None,
 ) -> None:
     if field is not None:
-        print(_scalar_text(record[field]))
+        value = (
+            LEGACY_OPERATION_CONTRACT
+            if field == "operation_contract" and record["schema"] == V1_SCHEMA
+            else record[field]
+        )
+        print(_scalar_text(value))
         return
     if output_format == "nul":
         output = bytearray()
         for name in FIELD_ORDER:
+            value = (
+                LEGACY_OPERATION_CONTRACT
+                if name == "operation_contract" and record["schema"] == V1_SCHEMA
+                else record[name]
+            )
             output.extend(name.encode("ascii"))
             output.append(0)
-            output.extend(_scalar_text(record[name]).encode("utf-8"))
+            output.extend(_scalar_text(value).encode("utf-8"))
             output.append(0)
         sys.stdout.buffer.write(bytes(output))
         sys.stdout.buffer.flush()

@@ -1,7 +1,24 @@
 import { execFile, execFileSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import {
+  isNativeBinaryProvider,
+  isUnqualifiedNativeBinaryProvider,
+  unqualifiedNativeBinaryReason,
+  type UnqualifiedNativeBinaryProvider,
+} from '../config/unqualifiedNativeBinaryLane';
 import { getProviderStatuses } from '../services/openclawConfigManager';
-import type { AgentExecutionScope, AgentProviderName } from './AgentProvider.interface';
+import type { AgentProviderName } from './AgentProvider.interface';
+import {
+  REGISTERED_AGENT_HARNESS_IDS,
+  requireHarnessDefinition,
+  type HarnessCapabilities,
+  type HarnessFollowUpMode,
+  type LegacyProviderAdapterFamily,
+  type HarnessModelCatalogKind,
+  type HarnessModelSelectionMode,
+} from './harnessCatalog';
 import {
   getLinkedOpenClawProviderIds,
   getNativeCliAuthStatus,
@@ -10,6 +27,7 @@ import {
   type NativeCliAuthState,
 } from './nativeCliAuth';
 import {
+  getCachedNativeProviderReadiness,
   getNativeProviderReadiness,
   type NativeProviderReadiness,
 } from './nativeProviderReadiness';
@@ -28,31 +46,23 @@ import {
   loadSelectableAgentZeroOAuthModels,
 } from './providers/agentZero/AgentZeroOAuthModelCatalog';
 import { localOllamaCliEnvironment } from '../services/ollamaPullManager';
+import { buildNativeCliEnvironment } from './providers/native/NativeCliEnvironment';
+import { buildAcpHarnessEnvironment } from './providers/native/acp/AcpHarnessEnvironment';
+import {
+  getCachedOpenClawExecutionAdmission,
+  getOpenClawExecutionAdmission,
+} from '../services/openClawExecutionAdmission';
 
-export type ProviderModelSelectionMode = 'none' | 'session' | 'launch';
-export type ProviderModelCatalogKind = 'none' | 'dynamic' | 'declared';
-export type ProviderFollowUpMode = 'interrupt_and_send' | 'queued_follow_up';
-export type ProviderAdapterFamily = 'openclaw-gateway' | 'native-cli' | 'agent-zero-connector';
-
-export interface ProviderCapabilitySummary {
-  implemented: boolean;
-  requiresGateway: boolean;
-  adapterFamily: ProviderAdapterFamily;
-  adapterKey: string;
-  supportsHistory: boolean;
-  supportsModelSelection: boolean;
-  modelSelectionMode: ProviderModelSelectionMode;
-  supportsCustomModelInput: boolean;
-  canEnumerateModels: boolean;
-  modelCatalogKind: ProviderModelCatalogKind;
-  supportsSessionList: boolean;
-  supportsExecApproval: boolean;
-  supportsInTurnSteering: boolean;
-  supportsQueuedFollowUps: boolean;
-  followUpMode: ProviderFollowUpMode;
-  /** Trust zones this adapter can enforce. Missing support is fail-closed. */
-  supportedExecutionScopes: readonly AgentExecutionScope[];
-}
+/** @deprecated Harness-aware code should import these names from harnessCatalog. */
+export type ProviderModelSelectionMode = HarnessModelSelectionMode;
+/** @deprecated Harness-aware code should import these names from harnessCatalog. */
+export type ProviderModelCatalogKind = HarnessModelCatalogKind;
+/** @deprecated Harness-aware code should import these names from harnessCatalog. */
+export type ProviderFollowUpMode = HarnessFollowUpMode;
+/** @deprecated Harness-aware code should import these names from harnessCatalog. */
+export type ProviderAdapterFamily = LegacyProviderAdapterFamily;
+/** @deprecated Harness-aware code should import HarnessCapabilities. */
+export type ProviderCapabilitySummary = HarnessCapabilities;
 
 export interface ProviderAvailability {
   name: AgentProviderName;
@@ -87,194 +97,32 @@ interface ProviderProbeDefinition {
   // Hard pin: availability fails closed on any mismatch (strict transport
   // contracts, e.g. the Grok ACP broker).
   exactTestedVersion?: string;
-  // Soft pin: the provider stays usable on mismatch, but the drift is
-  // reported in the availability payload and reason text. Used for CLIs the
-  // vendor can self-update underneath the installer's convergence.
+  // Soft pin: the provider stays usable on mismatch, but independently
+  // changed package drift is reported in the availability payload and reason.
   driftTestedVersion?: string;
   capabilities: ProviderCapabilitySummary;
 }
 
-const DEFINITIONS: Record<AgentProviderName, ProviderProbeDefinition> = {
-  OPENCLAW: {
-    native: false,
-    implemented: true,
-    commands: ['openclaw'],
-    versionArgs: ['--version'],
-    capabilities: {
-      implemented: true,
-      requiresGateway: true,
-      adapterFamily: 'openclaw-gateway',
-      adapterKey: 'openclaw',
-      supportsHistory: true,
-      supportsModelSelection: true,
-      modelSelectionMode: 'session',
-      supportsCustomModelInput: true,
-      canEnumerateModels: true,
-      modelCatalogKind: 'dynamic',
-      supportsSessionList: true,
-      supportsExecApproval: false,
-      supportsInTurnSteering: true,
-      supportsQueuedFollowUps: false,
-      followUpMode: 'interrupt_and_send',
-      // Project Chat uses its separately materialized Docker agent/binding;
-      // the generic OpenClaw provider adapter must not fabricate that scope.
-      supportedExecutionScopes: ['HOST_OPERATOR'],
-    },
-  },
-  CLAUDE_CODE: {
-    native: true,
-    implemented: true,
-    commands: ['claude'],
-    versionArgs: ['--version'],
-    driftTestedVersion: PORTAL_TOOL_VERSIONS.claudeCode,
-    capabilities: {
-      implemented: true,
-      requiresGateway: false,
-      adapterFamily: 'native-cli',
-      adapterKey: 'claude-code',
-      supportsHistory: true,
-      supportsModelSelection: true,
-      modelSelectionMode: 'session',
-      supportsCustomModelInput: false,
-      canEnumerateModels: true,
-      modelCatalogKind: 'declared',
-      supportsSessionList: true,
-      supportsExecApproval: true,
-      supportsInTurnSteering: false,
-      supportsQueuedFollowUps: true,
-      followUpMode: 'queued_follow_up',
-      supportedExecutionScopes: ['HOST_OPERATOR', 'PROJECT_SANDBOX'],
-    },
-  },
-  CODEX: {
-    native: true,
-    implemented: true,
-    commands: ['codex'],
-    versionArgs: ['--version'],
-    driftTestedVersion: PORTAL_TOOL_VERSIONS.codexCli,
-    capabilities: {
-      implemented: true,
-      requiresGateway: false,
-      adapterFamily: 'native-cli',
-      adapterKey: 'codex',
-      supportsHistory: true,
-      supportsModelSelection: true,
-      modelSelectionMode: 'session',
-      supportsCustomModelInput: true,
-      canEnumerateModels: true,
-      modelCatalogKind: 'declared',
-      supportsSessionList: true,
-      supportsExecApproval: true,
-      supportsInTurnSteering: false,
-      supportsQueuedFollowUps: true,
-      followUpMode: 'queued_follow_up',
-      supportedExecutionScopes: ['HOST_OPERATOR', 'PROJECT_SANDBOX'],
-    },
-  },
-  GROK: {
-    native: true,
-    implemented: true,
-    commands: ['grok'],
-    versionArgs: ['--no-auto-update', '--version'],
-    exactTestedVersion: PORTAL_TOOL_VERSIONS.grokBuild,
-    capabilities: {
-      implemented: true,
-      requiresGateway: false,
-      adapterFamily: 'native-cli',
-      adapterKey: 'grok-build',
-      supportsHistory: true,
-      supportsModelSelection: true,
-      modelSelectionMode: 'session',
-      supportsCustomModelInput: true,
-      canEnumerateModels: true,
-      modelCatalogKind: 'dynamic',
-      supportsSessionList: true,
-      // The ACP broker preserves unrestricted host-operator execution while
-      // forwarding Grok's native permission requests to Portal admins.
-      supportsExecApproval: true,
-      supportsInTurnSteering: false,
-      supportsQueuedFollowUps: true,
-      followUpMode: 'queued_follow_up',
-      supportedExecutionScopes: ['HOST_OPERATOR'],
-    },
-  },
-  AGENT_ZERO: {
-    native: false,
-    implemented: true,
-    commands: [],
-    capabilities: {
-      implemented: true,
-      requiresGateway: false,
-      adapterFamily: 'agent-zero-connector',
-      adapterKey: 'agent-zero-v2.5-connector',
-      supportsHistory: true,
-      supportsModelSelection: true,
-      // Main Agent Chat only publishes exact models returned by currently
-      // connected official Agent Zero OAuth providers.
-      modelSelectionMode: 'session',
-      supportsCustomModelInput: false,
-      canEnumerateModels: true,
-      modelCatalogKind: 'dynamic',
-      supportsSessionList: true,
-      supportsExecApproval: false,
-      supportsInTurnSteering: false,
-      supportsQueuedFollowUps: true,
-      followUpMode: 'queued_follow_up',
-      // Host-operator bridge only: the Project sandbox adapter is a separate
-      // contract and stays closed until it passes its own qualification.
-      supportedExecutionScopes: ['HOST_OPERATOR'],
-    },
-  },
-  GEMINI: {
-    native: true,
-    implemented: true,
-    commands: ['agy'],
-    versionArgs: ['--version'],
-    driftTestedVersion: PORTAL_TOOL_VERSIONS.antigravity,
-    capabilities: {
-      implemented: true,
-      requiresGateway: false,
-      adapterFamily: 'native-cli',
-      adapterKey: 'antigravity',
-      supportsHistory: true,
-      supportsModelSelection: true,
-      modelSelectionMode: 'launch',
-      supportsCustomModelInput: true,
-      canEnumerateModels: true,
-      modelCatalogKind: 'dynamic',
-      supportsSessionList: true,
-      supportsExecApproval: true,
-      supportsInTurnSteering: false,
-      supportsQueuedFollowUps: true,
-      followUpMode: 'queued_follow_up',
-      supportedExecutionScopes: ['HOST_OPERATOR', 'PROJECT_SANDBOX'],
-    },
-  },
-  OLLAMA: {
-    native: true,
-    implemented: true,
-    commands: ['ollama'],
-    versionArgs: ['--version'],
-    capabilities: {
-      implemented: true,
-      requiresGateway: false,
-      adapterFamily: 'native-cli',
-      adapterKey: 'ollama',
-      supportsHistory: true,
-      supportsModelSelection: true,
-      modelSelectionMode: 'launch',
-      supportsCustomModelInput: true,
-      canEnumerateModels: true,
-      modelCatalogKind: 'dynamic',
-      supportsSessionList: true,
-      supportsExecApproval: false,
-      supportsInTurnSteering: false,
-      supportsQueuedFollowUps: true,
-      followUpMode: 'queued_follow_up',
-      supportedExecutionScopes: ['HOST_OPERATOR'],
-    },
-  },
-};
+const DEFINITIONS = Object.freeze(Object.fromEntries(
+  REGISTERED_AGENT_HARNESS_IDS.map((name) => {
+    const harness = requireHarnessDefinition(name);
+    const executable = harness.command.executable;
+    const versionPolicy = harness.command.versionPolicy;
+    return [name, {
+      native: harness.native,
+      implemented: harness.implemented,
+      commands: executable ? [executable] : [],
+      versionArgs: [...harness.command.versionArgs],
+      exactTestedVersion: versionPolicy.kind === 'exact-pin'
+        ? versionPolicy.testedVersion
+        : undefined,
+      driftTestedVersion: versionPolicy.kind === 'soft-pin'
+        ? versionPolicy.testedVersion
+        : undefined,
+      capabilities: harness.capabilities,
+    } satisfies ProviderProbeDefinition];
+  }),
+)) as Readonly<Record<AgentProviderName, ProviderProbeDefinition>>;
 
 // CLI availability probes are synchronous execs that block the event loop —
 // stacked probes (claude/codex/gemini version checks) previously cost multiple
@@ -299,9 +147,20 @@ let agentZeroCatalogAuthRefreshAttempt: AgentZeroAuthRefreshAttempt | null = nul
 let agentZeroAuthRefreshCooldownUntil = 0;
 let forceNextAgentZeroAuthRefresh = false;
 
+function packageVersionRemediation(name: AgentProviderName): string {
+  if (name === 'OPENCLAW' || name === 'CODEX' || name === 'CLAUDE_CODE') {
+    return 'Owner can restore the exact Portal-qualified bundle under Admin > Maintenance > Update Compatible AI Tools; do not update this tool independently.';
+  }
+  return 'Use this runtime\'s dedicated Portal setup or maintenance path; do not update it independently.';
+}
+
 function providerProbeEnvironment(command: string): NodeJS.ProcessEnv {
-  if (command === 'grok') return { ...process.env, GROK_DISABLE_AUTOUPDATER: '1' };
-  if (command === 'agy') return { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: '1' };
+  if (command === 'grok') return buildNativeCliEnvironment('GROK');
+  if (command === 'agy') return buildNativeCliEnvironment('GEMINI');
+  if (command === 'claude') return buildNativeCliEnvironment('CLAUDE_CODE');
+  if (command === 'codex') return buildNativeCliEnvironment('CODEX');
+  if (command === 'hermes') return buildAcpHarnessEnvironment('HERMES');
+  if (command === 'opencode') return buildAcpHarnessEnvironment('OPENCODE');
   if (command === 'ollama') return localOllamaCliEnvironment();
   return process.env;
 }
@@ -366,6 +225,39 @@ function resolveCommand(candidates: string[]): string | undefined {
   return undefined;
 }
 
+function detectUnqualifiedNativeBinary(provider: UnqualifiedNativeBinaryProvider): boolean {
+  const executable = provider === 'GEMINI' ? 'agy' : 'grok';
+  return String(process.env.PATH || '/usr/local/bin:/usr/bin:/bin')
+    .split(path.delimiter)
+    .filter(Boolean)
+    .some((directory) => {
+      try {
+        const candidate = path.join(directory, executable);
+        return fs.statSync(candidate).isFile() && Boolean(fs.statSync(candidate).mode & 0o111);
+      } catch {
+        return false;
+      }
+    });
+}
+
+function buildUnqualifiedNativeBinaryAvailability(
+  provider: UnqualifiedNativeBinaryProvider,
+): ProviderAvailability {
+  const definition = DEFINITIONS[provider];
+  return {
+    name: provider,
+    installed: detectUnqualifiedNativeBinary(provider),
+    implemented: false,
+    usable: false,
+    native: true,
+    reason: unqualifiedNativeBinaryReason(provider),
+    nativeAuthStatus: 'not_applicable',
+    nativeAuthMessage: unqualifiedNativeBinaryReason(provider),
+    requiresSeparateNativeLogin: false,
+    capabilities: definition.capabilities,
+  };
+}
+
 async function resolveCommandAsync(candidates: string[]): Promise<string | undefined> {
   for (const command of candidates) {
     const out = await tryExecAsync('bash', ['-lc', `command -v ${command}`]);
@@ -406,7 +298,11 @@ export function nativeAuthBlocksProviderUsage(
   // Ambiguous auth for either provider must therefore fail closed so the
   // provider catalog never advertises a turn that execution admission rejects.
   return nativeCliAuthBlocksUsage(status)
-    || ((name === 'GROK' || name === 'GEMINI') && status?.status !== 'authenticated');
+    || ((name === 'GROK'
+      || name === 'GEMINI'
+      || name === 'HERMES'
+      || name === 'OPENCODE')
+      && status?.status !== 'authenticated');
 }
 
 export function getProviderCapabilities(name: AgentProviderName): ProviderCapabilitySummary | null {
@@ -414,6 +310,13 @@ export function getProviderCapabilities(name: AgentProviderName): ProviderCapabi
 }
 
 function authStatusFromReadiness(readiness: NativeProviderReadiness): NativeCliAuthStatus {
+  const loginCommand = readiness.provider === 'GEMINI'
+    ? 'agy'
+    : readiness.provider === 'HERMES'
+      ? 'hermes model'
+      : readiness.provider === 'OPENCODE'
+        ? 'opencode auth login'
+        : undefined;
   return {
     provider: readiness.provider,
     status: readiness.usable
@@ -422,9 +325,45 @@ function authStatusFromReadiness(readiness: NativeProviderReadiness): NativeCliA
         ? 'needs_login'
         : 'unknown',
     message: readiness.message,
-    loginCommand: readiness.provider === 'GEMINI' ? 'agy' : undefined,
+    loginCommand,
     requiresSeparateLogin: true,
   };
+}
+
+function buildAdmittedHostCliAvailability(
+  name: 'CODEX' | 'CLAUDE_CODE',
+  hostReadiness: NativeProviderReadiness | null,
+): ProviderAvailability {
+  const def = DEFINITIONS[name];
+  const nativeAuth = hostReadiness ? authStatusFromReadiness(hostReadiness) : null;
+  const packageInstalled = hostReadiness?.runtimeInstalled === true;
+  return {
+    name,
+    installed: packageInstalled,
+    implemented: true,
+    // Advisory only. The provider freshly repeats admission immediately before
+    // each Host Operator attempt under the generic systemd-scope boundary.
+    usable: hostReadiness?.usable === true,
+    native: true,
+    version: hostReadiness?.runtimeVersion,
+    reason: hostReadiness?.message
+      || 'Native host CLI admission has not been checked asynchronously.',
+    nativeAuthStatus: nativeAuth?.status,
+    nativeAuthMessage: nativeAuth?.message,
+    nativeAuthLoginCommand: nativeAuth?.loginCommand,
+    requiresSeparateNativeLogin: nativeAuth?.requiresSeparateLogin,
+    linkedOpenClawProviders: [],
+    capabilities: def.capabilities,
+  };
+}
+
+async function getAdmittedHostProviderAvailability(
+  name: 'CODEX' | 'CLAUDE_CODE',
+): Promise<ProviderAvailability> {
+  const hostReadiness = await getNativeProviderReadiness(name, {
+    executionScope: 'HOST_OPERATOR',
+  });
+  return buildAdmittedHostCliAvailability(name, hostReadiness);
 }
 
 function agentZeroAuthReadinessSnapshot(): AgentZeroAuthReadiness {
@@ -585,6 +524,23 @@ function buildDetectedProviderAvailability(
       : getNativeCliAuthStatus(name)
     : null;
 
+  if (name === 'OPENCLAW') {
+    const admission = getCachedOpenClawExecutionAdmission();
+    return {
+      name,
+      installed,
+      implemented: true,
+      usable: installed && admission.ready,
+      native: false,
+      command,
+      version,
+      reason: installed
+        ? admission.reason
+        : 'OpenClaw is not installed on this host.',
+      capabilities: def.capabilities,
+    };
+  }
+
   if (!def.implemented) {
     return {
       name,
@@ -630,7 +586,7 @@ function buildDetectedProviderAvailability(
       native: def.native,
       command,
       version,
-      reason: `Installed CLI is outside the Portal-tested version (${def.exactTestedVersion}). Reinstall the pinned version before using this provider.`,
+      reason: `Installed CLI is outside the Portal-tested version (${def.exactTestedVersion}). Portal refuses this runtime. ${packageVersionRemediation(name)}`,
       nativeAuthStatus: nativeAuth?.status,
       nativeAuthMessage: nativeAuth?.message,
       nativeAuthLoginCommand: nativeAuth?.loginCommand,
@@ -650,7 +606,7 @@ function buildDetectedProviderAvailability(
     ? { tested: def.driftTestedVersion, installed: installedVersion }
     : undefined;
   const driftNote = versionDrift
-    ? ` Installed ${def.commands[0]} ${versionDrift.installed} has drifted from the Portal-tested ${versionDrift.tested}; run the Portal update (or the installer with --maintain-tools) to reconverge.`
+    ? ` Installed ${def.commands[0]} ${versionDrift.installed} has drifted from the Portal-tested ${versionDrift.tested}; Portal refuses the drifted runtime. ${packageVersionRemediation(name)}`
     : '';
   const reason = authBlocked
     ? linkedConfigured.length
@@ -660,6 +616,8 @@ function buildDetectedProviderAvailability(
       ? 'Uses OpenClaw gateway transport'
       : name === 'GROK'
         ? `${nativeAuth?.message || 'Grok Build is authenticated on this server.'} Uses the pinned Grok Build ${PORTAL_TOOL_VERSIONS.grokBuild} ACP transport with native text, thought, tool, permission, cancellation, and persisted-session events.`
+        : name === 'HERMES' || name === 'OPENCODE'
+          ? `${nativeAuth?.message || `${requireHarnessDefinition(name).displayName} is authenticated on this server.`} Uses the exact-pinned ACP stdio transport with attested identity/version, native text, reasoning, tool, permission, cancellation, dynamic model, and persisted-session events.`
         : (nativeAuth?.message || 'Runs natively via local provider CLI');
 
   return {
@@ -685,6 +643,15 @@ function buildProviderAvailability(
   name: AgentProviderName,
   nativeReadiness?: NativeProviderReadiness,
 ): ProviderAvailability {
+  if (isNativeBinaryProvider(name) && isUnqualifiedNativeBinaryProvider(name)) {
+    return buildUnqualifiedNativeBinaryAvailability(name);
+  }
+  if (name === 'CODEX' || name === 'CLAUDE_CODE') {
+    return buildAdmittedHostCliAvailability(
+      name,
+      nativeReadiness || getCachedNativeProviderReadiness(name),
+    );
+  }
   const def = DEFINITIONS[name];
   if (name === 'AGENT_ZERO') {
     const runtime = probeAgentZeroRuntime();
@@ -703,6 +670,12 @@ async function buildProviderAvailabilityAsync(
   name: Exclude<AgentProviderName, 'AGENT_ZERO'>,
   nativeReadiness?: NativeProviderReadiness,
 ): Promise<ProviderAvailability> {
+  if (isNativeBinaryProvider(name) && isUnqualifiedNativeBinaryProvider(name)) {
+    return buildUnqualifiedNativeBinaryAvailability(name);
+  }
+  if (name === 'CODEX' || name === 'CLAUDE_CODE') {
+    return getAdmittedHostProviderAvailability(name);
+  }
   const def = DEFINITIONS[name];
   const command = await resolveCommandAsync(def.commands);
   const version = command ? await detectVersionAsync(command, def.versionArgs) : undefined;
@@ -722,7 +695,20 @@ export function getProviderAvailability(name: AgentProviderName): ProviderAvaila
  * path below and keeps model enumeration on `/models`.
  */
 export async function getProviderAvailabilityAsync(name: AgentProviderName): Promise<ProviderAvailability> {
-  if (name === 'CLAUDE_CODE' || name === 'CODEX' || name === 'GROK' || name === 'GEMINI') {
+  if (isNativeBinaryProvider(name) && isUnqualifiedNativeBinaryProvider(name)) {
+    return buildUnqualifiedNativeBinaryAvailability(name);
+  }
+  if (name === 'CLAUDE_CODE' || name === 'CODEX') {
+    return getAdmittedHostProviderAvailability(name);
+  }
+  if (name === 'OPENCLAW') {
+    await getOpenClawExecutionAdmission();
+    return buildProviderAvailability(name);
+  }
+  if (name === 'HERMES'
+    || name === 'OPENCODE'
+    || name === 'GROK'
+    || name === 'GEMINI') {
     const readiness = await getNativeProviderReadiness(name);
     return buildProviderAvailability(name, readiness);
   }
@@ -759,6 +745,9 @@ export async function getProviderAvailabilityAsync(name: AgentProviderName): Pro
 export async function getProviderCatalogAvailabilityAsync(
   name: AgentProviderName,
 ): Promise<ProviderAvailability> {
+  if (isNativeBinaryProvider(name) && isUnqualifiedNativeBinaryProvider(name)) {
+    return buildUnqualifiedNativeBinaryAvailability(name);
+  }
   if (name === 'AGENT_ZERO') {
     const runtime = await probeAgentZeroRuntimeAsync();
     let authentication = agentZeroAuthReadinessSnapshot();
@@ -767,7 +756,17 @@ export async function getProviderCatalogAvailabilityAsync(
     }
     return buildAgentZeroAvailability(authentication, runtime);
   }
-  if (name === 'CLAUDE_CODE' || name === 'CODEX' || name === 'GROK' || name === 'GEMINI') {
+  if (name === 'CLAUDE_CODE' || name === 'CODEX') {
+    return getAdmittedHostProviderAvailability(name);
+  }
+  if (name === 'OPENCLAW') {
+    await getOpenClawExecutionAdmission();
+    return buildProviderAvailability(name);
+  }
+  if (name === 'HERMES'
+    || name === 'OPENCODE'
+    || name === 'GROK'
+    || name === 'GEMINI') {
     const readiness = await getNativeProviderReadiness(name);
     return buildProviderAvailabilityAsync(name, readiness);
   }

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '../../test/setup';
 import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -21,7 +21,6 @@ const mocks = vi.hoisted(() => ({
   callback: vi.fn(),
   models: vi.fn(),
   disconnect: vi.fn(),
-  reconcile: vi.fn(),
 }));
 
 vi.mock('../../api/agentRuntime', async () => {
@@ -37,7 +36,6 @@ vi.mock('../../api/agentRuntime', async () => {
       completeAgentZeroOAuthCallback: mocks.callback,
       agentZeroOAuthModels: mocks.models,
       disconnectAgentZeroOAuth: mocks.disconnect,
-      reconcileAgentZeroRuntime: mocks.reconcile,
     },
   };
 });
@@ -47,16 +45,6 @@ vi.mock('../../contexts/AuthContext', () => ({
     user: { id: 'owner-1', role: 'OWNER' },
   }),
 }));
-
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
 
 function SettingsOwnershipHarness({ children }: { children: ReactNode }) {
   const ownerRef = useRef<string | null>(null);
@@ -83,13 +71,13 @@ function SettingsOwnershipHarness({ children }: { children: ReactNode }) {
 
 function readyStatus(): AgentZeroSetupStatus {
   return {
-    testedVersions: { agentZero: '2.5', connector: '0.1.0', hostBridge: '2.5' },
+    testedVersions: { agentZero: '2.10', connector: '0.1.0', hostBridge: '2.10' },
     credentials: { configured: true, protected: true, reason: 'ready' },
     runtime: {
       installed: true,
       running: true,
       protocolReady: true,
-      expectedVersion: '2.5',
+      expectedVersion: '2.10',
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -103,7 +91,7 @@ function readyStatus(): AgentZeroSetupStatus {
       installed: true,
       running: true,
       ready: true,
-      expectedCliVersion: '2.5',
+      expectedCliVersion: '2.10',
       gatewayId: 'bridgesllm-portal-host',
       capabilities: {
         scope: 'HOST_OPERATOR',
@@ -133,7 +121,11 @@ function readyStatus(): AgentZeroSetupStatus {
     },
     actions: {
       provisionCredentials: { ownerOnly: true, confirmationPhrase: 'SAVE AGENT ZERO CREDENTIALS' },
-      reconcileRuntime: { ownerOnly: true, confirmationPhrase: 'SET UP AGENT ZERO' },
+      reconcileRuntime: {
+        ownerOnly: true,
+        available: false,
+        unavailableCode: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
+      },
       verifyAuthentication: { ownerOnly: true, available: true },
     },
     provider: {
@@ -206,7 +198,6 @@ describe('AgentZeroSetupPanel provider presentation', () => {
     mocks.status.mockResolvedValue(readyStatus());
     mocks.oauthStatus.mockResolvedValue(oauthStatus());
     mocks.models.mockResolvedValue({ providerId: 'codex_oauth', models: [] });
-    mocks.reconcile.mockReset();
   });
 
   it('uses a standard provider card and opens the account surface in a body-owned modal', async () => {
@@ -257,38 +248,17 @@ describe('AgentZeroSetupPanel provider presentation', () => {
     expect(within(card).getByText(/Runs on this server/i)).toBeInTheDocument();
   });
 
-  it('claims Settings synchronously before an Agent Zero runtime confirmation can be submitted twice', async () => {
-    const user = userEvent.setup();
-    const reconciliation = deferred<{ status: AgentZeroSetupStatus; message: string }>();
-    mocks.reconcile.mockReturnValue(reconciliation.promise);
+  it('shows runtime acquisition as unavailable without a reconcile control', async () => {
     render(
       <SettingsOwnershipHarness>
         <AgentZeroSetupPanel />
       </SettingsOwnershipHarness>,
     );
 
-    await user.click(await screen.findByRole('button', { name: 'Reconcile runtime' }));
-    const dialog = screen.getByRole('dialog', { name: 'Install or repair Agent Zero?' });
-    await user.type(
-      within(dialog).getByRole('textbox', { name: /Type SET UP AGENT ZERO to continue/i }),
-      'SET UP AGENT ZERO',
-    );
-    const confirm = within(dialog).getByRole('button', { name: 'Reconcile runtime' });
-    act(() => {
-      confirm.click();
-      confirm.click();
-    });
-
-    expect(mocks.reconcile).toHaveBeenCalledTimes(1);
-    expect(mocks.reconcile).toHaveBeenCalledWith('SET UP AGENT ZERO');
-    expect(screen.getByText('Leave Settings').closest('button')).toBeDisabled();
-    expect(within(dialog).getByRole('button', { name: 'Reconcile runtime' })).toHaveAttribute('aria-busy', 'true');
-
-    await act(async () => {
-      reconciliation.resolve({ status: readyStatus(), message: 'Runtime reconciled.' });
-      await reconciliation.promise;
-    });
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Install or repair Agent Zero?' })).not.toBeInTheDocument());
+    expect(await screen.findByText(/Portal inspects the pinned Agent Zero/i)).toBeInTheDocument();
+    expect(screen.getByText(/Runtime package changes remain unavailable until the Agent Zero host transaction ships/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Reconcile runtime' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Install or repair Agent Zero?' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Leave Settings' })).toBeEnabled();
   });
 

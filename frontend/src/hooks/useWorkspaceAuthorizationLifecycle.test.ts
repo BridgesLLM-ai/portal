@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import React, { StrictMode } from 'react';
-import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
+import {
+  act,
+  cleanup,
+  fireEvent,
+  renderHook,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '../contexts/AuthContext';
 import {
@@ -54,6 +61,8 @@ const socketHarness = vi.hoisted(() => {
 vi.mock('socket.io-client', () => ({ io: socketHarness.io }));
 
 import {
+  WORKSPACE_AUTHORIZATION_CHECK_DEADLINE_MS,
+  WORKSPACE_AUTHORIZATION_RECONNECT_ATTEMPTS,
   hideWorkspacePrivacyCurtain,
   quarantineWorkspaceAuthorization,
   showWorkspacePrivacyCurtain,
@@ -61,6 +70,7 @@ import {
 } from './useWorkspaceAuthorizationLifecycle';
 
 const originalRestoreSession = useAuthStore.getState().restoreSession;
+const originalAbandonQuarantinedSession = useAuthStore.getState().abandonQuarantinedSession;
 
 function persistedPageShowEvent(): PageTransitionEvent {
   const event = new Event('pageshow') as PageTransitionEvent;
@@ -70,6 +80,7 @@ function persistedPageShowEvent(): PageTransitionEvent {
 
 describe('workspace authorization quarantine', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     cleanup();
     socketHarness.sockets.splice(0);
     socketHarness.io.mockClear();
@@ -89,14 +100,19 @@ describe('workspace authorization quarantine', () => {
       isAuthenticated: true,
       isLoading: false,
       sessionRestoreError: false,
-      restoreSession: originalRestoreSession,
+      restoreSession: vi.fn(async () => true),
+      abandonQuarantinedSession: originalAbandonQuarantinedSession,
     });
   });
 
   afterEach(() => {
     cleanup();
     hideWorkspacePrivacyCurtain();
-    useAuthStore.setState({ restoreSession: originalRestoreSession });
+    vi.useRealTimers();
+    useAuthStore.setState({
+      restoreSession: originalRestoreSession,
+      abandonQuarantinedSession: originalAbandonQuarantinedSession,
+    });
   });
 
   it('hides stale DOM synchronously, scrubs workspace state, and replaces the route', () => {
@@ -186,6 +202,140 @@ describe('workspace authorization quarantine', () => {
 
     await act(async () => resolveRestore(true));
     expect(document.getElementById('root')?.style.visibility).toBe('hidden');
+  });
+
+  it('bounds socket reconnect attempts and exposes sanitized recovery actions when they exhaust', async () => {
+    const restoreSession = vi.fn(async () => true);
+    useAuthStore.setState({ restoreSession });
+    renderHook(() => useWorkspaceAuthorizationLifecycle(vi.fn()));
+    const socket = socketHarness.sockets.at(-1)!;
+    socket.connected = false;
+
+    await act(async () => {
+      for (let attempt = 0; attempt < WORKSPACE_AUTHORIZATION_RECONNECT_ATTEMPTS; attempt += 1) {
+        socket.serverEmit('connect_error', new Error('internal host and credential detail'));
+      }
+    });
+
+    const socketOptions = (socketHarness.io.mock.calls.at(-1) as unknown as [
+      string,
+      Record<string, unknown>,
+    ])[1];
+    expect(socketOptions).toMatchObject({
+      reconnectionAttempts: WORKSPACE_AUTHORIZATION_RECONNECT_ATTEMPTS,
+    });
+    const retryButton = screen.getByRole<HTMLButtonElement>('button', { name: 'Retry access check' });
+    expect(retryButton.disabled).toBe(false);
+    expect(document.activeElement).toBe(retryButton);
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Sign in again' }).disabled)
+      .toBe(false);
+    expect(document.getElementById('portal-workspace-authorization-curtain')?.textContent)
+      .not.toContain('internal host and credential detail');
+    expect(document.getElementById('root')?.style.visibility).toBe('hidden');
+    expect(document.getElementById('root')?.getAttribute('aria-hidden')).toBe('true');
+  });
+
+  it('turns a stalled access check into a finite privacy-closed failure state', () => {
+    vi.useFakeTimers();
+    const restoreSession = vi.fn(() => new Promise<boolean>(() => {}));
+    useAuthStore.setState({ restoreSession });
+    renderHook(() => useWorkspaceAuthorizationLifecycle(vi.fn()));
+    const socket = socketHarness.sockets.at(-1)!;
+
+    act(() => socket.serverEmit('authorization_snapshot', { authorizationVersion: 1 }));
+    expect(document.getElementById('root')?.style.visibility).toBe('');
+    act(() => {
+      socket.connected = false;
+      socket.serverEmit('disconnect', 'transport close');
+      vi.advanceTimersByTime(WORKSPACE_AUTHORIZATION_CHECK_DEADLINE_MS);
+    });
+
+    expect(screen.getByRole('alert').textContent).toContain('Workspace access check unavailable');
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Retry access check' }).disabled)
+      .toBe(false);
+    expect(document.getElementById('root')?.style.visibility).toBe('hidden');
+    expect(document.getElementById('root')?.textContent).toContain('owner-secret-project');
+  });
+
+  it('bounds a BFCache revalidation even when the socket recovers but the REST probe stalls', () => {
+    vi.useFakeTimers();
+    const restoreSession = vi.fn(() => new Promise<boolean>(() => {}));
+    useAuthStore.setState({ restoreSession });
+    renderHook(() => useWorkspaceAuthorizationLifecycle(vi.fn()));
+    const socket = socketHarness.sockets.at(-1)!;
+
+    act(() => socket.serverEmit('authorization_snapshot', { authorizationVersion: 1 }));
+    expect(document.getElementById('root')?.style.visibility).toBe('');
+    act(() => {
+      window.dispatchEvent(new Event('pagehide'));
+      window.dispatchEvent(persistedPageShowEvent());
+      socket.serverEmit('authorization_snapshot', { authorizationVersion: 1 });
+      vi.advanceTimersByTime(WORKSPACE_AUTHORIZATION_CHECK_DEADLINE_MS);
+    });
+
+    expect(screen.getByRole('alert').textContent).toContain('Workspace access check unavailable');
+    expect(document.getElementById('root')?.style.visibility).toBe('hidden');
+    expect(restoreSession).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry access check' }));
+      socket.serverEmit('authorization_snapshot', { authorizationVersion: 1 });
+    });
+    expect(document.getElementById('portal-workspace-authorization-curtain')).toBeNull();
+    expect(document.getElementById('root')?.style.visibility).toBe('');
+  });
+
+  it('recovers only after retry receives a matching authorization snapshot', async () => {
+    const restoreSession = vi.fn(async () => true);
+    useAuthStore.setState({ restoreSession });
+    renderHook(() => useWorkspaceAuthorizationLifecycle(vi.fn()));
+    const socket = socketHarness.sockets.at(-1)!;
+    socket.connected = false;
+
+    await act(async () => {
+      for (let attempt = 0; attempt < WORKSPACE_AUTHORIZATION_RECONNECT_ATTEMPTS; attempt += 1) {
+        socket.serverEmit('connect_error', new Error('offline'));
+      }
+    });
+    expect(document.getElementById('root')?.style.visibility).toBe('hidden');
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry access check' }));
+    });
+    expect(socket.connect).toHaveBeenCalledTimes(1);
+    expect(document.getElementById('root')?.style.visibility).toBe('hidden');
+
+    act(() => socket.serverEmit('authorization_snapshot', { authorizationVersion: 1 }));
+    expect(document.getElementById('portal-workspace-authorization-curtain')).toBeNull();
+    expect(document.getElementById('root')?.style.visibility).toBe('');
+  });
+
+  it('keeps stale DOM covered and navigates to sign-in even when session abandonment fails', async () => {
+    const navigate = vi.fn();
+    const restoreSession = vi.fn(async () => true);
+    const abandonQuarantinedSession = vi.fn(async () => {
+      throw new Error('private logout transport detail');
+    });
+    useAuthStore.setState({ restoreSession, abandonQuarantinedSession });
+    renderHook(() => useWorkspaceAuthorizationLifecycle(navigate));
+    const socket = socketHarness.sockets.at(-1)!;
+    socket.connected = false;
+
+    await act(async () => {
+      for (let attempt = 0; attempt < WORKSPACE_AUTHORIZATION_RECONNECT_ATTEMPTS; attempt += 1) {
+        socket.serverEmit('connect_error', new Error('offline'));
+      }
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Sign in again' }));
+    });
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/login'));
+    expect(abandonQuarantinedSession).toHaveBeenCalledTimes(1);
+    expect(document.getElementById('root')?.style.visibility).toBe('hidden');
+    expect(document.getElementById('root')?.getAttribute('aria-hidden')).toBe('true');
+    expect(document.getElementById('portal-workspace-authorization-curtain')?.textContent)
+      .not.toContain('private logout transport detail');
   });
 
   it('revalidates a BFCache restoration before revealing the preserved DOM', async () => {

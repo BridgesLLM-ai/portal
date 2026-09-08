@@ -654,6 +654,7 @@ describe('Project qualification provider registry', () => {
     };
     const deps = __projectQualificationRegistryTest.qualificationDefaults('AGENT_ZERO', {
       executor,
+      evidenceRoot: path.join(root, 'evidence'),
       resolveAgentZeroModelSelection: jest.fn(async () => AGENT_ZERO_SELECTION),
       convergeAgentZeroRuntime: jest.fn(async () => status as any),
       qualifyAgentZeroRuntime: jest.fn(async () => status as any),
@@ -1390,7 +1391,7 @@ describe('confined native Project live model challenge', () => {
       terminateSession,
       abortActiveRun: jest.fn().mockResolvedValue(true),
     };
-    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider);
+    jest.spyOn(projectProviderRegistry, 'getProjectChatProviderAdapter').mockReturnValue(provider);
 
     await expect(__projectQualificationRegistryTest.runDefaultNativeCliModelProbe({
       provider: 'CLAUDE_CODE',
@@ -1425,7 +1426,7 @@ describe('confined native Project live model challenge', () => {
       terminateSession,
       abortActiveRun: jest.fn().mockResolvedValue(true),
     };
-    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider);
+    jest.spyOn(projectProviderRegistry, 'getProjectChatProviderAdapter').mockReturnValue(provider);
 
     await expect(__projectQualificationRegistryTest.runDefaultNativeCliModelProbe({
       provider: 'CLAUDE_CODE',
@@ -1453,7 +1454,7 @@ describe('confined native Project live model challenge', () => {
       terminateSession,
       abortActiveRun: jest.fn().mockResolvedValue(true),
     };
-    jest.spyOn(AgentRegistry, 'get').mockReturnValue(provider);
+    jest.spyOn(projectProviderRegistry, 'getProjectChatProviderAdapter').mockReturnValue(provider);
 
     await expect(__projectQualificationRegistryTest.runDefaultNativeCliModelProbe({
       provider: 'CLAUDE_CODE',

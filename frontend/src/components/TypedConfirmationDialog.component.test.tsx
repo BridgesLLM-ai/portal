@@ -153,7 +153,7 @@ describe("TypedConfirmationDialog modal behavior", () => {
           busyProgress={0.64}
           busyStartedAt="2026-08-10T12:00:00.000Z"
           busyPhaseLabel="Restarting Portal"
-          busyPhaseDetail="Waiting for the API to return before postflight checks."
+          busyPhaseDetail="Waiting for the API to return before final Portal verification."
           busyConnectionState="reconnecting"
           busySteps={[
             { label: "Release verified", detail: "Signature and manifest matched." },
