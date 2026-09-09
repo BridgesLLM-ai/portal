@@ -114,10 +114,11 @@ const PROVIDER_CATALOG_TTL_MS = 60_000;
 const PROVIDER_CATALOG_FAILURE_RETRY_MS = 10_000;
 const PROVIDER_CATALOG_RESPONSE_BUDGET_MS = 250;
 const PROVIDER_CATALOG_PROBE_DEADLINE_MS = 35_000;
-// OpenClaw serializes bounded CLI checks. Its rare authenticated-version
-// fallback can take 64s in total; the catalog must not discard that result
-// at 35s. HTTP callers still receive a checking row within 250ms.
-const OPENCLAW_CATALOG_PROBE_DEADLINE_MS = 75_000;
+// OpenClaw serializes bounded CLI checks (4s + 15s + 25s + 25s, plus a 25s
+// discovery fallback when gateway status omits the version): up to ~96.5s
+// including package discovery. The catalog must not discard that result at
+// 35s. HTTP callers still receive a checking row within 250ms.
+const OPENCLAW_CATALOG_PROBE_DEADLINE_MS = 100_000;
 
 interface ProviderCatalogCacheEntry {
   availability?: ProviderAvailability;

@@ -331,8 +331,14 @@ async function collectOpenClawSetupReadinessUncached(
   const gatewayProbeResult = authenticatedRpc && !statusRunningVersion
     ? await dependencies.runOpenClawCli(['gateway', 'probe', '--json'], 25_000)
     : null;
-  const codexPluginResult = await dependencies.runOpenClawCli(['plugins', 'inspect', 'codex', '--json'], 10_000);
-  const authStoreResult = await dependencies.runOpenClawCli(['models', 'auth', '--agent', 'main', 'list', '--json'], 10_000);
+  // Both of these shell into OpenClaw's plugin registry and auth store. On a
+  // loaded production host they measured ~7s at rest, ~15s cold, and ~21s under
+  // CLI contention while still succeeding, so the former 10s budget reported a
+  // healthy credential store as `auth-store-unavailable`, which also fails
+  // OpenClaw execution admission (Agent Chat sends). Use the same 25s bound
+  // as discovery; the 60s cache and in-flight dedup keep the cost bounded.
+  const codexPluginResult = await dependencies.runOpenClawCli(['plugins', 'inspect', 'codex', '--json'], 25_000);
+  const authStoreResult = await dependencies.runOpenClawCli(['models', 'auth', '--agent', 'main', 'list', '--json'], 25_000);
   const packageMetadata = await dependencies.resolvePackageMetadata();
 
   const version = parseOpenClawVersion(cliVersionResult.stdout);

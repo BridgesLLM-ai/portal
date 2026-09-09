@@ -1066,11 +1066,13 @@ interface OpenClawVersionStatus {
 }
 
 const OPENCLAW_VERSION_STATUS_TTL_MS = Number(process.env.PORTAL_OPENCLAW_VERSION_STATUS_TTL_MS || 5 * 60 * 1000);
-// A cold shared readiness pass has five individually bounded CLI checks
-// (49 seconds total), two package-discovery lookups (2.5 seconds each), the
-// version-status update lookup (9 seconds), listener inspection (3.5 seconds),
-// and the wait loop's initial delay. Keep margin around the 67.5-second bound.
-const OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS = 75_000;
+// A cold shared readiness pass has five individually bounded, serialized CLI
+// checks: --version 4s, gateway status 15s, gateway probe 25s (only when status
+// omits the version), plugins inspect 25s, models auth list 25s = 94s worst
+// case. Add two package-discovery lookups (2.5s each), the version-status
+// update lookup (9s), listener inspection (3.5s), and the wait loop's initial
+// delay: ~111.5s. Keep margin around that bound.
+const OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS = 120_000;
 const OPENCLAW_UPDATE_STATUS_TIMEOUT_MS = 9_000;
 let openClawVersionStatusCache: { status: OpenClawVersionStatus; checkedAtMs: number } | null = null;
 let openClawVersionStatusProbe: Promise<OpenClawVersionStatus> | null = null;

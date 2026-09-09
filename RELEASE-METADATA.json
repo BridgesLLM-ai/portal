@@ -1,11 +1,10 @@
 {
   "schema": 1,
-  "version": "5.0.2",
+  "version": "5.0.3",
   "releasedAt": "2026-09-09",
   "releaseClass": "hotfix",
   "highlights": [
-    "Fix backups for configured PostgreSQL connections, including Docker databases and nondefault ports.",
-    "Restore server-reported update percentages and preserve the last checkpoint across reconnects.",
-    "Keep authenticated recovery-archive requirements and verify ready health before showing update completion."
+    "Stop reporting a healthy OpenClaw authentication store as unavailable: the Codex plugin and saved-auth readiness probes now get the same 25-second budget as gateway discovery.",
+    "Also fixes OpenClaw Agent Chat sends and session creation being rejected with that message on busy hosts, since chat admission shares the same readiness result."
   ]
 }

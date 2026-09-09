@@ -270,9 +270,31 @@ describe('OpenClaw setup readiness', () => {
     expect(commands).toEqual([
       '--version@4000',
       'gateway status --require-rpc --timeout 10000 --json@15000',
-      'plugins inspect codex --json@10000',
-      'models auth --agent main list --json@10000',
+      'plugins inspect codex --json@25000',
+      'models auth --agent main list --json@25000',
     ]);
+  });
+
+  it('gives the plugin and auth-store probes the discovery budget so a slow but healthy store is not reported unavailable', async () => {
+    // Production measurement 2026-09-09: `models auth --agent main list` succeeded
+    // in ~7s at rest, ~15s cold, and ~21s under CLI contention, and `plugins
+    // inspect codex` measured ~7s. A 10s budget produced the false
+    // `auth-store-unavailable` blocker on a healthy host. Keep both at the same
+    // 25s bound as gateway discovery.
+    const base = makeDependencies();
+    const budgets = new Map<string, number | undefined>();
+    const status = await getOpenClawSetupReadiness({
+      ...base,
+      runOpenClawCli: async (args, timeoutMs) => {
+        budgets.set(args.join(' '), timeoutMs);
+        return base.runOpenClawCli(args, timeoutMs);
+      },
+    });
+
+    expect(status.credentialStoreReady).toBe(true);
+    expect(status.blockers).not.toContainEqual(expect.objectContaining({ code: 'auth-store-unavailable' }));
+    expect(budgets.get('models auth --agent main list --json')).toBe(25_000);
+    expect(budgets.get('plugins inspect codex --json')).toBe(25_000);
   });
 
   it('deduplicates shared callers, reuses a fresh result, and honors a forced refresh', async () => {

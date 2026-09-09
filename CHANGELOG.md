@@ -2,6 +2,22 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.3] - 2026-09-09
+
+### OpenClaw readiness
+
+- Give the Codex plugin and saved-authentication readiness probes the same
+  25-second budget as gateway discovery. On a busy host, `openclaw models auth
+  list` and `openclaw plugins inspect codex` legitimately take 7-20 seconds while
+  still succeeding; the previous 10-second budget reported a healthy
+  authentication store as unavailable. Because OpenClaw execution admission
+  shares that readiness result, the false blocker also rejected OpenClaw Agent
+  Chat sends and session creation with the same message; those now succeed
+  once the probes complete within budget.
+- Recompute the dashboard cold-probe budget and the OpenClaw provider-catalog
+  deadline for the longer serialized readiness chain so a slow-but-healthy
+  result is not discarded before it arrives.
+
 ## [5.0.2] - 2026-09-09
 
 ### Backup connection fixes

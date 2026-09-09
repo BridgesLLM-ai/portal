@@ -113,8 +113,8 @@ describe('OpenClaw dashboard version probe', () => {
     expect(calls).toEqual([
       { command: '--version', timeoutMs: 4000 },
       { command: 'gateway status --require-rpc --timeout 10000 --json', timeoutMs: 15000 },
-      { command: 'plugins inspect codex --json', timeoutMs: 10000 },
-      { command: 'models auth --agent main list --json', timeoutMs: 10000 },
+      { command: 'plugins inspect codex --json', timeoutMs: 25000 },
+      { command: 'models auth --agent main list --json', timeoutMs: 25000 },
       { command: 'update status --json --timeout 3', timeoutMs: 9000 },
     ]);
     expect(maximumActiveCalls).toBe(1);
@@ -134,7 +134,7 @@ describe('OpenClaw dashboard version probe', () => {
       probeOk: true,
       probeError: null,
     }));
-    expect(__gatewayVersionProbeTest.OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS).toBe(75_000);
+    expect(__gatewayVersionProbeTest.OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS).toBe(120_000);
   });
 
   it('propagates a forced refresh to shared readiness before update discovery', async () => {
