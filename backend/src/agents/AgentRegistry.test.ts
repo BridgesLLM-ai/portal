@@ -393,6 +393,32 @@ describe('AgentRegistry fail-soft provider catalog', () => {
     ]));
   });
 
+  test.each([true, false])('keeps bounded OpenClaw checks alive without admitting a hung probe: resolves=%s', async (resolves) => {
+    jest.useFakeTimers();
+    mockedGetProviderCatalogAvailabilityAsync.mockImplementation(async (name) => {
+      if (name !== 'OPENCLAW') return availability(name);
+      return new Promise<ReturnType<typeof availability>>((resolve) => {
+        if (resolves) setTimeout(() => resolve(availability(name)), 64_000);
+      });
+    });
+    const cold = AgentRegistry.listProvidersAsync();
+    await jest.advanceTimersByTimeAsync(250);
+    await expect(cold).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'OPENCLAW', availabilityState: 'checking', usable: false }),
+      expect.objectContaining({ name: 'CODEX', availabilityState: 'ready', usable: true }),
+    ]));
+    await jest.advanceTimersByTimeAsync(34_750);
+    const ongoing = AgentRegistry.listProvidersAsync();
+    await jest.advanceTimersByTimeAsync(250);
+    await expect(ongoing).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'OPENCLAW', availabilityState: 'checking', usable: false }),
+    ]));
+    await jest.advanceTimersByTimeAsync(39_750);
+    await expect(AgentRegistry.listProvidersAsync()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'OPENCLAW', availabilityState: resolves ? 'ready' : 'error', usable: resolves }),
+    ]));
+  });
+
   test('invalidates a warm ready row immediately after an exact native auth rejection', async () => {
     mockedGetProviderCatalogAvailabilityAsync.mockImplementation(async (name) => availability(name));
     await expect(AgentRegistry.listProvidersAsync()).resolves.toEqual(expect.arrayContaining([

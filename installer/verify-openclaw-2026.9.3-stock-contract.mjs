@@ -7,18 +7,18 @@ import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const CORE_NAME = "openclaw";
-const CORE_VERSION = "2026.9.1";
-const CORE_COMMIT = "ad6fe23aecb9b833d68139b0ddc9f239b894d2f1";
+const CORE_VERSION = "2026.9.3";
+const CORE_COMMIT = "1391f7cd2d40ab5bbcf2f5f831d3a64f520e72d7";
 const CODEX_NAME = "@openclaw/codex";
-const CODEX_VERSION = "2026.9.1";
-const NODE_RANGE = ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0";
-const RUNS_STOCK_SHA256 = "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359";
+const CODEX_VERSION = "2026.9.3";
+const NODE_RANGE = ">=24.16.0 <25 || >=26.1.0";
+const RUNS_STOCK_SHA256 = "4b06318761b7cb997caeed25f02f1bfe679b6360465a5d0ec29183b583ea6c90";
 const RUNS_BRIDGED_SHA256 = RUNS_STOCK_SHA256;
 const WATCHDOG_STOCK_SHA256 = "9c4200a8f6f6324277408a7437be215b122b4f92944a317e862bd237db2b1067";
-const DELETE_SCHEMA_STOCK_SHA256 = "c3a060a7deb79384ec1294f6e551cb21c3e3c423ab9ac19ea1985a08334c41a0";
-const DELETE_SCHEMA_BRIDGED_SHA256 = "3d1bcd9a9343e3ea3193998f1cb4863470e3dbd19c6d5a89282ff78d9e585cc4";
-const DELETE_HANDLER_STOCK_SHA256 = "7f60601501c1fe5e018e84c7ef1de2b4522b09f46eaaec98a7076356cde9a352";
-const DELETE_HANDLER_BRIDGED_SHA256 = "58b1845f613261c0451cdbb1ff26c8b9e8f58f96d493183f82920a7cb51dc536";
+const DELETE_SCHEMA_STOCK_SHA256 = "41325a6f1d67feea29d9ac59a6d37db03ad994c9a55798bdd46172463785e47b";
+const DELETE_SCHEMA_BRIDGED_SHA256 = "7b5f05641d48948cbbee85372cf99c679caf6e6ef517797a049e452df33020d2";
+const DELETE_HANDLER_STOCK_SHA256 = "5061d7fba26bc1777927f7e5117d21c7c6cf1e36d7ec9a956fe3e11b80761556";
+const DELETE_HANDLER_BRIDGED_SHA256 = "1ae2ba33acf0273f1e7e7fbfd600983a58258e256ead4507638e1d09c2b22afe";
 const RUNS_BACKUP_SUFFIX = ".bridgesllm-pending-input-v1.bak";
 const HARD_DELETE_BACKUP_SUFFIX = ".bridgesllm-hard-delete-v1.bak";
 const HARD_DELETE_MARKER = "bridgesllm-openclaw-hard-delete-transcript-2026.9.1-v1";
@@ -95,7 +95,7 @@ const findUniqueBundle = (dist, prefix, markers, label) => {
     fail(`could not list ${dist}: ${error.message}`);
   }
   const candidates = names
-    .filter((name) => name.startsWith(prefix) && name.endsWith(".js"))
+    .filter((name) => name.startsWith(prefix) && /\.m?js$/.test(name))
     .map((name) => path.join(dist, name))
     .filter((filename) => {
       const text = readRegularFile(filename);
@@ -150,7 +150,7 @@ const assertNoLegacyMutationResidue = (packageRoot, allowedPortalFiles = new Set
         && !allowedPortalFiles.has(path.resolve(filename))) {
         fail(`legacy hotfix artifact remains in stock package: ${filename}`);
       }
-      if (entry.name.endsWith(".js")) {
+      if (/\.m?js$/u.test(entry.name)) {
         const text = readRegularFile(filename);
         const marker = forbiddenContent.find((value) => text.includes(value));
         if (marker && !allowedPortalFiles.has(path.resolve(filename))) {
@@ -324,22 +324,36 @@ const verifyCore = async (coreInput, contractState = "stock") => {
     "registerPendingAgentQuestion",
     "shouldIncludeAskUserToolForOpenClawTools",
   ], "native ask_user");
-  findUniqueBundle(dist, "server-methods-list-", [
-    '"question.request"', '"question.waitAnswer"', '"question.resolve"',
-    '"question.get"', '"question.list"', '"question.requested"', '"question.resolved"',
+  const methodCatalog = findUniqueBundle(dist, "server-methods-list-", [
+    "listCoreAdvertisedGatewayMethodNames", '"question.requested"', '"question.resolved"',
   ], "question RPC catalog");
-  findUniqueBundle(dist, "method-scopes-", [
+  const methodScopes = findUniqueBundle(dist, "method-scopes-", [
     '"question.request"', '"question.waitAnswer"', '"question.resolve"',
     '"question.get"', '"question.list"', '"operator.questions"',
+    "function listCoreAdvertisedGatewayMethodNames(",
   ], "question RPC scope");
+  // 9.3 derives the advertised method list from the scope descriptors instead
+  // of copying string literals into server-methods-list. Verify the actual
+  // derived catalog and the event list, not obsolete source duplication.
+  const scopeContract = await importFresh(methodScopes);
+  const catalogContract = await importFresh(methodCatalog);
+  if (typeof scopeContract.f !== "function" || !Array.isArray(catalogContract.t)) {
+    fail("question method/event catalog exports drifted");
+  }
+  const advertised = scopeContract.f();
+  if (!Array.isArray(advertised) || ["question.request", "question.waitAnswer", "question.resolve", "question.get", "question.list"]
+    .some((method) => !advertised.includes(method))
+    || ["question.requested", "question.resolved"].some((event) => !catalogContract.t.includes(event))) {
+    fail("question method/event catalog omitted required capabilities");
+  }
   findUniqueBundle(dist, "chat-send-handler-", [
     "queueModeOverride: p.queueMode",
     'p.queueMode === "steer"',
     'messageInjectionDisposition: "rejected"',
     "resolveCurrentMessageInjectionTarget",
   ], "chat.send steer");
-  const claude = findUniqueBundle(dist, "agent-sdk-user-input-", [
-    "function createClaudeAgentSdkUserInputAuthorizer(context)",
+  const claude = findUniqueBundle(dist, "cli-user-input-", [
+    "function createClaudeCliUserInputAuthorizer(context)",
     'toolName: "AskUserQuestion"',
     "context.requestUserInput",
     'behavior: "allow"',
@@ -458,7 +472,7 @@ const verifyCodex = async (codexInput) => {
   if (packageJson.name !== CODEX_NAME || packageJson.version !== CODEX_VERSION) {
     fail(`expected ${CODEX_NAME}@${CODEX_VERSION}, found ${packageJson.name}@${packageJson.version}`);
   }
-  if (packageJson.peerDependencies?.openclaw !== ">=2026.9.1") {
+  if (packageJson.peerDependencies?.openclaw !== ">=2026.9.3") {
     fail(`unexpected Codex OpenClaw peer contract: ${packageJson.peerDependencies?.openclaw}`);
   }
   const dist = resolveInside(root, "dist", "Codex dist directory");

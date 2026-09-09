@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # package records. Portal qualifies this exact stable set. ACPX is required for
 # the Portal ACP compatibility surface; the other plugins are converged only
 # when the operator already has them installed.
-readonly OPENCLAW_STABLE_PLUGIN_VERSION="2026.9.1"
+readonly OPENCLAW_STABLE_PLUGIN_VERSION="2026.9.3"
 readonly OPENCLAW_PLUGIN_MAX_ARCHIVE_BYTES=$((96 * 1024 * 1024))
 readonly OPENCLAW_PLUGIN_MAX_EXPANDED_BYTES=$((384 * 1024 * 1024))
 openclaw_plugin_managed_entry_bound=250000
@@ -41,17 +41,17 @@ openclaw_stable_plugin_rows() {
   if [[ "${OPENCLAW_STABLE_PLUGIN_CATALOG:-default}" == "codex" \
     || "${OPENCLAW_STABLE_PLUGIN_CATALOG:-default}" == "portal" ]]; then
     cat <<'EOF'
-codex|@openclaw/codex|2026.9.1|sha512-O+HzImle5txYh93pa5CqeFQUA4XHqCpC4bFo7GKrb3WiyPppXtM0JZQ/sVC8E4aeGPGiy3Yx3rI8sl6ceSDH9g==|required
+codex|@openclaw/codex|2026.9.3|sha512-nj9zeQzdkW3g4O7fYpaaHIiZRHjjVp94qyWnj0ZWZFYvMPiVtdB8WQjShygq0kmDi0Gn1iybR9CYJJPPBRR8Yg==|required
 EOF
     [[ "${OPENCLAW_STABLE_PLUGIN_CATALOG}" == "codex" ]] && return
   fi
   [[ "${OPENCLAW_STABLE_PLUGIN_CATALOG:-default}" == "default" \
     || "${OPENCLAW_STABLE_PLUGIN_CATALOG:-default}" == "portal" ]] || return 1
   cat <<'EOF'
-acpx|@openclaw/acpx|2026.9.1|sha512-ELP2Fx63XoaKjPuQ66E57rwU7UeRryQ+Lfax9WrVkxcnZohEUxPbJtOlYHf6NRtcPRc8V+c9z8UxEoUNsDkq5A==|required
-brave|@openclaw/brave-plugin|2026.9.1|sha512-4+j+eQTToV3k7Cb25MUL6h2uL8cJYyuLytfpd/sJK/HjR43dgKBqKpBsb1+I3w1Jr6PLpnjSf6/I3//3K0cdnA==|existing
-discord|@openclaw/discord|2026.9.1|sha512-qNmN2a8A9dET4igPp0RML171sEn8PDMyNCYNp/DqcJ4tn3XTHpacSOTkqBmv5yXTycJRC9rfFP8FT/SdW0Rldg==|existing
-voice-call|@openclaw/voice-call|2026.9.1|sha512-Q+YF0SBneLRbX5wyuqxf5Ooo8wSviwUXo+4NrEqFsQ8dLyYdNamg1zUCPlcEUONnQovORtEOQ69Qo9/y80xEsQ==|existing
+acpx|@openclaw/acpx|2026.9.3|sha512-0YZN0YZmYbe/8GzbTj8jsYBE1fgJxF703CVfS4RX6nrVKdTdJgAUgo2Q3eJCvQnBK1/bnvlw5mSJDbsEsHzpYQ==|required
+brave|@openclaw/brave-plugin|2026.9.3|sha512-xemLgmXRyv83Rrj33AKgb9ZeFVIZF5vGv2/zf6uGuUSGuNTNgesnyZmUZkP7J/OLEWWQrp88+Ko7UxwmPZn8zg==|existing
+discord|@openclaw/discord|2026.9.3|sha512-m6V9wg6OljheSXwOJlT+ZZlyfYrzkNGAA5gky0PfwSg64aEsjdkSEqsPg3acCuufHlyBVerToEpmK4PVc7rrgw==|existing
+voice-call|@openclaw/voice-call|2026.9.3|sha512-PdlZo6GUimxpLgfB4nOSNK18MGHFC0iBqviSPWUOifYa83JVztMYYbYPHuv7F1FGLKyIt9SnlfEY9B29AosapQ==|existing
 EOF
 }
 
@@ -791,7 +791,7 @@ else:
                             package = json.loads((resolved / "package.json").read_text(encoding="utf-8"))
                         except Exception:
                             fail(f"managed npm peer link target has no valid package manifest: {relative}")
-                        if package.get("name") != "openclaw" or package.get("version") != "2026.9.1":
+                        if package.get("name") != "openclaw" or package.get("version") not in {"2026.9.1", "2026.9.2", "2026.9.3"}:
                             fail(f"managed npm peer link target is not the pinned OpenClaw package: {relative}")
                     elif not os.path.isabs(target):
                         try:
@@ -1036,7 +1036,7 @@ def inventory(root):
                         raise SystemExit(f"foreign OpenClaw peer link target: {rel}")
                     try: package = json.loads((resolved / "package.json").read_text(encoding="utf-8"))
                     except Exception: raise SystemExit(f"invalid OpenClaw peer link target: {rel}")
-                    if package.get("name") != "openclaw" or package.get("version") != "2026.9.1":
+                    if package.get("name") != "openclaw" or package.get("version") not in {"2026.9.1", "2026.9.2", "2026.9.3"}:
                         raise SystemExit(f"unpinned OpenClaw peer link target: {rel}")
                 elif not os.path.isabs(target):
                     try: resolved.relative_to(root.resolve(strict=True))
@@ -1188,7 +1188,7 @@ def normalized(value):
     # OpenClaw 2026.9.1 bookkeeping, not user configuration.
     meta = value.get("meta")
     if isinstance(meta, dict):
-        if meta.get("lastTouchedVersion") == "2026.9.1":
+        if meta.get("lastTouchedVersion") in {"2026.9.1", "2026.9.3"}:
             # The pinned core replaces the previous receipt on its first
             # plugin write. Compare against that exact recorded receipt;
             # dropping only the new value rejects retained-runtime upgrades.
@@ -1998,7 +1998,7 @@ def normalized(value):
             value.pop("plugins", None)
     meta = value.get("meta")
     if isinstance(meta, dict):
-        if meta.get("lastTouchedVersion") == "2026.9.1":
+        if meta.get("lastTouchedVersion") in {"2026.9.1", "2026.9.3"}:
             # The pinned core replaces the previous receipt on its first
             # plugin write. Compare against that exact recorded receipt;
             # dropping only the new value rejects retained-runtime upgrades.

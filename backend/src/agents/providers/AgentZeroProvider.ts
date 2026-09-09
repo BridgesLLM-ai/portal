@@ -2,9 +2,9 @@
  * Agent Zero provider backed by the authenticated `_a0_connector` HTTP and
  * Socket.IO APIs.
  *
- * Streaming/replay is implemented against the exact Agent Zero v2.10 connector
+ * Streaming/replay is implemented against the exact Agent Zero v2.11 connector
  * contract. Main Agent Chat host tools are gated through the separately
- * supervised official A0 v2.10 host gateway. Project sandboxing, attachments,
+ * supervised official A0 v2.11 host gateway. Project sandboxing, attachments,
  * execution approvals, and hard abort are still not advertised or emulated.
  */
 

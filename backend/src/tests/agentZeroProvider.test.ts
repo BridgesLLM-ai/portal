@@ -40,8 +40,8 @@ const HOST_GATEWAY_READY_STATUS: AgentZeroHostGatewayStatus = {
   installed: true,
   running: true,
   ready: true,
-  cliVersion: '2.10',
-  expectedCliVersion: '2.10',
+  cliVersion: '2.11',
+  expectedCliVersion: '2.11',
   gatewayId: 'bridgesllm-portal-host',
   capabilities: {
     scope: 'HOST_OPERATOR',
@@ -110,7 +110,7 @@ function capabilities(features: string[], authRequired = true): Record<string, u
   return {
     protocol: 'a0-connector.v1',
     version: '0.1.0',
-    agent_zero_version: '2.10',
+    agent_zero_version: '2.11',
     auth: ['session'],
     auth_required: authRequired,
     transports: ['http', 'websocket'],
@@ -207,7 +207,7 @@ class ProviderStreamSocket implements AgentZeroSocketLike {
     if (event === 'connector_hello') {
       ok({
         protocol: 'a0-connector.v1',
-        agent_zero_version: '2.10',
+        agent_zero_version: '2.11',
         features: ['connector_subscribe_context', 'connector_send_message'],
       });
     } else if (event === 'connector_subscribe_context') {
@@ -323,7 +323,7 @@ describe('AgentZeroConnectorClient', () => {
 
     await expect(client.getCapabilities()).resolves.toMatchObject({
       protocol: 'a0-connector.v1',
-      agentZeroVersion: '2.10',
+      agentZeroVersion: '2.11',
       authRequired: true,
       features: ['chat_create'],
     });

@@ -43,7 +43,7 @@ Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · r
 - **Progress means what it says.** Fresh installs use semantic phases, measured percentages only for measured work, stable narrow-terminal output, and clean plain/`NO_COLOR` fallbacks. Dashboard updates stop presenting compatibility markers as fake precision.
 - **Account retirement is transactional.** Admission closes first, then managed sessions, projects, files, apps, shares, credentials, and runtime state are removed or reassigned with durable recovery evidence.
 
-Read the complete [5.0.0 changelog](CHANGELOG.md#500---2026-09-08) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
+Read the complete [5.0.1 changelog](CHANGELOG.md#501---2026-09-09) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
 
 ## What you get
 

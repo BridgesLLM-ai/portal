@@ -81,9 +81,9 @@ export interface AgentZeroSetupSurface {
 
 export interface AgentZeroSetupStatus {
   testedVersions: {
-    agentZero: '2.10';
+    agentZero: '2.11';
     connector: '0.1.0';
-    hostBridge: '2.10';
+    hostBridge: '2.11';
   };
   credentials: {
     configured: boolean;
@@ -95,7 +95,7 @@ export interface AgentZeroSetupStatus {
     running: boolean;
     protocolReady: boolean;
     version?: string;
-    expectedVersion: '2.10';
+    expectedVersion: '2.11';
     pinnedImage: boolean;
     loopbackOnly: boolean;
     persistentData: boolean;
@@ -333,7 +333,7 @@ export function buildAgentZeroSetupStatus(input: {
     setupStep('protected_credentials', 'Protected credentials', credentials.configured, credentials.reason),
     setupStep(
       'managed_runtime',
-      'Pinned Agent Zero 2.10 runtime',
+      'Pinned Agent Zero 2.11 runtime',
       runtime.installed && runtime.pinnedImage && runtime.loopbackOnly && runtime.persistentData,
       runtime.reason,
     ),
@@ -353,7 +353,7 @@ export function buildAgentZeroSetupStatus(input: {
     ),
     setupStep(
       'host_operator_bridge',
-      'Official A0 2.10 host bridge',
+      'Official A0 2.11 host bridge',
       hostGateway.installed,
       hostGateway.reason,
     ),
@@ -367,7 +367,7 @@ export function buildAgentZeroSetupStatus(input: {
       'project_sandbox_adapter',
       'Project-confined Agent Zero adapter',
       true,
-      'A deterministic per-project v2.10 container, volume, credentials, authenticated connector, loopback port, read-only host baseline, and no-egress firewall are implemented. The unrestricted host bridge is never reused for Projects.',
+      'A deterministic per-project v2.11 container, volume, credentials, authenticated connector, loopback port, read-only host baseline, and no-egress firewall are implemented. The unrestricted host bridge is never reused for Projects.',
     ),
     setupStep(
       'project_escape_validation',
@@ -378,7 +378,7 @@ export function buildAgentZeroSetupStatus(input: {
   ];
 
   return {
-    testedVersions: { agentZero: '2.10', connector: '0.1.0', hostBridge: '2.10' },
+    testedVersions: { agentZero: '2.11', connector: '0.1.0', hostBridge: '2.11' },
     credentials,
     runtime: {
       installed: runtime.installed,

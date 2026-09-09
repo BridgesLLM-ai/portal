@@ -123,7 +123,7 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   {
     id: 'agent-zero',
     name: 'Agent Zero',
-    description: 'Managed Agent Zero v2.10 runtime. The provider stays disabled until its host and project trust gates are proven.',
+    description: 'Managed Agent Zero v2.11 runtime. The provider stays disabled until its host and project trust gates are proven.',
     detect: {
       command: 'bash /opt/bridgesllm/portal/installer/agent-zero-runtime.sh status',
       timeoutMs: 20_000,

@@ -45,6 +45,9 @@ import {
   AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL,
   AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
   AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
+  AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION,
+  getAgentZeroProjectLegacyV210SourceCommit,
+  getAgentZeroProjectLegacyV210UpstreamImageRef,
   getAgentZeroProjectSandboxImageId,
   getAgentZeroProjectLegacyV25SourceCommit,
   getAgentZeroProjectLegacyV25UpstreamImageRef,
@@ -317,10 +320,12 @@ function expectedDerivedImageIdentity(
 } | null {
   const sourceCommit = generation === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
     ? getAgentZeroProjectLegacyV25SourceCommit(architecture)
-    : getAgentZeroProjectSourceCommit(architecture);
+    : generation === AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION
+      ? getAgentZeroProjectLegacyV210SourceCommit(architecture) : getAgentZeroProjectSourceCommit(architecture);
   const upstreamRef = generation === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
     ? getAgentZeroProjectLegacyV25UpstreamImageRef(architecture)
-    : getAgentZeroProjectUpstreamImageRef(architecture);
+    : generation === AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION
+      ? getAgentZeroProjectLegacyV210UpstreamImageRef(architecture) : getAgentZeroProjectUpstreamImageRef(architecture);
   if (!sourceCommit || !upstreamRef) return null;
   const upstreamDigest = upstreamRef.split('@')[1] || '';
   const normalizedArchitecture = upstreamDigest
@@ -1426,7 +1431,7 @@ export function probeAgentZeroProjectSandboxRuntime(
   } catch {
     return emptyStatus(
       descriptor,
-      'The isolated Agent Zero v2.10 Project runtime or its controlled-egress identity is unavailable.',
+      'The isolated Agent Zero v2.11 Project runtime or its controlled-egress identity is unavailable.',
     );
   }
 
@@ -1518,7 +1523,7 @@ export function probeAgentZeroProjectSandboxRuntime(
         ? 'Agent Zero Project Sandbox shared egress plane, membership, or ordered firewall is missing or drifted.'
         : !qualified
           ? 'Agent Zero Project Sandbox is isolated but lacks a current exact live public-egress, escape, replay, gateway, and model qualification.'
-          : 'Agent Zero v2.10 Project Sandbox has a current exact live qualification.';
+          : 'Agent Zero v2.11 Project Sandbox has a current exact live qualification.';
 
   return {
     ready: structuralIsolation && volumeProvenance && egressPlaneReady,
@@ -1877,33 +1882,29 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       )
       ? AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION
       : existingImageRef
-        && exactDerivedImageLabels(
-          container.Config?.Labels,
-          architecture,
-          AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
-        )
-        ? AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
+        ? [AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION, AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION]
+          .find((generation) => exactDerivedImageLabels(container?.Config?.Labels, architecture, generation)) || null
         : null;
     if (!existingImageRef || !imageGeneration) {
       throw new Error('Existing Agent Zero project container is neither the current nor a recognized legacy image generation.');
     }
-    if (imageGeneration === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION) {
+    if (imageGeneration !== AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION) {
       let legacyImage: Record<string, any>;
       try {
         legacyImage = parseSingleInspect(
           runCommand('docker', ['image', 'inspect', existingImageRef]),
-          'Agent Zero v2.5 project predecessor image',
+          'Agent Zero legacy project predecessor image',
         );
       } catch {
-        throw new Error('Existing Agent Zero v2.5 project predecessor image inspection is unavailable.');
+        throw new Error('Existing Agent Zero legacy project predecessor image inspection is unavailable.');
       }
       if (!exactDerivedImageInspect(
         legacyImage,
         existingImageRef,
         architecture,
-        AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
+        imageGeneration,
       )) {
-        throw new Error('Existing Agent Zero v2.5 project predecessor image identity is not exact.');
+        throw new Error('Existing Agent Zero legacy project predecessor image identity is not exact.');
       }
     }
     const currentFingerprint = buildAgentZeroProjectRuntimeFingerprint({
@@ -1953,8 +1954,8 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       'CURRENT',
       imageGeneration,
     );
-    const legacyV25Immutable = !current
-      && imageGeneration === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
+    const legacyImageImmutable = !current
+      && imageGeneration !== AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION
       && preflightNetworkBinding.generation === 'CURRENT'
       && exactContainerIsolation(
         container,
@@ -1973,7 +1974,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         'CURRENT',
         imageGeneration,
       );
-    const currentNameMode = !current && !legacyV25Immutable
+    const currentNameMode = !current && !legacyImageImmutable
       && preflightNetworkBinding.generation === 'CURRENT'
       && exactContainerIsolation(
       container,
@@ -1992,7 +1993,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       'CURRENT',
       imageGeneration,
     );
-    const preConfinement = !current && !legacyV25Immutable && !currentNameMode
+    const preConfinement = !current && !legacyImageImmutable && !currentNameMode
       && preflightNetworkBinding.generation === 'LEGACY_PRE_CONFINEMENT'
       && exactContainerIsolation(
       container,
@@ -2011,7 +2012,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       'LEGACY_PRE_CONFINEMENT',
       imageGeneration,
     );
-    const legacy = !current && !legacyV25Immutable && !currentNameMode && !preConfinement
+    const legacy = !current && !legacyImageImmutable && !currentNameMode && !preConfinement
       && preflightNetworkBinding.generation === 'LEGACY_PRE_CONFINEMENT'
       && exactContainerIsolation(
       container,
@@ -2030,7 +2031,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       'LEGACY_PRE_CONFINEMENT',
       imageGeneration,
     );
-    if (!current && !legacyV25Immutable && !currentNameMode && !preConfinement && !legacy) {
+    if (!current && !legacyImageImmutable && !currentNameMode && !preConfinement && !legacy) {
       throw new Error('Existing Agent Zero project container is neither the current nor a recognized legacy generation.');
     }
     currentContainerId = exactAgentZeroContainerId(container);
@@ -2053,22 +2054,22 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         imageGeneration,
       );
     }
-    if (legacyV25Immutable || currentNameMode || preConfinement || legacy) {
-      const retirementFingerprint = legacyV25Immutable || currentNameMode
+    if (legacyImageImmutable || currentNameMode || preConfinement || legacy) {
+      const retirementFingerprint = legacyImageImmutable || currentNameMode
         ? currentFingerprint
         : preConfinement
           ? preConfinementFingerprint
           : legacyFingerprint;
       const retirementRuntimeIpv4 = legacy ? null : preflightRuntimeIpv4;
-      const retirementSpec = legacyV25Immutable || currentNameMode ? spec : preConfinementSpec;
+      const retirementSpec = legacyImageImmutable || currentNameMode ? spec : preConfinementSpec;
       const retirementNetworkGeneration: AgentZeroRuntimeNetworkGeneration
-        = legacyV25Immutable
+        = legacyImageImmutable
           ? 'IMMUTABLE_ID'
           : currentNameMode
             ? 'CURRENT_NAME_MODE'
             : 'DETERMINISTIC_NAME';
       const retirementConfinement: AgentZeroRuntimeConfinementGeneration
-        = legacyV25Immutable || currentNameMode ? 'CURRENT' : 'LEGACY_PRE_CONFINEMENT';
+        = legacyImageImmutable || currentNameMode ? 'CURRENT' : 'LEGACY_PRE_CONFINEMENT';
       const beforeStopInventory = inspectExactAgentZeroProjectRuntimeInventory(
         runCommand,
         descriptor,

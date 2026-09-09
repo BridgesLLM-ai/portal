@@ -256,7 +256,7 @@ describe('AgentZeroSetupPanel provider presentation', () => {
     );
 
     expect(await screen.findByText(/Portal inspects the pinned Agent Zero/i)).toBeInTheDocument();
-    expect(screen.getByText(/Runtime package changes remain unavailable until the Agent Zero host transaction ships/i)).toBeInTheDocument();
+    expect(screen.getByText(/Install or update runtime packages with Update Compatible AI Tools in Maintenance/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Reconcile runtime' })).not.toBeInTheDocument();
     expect(screen.queryByRole('dialog', { name: 'Install or repair Agent Zero?' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Leave Settings' })).toBeEnabled();

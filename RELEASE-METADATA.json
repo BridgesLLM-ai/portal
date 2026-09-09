@@ -1,13 +1,12 @@
 {
   "schema": 1,
-  "version": "5.0.0",
-  "releasedAt": "2026-09-08",
-  "releaseClass": "feature",
+  "version": "5.0.1",
+  "releasedAt": "2026-09-09",
+  "releaseClass": "hotfix",
   "highlights": [
-    "Keep project work conversational with live tools, a persistent workspace, and questions beside the composer.",
-    "Inspect file sizes, modification times and added/removed lines, preview media, and open exact files in Projects.",
-    "Back up projects and settings, with optional agent context as reference material.",
-    "Preserve conversations across ordinary restarts and support OpenClaw 9.2 isolated project identities.",
-    "Keep Portal updates separate from AI runtime maintenance, with verified installation and recovery paths."
+    "Restore OpenClaw availability using the authenticated gateway status instead of a redundant discovery timeout.",
+    "Update the tested AI tools to current stable versions, including OpenClaw 2026.9.3 and its official plugins.",
+    "Preserve existing conversations and recovery protections while updating native harness compatibility.",
+    "Keep Portal updates separate from AI tool maintenance; OpenClaw 9.3 requires Node 24.16+ on the supported stable lines."
   ]
 }

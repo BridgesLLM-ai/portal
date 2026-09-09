@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="5.0.0"
+readonly VERSION="5.0.1"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -106,41 +106,41 @@ readonly MIN_DISK_GB=35
 # Tested compatibility matrix. Package revisions are deliberately independent:
 # the CLI/gateway reports the normalized runtime version, while npm retains the
 # exact stable package revision used to build it.
-readonly PIN_OPENCLAW_RUNTIME_VERSION="2026.9.1"
-readonly PIN_OPENCLAW_CORE_PACKAGE_VERSION="2026.9.1"
-readonly PIN_OPENCLAW_CORE_PACKAGE_INTEGRITY="sha512-0Ve0631CdgkJDwd4NNG1BawIdF5yCL2sO+Tts8amStw+H6vKURTj0K4rOa4+hFpJk1Dnw5LyKl5twzwX1VtA2w=="
-readonly PIN_OPENCLAW_CORE_COMMIT="ad6fe23aecb9b833d68139b0ddc9f239b894d2f1"
-readonly OPENCLAW_2026_9_1_RUNS_STOCK_SHA256="407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359"
-readonly OPENCLAW_2026_9_1_RUNS_BRIDGED_SHA256="407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359"
-readonly OPENCLAW_2026_9_1_DELETE_SCHEMA_STOCK_SHA256="c3a060a7deb79384ec1294f6e551cb21c3e3c423ab9ac19ea1985a08334c41a0"
-readonly OPENCLAW_2026_9_1_DELETE_SCHEMA_BRIDGED_SHA256="3d1bcd9a9343e3ea3193998f1cb4863470e3dbd19c6d5a89282ff78d9e585cc4"
-readonly OPENCLAW_2026_9_1_DELETE_HANDLER_STOCK_SHA256="7f60601501c1fe5e018e84c7ef1de2b4522b09f46eaaec98a7076356cde9a352"
-readonly OPENCLAW_2026_9_1_DELETE_HANDLER_BRIDGED_SHA256="58b1845f613261c0451cdbb1ff26c8b9e8f58f96d493183f82920a7cb51dc536"
-readonly PIN_OPENCLAW_CODEX_PLUGIN_VERSION="2026.9.1"
-readonly PIN_OPENCLAW_CODEX_PLUGIN_INTEGRITY="sha512-O+HzImle5txYh93pa5CqeFQUA4XHqCpC4bFo7GKrb3WiyPppXtM0JZQ/sVC8E4aeGPGiy3Yx3rI8sl6ceSDH9g=="
-readonly PIN_OPENCLAW_ACPX_PLUGIN_VERSION="2026.9.1"
-readonly PIN_OPENCLAW_BRAVE_PLUGIN_VERSION="2026.9.1"
-readonly PIN_OPENCLAW_DISCORD_PLUGIN_VERSION="2026.9.1"
-readonly PIN_OPENCLAW_VOICE_CALL_PLUGIN_VERSION="2026.9.1"
+readonly PIN_OPENCLAW_RUNTIME_VERSION="2026.9.3"
+readonly PIN_OPENCLAW_CORE_PACKAGE_VERSION="2026.9.3"
+readonly PIN_OPENCLAW_CORE_PACKAGE_INTEGRITY="sha512-CzDHMeHdnjlIZ76ZyBb1lvLO4H/yBIMYXupFGGBN87x0853y3hg5nLAnKfxSKqLzqhbUKqy9ebDRAWWV4t8aew=="
+readonly PIN_OPENCLAW_CORE_COMMIT="1391f7cd2d40ab5bbcf2f5f831d3a64f520e72d7"
+readonly OPENCLAW_2026_9_1_RUNS_STOCK_SHA256="4b06318761b7cb997caeed25f02f1bfe679b6360465a5d0ec29183b583ea6c90"
+readonly OPENCLAW_2026_9_1_RUNS_BRIDGED_SHA256="4b06318761b7cb997caeed25f02f1bfe679b6360465a5d0ec29183b583ea6c90"
+readonly OPENCLAW_2026_9_1_DELETE_SCHEMA_STOCK_SHA256="41325a6f1d67feea29d9ac59a6d37db03ad994c9a55798bdd46172463785e47b"
+readonly OPENCLAW_2026_9_1_DELETE_SCHEMA_BRIDGED_SHA256="7b5f05641d48948cbbee85372cf99c679caf6e6ef517797a049e452df33020d2"
+readonly OPENCLAW_2026_9_1_DELETE_HANDLER_STOCK_SHA256="5061d7fba26bc1777927f7e5117d21c7c6cf1e36d7ec9a956fe3e11b80761556"
+readonly OPENCLAW_2026_9_1_DELETE_HANDLER_BRIDGED_SHA256="1ae2ba33acf0273f1e7e7fbfd600983a58258e256ead4507638e1d09c2b22afe"
+readonly PIN_OPENCLAW_CODEX_PLUGIN_VERSION="2026.9.3"
+readonly PIN_OPENCLAW_CODEX_PLUGIN_INTEGRITY="sha512-nj9zeQzdkW3g4O7fYpaaHIiZRHjjVp94qyWnj0ZWZFYvMPiVtdB8WQjShygq0kmDi0Gn1iybR9CYJJPPBRR8Yg=="
+readonly PIN_OPENCLAW_ACPX_PLUGIN_VERSION="2026.9.3"
+readonly PIN_OPENCLAW_BRAVE_PLUGIN_VERSION="2026.9.3"
+readonly PIN_OPENCLAW_DISCORD_PLUGIN_VERSION="2026.9.3"
+readonly PIN_OPENCLAW_VOICE_CALL_PLUGIN_VERSION="2026.9.3"
 readonly OPENCLAW_PACKAGE_MAX_ARCHIVE_BYTES=$((192 * 1024 * 1024))
 readonly OPENCLAW_PACKAGE_MAX_EXPANDED_BYTES=$((768 * 1024 * 1024))
 readonly PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION="4.0.0"
-readonly PIN_CODEX_CLI_VERSION="0.153.2"
-readonly PIN_CLAUDE_CODE_VERSION="2.1.260"
+readonly PIN_CODEX_CLI_VERSION="0.153.4"
+readonly PIN_CLAUDE_CODE_VERSION="2.1.263"
 readonly PIN_CLAWHUB_VERSION="0.23.3"
-readonly PIN_ANTIGRAVITY_VERSION="1.1.17"
-readonly PIN_GROK_BUILD_VERSION="1.0.5"
-readonly PIN_OPENCODE_VERSION="1.18.19"
-readonly PIN_HERMES_VERSION="0.20.4"
+readonly PIN_ANTIGRAVITY_VERSION="1.1.27"
+readonly PIN_GROK_BUILD_VERSION="1.0.13"
+readonly PIN_OPENCODE_VERSION="1.18.29"
+readonly PIN_HERMES_VERSION="0.21.1"
 readonly PIN_HERMES_UV_VERSION="0.12.5"
 readonly PIN_HERMES_PYTHON_VERSION="3.11.15"
-readonly PIN_OLLAMA_VERSION="0.32.15"
+readonly PIN_OLLAMA_VERSION="0.33.3"
 readonly OLLAMA_ASSET_AMD64_URL="https://github.com/ollama/ollama/releases/download/v${PIN_OLLAMA_VERSION}/ollama-linux-amd64.tar.zst"
-readonly OLLAMA_ASSET_AMD64_SHA256="50539c5fe9bf85887733355098dcdb266b433cb8c73fa180713417e9ed6e42bb"
-readonly OLLAMA_ASSET_AMD64_SIZE="1422416084"
+readonly OLLAMA_ASSET_AMD64_SHA256="c13cea8f3389db4145f8a6cb88d1747242a48639d7c13e3bda7c1ebdc6eebb2f"
+readonly OLLAMA_ASSET_AMD64_SIZE="1433825108"
 readonly OLLAMA_ASSET_ARM64_URL="https://github.com/ollama/ollama/releases/download/v${PIN_OLLAMA_VERSION}/ollama-linux-arm64.tar.zst"
-readonly OLLAMA_ASSET_ARM64_SHA256="c898270b1690eab0f51aa9e9197686b7b4c6a7d88b83967763818f3127e477e9"
-readonly OLLAMA_ASSET_ARM64_SIZE="1543177713"
+readonly OLLAMA_ASSET_ARM64_SHA256="4425a112af999ae6572c1ce211fbabeaca7bab23ed5860972acdfc0cc2358420"
+readonly OLLAMA_ASSET_ARM64_SIZE="1554076220"
 readonly OLLAMA_ARCHIVE_MAX_MEMBERS="20000"
 readonly OLLAMA_ARCHIVE_MAX_FILE_SIZE="4294967296"
 readonly OLLAMA_ARCHIVE_MAX_EXPANDED_SIZE="12884901888"
@@ -148,11 +148,11 @@ readonly OLLAMA_MANAGED_BIN_PATH="/usr/local/bin/ollama"
 readonly OLLAMA_MANAGED_LIB_PATH="/usr/local/lib/ollama"
 readonly OLLAMA_MANAGED_UNIT_PATH="/etc/systemd/system/ollama.service"
 readonly OLLAMA_TRANSACTION_PATH="/usr/local/.bridgesllm-ollama-transaction-v1"
-readonly PIN_NODE_MAJOR="22"
-readonly PIN_NODE_22_MIN_VERSION="22.22.3"
-readonly PIN_NODE_24_MIN_VERSION="24.15.0"
-readonly PIN_NODE_25_MIN_VERSION="25.9.0"
-readonly OPENCLAW_NODE_ENGINE_RANGE=">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
+readonly PIN_NODE_MAJOR="24"
+readonly PIN_NODE_24_MIN_VERSION="24.16.0"
+readonly PIN_NODE_26_MIN_VERSION="26.1.0"
+readonly OPENCLAW_NODE_ENGINE_RANGE=">=24.16.0 <25 || >=26.1.0"
+readonly PORTAL_NODE_ENGINE_RANGE=">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
 readonly OPENCLAW_PROJECT_SANDBOX_IMAGE_TAG="openclaw-sandbox:bookworm-slim"
 readonly CODEX_PROJECT_SANDBOX_IMAGE_TAG="bridgesllm-codex-project-runtime:v1"
 readonly CLAUDE_CODE_PROJECT_SANDBOX_IMAGE_TAG="bridgesllm-claude-code-project-runtime:v1"
@@ -201,9 +201,9 @@ readonly AGENT_ZERO_PROJECT_SOURCE_COMMIT_LABEL="com.bridgesllm.agent-zero-proje
 readonly AGENT_ZERO_PROJECT_UPSTREAM_DIGEST_LABEL="com.bridgesllm.agent-zero-project.upstream-digest"
 readonly AGENT_ZERO_PROJECT_RUNTIME_USER_LABEL="com.bridgesllm.agent-zero-project.runtime-user"
 readonly AGENT_ZERO_PROJECT_RUNTIME_USER="1000:1000"
-readonly AGENT_ZERO_PROJECT_SOURCE_COMMIT="b22a144bf59f15b1516084c9e7b88133ba92c8a9"
-readonly AGENT_ZERO_PROJECT_AMD64_UPSTREAM_DIGEST="sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0"
-readonly AGENT_ZERO_PROJECT_ARM64_UPSTREAM_DIGEST="sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8"
+readonly AGENT_ZERO_PROJECT_SOURCE_COMMIT="6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1"
+readonly AGENT_ZERO_PROJECT_AMD64_UPSTREAM_DIGEST="sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30"
+readonly AGENT_ZERO_PROJECT_ARM64_UPSTREAM_DIGEST="sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3"
 readonly PROJECT_EGRESS_RECIPE_LABEL="com.bridgesllm.project-egress.recipe-sha256"
 readonly PROJECT_EGRESS_ARTIFACTS_LABEL="com.bridgesllm.project-egress.artifacts-sha256"
 readonly PROJECT_EGRESS_POLICY_LABEL="com.bridgesllm.project-egress.policy"
@@ -458,8 +458,33 @@ node_version_meets_minimum() {
   patch="${version#*.*.}"
   [[ "${major}" =~ ^[0-9]+$ && "${minor}" =~ ^[0-9]+$ && "${patch}" =~ ^[0-9]+$ ]] || return 1
 
-  # Match the exact engine range published by the tested OpenClaw package.
-  # Node 23 is intentionally unsupported; Node 22/24 also have patch floors.
+  # Exact engines from the admitted OpenClaw 2026.9.3 package.
+  if (( major == 24 )); then
+    (( minor >= 16 ))
+  elif (( major >= 26 )); then
+    (( major > 26 || minor >= 1 ))
+  else
+    return 1
+  fi
+}
+
+portal_node_version_meets_minimum() {
+  local node_binary="${1:-node}"
+  if [[ "${node_binary}" == */* ]]; then
+    [[ -x "${node_binary}" ]] || return 1
+  else
+    command -v "${node_binary}" &>/dev/null || return 1
+  fi
+  local version major minor patch
+  version="$("${node_binary}" -v 2>/dev/null | sed 's/^v//' || true)"
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  patch="${version#*.*.}"
+  [[ "${major}" =~ ^[0-9]+$ && "${minor}" =~ ^[0-9]+$ && "${patch}" =~ ^[0-9]+$ ]] || return 1
+
+  # Portal-only cutover preserves the predecessor host runtime. This range
+  # is independent of the newer OpenClaw maintenance prerequisite.
   if (( major == 22 )); then
     (( minor > 22 || (minor == 22 && patch >= 3) ))
   elif (( major == 23 )); then
@@ -479,7 +504,7 @@ ensure_supported_node_runtime() {
     return 0
   fi
 
-  info "Node.js $(node --version 2>/dev/null || echo missing) is outside ${OPENCLAW_NODE_ENGINE_RANGE}; converging the supported Node 22 lane first..."
+  info "Node.js $(node --version 2>/dev/null || echo missing) is outside ${OPENCLAW_NODE_ENGINE_RANGE}; converging the supported Node 24 LTS lane first..."
   spin "Setting up Node.js ${PIN_NODE_MAJOR} repository" "curl -fsSL https://deb.nodesource.com/setup_${PIN_NODE_MAJOR}.x | bash -"
   spin "Installing compatible Node.js runtime" "apt-get update -qq && apt-get install -y -qq --allow-downgrades nodejs"
   node_version_meets_minimum \
@@ -568,9 +593,9 @@ admit_portal_only_update_host_compatibility() {
     || ! -f /usr/bin/node || ! -x /usr/bin/node \
     || -L /usr/bin/node \
     || ! "${node_metadata}" =~ ^0:[0-7][0145][0145]$ ]] \
-    || ! node_version_meets_minimum /usr/bin/node; then
+    || ! portal_node_version_meets_minimum /usr/bin/node; then
     printf '%s\n' \
-      "Portal-only update requires the root-owned exact /usr/bin/node runtime in ${OPENCLAW_NODE_ENGINE_RANGE}. Repair Node in a separate host-maintenance operation, then retry." \
+      "Portal-only update requires the root-owned exact /usr/bin/node runtime in ${PORTAL_NODE_ENGINE_RANGE}. Repair Node in a separate host-maintenance operation, then retry." \
       >&2
     return 1
   fi
@@ -8318,7 +8343,10 @@ openclaw_standard_state_is_confirmed() {
 }
 
 openclaw_2026_9_1_migration_needed() {
-  [[ "$(openclaw_core_package_version || true)" == "2026.9.1" ]] || return 1
+  case "$(openclaw_core_package_version || true)" in
+    2026.9.1|2026.9.3) ;;
+    *) return 1 ;;
+  esac
   if [[ -d "/root/.openclaw/agents" ]] \
     && find /root/.openclaw/agents -path '*/sessions/sessions.json' -type f -print -quit \
       | grep -q .; then
@@ -9105,7 +9133,7 @@ create_openclaw_migration_transaction() {
     && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] || return 1
   [[ -f "${OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE}" \
     && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE}" ]] || return 1
-  local migration_helper_source="${PORTAL_DIR}/installer/migrate-openclaw-2026.9.1.mjs"
+  local migration_helper_source="${PORTAL_DIR}/installer/migrate-openclaw-${PIN_OPENCLAW_CORE_PACKAGE_VERSION}.mjs"
   local stable_plugins_helper_source="${PORTAL_DIR}/installer/openclaw-stable-plugins.sh"
   local gateway_identity="null" gateway_identity_active="false"
   local gateway_unit_preexisted=false
@@ -9843,6 +9871,17 @@ reconcile_openclaw_migration_transaction() {
   normalize_legacy_openclaw_gateway_permit_definition || return 1
   load_openclaw_migration_transaction || return 1
 
+  # Resolve the durable decision before any rollback quiescence or plugin
+  # restoration. A crash immediately after decision publication rolls forward.
+  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "commit-pending" ]] \
+    && [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] \
+    && openclaw_migration_transaction_matches_decision; then
+    advance_openclaw_migration_transaction \
+      commit-pending commit-applying "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || return 1
+  fi
+
   local native_phase="absent" rollback_quiescence_required=false
   native_phase="$(native_cli_bundle_transaction_phase)" || return 1
   if [[ "${native_phase}" != "absent" ]]; then
@@ -9913,14 +9952,6 @@ reconcile_openclaw_migration_transaction() {
     return
   fi
 
-  if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "commit-pending" ]] \
-    && [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
-      || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] \
-    && openclaw_migration_transaction_matches_decision; then
-    advance_openclaw_migration_transaction \
-      commit-pending commit-applying "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
-      || return 1
-  fi
   if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "commit-applying" ]]; then
     reconcile_openclaw_core_gateway_action || return 1
     [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
@@ -10097,7 +10128,7 @@ prepare_openclaw_upgrade_state() {
   fi
 
   local needs_preparation=false
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]] \
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]] \
     && { $MAINTAIN_TOOLS || ! $UPDATE_MODE; }; then
     # Every fresh/reinstall 9.1 compatibility run needs one v5 outer owner,
     # including a truly new host and an already-current package with no legacy
@@ -10228,7 +10259,7 @@ if (!result.readyForGatewayStart) process.exit(42);
 
   ok "OpenClaw legacy state checked and recoverably preserved"
 
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]]; then
     local openclaw_package_dir=""
     openclaw_package_dir="$(openclaw_core_package_dir || true)"
     if [[ -z "${openclaw_package_dir}" ]]; then
@@ -14083,10 +14114,13 @@ required_baseline_members = {
     "portal/installer/hermes-runtime.sh",
     "portal/installer/install.sh",
     "portal/installer/migrate-openclaw-2026.9.1.mjs",
+    "portal/installer/migrate-openclaw-2026.9.3.mjs",
     "portal/installer/patch-openclaw-2026.9.1-portal-contract.mjs",
+    "portal/installer/patch-openclaw-2026.9.3-portal-contract.mjs",
     "portal/installer/opencode-runtime.sh",
     "portal/installer/openclaw-stable-plugins.sh",
     "portal/installer/verify-openclaw-2026.9.1-stock-contract.mjs",
+    "portal/installer/verify-openclaw-2026.9.3-stock-contract.mjs",
     "portal/installer/install.sh.sig",
     "portal/installer/Setup-OllamaTailnet.ps1",
     "portal/installer/Start-Here.cmd",
@@ -15721,8 +15755,10 @@ Options:
                     of the Portal installs and runs normally.
   --maintain-tools  On an existing Portal, run the separate Portal-qualified
                     AI compatibility-bundle transaction. Installs exact signed
-                    OpenClaw/plugins, Codex, Claude Code, and ClawHub versions;
-                    ordinary --update remains Portal-only.
+                    OpenClaw/plugins, Codex, Claude Code, and ClawHub versions,
+                    then qualified Ollama/native harnesses and configured Agent
+                    Zero through their own lifecycle checks. Ordinary --update
+                    remains Portal-only.
   --update          Update Portal, keeping data and the installed AI runtimes
   --repair          Reinstall Portal files, keeping data and AI runtimes
   --reinstall       Alias for --repair; never deletes your data
@@ -23657,7 +23693,7 @@ ensure_agent_zero_project_sandbox_image() {
     if ! spin "Building Agent Zero Project sandbox image" \
       "docker build --pull --tag '${image}' --network none --build-arg 'PORTAL_RECIPE_SHA256=${recipe_fingerprint}' --build-arg 'A0_BASE_IMAGE=${upstream_ref}' --build-arg 'A0_SOURCE_COMMIT=${AGENT_ZERO_PROJECT_SOURCE_COMMIT}' --build-arg 'A0_UPSTREAM_DIGEST=${upstream_digest}' '${build_dir}'"; then
       rm -rf -- "${build_dir}"
-      fail "Failed to build ${image} from the audited Agent Zero v2.10 source."
+      fail "Failed to build ${image} from the audited Agent Zero v2.11 source."
     fi
     if ! verify_agent_zero_project_sandbox_image \
       "${image}" "${recipe_fingerprint}" "${upstream_digest}" "${AGENT_ZERO_PROJECT_SOURCE_COMMIT}"; then
@@ -26190,28 +26226,28 @@ specs = [
         "activeRuns",
         target_paths[0],
         ".bridgesllm-pending-input-v1.bak",
-        "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359",
-        "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359",
+        "4b06318761b7cb997caeed25f02f1bfe679b6360465a5d0ec29183b583ea6c90",
+        "4b06318761b7cb997caeed25f02f1bfe679b6360465a5d0ec29183b583ea6c90",
     ),
     (
         "hardDeleteSchema",
         "deleteSchema",
         target_paths[1],
         ".bridgesllm-hard-delete-v1.bak",
-        "c3a060a7deb79384ec1294f6e551cb21c3e3c423ab9ac19ea1985a08334c41a0",
-        "3d1bcd9a9343e3ea3193998f1cb4863470e3dbd19c6d5a89282ff78d9e585cc4",
+        "41325a6f1d67feea29d9ac59a6d37db03ad994c9a55798bdd46172463785e47b",
+        "7b5f05641d48948cbbee85372cf99c679caf6e6ef517797a049e452df33020d2",
     ),
     (
         "hardDeleteHandler",
         "deleteHandler",
         target_paths[2],
         ".bridgesllm-hard-delete-v1.bak",
-        "7f60601501c1fe5e018e84c7ef1de2b4522b09f46eaaec98a7076356cde9a352",
-        "58b1845f613261c0451cdbb1ff26c8b9e8f58f96d493183f82920a7cb51dc536",
+        "5061d7fba26bc1777927f7e5117d21c7c6cf1e36d7ec9a956fe3e11b80761556",
+        "1ae2ba33acf0273f1e7e7fbfd600983a58258e256ead4507638e1d09c2b22afe",
     ),
 ]
 
-if action not in {"check", "rollback", "commit"}:
+if action not in {"check", "arm-retained", "rollback", "commit"}:
     raise SystemExit(1)
 
 def safe_file(path, *, mode=None):
@@ -26333,7 +26369,49 @@ expected_journal = {
     ],
 }
 
+retained_journal = {
+    **expected_journal,
+    "schema": "bridgesllm-openclaw-retained-portal-bridge-transaction-v1",
+    "targets": [
+        {**entry, "backupSha256": entry["patchedSha256"]}
+        for entry in expected_journal["targets"]
+    ],
+}
+retained = False
+
+def publish_private(path, payload):
+    fd, temporary = tempfile.mkstemp(prefix=".bridgesllm-retained-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        os.fchown(fd, 0, 0)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Publish without replacing any pre-existing recovery artifact.
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = libc.renameat2
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(temporary), -100, os.fsencode(path), 1) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        temporary = None
+        fsync_directory(path.parent)
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+
 try:
+    if os.path.lexists(journal):
+        if not safe_file(journal, mode=0o600):
+            raise OSError("unsafe transaction journal")
+        raw = journal.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        retained = parsed == retained_journal
+        if parsed not in (expected_journal, retained_journal) or raw != json.dumps(parsed, separators=(",", ":")) + "\n":
+            raise OSError("transaction journal binding mismatch")
     package_metadata = os.lstat(package_root)
     if (
         not stat.S_ISDIR(package_metadata.st_mode)
@@ -26352,7 +26430,8 @@ try:
         backup = target.with_name(target.name + suffix)
         backup_exists = os.path.lexists(backup)
         if backup_exists and (
-            not safe_file(backup, mode=0o600) or digest(backup) != stock_hash
+            not safe_file(backup, mode=0o600)
+            or digest(backup) != (patched_hash if retained else stock_hash)
         ):
             raise OSError(f"unsafe rollback backup: {backup}")
         states.append(
@@ -26366,7 +26445,7 @@ try:
         raw_journal = journal.read_text(encoding="utf-8")
         journal_value = json.loads(raw_journal)
         if (
-            journal_value != expected_journal
+            journal_value != (retained_journal if retained else expected_journal)
             or raw_journal != json.dumps(
                 journal_value, separators=(",", ":")
             ) + "\n"
@@ -26378,6 +26457,28 @@ except (OSError, UnicodeError, json.JSONDecodeError):
 all_stock = all(state[5] == state[3] for state in states)
 all_patched = all(state[5] == state[4] for state in states)
 any_artifact = journal_exists or any(state[6] for state in states)
+
+if action == "arm-retained":
+    # This branch does not alter any runtime member. A write-ahead journal
+    # makes partial backup creation recoverable without claiming a stock
+    # baseline that did not exist at the beginning of this maintenance run.
+    if not all_patched or any_artifact or os.path.lexists(record):
+        raise SystemExit(1)
+    publish_private(journal, (json.dumps(retained_journal, separators=(",", ":")) + "\n").encode())
+    maybe_kill("retained-journal")
+    for component, target, backup, _, patched_hash, _, _ in states:
+        if not safe_file(target, mode=0o644) or digest(target) != patched_hash:
+            raise SystemExit(1)
+        payload = target.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != patched_hash:
+            raise SystemExit(1)
+        publish_private(backup, payload)
+        maybe_kill(f"retained-backup-{component}")
+    if not all(safe_file(state[1], mode=0o644) and digest(state[1]) == state[4]
+               and safe_file(state[2], mode=0o600) and digest(state[2]) == state[4]
+               for state in states):
+        raise SystemExit(1)
+    raise SystemExit(0)
 
 if action == "check":
     if not all_patched or not journal_exists or not all(state[6] for state in states):
@@ -26395,6 +26496,20 @@ if action == "rollback":
         # committed steady state. Only a mixed artifact-free generation is
         # ambiguous.
         raise SystemExit(0 if (all_stock or all_patched) else 1)
+    if retained:
+        # Retained preparation never writes runtime bytes, including when
+        # killed between snapshots. Refuse any target drift instead of
+        # restoring over an unknown change, and preserve the existing inodes.
+        if not all_patched:
+            raise SystemExit(1)
+        for component, _, backup, _, _, _, present in states:
+            if present:
+                backup.unlink()
+                fsync_directory(backup.parent)
+                maybe_kill(f"retained-rollback-cleanup-{component}")
+        journal.unlink()
+        fsync_directory(journal.parent)
+        raise SystemExit(0)
     for state in states:
         if state[5] == state[4] and not state[6]:
             raise SystemExit(1)
@@ -26482,8 +26597,9 @@ resolve_openclaw_2026_9_1_pending_contract_group() {
 
 resolve_openclaw_pending_input_hotfix_target() {
   local openclaw_dist="$1"
-  if [[ "$(node_package_version_from_dir \
-    "$(dirname -- "${openclaw_dist}")" 2>/dev/null || true)" == "2026.9.1" ]]; then
+  local native_package_version
+  native_package_version="$(node_package_version_from_dir "$(dirname -- "${openclaw_dist}")" 2>/dev/null || true)"
+  if [[ "${native_package_version}" == "2026.9.1" || "${native_package_version}" == "2026.9.3" ]]; then
     local package_dir target_output=""
     local -a targets=()
     package_dir="$(dirname -- "${openclaw_dist}")"
@@ -26798,8 +26914,9 @@ PY
 
 resolve_openclaw_claude_ask_user_hotfix_target() {
   local openclaw_dist="$1"
-  if [[ "$(node_package_version_from_dir \
-    "$(dirname -- "${openclaw_dist}")" 2>/dev/null || true)" == "2026.9.1" ]]; then
+  local native_package_version
+  native_package_version="$(node_package_version_from_dir "$(dirname -- "${openclaw_dist}")" 2>/dev/null || true)"
+  if [[ "${native_package_version}" == "2026.9.1" || "${native_package_version}" == "2026.9.3" ]]; then
     local package_dir target_output=""
     local -a targets=()
     package_dir="$(dirname -- "${openclaw_dist}")"
@@ -27359,16 +27476,16 @@ try:
     }
     exact_9_1 = {
         "pendingInput": (
-            "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359",
-            "407999737bf83f799b68042ab6e9de48920bcdf656be8fba58c3183a82f24359",
+            "4b06318761b7cb997caeed25f02f1bfe679b6360465a5d0ec29183b583ea6c90",
+            "4b06318761b7cb997caeed25f02f1bfe679b6360465a5d0ec29183b583ea6c90",
         ),
         "hardDeleteSchema": (
-            "3d1bcd9a9343e3ea3193998f1cb4863470e3dbd19c6d5a89282ff78d9e585cc4",
-            "c3a060a7deb79384ec1294f6e551cb21c3e3c423ab9ac19ea1985a08334c41a0",
+            "7b5f05641d48948cbbee85372cf99c679caf6e6ef517797a049e452df33020d2",
+            "41325a6f1d67feea29d9ac59a6d37db03ad994c9a55798bdd46172463785e47b",
         ),
         "hardDeleteHandler": (
-            "58b1845f613261c0451cdbb1ff26c8b9e8f58f96d493183f82920a7cb51dc536",
-            "7f60601501c1fe5e018e84c7ef1de2b4522b09f46eaaec98a7076356cde9a352",
+            "1ae2ba33acf0273f1e7e7fbfd600983a58258e256ead4507638e1d09c2b22afe",
+            "5061d7fba26bc1777927f7e5117d21c7c6cf1e36d7ec9a956fe3e11b80761556",
         ),
     }
     for component in components:
@@ -27403,7 +27520,6 @@ try:
             "pendingInput", "hardDeleteSchema", "hardDeleteHandler"
         ] and (
             entry.get("sha256") != exact_9_1[component][0]
-            or backup_binding.get("sha256") != exact_9_1[component][1]
         ):
             raise OSError("tested-pair 9.1 hash binding mismatch")
         if os.path.lexists(component_backup):
@@ -27413,6 +27529,17 @@ try:
                 or entry["backup"] != backup_identity(component_backup)
             ):
                 raise OSError("tested-pair backup generation mismatch")
+    if components == ["pendingInput", "hardDeleteSchema", "hardDeleteHandler"]:
+        # A repeat maintenance snapshots the already-bridged generation, not
+        # the stock package. Admit only a complete, exact stock OR retained
+        # baseline, never a mixture. The decision's per-file inode/hash binding
+        # above remains authoritative even during partial terminal cleanup.
+        backup_hashes = tuple(value[component]["backup"]["sha256"] for component in components)
+        if backup_hashes not in (
+            tuple(exact_9_1[component][1] for component in components),
+            tuple(exact_9_1[component][0] for component in components),
+        ):
+            raise OSError("tested-pair bridge backup set mismatch")
     ask_user = value.get("askUser")
     if not isinstance(ask_user, dict):
         raise OSError("missing ask-user binding")
@@ -27782,7 +27909,7 @@ PY
 }
 
 openclaw_2026_9_1_stock_contract_verifier() {
-  local verifier="${PORTAL_DIR}/installer/verify-openclaw-2026.9.1-stock-contract.mjs"
+  local verifier="${PORTAL_DIR}/installer/verify-openclaw-${PIN_OPENCLAW_CORE_PACKAGE_VERSION}-stock-contract.mjs"
   local owner mode
   [[ -f "${verifier}" && ! -L "${verifier}" ]] || return 1
   owner="$(stat -c '%u:%g' -- "${verifier}" 2>/dev/null)" || return 1
@@ -27878,7 +28005,7 @@ auto_apply_openclaw_compatibility_hotfix() {
     fail "Could not resolve the exact OpenClaw ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} package directory for required compatibility preparation."
   fi
 
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]]; then
     if ! stock_target_output="$(resolve_openclaw_2026_9_1_transaction_targets \
       "${openclaw_package_dir}" 2>> "${LOG_FILE}")"; then
       fail "Could not resolve the exact OpenClaw 2026.9.1 Portal-bridge transaction targets."
@@ -27912,6 +28039,15 @@ auto_apply_openclaw_compatibility_hotfix() {
     if ${openclaw_9_1_bridged}; then
       if ! retire_openclaw_tested_pair_commit_record_if_clean; then
         fail "Could not safely retire the completed OpenClaw tested-pair commit record."
+      fi
+      if openclaw_gateway_migration_authority_exists; then
+        openclaw_2026_9_1_bridge_transaction arm-retained \
+          "${openclaw_package_dir}" \
+          || fail "Could not snapshot the retained Portal bridge for this maintenance transaction."
+        OPENCLAW_PENDING_INPUT_HOTFIX_TARGET="${pending_input_target}"
+        OPENCLAW_PENDING_INPUT_HOTFIX_BACKUP="${pending_input_target}.bridgesllm-pending-input-v1.bak"
+        OPENCLAW_PENDING_INPUT_HOTFIX_APPLIED=true
+        OPENCLAW_PENDING_INPUT_HOTFIX_COMMITTED=false
       fi
       ok "OpenClaw 2026.9.1 Portal bridge contracts verified"
       return 0
@@ -28088,47 +28224,6 @@ repair_openclaw_portal_model_config() {
   ok "OpenClaw model configuration checked"
 }
 
-bridge_openclaw_codex_cli_auth() {
-  local portal_root="${1:-${PORTAL_DIR}}"
-  if $SKIP_OPENCLAW || ! command -v node &>/dev/null; then
-    return 0
-  fi
-
-  local helper="${portal_root}/backend/dist/services/openclawConfigManager.js"
-  if [[ ! -f "${helper}" ]]; then
-    warn "Portal OpenClaw Codex auth bridge helper is missing. Skipping Codex auth bridge."
-    return 0
-  fi
-
-  local portal_service_codex_home=""
-  local portal_env_file="${portal_root}/backend/.env.production"
-  if [[ -f "${portal_env_file}" ]]; then
-    portal_service_codex_home="$(
-      read_env_value "${portal_env_file}" CODEX_HOME 2>/dev/null || true
-    )"
-  fi
-  # The Portal service EnvironmentFile is the runtime authority. Never borrow
-  # a transient installer-shell CODEX_HOME: an update launched from an agent
-  # can inherit that agent's private Codex home, which the Portal service will
-  # not use after restart.
-  local portal_codex_home="${portal_service_codex_home:-${HOME}/.codex}"
-  if [[ -n "${CODEX_HOME:-}" && "${CODEX_HOME}" != "${portal_codex_home}" ]]; then
-    warn "Ignoring transient installer CODEX_HOME; using the Portal service credential path"
-  fi
-  local -x CODEX_HOME="${portal_codex_home}"
-  if [[ ! -f "${portal_codex_home}/auth.json" ]]; then
-    ok "OpenClaw Codex auth bridge skipped (no external Codex CLI auth found)"
-    return 0
-  fi
-
-  if ! spin "Bridging Codex CLI auth into OpenClaw" "OPENCLAW_ALLOW_ROOT=1 NODE_PATH='${PORTAL_DIR}/backend/node_modules' node -e 'const helper = process.argv[1]; const mod = require(helper); const result = mod.pinCodexExternalCliAuthProfile(); console.log(JSON.stringify(result));' '${helper}'"; then
-    warn "OpenClaw Codex auth bridge failed. Continuing update; re-run Codex setup in Settings if needed."
-    return 0
-  fi
-
-  ok "OpenClaw Codex auth bridge checked"
-}
-
 openclaw_codex_plugin_package_dir() {
   local source_path="$1" candidate package_name depth
   [[ -n "${source_path}" ]] || return 1
@@ -28218,7 +28313,7 @@ process.stdin.on("end", () => {
     const matches = plugins.filter(plugin => plugin?.id === "codex");
     const core = fs.realpathSync(process.argv[1]);
     const identity = JSON.parse(fs.readFileSync(path.join(core, "package.json"), "utf8"));
-    if (matches.length === 0 && identity.name === "openclaw" && identity.version === "2026.9.1") process.exit(0);
+    if (matches.length === 0 && identity.name === "openclaw" && ["2026.9.1", "2026.9.3"].includes(identity.version)) process.exit(0);
     if (matches.length !== 1) process.exit(1);
     const plugin = matches[0];
     const root = fs.realpathSync(plugin.rootDir);
@@ -28658,7 +28753,7 @@ verify_openclaw_codex_plugin_pending_input_hotfix() {
   if $SKIP_OPENCLAW || ! command -v openclaw &>/dev/null; then
     return 0
   fi
-  if [[ "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" ]]; then
+  if [[ ( "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.3" ) ]]; then
     local stock_core_dir stock_codex_dir
     stock_core_dir="$(openclaw_core_package_dir || true)"
     stock_codex_dir="$(openclaw_codex_plugin_attested_package_dir || true)"
@@ -29475,6 +29570,20 @@ rollback_openclaw_codex_plugin() {
 quiesce_openclaw_tested_pair_rollback() {
   local before inactive pending_disposition
   openclaw_gateway_migration_authority_exists || return 1
+  load_openclaw_migration_transaction || return 1
+  [[ ! -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+    && ! -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]] || return 1
+  case "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" in
+    recovery-pending|migration-restored|upgrade-restored|core-rollback-pending|core-restored|core-remove-pending|core-removed|restored-cleanup)
+      ;;
+    commit-applying|committed-cleanup) return 1 ;;
+    *)
+      # The stop is recovery-owned only after the durable owner has recorded
+      # that intent. An existing decision, even malformed, forbids rollback.
+      advance_openclaw_migration_transaction \
+        "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" recovery-pending || return 1
+      ;;
+  esac
   pending_disposition="$(reconcile_openclaw_core_gateway_action_without_start)" \
     || return 1
   before="$(openclaw_gateway_systemd_identity)" || return 1
@@ -29632,7 +29741,7 @@ verify_openclaw_tested_pair() {
   verify_openclaw_core_package_pin || return 1
   openclaw_package_dir="$(openclaw_core_package_dir || true)"
   [[ -n "${openclaw_package_dir}" ]] || return 1
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]]; then
     verify_openclaw_2026_9_1_bridged_core_contract \
       "${openclaw_package_dir}" || return 1
   else
@@ -29648,7 +29757,7 @@ verify_openclaw_tested_pair() {
     observed_gateway="$(openclaw_gateway_version || true)"
     if [[ "${observed_gateway}" == "${PIN_OPENCLAW_RUNTIME_VERSION}" ]] \
       && verify_openclaw_codex_plugin_pin "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}"; then
-      if [[ "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" ]]; then
+      if [[ ( "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.3" ) ]]; then
         codex_package_dir="$(openclaw_codex_plugin_attested_package_dir || true)"
         if [[ -n "${codex_package_dir}" ]] \
           && verify_openclaw_2026_9_1_bridged_pair_contract \
@@ -29721,7 +29830,7 @@ bridgesllm_ask_user_question_authority() {
         || return 1
       printf 'legacy-custom\n'
       ;;
-    2026.9.1)
+    2026.9.1|2026.9.3)
       [[ "${PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION:-}" == "4.0.0" ]] \
         || return 1
       printf 'native\n'
@@ -30721,7 +30830,7 @@ apply_openclaw_codex_plugin_pending_input_hotfix() {
     return 0
   fi
 
-  if [[ "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" ]]; then
+  if [[ ( "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CODEX_PLUGIN_VERSION}" == "2026.9.3" ) ]]; then
     if verify_openclaw_codex_plugin_pending_input_hotfix; then
       ok "OpenClaw 2026.9.1 native request_user_input and chat.send steer contracts verified"
       return 0
@@ -30803,7 +30912,7 @@ commit_openclaw_tested_pair() {
   local sigint_trap="" sigterm_trap="" sighup_trap=""
   verify_openclaw_tested_pair || return 1
   openclaw_package_dir="$(openclaw_core_package_dir || true)"
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]]; then
     stock_target_output="$(resolve_openclaw_2026_9_1_contract_targets \
       "${openclaw_package_dir}" 2>> "${LOG_FILE}")" || return 1
     mapfile -t stock_targets <<< "${stock_target_output}"
@@ -30830,7 +30939,7 @@ commit_openclaw_tested_pair() {
     openclaw_claude_ask_user_hotfix_is_applied "${claude_target}" || return 1
   fi
   [[ -n "${pending_target}" ]] || return 1
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]]; then
     [[ -n "${hard_delete_schema_target}" \
       && -n "${hard_delete_handler_target}" ]] || return 1
     decision_second_target="${hard_delete_schema_target}"
@@ -30856,7 +30965,7 @@ commit_openclaw_tested_pair() {
   sigterm_trap="$(trap -p TERM || true)"
   sighup_trap="$(trap -p HUP || true)"
   trap '' SIGINT TERM HUP
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]]; then
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]]; then
     load_openclaw_migration_transaction \
       || { [[ -n "${sigint_trap}" ]] && eval "${sigint_trap}" || trap - SIGINT;
            [[ -n "${sigterm_trap}" ]] && eval "${sigterm_trap}" || trap - SIGTERM;
@@ -30897,7 +31006,7 @@ commit_openclaw_tested_pair() {
     return 1
   fi
 
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" ]] \
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]] \
     && { ! advance_openclaw_migration_transaction \
           commit-pending commit-applying "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
       || ! run_durable_openclaw_codex_plugin_helper commit-held \
@@ -30907,7 +31016,7 @@ commit_openclaw_tested_pair() {
     warn "The tested OpenClaw pair committed, but its 9.1 migration transaction did not reach terminal cleanup; its v5-bound root-only evidence remains safe for restart reconciliation."
     return 1
   fi
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" \
+  if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) \
     && "${OPENCLAW_MIGRATION_TRANSACTION_PHASE:-}" == "committed-cleanup" ]] \
     && ! disarm_openclaw_gateway_migration_fence; then
     warn "The tested OpenClaw pair committed, but its durable gateway reboot fence could not be retired; restart reconciliation is required."
@@ -30917,7 +31026,7 @@ commit_openclaw_tested_pair() {
   if ! commit_openclaw_pending_input_hotfix; then
     warn "The tested pair committed, but the native pending-input backup could not be retired; the durable commit record will reconcile it on the next run."
   fi
-  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" != "2026.9.1" ]] \
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" != "2026.9.1" && "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" != "2026.9.3" ]] \
     && ! commit_openclaw_claude_ask_user_hotfix; then
     warn "The tested pair committed, but the Claude ask-user backup could not be retired; the durable commit record will reconcile it on the next run."
   fi
@@ -31204,7 +31313,8 @@ prepare_openclaw_runtime_for_portal() {
   # These writers need disk state only. Keep them within the bridge's held
   # config layer, before either planned boot or any live readiness attestation.
   repair_openclaw_portal_model_config
-  bridge_openclaw_codex_cli_auth
+  # Authentication belongs to OpenClaw and its native providers. Never rebuild
+  # legacy profiles or copy another harness's login after native migration.
   if ! enforce_openclaw_update_pin_policy; then
     fail "OpenClaw automatic update policy could not be pinned before gateway startup. The compatibility-bundle rollback remains armed."
   fi
@@ -39359,8 +39469,10 @@ AGENT_ZERO_CONTAINER_RES = [
 ]
 AGENT_ZERO_VOLUME = "bridgesllm-agent-zero-usr"
 AGENT_ZERO_IMAGES = {
-    "agent0ai/agent-zero@sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0",
-    "agent0ai/agent-zero@sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8",
+    "agent0ai/agent-zero@sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30": "2.11",
+    "agent0ai/agent-zero@sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3": "2.11",
+    "agent0ai/agent-zero@sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0": "2.10",
+    "agent0ai/agent-zero@sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8": "2.10",
 }
 AGENT_ZERO_PATHS = [
     mapped_path("/etc/bridgesllm/agent-zero.env"),
@@ -39600,7 +39712,7 @@ def agent_zero_container_contract(record):
     managed_label = labels.get("io.bridgesllm.agent-zero.managed")
     if (
         config.get("Image") not in AGENT_ZERO_IMAGES
-        or labels.get("io.bridgesllm.agent-zero.version") != "2.10"
+        or labels.get("io.bridgesllm.agent-zero.version") != AGENT_ZERO_IMAGES.get(config.get("Image"))
         or managed_label not in {None, "true"}
         or ((host.get("RestartPolicy") or {}).get("Name")) != "unless-stopped"
         or len(host.get("PortBindings") or {}) != 1
@@ -44452,6 +44564,66 @@ const expected = [
 NODE
 }
 
+maintain_managed_agent_zero_runtime() {
+  local auth_file="/etc/bridgesllm/agent-zero.env"
+  local helper="${PORTAL_DIR}/installer/agent-zero-runtime.sh"
+  local containers volumes
+  if [[ ! -e "${auth_file}" && ! -L "${auth_file}" ]]; then
+    # Missing credentials are not authority to reset an existing installation.
+    # Docker inspection failure must not be confused with an absent runtime.
+    if command -v docker >/dev/null 2>&1; then
+      containers="$(docker ps --all --format '{{.Names}}')" || return 1
+      volumes="$(docker volume ls --format '{{.Name}}')" || return 1
+      if grep -Eq '^bridgesllm-agent-zero($|-)' <<<"${containers}" \
+        || grep -Fxq 'bridgesllm-agent-zero-usr' <<<"${volumes}"; then
+        warn "Agent Zero has retained runtime data but no protected login file; restore its existing login before maintenance."
+        return 1
+      fi
+    fi
+    info "Agent Zero is not configured; no container or login was created."
+    return 0
+  fi
+  # The lifecycle validates the protected auth file and exact retained image,
+  # labels, ports, and mounts. Never route maintenance through the disabled
+  # generic host-install endpoints or mutate an unowned container.
+  bash "${helper}" runtime-active >> "${LOG_FILE}" 2>&1 || return 1
+  bash "${helper}" reconcile >> "${LOG_FILE}" 2>&1 || return 1
+  bash "${helper}" status >> "${LOG_FILE}" 2>&1 || return 1
+  ensure_agent_zero_project_model_bridge
+}
+
+maintain_additional_ai_harnesses() {
+  # These independently verified runtimes are not part of OpenClaw's atomic
+  # four-tool tuple. Its commit must finish before these lifecycle owners run.
+  # Stop on the first failure; a retry re-attests completed tools and resumes
+  # through each helper's own recovery path, without rolling back the tuple.
+  terminal_operation_update progress \
+    "Updating the remaining chat harnesses" \
+    "Each runtime is installed and verified separately; completed updates are retained if a later tool fails."
+  if ! $SKIP_OLLAMA; then
+    install_or_update_ollama
+    verify_ollama_client_server_parity 4 \
+      || fail "Ollama did not pass exact client/server verification. Completed tool updates remain installed; review the runtime log before retrying."
+  else
+    info "Skipping Ollama (--skip-ollama)"
+  fi
+  if [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]; then
+    converge_antigravity \
+      || fail "Antigravity maintenance failed. Completed tool updates remain installed; its log identifies the remaining work."
+    converge_grok_build \
+      || fail "Grok Build maintenance failed. Completed tool updates remain installed; its log identifies the remaining work."
+    converge_opencode \
+      || fail "OpenCode maintenance failed. Completed tool updates remain installed; its log identifies the remaining work."
+    converge_hermes \
+      || fail "Hermes maintenance failed. Completed tool updates remain installed; its log identifies the remaining work."
+  else
+    info "Antigravity, Grok Build, OpenCode, and Hermes Host Operator harnesses are not qualified on this architecture."
+  fi
+  maintain_managed_agent_zero_runtime \
+    || fail "Agent Zero maintenance could not be verified. Completed tool updates remain installed; retained Agent Zero data and recovery records must not be cleared."
+  ok "Additional supported harness runtimes verified; provider sign-in and model access remain separate account checks."
+}
+
 do_maintain_compatible_ai_tools() {
   PORTAL_ONLY_UPDATE=false
   CURRENT_STEP="compatible AI tools"
@@ -44491,6 +44663,7 @@ do_maintain_compatible_ai_tools() {
     || fail "The committed Codex, Claude Code, or ClawHub package no longer matches the signed Portal admission catalog."
   verify_openclaw_tested_pair \
     || fail "The committed OpenClaw runtime and Portal bridge did not pass final tested-pair verification."
+  maintain_additional_ai_harnesses
   ok "Compatible AI tools verified: OpenClaw ${PIN_OPENCLAW_RUNTIME_VERSION}, Codex ${PIN_CODEX_CLI_VERSION}, Claude Code ${PIN_CLAUDE_CODE_VERSION}, ClawHub ${PIN_CLAWHUB_VERSION}"
 }
 
@@ -44541,7 +44714,10 @@ print_dry_run_plan() {
       echo "    ${BULLET} Verify the installed signed Portal and exact compatibility catalog"
       echo "    ${BULLET} Stage checksum- and SRI-bound Codex, Claude Code, and ClawHub trees"
       echo "    ${BULLET} Fence new native launches and migrate OpenClaw under one combined decision"
-      echo "    ${BULLET} Commit the complete tested tuple or restore the complete prior tuple"
+      echo "    ${BULLET} Commit the core tuple or restore the complete prior tuple"
+      echo "    ${BULLET} Separately verify and update Ollama and supported native chat harnesses"
+      echo "    ${BULLET} Update configured Agent Zero through its managed, data-preserving lifecycle"
+      echo "    ${BULLET} Stop on any tool failure; earlier verified tool updates remain installed"
       ;;
     uninstall)
       echo "  A real run would:"
@@ -44643,7 +44819,7 @@ main() {
     terminal_run_captured_handler do_maintain_compatible_ai_tools
     terminal_operation_end completed
     publish_installer_terminal_state "Compatible AI tools verified" \
-      "The exact Portal-qualified OpenClaw, Codex, Claude Code, and ClawHub tuple committed successfully." \
+      "The core compatibility bundle and supported configured harness runtimes passed verification." \
       "Return to the Dashboard and test your provider accounts and models."
     exit 0
   fi

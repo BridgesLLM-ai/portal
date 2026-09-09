@@ -335,22 +335,28 @@ function ensureCodexModelRuntimePolicy(
   return true;
 }
 
-function ensureAstraSubscriptionTransport(config: any): boolean {
-  const entry = config?.agents?.defaults?.models?.['openai/gpt-6-astra'];
-  if (entry?.agentRuntime?.id !== 'codex') return false;
-  // OpenClaw 9.1 predates Astra's ChatGPT route mapping. Scope this override to
-  // Astra; ordinary OpenAI API-key models and credentials stay untouched.
-  config.models ||= {};
-  config.models.providers ||= {};
-  const provider = config.models.providers.openai ||= { baseUrl: 'https://api.openai.com/v1', models: [] };
-  provider.models = Array.isArray(provider.models) ? provider.models : [];
-  let model = provider.models.find((row: any) => row?.id === 'gpt-6-astra');
-  if (model?.api === 'openai-chatgpt-responses') return false;
-  if (!model) {
-    model = { id: 'gpt-6-astra', name: 'GPT-6 Astra' };
-    provider.models.push(model);
-  }
-  model.api = 'openai-chatgpt-responses';
+function retireLegacyAstraSubscriptionTransport(config: any, authProfiles: any): boolean {
+  // The old Portal template forced every OpenAI model onto the Platform
+  // endpoint just to add Astra. Native OpenClaw owns endpoint/auth routing.
+  // Retire only the exact template on a subscription-only selection; never
+  // remove user provider declarations, API keys, headers, or custom endpoints.
+  if (!authSelectionUnambiguouslyUsesCodex(config, authProfiles)
+    || config?.agents?.defaults?.models?.['openai/gpt-6-astra']?.agentRuntime?.id !== 'codex') return false;
+  const openAiProfiles = Object.entries<any>(collectAuthProfiles(config, authProfiles))
+    .filter(([id, profile]) => authProfileBelongsToOpenAI(id, profile));
+  // A legacy name containing "codex" is not proof of OAuth. Preserve all
+  // explicit API-key/unknown profile types, even if currently unordered.
+  if (openAiProfiles.length === 0 || openAiProfiles.some(([, profile]) =>
+    String(profile?.mode || profile?.type || '').trim().toLowerCase() !== 'oauth')) return false;
+  const provider = config?.models?.providers?.openai;
+  if (!provider || Object.keys(provider).sort().join(',') !== 'baseUrl,models'
+    || provider.baseUrl !== 'https://api.openai.com/v1'
+    || !Array.isArray(provider.models) || provider.models.length !== 1) return false;
+  const model = provider.models[0];
+  if (!model || Object.keys(model).sort().join(',') !== 'api,id,name'
+    || model.id !== 'gpt-6-astra' || model.name !== 'GPT-6 Astra'
+    || model.api !== 'openai-chatgpt-responses') return false;
+  delete config.models.providers.openai;
   return true;
 }
 
@@ -764,9 +770,6 @@ export function ensureOpenClawModelDeclaration(rawModel: string): { changed: boo
     if (ensureCodexModelRuntimePolicy(entry, codexFamily)) changed = true;
   }
 
-  if (routesThroughCodex && codexFamily === '2026.9.1' && normalized === 'openai/gpt-6-astra') {
-    if (ensureAstraSubscriptionTransport(config)) changed = true;
-  }
   if (changed) writeJson(CONFIG_PATH, config);
   return { changed, model: normalized };
 }
@@ -917,7 +920,7 @@ export function repairClaudeSubscriptionConfig(preferredModel?: string | null): 
     changed = true;
   }
 
-  if (codexFamily === '2026.9.1' && ensureAstraSubscriptionTransport(config)) changed = true;
+  if (codexFamily === '2026.9.1' && retireLegacyAstraSubscriptionTransport(config, authProfiles)) changed = true;
 
   const memoryFlushRepair = ensureMemoryFlushMaintenanceModel(config);
   if (memoryFlushRepair.changed) changed = true;

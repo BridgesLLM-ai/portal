@@ -21,6 +21,7 @@ function makeDependencies(options: {
   gatewayStatusVersion?: string;
   gatewayProbeSelfVersion?: string | null;
   gatewayProbeOk?: boolean;
+  gatewayProbeUrl?: string;
   pluginVersion?: string;
   pluginSpec?: string;
   pluginResolvedSpec?: string | null;
@@ -47,6 +48,7 @@ function makeDependencies(options: {
       if (command.startsWith('gateway status ')) {
         return options.gatewayStatus || ok(JSON.stringify({
           gateway: { version: options.gatewayStatusVersion || gatewayRunningVersion },
+          rpc: { ok: true },
         }));
       }
       if (command === 'gateway probe --json') {
@@ -56,7 +58,7 @@ function makeDependencies(options: {
           : { version: options.gatewayProbeSelfVersion || gatewayRunningVersion };
         return ok(JSON.stringify({
           ok: gatewayProbeOk,
-          targets: [{ self }],
+          targets: [{ self, url: options.gatewayProbeUrl || 'ws://127.0.0.1:18789', connect: { rpcOk: true } }],
         }));
       }
       if (command === 'plugins inspect codex --json') {
@@ -120,7 +122,9 @@ describe('OpenClaw setup readiness', () => {
   it.each([
     ['2026.9.2', '2026.9.2', true],
     ['2026.9.2', '2026.9.1', false],
-    ['2026.9.3', '2026.9.3', false],
+    ['2026.9.3', '2026.9.3', true],
+    ['2026.9.3', '2026.9.2', false],
+    ['2026.9.4', '2026.9.4', false],
   ])('checks the native patch tuple core=%s plugin=%s', async (core, plugin, expected) => {
     const status = await getOpenClawSetupReadiness(makeDependencies({
       corePackageVersion: core, cliVersion: core, gatewayRunningVersion: core,
@@ -129,8 +133,8 @@ describe('OpenClaw setup readiness', () => {
     expect(status.ready).toBe(expected);
     if (expected) {
       expect(status.testedRuntimeFamily).toBe('current-2026.9.1');
-      expect(status.testedCorePackageVersion).toBe('2026.9.2');
-      expect(status.testedCodexPluginVersion).toBe('2026.9.2');
+      expect(status.testedCorePackageVersion).toBe(core);
+      expect(status.testedCodexPluginVersion).toBe(plugin);
       expect(status.blockers).toEqual([]);
     }
   });
@@ -241,7 +245,7 @@ describe('OpenClaw setup readiness', () => {
     expect(status.blockers.map((blocker) => blocker.code)).toContain('codex-plugin-mismatch');
   });
 
-  it('serializes the five bounded CLI checks within one readiness pass', async () => {
+  it('serializes bounded checks without redundant discovery when RPC metadata is complete', async () => {
     const base = makeDependencies();
     const commands: string[] = [];
     let active = 0;
@@ -266,7 +270,6 @@ describe('OpenClaw setup readiness', () => {
     expect(commands).toEqual([
       '--version@4000',
       'gateway status --require-rpc --timeout 10000 --json@15000',
-      'gateway probe --json@10000',
       'plugins inspect codex --json@10000',
       'models auth --agent main list --json@10000',
     ]);
@@ -292,16 +295,16 @@ describe('OpenClaw setup readiness', () => {
     const [firstStatus, concurrentStatus] = await Promise.all([first, concurrent]);
 
     expect(firstStatus).toBe(concurrentStatus);
-    expect(cliCalls).toBe(5);
+    expect(cliCalls).toBe(4);
     expect(await getOpenClawSetupReadiness()).toBe(firstStatus);
-    expect(cliCalls).toBe(5);
+    expect(cliCalls).toBe(4);
 
     const refreshed = await getOpenClawSetupReadiness(
       dependencies,
       { force: true, useSharedCache: true },
     );
     expect(refreshed.ready).toBe(true);
-    expect(cliCalls).toBe(10);
+    expect(cliCalls).toBe(8);
   });
 
   it('rejects a configured token that cannot authenticate to the running gateway', async () => {
@@ -313,6 +316,58 @@ describe('OpenClaw setup readiness', () => {
       'gateway-rpc-unavailable',
       'gateway-token-mismatch',
     ]));
+  });
+
+  it('does not disable a healthy gateway when unrelated discovery would time out', async () => {
+    const base = makeDependencies();
+    const run = jest.fn(async (args: string[], timeout?: number) => {
+      if (args[1] === 'probe') throw new Error('slow discovery must not run');
+      return base.runOpenClawCli(args, timeout);
+    });
+    const status = await getOpenClawSetupReadiness({ ...base, runOpenClawCli: run });
+    expect(status.ready).toBe(true);
+    expect(status.authenticatedRpc).toBe(true);
+    expect(status.gatewayProbeError).toBeNull();
+  });
+
+  it.each([
+    ok('not JSON'), ok('{}'), ok(JSON.stringify({ rpc: { ok: false }, gateway: { version: '2026.9.1' } })),
+    failed('command timed out'),
+  ])('does not treat exit status or discovery success as RPC proof', async (gatewayStatus) => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({ gatewayStatus }));
+    expect(status.ready).toBe(false);
+    expect(status.authenticatedRpc).toBe(false);
+    expect(status.blockers).toContainEqual(expect.objectContaining({ code: 'gateway-rpc-unavailable' }));
+    expect(status.blockers).not.toContainEqual(expect.objectContaining({ code: 'gateway-token-mismatch' }));
+  });
+
+  it('uses authenticated discovery only to fill missing version metadata', async () => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({
+      gatewayStatus: ok(JSON.stringify({ rpc: { ok: true, url: 'ws://127.0.0.1:18789' } })),
+    }));
+    expect(status.ready).toBe(true);
+    expect(status.runningVersion).toBe('2026.9.1');
+    const unavailable = await getOpenClawSetupReadiness(makeDependencies({
+      gatewayStatus: ok(JSON.stringify({ rpc: { ok: true, url: 'ws://127.0.0.1:18789' } })), gatewayProbeOk: false,
+    }));
+    expect(unavailable.ready).toBe(false);
+    expect(unavailable.blockers).toContainEqual(expect.objectContaining({ code: 'gateway-runtime-mismatch' }));
+    expect(unavailable.blockers).not.toContainEqual(expect.objectContaining({ code: 'gateway-token-mismatch' }));
+  });
+
+  it.each(['ws://127.0.0.1:18790', 'wss://unrelated.example:18789', 'ws://127.0.0.1:18789/?untrusted=1'])('rejects discovery version from a different endpoint: %s', async (gatewayProbeUrl) => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({
+      gatewayStatus: ok(JSON.stringify({ rpc: { ok: true, url: 'ws://127.0.0.1:18789' } })), gatewayProbeUrl,
+    }));
+    expect(status.ready).toBe(false);
+    expect(status.authenticatedRpc).toBe(true);
+    expect(status.blockers).toContainEqual(expect.objectContaining({ code: 'gateway-runtime-mismatch' }));
+  });
+
+  it('does not use discovery metadata without an authenticated endpoint binding', async () => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({ gatewayStatus: ok(JSON.stringify({ rpc: { ok: true } })) }));
+    expect(status.ready).toBe(false);
+    expect(status.runningVersion).toBeNull();
   });
 
   it('rejects a stale listener running a different OpenClaw runtime', async () => {

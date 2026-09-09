@@ -114,7 +114,7 @@ const PROJECT_CHAT_PROVIDER_CAPABILITIES: readonly ProjectChatProviderCapability
     supportsAbort: true,
     supportsReset: true,
     requiresOAuth: true,
-    reason: 'The isolated v2.10 adapter exists but remains closed until this project passes exact connector 0.1.0 authentication, host/egress escape, WebSocket replay, and model round-trip qualification.',
+    reason: 'The isolated v2.11 adapter exists but remains closed until this project passes exact connector 0.1.0 authentication, host/egress escape, WebSocket replay, and model round-trip qualification.',
   },
   {
     provider: 'GEMINI',

@@ -232,6 +232,7 @@ portal/installer/install-windows.ps1
 portal/installer/install.sh
 portal/installer/install.sh.sig
 portal/installer/migrate-openclaw-2026.9.1.mjs
+portal/installer/migrate-openclaw-2026.9.3.mjs
 portal/installer/native-cli-bundle-transaction.py
 portal/installer/ollama-tailnet-README.txt
 portal/installer/openclaw-ask-user-plugin/index.js
@@ -242,6 +243,7 @@ portal/installer/openclaw-migration-transaction.py
 portal/installer/openclaw-stable-plugins.sh
 portal/installer/opencode-runtime.sh
 portal/installer/patch-openclaw-2026.9.1-portal-contract.mjs
+portal/installer/patch-openclaw-2026.9.3-portal-contract.mjs
 portal/installer/portal-recovery-archive.py
 portal/installer/project-runtime-image-repair-launcher.py
 portal/installer/release-required-members.txt
@@ -253,6 +255,7 @@ portal/installer/scripts/bridges-rd-xtigervnc-start.sh
 portal/installer/update-transaction-state.py
 portal/installer/update-validation-protocol-v1
 portal/installer/verify-openclaw-2026.9.1-stock-contract.mjs
+portal/installer/verify-openclaw-2026.9.3-stock-contract.mjs
 portal/installer/xfce4-config/helpers.rc
 portal/novnc-conf/websockify.conf
 portal/restore-full.sh

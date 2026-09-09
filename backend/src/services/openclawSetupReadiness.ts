@@ -11,13 +11,13 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-export const TESTED_OPENCLAW_CORE_PACKAGE_VERSION = process.env.PORTAL_OPENCLAW_CORE_PACKAGE_VERSION || '2026.9.1';
-export const TESTED_OPENCLAW_RUNTIME_VERSION = process.env.PORTAL_OPENCLAW_RUNTIME_VERSION || '2026.9.1';
+export const TESTED_OPENCLAW_CORE_PACKAGE_VERSION = process.env.PORTAL_OPENCLAW_CORE_PACKAGE_VERSION || '2026.9.3';
+export const TESTED_OPENCLAW_RUNTIME_VERSION = process.env.PORTAL_OPENCLAW_RUNTIME_VERSION || '2026.9.3';
 export const LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION = '2026.7.1-2';
 export const LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION = '2026.7.1';
 
 // The family names identify API contracts, not every compatible patch release.
-export const QUALIFIED_OPENCLAW_NATIVE_PATCHES: readonly string[] = Object.freeze(['2026.9.1', '2026.9.2']);
+export const QUALIFIED_OPENCLAW_NATIVE_PATCHES: readonly string[] = Object.freeze(['2026.9.1', '2026.9.2', '2026.9.3']);
 
 export type OpenClawTestedRuntimeFamily = 'legacy-2026.7.1' | 'current-2026.9.1';
 
@@ -273,7 +273,7 @@ const defaultDependencies: OpenClawSetupReadinessDependencies = {
   credentialStoreWritable: isOpenClawCredentialStoreWritable,
 };
 
-// Each CLI invocation boots a full Node process. Running five of them in
+// Each CLI invocation boots a full Node process. Running all of them in
 // parallel on every dashboard/readiness query causes multi-core CPU spikes
 // and, under contention, RPC-probe timeouts that report a healthy gateway as
 // offline. Serialize the probes and cache the result briefly.
@@ -317,43 +317,57 @@ async function collectOpenClawSetupReadinessUncached(
   const dependencies = { ...defaultDependencies, ...overrides };
   const cliVersionResult = await dependencies.runOpenClawCli(['--version'], 4000);
   const gatewayStatusResult = await dependencies.runOpenClawCli(['gateway', 'status', '--require-rpc', '--timeout', '10000', '--json'], 15_000);
-  const gatewayProbeResult = await dependencies.runOpenClawCli(['gateway', 'probe', '--json'], 10_000);
+  const gatewayStatus = parseJsonOutput(gatewayStatusResult.stdout);
+  // --require-rpc binds this response to the configured gateway's authenticated
+  // RPC handshake. Discovery is not a second authentication authority: it can
+  // exhaust its budget finding unrelated gateways while this one is healthy.
+  const authenticatedRpc = gatewayStatusResult.ok && gatewayStatus?.rpc?.ok === true;
+  const statusRunningVersion = parseOpenClawVersion(
+    gatewayStatus?.gateway?.version || gatewayStatus?.rpc?.server?.version || gatewayStatus?.rpc?.version,
+  );
+  // Older status shapes may omit the server version. Only perform discovery
+  // for that metadata gap, after authentication has already succeeded. A
+  // discovery result can never rescue failed or missing RPC authentication.
+  const gatewayProbeResult = authenticatedRpc && !statusRunningVersion
+    ? await dependencies.runOpenClawCli(['gateway', 'probe', '--json'], 25_000)
+    : null;
   const codexPluginResult = await dependencies.runOpenClawCli(['plugins', 'inspect', 'codex', '--json'], 10_000);
   const authStoreResult = await dependencies.runOpenClawCli(['models', 'auth', '--agent', 'main', 'list', '--json'], 10_000);
   const packageMetadata = await dependencies.resolvePackageMetadata();
 
   const version = parseOpenClawVersion(cliVersionResult.stdout);
-  const gatewayProbe = parseJsonOutput(gatewayProbeResult.stdout);
-  const primaryGatewayTarget = Array.isArray(gatewayProbe?.targets) ? gatewayProbe.targets[0] : null;
-  // The running gateway version must not come only from `gateway probe`. That
-  // probe needs the `operator.read` scope, and on a stock install it answers
-  // `missing scope: operator.read`, leaving self.version absent -- which the
-  // Portal then reported to the operator as "detected unknown" on a host whose
-  // gateway was healthy and correctly versioned. `gateway status --json`,
-  // which this check already runs, reports the same version without that
-  // scope, so it is the primary source and the probe is the fallback.
-  const gatewayStatus = parseJsonOutput(gatewayStatusResult.stdout);
-  const runningVersion = parseOpenClawVersion(
-    gatewayStatus?.gateway?.version
-    || gatewayStatus?.rpc?.server?.version
-    || primaryGatewayTarget?.self?.version
-    || gatewayProbe?.self?.version,
+  const gatewayProbe = gatewayProbeResult ? parseJsonOutput(gatewayProbeResult.stdout) : null;
+  const endpointIdentity = (value: unknown): string | null => {
+    if (typeof value !== 'string' || !value.trim()) return null;
+    try {
+      const url = new URL(value);
+      if (!['ws:', 'wss:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return null;
+      return url.href;
+    } catch { return null; }
+  };
+  const authenticatedEndpoint = endpointIdentity(gatewayStatus?.rpc?.url || gatewayStatus?.gateway?.probeUrl);
+  const matchingGatewayTargets = Array.isArray(gatewayProbe?.targets) && authenticatedEndpoint
+    ? gatewayProbe.targets.filter((target: any) => target?.connect?.rpcOk === true
+      && endpointIdentity(target?.url) === authenticatedEndpoint)
+    : [];
+  const primaryGatewayTarget = matchingGatewayTargets.length === 1 ? matchingGatewayTargets[0] : null;
+  const runningVersion = statusRunningVersion || (gatewayProbeResult?.ok && gatewayProbe?.ok === true
+    ? parseOpenClawVersion(primaryGatewayTarget?.self?.version)
+    : null);
+  // Keep the public field for existing clients; it now describes the required
+  // configured-gateway RPC probe, not optional network discovery.
+  const gatewayProbeOk = authenticatedRpc;
+  const statusError = gatewayStatus?.rpc?.error;
+  const gatewayProbeError = authenticatedRpc ? null
+    : (typeof statusError === 'string' && statusError.trim())
+      || String(gatewayStatusResult.stderr || gatewayStatusResult.error || '').trim()
+      || 'OpenClaw gateway did not return a successful authenticated RPC handshake.';
+  const authenticationRejected = !authenticatedRpc && /(?:AUTH_TOKEN_MISMATCH|token[_ -]mismatch|invalid (?:gateway )?token|authentication failed|unauthorized)/i.test(
+    String(statusError || gatewayStatusResult.stderr || gatewayStatusResult.error || ''),
   );
-  const gatewayProbeOk = gatewayProbeResult.ok && Boolean(gatewayProbe?.ok);
-  const gatewayProbeReportedError = primaryGatewayTarget?.connect?.error || gatewayProbe?.warnings?.[0]?.message;
-  const gatewayProbeStderr = String(gatewayProbeResult.stderr || '').trim();
-  const gatewayProbeExecutionError = String(gatewayProbeResult.error || '').trim();
-  const gatewayProbeError = typeof gatewayProbeReportedError === 'string' && gatewayProbeReportedError.trim()
-    ? gatewayProbeReportedError.trim()
-    : gatewayProbeStderr
-      || gatewayProbeExecutionError
-      || (gatewayProbeOk
-      ? null
-      : 'OpenClaw gateway RPC probe failed.');
   const codexPlugin = parseJsonOutput(codexPluginResult.stdout);
   const authStorePayload = parseJsonOutput(authStoreResult.stdout);
   const hasToken = Boolean(dependencies.readGatewayToken());
-  const authenticatedRpc = gatewayStatusResult.ok && gatewayProbeOk;
   const tokenParity = hasToken && authenticatedRpc;
   const credentialStoreWritable = dependencies.credentialStoreWritable();
   const credentialStoreReady = authStoreResult.ok && authStorePayload !== null;
@@ -415,7 +429,7 @@ async function collectOpenClawSetupReadinessUncached(
   }
   if (!hasToken) {
     blockers.push({ code: 'gateway-token-missing', message: 'The OpenClaw gateway token is not configured.' });
-  } else if (!tokenParity) {
+  } else if (authenticationRejected) {
     blockers.push({ code: 'gateway-token-mismatch', message: 'The configured gateway token did not authenticate to the running OpenClaw gateway.' });
   }
   if (!codexPluginExact) {

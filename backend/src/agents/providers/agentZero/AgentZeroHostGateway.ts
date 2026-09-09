@@ -26,11 +26,11 @@ import {
   type AgentZeroRuntimeStatus,
 } from './AgentZeroRuntime';
 
-export const AGENT_ZERO_HOST_GATEWAY_CLI_VERSION = '2.10';
-export const AGENT_ZERO_HOST_GATEWAY_CLI_TAG = 'v2.10';
-export const AGENT_ZERO_HOST_GATEWAY_CLI_COMMIT = '42fb7fcde3f7f5ca70d3cf02f972f3854e403442';
+export const AGENT_ZERO_HOST_GATEWAY_CLI_VERSION = '2.11';
+export const AGENT_ZERO_HOST_GATEWAY_CLI_TAG = 'v2.11';
+export const AGENT_ZERO_HOST_GATEWAY_CLI_COMMIT = '7a5095f356a8c317c219e54796a3c294e967ce77';
 export const AGENT_ZERO_HOST_GATEWAY_ARCHIVE_SHA256 =
-  '403d7b453983caf67a8a0976f9842f23bac4697f7a7756c39870d467793c1c40';
+  '898d3eb0776c9b58fc22fa36c153a5d9de162cf4fef183197e43de5995df219a';
 export const AGENT_ZERO_HOST_GATEWAY_RUNTIME_CONSTRAINTS_SHA256 =
   'e19e4907251ef75d7cca3f500a9f0ba476bcb4d20451751e2ebed8c08a3ccc71';
 export const AGENT_ZERO_HOST_GATEWAY_BUILD_CONSTRAINTS_SHA256 =
@@ -193,7 +193,7 @@ function parseProvenance(payload: string): Map<string, string> {
   }
   for (const [key, expected] of Object.entries(REQUIRED_PROVENANCE)) {
     if (values.get(key) !== expected) {
-      throw new AgentZeroHostGatewayError('Managed Agent Zero host-gateway provenance is outside the tested v2.10 pin.');
+      throw new AgentZeroHostGatewayError('Managed Agent Zero host-gateway provenance is outside the tested v2.11 pin.');
     }
   }
   return values;
@@ -530,7 +530,7 @@ export class AgentZeroHostGatewayManager implements AgentZeroHostGatewayControll
     try {
       this.verifyInstallation();
       this.status = {
-        ...stoppedStatus('Official A0 CLI v2.10 host gateway is installed and will start on first authorized use.'),
+        ...stoppedStatus('Official A0 CLI v2.11 host gateway is installed and will start on first authorized use.'),
         installed: true,
         cliVersion: AGENT_ZERO_HOST_GATEWAY_CLI_VERSION,
       };
@@ -711,7 +711,7 @@ export class AgentZeroHostGatewayManager implements AgentZeroHostGatewayControll
         installed: true,
         running: true,
         ready: true,
-        reason: 'Agent Zero v2.10 host gateway is authenticated with read/write/exec access.',
+        reason: 'Agent Zero v2.11 host gateway is authenticated with read/write/exec access.',
       };
       return this.snapshot();
     } catch (error) {
@@ -753,7 +753,7 @@ export class AgentZeroHostGatewayManager implements AgentZeroHostGatewayControll
     }
     if (deadline !== undefined) this.assertWithinReadinessDeadline(deadline);
     if (version !== AGENT_ZERO_HOST_GATEWAY_CLI_VERSION) {
-      throw new AgentZeroHostGatewayError('Managed Agent Zero host-gateway executable is outside the tested v2.10 pin.');
+      throw new AgentZeroHostGatewayError('Managed Agent Zero host-gateway executable is outside the tested v2.11 pin.');
     }
 
     // The runtime probe and shared authentication manager independently verify

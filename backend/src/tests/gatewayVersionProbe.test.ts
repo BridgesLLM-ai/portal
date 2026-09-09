@@ -48,7 +48,7 @@ describe('OpenClaw dashboard version probe', () => {
     const responses = new Map<string, CliResult>([
       ['--version', ok('OpenClaw 2026.9.1')],
       ['gateway status --require-rpc --timeout 10000 --json', ok(JSON.stringify({
-        gateway: { version: '2026.9.1' },
+        gateway: { version: '2026.9.1' }, rpc: { ok: true },
       }))],
       ['gateway probe --json', ok(JSON.stringify({
         ok: true,
@@ -113,7 +113,6 @@ describe('OpenClaw dashboard version probe', () => {
     expect(calls).toEqual([
       { command: '--version', timeoutMs: 4000 },
       { command: 'gateway status --require-rpc --timeout 10000 --json', timeoutMs: 15000 },
-      { command: 'gateway probe --json', timeoutMs: 10000 },
       { command: 'plugins inspect codex --json', timeoutMs: 10000 },
       { command: 'models auth --agent main list --json', timeoutMs: 10000 },
       { command: 'update status --json --timeout 3', timeoutMs: 9000 },
@@ -230,7 +229,7 @@ describe('OpenClaw dashboard version probe', () => {
       runOpenClawCli: async (args) => {
         const command = args.join(' ');
         if (command === '--version') return ok('OpenClaw 2026.9.1');
-        if (command.startsWith('gateway status ')) return ok('RPC probe: ok');
+        if (command.startsWith('gateway status ')) return { ok: false, stdout: '', stderr: 'Gateway connect failed: protocol mismatch with stale listener' };
         if (command === 'gateway probe --json') {
           return {
             ok: false,

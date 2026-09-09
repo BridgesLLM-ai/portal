@@ -2,6 +2,67 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.1] - 2026-09-09
+
+### Agent Chat compatibility
+
+- Leave native OpenAI endpoint selection to OpenClaw. Retire only the exact old
+  Portal Astra transport template on subscription-only setups; preserve custom
+  routes, API-key configurations, and explicit model choices.
+
+- Stop the obsolete Portal Codex-auth bridge from copying another harness's login
+  and recreating legacy profiles after OpenClaw migration. Authentication stays
+  with OpenClaw and its native providers.
+- Recognize exact empty profile stubs left by older integrations,
+  while preserving migrated logins and rejecting unknown or malformed auth inputs.
+- Complete repeated-maintenance cleanup for both stock and retained bridge backups;
+  committed transactions resume forward without rolling back newer state.
+
+- Use OpenClaw's authenticated gateway status for readiness. A slow discovery
+  scan no longer marks a healthy, authenticated gateway as unavailable or reports
+  a transport timeout as a credential mismatch.
+- Update the tested tool set to OpenClaw 2026.9.3 with matching official plugins,
+  Codex 0.153.4, Claude Code 2.1.263, Antigravity 1.1.27, Grok Build 1.0.13,
+  Hermes 0.21.1, OpenCode 1.18.29, Ollama 0.33.3, and Agent Zero 2.11.
+  ClawHub remains at the current stable 0.23.3.
+- Preserve previously qualified Codex and Claude identities in the admission
+  catalog and keep native tools from silently updating outside the tested set.
+
+### Maintenance and recovery
+
+- Safely repeat AI-tool maintenance when OpenClaw already has the Portal bridge.
+  Snapshot the actual retained baseline, record recovery intent before stopping
+  services, and honor a committed decision after an interrupted cleanup.
+
+- Migrate legacy OpenClaw login stores with the exact upstream 9.3 importer,
+  including copied-state verification, settled database leases, and byte-exact
+  credential rollback. The independent Codex runtime home is retained in place;
+  its temporary command links are not treated as login authority. General repair
+  is not run.
+
+- Recognize the exact managed Agent Zero 2.5 images shipped with Portal 4.0
+  during maintenance and rollback, while retaining all ownership, mount, port,
+  and label checks. Old images do not qualify as the current chat runtime.
+
+- Return a retryable authorization response when the database is temporarily
+  unavailable, instead of crashing Portal or discarding a valid sign-in session.
+
+- Extend compatible-tools maintenance to Ollama, Antigravity, Grok Build,
+  OpenCode, Hermes, and configured Agent Zero installations. Later harness
+  failures are reported separately and do not undo an already verified
+  OpenClaw bundle. Existing provider logins and Agent Zero data are retained.
+
+- Verify populated OpenClaw memory stores with the checksum-qualified SQLite
+  vector extension, preserving vector rows and write-ahead-log contents during
+  migration and rollback.
+- Add the exact OpenClaw 9.3 module, plugin, and session-store migration contracts,
+  retaining prior migration helpers for interrupted-operation recovery.
+- Keep Portal-only updates compatible with their existing Node 22 runtime.
+  OpenClaw 9.3 maintenance requires Node 24.16+ within 24.x, or 26.1+;
+  fresh installations use the Node 24 LTS lane.
+- Preserve authenticated-session, package-integrity, file-ownership, and
+  rollback checks. Normal readiness does not reset provider credentials or history.
+
 ## [5.0.0] - 2026-09-08
 
 ### Conversation-first project work

@@ -1,6 +1,6 @@
 import { validateNativeHostSessionId, type NativeCliTurnContext } from '../types';
 
-/** Antigravity 1.1.17 stream-json. Only native events, never inferred prose. */
+/** Antigravity 1.1.27 stream-json. Only native events, never inferred prose. */
 export function handleAntigravityStreamLine(line: string, ctx: NativeCliTurnContext): void {
   let event: any;
   try { event = JSON.parse(line); } catch { return; }

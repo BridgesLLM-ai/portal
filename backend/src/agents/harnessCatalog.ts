@@ -525,7 +525,7 @@ const definitions: HarnessDefinition[] = [
       implemented: true,
       requiresGateway: false,
       adapterFamily: 'agent-zero-connector',
-      adapterKey: 'agent-zero-v2.10-connector',
+      adapterKey: 'agent-zero-v2.11-connector',
       models: AGENT_ZERO_MODELS,
     }),
   },
@@ -655,7 +655,7 @@ const definitions: HarnessDefinition[] = [
       versionPolicy: {
         kind: 'exact-pin',
         testedVersion: PORTAL_TOOL_VERSIONS.hermes,
-        reason: 'Pinned to Hermes v2026.8.18 (0.20.4), commit e624e9fde561e1add9388384012b295fde669ade, canonical source-tree SHA-256 d522ae12f24f5e0377485a648207d780ffb24f183c25a9e78657c5af7daf9173.',
+        reason: 'Pinned to Hermes v2026.9.7 (0.21.1), commit 2237be355906fbe6065ce1815711eee52b2d646e, canonical source-tree SHA-256 77aa1e1cabc237bb62b291e77927d99977ac356484a9d16f897bb66cda248773.',
       },
     },
     auth: {
@@ -715,7 +715,7 @@ const definitions: HarnessDefinition[] = [
       versionPolicy: {
         kind: 'exact-pin',
         testedVersion: PORTAL_TOOL_VERSIONS.openCode,
-        reason: 'Pinned to OpenCode v1.18.19; official glibc Linux x64 baseline asset opencode-linux-x64-baseline.tar.gz SHA-256 0acea3a0e22d4b6bcf7068580def4e151e413a7a4c3f03eba638568b3fababa5.',
+        reason: 'Pinned to OpenCode v1.18.29; official glibc Linux x64 baseline asset opencode-linux-x64-baseline.tar.gz SHA-256 03a3f2f063e23477e3e4c3a738eb389f56c5a6ecf54d6a5a6d91caab557f042d.',
       },
     },
     auth: {

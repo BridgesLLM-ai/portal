@@ -7,10 +7,10 @@ set -Eeuo pipefail
 # pinned container lifecycle so later setup/streaming work cannot inherit an
 # unpinned, unauthenticated, publicly-bound Docker deployment.
 
-readonly A0_VERSION="2.10"
+readonly A0_VERSION="2.11"
 readonly A0_IMAGE_REPOSITORY="agent0ai/agent-zero"
-readonly A0_AMD64_DIGEST="sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0"
-readonly A0_ARM64_DIGEST="sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8"
+readonly A0_AMD64_DIGEST="sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30"
+readonly A0_ARM64_DIGEST="sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3"
 readonly A0_CONTAINER="bridgesllm-agent-zero"
 readonly A0_ROLLBACK_CONTAINER="bridgesllm-agent-zero-rollback"
 readonly A0_VOLUME="bridgesllm-agent-zero-usr"
@@ -29,20 +29,20 @@ readonly A0_CONNECTOR_VERSION="0.1.0"
 # discovery for omitting client_version. Keep this aligned with Portal's tested
 # Codex CLI compatibility pin and converge it into the persistent _oauth plugin
 # configuration without installing another mutable CLI inside the container.
-readonly A0_CODEX_CLIENT_VERSION="0.153.2"
+readonly A0_CODEX_CLIENT_VERSION="0.153.4"
 
-# Official Agent Zero A0 CLI v2.10 host-gateway component. The release has no
+# Official Agent Zero A0 CLI v2.11 host-gateway component. The release has no
 # uploaded binary assets, so Portal installs the official source archive into a
 # dedicated venv only after verifying the archive and both official hashed
 # dependency locks. The provider then verifies this provenance again at runtime.
-readonly A0_CLI_VERSION="2.10"
-readonly A0_CLI_TAG="v2.10"
-readonly A0_CLI_COMMIT="42fb7fcde3f7f5ca70d3cf02f972f3854e403442"
-readonly A0_CLI_ARCHIVE_URL="https://github.com/agent0ai/a0-connector/archive/refs/tags/v2.10.tar.gz"
-readonly A0_CLI_ARCHIVE_SHA256="403d7b453983caf67a8a0976f9842f23bac4697f7a7756c39870d467793c1c40"
-readonly A0_CLI_RUNTIME_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/refs/tags/v2.10/constraints/a0-runtime.txt"
+readonly A0_CLI_VERSION="2.11"
+readonly A0_CLI_TAG="v2.11"
+readonly A0_CLI_COMMIT="7a5095f356a8c317c219e54796a3c294e967ce77"
+readonly A0_CLI_ARCHIVE_URL="https://api.github.com/repos/agent0ai/a0-connector/tarball/7a5095f356a8c317c219e54796a3c294e967ce77"
+readonly A0_CLI_ARCHIVE_SHA256="898d3eb0776c9b58fc22fa36c153a5d9de162cf4fef183197e43de5995df219a"
+readonly A0_CLI_RUNTIME_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/7a5095f356a8c317c219e54796a3c294e967ce77/constraints/a0-runtime.txt"
 readonly A0_CLI_RUNTIME_CONSTRAINTS_SHA256="e19e4907251ef75d7cca3f500a9f0ba476bcb4d20451751e2ebed8c08a3ccc71"
-readonly A0_CLI_BUILD_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/refs/tags/v2.10/constraints/a0-build.txt"
+readonly A0_CLI_BUILD_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/7a5095f356a8c317c219e54796a3c294e967ce77/constraints/a0-build.txt"
 readonly A0_CLI_BUILD_CONSTRAINTS_SHA256="701698e7490e500313195ea676b2c1925117709541a0ee4913636405a932371d"
 readonly A0_CLI_ROOT="${A0_STATE_DIR}/a0-cli"
 readonly A0_CLI_ROLLBACK_ROOT="${A0_STATE_DIR}/a0-cli-rollback"
@@ -356,8 +356,30 @@ create_container() {
     "$(image_ref)" >/dev/null
 }
 
+# Exact images shipped by Portal 4.0/5.0 authorize maintenance admission and
+# recovery/cleanup only, never current readiness. All labels, ports, and mounts
+# must still pass the complete managed-container contract.
+managed_image_version() {
+  case "$(normalized_architecture):$1" in
+    "amd64:${A0_IMAGE_REPOSITORY}@${A0_AMD64_DIGEST}"|"arm64:${A0_IMAGE_REPOSITORY}@${A0_ARM64_DIGEST}") printf '%s\n' "$A0_VERSION" ;;
+    amd64:agent0ai/agent-zero@sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0|arm64:agent0ai/agent-zero@sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8) printf '2.10\n' ;;
+    amd64:agent0ai/agent-zero@sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb|arm64:agent0ai/agent-zero@sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c) printf '2.5\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+attested_retained_container_version() {
+  local name="$1" image version label
+  managed_container_uninstall_contract_ok "$name" || return 1
+  image="$(docker inspect --format '{{.Config.Image}}' "$name")" || return 1
+  version="$(managed_image_version "$image")" || return 1
+  label="$(docker inspect --format '{{index .Config.Labels "io.bridgesllm.agent-zero.version"}}' "$name")" || return 1
+  [[ "$label" == "$version" ]] || return 1
+  printf '%s\n' "$version"
+}
+
 connector_protocol_ready() {
-  local host_port="$1" payload
+  local host_port="$1" expected_version="${2:-$A0_VERSION}" payload
   payload="$(curl --fail --silent --show-error --max-time 3 \
     --request POST \
     --header 'Content-Type: application/json' \
@@ -386,14 +408,14 @@ ok = (
     and "connector_login" not in (value.get("features") or [])
 )
 raise SystemExit(0 if ok else 1)
-' "$A0_CONNECTOR_VERSION" "$A0_VERSION" <<<"$payload"
+' "$A0_CONNECTOR_VERSION" "$expected_version" <<<"$payload"
 }
 
 wait_until_ready() {
-  local host_port="$1" attempts="${2:-60}"
+  local host_port="$1" attempts="${2:-60}" expected_version="${3:-$A0_VERSION}"
   local attempt
   for ((attempt = 1; attempt <= attempts; attempt += 1)); do
-    connector_protocol_ready "$host_port" && return 0
+    connector_protocol_ready "$host_port" "$expected_version" && return 0
     sleep 2
   done
   return 1
@@ -585,13 +607,14 @@ preflight_image() {
 }
 
 rollback_failed_update() {
-  local snapshot="$1"
+  local snapshot="$1" previous_version
+  previous_version="$(attested_retained_container_version "$A0_ROLLBACK_CONTAINER")" || die 'Previous Agent Zero runtime identity is not exact.'
   log 'Candidate failed readiness; restoring the previous container and data snapshot.'
   docker rm -f "$A0_CONTAINER" >/dev/null 2>&1 || true
   restore_data_snapshot "$snapshot"
   docker rename "$A0_ROLLBACK_CONTAINER" "$A0_CONTAINER"
   docker start "$A0_CONTAINER" >/dev/null
-  wait_until_ready "$A0_PORT" 60 || die 'Previous Agent Zero container was restored but did not become ready.'
+  wait_until_ready "$A0_PORT" 60 "$previous_version" || die 'Previous Agent Zero container was restored but did not become ready.'
   configure_agent_zero_codex_client_version \
     || die 'Previous Agent Zero container was restored but its Codex OAuth model-discovery contract could not be converged.'
 }
@@ -671,7 +694,8 @@ rollback_runtime() {
   require_command realpath
   validate_auth_file
   container_exists "$A0_ROLLBACK_CONTAINER" || die 'No managed Agent Zero rollback container exists.'
-  local snapshot failed_name
+  local snapshot failed_name previous_version
+  previous_version="$(attested_retained_container_version "$A0_ROLLBACK_CONTAINER")" || die 'Previous Agent Zero runtime identity is not exact.'
   snapshot="$(validated_snapshot)"
   failed_name="${A0_CONTAINER}-pre-rollback-$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -684,7 +708,7 @@ rollback_runtime() {
   fi
   docker rename "$A0_ROLLBACK_CONTAINER" "$A0_CONTAINER"
   docker start "$A0_CONTAINER" >/dev/null
-  wait_until_ready "$A0_PORT" 60 \
+  wait_until_ready "$A0_PORT" 60 "$previous_version" \
     || die "Rollback container did not become ready; pre-rollback container remains at $failed_name"
   configure_agent_zero_codex_client_version \
     || die "Rollback container is ready but Codex OAuth model discovery could not be configured; pre-rollback container remains at $failed_name"
@@ -759,15 +783,15 @@ globally_discovered_agent_zero_container_names() {
 }
 
 managed_container_uninstall_contract_ok() {
-  local name="$1" expected image version_label managed_label restart_policy running
+  local name="$1" expected_version image version_label managed_label restart_policy running
   local binding binding_count mount_count data_mount auth_mount data_mount_ok='false'
   local retained_pre_rollback='false'
   if [[ "$name" != "$A0_CONTAINER" && "$name" != "$A0_ROLLBACK_CONTAINER" ]]; then
     managed_pre_rollback_container_name_ok "$name" || return 1
     retained_pre_rollback='true'
   fi
-  expected="$(image_ref)"
   image="$(docker inspect --format '{{.Config.Image}}' "$name" 2>/dev/null)" || return 1
+  expected_version="$(managed_image_version "$image")" || return 1
   version_label="$(docker inspect --format '{{index .Config.Labels "io.bridgesllm.agent-zero.version"}}' "$name" 2>/dev/null)" || return 1
   managed_label="$(docker inspect --format '{{index .Config.Labels "io.bridgesllm.agent-zero.managed"}}' "$name" 2>/dev/null)" || return 1
   running="$(docker inspect --format '{{.State.Running}}' "$name" 2>/dev/null)" || return 1
@@ -798,8 +822,7 @@ managed_container_uninstall_contract_ok() {
     [[ "$data_mount" == "volume|${A0_VOLUME}|true" ]] && data_mount_ok='true'
   fi
 
-  [[ "$image" == "$expected" \
-    && "$version_label" == "$A0_VERSION" \
+  [[ "$version_label" == "$expected_version" \
     && "$restart_policy" == 'unless-stopped' \
     && "$binding_count" == '1' \
     && "$binding" == "${A0_HOST}|${A0_PORT}|1" \
@@ -1058,8 +1081,8 @@ Commands:
   resume                Start the attested primary container if it is stopped
   uninstall             Remove only the attested managed runtime and all data
   credentials-reload    Reload an atomically replaced protected auth file
-  host-bridge-status     Verify the immutable official A0 CLI v2.10 bridge
-  host-bridge-reconcile  Install/update only the immutable A0 CLI v2.10 bridge
+  host-bridge-status     Verify the immutable official A0 CLI v2.11 bridge
+  host-bridge-reconcile  Install/update only the immutable A0 CLI v2.11 bridge
   host-bridge-rollback   Restore the previous A0 CLI host-bridge installation
 
 Before reconcile, create /etc/bridgesllm/agent-zero.env as root with mode 600

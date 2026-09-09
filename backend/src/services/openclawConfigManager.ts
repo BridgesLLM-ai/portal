@@ -4,7 +4,6 @@ import crypto from 'crypto';
 import { execFile, execFileSync } from 'child_process';
 import { isDeepStrictEqual } from 'util';
 import type { AgentProviderName } from '../agents/AgentProvider.interface';
-import { resolveNativeCliCredentialPaths } from '../agents/providers/native/NativeCliEnvironment';
 import {
   getNativeCliAuthStatus,
   getNativeCliAuthStatusAsync,
@@ -26,8 +25,7 @@ export const CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 export const AUTH_PROFILES_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'auth-profiles.json');
 export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'models.json');
 export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
-export const OPENCLAW_CODEX_HOME_AUTH_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'codex-home', 'auth.json');
-export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.9.1';
+export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.9.3';
 export const LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION = '2026.7.1-1';
 const LEGACY_OPENCLAW_HOME = path.join(HOME_DIR, '.clawdbot');
 const LEGACY_PLUGIN_INSTALLS_PATH = path.join(OPENCLAW_HOME, 'plugins', 'installs.json');
@@ -1887,112 +1885,6 @@ export function saveProviderToken(provider: string, token: string): { profileId:
 
 function uniqueOrder(profileIds: string[]): string[] {
   return Array.from(new Set(profileIds.map((profileId) => String(profileId || '').trim()).filter(Boolean)));
-}
-
-function isLegacyCodexProfile(profileId: string, rawProfile: any, keepProfileId: string): boolean {
-  if (profileId === keepProfileId) return false;
-  const provider = String(rawProfile?.provider || '').trim();
-  const type = String(rawProfile?.type || rawProfile?.mode || '').trim();
-  if (provider === 'openai' && type === 'api_key') return false;
-  return provider === 'openai-codex'
-    || provider === 'codex'
-    || provider === 'codex-cli'
-    || profileId.startsWith('openai-codex:')
-    || profileId.startsWith('codex:')
-    || profileId.includes(':codex')
-    || profileId.includes('codex-cli');
-}
-
-function removeLegacyCodexProfiles(profiles: Record<string, any> | undefined, keepProfileId: string): string[] {
-  if (!profiles || typeof profiles !== 'object') return [];
-  const removed: string[] = [];
-  for (const [profileId, rawProfile] of Object.entries(profiles)) {
-    if (!isLegacyCodexProfile(profileId, rawProfile, keepProfileId)) continue;
-    delete profiles[profileId];
-    removed.push(profileId);
-  }
-  return removed;
-}
-
-export function syncCodexCliAuthToOpenClawCodexHome(): boolean {
-  const [codexCliAuthPath] = resolveNativeCliCredentialPaths('CODEX');
-  if (!codexCliAuthPath || !fs.existsSync(codexCliAuthPath)) return false;
-  const parsed = safeReadJson<any>(codexCliAuthPath, null);
-  const hasUsableCredential = Boolean(
-    parsed?.tokens?.access_token
-      || parsed?.tokens?.refresh_token
-      || (typeof parsed?.OPENAI_API_KEY === 'string' && parsed.OPENAI_API_KEY.trim())
-      || (parsed?.OPENAI_API_KEY && typeof parsed.OPENAI_API_KEY === 'object' && Object.keys(parsed.OPENAI_API_KEY).length > 0),
-  );
-  if (!hasUsableCredential) return false;
-
-  fs.mkdirSync(path.dirname(OPENCLAW_CODEX_HOME_AUTH_PATH), { recursive: true });
-  fs.copyFileSync(codexCliAuthPath, OPENCLAW_CODEX_HOME_AUTH_PATH);
-  try {
-    fs.chmodSync(OPENCLAW_CODEX_HOME_AUTH_PATH, 0o600);
-  } catch {
-    // Best effort only; the copy itself is the important part.
-  }
-  return true;
-}
-
-/**
- * OpenClaw 2026.6 runs Codex app-server auth through the canonical OpenAI
- * auth namespace, while the Portal still presents this as "OpenAI Codex".
- * Keep the Portal-facing provider separate, but pin OpenClaw to a dedicated
- * external-CLI bootstrap profile so Codex OAuth never overwrites OpenAI API keys.
- */
-export function pinCodexExternalCliAuthProfile(profileId = CODEX_EXTERNAL_CLI_PROFILE_ID): { profileId: string; syncedCodexHomeAuth: boolean } {
-  const syncedCodexHomeAuth = syncCodexCliAuthToOpenClawCodexHome();
-  if (!syncedCodexHomeAuth) {
-    throw new Error('Portal could not bridge a usable file-backed Codex credential into OpenClaw. No Codex auth profile was pinned.');
-  }
-
-  const authData = readAuthProfiles();
-  authData.version = authData.version || 2;
-  const removedStoredProfiles = removeLegacyCodexProfiles(authData.profiles, profileId);
-  if (authData.usageStats) {
-    for (const removedProfileId of removedStoredProfiles) delete authData.usageStats[removedProfileId];
-  }
-  if (authData.lastGood) {
-    for (const [provider, lastGoodProfileId] of Object.entries(authData.lastGood)) {
-      if (provider === 'openai-codex' || provider === 'codex' || removedStoredProfiles.includes(lastGoodProfileId)) {
-        delete authData.lastGood[provider];
-      }
-    }
-  }
-  authData.profiles[profileId] = {
-    ...(authData.profiles[profileId] || {}),
-    type: 'oauth',
-    provider: 'openai',
-  };
-  writeAuthProfilesFile(authData);
-
-  const config = readOpenClawConfig();
-  if (!config.auth) config.auth = {};
-  if (!config.auth.profiles) config.auth.profiles = {};
-  if (!config.auth.order) config.auth.order = {};
-  removeLegacyCodexProfiles(config.auth.profiles, profileId);
-
-  config.auth.profiles[profileId] = {
-    ...(config.auth.profiles[profileId] || {}),
-    provider: 'openai',
-    mode: 'oauth',
-  };
-  const currentOpenAiOrder = Array.isArray(config.auth.order.openai) ? config.auth.order.openai : [];
-  config.auth.order.openai = uniqueOrder([
-    profileId,
-    ...currentOpenAiOrder.filter((candidate: unknown) => {
-      const candidateId = String(candidate || '');
-      return !isLegacyCodexProfile(candidateId, config.auth.profiles?.[candidateId], profileId);
-    }),
-  ]);
-  delete config.auth.order.codex;
-  delete config.auth.order['codex-cli'];
-  delete config.auth.order['openai-codex'];
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
-
-  return { profileId, syncedCodexHomeAuth };
 }
 
 function normalizeProviderRuntimeModelId(provider: string, modelId: string): string | null {

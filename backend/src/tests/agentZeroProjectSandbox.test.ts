@@ -44,6 +44,8 @@ import {
   AGENT_ZERO_PROJECT_SANDBOX_IMAGE_ENV,
   AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
   AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
+  AGENT_ZERO_PROJECT_LEGACY_V210_SOURCE_COMMITS,
+  AGENT_ZERO_PROJECT_LEGACY_V210_UPSTREAM_IMAGE_DIGESTS,
   AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS,
   AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS,
   AGENT_ZERO_PROJECT_SOURCE_COMMITS,
@@ -665,7 +667,7 @@ function qualification(input: ReturnType<typeof fixture>): AgentZeroProjectQuali
     dataVolumeMountpoint: input.volume.Mountpoint,
     protocol: 'a0-connector.v1',
     connectorVersion: '0.1.0',
-    agentZeroVersion: '2.10',
+    agentZeroVersion: '2.11',
     modelBridgePolicyVersion: AGENT_ZERO_PROJECT_MODEL_BRIDGE_POLICY_VERSION,
     modelBridgePort: AGENT_ZERO_PROJECT_MODEL_BRIDGE_PORT,
     modelBridgeGatewayIpv4: BRIDGE_GATEWAY_IPV4,
@@ -819,7 +821,7 @@ function installExactLegacyPreConfinementRuntime(input: ReturnType<typeof fixtur
   input.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
 }
 
-function installExactLegacyV25Image(input: ReturnType<typeof fixture>): {
+function installExactLegacyV25Image(input: ReturnType<typeof fixture>, version: '2.5' | '2.10' = '2.5'): {
   imageRef: string;
   image: Record<string, any>;
   runCommand: AgentZeroProjectCommandRunner;
@@ -827,8 +829,8 @@ function installExactLegacyV25Image(input: ReturnType<typeof fixture>): {
   const legacyImageRef = `sha256:${'7'.repeat(64)}`;
   const legacyLabels = {
     [AGENT_ZERO_PROJECT_IMAGE_RECIPE_LABEL]: '8'.repeat(64),
-    [AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL]: AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS.amd64,
-    [AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL]: AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS.amd64,
+    [AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL]: (version === '2.10' ? AGENT_ZERO_PROJECT_LEGACY_V210_SOURCE_COMMITS : AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS).amd64,
+    [AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL]: (version === '2.10' ? AGENT_ZERO_PROJECT_LEGACY_V210_UPSTREAM_IMAGE_DIGESTS : AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS).amd64,
     [AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER_LABEL]: AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER,
   };
   const legacyImage = {
@@ -901,7 +903,7 @@ function qualificationClient(overrides: {
     getCapabilities: jest.fn(async () => ({
       protocol: 'a0-connector.v1',
       connectorVersion: '0.1.0',
-      agentZeroVersion: '2.10',
+      agentZeroVersion: '2.11',
       auth: ['session'],
       authRequired: true,
       transports: ['http', 'websocket'],
@@ -996,16 +998,16 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
     })).toThrow(/not protected/i);
   });
 
-  test('pins both upstream architectures to the same audited v2.10 source commit', () => {
+  test('pins both upstream architectures to the same audited v2.11 source commit', () => {
     expect(AGENT_ZERO_PROJECT_UPSTREAM_IMAGE_DIGESTS).toEqual({
-      amd64: 'sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0',
-      arm64: 'sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8',
+      amd64: 'sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30',
+      arm64: 'sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3',
     });
     expect(AGENT_ZERO_PROJECT_SOURCE_COMMITS).toEqual({
-      amd64: 'b22a144bf59f15b1516084c9e7b88133ba92c8a9',
-      arm64: 'b22a144bf59f15b1516084c9e7b88133ba92c8a9',
+      amd64: '6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1',
+      arm64: '6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1',
     });
-    expect(AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION).toBe('agent-zero-v2.10');
+    expect(AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION).toBe('agent-zero-v2.11');
     expect(AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION).toBe('agent-zero-v2.5');
     expect(AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS).toEqual({
       amd64: 'sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb',
@@ -1015,7 +1017,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       amd64: 'd1d48bc9c0e6e253e87c354ce757c518820c6e25',
       arm64: 'd1d48bc9c0e6e253e87c354ce757c518820c6e25',
     });
-    expect(getAgentZeroProjectUpstreamImageRef('amd64')).toContain('@sha256:892c60c');
+    expect(getAgentZeroProjectUpstreamImageRef('amd64')).toContain('@sha256:9b65805');
     expect(getAgentZeroProjectSourceCommit('aarch64')).toBe(AGENT_ZERO_PROJECT_SOURCE_COMMITS.arm64);
     expect(getAgentZeroProjectLegacyV25UpstreamImageRef('arm64')).toContain('@sha256:da107b6');
     expect(getAgentZeroProjectLegacyV25SourceCommit('x86_64'))
@@ -1695,9 +1697,9 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
     ))).toBe(false);
   });
 
-  test('recognizes exact Agent Zero v2.5 only as a predecessor and migrates it to required v2.10', async () => {
+  test.each(['2.5', '2.10'] as const)('recognizes exact Agent Zero %s only as a predecessor and migrates it to required v2.11', async (version) => {
     const value = fixture();
-    const predecessor = installExactLegacyV25Image(value);
+    const predecessor = installExactLegacyV25Image(value, version);
     const originalVolume = JSON.parse(JSON.stringify(value.volume));
 
     const before = probeAgentZeroProjectSandboxRuntime(value.executionContext, {
@@ -1722,7 +1724,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       egressExecutor: { run: jest.fn() },
     })).resolves.toMatchObject({
       ready: true,
-      // A migrated runtime still requires a fresh v2.10 live qualification.
+      // A migrated runtime still requires a fresh v2.11 live qualification.
       selectable: false,
       imageRef: value.imageRef,
       containerId: 'a'.repeat(64),
@@ -1760,6 +1762,36 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
   ] as const)('rejects a v2.5-looking predecessor with drifted %s without mutation', async (_label, drift) => {
     const value = fixture();
     const predecessor = installExactLegacyV25Image(value);
+    drift(value, predecessor);
+    const ensureEgressPlane = jest.fn(async () => exactEgressHandle(value));
+
+    await expect(convergeAgentZeroProjectSandboxRuntime(value.executionContext, {
+      stateRoot,
+      architecture: 'amd64',
+      egress: value.egress,
+      runCommand: predecessor.runCommand,
+      resolveInternalNetworkBinding: recognizedInternalNetworkBinding(value),
+      ensureEgressPlane,
+      constrainRuntime: jest.fn(async () => undefined),
+      egressExecutor: { run: jest.fn() },
+    })).rejects.toThrow(/recognized legacy|predecessor image identity/i);
+    expect(ensureEgressPlane).not.toHaveBeenCalled();
+    expect(value.calls.some(({ args }) => (
+      args[0] === 'container' && (args[1] === 'stop' || args[1] === 'rm')
+    ))).toBe(false);
+  });
+
+  test.each([
+    ['container labels', (value: ReturnType<typeof fixture>) => {
+      value.container.Config.Labels[AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL] = '6'.repeat(40);
+    }],
+    ['immutable image labels', (_value: ReturnType<typeof fixture>, predecessor: ReturnType<typeof installExactLegacyV25Image>) => {
+      predecessor.image.Config.Labels[AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL]
+        = `sha256:${'6'.repeat(64)}`;
+    }],
+  ] as const)('rejects a v2.10-looking predecessor with drifted %s without mutation', async (_label, drift) => {
+    const value = fixture();
+    const predecessor = installExactLegacyV25Image(value, '2.10');
     drift(value, predecessor);
     const ensureEgressPlane = jest.fn(async () => exactEgressHandle(value));
 

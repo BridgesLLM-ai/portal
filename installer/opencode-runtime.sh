@@ -3,17 +3,17 @@ set -Eeuo pipefail
 
 # Portal-tested OpenCode runtime. Portal installs immutable upstream release
 # archives directly; it never runs the mutable npm/npx installer path.
-readonly OPENCODE_TESTED_VERSION="1.18.19"
+readonly OPENCODE_TESTED_VERSION="1.18.29"
 # The x64 baseline build is intentional: it trades newer CPU instructions for
 # a wider host compatibility floor. Its archive is distinct from the ordinary
 # opencode-linux-x64.tar.gz asset even though both contain one `opencode`
 # binary and have nearly identical sizes.
 readonly OPENCODE_ASSET_X86_64="opencode-linux-x64-baseline.tar.gz"
 readonly OPENCODE_ASSET_AARCH64="opencode-linux-arm64.tar.gz"
-readonly OPENCODE_SHA256_X86_64="0acea3a0e22d4b6bcf7068580def4e151e413a7a4c3f03eba638568b3fababa5"
-readonly OPENCODE_SHA256_AARCH64="506f98a1f618551f1f6fc5dcf591f824bef9d6819d40b27928ad7febcb7c363b"
-readonly OPENCODE_BINARY_SHA256_X86_64="fd4cfd76ca65a706d0138886dd23094dd07e35460080024b1467baaf32dcee2e"
-readonly OPENCODE_BINARY_SHA256_AARCH64="c34a30f5567f989d9a089cc4a0bf5860d81273fc6644de96671bd5cbe5dd31ec"
+readonly OPENCODE_SHA256_X86_64="03a3f2f063e23477e3e4c3a738eb389f56c5a6ecf54d6a5a6d91caab557f042d"
+readonly OPENCODE_SHA256_AARCH64="70baf769395ca4e7a68924026530c390eace194f3b7e4919d4efcb2aa2eed3c0"
+readonly OPENCODE_BINARY_SHA256_X86_64="ca6c0e1f42be3120595bf6848937e7586ec862c87fa7aa111e89c7cc6e9a4650"
+readonly OPENCODE_BINARY_SHA256_AARCH64="e94d9ebec16ce2611eae94026afe8ec87f2e2dcc66db40bc4f889955b026eb75"
 readonly OPENCODE_URL_X86_64="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_TESTED_VERSION}/${OPENCODE_ASSET_X86_64}"
 readonly OPENCODE_URL_AARCH64="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_TESTED_VERSION}/${OPENCODE_ASSET_AARCH64}"
 readonly OPENCODE_MAX_ARCHIVE_BYTES=$((128 * 1024 * 1024))

@@ -269,7 +269,7 @@ describe('openclawCli model declaration self-heal', () => {
     expect(written.agents.defaults.models['openai/gpt-6-astra']).toEqual({
       agentRuntime: { id: 'codex' },
     });
-    expect(written.models.providers.openai.models).toContainEqual({ id: 'gpt-6-astra', name: 'GPT-6 Astra', api: 'openai-chatgpt-responses' });
+    expect(written.models?.providers?.openai).toBeUndefined();
     expect(written.agents.defaults.model).toEqual({ primary: 'openai/gpt-5.5', fallbacks: [] });
   });
 
@@ -397,6 +397,42 @@ describe('openclawCli model declaration self-heal', () => {
     });
     const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
     expect(written.agents.defaults.models['openai/gpt-4.1-mini']).toEqual({});
+  });
+
+  test.each(['template', 'api-key', 'mixed', 'legacy-id-api-key', 'unordered-api-key', 'custom-endpoint', 'extra-header', 'extra-model'])
+  ('maintenance retires only its exact subscription routing template: %s', (kind) => {
+    const provider: any = { baseUrl: 'https://api.openai.com/v1', models: [
+      { id: 'gpt-6-astra', name: 'GPT-6 Astra', api: 'openai-chatgpt-responses' },
+    ] };
+    const profiles: any = { 'openai:subscription': { provider: 'openai', mode: 'oauth' } };
+    const order = ['openai:subscription'];
+    if (kind === 'api-key' || kind === 'mixed') {
+      profiles['openai:api'] = { provider: 'openai', mode: 'api_key' };
+      if (kind === 'api-key') order.splice(0, 1);
+      order.push('openai:api');
+    }
+    if (kind === 'legacy-id-api-key') {
+      profiles['openai:codex-cli'] = { provider: 'openai', mode: 'api_key' };
+      order.splice(0, 1, 'openai:codex-cli');
+    }
+    if (kind === 'unordered-api-key') profiles['openai:api'] = { provider: 'openai', mode: 'api_key' };
+    if (kind === 'custom-endpoint') provider.baseUrl = 'https://example.test/v1';
+    if (kind === 'extra-header') provider.headers = { 'X-User-Route': 'retained' };
+    if (kind === 'extra-model') provider.models.push({ id: 'gpt-5.5', name: 'Custom model' });
+    const config = { auth: { profiles, order: { openai: order } }, models: { providers: { openai: provider } },
+      agents: { entries: { main: {} }, defaults: {
+        model: { primary: 'openai/gpt-5.5', fallbacks: [] },
+        models: { 'openai/gpt-6-astra': { agentRuntime: { id: 'codex' } } },
+      } } };
+    const home = setupHome(config), mod = loadModule();
+    mod.repairClaudeSubscriptionConfig();
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(written.models.providers.openai).toEqual(kind === 'template' ? undefined : provider);
+    expect(written.auth).toEqual(config.auth);
+    expect(written.agents.defaults.model).toEqual(config.agents.defaults.model);
+    mod.repairClaudeSubscriptionConfig();
+    const repeated = JSON.parse(fs.readFileSync(path.join(home, 'openclaw.json'), 'utf8'));
+    expect(repeated.models.providers.openai).toEqual(kind === 'template' ? undefined : provider);
   });
 
   test('repairClaudeSubscriptionConfig seeds recommended models for existing subscription auth', () => {

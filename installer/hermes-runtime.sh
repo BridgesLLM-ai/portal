@@ -5,15 +5,15 @@ set -Eeuo pipefail
 # main and can install optional components lazily. Portal instead installs one
 # exact release-commit source tree, one exact uv release, one exact Python
 # patch, and the repository's frozen dependency lock into a versioned root.
-readonly HERMES_TESTED_VERSION="0.20.4"
-readonly HERMES_TESTED_TAG="v2026.8.18"
-readonly HERMES_TESTED_COMMIT="e624e9fde561e1add9388384012b295fde669ade"
-readonly HERMES_SOURCE_URL="https://github.com/NousResearch/hermes-agent/archive/e624e9fde561e1add9388384012b295fde669ade.tar.gz"
+readonly HERMES_TESTED_VERSION="0.21.1"
+readonly HERMES_TESTED_TAG="v2026.9.7"
+readonly HERMES_TESTED_COMMIT="2237be355906fbe6065ce1815711eee52b2d646e"
+readonly HERMES_SOURCE_URL="https://api.github.com/repos/NousResearch/hermes-agent/tarball/2237be355906fbe6065ce1815711eee52b2d646e"
 # GitHub regenerates auto-generated tag/commit tarballs: the gzip bytes and
 # root directory can change while the exact commit tree remains identical.
 # Pin a canonical SHA-256 over every regular file's relative path, executable
 # mode, size and bytes instead of a mutable transport archive hash.
-readonly HERMES_SOURCE_TREE_SHA256="d522ae12f24f5e0377485a648207d780ffb24f183c25a9e78657c5af7daf9173"
+readonly HERMES_SOURCE_TREE_SHA256="77aa1e1cabc237bb62b291e77927d99977ac356484a9d16f897bb66cda248773"
 readonly HERMES_SOURCE_MAX_BYTES=$((96 * 1024 * 1024))
 readonly HERMES_SOURCE_MAX_EXPANDED_BYTES=$((512 * 1024 * 1024))
 

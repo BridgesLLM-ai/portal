@@ -6,6 +6,7 @@ import { clearAuthCookies } from '../utils/authCookies';
 import {
   authorizeAccessTokenPayload,
   type AuthorizedAccessIdentity,
+  type AccessPayloadAuthorizationResult,
 } from '../services/accessTokenAuthorization';
 import {
   admitWorkspaceAuthorizationRequest,
@@ -79,6 +80,29 @@ function respondRevokedSession(req: Request, res: Response): void {
   });
 }
 
+// Express 4 does not observe rejected async middleware promises. An unavailable
+// database must deny this request without crashing the process, clearing valid
+// cookies, or treating missing authority evidence as a revoked account.
+async function authorizeRequestPayload(
+  payload: JwtPayload,
+  req: Request,
+  res: Response,
+): Promise<AccessPayloadAuthorizationResult | null> {
+  try {
+    return await authorizeAccessTokenPayload(payload);
+  } catch {
+    if (settleWorkspaceAuthorizationRequestIfResponseEnded(req, res)) return null;
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.setHeader('Retry-After', '1');
+    res.status(503).json({
+      error: 'Authorization is temporarily unavailable. Retry shortly.',
+      code: 'AUTHORIZATION_UNAVAILABLE',
+      retryable: true,
+    });
+    return null;
+  }
+}
+
 function applyAuthorizationResponsePolicy(res: Response, user: JwtPayload): void {
   res.setHeader(AUTHORIZATION_VERSION_HEADER, String(user.authorizationVersion ?? 1));
   res.setHeader('Cache-Control', 'private, no-store, max-age=0');
@@ -121,7 +145,8 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
   // with the barrier, allowing one old-generation request through after the
   // fence has already reopened.
   if (!admitWorkspaceAuthorizationRequest(req, res, payload.userId)) return;
-  const authorized = await authorizeAccessTokenPayload(payload);
+  const authorized = await authorizeRequestPayload(payload, req, res);
+  if (!authorized) return;
   if (!authorized.ok) {
     if (authorized.reason === 'session_revoked') {
       respondRevokedSession(req, res);
@@ -161,7 +186,8 @@ export async function browserAuthRedirect(req: Request, res: Response, next: Nex
     const payload = verifyAccessToken(token);
     if (payload) {
       if (!admitWorkspaceAuthorizationRequest(req, res, payload.userId)) return;
-      const authorized = await authorizeAccessTokenPayload(payload);
+      const authorized = await authorizeRequestPayload(payload, req, res);
+      if (!authorized) return;
       if (authorized.ok) {
         if (settleWorkspaceAuthorizationRequestIfResponseEnded(req, res)) return;
         const authorizedUser = authorized.identity;
@@ -207,7 +233,8 @@ export async function browserAssetAuth(req: Request, res: Response, next: NextFu
     return;
   }
 
-  const authorized = await authorizeAccessTokenPayload(payload);
+  const authorized = await authorizeRequestPayload(payload, req, res);
+  if (!authorized) return;
   if (!authorized.ok) {
     if (authorized.reason === 'session_revoked') {
       clearRejectedCookieSession(req, res);

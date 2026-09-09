@@ -114,6 +114,10 @@ const PROVIDER_CATALOG_TTL_MS = 60_000;
 const PROVIDER_CATALOG_FAILURE_RETRY_MS = 10_000;
 const PROVIDER_CATALOG_RESPONSE_BUDGET_MS = 250;
 const PROVIDER_CATALOG_PROBE_DEADLINE_MS = 35_000;
+// OpenClaw serializes bounded CLI checks. Its rare authenticated-version
+// fallback can take 64s in total; the catalog must not discard that result
+// at 35s. HTTP callers still receive a checking row within 250ms.
+const OPENCLAW_CATALOG_PROBE_DEADLINE_MS = 75_000;
 
 interface ProviderCatalogCacheEntry {
   availability?: ProviderAvailability;
@@ -248,7 +252,9 @@ async function probeProviderCatalogWithDeadline(
       new Promise<ProviderAvailability>((_resolve, reject) => {
         timeout = setTimeout(() => {
           reject(new Error(`Provider catalog probe timed out for ${name}`));
-        }, PROVIDER_CATALOG_PROBE_DEADLINE_MS);
+        }, name === 'OPENCLAW'
+          ? OPENCLAW_CATALOG_PROBE_DEADLINE_MS
+          : PROVIDER_CATALOG_PROBE_DEADLINE_MS);
         timeout.unref?.();
       }),
     ]);

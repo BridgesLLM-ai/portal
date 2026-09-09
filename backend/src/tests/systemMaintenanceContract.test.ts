@@ -225,7 +225,10 @@ describe('system maintenance action contract', () => {
       automationLevel: 'guarded',
       confirmationPhrase: 'UPDATE COMPATIBLE AI TOOLS',
     });
-    expect(compatibleTools.description).toContain('exact OpenClaw, Codex, Claude Code, and ClawHub versions');
+    expect(compatibleTools.description).toContain('OpenClaw, Codex, Claude Code, ClawHub, Ollama');
+    expect(compatibleTools.description).toContain('Agent Zero when configured');
+    expect(compatibleTools.recovery).toContain('keep earlier verified updates');
+    expect(compatibleTools.impact).toContain('Provider logins are preserved, not created.');
     expect(maintenanceWindowAcknowledgementValid(compatibleTools, false)).toBe(false);
     expect(maintenanceWindowAcknowledgementValid(compatibleTools, true)).toBe(true);
     expect(maintenanceWindowAcknowledgementValid(refresh, undefined)).toBe(true);

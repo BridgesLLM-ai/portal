@@ -199,7 +199,7 @@ export default function AgentZeroSetupPanel({
       setShowPassword(false);
       setNotice(result.verified
         ? 'Credentials saved in the protected server file and authentication verified.'
-        : 'Credentials saved. Runtime package changes remain unavailable until the Agent Zero host transaction ships.');
+        : 'Credentials saved. Install or update Agent Zero with Update Compatible AI Tools in Maintenance.');
       setError(null);
       setPendingAction(null);
     } catch (requestError: any) {
@@ -406,7 +406,7 @@ export default function AgentZeroSetupPanel({
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <h3 id="agent-zero-setup-title" className="text-sm font-semibold text-white">Agent Zero 2.10</h3>
+            <h3 id="agent-zero-setup-title" className="text-sm font-semibold text-white">Agent Zero {status.testedVersions.agentZero}</h3>
             <span className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-2 py-1 text-[11px] font-semibold uppercase text-amber-200">
               {agentZeroSurfaceLabel(status)}
             </span>
@@ -424,7 +424,7 @@ export default function AgentZeroSetupPanel({
       {notice && <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200" role="status">{notice}</div>}
 
       <div className="rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2 text-[11px] leading-5 text-amber-100">
-        Runtime package changes remain unavailable until the Agent Zero host transaction ships. Runtime, authentication, and Project qualification status remain read-only here.
+        Install or update runtime packages with Update Compatible AI Tools in Maintenance. This panel manages protected credentials and reports runtime, authentication, and Project qualification status.
       </div>
 
       <div className="rounded-lg border border-sky-500/25 bg-sky-500/[0.06] px-3 py-2 text-[11px] leading-5 text-sky-100">

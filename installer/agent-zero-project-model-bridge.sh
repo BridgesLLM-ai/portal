@@ -37,7 +37,7 @@ readonly A0_LOOPBACK_PORT='50001'
 # Keep in lockstep with Portal's tested Codex CLI pin and the managed Agent Zero
 # runtime lifecycle. The managed Agent Zero image has no compatible Codex
 # binary from which to infer the Portal-qualified client version.
-readonly A0_CODEX_CLIENT_VERSION='0.153.2'
+readonly A0_CODEX_CLIENT_VERSION='0.153.4'
 
 log() { printf '[Agent Zero Project model bridge] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }

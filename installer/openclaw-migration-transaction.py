@@ -2259,7 +2259,7 @@ def validate_migration_manifest_constraints(value):
     if (
         document.get("contractVersion") != 2
         or document.get("packageName") != "openclaw"
-        or document.get("packageVersion") != "2026.9.1"
+        or document.get("packageVersion") not in {"2026.9.1", "2026.9.3"}
         or Path(str(document.get("manifestPath", ""))) != target
         or Path(str(document.get("stateDir", ""))) != state_dir
         or Path(str(document.get("configPath", ""))) != config_path
@@ -2279,8 +2279,8 @@ def validate_migration_manifest_constraints(value):
         # Upstream package metadata is public code, not private journal state.
         # Match the stock verifier while retaining root ownership/link/size checks.
         package = read_json(package_json, maximum=1024 * 1024, mode=0o644)
-        if package.get("name") != "openclaw" or package.get("version") != "2026.9.1":
-            fail("migration package binding is not exact OpenClaw 2026.9.1")
+        if package.get("name") != "openclaw" or package.get("version") != document["packageVersion"]:
+            fail("migration package does not match its exact supported manifest version")
     entries = snapshot.get("entries")
     if not isinstance(entries, list):
         fail("migration authority snapshot entries are invalid")

@@ -55,8 +55,8 @@ function runtimeReady(overrides: Partial<AgentZeroRuntimeStatus> = {}): AgentZer
     installed: true,
     running: true,
     ready: true,
-    version: '2.10',
-    expectedVersion: '2.10',
+    version: '2.11',
+    expectedVersion: '2.11',
     pinnedImage: true,
     loopbackOnly: true,
     persistentData: true,
@@ -200,7 +200,7 @@ function createManager(options: {
   const getCapabilities = jest.fn(async () => ({
     protocol: 'a0-connector.v1' as const,
     connectorVersion: '0.1.0' as const,
-    agentZeroVersion: '2.10' as const,
+    agentZeroVersion: '2.11' as const,
     auth: ['session'] as ['session'],
     authRequired: true,
     transports: ['http', 'websocket'],
@@ -239,7 +239,7 @@ function createManager(options: {
     persistSession,
     runtimeProbe: () => options.runtime || runtimeReady(),
     spawnImpl: spawnImpl as any,
-    execFileImpl: options.execFileImpl || (() => '2.10'),
+    execFileImpl: options.execFileImpl || (() => '2.11'),
     readFile,
     statFile: (path) => (
       [AGENT_ZERO_HOST_GATEWAY_BINARY, AGENT_ZERO_HOST_GATEWAY_PROVENANCE, AUTH_FILE].includes(path)
@@ -263,7 +263,7 @@ function createManager(options: {
   };
 }
 
-describe('Agent Zero v2.10 HOST_OPERATOR gateway', () => {
+describe('Agent Zero v2.11 HOST_OPERATOR gateway', () => {
   test('persists only a root-private browser session and never gateway login credentials', () => {
     const homePath = '/managed/agent-zero-gateway';
     const sessionDirectory = `${homePath}/.agent-zero`;
@@ -319,7 +319,7 @@ describe('Agent Zero v2.10 HOST_OPERATOR gateway', () => {
       new Response(JSON.stringify({
         protocol: 'a0-connector.v1',
         version: '0.1.0',
-        agent_zero_version: '2.10',
+        agent_zero_version: '2.11',
         auth: ['session'],
         auth_required: true,
         transports: ['http', 'websocket'],
@@ -355,7 +355,7 @@ describe('Agent Zero v2.10 HOST_OPERATOR gateway', () => {
     await expect(manager.ensureReady()).resolves.toMatchObject({
       state: 'ready',
       ready: true,
-      cliVersion: '2.10',
+      cliVersion: '2.11',
       gatewayId: AGENT_ZERO_HOST_GATEWAY_ID,
       capabilities: {
         scope: 'HOST_OPERATOR',
@@ -504,7 +504,7 @@ describe('Agent Zero v2.10 HOST_OPERATOR gateway', () => {
       startTimeoutMs: 500,
       execFileImpl: (_command, _args, timeoutMs) => {
         executableTimeoutMs = timeoutMs;
-        return '2.10';
+        return '2.11';
       },
     });
 
@@ -536,7 +536,7 @@ describe('Agent Zero v2.10 HOST_OPERATOR gateway', () => {
       setTimeout(() => resolve({
         protocol: 'a0-connector.v1',
         connectorVersion: '0.1.0',
-        agentZeroVersion: '2.10',
+        agentZeroVersion: '2.11',
         auth: ['session'],
         authRequired: true,
         transports: ['http', 'websocket'],
@@ -611,7 +611,7 @@ describe('Agent Zero v2.10 HOST_OPERATOR gateway', () => {
     const provenanceFailure = createManager({
       provenanceText: provenance({ A0_CLI_COMMIT: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }),
     });
-    await expect(provenanceFailure.manager.ensureReady()).rejects.toThrow(/outside the tested v2.10 pin/);
+    await expect(provenanceFailure.manager.ensureReady()).rejects.toThrow(/outside the tested v2.11 pin/);
     expect(provenanceFailure.spawnImpl).not.toHaveBeenCalled();
   });
 

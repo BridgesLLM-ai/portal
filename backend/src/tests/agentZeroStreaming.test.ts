@@ -44,8 +44,8 @@ const hostGateway: AgentZeroHostGatewayController = {
     installed: true,
     running: true,
     ready: true,
-    cliVersion: '2.10',
-    expectedCliVersion: '2.10',
+    cliVersion: '2.11',
+    expectedCliVersion: '2.11',
     gatewayId: 'bridgesllm-portal-host',
     capabilities: {
       scope: 'HOST_OPERATOR',
@@ -129,7 +129,7 @@ function capabilities(features: string[] = ['chat_create', 'chat_get', 'message_
   return {
     protocol: 'a0-connector.v1',
     version: '0.1.0',
-    agent_zero_version: '2.10',
+    agent_zero_version: '2.11',
     auth: ['session'],
     auth_required: true,
     transports: ['http', 'websocket'],
@@ -158,7 +158,7 @@ function defaultSocketScript(
     if (event === 'connector_hello') {
       ack(ackOk({
         protocol: 'a0-connector.v1',
-        agent_zero_version: '2.10',
+        agent_zero_version: '2.11',
         features: ['connector_subscribe_context', 'connector_send_message'],
       }));
       return;
@@ -247,7 +247,7 @@ beforeEach(() => {
   jest.mocked(hostGateway.ensureReady).mockClear();
 });
 
-describe('Agent Zero v2.10 authenticated streaming', () => {
+describe('Agent Zero v2.11 authenticated streaming', () => {
   test('connects the JavaScript Socket.IO client to the official /ws namespace', async () => {
     const contextId = 'CtxOfficialNamespace';
     const socket = new FakeAgentZeroSocket(defaultSocketScript((activeSocket) => {
