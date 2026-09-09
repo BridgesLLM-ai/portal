@@ -43,6 +43,7 @@ type ProgressMonitorApi = {
 };
 
 type ProgressMonitorOptions = {
+  initialProgress?: PortalSelfUpdateProgress | null;
   delay?: (milliseconds: number) => Promise<void>;
   pollIntervalMs?: number;
   maxAttempts?: number;
@@ -228,7 +229,10 @@ export async function monitorPortalSelfUpdate(
   if (!Number.isInteger(maxUnattachedAttempts) || maxUnattachedAttempts < 1) {
     throw new Error('Portal update monitor received an invalid unattached admission budget.');
   }
-  let latest: PortalSelfUpdateProgress | null = null;
+  const initial = parsePortalSelfUpdateProgress(options.initialProgress);
+  let latest: PortalSelfUpdateProgress | null = initial
+    && initial.operationId === operationId && initial.expectedVersion === expectedVersion
+    && ['starting', 'running', 'recovering'].includes(initial.status) ? initial : null;
   let pinnedOperationId = operationId;
   let unattachedAttempts = 0;
 
@@ -243,10 +247,10 @@ export async function monitorPortalSelfUpdate(
           if (attempt < maxAttempts - 1) await delay(pollIntervalMs);
           continue;
         }
-        latest = parsed;
         connected = true;
         options.onConnectionChange?.('connected');
         if (parsed.status !== 'succeeded' && TERMINAL_STATUSES.has(parsed.status)) {
+          latest = parsed;
           options.onProgress?.(parsed);
           return { outcome: 'failed', progress: parsed, error: parsed.detail };
         }
@@ -255,6 +259,7 @@ export async function monitorPortalSelfUpdate(
             if (readyPortalVersion(await api.readPortalVersion()) === expectedVersion) {
               // Do not let the UI present a terminal success receipt before
               // the restarted Portal itself corroborates exact ready health.
+              latest = parsed;
               options.onProgress?.(parsed);
               return { outcome: 'succeeded', progress: parsed };
             }
@@ -262,6 +267,7 @@ export async function monitorPortalSelfUpdate(
             options.onConnectionChange?.('reconnecting');
           }
         } else {
+          latest = parsed;
           options.onProgress?.(parsed);
         }
       }

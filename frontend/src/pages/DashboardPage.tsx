@@ -28,6 +28,7 @@ import {
   forgetPortalUpdateCheckpoint,
   PORTAL_UPDATE_OPERATION_SESSION_KEY,
   rememberPortalUpdateCheckpoint,
+  rememberedPortalUpdateCheckpoint,
 } from '../utils/portalUpdateSession';
 import {
   Cpu, HardDrive,
@@ -1087,6 +1088,7 @@ export default function DashboardPage() {
   const updateBackupDescription = useMemo(() => describeUpdateBackup(updateBackup), [updateBackup]);
   const updateBackupRunning = updateBackup?.state === 'running';
   const updateBackupCanUseCurrent = updateBackup?.state === 'candidate' || updateBackup?.state === 'fresh';
+  const updatePercent = updateProgress && updateProgress.status !== 'idle' ? updateProgress.percent : null;
   const updateProgressActive = portalUpdateProgressIsActive(updateProgress);
   const updateProgressTerminal = portalUpdateProgressIsTerminal(updateProgress);
   const updateRetryBlocked = updateProgressAmbiguous || portalUpdateProgressBlocksRetry(updateProgress);
@@ -1183,6 +1185,10 @@ export default function DashboardPage() {
     attachmentFence?: PortalUpdateAttachmentFence,
   ): Promise<void> => {
     const generation = ++updateMonitorGenerationRef.current;
+    const savedCheckpoint = operationId ? rememberedPortalUpdateCheckpoint(operationId) : null;
+    const initialProgress = savedCheckpoint?.expectedVersion === expectedVersion
+      && portalUpdateProgressIsActive(savedCheckpoint) ? savedCheckpoint : null;
+    if (initialProgress) setUpdateProgress(initialProgress);
     rememberPortalUpdateVersion(expectedVersion);
     updateSubmissionRef.current = true;
     setUpdateInProgress(true);
@@ -1218,6 +1224,7 @@ export default function DashboardPage() {
           return response.json().catch(() => null);
         },
       }, {
+        initialProgress,
         onProgress: (progress) => {
           if (updateMonitorGenerationRef.current !== generation) return;
           setUpdateProgress(progress);
@@ -1502,6 +1509,11 @@ export default function DashboardPage() {
         await monitorRememberedOperation();
         return;
       }
+      if (parsed.status === 'succeeded' && parsed.expectedVersion && parsed.operationId) {
+        // A cold reconnect must corroborate terminal success with ready health too.
+        await trackPortalSelfUpdate(parsed.expectedVersion, parsed.operationId);
+        return;
+      }
       setUpdateProgress(parsed);
       rememberPortalUpdateCheckpoint(parsed);
       setUpdateMessage(parsed.detail || parsed.label);
@@ -1600,10 +1612,15 @@ export default function DashboardPage() {
                   <div
                     role="progressbar"
                     aria-label="Portal update progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={updatePercent ?? undefined}
+                    aria-valuetext={updatePercent === null ? updateProgress?.label : `${updatePercent}% — ${updateProgress?.label}`}
                     className="mt-2 h-1.5 w-full max-w-xl overflow-hidden rounded-full bg-theme-border/70"
                   >
                     <div
-                      className="typed-confirmation-progress-sweep h-full w-1/3 rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400"
+                      className={`${updatePercent === null ? 'typed-confirmation-progress-sweep w-1/3' : 'transition-[width] duration-500 motion-reduce:transition-none'} h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400`}
+                      style={updatePercent === null ? undefined : { width: `${updatePercent}%` }}
                     />
                   </div>
                 ) : null}
@@ -1659,10 +1676,15 @@ export default function DashboardPage() {
                       <div
                         role="progressbar"
                         aria-label="Portal update progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={updatePercent ?? undefined}
+                        aria-valuetext={updatePercent === null ? updateProgress?.label : `${updatePercent}% — ${updateProgress?.label}`}
                         className="mt-2 h-1.5 overflow-hidden rounded-full bg-theme-border/70"
                       >
                         <div
-                          className="typed-confirmation-progress-sweep h-full w-1/3 rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400"
+                          className={`${updatePercent === null ? 'typed-confirmation-progress-sweep w-1/3' : 'transition-[width] duration-500 motion-reduce:transition-none'} h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400`}
+                          style={updatePercent === null ? undefined : { width: `${updatePercent}%` }}
                         />
                       </div>
                     </div>
@@ -2213,8 +2235,8 @@ export default function DashboardPage() {
               ? 'Update without backup'
               : 'Install update'}
         busyLabel={updateProgress?.label || (updatePlan === 'create-backup' ? 'Backing up safely…' : 'Starting signed updater…')}
-        busy={updateInProgress}
-        busyProgress={null}
+        busy={updateInProgress || updateProgressActive}
+        busyProgress={updatePercent === null ? null : updatePercent / 100}
         busyStartedAt={updateProgress?.startedAt}
         busyUpdatedAt={updateProgress?.updatedAt}
         busyPhaseLabel={updateProgress?.label}

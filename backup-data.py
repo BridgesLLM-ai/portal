@@ -17,7 +17,6 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
-import pwd
 import re
 import shutil
 import stat
@@ -26,7 +25,7 @@ import sys
 import tarfile
 import tempfile
 import uuid
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 SCHEMA = "bridgesllm.portal-data.v1"
 TYPES = ("daily", "weekly", "monthly", "comprehensive")
@@ -72,6 +71,11 @@ def write_json(path, value):
             out.flush()
             os.fsync(out.fileno())
         os.replace(tmp, path)
+        directory = os.open(Path(path).parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -84,7 +88,7 @@ def environment():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         key, sep, value = line.partition("=")
-        if not sep or not re.fullmatch(r"[A-Z_][A-Z_0-9]*", key):
+        if not sep or not re.fullmatch(r"[A-Z_][A-Z_0-9]*", key) or key in result:
             raise RuntimeError("Portal environment has an unsupported assignment")
         if value[:1] in ("'", '"') and value[-1:] == value[:1]:
             value = value[1:-1]
@@ -106,32 +110,141 @@ def data_roots(env):
     }
 
 
+# Keep the client security floor aligned with backup-full.sh. Older server
+# patches remain backup-able so their upgrade can first obtain a recovery copy.
+PG_CLIENT_FLOORS = {14: 23, 15: 18, 16: 14, 17: 10, 18: 4}
+PG_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+
+
+def postgresql_tools(major=None):
+    for version in ([major] if major is not None else sorted(PG_CLIENT_FLOORS, reverse=True)):
+        if version not in PG_CLIENT_FLOORS:
+            break
+        paths, versions = {}, []
+        try:
+            for name in ("psql", "pg_dump", "pg_restore"):
+                path = private(Path("/usr/lib/postgresql") / str(version) / "bin" / name)
+                info = path.stat()
+                if info.st_gid != 0 or not info.st_mode & 0o100:
+                    raise ValueError()
+                result = subprocess.run([str(path), "--version"], stdin=subprocess.DEVNULL,
+                                        capture_output=True, env=PG_ENV, timeout=10)
+                match = re.fullmatch(rf"{name} \(PostgreSQL\) ([0-9]+)\.([0-9]+)(?:[^\n]*)\n?", result.stdout.decode("ascii"))
+                if result.returncode or result.stderr or not match:
+                    raise ValueError()
+                found = tuple(map(int, match.groups()))
+                if found[0] != version or found[1] < PG_CLIENT_FLOORS[version]:
+                    raise ValueError()
+                paths[name] = str(path)
+                versions.append(found)
+            if len(set(versions)) == 1:
+                return paths
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            continue
+    raise RuntimeError("Install matching trusted PostgreSQL clients at the supported security floor "
+                       "(14.23, 15.18, 16.14, 17.10 or 18.4 or newer patches). No services were stopped.")
+
+
+class Database:
+    """One configured TCP authority for dumps, probes and every restore database.
+
+    No peer/default-socket fallback: a published Docker database and a native
+    cluster may coexist. Only the database name changes for restore staging.
+    Passwords are delivered to libpq solely through an inherited anonymous fd.
+    """
+    def __init__(self, env):
+        try:
+            raw = env.get("DATABASE_URL", "")
+            if (not raw or len(raw) > 128000 or "#" in raw
+                    or re.search(r"%(?![0-9a-fA-F]{2})", raw)
+                    or any(ord(c) < 32 or ord(c) == 127 for c in raw)):
+                raise ValueError()
+            url = urlsplit(raw)
+            self.host = url.hostname
+            self.port = str(url.port if url.port is not None else 5432)
+            self.name = unquote(url.path[1:], errors="strict")
+            self.user = unquote(url.username or "", errors="strict")
+            self._password = unquote(url.password or "", errors="strict")
+            if (url.scheme not in ("postgres", "postgresql")
+                    or self.host not in ("localhost", "127.0.0.1", "::1")
+                    or url.netloc.count("@") != 1 or not 1 <= int(self.port) <= 65535
+                    or not url.path.startswith("/") or url.path.count("/") != 1
+                    or not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9-]{0,62}", self.name)
+                    or not self.user or any(ord(c) < 32 or ord(c) == 127
+                                           for v in (self.user, self._password) for c in v)):
+                raise ValueError()
+            self.sslmode = "prefer"
+            seen = set()
+            for key, value in parse_qsl(url.query, keep_blank_values=True, strict_parsing=True):
+                if key in seen:
+                    raise ValueError()
+                seen.add(key)
+                if key == "schema" and value == "public":
+                    continue  # Prisma namespace, not a libpq connection parameter.
+                if key == "sslmode" and value in ("disable", "allow", "prefer", "require", "verify-ca", "verify-full"):
+                    self.sslmode = value
+                else:
+                    raise ValueError()
+        except (ValueError, UnicodeError):
+            raise RuntimeError("Unsupported DATABASE_URL. Configure one explicit loopback PostgreSQL "
+                               "host, port, user and database; only schema=public and sslmode query options "
+                               "are supported. No services were stopped.") from None
+        self.tools = postgresql_tools()
+        version = self.sql("SELECT current_setting('server_version_num')")
+        if not re.fullmatch(r"[0-9]{6}", version):
+            raise RuntimeError("Could not identify the configured PostgreSQL server version")
+        self.tools = postgresql_tools(int(version) // 10000)
+
+    def run(self, tool, args, *, db=None, stdin=None, stdout=subprocess.PIPE):
+        name = self.name if db is None else db
+        fd = None
+        try:
+            fd = os.memfd_create("portal-data-pgpass", os.MFD_CLOEXEC)
+            os.fchmod(fd, 0o600)
+            escape = lambda value: value.replace("\\", "\\\\").replace(":", "\\:")
+            # An empty private passfile also prevents ambient ~/.pgpass fallback.
+            if self._password:
+                payload = (":".join(escape(v) for v in
+                           (self.host, self.port, name, self.user, self._password)) + "\n").encode()
+                with os.fdopen(os.dup(fd), "wb") as out:
+                    out.write(payload)
+                    out.flush()
+                os.lseek(fd, 0, os.SEEK_SET)
+            result = subprocess.run([self.tools[tool], "--no-password", "--host=" + self.host,
+                                     "--port=" + self.port, "--username=" + self.user, "--dbname=" + name, *args],
+                                    stdin=stdin, stdout=stdout, stderr=subprocess.PIPE, cwd="/",
+                                    pass_fds=(fd,), env={**PG_ENV, "PGPASSFILE": f"/proc/self/fd/{fd}",
+                                                        "PGSSLMODE": self.sslmode, "PGCONNECT_TIMEOUT": "10"}, timeout=1800)
+            if result.returncode:
+                raise RuntimeError(tool + " could not use the configured PostgreSQL database. Check its "
+                                   "loopback endpoint, authentication and role permissions; no default socket "
+                                   "was used. Existing backups and restore checkpoints are retained.")
+            return result.stdout
+        except (OSError, subprocess.SubprocessError):
+            # libpq errors and TimeoutExpired can contain connection information.
+            raise RuntimeError("PostgreSQL client or private credential descriptor unavailable; "
+                               "check installed clients and the configured database connection") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def sql(self, statement, db=None):
+        return self.run("psql", ["-X", "-v", "ON_ERROR_STOP=1", "-A", "-t", "-c", statement], db=db).decode().strip()
+
+    def restore_owner(self):
+        # Preflight all required authority before staging a DB or stopping writers.
+        owner = self.sql("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=" + literal(self.name), "postgres")
+        allowed = self.sql("SELECT rolsuper OR (rolcreatedb AND pg_has_role(" + literal(owner) +
+                           ", 'USAGE')) FROM pg_roles WHERE rolname=current_user", "postgres")
+        if not owner or allowed != "t":
+            raise RuntimeError("Data restore requires the configured PostgreSQL role to own the database "
+                               "(or inherit its owner role) and have CREATEDB, or be a superuser. "
+                               "No services were stopped; use an authorized database administrator for restore.")
+        return owner
+
+
 def database(env):
-    url = urlparse(env.get("DATABASE_URL", ""))
-    name = unquote(url.path.lstrip("/"))
-    if url.hostname not in ("localhost", "127.0.0.1", "::1") or not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9-]{0,62}", name):
-        raise RuntimeError("Data restore currently supports the installed local PostgreSQL database")
-    return name
-
-
-def peer(tool, args, *, stdin=None, stdout=subprocess.PIPE):
-    account = pwd.getpwnam("postgres")
-    def drop():
-        os.setgroups([])
-        os.setgid(account.pw_gid)
-        os.setuid(account.pw_uid)
-    # Root opens the archive first; PostgreSQL reads the inherited stdin.
-    # Never reopen a root-only path after switching accounts.
-    result = subprocess.run(["/usr/bin/" + tool, *args], stdin=stdin, stdout=stdout,
-                            stderr=subprocess.PIPE, cwd="/", preexec_fn=drop,
-                            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, timeout=1800)
-    if result.returncode:
-        raise RuntimeError(tool + " failed; the existing backup and restore checkpoint are retained")
-    return result.stdout
-
-
-def sql(db, statement):
-    return peer("psql", ["-X", "-v", "ON_ERROR_STOP=1", "-A", "-t", "-d", db, "-c", statement]).decode().strip()
+    return Database(env)
 
 
 def ident(value):
@@ -311,7 +424,7 @@ def create(kind):
                 work = Path(work)
                 dump = work / "database.dump"
                 with dump.open("xb") as out:
-                    peer("pg_dump", ["--format=custom", "--no-owner", "--no-acl", "--schema=public", "-d", database(env)], stdout=out)
+                    database(env).run("pg_dump", ["--format=custom", "--no-owner", "--no-acl", "--schema=public"], stdout=out)
                 manifest = {
                     "schema": SCHEMA, "createdAt": now(), "type": kind,
                     "portalVersion": json.loads((ROOT / "backend/package.json").read_text())["version"],
@@ -432,7 +545,9 @@ def restore(archive, confirmed):
         raise RuntimeError("Restore replaces Portal data. Run with --confirm after saving your current work.")
     with locks():
         env = environment()
-        db = database(env)
+        connection = database(env)
+        db = connection.name
+        owner = connection.restore_owner()
         roots = data_roots(env)
         base = base_directory()
         before = private(base / ("before-data-restore-" + uuid.uuid4().hex[:12]), directory=True, create=True)
@@ -456,22 +571,22 @@ def restore(archive, confirmed):
                 raise RuntimeError("Portal key record is invalid")
             candidate = "portal_restore_" + uuid.uuid4().hex[:16]
             previous = "portal_before_" + uuid.uuid4().hex[:16]
-            owner = sql("postgres", "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=" + literal(db))
-            peer("createdb", ["--owner=" + owner, candidate])
+            connection.sql("CREATE DATABASE " + ident(candidate) + " OWNER " + ident(owner), "postgres")
             activated = False
+            swap_pending = False
             moved = []
             was_active = [unit for unit in UNITS if service("is-active", unit).returncode == 0]
             state = {"phase": "prepared", "originalDatabase": db, "candidateDatabase": candidate,
                      "previousDatabase": previous, "components": components, "previousFiles": str(before),
-                     "activeServices": was_active}
+                     "activeServices": was_active, "databaseSwap": "not-started"}
             write_json(checkpoint, state)
             fences = []
             try:
                 with (work / "database.dump").open("rb") as dump:
-                    peer("pg_restore", ["--exit-on-error", "--clean", "--if-exists", "--no-owner", "--no-acl", "--role=" + owner, "-d", candidate], stdin=dump)
+                    connection.run("pg_restore", ["--exit-on-error", "--clean", "--if-exists", "--no-owner", "--no-acl", "--role=" + owner], db=candidate, stdin=dump)
                 # Files are newly materialized: bind active project identities to
                 # their restored inode and invalidate pre-restore execution grants.
-                rows = sql(candidate, "SELECT COALESCE(json_agg(row_to_json(p)), '[]'::json) FROM (SELECT id, \"canonicalRoot\", generation FROM \"ProjectIdentity\" WHERE \"lifecycleStatus\"='ACTIVE') p")
+                rows = connection.sql("SELECT COALESCE(json_agg(row_to_json(p)), '[]'::json) FROM (SELECT id, \"canonicalRoot\", generation FROM \"ProjectIdentity\" WHERE \"lifecycleStatus\"='ACTIVE') p", candidate)
                 for row in json.loads(rows):
                     relative = Path(row["canonicalRoot"]).relative_to(roots["projects"])
                     staged = work / "data/projects" / relative
@@ -480,9 +595,9 @@ def restore(archive, confirmed):
                     info = json.loads(subprocess.check_output(["/usr/bin/node", "-e",
                         "const s=require('fs').lstatSync(process.argv[1],{bigint:true});process.stdout.write(JSON.stringify([s.dev.toString(),s.ino.toString(),s.birthtimeNs.toString()]));",
                         str(staged)], text=True))
-                    sql(candidate, 'UPDATE "ProjectIdentity" SET "rootDevice"=' + literal(info[0]) +
+                    connection.sql('UPDATE "ProjectIdentity" SET "rootDevice"=' + literal(info[0]) +
                         ', "rootInode"=' + literal(info[1]) + ', "rootBirthtimeNs"=' + literal(info[2]) +
-                        ', generation=generation+1 WHERE id=' + literal(row["id"]))
+                        ', generation=generation+1 WHERE id=' + literal(row["id"]), candidate)
                 shutil.copy2(ENV_FILE, before / "environment.previous")
                 private(before / "environment.previous")
                 marker = before / "pending"
@@ -508,10 +623,17 @@ def restore(archive, confirmed):
                         os.rename(target, old)
                     moved.append((name, existed))
                     os.rename(work / "data" / name, target)
-                sql("postgres", "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=" + literal(db) + " AND pid<>pg_backend_pid()")
-                sql("postgres", "ALTER DATABASE " + ident(db) + " RENAME TO " + ident(previous) +
-                    "; ALTER DATABASE " + ident(candidate) + " RENAME TO " + ident(db))
+                connection.sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=" + literal(db) + " AND pid<>pg_backend_pid()", "postgres")
+                # A client error cannot tell us whether PostgreSQL committed.
+                # Persist intent first; unknown outcomes must stay fenced.
+                state.update(phase="swap-pending", databaseSwap="forward-pending")
+                write_json(checkpoint, state)
+                swap_pending = True
+                connection.sql("ALTER DATABASE " + ident(db) + " RENAME TO " + ident(previous) +
+                    "; ALTER DATABASE " + ident(candidate) + " RENAME TO " + ident(db), "postgres")
                 activated = True
+                swap_pending = False
+                state["databaseSwap"] = "forward-confirmed"
                 lines = ENV_FILE.read_text().splitlines()
                 lines = [line for line in lines if line.partition("=")[0] not in keys]
                 lines += [key + "=" + json.dumps(value) for key, value in keys.items()]
@@ -523,9 +645,16 @@ def restore(archive, confirmed):
                 write_json(checkpoint, state)
             except Exception:
                 try:
+                    if swap_pending:
+                        raise RuntimeError("Database swap outcome is unknown")
                     if activated:
-                        sql("postgres", "ALTER DATABASE " + ident(db) + " RENAME TO " + ident(candidate) +
-                            "; ALTER DATABASE " + ident(previous) + " RENAME TO " + ident(db))
+                        state.update(phase="rollback-swap-pending", databaseSwap="reverse-pending")
+                        write_json(checkpoint, state)
+                        swap_pending = True
+                        connection.sql("ALTER DATABASE " + ident(db) + " RENAME TO " + ident(candidate) +
+                            "; ALTER DATABASE " + ident(previous) + " RENAME TO " + ident(db), "postgres")
+                        swap_pending = False
+                        state["databaseSwap"] = "reverse-confirmed"
                     for name, existed in reversed(moved):
                         target = roots[name]
                         if target.exists():
@@ -556,8 +685,8 @@ def restore(archive, confirmed):
                         state["unavailableServices"] = unavailable
                         write_json(checkpoint, state)
                         raise RuntimeError("Data is restored but service startup needs attention. Checkpoint: " + str(checkpoint))
-                if not activated:
-                    peer("dropdb", ["--if-exists", candidate])
+                if not activated and state["phase"] in ("rolled-back", "rolled-back-services-unavailable"):
+                    connection.sql("DROP DATABASE IF EXISTS " + ident(candidate), "postgres")
             print(json.dumps({"restored": True, "previousData": str(before), "previousDatabase": previous,
                               "agentExport": "Optional harness context remains in the archive for selective import."}))
 

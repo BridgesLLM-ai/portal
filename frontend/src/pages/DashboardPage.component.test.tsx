@@ -793,9 +793,10 @@ describe('dashboard role-aware loading', () => {
     expect(guardedReads[0]).toBeNull();
     expect(guardedReads[1]).toEqual(runningProgress);
     expect(screen.getByRole('dialog', { name: 'Updating Portal to v4.1.0' })).toBeVisible();
-    expect(screen.getByRole('progressbar', { name: 'Installing signed release' })).not.toHaveAttribute('aria-valuenow');
-    expect(screen.queryByText('48%')).not.toBeInTheDocument();
-    expect(screen.getByText(/Working…/)).toBeVisible();
+    expect(screen.getByRole('progressbar', { name: 'Installing signed release' })).toHaveAttribute('aria-valuenow', '48');
+    expect(screen.getByRole('progressbar', { name: 'Installing signed release' }).firstElementChild).toHaveStyle({ width: '48%' });
+
+    expect(screen.getByText(/^48% ·/)).toBeVisible();
     expect(screen.getByText('Installing signed release')).toHaveFocus();
     expect(screen.queryByRole('textbox', { name: /UPDATE PORTAL/i })).not.toBeInTheDocument();
     expect(screen.getByText('Release verified')).toBeVisible();
@@ -812,8 +813,9 @@ describe('dashboard role-aware loading', () => {
     expect(screen.queryByRole('dialog', { name: 'Updating Portal to v4.1.0' })).not.toBeInTheDocument();
     expect(reviewButton).toHaveTextContent('View update progress');
     expect(reviewButton).toBeEnabled();
-    expect(screen.getByRole('progressbar', { name: 'Portal update progress' })).not.toHaveAttribute('aria-valuenow');
-    expect(screen.queryByText('48%')).not.toBeInTheDocument();
+    expect(screen.getByRole('progressbar', { name: 'Portal update progress' })).toHaveAttribute('aria-valuenow', '48');
+    expect(screen.getByRole('progressbar', { name: 'Portal update progress' }).firstElementChild).toHaveStyle({ width: '48%' });
+
     expect(screen.getByText('Applying the verified Portal bundle and database migrations.')).toBeVisible();
     fireEvent.click(reviewButton);
     expect(screen.getByRole('dialog', { name: 'Updating Portal to v4.1.0' })).toBeVisible();
@@ -1027,8 +1029,9 @@ describe('dashboard role-aware loading', () => {
       { _silent: true },
     );
     expect(mocks.monitorPortalSelfUpdate.mock.calls[0][1]).toBe(UPDATE_OPERATION_ID);
-    expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' })).not.toHaveAttribute('aria-valuenow');
-    expect(screen.queryByText('61%')).not.toBeInTheDocument();
+    expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' })).toHaveAttribute('aria-valuenow', '61');
+    expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' }).firstElementChild).toHaveStyle({ width: '61%' });
+
     expect(screen.getByText('Release verified')).toBeVisible();
     expect(screen.getByText('The API may be briefly unavailable while services restart.')).toBeVisible();
     expect(screen.getByText(/live feedback will resume automatically/i)).toBeVisible();
@@ -1036,8 +1039,9 @@ describe('dashboard role-aware loading', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Hide for now' }));
     expect(screen.queryByRole('dialog', { name: 'Updating Portal to v4.1.0' })).not.toBeInTheDocument();
     const activeUpdateProgress = screen.getByRole('progressbar', { name: 'Portal update progress' });
-    expect(activeUpdateProgress).not.toHaveAttribute('aria-valuenow');
-    expect(screen.queryByText('61%')).not.toBeInTheDocument();
+    expect(activeUpdateProgress).toHaveAttribute('aria-valuenow', '61');
+    expect(activeUpdateProgress.firstElementChild).toHaveStyle({ width: '61%' });
+
     const activeUpdateStatus = activeUpdateProgress.closest('[role="status"]');
     expect(activeUpdateStatus).not.toBeNull();
     expect(activeUpdateStatus).toHaveTextContent('Restarting Portal services');
@@ -1048,6 +1052,50 @@ describe('dashboard role-aware loading', () => {
       monitorResult.resolve({ outcome: 'failed', progress: terminal, error: terminal.detail });
       await monitorResult.promise;
     });
+  });
+
+  it('uses indeterminate feedback only until a checkpoint arrives, including zero and later progress', async () => {
+    const monitorResult = deferred<any>();
+    let callbacks: any;
+    sessionStorage.setItem('dashboard-self-update-operation-id', UPDATE_OPERATION_ID);
+    sessionStorage.setItem('dashboard-self-update-expected-version', '4.1.0');
+    mockOwnerBackgroundChecks(verifiedUpdate, new Error('Portal restarting'));
+    mocks.monitorPortalSelfUpdate.mockImplementationOnce(async (_version, _operation, _api, options) => {
+      callbacks = options;
+      return monitorResult.promise;
+    });
+    render(<DashboardPage />);
+    await screen.findByRole('dialog');
+    expect(screen.getByRole('progressbar')).not.toHaveAttribute('aria-valuenow');
+    for (const percent of [0, 48, 73]) {
+      act(() => callbacks.onProgress(updateProgress('running', { percent })));
+      expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', String(percent));
+      expect(screen.getByRole('progressbar').firstElementChild).toHaveStyle({ width: `${percent}%` });
+    }
+    act(() => callbacks.onConnectionChange('reconnecting'));
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '73');
+    await act(async () => {
+      monitorResult.resolve({ outcome: 'timeout', progress: updateProgress('running', { percent: 73 }) });
+      await monitorResult.promise;
+    });
+  });
+
+  it('restores a saved active checkpoint during a cold reconnect without claiming terminal success', async () => {
+    const monitorResult = deferred<any>();
+    sessionStorage.setItem('dashboard-self-update-operation-id', UPDATE_OPERATION_ID);
+    sessionStorage.setItem('dashboard-self-update-expected-version', '4.1.0');
+    sessionStorage.setItem('dashboard-self-update-progress-checkpoint', JSON.stringify(updateProgress('running', { percent: 73 })));
+    mockOwnerBackgroundChecks(verifiedUpdate, updateProgress('succeeded'));
+    mocks.monitorPortalSelfUpdate.mockImplementationOnce(async () => monitorResult.promise);
+    render(<DashboardPage />);
+    await screen.findByRole('dialog', { name: 'Updating Portal to v4.1.0' });
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '73');
+    expect(mocks.monitorPortalSelfUpdate.mock.calls[0][3].initialProgress.percent).toBe(73);
+    await act(async () => {
+      monitorResult.resolve({ outcome: 'timeout', progress: null });
+      await monitorResult.promise;
+    });
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '73');
   });
 
   it('keeps retrying current-operation discovery in a brand-new tab through a long backend restart', async () => {
@@ -1102,8 +1150,9 @@ describe('dashboard role-aware loading', () => {
         expect.anything(),
       );
       expect(screen.getByRole('dialog', { name: 'Updating Portal to v4.1.0' })).toBeVisible();
-      expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' })).not.toHaveAttribute('aria-valuenow');
-      expect(screen.queryByText('61%')).not.toBeInTheDocument();
+      expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' })).toHaveAttribute('aria-valuenow', '61');
+      expect(screen.getByRole('progressbar', { name: 'Restarting Portal services' }).firstElementChild).toHaveStyle({ width: '61%' });
+
       expect(mocks.clientPost.mock.calls.filter(([url]) => url === '/admin/self-update')).toHaveLength(0);
 
       await act(async () => {

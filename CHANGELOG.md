@@ -2,6 +2,25 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.2] - 2026-09-09
+
+### Backup connection fixes
+
+- Use the configured PostgreSQL host, port, database, and role for backup and
+  restore, including local Docker databases without a host `postgres` account.
+- Deliver database credentials through a private inherited descriptor, retain
+  matching patched PostgreSQL clients, and reject connection or restore-authority
+  failures without falling back to another database.
+- Keep authenticated comprehensive-backup admission for AI-tool maintenance.
+
+### Update progress
+
+- Display server-reported checkpoint percentages in the update dialog, banner,
+  and status card. Unknown progress remains indeterminate; no time-based
+  percentage is invented.
+- Retain the last known checkpoint after reconnecting and require the restarted
+  Portal to report the expected ready version before displaying completion.
+
 ## [5.0.1] - 2026-09-09
 
 ### Agent Chat compatibility

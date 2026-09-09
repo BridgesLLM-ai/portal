@@ -140,6 +140,24 @@ describe('Portal self-update progress contract', () => {
     expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'succeeded' }));
   });
 
+  it('retains the last displayed checkpoint while terminal success awaits health corroboration', async () => {
+    const onProgress = vi.fn();
+    await expect(monitorPortalSelfUpdate('4.0.14', OPERATION_ID, {
+      readProgress: vi.fn()
+        .mockResolvedValueOnce(updateProgress({ percent: 73 }))
+        .mockRejectedValueOnce(new Error('restarting'))
+        .mockResolvedValue(updateProgress({
+          status: 'succeeded', phase: 'complete', percent: 100,
+          finishedAt: '2026-08-10T06:01:00Z',
+        })),
+      readPortalVersion: vi.fn().mockResolvedValue({ status: 'starting', version: '4.0.14' }),
+    }, {
+      delay: async () => {}, maxAttempts: 4, onProgress,
+    })).resolves.toMatchObject({ outcome: 'timeout', progress: { status: 'running', percent: 73 } });
+    expect(onProgress).toHaveBeenCalledTimes(1);
+    expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ percent: 73 }));
+  });
+
   it('never treats target-version health as success without a terminal updater receipt', async () => {
     await expect(monitorPortalSelfUpdate('4.0.14', undefined, {
       readProgress: vi.fn().mockRejectedValue(new Error('connection reset')),
@@ -166,6 +184,18 @@ describe('Portal self-update progress contract', () => {
         maxAttempts: 1,
       })).resolves.toMatchObject({ outcome: 'failed', progress: { status } });
     }
+  });
+
+  it('does not regress a resumed checkpoint while the backend reconnects', async () => {
+    const onProgress = vi.fn();
+    await expect(monitorPortalSelfUpdate('4.0.14', OPERATION_ID, {
+      readProgress: vi.fn().mockResolvedValue(updateProgress({ percent: 34 })),
+      readPortalVersion: vi.fn(),
+    }, {
+      initialProgress: updateProgress({ percent: 73 }),
+      delay: async () => {}, maxAttempts: 1, onProgress,
+    })).resolves.toMatchObject({ outcome: 'timeout', progress: { percent: 73 } });
+    expect(onProgress).not.toHaveBeenCalled();
   });
 
   it('ignores a regressing snapshot for the same operation', async () => {

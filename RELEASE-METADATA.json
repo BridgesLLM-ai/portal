@@ -1,12 +1,11 @@
 {
   "schema": 1,
-  "version": "5.0.1",
+  "version": "5.0.2",
   "releasedAt": "2026-09-09",
   "releaseClass": "hotfix",
   "highlights": [
-    "Restore OpenClaw availability using the authenticated gateway status instead of a redundant discovery timeout.",
-    "Update the tested AI tools to current stable versions, including OpenClaw 2026.9.3 and its official plugins.",
-    "Preserve existing conversations and recovery protections while updating native harness compatibility.",
-    "Keep Portal updates separate from AI tool maintenance; OpenClaw 9.3 requires Node 24.16+ on the supported stable lines."
+    "Fix backups for configured PostgreSQL connections, including Docker databases and nondefault ports.",
+    "Restore server-reported update percentages and preserve the last checkpoint across reconnects.",
+    "Keep authenticated recovery-archive requirements and verify ready health before showing update completion."
   ]
 }
