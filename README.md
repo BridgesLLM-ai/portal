@@ -34,7 +34,7 @@ Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · r
 
 4.1 turns the 4.0 foundation into a calmer workstation: stronger long-running chat, truthful provider readiness, safer recovery, and updates that keep the Portal and its AI tools compatible without silently changing the host.
 
-- **Existing-install updates change Portal, not the whole host.** OpenClaw, native CLIs, Docker/AppArmor, Project runtimes, Remote Desktop, Ollama, and unrelated services stay unchanged while the signed Portal transaction stages, proves, and cuts over the new release.
+- **Existing-install updates change Portal, not the whole host.** OpenClaw core and data, native CLIs, Docker/AppArmor, Project runtimes, Remote Desktop, Ollama, and unrelated services stay unchanged. On supported OpenClaw 9.x, an obsolete question plugin is repaired before Portal promotion, with a brief gateway reconnect and automatic plugin rollback on failure.
 - **AI-tool updates are explicit compatibility bundles.** After the Portal update, the Dashboard can install one Portal-qualified set of OpenClaw 2026.9.1, Codex CLI 0.153.2, Claude Code 2.1.260, and ClawHub 0.23.3. Exact versions and package identities are signed and verified together; upstream `latest` tags and independent self-updaters are not used.
 - **The transition is staged, not improvised.** An ordinary Portal-only update can retain the supported OpenClaw 2026.7.1 lane without mutating or restarting it. The separate compatibility action then moves the complete tested tool tuple, or restores the complete predecessor tuple on failure. Fresh installs converge directly to the same qualified bundle.
 - **Long Agent Chat runs keep one identity.** Reconnect, history, steering, clarification replies, and confirmed aborts stay attached to the exact run through refreshes, retries, Gateway restarts, and competing tabs.
@@ -43,7 +43,7 @@ Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · r
 - **Progress means what it says.** Fresh installs use semantic phases, measured percentages only for measured work, stable narrow-terminal output, and clean plain/`NO_COLOR` fallbacks. Dashboard updates stop presenting compatibility markers as fake precision.
 - **Account retirement is transactional.** Admission closes first, then managed sessions, projects, files, apps, shares, credentials, and runtime state are removed or reassigned with durable recovery evidence.
 
-Read the complete [5.0.6 changelog](CHANGELOG.md#506---2026-09-10) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
+Read the complete [5.0.7 changelog](CHANGELOG.md#507---2026-09-10) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
 
 ## What you get
 

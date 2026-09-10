@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "version": "5.0.6",
+  "version": "5.0.7",
   "releasedAt": "2026-09-10",
   "releaseClass": "hotfix",
   "highlights": [
-    "Fix Update Compatible AI Tools failing with 'unsafe transaction file' on hosts with large OpenClaw state: manifest readers and producers share one 16 MiB contract.",
-    "Fix recovery after an interruption between migration-prepared and commit: rollback now completes instead of leaving the gateway fenced (prepared artifact drift).",
-    "Oversized OpenClaw state inventories fail closed with a clear error before any package or gateway transition.",
-    "Release gates cover production-scale manifests, size boundaries, and sealed-manifest rollback; transactions sealed by 5.0.4 remain reconcilable."
+    "Keep maintenance recoverable when systemd discards inactive process history during package updates.",
+    "Stop completed, untriggered repair jobs from blocking updates; active automation and remaining stop hooks are still checked.",
+    "Verify Portal data backups with their authenticated data-format verifier instead of the legacy full-server verifier.",
+    "Repair the old question plugin before Portal promotion on supported native OpenClaw versions, without a core or database upgrade."
   ]
 }

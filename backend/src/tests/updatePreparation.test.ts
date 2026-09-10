@@ -189,6 +189,29 @@ describe('Portal update backup readiness', () => {
     }
   });
 
+  test('authenticates data backups with their own verifier, without legacy fallback', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-data-update-'));
+    const filename = 'portal-comprehensive-20260910-142738-data-90b0735d.tar.gz';
+    const fullPath = path.join(directory, filename);
+    fs.writeFileSync(fullPath, 'fixture');
+    const initial = fs.lstatSync(fullPath, { bigint: true });
+    const candidate = { filename, fullPath, ...admittedBackup,
+      mtimeMs: Number(initial.mtimeMs), mtimeNs: initial.mtimeNs.toString(),
+      size: Number(initial.size), dev: initial.dev.toString(), ino: initial.ino.toString() };
+    try {
+      const execFileImpl = jest.fn().mockResolvedValue(undefined);
+      expect(await verifyUpdateBackupArchive(candidate, { execFileImpl })).toBe(true);
+      expect(execFileImpl).toHaveBeenCalledWith('/usr/bin/python3', [
+        '-I', '/opt/bridgesllm/portal/backup-data.py', 'verify', fullPath, '--require-receipt',
+      ], expect.objectContaining({ timeout: 900_000 }));
+      const rejects = jest.fn().mockRejectedValue(new Error('invalid receipt'));
+      expect(await verifyUpdateBackupArchive(candidate, { execFileImpl: rejects })).toBe(false);
+      expect(rejects).toHaveBeenCalledTimes(1);
+      const changes = jest.fn().mockImplementation(async () => fs.appendFileSync(fullPath, 'changed'));
+      expect(await verifyUpdateBackupArchive(candidate, { execFileImpl: changes })).toBe(false);
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
   test('checks a bounded newest-first set and accepts the next restore-admitted archive', async () => {
     const newest = {
       filename: 'portal-comprehensive-new.tar.gz',

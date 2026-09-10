@@ -1789,14 +1789,23 @@ def adopt_core_gateway_identity(args) -> None:
     )
     known_identity = core_gateway_known_identity(value, identity)
     current = core["gatewayCurrentUnitIdentity"]
-    # daemon-reload resets only ExecStart's historical invocation telemetry.
-    # Both units must already be inactive; PID and definition authority remain
-    # exact, and the durable fence must still prevent an unowned start.
+    # systemd may discard all historical execution telemetry when reloading
+    # an inactive unit. Only allow retained values to become empty/zero; a new
+    # invocation is still foreign. Definition, PID, boot and fence authority
+    # remain exact, and neither observation may have a populated cgroup.
     inactive_reload_rebase = (
         not known_identity and current is not None
         and not current["active"] and not identity["active"]
+        and value["createdBootId"] == current_boot_id()
+        and current["controlGroup"] == identity["controlGroup"] == ""
+        and identity["invocationId"] in {"", current["invocationId"]}
+        and identity["execMainStartTimestampMonotonic"] in {
+            0, current["execMainStartTimestampMonotonic"],
+        }
         and all(current[field] == identity[field]
-                for field in GATEWAY_IDENTITY_FIELDS - {"execStart"})
+                for field in GATEWAY_IDENTITY_FIELDS - {
+                    "execStart", "invocationId", "execMainStartTimestampMonotonic",
+                })
     )
     if inactive_reload_rebase:
         attest_gateway_fence_marker(args.fence_marker)

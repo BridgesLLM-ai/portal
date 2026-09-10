@@ -457,6 +457,7 @@ type BackupRun = Pick<BackupStatus, 'status'> | null;
 type BackupVerificationDependencies = {
   execFileImpl?: ExecFileLike;
   restoreScriptPath?: string;
+  dataScriptPath?: string;
   timeoutMs?: number;
 };
 
@@ -479,7 +480,15 @@ export async function verifyUpdateBackupArchive(
     : BACKUP_VERIFY_TIMEOUT_MS;
 
   try {
-    await execFileImpl('/bin/bash', [
+    // This suffix selects a verifier, never establishes trust. The data
+    // verifier authenticates the receipt AND validates the complete archive;
+    // a renamed legacy/corrupt file cannot fall back to another format.
+    const dataArchive = /^portal-comprehensive-\d{8}-\d{6}-data-[a-f0-9]{8}\.tar\.gz$/.test(candidate.filename);
+    const dataScript = dependencies.dataScriptPath
+      || path.join(path.dirname(restoreScript), 'backup-data.py');
+    await execFileImpl(dataArchive ? '/usr/bin/python3' : '/bin/bash', dataArchive ? [
+      '-I', dataScript, 'verify', candidate.fullPath, '--require-receipt',
+    ] : [
       restoreScript,
       '--verify-archive',
       candidate.fullPath,

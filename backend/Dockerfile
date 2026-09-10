@@ -71,6 +71,7 @@ COPY ["installer/portal-recovery-archive.py", "/runtime/installer/portal-recover
 COPY ["installer/project-runtime-image-repair-launcher.py", "/runtime/installer/project-runtime-image-repair-launcher.py"]
 COPY ["installer/release-required-members.txt", "/runtime/installer/release-required-members.txt"]
 COPY ["installer/release-signing-ed25519.pub.pem", "/runtime/installer/release-signing-ed25519.pub.pem"]
+COPY ["installer/repair-openclaw-native-bridge.py", "/runtime/installer/repair-openclaw-native-bridge.py"]
 COPY ["installer/scripts", "/runtime/installer/scripts"]
 COPY ["installer/update-transaction-state.py", "/runtime/installer/update-transaction-state.py"]
 COPY ["installer/update-validation-protocol-v1", "/runtime/installer/update-validation-protocol-v1"]

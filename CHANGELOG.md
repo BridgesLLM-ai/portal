@@ -2,6 +2,19 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.7] - 2026-09-10
+
+### Fixed
+- **Recoverable tools maintenance:** accept systemd clearing an inactive gateway's historical invocation and start timestamp during daemon-reload. A new invocation, live process, changed unit definition, missing fence, or changed enablement is still rejected.
+- **Finished repair jobs no longer block updates:** completed, untriggered transient one-shot startup commands are history, not recurring cleanup. Active jobs, timers, restart policies and pending stop hooks remain audited.
+- **Fresh data backups are accepted:** the Dashboard uses the data-backup verifier, including the authenticated publication receipt and archive identity recheck. Legacy backups retain their existing verifier; invalid data archives never fall back to it.
+- **Portal chat survives the plugin transition:** before promoting Portal, supported OpenClaw 9.1/9.2/9.3 installations with question plugin 3.3.0 receive the native 4.0.0 plugin through an atomic, recoverable directory exchange. Only the gateway may briefly restart. OpenClaw core, providers, configuration, sessions and databases are not upgraded. Already-compatible and retained 7.1 installations are unchanged.
+
+### Upgrade notes
+- Install this Portal update before running **Update Compatible AI Tools**. Existing interrupted migration records still require their documented recovery; do not delete their ledgers or safety files.
+- A 5.0.6 Dashboard cannot retroactively gain the new backup verifier. If it rejects a data backup, verify that archive with the installed `backup-data.py verify --require-receipt` command before explicitly choosing to proceed with the saved backup. Subsequent Dashboard updates use the corrected verifier.
+- The 5.0.6 large-manifest and restored-manifest fixes remain included. No new permissions, provider credentials, or blanket cleanup bypasses are required.
+
 ## [5.0.6] - 2026-09-10
 
 ### OpenClaw updater manifest size contract and rollback recovery

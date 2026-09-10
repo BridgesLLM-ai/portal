@@ -240,6 +240,7 @@ portal/installer/openclaw-ask-user-plugin/openclaw.plugin.json
 portal/installer/openclaw-ask-user-plugin/package.json
 portal/installer/openclaw-ask-user-plugin/register.py
 portal/installer/openclaw-migration-transaction.py
+portal/installer/repair-openclaw-native-bridge.py
 portal/installer/openclaw-stable-plugins.sh
 portal/installer/opencode-runtime.sh
 portal/installer/patch-openclaw-2026.9.1-portal-contract.mjs

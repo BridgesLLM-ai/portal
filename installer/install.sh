@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="5.0.6"
+readonly VERSION="5.0.7"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -81,8 +81,8 @@ readonly LEGACY_OPENCLAW_GATEWAY_PERMIT_DRIFT_HELPER_SHA256="16a86a2144f0d2c36e3
 # re-verifies both on every call. The successor digest is the sha256 of this
 # release's installer/openclaw-migration-transaction.py and is enforced by
 # scripts/validation/openclaw-migration-helper-identity-static.py.
-readonly OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S="28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9,677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5"
-readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="4d1f3e4ca51191348161b8e4d8be6e92a2f97061ee40b90060db95c2dc7cd15a"
+readonly OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S="28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9,677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5,4d1f3e4ca51191348161b8e4d8be6e92a2f97061ee40b90060db95c2dc7cd15a"
+readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="dadccebd37aba59ab13ccdb9df54fb4ea9ed7ddff0518213fecb7665af5c1610"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR="/root/.config/systemd/user/openclaw-gateway.service.d"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
 readonly RETAINED_INSTALL_MARKER="${INSTALL_ROOT}/.retained-install-v1.json"
@@ -16457,6 +16457,7 @@ import re
 import shlex
 import stat
 import sys
+import subprocess
 
 LIMIT = 1024 * 1024
 HELPER_FILE_LIMIT = 128 * 1024
@@ -19659,6 +19660,47 @@ def inspect_scheduled_command(
     return None
 
 
+def finished_transient_oneshot(unit, definitions):
+    """A terminal, untriggered one-shot is history, not scheduled automation.
+
+    Never infer this from a filename or trust stale on-disk Type=oneshot.
+    Ask the system manager; unknown/racing/active/triggered units stay audited.
+    Static alternate-root fixtures cannot query the host's system manager.
+    """
+    if root != "/" or not unit.endswith(".service") or len(definitions) != 1:
+        return False
+    origin, target = definitions[0]
+    expected = "/run/systemd/transient/" + unit
+    if display(origin) != expected or display(target) != expected:
+        return False
+    properties = (
+        "Id", "Transient", "Type", "ActiveState", "SubState", "MainPID",
+        "ControlPID", "Restart", "TriggeredBy", "Job", "ExecMainExitTimestampMonotonic",
+    )
+    try:
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "show", "--no-pager", "--property=" + ",".join(properties), "--", unit],
+            capture_output=True, text=True, timeout=5,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+        )
+        if result.returncode or len(result.stdout) > 8192:
+            return False
+        data = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        return (
+            set(data) == set(properties) and data["Id"] == unit
+            and data["Transient"] == "yes" and data["Type"] == "oneshot"
+            and (data["ActiveState"], data["SubState"]) in {
+                ("inactive", "dead"), ("failed", "failed"), ("active", "exited"),
+            }
+            and data["MainPID"] == data["ControlPID"] == "0"
+            and data["Restart"] == "no" and not data["TriggeredBy"]
+            and data["Job"] in {"", "0"}
+            and int(data["ExecMainExitTimestampMonotonic"]) > 0
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 def unsafe_jobs(excluded):
     findings, inspected = [], set()
     scheduler_entry_budget = [0]
@@ -19673,6 +19715,7 @@ def unsafe_jobs(excluded):
         ):
             continue
         if kind == "systemd":
+            finished_oneshot = finished_transient_oneshot(definition, resolved_target)
             effective = {key: [] for key in sorted(EXEC_KEYS)}
             service_assignments = []
             for origin, target in resolved_target:
@@ -19786,6 +19829,12 @@ def unsafe_jobs(excluded):
                     )
             unit_found = False
             for key in sorted(effective):
+                # Stop hooks can still execute when an active-exited unit is
+                # collected. Only its completed startup is historical.
+                if finished_oneshot and key in {
+                    "ExecCondition", "ExecStartPre", "ExecStart", "ExecStartPost",
+                }:
+                    continue
                 for origin, number, command in effective[key]:
                     finding = inspect_scheduled_command(
                         command,
@@ -37650,6 +37699,17 @@ do_update() {
     "Signed release verified" \
     "Step 5 of 13 · Manifest signature, release version, digest, and archive boundaries passed."
   local staged_update_dir="${UPDATE_RELEASE_STAGE_DIR}/portal"
+  # A Portal update must not require a later core/database migration merely
+  # to retain chat access. Repair only the legacy question bridge on already
+  # supported native OpenClaw versions, using the verified staged release.
+  # This may briefly restart the gateway; core, providers and data stay put.
+  dashboard_update_progress running 30 openclaw-bridge \
+    "Checking OpenClaw chat compatibility" \
+    "Repairing an older question plugin if needed; OpenClaw may briefly reconnect."
+  python3 -I "${staged_update_dir}/installer/repair-openclaw-native-bridge.py" \
+    --source "${staged_update_dir}/installer/openclaw-ask-user-plugin" \
+    >> "${LOG_FILE}" 2>&1 \
+    || fail "OpenClaw chat compatibility repair failed before Portal promotion. The previous plugin is preserved; see ${LOG_FILE}."
   prepare_staged_backend_runtime_dependencies "${staged_update_dir}" \
     || fail "Candidate runtime dependencies could not be prepared and verified before downtime."
   local continuity_repair_plan=""
