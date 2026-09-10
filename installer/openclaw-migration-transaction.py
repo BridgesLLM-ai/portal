@@ -21,6 +21,15 @@ import tempfile
 
 SCHEMA = "bridgesllm-openclaw-2026.9.1-migration-transaction-v2"
 DECISION_SCHEMA = "bridgesllm-openclaw-tested-pair-commit-v5"
+# Size contract for migration.json. The producer embeds every managed
+# authority entry, so the document grows with state cardinality: 23,323
+# entries encoded to 10,285,603 bytes on production (2026-09-09) and the
+# generic 4 MiB read_json default then rejected a manifest the paired
+# producer had just written, after the core package had converged (P4-B313).
+# Every manifest reader below and both migrate-openclaw-*.mjs producers use
+# this exact ceiling; ownership, mode, link, symlink, path-binding, digest
+# and duplicate-key checks are unchanged. Keep in sync with the producers.
+MIGRATION_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 GENERATION = re.compile(r"^[a-f0-9]{32}$")
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
 NPM_INTEGRITY = re.compile(r"^sha512-[A-Za-z0-9+/]+={0,2}$")
@@ -3006,7 +3015,7 @@ def validate_upgrade_manifest_constraints(value):
 
 def validate_migration_manifest_constraints(value):
     target = Path(value["paths"]["migrationManifest"])
-    document = read_json(target)
+    document = read_json(target, maximum=MIGRATION_MANIFEST_MAX_BYTES)
     state_dir, config_path = expected_state_paths()
     package_dir = Path(str(document.get("packageDir", "")))
     config_backup = Path(str(document.get("configBackupPath", "")))
@@ -3114,7 +3123,7 @@ def advance(args) -> None:
     elif after == "migration-prepared":
         validate_prepared_file(value, "upgradeStateSha256", "upgradeStateManifest", required=True)
         target = Path(value["paths"]["migrationManifest"])
-        safe_file(target)
+        safe_file(target, maximum=MIGRATION_MANIFEST_MAX_BYTES)
         migration = validate_migration_manifest_constraints(value)
         value["prepared"]["migrationSha256"] = sha256_file(target)
         value["prepared"]["migrationPackageDir"] = migration["packageDir"]
@@ -3425,9 +3434,19 @@ def inspect(args) -> None:
         if value["prepared"]["migrationPackageDir"] is not None \
                 and migration["packageDir"] != value["prepared"]["migrationPackageDir"]:
             fail("migration package directory does not match the sealed generation")
+    # The sealed prepared digests bind the forward path only. Once recovery
+    # has restored the migration manifest (the producer rewrites it with
+    # state "restored"), every later rollback phase reads the restored
+    # document, so the forward digests are stale by design. The core
+    # rollback/removal phases were missing from this set: an interruption
+    # between migration-prepared and commit-applying recovered as far as
+    # core-rollback-pending and then every inspect failed with "prepared
+    # artifact drift", leaving the gateway fenced (TEST rehearsal,
+    # 2026-09-10; the same rollback phase set as the gateway-action checks).
     if phase not in {
         "recovery-pending", "migration-restored", "upgrade-restored",
-        "restored-cleanup", "commit-applying", "committed-cleanup",
+        "core-rollback-pending", "core-restored", "core-remove-pending",
+        "core-removed", "restored-cleanup", "commit-applying", "committed-cleanup",
     }:
         if value["prepared"]["upgradeStateSha256"] is not None:
             validate_prepared_file(value, "upgradeStateSha256", "upgradeStateManifest", required=True)
@@ -3593,7 +3612,7 @@ def load_terminal_intent(root: Path, tombstone: Path):
 def retain_runtime_bookkeeping(root: Path, migration_manifest: Path) -> None:
     receipt_path = root / "migration.json.runtime-bookkeeping.json"
     if os.path.lexists(receipt_path):
-        migration = read_json(migration_manifest)
+        migration = read_json(migration_manifest, maximum=MIGRATION_MANIFEST_MAX_BYTES)
         if migration.get("state") != "restored" or migration.get("phase") != "restored":
             fail("runtime bookkeeping evidence requires a completed rollback")
         safe_file(receipt_path, mode=0o600, maximum=16 * 1024 * 1024)
@@ -3667,7 +3686,7 @@ def cleanup(args) -> None:
     migration_manifest = Path(value["paths"]["migrationManifest"])
     required_migration_state = "restored" if value["phase"] == "restored-cleanup" else "committed"
     if os.path.lexists(migration_manifest):
-        migration = read_json(migration_manifest)
+        migration = read_json(migration_manifest, maximum=MIGRATION_MANIFEST_MAX_BYTES)
         if (
             migration.get("state") != required_migration_state
             or Path(str(migration.get("manifestPath", ""))).resolve() != migration_manifest
@@ -3689,7 +3708,7 @@ def cleanup(args) -> None:
         else:
             maximum = 512 * 1024 * 1024 \
                 if entry.name == "openclaw-core-rollback.tgz" \
-                else 16 * 1024 * 1024
+                else MIGRATION_MANIFEST_MAX_BYTES
             safe_file(entry, mode=None, maximum=maximum)
     tombstone = Path(args.tombstone)
     if (

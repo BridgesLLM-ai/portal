@@ -1,13 +1,12 @@
 {
   "schema": 1,
-  "version": "5.0.4",
-  "releasedAt": "2026-09-09",
+  "version": "5.0.6",
+  "releasedAt": "2026-09-10",
   "releaseClass": "hotfix",
   "highlights": [
-    "Recover Dashboard updates blocked by an interrupted OpenClaw migration after a manual gateway rescue.",
-    "Preserve native Codex runtime homes during maintenance snapshots and rollback, including temporary command symlinks.",
-    "Allow slower OpenClaw startup preflight and recover interrupted or repeated gateway-rescue operations.",
-    "Explicit root-only recovery preserves the original migration record and rescue evidence before restarting the gateway.",
-    "Includes the 5.0.3 fix for false OpenClaw authentication-store readiness failures."
+    "Fix Update Compatible AI Tools failing with 'unsafe transaction file' on hosts with large OpenClaw state: manifest readers and producers share one 16 MiB contract.",
+    "Fix recovery after an interruption between migration-prepared and commit: rollback now completes instead of leaving the gateway fenced (prepared artifact drift).",
+    "Oversized OpenClaw state inventories fail closed with a clear error before any package or gateway transition.",
+    "Release gates cover production-scale manifests, size boundaries, and sealed-manifest rollback; transactions sealed by 5.0.4 remain reconcilable."
   ]
 }

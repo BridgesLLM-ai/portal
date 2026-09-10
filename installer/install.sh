@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="5.0.4"
+readonly VERSION="5.0.6"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -71,7 +71,8 @@ readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR="/etc/systemd/system/op
 readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
 readonly OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR}/30-bridgesllm-migration-permit.conf"
 readonly LEGACY_OPENCLAW_GATEWAY_PERMIT_DRIFT_HELPER_SHA256="16a86a2144f0d2c36e3353af4a44e2eb0c953af6a8e54fb3410d7f671fd148d1"
-# Helper succession (5.0.4). An open OpenClaw migration transaction always
+# Helper succession (5.0.4+; 5.0.6 adds the 5.0.4 helper 677c8464 as a
+# predecessor). An open OpenClaw migration transaction always
 # runs the helper sealed into its ledger. When that sealed helper is one of
 # these predecessor releases and lacks a verb this release needs, only the
 # explicit --reconcile-rescued-gateway operation may record this release's
@@ -80,8 +81,8 @@ readonly LEGACY_OPENCLAW_GATEWAY_PERMIT_DRIFT_HELPER_SHA256="16a86a2144f0d2c36e3
 # re-verifies both on every call. The successor digest is the sha256 of this
 # release's installer/openclaw-migration-transaction.py and is enforced by
 # scripts/validation/openclaw-migration-helper-identity-static.py.
-readonly OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S="28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9"
-readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5"
+readonly OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S="28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9,677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5"
+readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="4d1f3e4ca51191348161b8e4d8be6e92a2f97061ee40b90060db95c2dc7cd15a"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR="/root/.config/systemd/user/openclaw-gateway.service.d"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
 readonly RETAINED_INSTALL_MARKER="${INSTALL_ROOT}/.retained-install-v1.json"

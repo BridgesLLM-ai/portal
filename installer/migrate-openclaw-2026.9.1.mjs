@@ -9,6 +9,12 @@ import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 
 const CONTRACT_VERSION = 2;
+// Shared with installer/openclaw-migration-transaction.py
+// MIGRATION_MANIFEST_MAX_BYTES (P4-B313). The manifest embeds the whole
+// managed authority inventory, so it must be measured as encoded bytes
+// before it is published or replaced, and refused before any package or
+// gateway transition depends on it.
+const MIGRATION_MANIFEST_MAX_BYTES = 16 * 1024 * 1024;
 const REQUIRED_PACKAGE_NAME = 'openclaw';
 const REQUIRED_PACKAGE_VERSION = '2026.9.1';
 const AGENT_ID_PATTERN = /^[a-z0-9_][a-z0-9_-]{0,63}$/i;
@@ -1431,6 +1437,7 @@ function buildEnvironment(stateDir, configPath) {
 }
 
 function readManifest(manifestPath) {
+  assertManifestBytesWithinContract(lstatRegularFile(manifestPath, 'Portal OpenClaw migration manifest').size, manifestPath);
   const manifest = readJson(manifestPath, 'Portal OpenClaw migration manifest');
   if (manifest.contractVersion !== CONTRACT_VERSION || manifest.packageVersion !== REQUIRED_PACKAGE_VERSION) {
     fail('Portal OpenClaw migration manifest has the wrong contract or package version');
@@ -1460,8 +1467,16 @@ function readManifest(manifestPath) {
   return manifest;
 }
 
+function assertManifestBytesWithinContract(bytes, manifestPath) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) fail(`migration manifest size is not measurable: ${manifestPath}`);
+  if (bytes > MIGRATION_MANIFEST_MAX_BYTES) {
+    fail(`Portal OpenClaw migration manifest is ${bytes} bytes, above the ${MIGRATION_MANIFEST_MAX_BYTES}-byte recovery contract: the managed OpenClaw state inventory is too large for this release, so no package or service transition may depend on it (${manifestPath})`);
+  }
+}
+
 function writeManifest(manifestPath, manifest, replace = false) {
   const content = `${JSON.stringify(manifest, null, 2)}\n`;
+  assertManifestBytesWithinContract(Buffer.byteLength(content, 'utf8'), manifestPath);
   if (!replace) writeExclusive(manifestPath, content, 0o600);
   else writeAtomic(manifestPath, content, 0o600);
 }

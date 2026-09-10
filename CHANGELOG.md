@@ -2,6 +2,34 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.6] - 2026-09-10
+
+### OpenClaw updater manifest size contract and rollback recovery
+
+- Fix "Update Compatible AI Tools" failing with `unsafe transaction file` on
+  hosts with large managed OpenClaw state. The migration manifest embeds the
+  full authority inventory; the transaction helper's manifest readers used the
+  generic 4 MiB ceiling while the producer had none, so a 23,323-entry
+  production inventory encoded to 10.3 MB and was rejected after the core
+  package had already converged, leaving the gateway behind its safety fence.
+  Every manifest reader (validation, terminal cleanup, retained bookkeeping)
+  and both migration producers now share one explicit 16 MiB contract, and the
+  producer refuses an oversized inventory with a distinct error before any
+  package or service transition depends on it.
+- Release gate: `openclaw-migration-manifest-bound-static.py` proves the shipped
+  helper admits the exact 2026-09-09 production shape and the size boundary
+  matrix, and that every sealed predecessor helper refuses it.
+- Fix recovery after an interruption between `migration-prepared` and commit:
+  the helper's `inspect` re-validated the sealed manifest digest through the
+  core rollback phases although the restore step legitimately rewrites the
+  manifest, so rollback stopped at `core-rollback-pending` with
+  `prepared artifact drift` and the gateway stayed fenced. The post-restore
+  phase set now matches the gateway-action checks; regression
+  `sealed_manifest_rollback_campaign` drives a sealed ledger through restore,
+  core rollback and terminal cleanup.
+- Helper succession: the 5.0.4 helper (`677c8464…`) is a known predecessor, so
+  transactions it sealed can be reconciled by this release.
+
 ## [5.0.4] - 2026-09-09
 
 ### OpenClaw updater recovery
