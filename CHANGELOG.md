@@ -2,6 +2,56 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.4] - 2026-09-09
+
+### OpenClaw updater recovery
+
+- Prevent maintenance snapshots from walking Codex's independently owned
+  harness-auth runtime homes. Temporary command symlinks no longer fail the
+  credential snapshot; native-home files, links, and directory identities are
+  preserved through migration and rollback.
+- Allow up to 180 seconds for OpenClaw's startup readiness checks, covering
+  slow SQLite preflight without interrupting an otherwise healthy startup.
+- Recover retries after an attested gateway stop and explicitly reconcile a
+  second manual rescue before the permitted restart. Each completed rescue
+  cycle and its operator evidence are preserved before the next is armed.
+
+- Fix Dashboard updates failing at phase 0/0 with "An interrupted OpenClaw
+  2026.9.1 migration could not be reconciled safely" on a host whose
+  interrupted OpenClaw migration was parked at `core-restored` and whose
+  gateway was then started by hand with the fence marker moved aside. The
+  ledger's sealed helper had no way to record a gateway generation the
+  migration never started, the lock reconciles that ledger before every
+  install or update, and so every later update failed and retrying could
+  not help.
+- Add an explicit, root-only recovery operation:
+  `install.sh --reconcile-rescued-gateway --quarantined-fence-marker PATH
+  --rescue-evidence PATH`, run from an extracted signed release tree (not the
+  one-line installer). It preserves the ledger, the sealed helpers, the
+  quarantined fence marker and the operator's rescue evidence before any
+  ledger write, records the manual rescue with that evidence, restores the
+  fence, stops exactly that gateway generation once through an attested stop,
+  restarts it through the migration's own permitted start, and retires the
+  ledger. `--dry-run` is a read-only preflight. Ordinary updates never
+  trigger it; they keep refusing, now with a message that names this
+  operation.
+- Helper succession: only under that explicit operation may this signed
+  installer record its own migration helper as the successor of an
+  allow-listed sealed predecessor helper (the 5.0.1-5.0.3 helper). The sealed
+  bytes and the ledger's helper pin are never rewritten; the loader re-verifies
+  both, and the successor copy, on every call.
+- Ordinary `--update` and `--maintain-tools` behaviour is unchanged. No
+  automatic adoption of a skipped or unowned gateway generation exists in this
+  release.
+
+### OpenClaw readiness
+
+- Carries the 5.0.3 readiness fix unchanged: the Codex plugin and
+  saved-authentication probes keep the 25-second budget, with the recomputed
+  dashboard cold-probe and provider-catalog deadlines.
+
+---
+
 ## [5.0.3] - 2026-09-09
 
 ### OpenClaw readiness

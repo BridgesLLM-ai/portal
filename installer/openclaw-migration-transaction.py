@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime
 import errno
 import hashlib
 import json
@@ -105,10 +106,48 @@ GATEWAY_DEFINITION_FIELDS = {
 GATEWAY_PROVISION_PHASES = {
     "armed", "unit-published", "daemon-reloaded",
 }
-GATEWAY_ACTION_PURPOSES = {"forward", "baseline-restore"}
+# Ordinary callers may arm only the two owned purposes. The rescue purpose is
+# armed exclusively by reconcile-rescued-gateway after it has bound the
+# observed unowned generation, and it is only ever a stop.
+GATEWAY_OWNED_ACTION_PURPOSES = {"forward", "baseline-restore"}
+GATEWAY_RESCUE_PURPOSE = "rescue-reconcile"
+GATEWAY_ACTION_PURPOSES = GATEWAY_OWNED_ACTION_PURPOSES | {GATEWAY_RESCUE_PURPOSE}
 GATEWAY_UNIT_REMOVAL_PHASES = {
     "upgrade-restored", "core-restored", "core-remove-pending",
 }
+# Helper succession: a signed later installer may take over an open
+# transaction whose sealed helper lacks a required verb. The sealed bytes are
+# never rewritten; the successor lives beside them and the loader re-verifies
+# both on every call.
+HELPER_SUCCESSION_SCHEMA = "bridgesllm-openclaw-migration-helper-succession-v1"
+HELPER_SUCCESSION_RECORD_NAME = "transaction.succession.json"
+HELPER_SUCCESSOR_NAME = "openclaw-migration-transaction.successor.py"
+HELPER_SUCCESSION_FIELDS = {
+    "schema", "ledgerGeneration", "ledgerSha256AtSuccession", "predecessorSha256",
+    "successorSha256", "successorPath", "installerSha256", "portalVersion",
+    "bootId", "recordedAt", "reason",
+}
+GATEWAY_RESCUE_SCHEMA = "bridgesllm-openclaw-gateway-rescue-reconcile-v1"
+GATEWAY_RESCUE_EVIDENCE_SCHEMA = "bridgesllm-openclaw-gateway-rescue-evidence-v1"
+GATEWAY_RESCUE_MANIFEST_SCHEMA = "bridgesllm-openclaw-gateway-rescue-evidence-manifest-v1"
+GATEWAY_RESCUE_RETAINED_SCHEMA = "bridgesllm-openclaw-gateway-rescue-retained-v1"
+GATEWAY_RESCUE_FIELDS = {
+    "schema", "recordedAt", "bootId", "ownership",
+    "lastOwnedIdentity", "lastOwnedIdentitySha256",
+    "observedIdentity", "observedIdentitySha256", "observations",
+    "quarantinedMarkerPath", "quarantinedMarkerSha256",
+    "packageAuthority", "configAuthority", "authoritySnapshotFileCount",
+    "rescueEvidenceSha256", "helperObserved",
+    "evidenceDir", "evidenceManifestSha256",
+    "stopResult", "stopResultSha256", "stoppedAt",
+}
+GATEWAY_RESCUE_OBSERVATION_FIELDS = {"identity", "identitySha256", "observedAt", "outcome"}
+GATEWAY_RESCUE_EVIDENCE_REQUIRED = {"schema", "operator", "rescuedAt", "description"}
+GATEWAY_RESCUE_EVIDENCE_OPTIONAL = {"rescueScriptPath", "rescueScriptSha256", "journalExcerpt"}
+RESCUE_EVIDENCE_DIR_SUFFIX = ".rescue-evidence-"
+RESCUE_RETAINED_SUFFIX = ".rescue-"
+FENCE_MARKER_RUNTIME_PATH = Path("/var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1")
+FENCE_PERMIT_RUNTIME_PATH = Path("/run/bridgesllm/openclaw-gateway-migration-permit.v1")
 
 
 class ContractError(RuntimeError):
@@ -236,7 +275,20 @@ def current_boot_id() -> str:
     return value
 
 
-def attest_gateway_fence_marker(path_value: str) -> None:
+def utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def kernel_root(name: str) -> Path:
+    """/proc and /sys/fs/cgroup; redirectable only under source-only fixtures."""
+    if os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") == "1":
+        override = os.environ.get("PORTAL_OPENCLAW_MIGRATION_TEST_KERNEL_ROOT")
+        if override:
+            return Path(override) / name.lstrip("/")
+    return Path(name)
+
+
+def bound_gateway_fence_marker_path(path_value: str) -> Path:
     marker = Path(path_value)
     if not marker.is_absolute() or Path(os.path.normpath(marker)) != marker:
         fail("gateway fence marker path is not canonical and absolute")
@@ -244,10 +296,23 @@ def attest_gateway_fence_marker(path_value: str) -> None:
         expected = os.environ.get("PORTAL_OPENCLAW_GATEWAY_FENCE_TEST_MARKER")
         if expected is None or marker != Path(expected):
             fail("source-only gateway fence marker is not the bound fixture")
-    elif marker != Path(
-        "/var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1"
-    ):
+    elif marker != FENCE_MARKER_RUNTIME_PATH:
         fail("gateway fence marker escaped the fixed runtime authority")
+    return marker
+
+
+def bound_gateway_fence_permit_path(path_value: str) -> Path:
+    permit = Path(path_value)
+    if not permit.is_absolute() or Path(os.path.normpath(permit)) != permit:
+        fail("gateway fence permit path is not canonical and absolute")
+    if os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") != "1" \
+            and permit != FENCE_PERMIT_RUNTIME_PATH:
+        fail("gateway fence permit escaped the fixed runtime authority")
+    return permit
+
+
+def attest_gateway_fence_marker(path_value: str) -> None:
+    marker = bound_gateway_fence_marker_path(path_value)
     safe_file(marker, mode=0o600, maximum=4096)
     if marker.read_bytes() != GATEWAY_FENCE_CONTENT:
         fail("gateway fence marker content changed")
@@ -796,7 +861,10 @@ def load_ledger(ledger: Path):
         "stablePluginsHelperSha256",
     }:
         fail("prepared fingerprint binding mismatch")
-    if not isinstance(core, dict) or set(core) != {
+    # gatewayRescue is the only optional core key. It is absent until
+    # reconcile-rescued-gateway records a manual rescue, and a ledger carrying
+    # it is no longer loadable by the sealed predecessor helper by design.
+    if not isinstance(core, dict) or set(core) - {"gatewayRescue"} != {
         "packageVersion", "runtimeVersion", "rollbackSha256",
         "gatewayWasActive", "gatewayWasEnabled", "packagePreexisted",
         "stateRootPreexisted", "statePreexisted", "stateConfigPreexisted",
@@ -809,6 +877,7 @@ def load_ledger(ledger: Path):
         "gatewayPendingAction", "gatewayUnitAbsenceRestored",
     }:
         fail("core rollback binding mismatch")
+    rescue = core.get("gatewayRescue")
     for field in ("packageVersion", "runtimeVersion"):
         version = core[field]
         if version is not None and not PACKAGE_VERSION.fullmatch(str(version)):
@@ -963,27 +1032,40 @@ def load_ledger(ledger: Path):
         )
         if pending_gateway.get("beforeSha256") \
                 != canonical_json_sha256(pending_before) \
-            or pending_before != current_gateway \
                 or pending_gateway["expectedActive"] \
                     != (pending_gateway["action"] == "start") \
                 or pending_before["active"] \
                     != (pending_gateway["action"] == "stop"):
             fail("core gateway pending action authority mismatch")
-        desired_active = (
-            core["gatewayCommittedActive"]
-            if pending_gateway["purpose"] == "forward"
-            else core["gatewayWasActive"]
-        )
-        if pending_gateway["action"] == "start" and not desired_active:
-            fail("core gateway start conflicts with its activation purpose")
-        recovery_phases = {
-            "recovery-pending", "migration-restored", "upgrade-restored",
-            "core-rollback-pending", "core-restored", "core-remove-pending",
-            "core-removed", "restored-cleanup",
-        }
-        if (pending_gateway["purpose"] == "baseline-restore") \
-                != (value["phase"] in recovery_phases):
-            fail("core gateway action purpose is not admitted in this phase")
+        if pending_gateway["purpose"] == GATEWAY_RESCUE_PURPOSE:
+            # A rescue stop targets the observed unowned generation, never
+            # the last owned identity, so `before` binds to the rescue record
+            # while gatewayCurrentUnitIdentity keeps the attested owned stop.
+            if rescue is None or pending_gateway["action"] != "stop" \
+                    or value["phase"] != "core-restored" \
+                    or pending_before != rescue.get("observedIdentity") \
+                    or rescue.get("stopResult") is not None:
+                fail("core gateway rescue stop authority mismatch")
+        else:
+            if pending_before != current_gateway:
+                fail("core gateway pending action authority mismatch")
+            desired_active = (
+                core["gatewayCommittedActive"]
+                if pending_gateway["purpose"] == "forward"
+                else core["gatewayWasActive"]
+            )
+            if pending_gateway["action"] == "start" and not desired_active:
+                fail("core gateway start conflicts with its activation purpose")
+            recovery_phases = {
+                "recovery-pending", "migration-restored", "upgrade-restored",
+                "core-rollback-pending", "core-restored", "core-remove-pending",
+                "core-removed", "restored-cleanup",
+            }
+            if (pending_gateway["purpose"] == "baseline-restore") \
+                    != (value["phase"] in recovery_phases):
+                fail("core gateway action purpose is not admitted in this phase")
+    if rescue is not None:
+        validate_gateway_rescue(value, rescue, ledger)
     if core["statePreexisted"] and not core["stateRootPreexisted"]:
         fail("preexisting OpenClaw state requires a preexisting state root")
     if core["stateConfigPreexisted"] and not core["statePreexisted"]:
@@ -1082,6 +1164,164 @@ def load_ledger(ledger: Path):
         if sha256_file(unit_path) != provision_sha256:
             fail("provisioned gateway unit drift")
     return value
+
+
+def rescue_evidence_dir(ledger: Path, generation: str) -> Path:
+    root = ledger.parent
+    return root.parent / (root.name + RESCUE_EVIDENCE_DIR_SUFFIX + generation)
+
+
+def rescue_retained_record_path(root: Path, generation: str) -> Path:
+    return root.parent / (root.name + RESCUE_RETAINED_SUFFIX + generation + ".json")
+
+
+def bounded_text(value, label: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum \
+            or "\x00" in value or "\n" in value or "\r" in value:
+        fail(f"{label} is malformed")
+    return value
+
+
+def validate_gateway_rescue(value, rescue, ledger: Path) -> None:
+    core = value["core"]
+    if not isinstance(rescue, dict) or set(rescue) != GATEWAY_RESCUE_FIELDS:
+        fail("core gateway rescue record shape mismatch")
+    if rescue["schema"] != GATEWAY_RESCUE_SCHEMA \
+            or rescue["ownership"] != "unowned-rescued" \
+            or rescue["bootId"] != value["createdBootId"] \
+            or not core["gatewayUnitPreexisted"] or not core["gatewayWasActive"]:
+        fail("core gateway rescue record binding mismatch")
+    bounded_text(rescue["recordedAt"], "core gateway rescue timestamp", 64)
+    for field in ("lastOwnedIdentity", "observedIdentity"):
+        validate_gateway_unit_identity(
+            rescue[field], label=f"core gateway rescue {field}",
+        )
+        if rescue[field + "Sha256"] != canonical_json_sha256(rescue[field]):
+            fail(f"core gateway rescue {field} digest mismatch")
+    if rescue["lastOwnedIdentity"]["active"] \
+            or not rescue["observedIdentity"]["active"]:
+        fail("core gateway rescue identities have the wrong activation shape")
+    definition_authority = (
+        core["gatewayProvisionedUnitIdentity"] or core["gatewayBaselineUnitIdentity"]
+    )
+    if definition_authority is None or not same_gateway_unit_definition(
+        definition_authority, rescue["observedIdentity"],
+    ):
+        fail("core gateway rescue observed definition drifted from the sealed authority")
+    observations = rescue["observations"]
+    if not isinstance(observations, list) or len(observations) > 64:
+        fail("core gateway rescue observations are malformed")
+    for observation in observations:
+        if not isinstance(observation, dict) \
+                or set(observation) != GATEWAY_RESCUE_OBSERVATION_FIELDS \
+                or observation["outcome"] != "superseded":
+            fail("core gateway rescue observation is malformed")
+        validate_gateway_unit_identity(
+            observation["identity"], label="core gateway rescue observation",
+        )
+        if observation["identitySha256"] != canonical_json_sha256(observation["identity"]):
+            fail("core gateway rescue observation digest mismatch")
+        bounded_text(observation["observedAt"], "core gateway rescue observation timestamp", 64)
+    quarantined = Path(bounded_text(rescue["quarantinedMarkerPath"], "quarantined marker path", 4096))
+    if not quarantined.is_absolute() or Path(os.path.normpath(quarantined)) != quarantined \
+            or rescue["quarantinedMarkerSha256"] \
+                != hashlib.sha256(GATEWAY_FENCE_CONTENT).hexdigest():
+        fail("core gateway rescue quarantined marker binding mismatch")
+    package = rescue["packageAuthority"]
+    if not isinstance(package, dict) or set(package) != {
+        "rollbackSha256", "packageVersion", "installedPackageDir",
+        "archiveMembers", "comparedFiles",
+    } or package["rollbackSha256"] != core["rollbackSha256"] \
+            or package["packageVersion"] != core["packageVersion"] \
+            or not isinstance(package["archiveMembers"], int) \
+            or not isinstance(package["comparedFiles"], int) \
+            or package["comparedFiles"] <= 0 \
+            or package["archiveMembers"] < package["comparedFiles"]:
+        fail("core gateway rescue package authority mismatch")
+    bounded_text(package["installedPackageDir"], "installed package dir", 4096)
+    config = rescue["configAuthority"]
+    if config is not None:
+        if not isinstance(config, dict) or set(config) != {
+            "snapshotPath", "liveConfigPath", "sha256",
+        } or not SHA256.fullmatch(str(config["sha256"])):
+            fail("core gateway rescue config authority mismatch")
+        bounded_text(config["snapshotPath"], "config snapshot path", 4096)
+        bounded_text(config["liveConfigPath"], "live config path", 4096)
+    count = rescue["authoritySnapshotFileCount"]
+    if count is not None and (not isinstance(count, int) or count < 0):
+        fail("core gateway rescue authority snapshot count is malformed")
+    if not SHA256.fullmatch(str(rescue["rescueEvidenceSha256"])):
+        fail("core gateway rescue evidence digest is malformed")
+    observed = rescue["helperObserved"]
+    if not isinstance(observed, dict) or set(observed) != {
+        "verifiedAt", "processStartTicks", "controlGroup", "unitTelemetrySha256",
+    } or observed["processStartTicks"] != rescue["observedIdentity"]["processStartTicks"] \
+            or observed["controlGroup"] != rescue["observedIdentity"]["controlGroup"] \
+            or (observed["unitTelemetrySha256"] is not None
+                and not SHA256.fullmatch(str(observed["unitTelemetrySha256"]))):
+        fail("core gateway rescue helper observation mismatch")
+    bounded_text(observed["verifiedAt"], "core gateway rescue verification timestamp", 64)
+    if rescue["evidenceDir"] != str(rescue_evidence_dir(ledger, value["generation"])) \
+            or not SHA256.fullmatch(str(rescue["evidenceManifestSha256"])):
+        fail("core gateway rescue evidence binding mismatch")
+    pending = core["gatewayPendingAction"]
+    stop = rescue["stopResult"]
+    if stop is None:
+        if rescue["stopResultSha256"] is not None or rescue["stoppedAt"] is not None \
+                or pending is None or pending["purpose"] != GATEWAY_RESCUE_PURPOSE \
+                or core["gatewayCurrentUnitIdentity"] != rescue["lastOwnedIdentity"]:
+            fail("core gateway rescue record has no armed stop")
+        return
+    validate_gateway_unit_identity(stop, label="core gateway rescue stop result")
+    observed_identity = rescue["observedIdentity"]
+    if rescue["stopResultSha256"] != canonical_json_sha256(stop) \
+            or stop["active"] or stop["controlGroup"] != "" \
+            or stop["invocationId"] != observed_identity["invocationId"] \
+            or stop["execMainStartTimestampMonotonic"] \
+                != observed_identity["execMainStartTimestampMonotonic"] \
+            or not same_gateway_unit_definition(observed_identity, stop) \
+            or (pending is not None and pending["purpose"] == GATEWAY_RESCUE_PURPOSE):
+        fail("core gateway rescue stop result mismatch")
+    bounded_text(rescue["stoppedAt"], "core gateway rescue stop timestamp", 64)
+
+
+def validate_helper_succession_record(value, record, ledger: Path) -> None:
+    root = ledger.parent
+    successor = root / HELPER_SUCCESSOR_NAME
+    if not isinstance(record, dict) or set(record) != HELPER_SUCCESSION_FIELDS:
+        fail("helper succession record shape mismatch")
+    if record["schema"] != HELPER_SUCCESSION_SCHEMA \
+            or record["ledgerGeneration"] != value["generation"] \
+            or record["predecessorSha256"] != value["prepared"]["transactionHelperSha256"] \
+            or record["successorPath"] != str(successor) \
+            or not SHA256.fullmatch(str(record["ledgerSha256AtSuccession"])) \
+            or not SHA256.fullmatch(str(record["successorSha256"])) \
+            or (record["installerSha256"] is not None
+                and not SHA256.fullmatch(str(record["installerSha256"]))) \
+            or not BOOT_ID.fullmatch(str(record["bootId"])):
+        fail("helper succession record binding mismatch")
+    bounded_text(record["portalVersion"], "helper succession portal version", 64)
+    bounded_text(record["recordedAt"], "helper succession timestamp", 64)
+    bounded_text(record["reason"], "helper succession reason", 256)
+    safe_file(successor, mode=0o600, maximum=4 * 1024 * 1024)
+    if sha256_file(successor) != record["successorSha256"]:
+        fail("durable successor helper drift")
+
+
+def load_helper_succession_record(value, ledger: Path):
+    root = ledger.parent
+    record_path = root / HELPER_SUCCESSION_RECORD_NAME
+    successor = root / HELPER_SUCCESSOR_NAME
+    if not os.path.lexists(record_path):
+        # A successor copy without a record is a crash between the copy and
+        # the record write; it is inert until record-helper-succession
+        # completes and is never executed by the loader.
+        return None
+    if not os.path.lexists(successor):
+        fail("helper succession record exists without its successor helper")
+    record = read_json(record_path, maximum=64 * 1024)
+    validate_helper_succession_record(value, record, ledger)
+    return record
 
 
 def create(args) -> None:
@@ -1390,6 +1630,8 @@ def arm_core_gateway_action(args) -> None:
         fail("terminal migration state cannot arm another gateway stop")
     if core["gatewayPendingAction"] is not None:
         fail("a core gateway action is already pending")
+    if args.purpose not in GATEWAY_OWNED_ACTION_PURPOSES:
+        fail("only reconcile-rescued-gateway may arm a rescue stop")
     identity = json_argument(args.identity_json, "core gateway action identity")
     validate_gateway_unit_identity(identity, label="core gateway action identity")
     definition_authority = (
@@ -1447,6 +1689,21 @@ def record_core_gateway_result(args) -> None:
             <= before["execMainStartTimestampMonotonic"]
     ):
         fail("core gateway start did not create a new process generation")
+    if pending["purpose"] == GATEWAY_RESCUE_PURPOSE:
+        # The stopped shape of exactly the observed rescued generation: systemd
+        # retains its InvocationID and start clock after a real stop, while a
+        # fenced skipped start would reset both. The kernel must also agree
+        # that the leader and its cgroup are gone.
+        if identity["controlGroup"] != "" \
+                or identity["invocationId"] != before["invocationId"] \
+                or identity["execMainStartTimestampMonotonic"] \
+                    != before["execMainStartTimestampMonotonic"] \
+                or not owned_gateway_generation_exited(before):
+            fail("core gateway rescue stop did not retire the observed generation")
+        rescue = core["gatewayRescue"]
+        rescue["stopResult"] = identity
+        rescue["stopResultSha256"] = canonical_json_sha256(identity)
+        rescue["stoppedAt"] = utc_now()
     core["gatewayCurrentUnitIdentity"] = identity
     core["gatewayCurrentUnitIdentitySha256"] = canonical_json_sha256(identity)
     core["gatewayPendingAction"] = None
@@ -1457,7 +1714,7 @@ def record_core_gateway_result(args) -> None:
 def owned_gateway_generation_exited(current) -> bool:
     """Read kernel identity, never infer process death from a systemd status alone."""
     try:
-        raw = Path(f"/proc/{current['mainPid']}/stat").read_text(encoding="ascii")
+        raw = (kernel_root("/proc") / str(current["mainPid"]) / "stat").read_text(encoding="ascii")
     except FileNotFoundError:
         pass
     except (OSError, UnicodeError):
@@ -1475,7 +1732,7 @@ def owned_gateway_generation_exited(current) -> bool:
     if not group.startswith("/") or ".." in Path(group).parts:
         return False
     try:
-        members = (Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.procs").read_text(encoding="ascii")
+        members = (kernel_root("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.procs").read_text(encoding="ascii")
         if members.strip():
             return False
     except FileNotFoundError:
@@ -1483,6 +1740,30 @@ def owned_gateway_generation_exited(current) -> bool:
     except (OSError, UnicodeError):
         return False
     return True
+
+
+def gateway_generation_is_live(identity) -> bool:
+    """The observed active generation must still be the kernel's own process.
+
+    systemd telemetry alone is not provenance: the leader must carry the exact
+    start ticks, must not be a zombie, and must still be listed in the unit's
+    control group.
+    """
+    try:
+        raw = (kernel_root("/proc") / str(identity["mainPid"]) / "stat").read_text(encoding="ascii")
+        fields = raw.rsplit(")", 1)[1].split()
+        if int(fields[19]) != identity["processStartTicks"] or fields[0] == "Z":
+            return False
+    except (OSError, UnicodeError, IndexError, ValueError):
+        return False
+    group = identity["controlGroup"]
+    if not group.startswith("/") or ".." in Path(group).parts:
+        return False
+    try:
+        members = (kernel_root("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.procs").read_text(encoding="ascii").split()
+    except (OSError, UnicodeError):
+        return False
+    return str(identity["mainPid"]) in members
 
 
 def adopt_core_gateway_identity(args) -> None:
@@ -1590,6 +1871,480 @@ def adopt_core_gateway_identity(args) -> None:
     core["gatewayCurrentUnitIdentitySha256"] = canonical_json_sha256(identity)
     atomic_json(ledger, value)
     print(json.dumps(identity, sort_keys=True, separators=(",", ":")))
+
+
+def record_helper_succession(args) -> None:
+    """Install this helper as the successor of an open transaction's sealed helper.
+
+    The sealed bytes stay in place and keep being verified against the pin on
+    every call. The successor copy and its record are written durably before
+    any other successor verb can run; the loader admits the successor only
+    while both re-verify. Repeated calls are no-ops when the record matches.
+    """
+    ledger = Path(args.ledger)
+    value = load_ledger(ledger)
+    root = ledger.parent
+    expected = str(args.expected_successor_sha256)
+    if not SHA256.fullmatch(expected):
+        fail("expected successor digest is malformed")
+    installer_sha256 = args.installer_sha256
+    if installer_sha256 is not None and not SHA256.fullmatch(str(installer_sha256)):
+        fail("installer digest is malformed")
+    portal_version = bounded_text(args.portal_version, "portal version", 64)
+    reason = bounded_text(args.reason, "succession reason", 256)
+    pin = value["prepared"]["transactionHelperSha256"]
+    if pin == expected:
+        fail("sealed helper already is the current helper; succession is unnecessary")
+    existing = load_helper_succession_record(value, ledger)
+    if existing is not None:
+        if existing["successorSha256"] != expected:
+            fail("a different successor helper is already recorded")
+        print(json.dumps(existing, sort_keys=True, separators=(",", ":")))
+        return
+    source = Path(__file__)
+    if not source.is_absolute() or Path(os.path.normpath(source)) != source:
+        fail("successor helper source path is not canonical")
+    successor = root / HELPER_SUCCESSOR_NAME
+    safe_directory(root, exact_mode=0o700)
+    fault("succession-before-successor-copy")
+    if os.path.lexists(successor) and not stat.S_ISREG(os.lstat(successor).st_mode):
+        fail("successor helper path is occupied by a non-regular file")
+    durable_copy(source, successor, maximum=4 * 1024 * 1024)
+    fault("succession-after-successor-copy")
+    if sha256_file(successor) != expected:
+        successor.unlink()
+        fsync_directory(root)
+        fail("successor helper bytes do not match the installer's signed successor digest")
+    record = {
+        "schema": HELPER_SUCCESSION_SCHEMA,
+        "ledgerGeneration": value["generation"],
+        "ledgerSha256AtSuccession": sha256_file(ledger),
+        "predecessorSha256": pin,
+        "successorSha256": expected,
+        "successorPath": str(successor),
+        "installerSha256": installer_sha256,
+        "portalVersion": portal_version,
+        "bootId": current_boot_id(),
+        "recordedAt": utc_now(),
+        "reason": reason,
+    }
+    fault("succession-before-record")
+    atomic_json(root / HELPER_SUCCESSION_RECORD_NAME, record)
+    fault("succession-after-record")
+    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+
+
+def validate_rescue_evidence_document(document) -> None:
+    if not isinstance(document, dict) \
+            or not GATEWAY_RESCUE_EVIDENCE_REQUIRED <= set(document) \
+            or not set(document) <= GATEWAY_RESCUE_EVIDENCE_REQUIRED | GATEWAY_RESCUE_EVIDENCE_OPTIONAL:
+        fail("rescue evidence document shape mismatch")
+    if document["schema"] != GATEWAY_RESCUE_EVIDENCE_SCHEMA:
+        fail("rescue evidence document schema mismatch")
+    bounded_text(document["operator"], "rescue evidence operator", 128)
+    bounded_text(document["rescuedAt"], "rescue evidence timestamp", 64)
+    bounded_text(document["description"], "rescue evidence description", 2048)
+    script = document.get("rescueScriptPath")
+    digest = document.get("rescueScriptSha256")
+    if (script is None) != (digest is None):
+        fail("rescue evidence script path and digest must be given together")
+    if script is not None:
+        path = Path(bounded_text(script, "rescue evidence script path", 4096))
+        if not path.is_absolute() or Path(os.path.normpath(path)) != path \
+                or not SHA256.fullmatch(str(digest)):
+            fail("rescue evidence script binding is malformed")
+        safe_file(path, mode=None, maximum=1024 * 1024)
+        if sha256_file(path) != digest:
+            fail("rescue evidence script does not match its stated digest")
+    excerpt = document.get("journalExcerpt")
+    if excerpt is not None:
+        if not isinstance(excerpt, list) or len(excerpt) > 256 \
+                or any(not isinstance(line, str) or len(line) > 4096 for line in excerpt):
+            fail("rescue evidence journal excerpt is malformed")
+
+
+def compare_archive_to_tree(archive: Path, installed: Path):
+    """Every regular file and symlink in the sealed rollback archive must equal
+    the installed package tree. Bounded by the archive; extra installed files
+    are not this verb's authority."""
+    safe_directory(installed)
+    members = 0
+    compared = 0
+    try:
+        with tarfile.open(archive, mode="r:gz") as bundle:
+            for member in bundle:
+                members += 1
+                parts = Path(member.name).parts
+                if len(parts) < 2 or parts[0] != "package" or ".." in parts \
+                        or member.name.startswith("/"):
+                    fail("core rollback archive member escapes its package root")
+                target = installed.joinpath(*parts[1:])
+                if member.isdir():
+                    continue
+                if member.issym():
+                    if not os.path.islink(target) or os.readlink(target) != member.linkname:
+                        fail(f"installed package link differs from the sealed rollback: {member.name}")
+                    continue
+                if not member.isfile():
+                    fail(f"unsupported core rollback archive member: {member.name}")
+                try:
+                    info = os.lstat(target)
+                except FileNotFoundError:
+                    fail(f"installed package is missing a sealed rollback member: {member.name}")
+                if not stat.S_ISREG(info.st_mode) or info.st_size != member.size:
+                    fail(f"installed package member differs from the sealed rollback: {member.name}")
+                stream = bundle.extractfile(member)
+                if stream is None:
+                    fail(f"unreadable core rollback archive member: {member.name}")
+                with target.open("rb") as installed_stream:
+                    while True:
+                        expected = stream.read(1024 * 1024)
+                        actual = installed_stream.read(1024 * 1024)
+                        if expected != actual:
+                            fail(f"installed package member differs from the sealed rollback: {member.name}")
+                        if not expected:
+                            break
+                compared += 1
+    except tarfile.TarError as error:
+        fail(f"invalid core rollback archive: {error}")
+    if compared <= 0:
+        fail("core rollback archive holds no comparable package files")
+    return members, compared
+
+
+def preserve_rescue_evidence(evidence_dir: Path, generation: str, entries) -> str:
+    """Copy evidence into the sibling evidence directory before any ledger
+    write. An existing directory must verify against its manifest; new names
+    are appended, existing names are never rewritten."""
+    parent = evidence_dir.parent
+    safe_directory(parent, exact_mode=0o700)
+    if not os.path.lexists(evidence_dir):
+        os.mkdir(evidence_dir, 0o700)
+        os.chown(evidence_dir, 0, 0)
+        fsync_directory(parent)
+    safe_directory(evidence_dir, exact_mode=0o700)
+    manifest_path = evidence_dir / "manifest.json"
+    if os.path.lexists(manifest_path):
+        manifest = read_json(manifest_path, maximum=1024 * 1024)
+        if not isinstance(manifest, dict) or set(manifest) != {"schema", "generation", "files"} \
+                or manifest["schema"] != GATEWAY_RESCUE_MANIFEST_SCHEMA \
+                or manifest["generation"] != generation \
+                or not isinstance(manifest["files"], dict):
+            fail("rescue evidence manifest is malformed")
+        for name, digest in manifest["files"].items():
+            if not isinstance(name, str) or "/" in name or name in {"", ".", ".."} \
+                    or not SHA256.fullmatch(str(digest)):
+                fail("rescue evidence manifest entry is malformed")
+            target = evidence_dir / name
+            safe_file(target, mode=0o600, maximum=512 * 1024 * 1024)
+            if sha256_file(target) != digest:
+                fail(f"preserved rescue evidence changed: {name}")
+    else:
+        manifest = {
+            "schema": GATEWAY_RESCUE_MANIFEST_SCHEMA,
+            "generation": generation,
+            "files": {},
+        }
+    for entry in evidence_dir.iterdir():
+        if entry.name != "manifest.json" and entry.name not in manifest["files"]:
+            fail(f"unknown rescue evidence artifact: {entry}")
+    changed = False
+    for name, source in entries:
+        if name in manifest["files"]:
+            continue
+        target = evidence_dir / name
+        if isinstance(source, Path):
+            durable_copy(source, target, maximum=512 * 1024 * 1024)
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=evidence_dir)
+            temporary = Path(temporary_name)
+            try:
+                os.fchown(descriptor, 0, 0)
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(source)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, target)
+                temporary = None
+                fsync_directory(evidence_dir)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        manifest["files"][name] = sha256_file(target)
+        changed = True
+    if changed or not os.path.lexists(manifest_path):
+        atomic_json(manifest_path, manifest)
+    return sha256_file(manifest_path)
+
+
+def reconcile_rescued_gateway(args) -> None:
+    """Record a manual rescue that started an unowned gateway generation and
+    arm its authorized stop.
+
+    Never adopts the foreign generation, never induces a skip, never rewrites
+    prior ownership. After the installer performs the attested stop and
+    records its result, the ledger's current identity is the stopped rescued
+    generation, and the ordinary baseline-restore start proceeds.
+    """
+    ledger = Path(args.ledger)
+    value = load_ledger(ledger)
+    core = value["core"]
+    root = ledger.parent
+    if value["phase"] != "core-restored":
+        fail("rescue reconciliation is admitted only at core-restored")
+    if not core["gatewayUnitPreexisted"] or not core["gatewayWasActive"]:
+        fail("rescue reconciliation requires a preexisting active gateway baseline")
+    if value["createdBootId"] != current_boot_id():
+        fail("rescue reconciliation requires the transaction's own boot")
+    rescue = core.get("gatewayRescue")
+    pending = core["gatewayPendingAction"]
+    identity = json_argument(args.identity_json, "observed gateway identity")
+    validate_gateway_unit_identity(identity, label="observed gateway identity")
+    completed_stop = rescue is not None and rescue["stopResult"] is not None
+    if completed_stop:
+        if identity == rescue["observedIdentity"] or core_gateway_known_identity(value, identity):
+            print(json.dumps({"state": "reconciled", "evidenceDir": rescue["evidenceDir"]},
+                             sort_keys=True, separators=(",", ":")))
+            return
+        # A new active manual rescue is a new explicit stop cycle. The
+        # previously attested stop remains the current owned identity; it is
+        # never replaced with the new, unowned live generation.
+        if pending is not None or core["gatewayCurrentUnitIdentity"] != rescue["stopResult"]:
+            fail("completed rescue stop is no longer the current gateway authority")
+    if pending is not None and pending["purpose"] != GATEWAY_RESCUE_PURPOSE:
+        fail("another core gateway action is pending")
+    if rescue is not None and len(rescue["observations"]) >= 64:
+        fail("core gateway rescue observation limit reached")
+    if not identity["active"]:
+        fail("observed gateway generation is not active")
+    if core_gateway_known_identity(value, identity):
+        fail("observed gateway generation is already owned by this transaction")
+    current = core["gatewayCurrentUnitIdentity"]
+    if current is None or current["active"]:
+        fail("last owned gateway identity must be an attested stop")
+    definition_authority = (
+        core["gatewayProvisionedUnitIdentity"] or core["gatewayBaselineUnitIdentity"]
+    )
+    if definition_authority is None \
+            or not same_gateway_unit_definition(definition_authority, identity):
+        fail("observed gateway definition drifted from the sealed authority")
+    fence_dropin = Path(bounded_text(args.fence_dropin, "fence drop-in path", 4096))
+    if not fence_dropin.is_absolute() \
+            or str(fence_dropin) not in identity["dropInPaths"].split():
+        fail("observed gateway definition does not carry the authorization fence drop-in")
+    if not gateway_generation_is_live(identity):
+        fail("observed gateway generation is not live in the kernel")
+    if pending is not None and pending["before"] == identity:
+        print(json.dumps({"state": "armed", "pending": pending, "evidenceDir": rescue["evidenceDir"]},
+                         sort_keys=True, separators=(",", ":")))
+        return
+
+    marker = bound_gateway_fence_marker_path(args.fence_marker)
+    if os.path.lexists(marker):
+        # A previous attempt already closed the window; presence only helps.
+        attest_gateway_fence_marker(args.fence_marker)
+    quarantined = Path(args.quarantined_marker)
+    if not quarantined.is_absolute() or Path(os.path.normpath(quarantined)) != quarantined \
+            or quarantined == marker:
+        fail("quarantined fence marker path is not canonical")
+    safe_file(quarantined, mode=0o600, maximum=4096)
+    if quarantined.read_bytes() != GATEWAY_FENCE_CONTENT:
+        fail("quarantined fence marker content mismatch")
+    permit = bound_gateway_fence_permit_path(args.permit)
+    if os.path.lexists(permit):
+        fail("a live migration permit exists; refusing to reconcile beside another controller")
+
+    if core["rollbackSha256"] is None:
+        fail("rescue reconciliation requires a sealed core rollback package")
+    rollback = Path(value["paths"]["coreRollbackPackage"])
+    if package_version_from_archive(rollback) != core["packageVersion"]:
+        fail("core rollback archive version differs from the sealed package version")
+    installed = Path(args.installed_package_dir)
+    if not installed.is_absolute() or Path(os.path.normpath(installed)) != installed:
+        fail("installed package directory is not canonical")
+    archive_members, compared_files = compare_archive_to_tree(rollback, installed)
+
+    snapshot = Path(f"{root / 'migration.json'}.openclaw.json.before")
+    config_authority = None
+    if os.path.lexists(snapshot):
+        safe_file(snapshot, mode=0o600, maximum=16 * 1024 * 1024)
+        live_config = Path(args.live_config)
+        if not live_config.is_absolute() or Path(os.path.normpath(live_config)) != live_config:
+            fail("live OpenClaw config path is not canonical")
+        safe_file(live_config, mode=None, maximum=16 * 1024 * 1024)
+        if live_config.read_bytes() != snapshot.read_bytes():
+            fail("live OpenClaw config differs from the pre-transaction snapshot")
+        config_authority = {
+            "snapshotPath": str(snapshot),
+            "liveConfigPath": str(live_config),
+            "sha256": sha256_file(snapshot),
+        }
+    authority_dir = Path(f"{root / 'migration.json'}.authority-before")
+    snapshot_file_count = None
+    if os.path.lexists(authority_dir):
+        validate_snapshot_tree(authority_dir)
+        snapshot_file_count = sum(
+            1 for entry in authority_dir.rglob("*") if entry.is_file()
+        )
+
+    evidence = Path(args.rescue_evidence)
+    if not evidence.is_absolute() or Path(os.path.normpath(evidence)) != evidence:
+        fail("rescue evidence path is not canonical")
+    evidence_info = safe_file(evidence, mode=None, maximum=64 * 1024)
+    if evidence_info.st_mode & 0o022:
+        fail("rescue evidence document is writable by other users")
+    document = read_json(evidence, maximum=64 * 1024, mode=None)
+    validate_rescue_evidence_document(document)
+    telemetry = None
+    telemetry_digest = None
+    if args.unit_telemetry is not None:
+        telemetry = Path(args.unit_telemetry)
+        if not telemetry.is_absolute() or Path(os.path.normpath(telemetry)) != telemetry:
+            fail("unit telemetry path is not canonical")
+        safe_file(telemetry, mode=0o600, maximum=256 * 1024)
+        telemetry_digest = sha256_file(telemetry)
+
+    sequence = 1 if rescue is None else len(rescue["observations"]) + 2
+    canonical = lambda item: (json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    entries = [
+        ("transaction.json", ledger),
+        ("openclaw-migration-transaction.py", Path(value["paths"]["transactionHelper"])),
+        ("openclaw-core-rollback.tgz.sha256", (core["rollbackSha256"] + "\n").encode("ascii")),
+        ("quarantined-fence-marker", quarantined),
+        ("rescue-evidence.json", evidence),
+        ("last-owned-identity.json", canonical(current)),
+        (f"observed-identity-{sequence}.json", canonical(identity)),
+    ]
+    for name in ("openclaw-stable-plugins.sh", "migrate-openclaw-2026.9.1.mjs",
+                 "migration.json.openclaw.json.before"):
+        candidate = root / name
+        if os.path.lexists(candidate):
+            entries.append((name, candidate))
+    if document.get("rescueScriptPath") is not None:
+        entries.append(("rescue-script", Path(document["rescueScriptPath"])))
+    if telemetry is not None:
+        entries.append((f"unit-telemetry-{sequence}.txt", telemetry))
+    if rescue is not None:
+        # Preserve every previous attested stop and the new operator document
+        # under unique names before re-arming. The original evidence remains
+        # immutable; the current document digest must name preserved bytes.
+        entries.extend([
+            (f"transaction-before-rearm-{sequence}.json", ledger),
+            (f"last-owned-identity-{sequence}.json", canonical(current)),
+            (f"rescue-evidence-{sequence}.json", evidence),
+        ])
+        if document.get("rescueScriptPath") is not None:
+            entries.append((f"rescue-script-{sequence}", Path(document["rescueScriptPath"])))
+    evidence_dir = rescue_evidence_dir(ledger, value["generation"])
+    fault("rescue-before-evidence")
+    manifest_digest = preserve_rescue_evidence(evidence_dir, value["generation"], entries)
+    # A retry after evidence publication may reuse names, but cannot bind a
+    # different observation/document to bytes preserved by the prior attempt.
+    current_names = {
+        f"observed-identity-{sequence}.json",
+        "rescue-evidence.json" if rescue is None else f"rescue-evidence-{sequence}.json",
+    }
+    for name, source in entries:
+        if name in current_names:
+            expected = sha256_file(source) if isinstance(source, Path) else hashlib.sha256(source).hexdigest()
+            if sha256_file(evidence_dir / name) != expected:
+                fail("current rescue observation differs from its preserved evidence")
+    fault("rescue-after-evidence")
+
+    now = utc_now()
+    helper_observed = {
+        "verifiedAt": now,
+        "processStartTicks": identity["processStartTicks"],
+        "controlGroup": identity["controlGroup"],
+        "unitTelemetrySha256": telemetry_digest,
+    }
+    if rescue is None:
+        rescue = {
+            "schema": GATEWAY_RESCUE_SCHEMA,
+            "recordedAt": now,
+            "bootId": value["createdBootId"],
+            "ownership": "unowned-rescued",
+            "lastOwnedIdentity": current,
+            "lastOwnedIdentitySha256": canonical_json_sha256(current),
+            "observedIdentity": identity,
+            "observedIdentitySha256": canonical_json_sha256(identity),
+            "observations": [],
+            "quarantinedMarkerPath": str(quarantined),
+            "quarantinedMarkerSha256": hashlib.sha256(GATEWAY_FENCE_CONTENT).hexdigest(),
+            "packageAuthority": {
+                "rollbackSha256": core["rollbackSha256"],
+                "packageVersion": core["packageVersion"],
+                "installedPackageDir": str(installed),
+                "archiveMembers": archive_members,
+                "comparedFiles": compared_files,
+            },
+            "configAuthority": config_authority,
+            "authoritySnapshotFileCount": snapshot_file_count,
+            "rescueEvidenceSha256": sha256_file(evidence),
+            "helperObserved": helper_observed,
+            "evidenceDir": str(evidence_dir),
+            "evidenceManifestSha256": manifest_digest,
+            "stopResult": None,
+            "stopResultSha256": None,
+            "stoppedAt": None,
+        }
+        core["gatewayRescue"] = rescue
+        state = "armed"
+    else:
+        # Supersede the earlier observation, not its history. A completed
+        # cycle's full ledger (including its attested stop) was preserved
+        # above before this single atomic write.
+        if pending is None and not completed_stop:
+            fail("rescue record without an armed stop cannot be re-armed")
+        rescue["lastOwnedIdentity"] = current
+        rescue["lastOwnedIdentitySha256"] = canonical_json_sha256(current)
+        rescue["stopResult"] = None
+        rescue["stopResultSha256"] = None
+        rescue["stoppedAt"] = None
+        rescue["observations"].append({
+            "identity": rescue["observedIdentity"],
+            "identitySha256": rescue["observedIdentitySha256"],
+            "observedAt": rescue["helperObserved"]["verifiedAt"],
+            "outcome": "superseded",
+        })
+        rescue["observedIdentity"] = identity
+        rescue["observedIdentitySha256"] = canonical_json_sha256(identity)
+        rescue["helperObserved"] = helper_observed
+        rescue["evidenceManifestSha256"] = manifest_digest
+        rescue["rescueEvidenceSha256"] = sha256_file(evidence)
+        state = "re-armed"
+    core["gatewayPendingAction"] = {
+        "action": "stop",
+        "purpose": GATEWAY_RESCUE_PURPOSE,
+        "before": identity,
+        "beforeSha256": canonical_json_sha256(identity),
+        "expectedActive": False,
+    }
+    fault("rescue-before-record")
+    atomic_json(ledger, value)
+    fault("rescue-after-record")
+    print(json.dumps({
+        "state": state,
+        "pending": core["gatewayPendingAction"],
+        "evidenceDir": str(evidence_dir),
+    }, sort_keys=True, separators=(",", ":")))
+
+
+def rescue_authority(args) -> None:
+    value = load_ledger(Path(args.ledger))
+    core = value["core"]
+    rescue = core.get("gatewayRescue")
+    print(json.dumps({
+        "phase": value["phase"],
+        "current": core["gatewayCurrentUnitIdentity"],
+        "pending": core["gatewayPendingAction"],
+        "recorded": rescue is not None,
+        "stopped": rescue is not None and rescue["stopResult"] is not None,
+        "observedIdentity": None if rescue is None else rescue["observedIdentity"],
+        "evidenceDir": None if rescue is None else rescue["evidenceDir"],
+        "succession": load_helper_succession_record(value, Path(args.ledger)),
+    }, sort_keys=True, separators=(",", ":")))
 
 
 def core_gateway_authority(args) -> None:
@@ -2858,6 +3613,41 @@ def retain_runtime_bookkeeping(root: Path, migration_manifest: Path) -> None:
             atomic_copy_file(receipt_path, retained, 0o600)
 
 
+TERMINAL_ROOT_ARTIFACTS = {
+    "transaction.json", "upgrade-state.json", "migration.json",
+    "migrate-openclaw-2026.9.1.mjs", "openclaw-migration-transaction.py",
+    "openclaw-stable-plugins.sh", "codex-plugin",
+    "codex-forward-gateway-proof.json", "codex-rollback-gateway-proof.json",
+    "openclaw-core-rollback.tgz", "openclaw-gateway.service",
+    "migration.json.openclaw.json.before", "migration.json.authority-before",
+    "migration.json.cron-before", "migration.json.runtime-bookkeeping.json",
+    HELPER_SUCCESSION_RECORD_NAME, HELPER_SUCCESSOR_NAME,
+}
+
+
+def retain_rescue_record(root: Path, value, ledger: Path) -> None:
+    """Keep the rescue record and succession record beside the evidence
+    directory so terminal cleanup never erases how the rescued generation was
+    reconciled. An existing retained record must match exactly."""
+    rescue = value["core"].get("gatewayRescue")
+    if rescue is None:
+        return
+    document = {
+        "schema": GATEWAY_RESCUE_RETAINED_SCHEMA,
+        "generation": value["generation"],
+        "terminalPhase": value["phase"],
+        "rescue": rescue,
+        "succession": load_helper_succession_record(value, ledger),
+    }
+    retained = rescue_retained_record_path(root, value["generation"])
+    if os.path.lexists(retained):
+        safe_file(retained, mode=0o600, maximum=16 * 1024 * 1024)
+        if read_json(retained) != document:
+            fail("retained rescue record changed")
+        return
+    atomic_json(retained, document)
+
+
 def cleanup(args) -> None:
     ledger = Path(args.ledger)
     value = load_ledger(ledger)
@@ -2886,16 +3676,9 @@ def cleanup(args) -> None:
     elif value["phase"] != "restored-cleanup" or value["prepared"]["migrationSha256"] is not None:
         fail("migration manifest is missing at terminal cleanup")
     retain_runtime_bookkeeping(root, migration_manifest)
+    retain_rescue_record(root, value, ledger)
     remove_upgrade_state_backups(value, value["phase"])
-    allowed = {
-        "transaction.json", "upgrade-state.json", "migration.json",
-        "migrate-openclaw-2026.9.1.mjs", "openclaw-migration-transaction.py",
-        "openclaw-stable-plugins.sh", "codex-plugin",
-        "codex-forward-gateway-proof.json", "codex-rollback-gateway-proof.json",
-        "openclaw-core-rollback.tgz", "openclaw-gateway.service",
-        "migration.json.openclaw.json.before", "migration.json.authority-before",
-        "migration.json.cron-before", "migration.json.runtime-bookkeeping.json",
-    }
+    allowed = TERMINAL_ROOT_ARTIFACTS
     for entry in root.iterdir():
         if entry.name not in allowed:
             fail(f"unknown migration transaction artifact: {entry}")
@@ -2943,15 +3726,7 @@ def retire_tombstone(root: Path, tombstone: Path, intent: Path, document) -> Non
         document["rootDevice"], document["rootInode"],
     ):
         fail("terminal migration tombstone inode changed")
-    allowed = {
-        "transaction.json", "upgrade-state.json", "migration.json",
-        "migrate-openclaw-2026.9.1.mjs", "openclaw-migration-transaction.py",
-        "openclaw-stable-plugins.sh", "codex-plugin",
-        "codex-forward-gateway-proof.json", "codex-rollback-gateway-proof.json",
-        "openclaw-core-rollback.tgz", "openclaw-gateway.service",
-        "migration.json.openclaw.json.before", "migration.json.authority-before",
-        "migration.json.cron-before", "migration.json.runtime-bookkeeping.json",
-    }
+    allowed = TERMINAL_ROOT_ARTIFACTS
     entries = sorted(tombstone.iterdir(), key=lambda item: item.name)
     for entry in entries:
         if entry.name not in allowed or entry.is_symlink():
@@ -3094,10 +3869,31 @@ def build_parser():
         "--action", required=True, choices=("start", "stop"),
     )
     core_gateway_arm_parser.add_argument(
-        "--purpose", required=True, choices=sorted(GATEWAY_ACTION_PURPOSES),
+        "--purpose", required=True, choices=sorted(GATEWAY_OWNED_ACTION_PURPOSES),
     )
     core_gateway_arm_parser.add_argument("--identity-json", required=True)
     core_gateway_arm_parser.set_defaults(handler=arm_core_gateway_action)
+    succession_parser = subparsers.add_parser("record-helper-succession")
+    succession_parser.add_argument("--ledger", required=True)
+    succession_parser.add_argument("--expected-successor-sha256", required=True)
+    succession_parser.add_argument("--installer-sha256")
+    succession_parser.add_argument("--portal-version", required=True)
+    succession_parser.add_argument(
+        "--reason", default="successor verb required: reconcile-rescued-gateway",
+    )
+    succession_parser.set_defaults(handler=record_helper_succession)
+    rescue_parser = subparsers.add_parser("reconcile-rescued-gateway")
+    rescue_parser.add_argument("--ledger", required=True)
+    rescue_parser.add_argument("--identity-json", required=True)
+    rescue_parser.add_argument("--fence-marker", required=True)
+    rescue_parser.add_argument("--fence-dropin", required=True)
+    rescue_parser.add_argument("--quarantined-marker", required=True)
+    rescue_parser.add_argument("--permit", required=True)
+    rescue_parser.add_argument("--rescue-evidence", required=True)
+    rescue_parser.add_argument("--installed-package-dir", required=True)
+    rescue_parser.add_argument("--live-config", required=True)
+    rescue_parser.add_argument("--unit-telemetry")
+    rescue_parser.set_defaults(handler=reconcile_rescued_gateway)
     core_gateway_result_parser = subparsers.add_parser("record-core-gateway-result")
     core_gateway_result_parser.add_argument("--ledger", required=True)
     core_gateway_result_parser.add_argument("--identity-json", required=True)
@@ -3133,12 +3929,13 @@ def build_parser():
         ("codex-authority", codex_authority),
         ("codex-helper", codex_helper),
         ("core-gateway-authority", core_gateway_authority),
+        ("rescue-authority", rescue_authority),
     ):
         child = subparsers.add_parser(command)
         child.add_argument("--ledger", required=True)
         if command == "gateway-status":
             child.add_argument(
-                "--purpose", required=True, choices=sorted(GATEWAY_ACTION_PURPOSES),
+                "--purpose", required=True, choices=sorted(GATEWAY_OWNED_ACTION_PURPOSES),
             )
         child.set_defaults(handler=handler)
     advance_parser = subparsers.add_parser("advance")

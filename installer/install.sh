@@ -25,7 +25,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="5.0.3"
+readonly VERSION="5.0.4"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -71,6 +71,17 @@ readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR="/etc/systemd/system/op
 readonly OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
 readonly OPENCLAW_GATEWAY_MIGRATION_PERMIT_DROPIN="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN_DIR}/30-bridgesllm-migration-permit.conf"
 readonly LEGACY_OPENCLAW_GATEWAY_PERMIT_DRIFT_HELPER_SHA256="16a86a2144f0d2c36e3353af4a44e2eb0c953af6a8e54fb3410d7f671fd148d1"
+# Helper succession (5.0.4). An open OpenClaw migration transaction always
+# runs the helper sealed into its ledger. When that sealed helper is one of
+# these predecessor releases and lacks a verb this release needs, only the
+# explicit --reconcile-rescued-gateway operation may record this release's
+# helper as the transaction's successor. The sealed bytes and the ledger pin
+# are never rewritten; the successor lives beside them and the loader
+# re-verifies both on every call. The successor digest is the sha256 of this
+# release's installer/openclaw-migration-transaction.py and is enforced by
+# scripts/validation/openclaw-migration-helper-identity-static.py.
+readonly OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S="28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9"
+readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR="/root/.config/systemd/user/openclaw-gateway.service.d"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
 readonly RETAINED_INSTALL_MARKER="${INSTALL_ROOT}/.retained-install-v1.json"
@@ -253,6 +264,13 @@ SKIP_OLLAMA=false
 SKIP_OPENCLAW=false
 SKIP_PROJECT_RUNTIMES=false
 MAINTAIN_TOOLS=false
+# Explicit root-only recovery of an OpenClaw migration transaction whose
+# gateway was started by a manual rescue while the transaction was parked at
+# core-restored. Never implied by --update or --maintain-tools.
+RECONCILE_RESCUED_GATEWAY=false
+RESCUED_GATEWAY_QUARANTINED_MARKER=""
+RESCUED_GATEWAY_EVIDENCE=""
+OPENCLAW_RESCUED_GATEWAY_DETECTED=false
 INSTALL_PROFILE="server"
 OPENCLAW_PACKAGE_UPDATED=false
 OPENCLAW_PACKAGE_UPDATE_ATTEMPTED=false
@@ -8629,30 +8647,60 @@ cleanup_native_cli_bundle_transaction() {
   run_native_cli_bundle_transaction_tool cleanup
 }
 
+openclaw_migration_transaction_successor_source() {
+  # The helper shipped beside this installer in a release tree. The Dashboard
+  # runs a standalone installer through a descriptor, so this is empty there;
+  # succession is only reachable from an extracted, verified release tree.
+  local candidate="" script_dir=""
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && -n "${PORTAL_OPENCLAW_MIGRATION_SUCCESSOR_SOURCE:-}" ]]; then
+    candidate="${PORTAL_OPENCLAW_MIGRATION_SUCCESSOR_SOURCE}"
+  else
+    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" \
+      || return 1
+    candidate="${script_dir}/openclaw-migration-transaction.py"
+  fi
+  [[ "${candidate}" == /* && -f "${candidate}" && ! -L "${candidate}" \
+    && "$(readlink -m -- "${candidate}")" == "${candidate}" ]] || return 1
+  printf '%s\n' "${candidate}"
+}
+
 run_openclaw_migration_transaction_tool() {
   local selected="${OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE}"
-  local durable=false
+  local durable=false successor_source=""
   if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
     || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]; then
     selected="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-migration-transaction.py"
     durable=true
+    successor_source="$(openclaw_migration_transaction_successor_source || true)"
   fi
   python3 -I - \
     "${selected}" \
     "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
     "${durable}" \
+    "${successor_source}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S}" \
     "$@" <<'PY'
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 
 selected = Path(sys.argv[1])
 transaction_root = Path(sys.argv[2])
 durable = sys.argv[3] == "true"
-arguments = sys.argv[4:]
+successor_source = sys.argv[4]
+successor_digest = sys.argv[5]
+predecessors = {item for item in sys.argv[6].split(",") if item}
+arguments = sys.argv[7:]
+verb = arguments[0] if arguments else ""
+SUCCESSION_RECORD = "transaction.succession.json"
+SUCCESSOR_HELPER = "openclaw-migration-transaction.successor.py"
+SUCCESSION_SCHEMA = "bridgesllm-openclaw-migration-helper-succession-v1"
 
 def reject(message):
     raise SystemExit(message)
@@ -8663,6 +8711,52 @@ if not selected.is_absolute() or Path(os.path.normpath(selected)) != selected:
     reject("OpenClaw migration transaction helper path is not canonical")
 
 flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def read_attested(descriptor, *, exact_mode, maximum):
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or info.st_mode & 0o022
+        or (exact_mode is not None and stat.S_IMODE(info.st_mode) != exact_mode)
+        or info.st_size <= 0
+        or info.st_size > maximum
+    ):
+        reject("OpenClaw migration transaction helper inode is unsafe")
+    data = bytearray()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        data.extend(chunk)
+    after = os.fstat(descriptor)
+    if (info.st_dev, info.st_ino, info.st_ctime_ns, info.st_size) != (
+        after.st_dev, after.st_ino, after.st_ctime_ns, after.st_size
+    ):
+        reject("OpenClaw migration transaction helper changed during read")
+    return bytes(data)
+
+
+def attest_source_boundary(source):
+    if not source.is_absolute() or Path(os.path.normpath(source)) != source:
+        reject("OpenClaw migration transaction source path is not canonical")
+    current = Path("/")
+    for component in source.parent.parts[1:]:
+        current /= component
+        info = os.lstat(current)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_mode & 0o022
+        ):
+            reject("OpenClaw migration transaction source boundary is unsafe")
+
+
 root_fd = None
 if durable:
     parent = transaction_root.parent
@@ -8691,90 +8785,135 @@ if durable:
     )
     descriptor = os.open(selected.name, flags, dir_fd=root_fd)
 else:
-    current = Path("/")
-    for component in selected.parent.parts[1:]:
-        current /= component
-        info = os.lstat(current)
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != 0
-            or info.st_gid != 0
-            or info.st_mode & 0o022
-        ):
-            reject("OpenClaw migration transaction source boundary is unsafe")
+    attest_source_boundary(selected)
     descriptor = os.open(selected, flags)
 try:
-    info = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != 0
-        or info.st_gid != 0
-        or info.st_nlink != 1
-        or info.st_mode & 0o022
-        or (durable and stat.S_IMODE(info.st_mode) != 0o600)
-        or info.st_size <= 0
-        or info.st_size > 1024 * 1024
-    ):
-        reject("OpenClaw migration transaction helper inode is unsafe")
-    payload = bytearray()
-    while True:
-        chunk = os.read(descriptor, 1024 * 1024)
-        if not chunk:
-            break
-        payload.extend(chunk)
-    after = os.fstat(descriptor)
-    if (info.st_dev, info.st_ino, info.st_ctime_ns, info.st_size) != (
-        after.st_dev, after.st_ino, after.st_ctime_ns, after.st_size
-    ):
-        reject("OpenClaw migration transaction helper changed during read")
+    payload = read_attested(
+        descriptor, exact_mode=0o600 if durable else None, maximum=1024 * 1024,
+    )
 finally:
     os.close(descriptor)
 
 if durable:
-    ledger_fd = os.open("transaction.json", flags, dir_fd=root_fd)
     try:
-        ledger_info = os.fstat(ledger_fd)
+        ledger_fd = os.open("transaction.json", flags, dir_fd=root_fd)
+        try:
+            ledger_info = os.fstat(ledger_fd)
+            if (
+                not stat.S_ISREG(ledger_info.st_mode)
+                or ledger_info.st_uid != 0
+                or ledger_info.st_gid != 0
+                or ledger_info.st_nlink != 1
+                or stat.S_IMODE(ledger_info.st_mode) != 0o600
+                or ledger_info.st_size <= 0
+                or ledger_info.st_size > 1024 * 1024
+            ):
+                reject("OpenClaw migration transaction ledger inode is unsafe")
+            raw_ledger = b""
+            while True:
+                chunk = os.read(ledger_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                raw_ledger += chunk
+        finally:
+            os.close(ledger_fd)
+        def reject_duplicates(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    reject("OpenClaw migration transaction ledger has duplicate keys")
+                value[key] = item
+            return value
+        try:
+            ledger = json.loads(raw_ledger.decode("utf-8"), object_pairs_hook=reject_duplicates)
+        except (UnicodeError, json.JSONDecodeError):
+            reject("OpenClaw migration transaction ledger is invalid")
+        expected_digest = ledger.get("prepared", {}).get("transactionHelperSha256")
+        # The sealed helper is verified against the ledger pin on every call,
+        # before and independently of any succession. The pin is read, never
+        # written.
         if (
-            not stat.S_ISREG(ledger_info.st_mode)
-            or ledger_info.st_uid != 0
-            or ledger_info.st_gid != 0
-            or ledger_info.st_nlink != 1
-            or stat.S_IMODE(ledger_info.st_mode) != 0o600
-            or ledger_info.st_size <= 0
-            or ledger_info.st_size > 1024 * 1024
+            ledger.get("schema") != "bridgesllm-openclaw-2026.9.1-migration-transaction-v2"
+            or ledger.get("paths", {}).get("root") != str(transaction_root)
+            or ledger.get("paths", {}).get("ledger") != str(transaction_root / "transaction.json")
+            or ledger.get("paths", {}).get("transactionHelper") != str(selected)
+            or not isinstance(expected_digest, str)
+            or hashlib.sha256(payload).hexdigest() != expected_digest
         ):
-            reject("OpenClaw migration transaction ledger inode is unsafe")
-        raw_ledger = b""
-        while True:
-            chunk = os.read(ledger_fd, 1024 * 1024)
-            if not chunk:
-                break
-            raw_ledger += chunk
+            reject("OpenClaw migration transaction helper does not match its sealed ledger identity")
+
+        def present(name):
+            try:
+                os.lstat(name, dir_fd=root_fd)
+            except FileNotFoundError:
+                return False
+            return True
+
+        record_present = present(SUCCESSION_RECORD)
+        successor_present = present(SUCCESSOR_HELPER)
+        if record_present:
+            # A recorded successor replaces the sealed helper for every verb,
+            # but only while the record binds this generation, names the
+            # sealed pin as its predecessor, that pin is still an allow-listed
+            # predecessor of this signed installer, and the successor bytes in
+            # the root hash to the recorded digest. A successor copy without a
+            # record (a kill between copy and record) is inert and is only
+            # ever replaced by the succession verb's own durable copy.
+            if not successor_present:
+                reject("OpenClaw migration helper succession record exists without its successor helper")
+            record_fd = os.open(SUCCESSION_RECORD, flags, dir_fd=root_fd)
+            try:
+                raw_record = read_attested(record_fd, exact_mode=0o600, maximum=64 * 1024)
+            finally:
+                os.close(record_fd)
+            try:
+                record = json.loads(raw_record.decode("utf-8"), object_pairs_hook=reject_duplicates)
+            except (UnicodeError, json.JSONDecodeError):
+                reject("OpenClaw migration helper succession record is invalid")
+            recorded_digest = record.get("successorSha256") if isinstance(record, dict) else None
+            if (
+                not isinstance(record, dict)
+                or record.get("schema") != SUCCESSION_SCHEMA
+                or record.get("ledgerGeneration") != ledger.get("generation")
+                or record.get("predecessorSha256") != expected_digest
+                or expected_digest not in predecessors
+                or record.get("successorPath") != str(transaction_root / SUCCESSOR_HELPER)
+                or not isinstance(recorded_digest, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", recorded_digest)
+            ):
+                reject("OpenClaw migration helper succession record does not bind this sealed transaction")
+            successor_fd = os.open(SUCCESSOR_HELPER, flags, dir_fd=root_fd)
+            try:
+                successor_payload = read_attested(successor_fd, exact_mode=0o600, maximum=1024 * 1024)
+            finally:
+                os.close(successor_fd)
+            if hashlib.sha256(successor_payload).hexdigest() != recorded_digest:
+                reject("OpenClaw migration successor helper does not match its succession record")
+            payload = successor_payload
+            selected = transaction_root / SUCCESSOR_HELPER
+        elif verb == "record-helper-succession":
+            # First contact: only the succession verb may run this release's
+            # shipped helper against a sealed predecessor, and only when the
+            # shipped bytes hash to the digest compiled into this installer.
+            if expected_digest not in predecessors:
+                reject("OpenClaw migration sealed helper is not an allow-listed predecessor of this installer")
+            if not re.fullmatch(r"[a-f0-9]{64}", successor_digest) or set(successor_digest) == {"0"}:
+                reject("OpenClaw migration successor digest is not configured in this installer")
+            if not successor_source:
+                reject("OpenClaw migration successor helper source is unavailable beside this installer")
+            source = Path(successor_source)
+            attest_source_boundary(source)
+            source_fd = os.open(source, flags)
+            try:
+                source_payload = read_attested(source_fd, exact_mode=None, maximum=1024 * 1024)
+            finally:
+                os.close(source_fd)
+            if hashlib.sha256(source_payload).hexdigest() != successor_digest:
+                reject("OpenClaw migration successor helper source does not match the installer's signed successor digest")
+            payload = source_payload
+            selected = source
     finally:
-        os.close(ledger_fd)
         os.close(root_fd)
-    def reject_duplicates(pairs):
-        value = {}
-        for key, item in pairs:
-            if key in value:
-                reject("OpenClaw migration transaction ledger has duplicate keys")
-            value[key] = item
-        return value
-    try:
-        ledger = json.loads(raw_ledger.decode("utf-8"), object_pairs_hook=reject_duplicates)
-    except (UnicodeError, json.JSONDecodeError):
-        reject("OpenClaw migration transaction ledger is invalid")
-    expected_digest = ledger.get("prepared", {}).get("transactionHelperSha256")
-    if (
-        ledger.get("schema") != "bridgesllm-openclaw-2026.9.1-migration-transaction-v2"
-        or ledger.get("paths", {}).get("root") != str(transaction_root)
-        or ledger.get("paths", {}).get("ledger") != str(transaction_root / "transaction.json")
-        or ledger.get("paths", {}).get("transactionHelper") != str(selected)
-        or not isinstance(expected_digest, str)
-        or hashlib.sha256(payload).hexdigest() != expected_digest
-    ):
-        reject("OpenClaw migration transaction helper does not match its sealed ledger identity")
 
 sys.argv = [str(selected), *arguments]
 namespace = {
@@ -8979,6 +9118,150 @@ run_durable_openclaw_gateway_action() {
     prepare_legacy_openclaw_gateway_permit_recovery_start || return 1
   fi
   reconcile_openclaw_core_gateway_action
+}
+
+succeed_openclaw_migration_transaction_helper() {
+  # Record this release's helper as the successor of an allow-listed sealed
+  # predecessor. The loader decides whether the shipped bytes may run for the
+  # succession verb; this only routes. Idempotent once recorded.
+  local sealed pin installer_sha256=""
+  sealed="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-migration-transaction.py"
+  [[ -f "${sealed}" && ! -L "${sealed}" ]] || return 1
+  pin="$(sha256sum -- "${sealed}" 2>/dev/null | awk '{print $1}')"
+  [[ "${pin}" =~ ^[a-f0-9]{64}$ ]] || return 1
+  if [[ "${pin}" == "${OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256}" ]]; then
+    return 0
+  fi
+  case ",${OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S}," in
+    *",${pin},"*) ;;
+    *)
+      warn "The sealed OpenClaw migration helper (${pin:0:12}…) is not a predecessor this installer can succeed."
+      return 1
+      ;;
+  esac
+  if [[ -f "${BASH_SOURCE[0]}" ]]; then
+    installer_sha256="$(sha256sum -- "${BASH_SOURCE[0]}" 2>/dev/null | awk '{print $1}')"
+    [[ "${installer_sha256}" =~ ^[a-f0-9]{64}$ ]] || installer_sha256=""
+  fi
+  run_openclaw_migration_transaction_tool record-helper-succession \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --expected-successor-sha256 "${OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256}" \
+    --portal-version "${VERSION}" \
+    ${installer_sha256:+--installer-sha256 "${installer_sha256}"} \
+    >> "${LOG_FILE}" 2>&1 || {
+      warn "The sealed OpenClaw migration helper could not be succeeded by this release's helper."
+      return 1
+    }
+  openclaw_core_gateway_action_fault_inject after-helper-succession
+}
+
+reconcile_rescued_openclaw_gateway() {
+  # Runs at core-restored, before the pending-action reconcile. Outside the
+  # explicit operation it only closes the fence window of an already-armed
+  # rescue stop and notes a rescued generation for the failure message;
+  # recording and arming happen exclusively under --reconcile-rescued-gateway.
+  local authority pending_purpose pending_before current_identity stopped
+  local live_identity package_dir telemetry status=0
+  # The live config compared against the transaction's pre-migration snapshot
+  # is the fixed root OpenClaw state; only source-only fixtures may redirect it.
+  local recovery_state_dir="/root/.openclaw"
+  if [[ "${BRIDGESLLM_INSTALLER_SOURCE_ONLY:-0}" == "1" \
+    && -n "${OPENCLAW_RECOVERY_STATE_DIR:-}" ]]; then
+    recovery_state_dir="${OPENCLAW_RECOVERY_STATE_DIR}"
+  fi
+  # core-gateway-authority exists in every sealed helper generation, so the
+  # rescued shape can be recognised (and named in the failure message) even
+  # before any succession has happened.
+  authority="$(openclaw_core_gateway_authority)" || return 1
+  IFS=$'\t' read -r pending_purpose pending_before current_identity \
+    < <(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); const encode=item => item == null ? "-" : JSON.stringify(item);
+    process.stdout.write([value.pending?.purpose ?? "-",
+      encode(value.pending?.before ?? null), encode(value.current)].join("\t") + "\n"); }
+  catch (_) { process.exit(1); }
+});
+') || return 1
+  live_identity="$(openclaw_gateway_systemd_identity)" || return 1
+  if [[ "${pending_purpose}" != "rescue-reconcile" ]] && ! $RECONCILE_RESCUED_GATEWAY; then
+    if [[ "${pending_purpose}" == "-" && "${current_identity}" != "-" ]] \
+      && openclaw_gateway_identity_is_active "${live_identity}" \
+      && ! json_documents_equal "${current_identity}" "${live_identity}"; then
+      OPENCLAW_RESCUED_GATEWAY_DETECTED=true
+    fi
+    return 0
+  fi
+  # From here the successor helper is required (a rescue stop can only have
+  # been armed by it, and the explicit operation has already succeeded it).
+  authority="$(run_openclaw_migration_transaction_tool rescue-authority \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")" \
+    || return 1
+  stopped="$(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); if (typeof value.stopped !== "boolean") process.exit(1);
+    process.stdout.write(value.stopped ? "true" : "false"); }
+  catch (_) { process.exit(1); }
+});
+')" || return 1
+  if [[ "${stopped}" == "true" ]]; then
+    # A completed stop is inert unless an explicit run observes a new active
+    # foreign generation. The helper revalidates every authority before
+    # recording that next cycle; ordinary runs never re-arm it.
+    if ! $RECONCILE_RESCUED_GATEWAY \
+      || [[ "${pending_purpose}" != "-" ]] \
+      || ! openclaw_gateway_identity_is_active "${live_identity}" \
+      || json_documents_equal "${current_identity}" "${live_identity}"; then
+      return 0
+    fi
+  fi
+  if [[ "${pending_purpose}" == "rescue-reconcile" ]]; then
+    if ! openclaw_gateway_identity_is_active "${live_identity}"; then
+      # The process may have died after systemctl stop but before recording
+      # its result. Let the existing pending-action validator attest the
+      # retained generation and kernel exit; it still rejects skip shapes.
+      write_openclaw_gateway_migration_fence_marker || return 1
+      return 0
+    fi
+    if json_documents_equal "${pending_before}" "${live_identity}"; then
+      # Armed and unchanged: make sure no bare start can slip in between the
+      # attested stop and the permitted baseline-restore start.
+      write_openclaw_gateway_migration_fence_marker || return 1
+      return 0
+    fi
+    if ! $RECONCILE_RESCUED_GATEWAY; then
+      warn "The rescued OpenClaw gateway generation changed after its stop was armed; rerun --reconcile-rescued-gateway to re-arm it."
+      return 1
+    fi
+  fi
+  [[ -n "${RESCUED_GATEWAY_QUARANTINED_MARKER}" && -n "${RESCUED_GATEWAY_EVIDENCE}" ]] \
+    || return 1
+  if ! openclaw_gateway_identity_is_active "${live_identity}"; then
+    warn "The OpenClaw gateway is not running; there is no rescued generation to reconcile."
+    return 1
+  fi
+  package_dir="$(openclaw_core_package_dir)" || return 1
+  telemetry="$(mktemp "${UPDATE_STATE_ROOT}/.openclaw-rescue-telemetry.XXXXXX")" || return 1
+  chmod 0600 "${telemetry}" || { rm -f -- "${telemetry}"; return 1; }
+  openclaw_gateway_systemd_snapshot > "${telemetry}" || { rm -f -- "${telemetry}"; return 1; }
+  run_openclaw_migration_transaction_tool reconcile-rescued-gateway \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --identity-json "${live_identity}" \
+    --fence-marker "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
+    --fence-dropin "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_DROPIN}" \
+    --quarantined-marker "${RESCUED_GATEWAY_QUARANTINED_MARKER}" \
+    --permit "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}" \
+    --rescue-evidence "${RESCUED_GATEWAY_EVIDENCE}" \
+    --installed-package-dir "${package_dir}" \
+    --live-config "${recovery_state_dir}/openclaw.json" \
+    --unit-telemetry "${telemetry}" \
+    >> "${LOG_FILE}" 2>&1 || status=$?
+  rm -f -- "${telemetry}"
+  (( status == 0 )) || return 1
+  openclaw_core_gateway_action_fault_inject after-rescue-record
+  # Close the window before the stop: from here every bare start is skipped
+  # at the fence, so only the permitted baseline-restore start can run.
+  write_openclaw_gateway_migration_fence_marker || return 1
+  openclaw_core_gateway_action_fault_inject after-rescue-fence
 }
 
 adopt_durable_openclaw_gateway_identity() {
@@ -9867,6 +10150,12 @@ reconcile_openclaw_migration_transaction() {
   fi
   [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
     || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] || return 0
+  # The explicit rescue operation must reach a transaction sealed to a
+  # predecessor helper before that helper is asked anything it cannot do.
+  # Every other operation keeps running exactly the sealed bytes.
+  if $RECONCILE_RESCUED_GATEWAY; then
+    succeed_openclaw_migration_transaction_helper || return 1
+  fi
   load_openclaw_migration_transaction || return 1
   normalize_legacy_openclaw_gateway_permit_definition || return 1
   load_openclaw_migration_transaction || return 1
@@ -10076,6 +10365,10 @@ let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () 
       # All native, ask-user, migration, upgrade, and core baselines are now
       # restored. A sealed legacy pending START may finally be spent.
       prepare_legacy_openclaw_gateway_permit_recovery_start || return 1
+      # A gateway generation started by a manual rescue is recorded and its
+      # authorized stop armed here, before the ordinary pending-action
+      # reconcile performs that attested stop and the baseline-restore start.
+      reconcile_rescued_openclaw_gateway || return 1
       reconcile_openclaw_core_gateway_action || return 1
       restore_openclaw_gateway_activation \
         "${restored_runtime_version}" baseline-restore \
@@ -10654,7 +10947,7 @@ verify_openclaw_gateway_stable() {
   local stability_seconds="${2:-18}"
   local cli_version gateway_version initial_pid initial_restarts waited=0
 
-  wait_for_openclaw_gateway_http_ready 60 || return 1
+  wait_for_openclaw_gateway_http_ready 180 || return 1
   cli_version="$(openclaw_cli_version)"
   gateway_version="$(openclaw_gateway_version)"
   [[ -n "${expected_version}" && "${cli_version}" == "${expected_version}" && "${gateway_version}" == "${expected_version}" ]] || return 1
@@ -15006,8 +15299,13 @@ acquire_portal_operation_lock() {
   # Recover the fixed OpenClaw singleton before generic update recovery can
   # replace its exact 9.1 package/helper. Absence is a no-op, so ordinary
   # Portal-only updates of retained 7.1 installations never mutate OpenClaw.
-  reconcile_openclaw_migration_transaction \
-    || fail "An interrupted OpenClaw 2026.9.1 migration could not be reconciled safely. Its root-only singleton and exact recovery bytes were preserved."
+  reconcile_openclaw_migration_transaction || {
+    local rescued_hint=""
+    if ${OPENCLAW_RESCUED_GATEWAY_DETECTED}; then
+      rescued_hint=" The running gateway is a generation this transaction never started (a manual rescue). From a verified release tree run: sudo bash installer/install.sh --reconcile-rescued-gateway --quarantined-fence-marker <path> --rescue-evidence <json>. Ordinary updates keep refusing until then."
+    fi
+    fail "An interrupted OpenClaw 2026.9.1 migration could not be reconciled safely. Its root-only singleton and exact recovery bytes were preserved.${rescued_hint}"
+  }
   if [[ -e "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
     || -L "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" ]]; then
     fail "The OpenClaw gateway reboot fence remains armed without an active migration owner. The gateway stays blocked until its exact root-only recovery authority is restored."
@@ -15767,6 +16065,25 @@ Options:
                     Repair only the installed Portal's canonical full-stack
                     Project runtime image. This Owner-triggered maintenance
                     mode accepts no other option and restarts only Portal.
+  --reconcile-rescued-gateway
+                    Root-only recovery for an interrupted OpenClaw migration
+                    whose gateway was started by hand (fence marker moved
+                    aside) while the migration was parked at core-restored.
+                    Run it from an extracted, signature-verified release tree,
+                    never from the one-line curl installer. Records the manual
+                    rescue with its evidence, stops that exact gateway
+                    generation once, restarts it through the migration's own
+                    permitted start, and retires the migration ledger. Portal
+                    files are not changed; run the ordinary update afterwards.
+                    Requires --quarantined-fence-marker and --rescue-evidence.
+                    With --dry-run: a read-only readiness preflight.
+  --quarantined-fence-marker PATH
+                    Where the manual rescue moved the gateway fence marker.
+  --rescue-evidence PATH
+                    Root-owned JSON describing the manual rescue (schema
+                    bridgesllm-openclaw-gateway-rescue-evidence-v1: operator,
+                    rescuedAt, description, optional rescueScriptPath +
+                    rescueScriptSha256, journalExcerpt).
   --residue-policy MODE
                     With --uninstall Clean slate, decide leftover managed
                     runtime residue from an earlier partial cleanup without a
@@ -15831,6 +16148,19 @@ parse_args() {
       --repair|--reinstall) FORCE_FRESH=true; shift ;;
       --uninstall)      UNINSTALL_MODE=true; shift ;;
       --repair-project-runtime-image) REPAIR_PROJECT_RUNTIME_IMAGE=true; shift ;;
+      --reconcile-rescued-gateway) RECONCILE_RESCUED_GATEWAY=true; shift ;;
+      --quarantined-fence-marker)
+        [[ $# -ge 2 && "${2:-}" == /* ]] \
+          || fail "--quarantined-fence-marker requires an absolute path."
+        RESCUED_GATEWAY_QUARANTINED_MARKER="$2"
+        shift 2
+        ;;
+      --rescue-evidence)
+        [[ $# -ge 2 && "${2:-}" == /* ]] \
+          || fail "--rescue-evidence requires an absolute path."
+        RESCUED_GATEWAY_EVIDENCE="$2"
+        shift 2
+        ;;
       --residue-policy)
         [[ "${2:-}" == "safe" || "${2:-}" == "wipe" ]] \
           || fail "--residue-policy requires 'safe' or 'wipe'."
@@ -15862,8 +16192,22 @@ parse_args() {
   $UNINSTALL_MODE && operation_count=$((operation_count + 1))
   $REPAIR_PROJECT_RUNTIME_IMAGE && operation_count=$((operation_count + 1))
   $MAINTAIN_TOOLS && operation_count=$((operation_count + 1))
+  $RECONCILE_RESCUED_GATEWAY && operation_count=$((operation_count + 1))
   (( operation_count <= 1 )) \
-    || fail "Choose one operation: --install, --update, --repair, --uninstall, --maintain-tools, or --repair-project-runtime-image."
+    || fail "Choose one operation: --install, --update, --repair, --uninstall, --maintain-tools, --reconcile-rescued-gateway, or --repair-project-runtime-image."
+  if $RECONCILE_RESCUED_GATEWAY; then
+    if $SKIP_OPENCLAW || $SKIP_OLLAMA || $SKIP_PROJECT_RUNTIMES \
+      || [[ -n "${DOMAIN}" || -n "${APP_CONTENT_DOMAIN}" || -n "${RESIDUE_POLICY}" ]] \
+      || [[ "${ORIGIN_SELECTION_EXPLICIT}" == "true" ]]; then
+      fail "--reconcile-rescued-gateway is a dedicated OpenClaw recovery operation; origin, skip-runtime, and uninstall-residue options are not accepted."
+    fi
+    if ! $DRY_RUN \
+      && [[ -z "${RESCUED_GATEWAY_QUARANTINED_MARKER}" || -z "${RESCUED_GATEWAY_EVIDENCE}" ]]; then
+      fail "--reconcile-rescued-gateway requires --quarantined-fence-marker PATH and --rescue-evidence PATH."
+    fi
+  elif [[ -n "${RESCUED_GATEWAY_QUARANTINED_MARKER}" || -n "${RESCUED_GATEWAY_EVIDENCE}" ]]; then
+    fail "--quarantined-fence-marker and --rescue-evidence are only accepted with --reconcile-rescued-gateway."
+  fi
   if $MAINTAIN_TOOLS \
     && { $SKIP_OPENCLAW || $SKIP_OLLAMA || $SKIP_PROJECT_RUNTIMES \
       || [[ -n "${DOMAIN}" || -n "${APP_CONTENT_DOMAIN}" || -n "${RESIDUE_POLICY}" ]] \
@@ -15901,7 +16245,8 @@ select_install_operation() {
   fi
   $DRY_RUN && return 0
   if $INSTALL_MODE || $UPDATE_MODE || $FORCE_FRESH || $UNINSTALL_MODE \
-    || $MAINTAIN_TOOLS || $REPAIR_PROJECT_RUNTIME_IMAGE; then
+    || $MAINTAIN_TOOLS || $REPAIR_PROJECT_RUNTIME_IMAGE \
+    || $RECONCILE_RESCUED_GATEWAY; then
     return 0
   fi
   if ! { exec {menu_fd}<>/dev/tty; } 2>/dev/null; then
@@ -15941,7 +16286,8 @@ classify_requested_update_scope() {
     || -e "${RETAINED_INSTALL_MANIFEST}" || -L "${RETAINED_INSTALL_MANIFEST}" ]]; then
     portal_or_reconnect_footprint=true
   fi
-  if ${UNINSTALL_MODE} || ${REPAIR_PROJECT_RUNTIME_IMAGE} || ${MAINTAIN_TOOLS}; then
+  if ${UNINSTALL_MODE} || ${REPAIR_PROJECT_RUNTIME_IMAGE} || ${MAINTAIN_TOOLS} \
+    || ${RECONCILE_RESCUED_GATEWAY}; then
     PORTAL_ONLY_UPDATE=false
   elif ${UPDATE_MODE} || ${portal_or_reconnect_footprint}; then
     PORTAL_ONLY_UPDATE=true
@@ -21408,14 +21754,14 @@ ensure_openclaw_gateway_boots_cleanly() {
   fi
 
   start_openclaw_gateway_with_identity_authority >> "$LOG_FILE" 2>&1 || true
-  if wait_for_openclaw_gateway_http_ready 60; then
+  if wait_for_openclaw_gateway_http_ready 180; then
     return 0
   fi
 
   warn "OpenClaw gateway did not come up cleanly. Restarting the exact admitted unit once."
   restart_openclaw_gateway_with_identity_authority >> "$LOG_FILE" 2>&1 || true
   sleep 2
-  if wait_for_openclaw_gateway_http_ready 60; then
+  if wait_for_openclaw_gateway_http_ready 180; then
     return 0
   fi
 
@@ -32900,6 +33246,13 @@ let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () 
   else
     return 1
   fi
+  write_openclaw_gateway_migration_fence_marker
+}
+
+write_openclaw_gateway_migration_fence_marker() {
+  # Marker-writing half of arming the fence: publishes the durable marker for
+  # the loaded ledger generation, or verifies an existing one byte-for-byte.
+  # Callers own the identity checks; this never inspects the live unit.
   python3 -I - \
     "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
     "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
@@ -44667,6 +45020,150 @@ do_maintain_compatible_ai_tools() {
   ok "Compatible AI tools verified: OpenClaw ${PIN_OPENCLAW_RUNTIME_VERSION}, Codex ${PIN_CODEX_CLI_VERSION}, Claude Code ${PIN_CLAUDE_CODE_VERSION}, ClawHub ${PIN_CLAWHUB_VERSION}"
 }
 
+print_rescued_gateway_preflight() {
+  # Read-only readiness check for --reconcile-rescued-gateway. Reads the
+  # ledger through the sealed helper's own read-only verbs, never records a
+  # succession, never writes, never takes the operation lock.
+  local status=0 sealed pin successor successor_digest="" ledger_phase="" authority
+  local current_identity="-" pending="-" live_identity="" live_active=false live_known=false
+  local checks=()
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    printf '%s\n' "The rescued-gateway preflight must run as root (it reads root-only recovery state)." >&2
+    return 1
+  fi
+  report() { checks+=("$1	$2"); [[ "$1" == "PASS" || "$1" == "INFO" ]] || status=1; }
+  if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]]; then
+    report PASS "open migration transaction root exists"
+  else
+    report FAIL "no open OpenClaw migration transaction root; nothing to reconcile"
+  fi
+  sealed="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-migration-transaction.py"
+  if [[ -f "${sealed}" && ! -L "${sealed}" ]]; then
+    pin="$(sha256sum -- "${sealed}" 2>/dev/null | awk '{print $1}')"
+    if [[ "${pin}" == "${OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256}" ]]; then
+      report PASS "sealed helper is already this release's helper (${pin:0:12}…)"
+    else
+      case ",${OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S}," in
+        *",${pin},"*) report PASS "sealed helper ${pin:0:12}… is an allow-listed predecessor" ;;
+        *) report FAIL "sealed helper ${pin:0:12}… is not a predecessor this installer can succeed" ;;
+      esac
+    fi
+  else
+    report FAIL "sealed helper is missing from the transaction root"
+  fi
+  if successor="$(openclaw_migration_transaction_successor_source)"; then
+    successor_digest="$(sha256sum -- "${successor}" 2>/dev/null | awk '{print $1}')"
+    if [[ "${successor_digest}" == "${OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256}" ]]; then
+      report PASS "successor helper beside this installer matches the signed digest"
+    else
+      report FAIL "successor helper beside this installer does not match the signed digest"
+    fi
+  else
+    report FAIL "no successor helper beside this installer (run from an extracted release tree)"
+  fi
+  if [[ -f "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" ]]; then
+    ledger_phase="$(run_openclaw_migration_transaction_tool inspect \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>/dev/null | cut -f2)" || ledger_phase=""
+    if [[ "${ledger_phase}" == "core-restored" ]]; then
+      report PASS "ledger phase is core-restored"
+    else
+      report FAIL "ledger phase is '${ledger_phase:-unreadable}', expected core-restored"
+    fi
+    if authority="$(run_openclaw_migration_transaction_tool core-gateway-authority \
+        --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>/dev/null)"; then
+      IFS=$'\t' read -r current_identity pending < <(printf '%s' "${authority}" | node -e '
+let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => {
+  try { const value=JSON.parse(raw); const encode=item => item == null ? "-" : JSON.stringify(item);
+    process.stdout.write(`${encode(value.current)}\t${encode(value.pending)}\n`); }
+  catch (_) { process.exit(1); }
+});
+') || { current_identity="-"; pending="-"; }
+      if [[ "${pending}" == "-" ]]; then
+        report PASS "no core gateway action is pending"
+      else
+        report INFO "a core gateway action is pending (a rerun will re-attest it)"
+      fi
+    else
+      report FAIL "ledger could not be read through its sealed helper"
+    fi
+  fi
+  if live_identity="$(openclaw_gateway_systemd_identity)"; then
+    if openclaw_gateway_identity_is_active "${live_identity}"; then
+      live_active=true
+      report PASS "openclaw-gateway.service is active"
+    else
+      report FAIL "openclaw-gateway.service is not active; there is no rescued generation to reconcile"
+    fi
+    if [[ "${current_identity}" != "-" ]] \
+      && json_documents_equal "${current_identity}" "${live_identity}"; then
+      live_known=true
+      report FAIL "the live gateway generation is already the ledger's current identity; no rescue to record"
+    elif [[ "${current_identity}" != "-" ]]; then
+      report PASS "the live gateway generation is unknown to the ledger (rescued shape)"
+    fi
+  else
+    report FAIL "openclaw-gateway.service identity could not be captured"
+  fi
+  if [[ -e "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
+    || -L "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" ]]; then
+    report INFO "fence marker is present at its authority path (window already closed)"
+  else
+    report PASS "fence marker is absent at its authority path (rescue state)"
+  fi
+  if [[ -n "${RESCUED_GATEWAY_QUARANTINED_MARKER}" ]]; then
+    if [[ -f "${RESCUED_GATEWAY_QUARANTINED_MARKER}" \
+      && ! -L "${RESCUED_GATEWAY_QUARANTINED_MARKER}" \
+      && "$(stat -c '%u:%g:%a:%h' -- "${RESCUED_GATEWAY_QUARANTINED_MARKER}" 2>/dev/null)" == "0:0:600:1" \
+      && "$(cat -- "${RESCUED_GATEWAY_QUARANTINED_MARKER}")" == '{"schema":"bridgesllm.openclaw-gateway-authorization-fence.v1","unit":"openclaw-gateway.service"}' ]]; then
+      report PASS "quarantined fence marker is root-only with the exact fence bytes"
+    else
+      report FAIL "quarantined fence marker is missing, not root-only 0600, or has unexpected bytes"
+    fi
+  else
+    report INFO "no --quarantined-fence-marker given; the live run requires it"
+  fi
+  if [[ -n "${RESCUED_GATEWAY_EVIDENCE}" ]]; then
+    if [[ -f "${RESCUED_GATEWAY_EVIDENCE}" && ! -L "${RESCUED_GATEWAY_EVIDENCE}" ]] \
+      && python3 - "${RESCUED_GATEWAY_EVIDENCE}" <<'PY' 2>/dev/null
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+required = {"schema", "operator", "rescuedAt", "description"}
+optional = {"rescueScriptPath", "rescueScriptSha256", "journalExcerpt"}
+ok = isinstance(value, dict) and required <= set(value) and set(value) <= required | optional \
+    and value["schema"] == "bridgesllm-openclaw-gateway-rescue-evidence-v1"
+raise SystemExit(0 if ok else 1)
+PY
+    then
+      report PASS "rescue evidence document parses with the expected schema"
+    else
+      report FAIL "rescue evidence document is missing or malformed"
+    fi
+  else
+    report INFO "no --rescue-evidence given; the live run requires it"
+  fi
+  if [[ -e "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}" ]]; then
+    report FAIL "a live migration permit exists; another controller may be running"
+  else
+    report PASS "no live migration permit"
+  fi
+  banner
+  echo ""
+  echo -e "  ${BOLD}${WHITE}Rescued-gateway reconciliation preflight (read-only)${NC}"
+  echo ""
+  local line
+  for line in "${checks[@]}"; do
+    printf '  %-5s %s\n' "${line%%	*}" "${line#*	}"
+  done
+  echo ""
+  if (( status == 0 )); then
+    echo -e "  ${GREEN}Ready.${NC} Run the same command without --dry-run to reconcile. The gateway will stop once and restart through the migration's permitted start."
+  else
+    echo -e "  ${RED}Not ready.${NC} Resolve the FAIL lines above before running without --dry-run."
+  fi
+  return "${status}"
+}
+
 print_dry_run_plan() {
   local existing_install=false action="install"
   if [[ -f "${PORTAL_DIR}/backend/package.json" \
@@ -44796,11 +45293,47 @@ main() {
   # check and operation lock: even creating the lock inode would violate the
   # advertised contract, and routing into update/uninstall would be dangerous.
   if $DRY_RUN; then
+    if $RECONCILE_RESCUED_GATEWAY; then
+      print_rescued_gateway_preflight
+      exit $?
+    fi
     print_dry_run_plan
     exit 0
   fi
 
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Must run as root. Use: sudo bash ${SCRIPT_NAME}"
+  if $RECONCILE_RESCUED_GATEWAY; then
+    # The whole recovery runs inside the operation lock's ordinary
+    # reconciliation; this mode only enables it and verifies the result.
+    mkdir -p "$LOG_DIR"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+    [[ -f "${PORTAL_DIR}/backend/package.json" ]] \
+      || fail "No installed Portal was found at ${PORTAL_DIR}; nothing to reconcile."
+    openclaw_migration_transaction_successor_source >/dev/null \
+      || fail "This operation must run from an extracted release tree with installer/openclaw-migration-transaction.py beside install.sh, not from the one-line installer."
+    [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+      || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] \
+      || fail "No open OpenClaw migration transaction exists; nothing to reconcile."
+    info "Reconciling the rescued OpenClaw gateway through the migration transaction's own recovery path."
+    acquire_portal_operation_lock
+    [[ ! -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+      && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+      && ! -e "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" \
+      && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" ]] \
+      || fail "The OpenClaw migration transaction did not reach its terminal state; its recovery bytes were preserved."
+    [[ ! -e "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
+      && ! -L "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" ]] \
+      || fail "The OpenClaw gateway fence remains armed after reconciliation."
+    systemctl is-active --quiet openclaw-gateway.service \
+      || fail "The OpenClaw gateway is not active after reconciliation."
+    ok "Rescued OpenClaw gateway reconciled: ledger retired, fence disarmed, gateway active on its permitted start."
+    ok "Rescue evidence retained under ${UPDATE_STATE_ROOT} (rescue-evidence and rescue records for the retired generation)."
+    publish_installer_terminal_state "Rescued gateway reconciled" \
+      "The interrupted OpenClaw migration recorded the manual rescue, restarted the gateway through its permitted start, and retired its ledger." \
+      "Return to the Dashboard and run the ordinary Portal update."
+    exit 0
+  fi
   acquire_portal_operation_lock
   if ${UNINSTALL_RECOVERED_THIS_RUN}; then
     info "The interrupted uninstall is complete. Run the installer again only if you now want to install Portal."

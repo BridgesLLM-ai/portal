@@ -1,10 +1,13 @@
 {
   "schema": 1,
-  "version": "5.0.3",
+  "version": "5.0.4",
   "releasedAt": "2026-09-09",
   "releaseClass": "hotfix",
   "highlights": [
-    "Stop reporting a healthy OpenClaw authentication store as unavailable: the Codex plugin and saved-auth readiness probes now get the same 25-second budget as gateway discovery.",
-    "Also fixes OpenClaw Agent Chat sends and session creation being rejected with that message on busy hosts, since chat admission shares the same readiness result."
+    "Recover Dashboard updates blocked by an interrupted OpenClaw migration after a manual gateway rescue.",
+    "Preserve native Codex runtime homes during maintenance snapshots and rollback, including temporary command symlinks.",
+    "Allow slower OpenClaw startup preflight and recover interrupted or repeated gateway-rescue operations.",
+    "Explicit root-only recovery preserves the original migration record and rescue evidence before restarting the gateway.",
+    "Includes the 5.0.3 fix for false OpenClaw authentication-store readiness failures."
   ]
 }

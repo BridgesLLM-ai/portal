@@ -267,12 +267,56 @@ function isAgentCredentialRoot(relativeRoot) {
   return /^agents\/[^/]+\/agent$/.test(relativeRoot);
 }
 
-// The Codex plugin owns this native runtime home, including disposable command
-// symlinks. The pinned auth importer does not touch it. It is neither copied into
-// the auth rehearsal nor replaced during credential rollback.
+// The Codex binary owns its native runtime homes (CODEX_HOME), including the
+// disposable command symlinks it creates under tmp/arg0/* and its plugin clones
+// under .tmp/*. Two such homes live inside an agent credential root:
+//   agents/<id>/agent/codex-home                       (plugin-managed home)
+//   agents/<id>/agent/harness-auth/codex/<binding-id>  (harness auth binding home)
+// The pinned auth importer never reads or writes either of them. They are
+// neither copied into the auth rehearsal nor replaced during credential
+// rollback; their bytes, link targets and inodes are preserved in place. Every
+// other path inside the credential root, including siblings under harness-auth,
+// keeps the strict no-symlink snapshot contract.
+const INDEPENDENT_CODEX_HOME_PATTERNS = [
+  ['codex-home'],
+  ['harness-auth', 'codex', /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/],
+];
+
+function matchIndependentCodexHomePattern(relativeRoot, relativePath) {
+  if (!isAgentCredentialRoot(relativeRoot)) return null;
+  const prefix = `${relativeRoot}${path.sep}`;
+  if (!relativePath.startsWith(prefix)) return null;
+  const segments = relativePath.slice(prefix.length).split(path.sep);
+  if (segments.some((segment) => segment.length === 0)) return null;
+  for (const pattern of INDEPENDENT_CODEX_HOME_PATTERNS) {
+    if (segments.length > pattern.length) continue;
+    const matched = segments.every((segment, index) => {
+      const expected = pattern[index];
+      return expected instanceof RegExp ? expected.test(segment) : expected === segment;
+    });
+    if (matched) return segments.length === pattern.length ? 'home' : 'ancestor';
+  }
+  return null;
+}
+
 function isIndependentCodexHome(relativeRoot, relativePath) {
-  return isAgentCredentialRoot(relativeRoot)
-    && relativePath === path.join(relativeRoot, 'codex-home');
+  return matchIndependentCodexHomePattern(relativeRoot, relativePath) === 'home';
+}
+
+// harness-auth and harness-auth/codex are ordinary snapshot directories that can
+// hold independent homes beneath them; rollback must descend instead of
+// removing them wholesale.
+function isIndependentCodexHomeAncestor(relativeRoot, relativePath) {
+  return matchIndependentCodexHomePattern(relativeRoot, relativePath) === 'ancestor';
+}
+
+// An independent home is skipped, never followed, opened, or altered. The skip
+// is only defined for a real directory in that position; a symlink or plain
+// file there is an ambiguous shape and is refused before any snapshot arms.
+function assertIndependentCodexHomeBoundary(target) {
+  const stat = fs.lstatSync(target);
+  if (stat.isSymbolicLink()) fail(`OpenClaw independent Codex home is a symlink: ${target}`);
+  if (!stat.isDirectory()) fail(`OpenClaw independent Codex home is not a directory: ${target}`);
 }
 
 function collectAuthorityTree(stateDir, relativeRoot, entries) {
@@ -281,7 +325,10 @@ function collectAuthorityTree(stateDir, relativeRoot, entries) {
   const credentialTree = relativeRoot === 'credentials'
     || isAgentCredentialRoot(relativeRoot);
   const walk = (target, relativePath) => {
-    if (isIndependentCodexHome(relativeRoot, relativePath)) return;
+    if (isIndependentCodexHome(relativeRoot, relativePath)) {
+      assertIndependentCodexHomeBoundary(target);
+      return;
+    }
     const stat = fs.lstatSync(target);
     if (stat.isSymbolicLink()) fail(`OpenClaw authority contains a symlink: ${target}`);
     if (stat.isDirectory()) {
@@ -464,16 +511,30 @@ function removeManagedAuthorityRoot(stateDir, relativeRoot) {
   }
   assertNoSymlinkComponents(target);
   lstatDirectory(target, 'credential rollback owner');
-  for (const child of fs.readdirSync(target)) {
-    const relativePath = path.join(relativeRoot, child);
-    if (!isIndependentCodexHome(relativeRoot, relativePath)) {
-      removeAuthorityPath(statePathFromRelative(stateDir, relativePath), stateDir);
-    }
-  }
-  // Do not move, unlink, chmod, recreate or follow the independent runtime.
+  // Do not move, unlink, chmod, recreate or follow an independent runtime.
   // Preserve its directory inode and every byte/link even during cold rollback.
-  if (fs.readdirSync(target).length === 0) fs.rmdirSync(target);
-  fsyncDirectory(path.dirname(target));
+  // Directories that may hold one (harness-auth, harness-auth/codex) are
+  // emptied entry by entry so the preserved home keeps its exact ancestors.
+  const prune = (directory, relativeDirectory) => {
+    for (const child of fs.readdirSync(directory)) {
+      const relativePath = path.join(relativeDirectory, child);
+      const childTarget = statePathFromRelative(stateDir, relativePath);
+      if (isIndependentCodexHome(relativeRoot, relativePath)) {
+        assertIndependentCodexHomeBoundary(childTarget);
+        continue;
+      }
+      if (isIndependentCodexHomeAncestor(relativeRoot, relativePath)
+        && !fs.lstatSync(childTarget).isSymbolicLink()
+        && fs.lstatSync(childTarget).isDirectory()) {
+        prune(childTarget, relativePath);
+        continue;
+      }
+      removeAuthorityPath(childTarget, stateDir);
+    }
+    if (fs.readdirSync(directory).length === 0) fs.rmdirSync(directory);
+    fsyncDirectory(path.dirname(directory));
+  };
+  prune(target, relativeRoot);
 }
 
 function materializeAuthoritySnapshot(snapshot, sourceStateDir, targetStateDir, replace = false) {
