@@ -1,6 +1,6 @@
 # Hosted and shared app origin isolation
 
-Portal 4.0 serves user-controlled HTML, JavaScript, and full-stack app responses
+Portal serves user-controlled HTML, JavaScript, and full-stack app responses
 from `APP_CONTENT_ORIGIN`. This origin must use a different registrable site
 from the authenticated Portal. A sibling such as `apps.portal.example.com` or
 an alternate port on `portal.example.com` is not sufficient: browser cookies

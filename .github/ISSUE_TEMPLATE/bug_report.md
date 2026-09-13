@@ -26,15 +26,22 @@ What actually happened. Include error messages or screenshots if available.
 
 ## Environment
 
-- **Portal version:** (check Dashboard → bottom of sidebar)
+- **Portal version:** (copy the installed version from Dashboard)
 - **OS:** (e.g., Ubuntu 24.04)
-- **Browser:** (e.g., Chrome 120)
+- **Browser:** (browser name, version, and desktop/mobile)
 - **Node.js version:** (`node --version`)
-- **Install method:** (fresh install / update)
+- **Install method:** (fresh install / Portal update / compatible-tools maintenance)
+- **Affected surface:** (Main Agent Chat / Project Work / shared browser / other)
+- **Harness and model, if relevant:** (OpenClaw / Codex / Claude Code / other)
+- **Runtime version and readiness message, if relevant:**
+- **Does it persist after reload or reconnect?**
+- **Previous version, for update regressions:**
 
 ## Logs
 
-If applicable, include relevant logs:
+Include only the relevant, redacted error excerpt. Review logs and screenshots before posting: remove credentials, private prompts/files, email addresses, and setup links. Do not upload backups or authentication files. Report suspected vulnerabilities privately using [SECURITY.md](https://github.com/BridgesLLM-ai/portal/blob/main/SECURITY.md).
+
+For a systemd installation, collect logs locally with:
 
 ```
 # Portal logs

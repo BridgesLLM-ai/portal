@@ -1,6 +1,6 @@
 # Project Sandbox Contract
 
-Portal 4.0 separates two deliberately different execution scopes. They must
+Portal separates two deliberately different execution scopes. They must
 never share a provider session or silently fall back into one another.
 
 ## Trust zones

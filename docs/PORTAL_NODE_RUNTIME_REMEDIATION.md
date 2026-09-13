@@ -10,7 +10,7 @@ stops the Portal.
 
 Portal-only updates retain the existing host interpreter and support these
 previously qualified ranges: `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`.
-Installing Portal 5.0.1 does **not** require replacing a supported Node 22
+Installing Portal 5.0.x does **not** require replacing a supported Node 22
 interpreter and does not upgrade OpenClaw in the same action.
 
 ## OpenClaw 2026.9.3 and compatible-tools maintenance

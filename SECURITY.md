@@ -1,12 +1,10 @@
 # Security Policy
 
-## Supported releases
+## Release guidance
 
-| Release | Status |
-|---|---|
-| 4.0.x | Current stable release |
-| 3.26.x | Security fixes only during the 4.0 transition |
-| Earlier releases | Upgrade required |
+The current stable line is **5.0.x**; the latest published release at this documentation update is **5.0.8**. Check [GitHub Releases](https://github.com/BridgesLLM-ai/portal/releases/latest) for the current signed release. Older 4.x and 3.x release notes are historical, not evidence of a current backport or support commitment.
+
+Use the [update guide](docs/UPDATING.md) when moving from an older installation. Portal and its AI runtimes have distinct compatibility requirements; a Portal update is not a blanket host upgrade.
 
 ## Reporting a vulnerability
 
@@ -134,9 +132,9 @@ identity, lifecycle, provider-switch, cleanup, and qualification contract.
   configured database URL, including external/custom PostgreSQL deployments.
 - Mailbox provisioning uses durable reconciliation. Desired database state is
   retained and retried instead of deleting Stalwart data on a transient failure.
-- Comprehensive backups cover the database, projects, apps, uploads, Portal
-  state, Stalwart data/configuration, and OpenClaw state. “Keep data” uninstall
-  preserves those locations.
+- Standard backups cover Portal database/settings and managed project, app, upload, and asset files, including the keys needed to read saved Portal settings. Comprehensive adds available agent personality files and Portal-native history as reference exports.
+- Current data backups **exclude mail, provider logins, upstream runtime databases, AI tool installations, containers, models, and the operating system**. Reference exports do not restore a running harness. Legacy server archives retain their original reader and contract. See [backup and recovery](docs/BACKUP_AND_RECOVERY.md).
+- “Keep data” uninstall and backup coverage are different contracts. Retaining data on a host is not an off-host backup; use a VPS snapshot for whole-server recovery.
 - Guarded system updates require a fresh structurally valid backup, matching
   database checksum, explicit maintenance-window acknowledgement, and a
   server-side single-job lock.

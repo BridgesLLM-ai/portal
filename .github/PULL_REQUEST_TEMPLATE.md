@@ -4,7 +4,7 @@ Brief description of the change.
 
 ## Why
 
-What problem does this solve? Link to the related issue: Fixes #
+What problem does this solve? Link the related issue, if any.
 
 ## How
 
@@ -14,10 +14,13 @@ How does this work? Anything non-obvious about the approach?
 
 How did you test this?
 
-- [ ] Tested locally (fresh install)
-- [ ] Tested locally (update from previous version)
-- [ ] Added/updated tests
-- [ ] Tested on mobile browser
+List commands and results, or explain why a check is not applicable.
+
+- [ ] Relevant automated checks passed
+- [ ] Browser behavior checked (UI changes; include viewport/harness)
+- [ ] Fresh install / update / recovery checked (lifecycle changes only)
+- [ ] Documentation and links checked (docs changes)
+- [ ] No private data, credentials, or local runtime files included
 
 ## Checklist
 

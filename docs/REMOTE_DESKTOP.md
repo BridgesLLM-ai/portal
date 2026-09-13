@@ -1,6 +1,6 @@
 # Remote Desktop architecture and operations
 
-This document describes the Portal 4.0 Remote Desktop stack. It is a host-managed, same-origin noVNC integration; it is not a Docker service and it does not expose a raw VNC or websockify port publicly.
+This document describes the Portal Remote Desktop stack. It is a host-managed, same-origin noVNC integration; it is not a Docker service and it does not expose a raw VNC or websockify port publicly.
 
 ## Request path
 

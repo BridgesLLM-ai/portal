@@ -26,24 +26,21 @@ Bring your own providers — Claude, Codex, Gemini, API keys, or Ollama running 
 curl -fsSL https://bridgesllm.ai/install.sh | sudo bash
 ```
 
-Choose **Install** on a new server, or **Update / Repair** when Portal is already installed. Update and Repair preserve your data and leave AI runtimes unchanged. Nothing changes until you choose. For unattended installation, add `-s -- --install`; use `--repair` to reinstall Portal files without deleting data.
+Choose **Install** on a new server, or **Update / Repair** when Portal is already installed. Update and Repair preserve your data. Portal updates leave AI runtime versions unchanged, with a narrow question-plugin compatibility repair on supported OpenClaw 9.x installations; that repair may briefly reconnect the gateway. Nothing changes until you choose. For unattended installation, add `-s -- --install`; use `--repair` to reinstall Portal files without deleting data.
 
 Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · root or sudo. A domain unlocks HTTPS, mail, and public share links.
 
-## What changed in 4.1
+## Current release: 5.0.8
 
-4.1 turns the 4.0 foundation into a calmer workstation: stronger long-running chat, truthful provider readiness, safer recovery, and updates that keep the Portal and its AI tools compatible without silently changing the host.
+Portal 5 brings a unified Project Work surface and broader native-harness support. The latest patches focus on reliable agent chats, safer updates, and recovery.
 
-- **Existing-install updates change Portal, not the whole host.** OpenClaw core and data, native CLIs, Docker/AppArmor, Project runtimes, Remote Desktop, Ollama, and unrelated services stay unchanged. On supported OpenClaw 9.x, an obsolete question plugin is repaired before Portal promotion, with a brief gateway reconnect and automatic plugin rollback on failure.
-- **AI-tool updates are explicit compatibility bundles.** After the Portal update, the Dashboard can install one Portal-qualified set of OpenClaw 2026.9.1, Codex CLI 0.153.2, Claude Code 2.1.260, and ClawHub 0.23.3. Exact versions and package identities are signed and verified together; upstream `latest` tags and independent self-updaters are not used.
-- **The transition is staged, not improvised.** An ordinary Portal-only update can retain the supported OpenClaw 2026.7.1 lane without mutating or restarting it. The separate compatibility action then moves the complete tested tool tuple, or restores the complete predecessor tuple on failure. Fresh installs converge directly to the same qualified bundle.
-- **Long Agent Chat runs keep one identity.** Reconnect, history, steering, clarification replies, and confirmed aborts stay attached to the exact run through refreshes, retries, Gateway restarts, and competing tabs.
-- **Provider readiness is evidence, not optimism.** Codex and Claude re-check exact root-owned local packages before launch. GPT-6 Astra appears through the Codex runtime when the qualified bundle is installed, but its availability still depends on the connected OpenAI account. Hermes and OpenCode appear when their runtimes and credentials qualify. Missing or drifted tools are shown as unavailable rather than repaired behind your back.
-- **Backups protect your work, not the whole VPS.** Standard backups save projects and Portal settings/data. Comprehensive adds available agent personality and Portal-native history as reference exports. AI runtimes, provider logins, mail, and the operating system are excluded; legacy archives keep their existing readers.
-- **Progress means what it says.** Fresh installs use semantic phases, measured percentages only for measured work, stable narrow-terminal output, and clean plain/`NO_COLOR` fallbacks. Dashboard updates stop presenting compatibility markers as fake precision.
-- **Account retirement is transactional.** Admission closes first, then managed sessions, projects, files, apps, shares, credentials, and runtime state are removed or reassigned with durable recovery evidence.
+- **Chat history stays coherent.** Late message echoes do not add duplicate user messages; completed replies stay within their original turns. Tool calls gain their missing output without duplicate blocks, while intentionally repeated messages remain distinct.
+- **Tasks are easier to follow.** Native progress cards show the current chat's plan, completion counts, and a scrollable panel that fits narrow screens. Unknown or stopped work is not presented as completed.
+- **Project Work brings the workspace together.** Use project chat, files, history, preview, and Git in the project-scoped interface. Main Agent Chat remains a separate operator-level surface.
+- **Maintenance is explicit.** Update Portal first, then review **Update Compatible AI Tools** for the release-qualified runtime set. Ordinary Portal updates do not upgrade the host interpreter or OpenClaw core. A supported 9.x question-plugin transition can briefly restart the gateway.
+- **Backups have a clear scope.** Standard backups save Portal data and project files. Comprehensive adds available agent personality and Portal-native history as reference exports—not provider logins, runtime databases, mail, or a whole-server image.
 
-Read the complete [5.0.8 changelog](CHANGELOG.md#508---2026-09-13) and [release history](https://github.com/BridgesLLM-ai/portal/releases).
+Read the [5.0.8 changelog](CHANGELOG.md#508---2026-09-13), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
 
 ## What you get
 
@@ -107,16 +104,17 @@ curl -fsSL https://bridgesllm.ai/install.sh | sudo bash -s -- --update
 
 Either path authenticates the signed release and exact installer, checks backup recoverability, stages the Portal while the current service remains online, proves a private candidate, and cuts over only after its runtime, schema, and readiness match the requested version. A failed Portal transaction rolls back its owned state.
 
-Ordinary Portal updates do not install, repair, configure, approve, or restart OpenClaw, Codex, Claude Code, ClawHub, Docker/AppArmor, Project runtimes, Remote Desktop, Ollama, or unrelated services. The retained OpenClaw 2026.7.1 lane remains supported while you review the new Portal. When you are ready, the Owner-only **Update compatible AI tools** action installs the exact Portal-qualified OpenClaw 2026.9.1, Codex CLI 0.153.2, Claude Code 2.1.260, and ClawHub 0.23.3 bundle. It does not follow upstream `latest` tags, and a failed transaction restores the prior tested tuple instead of leaving mixed versions. Fresh installs converge to that same exact bundle.
+Ordinary Portal updates preserve OpenClaw core, native CLI versions, provider credentials, and runtime data. **Exception:** on supported OpenClaw 9.1/9.2/9.3 installations, an obsolete question plugin is replaced with the compatible native plugin before Portal promotion. That bounded repair may briefly restart the gateway; it is not a core or provider upgrade. Already-compatible installations and the retained 2026.7.1 lane are unchanged by that repair.
 
-### Read this before upgrading to 4.1
+The separate Owner-only **Update Compatible AI Tools** action installs the exact tools qualified for the Portal release. It does not follow upstream `latest`. The core bundle is transactional; subsequent optional-harness updates have separate checkpoints and are not one all-or-nothing transaction. Fresh installs provision the release-qualified tools on a supported host.
 
-- **Portal update first, compatibility update second.** The Portal stage keeps the current AI runtime online. The separate tool stage is deliberate because OpenClaw, its plugins, and native harnesses must move and roll back as one tested compatibility unit.
-- **GPT-6 Astra is account-dependent.** Portal uses the exact `gpt-6-astra` model ID through the qualified Codex runtime and never silently makes it the default or fallback. A connected OpenAI account still has to be entitled to use it.
-- **Do not independently update the managed tools.** Package drift is reported as needing repair. The compatibility action—not an upstream self-updater—is the supported route back to an attested bundle.
-- **Existing upgrades do not add Hermes or OpenCode automatically.** Those optional runtimes remain available only when their own installed packages and credentials qualify.
-- **DeepSeek API models and the native DeepSeek Harness are different paths.** API-model access remains available through supported providers; the native Harness is disabled and non-selectable in 4.1.
-- **A Complete wipe only removes what it recorded.** If you copied managed data somewhere else before uninstalling, check the host yourself.
+### Before updating
+
+- **Back up and verify first.** Review the [backup scope and recovery guide](docs/BACKUP_AND_RECOVERY.md); use a VPS snapshot for whole-server recovery.
+- **Portal first, compatible tools second.** Review [current pins, Node requirements, downtime, and recovery](docs/UPDATING.md). The Node version supported by Portal alone is not necessarily sufficient for the newer OpenClaw bundle.
+- **Provider access remains account-dependent.** Installing a runtime does not sign in, grant model entitlement, or change your chosen default model.
+- **Do not bypass interrupted-update records.** Resolve the reported condition; do not delete journals, fences, or provider authentication to make a retry pass.
+- **Native DeepSeek remains unavailable.** DeepSeek API models through supported providers are a separate path from the disabled native harness.
 
 ## Privacy and telemetry
 

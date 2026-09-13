@@ -32,7 +32,7 @@ Small fixes (typos, docs, one-liners) can skip the issue step.
 
 ### Prerequisites
 
-- Node.js 22.22.3+ on the 22.x line, 24.15.0+ on the 24.x line, or 25.9.0+ (Node 22 LTS recommended)
+- For Portal source builds, use a qualified Node version from the [Node compatibility guide](docs/PORTAL_NODE_RUNTIME_REMEDIATION.md). For a full installation with the current OpenClaw bundle, the qualified LTS target is Node 24.20.0; see [Node compatibility](docs/PORTAL_NODE_RUNTIME_REMEDIATION.md). Node 22 source-build compatibility does not imply current OpenClaw compatibility.
 - PostgreSQL 15+
 - Docker (optional, for local PostgreSQL and sandbox features)
 
@@ -44,8 +44,8 @@ git clone https://github.com/YOUR_USERNAME/portal.git
 cd portal
 
 # Install dependencies
-cd backend && npm install && cd ..
-cd frontend && npm install && cd ..
+cd backend && npm ci && cd ..
+cd frontend && npm ci && cd ..
 
 # Choose the password used by the local Compose database
 export POSTGRES_PASSWORD='choose-a-local-development-password'
@@ -85,6 +85,28 @@ The root `docker-compose.yml` models the host-integrated Linux deployment and
 expects its listed host paths and companion services to exist. For ordinary
 source development, use only its `postgres` service as shown above; use the
 installer for a complete Portal host.
+
+## Checking a change
+
+Use the committed lockfiles (`npm ci`), not an incidental dependency upgrade. The public CI checks both TypeScript projects, builds the backend, lints the frontend with zero warnings, and builds the frontend:
+
+```bash
+cd backend
+npm run type-check
+npm run build
+cd ../frontend
+npx tsc --noEmit
+npx eslint src --max-warnings=0
+npm run build
+```
+
+Run the tests relevant to the changed behavior. For chat/UI changes, describe the browser, viewport, reconnect/reload behavior, and any provider-specific limits you actually checked. For installer or recovery changes, use a disposable supported host and document fresh-install/update coverage. Never test destructive lifecycle changes on a server holding work you need to keep.
+
+Docs-only changes need accurate source references and working links, not a new runtime release. Do not rewrite historical changelog entries to describe later behavior.
+
+### Integration proposals
+
+Describe the user problem and overlap with existing functionality. For a memory or context integration, include deployment and licensing terms, required external services, project/user isolation, read/write permissions, consent, retention/deletion, and how users export their data or disable the integration. A proposal is not an integration commitment; keep any adapter optional until its boundary is agreed and tested.
 
 ## Code Style
 
