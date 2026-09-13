@@ -438,7 +438,10 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
     return short ? `Read memory ${short}` : 'Read memory';
   }
 
-  if (canonical === 'update_plan') {
+  const isProgressCard = canonical === 'progress_card' || canonical.endsWith('__progress_card');
+  if (isProgressCard && !Array.isArray(args?.plan)) return 'Update progress';
+
+  if (canonical === 'update_plan' || isProgressCard) {
     const count = Array.isArray(args?.plan) ? args.plan.length : 0;
     return count > 0 ? `Update plan (${count} steps)` : 'Update plan';
   }

@@ -2892,33 +2892,34 @@ describe('ChatStateProvider session-control ownership', () => {
     ]);
   });
 
-  it('does not let a lone far historical identical assistant hijack the live identity', async () => {
+  it.each([[false, 3_600_000], [true, 3_600_000], [true, 2_000]])('does not let a lone historical identical assistant consume the current reply (completed=%s, age=%s)', async (completed, oldAgeMs) => {
     const runId = 'old-only-identical-r1';
     const repeatedText = 'The same assistant response can legitimately be sent again.';
     const baseTs = Date.now();
     const currentUserTs = baseTs - 1_000;
     let durableHistoryReady = false;
+    let currentReplyCommitted = false;
     let historyReads = 0;
     chatMocks.clientGet.mockImplementation(async (url: string) => {
       if (url === '/gateway/history') {
         historyReads += 1;
         return {
           data: {
-            activeStream: durableHistoryReady
+            activeStream: durableHistoryReady && !completed
               ? { active: true, runId, phase: 'streaming', content: repeatedText, startedAt: baseTs }
               : { active: false },
             messages: durableHistoryReady ? [
               {
                 id: 'old-only-identical-user',
                 role: 'user',
-                content: 'Repeat the response from the old turn',
-                timestamp: new Date(baseTs - 3_601_000).toISOString(),
+                content: 'Repeat the response for the current turn',
+                timestamp: new Date(baseTs - Number(oldAgeMs) - 1_000).toISOString(),
               },
               {
                 id: 'old-only-identical-assistant',
                 role: 'assistant',
                 content: repeatedText,
-                timestamp: new Date(baseTs - 3_600_000).toISOString(),
+                timestamp: new Date(baseTs - Number(oldAgeMs)).toISOString(),
               },
               {
                 id: 'old-only-current-user',
@@ -2926,6 +2927,10 @@ describe('ChatStateProvider session-control ownership', () => {
                 content: 'Repeat the response for the current turn',
                 timestamp: new Date(currentUserTs).toISOString(),
               },
+              ...(currentReplyCommitted ? [{
+                id: 'current-committed-assistant', role: 'assistant', content: repeatedText,
+                timestamp: new Date(baseTs + 10).toISOString(),
+              }] : []),
             ] : [],
             pagination: { beforeCursor: null, hasMoreBefore: false },
           },
@@ -2960,6 +2965,12 @@ describe('ChatStateProvider session-control ownership', () => {
     const liveAssistantId = screen.getByTestId('streaming-assistant-id').textContent || '';
     expect(liveAssistantId).toBeTruthy();
 
+    if (completed) {
+      act(() => {
+        socket.emit({ type: 'done', sessionKey: 'agent:main:first', runId });
+      });
+      expect(screen.getByTestId('is-running')).toHaveTextContent('idle');
+    }
     durableHistoryReady = true;
     act(() => {
       socket.emit({
@@ -2976,7 +2987,16 @@ describe('ChatStateProvider session-control ownership', () => {
       'old-only-identical-assistant',
       liveAssistantId,
     ]);
-    expect(screen.getByTestId('streaming-assistant-id')).toHaveTextContent(liveAssistantId);
+    if (!completed) expect(screen.getByTestId('streaming-assistant-id')).toHaveTextContent(liveAssistantId);
+    if (completed) {
+      currentReplyCommitted = true;
+      await userEvent.setup().click(screen.getByRole('button', { name: 'Retry history' }));
+      const committed = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+        .filter((message: { role: string }) => message.role === 'assistant');
+      expect(committed.map((message: { id: string }) => message.id)).toEqual([
+        'old-only-identical-assistant', 'current-committed-assistant',
+      ]);
+    }
   });
 
   it('retains a mismatched runtime row without letting it consume the live assistant', async () => {
@@ -3490,7 +3510,7 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(screen.getByTestId('is-running')).toHaveTextContent('running');
   });
 
-  it('acknowledges an echoed optimistic user message without duplicating it', async () => {
+  it('acknowledges an optimistic user message and dedupes late echo replay after durable refresh', async () => {
     let durableReady = false;
     let echoTimestamp = 0;
     chatMocks.clientGet.mockImplementation(async (url: string) => {
@@ -3562,6 +3582,59 @@ describe('ChatStateProvider session-control ownership', () => {
       expect(matching).toHaveLength(1);
       expect(matching[0]?.id).toBe('durable-local-yes');
     });
+
+    // A second history read must retain the already-established echo identity.
+    await user.click(screen.getByRole('button', { name: 'Retry history' }));
+    act(() => {
+      socket.emit({
+        type: 'user_message', sessionKey: 'agent:main:first', runId: 'echo-run',
+        messageId: clientMessageId, messageTimestamp: echoTimestamp, content: 'Yes',
+      });
+    });
+    const replayed = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+    expect(replayed.filter((message: { role: string }) => message.role === 'user')
+      .map((message: { id: string }) => message.id)).toEqual(['durable-local-yes']);
+    act(() => {
+      socket.emit({
+        type: 'user_message', sessionKey: 'agent:main:first', runId: 'echo-run',
+        messageId: 'intentional-repeat', messageTimestamp: echoTimestamp, content: 'Yes',
+      });
+    });
+    const repeated = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+    expect(repeated.filter((message: { role: string }) => message.role === 'user')
+      .map((message: { id: string }) => message.id)).toEqual(['durable-local-yes', 'intentional-repeat']);
+
+    // Echo aliases belong to the selected conversation, not the provider instance.
+    await user.click(screen.getByRole('button', { name: 'Navigate session' }));
+    act(() => {
+      socket.emit({
+        type: 'user_message', sessionKey: 'agent:main:second', runId: 'second-echo-run',
+        messageId: clientMessageId, messageTimestamp: echoTimestamp, content: 'Yes',
+      });
+    });
+    expect(JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .some((message: { id: string }) => message.id === clientMessageId)).toBe(true);
+  });
+
+  it('preserves distinct assistant IDs with identical text and timestamps across history reload', async () => {
+    const timestamp = new Date().toISOString();
+    const messages = [
+      { id: 'prompt-1', role: 'user', content: 'Say it', timestamp },
+      { id: 'answer-1', role: 'assistant', content: 'The repeated answer.', timestamp },
+      { id: 'prompt-2', role: 'user', content: 'Say it', timestamp },
+      { id: 'answer-2', role: 'assistant', content: 'The repeated answer.', timestamp },
+      // Exact-ID replay is still one message; a distinct ID is not a replay.
+      { id: 'answer-2', role: 'assistant', content: 'The repeated answer.', timestamp },
+    ];
+    chatMocks.clientGet.mockImplementation(async (url: string) => ({ data: url === '/gateway/history'
+      ? { activeStream: { active: false }, messages }
+      : {} }));
+    await renderReadyHarness();
+    const ids = () => JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .map((message: { id: string }) => message.id);
+    expect(ids()).toEqual(['prompt-1', 'answer-1', 'prompt-2', 'answer-2']);
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Retry history' }));
+    expect(ids()).toEqual(['prompt-1', 'answer-1', 'prompt-2', 'answer-2']);
   });
 
   it('does not let an older identical durable prompt consume a newly echoed local message', async () => {

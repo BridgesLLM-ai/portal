@@ -209,6 +209,8 @@ export interface ChatMessage {
   createdAt: Date;
   queued?: boolean;
   pendingAck?: boolean;
+  /** Live echo IDs already reconciled to this durable user row (session-local). */
+  liveUserMessageIds?: string[];
   provenance?: string;
   model?: string;
   toolCalls?: ToolCall[];
@@ -1630,10 +1632,9 @@ function orderMessageToolVisibleMirrorsBeforeFinal(messages: ChatMessage[]): Cha
 
 function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
   const seenIds = new Set<string>();
-  const seenSignatures = new Set<string>();
   const deduped: ChatMessage[] = [];
   for (const msg of collapseGatewayInjectedAbortMirrors(messages)) {
-    if (msg.id && seenIds.has(msg.id)) continue;
+    if (msg.id && seenIds.has(`${msg.role}|${msg.id}`)) continue;
     const previous = deduped[deduped.length - 1];
     if (isLikelyHistoryReplayDuplicate(previous, msg)) continue;
     if (isEquivalentCompactionNotice(previous, msg)) continue;
@@ -1643,9 +1644,7 @@ function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
       if (isTrajectoryRecoveryMessage(deduped[trajectoryDuplicateIndex]) && !isTrajectoryRecoveryMessage(msg)) {
         const previous = deduped[trajectoryDuplicateIndex];
         const previousId = previous.id;
-        if (previousId) seenIds.delete(previousId);
-        const previousTs = previous.createdAt instanceof Date ? previous.createdAt.getTime() : Date.now();
-        seenSignatures.delete(`${previous.role}|${Number.isFinite(previousTs) ? previousTs : 0}|${previous.content}`);
+        if (previousId) seenIds.delete(`${previous.role}|${previousId}`);
         // Do not replace in-place. Trajectory recovery can be slightly out of
         // order; keep the canonical persisted message at its real position.
         deduped.splice(trajectoryDuplicateIndex, 1);
@@ -1654,11 +1653,9 @@ function dedupeHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
       }
     }
 
-    const ts = msg.createdAt instanceof Date ? msg.createdAt.getTime() : Date.now();
-    const signature = `${msg.role}|${Number.isFinite(ts) ? ts : 0}|${msg.content}`;
-    if (msg.role === 'assistant' && seenSignatures.has(signature)) continue;
-    if (msg.id) seenIds.add(msg.id);
-    seenSignatures.add(signature);
+    // Equal text/timestamps are not replay identity: providers may persist
+    // distinct replies in the same clock tick, including across user turns.
+    if (msg.id) seenIds.add(`${msg.role}|${msg.id}`);
     deduped.push(msg);
   }
   return deduped;
@@ -1985,6 +1982,26 @@ function mergeLoadedHistoryWithLocalMessages(
   const preserveActiveAssistant = Boolean(options?.preserveActiveAssistant && activeAssistantId);
   const activeRunId = preserveActiveAssistant ? normalizeRunId(options?.activeRunId) : null;
   const merged = [...loadedMessages];
+  const rememberLiveUserIdentity = (durable: ChatMessage, local: ChatMessage) => {
+    if (durable.role !== 'user' || local.role !== 'user') return;
+    durable.liveUserMessageIds = [...new Set([
+      ...(durable.liveUserMessageIds || []),
+      ...(local.liveUserMessageIds || []),
+      ...(local.id !== durable.id ? [local.id] : []),
+    ])];
+  };
+  // History owns the visible ID. Carry known echo aliases through subsequent
+  // reloads without retaining otherwise-evicted durable rows as optimistic tail.
+  for (const local of currentMessages) {
+    if (local.role !== 'user' || !local.liveUserMessageIds?.length) continue;
+    const durable = merged.find((message) => message.role === 'user' && message.id === local.id);
+    if (durable) rememberLiveUserIdentity(durable, local);
+  }
+  const findIdentifiedUser = (candidate: ChatMessage) => merged.find((message) => (
+    message.role === 'user' && message.id === candidate.id
+  )) || merged.find((message) => (
+    message.role === 'user' && message.liveUserMessageIds?.includes(candidate.id)
+  ));
   const consumedCommittedUserMatches = new Set<ChatMessage>();
   const now = Date.now();
   const latestLoadedTs = loadedMessages.reduce((latest, message) => {
@@ -2183,6 +2200,37 @@ function mergeLoadedHistoryWithLocalMessages(
     return preferred ? preferred.message : null;
   };
 
+  const sharesCompletedAssistantTurn = (existing: ChatMessage, candidate: ChatMessage): boolean => {
+    const existingRun = normalizeRunId(existing.runtimeRunId);
+    const candidateRun = normalizeRunId(candidate.runtimeRunId);
+    if (existingRun && candidateRun) return existingRun === candidateRun;
+
+    const precedingUser = (messages: ChatMessage[], assistant: ChatMessage) => {
+      const index = messages.indexOf(assistant);
+      for (let i = index - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') return messages[i];
+      }
+      return undefined;
+    };
+    const localUser = precedingUser(currentMessages, candidate);
+    if (!localUser) {
+      // Legacy/snapshot-only turns may omit the prompt. Without that boundary,
+      // content can match only nearby history, never an arbitrary older turn.
+      const existingTs = existing.createdAt.getTime();
+      const candidateTs = candidate.createdAt.getTime();
+      return Number.isFinite(existingTs) && Number.isFinite(candidateTs)
+        && Math.abs(existingTs - candidateTs) <= LOCAL_PENDING_ACK_WINDOW_MS;
+    }
+    const durableUser = precedingUser(merged, existing);
+    if (!durableUser) return false;
+    const identifiedUser = findIdentifiedUser(localUser);
+    if (identifiedUser) return identifiedUser === durableUser;
+    return Boolean(
+      (localUser.pendingAck || localUser.provenance === 'live-local-user' || localUser.provenance === 'live-foreign-user')
+      && isLikelyCommittedPendingUser(localUser, durableUser),
+    );
+  };
+
   const alreadyRepresented = (candidate: ChatMessage): boolean => {
     const isActiveAssistantCandidate = preserveActiveAssistant
       && candidate.role === 'assistant'
@@ -2190,7 +2238,11 @@ function mergeLoadedHistoryWithLocalMessages(
     const preferredActiveMatch = isActiveAssistantCandidate
       ? preferredActiveAssistantMatch(candidate)
       : null;
+    const identifiedUserMatch = candidate.role === 'user' ? findIdentifiedUser(candidate) : undefined;
     return merged.some((existing, existingIndex) => {
+      // An earlier equal-text prompt must not consume a local row whose exact
+      // durable identity is already present later in this history window.
+      if (identifiedUserMatch && existing !== identifiedUserMatch) return false;
       if (isActiveAssistantCandidate && existing.role === 'assistant') {
         if (existing !== preferredActiveMatch) return false;
         enrichAssistantHistoryFromLocalProjection(existing, candidate);
@@ -2206,7 +2258,9 @@ function mergeLoadedHistoryWithLocalMessages(
         preserveMatchedActiveAssistantIdentity(existing, candidate);
         return true;
       }
-      if (existing.id && candidate.id && existing.id === candidate.id) {
+      if (identifiedUserMatch === existing || (
+        existing.id && candidate.id && existing.id === candidate.id && existing.role === candidate.role
+      )) {
         if (
           candidate.role === 'user'
           && (
@@ -2216,6 +2270,7 @@ function mergeLoadedHistoryWithLocalMessages(
           )
         ) {
           consumedCommittedUserMatches.add(existing);
+          rememberLiveUserIdentity(existing, candidate);
         }
         return true;
       }
@@ -2230,11 +2285,13 @@ function mergeLoadedHistoryWithLocalMessages(
         if (consumedCommittedUserMatches.has(existing)) return false;
         if (isLikelyCommittedPendingUser(candidate, existing)) {
           consumedCommittedUserMatches.add(existing);
+          rememberLiveUserIdentity(existing, candidate);
           return true;
         }
         return false;
       }
       if (candidate.role === 'assistant' && existing.role === 'assistant') {
+        if (!sharesCompletedAssistantTurn(existing, candidate)) return false;
         const candidateContent = normalizeHistoryReplayContent(candidate.content);
         const existingContent = normalizeHistoryReplayContent(existing.content);
         const candidateTs = candidate.createdAt instanceof Date ? candidate.createdAt.getTime() : NaN;
@@ -3002,7 +3059,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       ? (rawTimestamp < 10_000_000_000 ? rawTimestamp * 1000 : rawTimestamp)
       : Date.now();
     const matchingLocal = messagesRef.current.find((message) => (
-      message.id === rawId && message.role === 'user'
+      message.role === 'user' && (message.id === rawId || message.liveUserMessageIds?.includes(rawId))
     ));
     if (matchingLocal) {
       if (outstandingChatDispatchRef.current?.clientMessageId === rawId) {

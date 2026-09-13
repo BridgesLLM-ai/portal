@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { CheckCircle2, Circle, ListTodo, Loader2, XCircle } from 'lucide-react';
+import { CheckCircle2, Circle, ListTodo, Loader2, X, XCircle } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import AnchoredPopover from '../AnchoredPopover';
 import client from '../../api/client';
@@ -14,6 +14,7 @@ export default function ChatTasksButton({ provider, session, messages, isRunning
 }) {
   const anchor = useRef<HTMLButtonElement>(null);
   const reducedMotion = useReducedMotion();
+  const close = () => { setOpen(false); anchor.current?.focus(); };
   const [open, setOpen] = useState(false);
   const [allTasks, setAllTasks] = useState<ChatTask[]>([]);
   const [scope, setScope] = useState<'session' | 'harness'>('session');
@@ -56,20 +57,24 @@ export default function ChatTasksButton({ provider, session, messages, isRunning
   const counts = taskCounts(tasks);
   const supportsFeed = ['OPENCLAW', 'CODEX', 'CLAUDE_CODE', 'HERMES', 'OPENCODE', 'GEMINI'].includes(provider) || plan.length > 0 || projectWork.length > 0;
   if (!supportsFeed) return null;
+  const complete = ownCounts.total > 0 && ownCounts.done === ownCounts.total;
+  const summary = counts.outstanding ? `${counts.outstanding} remaining` : counts.failed ? `${counts.failed} failed` : counts.cancelled ? `${counts.cancelled} stopped` : counts.total && counts.done === counts.total ? 'All complete' : counts.total ? 'Last reported progress' : 'No active tasks';
   return <>
-    <button type="button" ref={anchor} aria-label={'Tasks' + (ownCounts.outstanding ? ', ' + ownCounts.outstanding + ' outstanding' : '')}
+    <button type="button" ref={anchor} aria-label={'Tasks' + (ownCounts.outstanding ? ', ' + ownCounts.outstanding + ' outstanding' : complete ? ', all completed' : '')}
       aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(v => !v)}
       title="Tasks and plan progress"
-      className="relative flex min-h-[32px] items-center gap-1 rounded-lg px-2 text-slate-400 transition-colors hover:bg-sky-500/10 hover:text-sky-300">
-      <ListTodo size={17} aria-hidden="true" />
-      {ownCounts.outstanding > 0 && <span className="rounded-md bg-sky-400/15 px-1.5 text-[10px] font-semibold tabular-nums text-sky-300">{ownCounts.outstanding}</span>}
+      className={'relative flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/70 ' + (open || ownCounts.outstanding ? 'border-sky-400/20 bg-sky-400/10 text-sky-300' : complete ? 'border-emerald-400/15 bg-emerald-400/5 text-emerald-300' : 'border-transparent text-slate-400 hover:bg-sky-500/10 hover:text-sky-300')}>
+      <ListTodo size={16} aria-hidden="true" />
+      <span className="hidden min-[900px]:inline">Tasks</span>
+      {ownCounts.total > 0 && <span aria-hidden="true" className="text-[10px] font-semibold tabular-nums">{ownCounts.done}/{ownCounts.total}</span>}
+      {ownCounts.running > 0 && <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-sky-300 motion-safe:animate-pulse" />}
     </button>
-    <AnchoredPopover open={open} anchorRef={anchor} onDismiss={() => setOpen(false)} width={370} ariaLabel="Chat tasks" className="overflow-hidden rounded-2xl border border-white/10 bg-[#11182b] shadow-2xl">
-      <motion.section role="dialog" aria-label="Chat tasks"
+    <AnchoredPopover open={open} anchorRef={anchor} onDismiss={close} width={384} ariaLabel="Chat tasks" className="overflow-hidden rounded-2xl border border-white/10 bg-[#11182b] shadow-2xl">
+      <motion.section role="dialog" aria-label="Chat tasks" className="flex min-h-0 max-h-full flex-col"
         initial={reducedMotion ? false : { opacity: 0, y: -7 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.16 }}>
-        <header className="border-b border-white/5 px-4 py-3">
-          <div className="flex items-center justify-between"><h3 className="text-sm font-semibold text-white">Tasks</h3>
-            <span className="text-xs text-slate-400">{counts.outstanding} outstanding</span></div>
+        <header className="shrink-0 border-b border-white/5 px-4 py-3">
+          <div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-semibold text-white">Tasks & progress</h3><p className="mt-0.5 text-[11px] text-slate-400">{summary}</p></div>
+            <button type="button" aria-label="Close chat tasks" onClick={close} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"><X size={16} aria-hidden="true" /></button></div>
           {provider === 'OPENCLAW' && <div className="mt-3 flex gap-1 text-xs" aria-label="Task scope">
             <button type="button" onClick={() => setScope('session')} aria-pressed={scope === 'session'} className={'rounded-md px-2 py-1 ' + (scope === 'session' ? 'bg-sky-400/15 text-sky-300' : 'text-slate-400')}>This chat</button>
             <button type="button" onClick={() => setScope('harness')} aria-pressed={scope === 'harness'} className={'rounded-md px-2 py-1 ' + (scope === 'harness' ? 'bg-sky-400/15 text-sky-300' : 'text-slate-400')}>All OpenClaw</button>
@@ -79,22 +84,23 @@ export default function ChatTasksButton({ provider, session, messages, isRunning
             <progress aria-label="Reported task progress" value={counts.done} max={counts.total} className="h-1 w-full overflow-hidden rounded-full accent-sky-400" />
           </div>}
         </header>
-        <div className="max-h-80 overflow-y-auto px-4 py-3">
+        <div className="min-h-0 max-h-80 overflow-y-auto overscroll-contain px-4 py-3">
           {error && <p role="status" className="mb-3 text-xs text-amber-300">{error}</p>}
-          {!tasks.length && <p className="py-4 text-center text-xs text-slate-400">{loading ? 'Loading tasks…' : 'No tasks reported for this chat.'}</p>}
+          {!tasks.length && <p className="py-4 text-center text-xs text-slate-400">{loading ? 'Loading tasks…' : scope === 'harness' ? 'No tasks reported by OpenClaw.' : 'No plan or tasks reported for this chat yet.'}</p>}
           <ul className="space-y-3">{tasks.map(task => {
             const href = taskConversationHref(task.sessionKey);
+            const statusLabel = ({ pending: 'Pending', running: 'In progress', done: 'Completed', failed: 'Failed', cancelled: 'Stopped', unknown: 'Status unavailable' })[task.status] || 'Status unavailable';
             const Icon = task.status === 'done' ? CheckCircle2 : task.status === 'running' ? Loader2 : task.status === 'failed' ? XCircle : Circle;
-            return <li key={task.id} className="flex gap-2.5">
-              <Icon aria-label={task.status} size={15} className={'mt-0.5 shrink-0 ' + (task.status === 'running' ? 'motion-safe:animate-spin text-sky-300' : task.status === 'done' ? 'text-emerald-400' : task.status === 'failed' ? 'text-rose-400' : 'text-slate-500')} />
+            return <li key={task.id} className="flex gap-2.5 rounded-lg border border-white/5 bg-white/[0.02] p-2.5">
+              <Icon aria-label={statusLabel} size={15} className={'mt-0.5 shrink-0 ' + (task.status === 'running' ? 'motion-safe:animate-spin text-sky-300' : task.status === 'done' ? 'text-emerald-400' : task.status === 'failed' ? 'text-rose-400' : 'text-slate-500')} />
               <div className="min-w-0 text-xs leading-relaxed">
-                {task.id.startsWith('project-work:') ? <button type="button" className="break-words text-left text-slate-200 hover:text-sky-300" onClick={() => { setOpen(false); document.querySelector(`[data-work-id="${CSS.escape(task.id.slice(13))}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }}>{task.name}</button> : href ? <Link to={href} onClick={() => setOpen(false)} className="break-words text-slate-200 hover:text-sky-300">{task.name}</Link> : <span className="break-words text-slate-200">{task.name}</span>}
+                {task.id.startsWith('project-work:') ? <button type="button" className="break-words text-left text-slate-200 hover:text-sky-300" onClick={() => { setOpen(false); document.querySelector(`[data-work-id="${CSS.escape(task.id.slice(13))}"]`)?.scrollIntoView({ block: 'center', behavior: reducedMotion ? 'auto' : 'smooth' }); }}>{task.name}</button> : href ? <Link to={href} onClick={() => setOpen(false)} className="break-words text-slate-200 hover:text-sky-300">{task.name}</Link> : <span className="break-words text-slate-200">{task.name}</span>}
                 {task.detail && <p className="mt-1 line-clamp-2 text-slate-500">{task.detail}</p>}
               </div>
             </li>;
           })}</ul>
         </div>
-        <footer className="border-t border-white/5 px-4 py-2.5 text-[11px] text-slate-500">
+        <footer className="shrink-0 border-t border-white/5 px-4 py-2.5 text-[11px] text-slate-400">
           {provider === 'OPENCLAW' ? <Link to="/tasks" onClick={() => setOpen(false)} className="text-sky-300">Open task board →</Link> : 'Plan reported by this harness'}
         </footer>
       </motion.section>

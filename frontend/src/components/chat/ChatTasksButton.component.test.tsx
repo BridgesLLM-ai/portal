@@ -5,7 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import ChatTasksButton from './ChatTasksButton';
-import { latestChatPlan } from '../../utils/chatTasks';
+import { latestChatPlan, sessionTasks } from '../../utils/chatTasks';
 import type { ChatMessage } from '../../contexts/ChatStateProvider';
 const mocks = vi.hoisted(() => ({ get: vi.fn() }));
 vi.mock('../../api/client', () => ({ default: { get: mocks.get } }));
@@ -51,4 +51,46 @@ describe('Tasks in chat', () => {
     latest[0].toolCalls!.push({ id: 'removed', name: 'update_plan', status: 'done', startedAt: 3, arguments: { plan: [] } });
     expect(latestChatPlan(latest)).toHaveLength(0);
   });
+});
+
+
+describe('Current native progress cards', () => {
+  it('renders the actual progress_card plan and completes it without a background-task feed', async () => {
+    const progress = structuredClone(messages);
+    progress[0].toolCalls![0].name = 'progress_card';
+    const user = userEvent.setup();
+    const { rerender } = render(<MemoryRouter><ChatTasksButton provider="CODEX" session="progress-session" messages={progress} isRunning /></MemoryRouter>);
+    await user.click(screen.getByRole('button', { name: 'Tasks, 2 outstanding' }));
+    expect(screen.getByRole('progressbar', { name: 'Reported task progress' })).toHaveAttribute('value', '1');
+    const completed = structuredClone(progress);
+    completed[0].toolCalls![0].arguments.plan.forEach((item: { status: string }) => { item.status = 'completed'; });
+    rerender(<MemoryRouter><ChatTasksButton provider="CODEX" session="progress-session" messages={completed} isRunning={false} /></MemoryRouter>);
+    expect(screen.getByRole('button', { name: 'Tasks, all completed' })).toBeInTheDocument();
+    expect(screen.getByText('3 of 3 completed')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Close chat tasks' }));
+    expect(screen.queryByRole('dialog', { name: 'Chat tasks' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Tasks, all completed' })).toHaveFocus();
+  });
+  it('supports namespaced progress tools, retains a plan on note-only updates, and honors a clear', () => {
+    const progress = structuredClone(messages);
+    progress[0].toolCalls![0].name = 'functions__progress_card';
+    progress[0].toolCalls!.push({ id: 'note', name: 'tools.progress_card', status: 'done', startedAt: 2, arguments: { markdown: 'Still working' } });
+    expect(latestChatPlan(progress)).toHaveLength(3);
+    progress[0].toolCalls!.push({ id: 'clear', name: 'progress_card', status: 'done', startedAt: 3, arguments: { plan: [] } });
+    expect(latestChatPlan(progress)).toEqual([]);
+  });
+  it('does not attach unscoped automation runs to an empty chat session', () => {
+    expect(sessionTasks([{ id: 'heartbeat', name: 'Heartbeat', status: 'failed', parentSession: '' }], '')).toEqual([]);
+  });
+});
+
+
+it('does not label an unknown task status as all complete', async () => {
+  mocks.get.mockResolvedValue({ data: { tasks: [{ id: 'unknown', name: 'Awaiting runtime status', status: 'unknown', parentSession: 'uncertain-session' }] } });
+  const user = userEvent.setup();
+  render(<MemoryRouter><ChatTasksButton provider="OPENCLAW" session="uncertain-session" messages={[]} isRunning={false} /></MemoryRouter>);
+  await user.click(screen.getByRole('button', { name: 'Tasks' }));
+  expect(await screen.findByText('Awaiting runtime status')).toBeInTheDocument();
+  expect(screen.queryByText('All complete')).not.toBeInTheDocument();
+  expect(screen.getByText('Last reported progress')).toBeInTheDocument();
 });

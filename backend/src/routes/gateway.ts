@@ -4484,6 +4484,7 @@ type RuntimeHistoryToolRepresentation = RuntimeHistoryRepresentation & { tool: a
 type RuntimeHistoryOwnershipIndex = {
   segments: Map<string, RuntimeHistoryRepresentation[]>;
   tools: Map<string, RuntimeHistoryToolRepresentation[]>;
+  toolPositionsByOwner: Map<number, Map<string, number[]>>;
 };
 
 type RuntimeHistoryMatch = {
@@ -4647,6 +4648,7 @@ function buildRuntimeHistoryOwnershipIndex(
 ): RuntimeHistoryOwnershipIndex | null {
   const segments = new Map<string, RuntimeHistoryRepresentation[]>();
   const tools = new Map<string, RuntimeHistoryToolRepresentation[]>();
+  const toolPositionsByOwner = new Map<number, Map<string, number[]>>();
   let entries = 0;
   const addSegment = (
     ownerIndex: number,
@@ -4710,8 +4712,21 @@ function buildRuntimeHistoryOwnershipIndex(
         true,
       )) return null;
     }
-    for (const tool of Array.isArray(message?.toolCalls) ? message.toolCalls : []) {
+    const toolCalls = Array.isArray(message?.toolCalls) ? message.toolCalls : [];
+    const positionsById = new Map<string, number[]>();
+    toolPositionsByOwner.set(ownerIndex, positionsById);
+    for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex += 1) {
       if (!consumeRuntimeHistoryWork(budget)) return null;
+      const tool = toolCalls[toolIndex];
+      // Malformed siblings cannot authorize hydration or pruning. Preserve the
+      // original history and runtime evidence instead of risking a partial merge.
+      if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return null;
+      const id = typeof tool.id === 'string' ? tool.id.trim() : '';
+      if (id) {
+        const positions = positionsById.get(id) || [];
+        positions.push(toolIndex);
+        positionsById.set(id, positions);
+      }
       const timestamp = finiteRuntimeHistoryTimestamp(tool?.startedAt ?? messageTimestamp);
       if (timestamp === null) continue;
       entries += 1;
@@ -4729,7 +4744,7 @@ function buildRuntimeHistoryOwnershipIndex(
     }
   }
 
-  return { segments, tools };
+  return { segments, tools, toolPositionsByOwner };
 }
 
 function isCoherentRuntimeHistoryActivityTimestamp(runtimeMessage: any, timestamp: number): boolean {
@@ -4884,25 +4899,38 @@ function findUniqueExactRuntimeHistoryToolOwner(
   return owners.size === 1 ? [...owners][0] : -1;
 }
 
-function mergeExactRuntimeHistoryToolIntoOwner(message: any, runtimeTool: any): any {
+function mergeExactRuntimeHistoryToolIntoOwner(
+  messages: any[],
+  ownerIndex: number,
+  runtimeTool: any,
+  ownership: RuntimeHistoryOwnershipIndex,
+  hydratedOwnerIndexes: Set<number>,
+  budget: RuntimeHistoryWorkBudget,
+  requireCompleteRepresentation = false,
+): boolean {
+  const message = messages[ownerIndex];
   const id = typeof runtimeTool?.id === 'string' ? runtimeTool.id.trim() : '';
-  if (!id || !Array.isArray(message?.toolCalls)) return message;
-  let changed = false;
-  const toolCalls = message.toolCalls.map((tool: any) => {
-    const durableId = typeof tool?.id === 'string' ? tool.id.trim() : '';
-    if (durableId !== id) return tool;
-    changed = true;
+  const positions = ownership.toolPositionsByOwner.get(ownerIndex)?.get(id);
+  if (!positions?.length || !Array.isArray(message?.toolCalls)) return false;
+  const updates: Array<{ index: number; tool: any }> = [];
+  for (const index of positions) {
+    if (!consumeRuntimeHistoryWork(budget)) return false;
+    const tool = message.toolCalls[index];
     const runtimeName = typeof runtimeTool?.name === 'string' && runtimeTool.name.trim()
       ? runtimeTool.name.trim()
       : undefined;
     const runtimeStatus = runtimeTool?.status === 'done' || runtimeTool?.status === 'error'
       ? runtimeTool.status
       : undefined;
-    return {
+    const enriched = {
       ...tool,
       ...(!tool?.name && runtimeName ? { name: runtimeName } : {}),
       arguments: tool?.arguments ?? runtimeTool?.arguments,
-      result: tool?.result ?? runtimeTool?.result,
+      // Native transcript hydration can explicitly return an empty result even
+      // when the exact runtime call has output (for example progress_card).
+      result: tool?.result === ''
+        ? runtimeTool?.result ?? tool.result
+        : tool?.result ?? runtimeTool?.result,
       startedAt: finiteRuntimeHistoryTimestamp(tool?.startedAt)
         ?? finiteRuntimeHistoryTimestamp(runtimeTool?.startedAt)
         ?? tool?.startedAt,
@@ -4919,15 +4947,32 @@ function mergeExactRuntimeHistoryToolIntoOwner(message: any, runtimeTool: any): 
         ? { order: runtimeTool.order }
         : {}),
     };
-  });
-  return changed ? { ...message, toolCalls } : message;
+    // Validate every occurrence of this ID, including malformed timestamps and
+    // conflicting siblings, before committing any of the candidate's fields.
+    if (requireCompleteRepresentation && !durableToolFullyRepresentsRuntimeTool(enriched, runtimeTool)) return false;
+    updates.push({ index, tool: enriched });
+  }
+  // Copy each owner's array once per staged reconciliation, not once per call.
+  // Both the copy and indexed writes must fit before any staged mutation.
+  const needsCopy = !hydratedOwnerIndexes.has(ownerIndex);
+  if (!consumeRuntimeHistoryWork(budget, updates.length + (needsCopy ? message.toolCalls.length : 0))) return false;
+  if (needsCopy) {
+    messages[ownerIndex] = { ...message, toolCalls: message.toolCalls.slice() };
+    hydratedOwnerIndexes.add(ownerIndex);
+  }
+  for (const update of updates) messages[ownerIndex].toolCalls[update.index] = update.tool;
+  return true;
 }
 
-function isCompleteContentlessRuntimeHistoryMessage(message: any): boolean {
+function isCompleteTerminalRuntimeHistoryMessage(message: any): boolean {
   return message?.__portal?.kind === 'runtime-turn-event-history'
     && message?.__portal?.terminal === true
     && message?.__portal?.complete === true
-    && message?.__portal?.truncated !== true
+    && message?.__portal?.truncated !== true;
+}
+
+function isCompleteContentlessRuntimeHistoryMessage(message: any): boolean {
+  return isCompleteTerminalRuntimeHistoryMessage(message)
     && !normalizeRuntimeHistoryMatchText(message?.content)
     && (
       (Array.isArray(message?.segments) && message.segments.length > 0)
@@ -4948,6 +4993,7 @@ function reconcileCompleteContentlessRuntimeHistory(
   }
   const allSourceIndexes = new Set(messages.map((_message, index) => index));
   const staged = messages.map((message) => ({ ...message }));
+  const hydratedOwnerIndexes = new Set<number>();
   const residualRuntimeMessages: any[] = [];
   let changed = false;
 
@@ -4994,6 +5040,7 @@ function reconcileCompleteContentlessRuntimeHistory(
 
     const remainingTools: any[] = [];
     for (const tool of Array.isArray(runtimeMessage?.toolCalls) ? runtimeMessage.toolCalls : []) {
+      if (!consumeRuntimeHistoryWork(budget)) return null;
       const toolTimestamp = finiteRuntimeHistoryTimestamp(tool?.startedAt);
       if (
         toolTimestamp === null
@@ -5010,10 +5057,15 @@ function reconcileCompleteContentlessRuntimeHistory(
         allSourceIndexes,
         budget,
       );
-      if (ownerIndex < 0 || !retainedSourceIndexes.has(ownerIndex)) {
+      if (
+        ownerIndex < 0
+        || !retainedSourceIndexes.has(ownerIndex)
+        || !mergeExactRuntimeHistoryToolIntoOwner(
+          staged, ownerIndex, tool, ownership, hydratedOwnerIndexes, budget,
+        )
+      ) {
         remainingTools.push(tool);
       } else {
-        staged[ownerIndex] = mergeExactRuntimeHistoryToolIntoOwner(staged[ownerIndex], tool);
         changed = true;
       }
     }
@@ -5329,6 +5381,7 @@ function mergeRuntimeHistoryMessages(
     if (changed) continue;
 
     const staged = combined.map((message) => ({ ...message }));
+    const hydratedOwnerIndexes = new Set<number>();
     const stagedResidualRuntimeMessages: any[] = [];
     const stagedResidualRuntimeIndexes: number[] = [];
     const contentUnsafeRuntimeIndexes = new Set<number>();
@@ -5361,14 +5414,32 @@ function mergeRuntimeHistoryMessages(
       }
       const remainingTools: any[] = [];
       for (const tool of runtimeTools) {
-        if (!hasUniqueRuntimeHistoryToolOwner(
+        if (!consumeRuntimeHistoryWork(pruneBudget)) return failClosedOriginalRuntimeHistory();
+        if (hasUniqueRuntimeHistoryToolOwner(
           entry.runtimeMessage,
           tool,
           turnIndex,
           ownership,
           retainedIndexes,
           pruneBudget,
-        )) remainingTools.push(tool);
+        )) continue;
+
+        // A complete terminal can supply missing output to its exact retained
+        // canonical call. Keeping the richer runtime copy as well would render
+        // the same call in both the transcript bubble and a residual tool row.
+        const ownerIndex = isCompleteTerminalRuntimeHistoryMessage(entry.runtimeMessage)
+          && typeof tool?.result === 'string'
+          && Boolean(tool.result.trim())
+          ? findUniqueExactRuntimeHistoryToolOwner(
+              entry.runtimeMessage, tool, turnIndex, ownership, retainedIndexes, pruneBudget,
+            )
+          : -1;
+        // Do not discard conflicting arguments/results or substitute a
+        // same-named tool. Only missing fields can be filled by this path.
+        if (ownerIndex >= 0 && mergeExactRuntimeHistoryToolIntoOwner(
+          staged, ownerIndex, tool, ownership, hydratedOwnerIndexes, pruneBudget, true,
+        )) continue;
+        remainingTools.push(tool);
       }
       if (pruneBudget.exhausted) {
         return failClosedOriginalRuntimeHistory();
@@ -5396,7 +5467,7 @@ function mergeRuntimeHistoryMessages(
         continue;
       }
       if (reconciledContent !== existing?.content) {
-        staged[entry.matchIndex] = { ...existing, content: reconciledContent };
+        staged[entry.matchIndex] = { ...staged[entry.matchIndex], content: reconciledContent };
       }
       const residualRuntimeMessage = {
         ...entry.runtimeMessage,

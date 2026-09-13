@@ -2,6 +2,14 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.8] - 2026-09-13
+
+### Fixed
+- **Tool activity appears once:** enrich saved tool calls with missing terminal output using their exact call identity, instead of rendering duplicate tool blocks after a refresh or reconnect. Conflicting or incomplete activity remains visible.
+- **Reliable message reconciliation:** retain live message identities when saved history arrives, preventing late echoes from duplicating user messages. Preserve distinct replies with identical text and timestamps, and keep completed replies within their original turns.
+- **Current task plans are visible:** recognize native progress cards, including namespaced tools, note-only updates and explicitly cleared plans. Unscoped background work no longer appears in an empty chat.
+- **Clearer task progress:** a compact Tasks control shows completion counts, with an accessible close control and a scrollable mobile-friendly panel. Unknown and stopped states are not reported as successful completion.
+
 ## [5.0.7] - 2026-09-10
 
 ### Fixed

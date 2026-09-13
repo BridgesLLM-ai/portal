@@ -15,7 +15,7 @@ function taskStatus(value: unknown): ChatTask['status'] {
   if (['in_progress', 'running', 'active'].includes(status)) return 'running';
   if (['pending', 'queued', 'todo', 'not_started'].includes(status)) return 'pending';
   if (['error', 'failed'].includes(status)) return 'failed';
-  if (['cancelled', 'canceled'].includes(status)) return 'cancelled';
+  if (['cancelled', 'canceled', 'aborted', 'stopped'].includes(status)) return 'cancelled';
   return 'unknown';
 }
 
@@ -26,8 +26,8 @@ export function latestChatPlan(messages: ChatMessage[]): ChatTask[] {
     for (let t = calls.length - 1; t >= 0; t -= 1) {
       const call = calls[t];
       if (call.status === 'error') continue;
-      const name = call.name.toLowerCase().replace(/^.*[./:]/, '').replace(/_/g, '');
-      if (!['updateplan', 'todowrite', 'writeplan', 'plan'].includes(name)) continue;
+      const name = call.name.toLowerCase().split(/[./:]|__/).pop()?.replace(/_/g, '');
+      if (!['updateplan', 'todowrite', 'writeplan', 'plan', 'progresscard'].includes(name || '')) continue;
       let args = call.arguments;
       if (typeof args === 'string') { try { args = JSON.parse(args); } catch { continue; } }
       const items = args?.plan ?? args?.todos ?? args?.entries;
@@ -35,7 +35,7 @@ export function latestChatPlan(messages: ChatMessage[]): ChatTask[] {
       return items.slice(0, 100).flatMap((item, i) => {
         const name = item?.step ?? item?.content ?? item?.title ?? item?.description;
         if (typeof name !== 'string' || !name.trim()) return [];
-        return [{ id: String(item.id || call.id + ':' + i), name: name.slice(0, 500), status: taskStatus(item.status) }];
+        return [{ id: 'plan:' + call.id + ':' + i, name: name.slice(0, 500), status: taskStatus(item.status) }];
       });
     }
   }
@@ -43,6 +43,7 @@ export function latestChatPlan(messages: ChatMessage[]): ChatTask[] {
 }
 
 export function sessionTasks(tasks: ChatTask[], session: string): ChatTask[] {
+  if (!session.trim()) return [];
   return tasks.filter(task => task.parentSession === session || task.sessionKey === session);
 }
 
@@ -50,6 +51,9 @@ export function taskCounts(tasks: ChatTask[]) {
   return {
     total: tasks.length,
     done: tasks.filter(t => t.status === 'done').length,
+    failed: tasks.filter(t => t.status === 'failed').length,
+    cancelled: tasks.filter(t => t.status === 'cancelled').length,
+    running: tasks.filter(t => t.status === 'running').length,
     outstanding: tasks.filter(t => t.status === 'running' || t.status === 'pending').length,
   };
 }

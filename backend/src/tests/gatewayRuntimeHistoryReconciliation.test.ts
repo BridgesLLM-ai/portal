@@ -16,6 +16,196 @@ describe('gateway runtime-history prune-only reconciliation', () => {
     message?.__portal?.kind === 'runtime-turn-event-history'
   ));
 
+  test.each(['plain', 'cumulative'])('hydrates empty tool results before suppressing duplicate calls (%s final)', (finalShape) => {
+    const finalContent = finalShape === 'cumulative'
+      ? 'CHATPOLISH_PROGRESS\n\nCHATPOLISH_DONE'
+      : 'CHATPOLISH_DONE';
+    const tools = [1, 2].map((revision) => ({
+      id: `progress-call-${revision}`, name: 'progress_card',
+      arguments: { plan: [{ step: 'Check chat', status: 'completed' }] },
+      result: `Progress card updated (rev ${revision})`,
+      startedAt: ms(revision * 10), endedAt: ms(revision * 10 + 1), status: 'done',
+    }));
+    // Browser-reproduced shape: user, tool-only, progress, tool-only, final.
+    // Canonical hydration has a blank result; the runtime lane has the output.
+    const canonical = [
+      { id: 'u', role: 'user', content: 'Check chat', timestamp: at(0) },
+      { id: 'tool-1', role: 'assistant', content: '', timestamp: at(10), toolCalls: [{ ...tools[0], result: '' }] },
+      { id: 'progress', role: 'assistant', content: 'CHATPOLISH_PROGRESS', timestamp: at(12) },
+      { id: 'tool-2', role: 'assistant', content: '', timestamp: at(20), toolCalls: [{ ...tools[1], result: '' }] },
+      { id: 'final', role: 'assistant', content: finalContent, timestamp: at(22) },
+    ];
+    const source = __gatewayHistoryTest.collapseFragmentedToolOnlyAssistantHistory(canonical);
+    const before = JSON.parse(JSON.stringify(source));
+    const runtime = overlay({
+      content: finalContent, timestamp: at(22), toolCalls: tools,
+      segments: finalShape === 'cumulative'
+        ? [{ text: 'CHATPOLISH_PROGRESS', kind: 'text', source: 'text', position: 'before', ts: ms(12) }]
+        : undefined,
+      __portal: { kind: 'runtime-turn-event-history', runId: 'run-test', terminal: true, complete: true },
+    });
+    const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime], 20);
+
+    expect(merged.flatMap((message: any) => message.toolCalls || [])).toEqual(tools);
+    expect(merged.map((message: any) => message.id)).toEqual(['u', 'progress', 'final']);
+    expect(merged.map((message: any) => message.content))
+      .toEqual(['Check chat', 'CHATPOLISH_PROGRESS', 'CHATPOLISH_DONE']);
+    expect(source).toEqual(before);
+    // A second reload must neither duplicate tools nor lose their richer output.
+    expect(__gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime], 20)).toEqual(merged);
+  });
+
+  test.each([null, undefined, 7, 'malformed', []])(
+    'fails closed without losing history when an exact tool owner has malformed sibling %p', (sibling) => {
+      const tool = {
+        id: 'stable-tool', name: 'progress_card', arguments: { revision: 1 },
+        result: 'Progress card updated', status: 'done', startedAt: ms(10), endedAt: ms(11),
+      };
+      const source = [
+        { id: 'u', role: 'user', content: 'go', timestamp: at(0) },
+        { id: 'owner', role: 'assistant', content: 'progress', timestamp: at(12), toolCalls: [sibling, { ...tool, result: '' }] },
+        { id: 'terminal', role: 'assistant', content: 'POST', timestamp: at(40) },
+      ];
+      const runtime = overlay({
+        toolCalls: [tool],
+        __portal: { kind: 'runtime-turn-event-history', terminal: true, complete: true },
+      });
+      const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime], 20);
+
+      expect(merged).toEqual([...source, runtime]);
+      expect(merged[1].toolCalls[0]).toBe(sibling);
+      expect(source[1].toolCalls?.[1]?.result).toBe('');
+    },
+  );
+
+  test.each([
+    { result: 'conflicting result' },
+    { arguments: { revision: 2 } },
+    { name: 'different-tool' },
+    { status: 'error' },
+  ])('retains same-ID conflicting evidence even with an unindexed timestamp: %p', (conflict) => {
+    const tool = {
+      id: 'stable-tool', name: 'progress_card', arguments: { revision: 1 },
+      result: 'Progress card updated', status: 'done', startedAt: ms(10), endedAt: ms(11),
+    };
+    const owner = {
+      id: 'owner', role: 'assistant', content: 'progress', timestamp: at(12),
+      toolCalls: [
+        { ...tool, result: '' },
+        { ...tool, result: '', ...conflict, startedAt: 'unindexed' },
+      ],
+    };
+    const source = [
+      { id: 'u', role: 'user', content: 'go', timestamp: at(0) },
+      owner,
+      { id: 'terminal', role: 'assistant', content: 'POST', timestamp: at(40) },
+    ];
+    const sourceSnapshot = JSON.parse(JSON.stringify(source));
+    const runtime = overlay({
+      toolCalls: [tool],
+      __portal: { kind: 'runtime-turn-event-history', terminal: true, complete: true },
+    });
+    const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime], 20);
+
+    expect(merged.find((message: any) => message.id === 'owner')).toEqual(owner);
+    expect(runtimeRows(merged)[0].toolCalls).toEqual([tool]);
+    expect(source).toEqual(sourceSnapshot);
+  });
+
+  test.each(['POST', ''])('charges owner-array hydration to the prune budget (terminal %p)', (content) => {
+    const tools = Array.from({ length: 128 }, (_, index) => ({
+      id: `tool-${index}`, name: 'exec', arguments: { command: `inspect-${index}` },
+      result: '', status: 'done', startedAt: ms(10), endedAt: ms(11),
+    }));
+    const earlierTool = { ...tools[0], id: 'earlier-tool', startedAt: ms(5), endedAt: ms(6) };
+    const source = [
+      { id: 'u', role: 'user', content: 'go', timestamp: at(0) },
+      { id: 'earlier-owner', role: 'assistant', content: 'earlier', timestamp: at(7), toolCalls: [earlierTool] },
+      { id: 'owner', role: 'assistant', content: 'progress', timestamp: at(12), toolCalls: tools },
+      { id: 'terminal', role: 'assistant', content: 'POST', timestamp: at(40) },
+    ];
+    const sourceSnapshot = JSON.parse(JSON.stringify(source));
+    const runtime = overlay({
+      content, toolCalls: [
+        { ...earlierTool, result: 'earlier runtime output' },
+        { ...tools[0], result: 'runtime output' },
+      ],
+      __portal: { kind: 'runtime-turn-event-history', terminal: true, complete: true },
+    });
+    // The first owner can be hydrated; copying the second owner's many
+    // siblings must exhaust the budget and roll back the entire staged merge.
+    const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime], 20, { prune: 64 });
+
+    expect(merged).toEqual([...sourceSnapshot, runtime]);
+    expect(source).toEqual(sourceSnapshot);
+  });
+
+  test.each(['POST', ''])('hydrates many exact calls with linear canonical visits (terminal %p)', (content) => {
+    const count = 256;
+    let idReads = 0;
+    const tools = Array.from({ length: count }, (_, index) => ({
+      id: `tool-${index}`, name: 'exec', arguments: { command: `inspect-${index}` },
+      result: `output-${index}`, status: 'done', startedAt: ms(10), endedAt: ms(11),
+    }));
+    const durableTools = tools.map((tool) => ({
+      ...tool,
+      // Count actual canonical identity reads, not elapsed time or calls to a
+      // particular helper. Per-runtime full-owner scans exceed this linear cap.
+      get id() { idReads += 1; return tool.id; },
+      result: '',
+    }));
+    const source = [
+      { id: 'u', role: 'user', content: 'go', timestamp: at(0) },
+      { id: 'owner', role: 'assistant', content: 'progress', timestamp: at(12), toolCalls: durableTools },
+      { id: 'terminal', role: 'assistant', content: 'POST', timestamp: at(40) },
+    ];
+    const runtime = overlay({
+      content, toolCalls: tools,
+      __portal: { kind: 'runtime-turn-event-history', terminal: true, complete: true },
+    });
+    const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime], 20, { prune: count * 16 });
+
+    expect(idReads).toBeLessThanOrEqual(count * 24);
+    expect(runtimeRows(merged)).toHaveLength(0);
+    expect(merged.find((message: any) => message.id === 'owner').toolCalls).toEqual(tools);
+    expect(durableTools.every((tool) => tool.result === '')).toBe(true);
+  });
+
+  test.each(['incomplete', 'active', 'truncated', 'fallback', 'conflict', 'ambiguous', 'other-turn', 'evicted-owner'])(
+    'preserves richer terminal tool evidence when ownership is %s', (shape) => {
+      const tool = {
+        id: 'stable-tool', name: 'progress_card', arguments: { revision: 1 },
+        result: 'Progress card updated', status: 'done', startedAt: ms(10), endedAt: ms(11),
+      };
+      const owner = {
+        id: 'owner', role: 'assistant', content: 'progress', timestamp: at(12),
+        toolCalls: [{ ...tool, result: shape === 'conflict' ? 'different durable result' : '' }],
+      };
+      const source = [
+        { id: 'u', role: 'user', content: 'go', timestamp: at(0) },
+        owner,
+        ...(shape === 'ambiguous' ? [{ ...owner, id: 'second-owner' }] : []),
+        ...(shape === 'other-turn' ? [{ id: 'next-u', role: 'user', content: 'again', timestamp: at(15) }] : []),
+        ...(shape === 'evicted-owner' ? [{ id: 'later', role: 'assistant', content: 'later', timestamp: at(30) }] : []),
+        { id: 'terminal', role: 'assistant', content: 'POST', timestamp: at(40) },
+      ];
+      const runtime: any = overlay({
+        toolCalls: [{
+          ...tool,
+          ...(shape === 'fallback' ? { identity: 'fallback' } : {}),
+          ...(shape === 'other-turn' ? { startedAt: ms(20), endedAt: ms(21) } : {}),
+        }],
+        __portal: {
+          kind: 'runtime-turn-event-history', runId: 'run-test',
+          terminal: shape !== 'active', complete: shape !== 'incomplete', truncated: shape === 'truncated',
+        },
+      });
+      const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime], shape === 'evicted-owner' ? 2 : 20);
+      expect(runtimeRows(merged)[0].toolCalls).toEqual(runtime.toolCalls);
+      if (shape !== 'evicted-owner') expect(merged.find((message: any) => message.id === owner.id)).toEqual(owner);
+    },
+  );
+
   test('prunes only activity already owned by durable rows in the same-run steer production shape', () => {
     const tool1 = {
       id: 'tool-1', name: 'exec', arguments: { cmd: 'one' }, result: 'one',

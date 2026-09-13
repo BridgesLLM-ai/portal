@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "version": "5.0.7",
-  "releasedAt": "2026-09-10",
+  "version": "5.0.8",
+  "releasedAt": "2026-09-13",
   "releaseClass": "hotfix",
   "highlights": [
-    "Keep maintenance recoverable when systemd discards inactive process history during package updates.",
-    "Stop completed, untriggered repair jobs from blocking updates; active automation and remaining stop hooks are still checked.",
-    "Verify Portal data backups with their authenticated data-format verifier instead of the legacy full-server verifier.",
-    "Repair the old question plugin before Portal promotion on supported native OpenClaw versions, without a core or database upgrade."
+    "Prevent late message echoes from duplicating chat messages while preserving intentional repeated replies.",
+    "Keep saved replies attached to their correct conversation turns during history refresh and reconnect.",
+    "Avoid duplicated tool activity when completed runtime output is reconciled with saved chat history.",
+    "Show current agent progress cards with clear task counts, completion states, and a refined mobile-friendly task panel."
   ]
 }
