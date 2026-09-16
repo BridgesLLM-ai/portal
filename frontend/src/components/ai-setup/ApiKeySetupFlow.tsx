@@ -236,7 +236,7 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
             <div className="space-y-4">
               <div>
                 <h3 className="text-lg font-semibold text-white">Save credential</h3>
-                <p className="mt-1 text-sm text-slate-400">Portal can save this credential now. Default-model routing and host activation remain unchanged; those mutations are unavailable in this release until a separately supported maintenance operation ships.</p>
+                <p className="mt-1 text-sm text-slate-400">Portal saves this credential now. OpenClaw's default model stays unchanged until you choose a model in the next step.</p>
               </div>
 
               {saveError ? (
@@ -272,7 +272,7 @@ export default function ApiKeySetupFlow({ provider, apiBase, onComplete, onCance
             <div className="rounded-3xl border border-emerald-500/20 bg-emerald-500/10 p-8 text-center">
               <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-300" />
               <h3 className="mt-4 text-lg font-semibold text-white">{provider.name} credential saved</h3>
-              <p className="mt-2 text-sm text-slate-300">Host model routing was not changed.</p>
+              <p className="mt-2 text-sm text-slate-300">OpenClaw's default model is unchanged. Close this dialog to verify the credential with OpenClaw and choose a model.</p>
               {credentialWarning ? <p className="mt-2 text-sm text-amber-200">{credentialWarning}</p> : null}
               <button type="button" onClick={onCancel} className="mt-5 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-emerald-400">
                 Done

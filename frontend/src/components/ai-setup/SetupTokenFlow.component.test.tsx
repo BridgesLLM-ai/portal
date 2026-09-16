@@ -58,7 +58,7 @@ describe('SetupTokenFlow Anthropic guidance', () => {
     mocks.clientGet.mockResolvedValue({ data: { defaultModel: 'anthropic/claude-fable-5' } });
   });
 
-  it('shows an existing-credential boundary without offering host Claude execution', async () => {
+  it('offers the process-free browser sign-in first and existing-token entry second, without host Claude execution', async () => {
     render(
       <SetupTokenFlow
         provider={anthropicProvider}
@@ -69,14 +69,330 @@ describe('SetupTokenFlow Anthropic guidance', () => {
     );
 
     expect(screen.getByRole('dialog', { name: 'Set up Claude' })).toHaveAttribute('aria-modal', 'true');
-    expect(screen.getByText('Credential boundary')).toBeInTheDocument();
-    expect(screen.getByText(/does not launch, probe, or reuse Claude Code on the host/i)).toBeInTheDocument();
-    expect(screen.getByText(/Project Sandbox authorization remains available through its separate process-free PKCE flow/i)).toBeInTheDocument();
+    expect(screen.getByText('What this sign-in does')).toBeInTheDocument();
+    expect(screen.getByText(/never launches Claude Code on the host/i)).toBeInTheDocument();
+    expect(screen.getByText(/OpenClaw's Claude CLI runtime and Portal Claude Code sessions share that login/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Sign in with your Claude account' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Paste an existing setup-token' })).toBeInTheDocument();
+    expect(screen.queryByText(/Project Sandbox/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Connect Claude' })).not.toBeInTheDocument();
     expect(screen.queryByText(/extra usage/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/check your Claude account/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Anthropic can change those terms/i)).not.toBeInTheDocument();
+    expect(mocks.clientPost).not.toHaveBeenCalled();
+  });
+
+  it('runs the process-free browser sign-in and completes with a pasted authorization code', async () => {
+    const user = userEvent.setup();
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const onComplete = vi.fn();
+    const startBodies: Array<Record<string, unknown>> = [];
+    const callbackBodies: Array<Record<string, unknown>> = [];
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url.endsWith('/status')) return { data: { defaultModel: 'anthropic/claude-fable-5' } };
+      if (url.endsWith('/models')) return { data: { models: [] } };
+      if (url.includes('/native-cli/status/')) {
+        return { data: { id: 'native-claude-openclaw', provider: 'claude-code', status: 'awaiting_callback' } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    mocks.clientPost.mockImplementation(async (url: string, body: Record<string, unknown>) => {
+      if (url.endsWith('/native-cli/start')) {
+        startBodies.push(body);
+        return {
+          data: {
+            success: true,
+            sessionId: 'native-claude-openclaw',
+            status: 'awaiting_callback',
+            authUrl: 'https://claude.com/cai/oauth/authorize?state=openclaw-test',
+          },
+        };
+      }
+      if (url.endsWith('/native-cli/callback')) {
+        callbackBodies.push(body);
+        return {
+          data: {
+            success: true,
+            finalized: true,
+            warning: 'Credential saved. Host Agent Chat will re-check both the credential and admitted CLI before the next turn.',
+          },
+        };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    render(
+      <SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={onComplete} onCancel={vi.fn()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Sign in with your Claude account' }));
+    expect(await screen.findByText(/Claude sign-in opened in a new tab/i)).toBeInTheDocument();
+    expect(startBodies).toEqual([{ provider: 'claude-code' }]);
+    expect(open).toHaveBeenCalledWith('https://claude.com/cai/oauth/authorize?state=openclaw-test', '_blank', 'noopener,noreferrer');
+
+    await user.click(screen.getByRole('button', { name: /I have the code/i }));
+    await user.type(await screen.findByRole('textbox', { name: 'Claude authorization code' }), 'pasted-code#state');
+    await user.click(screen.getByRole('button', { name: 'Complete Sign-In' }));
+
+    expect(await screen.findByText('Claude is signed in on this server')).toBeInTheDocument();
+    expect(callbackBodies).toEqual([{ sessionId: 'native-claude-openclaw', callbackUrl: 'pasted-code#state' }]);
+    expect(screen.getByText(/Host Agent Chat will re-check/i)).toBeInTheDocument();
+    expect(screen.getByText(/OpenClaw's Claude CLI runtime and Portal Claude Code sessions use this login/i)).toBeInTheDocument();
+    expect(mocks.clientPost.mock.calls.some(([url]) => String(url).includes('/claude/'))).toBe(false);
+    expect(mocks.clientPost.mock.calls.some(([url]) => String(url).includes('/save-setup-token'))).toBe(false);
+
+    await user.click(screen.getByRole('button', { name: 'Choose a model' }));
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    open.mockRestore();
+  });
+
+  it('ends the sign-in on a rejected authorization code and cancels the session before a fresh start', async () => {
+    const user = userEvent.setup();
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const cancelBodies: Array<Record<string, unknown>> = [];
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url.endsWith('/status')) return { data: { defaultModel: 'anthropic/claude-fable-5' } };
+      if (url.endsWith('/models')) return { data: { models: [] } };
+      if (url.includes('/native-cli/status/')) {
+        return { data: { id: 'native-claude-rejected', provider: 'claude-code', status: 'awaiting_callback' } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    mocks.clientPost.mockImplementation(async (url: string, body: Record<string, unknown>) => {
+      if (url.endsWith('/native-cli/start')) {
+        return {
+          data: {
+            success: true,
+            sessionId: 'native-claude-rejected',
+            status: 'awaiting_callback',
+            authUrl: 'https://claude.com/cai/oauth/authorize?state=rejected-test',
+          },
+        };
+      }
+      if (url.endsWith('/native-cli/callback')) {
+        return { data: { success: false, error: 'Claude token exchange failed: invalid_grant' } };
+      }
+      if (url.endsWith('/oauth/cancel')) {
+        cancelBodies.push(body);
+        return { data: { success: true, status: 'cancelled' } };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    render(
+      <SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Sign in with your Claude account' }));
+    await user.click(await screen.findByRole('button', { name: /I have the code/i }));
+    await user.type(await screen.findByRole('textbox', { name: 'Claude authorization code' }), 'stale-code');
+    await user.click(screen.getByRole('button', { name: 'Complete Sign-In' }));
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Claude token exchange failed: invalid_grant'));
+    expect(screen.getByText('Setup failed')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Try Again' }));
+    await waitFor(() => expect(cancelBodies).toEqual([{ sessionId: 'native-claude-rejected' }]));
+    expect(await screen.findByRole('button', { name: 'Sign in with your Claude account' })).toBeInTheDocument();
+    open.mockRestore();
+  });
+
+  it('keeps the rejected-code error stable while the server reports the ended session, then cancels once', async () => {
+    const user = userEvent.setup();
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const cancelBodies: Array<Record<string, unknown>> = [];
+    let rejected = false;
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url.endsWith('/status')) return { data: { defaultModel: 'anthropic/claude-fable-5' } };
+      if (url.endsWith('/models')) return { data: { models: [] } };
+      if (url.includes('/native-cli/status/')) {
+        return rejected
+          ? { data: { id: 'native-claude-ended', provider: 'claude-code', status: 'error', cleanupPending: true, error: 'Claude token exchange failed: invalid_grant' } }
+          : { data: { id: 'native-claude-ended', provider: 'claude-code', status: 'awaiting_callback' } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    mocks.clientPost.mockImplementation(async (url: string, body: Record<string, unknown>) => {
+      if (url.endsWith('/native-cli/start')) {
+        return { data: { success: true, sessionId: 'native-claude-ended', status: 'awaiting_callback', authUrl: 'https://claude.com/cai/oauth/authorize?state=ended' } };
+      }
+      if (url.endsWith('/native-cli/callback')) {
+        rejected = true;
+        return { data: { success: false, error: 'Claude token exchange failed: invalid_grant' } };
+      }
+      if (url.endsWith('/oauth/cancel')) {
+        cancelBodies.push(body);
+        return { data: { success: true, status: 'cancelled' } };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    render(
+      <SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Sign in with your Claude account' }));
+    await user.click(await screen.findByRole('button', { name: /I have the code/i }));
+    await user.type(await screen.findByRole('textbox', { name: 'Claude authorization code' }), 'stale-code');
+    await user.click(screen.getByRole('button', { name: 'Complete Sign-In' }));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Claude token exchange failed: invalid_grant'));
+
+    // Let the error-step poll observe the server's ended session at least once.
+    await waitFor(() => expect(mocks.clientGet.mock.calls.filter(([url]) => String(url).includes('/native-cli/status/')).length).toBeGreaterThanOrEqual(1), { timeout: 5000 });
+    expect(screen.getByRole('alert')).toHaveTextContent('Claude token exchange failed: invalid_grant');
+    expect(screen.getByText('Setup failed')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Try Again' }));
+    await waitFor(() => expect(cancelBodies).toEqual([{ sessionId: 'native-claude-ended' }]));
+    expect(await screen.findByRole('button', { name: 'Sign in with your Claude account' })).toBeInTheDocument();
+    expect(cancelBodies).toHaveLength(1);
+    open.mockRestore();
+  });
+
+  it('moves an unattended sign-in that the server expired onto the error step and cancels before a fresh start', async () => {
+    const user = userEvent.setup();
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const cancelBodies: Array<Record<string, unknown>> = [];
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url.endsWith('/status')) return { data: { defaultModel: 'anthropic/claude-fable-5' } };
+      if (url.endsWith('/models')) return { data: { models: [] } };
+      if (url.includes('/native-cli/status/')) {
+        return { data: { id: 'native-claude-expired', provider: 'claude-code', status: 'expired', cleanupPending: true, error: 'Claude sign-in expired before the authorization code was submitted.' } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    mocks.clientPost.mockImplementation(async (url: string, body: Record<string, unknown>) => {
+      if (url.endsWith('/native-cli/start')) {
+        return { data: { success: true, sessionId: 'native-claude-expired', status: 'awaiting_callback', authUrl: 'https://claude.com/cai/oauth/authorize?state=expired' } };
+      }
+      if (url.endsWith('/oauth/cancel')) {
+        cancelBodies.push(body);
+        return { data: { success: true, status: 'cancelled' } };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    render(
+      <SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Sign in with your Claude account' }));
+    expect(await screen.findByText(/Claude sign-in opened in a new tab/i)).toBeInTheDocument();
+
+    expect(await screen.findByText('Setup failed', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/expired before the authorization code/i);
+    expect(screen.queryByText(/Claude sign-in opened in a new tab/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Try Again' }));
+    await waitFor(() => expect(cancelBodies).toEqual([{ sessionId: 'native-claude-expired' }]));
+    expect(await screen.findByRole('button', { name: 'Sign in with your Claude account' })).toBeInTheDocument();
+    open.mockRestore();
+  });
+
+  it('recovers to the signed-in screen when the callback response is lost but the server finalized the login', async () => {
+    const user = userEvent.setup();
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const onComplete = vi.fn();
+    let callbackAttempted = false;
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url.endsWith('/status')) return { data: { defaultModel: 'anthropic/claude-fable-5' } };
+      if (url.endsWith('/models')) return { data: { models: [] } };
+      if (url.includes('/native-cli/status/')) {
+        return callbackAttempted
+          ? { data: { id: 'native-claude-lost', provider: 'claude-code', status: 'complete', finalized: true, credentialState: 'committed', finalizationWarning: 'Credential saved. Host Agent Chat will re-check both the credential and admitted CLI before the next turn.' } }
+          : { data: { id: 'native-claude-lost', provider: 'claude-code', status: 'awaiting_callback' } };
+      }
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    mocks.clientPost.mockImplementation(async (url: string) => {
+      if (url.endsWith('/native-cli/start')) {
+        return { data: { success: true, sessionId: 'native-claude-lost', status: 'awaiting_callback', authUrl: 'https://claude.com/cai/oauth/authorize?state=lost' } };
+      }
+      if (url.endsWith('/native-cli/callback')) {
+        callbackAttempted = true;
+        throw new Error('Network Error');
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    render(
+      <SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={onComplete} onCancel={vi.fn()} />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Sign in with your Claude account' }));
+    await user.click(await screen.findByRole('button', { name: /I have the code/i }));
+    await user.type(await screen.findByRole('textbox', { name: 'Claude authorization code' }), 'real-code#state');
+    await user.click(screen.getByRole('button', { name: 'Complete Sign-In' }));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Network Error'));
+
+    expect(await screen.findByText('Claude is signed in on this server', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByText(/Host Agent Chat will re-check/i)).toBeInTheDocument();
+    expect(mocks.clientPost.mock.calls.some(([url]) => String(url).includes('/oauth/cancel'))).toBe(false);
+    await user.click(screen.getByRole('button', { name: 'Choose a model' }));
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    open.mockRestore();
+  });
+
+  it('reuses a verified login and closes into model selection without an auth write', async () => {
+    const user = userEvent.setup();
+    const callbacks: string[] = [];
+    const status = { id: 'anthropic', nativeCliAuthStatus: 'authenticated' } as React.ComponentProps<typeof SetupTokenFlow>['status'];
+    render(<SetupTokenFlow provider={anthropicProvider} status={status} apiBase="/ai-setup"
+      onComplete={() => callbacks.push('complete')} onCancel={() => callbacks.push('close')} />);
+    await user.click(screen.getByRole('button', { name: 'Use existing login and choose a model' }));
+    expect(callbacks).toEqual(['complete', 'close']);
+    expect(mocks.clientPost).not.toHaveBeenCalled();
+  });
+
+  it('requires acknowledging replacement when a Claude login already exists on the server', async () => {
+    const user = userEvent.setup();
+    const existingLogin = {
+      id: 'anthropic',
+      status: 'unconfigured',
+      authType: 'setup_token',
+      profileId: null,
+      currentModel: null,
+      isDefault: false,
+      error: null,
+      cooldownUntil: null,
+      lastUsed: null,
+      expiresAt: null,
+      nativeProvider: 'CLAUDE_CODE',
+      nativeCliAuthStatus: 'authenticated',
+    } as unknown as React.ComponentProps<typeof SetupTokenFlow>['status'];
+    render(
+      <SetupTokenFlow provider={anthropicProvider} status={existingLogin} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
+    );
+
+    expect(screen.getByText(/A Claude login already exists on this server/i)).toBeInTheDocument();
+    const replace = screen.getByRole('button', { name: 'Replace the Claude login on this server' });
+    expect(replace).toBeDisabled();
+    await user.click(screen.getByRole('checkbox'));
+    expect(replace).toBeEnabled();
+    expect(mocks.clientPost).not.toHaveBeenCalled();
+  });
+
+  it('refuses to open a non-Anthropic authorization URL from the start response', async () => {
+    const user = userEvent.setup();
+    const open = vi.spyOn(window, 'open').mockReturnValue(null);
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url.endsWith('/status')) return { data: { defaultModel: 'anthropic/claude-fable-5' } };
+      if (url.endsWith('/models')) return { data: { models: [] } };
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    mocks.clientPost.mockImplementation(async (url: string) => {
+      if (url.endsWith('/native-cli/start')) {
+        return { data: { success: true, sessionId: 'native-claude-phish', status: 'awaiting_callback', authUrl: 'https://claude-login.example/cai/oauth/authorize?state=x' } };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    render(
+      <SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={vi.fn()} />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Sign in with your Claude account' }));
+    expect(await screen.findByText('Setup failed')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/incomplete Claude sign-in start response/i);
+    expect(screen.getByRole('button', { name: 'Close and review provider status' })).toBeInTheDocument();
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
   });
 
   it('sets initial focus, traps Tab, closes on Escape, and restores the opener', async () => {
@@ -102,9 +418,9 @@ describe('SetupTokenFlow Anthropic guidance', () => {
     const opener = screen.getByRole('button', { name: 'Open Claude setup' });
     await user.click(opener);
     const dialog = screen.getByRole('dialog', { name: 'Set up Claude' });
-    const primary = screen.getByRole('button', { name: 'Paste an existing setup-token' });
+    const primary = screen.getByRole('button', { name: 'Sign in with your Claude account' });
     const close = screen.getByRole('button', { name: 'Close Claude setup' });
-    const last = primary;
+    const last = screen.getByRole('button', { name: 'Paste an existing setup-token' });
 
     await waitFor(() => expect(primary).toHaveFocus());
     last.focus();
@@ -119,7 +435,7 @@ describe('SetupTokenFlow Anthropic guidance', () => {
     await waitFor(() => expect(opener).toHaveFocus());
   });
 
-  it('moves to existing-token entry without calling the disabled host start route', async () => {
+  it('moves to existing-token entry without calling any sign-in start route', async () => {
     const user = userEvent.setup();
     render(
       <SetupTokenFlow

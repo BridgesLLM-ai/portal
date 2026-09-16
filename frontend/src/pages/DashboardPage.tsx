@@ -1088,7 +1088,8 @@ export default function DashboardPage() {
   const updateBackupDescription = useMemo(() => describeUpdateBackup(updateBackup), [updateBackup]);
   const updateBackupRunning = updateBackup?.state === 'running';
   const updateBackupCanUseCurrent = updateBackup?.state === 'candidate' || updateBackup?.state === 'fresh';
-  const updatePercent = updateProgress && updateProgress.status !== 'idle' ? updateProgress.percent : null;
+  // Installer percentages are compatibility checkpoints, not measured work.
+  // Keep the wire values for recovery ordering; present semantic progress only.
   const updateProgressActive = portalUpdateProgressIsActive(updateProgress);
   const updateProgressTerminal = portalUpdateProgressIsTerminal(updateProgress);
   const updateRetryBlocked = updateProgressAmbiguous || portalUpdateProgressBlocksRetry(updateProgress);
@@ -1614,13 +1615,11 @@ export default function DashboardPage() {
                     aria-label="Portal update progress"
                     aria-valuemin={0}
                     aria-valuemax={100}
-                    aria-valuenow={updatePercent ?? undefined}
-                    aria-valuetext={updatePercent === null ? updateProgress?.label : `${updatePercent}% — ${updateProgress?.label}`}
+                    aria-valuetext={updateProgress?.label}
                     className="mt-2 h-1.5 w-full max-w-xl overflow-hidden rounded-full bg-theme-border/70"
                   >
                     <div
-                      className={`${updatePercent === null ? 'typed-confirmation-progress-sweep w-1/3' : 'transition-[width] duration-500 motion-reduce:transition-none'} h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400`}
-                      style={updatePercent === null ? undefined : { width: `${updatePercent}%` }}
+                      className="typed-confirmation-progress-sweep w-1/3 h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400"
                     />
                   </div>
                 ) : null}
@@ -1678,13 +1677,11 @@ export default function DashboardPage() {
                         aria-label="Portal update progress"
                         aria-valuemin={0}
                         aria-valuemax={100}
-                        aria-valuenow={updatePercent ?? undefined}
-                        aria-valuetext={updatePercent === null ? updateProgress?.label : `${updatePercent}% — ${updateProgress?.label}`}
+                        aria-valuetext={updateProgress?.label}
                         className="mt-2 h-1.5 overflow-hidden rounded-full bg-theme-border/70"
                       >
                         <div
-                          className={`${updatePercent === null ? 'typed-confirmation-progress-sweep w-1/3' : 'transition-[width] duration-500 motion-reduce:transition-none'} h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400`}
-                          style={updatePercent === null ? undefined : { width: `${updatePercent}%` }}
+                          className="typed-confirmation-progress-sweep w-1/3 h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400"
                         />
                       </div>
                     </div>
@@ -2236,7 +2233,7 @@ export default function DashboardPage() {
               : 'Install update'}
         busyLabel={updateProgress?.label || (updatePlan === 'create-backup' ? 'Backing up safely…' : 'Starting signed updater…')}
         busy={updateInProgress || updateProgressActive}
-        busyProgress={updatePercent === null ? null : updatePercent / 100}
+        busyProgress={null}
         busyStartedAt={updateProgress?.startedAt}
         busyUpdatedAt={updateProgress?.updatedAt}
         busyPhaseLabel={updateProgress?.label}

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '../../test/setup';
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { ProviderStatus } from './ProviderCard';
 import QuickStartBanner from './QuickStartBanner';
@@ -8,6 +8,7 @@ import QuickStartBanner from './QuickStartBanner';
 function providerStatus(
   id: string,
   nativeCliAuthStatus: ProviderStatus['nativeCliAuthStatus'],
+  overrides: Partial<ProviderStatus> = {},
 ): ProviderStatus {
   return {
     id,
@@ -21,19 +22,23 @@ function providerStatus(
     lastUsed: null,
     expiresAt: Date.now() - 60_000,
     nativeCliAuthStatus,
+    ...overrides,
   };
 }
 
 describe('QuickStartBanner native credential badges', () => {
-  it('does not offer unqualified Grok or Antigravity native setup controls', () => {
+  it('offers the Linux x86-64 qualified Grok Build and Antigravity native cards and routes them to the native login', () => {
+    const onNativeCliLogin = vi.fn();
     const statusMap = new Map<string, ProviderStatus>([
       ['xai', providerStatus('xai', 'authenticated')],
     ]);
-    render(<QuickStartBanner compact statusMap={statusMap} onChoose={vi.fn()} onNativeCliLogin={vi.fn()} />);
+    render(<QuickStartBanner compact statusMap={statusMap} onChoose={vi.fn()} onNativeCliLogin={onNativeCliLogin} />);
 
-    expect(screen.queryByRole('button', { name: /Grok Build/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Antigravity/i })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /OpenClaw/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Grok Build/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Antigravity/i }));
+    expect(onNativeCliLogin).toHaveBeenNthCalledWith(1, 'grok');
+    expect(onNativeCliLogin).toHaveBeenNthCalledWith(2, 'gemini');
+    expect(screen.getByRole('button', { name: /^OpenClaw\b/ })).toBeInTheDocument();
   });
 
   it('shows native login state instead of the unrelated OpenClaw expiry label', () => {
@@ -42,9 +47,38 @@ describe('QuickStartBanner native credential badges', () => {
     ]);
     render(<QuickStartBanner compact statusMap={statusMap} onChoose={vi.fn()} onNativeCliLogin={vi.fn()} />);
 
-    const claudeCard = screen.getByRole('button', { name: /Claude Project Sandbox/i });
+    const claudeCard = screen.getByRole('button', { name: /Claude Code/i });
     expect(within(claudeCard).getByText('Needs login')).toBeInTheDocument();
+    expect(within(claudeCard).getByText(/shared with OpenClaw/i)).toBeInTheDocument();
+    expect(within(claudeCard).queryByText(/Project Sandbox/i)).not.toBeInTheDocument();
     expect(within(claudeCard).queryByText('Expired')).not.toBeInTheDocument();
+  });
+
+  it('keeps a signed-in Claude login distinct from OpenClaw registration on the card', () => {
+    const statusMap = new Map<string, ProviderStatus>([
+      ['anthropic', providerStatus('anthropic', 'authenticated', { status: 'unconfigured', expiresAt: null })],
+    ]);
+    render(<QuickStartBanner statusMap={statusMap} onChoose={vi.fn()} onNativeCliLogin={vi.fn()} />);
+
+    const claudeCard = screen.getByRole('button', { name: /Claude Code/i });
+    expect(within(claudeCard).getByText('OpenClaw: not registered')).toBeInTheDocument();
+    expect(within(claudeCard).getByText('Reconfigure')).toBeInTheDocument();
+  });
+
+  it('offers the ChatGPT / Codex subscription through the OpenClaw provider and reports the Codex harness login separately', () => {
+    const onChoose = vi.fn();
+    const onNativeCliLogin = vi.fn();
+    const statusMap = new Map<string, ProviderStatus>([
+      ['openai-codex', providerStatus('openai-codex', 'needs_login', { status: 'unconfigured', expiresAt: null })],
+    ]);
+    render(<QuickStartBanner statusMap={statusMap} onChoose={onChoose} onNativeCliLogin={onNativeCliLogin} />);
+
+    const codexCard = screen.getByRole('button', { name: /ChatGPT \/ Codex/i });
+    expect(within(codexCard).getByText(/Sign in with your ChatGPT account through OpenClaw's own sign-in wizard/i)).toBeInTheDocument();
+    expect(within(codexCard).getByText('OpenClaw: not registered · Codex harness: needs login')).toBeInTheDocument();
+    fireEvent.click(codexCard);
+    expect(onChoose).toHaveBeenCalledWith('openai-codex');
+    expect(onNativeCliLogin).not.toHaveBeenCalled();
   });
 
   it('shows Portal-profile harness setup only on authenticated Settings surfaces', () => {

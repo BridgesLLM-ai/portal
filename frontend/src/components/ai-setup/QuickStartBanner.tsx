@@ -2,9 +2,11 @@ import { AlertTriangle, CheckCircle2, ChevronRight, Clock } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { ProviderStatus } from './ProviderCard';
 
+type QuickStartNativeProvider = 'claude-code' | 'codex' | 'gemini' | 'grok' | 'hermes' | 'opencode';
+
 interface QuickStartBannerProps {
   onChoose: (providerId: string) => void;
-  onNativeCliLogin?: (nativeProvider: 'claude-code' | 'codex' | 'gemini' | 'grok' | 'hermes' | 'opencode') => void;
+  onNativeCliLogin?: (nativeProvider: QuickStartNativeProvider) => void;
   statusMap?: Map<string, ProviderStatus>;
   compact?: boolean;
   additionalCards?: ReactNode;
@@ -12,23 +14,48 @@ interface QuickStartBannerProps {
   showHarnessNativeCards?: boolean;
 }
 
-const cards = [
+interface QuickStartCard {
+  id: string;
+  title: string;
+  subtitle: string;
+  description: string;
+  color: string;
+  isNativeCli: boolean;
+  nativeCliProvider?: QuickStartNativeProvider;
+  /** OpenClaw provider whose runtime registration this card should report. */
+  openclawProvider?: string;
+  /** Portal-native harness whose login state this card should report. */
+  harnessLabel?: string;
+}
+
+const cards: QuickStartCard[] = [
   {
     id: 'openclaw',
     title: 'OpenClaw',
-    subtitle: 'Supported providers via OpenClaw',
-    description: 'Configure the API-key and OAuth providers exposed by the installed OpenClaw runtime.',
+    subtitle: 'All providers via OpenClaw',
+    description: 'Configure every subscription, OAuth, and API-key provider the installed OpenClaw runtime supports, and choose its default model.',
     color: 'bg-emerald-500',
     isNativeCli: false,
   },
   {
     id: 'native-claude-code',
-    title: 'Claude Project Sandbox',
-    subtitle: 'Process-free project credential',
-    description: 'Authorize Claude for confined Project Sandbox sessions without launching Claude Code on the host.',
+    title: 'Claude Code',
+    subtitle: 'Browser sign-in, shared with OpenClaw',
+    description: 'Sign in with your Claude account. OpenClaw\'s Claude CLI runtime and Portal Claude Code sessions on this server use this login. Portal never launches Claude Code to sign in.',
     color: 'bg-amber-500',
     isNativeCli: true,
-    nativeCliProvider: 'claude-code' as const,
+    nativeCliProvider: 'claude-code',
+    openclawProvider: 'anthropic',
+  },
+  {
+    id: 'openai-codex',
+    title: 'ChatGPT / Codex',
+    subtitle: 'ChatGPT subscription via OpenClaw',
+    description: 'Sign in with your ChatGPT account through OpenClaw\'s own sign-in wizard for OpenAI models and the Codex harness. Availability follows the installed OpenClaw.',
+    color: 'bg-sky-500',
+    isNativeCli: false,
+    openclawProvider: 'openai-codex',
+    harnessLabel: 'Codex harness',
   },
   {
     id: 'native-grok',
@@ -37,7 +64,8 @@ const cards = [
     description: 'Sign in with a Grok subscription for a native full-server Agent Chat option. Server API keys remain supported separately.',
     color: 'bg-orange-500',
     isNativeCli: true,
-    nativeCliProvider: 'grok' as const,
+    nativeCliProvider: 'grok',
+    openclawProvider: 'xai',
   },
   {
     id: 'native-gemini',
@@ -46,7 +74,7 @@ const cards = [
     description: 'Sign in with Google to use Antigravity as a native agent in Agent Chat.',
     color: 'bg-violet-500',
     isNativeCli: true,
-    nativeCliProvider: 'gemini' as const,
+    nativeCliProvider: 'gemini',
   },
   {
     id: 'native-hermes',
@@ -55,7 +83,7 @@ const cards = [
     description: 'Run the fixed Hermes provider/model wizard in the dedicated Portal profile, then discover the models that Hermes exposes for that account.',
     color: 'bg-emerald-500',
     isNativeCli: true,
-    nativeCliProvider: 'hermes' as const,
+    nativeCliProvider: 'hermes',
   },
   {
     id: 'native-opencode',
@@ -64,7 +92,7 @@ const cards = [
     description: 'Run OpenCode’s own provider login wizard in the dedicated Portal profile, then discover its account-specific model catalog.',
     color: 'bg-cyan-500',
     isNativeCli: true,
-    nativeCliProvider: 'opencode' as const,
+    nativeCliProvider: 'opencode',
   },
 ];
 
@@ -118,6 +146,33 @@ function getExpiryInfo(statusMap: Map<string, ProviderStatus> | undefined, id: s
   return { label: `Expires ${new Date(status.expiresAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`, urgency: 'ok' };
 }
 
+/**
+ * Secondary facts a card must not blur into its headline state: whether
+ * OpenClaw has registered a runtime profile for the login, and (for the
+ * ChatGPT card) whether the separate Codex harness login exists.
+ */
+function getRuntimeNotes(statusMap: Map<string, ProviderStatus> | undefined, card: QuickStartCard): string[] {
+  if (!statusMap) return [];
+  const notes: string[] = [];
+  if (card.openclawProvider) {
+    const status = statusMap.get(card.openclawProvider);
+    if (status) {
+      notes.push(status.status === 'configured'
+        ? `OpenClaw: registered${status.currentModel ? ` · ${status.currentModel}` : ''}`
+        : status.status === 'unconfigured'
+          ? 'OpenClaw: not registered'
+          : `OpenClaw: ${status.status}`);
+    }
+  }
+  if (card.harnessLabel && card.openclawProvider) {
+    const native = statusMap.get(card.openclawProvider)?.nativeCliAuthStatus;
+    if (native === 'authenticated') notes.push(`${card.harnessLabel}: signed in`);
+    else if (native === 'needs_login') notes.push(`${card.harnessLabel}: needs login`);
+    else if (native === 'unknown') notes.push(`${card.harnessLabel}: login not verified`);
+  }
+  return notes;
+}
+
 export default function QuickStartBanner({
   onChoose,
   onNativeCliLogin,
@@ -127,21 +182,29 @@ export default function QuickStartBanner({
   showBuiltInCards = true,
   showHarnessNativeCards = true,
 }: QuickStartBannerProps) {
-  const qualifiedCards = cards;
   const visibleCards = showHarnessNativeCards
-    ? qualifiedCards
-    : qualifiedCards.filter((card) => card.id !== 'native-hermes' && card.id !== 'native-opencode');
+    ? cards
+    : cards.filter((card) => card.id !== 'native-hermes' && card.id !== 'native-opencode');
+  const activate = (card: QuickStartCard) => {
+    if (card.isNativeCli && card.nativeCliProvider && onNativeCliLogin) {
+      onNativeCliLogin(card.nativeCliProvider);
+      return;
+    }
+    onChoose(card.id);
+  };
+
   if (compact) {
     return (
       <div className="space-y-1.5">
         {showBuiltInCards ? visibleCards.map((card) => {
           const configured = isConfigured(statusMap, card.id);
           const expiry = getExpiryInfo(statusMap, card.id);
+          const notes = getRuntimeNotes(statusMap, card);
           return (
             <button
               key={card.id}
               type="button"
-              onClick={() => card.isNativeCli && card.nativeCliProvider && onNativeCliLogin ? onNativeCliLogin(card.nativeCliProvider) : onChoose(card.id)}
+              onClick={() => activate(card)}
               className="group flex w-full items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2.5 text-left transition hover:border-slate-600 hover:bg-slate-800/60 active:bg-slate-800"
             >
               <div className={`h-2 w-2 shrink-0 rounded-full ${configured ? 'bg-emerald-400' : card.color + '/40'}`} />
@@ -161,6 +224,9 @@ export default function QuickStartBanner({
                   ) : null}
                 </div>
                 <div className="text-[11px] text-slate-400">{card.subtitle}</div>
+                {notes.length ? (
+                  <div className="text-[10px] text-slate-500">{notes.join(' · ')}</div>
+                ) : null}
               </div>
               <ChevronRight className="h-4 w-4 shrink-0 text-slate-600 transition group-hover:text-slate-400" />
             </button>
@@ -176,7 +242,7 @@ export default function QuickStartBanner({
       <div>
         <h2 className="text-lg font-semibold text-white">Connect an AI provider</h2>
         <p className="mt-1 text-sm text-slate-400">
-          Pick how you want to get started. Each option walks you through setup step by step.
+          Pick how you want to get started. Each option walks you through sign-in, then verifies it with OpenClaw and lets you choose a model.
         </p>
       </div>
 
@@ -184,11 +250,12 @@ export default function QuickStartBanner({
         {showBuiltInCards ? visibleCards.map((card) => {
           const configured = isConfigured(statusMap, card.id);
           const expiry = getExpiryInfo(statusMap, card.id);
+          const notes = getRuntimeNotes(statusMap, card);
           return (
             <button
               key={card.id}
               type="button"
-              onClick={() => card.isNativeCli && card.nativeCliProvider && onNativeCliLogin ? onNativeCliLogin(card.nativeCliProvider) : onChoose(card.id)}
+              onClick={() => activate(card)}
               className={`group relative flex flex-col rounded-xl border bg-slate-950/60 p-5 text-left transition hover:bg-slate-900/80 active:bg-slate-900 ${
                 expiry?.urgency === 'expired' || expiry?.urgency === 'danger'
                   ? 'border-red-500/30 hover:border-red-500/50'
@@ -221,6 +288,9 @@ export default function QuickStartBanner({
               ) : null}
 
               <p className="mt-2 text-sm leading-relaxed text-slate-400">{card.description}</p>
+              {notes.length ? (
+                <p className="mt-2 text-xs text-slate-500">{notes.join(' · ')}</p>
+              ) : null}
               <div className="mt-3 flex items-center gap-1 text-sm font-medium text-slate-300 group-hover:text-white transition-colors">
                 <span>{expiry?.urgency === 'expired' ? 'Re-authenticate' : configured ? 'Reconfigure' : 'Set up'}</span>
                 <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />

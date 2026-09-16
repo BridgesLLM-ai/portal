@@ -6,6 +6,8 @@ import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
 import {
   getToolAdapter,
+  MISSING_CLI_INSTALL_TOOL_IDS,
+  missingCliInstallCommand,
   HOST_NATIVE_AGENT_TOOL_IDS,
   HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE,
   isInstallCommandAllowed,
@@ -15,6 +17,7 @@ import { AgentJobRequestError, startAgentJob } from '../services/agentJobs';
 import { confirmationForToolInstall, isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
 import {
   getNativeHostCliStatus,
+  invalidateNativeHostCliStatus,
   type NativeHostCliStatusState,
   type NativeHostCliStatusTool,
 } from '../services/nativeHostCliStatus';
@@ -61,8 +64,9 @@ type SetupMutationGuards = Readonly<{
 }>;
 
 /**
- * Mount disabled native-runtime acquisition endpoints before request-body
- * parsing. Agent Zero's combined container/volume/host-bridge reconcile is
+ * Apply acquisition authorization before request-body parsing. Supported
+ * missing-only CLI installs continue to the bounded route; other mutations
+ * remain explicitly unavailable. Agent Zero's combined container/volume/host-bridge reconcile is
  * disabled as one unit because Portal cannot transact only its host bridge.
  */
 export function mountHostNativeRuntimeMutationFence(
@@ -93,14 +97,16 @@ export function mountHostNativeRuntimeMutationFence(
     sendHostNativeRuntimeMutationUnavailable,
   );
 
-  for (const toolId of HOST_NATIVE_AGENT_TOOL_IDS) {
+  for (const toolId of new Set([...HOST_NATIVE_AGENT_TOOL_IDS, ...MISSING_CLI_INSTALL_TOOL_IDS])) {
     app.post(
       `/api/agent-tools/${toolId}/install`,
       setupGuards.requireSetupComplete,
       authenticateToken,
       requireApproved,
       requireAdmin,
-      sendHostNativeRuntimeMutationUnavailable,
+      MISSING_CLI_INSTALL_TOOL_IDS.has(toolId)
+        ? (_req, _res, next) => next()
+        : sendHostNativeRuntimeMutationUnavailable,
     );
   }
 }
@@ -198,8 +204,8 @@ async function admittedHostDetectionStatus(
     missing: status.state === 'absent',
     checkedAt: status.checkedAt,
     state: status.state,
-    installAvailable: false,
-    installUnavailableCode: HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE.code,
+    installAvailable: status.installed === false,
+    ...(status.installed === false ? {} : { installUnavailableCode: 'CLI_ALREADY_PRESENT' }),
   };
 }
 
@@ -220,7 +226,14 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
           : detectedStatus;
         return {
           ...adapter,
-          status,
+          install: MISSING_CLI_INSTALL_TOOL_IDS.has(adapter.id)
+            ? [{ label: `Install ${adapter.name}`, command: missingCliInstallCommand(adapter.id), description: 'Install this missing CLI, then continue to sign in.' }]
+            : adapter.install,
+          status: MISSING_CLI_INSTALL_TOOL_IDS.has(adapter.id)
+            ? { ...status, installAvailable: !status.installed && (!status.state || status.state === 'absent')
+                && process.platform === 'linux' && ['x64', 'arm64'].includes(process.arch)
+                && (!['gemini', 'antigravity', 'grok-build'].includes(adapter.id) || process.arch === 'x64') }
+            : status,
         };
       }),
     );
@@ -240,7 +253,7 @@ router.post('/:toolId/install', async (req: Request, res: Response): Promise<voi
     return;
   }
 
-  if (HOST_NATIVE_AGENT_TOOL_IDS.has(toolId)) {
+  if (HOST_NATIVE_AGENT_TOOL_IDS.has(toolId) && !MISSING_CLI_INSTALL_TOOL_IDS.has(toolId)) {
     sendHostNativeRuntimeMutationUnavailable(req, res);
     return;
   }
@@ -248,6 +261,46 @@ router.post('/:toolId/install', async (req: Request, res: Response): Promise<voi
   const body = z.object({ confirmation: z.string().max(200) }).strict().safeParse(req.body);
   if (!body.success) {
     res.status(400).json({ error: 'A strict typed-confirmation body is required.', code: 'INVALID_INSTALL_REQUEST' });
+    return;
+  }
+
+  const managedCommand = missingCliInstallCommand(adapter.id);
+  if (managedCommand) {
+    if (!isTypedConfirmationMatch(body.data.confirmation, confirmationForToolInstall(adapter.id))) {
+      res.status(400).json({ error: 'Confirm the CLI installation to continue.', code: 'INSTALL_CONFIRMATION_REQUIRED' });
+      return;
+    }
+    if (process.platform !== 'linux' || !['x64', 'arm64'].includes(process.arch)
+      || (['gemini', 'antigravity', 'grok-build'].includes(adapter.id) && process.arch !== 'x64')) {
+      res.status(409).json({ error: 'Automatic installation is not available for this server architecture.', code: 'CLI_PLATFORM_UNSUPPORTED' });
+      return;
+    }
+    // Never use the first-install action to upgrade or overwrite an existing tool.
+    try {
+      const current = adapter.id === 'codex' || adapter.id === 'claude-code'
+        ? await admittedHostDetectionStatus(adapter.id, true)
+        : await detectWithCache(adapter.id, adapter.detect?.command, true, true);
+      if (current.installed || (current.state && current.state !== 'absent')) {
+        res.status(409).json({ error: current.installed
+          ? 'This CLI is already installed. Refresh and continue to sign in.'
+          : 'Could not check the CLI installation. Refresh its status before retrying.',
+        code: current.installed ? 'CLI_ALREADY_PRESENT' : 'CLI_STATUS_UNAVAILABLE' });
+        return;
+      }
+      const job = await startAgentJob({ userId: req.user!.userId,
+        actorAuthorizationVersion: req.user!.authorizationVersion!, toolId: `_install:${adapter.id}`,
+        title: `Install ${adapter.name}`, command: managedCommand, cwd: '/opt/bridgesllm/portal' });
+      detectionCache.delete(adapter.id);
+      if (adapter.id === 'codex' || adapter.id === 'claude-code') invalidateNativeHostCliStatus(adapter.id);
+      res.status(202).json({ jobId: job.id, room: `job:${job.id}`, toolId: adapter.id,
+        message: `Installing ${adapter.name}. Continue to sign in when installation finishes.` });
+    } catch (error) {
+      if (error instanceof AgentJobRequestError) {
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
+      } else {
+        res.status(500).json({ error: 'Could not start the CLI installer. No login was changed. Please retry.', code: 'CLI_INSTALL_START_FAILED' });
+      }
+    }
     return;
   }
 

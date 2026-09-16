@@ -1,12 +1,13 @@
 {
   "schema": 1,
-  "version": "5.0.8",
-  "releasedAt": "2026-09-13",
+  "version": "5.0.9",
+  "releasedAt": "2026-09-15",
   "releaseClass": "hotfix",
   "highlights": [
-    "Prevent late message echoes from duplicating chat messages while preserving intentional repeated replies.",
-    "Keep saved replies attached to their correct conversation turns during history refresh and reconnect.",
-    "Avoid duplicated tool activity when completed runtime output is reconciled with saved chat history.",
-    "Show current agent progress cards with clear task counts, completion states, and a refined mobile-friendly task panel."
+    "Restore guided subscription sign-in, install missing CLIs, register available OpenClaw models, and explicitly choose a default without losing other providers.",
+    "Prevent hidden package prompts from freezing installation and tools maintenance.",
+    "Redesign setup and update progress with clear stages, useful recovery guidance, and small-terminal support.",
+    "Load Tasks on demand, keep native Chat history scheduling and message identities intact, and route transcript notes through the authorized Portal broker.",
+    "Deliver version-qualified native repairs with preserved originals and interrupted-operation recovery."
   ]
 }

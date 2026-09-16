@@ -1,3 +1,4 @@
+import { noninteractiveHostPackageCommand } from './hostPackagePolicy';
 import { unqualifiedNativeBinaryReason } from './unqualifiedNativeBinaryLane';
 
 export type ToolTier = 1 | 2;
@@ -49,8 +50,20 @@ export const HOST_NATIVE_AGENT_TOOL_IDS = Object.freeze(new Set([
   'opencode',
 ]));
 
-export const FFMPEG_INSTALL_COMMAND =
-  'command -v apt-get >/dev/null 2>&1 && apt-get -o DPkg::Lock::Timeout=300 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg';
+// First installation is additive. Updates to an existing native runtime still
+// use Maintenance; the helper never replaces a configured CLI or login.
+export const MISSING_CLI_INSTALL_TOOL_IDS = Object.freeze(new Set([
+  'claude-code', 'codex', 'gemini', 'antigravity', 'grok-build', 'hermes', 'opencode',
+]));
+
+export function missingCliInstallCommand(toolId: string): string | null {
+  if (!MISSING_CLI_INSTALL_TOOL_IDS.has(toolId)) return null;
+  return `/usr/bin/timeout --foreground --kill-after=30s 30m /usr/bin/python3 -I -B /opt/bridgesllm/portal/installer/install-missing-cli.py ${toolId}`;
+}
+
+export const FFMPEG_INSTALL_COMMAND = noninteractiveHostPackageCommand(
+  'command -v apt-get >/dev/null 2>&1 && apt-get -o DPkg::Lock::Timeout=300 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg',
+);
 
 export const SAFE_INSTALL_ALLOWLIST = new Set<string>([
   FFMPEG_INSTALL_COMMAND,
@@ -73,7 +86,7 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   {
     id: 'claude-code',
     name: 'Claude Code',
-    description: 'Root-owned, hash-admitted Claude Code runtime for Portal Agent Chat. Owner updates it only with the exact compatibility bundle under Admin > Maintenance.',
+    description: 'Claude Code subscription and coding assistant. Install it here if missing, then sign in with your Claude account.',
     install: [],
     commands: [],
     authRequired: false,
@@ -82,7 +95,7 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
   {
     id: 'codex',
     name: 'OpenAI Codex',
-    description: 'Root-owned, hash-admitted Codex runtime for Portal Agent Chat. Owner updates it only with the exact compatibility bundle under Admin > Maintenance.',
+    description: 'Codex coding assistant and ChatGPT subscription. Install it here if missing, then sign in with your ChatGPT account.',
     install: [],
     commands: [],
     authRequired: false,
@@ -151,6 +164,20 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
     tier: 1,
   },
   {
+    id: 'hermes',
+    name: 'Hermes',
+    description: 'Hermes coding assistant. Install it, then connect your model provider.',
+    detect: { command: "test -x /usr/local/bin/hermes && printf '%s\\n' detected" },
+    install: [], commands: [], authRequired: true, tier: 1,
+  },
+  {
+    id: 'opencode',
+    name: 'OpenCode',
+    description: 'OpenCode coding assistant. Install it, then connect your model provider.',
+    detect: { command: "test -x /usr/local/bin/opencode && printf '%s\\n' detected" },
+    install: [], commands: [], authRequired: true, tier: 1,
+  },
+  {
     id: 'ffmpeg',
     name: 'Media Processing (FFmpeg)',
     description: 'Required host media tools for validating, cropping, and preserving animated GIF uploads.',
@@ -188,7 +215,9 @@ export const TOOL_ADAPTERS: ToolAdapter[] = [
 ];
 
 export function getToolAdapter(toolId: string): ToolAdapter | undefined {
-  return TOOL_ADAPTERS.find((adapter) => adapter.id === toolId);
+  const canonical = toolId === 'antigravity' ? 'gemini' : toolId;
+  const adapter = TOOL_ADAPTERS.find((entry) => entry.id === canonical);
+  return adapter && canonical !== toolId ? { ...adapter, id: toolId } : adapter;
 }
 
 export function isInstallCommandAllowed(command: string): boolean {

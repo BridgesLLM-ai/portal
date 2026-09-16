@@ -45,6 +45,7 @@ PORTAL_ONLY_OPERATION_CONTRACT = "portal-only-v1"
 OPERATION_CONTRACTS = (
     LEGACY_OPERATION_CONTRACT,
     PORTAL_ONLY_OPERATION_CONTRACT,
+    "portal-retained-chat-v1",
 )
 PRODUCTION_METADATA_ROOT = "/var/lib/bridgesllm-installer"
 PRODUCTION_TRANSACTION_ROOT = "/var/lib/bridgesllm-installer/transactions"

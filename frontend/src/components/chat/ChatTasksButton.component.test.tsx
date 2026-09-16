@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '../../test/setup';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi, afterEach } from 'vitest';
@@ -9,7 +9,7 @@ import { latestChatPlan, sessionTasks } from '../../utils/chatTasks';
 import type { ChatMessage } from '../../contexts/ChatStateProvider';
 const mocks = vi.hoisted(() => ({ get: vi.fn() }));
 vi.mock('../../api/client', () => ({ default: { get: mocks.get } }));
-afterEach(() => mocks.get.mockReset());
+afterEach(() => { mocks.get.mockReset(); vi.useRealTimers(); });
 const messages = [{ id: 'reply', role: 'assistant', content: '', toolCalls: [
   { id: 'plan', name: 'update_plan', status: 'done', startedAt: 1, arguments: { plan: [
     { step: 'Read the project', status: 'completed' }, { step: 'Make the change', status: 'in_progress' },
@@ -32,9 +32,10 @@ describe('Tasks in chat', () => {
     ] } });
     const user = userEvent.setup();
     render(<MemoryRouter><ChatTasksButton provider="OPENCLAW" session="agent:main:one" messages={[]} isRunning={false} /></MemoryRouter>);
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Tasks, 1 outstanding' })).toBeInTheDocument());
-    await user.click(screen.getByRole('button', { name: 'Tasks, 1 outstanding' }));
-    expect(screen.getByText('My task')).toBeInTheDocument();
+    expect(mocks.get).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Tasks' }));
+    await waitFor(() => expect(screen.getByText('My task')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Tasks, 1 outstanding' })).toBeInTheDocument();
     expect(screen.queryByText('Another chat task')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'All OpenClaw' }));
     expect(screen.getByText('Another chat task')).toBeInTheDocument();
@@ -93,4 +94,81 @@ it('does not label an unknown task status as all complete', async () => {
   expect(await screen.findByText('Awaiting runtime status')).toBeInTheDocument();
   expect(screen.queryByText('All complete')).not.toBeInTheDocument();
   expect(screen.getByText('Last reported progress')).toBeInTheDocument();
+});
+
+
+describe('OpenClaw task feed demand', () => {
+  it.each([
+    ['OPENCLAW', 'OPENCLAW', 'agent:main:two'],
+    ['OPENCLAW', 'CODEX', 'native-two'],
+    ['CODEX', 'OPENCLAW', 'agent:main:two'],
+  ])('closes %s tasks on navigation to %s without fetching the new scope', async (provider, nextProvider, nextSession) => {
+    mocks.get.mockImplementation(() => new Promise(() => {}));
+    const { rerender } = render(<MemoryRouter><ChatTasksButton provider={provider} session="agent:main:one" messages={[]} isRunning={false} /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks' }));
+    const initialCalls = provider === 'OPENCLAW' ? 1 : 0;
+    expect(mocks.get).toHaveBeenCalledTimes(initialCalls);
+    const signal = mocks.get.mock.calls[0]?.[1].signal as AbortSignal | undefined;
+    rerender(<MemoryRouter><ChatTasksButton provider={nextProvider} session={nextSession} messages={[]} isRunning={false} /></MemoryRouter>);
+    expect(screen.queryByRole('dialog', { name: 'Chat tasks' })).not.toBeInTheDocument();
+    expect(mocks.get).toHaveBeenCalledTimes(initialCalls);
+    if (signal) expect(signal.aborted).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks' }));
+    expect(mocks.get).toHaveBeenCalledTimes(initialCalls + (nextProvider === 'OPENCLAW' ? 1 : 0));
+    if (nextProvider !== 'OPENCLAW') {
+      expect(screen.queryByText('Loading tasks…')).not.toBeInTheDocument();
+      expect(screen.getByText('No plan or tasks reported for this chat yet.')).toBeInTheDocument();
+    }
+  });
+
+  it('does not enumerate tasks on chat mount, idle polling, or run-state changes', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    mocks.get.mockResolvedValue({ data: { tasks: [] } });
+    const { rerender } = render(<MemoryRouter><ChatTasksButton provider="OPENCLAW" session="agent:main:one" messages={messages} isRunning={false} /></MemoryRouter>);
+    expect(screen.getByRole('button', { name: 'Tasks, 2 outstanding' })).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
+    rerender(<MemoryRouter><ChatTasksButton provider="OPENCLAW" session="agent:main:one" messages={messages} isRunning /></MemoryRouter>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
+    expect(mocks.get).not.toHaveBeenCalled();
+  });
+
+  it('polls only the open feed, waits for slow requests, and stops on close', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let finish!: (value: unknown) => void;
+    mocks.get.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    mocks.get.mockResolvedValue({ data: { tasks: [] } });
+    const { rerender } = render(<MemoryRouter><ChatTasksButton provider="OPENCLAW" session="agent:main:one" messages={[]} isRunning={false} /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks' }));
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    expect(mocks.get).toHaveBeenCalledWith('/gateway/tasks', expect.objectContaining({ signal: expect.any(AbortSignal), timeout: 35_000 }));
+    rerender(<MemoryRouter><ChatTasksButton provider="OPENCLAW" session="agent:main:one" messages={[]} isRunning /></MemoryRouter>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    await act(async () => { finish({ data: { tasks: [] } }); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    const signal = mocks.get.mock.calls[1][1].signal as AbortSignal;
+    fireEvent.click(screen.getByRole('button', { name: 'Close chat tasks' }));
+    expect(signal.aborted).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks' }));
+    await act(async () => {});
+    expect(mocks.get).toHaveBeenCalledTimes(3);
+  });
+
+  it('ignores a late response after closing and switching conversations', async () => {
+    let finish!: (value: unknown) => void;
+    mocks.get.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const { rerender } = render(<MemoryRouter><ChatTasksButton provider="OPENCLAW" session="agent:main:one" messages={[]} isRunning={false} /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks' }));
+    const signal = mocks.get.mock.calls[0][1].signal as AbortSignal;
+    fireEvent.click(screen.getByRole('button', { name: 'Close chat tasks' }));
+    rerender(<MemoryRouter><ChatTasksButton provider="OPENCLAW" session="agent:main:two" messages={[]} isRunning={false} /></MemoryRouter>);
+    await act(async () => { finish({ data: { tasks: [{ id: 'late', name: 'Old task', status: 'running', parentSession: 'agent:main:one' }] } }); });
+    expect(signal.aborted).toBe(true);
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'Tasks' })).toBeInTheDocument();
+    expect(screen.queryByText('Old task')).not.toBeInTheDocument();
+  });
 });

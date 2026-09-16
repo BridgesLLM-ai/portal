@@ -112,7 +112,8 @@ describe('AiProviderSetup Amazon Bedrock routing', () => {
       </SettingsOwnershipHarness>,
     );
 
-    const openClaw = await screen.findByRole('button', { name: /OpenClaw/i });
+    // The Claude Code card also mentions OpenClaw, so anchor on the card title.
+    const openClaw = await screen.findByRole('button', { name: /^OpenClaw\b/ });
     fireEvent.click(openClaw);
     expect(screen.getByRole('heading', { name: 'All Providers' })).toBeInTheDocument();
 
@@ -129,7 +130,9 @@ describe('AiProviderSetup Amazon Bedrock routing', () => {
       screen.getByText('Provider plugin is missing'),
     ).toBeInTheDocument();
     expect(screen.getByText('Leave Settings').closest('button')).toBeDisabled();
-    await waitFor(() => expect(mocks.clientGet).toHaveBeenCalledTimes(2));
+    // Read-only setup discovery includes support and CLI inventory.
+    await waitFor(() => expect(mocks.clientGet).toHaveBeenCalledWith('/ai-setup/oauth/providers'));
+    expect(mocks.clientPost).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: 'Check again' }));
     await waitFor(() => expect(mocks.clientGet).toHaveBeenCalledWith(
@@ -144,7 +147,7 @@ describe('AiProviderSetup Amazon Bedrock routing', () => {
   it('uses the same manual Bedrock route from the compact Agent Chat sidebar', async () => {
     render(<AiProviderSetup mode="settings" apiBase="/ai-setup" compact />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /OpenClaw/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /^OpenClaw\b/ }));
     fireEvent.click(screen.getByText('Advanced / Other'));
     fireEvent.click(screen.getByRole('button', { name: /Amazon Bedrock/i }));
 

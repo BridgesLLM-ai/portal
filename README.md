@@ -30,9 +30,9 @@ Choose **Install** on a new server, or **Update / Repair** when Portal is alread
 
 Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · root or sudo. A domain unlocks HTTPS, mail, and public share links.
 
-## Current release: 5.0.8
+## Current release: 5.0.9
 
-Portal 5 brings a unified Project Work surface and broader native-harness support. The latest patches focus on reliable agent chats, safer updates, and recovery.
+Portal 5 brings a unified Project Work surface and broader native-harness support. The latest patch improves installer presentation and recovery, prevents hidden package prompts, and reduces unnecessary Chat work.
 
 - **Chat history stays coherent.** Late message echoes do not add duplicate user messages; completed replies stay within their original turns. Tool calls gain their missing output without duplicate blocks, while intentionally repeated messages remain distinct.
 - **Tasks are easier to follow.** Native progress cards show the current chat's plan, completion counts, and a scrollable panel that fits narrow screens. Unknown or stopped work is not presented as completed.
@@ -40,7 +40,7 @@ Portal 5 brings a unified Project Work surface and broader native-harness suppor
 - **Maintenance is explicit.** Update Portal first, then review **Update Compatible AI Tools** for the release-qualified runtime set. Ordinary Portal updates do not upgrade the host interpreter or OpenClaw core. A supported 9.x question-plugin transition can briefly restart the gateway.
 - **Backups have a clear scope.** Standard backups save Portal data and project files. Comprehensive adds available agent personality and Portal-native history as reference exports—not provider logins, runtime databases, mail, or a whole-server image.
 
-Read the [5.0.8 changelog](CHANGELOG.md#508---2026-09-13), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
+Read the complete [5.0.9 changelog](CHANGELOG.md#509---2026-09-15), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
 
 ## What you get
 

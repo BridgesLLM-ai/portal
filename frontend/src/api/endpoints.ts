@@ -2073,7 +2073,21 @@ export interface AgentChatDiagnosticEventsResponse {
   generatedAt: string;
 }
 
+export interface GatewayChatInjectResult {
+  ok: true;
+  sessionKey: string;
+}
+
 export const gatewayAPI = {
+  injectNote: async (session: string, text: string): Promise<GatewayChatInjectResult> => {
+    // Injection is an append without an idempotency key: never replay a lost response.
+    const { data } = await client.post<GatewayChatInjectResult>(
+      '/gateway/chat/inject',
+      { session, text },
+      { _skipNetworkRetry: true } as any,
+    );
+    return data;
+  },
   status: async () => {
     const { data } = await client.get('/gateway/status');
     return data;

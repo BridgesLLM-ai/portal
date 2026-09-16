@@ -232,7 +232,10 @@ build_host_bridge_candidate() {
   # with an opaque build failure.
   if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
     log 'Installing python3-venv (required for the A0 CLI host gateway).'
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv >/dev/null 2>&1 \
+    # This helper can run independently of install.sh. Defer needrestart's
+    # host-wide prompts/restarts just as the installer does.
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 \
+      apt-get install -y -qq python3-venv >/dev/null 2>&1 \
       || die 'python3-venv is missing and could not be installed automatically.'
     python3 -c 'import ensurepip' >/dev/null 2>&1 \
       || die 'python3-venv installation did not provide ensurepip.'

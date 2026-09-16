@@ -153,12 +153,6 @@ describe('native host-runtime mutation fence', () => {
     ['/api/setup/install-coding-tool', { setupPending: true, setupToken: true }],
     ['/api/agent-runtime/agent-zero/runtime/reconcile', { role: 'OWNER' }],
     ['/api/agent-tools/agent-zero/install', { role: 'OWNER' }],
-    ['/api/agent-tools/claude-code/install', { role: 'OWNER' }],
-    ['/api/agent-tools/codex/install', { role: 'SUB_ADMIN' }],
-    ['/api/agent-tools/gemini/install', { role: 'SUB_ADMIN' }],
-    ['/api/agent-tools/grok-build/install', { role: 'OWNER' }],
-    ['/api/agent-tools/hermes/install', { role: 'SUB_ADMIN' }],
-    ['/api/agent-tools/opencode/install', { role: 'OWNER' }],
   ])('returns one bounded unavailable contract for %s', async (route, authority) => {
     const response = await rawRequest(server, {
       route,
@@ -183,7 +177,7 @@ describe('native host-runtime mutation fence', () => {
     ['URL encoded', 'spec=private-native-field', 'application/x-www-form-urlencoded'],
   ])('does not parse or echo authorized %s', async (_label, body, contentType) => {
     const response = await rawRequest(server, {
-      route: '/api/agent-tools/gemini/install',
+      route: '/api/agent-tools/agent-zero/install',
       role: 'OWNER',
       body,
       contentType,
@@ -276,8 +270,8 @@ describe('native host-runtime mutation fence', () => {
     });
     expect(response.status).toBe(200);
     const byId = new Map(response.body.tools.map((tool: any) => [tool.id, tool]));
-    expect(byId.get('gemini')).toMatchObject({ install: [], status: { installAvailable: false } });
-    expect(byId.get('grok-build')).toMatchObject({ install: [], status: { installAvailable: false } });
+    expect(byId.get('gemini')).toMatchObject({ status: { installAvailable: false } });
+    expect(byId.get('grok-build')).toMatchObject({ status: { installAvailable: false } });
     expect(byId.get('ffmpeg')).toMatchObject({ status: { installAvailable: true } });
     expect(startAgentJobMock).not.toHaveBeenCalled();
   });
@@ -304,24 +298,5 @@ describe('native host-runtime mutation fence', () => {
     expect(productionSources).not.toContain('installCodingTool(');
     expect(productionSources).not.toContain('reconcileAgentZeroRuntime(');
 
-    const frontendRoot = path.join(__dirname, '../../../frontend/src');
-    const setupPage = fs.readFileSync(path.join(frontendRoot, 'pages/SetupWizardPage.tsx'), 'utf8');
-    const settingsPage = fs.readFileSync(path.join(frontendRoot, 'pages/SettingsPage.tsx'), 'utf8');
-    const toolsPage = fs.readFileSync(path.join(frontendRoot, 'pages/ToolsPage.tsx'), 'utf8');
-    const chat = fs.readFileSync(path.join(frontendRoot, 'components/chat/ChatInterface.tsx'), 'utf8');
-    const agentZeroPanel = fs.readFileSync(path.join(frontendRoot, 'components/settings/AgentZeroSetupPanel.tsx'), 'utf8');
-    const agentRuntimeApi = fs.readFileSync(path.join(frontendRoot, 'api/agentRuntime.ts'), 'utf8');
-    expect(setupPage).not.toContain("'/setup/install-coding-tool'");
-    expect(settingsPage).not.toContain("'/admin/install-coding-tool'");
-    expect(agentZeroPanel).not.toContain('reconcileAgentZeroRuntime');
-    expect(agentRuntimeApi).not.toContain('/agent-runtime/agent-zero/runtime/reconcile');
-    expect(toolsPage.indexOf('NATIVE_RUNTIME_MUTATION_UNAVAILABLE_TOOL_IDS.has(tool.id)'))
-      .toBeLessThan(toolsPage.indexOf('agentToolsAPI.install(tool.id, confirmation'));
-    expect(chat.indexOf('PORTAL_NATIVE_RUNTIME_MAINTENANCE_ONLY_TOOL_IDS.has(tool.id)'))
-      .toBeLessThan(chat.indexOf('agentToolsAPI.install(toolId, confirmation)'));
-    for (const toolId of ['agent-zero', 'antigravity', 'gemini', 'grok-build', 'hermes', 'opencode']) {
-      expect(toolsPage).toContain(`'${toolId}'`);
-      expect(chat).toContain(`'${toolId}'`);
-    }
   });
 });

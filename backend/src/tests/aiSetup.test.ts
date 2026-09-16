@@ -165,32 +165,9 @@ describe('durable credential-write route contracts', () => {
     expect(pty.spawn).not.toHaveBeenCalled();
   });
 
-  test('reports Gemini runtime smoke as unqualified rather than as a credential-flow failure', async () => {
-    const router = createAiSetupRouter();
-    const layer = (router as any).stack.find((entry: any) => (
-      entry.route?.path === '/provider/:id/smoke' && entry.route?.methods?.post
-    ));
-    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
-    const response: any = { status: jest.fn(), json: jest.fn() };
-    response.status.mockReturnValue(response);
-    response.json.mockReturnValue(response);
-
-    await handler({ params: { id: 'google-gemini-cli' } }, response);
-
-    expect(response.status).toHaveBeenCalledWith(503);
-    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({
-      ok: false,
-      code: 'NATIVE_BINARY_RUNTIME_UNQUALIFIED',
-      retryable: false,
-      error: expect.stringMatching(/detection-only/i),
-    }));
-  });
-
+  // Restored native setup/default/smoke operations have HTTP + native-schema
+  // coverage in providerActivationHandlers.test.ts. Host restarts remain fenced.
   test.each([
-    ['/oauth/start', { provider: 'openai-codex' }, 'oauth-device'],
-    ['/oauth/start', { provider: 'xai' }, 'oauth-device'],
-    ['/oauth/device/start', { provider: 'github-copilot' }, 'oauth-device'],
-    ['/set-default-model', { provider: 'openai', model: 'openai/gpt-5' }, 'configuration'],
     ['/restart-gateway', {}, 'restart'],
   ])('%s rejects the exact OpenClaw host mutation before spawning it', async (routePath, body, operation) => {
     (pty.spawn as jest.Mock).mockClear();
@@ -809,7 +786,7 @@ describe('durable credential-write route contracts', () => {
     expect(saveKeyRoute.indexOf('claimProviderCredentialWriteLifecycle('))
       .toBeLessThan(saveKeyRoute.indexOf('saveProviderApiKey(provider, apiKey,'));
     expect(saveKeyRoute.lastIndexOf('completeProviderCredentialWriteLifecycle('))
-      .toBeLessThan(saveKeyRoute.lastIndexOf('res.json(responsePayload)'));
+      .toBeLessThan(saveKeyRoute.lastIndexOf('respondCredentialSaved(res, responsePayload'));
     const recoveredKeyBranch = saveKeyRoute.slice(
       saveKeyRoute.indexOf("admission.disposition === 'recovered'"),
       saveKeyRoute.indexOf('} else {', saveKeyRoute.indexOf("admission.disposition === 'recovered'")),
@@ -824,7 +801,7 @@ describe('durable credential-write route contracts', () => {
       .toBeLessThan(setupTokenRoute.indexOf('runOpenClawWithSecretInput(['));
     expect(setupTokenRoute).not.toContain("'--token'");
     expect(setupTokenRoute.lastIndexOf('completeProviderCredentialWriteLifecycle('))
-      .toBeLessThan(setupTokenRoute.lastIndexOf('res.json(responsePayload)'));
+      .toBeLessThan(setupTokenRoute.lastIndexOf('respondCredentialSaved(res, responsePayload'));
     const recoveredBranch = setupTokenRoute.slice(
       setupTokenRoute.indexOf("admission.disposition === 'recovered'"),
       setupTokenRoute.indexOf('} else {', setupTokenRoute.indexOf("admission.disposition === 'recovered'")),

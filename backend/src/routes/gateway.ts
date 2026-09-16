@@ -11114,10 +11114,11 @@ router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res
 // GET /api/gateway/stream-status — check if a stream is active for a session
 router.get('/stream-status', authenticateToken, async (req: Request, res: Response) => {
   const providerName = normalizeProviderName(harnessOrProviderInput(req.query));
-  const sessionKey = providerName === 'OPENCLAW'
-    ? await resolveOpenClawSessionKey(req.query.session as string, req.user)
-    : String(req.query.session || '').trim();
+  let sessionKey: string;
   try {
+    sessionKey = providerName === 'OPENCLAW'
+      ? await resolveOpenClawSessionKey(req.query.session as string, req.user)
+      : String(req.query.session || '').trim();
     await assertExistingGatewaySessionAccess(sessionKey, req.user!, { providerName });
   } catch (err: any) {
     res.status(403).json({ error: 'Admin access required', detail: err.message });
@@ -13675,7 +13676,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     }
 
     // Enforce method allowlist — reject anything not explicitly allowed for this user.
-    // chat.inject stays admin-only to match the portal WS/HTTP injection paths.
+    // Mutations, including chat.inject, use the Portal WS/HTTP authorization broker.
     if (frame.type === 'req' && frame.method && !isDirectGatewayMethodAllowed(frame.method, user)) {
       browserWs.send(JSON.stringify({
         type: 'res',
@@ -14041,6 +14042,7 @@ export const __gatewayExecutionScopeTest = {
   directGatewayChatSendTimeoutMs: DIRECT_GATEWAY_CHAT_SEND_TIMEOUT_MS,
   handleWsSend,
   handleWsAbort,
+  handleWsInject,
   handleWsExecApproval,
   handleWsHistory,
   handleWsReconnect,

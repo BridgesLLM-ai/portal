@@ -3,6 +3,7 @@ import * as unqualifiedNativeBinaryLane from '../config/unqualifiedNativeBinaryL
 import gatewayRouter, { __gatewayExecutionScopeTest } from '../routes/gateway';
 import { AgentRegistry } from '../agents';
 import { __persistentGatewayWsTest } from '../agents/providers/PersistentGatewayWs';
+import * as persistentGatewayWs from '../agents/providers/PersistentGatewayWs';
 import { streamEventBus, type StreamEvent } from '../services/StreamEventBus';
 import * as openclawGatewayRpc from '../utils/openclawGatewayRpc';
 import * as openClawHostRunJournal from '../services/openClawHostRunJournal';
@@ -244,6 +245,67 @@ describe('Agent Chat execution boundary', () => {
     streamEventBus.clearStream('terminal-global-fanout-error');
     streamEventBus.clearStream('native-reconnect-completed');
     jest.restoreAllMocks();
+  });
+
+  describe.each(['http', 'ws'] as const)('%s chat injection authorization', (transport) => {
+    const actorId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const session = `agent:main:portal-${actorId}-injection`;
+    const actor = { userId: actorId, role: 'OWNER', email: 'owner@example.com' } as any;
+
+    async function invoke(user = actor, text: unknown = '  synthetic note  ', target = session) {
+      if (transport === 'http') {
+        const res = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() };
+        await gatewayRouteHandler('/chat/inject')({ user, body: { session: target, text } }, res);
+        return res.json.mock.calls.at(-1)?.[0];
+      }
+      const socket = { readyState: 1, send: jest.fn() } as any;
+      await __gatewayExecutionScopeTest.handleWsInject(socket, { session: target, text }, user);
+      return JSON.parse(socket.send.mock.calls.at(-1)[0]);
+    }
+
+    test('allows an owned operator note only after admission and access checks', async () => {
+      const inject = jest.spyOn(persistentGatewayWs, 'injectChatMessage').mockResolvedValue();
+      expect(await invoke()).toMatchObject({ ok: true, sessionKey: session });
+      expect(openClawExecutionAdmission.assertOpenClawExecutionAdmitted).toHaveBeenCalledTimes(1);
+      expect(inject).toHaveBeenCalledWith(session, 'synthetic note');
+      expect(inject).toHaveBeenCalledTimes(1);
+    });
+
+    test('rejects non-operators before execution admission', async () => {
+      const inject = jest.spyOn(persistentGatewayWs, 'injectChatMessage').mockResolvedValue();
+      expect(await invoke({ ...actor, role: 'USER' })).toMatchObject({ error: 'Admin access required' });
+      expect(inject).not.toHaveBeenCalled();
+      expect(openClawExecutionAdmission.assertOpenClawExecutionAdmitted).not.toHaveBeenCalled();
+    });
+
+    test('rejects another Portal user even when the actor is Owner', async () => {
+      const inject = jest.spyOn(persistentGatewayWs, 'injectChatMessage').mockResolvedValue();
+      const foreign = 'agent:main:portal-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee-private';
+      expect(await invoke(actor, 'note', foreign)).toMatchObject({ error: 'Admin access required' });
+      expect(inject).not.toHaveBeenCalled();
+    });
+
+    test.each(['   ', { role: 'assistant', content: 'note' }])('rejects invalid Portal text %#', async (text) => {
+      const inject = jest.spyOn(persistentGatewayWs, 'injectChatMessage').mockResolvedValue();
+      expect(await invoke(actor, text)).toMatchObject({ error: 'text required' });
+      expect(inject).not.toHaveBeenCalled();
+    });
+
+    test('does not inject while admission refuses execution', async () => {
+      const inject = jest.spyOn(persistentGatewayWs, 'injectChatMessage').mockResolvedValue();
+      jest.mocked(openClawExecutionAdmission.assertOpenClawExecutionAdmitted)
+        .mockRejectedValue(new Error('maintenance refusal'));
+      const result = await invoke();
+      expect(result.ok).not.toBe(true);
+      expect(inject).not.toHaveBeenCalled();
+    });
+
+    test('propagates native failure without retry or successful acknowledgment', async () => {
+      const inject = jest.spyOn(persistentGatewayWs, 'injectChatMessage')
+        .mockRejectedValue(new Error('chat.inject RPC timeout'));
+      expect((await invoke()).ok).not.toBe(true);
+      expect(inject).toHaveBeenCalledTimes(1);
+    });
   });
 
   test('native conversation creation persists an owner-scoped parent without model dispatch and rejects a non-operator', async () => {

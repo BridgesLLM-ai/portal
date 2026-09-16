@@ -96,9 +96,9 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     keyPlaceholder: 'Paste an existing Claude setup-token',
     consoleUrl: 'https://docs.anthropic.com/en/docs/claude-code',
     signupUrl: 'https://claude.ai/',
-    pricingNote: 'Supports Anthropic API-key billing or an existing setup-token. This setup flow does not launch interactive Claude Code host sign-in.',
+    pricingNote: 'Sign in with your Claude account (usage limits follow that account), or use Anthropic API-key billing or an existing setup-token. Portal never launches Claude Code on the host to sign in.',
     freeTier: null,
-    description: 'Connect Claude to OpenClaw with an API key or an existing setup-token. Claude Project Sandbox sign-in is a separate process-free flow.',
+    description: 'Sign in to Claude for OpenClaw\'s Claude CLI runtime in the browser, or connect with an API key or an existing setup-token. The browser sign-in is the same Claude Code login Portal Claude Code sessions use on this server.',
     validationEndpoint: 'https://api.anthropic.com/v1/models',
     validationMethod: 'x-api-key',
     onboardAuthChoice: 'anthropic-api-key',
@@ -112,9 +112,9 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
       { id: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', tier: 'fast', description: 'Fastest and lowest-cost Claude model.' },
     ],
     setupInstructions: [
-      { stepNumber: 1, title: 'Choose an existing credential', detail: 'Use an Anthropic API key or paste a setup-token created in a separately managed environment.' },
-      { stepNumber: 2, title: 'Paste and validate it', detail: 'Portal saves the supplied credential without launching the managed Claude Code host package.' },
-      { stepNumber: 3, title: 'Activation unavailable', detail: 'Default-model routing is unchanged. Routing activation is unavailable in this release until a separately supported maintenance operation ships.' },
+      { stepNumber: 1, title: 'Sign in with your Claude account', detail: 'Open the browser sign-in, authorize Claude Code, and paste the authorization code back into Portal. Portal completes the exchange itself and never launches Claude Code on the host.' },
+      { stepNumber: 2, title: 'Or use an existing credential', detail: 'Paste an Anthropic API key or a setup-token created in a separately managed environment. Portal saves only the supplied credential.' },
+      { stepNumber: 3, title: 'Choose your model', detail: 'Refresh the authenticated model catalog, then explicitly choose a ready model. Sign-in alone leaves the default unchanged.' },
     ],
   },
   {
@@ -155,11 +155,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     tier: 1,
     authTypes: ['oauth'],
     primaryAuthType: 'oauth',
-    guidedSetup: manualSetup(
-      'Codex subscription sign-in is unavailable from Portal in this release. Supervised Agent Chat can use an existing attested host credential, and existing credentials are preserved.',
-      'https://developers.openai.com/codex/auth',
-      'Review Codex authentication documentation',
-    ),
+    guidedSetup: guidedSetup('oauth'),
     consoleUrl: 'https://chatgpt.com/',
     signupUrl: 'https://chatgpt.com/',
     pricingNote: 'Uses your existing ChatGPT Plus/Pro/Team subscription. No per-token charges.',
@@ -174,7 +170,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
       { id: 'openai/gpt-5.5', name: 'GPT-5.5', tier: 'balanced', description: 'Compatibility choice for Codex workspaces that do not expose GPT-5.6.' },
     ],
     setupInstructions: [
-      { stepNumber: 1, title: 'Host sign-in unavailable in this release', detail: 'Portal preserves existing Codex subscription credentials but does not launch interactive Codex host sign-in. Supervised Agent Chat can use an existing attested host credential.', link: { url: 'https://developers.openai.com/codex/auth', label: 'Review Codex authentication documentation' } },
+      { stepNumber: 1, title: 'Connect your ChatGPT subscription', detail: 'Use the native browser authorization steps when supported by the installed Codex provider. Existing credentials are preserved; choose the default model separately.', link: { url: 'https://developers.openai.com/codex/auth', label: 'Review Codex authentication documentation' } },
     ],
   },
   {
@@ -184,11 +180,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     tier: 1,
     authTypes: ['oauth'],
     primaryAuthType: 'oauth',
-    guidedSetup: manualSetup(
-      'Portal cannot launch the OpenClaw Gemini OAuth process in this release. Existing credentials remain readable.',
-      'https://docs.openclaw.ai/providers/google',
-      'Review OpenClaw Google provider documentation',
-    ),
+    guidedSetup: guidedSetup('oauth'),
     consoleUrl: 'https://gemini.google.com/',
     signupUrl: 'https://gemini.google.com/',
     pricingNote: 'Uses Gemini CLI OAuth through OpenClaw. This is an unofficial Google integration; use a non-critical Google account if you are risk-sensitive.',
@@ -206,7 +198,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
       { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', tier: 'fast', description: 'Fast Gemini CLI preset using the canonical Google model ID.' },
     ],
     setupInstructions: [
-      { stepNumber: 1, title: 'OpenClaw OAuth maintenance required', detail: 'Portal preserves existing credentials but does not launch this OpenClaw host login flow in this release.' },
+      { stepNumber: 1, title: 'Connect Google', detail: 'Use the native authorization steps when the installed Gemini provider supports them. The live provider catalog explains any missing upstream capability without hiding your existing models.' },
     ],
   },
   {
@@ -307,14 +299,15 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     name: 'xAI (Grok)',
     icon: 'zap',
     tier: 1,
-    authTypes: ['api_key'],
+    authTypes: ['oauth', 'api_key'],
     primaryAuthType: 'api_key',
-    guidedSetup: guidedSetup('api_key'),
+    guidedSetup: guidedSetup('oauth', 'api_key'),
     authOptions: [
+      { type: 'oauth', label: 'Use an xAI subscription', description: 'Follow native browser/device authorization, then choose a ready model.' },
       {
         type: 'api_key',
         label: 'Use an xAI API key',
-        description: 'Save an xAI developer API key without changing OpenClaw routing. Subscription OAuth mutation is unavailable in this release until a separately supported maintenance operation ships.',
+        description: 'Use separately billed xAI API access. Choose the default model after authentication.',
         recommended: true,
       },
     ],
@@ -322,9 +315,9 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     keyPlaceholder: 'xai-...',
     consoleUrl: 'https://x.ai/',
     signupUrl: 'https://x.ai/',
-    pricingNote: 'Guided setup supports usage-based xAI API billing. OpenClaw subscription OAuth is unavailable from Portal in this release.',
+    pricingNote: 'Connect an xAI subscription through native OAuth, or use separately billed API access.',
     freeTier: null,
-    description: 'Save a separately billed xAI API key. Portal does not enable the plugin, change auth order, register models, select defaults, or probe a host turn during credential entry.',
+    description: 'Connect through supported native OAuth or an API key. Authentication preserves the default; model selection is explicit.',
     validationEndpoint: 'https://api.x.ai/v1/models',
     validationMethod: 'bearer',
     onboardAuthChoice: 'xai-api-key',
@@ -340,7 +333,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     setupInstructions: [
       { stepNumber: 1, title: 'Create an xAI API key', detail: 'Use the xAI Console to create a separately billed developer API key.', link: { url: 'https://console.x.ai/', label: 'Open xAI Console' } },
       { stepNumber: 2, title: 'Validate and save it', detail: 'Portal validates the key against xAI and saves only the credential.' },
-      { stepNumber: 3, title: 'Activation unavailable', detail: 'Plugin policy, auth order, model registration, routing, and host probes remain unchanged. Those mutations and routing activation are unavailable in this release until a separately supported maintenance operation ships.' },
+      { stepNumber: 3, title: 'Choose a model', detail: 'Refresh the native model catalog and explicitly select a ready model. OAuth and API-key entry do not change the default automatically.' },
     ],
   },
   {
@@ -743,7 +736,20 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
   },
 ];
 
-const GUIDED_OAUTH_PROVIDERS = new Set<string>();
+for (const [id, name, url] of [
+  ['qwen-portal', 'Qwen Portal', 'https://chat.qwen.ai/'],
+  ['github-copilot', 'GitHub Copilot', 'https://github.com/features/copilot'],
+]) {
+  AI_PROVIDERS.push({ id, name, icon: 'code-2', tier: 2, authTypes: ['oauth'], primaryAuthType: 'oauth',
+    guidedSetup: guidedSetup('oauth'), consoleUrl: url, signupUrl: url,
+    pricingNote: 'Account eligibility and limits are controlled by the provider.', freeTier: null,
+    description: 'Native subscription authorization. The live capability check reports whether the installed provider supports this flow.',
+    defaultModels: [], setupInstructions: [{ stepNumber: 1, title: 'Connect your account',
+      detail: 'Follow the native authorization steps, then explicitly select a ready model. Existing accounts and defaults are preserved.' }],
+  });
+}
+
+const GUIDED_OAUTH_PROVIDERS = new Set(['openai-codex', 'google-gemini-cli', 'xai', 'qwen-portal', 'github-copilot']);
 
 export function assertAiProviderGuidedSetupContract(provider: AiProviderMeta): void {
   if (provider.guidedSetup.status === 'manual') return;

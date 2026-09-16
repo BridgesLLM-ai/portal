@@ -1,17 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ChevronRight, Cpu, Loader2, RefreshCw, Trash2, X } from 'lucide-react';
+import { AlertTriangle, ChevronRight, Cpu, Loader2, RefreshCw, Sparkles, Trash2, X } from 'lucide-react';
 import client from '../../api/client';
+import { agentToolsAPI, type AgentTool } from '../../api/agentTools';
+import { NATIVE_LOGIN_TOOL_ID, OPENCLAW_PROVIDER_HARNESS_TOOL_ID } from './cliInstallContract';
 import ViewportModal from '../ViewportModal';
 import ApiKeySetupFlow from './ApiKeySetupFlow';
 import AwsSdkSetupFlow from './AwsSdkSetupFlow';
 import NativeCliSetupFlow from './NativeCliSetupFlow';
 import OAuthSetupFlow from './OAuthSetupFlow';
-import OpenClawProviderPicker from './OpenClawProviderPicker';
+import OpenClawAuthWizardFlow from './OpenClawAuthWizardFlow';
+import OpenClawProviderPicker, { getProviderGuidance } from './OpenClawProviderPicker';
+import ProviderActivationStep from './ProviderActivationStep';
 import ProviderAuthChoice from './ProviderAuthChoice';
+import ProviderManualNotice from './ProviderManualNotice';
 import type { ProviderStatus } from './ProviderCard';
 import QuickStartBanner from './QuickStartBanner';
 import SetupTokenFlow from './SetupTokenFlow';
 import { getProviderConfig, parseProviderCatalog, type ProviderAuthType, type ProviderUIConfig } from './providerConfig';
+import { buildProviderCoverageMap, deriveProviderCoverage } from './providerCoverage';
+import { parseOAuthProviderSupport, type OAuthProviderSupport } from './openclawAuthWizardContract';
 import { getProviderRemovalConfirmation } from './providerRemovalContract';
 import { useSettingsMutationCoordinator } from '../settings/SettingsMutationContext';
 
@@ -27,6 +34,11 @@ interface AiSetupStatusResponse {
 }
 
 export type NativeCliSetupProvider = 'claude-code' | 'codex' | 'gemini' | 'grok' | 'hermes' | 'opencode';
+
+interface ActivationRequest {
+  provider: ProviderUIConfig | null;
+  mode: 'post-login' | 'default';
+}
 
 interface AiProviderSetupProps {
   mode: 'wizard' | 'settings';
@@ -45,6 +57,11 @@ interface AiProviderSetupProps {
   onInitialNativeCliProviderConsumed?: () => void;
 }
 
+/** Native logins that are also OpenClaw runtime credentials on this server. */
+const NATIVE_LOGIN_OPENCLAW_PROVIDER: Partial<Record<NativeCliSetupProvider, string>> = {
+  'claude-code': 'anthropic',
+};
+
 export default function AiProviderSetup({ mode, apiBase, onComplete, compact = false, onNativeModelSelected, additionalProviderCards, initialNativeCliProvider = null, onInitialNativeCliProviderConsumed }: AiProviderSetupProps) {
   const settingsMutation = useSettingsMutationCoordinator();
   const settingsClaim = settingsMutation?.claim;
@@ -53,11 +70,15 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<AiSetupStatusResponse | null>(null);
+  const [tools, setTools] = useState<AgentTool[]>([]);
   const [providers, setProviders] = useState<ProviderUIConfig[]>([]);
+  const [oauthSupport, setOauthSupport] = useState<Map<string, OAuthProviderSupport>>(new Map());
   const [activeSetup, setActiveSetup] = useState<ProviderUIConfig | null>(null);
   const [activeAuthType, setActiveAuthType] = useState<ProviderAuthType | null>(null);
   const [activeNativeCliFlow, setActiveNativeCliFlow] = useState<NativeCliSetupProvider | null>(null);
   const [showProviderPicker, setShowProviderPicker] = useState(false);
+  const [manualNotice, setManualNotice] = useState<ProviderUIConfig | null>(null);
+  const [activation, setActivation] = useState<ActivationRequest | null>(null);
   const [removalTarget, setRemovalTarget] = useState<{
     provider: ProviderUIConfig;
     operationId: string;
@@ -67,6 +88,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   const [removalError, setRemovalError] = useState<string | null>(null);
   const settingsFlowOwnerRef = useRef<string | null>(null);
   const consumedInitialNativeCliProviderRef = useRef<NativeCliSetupProvider | null>(null);
+  const pendingActivationRef = useRef<string | null>(null);
 
   const claimSettingsFlow = useCallback((settingsOwner: string) => {
     if (settingsFlowOwnerRef.current) return false;
@@ -87,14 +109,33 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
     else setRefreshing(true);
     setError(null);
     try {
-      const [statusResponse, catalogResponse] = await Promise.all([
+      const [statusResponse, catalogResponse, supportResponse] = await Promise.all([
         client.get<AiSetupStatusResponse>(`${apiBase}/status`, {
           params: silent ? { refreshProviderReadiness: '1' } : undefined,
         }),
         client.get<unknown>(`${apiBase}/catalog`),
+        // Older servers do not report OAuth support; the static catalog is the
+        // fallback authority in that case.
+        client.get<unknown>(`${apiBase}/oauth/providers`)
+          .then((response) => parseOAuthProviderSupport(response.data))
+          .catch(() => [] as OAuthProviderSupport[]),
       ]);
       setStatus(statusResponse.data);
-      setProviders(parseProviderCatalog(catalogResponse.data));
+      setProviders(parseProviderCatalog(catalogResponse.data).map((provider) => {
+        // Offer subscription login only when the installed native provider exposes it.
+        const support = supportResponse.find((entry) => entry.id === provider.id);
+        if (provider.id !== 'xai' || !support?.supported) return provider;
+        return {
+          ...provider,
+          primaryAuthType: 'oauth' as const,
+          authOptions: [
+            { type: 'oauth' as const, label: 'Sign in with your xAI account', description: 'Connect your subscription through OpenClaw.' },
+            { type: 'api_key' as const, label: 'Use an API key', description: 'Use metered xAI API access.' },
+          ],
+          guidedSetup: { status: 'available' as const, authTypes: ['oauth' as const, 'api_key' as const] },
+        };
+      }));
+      setOauthSupport(new Map(supportResponse.map((entry) => [entry.id, entry])));
     } catch (err: any) {
       setError(err?.response?.data?.error || err?.message || 'Failed to load AI provider status');
     } finally {
@@ -107,9 +148,25 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
     void loadStatus();
   }, [loadStatus]);
 
+  useEffect(() => {
+    if (!activeSetup && !activeNativeCliFlow) return;
+    let current = true;
+    agentToolsAPI.list(true, { timeoutMs: 10_000 })
+      .then((inventory) => { if (current) setTools(Array.isArray(inventory.tools) ? inventory.tools : []); })
+      .catch(() => { if (current) setTools([]); });
+    return () => { current = false; };
+  }, [activeSetup, activeNativeCliFlow]);
+
+  const toolFor = (id: string | undefined) => id ? { id, tool: tools.find((entry) => entry.id === id) || null } : null;
+
   const statusMap = useMemo(
     () => new Map((status?.providers || []).map((p) => [p.id, p])),
     [status?.providers],
+  );
+
+  const coverageMap = useMemo(
+    () => buildProviderCoverageMap(providers, statusMap),
+    [providers, statusMap],
   );
 
   const beginProviderSetup = (provider: ProviderUIConfig | null) => {
@@ -118,21 +175,48 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
   };
 
   const beginOwnedProviderSetup = (provider: ProviderUIConfig) => {
-    if (provider.guidedSetup.status !== 'available') return false;
+    if (!getProviderGuidance(provider, oauthSupport).guided) {
+      // Never swallow the click: say why this sign-in is unavailable here.
+      setShowProviderPicker(false);
+      setManualNotice(provider);
+      return false;
+    }
     if (!claimSettingsFlow(`settings:ai-provider:${provider.id}`)) return false;
     beginProviderSetup(provider);
     return true;
   };
 
+  const openPendingActivation = useCallback(() => {
+    const providerId = pendingActivationRef.current;
+    pendingActivationRef.current = null;
+    if (!providerId) return;
+    const provider = getProviderConfig(providers, providerId);
+    if (!provider) return;
+    if (!claimSettingsFlow(`settings:ai-provider:activate:${provider.id}`)) return;
+    setActivation({ provider, mode: 'post-login' });
+  }, [claimSettingsFlow, providers]);
+
   const closeProviderSetup = () => {
     setActiveSetup(null);
     setActiveAuthType(null);
     releaseSettingsFlow();
+    openPendingActivation();
   };
 
   const closeNativeCliFlow = () => {
     setActiveNativeCliFlow(null);
     releaseSettingsFlow();
+    openPendingActivation();
+  };
+
+  const closeActivation = () => {
+    setActivation(null);
+    releaseSettingsFlow();
+  };
+
+  const openDefaultModelChooser = () => {
+    if (!claimSettingsFlow('settings:ai-provider:default-model')) return;
+    setActivation({ provider: null, mode: 'default' });
   };
 
   const handleCardChoose = (id: string) => {
@@ -144,7 +228,20 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
     if (provider) beginOwnedProviderSetup(provider);
   };
 
-  const handleComplete = async () => {
+  /**
+   * A finished login refreshes status and, for OpenClaw-capable providers,
+   * queues the verify → models → default step to open once the login dialog
+   * closes. Signing in never changes OpenClaw's default by itself.
+   */
+  const handleComplete = async (providerId?: string | null) => {
+    // Queue before any await: a login dialog may close in the same frame it
+    // reports completion, and the close handler is what opens the step.
+    if (providerId) {
+      const provider = getProviderConfig(providers, providerId);
+      if (provider && deriveProviderCoverage(provider, statusMap.get(providerId)).activatesOpenClaw) {
+        pendingActivationRef.current = providerId;
+      }
+    }
     await loadStatus(true);
     onComplete?.();
     // Don't auto-advance the wizard — let user add more providers first
@@ -307,6 +404,96 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
 
   useEffect(() => () => releaseSettingsFlow(), [releaseSettingsFlow]);
 
+  const usesNativeWizard = (provider: ProviderUIConfig) => oauthSupport.get(provider.id)?.supported === true;
+
+  const renderModals = () => (
+    <>
+      {showProviderPicker ? (
+        <OpenClawProviderPicker
+          providers={providers}
+          statusMap={statusMap}
+          coverageMap={coverageMap}
+          oauthSupport={oauthSupport}
+          onSelect={(provider) => {
+            if (!beginOwnedProviderSetup(provider)) return;
+            setShowProviderPicker(false);
+          }}
+          onRemove={beginProviderRemoval}
+          onClose={() => setShowProviderPicker(false)}
+        />
+      ) : null}
+      {providerRemovalDialog}
+      {manualNotice ? (
+        <ProviderManualNotice
+          provider={manualNotice}
+          coverage={coverageMap.get(manualNotice.id) || deriveProviderCoverage(manualNotice, statusMap.get(manualNotice.id))}
+          serverReason={oauthSupport.get(manualNotice.id)?.reason || null}
+          onClose={() => setManualNotice(null)}
+        />
+      ) : null}
+      {activation ? (
+        <ProviderActivationStep
+          provider={activation.provider}
+          apiBase={apiBase}
+          mode={activation.mode}
+          onClose={closeActivation}
+          onChanged={async () => {
+            await loadStatus(true);
+            onComplete?.();
+          }}
+        />
+      ) : null}
+      {activeSetup && !activeAuthType && activeSetup.authOptions?.length ? (
+        <ProviderAuthChoice provider={activeSetup} onSelect={setActiveAuthType} onCancel={closeProviderSetup} />
+      ) : null}
+      {activeSetup && activeAuthType === 'api_key' ? (
+        <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={() => handleComplete(activeSetup.id)} onCancel={closeProviderSetup} />
+      ) : null}
+      {activeSetup && (activeAuthType === 'oauth' || activeAuthType === 'device_code') ? (
+        usesNativeWizard(activeSetup) ? (
+          <OpenClawAuthWizardFlow harnessTool={toolFor(OPENCLAW_PROVIDER_HARNESS_TOOL_ID[activeSetup.id])} onToolInventory={setTools} provider={activeSetup} apiBase={apiBase} onComplete={() => handleComplete(activeSetup.id)} onCancel={closeProviderSetup} />
+        ) : (
+          <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={() => handleComplete(activeSetup.id)} onCancel={closeProviderSetup} />
+        )
+      ) : null}
+      {activeSetup && activeAuthType === 'aws_sdk' ? (
+        <AwsSdkSetupFlow
+          provider={activeSetup}
+          status={statusMap.get(activeSetup.id) || null}
+          refreshing={refreshing}
+          onRefresh={() => loadStatus(true)}
+          onCancel={closeProviderSetup}
+        />
+      ) : null}
+      {activeSetup && activeAuthType === 'setup_token' ? (
+        <SetupTokenFlow
+          harnessTool={toolFor(OPENCLAW_PROVIDER_HARNESS_TOOL_ID[activeSetup.id])}
+          onToolInventory={setTools}
+          provider={activeSetup}
+          status={statusMap.get(activeSetup.id) || null}
+          apiBase={apiBase}
+          onComplete={() => handleComplete(activeSetup.id)}
+          onCancel={closeProviderSetup}
+        />
+      ) : null}
+      {activeNativeCliFlow ? (
+        <NativeCliSetupFlow
+          harnessTool={toolFor(NATIVE_LOGIN_TOOL_ID[activeNativeCliFlow])}
+          onToolInventory={setTools}
+          provider={activeNativeCliFlow}
+          apiBase={apiBase}
+          onComplete={async () => {
+            await handleComplete(NATIVE_LOGIN_OPENCLAW_PROVIDER[activeNativeCliFlow] || null);
+            closeNativeCliFlow();
+          }}
+          onCancel={closeNativeCliFlow}
+          onModelSelected={onNativeModelSelected}
+          replacesExistingLogin={statusMap.get('anthropic')?.nativeCliAuthStatus === 'authenticated'}
+        />
+      ) : null}
+    </>
+  );
+
   // ── Compact layout (sidebar drawer) ──────────────────────────────
   if (compact) {
     return (
@@ -346,8 +533,17 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
           <div className="rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
             <div className="text-[10px] text-slate-500">Default model</div>
             <div className="mt-0.5 truncate text-xs font-medium text-white">{status.defaultModel || 'Not configured'}</div>
-            <div className="mt-1 text-[10px] text-slate-600">
-              {status.configuredProfileCount || 0} provider{(status.configuredProfileCount || 0) !== 1 ? 's' : ''} connected
+            <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-slate-600">
+              <span>
+                {status.configuredProfileCount || 0} provider{(status.configuredProfileCount || 0) !== 1 ? 's' : ''} connected
+              </span>
+              <button
+                type="button"
+                onClick={openDefaultModelChooser}
+                className="rounded border border-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400 transition hover:border-slate-600 hover:text-slate-200"
+              >
+                Change default
+              </button>
             </div>
           </div>
         ) : null}
@@ -366,49 +562,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
         ) : null}
 
         {/* Modals */}
-        {showProviderPicker ? (
-          <OpenClawProviderPicker
-            providers={providers}
-            statusMap={statusMap}
-            onSelect={(provider) => {
-              if (!beginOwnedProviderSetup(provider)) return;
-              setShowProviderPicker(false);
-            }}
-            onRemove={beginProviderRemoval}
-            onClose={() => setShowProviderPicker(false)}
-          />
-        ) : null}
-        {providerRemovalDialog}
-        {activeSetup && !activeAuthType && activeSetup.authOptions?.length ? (
-          <ProviderAuthChoice provider={activeSetup} onSelect={setActiveAuthType} onCancel={closeProviderSetup} />
-        ) : null}
-        {activeSetup && activeAuthType === 'api_key' ? (
-          <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={closeProviderSetup} />
-        ) : null}
-        {activeSetup && activeAuthType === 'oauth' ? (
-          <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={closeProviderSetup} />
-        ) : null}
-        {activeSetup && activeAuthType === 'aws_sdk' ? (
-          <AwsSdkSetupFlow
-            provider={activeSetup}
-            status={statusMap.get(activeSetup.id) || null}
-            refreshing={refreshing}
-            onRefresh={() => loadStatus(true)}
-            onCancel={closeProviderSetup}
-          />
-        ) : null}
-        {activeSetup && activeAuthType === 'setup_token' ? (
-          <SetupTokenFlow
-            provider={activeSetup}
-            status={statusMap.get(activeSetup.id) || null}
-            apiBase={apiBase}
-            onComplete={handleComplete}
-            onCancel={closeProviderSetup}
-          />
-        ) : null}
-        {activeNativeCliFlow ? (
-          <NativeCliSetupFlow provider={activeNativeCliFlow} apiBase={apiBase} onComplete={async () => { await handleComplete(); closeNativeCliFlow(); }} onCancel={closeNativeCliFlow} onModelSelected={onNativeModelSelected} />
-        ) : null}
+        {renderModals()}
       </div>
     );
   }
@@ -463,10 +617,18 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Current default model</div>
-              <div className="mt-1 text-base font-medium text-white">{status.defaultModel || 'No default model configured yet'}</div>
+              <div className="mt-1 text-base font-medium text-white" data-testid="ai-setup-default-model">{status.defaultModel || 'No default model configured yet'}</div>
               <div className="mt-2 text-sm text-slate-400">
                 Gateway: {status.gatewayRunning ? 'Running' : 'Unavailable'} · OpenClaw: {status.openclawInstalled ? (status.openclawVersion || 'Installed') : 'Not installed'}
               </div>
+              <button
+                type="button"
+                onClick={openDefaultModelChooser}
+                className="mt-3 inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-200 transition hover:border-slate-600 hover:bg-slate-900"
+              >
+                <Sparkles className="h-4 w-4 text-emerald-300" />
+                Change default model
+              </button>
             </div>
             <div className="max-w-xl text-sm text-slate-400">
               <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Fallback models</div>
@@ -478,7 +640,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
         </div>
       ) : null}
 
-      {/* ── Four cards ── */}
+      {/* ── Cards ── */}
       {!loading || additionalProviderCards ? (
         <QuickStartBanner
           onChoose={handleCardChoose}
@@ -491,56 +653,7 @@ export default function AiProviderSetup({ mode, apiBase, onComplete, compact = f
       ) : null}
 
       {/* ── Modals ── */}
-      {showProviderPicker ? (
-        <OpenClawProviderPicker
-          providers={providers}
-          statusMap={statusMap}
-          onSelect={(provider) => {
-            if (!beginOwnedProviderSetup(provider)) return;
-            setShowProviderPicker(false);
-          }}
-          onRemove={beginProviderRemoval}
-          onClose={() => setShowProviderPicker(false)}
-        />
-      ) : null}
-      {providerRemovalDialog}
-
-      {activeSetup && !activeAuthType && activeSetup.authOptions?.length ? (
-        <ProviderAuthChoice provider={activeSetup} onSelect={setActiveAuthType} onCancel={closeProviderSetup} />
-      ) : null}
-      {activeSetup && activeAuthType === 'api_key' ? (
-        <ApiKeySetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={closeProviderSetup} />
-      ) : null}
-      {activeSetup && activeAuthType === 'oauth' ? (
-        <OAuthSetupFlow provider={activeSetup} apiBase={apiBase} onComplete={handleComplete} onCancel={closeProviderSetup} />
-      ) : null}
-      {activeSetup && activeAuthType === 'aws_sdk' ? (
-        <AwsSdkSetupFlow
-          provider={activeSetup}
-          status={statusMap.get(activeSetup.id) || null}
-          refreshing={refreshing}
-          onRefresh={() => loadStatus(true)}
-          onCancel={closeProviderSetup}
-        />
-      ) : null}
-      {activeSetup && activeAuthType === 'setup_token' ? (
-        <SetupTokenFlow
-          provider={activeSetup}
-          status={statusMap.get(activeSetup.id) || null}
-          apiBase={apiBase}
-          onComplete={handleComplete}
-          onCancel={closeProviderSetup}
-        />
-      ) : null}
-      {activeNativeCliFlow ? (
-        <NativeCliSetupFlow
-          provider={activeNativeCliFlow}
-          apiBase={apiBase}
-          onComplete={async () => { await handleComplete(); closeNativeCliFlow(); }}
-          onCancel={closeNativeCliFlow}
-          onModelSelected={onNativeModelSelected}
-        />
-      ) : null}
+      {renderModals()}
 
       {/* Wizard: manual continue button */}
       {mode === 'wizard' && !loading ? (

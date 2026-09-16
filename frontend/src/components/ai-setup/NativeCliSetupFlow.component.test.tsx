@@ -48,14 +48,14 @@ describe('NativeCliSetupFlow Antigravity model handoff', () => {
     expect(mocks.clientPost).not.toHaveBeenCalled();
   });
 
-  it('labels Claude as a process-free Project Sandbox authorization', async () => {
+  it('labels Claude Code as a process-free browser sign-in shared with OpenClaw', async () => {
     const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
     mocks.clientPost.mockResolvedValueOnce({
       data: {
         success: true,
         sessionId: 'native-claude-project',
         status: 'awaiting_callback',
-        authUrl: 'https://claude.ai/oauth/authorize?state=project-test',
+        authUrl: 'https://claude.com/cai/oauth/authorize?code=true&state=project-test',
         alreadyAuthenticated: false,
         reauthSupported: true,
       },
@@ -70,11 +70,63 @@ describe('NativeCliSetupFlow Antigravity model handoff', () => {
       />,
     );
 
-    expect(screen.getByText(/process-free credential flow/i)).toBeVisible();
-    expect(screen.getByText(/will not launch Claude Code on the host/i)).toBeVisible();
-    fireEvent.click(screen.getByRole('button', { name: 'Authorize Claude Project Sandbox' }));
-    expect(await screen.findByRole('link', { name: /Open Claude Project Sandbox login/i })).toBeVisible();
+    expect(screen.getByText(/process-free browser flow/i)).toBeVisible();
+    expect(screen.getByText(/will not launch Claude Code on the host to sign in/i)).toBeVisible();
+    expect(screen.getByText(/OpenClaw's Claude CLI runtime and Portal Claude Code sessions read the same Claude credential store/i)).toBeVisible();
+    expect(screen.queryByText(/Project Sandbox/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in to Claude Code' }));
+    expect(await screen.findByRole('link', { name: /Open Claude Code login/i })).toBeVisible();
     expect(mocks.clientPost).toHaveBeenCalledWith('/ai-setup/native-cli/start', { provider: 'claude-code' });
+    open.mockRestore();
+  });
+
+  it('requires acknowledging replacement of an existing Claude login before the Claude Code sign-in starts', () => {
+    render(
+      <NativeCliSetupFlow
+        provider="claude-code"
+        apiBase="/ai-setup"
+        onComplete={vi.fn()}
+        onCancel={vi.fn()}
+        replacesExistingLogin
+      />,
+    );
+
+    expect(screen.getByText(/A Claude login already exists on this server/i)).toBeVisible();
+    const replace = screen.getByRole('button', { name: 'Replace the Claude login on this server' });
+    expect(replace).toBeDisabled();
+    fireEvent.click(replace);
+    expect(mocks.clientPost).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('checkbox'));
+    expect(replace).toBeEnabled();
+  });
+
+  it('refuses a non-Anthropic Claude Code authorization URL instead of opening it', async () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue(null);
+    mocks.clientPost.mockResolvedValueOnce({
+      data: {
+        success: true,
+        sessionId: 'native-claude-phish',
+        status: 'awaiting_callback',
+        authUrl: 'https://claude-login.example/cai/oauth/authorize?state=x',
+        alreadyAuthenticated: false,
+        reauthSupported: true,
+      },
+    });
+
+    render(
+      <NativeCliSetupFlow
+        provider="claude-code"
+        apiBase="/ai-setup"
+        onComplete={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in to Claude Code' }));
+    expect(await screen.findByText(/unexpected Claude authorization URL/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close and review provider status' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Open Claude Code login/i })).not.toBeInTheDocument();
+    expect(open).not.toHaveBeenCalled();
     open.mockRestore();
   });
 

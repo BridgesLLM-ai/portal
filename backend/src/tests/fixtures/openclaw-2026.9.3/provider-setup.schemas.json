@@ -1,0 +1,229 @@
+{
+  "modelsList": {
+    "type": "object",
+    "properties": {
+      "agentId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "includeProviderCapabilities": {
+        "type": "boolean"
+      },
+      "preparedOnly": {
+        "type": "boolean"
+      },
+      "refresh": {
+        "type": "boolean"
+      },
+      "view": {
+        "anyOf": [
+          {
+            "type": "string",
+            "const": "default"
+          },
+          {
+            "type": "string",
+            "const": "configured"
+          },
+          {
+            "type": "string",
+            "const": "provider-config"
+          },
+          {
+            "type": "string",
+            "const": "all"
+          }
+        ]
+      }
+    },
+    "additionalProperties": false,
+    "not": {
+      "properties": {
+        "preparedOnly": {
+          "const": true
+        },
+        "refresh": {
+          "const": true
+        }
+      },
+      "required": [
+        "preparedOnly",
+        "refresh"
+      ]
+    }
+  },
+  "modelsAuthStatus": {
+    "type": "object",
+    "properties": {
+      "refresh": {
+        "type": "boolean"
+      },
+      "agentId": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  },
+  "configPatch": {
+    "type": "object",
+    "required": [
+      "raw"
+    ],
+    "properties": {
+      "raw": {
+        "type": "string",
+        "minLength": 1
+      },
+      "baseHash": {
+        "type": "string",
+        "minLength": 1
+      },
+      "sessionKey": {
+        "type": "string"
+      },
+      "deliveryContext": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "accountId": {
+            "type": "string"
+          },
+          "threadId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "note": {
+        "type": "string"
+      },
+      "restartDelayMs": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "replacePaths": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "maxItems": 256
+      }
+    },
+    "additionalProperties": false
+  },
+  "wizardNext": {
+    "type": "object",
+    "required": [
+      "sessionId"
+    ],
+    "properties": {
+      "sessionId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "answer": {
+        "type": "object",
+        "required": [
+          "stepId"
+        ],
+        "properties": {
+          "stepId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {}
+        },
+        "additionalProperties": false
+      }
+    },
+    "additionalProperties": false
+  },
+  "wizardCancel": {
+    "type": "object",
+    "required": [
+      "sessionId"
+    ],
+    "properties": {
+      "sessionId": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "additionalProperties": false
+  },
+  "prepare": {
+    "type": "object",
+    "required": [
+      "sessionId",
+      "authChoice"
+    ],
+    "properties": {
+      "sessionId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "agentId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "authChoice": {
+        "type": "string",
+        "minLength": 1
+      },
+      "workspace": {
+        "type": "string"
+      },
+      "nativeSessionCatalogsEnabled": {
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": false
+  },
+  "detect": {
+    "type": "object",
+    "properties": {
+      "agentId": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "additionalProperties": false
+  },
+  "modelsProbe": {
+    "type": "object",
+    "required": [
+      "provider"
+    ],
+    "properties": {
+      "provider": {
+        "type": "string",
+        "minLength": 1
+      },
+      "profileId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "agentId": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  }
+}

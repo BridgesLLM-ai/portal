@@ -671,21 +671,6 @@ export class OpenClawGatewayClient {
 
 
   /**
-   * Inject an assistant-side transcript note without starting a new turn.
-   * This does NOT steer the running agent.
-   */
-  async injectMessage(sessionKey: string, text: string): Promise<void> {
-    this.currentSessionKey = sessionKey;
-    await this.request('chat.inject', {
-      sessionKey,
-      message: {
-        role: 'assistant',
-        content: [{ type: 'input_text', text }],
-      },
-    });
-  }
-
-  /**
    * Load message history for a session.
    */
   async loadHistory(sessionKey: string, limit = 200): Promise<GatewayHistoryResponse> {

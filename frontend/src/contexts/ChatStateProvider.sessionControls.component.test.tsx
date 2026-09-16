@@ -10,6 +10,8 @@ import {
 } from './ChatStateProvider';
 
 const chatMocks = vi.hoisted(() => ({
+  useDirectGateway: false,
+  injectNote: vi.fn(),
   clientGet: vi.fn(),
   clientPost: vi.fn(),
   createSession: vi.fn(),
@@ -31,6 +33,7 @@ vi.mock('../api/client', () => ({
 
 vi.mock('../api/endpoints', () => ({
   gatewayAPI: {
+    injectNote: chatMocks.injectNote,
     createSession: chatMocks.createSession,
     getConfigPath: chatMocks.getConfigPath,
     patchConfigPath: chatMocks.patchConfigPath,
@@ -47,7 +50,7 @@ vi.mock('../api/auth', () => ({
 }));
 
 vi.mock('../hooks/usePublicSettings', () => ({
-  usePublicSettings: () => ({ useDirectGateway: false }),
+  usePublicSettings: () => ({ useDirectGateway: chatMocks.useDirectGateway }),
 }));
 
 function deferred<T>() {
@@ -114,8 +117,14 @@ function sessionInfo(fastMode: boolean) {
 
 function SessionControlsHarness() {
   const chat = useChatState();
+  const [noteResult, setNoteResult] = React.useState('idle');
   return (
     <div>
+      <output data-testid="note-result">{noteResult}</output>
+      <button type="button" onClick={() => {
+        void chat.injectNote('  synthetic note  ').then(() => setNoteResult('saved'))
+          .catch((error) => setNoteResult(error.message));
+      }}>Inject note</button>
       <output data-testid="session">{chat.session}</output>
       <output data-testid="provider">{chat.provider}</output>
       <output data-testid="model">{chat.selectedModel}</output>
@@ -206,6 +215,8 @@ async function renderReadyHarness() {
 describe('ChatStateProvider session-control ownership', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    chatMocks.useDirectGateway = false;
+    chatMocks.injectNote.mockResolvedValue({ ok: true, sessionKey: 'agent:main:first' });
     PendingWebSocket.instances = [];
     vi.stubGlobal('WebSocket', PendingWebSocket);
     localStorage.clear();
@@ -250,6 +261,33 @@ describe('ChatStateProvider session-control ownership', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it.each([false, true])('routes notes through the broker with direct preference %s and awaits acknowledgment', async (directPreference) => {
+    chatMocks.useDirectGateway = directPreference;
+    const pending = deferred<{ ok: true; sessionKey: string }>();
+    chatMocks.injectNote.mockReturnValue(pending.promise);
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    await act(async () => {
+      for (const socket of PendingWebSocket.instances) socket.open();
+    });
+    await user.click(screen.getByRole('button', { name: 'Inject note' }));
+    expect(chatMocks.injectNote).toHaveBeenCalledWith('agent:main:first', 'synthetic note');
+    expect(screen.getByTestId('note-result')).toHaveTextContent('idle');
+    expect(PendingWebSocket.instances.flatMap((socket) => socket.sent)
+      .some((frame) => frame.type === 'inject' || frame.method === 'chat.inject')).toBe(false);
+    await act(async () => pending.resolve({ ok: true, sessionKey: 'agent:main:first' }));
+    expect(screen.getByTestId('note-result')).toHaveTextContent('saved');
+  });
+
+  it('surfaces injection refusal to the caller', async () => {
+    chatMocks.injectNote.mockRejectedValue(new Error('Admin access required'));
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    await user.click(screen.getByRole('button', { name: 'Inject note' }));
+    expect(screen.getByTestId('note-result')).toHaveTextContent('Admin access required');
+    expect(chatMocks.injectNote).toHaveBeenCalledTimes(1);
   });
 
   it('loads missing session-control metadata without mutating the session', async () => {

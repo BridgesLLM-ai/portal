@@ -4821,50 +4821,22 @@ export async function sendChatMessage(
 }
 
 
+// Native chat.inject accepts a string, not a chat message object or Portal's text field.
+export interface ChatInjectParams {
+  sessionKey: string;
+  message: string;
+}
+
+export async function injectChatMessageWithRpc(
+  sessionKey: string,
+  text: string,
+  rpc: (method: 'chat.inject', params: ChatInjectParams, timeoutMs: number) => Promise<unknown>,
+): Promise<void> {
+  await rpc('chat.inject', { sessionKey, message: text }, 30000);
+}
+
 export async function injectChatMessage(sessionKey: string, text: string): Promise<void> {
-  if (!singletonWs || singletonWs.readyState !== WebSocket.OPEN) {
-    throw new Error('Persistent WebSocket not connected');
-  }
-  if (!isAuthenticated) {
-    throw new Error('Persistent WebSocket not authenticated');
-  }
-
-  const requestId = nextId();
-
-  return new Promise((resolve, reject) => {
-    const timeoutTimer = setTimeout(() => {
-      pendingResponses.delete(requestId);
-      reject(new Error('chat.inject RPC timeout'));
-    }, 30000);
-
-    pendingResponses.set(requestId, {
-      resolve: () => {
-        clearTimeout(timeoutTimer);
-        resolve();
-      },
-      reject: (err: Error) => {
-        clearTimeout(timeoutTimer);
-        reject(err);
-      },
-    });
-
-    try {
-      singletonWs!.send(JSON.stringify({
-        type: 'req',
-        id: requestId,
-        method: 'chat.inject',
-        params: {
-          sessionKey,
-          text,
-          role: 'assistant',
-        },
-      }));
-    } catch (err: any) {
-      clearTimeout(timeoutTimer);
-      pendingResponses.delete(requestId);
-      reject(new Error(`Failed to send chat.inject: ${err.message}`));
-    }
-  });
+  await injectChatMessageWithRpc(sessionKey, text, callGatewayRpc);
 }
 
 export async function steerSessionMessage(

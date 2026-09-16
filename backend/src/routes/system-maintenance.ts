@@ -1,3 +1,4 @@
+import { noninteractiveHostPackageCommand } from '../config/hostPackagePolicy';
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -361,8 +362,7 @@ cat <<'EOF'
 This checklist does not reboot the server.
 EOF`;
 
-const SECURITY_UPDATE_COMMAND = `set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
+const SECURITY_UPDATE_COMMAND = noninteractiveHostPackageCommand(`set -euo pipefail
 
 protected="$(apt list --upgradable 2>/dev/null \\
   | tail -n +2 \\
@@ -381,7 +381,19 @@ EOF
 fi
 
 command -v unattended-upgrade >/dev/null
-unattended-upgrade -v`;
+# python-apt loads the host policy first; override only reboot permission in this
+# process. unattended-upgrade has no apt-get-style -o option. Import apt before
+# setting the override so its initialization cannot reload the host default.
+/usr/bin/python3 - <<'PYTHON'
+import apt
+import apt_pkg
+import runpy
+import shutil
+import sys
+apt_pkg.config.set("Unattended-Upgrade::Automatic-Reboot", "false")
+sys.argv = [shutil.which("unattended-upgrade"), "-v"]
+runpy.run_path(sys.argv[0], run_name="__main__")
+PYTHON`);
 
 function ageHoursSince(mtimeMs: number): number {
   return Math.round(((Date.now() - mtimeMs) / 3_600_000) * 10) / 10;
@@ -440,7 +452,7 @@ const ACTIONS: Record<string, MaintenanceAction & { command: string; title: stri
     impact: 'Updates local apt metadata only. It does not install or remove packages.',
     recovery: 'Usually no rollback needed; rerun package checks if the cache refresh fails.',
     confirmationPhrase: 'REFRESH PACKAGE CACHE',
-    command: 'set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update',
+    command: noninteractiveHostPackageCommand('set -euo pipefail\napt-get update'),
   },
   'apply-security-updates': {
     id: 'apply-security-updates',

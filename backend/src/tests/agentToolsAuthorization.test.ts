@@ -119,54 +119,60 @@ describe('Agent Tools host-inventory authorization', () => {
     for (const toolId of ['codex', 'claude-code']) {
       const tool = response.body.tools.find((entry: any) => entry.id === toolId);
       expect(tool).toMatchObject({
-        install: [],
         commands: [],
         status: {
           installed: true,
           state: 'verified',
           installAvailable: false,
-          installUnavailableCode: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
+          installUnavailableCode: 'CLI_ALREADY_PRESENT',
         },
       });
     }
   });
 
-  it('fails admitted host package mutations closed before parsing request-controlled commands', async () => {
+  it('rejects request-controlled commands and missing confirmation before starting an installer', async () => {
     const invalid = await request(server, 'OWNER', '/agent-tools/claude-code/install', {
-      confirmation: 'INSTALL CLAUDE-CODE',
-      command: 'npm install -g anything',
+      confirmation: 'INSTALL CLAUDE-CODE', command: 'npm install -g anything',
     });
-    expect(invalid.status).toBe(503);
-    expect(invalid.body.code).toBe('HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE');
-
-    const rejected = await request(server, 'OWNER', '/agent-tools/claude-code/install', {
-      confirmation: 'wrong',
-    });
-    expect(rejected.status).toBe(503);
-    expect(rejected.body.code).toBe('HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE');
-    expect(startAgentJobMock).not.toHaveBeenCalled();
-
-    const unavailable = await request(server, 'OWNER', '/agent-tools/claude-code/install', {
-      confirmation: 'INSTALL CLAUDE-CODE',
-    });
-    expect(unavailable.status).toBe(503);
-    expect(unavailable.body).toMatchObject({
-      code: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
-      retryable: false,
-    });
+    expect(invalid.status).toBe(400);
+    expect(invalid.body.code).toBe('INVALID_INSTALL_REQUEST');
+    const rejected = await request(server, 'OWNER', '/agent-tools/claude-code/install', { confirmation: 'wrong' });
+    expect(rejected.status).toBe(400);
     expect(startAgentJobMock).not.toHaveBeenCalled();
   });
 
-  it('fails native-runtime installation closed without creating an AgentJob', async () => {
-    const response = await request(server, 'OWNER', '/agent-tools/grok-build/install', {
-      confirmation: 'INSTALL GROK-BUILD',
-    });
-    expect(response.status).toBe(503);
-    expect(response.body).toMatchObject({
-      code: 'HOST_NATIVE_RUNTIME_MUTATION_UNAVAILABLE',
-      retryable: false,
-    });
+  it('does not overwrite a CLI that is already present', async () => {
+    const response = await request(server, 'OWNER', '/agent-tools/claude-code/install', { confirmation: 'INSTALL CLAUDE-CODE' });
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('CLI_ALREADY_PRESENT');
     expect(startAgentJobMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['codex', 'claude-code'])('installs missing %s through a fixed, retained job', async (toolId) => {
+    getNativeHostCliStatusMock.mockResolvedValue({ installed: false, state: 'absent' });
+    const response = await request(server, 'SUB_ADMIN', `/agent-tools/${toolId}/install`, { confirmation: `INSTALL ${toolId.toUpperCase()}` });
+    expect(response.status).toBe(202);
+    expect(response.body).toMatchObject({ jobId: 'install-job-1', room: 'job:install-job-1' });
+    expect(startAgentJobMock).toHaveBeenCalledTimes(1);
+    expect(startAgentJobMock).toHaveBeenCalledWith(expect.objectContaining({
+      toolId: `_install:${toolId}`,
+      command: `/usr/bin/timeout --foreground --kill-after=30s 30m /usr/bin/python3 -I -B /opt/bridgesllm/portal/installer/install-missing-cli.py ${toolId}`,
+    }));
+  });
+
+  it('distinguishes unknown CLI state from absence', async () => {
+    getNativeHostCliStatusMock.mockResolvedValue({ installed: null, state: 'indeterminate' });
+    const response = await request(server, 'OWNER', '/agent-tools/codex/install', { confirmation: 'INSTALL CODEX' });
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('CLI_STATUS_UNAVAILABLE');
+    expect(startAgentJobMock).not.toHaveBeenCalled();
+  });
+
+  it('offers installation for missing CLIs without hiding existing sign-ins', async () => {
+    getNativeHostCliStatusMock.mockResolvedValue({ installed: false, state: 'absent' });
+    const response = await request(server, 'OWNER', '/agent-tools?refresh=1');
+    expect(response.status).toBe(200);
+    expect(response.body.tools.find((tool: any) => tool.id === 'claude-code').status.installAvailable).toBe(true);
   });
 
   it('retains the bounded AgentJob lane only for the unrelated FFmpeg adapter', async () => {

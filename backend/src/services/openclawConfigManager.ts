@@ -2198,6 +2198,15 @@ export function getProviderStatuses(options: ProviderStatusOptions = {}): Provid
         status = 'error';
         error = nativeAuth.message;
       }
+    } else if ((provider.id === 'anthropic' || provider.id === 'openai-codex')
+      && nativeAuth?.status === 'authenticated' && !regularProfileConfigured) {
+      const expectedRuntime = provider.id === 'anthropic' ? 'claude-cli' : 'codex';
+      const prefix = provider.id === 'anthropic' ? 'anthropic/' : 'openai/';
+      const registered = Object.entries<any>(configuredModelEntries || {}).some(([ref, entry]) =>
+        normalizePortalModelId(ref).startsWith(prefix) && entry?.agentRuntime?.id === expectedRuntime);
+      effectiveAuthType = 'cli';
+      status = registered ? 'configured' : 'unconfigured';
+      warning = registered ? null : 'Signed in. Choose models to finish connecting this subscription to OpenClaw.';
     } else if (regularProfileConfigured) {
       status = 'configured';
       effectiveProfileId = profileId;

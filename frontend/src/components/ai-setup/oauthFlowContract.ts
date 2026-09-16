@@ -196,6 +196,27 @@ export function readStructuredOAuthCancellationState(
   return { outcome: 'indeterminate', error, cleanupPending, credentialState };
 }
 
+/**
+ * The server builds the Claude authorization URL itself, so a Claude sign-in
+ * dialog only ever opens Anthropic's fixed authorization endpoint. Anything
+ * else is treated as an incomplete start response rather than lending
+ * Portal's trust to an unexpected destination.
+ */
+export function readClaudeAuthorizationUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value.trim());
+    // `origin` ignores userinfo, so reject it explicitly: a URL such as
+    // https://evil.example@claude.com/... still reaches claude.com but shows a
+    // confusing credential prompt in some browsers.
+    if (url.username || url.password) return null;
+    if (url.origin !== 'https://claude.com' || url.pathname !== '/cai/oauth/authorize') return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 export function isOAuthFlowExpired(state: StructuredOAuthFlowState, now = Date.now()): boolean {
   return state.status === 'expired' || Boolean(state.expiresAt && state.expiresAt <= now);
 }

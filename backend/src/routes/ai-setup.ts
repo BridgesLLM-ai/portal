@@ -1,3 +1,6 @@
+import { requireAdmin } from '../middleware/requireAdmin';
+import { ProviderActivationService } from '../services/providerActivation';
+import { ProviderSetupWizard } from '../services/providerSetupWizard';
 import express, { Request, Response, Router } from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -135,11 +138,10 @@ const saveSetupTokenSchema = z.object({
 const setFallbacksSchema = z.object({
   fallbacks: z.array(z.string().max(200).refine((value) => value.includes('/'), 'Fallback model must include provider prefix')).max(10),
 });
-const smokeProviderSchema = z.enum(['google-gemini-cli']);
 const oauthStartSchema = z.object({
-  provider: z.enum(['openai-codex', 'google-gemini-cli', 'qwen-portal', 'xai']),
-  googleProjectId: z.string().min(1).optional(),
-});
+  provider: z.enum(['openai-codex', 'google-gemini-cli', 'qwen-portal', 'xai', 'github-copilot']),
+  operationId: z.string().uuid(),
+}).strict();
 const oauthCallbackSchema = z.object({
   sessionId: z.string().min(1),
   callbackUrl: z.string().min(1, 'Callback URL is required').transform((value) => {
@@ -2677,24 +2679,54 @@ export function normalizeModelPayload(models: any[], providerHint?: string | nul
   }).filter(Boolean);
 }
 
-export function createAiSetupRouter(): Router {
+export function createAiSetupRouter(deps: { activation?: ProviderActivationService; wizard?: ProviderSetupWizard } = {}): Router {
   const router = express.Router();
+  const activation = deps.activation || new ProviderActivationService();
+  const wizard = deps.wizard || new ProviderSetupWizard();
+  const setupError = (res: Response, error: any) => res.status(error?.statusCode || 503).json({
+    success: false, code: error?.code || 'NATIVE_SETUP_UNAVAILABLE',
+    error: error?.code ? error.message : 'Native provider setup is unavailable. Refresh and retry.',
+  });
+  const respondCredentialSaved = async (res: Response, receipt: Record<string, unknown>, provider: string, setDefault: boolean | undefined, model: string) => {
+    let outcome: Record<string, unknown> | undefined;
+    if (setDefault && model) {
+      try { outcome = await activation.apply({ provider, primary: model }); }
+      catch (error: any) { outcome = { success: false, code: error?.code || 'MODEL_ACTIVATION_PENDING', model }; }
+    }
+    res.json({ ...receipt, warning: outcome?.success ? null : 'Credential saved. Choose a ready model to activate it.',
+      activationRequired: outcome?.success !== true, ...(outcome ? { activation: outcome } : {}) });
+  };
+  router.get('/oauth/providers', requireAdmin, async (_req, res) => {
+    try { res.setHeader('Cache-Control', 'private, no-store'); res.json(await wizard.catalog()); }
+    catch (error) { setupError(res, error); }
+  });
+  router.post('/oauth/answer', requireAdmin, async (req, res) => {
+    const parsed = z.object({ sessionId: z.string().uuid(), stepId: z.string().min(1).max(200),
+      value: z.union([z.string().max(10000), z.boolean(), z.number(), z.array(z.string().max(200)).max(100)]).optional(),
+    }).strict().safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: 'Invalid authorization answer' }); return; }
+    try { res.json(await wizard.answer(parsed.data.sessionId, getOAuthRequestOwnerId(req), parsed.data.stepId, parsed.data.value)); }
+    catch (error) { setupError(res, error); }
+  });
+  router.post('/register-models', requireAdmin, async (req, res) => {
+    const parsed = z.object({ provider: providerIdSchema, models: z.array(z.string().min(3).max(200)).min(1).max(100) }).strict().safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: 'Invalid provider model selection' }); return; }
+    try { res.json(await activation.apply(parsed.data)); } catch (error) { setupError(res, error); }
+  });
 
   router.get('/catalog', (_req: Request, res: Response) => {
     res.setHeader('Cache-Control', 'private, no-store');
     res.json({ providers: getPublicAiProviderCatalog(), source: 'backend' });
   });
 
-  router.post('/oauth/start', async (req: Request, res: Response) => {
+  router.post('/oauth/start', requireAdmin, async (req: Request, res: Response) => {
     const parsed = oauthStartSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues.map((i: any) => i.message).join("; ") || "Invalid request" });
       return;
     }
-    // Every provider in this route launches `openclaw models auth login` in a
-    // Portal-owned PTY. Credential entry remains available through the
-    // process-free save routes; interactive OpenClaw login awaits supervision.
-    rejectPortalOwnedOpenClawExecution('oauth-device', res);
+    try { res.json(await wizard.start(parsed.data.provider, parsed.data.operationId, getOAuthRequestOwnerId(req))); }
+    catch (error) { setupError(res, error); }
   });
 
   // Owner-initiated recovery from a stuck credential lifecycle. A failed
@@ -2758,8 +2790,11 @@ export function createAiSetupRouter(): Router {
     }
   });
 
-  router.post('/oauth/device/start', async (_req: Request, res: Response) => {
-    rejectPortalOwnedOpenClawExecution('oauth-device', res);
+  router.post('/oauth/device/start', requireAdmin, async (req: Request, res: Response) => {
+    const parsed = z.object({ provider: z.literal('github-copilot'), operationId: z.string().uuid() }).safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: 'Provider and operationId are required' }); return; }
+    try { res.json(await wizard.start(parsed.data.provider, parsed.data.operationId, getOAuthRequestOwnerId(req))); }
+    catch (error) { setupError(res, error); }
   });
 
   router.post('/oauth/callback', async (req: Request, res: Response) => {
@@ -2769,6 +2804,10 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
+    if (wizard.owns(parsed.data.sessionId)) {
+      res.status(400).json({ code: 'NATIVE_WIZARD_ANSWER_REQUIRED', error: 'Submit the current native step through /oauth/answer.' });
+      return;
+    }
     const ownerId = getOAuthRequestOwnerId(req);
     const retainedStatus = getOAuthFlowStatus(parsed.data.sessionId, ownerId);
     if (!retainedStatus) {
@@ -2785,6 +2824,11 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
+    if (wizard.owns(parsed.data.sessionId)) {
+      try { res.json(await wizard.cancel(parsed.data.sessionId, getOAuthRequestOwnerId(req))); }
+      catch (error) { setupError(res, error); }
+      return;
+    }
     const ownerId = getOAuthRequestOwnerId(req);
     const result = await cancelOAuthFlow(parsed.data.sessionId, ownerId);
     if (!result) {
@@ -2820,6 +2864,11 @@ export function createAiSetupRouter(): Router {
   });
 
   router.get('/oauth/status/:sessionId', async (req: Request, res: Response) => {
+    if (wizard.owns(req.params.sessionId)) {
+      try { res.setHeader('Cache-Control', 'private, no-store'); res.json(await wizard.status(req.params.sessionId, getOAuthRequestOwnerId(req))); }
+      catch (error) { setupError(res, error); }
+      return;
+    }
     const status = getOAuthFlowStatus(req.params.sessionId, getOAuthRequestOwnerId(req));
     if (!status) {
       res.status(404).json({ error: 'OAuth session not found' });
@@ -2922,25 +2971,10 @@ export function createAiSetupRouter(): Router {
     });
   });
 
-  router.post('/provider/:id/smoke', async (req: Request, res: Response) => {
-    const parsed = smokeProviderSchema.safeParse(req.params.id);
-    if (!parsed.success) {
-      res.status(400).json({ ok: false, error: 'Runtime smoke test is not available for this provider yet.' });
-      return;
-    }
-
-    if (parsed.data === 'google-gemini-cli') {
-      const error = new NativeBinaryRuntimeUnqualifiedError('GEMINI');
-      res.status(error.statusCode).json({
-        ok: false,
-        code: error.code,
-        error: error.message,
-        retryable: error.retryable,
-      });
-      return;
-    }
-
-    res.status(400).json({ ok: false, error: 'Runtime smoke test is not available for this provider yet.' });
+  router.post('/provider/:id/smoke', requireAdmin, async (req: Request, res: Response) => {
+    const parsed = providerIdSchema.safeParse(req.params.id);
+    if (!parsed.success) { res.status(400).json({ ok: false, error: 'Unknown provider' }); return; }
+    try { res.json(await activation.probe(parsed.data)); } catch (error) { setupError(res, error); }
   });
 
   router.post('/validate-key', async (req: Request, res: Response) => {
@@ -2974,10 +3008,6 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    if (parsed.data.setDefault === true) {
-      rejectPortalOwnedOpenClawExecution('configuration', res);
-      return;
-    }
 
     const { provider, apiKey, setDefault, model, operationId } = parsed.data;
     const normalizedModel = canonicalizeProviderModelId(provider, model || '');
@@ -2989,6 +3019,8 @@ export function createAiSetupRouter(): Router {
       success: true,
       profileId: savedProfileId,
       model: normalizedModel || null,
+      // This exact receipt field is retained for pre-upgrade operation replay.
+      // respondCredentialSaved projects the current UI message separately.
       warning: 'Credential saved. Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.',
     };
     const requestFingerprint = credentialWriteRequestFingerprint({
@@ -3062,7 +3094,7 @@ export function createAiSetupRouter(): Router {
         }
         releaseProviderCredentialLifecycle(writeClaim);
         writeClaim = null;
-        res.json(responsePayload);
+        await respondCredentialSaved(res, responsePayload, provider, setDefault, normalizedModel);
         return;
       }
 
@@ -3117,7 +3149,7 @@ export function createAiSetupRouter(): Router {
         credentialWriteResultFingerprint(responsePayload, finalProof.fingerprint),
       );
       writeClaim = null;
-      res.json(responsePayload);
+      await respondCredentialSaved(res, responsePayload, provider, setDefault, normalizedModel);
     } catch (error: any) {
       if (provider === 'xai' && !credentialSaved && error instanceof ProviderApiKeySaveError) {
         credentialSaved = error.credentialState === 'committed';
@@ -3214,10 +3246,6 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    if (parsed.data.setDefault === true) {
-      rejectPortalOwnedOpenClawExecution('configuration', res);
-      return;
-    }
 
     const { provider, token, setDefault, model, operationId } = parsed.data;
     const authProviderId = provider;
@@ -3229,6 +3257,8 @@ export function createAiSetupRouter(): Router {
       success: true,
       profileId: savedProfileId,
       model: normalizedModel || null,
+      // This exact receipt field is retained for pre-upgrade operation replay.
+      // respondCredentialSaved projects the current UI message separately.
       warning: 'Credential saved. Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.',
     };
     const requestFingerprint = credentialWriteRequestFingerprint({
@@ -3285,7 +3315,7 @@ export function createAiSetupRouter(): Router {
         }
         releaseProviderCredentialLifecycle(writeClaim);
         writeClaim = null;
-        res.json(responsePayload);
+        await respondCredentialSaved(res, responsePayload, provider, setDefault, normalizedModel);
         return;
       }
 
@@ -3332,7 +3362,7 @@ export function createAiSetupRouter(): Router {
         credentialWriteResultFingerprint(responsePayload, finalProof.fingerprint),
       );
       writeClaim = null;
-      res.json(responsePayload);
+      await respondCredentialSaved(res, responsePayload, provider, setDefault, normalizedModel);
     } catch (error: any) {
       const operationNotAdmitted = credentialOperationWasNotAdmitted(error, {
         claim: writeClaim,
@@ -3371,26 +3401,25 @@ export function createAiSetupRouter(): Router {
     }
   });
 
-  router.post('/set-default-model', async (req: Request, res: Response) => {
+  router.post('/set-default-model', requireAdmin, async (req: Request, res: Response) => {
     const parsed = setDefaultSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues.map((i: any) => i.message).join("; ") || "Invalid request" });
       return;
     }
 
-    // Primary model changes can retarget a future autonomous OpenClaw turn.
-    // Reject before config reads, operation-gate claims, CLI/RPC, or writes.
-    rejectPortalOwnedOpenClawExecution('configuration', res);
+    try { res.json(await activation.apply({ primary: parsed.data.model, provider: parsed.data.provider, profileId: parsed.data.profileId })); }
+    catch (error) { setupError(res, error); }
   });
 
-  router.post('/set-fallbacks', async (req: Request, res: Response) => {
+  router.post('/set-fallbacks', requireAdmin, async (req: Request, res: Response) => {
     const parsed = setFallbacksSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues.map((i: any) => i.message).join("; ") || "Invalid request" });
       return;
     }
 
-    rejectPortalOwnedOpenClawExecution('configuration', res);
+    try { res.json(await activation.apply(parsed.data)); } catch (error) { setupError(res, error); }
   });
 
   router.get('/models', async (req: Request, res: Response) => {
@@ -3398,11 +3427,6 @@ export function createAiSetupRouter(): Router {
     const exactNativeCatalog = req.query.exact === '1';
     const fallbackModels = getProviderDefaultModelPayload(providerFilter);
     const warnings: string[] = [];
-
-    if (providerFilter && DEFAULT_ONLY_MODEL_DISCOVERY_PROVIDERS.has(providerFilter)) {
-      res.json({ models: fallbackModels, source: 'defaults' });
-      return;
-    }
 
     if (providerFilter === 'google-antigravity' && isUnqualifiedNativeBinaryProvider('GEMINI')) {
       res.status(503).json({
@@ -3435,52 +3459,12 @@ export function createAiSetupRouter(): Router {
       return;
     }
 
-    // xAI transports pass registered model ids through, and the save path
-    // registers + live-probes whatever is chosen — so Portal-curated catalog
-    // models must stay selectable even when the gateway only has the models a
-    // previous setup already registered (e.g. Grok 4.5 next to grok-4.3).
-    const withCuratedXaiModels = (models: any[]): any[] => {
-      if (providerFilter !== 'xai') return models;
-      const seen = new Set(models.map((model) => String(model?.id || '').toLowerCase()).filter(Boolean));
-      return [
-        ...models,
-        ...fallbackModels.filter((model) => {
-          const id = String(model?.id || '').toLowerCase();
-          return id && !seen.has(id);
-        }),
-      ];
-    };
-
     try {
-      const rpcResult = await listGatewayModels();
-      if (rpcResult.ok) {
-        let models = normalizeModelPayload(rpcResult.models || [], providerFilter);
-        if (providerFilter) models = models.filter((model) => matchesProviderModel(providerFilter, model.id || model.name || ''));
-        models = withCuratedXaiModels(models);
-        res.json({ models: models.length ? models : fallbackModels, source: models.length ? 'gateway' : 'defaults' });
-        return;
-      }
-      if (rpcResult.error) warnings.push(`Gateway model catalog unavailable: ${rpcResult.error}`);
-    } catch (error: any) {
-      warnings.push(`Gateway model catalog unavailable: ${error?.message || String(error)}`);
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.json(await activation.discover(providerFilter || undefined, req.query.refresh === '1'));
+    } catch (error) {
+      setupError(res, error);
     }
-
-    try {
-      const cliModels = JSON.parse(runOpenClaw(['models', 'list', '--json'], 20000));
-      let models = normalizeModelPayload(Array.isArray(cliModels) ? cliModels : cliModels.models || [], providerFilter);
-      if (providerFilter) models = models.filter((model) => matchesProviderModel(providerFilter, model.id || model.name || ''));
-      models = withCuratedXaiModels(models);
-      res.json({ models: models.length ? models : fallbackModels, source: models.length ? 'cli' : 'defaults', warnings });
-      return;
-    } catch (error: any) {
-      warnings.push(`OpenClaw model list unavailable: ${error?.message || 'Failed to list models'}`);
-    }
-
-    // Setup must be able to proceed before OpenClaw is fully configured. Model
-    // discovery is a convenience, not a wizard-blocking prerequisite; the UI can
-    // render static provider defaults and let the save path register models after
-    // auth completes.
-    res.json({ models: fallbackModels, source: 'defaults', warnings });
   });
 
   router.delete('/provider/:id', async (req: Request, res: Response) => {

@@ -1614,7 +1614,9 @@ function AgentsTab({ addToast, onOpenProviders, claimMutation, releaseMutation }
                     ? 'opencode'
                     : null;
                 const managedProjectOnlyHarness = entry.harnessId === 'CODEX' || entry.harnessId === 'CLAUDE_CODE';
-                const authenticationLabel = managedProjectOnlyHarness
+                const authenticationLabel = entry.harnessId === 'CLAUDE_CODE'
+                  ? 'Claude account sign-in (Model Providers); shared with OpenClaw Claude CLI on this server'
+                  : managedProjectOnlyHarness
                   ? 'Project Sandbox credential; host login unavailable'
                   : entry.auth?.owner === 'harness-local-login'
                   ? entry.nativeAuthLoginCommand

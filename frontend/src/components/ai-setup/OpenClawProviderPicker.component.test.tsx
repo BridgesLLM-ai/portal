@@ -1,10 +1,33 @@
 // @vitest-environment jsdom
 import '../../test/setup';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import OpenClawProviderPicker from './OpenClawProviderPicker';
 import type { ProviderUIConfig } from './providerConfig';
 import type { ProviderStatus } from './ProviderCard';
+import { buildProviderCoverageMap } from './providerCoverage';
+import type { OAuthProviderSupport } from './openclawAuthWizardContract';
+
+const codexProvider: ProviderUIConfig = {
+  id: 'openai-codex',
+  name: 'OpenAI Codex (ChatGPT Subscription)',
+  icon: 'code-2',
+  tier: 1,
+  primaryAuthType: 'oauth',
+  guidedSetup: {
+    status: 'manual',
+    reason: 'Codex subscription sign-in is unavailable from Portal in this release.',
+    action: { url: 'https://developers.openai.com/codex/auth', label: 'Review Codex authentication documentation' },
+  },
+  authOptions: [],
+  consoleUrl: 'https://chatgpt.com/',
+  signupUrl: 'https://chatgpt.com/',
+  pricingNote: 'ChatGPT subscription.',
+  freeTier: null,
+  description: 'ChatGPT subscription through OpenClaw.',
+  setupInstructions: [],
+  defaultModels: [],
+};
 
 const providers: ProviderUIConfig[] = [
   {
@@ -184,5 +207,66 @@ describe('OpenClawProviderPicker provider boundaries', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }));
     expect(onRemove).toHaveBeenCalledWith(providers[4]);
     expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('lists every subscription provider under Subscription / Sign-in, including ones this server cannot sign in, with the reason visible', () => {
+    const onSelect = vi.fn();
+    const statusMap = new Map<string, ProviderStatus>([
+      ['openai-codex', { ...providerStatus('openai-codex', false), status: 'unconfigured', authType: null, profileId: null, nativeProvider: 'CODEX', nativeCliAuthStatus: 'needs_login' }],
+    ]);
+    render(
+      <OpenClawProviderPicker
+        providers={[...providers, codexProvider]}
+        statusMap={statusMap}
+        coverageMap={buildProviderCoverageMap([...providers, codexProvider], statusMap)}
+        onSelect={onSelect}
+        onRemove={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const subscription = screen.getByTestId('provider-group-subscription');
+    const codexRow = within(subscription).getByTestId('provider-row-openai-codex');
+    const codexButton = within(codexRow).getByRole('button', { name: /OpenAI Codex/i });
+    expect(codexButton).toBeDisabled();
+    expect(within(codexRow).getByText(/Codex subscription sign-in is unavailable from Portal in this release/)).toBeInTheDocument();
+    expect(within(codexRow).getByRole('link', { name: /Review Codex authentication documentation/i }))
+      .toHaveAttribute('href', 'https://developers.openai.com/codex/auth');
+    const coverage = within(codexRow).getByTestId('provider-coverage-openai-codex');
+    expect(within(coverage).getByText('Not signed in')).toBeInTheDocument();
+    expect(within(coverage).getByText('Not registered')).toBeInTheDocument();
+    expect(within(coverage).getByText('Needs login')).toBeInTheDocument();
+    expect(screen.queryByTestId('provider-group-advanced')).not.toContainElement(codexRow);
+
+    fireEvent.click(codexButton);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('lets server-reported OAuth support override the static catalog in both directions', () => {
+    const onSelect = vi.fn();
+    const oauthSupport = new Map<string, OAuthProviderSupport>([
+      ['openai-codex', { id: 'openai-codex', supported: true, transport: 'native-wizard', authChoice: null, mode: null, code: null, methods: ['oauth'], reason: null, documentationUrl: null }],
+      ['google-gemini-cli', { id: 'google-gemini-cli', supported: false, transport: null, authChoice: null, mode: null, code: null, methods: [], reason: 'Gemini CLI is not installed on this server.', documentationUrl: 'https://docs.openclaw.ai/providers/google' }],
+    ]);
+    render(
+      <OpenClawProviderPicker
+        providers={[...providers, codexProvider]}
+        statusMap={new Map()}
+        oauthSupport={oauthSupport}
+        onSelect={onSelect}
+        onRemove={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const subscription = screen.getByTestId('provider-group-subscription');
+    fireEvent.click(within(subscription).getByRole('button', { name: /OpenAI Codex/i }));
+    expect(onSelect).toHaveBeenCalledWith(codexProvider);
+
+    const gemini = within(subscription).getByRole('button', { name: /Google Gemini CLI \(OpenClaw\)/i });
+    expect(gemini).toBeDisabled();
+    expect(within(subscription).getByText('Gemini CLI is not installed on this server.')).toBeInTheDocument();
+    expect(within(subscription).getByRole('link', { name: /Open provider documentation/i }))
+      .toHaveAttribute('href', 'https://docs.openclaw.ai/providers/google');
   });
 });

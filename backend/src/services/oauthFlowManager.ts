@@ -815,10 +815,13 @@ function nativeCliIsInstalled(command: string): boolean {
  * on. A missing CLI is by far the most common cause and used to surface as an
  * opaque attestation error with no hint that anything needed installing.
  */
-function describeNativeCredentialAttestationFailure(provider: NativeCredentialProvider): string {
-  if (provider === 'CODEX' || provider === 'CLAUDE_CODE') {
+export function describeNativeCredentialAttestationFailure(provider: NativeCredentialProvider): string {
+  if (provider === 'CODEX') {
     return 'HOST_CREDENTIAL_FLOW_UNAVAILABLE: Interactive host login and ad hoc CLI probing require a bounded credential-process boundary. Portal Agent Chat can use an existing admitted credential; Project Sandbox credentials remain separate.';
   }
+  // CLAUDE_CODE signs in through the process-free browser flow, which needs no
+  // host CLI process. An indeterminate snapshot there is a credential-file
+  // attestation problem, so fall through to the path-based explanation.
   const cli = NATIVE_PROVIDER_CLI[provider];
   if (cli && !nativeCliIsInstalled(cli.command)) {
     return `${cli.label} is not installed on this server, so its sign-in cannot run. Install it from Setup → AI tools (or run \`${cli.command}\` on the server), then connect this provider again.`;
@@ -3336,8 +3339,32 @@ function persistNativeClaudeCredentials(data: Record<string, any>): void {
     subscriptionType: existing.claudeAiOauth?.subscriptionType ?? null,
     rateLimitTier: existing.claudeAiOauth?.rateLimitTier ?? null,
   };
-  fs.mkdirSync(path.dirname(credentialsPath), { recursive: true });
-  fs.writeFileSync(credentialsPath, JSON.stringify(existing, null, 2));
+  // This is the primary Claude login write for OpenClaw's Claude CLI runtime.
+  // Claude Code creates this file 0600; a fresh install must not leave OAuth
+  // tokens world-readable under the process umask. `mode` only applies when
+  // the file is created, so write a private temporary file and rename it over
+  // the destination: an existing looser file is never rewritten in place, and
+  // a crash mid-write cannot leave an empty or partial credential file.
+  fs.mkdirSync(path.dirname(credentialsPath), { recursive: true, mode: 0o700 });
+  const temporaryPath = `${credentialsPath}.${process.pid}.${Date.now()}.tmp`;
+  const descriptor = fs.openSync(temporaryPath, 'wx', 0o600);
+  let descriptorOpen = true;
+  try {
+    fs.fchmodSync(descriptor, 0o600);
+    fs.writeFileSync(descriptor, JSON.stringify(existing, null, 2));
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptorOpen = false;
+    fs.renameSync(temporaryPath, credentialsPath);
+  } catch (error) {
+    // Never leave a token-bearing temp file behind on any failure (write,
+    // fsync, or rename). The existing credential file is untouched.
+    if (descriptorOpen) {
+      try { fs.closeSync(descriptor); } catch { /* already closed */ }
+    }
+    fs.rmSync(temporaryPath, { force: true });
+    throw error;
+  }
 }
 
 /**
@@ -3987,7 +4014,9 @@ async function runNativeCliCallbackCompletion(
       (dependencies.persistClaudeCredentials || persistNativeClaudeCredentials)(data);
       invalidateNativeCliAuthStatus('CLAUDE_CODE');
       invalidateNativeProviderReadiness('CLAUDE_CODE');
-      console.log('[NativeCLI] Claude OAuth tokens written to credentials file');
+      // Audit line: the server-wide Claude login changed; name the Portal
+      // actor (owner id only, never token material).
+      console.log(`[NativeCLI] Claude OAuth tokens written to credentials file by ${session.ownerId || 'setup:pending'}`);
     } catch (err: any) {
       if (isTerminalOAuthStop(session)) {
         return { success: false, error: `Native CLI session is ${session.status}. No credential was saved.` };

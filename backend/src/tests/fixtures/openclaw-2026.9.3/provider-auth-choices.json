@@ -1,0 +1,73 @@
+{
+  "openai": {
+    "sha256": "3587126e05f1ebf7640518fb59cf90d5fd76dd7ae735ce22616140b634d5e753",
+    "choices": [
+      {
+        "provider": "openai",
+        "method": "oauth",
+        "choiceId": "openai",
+        "appGuidedAuth": "oauth"
+      },
+      {
+        "provider": "openai",
+        "method": "device-code",
+        "choiceId": "openai-device-code",
+        "appGuidedAuth": "device-code"
+      },
+      {
+        "provider": "openai",
+        "method": "api-key",
+        "choiceId": "openai-api-key"
+      }
+    ]
+  },
+  "xai": {
+    "sha256": "7b05daf4cfe305725b2527034207d45deddf489c1bffac725588563b7848490c",
+    "choices": [
+      {
+        "provider": "xai",
+        "method": "api-key",
+        "choiceId": "xai-api-key"
+      },
+      {
+        "provider": "xai",
+        "method": "oauth",
+        "choiceId": "xai-oauth",
+        "appGuidedAuth": "device-code"
+      },
+      {
+        "provider": "xai",
+        "method": "device-code",
+        "choiceId": "xai-device-code",
+        "appGuidedAuth": "device-code"
+      }
+    ]
+  },
+  "google": {
+    "sha256": "aa9dea23ee9097d301bfa35ba60bdeee04d09cde34ab36d1725c74781bc87eee",
+    "choices": [
+      {
+        "provider": "google",
+        "method": "api-key",
+        "choiceId": "gemini-api-key"
+      }
+    ]
+  },
+  "github-copilot": {
+    "sha256": "67789c82c8e8ed0e43bce996e852ddb7573ebb4a2a6af1bb9f3ea8fc8bd377ee",
+    "choices": [
+      {
+        "provider": "github-copilot",
+        "method": "device",
+        "choiceId": "github-copilot",
+        "appGuidedAuth": "device-code"
+      },
+      {
+        "provider": "github-copilot",
+        "method": "device-enterprise",
+        "choiceId": "github-copilot-enterprise",
+        "appGuidedAuth": "device-code"
+      }
+    ]
+  }
+}

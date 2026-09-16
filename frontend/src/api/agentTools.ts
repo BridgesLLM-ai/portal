@@ -60,9 +60,14 @@ export const agentToolsAPI = {
     const timeout = Number.isFinite(options?.timeoutMs) && Number(options?.timeoutMs) > 0
       ? Math.max(1, Math.floor(Number(options?.timeoutMs)))
       : undefined;
-    const { data } = timeout
-      ? await client.post(`/agent-tools/${toolId}/install`, { confirmation }, { timeout })
-      : await client.post(`/agent-tools/${toolId}/install`, { confirmation });
+    // An install request is never replayed by the transport layer. A lost
+    // response is reported to the caller, which checks the retained job
+    // inventory instead of submitting a second host mutation.
+    const { data } = await client.post(
+      `/agent-tools/${toolId}/install`,
+      { confirmation },
+      { _skipNetworkRetry: true, ...(timeout ? { timeout } : {}) } as any,
+    );
     return data;
   },
 };

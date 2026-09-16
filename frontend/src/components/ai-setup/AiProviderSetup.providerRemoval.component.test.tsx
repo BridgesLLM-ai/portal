@@ -85,7 +85,8 @@ describe('AiProviderSetup provider removal', () => {
       .mockResolvedValueOnce({ data: { success: true, disconnected: true } });
 
     render(<AiProviderSetup mode="settings" apiBase="/ai-setup" />);
-    fireEvent.click(await screen.findByRole('button', { name: /OpenClaw/i }));
+    // The Claude Code card also mentions OpenClaw, so anchor on the card title.
+    fireEvent.click(await screen.findByRole('button', { name: /^OpenClaw\b/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }));
 
     expect(screen.getByRole('heading', { name: 'Disconnect OpenRouter' })).toBeInTheDocument();
@@ -129,7 +130,7 @@ describe('AiProviderSetup provider removal', () => {
       .mockResolvedValueOnce({ data: { success: true, disconnected: true } });
 
     render(<AiProviderSetup mode="settings" apiBase="/ai-setup" />);
-    fireEvent.click(await screen.findByRole('button', { name: /OpenClaw/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /^OpenClaw\b/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }));
     fireEvent.change(screen.getByLabelText('Provider id'), { target: { value: 'openrouter' } });
     fireEvent.click(screen.getByRole('button', { name: 'Disconnect provider' }));

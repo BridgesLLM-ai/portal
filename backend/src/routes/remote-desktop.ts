@@ -1,3 +1,4 @@
+import { noninteractiveHostPackageCommand } from '../config/hostPackagePolicy';
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
@@ -1719,7 +1720,7 @@ export async function runRemoteDesktopAutoSetup(): Promise<{
     const missingPkgs = missingCheck.stdout.trim();
     if (missingPkgs.length > 0) {
       const install = await runShell(
-        `DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${requiredPkgs.join(' ')}`,
+        noninteractiveHostPackageCommand(`DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${requiredPkgs.join(' ')}`),
         600000, // 10 minutes — xfce4 + firefox can take 3-5 min on fresh servers
       );
       steps.push({ step: 'Install RD packages', ok: install.ok, message: install.ok ? 'Packages installed' : install.stderr.slice(0, 300) });
@@ -1741,7 +1742,7 @@ export async function runRemoteDesktopAutoSetup(): Promise<{
     const chromeCheck = await runShell('dpkg -s google-chrome-stable 2>/dev/null | grep "Status: install ok installed"', 3000);
     if (!chromeCheck.ok) {
       const chromeInstall = await runShell(
-        `wget -q -O /tmp/google-chrome.deb "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" && DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/google-chrome.deb && rm -f /tmp/google-chrome.deb`,
+        noninteractiveHostPackageCommand(`wget -q -O /tmp/google-chrome.deb "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" && DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/google-chrome.deb && rm -f /tmp/google-chrome.deb`),
         120000,
       );
       steps.push({ step: 'Install Google Chrome', ok: chromeInstall.ok, message: chromeInstall.ok ? 'Chrome installed' : `Chrome install failed (non-fatal): ${chromeInstall.stderr.slice(0, 200)}` });
@@ -1754,7 +1755,7 @@ export async function runRemoteDesktopAutoSetup(): Promise<{
     const themeCount = parseInt(themeCheck.stdout, 10) || 0;
     if (themeCount < 2) {
       const themeInstall = await runShell(
-        'DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends greybird-gtk-theme elementary-xfce-icon-theme numix-gtk-theme gnome-themes-extra',
+        noninteractiveHostPackageCommand('DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends greybird-gtk-theme elementary-xfce-icon-theme numix-gtk-theme gnome-themes-extra'),
         120000,
       );
       steps.push({ step: 'Install desktop themes', ok: themeInstall.ok, message: themeInstall.ok ? 'Themes installed' : `Theme install failed (non-fatal): ${themeInstall.stderr.slice(0, 200)}` });

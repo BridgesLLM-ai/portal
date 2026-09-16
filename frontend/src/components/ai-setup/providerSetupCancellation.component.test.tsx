@@ -282,14 +282,15 @@ describe('provider setup active-session cancellation', () => {
     );
   });
 
-  it('keeps Claude setup credential-only and closes without creating cancellation authority', async () => {
+  it('keeps Claude setup process-free and closes without creating cancellation authority', async () => {
     const user = userEvent.setup();
     const onCancel = vi.fn();
 
     render(<SetupTokenFlow provider={anthropicProvider} apiBase="/ai-setup" onComplete={vi.fn()} onCancel={onCancel} />);
 
-    expect(screen.getByText(/accepts an existing Claude setup-token/i)).toBeInTheDocument();
-    expect(screen.getByText(/never starts a Claude host process/i)).toBeInTheDocument();
+    expect(screen.getByText(/never launches Claude Code on the host/i)).toBeInTheDocument();
+    expect(screen.getByText(/Your existing default stays unchanged until you choose/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Sign in with your Claude account' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Connect Claude' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Close Claude setup' }));
 
@@ -836,7 +837,7 @@ describe('provider setup active-session cancellation', () => {
     save.resolve({ data: { success: true } });
     await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
     expect(await screen.findByText(/Claude credential saved/i)).toBeInTheDocument();
-    expect(screen.getByText(/Host model routing activation is unavailable in this release until a separately supported maintenance operation ships/i)).toBeInTheDocument();
+    expect(screen.getByText(/OpenClaw's default model is unchanged\. Close this dialog to verify the login with OpenClaw and choose a model/i)).toBeInTheDocument();
   });
 
   it('bounds an unresolved Antigravity catalog verification', async () => {

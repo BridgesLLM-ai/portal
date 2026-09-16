@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import datetime
 import errno
@@ -13,6 +14,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
+import subprocess
 import signal
 import stat
 import tarfile
@@ -20,6 +23,17 @@ import tempfile
 
 
 SCHEMA = "bridgesllm-openclaw-2026.9.1-migration-transaction-v2"
+RETAINED_CHAT_SCHEMA = "bridgesllm-openclaw-retained-chat-v1"
+RETAINED_CHAT_TARGETS = {'2026.9.2': {'chat-IsrqkYID.js': ('b0387dcd7a41f60618f336cebbf9f01c21ac4cef83cda08e69fdc3bf9abc2e0a',
+                                   '20c7b18e6d903972735e9ffb6b62930ea0eaaded9a9aef01277dd02ad07a8644'),
+              'session-history-tail-BuFrV1Wb.js': ('6d8d0cbb5552f67b1c533cc6d847d44c3e67c7c0cd46c2a8d9b0e59e5825f5fd',
+                                                   '2627a3715460f960df50bdcd33fe8aeead991cc7b3898af9bca93e4fd897ca8d'),
+              'session-transcript-readers-CYDRQsH5.js': ('6435d6948bafc69c5153f3ff39b51c3960696e3c2bbb494f84b4db60e4b70e07',
+                                                         'afe7a440b2da76aa3cf1d0f42d957f90507f8c98dd5952f26e9e9f9e61dfab7d')},
+ '2026.9.3': {'session-history-tail-DUGCG5bk.mjs': ('3e400a2e140d3ba4cb8e74ef91aef7807280e13428a51b8c0581a2fb9445fa8c',
+                                                    'dbb27a3a6f9349a201df3db9d78983b559dbaba63d33045e3a228bb97ee6bf15'),
+              'session-transcript-readers-DZrB96ki.mjs': ('f25537601756508d41bb612daf362b6750778f8319e2034a99cdd5846c40862b',
+                                                          '80254a0fc5027f4e073767b6c910279652a4eaf5aff5eba64e9d121700c844ba')}}
 DECISION_SCHEMA = "bridgesllm-openclaw-tested-pair-commit-v5"
 # Size contract for migration.json. The producer embeds every managed
 # authority entry, so the document grows with state cardinality: 23,323
@@ -329,7 +343,10 @@ def attest_gateway_fence_marker(path_value: str) -> None:
 
 def atomic_json(target: Path, value) -> None:
     safe_directory(target.parent, exact_mode=0o700)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    stage = None
+    if isinstance(value, dict) and value.get("schema") == RETAINED_CHAT_SCHEMA:
+        stage = Path(tempfile.mkdtemp(prefix=".retained-chat-journal-", dir=target.parent.parent))
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=stage or target.parent)
     temporary = Path(temporary_name)
     try:
         os.fchown(descriptor, 0, 0)
@@ -348,6 +365,9 @@ def atomic_json(target: Path, value) -> None:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+        if stage is not None:
+            stage.rmdir()
+            fsync_directory(stage.parent)
 
 
 def durable_copy(source: Path, target: Path, *, maximum: int = 16 * 1024 * 1024) -> None:
@@ -847,12 +867,13 @@ def load_ledger(ledger: Path):
         fail("transaction ledger path must be canonical and absolute")
     safe_directory(ledger.parent, exact_mode=0o700)
     value = read_json(ledger)
-    if not isinstance(value, dict) or set(value) != {
+    retained = isinstance(value, dict) and value.get("schema") == RETAINED_CHAT_SCHEMA
+    if not isinstance(value, dict) or set(value) != ({
         "schema", "generation", "phase", "paths", "prepared", "core", "codex", "commit",
         "createdBootId", "recoveryFrom",
-    }:
+    } | ({"retainedChat"} if retained else set())):
         fail("transaction ledger shape mismatch")
-    if value.get("schema") != SCHEMA or not GENERATION.fullmatch(str(value.get("generation", ""))):
+    if value.get("schema") not in {SCHEMA, RETAINED_CHAT_SCHEMA} or not GENERATION.fullmatch(str(value.get("generation", ""))):
         fail("transaction ledger identity mismatch")
     if not BOOT_ID.fullmatch(str(value.get("createdBootId", ""))):
         fail("transaction creation boot identity mismatch")
@@ -1172,6 +1193,8 @@ def load_ledger(ledger: Path):
         safe_file(unit_path, mode=0o644, maximum=64 * 1024)
         if sha256_file(unit_path) != provision_sha256:
             fail("provisioned gateway unit drift")
+    if retained:
+        validate_retained_chat(value, ledger)
     return value
 
 
@@ -1341,13 +1364,16 @@ def create(args) -> None:
     safe_directory(root.parent)
     if os.path.lexists(root):
         fail("a migration transaction already exists")
-    os.mkdir(root, 0o700)
-    os.chown(root, 0, 0)
+    retained = args.retained_chat_package is not None
+    storage = Path(tempfile.mkdtemp(prefix=".retained-chat-prepare-", dir=root.parent)) if retained else root
+    if not retained:
+        os.mkdir(storage, 0o700)
+    os.chown(storage, 0, 0)
     fsync_directory(root.parent)
     try:
-        migration_helper = root / "migrate-openclaw-2026.9.1.mjs"
-        transaction_helper = root / "openclaw-migration-transaction.py"
-        stable_plugins_helper = root / "openclaw-stable-plugins.sh"
+        migration_helper = storage / "migrate-openclaw-2026.9.1.mjs"
+        transaction_helper = storage / "openclaw-migration-transaction.py"
+        stable_plugins_helper = storage / "openclaw-stable-plugins.sh"
         durable_copy(Path(args.migration_helper_source), migration_helper)
         durable_copy(Path(args.transaction_helper_source), transaction_helper)
         durable_copy(Path(args.stable_plugins_helper_source), stable_plugins_helper)
@@ -1436,12 +1462,20 @@ def create(args) -> None:
             "createdBootId": boot_id,
             "recoveryFrom": None,
         }
-        atomic_json(ledger, value)
+        if retained:
+            if not package_preexisted or not gateway_unit_preexisted:
+                fail("retained Chat requires an installed core and gateway unit")
+            value["schema"] = RETAINED_CHAT_SCHEMA
+            value["retainedChat"] = prepare_retained_chat(args, ledger)
+        atomic_json(storage / "transaction.json", value)
+        if retained:
+            os.rename(storage, root)
+            fsync_directory(root.parent)
         print(f"{value['generation']}\t{value['phase']}")
     except BaseException:
         # No live authority has been touched before create returns. Cleanup of
         # a failed root publication is therefore safe and leaves no false owner.
-        shutil.rmtree(root)
+        shutil.rmtree(storage)
         fsync_directory(root.parent)
         raise
 
@@ -1637,6 +1671,12 @@ def arm_core_gateway_action(args) -> None:
     if value["phase"] in {"restored-cleanup", "committed-cleanup"} \
             and args.action == "stop":
         fail("terminal migration state cannot arm another gateway stop")
+    if value["schema"] == RETAINED_CHAT_SCHEMA and args.action == "start":
+        allowed = ({"upgrade-restored", "restored-cleanup"} if args.purpose == "baseline-restore"
+                   else {"migration-prepared", "commit-pending", "commit-applying", "committed-cleanup"})
+        if value["phase"] not in allowed:
+            fail("retained Chat cannot start before exact byte preparation/restoration")
+        verify_retained_targets(value, committed=args.purpose == "forward")
     if core["gatewayPendingAction"] is not None:
         fail("a core gateway action is already pending")
     if args.purpose not in GATEWAY_OWNED_ACTION_PURPOSES:
@@ -1715,6 +1755,9 @@ def record_core_gateway_result(args) -> None:
         rescue["stoppedAt"] = utc_now()
     core["gatewayCurrentUnitIdentity"] = identity
     core["gatewayCurrentUnitIdentitySha256"] = canonical_json_sha256(identity)
+    if value.get('retainedChat',{}).get('execution',{}).get('kind')==NODE_INDEX_KIND:
+        node_index_process(value)
+        if pending['action']=='start':verify_retained_targets(value,committed=pending['purpose']=='forward')
     core["gatewayPendingAction"] = None
     atomic_json(ledger, value)
     print(json.dumps(identity, sort_keys=True, separators=(",", ":")))
@@ -2947,6 +2990,7 @@ def gateway_status(args) -> None:
 
 
 def validate_gateway_terminal_activation(value, *, committed: bool) -> None:
+    node_index_process(value)
     core = value["core"]
     if core["gatewayPendingAction"] is not None \
             or core["gatewayProvisionPending"] is not None:
@@ -3689,6 +3733,10 @@ def cleanup(args) -> None:
         if value["phase"] == "restored-cleanup"
         else {"forward-attested"}
     )
+    retained = value["schema"] == RETAINED_CHAT_SCHEMA
+    if retained:
+        required_codex_phase = {"unarmed"}
+        verify_retained_targets(value, committed=value["phase"] == "committed-cleanup")
     if value["codex"]["phase"] not in required_codex_phase:
         fail("Codex journal is not at the matching terminal boundary")
     root = ledger.parent
@@ -3701,7 +3749,7 @@ def cleanup(args) -> None:
             or Path(str(migration.get("manifestPath", ""))).resolve() != migration_manifest
         ):
             fail("migration manifest is not at the matching terminal state")
-    elif value["phase"] != "restored-cleanup" or value["prepared"]["migrationSha256"] is not None:
+    elif not retained and (value["phase"] != "restored-cleanup" or value["prepared"]["migrationSha256"] is not None):
         fail("migration manifest is missing at terminal cleanup")
     retain_runtime_bookkeeping(root, migration_manifest)
     retain_rescue_record(root, value, ledger)
@@ -3806,9 +3854,1169 @@ def sweep_terminal(args) -> None:
     retire_tombstone(root, tombstone, intent, document)
 
 
+# Retained-core Chat is a distinct generation of THIS owner. No old migration,
+# Codex, bridge, or tested-pair authority is manufactured or amended.
+RETAINED_PORTAL_FIELDS = set(
+    'schema operation_contract transaction_id generation phase recovery_from_phase created_at updated_at '
+    'transaction_dir backup_dir stage_dir previous_version target_version release_artifact_sha256 '
+    'release_manifest_sha256 database_system_identifier database_topology_sha256 previous_main_pid '
+    'baseline_boot_id previous_main_start_time portal_was_active portal_was_enabled '
+    'deploy_stamp_preexisted caddy_snapshot_required node_modules_preexisted repair_reinstall '
+    'openclaw_package_preexisted openclaw_package_version openclaw_runtime_version '
+    'openclaw_state_preexisted openclaw_gateway_was_active openclaw_gateway_was_enabled '
+    'openclaw_codex_plugin_preexisted openclaw_codex_plugin_version integrity_sha256 '
+.split())
+RETAINED_PORTAL_MUTABLE = {'generation', 'phase', 'updated_at', 'recovery_from_phase', 'integrity_sha256'}
+RETAINED_PHASES = {'created', 'migration-prepared', 'commit-pending', 'commit-applying',
+                   'recovery-pending', 'upgrade-restored', 'restored-cleanup', 'committed-cleanup'}
+
+
+def retained_read(path, mode=0o644):
+    for parent in [*reversed(path.parent.parents), path.parent]:
+        # Same isolated-fixture /tmp exception as the Chat source qualifier.
+        if parent == Path('/tmp') and parent.lstat().st_mode & stat.S_ISVTX:
+            continue
+        safe_directory(parent)
+    safe_file(path, mode=mode, maximum=2_000_000)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            data = stream.read(2_000_001)
+        after, named = os.fstat(fd), path.lstat()
+        fields = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid,
+                            s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        if fields(before) != fields(after) or fields(after) != fields(named) or len(data) != before.st_size:
+            fail('retained Chat source changed during read')
+        return data
+    finally:
+        os.close(fd)
+
+
+# Execution qualification is read-only and independent of the mutable Chat
+# targets. Never use a version string (or a root named by npm alone) as source
+# authority. Exact reviewed launcher/dispatch pins are embedded in the sealed
+# helper; changing this table does not reinterpret any predecessor ledger.
+RETAINED_EXECUTION_PINS = {
+    "2026.9.2": {
+        "dist/chat-BbagnMEy.js": "c74caccd80c39788619b8c7003fd6abdd1bcf3de536090fcfd5319ef2fdcf778",
+        "dist/cli/run-main.js": "f75518324036fb8dcc7bee3d039d94857bff30160bc2d0422d07f0a2b3fe37b2",
+        "dist/container-target-yd6OnwF_.js": "bcef065a63cbe03030b0471553b4c9ecf3a7ff074dbb47587bb507d6487ec430",
+        "dist/entry.esm-resolve-fast-path-jqbSGeOV.js": "37ab850fcd3939ffe89fb423fb22a5f1d6e3462fcb3f6d4a2afc390db8df085f",
+        "dist/entry.js": "bad8433cca24a0fe91ed1f7c7097995daa4ad33427d78171d76d5c0f67d04247",
+        "dist/entry.version-fast-path-BBTOuUbi.js": "a41dab629535b3a2adcfd087639ff9b73f3d8c57aee6412bc9a636e6c8ae637a",
+        "dist/is-main-CH4EEB_R.js": "6d3efa89e4a9271bd931b911fde0e2129c499594508b55526d4654bcbfe11428",
+        "dist/run-Bv5QIhyZ.js": "361f36c7bcfe161e1c9ca26c9b1ed1728822a62198f9349bf51afaff63328ff0",
+        "dist/run-command-CnJq_lHv.js": "01017f787f477b170552c847191d8ce51abbd95cac1e4ae2c17c2e691a1c02aa",
+        "dist/run-command-DmbUEIkF.js": "f4fe871510e7f0544a6be0889cf0793285c261520569bc127e1bdc94807ee5bb",
+        "dist/server-Dh8qT1MR.js": "1fce5f5137de1c99ee55d98fcaa029f0af882ee0d5e2b9c0f0bf0004970c1cbe",
+        "dist/server-methods-CRX3McIT.js": "cc09f1b52e6bef80bddff1e4a68e47845faedc692b5dcd709a9dc665b213f0eb",
+        "dist/server-methods-D5bRlIc3.js": "48284fb1fab8cd8989f7d73508f4089957cd5ed0169bcf2050be3319d5e9610b",
+        "dist/server-start-yuOHTviK.js": "50e6605ad5a9bbd866be923486c936d9e5b6a228ade7a166f47b877f87fcbbb5",
+        "dist/sessions-history-http-CE816_yS.js": "5e8df9f3c8e4616dff5a3f0aa125f279d82cc63bc52fd625b238fd09621cc717",
+        "dist/startup-trace-C2SBInNS.js": "ee824dd5438900a2141b3fee1f1e1d76ac975f5f5254e00d0cc191dd4900584e"
+    },
+    "2026.9.3": {
+        "dist/chat-Bbxpq75_.mjs": "cd1832c6bde1f3f5a789397c4dc4f5bddc8f4aca90c2ed0fc3d2172a46888074",
+        "dist/cli/run-main.js": "c49db9bffea98416fd31dcb90e2bbbe6d1182d048cecd25baff2f1fc61c3387d",
+        "dist/container-target-CCIzeaXI.mjs": "9e6e1cedf72c7c0b812eb1d0cc06a65dab86de79456f229aca5690d20de2e68a",
+        "dist/entry.esm-resolve-fast-path-gJ7_FrDl.mjs": "0c40454f83d9e901fab97adc3dd9e08ab5bbb0530645fc95e00e106a232b47e7",
+        "dist/entry.js": "7f1e1db8c7d145053bf81715c5985ad7b3a973500aac38963c1dc08b7d1aca73",
+        "dist/entry.respawn-CCqfKaWP.mjs": "8f8e6134132a219856e05ada4508f2908b3dc3c9959c596b1546cdd74b841823",
+        "dist/entry.version-fast-path-BRuquK86.mjs": "4b8f5a369776eafa24562d56471b69601cda17b1a69084ff1edcb7733fb8bcd0",
+        "dist/is-main-CH4EEB_R.mjs": "6d3efa89e4a9271bd931b911fde0e2129c499594508b55526d4654bcbfe11428",
+        "dist/run-CiAIvodT.mjs": "295879bb8426ed9495c74b1f1406dab83c4a5c6c18d674ec95cc62e8ef59424e",
+        "dist/run-command-B-U8OmmP.mjs": "bb428780d6ff1b0f26ed8dc42687393aa38d2998adc1d427bf0fe809a21f7941",
+        "dist/run-command-BZUlmFcg.mjs": "3bf6552ea122614d5d23d4ad15c263351445150e18cc2e92316cf4ca696e6c6e",
+        "dist/server-ltHvV9wE.mjs": "89d2bab97ee2aa5fc6f1cc14fd297aafe3379595c8eb0c717793a07d97320b0a",
+        "dist/server-methods-CWI3KUiQ.mjs": "88796e796c68499288f9aeb30a5837255f00abae66aaa61b8eeb53e4ab55df1c",
+        "dist/server-methods-MvOPdzVq.mjs": "06dc21e6ee998a7f6675d3db34a5df9e1128b66f096280b881a227346557459c",
+        "dist/server-start-BB-IxTAg.mjs": "8f558ec53c4f610af50171abd6b36d34fa4c8849430964572aa9ded498865831",
+        "dist/sessions-history-http-CYGxxN6o.mjs": "38d00e463437cb73296ff05b62cd24d0eb122be0533a5a37e8fac2c8b562b171",
+        "dist/startup-trace-DHqn25HZ.mjs": "f089ccb9958dc53c14e91727652758426424a6b5461db170fb975818b74c4d47"
+    }
+}
+RETAINED_LAUNCHER_PINS = {
+    '2026.9.2': '4f4d29770da4f86dbd0e07cbd4d46deab785905dd89ac719033fcfd866fb5d17',
+    '2026.9.3': 'cbf9a0b83f0ce95179ab72b8ce37e6c4106c0ea29c56d69b941b5c6a182b073f',
+}
+
+
+def retained_execution_stat(path):
+    st = path.lstat()
+    return dict(device=st.st_dev, inode=st.st_ino, mode=st.st_mode,
+                uid=st.st_uid, gid=st.st_gid, links=st.st_nlink, size=st.st_size,
+                mtime=st.st_mtime_ns, ctime=st.st_ctime_ns)
+
+
+def retained_execution_path(raw, *, executable=True, strict=False):
+    # Admit the normal root-owned npm bin symlink and merged-/usr directories,
+    # recording every link. Resolve components ourselves: resolving first and
+    # merely checking the final file loses mutable intermediate authority.
+    if not isinstance(raw, str) or not re.fullmatch(r'/[A-Za-z0-9_./+@-]+', raw) \
+            or os.path.normpath(raw) != raw:
+        fail('retained Chat execution path is not unambiguous and absolute')
+    remaining = list(Path(raw).parts[1:]); current = Path('/'); links = []
+    while remaining:
+        part = remaining.pop(0)
+        if part in {'', '.'}:
+            continue
+        if part == '..':
+            current = current.parent
+            continue
+        current /= part
+        st = current.lstat()
+        if st.st_uid != 0 or st.st_gid != 0:
+            fail('retained Chat execution path is not root owned')
+        if stat.S_ISLNK(st.st_mode):
+            if len(links) >= 32:
+                fail('retained Chat execution symlink chain is ambiguous')
+            target = os.readlink(current)
+            links.append(dict(path=str(current), target=target, identity=retained_execution_stat(current)))
+            current = Path('/') if target.startswith('/') else current.parent
+            remaining = list(Path(target).parts[1:] if target.startswith('/') else Path(target).parts) + remaining
+        elif remaining:
+            if not strict and current == Path('/tmp') and st.st_mode & stat.S_ISVTX:
+                continue  # same isolated-fixture boundary as retained_read
+            safe_directory(current)
+        else:
+            safe_file(current, mode=None, maximum=512 * 1024 * 1024)
+            if st.st_mode & 0o022 or (executable and not st.st_mode & 0o111):
+                fail('retained Chat execution file is not a safe executable')
+    return current, links
+
+
+def retained_service_entry(identity):
+    validate_gateway_unit_identity(identity, label='retained Chat execution unit')
+    # systemctl show serialization, NOT shell syntax. Reject multiple commands,
+    # prefixes, escapes, quotes, expansion, node options, and wrapper executors.
+    match = re.fullmatch(r'\{ path=(/[^ ;{}]+) ; argv\[\]=([^;{}]+) ; ignore_errors=no ;(?: [^{}]*)?\}', identity['execStart'])
+    if match is None:
+        fail('retained Chat service execution is wrapped or ambiguous')
+    executable, command = match.groups()
+    argv = command.strip().split(' ')
+    if any(not item for item in argv) or argv[0] != executable:
+        fail('retained Chat service argv does not bind its executable')
+    if len(argv) == 4 and argv[1:3] == ['gateway', '--port']:
+        entry, runtime = argv[0], None
+    elif len(argv) == 5 and argv[2:4] == ['gateway', '--port']:
+        entry, runtime = argv[1], argv[0]
+    else:
+        fail('retained Chat service invocation is outside the reviewed gateway layout')
+    if not re.fullmatch(r'[1-9][0-9]{0,4}', argv[-1]) or int(argv[-1]) > 65535:
+        fail('retained Chat gateway port is invalid')
+    return entry, runtime
+
+
+def retained_execution_context(identity):
+    # Read execution-affecting systemd properties only. Environment values may
+    # contain secrets: inspect in memory; never emit or persist the raw output.
+    properties = ('ExecStart', 'Environment', 'EnvironmentFiles', 'PassEnvironment',
+                  'UnsetEnvironment', 'ExecSearchPath', 'RootDirectory', 'RootImage',
+                  'BindPaths', 'BindReadOnlyPaths', 'TemporaryFileSystem',
+                  'MountImages', 'ExtensionImages', 'ExtensionDirectories')
+    def query(argv):
+        result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=10, check=False)
+        if result.returncode or len(result.stdout) > 262144:
+            fail('retained Chat execution properties are unavailable')
+        return result.stdout.decode('utf-8', errors='strict')
+    raw = query(['systemctl', 'show', 'openclaw-gateway.service', '--all',
+                 *['--property=' + p for p in properties]])
+    values = {}
+    for line in raw.splitlines():
+        key, sep, val = line.partition('=')
+        if not sep or key not in properties or key in values:
+            fail('retained Chat execution properties are ambiguous')
+        values[key] = val
+    # systemctl may omit an empty a(sb) even with --all. Ask the manager's
+    # typed property directly; missing/unknown output never means "empty".
+    if set(properties) - set(values) == {'EnvironmentFiles'}:
+        environment_files = json.loads(query([
+            'busctl', '--system', '--json=short', 'get-property',
+            'org.freedesktop.systemd1',
+            '/org/freedesktop/systemd1/unit/openclaw_2dgateway_2eservice',
+            'org.freedesktop.systemd1.Service', 'EnvironmentFiles',
+        ]), object_pairs_hook=duplicate_rejecting_object)
+        if environment_files != {'type': 'a(sb)', 'data': []}:
+            fail('retained Chat indirect execution environment is unsupported')
+        values['EnvironmentFiles'] = ''
+    if set(values) != set(properties) or any(values[k] for k in properties[2:]):
+        fail('retained Chat remapped or indirect execution environment is unsupported')
+    observed = dict(identity, execStart=values['ExecStart'])
+    if retained_service_entry(observed) != retained_service_entry(identity):
+        fail('retained Chat service execution changed')
+    service_env = {}
+    for item in shlex.split(values['Environment']):
+        key, sep, val = item.partition('=')
+        if not sep or key in service_env:
+            fail('retained Chat service environment is ambiguous')
+        service_env[key] = val
+    manager_env = {}
+    for item in query(['systemctl', 'show-environment']).splitlines():
+        key, sep, val = item.partition('=')
+        if sep:
+            manager_env[key] = val
+    # No custom loader, preload, or container may redirect these pinned imports.
+    forbidden = ('NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+                 'OPENCLAW_CONTAINER')
+    if any(env.get(k) for env in (service_env, manager_env, os.environ) for k in forbidden):
+        fail('retained Chat execution redirection environment is unsupported')
+    default_path = query(['systemd-path', 'search-binaries-default']).strip()
+    search_path = service_env.get('PATH', manager_env.get('PATH', default_path))
+    if not search_path or any(not p.startswith('/') for p in search_path.split(':')):
+        fail('retained Chat service node search path is ambiguous')
+    node = shutil.which('node', path=search_path)
+    if node is None:
+        fail('retained Chat service node interpreter is unavailable')
+    return node
+
+
+# New helper generations only. This profile is data, not a wrapper allowlist.
+NODE_INDEX_PROFILE = Path('/etc/bridgesllm/openclaw-node-index-v1.json')
+NODE_INDEX_OWNER = Path('/var/lib/bridgesllm-installer/openclaw-2026.9.1-migration-v2/transaction.json')
+NODE_INDEX_KIND = 'node-index-data-env-v1'
+NODE_INDEX_PINS = {'dist/argv-DNjh_yaF.js': '805517eae7701e448fc300dc85eedff32e2f0d2e6b42ddc6f885907e370047f7',
+ 'dist/argv-invocation-C1WhAkJL.js': '4c3cb4aa8866af9d08c80cdb0c42f4f4be26f9db6b7e45d0f267eb22afef3b40',
+ 'dist/chat-BbagnMEy.js': 'c74caccd80c39788619b8c7003fd6abdd1bcf3de536090fcfd5319ef2fdcf778',
+ 'dist/cli-root-options-CgExE0zj.js': '94255bd647a45efa2b997b26c3cb30561c7288537918fa72d3dbacc304f45f92',
+ 'dist/cli/run-main.js': 'f75518324036fb8dcc7bee3d039d94857bff30160bc2d0422d07f0a2b3fe37b2',
+ 'dist/container-target-yd6OnwF_.js': 'bcef065a63cbe03030b0471553b4c9ecf3a7ff074dbb47587bb507d6487ec430',
+ 'dist/dotenv-BHEKhHyV.js': '10cf3ffa3cd2c7c7529d4f782794c8caef16d1c4c1b15a64a8273e21b1cacc0c',
+ 'dist/dotenv-Bvm6eLnE.js': '7d9ccbc752d252f6735e97d650dd77aedcce20d77a12551ef4fddb9bd24db54b',
+ 'dist/dotenv-global-BxHOyAmz.js': '8df0a6add0c5d1aa018d65ad8a13ecd1371214f3c0c9f31f839fc23f5cc2105c',
+ 'dist/entry.esm-resolve-fast-path-B5cWT-rq.js': 'a8045218b91a0c6505952c44bace21f05d4a18fa23242763a4fba0fac1debf80',
+ 'dist/entry.esm-resolve-fast-path-jqbSGeOV.js': '37ab850fcd3939ffe89fb423fb22a5f1d6e3462fcb3f6d4a2afc390db8df085f',
+ 'dist/entry.js': 'bad8433cca24a0fe91ed1f7c7097995daa4ad33427d78171d76d5c0f67d04247',
+ 'dist/entry.version-fast-path-BBTOuUbi.js': 'a41dab629535b3a2adcfd087639ff9b73f3d8c57aee6412bc9a636e6c8ae637a',
+ 'dist/entry.version-fast-path-BZjxe_NG.js': '443969f7320c574bc56e093a13d15ed2cc88b8ab02b651fabee17238935e65a9',
+ 'dist/env-vars-ClwUESUh.js': 'a23de95e5519affba48b79327b0f8dd20e5e1fb11ff2524817ec25580ef15e84',
+ 'dist/errno-CkbDOfLk.js': '4f3aa2abbb8cb32e20aa0e844d10c41bfb1667ecf34f82a29c3c3b27e9a34089',
+ 'dist/error-coercion-D_-xJ90S.js': '533da3e512ba6700302bcce9dfbd300770c15e1ca35121058986dc6fd5feb4b7',
+ 'dist/errors-Db3Ymjlb.js': '19aea42563717eac4205555f4ebe88fd3040cff57360baf91a461389cdf12f6d',
+ 'dist/failure-output-Dc5ce9_F.js': 'c2b19d14aea4ff6fb6c2684a4fceb01400d1f9381cc59419e69f94cc94af7ab4',
+ 'dist/failure-output-DoW9YQTW.js': 'ba1374f5a3a33f5572a138142225d2d062a8a4a5afcee8f37709eb0ae2963cdb',
+ 'dist/fatal-error-hooks-D8bswZzH.js': '5007077dffa8e87e990a2fbb62bcfde046ac311b426c4031a2ea90fd8b87a3cc',
+ 'dist/fatal-error-hooks-DMH8gY71.js': 'f916fa9ed004c8e0cb334d1343bac9761618e1a176a28cba96d1578bba97246b',
+ 'dist/index.js': '207543c4c2ad6b398c23718ee071bc3e163ff107ebfd117bb15711976de339d3',
+ 'dist/infra/errors.js': '2ec35c446444710c97bb0191d0260581f0117154af1437c629bf0d85299e4466',
+ 'dist/is-main-CH4EEB_R.js': '6d3efa89e4a9271bd931b911fde0e2129c499594508b55526d4654bcbfe11428',
+ 'dist/is-main-DCeI9Mvk.js': 'e8dda9f6e97d1c22f630bb291478a10bb59fdca26d778b13ba9c547679e7aa4b',
+ 'dist/json-output-mode-D0F07HLf.js': 'f4fb3b4556dedccb02efe3f0f5d6b9ef5b840772d4d4b278ba302cc9e06ae539',
+ 'dist/json-output-mode-D6GIUD5R.js': '7c9dd6e7e6f87a0148689104480bef6fcbd6ae3c20f9fd7a6046811d6690df87',
+ 'dist/node-options-W869vrJq.js': 'ebd01ce5078a93c837cd64387aea05eeeb7888d05ac8a5e65ccef7d5688745ab',
+ 'dist/one-shot-exit-B_krMBPI.js': 'e1ab75b13a6c567eb28b4a8a2d59790dc659c65bccace77c005e787045d97bf2',
+ 'dist/one-shot-exit-BkFPnjbM.js': 'c5f723b244320408b7c42f86c34f207135fa6831a5162462d4fe32056b9bccd0',
+ 'dist/ports-DQQYK5F1.js': '4d76adb8b8e64643d7471293251f2daa3e050345963b0c08cf290194c9c84bd0',
+ 'dist/pre-bootstrap-CenrzAsB.js': 'd75933f849402c010aa16b834fc9b449e48d5d9cab91a7e5db901d5f1346b4f4',
+ 'dist/retryable-network-errors-D2gJmBqw.js': 'e8606c697998c9599c18117f6319fa5739e9f0a32c57af65c46193ac4d7f7c96',
+ 'dist/run-Bv5QIhyZ.js': '361f36c7bcfe161e1c9ca26c9b1ed1728822a62198f9349bf51afaff63328ff0',
+ 'dist/run-command-CnJq_lHv.js': '01017f787f477b170552c847191d8ce51abbd95cac1e4ae2c17c2e691a1c02aa',
+ 'dist/run-command-DmbUEIkF.js': 'f4fe871510e7f0544a6be0889cf0793285c261520569bc127e1bdc94807ee5bb',
+ 'dist/runtime-CF2WjnNZ.js': 'bedf2db31e39e7c6c6ff79906e5ddcb3eb3362017284ade92b9ad8420e91ffa8',
+ 'dist/runtime-DixL8FcQ.js': '260d409e1bb02f8a43f86e185037282a7c473a6a1bef545562034e1b8e697796',
+ 'dist/runtime-cleanup-scope-C7l7qaSh.js': 'f5db487b34f5c5c18681276a345674e4941eecf2166cdeb91068cbdf6679daa2',
+ 'dist/runtime-cleanup-scope-cCKdH8QO.js': '93ea90c345877ed89e93d2506bef24fc940040acccf07df6354dc2ce8e707c56',
+ 'dist/server-Dh8qT1MR.js': '1fce5f5137de1c99ee55d98fcaa029f0af882ee0d5e2b9c0f0bf0004970c1cbe',
+ 'dist/server-methods-CRX3McIT.js': 'cc09f1b52e6bef80bddff1e4a68e47845faedc692b5dcd709a9dc665b213f0eb',
+ 'dist/server-methods-D5bRlIc3.js': '48284fb1fab8cd8989f7d73508f4089957cd5ed0169bcf2050be3319d5e9610b',
+ 'dist/server-start-yuOHTviK.js': '50e6605ad5a9bbd866be923486c936d9e5b6a228ade7a166f47b877f87fcbbb5',
+ 'dist/sessions-history-http-CE816_yS.js': '5e8df9f3c8e4616dff5a3f0aa125f279d82cc63bc52fd625b238fd09621cc717',
+ 'dist/shell-env-CLXu7ydM.js': '4063437c2d324fcde40c63cef9d9c6df036f922ebf441a4b6b978a7d885ac831',
+ 'dist/shell-env-expected-keys-CIk5gFSi.js': '5ad0e4b77819f3a6dcedef148cadcaf22aa773d77ead601a797e64310c3eb3b1',
+ 'dist/shell-env-expected-keys-Csdxgnwf.js': '0180e66fa63bd3f657bec5c71481252345806c475626ad602e062acf1715ada8',
+ 'dist/shell-env-ti8g83F7.js': 'f7c0ae4968740bcabe40a18cf960d6c88ee0c92ca48ee6adff724479dbc07d1f',
+ 'dist/startup-trace-C2SBInNS.js': 'ee824dd5438900a2141b3fee1f1e1d76ac975f5f5254e00d0cc191dd4900584e',
+ 'dist/unhandled-rejections-BbwPmmNc.js': 'e3c796c4817c2168d6254961f0860841889eaea65394af411e0f93b4f9ee1ccc',
+ 'dist/unhandled-rejections-iZOzdBz8.js': 'ea66923fe01caf74507bc010a2060a9db42eaeb913b7ff99b6b921384f3e7bf3',
+ 'package.json': 'aaba2fdde13e3d1a676102fc53195bac94d6236e9d9bef192c84dca04cf9ea5b'}
+NODE_INDEX_PERMIT_ARGV = ['/bin/sh', '-c', 'if [ ! -e /var/lib/bridgesllm/openclaw-gateway-authorization-fence.v1 ]; then exit 0; fi; IFS=\' \' read -r pid start boot < /run/bridgesllm/openclaw-gateway-migration-permit.v1 || exit 1; [ -n "$pid" ] && [ -n "$start" ] || exit 1; case "$pid:$start" in *[!0-9:]*) exit 1;; esac; [ "$boot" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ] || exit 1; [ -r "/proc/$pid/stat" ] || exit 1; current=$(sed \'s/.*) //\' "/proc/$pid/stat" | cut -d \' \' -f 20); [ "$current" = "$start" ]']
+
+NODE_INDEX_UNIT_SEARCH = ('/etc/systemd/system.control','/run/systemd/system.control',
+    '/run/systemd/transient','/run/systemd/generator.early','/etc/systemd/system',
+    '/etc/systemd/system.attached','/run/systemd/system','/run/systemd/system.attached',
+    '/run/systemd/generator','/usr/local/lib/systemd/system','/usr/lib/systemd/system',
+    '/run/systemd/generator.late')
+NODE_INDEX_ABSENT = ('.git', 'src/entry.ts', 'dist/entry.ts', 'dist/entry.mjs',
+    'dist/index.mjs', '.openclaw-lifecycle-pending', 'dist/openclaw-install-guard',
+    'dist/package.json', 'dist/cli/package.json', 'dist/infra/package.json')
+NODE_INDEX_REPAIRS = {
+    'subagent-announce.requester-settle-wake-B2r6GRpv.js': '886298c96125a8150313b217af8563e9a5b55a9abdfad5ee0eef697093dce884',
+    'subagent-completion-admission.store-ieYRlFt3.js': 'a9ab8e869321a15ff0ba44baa52690f4658f8c0c906ff3cd11582ae3c8c99c0f',
+    'subagent-registry-BMJDw92y.js': '661a074f842b6770afccd159e4dd36602973cd87ffefcb0624ff75d5e845fb70',
+}
+
+
+def node_index_path(raw):
+    if not isinstance(raw, str) or not re.fullmatch(r'/[A-Za-z0-9_./+@-]+', raw) or os.path.normpath(raw) != raw:
+        fail('Node/index path is not a canonical literal')
+    return Path(raw)
+
+
+def node_index_file(path, *, private=False, maximum=512 * 1024 * 1024):
+    # No sticky-/tmp or unsafe-parent exception in the production variant.
+    parents = []
+    for parent in [*reversed(path.parent.parents), path.parent]:
+        safe_directory(parent)
+        st = parent.lstat()
+        parents.append(dict(path=str(parent), device=st.st_dev, inode=st.st_ino,
+                            mode=st.st_mode, uid=st.st_uid, gid=st.st_gid))
+    safe_file(path, mode=0o600 if private else None, maximum=maximum)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = retained_execution_stat(path)
+        st = os.fstat(fd)
+        if st.st_mode & 0o022 or (st.st_dev, st.st_ino) != (before['device'], before['inode']):
+            fail('Node/index unsafe file')
+        digest = hashlib.sha256(); chunks = []; total = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk: break
+            total += len(chunk)
+            if total > maximum: fail('Node/index file exceeds bound')
+            digest.update(chunk)
+            if maximum <= 2_000_000: chunks.append(chunk)
+        end = os.fstat(fd)
+        if before != retained_execution_stat(path) or any(getattr(st, k) != getattr(end, k)
+                for k in ('st_dev','st_ino','st_mode','st_uid','st_gid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')) or total != st.st_size:
+            fail('Node/index dependency changed during read')
+        return dict(sha256=digest.hexdigest(), identity=before, parents=parents), b''.join(chunks)
+    finally:
+        os.close(fd)
+
+
+def node_index_data(raw, grammar):
+    # A deliberately small common data grammar. Never source/eval or use a
+    # shell lexer to approve executable expressions. No value-bearing errors.
+    try: text = raw.decode('utf-8')
+    except UnicodeError: fail('Node/index environment encoding refused')
+    if '\x00' in text or '\r' in text: fail('Node/index environment control byte refused')
+    result = {}
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#'): continue
+        if grammar == 'export-v1':
+            if not line.startswith('export '): fail('Node/index exported data grammar refused')
+            line = line[7:]
+        key, sep, rhs = line.partition('=')
+        if not sep or not re.fullmatch(r'[A-Z][A-Z0-9_]{0,127}', key) or key in result:
+            fail('Node/index environment assignment refused')
+        if rhs.startswith("'") and rhs.endswith("'") and "'" not in rhs[1:-1]:
+            value = rhs[1:-1]
+        elif rhs.startswith('"') and rhs.endswith('"'):
+            value = ''; i = 1
+            while i < len(rhs)-1:
+                c = rhs[i]
+                if c == '\\':
+                    i += 1
+                    if i >= len(rhs)-1 or rhs[i] not in '\\"$`':
+                        fail('Node/index environment escape refused')
+                    value += rhs[i]
+                elif c == '"' or (grammar != 'systemd-v1' and c in '$`'):
+                    fail('Node/index environment expansion refused')
+                else: value += c
+                i += 1
+        elif re.fullmatch(r'[A-Za-z0-9_./:@%+,=-]*', rhs): value = rhs
+        else: fail('Node/index literal environment grammar refused')
+        if any(ord(c) < 32 or ord(c) == 127 for c in value): fail('Node/index environment control refused')
+        result[key] = value
+    return result
+
+
+def node_index_render(values):
+    # systemd does not expand $ or backticks; double quotes protect whitespace.
+    return ''.join(k+'="'+v.replace('\\','\\\\').replace('"','\\"')+'"\n'
+                   for k,v in values.items()).encode('utf-8')
+
+
+def node_index_controls(values, *, application=False):
+    if not isinstance(values, dict): fail('Node/index environment object refused')
+    denied = {'NODE_OPTIONS','NODE_PATH','BASH_ENV','ENV','SHELLOPTS','BASHOPTS','CDPATH','IFS',
+        'GCONV_PATH','LOCPATH','PYTHONPATH','PYTHONHOME','GLIBC_TUNABLES','pm_exec_path',
+        'BASH_COMPAT','BASH_XTRACEFD','POSIXLY_CORRECT','PYTHONINSPECT','PYTHONSTARTUP'}
+    for key, value in values.items():
+        if not isinstance(key,str) or not isinstance(value,str): fail('Node/index environment types refused')
+        if key.startswith('OPENSSL_') and value and (key!='OPENSSL_CONF' or value!='/dev/null'):
+            fail('Node/index crypto module configuration refused')
+        if key.startswith(('LD_', 'BASH_FUNC_', 'DYLD_')) or key in denied:
+            if value: fail('Node/index execution-control environment refused')
+        if key.startswith(('OPENCLAW_', 'CLAWDBOT_')) and key != 'OPENCLAW_DEFER_SHELL_ENV_FALLBACK':
+            # No alternate source/config/state/plugin/QA/respawn policy.
+            if value: fail('Node/index native execution-control environment refused')
+        if key == 'OPENCLAW_DEFER_SHELL_ENV_FALLBACK' and value != '1':
+            fail('Node/index login fallback policy refused')
+        if application and (not re.fullmatch(r'[A-Z][A-Z0-9_]*_(?:API_KEY|TOKEN|PASSWORD|PASS|SECRET|PROJECT_ID|PROJECT|URL|HOST|RECORD_CALLS|RECORDING_CHANNELS)',key)
+                or key.startswith(('NODE_', 'LD_', 'OPENCLAW_', 'CLAWDBOT_', 'PYTHON_', 'BASH_'))):
+            fail('Node/index application key class refused')
+        if application and key.endswith('_RECORD_CALLS') and value not in {'0','1','true','false'}:
+            fail('Node/index recording boolean refused')
+        if application and key.endswith('_RECORDING_CHANNELS') and value not in {'mono','dual'}:
+            fail('Node/index recording channels refused')
+
+
+def node_index_argv(raw):
+    match = re.fullmatch(r'\{ path=(/[^ ;{}]+) ; argv\[\]=([^;{}]+) ; ignore_errors=no ;(?: [^{}]*)?\}',raw)
+    if not match: fail('Node/index command serialization refused')
+    argv = match[2].strip().split(' ')
+    if len(argv) != 8 or argv[0] != match[1] or argv[2:4] != ['gateway','--port'] or argv[5:] != ['--bind','loopback','--verbose']:
+        fail('Node/index gateway argv refused')
+    node_index_path(argv[0]); node_index_path(argv[1])
+    if not re.fullmatch(r'[1-9][0-9]{0,4}',argv[4]) or int(argv[4]) > 65535:
+        fail('Node/index port refused')
+    return argv
+
+
+def node_index_query(argv):
+    r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False,
+        env={'PATH':'/usr/bin:/bin','LC_ALL':'C'})
+    if r.returncode or len(r.stdout)>262144: fail('Node/index systemd observation unavailable')
+    return r.stdout.decode('utf-8',errors='strict')
+
+
+def node_index_typed(name, signature):
+    value = json.loads(node_index_query(['/usr/bin/busctl','--system','--json=short','get-property',
+        'org.freedesktop.systemd1','/org/freedesktop/systemd1/unit/openclaw_2dgateway_2eservice',
+        'org.freedesktop.systemd1.Service',name]), object_pairs_hook=duplicate_rejecting_object)
+    if not isinstance(value,dict) or set(value)!={'type','data'} or value['type']!=signature:
+        fail('Node/index typed service property refused')
+    return value['data']
+
+
+def node_index_profile():
+    identity, raw = node_index_file(NODE_INDEX_PROFILE,private=True,maximum=65536)
+    try: p = json.loads(raw, object_pairs_hook=duplicate_rejecting_object)
+    except (ValueError,TypeError): fail('Node/index profile grammar refused')
+    fields = {'schema','package','cli','node','home','state','config','environmentFile','guardHelper','port','lockPath'}
+    if not isinstance(p,dict) or set(p)!=fields or p['schema']!=NODE_INDEX_KIND or type(p['port']) is not int or not 1<=p['port']<=65535:
+        fail('Node/index finite profile refused')
+    for key in fields-{'schema','port'}: node_index_path(p[key])
+    if p['node']!='/usr/bin/node' or p['state']!=p['home']+'/.openclaw' or p['config']!=p['state']+'/openclaw.json' \
+            or p['lockPath']!=p['state']+'/gateway.lock':
+        fail('Node/index source roles refused')
+    return p, identity
+
+
+def node_index_elf(raw, *, systemd_tool=False):
+    # Read ELF metadata, never ldd or execute a selected binary. Finite Linux
+    # x86-64 system-loader layout; unsupported architectures fail closed.
+    import struct
+    if raw[:6]!=b'\x7fELF\x02\x01' or len(raw)<64 or struct.unpack_from('<H',raw,18)[0]!=62:
+        fail('Node/index ELF platform refused')
+    phoff=struct.unpack_from('<Q',raw,32)[0]; size,count=struct.unpack_from('<HH',raw,54)
+    if size!=56 or count>128 or phoff+count*size>len(raw): fail('Node/index ELF headers refused')
+    segments=[struct.unpack_from('<IIQQQQQQ',raw,phoff+i*size) for i in range(count)]
+    interp=[]; dyn=[]
+    for typ,flags,offset,va,pa,fs,ms,align in segments:
+        if offset+fs>len(raw): fail('Node/index ELF segment refused')
+        if typ==3: interp.append(raw[offset:offset+fs].rstrip(b'\x00').decode('ascii'))
+        if typ==2:
+            if fs>1048576 or fs%16: fail('Node/index ELF dynamic table refused')
+            for pos in range(offset,offset+fs,16):
+                tag,val=struct.unpack_from('<qQ',raw,pos)
+                if tag==0: break
+                if tag in {15,0x7fffffff,0x7ffffffd,0x6ffffefb,0x6ffffefc} or tag==29 and not systemd_tool: fail('Node/index ELF remapping refused')
+                dyn.append((tag,val))
+    tables=[v for t,v in dyn if t==5]
+    if len(tables)!=1 or len(interp)>1: fail('Node/index ELF string table refused')
+    locations=[off+tables[0]-va for typ,fl,off,va,pa,fs,ms,al in segments if typ==1 and va<=tables[0]<va+fs]
+    if len(locations)!=1: fail('Node/index ELF string mapping refused')
+    for tag,val in dyn:
+        if tag==29:
+            start=locations[0]+val;end=raw.find(b'\x00',start,start+256)
+            if end<0 or raw[start:end]!=b'/usr/lib/x86_64-linux-gnu/systemd':
+                fail('Node/index systemd runpath refused')
+    needed=[]
+    for tag,val in dyn:
+        if tag==1:
+            start=locations[0]+val; end=raw.find(b'\x00',start,start+256)
+            if end<0: fail('Node/index ELF dependency refused')
+            name=raw[start:end].decode('ascii')
+            if name != 'ld-linux-x86-64.so.2' and not re.fullmatch(r'lib(?:node|c|m|dl|pthread|rt|stdc\+\+|gcc_s|uv|z|brotlidec|brotlienc|brotlicommon|cares|nghttp2|crypto|ssl|icui18n|icuuc|icudata|zstd|atomic|python3\.[0-9]+|expat|ffi|bz2|lzma|tinfo|pcre2-8|selinux|acl|cap|mount|blkid|gcrypt|gpg-error|lz4|systemd|systemd-shared-(?:252|255)|crypt|kmod|pam|seccomp|audit|cap-ng)\.so(?:\.[0-9]+)*',name):
+                fail('Node/index unknown ELF dependency')
+            needed.append(name)
+    return interp,needed
+
+
+def node_index_binary(path):
+    resolved,links=retained_execution_path(str(path), executable=False, strict=True)
+    binding,_=node_index_file(resolved)
+    # Bounded descriptor read for ELF parsing, checked against the stable hash.
+    fd=os.open(resolved,os.O_RDONLY|os.O_NOFOLLOW)
+    try:
+        with os.fdopen(fd,'rb',closefd=False) as stream: raw=stream.read(512*1024*1024+1)
+    finally: os.close(fd)
+    if hashlib.sha256(raw).hexdigest()!=binding['sha256']: fail('Node/index ELF changed')
+    interp,needed=node_index_elf(raw,systemd_tool=str(path) in {'/usr/bin/systemctl','/usr/bin/busctl'})
+    return dict(path=str(path),resolved=str(resolved),links=links,**binding),interp,needed
+
+
+def node_index_loader(node, extra=()):
+    # Parse the finite glibc cache as data. Never execute ldconfig/ldd or a
+    # selected interpreter to discover its own dependencies.
+    import struct
+    if os.path.lexists('/etc/ld.so.preload'): fail('Node/index preload present')
+    cache,raw=node_index_file(Path('/etc/ld.so.cache'),maximum=2_000_000)
+    if raw[:20]!=b'glibc-ld.so.cache1.1' or len(raw)<48:
+        fail('Node/index loader cache format refused')
+    count,strings=struct.unpack_from('<II',raw,20)
+    if count>16384 or 48+count*24+strings>len(raw): fail('Node/index loader cache bounds refused')
+    catalog={}
+    for i in range(count):
+        flags,key,val,version,hwcap=struct.unpack_from('<iIIIQ',raw,48+i*24)
+        if flags!=0x303: continue
+        def string(offset):
+            if not 48+count*24<=offset<48+count*24+strings: fail('Node/index cache string refused')
+            end=raw.find(b'\x00',offset,48+count*24+strings)
+            if end<0: fail('Node/index cache terminator refused')
+            return raw[offset:end].decode('ascii')
+        name,path=string(key),string(val)
+        catalog.setdefault(name,[]).append((path,hwcap))
+    # Cache hwcap alternatives and uncached legacy/cpu search directories must
+    # not silently select a different library than the one committed below.
+    absent=[]
+    for parent in ('/usr/lib/x86_64-linux-gnu','/usr/lib','/lib/x86_64-linux-gnu','/lib'):
+        for suffix in ('glibc-hwcaps','tls','haswell','x86_64'):
+            path=parent+'/'+suffix
+            if os.path.lexists(path): fail('Node/index loader alternate search directory refused')
+            absent.append(path)
+    queue=[node,*extra]; files={}
+    while queue:
+        requested=queue.pop(0)
+        if requested in files: continue
+        if len(files)>=96: fail('Node/index ELF closure exceeds bound')
+        binding,interp,needed=node_index_binary(Path(requested));files[requested]=binding
+        for path in interp:
+            if path!='/lib64/ld-linux-x86-64.so.2': fail('Node/index dynamic interpreter refused')
+            queue.append(path)
+        for name in needed:
+            if name == 'ld-linux-x86-64.so.2':
+                queue.append('/lib64/ld-linux-x86-64.so.2'); continue
+            if requested in {'/usr/bin/systemctl','/usr/bin/busctl'}:
+                local='/usr/lib/x86_64-linux-gnu/systemd/'+name
+                if re.fullmatch(r'libsystemd-shared-(?:252|255)\.so',name):
+                    queue.append(local); continue
+                if os.path.lexists(local): fail('Node/index systemd runpath shadow refused')
+                absent.append(local)
+            paths=catalog.get(name,[])
+            if len(paths)!=1 or paths[0][1]!=0 or not re.fullmatch(r'/(?:usr/)?lib/x86_64-linux-gnu/'+re.escape(name),paths[0][0]):
+                fail('Node/index loader resolution refused')
+            queue.append(paths[0][0])
+    return dict(files=files,cache=cache,preloadAbsent=True,searchAbsent=absent)
+
+
+NODE_INDEX_HOOKS = ('/usr/bin/python3','/bin/bash','/bin/sh','/usr/bin/rm',
+    '/usr/bin/cat','/usr/bin/sed','/usr/bin/cut','/usr/bin/systemctl','/usr/bin/busctl')
+# Guard imports, including compression modules lazily imported by shutil and
+# tarfile. Built-in/frozen forms need no extra ELF. Other stdlib extensions are
+# inert inventory members, never approved as helper imports by this contract.
+NODE_INDEX_PYTHON_EXTENSIONS = frozenset(('_ctypes','_struct','_hashlib','_blake2',
+    '_sha1','_sha2','_sha3','_sha256','_sha512','_md5','_json','_bz2','_lzma','zlib',
+    '_datetime','math','_random','_bisect','_posixsubprocess','select','fcntl','binascii'))
+
+
+def node_index_python():
+    interpreter,links=retained_execution_path('/usr/bin/python3',strict=True)
+    if str(interpreter) not in {'/usr/bin/python3.11','/usr/bin/python3.12'}:
+        fail('Node/index Python layout refused')
+    version=interpreter.name[6:];root=Path('/usr/lib')/('python'+version)
+    absent=['/usr/lib/python'+version.replace('.','')+'.zip','/usr/pyvenv.cfg',
+        '/usr/bin/pyvenv.cfg','/usr/bin/python3._pth',str(interpreter)+'._pth']
+    if any(os.path.lexists(p) for p in absent): fail('Node/index Python alternate path refused')
+    tree,extensions=node_index_python_tree(root,version)
+    return dict(root=str(root),links=links,absent=absent,**tree),extensions
+
+
+def node_index_python_tree(root,version):
+    # -I -S -B excludes user/site startup and cache writes. Commit the complete
+    # standard-library namespace (including existing bytecode), not only modules
+    # loaded during one lucky invocation. No site/dist-packages are import roots.
+    files={};directories={};extensions=[];total=0
+    def visit(directory):
+        nonlocal total
+        safe_directory(directory)
+        members=sorted(directory.iterdir())
+        st=directory.lstat()
+        directories[str(directory.relative_to(root))]=dict(device=st.st_dev,inode=st.st_ino,
+            mode=st.st_mode,uid=st.st_uid,gid=st.st_gid,members=[p.name for p in members])
+        for path in members:
+            name=str(path.relative_to(root))
+            # Debian sitecustomize and build configuration are unreachable under
+            # this isolated runtime. Their names remain committed as membership.
+            if name in {'sitecustomize.py','config-'+version+'-x86_64-linux-gnu'}: continue
+            if path.is_dir() and not path.is_symlink(): visit(path); continue
+            resolved,ln=retained_execution_path(str(path),executable=False,strict=True)
+            if not resolved.is_relative_to(root): fail('Node/index Python source escapes stdlib')
+            binding,_=node_index_file(resolved,maximum=16*1024*1024)
+            total+=binding['identity']['size']
+            if len(files)>=4096 or total>128*1024*1024: fail('Node/index Python closure exceeds bound')
+            files[name]=dict(binding=binding,links=ln)
+            if path.suffix=='.so' and path.name.split('.')[0] in NODE_INDEX_PYTHON_EXTENSIONS:
+                if path.parent!=root/'lib-dynload': fail('Node/index Python extension location refused')
+                extensions.append(str(path))
+        if members!=sorted(directory.iterdir()) or any(getattr(st,k)!=getattr(directory.lstat(),k)
+                for k in ('st_dev','st_ino','st_mode','st_uid','st_gid','st_mtime_ns','st_ctime_ns')):
+            fail('Node/index Python namespace changed during read')
+    visit(root)
+    return dict(files=len(files),
+        treeSha256=canonical_json_sha256(dict(files=files,directories=directories)),
+        extensions=sorted(extensions)),extensions
+
+
+NODE_INDEX_EMPTY_PROPERTIES = ('PassEnvironment','UnsetEnvironment','ExecSearchPath','RootDirectory','RootImage','BindPaths',
+    'BindReadOnlyPaths','TemporaryFileSystem','MountImages','ExtensionImages','ExtensionDirectories',
+    'PAMName','LoadCredential','LoadCredentialEncrypted','ImportCredential','SetCredential','SetCredentialEncrypted',
+    'AppArmorProfile','SELinuxContext','RootImageOptions','RootHash','RootHashSignature','RootVerity',
+    'JoinsNamespaceOf','NetworkNamespacePath','IPCNamespacePath','InaccessiblePaths','ReadOnlyPaths','ReadWritePaths',
+    'ExecPaths','NoExecPaths','ConfigurationDirectory','RuntimeDirectory','StateDirectory','CacheDirectory','LogsDirectory',
+    'SupplementaryGroups','SystemCallFilter','SystemCallArchitectures','RestrictAddressFamilies','SocketBindAllow','SocketBindDeny')
+NODE_INDEX_NO_PROPERTIES = ('RootDirectoryStartOnly','PrivateMounts','PrivateTmp','PrivateUsers','PrivateDevices',
+    'PrivateNetwork','DynamicUser','MountAPIVFS','ProtectKernelTunables','ProtectKernelModules','ProtectKernelLogs',
+    'ProtectControlGroups','ProtectClock','ProtectHostname','MemoryDenyWriteExecute','RootEphemeral')
+NODE_INDEX_FIXED_PROPERTIES = {'ProtectSystem':'no','ProtectHome':'no','ProtectProc':'default','ProcSubset':'all'}
+
+
+def node_index_unit(p, identity):
+    empty=NODE_INDEX_EMPTY_PROPERTIES
+    no=NODE_INDEX_NO_PROPERTIES
+    fixed=NODE_INDEX_FIXED_PROPERTIES
+    props=('ExecStart','Environment','FragmentPath','DropInPaths','SourcePath','NeedDaemonReload',
+        'User','Group','WorkingDirectory','Restart','KillMode','TimeoutStopUSec','Type',*empty,*no,*fixed)
+    raw=node_index_query(['/usr/bin/systemctl','show','openclaw-gateway.service','--all',*['--property='+k for k in props]])
+    v={}
+    for line in raw.splitlines():
+        key,sep,val=line.partition('=')
+        if not sep or key not in props or key in v: fail('Node/index effective properties refused')
+        v[key]=val
+    # systemctl omits some empty struct arrays even with --all. Recover only
+    # these known omissions from the manager's typed API; absence alone is not
+    # evidence of emptiness. Unknown, malformed or nonempty values still refuse.
+    omitted_structs={'RootImageOptions':'a(ss)','SocketBindAllow':'a(iiqq)','SocketBindDeny':'a(iiqq)'}
+    for key in set(props)-set(v):
+        if key not in omitted_structs or node_index_typed(key,omitted_structs[key])!=[]:
+            fail('Node/index remapped/unknown effective properties refused')
+        v[key]=''
+    # systemctl --all renders some EMPTY typed values non-emptily on systemd 255:
+    # empty a(ss)/a(say) credential and image-option arrays print "[unprintable]",
+    # empty (bas) syscall/address-family sets print "~". Accept only that exact
+    # rendering after the typed API proves the exact empty value; any other text
+    # or a nonempty typed value still refuses.
+    rendered_empty={'LoadCredential':('[unprintable]','a(ss)',[]),'LoadCredentialEncrypted':('[unprintable]','a(ss)',[]),
+        'SetCredential':('[unprintable]','a(say)',[]),'SetCredentialEncrypted':('[unprintable]','a(say)',[]),
+        'RootImageOptions':('[unprintable]','a(ss)',[]),'SystemCallFilter':('~','(bas)',[False,[]]),
+        'RestrictAddressFamilies':('~','(bas)',[False,[]])}
+    for key,(text,signature,expected) in rendered_empty.items():
+        if v.get(key)==text:
+            data=node_index_typed(key,signature)
+            if data==expected and (signature!='(bas)' or data[0] is False): v[key]=''
+    if set(v)!=set(props) or any(v[k] for k in empty) or any(v[k]!='no' for k in no) or any(v[k]!=fixed[k] for k in fixed):
+        fail('Node/index remapped/unknown effective properties refused')
+    argv=node_index_argv(v['ExecStart'])
+    expected=[p['node'],p['package']+'/dist/index.js','gateway','--port',str(p['port']),'--bind','loopback','--verbose']
+    if argv!=expected or identity is not None and node_index_argv(identity['execStart'])!=argv:
+        fail('Node/index effective command drift')
+    if v['NeedDaemonReload']!='no' or v['SourcePath'] or v['User']!='root' or v['Group']!='root' \
+            or v['WorkingDirectory']!=p['home'] or v['Restart']!='always' or v['KillMode']!='control-group' \
+            or v['TimeoutStopUSec']!='5min 30s' or v['Type']!='simple':
+        fail('Node/index service policy refused')
+    if node_index_typed('EnvironmentFiles','a(sb)')!=[[p['environmentFile'],False]]:
+        fail('Node/index typed environment sources/order refused')
+    service={}
+    for item in shlex.split(v['Environment']):
+        key,sep,val=item.partition('=')
+        if not sep or key in service: fail('Node/index service environment refused')
+        service[key]=val
+    node_index_controls(service)
+    if service.get('HOME')!=p['home'] or service.get('OPENCLAW_DEFER_SHELL_ENV_FALLBACK')!='1' \
+            or service.get('PATH')!='/usr/bin:/bin' or service.get('LC_ALL')!='C' \
+            or service.get('OPENSSL_CONF')!='/dev/null':
+        fail('Node/index fixed environment policy missing')
+    # Only application data, HOME and the fixed fallback policy are admitted.
+    node_index_controls({k:val for k,val in service.items() if k not in {'HOME','OPENCLAW_DEFER_SHELL_ENV_FALLBACK','PATH','LC_ALL','OPENSSL_CONF'}},application=True)
+    manager={}
+    for item in node_index_query(['/usr/bin/systemctl','show-environment']).splitlines():
+        key,sep,val=item.partition('=')
+        if not sep or key in manager: fail('Node/index manager environment refused')
+        manager[key]=val
+    node_index_controls(manager);node_index_controls(dict(os.environ))
+    def commands(name):
+        data=node_index_typed(name,'a(sasbttttuii)')
+        if not isinstance(data,list) or any(not isinstance(row,list) or len(row)!=10 or row[2] is not False for row in data):
+            fail('Node/index command metadata refused')
+        return [[row[0],row[1]] for row in data]
+    guard=['/usr/bin/python3','-B','-I','-S',p['guardHelper'],'node-index-start-condition']
+    if commands('ExecCondition') != [[NODE_INDEX_PERMIT_ARGV[0],NODE_INDEX_PERMIT_ARGV], [guard[0],guard]]:
+        fail('Node/index permit/guard ordering refused')
+    lock=['/bin/bash','-c','rm -f '+p['lockPath']+' || true']
+    if commands('ExecStartPre') != [[lock[0],lock]]:
+        fail('Node/index fixed lock cleanup refused')
+    for key in ('ExecStartPost','ExecStop','ExecStopPost','ExecReload'):
+        if commands(key): fail('Node/index extra service command refused')
+    files={};directories={}
+    def directory_binding(path):
+        st=safe_directory(path)
+        return dict(device=st.st_dev,inode=st.st_ino,mode=st.st_mode,uid=st.st_uid,gid=st.st_gid,
+            members=sorted(x.name for x in path.iterdir()))
+    paths=[v['FragmentPath'],*v['DropInPaths'].split()]
+    if len(paths)<3 or len(paths)>8 or len(set(paths))!=len(paths): fail('Node/index unit source set refused')
+    for raw_path in paths:
+        path=node_index_path(raw_path);binding,data=node_index_file(path,maximum=262144)
+        files[raw_path]=binding
+        # Reject includes, generators and execution-affecting unknown unit
+        # directives, even when the currently loaded manager omits them.
+        allowed={'Description','After','Wants','WantedBy','Type','User','Group','WorkingDirectory','ExecStart',
+            'Environment','EnvironmentFile','Restart','RestartSec','KillMode','TimeoutStopSec','ExecCondition',
+            'ExecStartPre','ConditionPathExists','StartLimitIntervalSec','StartLimitBurst'}
+        for line in data.decode('utf-8').splitlines():
+            line=line.strip()
+            if not line or line.startswith(('#',';')) or line in {'[Unit]','[Service]','[Install]'}: continue
+            key,sep,val=line.partition('=')
+            if not sep or key not in allowed or line.endswith('\\'): fail('Node/index unit directive refused')
+            if key.startswith('Exec') and val and not val.startswith('/'):
+                fail('Node/index command prefix refused')
+        if path.suffix=='.conf':
+            directories[str(path.parent)]=directory_binding(path.parent)
+    # System-wide service drop-ins can change selection even before reload.
+    for parent in NODE_INDEX_UNIT_SEARCH:
+        candidate=Path(parent)/'openclaw-gateway.service'
+        if os.path.lexists(candidate) and str(candidate) not in files:
+            fail('Node/index alternate unit source refused')
+        for suffix in ('service.d','openclaw-.service.d','openclaw-gateway.service.d'):
+            path=Path(parent)/suffix
+            if path.exists():
+                binding=directory_binding(path)
+                if str(path) not in directories and binding['members']: fail('Node/index unbound service drop-in directory')
+                directories[str(path)]=binding
+    v['ExecStart']=' '.join(argv)  # discard process-specific systemd command telemetry
+    return dict(files=files,directories=directories,effectiveSha256=canonical_json_sha256(v)),argv
+
+
+def retained_node_index_execution(package, cli, identity):
+    try:
+        p,profile=node_index_profile();root=Path(package['path'])
+        # This route executes absolute Node/index argv, not the CLI. Bind the
+        # installer's explicit npm alias/profile to its exact pinned package;
+        # the guard's utility-only PATH must not select a different source.
+        if package['version']!='2026.9.2' or p['package']!=str(root) or p['cli']!=cli:
+            fail('Node/index npm/CLI/profile roots differ')
+        selected,links=retained_execution_path(cli, strict=True)
+        if selected!=root/'openclaw.mjs': fail('Node/index CLI source differs')
+        launcher,_=node_index_file(selected)
+        if launcher['sha256']!=RETAINED_LAUNCHER_PINS['2026.9.2']: fail('Node/index CLI pin refused')
+        unit,argv=node_index_unit(p,identity)
+        files={}
+        for name,pin in {**NODE_INDEX_PINS,**{'dist/'+k:v for k,v in NODE_INDEX_REPAIRS.items()}}.items():
+            binding,_=node_index_file(root/name)
+            if binding['sha256']!=pin: fail('Node/index reviewed source drift')
+            files[name]=binding
+        for name in NODE_INDEX_ABSENT:
+            if os.path.lexists(root/name): fail('Node/index source/lifecycle marker refused')
+        sources=[]
+        for path,grammar in ((Path(p['environmentFile']),'systemd-v1'),(Path(p['state'])/'.env','dotenv-v1')):
+            binding,data=node_index_file(path,private=True,maximum=262144)
+            values=node_index_data(data,grammar);node_index_controls(values,application=True)
+            sources.append(dict(path=str(path),grammar=grammar,keys=sorted(values),binding=binding))
+        binding,data=node_index_file(Path(p['config']),private=True,maximum=2_000_000)
+        cfg=json.loads(data,object_pairs_hook=duplicate_rejecting_object)
+        if not isinstance(cfg,dict): fail('Node/index config object refused')
+        def includes(value):
+            if isinstance(value,dict): return '$include' in value or any(includes(v) for v in value.values())
+            return isinstance(value,list) and any(includes(v) for v in value)
+        if includes(cfg) or cfg.get('plugins',{}).get('load',{}).get('paths'):
+            fail('Node/index config import/plugin roots refused')
+        env=cfg.get('env',{})
+        if not isinstance(env,dict): fail('Node/index config env schema refused')
+        node_index_controls({k:v for k,v in env.items() if k not in {'vars','shellEnv'}},application=True)
+        node_index_controls(env.get('vars',{}),application=True)
+        if 'shellEnv' in env and (not isinstance(env['shellEnv'],dict) or set(env['shellEnv'])-{'enabled','timeoutMs'}):
+            fail('Node/index config shell policy refused')
+        sources.append(dict(path=p['config'],grammar='native-json-env-v1',binding=binding))
+        for path in (Path(p['home'])/'.env',Path(p['home'])/'.config/openclaw/gateway.env',
+                Path(p['state'])/'gateway.env',root/'.env'):
+            if os.path.lexists(path): fail('Node/index extra dotenv source refused')
+        guard,_=node_index_file(Path(p['guardHelper']))
+        if guard['sha256']!=sha256_file(Path(__file__)): fail('Node/index guard is not this sealed helper generation')
+        python,extensions=node_index_python()
+        loader=node_index_loader(p['node'],(*NODE_INDEX_HOOKS,*extensions))
+        return dict(bindingVersion=2,kind=NODE_INDEX_KIND,cli=cli,cliLinks=links,launcher=launcher,
+            profile=profile,argv=argv,node=loader,unitDefinition=unit,environment=sources,files=files,
+            absent=list(NODE_INDEX_ABSENT),guard=guard,python=python)
+    except (ValueError,TypeError,KeyError,UnicodeError,IndexError,AttributeError):
+        fail('Node/index data or source contract refused')
+
+
+def node_index_process_observation(pid):
+    base=Path('/proc')/str(pid)
+    before=(base/'stat').read_text().rsplit(')',1)[1].split()[19]
+    executable=(base/'exe').stat()
+    result=dict(exeDevice=executable.st_dev,exeInode=executable.st_ino,ticks=int(before),argv=(base/'cmdline').read_bytes().rstrip(b'\x00').decode().split('\x00'),
+        exe=os.readlink(base/'exe'),cwd=os.readlink(base/'cwd'),root=os.readlink(base/'root'),
+        sameMount=(base/'ns/mnt').stat().st_ino==Path('/proc/self/ns/mnt').stat().st_ino,
+        cgroup=(base/'cgroup').read_text().strip(),environment={})
+    for item in (base/'environ').read_bytes().split(b'\x00'):
+        if item:
+            key,sep,val=item.decode().partition('=')
+            if not sep or key in result['environment']: fail('Node/index activated environment refused')
+            result['environment'][key]=val
+    if (base/'stat').read_text().rsplit(')',1)[1].split()[19]!=before: fail('Node/index process changed')
+    return result
+
+
+def node_index_process(value):
+    chat=value.get('retainedChat',{});binding=chat.get('execution',{})
+    if binding.get('kind')!=NODE_INDEX_KIND: return
+    current=value['core']['gatewayCurrentUnitIdentity']
+    if not current or not current['active']: return
+    observed=node_index_process_observation(current['mainPid']);argv=binding['argv']
+    executable=binding['node']['files'][argv[0]]
+    if observed['argv']!=argv or observed['exe']!=executable['resolved'] \
+            or (observed['exeDevice'],observed['exeInode'])!=(executable['identity']['device'],executable['identity']['inode']) \
+            or observed['ticks']!=current['processStartTicks']:
+        fail('Node/index activated process identity refused')
+    p,_=node_index_profile()
+    if observed['cwd']!=p['home'] or observed['root']!='/' or not observed['sameMount'] \
+            or observed['cgroup']!='0::/system.slice/openclaw-gateway.service':
+        fail('Node/index activated namespace refused')
+    env=observed['environment'];node_index_controls(env)
+    if env.get('OPENCLAW_DEFER_SHELL_ENV_FALLBACK')!='1' or env.get('HOME')!=p['home'] \
+            or env.get('PATH')!='/usr/bin:/bin' or env.get('LC_ALL')!='C' or env.get('OPENSSL_CONF')!='/dev/null':
+        fail('Node/index activated fixed environment refused')
+
+
+def node_index_start_condition(args):
+    # Read-only: never consume a permit, mutate a target or recover a wrapper.
+    p,_=node_index_profile()
+    if os.path.lexists(NODE_INDEX_OWNER):
+        value=load_ledger(NODE_INDEX_OWNER)
+        if value.get('retainedChat',{}).get('execution',{}).get('kind')!=NODE_INDEX_KIND:
+            fail('Node/index owner kind refused')
+        pending=value['core']['gatewayPendingAction']
+        if not pending or pending['action']!='start': fail('Node/index has no queued start authority')
+        verify_retained_targets(value,committed=pending['purpose']=='forward')
+        if not os.path.lexists(FENCE_MARKER_RUNTIME_PATH): fail('Node/index owner fence absent')
+        raw=retained_read(FENCE_PERMIT_RUNTIME_PATH,0o600).decode('ascii')
+        if not re.fullmatch(r'[1-9][0-9]* [1-9][0-9]* [a-f0-9-]{36}\n',raw): fail('Node/index permit refused')
+        pid,ticks,boot=raw.split()
+        if boot!=Path('/proc/sys/kernel/random/boot_id').read_text().strip() \
+                or Path('/proc/'+pid+'/stat').read_text().rsplit(')',1)[1].split()[19]!=ticks:
+            fail('Node/index stale permit refused')
+    else:
+        if os.path.lexists(NODE_INDEX_OWNER.parent) or os.path.lexists(FENCE_MARKER_RUNTIME_PATH) or os.path.lexists(FENCE_PERMIT_RUNTIME_PATH):
+            fail('Node/index unresolved owner/fence/permit refused')
+        package=retained_package(Path(p['package']))
+        retained_node_index_execution(package,p['cli'],None)
+        generations=[]
+        for name,pins in RETAINED_CHAT_TARGETS['2026.9.2'].items():
+            binding,_=node_index_file(Path(p['package'])/'dist'/name)
+            if binding['sha256'] not in pins: fail('Node/index unknown target refused')
+            generations.append(pins.index(binding['sha256']))
+        if len(set(generations))!=1: fail('Node/index unowned mixed targets refused')
+
+
+def retained_execution(package, cli, identity):
+    if "/dist/index.js" in identity["execStart"]:
+        return retained_node_index_execution(package, cli, identity)
+    root = Path(package['path']); version = package['version']
+    if shutil.which('openclaw') != cli:
+        fail('retained Chat CLI selection changed')
+    launcher = root / 'openclaw.mjs'
+    cli_path, cli_links = retained_execution_path(cli)
+    entry, runtime = retained_service_entry(identity)
+    service_node = retained_execution_context(identity)
+    runtime = runtime or service_node
+    service_path, service_links = retained_execution_path(entry)
+    if cli_path != launcher or service_path != launcher:
+        fail('retained Chat npm/CLI/service execution roots differ')
+    launcher_raw = retained_read(launcher, mode=None)
+    if hashlib.sha256(launcher_raw).hexdigest() != RETAINED_LAUNCHER_PINS.get(version):
+        fail('retained Chat launcher is not the exact qualified source')
+    # These packaged launchers prefer entry.js; source checkouts and the
+    # fallback entry.mjs are not the reviewed layout. Nested package scopes
+    # must not redirect Node module interpretation.
+    for name in ('.git', 'src/entry.ts', 'dist/entry.mjs', 'dist/package.json', 'dist/cli/package.json'):
+        if os.path.lexists(root / name):
+            fail('retained Chat launcher has ambiguous entry/package scope')
+    files = {'openclaw.mjs': dict(sha256=hashlib.sha256(launcher_raw).hexdigest(),
+                                identity=retained_execution_stat(launcher))}
+    for name, pin in RETAINED_EXECUTION_PINS[version].items():
+        path = root / name
+        if hashlib.sha256(retained_read(path, mode=None)).hexdigest() != pin or path.lstat().st_mode & 0o022:
+            fail('retained Chat entry/import source drift: ' + name)
+        files[name] = dict(sha256=pin, identity=retained_execution_stat(path))
+    node = None
+    if runtime is not None:
+        resolved, links = retained_execution_path(runtime)
+        with resolved.open('rb') as stream:
+            if stream.read(4) != b'\x7fELF' or resolved != Path('/usr/bin/node').resolve():
+                fail('retained Chat service interpreter is a wrapper')
+        node = dict(path=runtime, resolved=str(resolved), links=links, identity=retained_execution_stat(resolved))
+    return dict(cli=cli, cliLinks=cli_links, serviceEntry=entry, serviceLinks=service_links,
+                node=node, files=files)
+
+
+def validate_retained_execution(value):
+    chat = value['retainedChat']
+    binding = chat['execution']
+    if not isinstance(binding, dict) or not isinstance(binding.get('cli'), str) \
+            or binding != retained_execution(chat['package'], binding['cli'], value['core']['gatewayBaselineUnitIdentity']):
+        fail('retained Chat execution binding changed; preserve owner and fence')
+
+
+def retained_package(path):
+    safe_directory(path)
+    dist = safe_directory(path / 'dist')
+    raw = retained_read(path / 'package.json')
+    document = json.loads(raw, object_pairs_hook=duplicate_rejecting_object)
+    version = document.get('version')
+    if document.get('name') != 'openclaw' or version not in RETAINED_CHAT_TARGETS:
+        fail('unsupported retained Chat core')
+    digest = hashlib.sha256(raw).hexdigest()
+    if version == '2026.9.2' and digest != 'aaba2fdde13e3d1a676102fc53195bac94d6236e9d9bef192c84dca04cf9ea5b':
+        fail('retained 9.2 package is not the qualified source')
+    if version == '2026.9.3' and digest != '226a35245ba5ba8b36ac707e68439eef62a9abb07a3234a154008d959976be7e':
+        fail('retained 9.3 package is not the qualified source')
+    if version == '2026.9.3' and document.get('gitHead', '1391f7cd2d40ab5bbcf2f5f831d3a64f520e72d7') != '1391f7cd2d40ab5bbcf2f5f831d3a64f520e72d7':
+        fail('retained 9.3 source commit drift')
+    st = path.lstat()
+    return dict(path=str(path), version=version, metadataSha256=digest,
+                device=st.st_dev, inode=st.st_ino, distDevice=dist.st_dev, distInode=dist.st_ino)
+
+
+def retained_portal_receipt(ledger):
+    parent = ledger.parent.parent
+    active, cutover = parent / 'active-update.json', parent / 'cutover-update.json'
+    present = [p for p in (active, cutover) if os.path.lexists(p)]
+    if len(present) != 1:
+        fail('retained Chat needs one exact Portal receipt')
+    path = present[0]
+    raw = retained_read(path, 0o600)
+    value = json.loads(raw, object_pairs_hook=duplicate_rejecting_object)
+    if len(raw) > 16 * 1024 or not isinstance(value, dict) or set(value) != RETAINED_PORTAL_FIELDS \
+            or value.get('schema') != 'bridgesllm-update-transaction-v2' \
+            or value.get('operation_contract') != 'portal-retained-chat-v1' \
+            or not GENERATION.fullmatch(str(value.get('transaction_id', ''))) \
+            or not SHA256.fullmatch(str(value.get('release_artifact_sha256', ''))) \
+            or not SHA256.fullmatch(str(value.get('release_manifest_sha256', ''))):
+        fail('retained Chat Portal release binding is invalid')
+    canonical = (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
+    unsigned = {k: v for k, v in value.items() if k != 'integrity_sha256'}
+    if raw != canonical or value.get('integrity_sha256') != hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(',', ':')).encode()).hexdigest():
+        fail('retained Chat Portal receipt integrity drift')
+    if type(value.get('generation')) is not int or not 1 <= value['generation'] <= 1_000_000 \
+            or not isinstance(value.get('phase'), str) or 'recovery_from_phase' not in value:
+        fail('invalid retained Chat Portal receipt state')
+    identity = {k: v for k, v in value.items() if k not in RETAINED_PORTAL_MUTABLE}
+    return path.name, value, identity, hashlib.sha256(raw).hexdigest()
+
+
+def prepare_retained_chat(args, ledger):
+    slot, receipt, portal, _ = retained_portal_receipt(ledger)
+    if slot != 'active-update.json' or receipt['phase'] != 'openclaw_update_pending' \
+            or receipt['recovery_from_phase'] is not None:
+        fail('retained Chat creation is outside the Portal update boundary')
+    package = retained_package(Path(args.retained_chat_package))
+    if args.retained_chat_runtime != package['version']:
+        fail('retained core runtime/package version mismatch')
+    execution = retained_execution(package, args.retained_chat_cli,
+        json_argument(args.gateway_unit_identity_json, 'retained Chat execution identity'))
+    targets = RETAINED_CHAT_TARGETS[package['version']]
+    payload = Path(args.retained_chat_payload)
+    expected_members = set(targets) | ({'SOURCE-LOCK.json'} if package['version'] == '2026.9.2' else set())
+    safe_directory(payload)
+    if {p.name for p in payload.iterdir()} != expected_members:
+        fail('unexpected retained Chat payload member')
+    if package['version'] == '2026.9.2' and hashlib.sha256(retained_read(payload / 'SOURCE-LOCK.json')).hexdigest() != 'cc40afabebfc179518c3bdb8525060903960d39e323aa9c8515778ad5842f96c':
+        fail('retained 9.2 source lock drift')
+    before, accepted = {}, {}
+    for name, pins in targets.items():
+        original = retained_read(Path(package['path']) / 'dist' / name)
+        candidate = retained_read(payload / name)
+        if hashlib.sha256(original).hexdigest() not in pins or hashlib.sha256(candidate).hexdigest() != pins[1]:
+            fail('retained Chat source/payload drift: ' + name)
+        before[name] = base64.b64encode(original).decode()
+        accepted[name] = base64.b64encode(candidate).decode()
+    if len({targets[n].index(hashlib.sha256(base64.b64decode(b)).hexdigest()) for n, b in before.items()}) != 1:
+        fail('retained Chat mixed generation without ownership')
+    return dict(package=package, runtime=package['version'], portal=portal, before=before, accepted=accepted, execution=execution,
+                armedReceiptSha256=None, decisionSha256=None)
+
+
+def validate_retained_chat(value, ledger):
+    chat = value['retainedChat']
+    if {p.name for p in ledger.parent.iterdir()} - {'transaction.json', 'openclaw-migration-transaction.py',
+            'migrate-openclaw-2026.9.1.mjs', 'openclaw-stable-plugins.sh'}:
+        fail('unknown retained Chat owner artifact; preserve evidence')
+    if not isinstance(chat, dict) or set(chat) != {'package', 'runtime', 'portal', 'before', 'accepted', 'execution',
+                                                  'armedReceiptSha256', 'decisionSha256'} \
+            or value['phase'] not in RETAINED_PHASES or value['codex']['phase'] != 'unarmed' \
+            or any(value['prepared'][n] is not None for n in ('migrationSha256', 'upgradeStateSha256', 'migrationPackageDir')) \
+            or any(value['core'][n] is not None for n in ('packageVersion', 'runtimeVersion', 'rollbackSha256', 'gatewayProvisionPending')) \
+            or value['commit'] != {'pendingLedgerSha256': None, 'decisionSha256': None} \
+            or any(value['core'][n] for n in ('stateRootPreexisted', 'statePreexisted', 'stateConfigPreexisted')) \
+            or not value['core']['packagePreexisted'] or not value['core']['gatewayUnitPreexisted']:
+        fail('retained Chat cannot carry legacy migration authority')
+    if chat['package'] != retained_package(Path(chat['package']['path'])) or chat['runtime'] != chat['package']['version']:
+        fail('retained Chat package identity changed')
+    validate_retained_execution(value)
+    targets = RETAINED_CHAT_TARGETS[chat['package']['version']]
+    for key in ('before', 'accepted'):
+        if set(chat[key]) != set(targets):
+            fail('retained Chat target binding changed')
+        for name, encoded in chat[key].items():
+            raw = base64.b64decode(encoded, validate=True)
+            if base64.b64encode(raw).decode() != encoded or hashlib.sha256(raw).hexdigest() not in (
+                    (targets[name][1],) if key == 'accepted' else targets[name]):
+                fail('retained Chat backup/candidate pin mismatch')
+    if len({targets[n].index(hashlib.sha256(base64.b64decode(b)).hexdigest()) for n, b in chat['before'].items()}) != 1:
+        fail('retained Chat mixed rollback baseline')
+    for key in ('armedReceiptSha256', 'decisionSha256'):
+        if chat[key] is not None and not SHA256.fullmatch(str(chat[key])):
+            fail('retained Chat decision fingerprint invalid')
+    if value['phase'] in {'commit-pending', 'commit-applying', 'committed-cleanup'} and chat['armedReceiptSha256'] is None:
+        fail('retained Chat commit was not armed')
+    if chat['decisionSha256'] is not None and chat['decisionSha256'] != chat['armedReceiptSha256']:
+        fail('retained Chat decision differs from armed cutover')
+    if value['phase'] in {'commit-applying', 'committed-cleanup'} and chat['decisionSha256'] is None:
+        fail('retained Chat has no published decision')
+    pending = value['core']['gatewayPendingAction']
+    if pending is not None and pending['action'] == 'start':
+        verify_retained_targets(value, committed=pending['purpose'] == 'forward')
+    slot, receipt, portal, digest = retained_portal_receipt(ledger)
+    if portal != chat['portal']:
+        fail('retained Chat belongs to another Portal release/transaction')
+    return slot, receipt, digest
+
+
+def verify_retained_targets(value, *, committed=None):
+    chat = value['retainedChat']
+    for name, pins in RETAINED_CHAT_TARGETS[chat['package']['version']].items():
+        raw = retained_read(Path(chat['package']['path']) / 'dist' / name)
+        if hashlib.sha256(raw).hexdigest() not in pins:
+            fail('unknown retained Chat target drift: ' + name)
+        if committed is not None and raw != base64.b64decode(chat['accepted' if committed else 'before'][name]):
+            fail('retained Chat targets do not match terminal generation')
+
+
+def retained_inactive(value, raw):
+    identity = json_argument(raw, 'retained Chat inactive identity')
+    validate_gateway_unit_identity(identity, label='retained Chat inactive identity')
+    if identity['active'] or identity['mainPid'] or identity['subState'] not in {'dead', 'failed'} \
+            or value['core']['gatewayPendingAction'] is not None \
+            or identity != value['core']['gatewayCurrentUnitIdentity']:
+        fail('retained Chat has no owned inactive gateway')
+    groups = {Path('/sys/fs/cgroup/system.slice/openclaw-gateway.service')}
+    group = identity['controlGroup']
+    if group:
+        if not group.startswith('/') or '..' in Path(group).parts:
+            fail('invalid retained Chat cgroup')
+        groups.add(Path('/sys/fs/cgroup') / group.lstrip('/'))
+    for group in groups:
+        if group.exists():
+            for members in [group / 'cgroup.procs', *group.rglob('cgroup.procs')]:
+                if members.read_text().strip():
+                    fail('retained Chat gateway cgroup is populated')
+
+
+def write_retained_targets(value, ledger, inactive_json, *, committed):
+    retained_inactive(value, inactive_json)
+    verify_retained_targets(value)  # inspect all targets before the first write
+    chat = value['retainedChat']
+    for name, encoded in chat['accepted' if committed else 'before'].items():
+        retained_inactive(value, inactive_json)
+        validate_retained_execution(value)
+        if retained_package(Path(chat['package']['path'])) != chat['package']:
+            fail('retained Chat package changed during replacement')
+        verify_retained_targets(value)
+        target = Path(chat['package']['path']) / 'dist' / name
+        raw = base64.b64decode(encoded)
+        if retained_read(target) != raw:
+            # Same-filesystem sibling scratch outside dist; uncommitted scratch
+            # survives crashes as inert evidence and cannot wedge owner cleanup.
+            stage = Path(tempfile.mkdtemp(prefix='.retained-chat-bytes-', dir=target.parent.parent))
+            temporary = stage / name
+            try:
+                with temporary.open('xb') as stream:
+                    os.fchmod(stream.fileno(), 0o644)
+                    stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                os.replace(temporary, target)
+                fsync_directory(target.parent)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+                stage.rmdir()
+                fsync_directory(stage.parent)
+        fault('retained-chat-target-' + name)
+    verify_retained_targets(value, committed=committed)
+
+
+def retained_chat(args):
+    ledger = Path(args.ledger)
+    value = load_ledger(ledger)
+    if value['schema'] != RETAINED_CHAT_SCHEMA:
+        fail('not a retained Chat generation')
+    chat, phase = value['retainedChat'], value['phase']
+    slot, receipt, receipt_hash = validate_retained_chat(value, ledger)
+    action = args.action
+    if action == 'status':
+        print(chat['runtime'] + '\t' + phase)
+        return
+    if action == 'verify':
+        verify_retained_targets(value, committed=phase not in {'recovery-pending', 'upgrade-restored', 'restored-cleanup'})
+        return
+    if action == 'apply':
+        if phase != 'created' or slot != 'active-update.json' or receipt['phase'] != 'openclaw_update_pending':
+            fail('retained Chat apply has no forward Portal authority')
+        write_retained_targets(value, ledger, args.inactive_json, committed=True)
+        value['phase'] = 'migration-prepared'
+    elif action == 'arm':
+        if phase not in {'migration-prepared', 'commit-pending'} or slot != 'active-update.json' \
+                or receipt['phase'] != 'cutover_pending' or receipt['recovery_from_phase'] is not None:
+            fail('retained Chat arm is not at Portal cutover')
+        verify_retained_targets(value, committed=True)
+        validate_gateway_terminal_activation(value, committed=True)
+        if chat['armedReceiptSha256'] not in {None, receipt_hash}:
+            fail('retained Chat armed receipt changed')
+        chat['armedReceiptSha256'] = receipt_hash
+        value['phase'] = 'commit-pending'
+    elif action == 'resolve':
+        if chat['decisionSha256'] is not None:
+            if phase not in {'commit-applying', 'committed-cleanup'}:
+                fail('retained Chat decision/phase mismatch')
+            verify_retained_targets(value, committed=True)
+            return
+        if slot == 'cutover-update.json':
+            if phase != 'commit-pending' or receipt['phase'] != 'cutover_pending' \
+                    or receipt_hash != chat['armedReceiptSha256']:
+                fail('retained Chat cutover is not the exact armed receipt')
+            verify_retained_targets(value, committed=True)
+            chat['decisionSha256'] = receipt_hash
+            value['phase'] = 'commit-applying'
+        elif phase not in {'recovery-pending', 'upgrade-restored', 'restored-cleanup'}:
+            if value['core']['gatewayPendingAction'] is not None:
+                fail('retained Chat must reconcile the owned gateway action before rollback')
+            value['recoveryFrom'] = phase
+            value['phase'] = 'recovery-pending'
+    elif action == 'restore':
+        if phase != 'recovery-pending' or slot != 'active-update.json' or chat['decisionSha256'] is not None:
+            fail('retained Chat restore lacks an undecided Portal owner')
+        write_retained_targets(value, ledger, args.inactive_json, committed=False)
+        value['phase'] = 'upgrade-restored'
+    elif action == 'finish':
+        committed = chat['decisionSha256'] is not None
+        if phase not in ({'commit-applying', 'committed-cleanup'} if committed else {'upgrade-restored', 'restored-cleanup'}):
+            fail('retained Chat cannot finish before restoration/decision')
+        verify_retained_targets(value, committed=committed)
+        validate_gateway_terminal_activation(value, committed=committed)
+        value['phase'] = 'committed-cleanup' if committed else 'restored-cleanup'
+    atomic_json(ledger, value)
+    fault('retained-chat-' + action)
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
+    guard_parser = subparsers.add_parser("node-index-start-condition")
+    guard_parser.set_defaults(handler=node_index_start_condition)
     create_parser = subparsers.add_parser("create")
     create_parser.add_argument("--root", required=True)
     create_parser.add_argument("--ledger", required=True)
@@ -3825,6 +5033,10 @@ def build_parser():
     create_parser.add_argument("--state-root-preexisted", required=True)
     create_parser.add_argument("--state-preexisted", required=True)
     create_parser.add_argument("--state-config-preexisted", required=True)
+    create_parser.add_argument("--retained-chat-package")
+    create_parser.add_argument("--retained-chat-payload")
+    create_parser.add_argument("--retained-chat-runtime")
+    create_parser.add_argument("--retained-chat-cli")
     create_parser.set_defaults(handler=create)
     arm_fresh_core_parser = subparsers.add_parser("arm-fresh-core")
     arm_fresh_core_parser.add_argument("--ledger", required=True)
@@ -3989,11 +5201,24 @@ def build_parser():
     sweep_parser.add_argument("--root", required=True)
     sweep_parser.add_argument("--tombstone", required=True)
     sweep_parser.set_defaults(handler=sweep_terminal)
+    retained_parser = subparsers.add_parser("retained-chat")
+    retained_parser.add_argument("action", choices=["status", "apply", "verify", "arm", "resolve", "restore", "finish"])
+    retained_parser.add_argument("--ledger", required=True)
+    retained_parser.add_argument("--inactive-json")
+    retained_parser.set_defaults(handler=retained_chat)
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    # A new-mode ledger cannot be driven by legacy upgrade/plugin/decision verbs.
+    if getattr(args, "ledger", None) and args.handler != create and Path(args.ledger).exists():
+        raw = read_json(Path(args.ledger))
+        if raw.get("schema") == RETAINED_CHAT_SCHEMA and args.handler not in {
+            retained_chat, inspect, cleanup, gateway_status, core_gateway_authority,
+            arm_core_gateway_action, record_core_gateway_result, adopt_core_gateway_identity,
+        }:
+            fail("legacy operation is not authorized by a retained Chat owner")
     args.handler(args)
 
 

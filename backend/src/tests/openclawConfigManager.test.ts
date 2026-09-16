@@ -16,7 +16,7 @@ import {
 
 describe('openclawConfigManager Claude CLI helpers', () => {
   test('defaults to the exact Portal-tested Codex plugin package revision', () => {
-    expect(OPENCLAW_CODEX_PLUGIN_VERSION).toBe('2026.9.1');
+    expect(OPENCLAW_CODEX_PLUGIN_VERSION).toBe('2026.9.3');
     expect(LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION).toBe('2026.7.1-1');
   });
 
@@ -457,6 +457,27 @@ describe('openclawConfigManager OpenClaw auth store bridge', () => {
       error: null,
       profileId: null,
     });
+  });
+
+  test('shared Claude login becomes configured after model registration, without a duplicated auth profile', () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-claude-registration-'));
+    process.env.OPENCLAW_HOME = tempDir;
+    const configPath = path.join(tempDir, 'openclaw.json');
+    const config = { agents: { defaults: { models: {} as Record<string, any> } } };
+    fs.writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
+    jest.resetModules();
+    const manager = require('../services/openclawConfigManager');
+    const options = { authStoreProfiles: {}, nativeAuthStatuses: { CLAUDE_CODE: { status: 'authenticated', message: 'Signed in' } } };
+    expect(manager.getProviderStatuses(options).find((p: any) => p.id === 'anthropic')).toMatchObject({
+      status: 'unconfigured', authType: 'cli', warning: expect.stringMatching(/Choose models/),
+    });
+    config.agents.defaults.models['anthropic/claude-fable-5-1'] = { agentRuntime: { id: 'claude-cli' } };
+    fs.writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
+    expect(manager.getProviderStatuses(options).find((p: any) => p.id === 'anthropic')).toMatchObject({
+      status: 'configured', authType: 'cli', profileId: null, warning: null, isDefault: false,
+    });
+    options.nativeAuthStatuses.CLAUDE_CODE.status = 'needs_login';
+    expect(manager.getProviderStatuses(options).find((p: any) => p.id === 'anthropic').status).toBe('unconfigured');
   });
 
   test('reports Bedrock as externally managed AWS SDK auth instead of OAuth', () => {

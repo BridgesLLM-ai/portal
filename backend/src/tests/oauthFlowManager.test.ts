@@ -29,6 +29,7 @@ import {
   completeClaudeSetupTokenProcessExit,
   commitClaudeSetupTokenCredential,
   createOAuthSessionId,
+  describeNativeCredentialAttestationFailure,
   getOAuthFlowStatus,
   getClaudeSetupToken,
   getCredentialLifecycleNamespaceForNativeProvider,
@@ -1425,6 +1426,117 @@ describe('oauthFlowManager terminal parsing', () => {
       else process.env.CLAUDE_CONFIG_DIR = originalClaudeConfig;
       fs.rmSync(tempHome, { recursive: true, force: true });
     }
+  });
+
+  test('cancels a processless Claude sign-in that ended in error after a rejected exchange and releases its lease', async () => {
+    const originalHome = process.env.HOME;
+    const originalClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-native-claude-rejected-'));
+    process.env.HOME = tempHome;
+    process.env.CLAUDE_CONFIG_DIR = path.join(tempHome, '.claude');
+    const namespace = 'credential-domain:anthropic';
+    let sessionId: string | null = null;
+    try {
+      const started = await startNativeCliFlow('claude-code', { ownerId: 'user:rejected' });
+      sessionId = started.sessionId;
+      expect(started).toMatchObject({ status: 'awaiting_callback' });
+      expect(__readProviderCredentialLifecycleLedgerForTests().records[namespace])
+        .toMatchObject({ bindingState: 'attested-processless' });
+
+      const fetchImpl = jest.fn(async () => new Response(JSON.stringify({
+        error: 'invalid_grant',
+        error_description: 'invalid_grant',
+      }), { status: 400, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
+      await expect(completeNativeCliFlow(sessionId, 'stale-code#state', 'user:rejected', { fetchImpl }))
+        .resolves.toMatchObject({ success: false, error: expect.stringMatching(/Claude token exchange failed: invalid_grant/) });
+      expect(getOAuthFlowStatus(sessionId, 'user:rejected')).toMatchObject({
+        status: 'error',
+        cleanupPending: true,
+      });
+      expect(fs.existsSync(path.join(tempHome, '.claude', '.credentials.json'))).toBe(false);
+
+      // The dialog's "Try Again" cancels the ended session first. The
+      // processless attestation proves nothing was written and releases both
+      // the in-memory lease and the durable ledger claim.
+      await expect(cancelOAuthFlow(sessionId, 'user:rejected')).resolves.toEqual({
+        success: true,
+        status: 'cancelled',
+      });
+      expect(getOAuthFlowStatus(sessionId, 'user:rejected')).toMatchObject({
+        status: 'cancelled',
+        cleanupPending: false,
+        credentialState: 'absent',
+      });
+      expect(forceReleaseCredentialLifecycleLease(namespace)).toBe('none');
+      expect(__readProviderCredentialLifecycleLedgerForTests().records[namespace]).toBeUndefined();
+
+      const restarted = await startNativeCliFlow('claude-code', { ownerId: 'user:rejected' });
+      expect(restarted).toMatchObject({ status: 'awaiting_callback' });
+      expect(restarted.sessionId).not.toBe(sessionId);
+      __deleteOAuthSessionForTests(restarted.sessionId);
+    } finally {
+      if (sessionId) __deleteOAuthSessionForTests(sessionId);
+      process.env.HOME = originalHome;
+      if (originalClaudeConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalClaudeConfig;
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  test('writes the native Claude credential file private (0600) on first browser sign-in', async () => {
+    const originalHome = process.env.HOME;
+    const originalClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
+    const originalUmask = process.umask(0o022);
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-native-claude-mode-'));
+    process.env.HOME = tempHome;
+    process.env.CLAUDE_CONFIG_DIR = path.join(tempHome, '.claude');
+    const credentialsPath = path.join(tempHome, '.claude', '.credentials.json');
+    // A pre-existing looser file from an older release must end up private
+    // and keep its non-token metadata; the write is a private temp + rename.
+    fs.mkdirSync(path.dirname(credentialsPath), { recursive: true });
+    fs.writeFileSync(credentialsPath, JSON.stringify({ claudeAiOauth: { accessToken: 'old', subscriptionType: 'pro', rateLimitTier: 'tier-1' } }), { mode: 0o644 });
+    fs.chmodSync(credentialsPath, 0o644);
+    let sessionId: string | null = null;
+    try {
+      const started = await startNativeCliFlow('claude-code', { ownerId: 'user:mode' });
+      sessionId = started.sessionId;
+      const fetchImpl = jest.fn(async () => new Response(JSON.stringify({
+        access_token: 'test-access-token',
+        refresh_token: 'test-refresh-token',
+        expires_in: 3600,
+        scope: 'user:inference',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
+
+      await expect(completeNativeCliFlow(sessionId, 'good-code#state', 'user:mode', { fetchImpl }))
+        .resolves.toEqual({ success: true });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(fs.statSync(credentialsPath).mode & 0o777).toBe(0o600);
+      expect(fs.readdirSync(path.dirname(credentialsPath)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+      const written = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'));
+      expect(written.claudeAiOauth).toMatchObject({
+        accessToken: 'test-access-token',
+        refreshToken: 'test-refresh-token',
+        scopes: ['user:inference'],
+        subscriptionType: 'pro',
+        rateLimitTier: 'tier-1',
+      });
+      expect(getOAuthFlowStatus(sessionId, 'user:mode')).toMatchObject({ status: 'complete' });
+      expect(markOAuthFlowFinalized(sessionId, 'user:mode')).toBe(true);
+    } finally {
+      if (sessionId) __deleteOAuthSessionForTests(sessionId);
+      process.umask(originalUmask);
+      process.env.HOME = originalHome;
+      if (originalClaudeConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalClaudeConfig;
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  test('explains a CLAUDE_CODE attestation failure by credential file, not the Codex host lockout', () => {
+    expect(describeNativeCredentialAttestationFailure('CODEX')).toMatch(/^HOST_CREDENTIAL_FLOW_UNAVAILABLE:/);
+    const claude = describeNativeCredentialAttestationFailure('CLAUDE_CODE');
+    expect(claude).not.toMatch(/HOST_CREDENTIAL_FLOW_UNAVAILABLE|Project Sandbox|bounded credential-process boundary/);
+    expect(claude).toMatch(/credential files/i);
   });
 
   test('rejects GitHub device-code start before lifecycle admission or PTY spawn', async () => {

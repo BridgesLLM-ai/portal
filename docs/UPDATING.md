@@ -44,9 +44,18 @@ The Portal updater does not silently replace the shared host interpreter. Plan a
 
 ## If an update stops
 
+- With the 5.0.9 installer, use `--status` to inspect the detected installation, lock, recovery records, and log locations without starting a repair. Status is not a service health check.
+- Use `--recover` to finish recovery supported by existing transaction records, then choose the next operation separately. Recovery can finish a previously authorized uninstall; it does not resume an unjournaled partial fresh installation.
+- If another installer still holds the lock, return to its original terminal and inspect its log. Do not launch another writer or delete the lock. If you interrupt the original operation, let its recovery finish before rerunning status.
 - Read the specific Dashboard or installer error before retrying. Do not delete transaction journals, fence markers, saved authentication, or rollback evidence.
 - For Portal `updated_with_errors` or `recovery_required` status, use [update attention recovery](PORTAL_UPDATE_ATTENTION_RECOVERY.md) only after the underlying failure is repaired and verified. This does not reconcile an interrupted OpenClaw migration.
 - For a previously interrupted OpenClaw migration or manually rescued gateway, consult the installed signed installer's recovery help and the [5.0.4 recovery notes](../CHANGELOG.md#504---2026-09-09). The explicit root-only recovery requires the recorded evidence; an ordinary retry cannot replace it.
 - A pre-5.0.7 Dashboard may reject a current data backup using its old verifier. See the [5.0.7 upgrade notes](../CHANGELOG.md#507---2026-09-10). Do not treat bypassing backup verification as the standard update procedure.
 
 After maintenance, check Dashboard health, provider readiness, and a real conversation using the intended harness/model. A healthy package probe is not proof of account access or a working agent turn.
+
+## Reading installation progress
+
+The installer names the current stage, shows elapsed time, and gives a specific next action. The Dashboard activity indicator means work is ongoing; stage checkpoints are not measured percentages or time estimates. Smaller terminals and redirected output use a compact log view.
+
+Package steps run noninteractively so operating-system restart notices cannot wait for input in a hidden dialog. The installer does not authorize an automatic host reboot; review any required reboot separately after installation.

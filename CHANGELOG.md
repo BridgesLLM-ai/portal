@@ -2,6 +2,23 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.9] - 2026-09-15
+
+### Fixed
+- **Claude browser sign-in restored:** OpenClaw Claude setup offers a process-free browser sign-in again (authorize in the browser, paste the code); Portal completes it on the server and never launches Claude Code on the host. The login is the same Claude Code login used by OpenClaw's Claude CLI runtime and Portal Claude Code sessions on that server, is stored privately, and replacing an existing login requires an explicit acknowledgement. Existing setup-token and API-key entry remain available. Continue into model selection after sign-in; the default only changes when explicitly selected.
+- **Complete provider setup:** subscription providers remain visible alongside API keys. Supported browser/device flows use the installed OpenClaw wizard; missing upstream methods have a specific explanation. Setup discovers models, registers the chosen runtime route, and confirms default selection from saved configuration while preserving unrelated providers.
+- **Install missing tools from setup:** named Install buttons use the existing pinned CLI installers and show progress, errors, and retry guidance. A lost response resumes the existing job instead of launching a duplicate; installed tools and existing logins are preserved.
+- **Package installation no longer waits on a hidden restart dialog:** nested system-package installers inherit noninteractive behavior. Reboot decisions remain with the operator.
+- **Clear installation and update progress:** cohesive welcome, choice, progress and result screens use named stages and elapsed time. Small terminals use concise stage updates; copyable diagnostic commands and paths stay intact. Dashboard stages are no longer presented as measured percentages.
+- **Useful rerun guidance:** `--status` reports installation and operation state; `--recover` delegates supported interrupted operations to their existing recovery owner. Active installers and incomplete installations receive specific guidance instead of a dead-end Repair choice. Unjournaled partial installations remain preserved.
+- **Responsive Chat history and Tasks:** opening Chat no longer polls a closed Tasks panel. Release-qualified native history repairs yield between bounded reads, retain exact message identities, and reject stale or unsafe continuation instead of returning duplicate or partial messages.
+- **Compatible transcript notes:** the frontend awaits the authorized Portal broker, which sends the native message schema. Existing ownership and operator checks remain in force; ambiguous network failures are not automatically replayed.
+- **Recoverable native delivery:** exact source checks and preserved originals protect native file replacement. Interrupted journal staging cannot become recovery authority or prevent the authoritative transaction from completing.
+
+### Upgrade notes
+- OpenClaw core and host-interpreter upgrades remain explicit maintenance choices. Native compatibility is tied to release-qualified versions and exact source files; unknown local modifications are not silently replaced.
+- Recovery preserves evidence. Do not delete installer locks, journals or partial installation directories to force a rerun.
+
 ## [5.0.8] - 2026-09-13
 
 ### Fixed

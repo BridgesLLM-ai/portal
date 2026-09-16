@@ -9,21 +9,25 @@ import type { ChatMessage } from '../../contexts/ChatStateProvider';
 import { latestChatPlan, sessionTasks, taskCounts, type ChatTask } from '../../utils/chatTasks';
 import { taskConversationHref } from '../../utils/taskConversation';
 
-export default function ChatTasksButton({ provider, session, messages, isRunning, projectWork = [] }: {
+export default function ChatTasksButton({ provider, session, messages, projectWork = [] }: {
   provider: string; session: string; messages: ChatMessage[]; isRunning: boolean; projectWork?: WorkCard[];
 }) {
   const anchor = useRef<HTMLButtonElement>(null);
   const reducedMotion = useReducedMotion();
-  const close = () => { setOpen(false); anchor.current?.focus(); };
-  const [open, setOpen] = useState(false);
+  const close = () => { setOpenContext(null); anchor.current?.focus(); };
+  const [openContext, setOpenContext] = useState<{ provider: string; session: string } | null>(null);
+  // Navigation closes the feed before effects run for the next conversation.
+  const open = openContext !== null && openContext.provider === provider && openContext.session === session;
   const [allTasks, setAllTasks] = useState<ChatTask[]>([]);
   const [scope, setScope] = useState<'session' | 'harness'>('session');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const plan = useMemo(() => latestChatPlan(messages), [messages]);
-  useEffect(() => { setOpen(false); setAllTasks([]); setError(''); setScope('session'); }, [provider, session]);
+  useEffect(() => { setOpenContext(null); setAllTasks([]); setError(''); setLoading(false); setScope('session'); }, [provider, session]);
   useEffect(() => {
-    if (provider !== 'OPENCLAW') return;
+    // The remote feed enumerates every agent's sessions. Keep closed chat
+    // controls local so opening a conversation does not trigger that sweep.
+    if (provider !== 'OPENCLAW' || !open) return;
     let alive = true;
     let timer: number | undefined;
     let controller: AbortController | undefined;
@@ -41,12 +45,12 @@ export default function ChatTasksButton({ provider, session, messages, isRunning
       } catch {
         if (alive) setError('Task feed unavailable. Last reported status is shown.');
       } finally {
-        if (alive) { setLoading(false); timer = window.setTimeout(refresh, open || isRunning ? 10_000 : 30_000); }
+        if (alive) { setLoading(false); timer = window.setTimeout(refresh, 10_000); }
       }
     };
     void refresh();
     return () => { alive = false; controller?.abort(); window.clearTimeout(timer); };
-  }, [provider, session, open, isRunning]);
+  }, [provider, session, open]);
   const related = useMemo(() => sessionTasks(allTasks, session), [allTasks, session]);
   const projectTasks: ChatTask[] = projectWork.map((card) => ({ id: `project-work:${card.id}`, name: `${card.projectName} · ${card.prompt}`,
     status: card.turn?.status === 'COMPLETED' ? 'done' : ['RUNNING', 'STARTING'].includes(card.turn?.status || '') ? 'running' : !card.turn ? 'pending' : card.turn.status === 'ABORTED' ? 'cancelled' : 'failed',
@@ -61,7 +65,7 @@ export default function ChatTasksButton({ provider, session, messages, isRunning
   const summary = counts.outstanding ? `${counts.outstanding} remaining` : counts.failed ? `${counts.failed} failed` : counts.cancelled ? `${counts.cancelled} stopped` : counts.total && counts.done === counts.total ? 'All complete' : counts.total ? 'Last reported progress' : 'No active tasks';
   return <>
     <button type="button" ref={anchor} aria-label={'Tasks' + (ownCounts.outstanding ? ', ' + ownCounts.outstanding + ' outstanding' : complete ? ', all completed' : '')}
-      aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(v => !v)}
+      aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpenContext(open ? null : { provider, session })}
       title="Tasks and plan progress"
       className={'relative flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/70 ' + (open || ownCounts.outstanding ? 'border-sky-400/20 bg-sky-400/10 text-sky-300' : complete ? 'border-emerald-400/15 bg-emerald-400/5 text-emerald-300' : 'border-transparent text-slate-400 hover:bg-sky-500/10 hover:text-sky-300')}>
       <ListTodo size={16} aria-hidden="true" />
@@ -94,14 +98,14 @@ export default function ChatTasksButton({ provider, session, messages, isRunning
             return <li key={task.id} className="flex gap-2.5 rounded-lg border border-white/5 bg-white/[0.02] p-2.5">
               <Icon aria-label={statusLabel} size={15} className={'mt-0.5 shrink-0 ' + (task.status === 'running' ? 'motion-safe:animate-spin text-sky-300' : task.status === 'done' ? 'text-emerald-400' : task.status === 'failed' ? 'text-rose-400' : 'text-slate-500')} />
               <div className="min-w-0 text-xs leading-relaxed">
-                {task.id.startsWith('project-work:') ? <button type="button" className="break-words text-left text-slate-200 hover:text-sky-300" onClick={() => { setOpen(false); document.querySelector(`[data-work-id="${CSS.escape(task.id.slice(13))}"]`)?.scrollIntoView({ block: 'center', behavior: reducedMotion ? 'auto' : 'smooth' }); }}>{task.name}</button> : href ? <Link to={href} onClick={() => setOpen(false)} className="break-words text-slate-200 hover:text-sky-300">{task.name}</Link> : <span className="break-words text-slate-200">{task.name}</span>}
+                {task.id.startsWith('project-work:') ? <button type="button" className="break-words text-left text-slate-200 hover:text-sky-300" onClick={() => { setOpenContext(null); document.querySelector(`[data-work-id="${CSS.escape(task.id.slice(13))}"]`)?.scrollIntoView({ block: 'center', behavior: reducedMotion ? 'auto' : 'smooth' }); }}>{task.name}</button> : href ? <Link to={href} onClick={() => setOpenContext(null)} className="break-words text-slate-200 hover:text-sky-300">{task.name}</Link> : <span className="break-words text-slate-200">{task.name}</span>}
                 {task.detail && <p className="mt-1 line-clamp-2 text-slate-500">{task.detail}</p>}
               </div>
             </li>;
           })}</ul>
         </div>
         <footer className="shrink-0 border-t border-white/5 px-4 py-2.5 text-[11px] text-slate-400">
-          {provider === 'OPENCLAW' ? <Link to="/tasks" onClick={() => setOpen(false)} className="text-sky-300">Open task board →</Link> : 'Plan reported by this harness'}
+          {provider === 'OPENCLAW' ? <Link to="/tasks" onClick={() => setOpenContext(null)} className="text-sky-300">Open task board →</Link> : 'Plan reported by this harness'}
         </footer>
       </motion.section>
     </AnchoredPopover>

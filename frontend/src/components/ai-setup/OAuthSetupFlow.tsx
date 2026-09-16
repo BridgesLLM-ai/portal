@@ -944,7 +944,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
               ) : null}
 
               <p className="text-sm text-slate-300">
-                Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.
+                OpenClaw's default model is unchanged. After this dialog closes, Portal verifies the credential with OpenClaw and lets you choose a model.
               </p>
 
               {error ? (
@@ -1065,7 +1065,7 @@ export default function OAuthSetupFlow({ provider, apiBase, onComplete, onCancel
             <div className="space-y-4 py-4 text-center">
               <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-400" />
               <h3 className="text-lg font-semibold text-white">{provider.name} credential saved</h3>
-              <p className="text-sm text-slate-400">Host model routing activation is unavailable in this release until a separately supported maintenance operation ships.</p>
+              <p className="text-sm text-slate-400">OpenClaw's default model is unchanged. Close this dialog to verify the credential with OpenClaw and choose a model.</p>
               {finalizationWarning ? (
                 <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-left text-sm text-amber-100">
                   <div className="flex items-start gap-2">

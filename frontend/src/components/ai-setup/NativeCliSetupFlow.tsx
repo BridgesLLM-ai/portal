@@ -1,20 +1,30 @@
 import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, ClipboardPaste, Copy, ExternalLink, Loader2, X } from 'lucide-react';
 import client from '../../api/client';
+import type { AgentTool } from '../../api/agentTools';
+import MissingCliInstallPanel from './MissingCliInstallPanel';
 import { normalizeAgentChatModelId } from '../../utils/agentChatModelSelection';
 import { setAgentChatProviderModelsCache } from '../../utils/agentChatProviderModelsCache';
 import ViewportModal from '../ViewportModal';
 import ModelSelector, { type SelectableModel } from './ModelSelector';
 import HarnessNativeCliTerminal from './HarnessNativeCliTerminal';
 import { cancelOAuthSession } from './oauthCancellation';
-import { getOAuthStartRecoveryDisposition, readStructuredOAuthStartFailure } from './oauthFlowContract';
+import { getOAuthStartRecoveryDisposition, readClaudeAuthorizationUrl, readStructuredOAuthStartFailure } from './oauthFlowContract';
 
 interface NativeCliSetupFlowProps {
+  harnessTool?: { id: string; tool: AgentTool | null } | null;
+  onToolInventory?: (tools: AgentTool[]) => void;
   provider: 'claude-code' | 'codex' | 'gemini' | 'grok' | 'hermes' | 'opencode';
   apiBase: string;
   onComplete: () => void;
   onCancel: () => void;
   onModelSelected?: (provider: 'GEMINI', model: string) => Promise<boolean | void> | boolean | void;
+  /**
+   * Claude Code only: a Claude login already exists on this server, so signing
+   * in replaces the login OpenClaw's Claude CLI runtime and Portal Claude Code
+   * sessions use. Requires an explicit acknowledgement before starting.
+   */
+  replacesExistingLogin?: boolean;
 }
 
 async function withNativeDeadline<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -34,7 +44,7 @@ async function withNativeDeadline<T>(operation: Promise<T>, timeoutMs: number, m
 type Step = 'start' | 'waiting' | 'paste' | 'device' | 'terminal' | 'finalizing' | 'catalog' | 'model' | 'done' | 'error';
 
 const PROVIDER_LABELS: Record<string, { name: string; color: string }> = {
-  'claude-code': { name: 'Claude Project Sandbox', color: 'emerald' },
+  'claude-code': { name: 'Claude Code', color: 'emerald' },
   codex: { name: 'Codex', color: 'blue' },
   gemini: { name: 'Antigravity', color: 'purple' },
   grok: { name: 'Grok Build', color: 'orange' },
@@ -61,8 +71,10 @@ function toAntigravityModel(raw: any): SelectableModel | null {
   };
 }
 
-export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCancel, onModelSelected }: NativeCliSetupFlowProps) {
+export default function NativeCliSetupFlow({ harnessTool = null, onToolInventory, provider, apiBase, onComplete, onCancel, onModelSelected, replacesExistingLogin = false }: NativeCliSetupFlowProps) {
   const [step, setStep] = useState<Step>('start');
+  const requiresReplaceAcknowledgement = provider === 'claude-code' && replacesExistingLogin;
+  const [replaceAcknowledged, setReplaceAcknowledged] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [authUrl, setAuthUrl] = useState<string | null>(null);
   const [deviceCode, setDeviceCode] = useState<string | null>(null);
@@ -74,7 +86,6 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
   const [reauthSupported, setReauthSupported] = useState<boolean | null>(null);
 
   const [loading, setLoading] = useState(false);
-  const [popupBlocked, setPopupBlocked] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sessionOwned, setSessionOwned] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -290,7 +301,9 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
       setError('Interactive host Codex login is unavailable from Portal. Supervised Agent Chat can use an existing attested host credential.');
       return;
     }
-    if (sessionOwned || reviewState || !claimOperation('start')) return;
+    if (sessionOwned || reviewState) return;
+    if (requiresReplaceAcknowledgement && !replaceAcknowledged) return;
+    if (!claimOperation('start')) return;
     setLoading(true);
     setError(null);
     setCancellationError(null);
@@ -358,13 +371,27 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
         setStep('terminal');
       } else {
         // Claude OAuth flow
-        setAuthUrl(data.authUrl || null);
-        if (data.authUrl) {
+        const nextAuthUrl = provider === 'claude-code'
+          ? readClaudeAuthorizationUrl(data.authUrl)
+          : (typeof data.authUrl === 'string' && data.authUrl.trim() ? data.authUrl.trim() : null);
+        if (provider === 'claude-code' && !nextAuthUrl) {
+          // The server builds Claude's authorization URL itself; anything else
+          // is an incomplete start response and must not be opened.
+          setSessionOwned(false);
+          setReviewState('review_required');
+          setError('Portal received an unexpected Claude authorization URL and cannot prove whether a sign-in began. Review the provider before starting another login.');
+          setStep('error');
+          return;
+        }
+        setAuthUrl(nextAuthUrl);
+        if (nextAuthUrl) {
           try {
-            const win = window.open(data.authUrl, '_blank', 'noopener,noreferrer');
-            if (!win) setPopupBlocked(true);
+            // `noopener` makes window.open return null by specification, so
+            // its return value cannot detect a blocked popup. The waiting step
+            // always shows the link as the fallback.
+            window.open(nextAuthUrl, '_blank', 'noopener,noreferrer');
           } catch {
-            setPopupBlocked(true);
+            // The link in the waiting step remains available.
           }
         }
         setStep('waiting');
@@ -474,9 +501,10 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
       case 'start':
         return (
           <div className="space-y-4">
+            {harnessTool ? <MissingCliInstallPanel toolId={harnessTool.id} tool={harnessTool.tool} onInventory={onToolInventory} disabled={loading} purpose={`Install ${meta.name} to use it with Agent Chat.`} /> : null}
             <p className="text-sm text-slate-300">
               {provider === 'claude-code'
-                ? <>Authorize <strong>{meta.name}</strong> with a process-free credential flow for confined Project sessions. Portal will not launch Claude Code on the host.</>
+                ? <>Sign in to <strong>{meta.name}</strong> on this server with a process-free browser flow: authorize in the browser, then paste the authorization code here. Portal will not launch Claude Code on the host to sign in.</>
                 : <>This will authenticate the <strong>{meta.name}</strong> harness in its dedicated Portal server profile for use with Agent Chat{isInteractiveHarnessFlow ? ' and qualified Project Chat sessions' : ' and other portal features'}.</>}
             </p>
             {error ? (
@@ -486,7 +514,7 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
             ) : null}
             <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm text-amber-100">
               <strong>Note:</strong> {provider === 'claude-code'
-                ? 'This Project Sandbox credential is separate from OpenClaw Claude provider setup and does not enable host Claude execution.'
+                ? 'This login is shared on this server: OpenClaw\'s Claude CLI runtime and Portal Claude Code sessions read the same Claude credential store. Signing in does not by itself admit host Claude execution or change OpenClaw model routing.'
                 : 'This is separate from OpenClaw and Remote Desktop auth. The native CLI has its own Portal credential store.'}
             </div>
             {provider === 'codex' ? (
@@ -494,18 +522,32 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                 Interactive host Codex login is unavailable from Portal. Supervised Agent Chat can use an existing attested host credential; Project Sandbox uses its separate confined credential.
               </div>
             ) : null}
+            {requiresReplaceAcknowledgement ? (
+              <label className="flex items-start gap-3 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                <input
+                  type="checkbox"
+                  checked={replaceAcknowledged}
+                  onChange={(event) => setReplaceAcknowledged(event.target.checked)}
+                  disabled={loading}
+                  className="mt-1 h-4 w-4 shrink-0 accent-amber-400"
+                />
+                <span>
+                  <strong>A Claude login already exists on this server.</strong> Signing in replaces the login that OpenClaw&apos;s Claude CLI runtime and Portal Claude Code sessions currently use. Check this box to replace it.
+                </span>
+              </label>
+            ) : null}
             {provider !== 'codex' ? <div className="flex justify-end">
               <button
                 type="button"
                 onClick={() => { void startFlow(); }}
-                disabled={loading}
+                disabled={loading || (requiresReplaceAcknowledgement && !replaceAcknowledged)}
                 className={`inline-flex items-center gap-2 rounded-xl bg-${meta.color}-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-${meta.color}-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400`}
               >
                 {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
                 {provider === 'gemini'
                   ? 'Connect or Re-authenticate Antigravity'
                   : provider === 'claude-code'
-                    ? 'Authorize Claude Project Sandbox'
+                    ? (requiresReplaceAcknowledgement ? 'Replace the Claude login on this server' : 'Sign in to Claude Code')
                   : isInteractiveHarnessFlow
                     ? `Configure Portal ${meta.name}`
                     : `Start ${meta.name} Login`}
@@ -530,11 +572,9 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                     Open {meta.name} login
                     <ExternalLink className="h-3.5 w-3.5" />
                   </a>
-                  {popupBlocked ? (
-                    <div className="mt-2 text-xs text-amber-300">
-                      Popup blocked — click the link above to open manually
-                    </div>
-                  ) : null}
+                  <div className="mt-2 text-xs text-slate-400">
+                    If a new tab did not open, click the link above.
+                  </div>
                 </div>
                 {(provider === 'claude-code' || provider === 'gemini') ? (
                   <>
@@ -687,6 +727,11 @@ export default function NativeCliSetupFlow({ provider, apiBase, onComplete, onCa
                 {meta.name} CLI is now authenticated!
               </div>
             </div>
+            {provider === 'claude-code' ? (
+              <p className="text-sm text-slate-400">
+                Next, Portal verifies that OpenClaw can use this Claude login and lets you choose a model. Signing in does not by itself register an OpenClaw provider or change the default model.
+              </p>
+            ) : null}
             {finalizationWarning ? (
               <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100" role="status">
                 {finalizationWarning}

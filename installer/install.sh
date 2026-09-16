@@ -14,6 +14,17 @@
 #
 set -Eeuo pipefail
 
+# Package hooks must never prompt on the piped script input or the captured log.
+# Export before any child shell (including NodeSource, Docker and Tailscale):
+# command-local apt assignments do not cover those scripts' package operations.
+# Suspend the apt needrestart hook for this process tree, even on hosts whose
+# hook explicitly requests automatic restarts. List-only is the fallback for
+# direct needrestart calls. Restart/reboot decisions remain separate maintenance;
+# no host needrestart configuration or service activation policy is changed.
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=l
+export NEEDRESTART_SUSPEND=1
+
 # The in-Portal updater launches this script as a systemd transient unit, and
 # systemd starts root units with USER set but HOME unset. Under `set -u` the
 # first bare ${HOME} reference aborts the whole update, so resolve HOME from
@@ -25,7 +36,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="5.0.8"
+readonly VERSION="5.0.9"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -53,6 +64,8 @@ readonly OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE="${UPDATE_STATE_ROOT}/openclaw
 readonly OPENCLAW_MIGRATION_TRANSACTION_LEDGER="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/transaction.json"
 readonly OPENCLAW_MIGRATION_UPGRADE_STATE_MANIFEST="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/upgrade-state.json"
 readonly OPENCLAW_MIGRATION_2026_9_1_MANIFEST="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/migration.json"
+readonly OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT="${UPDATE_STATE_ROOT}/openclaw-native-chat-v1"
+readonly OPENCLAW_NATIVE_CHAT_HELPER_SHA256="8078a578f09547855c402c96c847383938f823acd29eb317c4bb27210e5e8403"
 readonly OPENCLAW_MIGRATION_TRANSACTION_HELPER_SOURCE="${PORTAL_DIR}/installer/openclaw-migration-transaction.py"
 readonly NATIVE_CLI_BUNDLE_TRANSACTION_ROOT="${UPDATE_STATE_ROOT}/native-cli-bundle-v1"
 readonly NATIVE_CLI_BUNDLE_TRANSACTION_TOMBSTONE="${UPDATE_STATE_ROOT}/native-cli-bundle-v1.terminal"
@@ -82,7 +95,7 @@ readonly LEGACY_OPENCLAW_GATEWAY_PERMIT_DRIFT_HELPER_SHA256="16a86a2144f0d2c36e3
 # release's installer/openclaw-migration-transaction.py and is enforced by
 # scripts/validation/openclaw-migration-helper-identity-static.py.
 readonly OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S="28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9,677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5,4d1f3e4ca51191348161b8e4d8be6e92a2f97061ee40b90060db95c2dc7cd15a"
-readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="dadccebd37aba59ab13ccdb9df54fb4ea9ed7ddff0518213fecb7665af5c1610"
+readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="6b871fcbf7d54ff485b66d1841af33dcbbef1bdcb7dbcd568c477f816a774f07"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR="/root/.config/systemd/user/openclaw-gateway.service.d"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
 readonly RETAINED_INSTALL_MARKER="${INSTALL_ROOT}/.retained-install-v1.json"
@@ -248,6 +261,8 @@ DRY_RUN=false
 PLAIN_OUTPUT=false
 VERBOSE=false
 INSTALL_MODE=false
+INSTALLER_STATUS=false
+RECOVER_ONLY=false
 UPDATE_MODE=false
 # Existing-install updates are a Portal transaction, not a general host
 # maintenance operation. Failure and signal handlers use this scope to avoid
@@ -432,7 +447,16 @@ TERMINAL_RENDER_HAS_FRAME=false
 TERMINAL_RENDER_FAILED=false
 TERMINAL_RENDER_LAYOUT="plain"
 TERMINAL_RENDER_WIDTH=80
-TERMINAL_SURFACE_LINES=8
+TERMINAL_RENDER_HEIGHT=24
+TERMINAL_PHASE_START_TS=""
+TERMINAL_PHASE_ELAPSED=()
+TERMINAL_CONTEXT_LINE=""
+TERMINAL_UPDATE_LEDGER_ACTIVE=false
+TERMINAL_UPDATE_STAGE=0
+TERMINAL_UPDATE_STARTED=""
+TERMINAL_UPDATE_LABELS=()
+TERMINAL_UPDATE_ELAPSED=()
+TERMINAL_SURFACE_LINES=10
 TERMINAL_PHASE_ID="startup"
 TERMINAL_PHASE_LABEL="Preparing installer"
 TERMINAL_PHASE_INDEX=0
@@ -445,7 +469,8 @@ TERMINAL_ACTIVITY_VALUE=""
 TERMINAL_ACTIVITY_TOTAL=""
 TERMINAL_LAST_WARNING="None"
 TERMINAL_OUTCOME="In progress"
-TERMINAL_NEXT_ACTION="Installer is preparing the next operation."
+TERMINAL_NEXT_ACTION="Choose Install, Update, or Repair."
+TERMINAL_NEXT_STAGE="Review the operation result"
 TERMINAL_VERBOSE_LOG_OFFSET=0
 TERMINAL_VERBOSE_LOG_READY=false
 TERMINAL_PRESENTATION_FD=""
@@ -620,7 +645,7 @@ admit_portal_only_update_host_compatibility() {
   fi
 
   for command_name in \
-    npm npx bash python3 make g++ gcc systemctl systemd-run systemd \
+    npm npx bash python3 make g++ gcc systemctl systemd-run \
     psql pg_dump pg_restore pg_isready ffmpeg ffprobe curl tar rsync \
     openssl sha256sum stat install; do
     command -v "${command_name}" >/dev/null 2>&1 \
@@ -632,7 +657,17 @@ admit_portal_only_update_host_compatibility() {
     return 1
   fi
 
-  systemd_version="$(systemd --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+  # Ubuntu keeps the systemd daemon outside PATH. Query the required client,
+  # retaining command failure and validating its first-line version header.
+  if ! systemd_version="$(systemctl --version 2>/dev/null)"; then
+    systemd_version=""
+  fi
+  systemd_version="${systemd_version%%$'\n'*}"
+  if [[ "${systemd_version}" =~ ^systemd[[:blank:]]+([1-9][0-9]{0,8})([[:blank:]]|$) ]]; then
+    systemd_version="${BASH_REMATCH[1]}"
+  else
+    systemd_version=""
+  fi
   if [[ ! "${systemd_version}" =~ ^[0-9]+$ ]] \
     || (( systemd_version < 249 )); then
     printf '%s\n' \
@@ -747,9 +782,20 @@ terminal_detect_width() {
   printf '%s\n' "${width}"
 }
 
+terminal_detect_height() {
+  local height="${LINES:-}"
+  if [[ ! "${height}" =~ ^[0-9]+$ ]] && command -v tput >/dev/null 2>&1; then
+    height="$(tput lines 2>/dev/null || true)"
+  fi
+  [[ "${height}" =~ ^[0-9]+$ ]] || height=24
+  (( height > 200 )) && height=200
+  (( height >= 1 )) || height=1
+  printf '%s\n' "${height}"
+}
+
 terminal_truncate_row() {
   local value="${1:-}" width="${2:-80}"
-  value="$(terminal_sanitize_text "${value}")"
+  value="$(terminal_sanitize_text "${value}" | LC_ALL=C tr -c '\040-\176' '?')"
   if (( ${#value} > width )); then
     if (( width >= 4 )); then
       printf '%s...\n' "${value:0:$((width - 3))}"
@@ -799,7 +845,16 @@ terminal_renderer_init() {
   TERMINAL_RENDER_HAS_FRAME=false
   TERMINAL_RENDER_FAILED=false
   TERMINAL_RENDER_LAYOUT="plain"
+  TERMINAL_NARROW_STAGE=""
+  TERMINAL_NARROW_COMPLETE=""
+  TERMINAL_NARROW_WARNING="None"
+  TERMINAL_START_TIME=""
   TERMINAL_RENDER_WIDTH="$(terminal_detect_width)"
+  TERMINAL_RENDER_HEIGHT="$(terminal_detect_height)"
+  TERMINAL_PHASE_ELAPSED=()
+  TERMINAL_UPDATE_LEDGER_ACTIVE=false
+  TERMINAL_UPDATE_STAGE=0
+  TERMINAL_UPDATE_ELAPSED=()
   TERMINAL_PHASE_INDEX=0
   TERMINAL_PHASE_TOTAL=0
   TERMINAL_PHASE_COMPLETE=false
@@ -891,7 +946,7 @@ terminal_plain_event() {
   message="$(terminal_sanitize_text "${message}")"
   detail="$(terminal_sanitize_text "${detail}")"
   if [[ -n "${detail}" ]]; then
-    terminal_present_printf '  %s %s — %s\n' \
+    terminal_present_printf '  %s %s - %s\n' \
       "${marker}" "${message}" "${detail}" || return 1
   else
     terminal_present_printf '  %s %s\n' "${marker}" "${message}" || return 1
@@ -929,29 +984,113 @@ terminal_activity_text() {
   terminal_sanitize_text "${text}"
 }
 
+terminal_update_ledger_init() {
+  TERMINAL_UPDATE_LABELS=(
+    'Checking this server and the current Portal'
+    'Downloading and verifying the signed release'
+    'Preparing the release'
+    'Backing up your Portal'
+    'Installing the runtime and migrating the database'
+    'Checking the updated Portal'
+    'Switching over and verifying'
+  )
+  TERMINAL_UPDATE_STAGE=1
+  TERMINAL_UPDATE_ELAPSED=()
+  TERMINAL_UPDATE_STARTED="$(date +%s 2>/dev/null || true)"
+  TERMINAL_UPDATE_LEDGER_ACTIVE=true
+  return 0
+}
+
+terminal_update_ledger_finish() {
+  local now
+  now="$(date +%s 2>/dev/null || true)"
+  if (( TERMINAL_UPDATE_STAGE > 0 )) \
+    && [[ "${now}" =~ ^[0-9]+$ && "${TERMINAL_UPDATE_STARTED}" =~ ^[0-9]+$ ]]; then
+    TERMINAL_UPDATE_ELAPSED[$((TERMINAL_UPDATE_STAGE - 1))]="$(format_elapsed "$((now - TERMINAL_UPDATE_STARTED))")"
+  fi
+  return 0
+}
+
+terminal_update_ledger_advance() {
+  [[ "${TERMINAL_UPDATE_LEDGER_ACTIVE}" == "true" ]] || return 0
+  local index=0
+  case "${1:-}" in
+    host-safety|portal-preflight|capacity-preflight) index=1 ;;
+    signed-release) index=2 ;;
+    openclaw-bridge|runtime-preparation) index=3 ;;
+    portal-transaction|portal-quiesced|rollback-snapshots) index=4 ;;
+    runtime-install|database-migration) index=5 ;;
+    candidate-verification) index=6 ;;
+    cutover-preparation|portal-cutover|portal-restarting|portal-committed|postflight) index=7 ;;
+    *) return 0 ;;
+  esac
+  # This table observes checkpoints, not the transaction or its percentage.
+  # Repeated, unknown and recovery checkpoints never advance it backwards.
+  (( index > TERMINAL_UPDATE_STAGE )) || return 0
+  terminal_update_ledger_finish
+  TERMINAL_UPDATE_STAGE="${index}"
+  TERMINAL_UPDATE_STARTED="$(date +%s 2>/dev/null || true)"
+  TERMINAL_NEXT_STAGE="${TERMINAL_UPDATE_LABELS[$index]:-Read the final verification result}"
+  if [[ "${TERMINAL_RENDER_MODE}" == "plain" ]]; then
+    terminal_plain_event '[phase]' \
+      "${index}/7 ${TERMINAL_UPDATE_LABELS[$((index - 1))]}" \
+      "Next: ${TERMINAL_NEXT_STAGE}" || true
+  fi
+  return 0
+}
+
+terminal_stage_summary() {
+  if [[ "${TERMINAL_UPDATE_LEDGER_ACTIVE}" == "true" ]] && (( TERMINAL_UPDATE_STAGE > 0 )); then
+    printf '%s/7 %s' "${TERMINAL_UPDATE_STAGE}" "${TERMINAL_UPDATE_LABELS[$((TERMINAL_UPDATE_STAGE - 1))]}"
+  else
+    printf '%s/%s %s' "${TERMINAL_PHASE_INDEX}" "${TERMINAL_PHASE_TOTAL}" "${TERMINAL_PHASE_LABEL}"
+  fi
+}
+
 terminal_render_impl() {
   [[ "${TERMINAL_RENDER_ACTIVE}" == "true" \
     && "${TERMINAL_RENDER_SUSPENDED}" != "true" ]] || return 0
   [[ "${TERMINAL_RENDER_MODE}" == "tty" ]] || return 0
 
-  local width previous_width layout elapsed phase_text activity_text rail="" rail_index
+  local width previous_width height previous_height layout elapsed phase_text activity_text status="Running"
+  local stage_index="${TERMINAL_PHASE_INDEX}" stage_total="${TERMINAL_PHASE_TOTAL}" stage_label="${TERMINAL_PHASE_LABEL}"
+  local -a labels=() timings=()
+  local timing_index
+  if [[ "${TERMINAL_UPDATE_LEDGER_ACTIVE}" == "true" ]] && (( TERMINAL_UPDATE_STAGE > 0 )); then
+    labels=("${TERMINAL_UPDATE_LABELS[@]}")
+    for ((timing_index = 0; timing_index < ${#labels[@]}; timing_index++)); do
+      timings[$timing_index]="${TERMINAL_UPDATE_ELAPSED[$timing_index]:-}"
+    done
+    stage_index="${TERMINAL_UPDATE_STAGE}"
+    stage_total="${#labels[@]}"
+    stage_label="${labels[$((stage_index - 1))]}"
+  elif (( ${#FRESH_INSTALL_PLAN_IDS[@]} == stage_total && stage_index > 0 )) \
+    && [[ "${FRESH_INSTALL_PLAN_IDS[$((stage_index - 1))]:-}" == "${TERMINAL_PHASE_ID}" ]]; then
+    labels=("${FRESH_INSTALL_PLAN_LABELS[@]}")
+    for ((timing_index = 0; timing_index < ${#labels[@]}; timing_index++)); do
+      timings[$timing_index]="${TERMINAL_PHASE_ELAPSED[$timing_index]:-}"
+    done
+  fi
   previous_width="${TERMINAL_RENDER_WIDTH}"
+  previous_height="${TERMINAL_RENDER_HEIGHT}"
   width="$(terminal_detect_width)"
+  height="$(terminal_detect_height)"
   # A terminal resize can reflow the previous rows, so its old physical height
-  # is unknowable. Never cursor-up across a width change: abandon that frame
+  # is unknowable. Never cursor-up across a width/height change: abandon it
   # and start a new bounded surface below it.
   if [[ "${TERMINAL_RENDER_HAS_FRAME}" == "true" \
-    && "${width}" != "${previous_width}" ]]; then
+    && ( "${width}" != "${previous_width}" || "${height}" != "${previous_height}" ) ]]; then
     terminal_present_printf '\n' || return 1
     TERMINAL_RENDER_HAS_FRAME=false
   fi
   TERMINAL_RENDER_WIDTH="${width}"
-  if (( width < 44 )); then
+  TERMINAL_RENDER_HEIGHT="${height}"
+  if (( width < 44 || height < 13 )); then
     layout="narrow"
-  elif (( width < 80 )); then
-    layout="compact"
+  elif (( width >= 80 && height >= 24 && ${#labels[@]} > 1 && ${#labels[@]} + 9 <= height - 3 )); then
+    layout="ledger"
   else
-    layout="full"
+    layout="compact"
   fi
   TERMINAL_RENDER_LAYOUT="${layout}"
 
@@ -960,68 +1099,96 @@ terminal_render_impl() {
       terminal_present_printf '\n' || return 1
       TERMINAL_RENDER_HAS_FRAME=false
     fi
-    phase_text="Phase ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL}: ${TERMINAL_PHASE_LABEL}"
-    terminal_plain_event '[phase]' "$(terminal_truncate_row "${phase_text}" "${width}")" \
-      || return 1
+    # Append only meaningful transitions, not every download/observer tick.
+    # Keep TTY mode so captured handlers retain the presentation descriptor.
+    local narrow_stage="${TERMINAL_PHASE_ID}:${stage_index}"
+    if [[ "${TERMINAL_NARROW_STAGE:-}" != "${narrow_stage}" ]]; then
+      terminal_plain_event '[phase]' "$(terminal_stage_summary)" "Next: ${TERMINAL_NEXT_STAGE}" || return 1
+      TERMINAL_NARROW_STAGE="${narrow_stage}"
+    fi
+    if [[ "${TERMINAL_PHASE_COMPLETE}" == "true" && "${TERMINAL_NARROW_COMPLETE:-}" != "${narrow_stage}" ]]; then
+      terminal_plain_event '[done]' "$(terminal_stage_summary)" "${TERMINAL_ACTIVITY}" || return 1
+      TERMINAL_NARROW_COMPLETE="${narrow_stage}"
+    fi
+    if [[ "${TERMINAL_LAST_WARNING}" != "None" && "${TERMINAL_LAST_WARNING}" != "${TERMINAL_NARROW_WARNING:-None}" ]]; then
+      terminal_plain_event 'WARN' "${TERMINAL_LAST_WARNING}" || return 1
+      TERMINAL_NARROW_WARNING="${TERMINAL_LAST_WARNING}"
+    fi
     if [[ "${TERMINAL_OUTCOME}" != "In progress" ]]; then
       terminal_plain_event '[final]' "${TERMINAL_OUTCOME}" \
-        "phase: ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}; ${TERMINAL_ACTIVITY}; next: ${TERMINAL_NEXT_ACTION}; log: ${LOG_FILE}" \
+        "stage: $(terminal_stage_summary); ${TERMINAL_ACTIVITY}; next: ${TERMINAL_NEXT_ACTION}; log: ${LOG_FILE}" \
         || return 1
     fi
     return 0
   fi
 
-  elapsed="$(elapsed_since_start)"
+  elapsed="$(elapsed_since_start "${TERMINAL_START_TIME:-}")"
   [[ -n "${elapsed}" ]] || elapsed="0s"
   activity_text="$(terminal_activity_text)"
-  if [[ "${TERMINAL_PHASE_TOTAL}" =~ ^[1-9][0-9]*$ ]]; then
-    for ((rail_index = 1; rail_index <= TERMINAL_PHASE_TOTAL; rail_index++)); do
-      if (( rail_index < TERMINAL_PHASE_INDEX )) \
-        || [[ "${TERMINAL_PHASE_COMPLETE}" == "true" \
-          && "${rail_index}" -eq "${TERMINAL_PHASE_INDEX}" ]]; then
-        rail+="#"
-      elif (( rail_index == TERMINAL_PHASE_INDEX )); then
-        rail+=">"
+  [[ "${TERMINAL_PHASE_COMPLETE}" != "true" ]] || status="Complete"
+  phase_text="Stage ${stage_index} of ${stage_total}  /  ${status}  /  Elapsed ${elapsed}"
+  local notice="No action needed."
+  [[ "${TERMINAL_LAST_WARNING}" == "None" ]] || notice="${TERMINAL_LAST_WARNING}"
+  local -a rows=() styles=()
+  if [[ "${layout}" == "ledger" ]]; then
+    rows=("  ${phase_text}" "  ${TERMINAL_CONTEXT_LINE}" "")
+    styles=("${BOLD}${WHITE}" "${DIM}" "")
+    local index glyph ledger_row timing
+    for ((index = 0; index < ${#labels[@]}; index++)); do
+      glyph='.'
+      timing="${timings[$index]:-}"
+      if [[ -n "${timing}" ]]; then
+        glyph='+'
+        styles+=("${DIM}")
+      elif (( index + 1 == stage_index )); then
+        glyph='>'
+        styles+=("${BOLD}${CYAN}")
       else
-        rail+="."
+        styles+=("${DIM}")
       fi
+      printf -v ledger_row '  %s  %-60s %7s' "${glyph}" "${labels[$index]}" "${timing}"
+      rows+=("${ledger_row}")
     done
-  fi
-  if [[ "${layout}" == "compact" ]]; then
-    phase_text="Phase ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL}  ${TERMINAL_PHASE_LABEL}"
+    rows+=("" "  ${activity_text}" "  Next     ${TERMINAL_NEXT_STAGE}" "" "  Notice   ${notice}" "  Log      ${LOG_FILE}")
+    styles+=("" "" "${CYAN}" "" "${DIM}" "${DIM}")
+    [[ "${TERMINAL_LAST_WARNING}" == "None" ]] || styles[$((${#styles[@]} - 2))]="${YELLOW}"
   else
-    phase_text="Phase ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} | ${TERMINAL_PHASE_ID} | ${TERMINAL_PHASE_LABEL}"
+    rows=(
+      "  BRIDGESLLM PORTAL / Installer ${VERSION}"
+      "  ${phase_text}"
+      "$(terminal_rule_text "${width}")"
+      ""
+      "  Now    ${stage_label}"
+      "         ${activity_text}"
+      "  Next   ${TERMINAL_NEXT_STAGE}"
+      ""
+      "  Notice ${notice}"
+      "  Log    ${LOG_FILE}"
+    )
+    styles=("${BOLD}${WHITE}" "${DIM}" "${CYAN}" "" "${BOLD}${CYAN}" "" "${CYAN}" "" "${DIM}" "${DIM}")
+    [[ "${TERMINAL_LAST_WARNING}" == "None" ]] || styles[8]="${YELLOW}"
   fi
-
-  local -a rows=(
-    "BRIDGESLLM PORTAL INSTALLER v${VERSION}"
-    "Plan: [${rail}] phase ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL}"
-    "${phase_text}"
-    "Current: ${activity_text}"
-    "Elapsed: ${elapsed}"
-    "Last warning: ${TERMINAL_LAST_WARNING}"
-    "Log: ${LOG_FILE}"
-    "Status: ${TERMINAL_OUTCOME} | Next: ${TERMINAL_NEXT_ACTION}"
-  )
-  # Style only the fixed presentation rows, after width/sanitization. Never
-  # interpret activity/log text as ANSI; NO_COLOR clears these trusted tokens.
-  local row row_index=0 row_style=""
+  # A new layout/row count cannot reuse a physically different old frame.
+  if [[ "${TERMINAL_RENDER_HAS_FRAME}" == "true" ]] \
+    && (( ${#rows[@]} != TERMINAL_SURFACE_LINES )); then
+    terminal_present_printf '\n' || return 1
+    TERMINAL_RENDER_HAS_FRAME=false
+  fi
+  # ASCII display cells keep width exact even for wide Unicode activity text.
+  # Keep one terminal cell spare: writing the last column can auto-wrap on
+  # some emulators. Only trusted style tokens are interpreted, never content.
+  local row row_index=0 row_style="" row_width=$((width - 1))
+  (( row_width <= 76 )) || row_width=76
   if [[ "${TERMINAL_RENDER_HAS_FRAME}" == "true" ]]; then
     terminal_present_printf '\033[%dA' "${TERMINAL_SURFACE_LINES}" || return 1
   fi
   for row in "${rows[@]}"; do
-    row="$(terminal_truncate_row "${row}" "${width}")"
-    case "${row_index}" in
-      0) row_style="${BOLD}${CYAN}" ;;
-      2) row_style="${BOLD}${WHITE}" ;;
-      3) row_style="${CYAN}" ;;
-      5) row_style="${YELLOW}" ;;
-      7) row_style="${BOLD}" ;;
-      *) row_style="${DIM}" ;;
-    esac
+    row="$(terminal_truncate_row "${row}" "${row_width}")"
+    row_style="${styles[$row_index]}"
     terminal_present_printf '\r\033[2K%b%s%b\n' "${row_style}" "${row}" "${NC}" || return 1
     row_index=$((row_index + 1))
   done
+  TERMINAL_SURFACE_LINES="${#rows[@]}"
   TERMINAL_RENDER_HAS_FRAME=true
   return 0
 }
@@ -1103,17 +1270,26 @@ terminal_operation_begin() {
   TERMINAL_PHASE_INDEX="${index}"
   TERMINAL_PHASE_TOTAL="${total}"
   TERMINAL_PHASE_COMPLETE=false
-  TERMINAL_ACTIVITY="Starting ${TERMINAL_PHASE_LABEL}"
+  TERMINAL_ACTIVITY="${TERMINAL_PHASE_LABEL}"
+  TERMINAL_PHASE_START_TS="$(date +%s 2>/dev/null || true)"
+  # Renderer timing never writes the installer's execution state.
+  [[ -n "${TERMINAL_START_TIME:-}" ]] || TERMINAL_START_TIME="${INSTALL_START_TIME:-${TERMINAL_PHASE_START_TS}}"
   TERMINAL_ACTIVITY_DETAIL=""
   TERMINAL_ACTIVITY_KIND="indeterminate"
   TERMINAL_OUTCOME="In progress"
-  TERMINAL_NEXT_ACTION="Complete the current phase."
+  # A next-stage label is supplied by the actual plan, never inferred from an
+  # ordinal or from the Dashboard's compatibility percentage.
+  TERMINAL_NEXT_STAGE="$(terminal_sanitize_text "${5:-Review the operation result}")"
+  if [[ "${TERMINAL_UPDATE_LEDGER_ACTIVE}" == "true" ]]; then
+    TERMINAL_NEXT_STAGE="${TERMINAL_UPDATE_LABELS[$TERMINAL_UPDATE_STAGE]:-Read the final verification result}"
+  fi
+  TERMINAL_NEXT_ACTION="${TERMINAL_NEXT_STAGE}"
   TERMINAL_RENDER_ACTIVE=true
   terminal_verbose_log_start
   if [[ "${TERMINAL_RENDER_MODE}" == "plain" ]]; then
     terminal_plain_event '[phase]' \
-      "${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}" \
-      "${TERMINAL_PHASE_ID}" || true
+      "$(terminal_stage_summary)" \
+      "Next: ${TERMINAL_NEXT_STAGE}" || true
   else
     terminal_render
   fi
@@ -1131,11 +1307,19 @@ terminal_operation_end() {
   TERMINAL_ACTIVITY_DETAIL="$(terminal_sanitize_text "${detail}")"
   TERMINAL_ACTIVITY_KIND="indeterminate"
   TERMINAL_PHASE_COMPLETE=true
+  local now
+  now="$(date +%s 2>/dev/null || true)"
+  if [[ "${now}" =~ ^[0-9]+$ && "${TERMINAL_PHASE_START_TS}" =~ ^[0-9]+$ ]]; then
+    TERMINAL_PHASE_ELAPSED[$((TERMINAL_PHASE_INDEX - 1))]="$(format_elapsed "$((now - TERMINAL_PHASE_START_TS))")"
+  fi
+  if [[ "${TERMINAL_UPDATE_LEDGER_ACTIVE}" == "true" ]]; then
+    terminal_update_ledger_finish
+  fi
   terminal_verbose_drain_log
   if [[ "${TERMINAL_RENDER_MODE}" == "plain" ]]; then
     terminal_plain_event '[done]' \
-      "${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}" \
-      "${outcome}${detail:+ — ${detail}}" || true
+      "$(terminal_stage_summary)" \
+      "${outcome}${detail:+ - ${detail}}" || true
   else
     terminal_render
   fi
@@ -1205,12 +1389,19 @@ terminal_renderer_cleanup() {
 
 terminal_final_field() {
   local label="$1" value="$2" width="$3"
-  local available chunk remainder
+  local available chunk remainder prefix='  ' continuation='  '
   value="$(terminal_sanitize_text "${value}")"
+  label="$(terminal_sanitize_text "${label}")"
   [[ -n "${value}" ]] || value="Not available"
-  available=$(( width - 2 ))
+  (( width <= 78 )) || width=78
+  if (( width >= 44 && ${#label} <= 11 )); then
+    printf -v prefix '  %-12s ' "${label}:"
+    printf -v continuation '%*s' "${#prefix}" ''
+  else
+    terminal_panel_text "${label}:" "${width}" || return 1
+  fi
+  available=$((width - ${#prefix} - 2))
   (( available >= 8 )) || available=8
-  terminal_present_printf '%s:\n' "${label}" || return 1
   remainder="${value}"
   while [[ -n "${remainder}" ]]; do
     if (( ${#remainder} <= available )); then
@@ -1220,19 +1411,29 @@ terminal_final_field() {
       chunk="${remainder:0:${available}}"
       if [[ "${chunk}" == *' '* ]]; then
         chunk="${chunk% *}"
+      else
+        # Preserve whole tokens, including UTF-8 text, on this copy surface.
+        chunk="${remainder%% *}"
       fi
       [[ -n "${chunk}" ]] || chunk="${remainder:0:${available}}"
       remainder="${remainder:${#chunk}}"
       remainder="${remainder#"${remainder%%[![:space:]]*}"}"
     fi
-    terminal_present_printf '  %s\n' "${chunk}" || return 1
+    terminal_present_printf '%s%s\n' "${prefix}" "${chunk}" || return 1
+    prefix="${continuation}"
   done
   return 0
 }
 
+terminal_path_field() {
+  terminal_panel_text "$1:" || return 1
+  terminal_present_printf '  %s\n' "$(terminal_sanitize_text "$2")" || return 1
+}
+
 terminal_render_final_block() {
-  local width phase
+  local width phase result_style="${CYAN}" result_label="RESULT"
   width="$(terminal_detect_width)"
+  (( width <= 78 )) || width=78
   if [[ "${TERMINAL_RENDER_HAS_FRAME}" == "true" ]]; then
     # The fixed-height surface ends here. The final record is append-only so
     # complete safety text can span bounded rows without being truncated or
@@ -1240,13 +1441,27 @@ terminal_render_final_block() {
     terminal_present_printf '\n' || return 1
     TERMINAL_RENDER_HAS_FRAME=false
   fi
-  phase="${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}"
-  terminal_present_printf '%s\n' 'Installer result' || return 1
-  terminal_final_field 'Phase' "${phase}" "${width}" || return 1
+  case "${TERMINAL_OUTCOME}" in
+    *interrupted*|*cancelled*) result_label="! Interrupted"; result_style="${YELLOW}" ;;
+    'Recovery required') result_label="! Recovery required"; result_style="${YELLOW}" ;;
+    'Portal updated with verification errors') result_label="! Verification needs attention"; result_style="${YELLOW}" ;;
+    *failed*|*errors*|*required*) result_label="X Needs attention"; result_style="${RED}" ;;
+    *restored*) result_label="! Previous version restored"; result_style="${YELLOW}" ;;
+    *verified*|*complete*|*reconciled*) result_label="+ Verified"; result_style="${GREEN}" ;;
+  esac
+  phase="$(terminal_stage_summary)"
+  terminal_panel_heading 'Installer result' || return 1
+  terminal_present_printf '%b' "${BOLD}${result_style}" || return 1
+  terminal_panel_text "${result_label} / ${TERMINAL_OUTCOME}" "${width}" || return 1
+  terminal_present_printf '%b\n' "${NC}" || return 1
+  terminal_final_field 'Stage' "${phase}" "${width}" || return 1
   terminal_final_field 'Outcome' "${TERMINAL_OUTCOME}" "${width}" || return 1
   terminal_final_field 'Reason' "${TERMINAL_ACTIVITY}" "${width}" || return 1
+  terminal_present_printf '\n%b' "${BOLD}${CYAN}" || return 1
   terminal_final_field 'Next action' "${TERMINAL_NEXT_ACTION}" "${width}" || return 1
-  terminal_final_field 'Log' "${LOG_FILE}" "${width}" || return 1
+  terminal_present_printf '%b\n' "${NC}" || return 1
+  terminal_path_field 'Log' "${LOG_FILE}" || return 1
+  terminal_present_printf '\n' || return 1
   return 0
 }
 
@@ -1275,7 +1490,7 @@ terminal_final_state() {
     terminal_renderer_cleanup
   else
     terminal_plain_event '[final]' "${TERMINAL_OUTCOME}" \
-      "phase: ${TERMINAL_PHASE_INDEX}/${TERMINAL_PHASE_TOTAL} ${TERMINAL_PHASE_LABEL}; ${TERMINAL_ACTIVITY}; next: ${TERMINAL_NEXT_ACTION}; log: ${LOG_FILE}" || true
+      "stage: $(terminal_stage_summary); ${TERMINAL_ACTIVITY}; next: ${TERMINAL_NEXT_ACTION}; log: ${LOG_FILE}" || true
     TERMINAL_RENDER_ACTIVE=false
   fi
   return 0
@@ -1314,7 +1529,12 @@ dashboard_update_progress() {
   # The helper's percentage is a compatibility ordinal owned by the installed
   # 4.0.19 updater, not a measured estimate.  Preserve it byte-for-byte on the
   # Dashboard wire while the terminal observer reports only semantic state.
-  terminal_observe update "${label}" "${detail:+${phase}: ${detail}}" || true
+  local terminal_detail="${detail}"
+  if [[ "${terminal_detail}" =~ ^Step\ [0-9]+\ of\ [0-9]+\ ·\ (.*)$ ]]; then
+    terminal_detail="${BASH_REMATCH[1]}"
+  fi
+  terminal_update_ledger_advance "${phase}"
+  terminal_observe update "${label}" "${terminal_detail}" || true
   [[ "${UPDATE_MODE:-false}" == "true" \
     && "${operation_id}" =~ ^[a-f0-9]{32}$ ]] || return 0
   DASHBOARD_UPDATE_PROGRESS_PERCENT="${percent}"
@@ -1382,20 +1602,9 @@ fail() {
       "${DASHBOARD_UPDATE_PROGRESS_PERCENT}" failure \
       "Update stopped before completion" "$1"
   fi
-  echo ""
-  echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "  ${RED}${BOLD}  ERROR${NC}  ${CYAN}${CURRENT_STEP}${NC}"
-  echo ""
-  echo -e "  ${WHITE}  $1${NC}"
-  echo ""
-  echo -e "  ${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo ""
-  if [[ -f "$LOG_FILE" ]]; then
-    echo -e "  ${DIM}Log: ${LOG_FILE}${NC}"
-    echo -e "  ${DIM}Last 5 lines:${NC}"
-    tail -5 "$LOG_FILE" 2>/dev/null | sed 's/^/    /'
-  fi
-  echo ""
+  # Print one final result after recovery settles, without echoing raw handler
+  # output or losing the immediate condition inside the captured handler log.
+  terminal_plain_event 'WARN' 'Operation stopped; checking recovery.' "$1" || true
   if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
     && declare -F settle_openclaw_compatibility_hotfix_process >/dev/null 2>&1; then
     settle_openclaw_compatibility_hotfix_process \
@@ -1512,7 +1721,7 @@ fail() {
   else
     terminal_final_state "Installation failed" \
       "${DASHBOARD_UPDATE_FAILURE_MESSAGE}" \
-      "Review the installer log, correct the reported condition, and retry."
+      "Review the installer log and use --status before retrying. --recover handles supported journals only; partial fresh-install files are not automatically resumed."
   fi
   exit 1
 }
@@ -1537,20 +1746,20 @@ build_fresh_install_plan() {
 
   fresh_install_plan_add preflight "Checking system requirements" fresh_install_preflight_phase
   if use_tailnet_profile; then
-    fresh_install_plan_add tailnet-origin "Joining your private Tailscale network" setup_tailnet_origin
+    fresh_install_plan_add tailnet-origin "Joining your Tailscale network" setup_tailnet_origin
   fi
   fresh_install_plan_add system-packages "Installing system packages" install_system_packages
-  fresh_install_plan_add database "Setting up database" setup_database
-  fresh_install_plan_add portal-runtime "Installing Portal runtime" build_portal
+  fresh_install_plan_add database "Preparing the database" setup_database
+  fresh_install_plan_add portal-runtime "Installing the Portal runtime" build_portal
   # Publish the signed migration helpers before any global OpenClaw package
   # replacement. This is the durable recovery boundary when a fresh Portal
   # install inherits a retained 7.1 OpenClaw runtime.
   fresh_install_plan_add ai-tools "Installing AI tools" install_ai_tools
-  fresh_install_plan_add native-providers "Installing native provider runtimes" install_native_provider_tools
-  fresh_install_plan_add services "Configuring services" configure_services
-  fresh_install_plan_add backups "Configuring backup automation" configure_backup_timers
+  fresh_install_plan_add native-providers "Installing provider runtimes" install_native_provider_tools
+  fresh_install_plan_add services "Registering system services" configure_services
+  fresh_install_plan_add backups "Scheduling backups" configure_backup_timers
   fresh_install_plan_add remote-desktop "Setting up Remote Desktop" setup_remote_desktop
-  fresh_install_plan_add activation "Starting and verifying Portal" start_portal
+  fresh_install_plan_add activation "Starting Portal and verifying health" start_portal
 
   local expected=10
   use_tailnet_profile && expected=11
@@ -1589,19 +1798,87 @@ run_fresh_install_plan() {
     terminal_operation_begin \
       "${FRESH_INSTALL_PLAN_IDS[$index]}" \
       "${FRESH_INSTALL_PLAN_LABELS[$index]}" \
-      "$((index + 1))" "${total}"
+      "$((index + 1))" "${total}" \
+      "${FRESH_INSTALL_PLAN_LABELS[$((index + 1))]:-Open Portal setup after verification}"
     terminal_run_captured_handler "${handler}"
     terminal_operation_end completed
   done
 }
 
+# Shared, append-only presentation primitives. No cursor movement, terminal
+# mode changes, external rendering tools, or installer authority live here.
+terminal_rule_text() {
+  local width="${1:-80}" rule
+  (( width <= 78 )) || width=78
+  printf -v rule '%*s' "$((width - 4))" ''
+  printf '  %s' "${rule// /-}"
+}
+
+terminal_panel_heading() {
+  local title="$1" subtitle="${2:-}" width
+  width="$(terminal_detect_width)"
+  terminal_present_printf '\n%b%s%b\n' "${CYAN}" "$(terminal_rule_text "${width}")" "${NC}" || return 1
+  terminal_present_printf '%b' "${BOLD}${WHITE}" || return 1
+  terminal_panel_text "${title}" || return 1
+  terminal_present_printf '%b' "${NC}" || return 1
+  if [[ -n "${subtitle}" ]]; then
+    terminal_present_printf '%b' "${DIM}" || return 1
+    terminal_panel_text "${subtitle}" || return 1
+    terminal_present_printf '%b' "${NC}" || return 1
+  fi
+  terminal_present_printf '\n' || return 1
+}
+
+terminal_panel_text() {
+  local value="$1" width="${2:-}" available chunk remainder
+  [[ -n "${width}" ]] || width="$(terminal_detect_width)"
+  (( width <= 78 )) || width=78
+  available=$((width - 4))
+  remainder="$(terminal_sanitize_text "${value}")"
+  while [[ -n "${remainder}" ]]; do
+    chunk="${remainder:0:${available}}"
+    if (( ${#remainder} > available )); then
+      if [[ "${chunk}" == *' '* ]]; then
+        chunk="${chunk% *}"
+      else
+        chunk="${remainder%% *}"
+      fi
+    fi
+    [[ -n "${chunk}" ]] || chunk="${remainder:0:${available}}"
+    remainder="${remainder:${#chunk}}"
+    remainder="${remainder#"${remainder%%[![:space:]]*}"}"
+    terminal_present_printf '  %s\n' "${chunk}" || return 1
+  done
+  return 0
+}
+
 banner() {
-  [[ "${TERMINAL_RENDER_MODE}" != "tty" ]] || clear 2>/dev/null || true
-  echo ""
-  echo -e "  ${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "  ${WHITE}${BOLD}  B R I D G E S  L L M   Portal${NC}"
-  echo -e "  ${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "  ${DIM}Installer v${VERSION}${NC}"
+  local width title
+  width="$(terminal_detect_width)"
+  if (( width >= 80 )); then
+    printf -v title 'BRIDGESLLM PORTAL%*sInstaller %s' "$((43 - ${#VERSION}))" '' "${VERSION}"
+  else
+    title="BRIDGESLLM PORTAL / Installer ${VERSION}"
+  fi
+  terminal_present_printf '\n%b' "${BOLD}${CYAN}"
+  terminal_panel_text "${title}"
+  terminal_present_printf '%b%s%b\n\n' "${CYAN}" "$(terminal_rule_text "${width}")" "${NC}"
+  return 0
+}
+
+terminal_install_review() {
+  terminal_panel_heading 'Install Portal' 'Configuration continues in your browser after verification.'
+  terminal_path_field 'Destination' "${PORTAL_DIR}"
+  terminal_panel_text "${#FRESH_INSTALL_PLAN_IDS[@]} stages: system checks, installation, and verification."
+  terminal_panel_text 'You can follow installation details in a second terminal.'
+  terminal_path_field 'Installer log' "${LOG_FILE}"
+  # Commands remain one logical line so copying does not insert a newline in
+  # a path. Let the terminal soft-wrap this append-only text; quote as Bash.
+  local follow_command
+  printf -v follow_command 'tail -f -- %q' "${LOG_FILE}"
+  terminal_present_printf '\n  %s\n' "${follow_command}"
+  terminal_present_printf '\n'
+  return 0
 }
 
 print_kv() {
@@ -1610,10 +1887,11 @@ print_kv() {
 }
 
 elapsed_since_start() {
-  if [[ -n "$INSTALL_START_TIME" ]]; then
+  local started="${1:-${INSTALL_START_TIME}}"
+  if [[ -n "${started}" ]]; then
     local now
     now=$(date +%s)
-    local diff=$((now - INSTALL_START_TIME))
+    local diff=$((now - started))
     local mins=$((diff / 60))
     local secs=$((diff % 60))
     if ((mins > 0)); then
@@ -1822,8 +2100,10 @@ ensure_telemetry_install_id() {
 }
 
 ensure_build_tools() {
-  if ! command -v make &>/dev/null || ! command -v g++ &>/dev/null; then
-    spin "Installing build tools"       "apt-get install -y -qq build-essential python3 || { apt-get update -qq && apt-get install -y -qq build-essential python3; }"
+  if ! command -v make &>/dev/null || ! command -v g++ &>/dev/null \
+    || ! command -v gcc &>/dev/null || ! command -v python3 &>/dev/null; then
+    spin "Installing build tools" \
+      "apt-get install -y -qq build-essential python3 || { apt-get update -qq && apt-get install -y -qq build-essential python3; }"
   fi
 }
 
@@ -8834,7 +9114,7 @@ if durable:
         # before and independently of any succession. The pin is read, never
         # written.
         if (
-            ledger.get("schema") != "bridgesllm-openclaw-2026.9.1-migration-transaction-v2"
+            ledger.get("schema") not in {"bridgesllm-openclaw-2026.9.1-migration-transaction-v2", "bridgesllm-openclaw-retained-chat-v1"}
             or ledger.get("paths", {}).get("root") != str(transaction_root)
             or ledger.get("paths", {}).get("ledger") != str(transaction_root / "transaction.json")
             or ledger.get("paths", {}).get("transactionHelper") != str(selected)
@@ -9458,7 +9738,7 @@ let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () 
       && "${OPENCLAW_GATEWAY_WAS_ENABLED}" == "false" ]] || return 1
   fi
   [[ "${gateway_identity_active}" == "${OPENCLAW_GATEWAY_WAS_ACTIVE}" ]] || return 1
-  run_openclaw_migration_transaction_tool create \
+  run_openclaw_migration_transaction_tool create "$@" \
     --root "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
     --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
     --migration-helper-source "${migration_helper_source}" \
@@ -9921,6 +10201,8 @@ restore_durable_openclaw_upgrade_state() {
 
 cleanup_openclaw_migration_transaction() {
   local expected="$1"
+  # The sidecar must finish before its generation/start authority disappears.
+  ! openclaw_native_chat_transaction_present || return 1
   run_openclaw_migration_transaction_tool cleanup \
     --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
     --expected "${expected}" \
@@ -10139,6 +10421,10 @@ let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () 
 }
 
 reconcile_openclaw_migration_transaction() {
+  if openclaw_native_chat_transaction_present; then
+    [[ -d "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+      && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] || return 1
+  fi
   local terminal_intent="${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}.intent"
   local recovery_state_dir="${OPENCLAW_RECOVERY_STATE_DIR:-/root/.openclaw}"
   if [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" \
@@ -10158,6 +10444,10 @@ reconcile_openclaw_migration_transaction() {
     succeed_openclaw_migration_transaction_helper || return 1
   fi
   load_openclaw_migration_transaction || return 1
+  if retained_chat_update_owner_present; then
+    reconcile_retained_chat_update
+    return
+  fi
   normalize_legacy_openclaw_gateway_permit_definition || return 1
   load_openclaw_migration_transaction || return 1
 
@@ -10170,6 +10460,19 @@ reconcile_openclaw_migration_transaction() {
     advance_openclaw_migration_transaction \
       commit-pending commit-applying "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
       || return 1
+  fi
+
+  # Resolve the independent Chat generation before any existing recovery
+  # branch can restart or replace the package. Old ledgers without a sidecar
+  # retain their original three-target behavior and sealed helper bytes.
+  if openclaw_native_chat_transaction_present; then
+    if [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]]; then
+      commit_openclaw_native_chat || return 1
+    else
+      rollback_openclaw_native_chat || return 1
+    fi
+    load_openclaw_migration_transaction || return 1
   fi
 
   local native_phase="absent" rollback_quiescence_required=false
@@ -13676,7 +13979,7 @@ handle_installer_signal() {
   elif [[ "${FRESH_INSTALL_IN_PROGRESS:-false}" == "true" ]]; then
     terminal_final_state "Installation interrupted" \
       "${message}. The current fresh-install phase was not transactionally rolled back; partial installation state may remain." \
-      "Review the root-only installer log, then rerun the installer to converge the installation."
+      "Review the root-only installer log, then use --status. --recover handles supported journals only; partial fresh-install files may require manual diagnosis."
   elif [[ "${DASHBOARD_UPDATE_PORTAL_COMMITTED:-false}" == "true" ]]; then
     terminal_final_state "Portal updated; verification interrupted" "${message}" \
       "Review the installer log before starting another update."
@@ -14411,6 +14714,14 @@ required_baseline_members = {
     "portal/installer/migrate-openclaw-2026.9.3.mjs",
     "portal/installer/patch-openclaw-2026.9.1-portal-contract.mjs",
     "portal/installer/patch-openclaw-2026.9.3-portal-contract.mjs",
+    "portal/installer/openclaw-native-chat-transaction.py",
+    "portal/installer/verify-openclaw-2026.9.2-native-chat.py",
+    "portal/installer/openclaw-native-chat-2026.9.2/SOURCE-LOCK.json",
+    "portal/installer/openclaw-native-chat-2026.9.2/chat-IsrqkYID.js",
+    "portal/installer/openclaw-native-chat-2026.9.2/session-history-tail-BuFrV1Wb.js",
+    "portal/installer/openclaw-native-chat-2026.9.2/session-transcript-readers-CYDRQsH5.js",
+    "portal/installer/openclaw-native-chat-2026.9.3/session-history-tail-DUGCG5bk.mjs",
+    "portal/installer/openclaw-native-chat-2026.9.3/session-transcript-readers-DZrB96ki.mjs",
     "portal/installer/opencode-runtime.sh",
     "portal/installer/openclaw-stable-plugins.sh",
     "portal/installer/verify-openclaw-2026.9.1-stock-contract.mjs",
@@ -15157,8 +15468,14 @@ stage_verified_release() {
 
   verify_release_bundle "${bundle_dir}" || return 1
   record_verified_release_identity "${bundle_dir}" || return 1
-  tar --extract --gzip --file "${bundle_dir}/portal.tar.gz" --directory "${bundle_dir}" \
-    --no-same-owner --no-same-permissions
+  # The signed archive contains public runtime modes (0644/0755). A caller's
+  # private log umask must not turn them into 0600/0700 and break sealed payload
+  # admission. Keep the staging root private and leave the caller's umask alone.
+  (
+    umask 022
+    tar --extract --gzip --file "${bundle_dir}/portal.tar.gz" --directory "${bundle_dir}" \
+      --no-same-owner --no-same-permissions
+  )
 }
 
 new_release_stage_dir() {
@@ -15274,14 +15591,24 @@ acquire_portal_operation_lock() {
   local expected_inode actual_inode active_journal cutover_journal
   local backup_journal restore_journal
   expected_inode="$(prepare_portal_operation_lock "${lock_path}")" \
-    || fail "Portal operation lock could not be prepared safely."
+    || portal_operation_admission_refused "Portal operation lock could not be prepared safely." "${lock_path}"
   exec 9<>"${lock_path}" \
-    || fail "Portal operation lock could not be opened safely."
+    || portal_operation_admission_refused "Portal operation lock could not be opened safely." "${lock_path}"
   actual_inode="$(stat -Lc '%d:%i:%u:%g:%a:%h:%s' /proc/$$/fd/9 2>/dev/null)" \
-    || fail "Portal operation lock descriptor could not be attested."
+    || portal_operation_admission_refused "Portal operation lock descriptor could not be attested." "${lock_path}"
   [[ "${actual_inode}" == "${expected_inode}" ]] \
-    || fail "Portal operation lock changed while it was being opened."
-  flock -n 9 || fail "Another BridgesLLM install, update, uninstall, or backup operation is already running."
+    || portal_operation_admission_refused "Portal operation lock changed while it was being opened." "${lock_path}"
+  flock -n 9 || portal_operation_admission_refused "Another BridgesLLM install, update, uninstall, backup, restore, or repair operation is already running." "${lock_path}"
+  if ${RECOVER_ONLY:-false}; then
+    if ! initialize_installer_recovery_log; then
+      # Exclusion is held, but no recovery owner has started. Refuse directly:
+      # fail() could enter cleanup without a usable log for this operation.
+      printf '  Recovery not started: a new private log could not be created.\n  Existing log files were preserved. Use --status to inspect earlier work.\n' >&2
+      exit 2
+    fi
+    printf '  Recovery log: %s\n' "${LOG_FILE}"
+    printf '  Reconciling supported journal owners under the shared lock.\n'
+  fi
   # Ownerless admission may retire only native states proved not to require
   # live-byte restoration. Mutation-bearing phases are reconciled below by the
   # durable OpenClaw owner, under its identity-authorized quiescence boundary.
@@ -15349,15 +15676,15 @@ acquire_project_runtime_image_repair_lock() {
   local lock_path="${1:-${PORTAL_OPERATION_LOCK_PATH}}"
   local expected_inode actual_inode journal resolved
   expected_inode="$(prepare_portal_operation_lock "${lock_path}")" \
-    || fail "Portal operation lock could not be prepared safely."
+    || portal_operation_admission_refused "Portal operation lock could not be prepared safely." "${lock_path}"
   exec 9<>"${lock_path}" \
-    || fail "Portal operation lock could not be opened safely."
+    || portal_operation_admission_refused "Portal operation lock could not be opened safely." "${lock_path}"
   actual_inode="$(stat -Lc '%d:%i:%u:%g:%a:%h:%s' /proc/$$/fd/9 2>/dev/null)" \
-    || fail "Portal operation lock descriptor could not be attested."
+    || portal_operation_admission_refused "Portal operation lock descriptor could not be attested." "${lock_path}"
   [[ "${actual_inode}" == "${expected_inode}" ]] \
-    || fail "Portal operation lock changed while it was being opened."
+    || portal_operation_admission_refused "Portal operation lock changed while it was being opened." "${lock_path}"
   flock -n 9 \
-    || fail "Another BridgesLLM install, update, uninstall, backup, restore, or repair operation is already running."
+    || portal_operation_admission_refused "Another BridgesLLM install, update, uninstall, backup, restore, or repair operation is already running." "${lock_path}"
 
   for journal in \
     "${UPDATE_ACTIVE_JOURNAL}" \
@@ -16058,6 +16385,12 @@ Options:
                     then qualified Ollama/native harnesses and configured Agent
                     Zero through their own lifecycle checks. Ordinary --update
                     remains Portal-only.
+  --status          Read-only filesystem, operation-lock, journal and log status.
+                    Does not inspect service health or stop another process.
+  --recover         Reconcile interrupted operations through their existing
+                    journals under the shared lock, then exit. May restore or
+                    finish an update/uninstall; never resumes a partial fresh
+                    install. Backup/restore barriers still require their owner.
   --update          Update Portal, keeping data and the installed AI runtimes
   --repair          Reinstall Portal files, keeping data and AI runtimes
   --reinstall       Alias for --repair; never deletes your data
@@ -16110,6 +16443,24 @@ EOF
 
 parse_args() {
   local original_count=$# repair_argument_count=0 argument
+  local recovery_argument_count=0
+  for argument in "$@"; do
+    case "${argument}" in --status|--recover) recovery_argument_count=$((recovery_argument_count + 1)) ;; esac
+  done
+  if (( recovery_argument_count > 0 )); then
+    # Refuse malformed diagnostic/recovery commands without fail(): no lock
+    # exists yet, so general transaction failure hooks have no authority.
+    (( recovery_argument_count == 1 )) || {
+      printf 'Choose one operation: --status or --recover.\n' >&2
+      exit 2
+    }
+    for argument in "$@"; do
+      case "${argument}" in
+        --status|--recover|--dry-run|--plain|--verbose) ;;
+        *) printf '%s\n' '--status and --recover accept only display options and --dry-run.' >&2; exit 2 ;;
+      esac
+    done
+  fi
   for argument in "$@"; do
     [[ "${argument}" == "--repair-project-runtime-image" ]] \
       && repair_argument_count=$((repair_argument_count + 1))
@@ -16145,6 +16496,8 @@ parse_args() {
       --skip-project-runtimes) SKIP_PROJECT_RUNTIMES=true; shift ;;
       --maintain-tools) MAINTAIN_TOOLS=true; shift ;;
       --install)        INSTALL_MODE=true; shift ;;
+      --status)         INSTALLER_STATUS=true; shift ;;
+      --recover)        RECOVER_ONLY=true; shift ;;
       --update)         UPDATE_MODE=true; shift ;;
       --repair|--reinstall) FORCE_FRESH=true; shift ;;
       --uninstall)      UNINSTALL_MODE=true; shift ;;
@@ -16187,6 +16540,8 @@ parse_args() {
   fi
 
   local operation_count=0
+  ${INSTALLER_STATUS:-false} && operation_count=$((operation_count + 1))
+  ${RECOVER_ONLY:-false} && operation_count=$((operation_count + 1))
   $INSTALL_MODE && operation_count=$((operation_count + 1))
   $UPDATE_MODE && operation_count=$((operation_count + 1))
   $FORCE_FRESH && operation_count=$((operation_count + 1))
@@ -16195,7 +16550,7 @@ parse_args() {
   $MAINTAIN_TOOLS && operation_count=$((operation_count + 1))
   $RECONCILE_RESCUED_GATEWAY && operation_count=$((operation_count + 1))
   (( operation_count <= 1 )) \
-    || fail "Choose one operation: --install, --update, --repair, --uninstall, --maintain-tools, --reconcile-rescued-gateway, or --repair-project-runtime-image."
+    || fail "Choose one operation: --install, --update, --repair, --status, --recover, --uninstall, --maintain-tools, --reconcile-rescued-gateway, or --repair-project-runtime-image."
   if $RECONCILE_RESCUED_GATEWAY; then
     if $SKIP_OPENCLAW || $SKIP_OLLAMA || $SKIP_PROJECT_RUNTIMES \
       || [[ -n "${DOMAIN}" || -n "${APP_CONTENT_DOMAIN}" || -n "${RESIDUE_POLICY}" ]] \
@@ -16217,31 +16572,235 @@ parse_args() {
   fi
 }
 
+classify_portal_installation() {
+  # Read-only routing evidence, never permission to overlay files or run code
+  # from the target. The operation re-attests under its existing authority.
+  if [[ ! -e "${PORTAL_DIR}" && ! -L "${PORTAL_DIR}" \
+    && ! -e "${RETAINED_INSTALL_MARKER}" && ! -L "${RETAINED_INSTALL_MARKER}" \
+    && ! -e "${RETAINED_INSTALL_MANIFEST}" && ! -L "${RETAINED_INSTALL_MANIFEST}" ]]; then
+    printf '%s\n' absent
+  elif [[ ! -e "${PORTAL_DIR}/backend/package.json" && ! -L "${PORTAL_DIR}/backend/package.json" \
+    && ( -e "${RETAINED_INSTALL_MARKER}" || -L "${RETAINED_INSTALL_MARKER}" \
+      || -e "${RETAINED_INSTALL_MANIFEST}" || -L "${RETAINED_INSTALL_MANIFEST}" ) ]]; then
+    printf '%s\n' retained
+  elif attest_existing_portal_for_update "${PORTAL_DIR}" >/dev/null 2>&1; then
+    printf '%s\n' installed
+  else
+    printf '%s\n' partial
+  fi
+}
+
+observe_portal_operation_lock() {
+  # Open existing inode only: no create, truncate, chmod, PID inference, or
+  # unlink. The instantaneous observation is not admission or stop authority.
+  python3 -I - "${1:-${PORTAL_OPERATION_LOCK_PATH}}" <<'PYLOCK'
+import fcntl
+import os
+import stat
+import sys
+
+try:
+    path = sys.argv[1]
+    if not os.path.isabs(path) or path != os.path.normpath(path):
+        raise ValueError()
+    parent = os.path.sep
+    for part in os.path.dirname(path).strip(os.path.sep).split(os.path.sep):
+        if not part:
+            continue
+        parent = os.path.join(parent, part)
+        info = os.lstat(parent)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            raise ValueError()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or info.st_nlink != 1 or info.st_size != 0 or info.st_mode & 0o022):
+            raise ValueError()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            print("available")
+        except BlockingIOError:
+            print("held")
+    finally:
+        os.close(fd)
+except FileNotFoundError:
+    print("absent")
+except (OSError, ValueError):
+    print("unknown")
+PYLOCK
+}
+
+print_installer_log_location() {
+  # Never dump environments, journal bodies, command lines, or log contents.
+  # Only report a bounded installer filename from a safe root-owned log tree.
+  python3 -I - "${LOG_DIR}" <<'PYLOG'
+import os
+import re
+import stat
+import sys
+
+try:
+    root = sys.argv[1]
+    if not os.path.isabs(root) or root != os.path.normpath(root):
+        raise ValueError()
+    current = os.path.sep
+    for part in root.strip(os.path.sep).split(os.path.sep):
+        current = os.path.join(current, part)
+        info = os.lstat(current)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            raise ValueError()
+    latest = None
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if not re.fullmatch(r"install-[0-9]{8}-[0-9]{6}\.log", entry.name):
+                continue
+            info = entry.stat(follow_symlinks=False)
+            if (stat.S_ISREG(info.st_mode) and info.st_uid == 0
+                    and info.st_nlink == 1 and not info.st_mode & 0o077):
+                latest = max(latest or entry.name, entry.name)
+    if latest:
+        path = os.path.join(root, latest)
+        print("  Latest installer log by filename (not proof of the active operation): " + path)
+        print("  Inspect locally as root: tail -n 80 -- " + path)
+    else:
+        print("  No safe root-only installer log found in " + root)
+except (OSError, ValueError):
+    print("  Installer logs unavailable or directory boundary unsafe; inspect locally as root.")
+PYLOG
+}
+
+print_installer_recovery_status() {
+  local lock_path="${1:-${PORTAL_OPERATION_LOCK_PATH}}" state lock_state journal found=false
+  state="$(classify_portal_installation)"
+  printf '\n  Portal recovery status (read-only snapshot)\n'
+  case "${state}" in
+    installed) printf '  Runtime files/configuration pass local attestation; service health is not checked.\n' ;;
+    retained) printf '  Retained-data receipt detected; exact tree verification is still required.\n' ;;
+    absent) printf '  Portal path is absent; this does not prove the host or database is fresh.\n' ;;
+    partial) printf '  Incomplete or unverified Portal path. No automatic fresh-install resume.\n' ;;
+  esac
+  printf '  Portal path: %s\n' "${PORTAL_DIR}"
+  lock_state="$(observe_portal_operation_lock "${lock_path}" 2>/dev/null)" || lock_state=unknown
+  case "${lock_state}" in
+    held) printf '  Operation lock: held. Another operation owns exclusion; activity/owner unknown.\n' ;;
+    available|absent) printf '  Operation lock: %s at this instant; this is not permission to bypass it.\n' "${lock_state}" ;;
+    *) printf '  Operation lock: unknown or unsafe; no operation is admitted by this report.\n' ;;
+  esac
+  printf '  Lock path: %s (never delete this file).\n' "${lock_path}"
+  for journal in \
+    "${UPDATE_ACTIVE_JOURNAL}" "${UPDATE_CUTOVER_JOURNAL}" \
+    "${UNINSTALL_ACTIVE_JOURNAL}" "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_TOMBSTONE}" \
+    "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" "${NATIVE_CLI_BUNDLE_TRANSACTION_TOMBSTONE}" \
+    "${NATIVE_CLI_BUNDLE_TRANSACTION_INTENT}" \
+    "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}" \
+    "${BACKUP_QUIESCENCE_JOURNAL}" "${RESTORE_ACTIVE_JOURNAL}"; do
+    if [[ -e "${journal}" || -L "${journal}" ]]; then
+      found=true
+      printf '  Recovery artifact present (not validated): %s\n' "${journal}"
+    fi
+  done
+  $found || printf '  No known admission journal/fence found; unreadable paths may hide state.\n'
+  print_installer_log_location || printf '  Log lookup unavailable.\n'
+  printf '  Status does not read journal contents or probe services.\n'
+  printf '  If a foreground installer is still open, return there to view progress.\n'
+  printf '  To request its stop, press Ctrl+C there once and wait for its final result.\n'
+  printf '  This installer cannot attach to or safely stop an unidentified operation.\n'
+  printf '  Once the owner exits, use --recover to reconcile supported journaled work.\n'
+  printf '  --recover may finish/restore an update or finish an uninstall, then exits.\n'
+  printf '  Backup/restore barriers require their own recovery owner; no bypass.\n'
+  case "${state}" in
+    installed) printf '  After recovery, --repair reinstalls through the attested update transaction.\n' ;;
+    retained) printf '  After recovery, --install can reconnect only an exactly verified retained tree.\n' ;;
+    partial) printf '  Partial files without valid recovery authority cannot be repaired automatically.\n  Preserve the Portal tree, database, secrets, and backups for local diagnosis.\n  Do not delete the directory or retry --install over it.\n' ;;
+    absent) printf '  Review prior logs/database state before choosing --install; it starts fresh stages.\n' ;;
+  esac
+}
+
+portal_operation_admission_refused() {
+  # No lock was acquired. fail() can recover transactions/release reserves,
+  # which must never run concurrently with the operation that owns exclusion.
+  printf '\n  Operation not started: %s\n' "$1" >&2
+  print_installer_recovery_status "${2:-${PORTAL_OPERATION_LOCK_PATH}}" >&2 || true
+  exit 2
+}
+
+initialize_installer_recovery_log() {
+  # Called only after exclusion. Do not truncate/reuse a previous run's log,
+  # follow links, or alter an existing directory's ownership or permissions.
+  python3 -I - "${LOG_DIR}" "${LOG_FILE}" <<'PYLOGCREATE'
+import os
+import stat
+import sys
+
+root, path = sys.argv[1:]
+if (not os.path.isabs(root) or root != os.path.normpath(root)
+        or os.path.dirname(path) != root):
+    raise SystemExit(1)
+current = os.path.sep
+for part in root.strip(os.path.sep).split(os.path.sep):
+    current = os.path.join(current, part)
+    try:
+        os.mkdir(current, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(current)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+            or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+        raise SystemExit(1)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+os.close(fd)
+PYLOGCREATE
+}
+
+run_installer_recovery_only() {
+  print_installer_recovery_status
+  if $DRY_RUN; then
+    printf '\n  Dry-run: would acquire the shared lock and reconcile only its supported journals.\n  No recovery, lock creation, downloads, or fresh-install stages ran.\n'
+    return 0
+  fi
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || {
+    printf '  Run --recover as root; no recovery was started.\n' >&2
+    exit 2
+  }
+  # Exactly the ordinary admission path: sealed owners keep their authority,
+  # ordering, barriers, fences, and cleanup. Never stage a new installation.
+  printf '\n  Requesting exclusive recovery; a held lock refuses this run.\n'
+  acquire_portal_operation_lock
+  printf '\n  Supported admission recovery checks completed under the shared lock.\n  No new install/update was started; Portal health was not checked by this command.\n'
+  if [[ "$(classify_portal_installation)" == partial ]]; then
+    printf '  Partial/unverified Portal files remain. Automatic file repair is unavailable.\n  Preserve data and inspect the previous installer log before further action.\n' >&2
+    exit 2
+  fi
+  printf '  Run --status again, then choose the next operation separately.\n'
+}
+
 select_install_operation() {
   # Routing only, before locks, downloads, or recovery. /dev/tty also works
   # with curl | bash, without consuming the script's standard input.
-  local existing=false retained=false choice="" menu_fd
-  [[ -e "${PORTAL_DIR}" || -L "${PORTAL_DIR}" ]] && existing=true
-  # A kept data tree is not an installed runtime. This is only a menu hint;
-  # detect_retained_install_reconnect still verifies the exact receipt/tree
-  # before any installation work can begin.
-  if $existing \
-    && [[ ! -e "${PORTAL_DIR}/backend/package.json" && ! -L "${PORTAL_DIR}/backend/package.json" ]] \
-    && [[ -e "${RETAINED_INSTALL_MARKER}" || -L "${RETAINED_INSTALL_MARKER}" \
-      || -e "${RETAINED_INSTALL_MANIFEST}" || -L "${RETAINED_INSTALL_MANIFEST}" ]]; then
-    retained=true
-    existing=false
-  fi
-  if $INSTALL_MODE && $existing; then
-    printf '%s\n' "Portal files already exist at ${PORTAL_DIR}. Choose --update or --repair; --install does not replace an existing installation." >&2
+  local state choice="" menu_fd
+  ${INSTALLER_STATUS:-false} && return 0
+  ${RECOVER_ONLY:-false} && return 0
+  state="$(classify_portal_installation)"
+  if $INSTALL_MODE && [[ "${state}" == installed || "${state}" == partial ]]; then
+    printf '%s\n' "Portal files already exist at ${PORTAL_DIR}; --install will not replace them." >&2
+    print_installer_recovery_status >&2
     exit 2
   fi
-  if $UPDATE_MODE && $retained; then
+  if $UPDATE_MODE && [[ "${state}" == retained ]]; then
     printf '%s\n' 'Portal data is retained, but its runtime was removed. Choose --install or --repair to reconnect it.' >&2
     exit 2
   fi
-  if $FORCE_FRESH && ! $existing && ! $retained && ! $DRY_RUN; then
-    printf '%s\n' 'No Portal installation was found. Use --install to set up Portal.' >&2
+  if { $UPDATE_MODE || $FORCE_FRESH; } && [[ "${state}" == partial ]]; then
+    print_installer_recovery_status >&2
+    printf '  --update/--repair require an attested runtime, not a partial directory.\n' >&2
+    exit 2
+  fi
+  if { $UPDATE_MODE || $FORCE_FRESH; } && [[ "${state}" == absent ]] && ! $DRY_RUN; then
+    printf '%s\n' 'No Portal installation was found. Use --status to inspect earlier work before --install.' >&2
     exit 2
   fi
   $DRY_RUN && return 0
@@ -16251,26 +16810,59 @@ select_install_operation() {
     return 0
   fi
   if ! { exec {menu_fd}<>/dev/tty; } 2>/dev/null; then
-    printf '%s\n' 'No interactive terminal. Choose --install, --update, or --repair (use --dry-run to preview).' >&2
+    printf '%s\n' 'No interactive terminal. Use --status for recovery guidance; choose --install, --update, --repair, or --recover explicitly (--dry-run previews).' >&2
+    print_installer_recovery_status >&2
     exit 2
   fi
-  printf '\nBridgesLLM Portal\n\n' >&"${menu_fd}"
-  if $existing; then
-    printf 'Portal detected at %s\n\n  1) Update Portal\n  2) Repair Portal\n  0) Exit\n\nUpdate and Repair keep your data and leave AI runtimes unchanged.\n' "${PORTAL_DIR}" >&"${menu_fd}"
-  elif $retained; then
-    printf 'Retained Portal data detected at %s\n\n  1) Reinstall Portal (keep data)\n  0) Exit\n\nYour retained data will be verified before reconnecting Portal.\n' "${PORTAL_DIR}" >&"${menu_fd}"
-  else
-    printf 'Portal is not installed.\n\n  1) Install Portal\n  0) Exit\n' >&"${menu_fd}"
-  fi
+  {
+    banner
+    terminal_panel_heading 'Welcome to Portal' 'Choose what happens on this server.'
+    case "${state}" in
+      installed)
+        terminal_panel_text "Portal files found at ${PORTAL_DIR}"
+        terminal_panel_text '1) Update Portal'
+        terminal_panel_text "   Move to ${VERSION}. Keep data and AI runtimes."
+        terminal_panel_text '2) Repair Portal'
+        terminal_panel_text "   Reinstall ${VERSION} files. Keep data and AI runtimes."
+        ;;
+      retained)
+        terminal_panel_text "Retained Portal data detected at ${PORTAL_DIR}"
+        terminal_panel_text '1) Reinstall Portal (keep data)'
+        terminal_panel_text '   Verify retained data before reconnecting Portal.'
+        ;;
+      absent)
+        terminal_panel_text 'Portal files not found. Earlier setup may have changed this server.'
+        terminal_panel_text '1) Install Portal'
+        terminal_panel_text '   Set up this server, then configure Portal in your browser.'
+        ;;
+      partial)
+        terminal_panel_text "Incomplete or unverified Portal files at ${PORTAL_DIR}"
+        terminal_panel_text 'This installation cannot be resumed or repaired automatically.'
+        terminal_panel_text 'Your files stay in place. Inspect status and logs before recovery.'
+        ;;
+    esac
+    printf '\n'
+    terminal_panel_text '3) Inspect status and log paths (read-only)'
+    terminal_panel_text '4) Recover an interrupted operation, then exit'
+    terminal_panel_text '   Uses saved recovery records. May restore or finish an update, or finish uninstall.'
+    terminal_panel_text '   Cannot resume a first-time install. Backup and restore recovery use their own tools.'
+    terminal_panel_text '0) Exit without changes'
+    printf '\n'
+    terminal_panel_text 'Nothing changes until you choose. Enter alone exits.'
+  } >&"${menu_fd}"
   while true; do
-    printf '\nChoose an option [0]: ' >&"${menu_fd}"
+    printf '\n  Choose an option [0]: ' >&"${menu_fd}"
     if ! IFS= read -r choice <&"${menu_fd}"; then choice=0; fi
     case "${choice}" in
       0|"") printf 'No changes made.\n' >&"${menu_fd}"; exit 0 ;;
-      1) if $existing; then UPDATE_MODE=true; else INSTALL_MODE=true; fi; break ;;
-      2) if $existing; then FORCE_FRESH=true; break; fi ;;
+      1)
+        if [[ "${state}" == installed ]]; then UPDATE_MODE=true; break
+        elif [[ "${state}" != partial ]]; then INSTALL_MODE=true; break; fi ;;
+      2) if [[ "${state}" == installed ]]; then FORCE_FRESH=true; break; fi ;;
+      3) print_installer_recovery_status >&"${menu_fd}"; continue ;;
+      4) RECOVER_ONLY=true; break ;;
     esac
-    printf 'Choose one of the options above.\n' >&"${menu_fd}"
+    printf '  Enter one of the listed numbers, or 0 to exit.\n' >&"${menu_fd}"
   done
   exec {menu_fd}>&-
 }
@@ -16519,6 +17111,28 @@ PORTAL_RUNTIME_REPAIR_UNIT = (
 PORTAL_RUNTIME_REPAIR_LAUNCHER_CURRENT = (8641, "9bb962ad51725c2025d4813bb84c1887c115f47ca891134a5f3e70abfa8bc9ee")
 PORTAL_RUNTIME_REPAIR_LAUNCHER_RELEASES = {
     PORTAL_RUNTIME_REPAIR_LAUNCHER_CURRENT,
+}
+# The strict Node/index gateway profile runs this release's sealed OpenClaw
+# migration helper as the gateway unit's own ExecCondition guard, so every
+# --update on that profile scans the helper as a scheduled command. The helper
+# is larger than the generic 128 KiB helper bound; attest its exact shipped
+# bytes at its exact path instead of parsing or raising the bound. The set is
+# exactly this release's successor helper plus the sealed predecessors the
+# installer can succeed (OPENCLAW_MIGRATION_TRANSACTION_*_HELPER_SHA256*);
+# scripts/validation/openclaw-migration-helper-identity-static.py fails the
+# build when it is anything else, so a host cannot be left unable to update.
+OPENCLAW_MIGRATION_HELPER = (
+    "/opt/bridgesllm/portal/installer/openclaw-migration-transaction.py"
+)
+OPENCLAW_MIGRATION_HELPER_CURRENT = (275336, "6b871fcbf7d54ff485b66d1841af33dcbbef1bdcb7dbcd568c477f816a774f07")
+OPENCLAW_MIGRATION_HELPER_RELEASES = {
+    OPENCLAW_MIGRATION_HELPER_CURRENT,
+    # Portal 5.0.1 / 5.0.2 / 5.0.3 sealed helper.
+    (153398, "28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9"),
+    # Portal 5.0.4 helper (4 MiB manifest reader).
+    (194643, "677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5"),
+    # Published Portal 5.0.6 helper.
+    (196185, "4d1f3e4ca51191348161b8e4d8be6e92a2f97061ee40b90060db95c2dc7cd15a"),
 }
 LEGACY = b'13 0 * * * root docker image prune -af --filter "until=24h"\n'
 SEPARATORS = {";", "&", "&&", "|", "||"}
@@ -18384,6 +18998,83 @@ def is_audited_portal_runtime_repair_launcher(logical_path, path, metadata):
     return True
 
 
+def is_audited_openclaw_migration_helper(logical_path, path, metadata):
+    # Exact logical path and exact resolved path: a link at the helper's path
+    # or a link elsewhere pointing at the helper's bytes is not the helper.
+    if (
+        os.path.normpath(logical_path) != OPENCLAW_MIGRATION_HELPER
+        or display(path) != OPENCLAW_MIGRATION_HELPER
+    ):
+        return False
+    if metadata.st_size > PORTAL_AUDITED_HELPER_LIMIT:
+        fail(
+            "scheduled OpenClaw migration helper exceeds its 1 MiB audited "
+            "release limit"
+        )
+    if metadata.st_size not in {
+        release_size for release_size, _ in OPENCLAW_MIGRATION_HELPER_RELEASES
+    }:
+        fail(
+            "scheduled OpenClaw migration helper does not match a known "
+            "shipped BridgesLLM release; restore it through a signed update "
+            "before retrying"
+        )
+    payload, current = read_root_file(
+        path,
+        modes={0o600, 0o644},
+        single_link=True,
+        require_root_group=True,
+    )
+    expected_identity = (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode,
+        metadata.st_uid, metadata.st_gid, metadata.st_nlink,
+        metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+    current_identity = (
+        current.st_dev, current.st_ino, current.st_mode,
+        current.st_uid, current.st_gid, current.st_nlink,
+        current.st_size, current.st_mtime_ns, current.st_ctime_ns,
+    )
+    if current_identity != expected_identity:
+        fail(
+            "scheduled OpenClaw migration helper changed before release "
+            "attestation"
+        )
+    digest = hashlib.sha256(payload).hexdigest()
+    if (
+        os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") == "1"
+        and root != "/"
+        and os.environ.get("BRIDGESLLM_DOCKER_PRUNE_TEST_HOOK", "")
+        == "portal-helper-post-read-replacement"
+    ):
+        replacement = path + ".test-replacement"
+        displaced = path + ".test-old"
+        if os.path.lexists(displaced) or not os.path.isfile(replacement):
+            fail("Portal helper replacement fixture is incomplete")
+        os.rename(path, displaced)
+        os.rename(replacement, path)
+    final = lstat_or_none(path)
+    if final is None:
+        fail("scheduled OpenClaw migration helper disappeared after attestation")
+    final_identity = (
+        final.st_dev, final.st_ino, final.st_mode,
+        final.st_uid, final.st_gid, final.st_nlink,
+        final.st_size, final.st_mtime_ns, final.st_ctime_ns,
+    )
+    if final_identity != expected_identity:
+        fail(
+            "scheduled OpenClaw migration helper changed during release "
+            "attestation"
+        )
+    if (metadata.st_size, digest) not in OPENCLAW_MIGRATION_HELPER_RELEASES:
+        fail(
+            "scheduled OpenClaw migration helper does not match a known "
+            "shipped BridgesLLM release; restore it through a signed update "
+            "before retrying"
+        )
+    return True
+
+
 class HelperBudget:
     def __init__(self, scheduler_entries, scheduler_directories):
         self.files = 0
@@ -18413,9 +19104,9 @@ class HelperBudget:
             )
         if identity in self.inspected:
             return False
-        if (
-            metadata.st_size > HELPER_FILE_LIMIT
-            and is_audited_portal_backup_helper(
+        if metadata.st_size > HELPER_FILE_LIMIT and (
+            is_audited_portal_backup_helper(logical_path, path, metadata)
+            or is_audited_openclaw_migration_helper(
                 logical_path, path, metadata
             )
         ):
@@ -20471,12 +21162,12 @@ preflight() {
   # RAM
   local mem_mb
   mem_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
-  (( mem_mb >= MIN_RAM_MB )) || fail "Need ${MIN_RAM_MB}MB+ RAM (found: ${mem_mb}MB)"
+  (( mem_mb >= MIN_RAM_MB )) || fail "This server has ${mem_mb} MB of RAM. Portal needs at least ${MIN_RAM_MB} MB."
 
   # Disk
   local disk_gb
   disk_gb=$(df -BG / | awk 'NR==2 {gsub("G",""); print $4}')
-  (( disk_gb >= MIN_DISK_GB )) || fail "Need ${MIN_DISK_GB}GB+ disk (found: ${disk_gb}GB)"
+  (( disk_gb >= MIN_DISK_GB )) || fail "This server has ${disk_gb} GB free. Portal needs at least ${MIN_DISK_GB} GB."
 
   # CPUs
   local cpus
@@ -20486,6 +21177,8 @@ preflight() {
   local uptime_min
   uptime_min=$(awk '{print int($1/60)}' /proc/uptime 2>/dev/null || echo 9999)
 
+  TERMINAL_CONTEXT_LINE="${OS_ID^} ${OS_VERSION} / ${cpus} CPU / ${mem_mb} MB RAM / ${disk_gb} GB free"
+  terminal_render
   print_kv "OS" "${OS_ID^} ${OS_VERSION}" "$WHITE"
   print_kv "CPUs" "${cpus}" "$WHITE"
   print_kv "RAM" "${mem_mb} MB" "$WHITE"
@@ -20523,7 +21216,7 @@ preflight() {
   fi
 
   # Internet
-  curl -fsSL --max-time 10 https://www.google.com &>/dev/null || fail "No internet connectivity"
+  curl -fsSL --max-time 10 https://www.google.com &>/dev/null || fail "This server cannot reach the internet. Check its network and DNS."
 
   # Public IP / local access
   if use_local_profile; then
@@ -20598,6 +21291,10 @@ install_system_packages() {
   # OpenClaw publishes a disjoint engine range with exact patch floors. Node 23
   # is not supported even though it is numerically newer than Node 22.
   ensure_supported_node_runtime
+
+  # Later updates require build tools even when this release ships node-pty
+  # prebuilts. Converge them here, never in ordinary update admission.
+  ensure_build_tools
 
   # PostgreSQL 16
   if command -v psql &>/dev/null; then
@@ -28027,6 +28724,11 @@ write_openclaw_tested_pair_commit_record() {
     native_cli_binding="$(native_cli_bundle_binding 2>> "${LOG_FILE}")" \
       || return 1
   fi
+  # Bind the complete current migration binding before the old fsynced v5
+  # decision is published. Never add fields to or rewrite an old decision.
+  if openclaw_native_chat_transaction_present; then
+    run_openclaw_native_chat_tool arm-commit --binding "${migration_binding}" || return 1
+  fi
   python3 - \
     "${record}" \
     "${pending_target}" \
@@ -28240,6 +28942,11 @@ PY
 }
 
 retire_openclaw_tested_pair_commit_record_if_clean() {
+  if openclaw_native_chat_transaction_present \
+    && [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]]; then
+    return 1
+  fi
   local record="${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}"
   [[ -e "${record}" || -L "${record}" ]] || return 0
   openclaw_tested_pair_commit_record_matches_ask_user_transaction "" "" "" \
@@ -28302,6 +29009,218 @@ try:
 except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
     raise SystemExit(1)
 PY
+}
+
+# Ordinary signed Portal updates retain core/plugins and use the existing
+# migration singleton solely for exact Chat bytes and gateway activation.
+prepare_retained_chat_update() {
+  local package_version package_dir runtime identity cli
+  command -v openclaw >/dev/null 2>&1 || return 0
+  [[ "$(type -t openclaw)" == "file" ]] || return 1
+  package_version="$(openclaw_core_package_version)" || return 1
+  case "${package_version}" in
+    2026.9.2|2026.9.3) ;;
+    *) warn "Native Chat repair is not qualified for retained OpenClaw ${package_version}; core is unchanged."; return 0 ;;
+  esac
+  runtime="$(openclaw_cli_version)" || return 1
+  [[ "${runtime}" == "${package_version}" ]] || return 1
+  package_dir="$(openclaw_core_package_dir)" || return 1
+  ! openclaw_native_chat_transaction_present || return 1
+  OPENCLAW_PACKAGE_PREEXISTED=true
+  OPENCLAW_STATE_ROOT_PREEXISTED=false
+  OPENCLAW_STATE_CONFIG_PREEXISTED=false
+  OPENCLAW_STATE_EXISTED_BEFORE_UPDATE=false
+  # This mode takes no config/state custody; these legacy absence fields
+  # cannot authorize absence restoration (legacy verbs are refused).
+  identity="$(openclaw_gateway_systemd_identity)" || return 1
+  OPENCLAW_GATEWAY_WAS_ACTIVE=false
+  OPENCLAW_GATEWAY_WAS_ENABLED=false
+  openclaw_gateway_identity_is_active "${identity}" && OPENCLAW_GATEWAY_WAS_ACTIVE=true
+  openclaw_gateway_identity_is_enabled "${identity}" && OPENCLAW_GATEWAY_WAS_ENABLED=true
+  cli="$(type -P openclaw)" || return 1
+  [[ "${cli}" == /* && -x "${cli}" ]] || return 1
+  create_openclaw_migration_transaction \
+    --retained-chat-cli "${cli}" \
+    --retained-chat-package "${package_dir}" \
+    --retained-chat-payload "${PORTAL_DIR}/installer/openclaw-native-chat-${package_version}" \
+    --retained-chat-runtime "${runtime}" || return 1
+  arm_openclaw_gateway_migration_fence || return 1
+  ensure_durable_openclaw_gateway_stopped forward || return 1
+  identity="$(openclaw_gateway_systemd_identity)" || return 1
+  run_openclaw_migration_transaction_tool retained-chat apply \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" --inactive-json "${identity}" \
+    >> "${LOG_FILE}" 2>&1 || return 1
+  restore_openclaw_gateway_activation "${runtime}" forward || return 1
+  run_openclaw_migration_transaction_tool retained-chat verify \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" >> "${LOG_FILE}" 2>&1 || return 1
+  [[ "$(openclaw_core_package_version)" == "${package_version}" \
+    && "$(openclaw_cli_version)" == "${runtime}" ]] || return 1
+}
+
+retained_chat_update_owner_present() {
+  # Selection only, not authority. The digest-pinned sealed loader validates
+  # the complete ledger before any operation or activation below.
+  [[ -f "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    && ! -L "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" ]] || return 1
+  python3 -I -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("schema") != "bridgesllm-openclaw-retained-chat-v1")' \
+    "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}"
+}
+
+arm_retained_chat_update_cutover() {
+  local contract package_version
+  contract="$(read_update_transaction_field active operation_contract)" || return 1
+  [[ "${contract}" == "portal-retained-chat-v1" ]] || return 0
+  if retained_chat_update_owner_present; then
+    run_openclaw_migration_transaction_tool retained-chat arm \
+      --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" >> "${LOG_FILE}" 2>&1
+  elif command -v openclaw >/dev/null 2>&1; then
+    package_version="$(openclaw_core_package_version)" || return 1
+    # A supported core cannot cross cutover without its exact repair owner.
+    [[ "${package_version}" != "2026.9.2" && "${package_version}" != "2026.9.3" ]]
+  fi
+}
+
+reconcile_retained_chat_update_if_present() {
+  [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] || return 0
+  # A malformed/linked/missing ledger in an existing root is a refusal, not
+  # an absent participant. Never activate Portal by skipping that evidence.
+  load_openclaw_migration_transaction || return 1
+  retained_chat_update_owner_present || return 1
+  reconcile_retained_chat_update
+}
+
+reconcile_retained_chat_update() {
+  local runtime phase identity purpose
+  # Finish any already-owned stop/start before changing its purpose phase.
+  reconcile_openclaw_core_gateway_action || return 1
+  run_openclaw_migration_transaction_tool retained-chat resolve \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" >> "${LOG_FILE}" 2>&1 || return 1
+  IFS=$'\t' read -r runtime phase < <(run_openclaw_migration_transaction_tool retained-chat status \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" 2>> "${LOG_FILE}")
+  [[ "${runtime}" == "2026.9.2" || "${runtime}" == "2026.9.3" ]] || return 1
+  case "${phase}" in
+    recovery-pending)
+      ensure_durable_openclaw_gateway_stopped baseline-restore || return 1
+      identity="$(openclaw_gateway_systemd_identity)" || return 1
+      run_openclaw_migration_transaction_tool retained-chat restore \
+        --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" --inactive-json "${identity}" \
+        >> "${LOG_FILE}" 2>&1 || return 1
+      purpose=baseline-restore ;;
+    upgrade-restored|restored-cleanup) purpose=baseline-restore ;;
+    commit-applying|committed-cleanup) purpose=forward ;;
+    *) return 1 ;;
+  esac
+  restore_openclaw_gateway_activation "${runtime}" "${purpose}" || return 1
+  run_openclaw_migration_transaction_tool retained-chat finish \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" >> "${LOG_FILE}" 2>&1 || return 1
+  load_openclaw_migration_transaction || return 1
+  disarm_openclaw_gateway_migration_fence || return 1
+  cleanup_openclaw_migration_transaction "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}"
+}
+
+openclaw_native_chat_transaction_present() {
+  [[ -e "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}" \
+    || -e "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}.terminal" \
+    || -L "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}.terminal" ]]
+}
+
+run_openclaw_native_chat_tool() {
+  local action="$1" helper="${PORTAL_DIR}/installer/openclaw-native-chat-transaction.py"
+  local sealed="${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}/openclaw-native-chat-transaction.py" mode
+  shift
+  local terminal="${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}.terminal"
+  if [[ -e "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}" \
+    || -L "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}" ]]; then
+    helper="${sealed}"
+  elif [[ -e "${terminal}" || -L "${terminal}" ]]; then
+    helper="${terminal}/openclaw-native-chat-transaction.py"
+    if [[ "${action}" == "cleanup" && ! -e "${helper}" && ! -L "${helper}" ]]; then
+      # After the final sealed file is unlinked, only an empty tombstone may
+      # remain. Finish that directory fsync even if Portal itself rolled back
+      # to a release without this new helper. No byte/start authority here.
+      python3 -I -c '
+import os, pathlib, stat, sys
+p = pathlib.Path(sys.argv[1])
+s = p.lstat(); parent = p.parent.lstat()
+if (p.resolve(strict=True) != p or not stat.S_ISDIR(s.st_mode)
+    or (s.st_uid, s.st_gid, stat.S_IMODE(s.st_mode)) != (0, 0, 0o700)
+    or (parent.st_uid, parent.st_gid) != (0, 0) or parent.st_mode & 0o022
+    or list(p.iterdir())):
+    raise SystemExit(1)
+os.rmdir(p)
+fd = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try: os.fsync(fd)
+finally: os.close(fd)
+' "${terminal}" >> "${LOG_FILE}" 2>&1
+      return
+    fi
+  fi
+  [[ -f "${helper}" && ! -L "${helper}" \
+    && "$(stat -c '%u:%g:%h' -- "${helper}")" == "0:0:1" \
+    && "$(sha256sum -- "${helper}" | cut -d' ' -f1)" == "${OPENCLAW_NATIVE_CHAT_HELPER_SHA256}" ]] || return 1
+  mode="$(stat -c '%a' -- "${helper}")" || return 1
+  [[ "${mode}" =~ ^[0-7]{3,4}$ ]] && (( (8#${mode} & 022) == 0 )) || return 1
+  python3 -I "${helper}" "${action}" \
+    --root "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}" \
+    --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
+    --decision "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" "$@" \
+    >> "${LOG_FILE}" 2>&1
+}
+
+verify_openclaw_native_chat() {
+  if openclaw_native_chat_transaction_present; then
+    run_openclaw_native_chat_tool verify
+  else
+    local package_dir
+    package_dir="$(openclaw_core_package_dir)" || return 1
+    run_openclaw_native_chat_tool installed --package "${package_dir}"
+  fi
+}
+
+prepare_openclaw_native_chat() {
+  [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ]] || return 0
+  local package_dir identity
+  openclaw_gateway_migration_authority_exists || return 1
+  load_openclaw_migration_transaction || return 1
+  [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "migration-prepared" ]] || return 1
+  package_dir="$(openclaw_core_package_dir)" || return 1
+  # Before the first boot, under the existing durable one-shot reboot fence.
+  # The helper also proves that the admitted and canonical cgroups are empty.
+  ensure_durable_openclaw_gateway_stopped forward || return 1
+  identity="$(openclaw_gateway_systemd_identity)" || return 1
+  openclaw_gateway_require_inactive_unit_definition "${identity}" >/dev/null || return 1
+  run_openclaw_native_chat_tool prepare --package "${package_dir}" \
+    --payload "${PORTAL_DIR}/installer/openclaw-native-chat-2026.9.3" \
+    --inactive-json "${identity}"
+}
+
+commit_openclaw_native_chat() {
+  openclaw_native_chat_transaction_present || return 0
+  if [[ -e "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}.terminal" \
+    || -L "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}.terminal" ]]; then
+    run_openclaw_native_chat_tool cleanup
+    return
+  fi
+  openclaw_migration_transaction_matches_decision || return 1
+  run_openclaw_native_chat_tool commit || return 1
+  run_openclaw_native_chat_tool cleanup
+}
+
+rollback_openclaw_native_chat() {
+  openclaw_native_chat_transaction_present || return 0
+  if [[ -e "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}.terminal" \
+    || -L "${OPENCLAW_NATIVE_CHAT_TRANSACTION_ROOT}.terminal" ]]; then
+    run_openclaw_native_chat_tool cleanup
+    return
+  fi
+  local identity
+  quiesce_openclaw_tested_pair_rollback || return 1
+  identity="$(openclaw_gateway_systemd_identity)" || return 1
+  openclaw_gateway_require_inactive_unit_definition "${identity}" >/dev/null || return 1
+  run_openclaw_native_chat_tool rollback --inactive-json "${identity}" || return 1
+  run_openclaw_native_chat_tool cleanup
 }
 
 openclaw_2026_9_1_stock_contract_verifier() {
@@ -30013,6 +30932,17 @@ rollback_openclaw_tested_pair() {
   local defer_plugin_restart=false
   local native_rollback_pending=false
 
+  # Durable presence, not a volatile applied flag, includes death between the
+  # first rename and the final applied marker. A decision forbids rollback.
+  if openclaw_native_chat_transaction_present; then
+    if [[ -e "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" \
+      || -L "${OPENCLAW_TESTED_PAIR_COMMIT_RECORD}" ]]; then
+      commit_openclaw_native_chat || return 1
+    else
+      rollback_openclaw_native_chat || return 1
+    fi
+  fi
+
   if ! $OPENCLAW_UPGRADE_COMMITTED \
     && { $OPENCLAW_PACKAGE_UPDATE_ATTEMPTED \
       || $OPENCLAW_PACKAGE_UPDATED \
@@ -30135,6 +31065,9 @@ verify_openclaw_tested_pair() {
   local codex_package_dir=""
   local claude_ask_user_target=""
   verify_openclaw_core_package_pin || return 1
+  if [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ]]; then
+    verify_openclaw_native_chat || return 1
+  fi
   openclaw_package_dir="$(openclaw_core_package_dir || true)"
   [[ -n "${openclaw_package_dir}" ]] || return 1
   if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.1" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.3" ) ]]; then
@@ -31395,6 +32328,11 @@ commit_openclaw_tested_pair() {
   [[ -n "${sigterm_trap}" ]] && eval "${sigterm_trap}" || trap - TERM
   [[ -n "${sighup_trap}" ]] && eval "${sighup_trap}" || trap - HUP
 
+  if ! commit_openclaw_native_chat; then
+    warn "The tested-pair decision is durable, but Chat generation cleanup requires restart reconciliation. No baseline restoration is authorized."
+    return 1
+  fi
+
   if [[ -d "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" \
     && ! -L "${NATIVE_CLI_BUNDLE_TRANSACTION_ROOT}" ]] \
     && ! commit_native_cli_bundle_transaction >> "${LOG_FILE}" 2>&1; then
@@ -31714,6 +32652,9 @@ prepare_openclaw_runtime_for_portal() {
   if ! enforce_openclaw_update_pin_policy; then
     fail "OpenClaw automatic update policy could not be pinned before gateway startup. The compatibility-bundle rollback remains armed."
   fi
+  if ! prepare_openclaw_native_chat; then
+    fail "The exact native Chat generation could not be prepared while the gateway was fenced and stopped. Its recovery evidence remains armed."
+  fi
   if ! ensure_openclaw_gateway_boots_cleanly; then
     fail "OpenClaw gateway did not boot cleanly with the replacement ask-user bridge. Check: journalctl -u openclaw-gateway -n 100 --no-pager"
   fi
@@ -32017,64 +32958,54 @@ print_success() {
   local elapsed
   elapsed="$(elapsed_since_start)"
 
-  echo ""
-  echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo ""
-  if [[ -n "$elapsed" ]]; then
-    echo -e "  ${GREEN}${BOLD}  Installation complete!${NC}  ${DIM}(${elapsed})${NC}"
-  else
-    echo -e "  ${GREEN}${BOLD}  Installation complete!${NC}"
-  fi
-  echo ""
-  echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo ""
+  terminal_panel_heading 'Portal is ready' "Verified installation${elapsed:+ / Elapsed ${elapsed}}"
   if [[ -z "${SETUP_TOKEN}" ]]; then
-    echo -e "  ${WHITE}  Open the Portal:${NC}"
+    terminal_panel_text "Next step: Sign in at the address below."
     echo ""
     echo -e "  ${BOLD}${CYAN}  ${url}${NC}"
   elif use_local_profile; then
-    echo -e "  ${WHITE}  Open this local-only URL to finish setup:${NC}"
+    terminal_panel_text "Next step: Open this link on this computer to create the admin account."
     echo ""
     echo -e "  ${BOLD}${CYAN}  ${url}${NC}"
     echo ""
-    echo -e "  ${DIM}  The bootstrap fragment is exchanged once on loopback and removed from the address bar.${NC}"
+    terminal_panel_text "The bootstrap fragment is exchanged once on loopback and removed from the address bar."
   elif use_tailnet_profile; then
-    echo -e "  ${WHITE}  Tailnet HTTPS was verified. From ANY device on your Tailscale network,${NC}"
-    echo -e "  ${WHITE}  open this URL to finish setup:${NC}"
+    terminal_panel_text "Tailnet HTTPS was verified. From ANY device on your Tailscale network,"
+    terminal_panel_text "open this link to create the admin account:"
     echo ""
     echo -e "  ${BOLD}${CYAN}  ${url}${NC}"
     echo ""
-    echo -e "  ${DIM}  Your portal is private: it is reachable only from devices signed into your tailnet.${NC}"
-    echo -e "  ${DIM}  No public ports are open. Mail and hosted app content need a public domain and are${NC}"
-    echo -e "  ${DIM}  disabled in this mode — rerun the installer with --domain later to enable them.${NC}"
-    echo -e "  ${YELLOW}  Note: tailnet origin mode is EXPERIMENTAL and still under field validation.${NC}"
+    terminal_panel_text "Your portal is private: it is reachable only from devices signed into your tailnet."
+    terminal_panel_text "No public ports are open. Mail and hosted app content need a public domain and are"
+    terminal_panel_text "disabled in this mode — rerun the installer with --domain later to enable them."
+    terminal_panel_text "Note: tailnet origin mode is EXPERIMENTAL and still under field validation."
   elif [[ -n "${DOMAIN}" ]]; then
-    echo -e "  ${WHITE}  TLS was verified. Open this HTTPS URL to finish setup:${NC}"
+    terminal_panel_text "Next step: Open this link in your browser to create the admin account."
     echo ""
     echo -e "  ${BOLD}${CYAN}  ${url}${NC}"
     echo ""
-    echo -e "  ${DIM}  The bootstrap fragment is exchanged once over HTTPS and removed from the address bar.${NC}"
+    terminal_panel_text "The bootstrap fragment is exchanged once over HTTPS and removed from the address bar."
   else
     local ssh_target
     ssh_target="$(portal_setup_ssh_user)@${PUBLIC_IP}"
-    echo -e "  ${WHITE}  No TLS domain is ready, so setup is loopback-only.${NC}"
-    echo -e "  ${WHITE}  On your computer, open a second terminal and keep this tunnel running:${NC}"
+    terminal_panel_text "No TLS domain is ready, so setup is loopback-only."
+    terminal_panel_text "On your computer, open a second terminal and keep this tunnel running:"
     echo ""
     echo -e "  ${BOLD}${CYAN}  ssh -N -L 4001:127.0.0.1:4001 ${ssh_target}${NC}"
     echo ""
-    echo -e "  ${WHITE}  Then open this loopback URL in your browser:${NC}"
+    terminal_panel_text "Then open this link in your browser to create the admin account:"
     echo ""
     echo -e "  ${BOLD}${CYAN}  ${url}${NC}"
     echo ""
-    echo -e "  ${DIM}  Public HTTP returns 403. The SSH tunnel carries setup credentials encrypted.${NC}"
+    terminal_panel_text "Public HTTP returns 403. The SSH tunnel carries setup credentials encrypted."
   fi
   if [[ -n "${SETUP_TOKEN}" ]]; then
-    echo -e "  ${YELLOW}  The one-time bootstrap expires no later than 24 hours after minting and cannot be replayed after exchange.${NC}"
+    terminal_panel_text "The one-time bootstrap expires no later than 24 hours after minting and cannot be replayed after exchange."
   fi
   echo ""
 
   # What was installed summary
-  echo -e "  ${DIM}What was installed:${NC}"
+  terminal_panel_heading 'Installed components' 'Runtime versions reported by this server'
   local node_ver="" pg_ver="" caddy_ver="" docker_ver="" ollama_ver="" openclaw_ver="" clawhub_ver=""
   node_ver="$(node -v 2>/dev/null || echo '?')"
   pg_ver="$(psql --version 2>/dev/null | grep -oP '\d+' | head -1 || echo '?')"
@@ -32085,18 +33016,18 @@ print_success() {
   openclaw_ver="$(openclaw --version 2>/dev/null | head -1 | grep -oP '\d{4}\.\d+\.\d+(-\d+)?' || echo '-')"
   clawhub_ver="$(clawhub --cli-version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' || echo '-')"
 
-  echo -e "  ${DIM}${BULLET}${NC} Node.js ${node_ver}  ${DIM}${BULLET}${NC} PostgreSQL ${pg_ver}  ${DIM}${BULLET}${NC} Caddy ${caddy_ver}"
-  echo -e "  ${DIM}${BULLET}${NC} Docker ${docker_ver}  ${DIM}${BULLET}${NC} Ollama ${ollama_ver}  ${DIM}${BULLET}${NC} OpenClaw ${openclaw_ver}  ${DIM}${BULLET}${NC} ClawHub ${clawhub_ver}"
+  terminal_panel_text "Node.js ${node_ver} / PostgreSQL ${pg_ver} / Caddy ${caddy_ver}"
+  terminal_panel_text "Docker ${docker_ver} / Ollama ${ollama_ver} / OpenClaw ${openclaw_ver} / ClawHub ${clawhub_ver}"
   echo ""
 
   if use_local_profile; then
-    echo -e "  ${DIM}This beta path is for local Windows / WSL testing and is still experimental / untested.${NC}"
-    echo -e "  ${DIM}In the wizard, skip domain + HTTPS for now and use localhost access.${NC}"
-    echo -e "  ${DIM}Public hosting, custom domains, and external share links remain VPS features for now.${NC}"
+    terminal_panel_text "This beta path is for local Windows / WSL testing and is still experimental / untested."
+    terminal_panel_text "In the wizard, skip domain + HTTPS for now and use localhost access."
+    terminal_panel_text "Public hosting, custom domains, and external share links remain VPS features for now."
   elif [[ -z "$DOMAIN" ]]; then
-    echo -e "  ${DIM}You can prove a domain and hand off to HTTPS in the wizard, or finish entirely through the tunnel.${NC}"
+    terminal_panel_text "You can prove a domain and hand off to HTTPS in the wizard, or finish entirely through the tunnel."
   fi
-  echo -e "  ${DIM}Log: ${LOG_FILE}${NC}"
+  terminal_final_field 'Log' "${LOG_FILE}" "$(terminal_detect_width)"
   echo ""
 
   telemetry_event "install_complete"
@@ -33421,6 +34352,75 @@ for path, exists in ((permit, permit_exists), (marker, marker_exists)):
 PY
 }
 
+retire_stale_retained_chat_recovery_permit() {
+  # Only an already-owned, inactive baseline start can replace a dead permit.
+  # The sealed helper validates the full owner, receipt, graph and restored bytes.
+  local expected_identity="$1" authority
+  retained_chat_update_owner_present || return 1
+  [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "upgrade-restored" \
+    || "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "restored-cleanup" ]] || return 1
+  authority="$(openclaw_core_gateway_authority)" || return 1
+  openclaw_gateway_require_exact_identity "${expected_identity}" >/dev/null || return 1
+  python3 -I - "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}" \
+    "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" "${authority}" \
+    "${expected_identity}" <<'PY' || return 1
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+permit, ledger = map(Path, sys.argv[1:3])
+authority, identity = map(json.loads, sys.argv[3:5])
+pending = authority.get('pending')
+if (not isinstance(pending, dict) or pending.get('action') != 'start'
+        or pending.get('purpose') != 'baseline-restore'
+        or pending.get('expectedActive') is not True
+        or pending.get('before') != identity or authority.get('current') != identity
+        or identity.get('active') is not False or identity.get('mainPid') != 0):
+    raise SystemExit(1)
+boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
+if json.loads(ledger.read_text())['createdBootId'] != boot:
+    raise SystemExit(1)
+parent_fd = os.open(permit.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    parent = os.fstat(parent_fd)
+    if ((parent.st_uid, parent.st_gid, stat.S_IMODE(parent.st_mode)) != (0, 0, 0o700)):
+        raise SystemExit(1)
+    fd = os.open(permit.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o600)
+                or not 0 < info.st_size <= 256):
+            raise SystemExit(1)
+        raw = os.read(fd, 257)
+        if not re.fullmatch(rb'[1-9][0-9]* [1-9][0-9]* [a-f0-9-]{36}\n', raw):
+            raise SystemExit(1)
+        pid, ticks, permit_boot = raw.decode('ascii').split()
+        if permit_boot != boot:
+            raise SystemExit(1)
+        try:
+            current = Path('/proc', pid, 'stat').read_text(encoding='ascii').rsplit(')', 1)[1].split()[19]
+        except FileNotFoundError:
+            current = None
+        if current == ticks:
+            raise SystemExit(1)  # Even a zombie/reused live controller is not ours to retire.
+        linked = os.stat(permit.name, dir_fd=parent_fd, follow_symlinks=False)
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink',
+                  'st_size', 'st_mtime_ns', 'st_ctime_ns')
+        if any(getattr(linked, field) != getattr(info, field) for field in fields):
+            raise SystemExit(1)
+        os.unlink(permit.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
 authorized_systemctl_openclaw_gateway() {
   local action="$1" expected_identity="${2:-}" durable_authorization="${3:-}"
   local fence_marker="${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_MARKER}"
@@ -33448,6 +34448,12 @@ authorized_systemctl_openclaw_gateway() {
     return
   fi
   load_openclaw_migration_transaction || return 1
+  if [[ -e "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}" \
+    || -L "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}" ]]; then
+    [[ "${durable_authorization}" == "durable-action" \
+      && -n "${expected_identity}" ]] || return 1
+    retire_stale_retained_chat_recovery_permit "${expected_identity}" || return 1
+  fi
   install -d -o root -g root -m 0700 -- \
     "$(dirname -- "${OPENCLAW_GATEWAY_AUTHORIZATION_FENCE_PERMIT}")" \
     || return 1
@@ -34418,7 +35424,7 @@ if schema == "bridgesllm-update-transaction-v1" and contract is None:
     print("legacy-host-integration-v1")
 elif (
     schema == "bridgesllm-update-transaction-v2"
-    and contract in {"legacy-host-integration-v1", "portal-only-v1"}
+    and contract in {"legacy-host-integration-v1", "portal-only-v1", "portal-retained-chat-v1"}
 ):
     print(contract)
 else:
@@ -36234,7 +37240,7 @@ prepare_update_transaction() {
   fi
   ${REPAIR_REINSTALL:-false} && repair_reinstall=true
   [[ "${PORTAL_ONLY_UPDATE:-false}" == "true" ]] \
-    && operation_contract="portal-only-v1"
+    && operation_contract="portal-retained-chat-v1"
   if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
     && command -v openclaw >/dev/null 2>&1; then
     openclaw_package_preexisted=true
@@ -36467,6 +37473,9 @@ cutover_update_transaction() {
   local generation transaction_id
   transaction_id="$(read_update_transaction_field active transaction_id)" || return 1
   generation="$(read_update_transaction_field active generation)" || return 1
+  if [[ "${expected_phase}" == "cutover_pending" ]]; then
+    arm_retained_chat_update_cutover || return 1
+  fi
   run_update_transaction_state_helper cutover \
     --transaction-id "${transaction_id}" \
     --expected-generation "${generation}" \
@@ -36848,7 +37857,7 @@ complete_update_transaction() {
           "${transaction_id}" "${cleanup_policy}" || return 1
       fi
       ;;
-    portal-only-v1)
+    portal-only-v1|portal-retained-chat-v1)
       ;;
     *)
       return 1
@@ -36884,7 +37893,7 @@ complete_committed_update_transaction() {
     read_update_transaction_field cutover operation_contract
   )" || return 1
   case "${operation_contract}" in
-    portal-only-v1)
+    portal-only-v1|portal-retained-chat-v1)
       configure_backup_data_entrypoint \
         && complete_update_transaction cutover committed
       ;;
@@ -36908,6 +37917,10 @@ refence_cutover_recovery() {
 
 finish_forward_cutover_transaction() {
   load_update_transaction_context cutover || return 1
+  # Capture native commit authority before any receipt phase update/re-fence.
+  if [[ "$(read_update_transaction_field cutover operation_contract)" == "portal-retained-chat-v1" ]]; then
+    reconcile_retained_chat_update_if_present || return 1
+  fi
   load_update_origin_from_environment \
     "${PORTAL_DIR}/backend/.env.production" || return 1
   local phase probe_token validation_assignment_status repair_reinstall
@@ -37033,8 +38046,12 @@ recover_active_update_transaction() {
           active recovery_quiesced recovery_openclaw_restore_pending || return 1
         ;;
       recovery_openclaw_restore_pending)
-        # Global OpenClaw/tool convergence is intentionally post-commit. These
-        # journal phases are a proven no-op kept for schema compatibility.
+        # Retained Chat rollback must finish while Portal is quiescent and
+        # before source rollback can remove the new helper. Old receipts with
+        # no native owner retain their no-op behavior.
+        if [[ "$(read_update_transaction_field active operation_contract)" == "portal-retained-chat-v1" ]]; then
+          reconcile_retained_chat_update_if_present || return 1
+        fi
         advance_update_transaction_phase \
           active recovery_openclaw_restore_pending recovery_openclaw_restored \
           || return 1
@@ -37465,7 +38482,7 @@ recover_pending_update_transaction() {
     read_update_transaction_field "${target}" operation_contract 2>/dev/null
   )" || return 1
   case "${operation_contract}" in
-    portal-only-v1)
+    portal-only-v1|portal-retained-chat-v1)
       PORTAL_ONLY_UPDATE=true
       ;;
     legacy-host-integration-v1)
@@ -37573,6 +38590,7 @@ do_update() {
   fi
   echo ""
   CURRENT_STEP="update"
+  terminal_update_ledger_init
   if $REPAIR_REINSTALL; then
     terminal_operation_begin repair "Repairing Portal" 1 1
   else
@@ -37587,7 +38605,7 @@ do_update() {
 
   local previous_portal_version=""
   previous_portal_version="$(attest_existing_portal_for_update "${PORTAL_DIR}")" \
-    || fail "The existing Portal runtime or configuration is incomplete, linked, writable by another account, or version-inconsistent. Repair it explicitly before updating."
+    || fail "The existing Portal runtime or configuration is incomplete, linked, writable by another account, or version-inconsistent. Automatic partial file repair is unavailable. Use --status for log paths and --recover only for supported journaled work; preserve the existing files and data."
 
   dashboard_update_progress running 16 portal-preflight \
     "Validating current Portal and recovery prerequisites" \
@@ -37807,9 +38825,9 @@ do_update() {
   advance_update_transaction_phase \
     active caddy_snapshot_complete openclaw_snapshot_pending \
     || fail "Could not record the ancillary-state snapshot phase."
-  # Keep these legacy phase tokens so existing recovery ordering remains
-  # stable. They are deliberate no-ops in a Portal-only transaction; global
-  # packages are neither snapshotted nor mutated by ordinary update.
+  # Keep the receipt phase ordering. Retained Chat seals its exact native
+  # baseline in the existing owner at openclaw_update_pending, after overlay
+  # supplies the signed helper. No core/plugin package snapshot or upgrade.
   advance_update_transaction_phase \
     active openclaw_snapshot_pending openclaw_snapshot_complete \
     || fail "Could not commit the ancillary-state snapshot phase."
@@ -37888,10 +38906,12 @@ do_update() {
 
   advance_update_transaction_phase \
     active database_migrated openclaw_update_pending \
-    || fail "Could not record the legacy ancillary no-op phase."
+    || fail "Could not record the retained Chat preparation phase."
+  prepare_retained_chat_update \
+    || fail "The exact retained-core Chat repair could not be applied and activated safely; recovery will restore its baseline."
   advance_update_transaction_phase \
     active openclaw_update_pending openclaw_updated \
-    || fail "Could not commit the legacy ancillary no-op phase."
+    || fail "Could not commit the retained Chat preparation phase."
 
   advance_update_transaction_phase \
     active openclaw_updated candidate_start_pending \
@@ -38307,7 +39327,7 @@ assert_fresh_install_target_available() {
     return 0
   fi
 
-  fail "A partial or unattested Portal path already exists at ${portal_dir}. Refusing to treat it as a fresh host; recover or remove that exact installation deliberately."
+  fail "A partial or unattested Portal path already exists at ${portal_dir}. Refusing to treat it as a fresh host. Use --status for log paths and --recover for supported journaled work only. Preserve this tree and its database; automatic partial fresh-install resume is unavailable."
 }
 
 remove_portal_runtime_preserving_data() {
@@ -45246,7 +46266,7 @@ print_dry_run_plan() {
 
   banner
   echo ""
-  echo -e "  ${BOLD}${WHITE}Dry-run plan${NC}"
+  terminal_panel_heading 'Dry-run plan' 'Review the operation without changing this server.'
   echo -e "  ${GREEN}No changes will be made.${NC}"
   echo -e "  ${DIM}This command performs no filesystem writes, lock creation, downloads,${NC}"
   echo -e "  ${DIM}telemetry, package work, service changes, firewall changes, Tailscale${NC}"
@@ -45324,7 +46344,16 @@ main() {
   terminal_prescan_display_mode "$@"
   parse_args "$@"
   select_install_operation
+  if ${INSTALLER_STATUS}; then
+    print_installer_recovery_status
+    exit 0
+  fi
   terminal_renderer_init
+  if ${RECOVER_ONLY}; then
+    # Stay Portal-only outside sealed recovery owners; no host convergence.
+    run_installer_recovery_only
+    exit $?
+  fi
   classify_requested_update_scope
   if ${REPAIR_PROJECT_RUNTIME_IMAGE}; then
     [[ "${EUID:-$(id -u)}" -eq 0 ]] \
@@ -45511,12 +46540,13 @@ main() {
   }
   build_fresh_install_plan \
     || fail "Fresh-install phase plan is invalid; no host changes were started."
+  terminal_install_review || true
   FRESH_INSTALL_IN_PROGRESS=true
   run_fresh_install_plan
   FRESH_INSTALL_IN_PROGRESS=false
   publish_installer_terminal_state "Installation verified" \
     "Portal started and passed exact-version readiness checks." \
-    "Open the setup URL printed below."
+    "Open the link below to create the admin account."
   print_success
 }
 

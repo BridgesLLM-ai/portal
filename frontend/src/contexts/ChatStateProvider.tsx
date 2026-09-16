@@ -8955,20 +8955,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     if (!note) return;
 
     const targetSession = sessionKey || sessionRef.current;
-    const directClient = directClientRef.current;
-    if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
-      await directClient.injectMessage(targetSession, note);
-      return;
-    }
-
-    const manager = wsManagerRef.current;
-    if (manager && manager.isConnected()) {
-      const sent = manager.send({ type: 'inject', session: targetSession, text: note });
-      if (sent) return;
-    }
-
-    await client.post('/gateway/chat/inject', { session: targetSession, text: note });
-  }, [useDirectGateway]);
+    // Mutations belong to the Portal broker even when history uses the direct proxy.
+    // Await its acknowledgment; a successful WebSocket send alone cannot prove an append.
+    await gatewayAPI.injectNote(targetSession, note);
+  }, []);
 
   // Cancel stream
   const cancelStream = useCallback((): Promise<void> => {

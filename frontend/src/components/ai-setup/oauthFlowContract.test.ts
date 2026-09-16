@@ -8,6 +8,7 @@ import {
   isOAuthFlowReadyForModel,
   readStructuredOAuthFlowState,
   readStructuredOAuthCancellationState,
+  readClaudeAuthorizationUrl,
   readStructuredOAuthStartFailure,
   sanitizeOAuthVerificationUrl,
 } from './oauthFlowContract';
@@ -156,5 +157,37 @@ describe('structured OAuth flow contract', () => {
       credentialState: 'indeterminate',
       error: 'The old session record is gone.',
     }, 404)).toMatchObject({ outcome: 'review_required', cleanupPending: true });
+  });
+});
+
+describe('readClaudeAuthorizationUrl', () => {
+  it('accepts only Anthropic\'s fixed authorization endpoint', () => {
+    const good = 'https://claude.com/cai/oauth/authorize?code=true&client_id=x&state=y';
+    expect(readClaudeAuthorizationUrl(good)).toBe(good);
+    expect(readClaudeAuthorizationUrl(`  ${good}  `)).toBe(good);
+    expect(readClaudeAuthorizationUrl('HTTPS://CLAUDE.COM/cai/oauth/authorize')).toBe('https://claude.com/cai/oauth/authorize');
+  });
+
+  it('rejects other hosts, schemes, ports, paths, userinfo, and non-strings', () => {
+    for (const bad of [
+      'https://claude-login.example/cai/oauth/authorize',
+      'https://claude.com.evil.example/cai/oauth/authorize',
+      'https://claude.com@evil.example/cai/oauth/authorize',
+      'https://evil.example@claude.com/cai/oauth/authorize',
+      'https://user:pw@claude.com/cai/oauth/authorize',
+      'https://claude.com:8443/cai/oauth/authorize',
+      'http://claude.com/cai/oauth/authorize',
+      'https://claude.com/cai/oauth/authorize/',
+      'https://claude.com/oauth/authorize',
+      'javascript:alert(1)',
+      '//claude.com/cai/oauth/authorize',
+      '',
+      null,
+      undefined,
+      42,
+      { toString: () => 'https://claude.com/cai/oauth/authorize' },
+    ]) {
+      expect(readClaudeAuthorizationUrl(bad)).toBeNull();
+    }
   });
 });

@@ -234,6 +234,7 @@ portal/installer/install.sh.sig
 portal/installer/migrate-openclaw-2026.9.1.mjs
 portal/installer/migrate-openclaw-2026.9.3.mjs
 portal/installer/native-cli-bundle-transaction.py
+portal/installer/install-missing-cli.py
 portal/installer/ollama-tailnet-README.txt
 portal/installer/openclaw-ask-user-plugin/index.js
 portal/installer/openclaw-ask-user-plugin/openclaw.plugin.json
@@ -241,6 +242,14 @@ portal/installer/openclaw-ask-user-plugin/package.json
 portal/installer/openclaw-ask-user-plugin/register.py
 portal/installer/openclaw-migration-transaction.py
 portal/installer/repair-openclaw-native-bridge.py
+portal/installer/openclaw-native-chat-2026.9.3/session-history-tail-DUGCG5bk.mjs
+portal/installer/openclaw-native-chat-2026.9.3/session-transcript-readers-DZrB96ki.mjs
+portal/installer/openclaw-native-chat-transaction.py
+portal/installer/verify-openclaw-2026.9.2-native-chat.py
+portal/installer/openclaw-native-chat-2026.9.2/SOURCE-LOCK.json
+portal/installer/openclaw-native-chat-2026.9.2/chat-IsrqkYID.js
+portal/installer/openclaw-native-chat-2026.9.2/session-history-tail-BuFrV1Wb.js
+portal/installer/openclaw-native-chat-2026.9.2/session-transcript-readers-CYDRQsH5.js
 portal/installer/openclaw-stable-plugins.sh
 portal/installer/opencode-runtime.sh
 portal/installer/patch-openclaw-2026.9.1-portal-contract.mjs
