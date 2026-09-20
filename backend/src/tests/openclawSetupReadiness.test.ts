@@ -1,6 +1,7 @@
 import {
   __openClawSetupReadinessTest,
   getOpenClawSetupReadiness,
+  __openClawSetupReadinessCacheTest,
   invalidateOpenClawSetupReadinessCache,
   type OpenClawSetupReadinessDependencies,
 } from '../services/openclawSetupReadiness';
@@ -327,6 +328,213 @@ describe('OpenClaw setup readiness', () => {
     );
     expect(refreshed.ready).toBe(true);
     expect(cliCalls).toBe(8);
+  });
+
+  it('serves a ready result while revalidating off the request path, and survives one contended probe', async () => {
+    const started = Date.parse('2026-09-20T04:00:00.000Z');
+    let now = started;
+    const dateNow = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    try {
+      const healthy = makeDependencies();
+      const busy = makeDependencies({ gatewayStatus: failed('gateway timeout after 10000ms') });
+      let cliCalls = 0;
+      let gatewayBusy = false;
+      const dependencies: OpenClawSetupReadinessDependencies = {
+        ...healthy,
+        runOpenClawCli: async (args, timeoutMs) => {
+          cliCalls += 1;
+          return (gatewayBusy ? busy : healthy).runOpenClawCli(args, timeoutMs);
+        },
+      };
+      const shared = { useSharedCache: true } as const;
+
+      const first = await getOpenClawSetupReadiness(dependencies, shared);
+      expect(first.ready).toBe(true);
+      const collected = cliCalls;
+
+      // Well past the old one-minute TTL: still served without a single spawn.
+      now = started + __openClawSetupReadinessCacheTest.READINESS_REFRESH_AFTER_MS - 1;
+      expect(await getOpenClawSetupReadiness(dependencies, shared)).toBe(first);
+      expect(cliCalls).toBe(collected);
+
+      // Stale: the caller still gets the ready result at once while one
+      // background probe runs against a gateway that is merely busy.
+      gatewayBusy = true;
+      now = started + __openClawSetupReadinessCacheTest.READINESS_REFRESH_AFTER_MS;
+      expect(await getOpenClawSetupReadiness(dependencies, shared)).toBe(first);
+      await settle();
+      await settle();
+      expect(cliCalls).toBeGreaterThan(collected);
+      const afterFirstFailure = cliCalls;
+      expect(await getOpenClawSetupReadiness(dependencies, shared)).toBe(first);
+      await settle();
+      expect(cliCalls).toBe(afterFirstFailure);
+
+      // A second consecutive failure after the retry interval displaces it.
+      now += __openClawSetupReadinessCacheTest.READINESS_BACKGROUND_RETRY_MS;
+      expect(await getOpenClawSetupReadiness(dependencies, shared)).toBe(first);
+      await settle();
+      await settle();
+      const displaced = await getOpenClawSetupReadiness(dependencies, shared);
+      expect(displaced.ready).toBe(false);
+      expect(displaced.blockers.map(blocker => blocker.code)).toContain('gateway-rpc-unavailable');
+
+      // Not-ready is short-lived: recovery is collected on the next request.
+      gatewayBusy = false;
+      now += __openClawSetupReadinessCacheTest.READINESS_NOT_READY_TTL_MS;
+      expect((await getOpenClawSetupReadiness(dependencies, shared)).ready).toBe(true);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('gives a diagnostic surface the one-minute freshness it asks for', async () => {
+    const started = Date.parse('2026-09-20T04:00:00.000Z');
+    let now = started;
+    const dateNow = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const base = makeDependencies();
+      let cliCalls = 0;
+      const dependencies: OpenClawSetupReadinessDependencies = {
+        ...base,
+        runOpenClawCli: async (args, timeoutMs) => { cliCalls += 1; return base.runOpenClawCli(args, timeoutMs); },
+      };
+      await getOpenClawSetupReadiness(dependencies, { useSharedCache: true });
+      const collected = cliCalls;
+
+      now = started + 59_999;
+      await getOpenClawSetupReadiness(dependencies, { useSharedCache: true, maxAgeMs: 60_000 });
+      expect(cliCalls).toBe(collected);
+
+      now = started + 60_000;
+      // A chat request path is still served the long-lived result…
+      await getOpenClawSetupReadiness(dependencies, { useSharedCache: true });
+      expect(cliCalls).toBe(collected);
+      // …while the maintenance page collects a current one.
+      await getOpenClawSetupReadiness(dependencies, { useSharedCache: true, maxAgeMs: 60_000 });
+      expect(cliCalls).toBeGreaterThan(collected);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('never lets a probe that began before an invalidation repopulate the cache', async () => {
+    const base = makeDependencies();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let gated = true;
+    let cliCalls = 0;
+    const dependencies: OpenClawSetupReadinessDependencies = {
+      ...base,
+      runOpenClawCli: async (args, timeoutMs) => {
+        cliCalls += 1;
+        if (gated) await gate;
+        return base.runOpenClawCli(args, timeoutMs);
+      },
+    };
+    const shared = { useSharedCache: true } as const;
+
+    const preBoundary = getOpenClawSetupReadiness(dependencies, shared);
+    invalidateOpenClawSetupReadinessCache();
+    gated = false;
+    release();
+    await preBoundary;
+    const callsBefore = cliCalls;
+
+    // The pre-boundary result was returned to its caller but not cached.
+    await getOpenClawSetupReadiness(dependencies, shared);
+    expect(cliCalls).toBeGreaterThan(callsBefore);
+  });
+
+  it('collects fresh for an attestation without giving up the contention debounce', async () => {
+    const healthy = makeDependencies();
+    const busy = makeDependencies({ gatewayStatus: failed('gateway timeout after 10000ms') });
+    let gatewayBusy = false;
+    let cliCalls = 0;
+    const dependencies: OpenClawSetupReadinessDependencies = {
+      ...healthy,
+      runOpenClawCli: async (args, timeoutMs) => {
+        cliCalls += 1;
+        return (gatewayBusy ? busy : healthy).runOpenClawCli(args, timeoutMs);
+      },
+    };
+
+    const first = await getOpenClawSetupReadiness(dependencies, { useSharedCache: true });
+    const collected = cliCalls;
+    gatewayBusy = true;
+    const fresh = await getOpenClawSetupReadiness(dependencies, { useSharedCache: true, fresh: true });
+    expect(cliCalls).toBeGreaterThan(collected);
+    // The fresh caller sees the truth; cached readers keep the ready result.
+    expect(fresh.ready).toBe(false);
+    expect(await getOpenClawSetupReadiness(dependencies, { useSharedCache: true })).toBe(first);
+  });
+
+  it('counts a second failure only after the retry interval, whichever path collected it', async () => {
+    const started = Date.parse('2026-09-20T04:00:00.000Z');
+    let now = started;
+    const dateNow = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const healthy = makeDependencies();
+      const busy = makeDependencies({ gatewayStatus: failed('gateway timeout after 10000ms') });
+      let gatewayBusy = false;
+      const dependencies: OpenClawSetupReadinessDependencies = {
+        ...healthy,
+        runOpenClawCli: async (args, timeoutMs) => (gatewayBusy ? busy : healthy).runOpenClawCli(args, timeoutMs),
+      };
+      const shared = { useSharedCache: true } as const;
+      const first = await getOpenClawSetupReadiness(dependencies, shared);
+      gatewayBusy = true;
+
+      // Two fresh collections inside one burst of contention are one piece of
+      // evidence, not two: the ready result survives both.
+      expect((await getOpenClawSetupReadiness(dependencies, { ...shared, fresh: true })).ready).toBe(false);
+      now += __openClawSetupReadinessCacheTest.READINESS_BACKGROUND_RETRY_MS - 1;
+      expect((await getOpenClawSetupReadiness(dependencies, { ...shared, fresh: true })).ready).toBe(false);
+      expect(await getOpenClawSetupReadiness(dependencies, shared)).toBe(first);
+
+      // A failure after the interval is independent, and displaces it.
+      now += 1;
+      expect((await getOpenClawSetupReadiness(dependencies, { ...shared, fresh: true })).ready).toBe(false);
+      expect((await getOpenClawSetupReadiness(dependencies, shared)).ready).toBe(false);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('publishes directly when a forced recheck joins a debounced collection', async () => {
+    const healthy = makeDependencies();
+    const busy = makeDependencies({ gatewayStatus: failed('gateway timeout after 10000ms') });
+    let gatewayBusy = false;
+    let release!: () => void;
+    let gate: Promise<void> | null = null;
+    const dependencies: OpenClawSetupReadinessDependencies = {
+      ...healthy,
+      runOpenClawCli: async (args, timeoutMs) => {
+        if (gate) await gate;
+        return (gatewayBusy ? busy : healthy).runOpenClawCli(args, timeoutMs);
+      },
+    };
+    const shared = { useSharedCache: true } as const;
+    await getOpenClawSetupReadiness(dependencies, shared);
+
+    gatewayBusy = true;
+    gate = new Promise<void>((resolve) => { release = resolve; });
+    const debounced = getOpenClawSetupReadiness(dependencies, { ...shared, fresh: true });
+    const forced = getOpenClawSetupReadiness(dependencies, { ...shared, force: true });
+    release();
+    expect((await forced).ready).toBe(false);
+    expect(await debounced).toBe(await forced);
+    // One probe ran, and the operator's recheck decided how it was published.
+    expect((await getOpenClawSetupReadiness(dependencies, shared)).ready).toBe(false);
+  });
+
+  it('serves a not-ready result for twice its collection time, within fifteen seconds to a minute', () => {
+    const ttl = __openClawSetupReadinessCacheTest.notReadySetupReadinessTtlMs;
+    expect(ttl(0)).toBe(__openClawSetupReadinessCacheTest.READINESS_NOT_READY_TTL_MS);
+    expect(ttl(Number.NaN)).toBe(15_000);
+    expect(ttl(27_000)).toBe(54_000);
+    expect(ttl(90_000)).toBe(__openClawSetupReadinessCacheTest.READINESS_NOT_READY_MAX_TTL_MS);
   });
 
   it('rejects a configured token that cannot authenticate to the running gateway', async () => {

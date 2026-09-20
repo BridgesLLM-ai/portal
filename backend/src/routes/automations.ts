@@ -4,7 +4,9 @@ import { requireAdmin } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';
 import { gatewayRpcCall } from '../utils/openclawGatewayRpc';
 import {
+  assertCachedOpenClawExecutionAdmitted,
   assertOpenClawExecutionAdmitted,
+  bindAdmittedOpenClawDispatch,
   OpenClawExecutionAdmissionError,
 } from '../services/openClawExecutionAdmission';
 
@@ -22,7 +24,7 @@ const AUTOMATIONS_LIST_CACHE_TTL_MS = 5000;
 let automationsListCache: { at: number; jobs: any[] } | null = null;
 let automationsListInflight: Promise<any[]> | null = null;
 
-type CronRpcResult = { ok: true; data: any } | { ok: false; error: string; data?: any };
+type CronRpcResult = { ok: true; data: any } | { ok: false; error: string; data?: any; code?: string };
 
 type CronSchedule =
   | { kind: 'every'; everyMs: number }
@@ -141,13 +143,39 @@ function cronFailureStatus(error: string): number {
 
 function sendCronFailure(res: Response, result: Extract<CronRpcResult, { ok: false }>, fallback: string): void {
   const message = result.error || fallback;
+  // The transport refused the call on durable maintenance evidence: answer
+  // with the same typed 503 the admission check above would have produced.
+  if (result.code?.startsWith('OPENCLAW_EXECUTION_')) {
+    res.status(503).json({
+      error: message,
+      code: result.code,
+      retryable: result.code === 'OPENCLAW_EXECUTION_MAINTENANCE',
+    });
+    return;
+  }
   res.status(cronFailureStatus(message)).json({ error: message });
 }
 
 async function runCronOnce(method: string, params: Record<string, any> = {}, timeoutMs = 30000): Promise<CronRpcResult> {
   const result = await gatewayRpcCall(method, params, timeoutMs);
   if (result.ok) return { ok: true, data: result.data };
-  return { ok: false, error: formatGatewayRpcError(result.error), data: result.data };
+  return {
+    ok: false,
+    error: formatGatewayRpcError(result.error),
+    data: result.data,
+    ...(typeof result.errorCode === 'string' ? { code: result.errorCode } : {}),
+  };
+}
+
+/**
+ * An automation write that starts or enables execution. The route's admission
+ * ran before job verification, which pages through the gateway and can take a
+ * while; this is the synchronous seam after it, and the dispatch stays bound to
+ * the generation admitted here until the transport writes it.
+ */
+function runAdmittedCron(method: string, params: Record<string, any>, timeoutMs = 30000, retries = 0): Promise<CronRpcResult> {
+  assertCachedOpenClawExecutionAdmitted();
+  return bindAdmittedOpenClawDispatch(() => runCron(method, params, timeoutMs, retries));
 }
 
 async function runCron(method: string, params: Record<string, any> = {}, timeoutMs = 30000, retries = 0): Promise<CronRpcResult> {
@@ -497,7 +525,9 @@ router.post('/', async (req: Request, res: Response) => {
   };
   if (agent) jobCreate.agentId = String(agent).trim();
 
-    const result = await runCron('cron.add', jobCreate, 45000);
+    const result = jobCreate.enabled
+      ? await runAdmittedCron('cron.add', jobCreate, 45000)
+      : await runCron('cron.add', jobCreate, 45000);
   if (!result.ok) {
     sendCronFailure(res, result, 'Failed to create cron job');
     return;
@@ -573,7 +603,12 @@ router.put('/:id', async (req: Request, res: Response) => {
     return;
   }
 
-  const result = await runCron('cron.update', { id, patch }, 45000);
+  // The transports let an automation write through during maintenance only
+  // when it says outright that the job ends up disabled.
+  if (!resultingEnabled) patch.enabled = false;
+  const result = resultingEnabled
+    ? await runAdmittedCron('cron.update', { id, patch }, 45000)
+    : await runCron('cron.update', { id, patch }, 45000);
   if (!result.ok) {
     sendCronFailure(res, result as Extract<CronRpcResult, { ok: false }>, 'Failed to update cron job');
     return;
@@ -610,7 +645,15 @@ router.post('/:id/toggle', async (req: Request, res: Response) => {
   const current = await requirePortalEditableAgentJob(id, res);
   if (!current) return;
 
-  const result = await runCron('cron.update', { id, patch: { enabled } });
+  let result: CronRpcResult;
+  try {
+    result = enabled
+      ? await runAdmittedCron('cron.update', { id, patch: { enabled } })
+      : await runCron('cron.update', { id, patch: { enabled } });
+  } catch (error) {
+    if (sendHostAutomationFence(res, error)) return;
+    throw error;
+  }
   if (!result.ok) {
     sendCronFailure(res, result, `Failed to ${enabled ? 'enable' : 'disable'} cron job`);
     return;
@@ -648,7 +691,13 @@ router.post('/:id/run', async (req: Request, res: Response) => {
     throw error;
   }
   if (!(await requirePortalEditableAgentJob(id, res))) return;
-  const result = await runCron('cron.run', { id, mode: 'force' }, 20_000, 0);
+  let result: CronRpcResult;
+  try {
+    result = await runAdmittedCron('cron.run', { id, mode: 'force' }, 20_000, 0);
+  } catch (error) {
+    if (sendHostAutomationFence(res, error)) return;
+    throw error;
+  }
   if (!result.ok) {
     sendCronFailure(res, result as Extract<CronRpcResult, { ok: false }>, 'Failed to run cron job');
     return;

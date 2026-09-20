@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'async_hooks';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -6,6 +7,8 @@ import {
 } from './openClawGatewayAuthorizationFence';
 import {
   getOpenClawSetupReadiness,
+  invalidateOpenClawSetupReadinessCache,
+  promoteOpenClawSetupReadinessInFlight,
   type OpenClawSetupReadiness,
 } from './openclawSetupReadiness';
 import {
@@ -25,7 +28,29 @@ export const OPENCLAW_HOST_MUTATION_ACTIVE_JOURNALS = Object.freeze([
   '/var/lib/bridgesllm-installer/host-mutations/native-binary-v1/active.json',
 ] as const);
 
-const READINESS_ATTESTATION_TTL_MS = 60_000;
+// A positive attestation describes the installed runtime tuple, which changes
+// only through installs and updates. Every Portal-managed mutation already
+// invalidates it immediately through the maintenance marker and host-mutation
+// WAL below, so age alone is weak evidence. Re-collecting it every minute put a
+// serialized chain of OpenClaw CLI processes (tens of CPU-seconds) on the chat
+// request path, and its gateway RPC probe reported a merely busy gateway as
+// unavailable. A positive result is therefore served while it is revalidated in
+// the background; only a missing, expired, or negative result blocks a request.
+const READINESS_ATTESTATION_REFRESH_AFTER_MS = 10 * 60_000;
+const READINESS_ATTESTATION_MAX_AGE_MS = 30 * 60_000;
+// Negative results stay short-lived so recovery is visible quickly, but never
+// so short that re-collecting them becomes the load. A negative is served for
+// at least twice as long as it took to collect, clamped between the floor and
+// the one-minute interval earlier releases used. That holds request-driven
+// collection to about a third of one core however often a caller asks.
+const READINESS_NEGATIVE_ATTESTATION_TTL_MS = 15_000;
+const READINESS_NEGATIVE_ATTESTATION_MAX_TTL_MS = 60_000;
+const READINESS_NEGATIVE_TTL_COLLECTION_MULTIPLE = 2;
+// One failed background revalidation is usually contention, not a changed
+// runtime. A still-valid positive attestation is displaced only after this many
+// consecutive background failures, retried no sooner than the retry interval.
+const READINESS_BACKGROUND_RETRY_MS = 20_000;
+const READINESS_BACKGROUND_NEGATIVES_TO_DISPLACE = 2;
 const MAX_MAINTENANCE_MARKER_BYTES = 2_048;
 const MAX_HOST_MUTATION_JOURNAL_BYTES = 16 * 1024 * 1024;
 
@@ -61,7 +86,14 @@ export interface OpenClawExecutionAdmissionDependencies {
   inspectAuthorizationFence(): OpenClawDurableEvidence;
   inspectMaintenanceMarker(): OpenClawDurableEvidence;
   inspectHostMutationJournal(): OpenClawDurableEvidence;
-  getReadiness(): Promise<OpenClawSetupReadiness>;
+  /**
+   * Identity of the directories that hold the maintenance marker and the
+   * host-mutation journals. It changes whenever an entry is created or removed
+   * there, so a mutation that began and ended between two admissions is still
+   * seen by the next one even though no marker is left to find.
+   */
+  readMutationEpoch(): string;
+  getReadiness(force?: boolean): Promise<OpenClawSetupReadiness>;
   getQuestionRuntimeReadiness(
     readiness: OpenClawSetupReadiness,
   ): Promise<OpenClawQuestionPluginReadiness>;
@@ -76,26 +108,91 @@ export interface OpenClawExecutionAdmissionOptions {
 type ReadinessAttestation = Readonly<{
   generation: number | null;
   at: number;
+  collectMs: number;
   readiness: OpenClawSetupReadiness | null;
   questionRuntime: OpenClawQuestionPluginReadiness | null;
 }>;
 
-type ReadinessAttestationInFlight = Readonly<{
-  generation: number;
+type ReadinessPublishPolicy = 'direct' | 'debounced';
+
+// `policy` is read when the collection settles, not when it starts: a forced
+// recheck that joins a background revalidation upgrades it to `direct`, so the
+// failure that caller is told about is also the state everyone else sees.
+type ReadinessAttestationInFlight = {
+  readonly generation: number;
   promise: Promise<ReadinessAttestation>;
-}>;
+  policy: ReadinessPublishPolicy;
+};
 
 let readinessAttestationGeneration = 0;
+let readinessAttestationEpoch: string | null = null;
+
+// A dispatch belongs to the attestation generation it was admitted under. The
+// generation advances at every maintenance or host-mutation boundary, observed
+// or not, so a turn that is still on its way to the gateway when one passes can
+// be recognised at the socket even though no marker is left to find.
+const admittedDispatchContext = new AsyncLocalStorage<Readonly<{ generation: number }>>();
 let readinessAttestationCache: ReadinessAttestation | null = null;
 let readinessAttestationInFlight: ReadinessAttestationInFlight | null = null;
+let readinessBackgroundNegatives = 0;
+let readinessBackgroundNextAttemptAt = 0;
+
+function readinessAttestationIsPositive(attestation: ReadinessAttestation): boolean {
+  return attestation.readiness?.ready === true && attestation.questionRuntime?.ready === true;
+}
+
+function usableCachedReadinessAttestation(now: number): ReadinessAttestation | null {
+  const cached = readinessAttestationCache;
+  if (!cached || cached.generation !== readinessAttestationGeneration) return null;
+  const maximumAge = readinessAttestationIsPositive(cached)
+    ? READINESS_ATTESTATION_MAX_AGE_MS
+    : negativeReadinessAttestationTtlMs(cached.collectMs);
+  return now - cached.at < maximumAge ? cached : null;
+}
+
+function negativeReadinessAttestationTtlMs(collectMs: number): number {
+  const scaled = Number.isFinite(collectMs) && collectMs > 0
+    ? collectMs * READINESS_NEGATIVE_TTL_COLLECTION_MULTIPLE
+    : 0;
+  return Math.min(
+    READINESS_NEGATIVE_ATTESTATION_MAX_TTL_MS,
+    Math.max(READINESS_NEGATIVE_ATTESTATION_TTL_MS, scaled),
+  );
+}
 
 function invalidateSharedReadinessAttestation(): void {
   readinessAttestationGeneration += 1;
   readinessAttestationCache = null;
+  readinessBackgroundNegatives = 0;
+  readinessBackgroundNextAttemptAt = 0;
+  // The setup-readiness layer now also retains positive results well past the
+  // length of a maintenance window, so it must cross this boundary with us.
+  invalidateOpenClawSetupReadinessCache();
   // A running probe cannot be cancelled, but detaching it here allows the
   // post-maintenance generation to start immediately. Its completion handler
   // is generation-bound and therefore cannot repopulate either shared slot.
   readinessAttestationInFlight = null;
+}
+
+const OPENCLAW_MUTATION_EPOCH_DIRECTORIES: readonly string[] = Object.freeze([...new Set([
+  OPENCLAW_MUTATION_MAINTENANCE_MARKER,
+  ...OPENCLAW_HOST_MUTATION_ACTIVE_JOURNALS,
+].map((filePath) => path.dirname(filePath)))]);
+
+function readMutationEvidenceEpoch(
+  directories: readonly string[] = OPENCLAW_MUTATION_EPOCH_DIRECTORIES,
+): string {
+  // Creating or removing an entry updates its directory's mtime and ctime, so
+  // these stamps outlive the marker or journal that caused them. Nothing else
+  // writes entries here during normal operation.
+  return directories.map((directory) => {
+    try {
+      const details = fs.lstatSync(directory, { bigint: true });
+      return `${details.dev}:${details.ino}:${details.mtimeNs}:${details.ctimeNs}`;
+    } catch (error: any) {
+      return error?.code === 'ENOENT' ? 'absent' : `unreadable:${String(error?.code || 'error')}`;
+    }
+  }).join('|');
 }
 
 function inspectSafeParentChain(filePath: string): 'safe' | 'absent' {
@@ -294,7 +391,11 @@ const defaultDependencies: OpenClawExecutionAdmissionDependencies = Object.freez
     maximumBytes: MAX_MAINTENANCE_MARKER_BYTES,
   }),
   inspectHostMutationJournal: inspectHostMutationJournals,
-  getReadiness: () => getOpenClawSetupReadiness(),
+  readMutationEpoch: () => readMutationEvidenceEpoch(),
+  // An attestation now outlives the setup-readiness cache by design, so it is
+  // always built from a fresh collection rather than from a cached one. A
+  // forced recheck forces that layer too, so both publish the same answer.
+  getReadiness: (force) => getOpenClawSetupReadiness({}, force ? { force: true } : { fresh: true }),
   getQuestionRuntimeReadiness: (readiness) => getOpenClawQuestionPluginReadiness(readiness),
   now: () => Date.now(),
 });
@@ -332,14 +433,25 @@ function evidenceSnapshot(
 function invalidateReadinessForRuntimeMutationEvidence(
   snapshot: ReturnType<typeof evidenceSnapshot>,
   shared: boolean,
+  dependencies: OpenClawExecutionAdmissionDependencies,
 ): void {
   if (!shared) return;
   // Authorization retirement does not change the installed runtime tuple.
   // Installer maintenance and every host-mutation WAL can. Unsafe evidence is
   // treated the same as present evidence: an old positive attestation must not
   // survive a boundary whose state could not be proved.
+  //
+  // A boundary nobody watched counts as well. Maintenance that started and
+  // finished between two admissions leaves no marker behind, but it does leave
+  // a different epoch, and every shared attestation, in-flight probe, and
+  // setup-readiness result belongs to the epoch it was collected under.
+  const epoch = dependencies.readMutationEpoch();
+  const crossedUnobservedBoundary = readinessAttestationEpoch !== null
+    && epoch !== readinessAttestationEpoch;
+  readinessAttestationEpoch = epoch;
   if (
-    snapshot.maintenanceMarker.state !== 'absent'
+    crossedUnobservedBoundary
+    || snapshot.maintenanceMarker.state !== 'absent'
     || snapshot.hostMutationJournal.state !== 'absent'
   ) {
     invalidateSharedReadinessAttestation();
@@ -413,36 +525,103 @@ async function collectReadinessAttestation(
   force: boolean,
 ): Promise<ReadinessAttestation> {
   const now = dependencies.now();
-  if (
-    shared
-    && !force
-    && readinessAttestationCache
-    && readinessAttestationCache.generation === readinessAttestationGeneration
-    && now - readinessAttestationCache.at < READINESS_ATTESTATION_TTL_MS
-  ) {
-    return readinessAttestationCache;
+  if (shared && !force) {
+    const cached = usableCachedReadinessAttestation(now);
+    if (cached) {
+      if (
+        readinessAttestationIsPositive(cached)
+        && now - cached.at >= READINESS_ATTESTATION_REFRESH_AFTER_MS
+      ) {
+        revalidateReadinessAttestationInBackground(dependencies, now);
+      }
+      return cached;
+    }
   }
+  return startReadinessAttestationCollection(dependencies, shared, force ? 'direct' : 'debounced');
+}
+
+function revalidateReadinessAttestationInBackground(
+  dependencies: OpenClawExecutionAdmissionDependencies,
+  now: number,
+): void {
+  if (readinessAttestationInFlight?.generation === readinessAttestationGeneration) return;
+  if (now < readinessBackgroundNextAttemptAt) return;
+  // Never awaited by a request. The collection itself cannot reject; the catch
+  // only guarantees a background probe can never surface as an unhandled
+  // rejection in the Portal process.
+  void startReadinessAttestationCollection(dependencies, true, 'debounced').catch(() => undefined);
+}
+
+function publishReadinessAttestation(
+  result: ReadinessAttestation,
+  policy: ReadinessPublishPolicy,
+  now: number,
+): void {
+  if (readinessAttestationIsPositive(result)) {
+    readinessAttestationCache = result;
+    readinessBackgroundNegatives = 0;
+    readinessBackgroundNextAttemptAt = 0;
+    return;
+  }
+  const retained = policy === 'debounced' ? usableCachedReadinessAttestation(now) : null;
+  if (retained && readinessAttestationIsPositive(retained)) {
+    // Spacing is enforced here, for every collection path: a second failure
+    // inside the retry interval is the same contention, not new evidence.
+    if (now < readinessBackgroundNextAttemptAt) return;
+    readinessBackgroundNegatives += 1;
+    if (readinessBackgroundNegatives < READINESS_BACKGROUND_NEGATIVES_TO_DISPLACE) {
+      readinessBackgroundNextAttemptAt = now + READINESS_BACKGROUND_RETRY_MS;
+      return;
+    }
+  }
+  readinessAttestationCache = result;
+  readinessBackgroundNegatives = 0;
+  readinessBackgroundNextAttemptAt = 0;
+}
+
+function startReadinessAttestationCollection(
+  dependencies: OpenClawExecutionAdmissionDependencies,
+  shared: boolean,
+  publishPolicy: ReadinessPublishPolicy,
+): Promise<ReadinessAttestation> {
   if (
     shared
     && readinessAttestationInFlight?.generation === readinessAttestationGeneration
-  ) return readinessAttestationInFlight.promise;
+  ) {
+    if (publishPolicy === 'direct' && readinessAttestationInFlight.policy !== 'direct') {
+      readinessAttestationInFlight.policy = 'direct';
+      // The joined probe may already be inside a debounced setup-readiness
+      // collection; that layer has to publish this result directly as well.
+      promoteOpenClawSetupReadinessInFlight();
+    }
+    return readinessAttestationInFlight.promise;
+  }
 
   const generation = shared ? readinessAttestationGeneration : null;
+  const startedAt = dependencies.now();
+  const settled = (
+    readiness: OpenClawSetupReadiness | null,
+    questionRuntime: OpenClawQuestionPluginReadiness | null,
+  ): ReadinessAttestation => {
+    const at = dependencies.now();
+    return Object.freeze({
+      generation,
+      at,
+      collectMs: Math.max(0, at - startedAt),
+      readiness,
+      questionRuntime,
+    });
+  };
 
   const collect = (async (): Promise<ReadinessAttestation> => {
     try {
-      const readiness = await dependencies.getReadiness();
+      const readiness = await dependencies.getReadiness(publishPolicy === 'direct');
       // A maintenance/WAL observation in another admission can invalidate this
       // probe while the setup-readiness subprocess is still running. Do not
       // continue into a question-authority probe against a possibly replaced
       // runtime family.
       if (generation !== null && generation !== readinessAttestationGeneration) {
-        return Object.freeze({
-          generation,
-          at: dependencies.now(),
-          readiness: null,
-          questionRuntime: null,
-        });
+        return settled(null, null);
       }
       let questionRuntime: OpenClawQuestionPluginReadiness | null = null;
       if (readiness.ready) {
@@ -452,37 +631,28 @@ async function collectReadinessAttestation(
           // A runtime-inspection failure is an unavailable attestation below.
         }
       }
-      return Object.freeze({
-        generation,
-        at: dependencies.now(),
-        readiness,
-        questionRuntime,
-      });
+      return settled(readiness, questionRuntime);
     } catch {
-      return Object.freeze({
-        generation,
-        at: dependencies.now(),
-        readiness: null,
-        questionRuntime: null,
-      });
+      return settled(null, null);
     }
   })();
   if (!shared) return collect;
 
-  let flight: ReadinessAttestationInFlight | null = null;
-  const promise = collect.then((result) => {
+  const flight: ReadinessAttestationInFlight = {
+    generation: generation!,
+    policy: publishPolicy,
+    promise: collect,
+  };
+  flight.promise = collect.then((result) => {
     if (generation === readinessAttestationGeneration) {
-      readinessAttestationCache = result;
+      publishReadinessAttestation(result, flight.policy, dependencies.now());
     }
     return result;
   }).finally(() => {
-    if (flight && readinessAttestationInFlight === flight) {
-      readinessAttestationInFlight = null;
-    }
+    if (readinessAttestationInFlight === flight) readinessAttestationInFlight = null;
   });
-  flight = Object.freeze({ generation: generation!, promise });
   readinessAttestationInFlight = flight;
-  return promise;
+  return flight.promise;
 }
 
 function readinessAdmission(
@@ -538,7 +708,7 @@ export async function getOpenClawExecutionAdmission(
   // fails closed instead of allowing an unbounded request during churn.
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const before = evidenceSnapshot(dependencies);
-    invalidateReadinessForRuntimeMutationEvidence(before, shared);
+    invalidateReadinessForRuntimeMutationEvidence(before, shared, dependencies);
     const beforeAdmission = durableAdmission(before, dependencies.now());
     if (beforeAdmission) return beforeAdmission;
 
@@ -551,7 +721,7 @@ export async function getOpenClawExecutionAdmission(
     // The readiness probe can take time. Re-attest every durable boundary after
     // it settles so maintenance or recovery cannot race the positive result.
     const after = evidenceSnapshot(dependencies);
-    invalidateReadinessForRuntimeMutationEvidence(after, shared);
+    invalidateReadinessForRuntimeMutationEvidence(after, shared, dependencies);
     const afterAdmission = durableAdmission(after, dependencies.now());
     if (afterAdmission) return afterAdmission;
     if (
@@ -563,7 +733,7 @@ export async function getOpenClawExecutionAdmission(
   }
 
   const finalSnapshot = evidenceSnapshot(dependencies);
-  invalidateReadinessForRuntimeMutationEvidence(finalSnapshot, shared);
+  invalidateReadinessForRuntimeMutationEvidence(finalSnapshot, shared, dependencies);
   const finalDurableAdmission = durableAdmission(finalSnapshot, dependencies.now());
   if (finalDurableAdmission) return finalDurableAdmission;
   return admission(
@@ -579,17 +749,15 @@ export function getCachedOpenClawExecutionAdmission(
 ): OpenClawExecutionAdmission {
   const dependencies = { ...defaultDependencies, ...overrides };
   const snapshot = evidenceSnapshot(dependencies);
-  invalidateReadinessForRuntimeMutationEvidence(snapshot, true);
+  invalidateReadinessForRuntimeMutationEvidence(snapshot, true, dependencies);
   const checkedAt = dependencies.now();
   const durable = durableAdmission(snapshot, checkedAt);
   if (durable) return durable;
 
-  const cached = readinessAttestationCache;
-  if (
-    !cached
-    || cached.generation !== readinessAttestationGeneration
-    || checkedAt - cached.at >= READINESS_ATTESTATION_TTL_MS
-  ) {
+  // This seam stays free of probes and of background scheduling: it only
+  // consumes an attestation that route admission already established.
+  const cached = usableCachedReadinessAttestation(checkedAt);
+  if (!cached) {
     return admission(
       'unavailable',
       'A current OpenClaw tested-runtime readiness attestation is not cached.',
@@ -647,15 +815,88 @@ export function assertCachedOpenClawExecutionAdmitted(): OpenClawExecutionAdmiss
   return current;
 }
 
+/**
+ * Last look before a chat turn is written to the gateway socket. Route
+ * admission and the send seam both run before work that can take a while
+ * (host-run journaling, a websocket reconnect of up to 15 s), and maintenance
+ * can begin in that gap. This reads only the durable evidence — marker,
+ * journals, fence — so it can refuse a turn but can never report OpenClaw as
+ * unavailable on cache state alone, and it never probes or schedules anything.
+ */
+export type OpenClawAdmittedDispatchBinding = Readonly<{ generation: number }>;
+
+/**
+ * The binding of the dispatch that is running now, if any. A transport whose
+ * socket write happens inside an event callback captures it on entry and hands
+ * it back to the guard, rather than relying on context propagation through the
+ * socket.
+ */
+export function captureAdmittedOpenClawDispatchBinding(): OpenClawAdmittedDispatchBinding | undefined {
+  return admittedDispatchContext.getStore();
+}
+
+export function assertOpenClawDispatchNotDurablyBlocked(
+  overrides: Partial<OpenClawExecutionAdmissionDependencies> = {},
+  options: Pick<OpenClawExecutionAdmissionOptions, 'useSharedCache'> & {
+    binding?: OpenClawAdmittedDispatchBinding | null;
+  } = {},
+): void {
+  const dependencies = { ...defaultDependencies, ...overrides };
+  const shared = usesSharedCache(overrides, options);
+  const snapshot = evidenceSnapshot(dependencies);
+  invalidateReadinessForRuntimeMutationEvidence(snapshot, shared, dependencies);
+  const checkedAt = dependencies.now();
+  const durable = durableAdmission(snapshot, checkedAt);
+  if (durable) throw new OpenClawExecutionAdmissionError(durable);
+
+  // Nothing is recorded now, but the read above may just have discovered that
+  // something was. A turn admitted before that boundary was admitted against a
+  // runtime that may since have been replaced: it is refused, retryably, and
+  // the retry goes through a fresh admission.
+  const admitted = options.binding === undefined
+    ? admittedDispatchContext.getStore()
+    : options.binding;
+  if (shared && admitted && admitted.generation !== readinessAttestationGeneration) {
+    throw new OpenClawExecutionAdmissionError(admission(
+      'maintenance',
+      'OpenClaw was updated while this turn was being sent. Send it again.',
+      checkedAt,
+      snapshot.evidence,
+    ));
+  }
+}
+
+/**
+ * Custody of an admitted turn. Call it directly after the synchronous final
+ * seam (`assertCachedOpenClawExecutionAdmitted`): `dispatch` and everything it
+ * awaits run bound to the attestation generation that seam just admitted, and
+ * the transport compares it again at the socket write.
+ */
+export function bindAdmittedOpenClawDispatch<T>(dispatch: () => T): T {
+  return admittedDispatchContext.run(
+    Object.freeze({ generation: readinessAttestationGeneration }),
+    dispatch,
+  );
+}
+
 export function __resetOpenClawExecutionAdmissionForTests(): void {
   invalidateSharedReadinessAttestation();
+  readinessAttestationEpoch = null;
 }
 
 export const __openClawExecutionAdmissionTest = Object.freeze({
-  READINESS_ATTESTATION_TTL_MS,
+  READINESS_ATTESTATION_REFRESH_AFTER_MS,
+  READINESS_ATTESTATION_MAX_AGE_MS,
+  READINESS_NEGATIVE_ATTESTATION_TTL_MS,
+  READINESS_NEGATIVE_ATTESTATION_MAX_TTL_MS,
+  READINESS_NEGATIVE_TTL_COLLECTION_MULTIPLE,
+  READINESS_BACKGROUND_RETRY_MS,
+  READINESS_BACKGROUND_NEGATIVES_TO_DISPLACE,
   MAX_HOST_MUTATION_JOURNAL_BYTES,
   MAX_MAINTENANCE_MARKER_BYTES,
   aggregateDurableEvidence,
   inspectRootOwnedEvidenceFile,
+  negativeReadinessAttestationTtlMs,
+  readMutationEvidenceEpoch,
   validateCanonicalMaintenanceMarker,
 });

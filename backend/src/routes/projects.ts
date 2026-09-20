@@ -86,8 +86,20 @@ import {
 } from '../services/project-git.service';
 import { getDefaultModel, getProviderStatusesAsync } from '../services/openclawConfigManager';
 import {
+  acquireProjectDownloadPermit,
+  closeProjectDownloadSource,
+  copyProjectDownloadSnapshot,
+  feedProjectDownloadArchive,
+  whenProjectDownloadSourceCloses,
+  ProjectDownloadSnapshotBusyError,
+  ProjectDownloadSnapshotLimitError,
+  type ProjectDownloadArchiveEntry,
+  type ProjectDownloadPermit,
+} from '../services/projectDownloadSnapshot';
+import {
   assertCachedOpenClawExecutionAdmitted,
   assertOpenClawExecutionAdmitted,
+  bindAdmittedOpenClawDispatch,
   OpenClawExecutionAdmissionError,
 } from '../services/openClawExecutionAdmission';
 import { canonicalizeProviderModelId, normalizePortalModelId } from '../utils/openclawCli';
@@ -16505,7 +16517,7 @@ ${message}`
       // so a maintenance transaction can arm after the async route admission.
       // Never dispatch the prepared OpenClaw turn across that boundary.
       assertCachedOpenClawExecutionAdmitted();
-      run = startProjectNativeRun({
+      run = bindAdmittedOpenClawDispatch(() => startProjectNativeRun({
         userId: req.user!.userId,
         projectId: executionContext.projectId,
         provider: 'OPENCLAW',
@@ -16569,7 +16581,7 @@ ${message}`
           releaseWorkspaceMutation();
         }
         },
-      });
+      }));
       providerRunStarted = true;
       try {
         await durableEventPersistenceGate.releaseAfter(markProjectChatTurnProviderDispatchAccepted({
@@ -16736,9 +16748,35 @@ router.post('/:name/assistant/read-file', authenticateToken, projectPathSandbox,
   }
 });
 
+const PROJECT_DOWNLOAD_SNAPSHOT_DEADLINE_MS = 10 * 60_000;
+// Copy, archive and streaming together. Long enough for the largest permitted
+// snapshot over a slow link; short enough that a stalled reader cannot hold a
+// snapshot and its export slot indefinitely.
+const PROJECT_DOWNLOAD_EXPORT_DEADLINE_MS = 2 * 60 * 60_000;
+const PROJECT_DOWNLOAD_STORED_EXTENSIONS: ReadonlySet<string> = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.heic', '.ico',
+  '.mp3', '.m4a', '.aac', '.ogg', '.opus', '.flac',
+  '.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi',
+  '.zip', '.gz', '.tgz', '.bz2', '.xz', '.zst', '.7z', '.rar', '.br',
+  '.pdf', '.docx', '.xlsx', '.pptx', '.woff', '.woff2', '.jar', '.apk',
+]);
+
 // GET /api/projects/:name/download - Download project as ZIP
 router.get('/:name/download', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   let snapshotRoot: string | undefined;
+  let exportPermit: ProjectDownloadPermit | undefined;
+  let activeArchiveSource: fs.ReadStream | null = null;
+  // One controller governs the whole export — copy, archive and streaming — so
+  // a client that leaves, or an export that outlives its deadline, always
+  // reaches the cleanup below instead of waiting on a stream that never ends.
+  const exportLifecycle = new AbortController();
+  const exportDeadline = setTimeout(() => {
+    exportLifecycle.abort(Object.assign(new Error('Project download exceeded its time limit'), { name: 'TimeoutError' }));
+  }, PROJECT_DOWNLOAD_EXPORT_DEADLINE_MS);
+  const abortExportOnClose = () => {
+    if (!res.writableEnded) exportLifecycle.abort(new Error('Project download was cancelled'));
+  };
+  res.once('close', abortExportOnClose);
   try {
     const ownerId = await getScopedOwnerId(req);
     const { name } = req.params;
@@ -16812,18 +16850,42 @@ router.get('/:name/download', authenticateToken, requireApproved, async (req: Re
     };
 
     // Archive an inert snapshot. Project workloads can mutate their workspace
-    // concurrently; copying without dereferencing links ensures the later ZIP
-    // walk cannot be raced into reading a host path.
+    // concurrently, so the snapshot is taken through pinned descriptors: no
+    // workload-controlled pathname is resolved, and links and special files
+    // never reach it. The later ZIP walk then reads only Portal-owned copies.
     snapshotRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-project-download-'));
     const snapshotDir = path.join(snapshotRoot, 'project');
-    fs.cpSync(projectDir, snapshotDir, {
-      recursive: true,
-      dereference: false,
-      filter: (sourcePath) => {
-        const relativePath = path.relative(projectDir, sourcePath).split(path.sep).join('/');
-        return !relativePath || !isExcludedArchivePath(relativePath);
-      },
-    });
+    // The previous synchronous copy blocked the whole Portal event loop — every
+    // chat stream and socket for every user — for as long as the project took
+    // to copy. This one runs off the loop, within a byte/entry/depth budget,
+    // and stops as soon as the browser goes away or the deadline passes.
+    try {
+      // Held until the snapshot has been removed (the outer finally): the slot
+      // and the disk it reserved cover archive streaming too, so a slow reader
+      // cannot keep a snapshot on disk while starting further exports.
+      exportPermit = acquireProjectDownloadPermit(`owner:${ownerId}`);
+      await copyProjectDownloadSnapshot(projectDir, snapshotDir, {
+        isExcluded: isExcludedArchivePath,
+        permit: exportPermit,
+        signal: AbortSignal.any([exportLifecycle.signal, AbortSignal.timeout(PROJECT_DOWNLOAD_SNAPSHOT_DEADLINE_MS)]),
+      });
+    } catch (error) {
+      if (res.destroyed || res.writableEnded) return;
+      if (error instanceof ProjectDownloadSnapshotBusyError) {
+        res.setHeader('Retry-After', '15');
+        res.status(429).json({ error: error.message });
+        return;
+      }
+      if (error instanceof ProjectDownloadSnapshotLimitError) {
+        res.status(413).json({ error: error.message });
+        return;
+      }
+      if ((error as { name?: string } | null)?.name === 'TimeoutError') {
+        res.status(504).json({ error: 'Preparing this project download took too long. Try again, or download a smaller selection.' });
+        return;
+      }
+      throw error;
+    }
     const snapshotEntry = fs.lstatSync(snapshotDir);
     if (snapshotEntry.isSymbolicLink() || !snapshotEntry.isDirectory()) {
       throw new Error('Project changed while the download snapshot was being created');
@@ -16836,11 +16898,13 @@ router.get('/:name/download', authenticateToken, requireApproved, async (req: Re
 
     // Import archiver
     const archiver = require('archiver');
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    // Level 9 spent several times the CPU of the default for about a percent
+    // of size, all before the browser received a byte.
+    const archive = archiver('zip', { zlib: { level: 6 } });
     const abortArchive = () => {
       if (!res.writableEnded) archive.abort();
     };
-    res.once('close', abortArchive);
+    exportLifecycle.signal.addEventListener('abort', abortArchive, { once: true });
 
     archive.on('error', (err: Error) => {
       console.error('[Download] Archive error:', err);
@@ -16927,7 +16991,11 @@ router.get('/:name/download', authenticateToken, requireApproved, async (req: Re
       return content;
     }
 
-    // Walk directory and add files
+    // Walk the snapshot into a plan. Sources are opened one at a time while
+    // the archive is fed below, so exactly one descriptor is ever open and this
+    // route owns it: a cancelled export can close it before the snapshot is
+    // removed, instead of leaving an unlinked file pinned by a stalled stream.
+    const archivePlan: ProjectDownloadArchiveEntry[] = [];
     function addDirectory(dirPath: string, zipPath: string = '') {
       const entries = fs.readdirSync(dirPath, { withFileTypes: true });
       
@@ -16959,32 +17027,55 @@ router.get('/:name/download', authenticateToken, requireApproved, async (req: Re
           
           const isBinary = !textExtensions.includes(ext);
           
-          if (stripComments && !isBinary && stat.size < 5 * 1024 * 1024) {
-            // Text file < 5MB: strip comments
-            try {
-              let content = fs.readFileSync(fullPath, 'utf-8');
-              content = stripCommentsFromCode(content, entry.name);
-              archive.append(content, { name: relPath });
-            } catch {
-              // If UTF-8 read fails, treat as binary
-              archive.file(fullPath, { name: relPath });
-            }
-          } else {
-            // Binary file or large file: add as-is
-            archive.file(fullPath, { name: relPath });
-          }
+          archivePlan.push({
+            fullPath,
+            relPath,
+            mode: stat.mode,
+            mtime: stat.mtime,
+            // Text file < 5MB in stripped mode: comments are removed.
+            strip: stripComments && !isBinary && stat.size < 5 * 1024 * 1024,
+            // Deflating media and archives that are already compressed only
+            // burns time.
+            store: PROJECT_DOWNLOAD_STORED_EXTENSIONS.has(ext),
+          });
         }
       }
     }
 
     addDirectory(snapshotDir);
 
-    try {
-      await archive.finalize();
-    } finally {
-      res.off('close', abortArchive);
+    // One owned source at a time; see feedProjectDownloadArchive.
+    const fed = await feedProjectDownloadArchive({
+      archive,
+      plan: archivePlan,
+      signal: exportLifecycle.signal,
+      isResponseGone: () => res.destroyed,
+      transformText: (entry, content) => stripCommentsFromCode(content, path.basename(entry.relPath)),
+      onSourceOpened: (source) => { activeArchiveSource = source; },
+      onSourceClosed: () => { activeArchiveSource = null; },
+      onSourceError: (error) => exportLifecycle.abort(error),
+    });
+    if (fed.skipped > 0) {
+      console.warn(`[Download] Left out ${fed.skipped} entr${fed.skipped === 1 ? 'y' : 'ies'} whose name cannot be stored in a ZIP archive`);
     }
-    
+
+    // archiver's finalize() promise settles only when the archive ends or
+    // errors; an aborted archive does neither. Settle on whichever comes first
+    // — the response finishing, the archive failing, or the export being
+    // cancelled — so cleanup is always reached.
+    await new Promise<void>((resolve) => {
+      res.once('finish', resolve);
+      res.once('close', resolve);
+      archive.once('error', () => resolve());
+      if (exportLifecycle.signal.aborted) resolve();
+      else exportLifecycle.signal.addEventListener('abort', () => resolve(), { once: true });
+      Promise.resolve(archive.finalize()).catch(() => resolve());
+    });
+    if (exportLifecycle.signal.aborted) {
+      if (!res.writableEnded) res.destroy();
+      return;
+    }
+
     console.log(`[Download] ${name} (${mode}) → ${archive.pointer()} bytes`);
   } catch (error: any) {
     console.error('[Download] Error:', error);
@@ -16992,8 +17083,30 @@ router.get('/:name/download', authenticateToken, requireApproved, async (req: Re
       res.status(500).json({ error: 'Download failed: ' + error.message });
     }
   } finally {
-    if (snapshotRoot) {
-      try { fs.rmSync(snapshotRoot, { recursive: true, force: true }); } catch {}
+    clearTimeout(exportDeadline);
+    res.off('close', abortExportOnClose);
+    // archiver's abort() kills queued work but leaves the entry it is reading
+    // alone, and a stalled reader leaves that entry's descriptor open. An
+    // unlinked file that is still open keeps its disk blocks, so the source is
+    // closed — and seen to be closed — before the snapshot goes and the permit
+    // with it.
+    const snapshotToRemove = snapshotRoot;
+    const permitToRelease = exportPermit;
+    const giveBack = () => {
+      if (snapshotToRemove) {
+        try { fs.rmSync(snapshotToRemove, { recursive: true, force: true }); } catch {}
+      }
+      // Only now is the disk this export used free again.
+      permitToRelease?.release();
+    };
+    const stillOpen = activeArchiveSource;
+    if (stillOpen && await closeProjectDownloadSource(stillOpen) === 'pending') {
+      // The request ends here; the export does not. A descriptor that has not
+      // closed may still pin its blocks, so the snapshot and the slot stay
+      // owned until it does.
+      whenProjectDownloadSourceCloses(stillOpen, giveBack);
+    } else {
+      giveBack();
     }
   }
 });

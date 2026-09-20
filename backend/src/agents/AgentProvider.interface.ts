@@ -168,6 +168,12 @@ export interface ListOpenClawSessionsOptions {
   includeHostSessions?: boolean;
   /** Agents to sweep for host sessions — normally the Agent Chat selector set. */
   hostAgentIds?: readonly string[];
+  /**
+   * Restrict the gateway sweep to these agents. The list route views one agent
+   * at a time; without this every poll issued one unbounded `sessions.list` per
+   * agent the user had ever claimed a session on, then discarded all but one.
+   */
+  onlyAgentIds?: readonly string[];
 }
 
 /** Summary of one agent session, returned by listSessions. */

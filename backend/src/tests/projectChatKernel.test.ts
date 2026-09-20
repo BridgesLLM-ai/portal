@@ -506,7 +506,11 @@ describe('Project Chat provider bindings', () => {
     const workspaceMutation = sendRoute.indexOf('await repairTerminalProjectChatPresentations');
     const openClawPreparation = sendRoute.indexOf('const catalogScope = await ensureOpenClawProjectAgentCatalogScope');
     const finalFence = sendRoute.indexOf('assertCachedOpenClawExecutionAdmitted()');
-    const openClawDispatch = sendRoute.lastIndexOf('run = startProjectNativeRun({');
+    // The OpenClaw run starts inside the generation binder, directly after the
+    // final fence, so the turn cannot cross a maintenance window on its way out.
+    const openClawDispatch = sendRoute.lastIndexOf(
+      'run = bindAdmittedOpenClawDispatch(() => startProjectNativeRun({',
+    );
     const errorPresenterStart = routeSource.indexOf('function sendProjectChatProviderError');
     const nextPresenterStart = routeSource.indexOf('function sendProjectChatQualificationError', errorPresenterStart);
     const errorPresenter = routeSource.slice(errorPresenterStart, nextPresenterStart);

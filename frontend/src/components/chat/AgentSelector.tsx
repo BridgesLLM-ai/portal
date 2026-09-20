@@ -745,9 +745,25 @@ export default function AgentSelector({
         if (!cancelled) setSessionsLoading(false);
       }
     }
+    let lastFetchAt = Date.now();
     void fetchSessions();
-    const interval = setInterval(fetchSessions, 30000);
-    return () => { cancelled = true; clearInterval(interval); };
+    // A hidden tab has nothing to repaint, and each refresh is a gateway
+    // session sweep. Pause while hidden; catch up once when the tab returns.
+    const refreshIfVisible = () => {
+      if (document.visibilityState === 'hidden') return;
+      lastFetchAt = Date.now();
+      void fetchSessions();
+    };
+    const interval = setInterval(refreshIfVisible, 30000);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && Date.now() - lastFetchAt >= 15000) refreshIfVisible();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [value, agentId, canAttemptSessionList, sessionsOpen, currentSessionKey, isAuthenticated, sessionsRefreshNonce]);
 
   const handleSelect = useCallback((provider: string, selectedAgentId?: string) => {

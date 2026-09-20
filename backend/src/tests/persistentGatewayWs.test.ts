@@ -2109,6 +2109,47 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
     }
   });
 
+  it('reads durable maintenance evidence immediately before the chat.send write, and writes nothing when blocked', () => {
+    const order: string[] = [];
+    const socket = { send: jest.fn((_data: string) => { order.push('send'); }) };
+    const frame = { type: 'req', id: 'req-1', method: 'chat.send', params: { sessionKey: 'agent:main:main' } };
+
+    __persistentGatewayWsTest.writeChatSendFrame(socket, frame, () => { order.push('evidence'); });
+    expect(order).toEqual(['evidence', 'send']);
+    expect(JSON.parse(socket.send.mock.calls[0][0])).toEqual(frame);
+
+    socket.send.mockClear();
+    const maintenance = Object.assign(new Error('OPENCLAW_EXECUTION_MAINTENANCE'), { code: 'OPENCLAW_EXECUTION_MAINTENANCE' });
+    expect(() => __persistentGatewayWsTest.writeChatSendFrame(socket, frame, () => { throw maintenance; }))
+      .toThrow(maintenance);
+    expect(socket.send).not.toHaveBeenCalled();
+  });
+
+  it('gives every execution-capable RPC the same last look, and never gates reads or aborts', () => {
+    const socket = { send: jest.fn((_data: string) => undefined) };
+    const inspected: string[] = [];
+    const write = (method: string, guard: () => void) => __persistentGatewayWsTest.writeGatewayRpcFrame(
+      socket, { type: 'req', id: '1', method, params: {} }, guard,
+    );
+    const gated = ['cron.run', 'cron.add', 'cron.update', 'sessions.steer', 'agent', 'question.resolve', 'bridgesllm.ask_user.dismiss'];
+    for (const method of gated) write(method, () => { inspected.push(method); });
+    expect(inspected).toEqual(gated);
+    expect(socket.send).toHaveBeenCalledTimes(gated.length);
+
+    socket.send.mockClear();
+    const blocked = () => { throw new Error('OPENCLAW_EXECUTION_MAINTENANCE'); };
+    expect(() => write('cron.run', blocked)).toThrow('OPENCLAW_EXECUTION_MAINTENANCE');
+    expect(socket.send).not.toHaveBeenCalled();
+    for (const method of ['chat.abort', 'chat.history', 'cron.list', 'cron.remove', 'sessions.list', 'config.get']) {
+      expect(() => write(method, blocked)).not.toThrow();
+    }
+    expect(socket.send).toHaveBeenCalledTimes(6);
+    // Disabling an automation is cleanup and stays available.
+    expect(() => __persistentGatewayWsTest.writeGatewayRpcFrame(
+      socket, { type: 'req', id: '2', method: 'cron.update', params: { id: 'job', patch: { enabled: false } } }, blocked,
+    )).not.toThrow();
+  });
+
   it('completes chat events for a direct-proxy run registered from chat.send ack', () => {
     const directSessionKey = 'test-direct-proxy-final-tracking';
     const events: StreamEvent[] = [];

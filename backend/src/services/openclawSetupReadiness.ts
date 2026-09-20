@@ -120,6 +120,18 @@ export interface OpenClawSetupReadinessDependencies {
 export interface OpenClawSetupReadinessOptions {
   force?: boolean;
   useSharedCache?: boolean;
+  /**
+   * Collect now instead of serving the cache, but keep the debounce that stops
+   * one contended probe from displacing a still-valid ready result. `force` is
+   * the explicit operator/maintenance recheck and always publishes directly.
+   */
+  fresh?: boolean;
+  /**
+   * Oldest cached result this caller accepts. Diagnostic surfaces (the
+   * maintenance page, the setup wizard) pass one minute so an operator who just
+   * changed something sees it, as they always did; request paths omit it.
+   */
+  maxAgeMs?: number;
 }
 
 function parseOpenClawVersion(raw: unknown): string | null {
@@ -276,13 +288,119 @@ const defaultDependencies: OpenClawSetupReadinessDependencies = {
 // Each CLI invocation boots a full Node process. Running all of them in
 // parallel on every dashboard/readiness query causes multi-core CPU spikes
 // and, under contention, RPC-probe timeouts that report a healthy gateway as
-// offline. Serialize the probes and cache the result briefly.
-const READINESS_CACHE_TTL_MS = 60_000;
-let readinessCache: { at: number; value: OpenClawSetupReadiness } | null = null;
-let readinessInFlight: Promise<OpenClawSetupReadiness> | null = null;
+// offline. Serialize the probes and cache the result.
+//
+// The result describes the installed runtime tuple, which only installs and
+// updates change, so a ready result is served while it is revalidated in the
+// background instead of putting the whole CLI chain on a request path every
+// minute. A not-ready result stays short-lived so recovery shows quickly. One
+// failed background revalidation is usually contention with a busy gateway, so
+// it takes consecutive failures to displace a still-valid ready result.
+// Execution admission invalidates this cache at every maintenance and
+// host-mutation boundary; `force` always collects fresh.
+const READINESS_REFRESH_AFTER_MS = 10 * 60_000;
+const READINESS_MAX_AGE_MS = 30 * 60_000;
+// A not-ready result is served for at least twice as long as it took to
+// collect, between this floor and the one-minute interval earlier releases
+// used, so re-collecting it can never become the load.
+const READINESS_NOT_READY_TTL_MS = 15_000;
+const READINESS_NOT_READY_MAX_TTL_MS = 60_000;
+const READINESS_NOT_READY_TTL_COLLECTION_MULTIPLE = 2;
+const READINESS_BACKGROUND_RETRY_MS = 20_000;
+const READINESS_BACKGROUND_FAILURES_TO_DISPLACE = 2;
+type SetupReadinessPublishPolicy = 'direct' | 'debounced';
+type SetupReadinessCacheEntry = { at: number; collectMs: number; value: OpenClawSetupReadiness };
+// `policy` is read when the collection settles: a forced recheck that joins a
+// debounced collection upgrades it, so the result it reports is also published.
+type SetupReadinessInFlight = {
+  readonly generation: number;
+  promise: Promise<OpenClawSetupReadiness>;
+  policy: SetupReadinessPublishPolicy;
+};
+let readinessGeneration = 0;
+let readinessCache: SetupReadinessCacheEntry | null = null;
+let readinessInFlight: SetupReadinessInFlight | null = null;
+let readinessBackgroundFailures = 0;
+let readinessBackgroundNextAttemptAt = 0;
 
 export function invalidateOpenClawSetupReadinessCache(): void {
+  // A running probe cannot be cancelled. Detaching it and advancing the
+  // generation keeps a pre-boundary result from repopulating the cache.
+  readinessGeneration += 1;
   readinessCache = null;
+  readinessInFlight = null;
+  readinessBackgroundFailures = 0;
+  readinessBackgroundNextAttemptAt = 0;
+}
+
+function notReadySetupReadinessTtlMs(collectMs: number): number {
+  const scaled = Number.isFinite(collectMs) && collectMs > 0
+    ? collectMs * READINESS_NOT_READY_TTL_COLLECTION_MULTIPLE
+    : 0;
+  return Math.min(READINESS_NOT_READY_MAX_TTL_MS, Math.max(READINESS_NOT_READY_TTL_MS, scaled));
+}
+
+function usableCachedSetupReadiness(now: number): SetupReadinessCacheEntry | null {
+  if (!readinessCache) return null;
+  const maximumAge = readinessCache.value.ready
+    ? READINESS_MAX_AGE_MS
+    : notReadySetupReadinessTtlMs(readinessCache.collectMs);
+  return now - readinessCache.at < maximumAge ? readinessCache : null;
+}
+
+function publishSetupReadiness(
+  value: OpenClawSetupReadiness,
+  policy: SetupReadinessPublishPolicy,
+  collectMs: number,
+): void {
+  const now = Date.now();
+  if (!value.ready && policy === 'debounced' && usableCachedSetupReadiness(now)?.value.ready) {
+    // Spacing is enforced here, for every collection path (`fresh` and
+    // `maxAgeMs` callers included): a second failure inside the retry interval
+    // is the same contention, not new evidence.
+    if (now < readinessBackgroundNextAttemptAt) return;
+    readinessBackgroundFailures += 1;
+    if (readinessBackgroundFailures < READINESS_BACKGROUND_FAILURES_TO_DISPLACE) {
+      readinessBackgroundNextAttemptAt = now + READINESS_BACKGROUND_RETRY_MS;
+      return;
+    }
+  }
+  readinessCache = { at: now, collectMs, value };
+  readinessBackgroundFailures = 0;
+  readinessBackgroundNextAttemptAt = 0;
+}
+
+/**
+ * Upgrade a running collection to direct publication. Execution admission
+ * calls this when a forced recheck joins a probe that started as a background
+ * revalidation.
+ */
+export function promoteOpenClawSetupReadinessInFlight(): void {
+  if (readinessInFlight?.generation === readinessGeneration) readinessInFlight.policy = 'direct';
+}
+
+function startSharedSetupReadinessCollection(
+  overrides: Partial<OpenClawSetupReadinessDependencies>,
+  policy: SetupReadinessPublishPolicy,
+): Promise<OpenClawSetupReadiness> {
+  if (readinessInFlight?.generation === readinessGeneration) {
+    if (policy === 'direct') readinessInFlight.policy = 'direct';
+    return readinessInFlight.promise;
+  }
+  const generation = readinessGeneration;
+  const startedAt = Date.now();
+  const collection = collectOpenClawSetupReadinessUncached(overrides);
+  const flight: SetupReadinessInFlight = { generation, policy, promise: collection };
+  flight.promise = collection.then((value) => {
+    if (generation === readinessGeneration) {
+      publishSetupReadiness(value, flight.policy, Math.max(0, Date.now() - startedAt));
+    }
+    return value;
+  }).finally(() => {
+    if (readinessInFlight === flight) readinessInFlight = null;
+  });
+  readinessInFlight = flight;
+  return flight.promise;
 }
 
 export async function getOpenClawSetupReadiness(
@@ -291,25 +409,47 @@ export async function getOpenClawSetupReadiness(
 ): Promise<OpenClawSetupReadiness> {
   const usesSharedCache = Object.keys(overrides).length === 0 || options.useSharedCache === true;
   if (usesSharedCache) {
-    if (!options.force && readinessCache && Date.now() - readinessCache.at < READINESS_CACHE_TTL_MS) {
-      return readinessCache.value;
-    }
-    if (readinessInFlight) return readinessInFlight;
     // Production callers use the default dependency set. Tests may opt an
     // injected dependency set into the same cache/in-flight contract so the
     // dashboard+maintenance concurrency boundary can be proven without
     // spawning real OpenClaw processes.
     const sharedOverrides = options.useSharedCache === true ? overrides : {};
-    readinessInFlight = collectOpenClawSetupReadinessUncached(sharedOverrides).then((value) => {
-      readinessCache = { at: Date.now(), value };
-      return value;
-    }).finally(() => {
-      readinessInFlight = null;
-    });
-    return readinessInFlight;
+    if (!options.force && !options.fresh) {
+      const now = Date.now();
+      const usable = usableCachedSetupReadiness(now);
+      const cached = usable
+        && (options.maxAgeMs === undefined || now - usable.at < options.maxAgeMs)
+        ? usable
+        : null;
+      if (cached) {
+        if (
+          cached.value.ready
+          && now - cached.at >= READINESS_REFRESH_AFTER_MS
+          && now >= readinessBackgroundNextAttemptAt
+          && readinessInFlight?.generation !== readinessGeneration
+        ) {
+          // Never awaited by a request; the catch keeps a background probe
+          // from ever surfacing as an unhandled rejection.
+          void startSharedSetupReadinessCollection(sharedOverrides, 'debounced').catch(() => undefined);
+        }
+        return cached.value;
+      }
+    }
+    return startSharedSetupReadinessCollection(sharedOverrides, options.force ? 'direct' : 'debounced');
   }
   return collectOpenClawSetupReadinessUncached(overrides);
 }
+
+export const __openClawSetupReadinessCacheTest = Object.freeze({
+  READINESS_REFRESH_AFTER_MS,
+  READINESS_MAX_AGE_MS,
+  READINESS_NOT_READY_TTL_MS,
+  READINESS_NOT_READY_MAX_TTL_MS,
+  READINESS_NOT_READY_TTL_COLLECTION_MULTIPLE,
+  READINESS_BACKGROUND_RETRY_MS,
+  READINESS_BACKGROUND_FAILURES_TO_DISPLACE,
+  notReadySetupReadinessTtlMs,
+});
 
 async function collectOpenClawSetupReadinessUncached(
   overrides: Partial<OpenClawSetupReadinessDependencies>,

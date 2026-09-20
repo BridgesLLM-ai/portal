@@ -1,13 +1,13 @@
 {
   "schema": 1,
-  "version": "5.0.9",
-  "releasedAt": "2026-09-15",
+  "version": "5.0.10",
+  "releasedAt": "2026-09-20",
   "releaseClass": "hotfix",
   "highlights": [
-    "Restore guided subscription sign-in, install missing CLIs, register available OpenClaw models, and explicitly choose a default without losing other providers.",
-    "Prevent hidden package prompts from freezing installation and tools maintenance.",
-    "Redesign setup and update progress with clear stages, useful recovery guidance, and small-terminal support.",
-    "Load Tasks on demand, keep native Chat history scheduling and message identities intact, and route transcript notes through the authorized Portal broker.",
-    "Deliver version-qualified native repairs with preserved originals and interrupted-operation recovery."
+    "Agent Chat no longer stalls, or reports OpenClaw as unavailable, while the gateway is only busy: runtime verification moved off the chat request path.",
+    "Replies from Claude CLI models appear once instead of two or three times.",
+    "An open Chat tab stops sweeping every agent's sessions and pauses its background checks while hidden.",
+    "Project downloads start sooner and no longer freeze the Portal while the archive is prepared.",
+    "Smoother streaming under load: status checks no longer block the Portal while they run."
   ]
 }

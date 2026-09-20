@@ -6,11 +6,17 @@ import {
   OpenClawExecutionAdmissionError,
   __openClawExecutionAdmissionTest,
   __resetOpenClawExecutionAdmissionForTests,
+  assertOpenClawDispatchNotDurablyBlocked,
+  bindAdmittedOpenClawDispatch,
+  captureAdmittedOpenClawDispatchBinding,
   getCachedOpenClawExecutionAdmission,
   getOpenClawExecutionAdmission,
   type OpenClawDurableEvidence,
   type OpenClawExecutionAdmissionDependencies,
 } from '../services/openClawExecutionAdmission';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import type { OpenClawSetupReadiness } from '../services/openclawSetupReadiness';
 import type { OpenClawQuestionPluginReadiness } from '../services/openClawQuestionRuntimeReadiness';
 
@@ -64,6 +70,7 @@ function dependencies(
     inspectAuthorizationFence: absent,
     inspectMaintenanceMarker: absent,
     inspectHostMutationJournal: absent,
+    readMutationEpoch: () => 'epoch-0',
     getReadiness: async () => readiness(),
     getQuestionRuntimeReadiness: async () => questionReadiness(),
     now: () => Date.parse('2026-08-22T21:00:00.000Z'),
@@ -429,7 +436,14 @@ describe('OpenClaw execution admission', () => {
     const input = dependencies({ getReadiness, now: () => now });
     await getOpenClawExecutionAdmission(input, { useSharedCache: true });
 
-    now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_TTL_MS;
+    // Stale enough to want revalidation, but the seam must neither probe nor
+    // schedule one: it only consumes what route admission established.
+    now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_REFRESH_AFTER_MS;
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'ready' });
+    expect(getReadiness).toHaveBeenCalledTimes(1);
+
+    now = Date.parse('2026-08-22T21:00:00.000Z')
+      + __openClawExecutionAdmissionTest.READINESS_ATTESTATION_MAX_AGE_MS;
     const final = getCachedOpenClawExecutionAdmission(input);
 
     expect(final).toMatchObject({
@@ -437,5 +451,355 @@ describe('OpenClaw execution admission', () => {
       reason: expect.stringMatching(/not cached/i),
     });
     expect(getReadiness).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves a stale positive attestation immediately and revalidates it off the request path', async () => {
+    let now = Date.parse('2026-08-22T21:00:00.000Z');
+    let releaseRevalidation!: (value: OpenClawSetupReadiness) => void;
+    const getReadiness = jest
+      .fn<Promise<OpenClawSetupReadiness>, []>()
+      .mockResolvedValueOnce(readiness())
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseRevalidation = resolve; }));
+    const input = dependencies({ getReadiness, now: () => now });
+
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_REFRESH_AFTER_MS - 1;
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    expect(getReadiness).toHaveBeenCalledTimes(1);
+
+    now += 1;
+    // The revalidation probe is still pending, yet admission resolves at once.
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'ready' });
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+    // Concurrent stale readers share that single background probe.
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+
+    releaseRevalidation(readiness());
+    await new Promise((resolve) => setImmediate(resolve));
+    now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_REFRESH_AFTER_MS - 1;
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'ready' });
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a valid positive attestation through one contended revalidation but not two', async () => {
+    let now = Date.parse('2026-08-22T21:00:00.000Z');
+    const busy = readiness({
+      ready: false,
+      authenticatedRpc: false,
+      blockers: [{ code: 'gateway-rpc-unavailable', message: 'The OpenClaw gateway did not pass an authenticated RPC probe.' }],
+    });
+    const getReadiness = jest
+      .fn<Promise<OpenClawSetupReadiness>, []>()
+      .mockResolvedValueOnce(readiness())
+      .mockResolvedValue(busy);
+    const input = dependencies({ getReadiness, now: () => now });
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_REFRESH_AFTER_MS;
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'ready' });
+    await settle();
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'ready' });
+
+    // Inside the retry interval no further probe is launched.
+    now += __openClawExecutionAdmissionTest.READINESS_BACKGROUND_RETRY_MS - 1;
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'ready' });
+    await settle();
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+
+    now += 1;
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'ready' });
+    await settle();
+    expect(getReadiness).toHaveBeenCalledTimes(3);
+    // The second consecutive failure is a changed runtime, not contention.
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({
+      state: 'unavailable',
+      readinessBlockers: ['gateway-rpc-unavailable'],
+    });
+  });
+
+  it('holds a negative attestation only briefly, then re-collects on the request path', async () => {
+    let now = Date.parse('2026-08-22T21:00:00.000Z');
+    const getReadiness = jest
+      .fn<Promise<OpenClawSetupReadiness>, []>()
+      .mockResolvedValueOnce(readiness({
+        ready: false,
+        blockers: [{ code: 'gateway-rpc-unavailable', message: 'The OpenClaw gateway did not pass an authenticated RPC probe.' }],
+      }))
+      .mockResolvedValue(readiness());
+    const input = dependencies({ getReadiness, now: () => now });
+
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'unavailable' });
+    now += __openClawExecutionAdmissionTest.READINESS_NEGATIVE_ATTESTATION_TTL_MS - 1;
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'unavailable' });
+    expect(getReadiness).toHaveBeenCalledTimes(1);
+
+    now += 1;
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'ready' });
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it('blocks on a fresh collection once a positive attestation reaches its maximum age', async () => {
+    let now = Date.parse('2026-08-22T21:00:00.000Z');
+    const getReadiness = jest
+      .fn<Promise<OpenClawSetupReadiness>, []>()
+      .mockResolvedValueOnce(readiness())
+      .mockResolvedValue(readiness({
+        ready: false,
+        blockers: [{ code: 'core-package-mismatch', message: 'OpenClaw core must match a supported version.' }],
+      }));
+    const input = dependencies({ getReadiness, now: () => now });
+
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_MAX_AGE_MS;
+    // Nothing valid is left to serve, so the changed runtime is reported now.
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'unavailable', readinessBlockers: ['core-package-mismatch'] });
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it('publishes a forced recheck directly, without the contention debounce', async () => {
+    const getReadiness = jest
+      .fn<Promise<OpenClawSetupReadiness>, []>()
+      .mockResolvedValueOnce(readiness())
+      .mockResolvedValue(readiness({
+        ready: false,
+        blockers: [{ code: 'codex-plugin-mismatch', message: 'The Codex plugin must be the pinned npm install.' }],
+      }));
+    const input = dependencies({ getReadiness });
+
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true, forceReadiness: true }))
+      .resolves.toMatchObject({ state: 'unavailable' });
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'unavailable' });
+  });
+
+  it('publishes directly when a forced recheck joins a background revalidation', async () => {
+    let now = Date.parse('2026-08-22T21:00:00.000Z');
+    let releaseRevalidation!: (value: OpenClawSetupReadiness) => void;
+    const getReadiness = jest
+      .fn<Promise<OpenClawSetupReadiness>, []>()
+      .mockResolvedValueOnce(readiness())
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseRevalidation = resolve; }));
+    const input = dependencies({ getReadiness, now: () => now });
+
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_REFRESH_AFTER_MS;
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+
+    const forced = getOpenClawExecutionAdmission(input, { useSharedCache: true, forceReadiness: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    // Joined the running probe rather than starting a second one.
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+    releaseRevalidation(readiness({
+      ready: false,
+      blockers: [{ code: 'core-package-mismatch', message: 'OpenClaw core must match a supported version.' }],
+    }));
+
+    await expect(forced).resolves.toMatchObject({ state: 'unavailable' });
+    // The failure the operator was told about is the state everyone now sees:
+    // the joined probe did not keep its background debounce.
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({
+      state: 'unavailable',
+      readinessBlockers: ['core-package-mismatch'],
+    });
+  });
+
+  it('drops a positive attestation when maintenance began and ended unobserved', async () => {
+    let epoch = 'epoch-1';
+    const getReadiness = jest.fn<Promise<OpenClawSetupReadiness>, []>().mockResolvedValue(readiness());
+    const input = dependencies({ getReadiness, readMutationEpoch: () => epoch });
+
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'ready' });
+
+    // A whole maintenance window passes with no admission looking. The marker
+    // is gone again, but its directory is no longer the one that was attested.
+    epoch = 'epoch-2';
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({
+      state: 'unavailable',
+      reason: 'A current OpenClaw tested-runtime readiness attestation is not cached.',
+    });
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'ready' });
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'ready' });
+  });
+
+  it('discards a probe that straddled an unobserved maintenance window', async () => {
+    let epoch = 'epoch-1';
+    let releaseStraddling!: (value: OpenClawSetupReadiness) => void;
+    const getReadiness = jest
+      .fn<Promise<OpenClawSetupReadiness>, []>()
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseStraddling = resolve; }))
+      .mockResolvedValue(readiness({ version: '2026.7.2' }));
+    const input = dependencies({ getReadiness, readMutationEpoch: () => epoch });
+
+    const pending = getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    epoch = 'epoch-2';
+    releaseStraddling(readiness());
+
+    await expect(pending).resolves.toMatchObject({ state: 'ready' });
+    // The pre-boundary answer was not trusted; a post-boundary one was collected.
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it('serves a negative attestation for twice its collection time, within fifteen seconds to a minute', async () => {
+    const ttl = __openClawExecutionAdmissionTest.negativeReadinessAttestationTtlMs;
+    expect(ttl(0)).toBe(15_000);
+    expect(ttl(Number.NaN)).toBe(15_000);
+    expect(ttl(5_000)).toBe(15_000);
+    expect(ttl(27_000)).toBe(54_000);
+    expect(ttl(45_000)).toBe(60_000);
+
+    let now = Date.parse('2026-08-22T21:00:00.000Z');
+    const getReadiness = jest.fn<Promise<OpenClawSetupReadiness>, []>().mockImplementation(async () => {
+      now += 27_000;
+      return readiness({
+        ready: false,
+        blockers: [{ code: 'gateway-rpc-unavailable', message: 'The OpenClaw gateway did not pass an authenticated RPC probe.' }],
+      });
+    });
+    const input = dependencies({ getReadiness, now: () => now });
+
+    await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+      .resolves.toMatchObject({ state: 'unavailable' });
+    // A caller that asks again and again cannot start the 27 s chain more
+    // often than once per 54 s of rest: about a third of one core, at most.
+    now += 54_000 - 1;
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    expect(getReadiness).toHaveBeenCalledTimes(1);
+    now += 1;
+    await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+    expect(getReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses dispatch on durable evidence alone and never consults the attestation cache', () => {
+    const present = (): OpenClawDurableEvidence => ({ state: 'present' });
+    const refusal = (overrides: Partial<OpenClawExecutionAdmissionDependencies>) => {
+      try {
+        assertOpenClawDispatchNotDurablyBlocked(dependencies(overrides));
+      } catch (error) {
+        return error;
+      }
+      return null;
+    };
+
+    // Nothing is cached in this test, and an open road is still an open road.
+    expect(refusal({})).toBeNull();
+    expect(refusal({ inspectMaintenanceMarker: present })).toMatchObject({
+      name: 'OpenClawExecutionAdmissionError', code: 'OPENCLAW_EXECUTION_MAINTENANCE', retryable: true, statusCode: 503,
+    });
+    expect(refusal({ inspectHostMutationJournal: present })).toMatchObject({
+      code: 'OPENCLAW_EXECUTION_RECOVERY_REQUIRED',
+    });
+    expect(refusal({ inspectAuthorizationFence: present })).toMatchObject({
+      code: 'OPENCLAW_EXECUTION_UNAVAILABLE',
+    });
+    expect(refusal({ inspectMaintenanceMarker: () => ({ state: 'unsafe', reason: 'unsafe marker' }) }))
+      .toBeInstanceOf(OpenClawExecutionAdmissionError);
+  });
+
+  it('refuses a turn that was admitted before a maintenance window it never saw', async () => {
+    let epoch = 'epoch-1';
+    const input = dependencies({ readMutationEpoch: () => epoch });
+    const shared = { useSharedCache: true } as const;
+    await getOpenClawExecutionAdmission(input, shared);
+
+    expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'ready' });
+    const refusalAtTheSocket = await bindAdmittedOpenClawDispatch(async () => {
+      // Host-run journaling, a reconnect wait: the turn is on its way.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(() => assertOpenClawDispatchNotDurablyBlocked(input, shared)).not.toThrow();
+
+      // Maintenance opens and closes entirely inside that wait. No marker is
+      // left; only the lock directories remember.
+      epoch = 'epoch-2';
+      await new Promise((resolve) => setImmediate(resolve));
+      try {
+        assertOpenClawDispatchNotDurablyBlocked(input, shared);
+      } catch (error) {
+        return error;
+      }
+      return null;
+    });
+
+    expect(refusalAtTheSocket).toMatchObject({
+      name: 'OpenClawExecutionAdmissionError',
+      code: 'OPENCLAW_EXECUTION_MAINTENANCE',
+      retryable: true,
+    });
+    // A dispatch that never went through the seam is judged on evidence alone,
+    // and the retry is admitted against the post-maintenance runtime.
+    expect(() => assertOpenClawDispatchNotDurablyBlocked(input, shared)).not.toThrow();
+    await getOpenClawExecutionAdmission(input, shared);
+    await bindAdmittedOpenClawDispatch(async () => {
+      expect(() => assertOpenClawDispatchNotDurablyBlocked(input, shared)).not.toThrow();
+    });
+  });
+
+  it('judges an explicitly captured binding exactly like the ambient one', async () => {
+    let epoch = 'epoch-1';
+    const input = dependencies({ readMutationEpoch: () => epoch });
+    const shared = { useSharedCache: true } as const;
+    await getOpenClawExecutionAdmission(input, shared);
+    // A transport that writes from a socket callback captures the binding on
+    // entry and hands it back, instead of trusting context propagation.
+    const captured = bindAdmittedOpenClawDispatch(() => captureAdmittedOpenClawDispatchBinding());
+    expect(captured).toEqual({ generation: expect.any(Number) });
+    expect(captureAdmittedOpenClawDispatchBinding()).toBeUndefined();
+
+    expect(() => assertOpenClawDispatchNotDurablyBlocked(input, { ...shared, binding: captured })).not.toThrow();
+    epoch = 'epoch-2';
+    expect(() => assertOpenClawDispatchNotDurablyBlocked(input, { ...shared, binding: captured }))
+      .toThrow(/OPENCLAW_EXECUTION_MAINTENANCE/);
+    // An unbound call is judged on evidence alone, even inside a bound context.
+    bindAdmittedOpenClawDispatch(() => {
+      expect(() => assertOpenClawDispatchNotDurablyBlocked(input, { ...shared, binding: null })).not.toThrow();
+    });
+  });
+
+  it('derives a mutation epoch that outlives the entry that changed it', async () => {
+    const read = __openClawExecutionAdmissionTest.readMutationEvidenceEpoch;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-mutation-epoch-'));
+    try {
+      const watched = [path.join(root, 'installer'), path.join(root, 'installer', 'journals')];
+      expect(read(watched)).toBe('absent|absent');
+      fs.mkdirSync(watched[1], { recursive: true });
+      const quiet = read(watched);
+      expect(quiet).not.toContain('absent');
+      expect(read(watched)).toBe(quiet);
+
+      // Coarse kernel timestamps: let the clock tick past the mkdir above.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const marker = path.join(watched[0], 'maintenance.json');
+      fs.writeFileSync(marker, '{}');
+      const during = read(watched);
+      expect(during).not.toBe(quiet);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      fs.rmSync(marker);
+      const after = read(watched);
+      // The marker is gone and the directory still says something happened.
+      expect(after).not.toBe(quiet);
+      expect(after).not.toBe(during);
+      // A change confined to a journal directory is seen as well.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      fs.writeFileSync(path.join(watched[1], 'active.json'), '{}');
+      expect(read(watched)).not.toBe(after);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

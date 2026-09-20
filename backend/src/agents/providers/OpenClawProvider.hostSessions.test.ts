@@ -156,6 +156,35 @@ describe('OpenClawProvider host-session visibility', () => {
     ]);
   });
 
+  test('a single-agent view sweeps only that agent, and can never widen visibility', async () => {
+    mockAgentSessionFindMany.mockResolvedValue([
+      { externalId: 'agent:research:new-1782222222222' },
+      { externalId: 'agent:kernel:new-1782222222223' },
+    ]);
+    gatewayRpc.gatewayRpcCall.mockImplementation(async (_method: string, params: any) => ({
+      ok: true,
+      data: { sessions: [{ key: `agent:${params.agentId}:dashboard:abc`, kind: 'direct' }] },
+    }));
+
+    const sessions = await new OpenClawProvider().listSessions(OWNER, {
+      includeHostSessions: true,
+      hostAgentIds: ['main'],
+      onlyAgentIds: ['main'],
+    });
+
+    expect(gatewayRpc.gatewayRpcCall).toHaveBeenCalledTimes(1);
+    expect(gatewayRpc.gatewayRpcCall).toHaveBeenCalledWith('sessions.list', { agentId: 'main' });
+    expect(sessions.map((s) => s.sessionId)).toEqual(['agent:main:dashboard:abc']);
+
+    // Naming an agent the caller neither claims nor may host-sweep adds nothing.
+    gatewayRpc.gatewayRpcCall.mockClear();
+    await expect(new OpenClawProvider().listSessions(OWNER, {
+      includeHostSessions: false,
+      onlyAgentIds: ['api'],
+    })).resolves.toEqual([]);
+    expect(gatewayRpc.gatewayRpcCall).not.toHaveBeenCalled();
+  });
+
   test('an explicitly claimed automation lane is still honoured', async () => {
     mockAgentSessionFindMany.mockResolvedValue([
       { externalId: 'agent:main:cron:cccccccc-2222-4333-8444-dddddddddddd' },

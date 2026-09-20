@@ -863,7 +863,9 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
     claudeStatus,
     clawhubStatus,
   ] = await Promise.all([
-    getOpenClawSetupReadiness(),
+    // A diagnostic surface: keep the one-minute freshness it always had rather
+    // than the long-lived result the chat request paths are served.
+    getOpenClawSetupReadiness({}, { maxAgeMs: 60_000 }),
     firstCommandLine('command -v caddy >/dev/null 2>&1 && caddy version'),
     firstCommandLine('command -v stalwart-mail >/dev/null 2>&1 && stalwart-mail --version || command -v stalwart >/dev/null 2>&1 && stalwart --version'),
     firstCommandLine("apt-cache policy caddy 2>/dev/null | awk '/Candidate:/ {print $2}'"),

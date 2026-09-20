@@ -4774,7 +4774,11 @@ export default function AppsPage() {
         clean: 'Clean',
         stripped: 'Stripped',
       };
-      
+
+      // The archive is built and transferred before the browser can offer a
+      // save dialog; without this the button looked dead for that whole time.
+      showToast(`Preparing ${selectedProject} (${modeLabels[mode]}) — the download starts when the archive is ready`, 'info');
+
       const response = await workspaceAuthorizedFetch(`/api/projects/${encodeURIComponent(selectedProject)}/download?mode=${mode}`, {
         credentials: 'include',
       });

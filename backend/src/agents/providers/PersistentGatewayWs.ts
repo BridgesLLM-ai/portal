@@ -23,6 +23,11 @@ import { redactNativeProviderText } from './native/NativeProviderDiagnostics';
 import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
 import { portalClientMessageIdFromIdempotencyKey } from './PortalMessageIdentity';
 import { questionAuthorityForOpenClawVersion } from '../../services/openClawQuestionRuntimeReadiness';
+import {
+  assertOpenClawDispatchNotDurablyBlocked,
+  OpenClawExecutionAdmissionError,
+} from '../../services/openClawExecutionAdmission';
+import { isOpenClawExecutionCapableGatewayCall } from '../../services/openClawExecutionCapableMethods';
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -3763,17 +3768,14 @@ export async function callGatewayRpc(method: string, params: Record<string, any>
     });
 
     try {
-      singletonWs!.send(JSON.stringify({
-        type: 'req',
-        id: requestId,
-        method,
-        params,
-      }));
+      writeGatewayRpcFrame(singletonWs!, { type: 'req', id: requestId, method, params });
     } catch (err: any) {
       clearTimeout(timeoutTimer);
       pendingResponses.delete(requestId);
       if (runReservation) failPendingRunReservation(rpcSessionKey, runReservation);
-      reject(new Error(`Failed to send ${method}: ${err.message}`));
+      reject(err instanceof OpenClawExecutionAdmissionError
+        ? Object.assign(err, { errorCode: err.code, errorMessage: err.message })
+        : new Error(`Failed to send ${method}: ${err.message}`));
     }
   });
 }
@@ -4700,6 +4702,36 @@ export async function steerActiveRun(
   );
 }
 
+/**
+ * The one place a chat turn reaches the gateway socket. The admission checks
+ * upstream ran before host-run journaling and a possible reconnect wait of up
+ * to 15 s, and maintenance can begin in that gap, so the durable evidence —
+ * marker, journals, fence — is read once more here. Nothing is awaited between
+ * that synchronous check and the write.
+ */
+function writeChatSendFrame(
+  socket: { send(data: string): void },
+  frame: Record<string, unknown>,
+  assertNotDurablyBlocked: () => void = assertOpenClawDispatchNotDurablyBlocked,
+): void {
+  assertNotDurablyBlocked();
+  socket.send(JSON.stringify(frame));
+}
+
+/**
+ * Every other RPC leaves through here. The ones that start, resume, steer or
+ * schedule execution (an automation's Run now, an answer to a waiting run) get
+ * the same last look as a chat turn; read-only calls and aborts never do.
+ */
+function writeGatewayRpcFrame(
+  socket: { send(data: string): void },
+  frame: { type: 'req'; id: string; method: string; params: Record<string, any> },
+  assertNotDurablyBlocked: () => void = assertOpenClawDispatchNotDurablyBlocked,
+): void {
+  if (isOpenClawExecutionCapableGatewayCall(frame.method, frame.params)) assertNotDurablyBlocked();
+  socket.send(JSON.stringify(frame));
+}
+
 export async function sendChatMessage(
   sessionKey: string,
   message: string,
@@ -4800,7 +4832,7 @@ export async function sendChatMessage(
     });
 
     try {
-      singletonWs!.send(JSON.stringify({
+      writeChatSendFrame(singletonWs!, {
         type: 'req',
         id: requestId,
         method: 'chat.send',
@@ -4810,12 +4842,16 @@ export async function sendChatMessage(
           idempotencyKey,
           deliver: false,
         },
-      }));
+      });
     } catch (err: any) {
       clearTimeout(timeoutTimer);
       pendingResponses.delete(requestId);
       failPendingRunReservation(sessionKey, reservationRunId);
-      reject(new Error(`Failed to send chat.send: ${err.message}`));
+      // Keep the typed 503 (code, retryable) so the client shows maintenance
+      // rather than a generic transport failure.
+      reject(err instanceof OpenClawExecutionAdmissionError
+        ? err
+        : new Error(`Failed to send chat.send: ${err.message}`));
     }
   });
 }
@@ -5007,6 +5043,8 @@ export function clearRun(sessionKey: string): void {
 }
 
 export const __persistentGatewayWsTest = {
+  writeChatSendFrame,
+  writeGatewayRpcFrame,
   gatewayMethodHasRequiredScope,
   answerPendingUserInputWithRpc,
   dismissPendingUserInputWithRpc,

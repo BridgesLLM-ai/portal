@@ -55,6 +55,146 @@ describe('gateway runtime-history prune-only reconciliation', () => {
     expect(__gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime], 20)).toEqual(merged);
   });
 
+  // Browser-reproduced on a Claude CLI (claude-cli runtime) turn that narrates
+  // between tool calls. OpenClaw's transcript holds each text block as its own
+  // assistant row AND one aggregate row repeating all of them (the CLI result
+  // text), and carries no tool calls. The Portal runtime lane holds the same
+  // text as segments plus the tools. Agent Chat rendered the turn three times.
+  describe('Claude CLI aggregate result mirror', () => {
+    const t0 = 1789880593088;
+    const toolCalls = [
+      {
+        id: 'toolu_one', name: 'Bash', identity: 'provider', arguments: { command: 'echo one' },
+        result: 'one', startedAt: t0 + 3563, endedAt: t0 + 3674, status: 'done', order: 1,
+      },
+      {
+        id: 'toolu_two', name: 'Bash', identity: 'provider', arguments: { command: 'echo two' },
+        result: 'two', startedAt: t0 + 5307, endedAt: t0 + 5335, status: 'done', order: 3,
+      },
+    ];
+    const canonical = () => [
+      { id: 'u', role: 'user', content: 'Do these steps in order.', timestamp: t0 },
+      { id: 'a', role: 'assistant', content: 'Starting now A.', stopReason: 'tool_use', api: 'anthropic-messages', provider: 'claude-cli', timestamp: t0 + 2949 },
+      { id: 'b', role: 'assistant', content: 'Halfway there B.', stopReason: 'tool_use', api: 'anthropic-messages', provider: 'claude-cli', timestamp: t0 + 4858 },
+      { id: 'c', role: 'assistant', content: 'All done C.', stopReason: 'end_turn', api: 'anthropic-messages', provider: 'claude-cli', timestamp: t0 + 6463 },
+      { id: 'aggregate', role: 'assistant', content: 'Starting now A.\n\nHalfway there B.\n\nAll done C.', stopReason: 'stop', api: 'cli', provider: 'claude-cli', timestamp: t0 + 6732 },
+    ];
+    const runtime = () => ({
+      id: 'runtime-turn-claude-cli',
+      role: 'assistant',
+      content: 'All done C.',
+      timestamp: new Date(t0 + 6761).toISOString(),
+      provenance: 'via OpenClaw',
+      toolCalls,
+      segments: [
+        { text: 'Starting now A.', position: 'before', kind: 'text', source: 'text', ts: t0 + 2856, order: 0 },
+        { text: 'Halfway there B.', position: 'before', kind: 'text', source: 'text', ts: t0 + 4934, order: 2 },
+      ],
+      __portal: { kind: 'runtime-turn-event-history', runId: 'run-claude-cli', terminal: true, complete: true, lastEventSeq: 13 },
+    });
+    const renderedText = (messages: any[]) => messages
+      .filter((message) => message.role === 'assistant')
+      .flatMap((message) => [
+        ...(Array.isArray(message.segments) ? message.segments.map((segment: any) => segment.text) : []),
+        message.content,
+      ])
+      .join('\n');
+    const occurrences = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+    test('renders every sentence and every tool exactly once', () => {
+      const source = canonical();
+      const before = JSON.parse(JSON.stringify(source));
+      const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime()], 80);
+      const text = renderedText(merged);
+
+      for (const sentence of ['Starting now A.', 'Halfway there B.', 'All done C.']) {
+        expect(occurrences(text, sentence)).toBe(1);
+      }
+      expect(merged.flatMap((message: any) => message.toolCalls || []).map((tool: any) => tool.id))
+        .toEqual(['toolu_one', 'toolu_two']);
+      expect(source).toEqual(before);
+      // Reloading the same history must be a fixed point.
+      expect(__gatewayHistoryTest.mergeRuntimeHistoryMessages(source, [runtime()], 80)).toEqual(merged);
+    });
+
+    test('collapses the aggregate even when the runtime lane is gone', () => {
+      const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(canonical(), [], 80);
+      expect(merged.map((message: any) => message.id)).toEqual(['u', 'a', 'b', 'c']);
+    });
+
+    test('keeps a final row that merely resembles an aggregate', () => {
+      const partial = canonical();
+      partial[4] = { ...partial[4], content: 'Starting now A.\n\nHalfway there B.\n\nAll done C. One more thing.' };
+      const kept = __gatewayHistoryTest.mergeRuntimeHistoryMessages(partial, [], 80);
+      expect(kept.map((message: any) => message.id)).toContain('aggregate');
+
+      // A repeat that carries its own tool call is real work, not a mirror.
+      const withTool = canonical();
+      withTool[4] = { ...withTool[4], toolCalls: [toolCalls[0]] } as any;
+      expect(__gatewayHistoryTest.mergeRuntimeHistoryMessages(withTool, [], 80).map((message: any) => message.id))
+        .toContain('aggregate');
+
+      // A user turn in between means the repeat is not part of the same turn.
+      const acrossTurns = [
+        ...canonical().slice(0, 4),
+        { id: 'u2', role: 'user', content: 'Say all of that again.', timestamp: t0 + 9000 },
+        { ...canonical()[4], timestamp: t0 + 12000 },
+      ];
+      expect(__gatewayHistoryTest.mergeRuntimeHistoryMessages(acrossTurns, [], 80).map((message: any) => message.id))
+        .toEqual(['u', 'a', 'b', 'c', 'u2', 'aggregate']);
+    });
+
+    test('keeps a row that differs from the join in case, separator, or order', () => {
+      const ids = (messages: any[]) => __gatewayHistoryTest
+        .mergeRuntimeHistoryMessages(messages, [], 80).map((message: any) => message.id);
+      const turn = (finalContent: string) => [
+        { id: 'u', role: 'user', content: 'Go.', timestamp: t0 },
+        { id: 'a', role: 'assistant', content: 'Use /tmp/A', timestamp: t0 + 1000 },
+        { id: 'b', role: 'assistant', content: 'then stop', timestamp: t0 + 2000 },
+        { id: 'final', role: 'assistant', content: finalContent, timestamp: t0 + 3000 },
+      ];
+      // A different path is different content, whatever a case-folding match says.
+      expect(ids(turn('Use /tmp/a\n\nthen stop'))).toContain('final');
+      // The CLI result text joins blocks with a blank line and nothing else.
+      expect(ids(turn('Use /tmp/A then stop'))).toContain('final');
+      expect(ids(turn('Use /tmp/A\nthen stop'))).toContain('final');
+      expect(ids(turn('then stop\n\nUse /tmp/A'))).toContain('final');
+      // The exact join is the mirror, with or without edge whitespace.
+      expect(ids(turn('Use /tmp/A\n\nthen stop'))).toEqual(['u', 'a', 'b']);
+      expect(ids(turn('  Use /tmp/A\n\nthen stop\n'))).toEqual(['u', 'a', 'b']);
+    });
+
+    test('stays linear when a turn carries thousands of mirrors', () => {
+      const rows: any[] = [
+        { id: 'u', role: 'user', content: 'Go.', timestamp: t0 },
+        { id: 'a', role: 'assistant', content: 'A', timestamp: t0 + 1 },
+        { id: 'b', role: 'assistant', content: 'B', timestamp: t0 + 2 },
+      ];
+      for (let index = 0; index < 40_000; index += 1) {
+        rows.push({ id: `m${index}`, role: 'assistant', content: 'A\n\nB', timestamp: t0 + 3 + index });
+      }
+      const startedAt = process.hrtime.bigint();
+      const merged = __gatewayHistoryTest.mergeRuntimeHistoryMessages(rows, [], 80);
+      const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      expect(merged.map((message: any) => message.id)).toEqual(['u', 'a', 'b']);
+      // The rescanning version needed ~8e8 set lookups here (tens of seconds).
+      expect(elapsedMs).toBeLessThan(1_500);
+    });
+
+    test('a mirror never becomes a part of a later mirror', () => {
+      const rows = [
+        { id: 'u', role: 'user', content: 'Go.', timestamp: t0 },
+        { id: 'a', role: 'assistant', content: 'A', timestamp: t0 + 1 },
+        { id: 'b', role: 'assistant', content: 'B', timestamp: t0 + 2 },
+        { id: 'm1', role: 'assistant', content: 'A\n\nB', timestamp: t0 + 3 },
+        // Would only match if the dropped row above had stayed in the run.
+        { id: 'real', role: 'assistant', content: 'A\n\nB\n\nA\n\nB', timestamp: t0 + 4 },
+      ];
+      expect(__gatewayHistoryTest.mergeRuntimeHistoryMessages(rows, [], 80).map((message: any) => message.id))
+        .toEqual(['u', 'a', 'b', 'real']);
+    });
+  });
+
   test.each([null, undefined, 7, 'malformed', []])(
     'fails closed without losing history when an exact tool owner has malformed sibling %p', (sibling) => {
       const tool = {
@@ -74,7 +214,7 @@ describe('gateway runtime-history prune-only reconciliation', () => {
 
       expect(merged).toEqual([...source, runtime]);
       expect(merged[1].toolCalls[0]).toBe(sibling);
-      expect(source[1].toolCalls?.[1]?.result).toBe('');
+      expect((source[1].toolCalls?.[1] as any)?.result).toBe('');
     },
   );
 

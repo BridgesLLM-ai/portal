@@ -145,7 +145,11 @@ describe('OpenClaw task feed demand', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
     expect(mocks.get).toHaveBeenCalledTimes(1);
     await act(async () => { finish({ data: { tasks: [] } }); });
-    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    // The poll interval stays above the server's task-feed cache TTL so an open
+    // feed is not a guaranteed gateway sweep on every tick.
+    await act(async () => { await vi.advanceTimersByTimeAsync(14_999); });
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(mocks.get).toHaveBeenCalledTimes(2);
     const signal = mocks.get.mock.calls[1][1].signal as AbortSignal;
     fireEvent.click(screen.getByRole('button', { name: 'Close chat tasks' }));

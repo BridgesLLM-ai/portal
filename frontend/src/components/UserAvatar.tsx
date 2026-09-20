@@ -199,11 +199,18 @@ export default function UserAvatar({ size = 'w-10 h-10', ringColor = 'ring-purpl
 
     setHarnessIndicator({ state: 'checking', label: `${assistantHarness}: Checking readiness…` });
     void checkHarnessStatus();
-    const interval = setInterval(() => { void checkHarnessStatus(); }, 30000);
+    // Every check forces a provider-catalog rebuild on the server. A hidden tab
+    // has no indicator to repaint, so skip it and catch up when the tab returns.
+    const checkIfVisible = () => {
+      if (document.visibilityState !== 'hidden') void checkHarnessStatus();
+    };
+    const interval = setInterval(checkIfVisible, 30000);
+    document.addEventListener('visibilitychange', checkIfVisible);
 
     return () => {
       cancelled = true;
       clearInterval(interval);
+      document.removeEventListener('visibilitychange', checkIfVisible);
     };
   }, [assistant, assistantHarness, isAuthenticated, userCanViewHarnessStatus]);
 

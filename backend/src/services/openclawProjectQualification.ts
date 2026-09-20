@@ -97,7 +97,10 @@ import {
   OLLAMA_PROJECT_MODEL_BRIDGE_POLICY_VERSION,
 } from '../agents/providers/ollama/OllamaProjectModelBridge';
 import { withOllamaAuthorityRunLease } from './ollamaAuthorityBarrier';
-import { assertCachedOpenClawExecutionAdmitted } from './openClawExecutionAdmission';
+import {
+  assertCachedOpenClawExecutionAdmitted,
+  bindAdmittedOpenClawDispatch,
+} from './openClawExecutionAdmission';
 
 export const OPENCLAW_PROJECT_QUALIFICATION_VERSION = 'portal-openclaw-project-qualification-v2';
 export const CODEX_PROJECT_QUALIFICATION_VERSION = 'portal-codex-project-qualification-v1';
@@ -2029,7 +2032,7 @@ async function runDefaultModelProbe(input: {
     // runtime marker staging above is deliberately outside the provider call,
     // and an installer transaction can arm during that awaited boundary.
     assertCachedOpenClawExecutionAdmitted();
-    const result = await Promise.race([
+    const result = await bindAdmittedOpenClawDispatch(() => Promise.race([
       provider.sendMessage(
         input.sessionKey,
         prompt,
@@ -2041,7 +2044,7 @@ async function runDefaultModelProbe(input: {
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => reject(new Error('OpenClaw qualification model roundtrip timed out')), MODEL_PROBE_TIMEOUT_MS);
       }),
-    ]);
+    ]));
     if (String(result.fullText || '').trim() !== expected) {
       fail('MODEL_PROBE_RESPONSE', 'OpenClaw qualification model response did not match its challenge');
     }

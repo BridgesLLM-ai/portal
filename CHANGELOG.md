@@ -2,6 +2,27 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.0.10] - 2026-09-20
+
+### Fixed
+- **Agent Chat no longer stalls or reports OpenClaw as unavailable while the gateway is only busy:** sending a message, opening a chat, changing a model and answering a question each waited for a full re-verification of the installed OpenClaw runtime whenever the last one was more than a minute old. That verification starts several OpenClaw command-line processes in sequence, took many seconds, and its gateway probe timed out when the gateway was simply working, so a healthy assistant was reported as unavailable. A verified runtime is now served immediately and re-verified in the background; a single contended check cannot take a healthy runtime offline, while repeated failures still do.
+- **Replies appear once with Claude CLI models:** OpenClaw's Claude CLI runtime records each part of a reply and then one more entry repeating all of them. Agent Chat showed both, so a reply that narrated between tool calls appeared two or three times, live and after a refresh. The repeated entry is now recognised and shown once. Entries with anything of their own, including extra words, a tool, reasoning or an attachment, are always kept.
+- **An open Chat tab no longer hammers the gateway:** the session list asked the gateway for every session of every agent you had ever used and discarded all but the agent on screen; it now asks only for that agent. Session, assistant-status and task checks pause while the tab is hidden and catch up when you return.
+- **Project downloads start sooner and do not freeze the Portal:** preparing a download copied the whole project while every other request, chat stream and user waited. The copy no longer blocks the Portal, archives use standard compression, already-compressed media is stored as-is, and the page says the archive is being prepared instead of appearing to do nothing.
+- **Smoother streaming under load:** the assistant status check no longer starts a login shell and waits for it on every poll, and a constant host lookup is resolved once.
+
+### Security
+- **Project downloads cannot be redirected to a host file:** the download snapshot is now taken through pinned directory and file descriptors instead of by path name. A project workload that swaps a file or folder for a link while its owner is downloading the project can no longer cause a file from elsewhere on the server to be copied into the archive. Links, pipes, sockets and devices are never included.
+- **Maintenance locks are re-checked at the moment work is sent to the gateway:** the supervised-maintenance, interrupted-update and authorization locks were checked before a turn was recorded and before a possible gateway reconnect, which left a window of up to several seconds. They are now read again immediately before anything that starts, resumes or schedules assistant work is written to the gateway connection — a chat turn, an answer to or dismissal of a waiting run, an automation's **Run now**, or a change that enables an automation — with nothing in between. Reading history, stopping a run, and disabling or deleting an automation are never blocked.
+- **Work cannot cross a maintenance window:** a chat turn or automation run that was accepted before maintenance began, and was still on its way when maintenance finished, is refused with a request to send it again instead of being delivered to a runtime that was never re-verified.
+- **Project downloads are bounded:** preparing a download is limited in total size, number of files and folder depth, keeps free disk space in reserve, counts a sparse file at its full apparent size, and stops when the browser disconnects or a time limit passes. Only a few exports, and one per user, run at a time, and each holds its place and its disk space until its temporary copy has been removed, so exports that start together cannot be promised the same free space. A project over the limit gets a clear message instead of filling the server's disk.
+- **Maintenance that nobody watched still counts:** an update that started and finished between two chat actions left no lock behind to notice. The verified-runtime result is now tied to the state of the installer's lock directories, so it is discarded and re-collected after any such window, including one that closed before the next request arrived.
+
+### Upgrade notes
+- Portal-managed updates and maintenance still re-verify the OpenClaw runtime immediately. A change made to OpenClaw outside the Portal is now noticed within about ten minutes rather than one; until then chats continue to reach the running gateway normally.
+- When OpenClaw really is unavailable, the Portal re-checks no more often than every fifteen seconds, and never more often than twice the time a check takes, up to one minute. An explicit forced re-check is still immediate, and its result is what every user then sees.
+- A project download still never follows links out of the project. A file that is being written while the download is prepared is included as it was at that moment; the archive is not a point-in-time image of a project that is changing.
+
 ## [5.0.9] - 2026-09-15
 
 ### Fixed

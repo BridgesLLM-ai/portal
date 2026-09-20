@@ -45,7 +45,7 @@ export default function ChatTasksButton({ provider, session, messages, projectWo
       } catch {
         if (alive) setError('Task feed unavailable. Last reported status is shown.');
       } finally {
-        if (alive) { setLoading(false); timer = window.setTimeout(refresh, 10_000); }
+        if (alive) { setLoading(false); timer = window.setTimeout(refresh, 15_000); }
       }
     };
     void refresh();

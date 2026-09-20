@@ -1634,7 +1634,7 @@ router.post('/ollama-pull', requireSetupPending, requireSetupToken, async (req: 
  */
 router.get('/openclaw-status', requireSetupPending, requireSetupToken, async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    res.json(await getOpenClawSetupReadiness());
+    res.json(await getOpenClawSetupReadiness({}, { maxAgeMs: 60_000 }));
   } catch (error) {
     next(error);
   }

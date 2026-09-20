@@ -3,6 +3,7 @@ import express, { NextFunction, Request, Response } from 'express';
 
 const gatewayRpcCallMock = jest.fn();
 const assertOpenClawExecutionAdmittedMock = jest.fn();
+const assertCachedOpenClawExecutionAdmittedMock = jest.fn();
 
 jest.mock('../utils/openclawGatewayRpc', () => ({
   gatewayRpcCall: gatewayRpcCallMock,
@@ -11,6 +12,7 @@ jest.mock('../utils/openclawGatewayRpc', () => ({
 jest.mock('../services/openClawExecutionAdmission', () => ({
   ...jest.requireActual('../services/openClawExecutionAdmission'),
   assertOpenClawExecutionAdmitted: assertOpenClawExecutionAdmittedMock,
+  assertCachedOpenClawExecutionAdmitted: assertCachedOpenClawExecutionAdmittedMock,
 }));
 
 jest.mock('../middleware/auth', () => ({
@@ -88,6 +90,7 @@ describe('Automations gateway contract', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     assertOpenClawExecutionAdmittedMock.mockResolvedValue({ state: 'ready', ready: true });
+    assertCachedOpenClawExecutionAdmittedMock.mockReturnValue({ state: 'ready', ready: true });
     gatewayRpcCallMock.mockImplementation(async (method: string) => {
       if (method === 'cron.list') {
         return {
@@ -253,11 +256,15 @@ describe('Automations gateway contract', () => {
 
     expect(response.status).toBe(200);
     expect(assertOpenClawExecutionAdmittedMock).not.toHaveBeenCalled();
+    expect(assertCachedOpenClawExecutionAdmittedMock).not.toHaveBeenCalled();
+    // The write states outright that the job stays disabled: that is what lets
+    // the gateway transports pass it during maintenance.
     expect(gatewayRpcCallMock).toHaveBeenNthCalledWith(2, 'cron.update', {
       id: 'disabled-job',
       patch: {
         payload: { kind: 'agentTurn', message: 'Repaired while still disabled' },
         delivery: { mode: 'none' },
+        enabled: false,
       },
     }, 45000);
   });
@@ -330,5 +337,72 @@ describe('Automations gateway contract', () => {
     expect(response.status).toBe(503);
     expect(response.body).toMatchObject({ code: 'OPENCLAW_EXECUTION_MAINTENANCE', retryable: true });
     expect(gatewayRpcCallMock).not.toHaveBeenCalled();
+  });
+
+  it('re-admits run-now synchronously after job verification and dispatches it under that admission', async () => {
+    const order: string[] = [];
+    const { captureAdmittedOpenClawDispatchBinding } = jest.requireActual('../services/openClawExecutionAdmission');
+    let bindingAtDispatch: unknown;
+    assertOpenClawExecutionAdmittedMock.mockImplementation(async () => { order.push('route-admission'); return { ready: true }; });
+    assertCachedOpenClawExecutionAdmittedMock.mockImplementation(() => { order.push('final-seam'); return { ready: true }; });
+    gatewayRpcCallMock.mockImplementation(async (method: string) => {
+      order.push(method);
+      if (method === 'cron.list') {
+        return {
+          ok: true,
+          data: {
+            jobs: [{ id: 'cron-1', name: 'Agent job', sessionTarget: 'isolated', payload: { kind: 'agentTurn', message: 'Task' } }],
+            hasMore: false,
+          },
+        };
+      }
+      bindingAtDispatch = captureAdmittedOpenClawDispatchBinding();
+      return { ok: true, data: { ran: true } };
+    });
+
+    const response = await request(server, { method: 'POST', path: '/automations/cron-1/run' });
+    expect(response.status).toBe(200);
+    // Verification pages through the gateway; the seam comes after it.
+    expect(order).toEqual(['route-admission', 'cron.list', 'final-seam', 'cron.run']);
+    // The transport can tell this dispatch from one admitted before a boundary.
+    expect(bindingAtDispatch).toEqual({ generation: expect.any(Number) });
+  });
+
+  it('refuses run-now when maintenance arrived during job verification', async () => {
+    assertCachedOpenClawExecutionAdmittedMock.mockImplementation(() => { throw maintenanceError(); });
+    const response = await request(server, { method: 'POST', path: '/automations/cron-1/run' });
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ code: 'OPENCLAW_EXECUTION_MAINTENANCE', retryable: true });
+    expect(gatewayRpcCallMock.mock.calls.map(([method]) => method)).toEqual(['cron.list']);
+  });
+
+  it('returns the typed refusal when the transport itself refuses an enabling write', async () => {
+    gatewayRpcCallMock.mockImplementation(async (method: string) => {
+      if (method === 'cron.list') {
+        return {
+          ok: true,
+          data: {
+            jobs: [{ id: 'cron-1', name: 'Agent job', enabled: false, sessionTarget: 'isolated', payload: { kind: 'agentTurn', message: 'Task' } }],
+            hasMore: false,
+          },
+        };
+      }
+      return {
+        ok: false,
+        error: 'OPENCLAW_EXECUTION_MAINTENANCE: OpenClaw was updated while this turn was being sent. Send it again.',
+        errorCode: 'OPENCLAW_EXECUTION_MAINTENANCE',
+      };
+    });
+    const response = await request(server, { method: 'POST', path: '/automations/cron-1/toggle', body: { enabled: true } });
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ code: 'OPENCLAW_EXECUTION_MAINTENANCE', retryable: true });
+
+    // Disabling is cleanup: no admission, no seam.
+    jest.clearAllMocks();
+    gatewayRpcCallMock.mockResolvedValue({ ok: true, data: { jobs: [{ id: 'cron-1', name: 'Agent job', sessionTarget: 'isolated', payload: { kind: 'agentTurn', message: 'Task' } }], hasMore: false } });
+    const disabled = await request(server, { method: 'POST', path: '/automations/cron-1/toggle', body: { enabled: false } });
+    expect(disabled.status).toBe(200);
+    expect(assertOpenClawExecutionAdmittedMock).not.toHaveBeenCalled();
+    expect(assertCachedOpenClawExecutionAdmittedMock).not.toHaveBeenCalled();
   });
 });

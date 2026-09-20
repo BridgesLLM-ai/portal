@@ -184,7 +184,9 @@ import {
 } from '../services/hostRuntimeMaintenancePolicy';
 import {
   assertCachedOpenClawExecutionAdmitted,
+  assertOpenClawDispatchNotDurablyBlocked,
   assertOpenClawExecutionAdmitted,
+  bindAdmittedOpenClawDispatch,
   OpenClawExecutionAdmissionError,
 } from '../services/openClawExecutionAdmission';
 import { assertHostAgentRunAttachable } from '../services/hostAgentRunJournal';
@@ -270,15 +272,9 @@ async function sendUntrackedHostOperatorProviderMessage(
   input: HostOperatorProviderSend,
 ): Promise<AgentSendResult> {
   assertQualifiedNativeBinaryProvider(input.provider.providerName);
-  // Native Host Operator providers enforce their durable systemd-scope run
-  // boundary inside the provider. OpenClaw gets a synchronous final marker/WAL recheck against
-  // the bounded readiness attestation established at route admission; this
-  // seam never launches expensive readiness probes immediately before IO.
-  if (input.provider.providerName === 'OPENCLAW') {
-    assertCachedOpenClawExecutionAdmitted();
-  }
-
   if (input.provider.providerName !== 'OPENCLAW') {
+    // Native Host Operator providers enforce their durable systemd-scope run
+    // boundary inside the provider.
     return input.provider.sendMessage(
       input.sessionId,
       input.message,
@@ -289,6 +285,19 @@ async function sendUntrackedHostOperatorProviderMessage(
     );
   }
 
+  // OpenClaw gets a synchronous final marker/WAL recheck against the bounded
+  // readiness attestation established at route admission; this seam never
+  // launches expensive readiness probes immediately before IO. The dispatch
+  // stays bound to the generation admitted here until the socket write, so a
+  // maintenance window that opens and closes during journaling or a reconnect
+  // wait cannot be crossed.
+  assertCachedOpenClawExecutionAdmitted();
+  return bindAdmittedOpenClawDispatch(() => sendAdmittedOpenClawHostOperatorMessage(input));
+}
+
+async function sendAdmittedOpenClawHostOperatorMessage(
+  input: HostOperatorProviderSend,
+): Promise<AgentSendResult> {
   // Mandatory final fence. Route-level checks prevent refused session/model
   // mutations, but only this centralized seam covers every Portal-owned
   // OpenClaw HOST_OPERATOR dispatch immediately before journaling/provider IO.
@@ -967,6 +976,8 @@ interface OpenClawPackageMetadata {
 
 let openClawPackageMetadataCache: { checkedAtMs: number; metadata: OpenClawPackageMetadata | null } | null = null;
 
+let openClawGlobalNpmRoot: string | null = null;
+
 function getOpenClawPackageMetadata(): OpenClawPackageMetadata | null {
   const now = Date.now();
   if (openClawPackageMetadataCache && now - openClawPackageMetadataCache.checkedAtMs < 5000) {
@@ -976,16 +987,21 @@ function getOpenClawPackageMetadata(): OpenClawPackageMetadata | null {
   if (process.env.PORTAL_OPENCLAW_PACKAGE_DIR) {
     packageDirs.add(path.resolve(process.env.PORTAL_OPENCLAW_PACKAGE_DIR));
   }
-  try {
-    const npmRoot = execFileSync('npm', ['root', '-g'], {
-      env: buildOpenClawCliEnv(),
-      timeout: 2500,
-      encoding: 'utf8',
-    }).trim();
-    if (npmRoot) packageDirs.add(path.join(npmRoot, 'openclaw'));
-  } catch {
-    // Fall through to common global npm layouts.
+  // `npm root -g` boots a whole Node process synchronously on the Portal event
+  // loop, and its answer cannot change while this process runs. Resolve it once;
+  // only a failed lookup is retried.
+  if (openClawGlobalNpmRoot === null) {
+    try {
+      openClawGlobalNpmRoot = execFileSync('npm', ['root', '-g'], {
+        env: buildOpenClawCliEnv(),
+        timeout: 2500,
+        encoding: 'utf8',
+      }).trim() || null;
+    } catch {
+      // Fall through to common global npm layouts.
+    }
   }
+  if (openClawGlobalNpmRoot) packageDirs.add(path.join(openClawGlobalNpmRoot, 'openclaw'));
   packageDirs.add('/usr/lib/node_modules/openclaw');
   packageDirs.add('/usr/local/lib/node_modules/openclaw');
 
@@ -1012,13 +1028,47 @@ function getOpenClawDistDir(): string {
   return path.join(getOpenClawPackageMetadata()?.packageDir || FALLBACK_OPENCLAW_PACKAGE_DIR, 'dist');
 }
 
-function getGatewayListenerProcess(): { pid: number | null; startedAt: string | null; startedAtMs: number | null } {
-  try {
-    const output = execFileSync('bash', ['-lc', "ss -ltnp 'sport = :18789' 2>/dev/null | tail -n +2 | head -n 1"], {
-      env: buildOpenClawCliEnv(),
+type GatewayListenerProcess = { pid: number | null; startedAt: string | null; startedAtMs: number | null };
+
+// The Assistant status indicator polls this through /gateway/health from every
+// open tab. It used to start a synchronous login shell each time, which froze
+// the Portal event loop (and every chat stream on it) for the life of that
+// shell. Run `ss` directly, remember the constant clock tick, and share one
+// short-lived answer between pollers.
+const GATEWAY_LISTENER_PROCESS_TTL_MS = 10_000;
+const SS_BINARY_CANDIDATES = ['/usr/bin/ss', '/usr/sbin/ss', '/bin/ss', '/sbin/ss'] as const;
+let gatewayListenerProcessCache: { at: number; value: GatewayListenerProcess } | null = null;
+let clockTicksPerSecond: number | null = null;
+
+function readGatewayListenerSocketLine(): string {
+  const ssBinary = SS_BINARY_CANDIDATES.find((candidate) => existsSync(candidate));
+  if (ssBinary) {
+    return execFileSync(ssBinary, ['-ltnpH', 'sport = :18789'], {
       timeout: 2500,
       encoding: 'utf8',
-    }).trim();
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).split('\n')[0]?.trim() || '';
+  }
+  return execFileSync('bash', ['-lc', "ss -ltnp 'sport = :18789' 2>/dev/null | tail -n +2 | head -n 1"], {
+    env: buildOpenClawCliEnv(),
+    timeout: 2500,
+    encoding: 'utf8',
+  }).trim();
+}
+
+function getGatewayListenerProcess(): GatewayListenerProcess {
+  const now = Date.now();
+  if (gatewayListenerProcessCache && now - gatewayListenerProcessCache.at < GATEWAY_LISTENER_PROCESS_TTL_MS) {
+    return gatewayListenerProcessCache.value;
+  }
+  const value = inspectGatewayListenerProcess();
+  gatewayListenerProcessCache = { at: now, value };
+  return value;
+}
+
+function inspectGatewayListenerProcess(): GatewayListenerProcess {
+  try {
+    const output = readGatewayListenerSocketLine();
     const pid = Number(output.match(/pid=(\d+)/)?.[1] || 0) || null;
     if (!pid) return { pid: null, startedAt: null, startedAtMs: null };
 
@@ -1027,7 +1077,10 @@ function getGatewayListenerProcess(): { pid: number | null; startedAt: string | 
     const afterCommand = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
     const startTicks = Number(afterCommand[19]); // proc stat field 22 after removing pid+comm
     const bootSeconds = Number(bootTimeRaw || 0);
-    const ticksPerSecond = Number(execFileSync('getconf', ['CLK_TCK'], { timeout: 1000, encoding: 'utf8' }).trim()) || 100;
+    if (clockTicksPerSecond === null) {
+      clockTicksPerSecond = Number(execFileSync('getconf', ['CLK_TCK'], { timeout: 1000, encoding: 'utf8' }).trim()) || 100;
+    }
+    const ticksPerSecond = clockTicksPerSecond;
     const startedAtMs = bootSeconds && Number.isFinite(startTicks) ? Math.round((bootSeconds + startTicks / ticksPerSecond) * 1000) : null;
     return {
       pid,
@@ -5249,12 +5302,87 @@ function failClosedRuntimeHistory(
     .slice(-Math.max(limit, 1));
 }
 
+function isPlainAssistantTextHistoryRow(message: any): boolean {
+  if (!message || message.role !== 'assistant') return false;
+  if (message?.__portal?.kind === 'runtime-turn-event-history') return false;
+  if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) return false;
+  if (Array.isArray(message.segments) && message.segments.length > 0) return false;
+  if (Array.isArray(message.attachments) && message.attachments.length > 0) return false;
+  if (typeof message.thinkingContent === 'string' && message.thinkingContent.trim()) return false;
+  return typeof message.content === 'string' && message.content.trim().length > 0;
+}
+
+/**
+ * OpenClaw's claude-cli runtime records every assistant text block of a turn as
+ * its own transcript row and then one more row whose text is all of those
+ * blocks joined by blank lines (the CLI result text). Rendering both showed the
+ * same reply twice — three times once the Portal runtime lane was overlaid.
+ *
+ * Only a provable mirror is dropped: a plain text row, in the same turn, whose
+ * text is exactly the blank-line join of at least two assistant text rows
+ * directly before it. The comparison is lossless — same characters, same case,
+ * on the text as it is displayed (reply tags and envelope stripped, edges
+ * trimmed) — so a row that differs in any visible way is kept. A row with anything of its own — extra words, a
+ * tool, thinking, an attachment — is kept too, as is a single repeated row
+ * (adjacent-duplicate handling owns that).
+ *
+ * One forward pass. A dropped row never joins the run it was compared against,
+ * and a candidate is matched right-to-left against its own text, so the work is
+ * bounded by the size of the history rather than by the number of mirrors in it.
+ */
+const AGGREGATE_MIRROR_SEPARATOR = '\n\n';
+
+function isBlankLineJoinOfTrailingRows(target: string, run: readonly string[]): boolean {
+  let end = target.length;
+  let matched = 0;
+  for (let cursor = run.length - 1; cursor >= 0; cursor -= 1) {
+    const part = run[cursor];
+    const start = end - part.length;
+    if (start < 0 || !target.startsWith(part, start)) return false;
+    matched += 1;
+    if (start === 0) return matched >= 2;
+    end = start - AGGREGATE_MIRROR_SEPARATOR.length;
+    if (end <= 0 || !target.startsWith(AGGREGATE_MIRROR_SEPARATOR, end)) return false;
+  }
+  return false;
+}
+
+function collapseAggregateAssistantMirrors(messages: any[]): any[] {
+  let dropped: Set<number> | null = null;
+  // Retained plain text rows of the current assistant run, oldest first.
+  let run: string[] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    // Any other role ends the turn.
+    if (message?.role !== 'assistant') {
+      if (run.length > 0) run = [];
+      continue;
+    }
+    if (!isPlainAssistantTextHistoryRow(message)) {
+      // Contentless assistant rows (tool-only fragments) sit between text
+      // blocks and are stepped over. A row with text and something of its own
+      // is real work: nothing after it can mirror what came before it.
+      if (run.length > 0 && typeof message.content === 'string' && sanitizeHistoryText(message.content)) run = [];
+      continue;
+    }
+    const text = sanitizeHistoryText(message.content);
+    if (!text) continue;
+    if (run.length >= 2 && isBlankLineJoinOfTrailingRows(text, run)) {
+      (dropped ??= new Set<number>()).add(index);
+      continue;
+    }
+    run.push(text);
+  }
+  return dropped ? messages.filter((_message, index) => !dropped!.has(index)) : messages;
+}
+
 function mergeRuntimeHistoryMessages(
   messages: any[],
   runtimeMessages: any[],
   limit = 200,
   workLimits: RuntimeHistoryWorkLimits = {},
 ): any[] {
+  messages = collapseAggregateAssistantMirrors(messages);
   if (runtimeMessages.length === 0) return messages;
   let pendingRuntimeMessages = runtimeMessages;
   let combined = messages
@@ -9012,6 +9140,9 @@ router.get('/sessions', authenticateToken, requireAdmin, async (req: Request, re
     const ownedSessions = await openClawProvider.listSessions(req.user!.userId, {
       includeHostSessions,
       hostAgentIds,
+      // Only narrows the sweep; visibility is still decided by claims and the
+      // OWNER host rule inside the provider, and the prefix filter below stays.
+      ...(agentId ? { onlyAgentIds: [agentId] } : {}),
     });
     const sessions = agentId
       ? ownedSessions.filter((session) => String(session.sessionId || '').startsWith(`agent:${agentId}:`))
@@ -9107,7 +9238,9 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
   }
 });
 
-const TASKS_ROUTE_CACHE_TTL_MS = 10000;
+// Each miss costs the gateway an unbounded sessions.list plus tasks.list. The
+// feed polls every 15s, so a TTL at or below that made every poll a miss.
+const TASKS_ROUTE_CACHE_TTL_MS = 20000;
 let tasksRouteCache: { at: number; payload: any } | null = null;
 let tasksRouteInflight: Promise<any> | null = null;
 
@@ -13338,6 +13471,43 @@ function buildDirectProxyConnectFrame(
  * This creates a transparent pipe between the browser and the OpenClaw gateway,
  * with one exception: 'connect' requests have the auth token injected server-side.
  */
+/**
+ * Refuse a turn-starting direct-proxy frame while maintenance, an interrupted
+ * host mutation, or an authorization transition is durably recorded. Returns
+ * true when the frame was answered here and must not be forwarded.
+ */
+function refuseDurablyBlockedDirectTurn(input: {
+  method: unknown;
+  frameId: unknown;
+  sessionKey: string | null | undefined;
+  reservationRunId?: string;
+  send: (payload: string) => void;
+  assertNotDurablyBlocked?: () => void;
+  releaseReservation?: (sessionKey: string, reservationRunId: string) => void;
+}): boolean {
+  if (input.method !== 'chat.send' && input.method !== 'sessions.steer') return false;
+  try {
+    (input.assertNotDurablyBlocked || assertOpenClawDispatchNotDurablyBlocked)();
+    return false;
+  } catch (error) {
+    if (input.sessionKey && input.reservationRunId) {
+      (input.releaseReservation || failDirectGatewayChatRun)(input.sessionKey, input.reservationRunId);
+    }
+    const refusal = error instanceof OpenClawExecutionAdmissionError ? error : null;
+    input.send(JSON.stringify({
+      type: 'res',
+      id: input.frameId,
+      ok: false,
+      error: {
+        code: refusal?.code || 'OPENCLAW_EXECUTION_UNAVAILABLE',
+        message: refusal?.admission.reason || 'OpenClaw execution is unavailable.',
+        retryable: refusal?.retryable === true,
+      },
+    }));
+    return true;
+  }
+}
+
 function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
   const userId = user.userId;
   const authorizationBinding = (browserWs as any).__portalAuthorizationBinding as
@@ -13772,6 +13942,17 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       subscribeBackendToLiveSessionEvents(frameSessionKey);
     }
 
+    // The direct proxy starts turns too. Everything from here to the socket
+    // write below is synchronous, so this is its last look at the maintenance
+    // marker, host-mutation journals and authorization fence.
+    if (refuseDurablyBlockedDirectTurn({
+      method: frameMethod,
+      frameId: frame.id,
+      sessionKey: frameSessionKey,
+      reservationRunId: directReservationRunId,
+      send: (payload) => browserWs.send(payload),
+    })) return;
+
     // Pass through request frames — coerce id to string (gateway requires string IDs)
     if (typeof frame.id === 'number') {
       const numericId = frame.id;
@@ -13986,6 +14167,7 @@ export function attachPortalWebSocket(httpServer: HttpServer) {
 // Narrow test surface for the Agent Chat trust-boundary ordering. Project Chat
 // keeps using the shared gateway transport for sandbox history/reconnect.
 export const __gatewayExecutionScopeTest = {
+  refuseDurablyBlockedDirectTurn,
   requireHostOperatorExecutionContext,
   openClawAgentChatSessionKey,
   isPortalAgentChatSessionKeyForUser,

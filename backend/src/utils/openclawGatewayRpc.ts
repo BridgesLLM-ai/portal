@@ -6,6 +6,7 @@
  * 
  * Protocol: JSON-RPC over WebSocket with connect handshake.
  */
+import { isOpenClawExecutionCapableGatewayCall } from '../services/openClawExecutionCapableMethods';
 import WebSocket from 'ws';
 import { getOpenClawWsUrl } from '../config/openclaw';
 import { buildSignedDevice, getOrCreateDeviceKeys } from './deviceIdentity';
@@ -94,6 +95,45 @@ export async function withOpenClawSessionMutation<T>(
  * The gateway enforces one connection per clientId. Creating throwaway connections
  * while the persistent WS is alive displaces it, breaking chat streaming.
  */
+/**
+ * The admission service reaches this module through its question-runtime probe,
+ * so it is loaded at call time rather than imported. A failure to load it, or
+ * to read the evidence, refuses the call: this guard never fails open.
+ */
+export function refuseDurablyBlockedExecutionRpc(
+  method: string,
+  params: unknown,
+  binding: { generation: number } | null,
+  assertNotDurablyBlocked?: () => void,
+): { error: string; errorCode: string; errorMessage: string } | null {
+  if (!isOpenClawExecutionCapableGatewayCall(method, params)) return null;
+  try {
+    if (assertNotDurablyBlocked) assertNotDurablyBlocked();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    else require('../services/openClawExecutionAdmission').assertOpenClawDispatchNotDurablyBlocked({}, { binding });
+    return null;
+  } catch (error: any) {
+    const errorMessage = typeof error?.message === 'string' && error.message
+      ? error.message
+      : 'OpenClaw execution is unavailable.';
+    const errorCode = typeof error?.code === 'string' && error.code.startsWith('OPENCLAW_EXECUTION_')
+      ? error.code
+      : 'OPENCLAW_EXECUTION_UNAVAILABLE';
+    return { error: errorMessage, errorCode, errorMessage };
+  }
+}
+
+function captureAdmittedDispatchBindingForRpc(method: string, params: unknown): { generation: number } | null {
+  if (!isOpenClawExecutionCapableGatewayCall(method, params)) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('../services/openClawExecutionAdmission').captureAdmittedOpenClawDispatchBinding() || null;
+  } catch {
+    // The guard itself loads the same module and refuses the call if it cannot.
+    return null;
+  }
+}
+
 export async function gatewayRpcCall(method: string, params: Record<string, any>, timeoutMs = 10000): Promise<RpcResponse> {
   // Try persistent WS first to avoid clientId collision. If the persistent RPC
   // path accepts the call but fails/times out, surface that failure instead of
@@ -149,6 +189,9 @@ function openThrowawayGatewayRpc(
   params: Record<string, any>,
   timeoutMs: number,
 ): Promise<RpcAttempt> {
+  // Captured here, in the caller's context: the method frame is written from a
+  // socket callback, and the guard must judge the dispatch that asked for it.
+  const admittedBinding = captureAdmittedDispatchBindingForRpc(method, params);
   return new Promise((resolve) => {
     let resolved = false;
     const done = (result: RpcAttempt) => {
@@ -268,7 +311,14 @@ function openThrowawayGatewayRpc(
               });
               return;
             }
-            // Step 2: Send the actual RPC method
+            // Step 2: Send the actual RPC method. One that starts, resumes or
+            // schedules execution gets a last synchronous look at the durable
+            // maintenance evidence; nothing is awaited between it and the write.
+            const refusal = refuseDurablyBlockedExecutionRpc(method, params, admittedBinding);
+            if (refusal) {
+              done({ ok: false, retriable: false, ...refusal });
+              return;
+            }
             messageId++;
             methodId = String(messageId);
             send({

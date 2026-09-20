@@ -3535,6 +3535,48 @@ describe('Agent Chat execution boundary', () => {
   });
 });
 
+describe('direct proxy turn dispatch honours durable maintenance evidence', () => {
+  const maintenance = () => {
+    throw Object.assign(new Error('OPENCLAW_EXECUTION_MAINTENANCE'), { code: 'OPENCLAW_EXECUTION_MAINTENANCE' });
+  };
+
+  it.each(['chat.send', 'sessions.steer'])('answers %s itself and releases the reservation when blocked', (method) => {
+    const sent: string[] = [];
+    const released: Array<[string, string]> = [];
+    const refused = __gatewayExecutionScopeTest.refuseDurablyBlockedDirectTurn({
+      method,
+      frameId: 41,
+      sessionKey: 'agent:main:main',
+      reservationRunId: 'direct-run-1',
+      send: (payload) => sent.push(payload),
+      assertNotDurablyBlocked: maintenance,
+      releaseReservation: (sessionKey, runId) => released.push([sessionKey, runId]),
+    });
+    expect(refused).toBe(true);
+    expect(released).toEqual([['agent:main:main', 'direct-run-1']]);
+    expect(sent).toHaveLength(1);
+    expect(JSON.parse(sent[0])).toMatchObject({
+      type: 'res', id: 41, ok: false, error: { code: 'OPENCLAW_EXECUTION_UNAVAILABLE', retryable: false },
+    });
+  });
+
+  it('forwards a turn when nothing is recorded, and never gates read-only frames', () => {
+    const sent: string[] = [];
+    let inspected = 0;
+    const open = () => { inspected += 1; };
+    expect(__gatewayExecutionScopeTest.refuseDurablyBlockedDirectTurn({
+      method: 'chat.send', frameId: 'a', sessionKey: 'agent:main:main', send: (payload) => sent.push(payload),
+      assertNotDurablyBlocked: open,
+    })).toBe(false);
+    expect(inspected).toBe(1);
+    expect(__gatewayExecutionScopeTest.refuseDurablyBlockedDirectTurn({
+      method: 'chat.history', frameId: 'b', sessionKey: 'agent:main:main', send: (payload) => sent.push(payload),
+      assertNotDurablyBlocked: maintenance,
+    })).toBe(false);
+    expect(sent).toEqual([]);
+  });
+});
+
 describe('host-created OpenClaw sessions stay reachable', () => {
   const OWNER = '11111111-2222-4333-8444-555555555555';
   const OTHER = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';

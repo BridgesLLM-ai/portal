@@ -520,6 +520,14 @@ export class OpenClawProvider implements AgentProvider {
         if (/^[a-zA-Z0-9_-]{1,64}$/.test(agentId)) agentIds.add(agentId);
       }
     }
+    if (options.onlyAgentIds) {
+      const requested = new Set(
+        options.onlyAgentIds.map((rawAgentId) => String(rawAgentId || '').trim()),
+      );
+      for (const agentId of Array.from(agentIds)) {
+        if (!requested.has(agentId)) agentIds.delete(agentId);
+      }
+    }
     if (agentIds.size === 0) return [];
 
     const snapshots = await Promise.all(Array.from(agentIds).map(async (agentId) => {

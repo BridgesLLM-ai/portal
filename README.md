@@ -40,7 +40,7 @@ Portal 5 brings a unified Project Work surface and broader native-harness suppor
 - **Maintenance is explicit.** Update Portal first, then review **Update Compatible AI Tools** for the release-qualified runtime set. Ordinary Portal updates do not upgrade the host interpreter or OpenClaw core. A supported 9.x question-plugin transition can briefly restart the gateway.
 - **Backups have a clear scope.** Standard backups save Portal data and project files. Comprehensive adds available agent personality and Portal-native history as reference exports—not provider logins, runtime databases, mail, or a whole-server image.
 
-Read the complete [5.0.9 changelog](CHANGELOG.md#509---2026-09-15), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
+Read the complete [5.0.10 changelog](CHANGELOG.md#5010---2026-09-20), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
 
 ## What you get
 
