@@ -96,6 +96,24 @@ describe('openclawAuthWizardContract', () => {
     expect(() => parseModelDiscovery({ source: 'gateway' })).toThrow(/malformed/);
   });
 
+  it('accepts recommendations only for exact ready discovered routes and removes duplicates', () => {
+    const result = parseModelDiscovery({ source: 'native', models: [
+      { id: 'anthropic/claude-sonnet-5-5', readiness: 'ready' },
+      { id: 'anthropic/claude-opus-5-5', readiness: 'unavailable' },
+      { id: 'anthropic/claude-haiku-5-5', readiness: 'unknown' },
+    ], suggestions: [
+      { id: 'anthropic/claude-opus-5-5', reason: 'Unavailable must not be suggested' },
+      { id: 'anthropic/claude-haiku-5-5', reason: 'Unknown must not be suggested' },
+      { id: 'anthropic/absent', reason: 'Not in catalog' },
+      { id: 'claude-cli/claude-sonnet-5-5', reason: 'Different route' },
+      { id: 'anthropic/claude-sonnet-5-5', reason: 'Balanced Claude work' },
+      { id: 'anthropic/claude-sonnet-5-5', reason: 'Duplicate' },
+    ] });
+    expect(result.suggestions).toEqual([{ id: 'anthropic/claude-sonnet-5-5', reason: 'Balanced Claude work' }]);
+    expect(parseModelDiscovery({ source: 'defaults', models: [{ id: 'anthropic/claude-sonnet-5-5' }],
+      suggestions: [{ id: 'anthropic/claude-sonnet-5-5', reason: 'Preset only' }] }).suggestions).toEqual([]);
+  });
+
   it('compares model ids canonically and formats server rejections with remediation and code', () => {
     expect(sameModel('claude-cli/claude-opus-5', 'anthropic/claude-opus-5')).toBe(true);
     expect(sameModel('anthropic/claude-opus-5', null)).toBe(false);

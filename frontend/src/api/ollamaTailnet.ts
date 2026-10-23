@@ -184,7 +184,7 @@ const modelSchema = z.object({
   size: z.number().finite().nonnegative().optional(),
   sizeBytes: z.number().finite().nonnegative().optional(),
   modifiedAt: boundedText(256).nullable().optional(),
-  details: z.record(z.unknown()).optional(),
+  details: z.record(z.string(), z.unknown()).optional(),
 });
 
 const inventoryAuthoritySchema = z.object({

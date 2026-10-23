@@ -48,6 +48,10 @@ const SS = '/usr/bin/ss';
 const SYSTEMD_CGROUP_ROOT = '/sys/fs/cgroup';
 const SYSTEMD_OPERATION_TIMEOUT_MS = 45_000;
 const SYSTEMD_SETTLE_TIMEOUT_MS = 30_000;
+// A native Gateway can be systemd-active while loading its provider plugins.
+// Installed acceptance observed a valid listener only after 47 seconds. Keep
+// stop/settlement bounds unchanged and allow a bounded cold-start separately.
+const GATEWAY_LISTENER_START_TIMEOUT_MS = 90_000;
 const SYSTEMD_SETTLE_POLL_MS = 100;
 
 export interface OpenClawGatewayUnitSnapshot {
@@ -1031,7 +1035,7 @@ export function createOpenClawGatewayAuthorizationFence(
   };
 
   const waitForListenerAuthority = async (port: number): Promise<void> => {
-    const deadline = dependencies.now() + SYSTEMD_SETTLE_TIMEOUT_MS;
+    const deadline = dependencies.now() + GATEWAY_LISTENER_START_TIMEOUT_MS;
     while (dependencies.now() <= deadline) {
       if (await assertListenerAuthority(port, true)) return;
       await dependencies.wait(SYSTEMD_SETTLE_POLL_MS);

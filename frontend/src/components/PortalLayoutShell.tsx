@@ -1,5 +1,6 @@
 import { MotionConfig } from 'framer-motion';
 import Layout from './Layout';
+import { QuestionAttentionProvider } from '../contexts/QuestionAttentionContext';
 import GlobalControls from './GlobalControls';
 import { useTheme } from '../contexts/ThemeContext';
 
@@ -14,7 +15,9 @@ export default function PortalLayoutShell() {
   return (
     <MotionConfig reducedMotion={resolvedEffects === 'reduced' ? 'always' : 'user'}>
       <GlobalControls>
-        <Layout />
+        <QuestionAttentionProvider>
+          <Layout />
+        </QuestionAttentionProvider>
       </GlobalControls>
     </MotionConfig>
   );

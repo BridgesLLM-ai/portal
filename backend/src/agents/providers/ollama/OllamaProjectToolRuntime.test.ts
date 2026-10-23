@@ -103,7 +103,7 @@ function inspectFor(fixture: Fixture, running = true): any {
       NanoCpus: 2_000_000_000,
       Ulimits: [
         { Name: 'nofile', Soft: 1024, Hard: 1024 },
-        { Name: 'nproc', Soft: 256, Hard: 256 },
+        { Name: 'nproc', Soft: 4096, Hard: 4096 },
       ],
       Devices: [],
       DeviceRequests: [],
@@ -139,7 +139,8 @@ class RuntimeExecutor implements OllamaProjectCommandExecutor {
       return { stdout: this.fixture.plan.runtimeImage + '\n', stderr: '', exitCode: 0 };
     }
     if (args[0] === 'container' && args[1] === 'inspect') {
-      return this.removed
+      const current = args[2] === this.fixture.plan.containerName || args[2] === 'd'.repeat(64);
+      return this.removed || !current
         ? { stdout: '', stderr: 'Error: No such container', exitCode: 1 }
         : { stdout: JSON.stringify([inspectFor(this.fixture)]), stderr: '', exitCode: 0 };
     }
@@ -288,7 +289,7 @@ describe('confined Ollama Project coding tool runtime', () => {
 
       const dockerOrderedUlimits = inspectFor(fixture);
       dockerOrderedUlimits.HostConfig.Ulimits = [
-        { Name: 'nproc', Hard: 256, Soft: 256 },
+        { Name: 'nproc', Hard: 4096, Soft: 4096 },
         { Name: 'nofile', Hard: 1024, Soft: 1024 },
       ];
       expect(() => attestOllamaProjectRuntimeContainer({
@@ -329,7 +330,8 @@ describe('confined Ollama Project coding tool runtime', () => {
         'python3', '-c',
       ]));
       expect(execCalls[1].options?.timeoutMs).toBe(30_000);
-      expect(executor.calls.filter((call) => call.args[0] === 'container' && call.args[1] === 'inspect')).toHaveLength(2);
+      // The absent pre-ceiling generation probe, the current runtime, and its re-attestation.
+      expect(executor.calls.filter((call) => call.args[0] === 'container' && call.args[1] === 'inspect')).toHaveLength(3);
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
@@ -526,5 +528,86 @@ describe('confined Ollama Project coding tool runtime', () => {
       releaseInitialInspect();
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Ollama Project runtime shared-UID process ceiling', () => {
+  function legacyInspect(fixture: Fixture, overrides: Record<string, any> = {}): any {
+    const legacyPlan = buildOllamaProjectRuntimePlan(fixture.context, 'LEGACY_SHARED_NPROC');
+    const inspect = inspectFor({ ...fixture, plan: legacyPlan });
+    inspect.Id = 'e'.repeat(64);
+    inspect.HostConfig.Ulimits = [
+      { Name: 'nofile', Soft: 1024, Hard: 1024 },
+      { Name: 'nproc', Soft: 256, Hard: 256 },
+    ];
+    return Object.assign(inspect, overrides);
+  }
+
+  class GenerationExecutor implements OllamaProjectCommandExecutor {
+    readonly calls: Array<{ args: readonly string[] }> = [];
+    private current: any = null;
+    constructor(private readonly fixture: Fixture, private legacy: any) {}
+    async run(_command: string, args: readonly string[]): Promise<OllamaProjectCommandResult> {
+      this.calls.push({ args });
+      const legacyName = buildOllamaProjectRuntimePlan(this.fixture.context, 'LEGACY_SHARED_NPROC').containerName;
+      if (args[0] === 'image' && args[1] === 'inspect') return { stdout: this.fixture.plan.runtimeImage + '\n', stderr: '', exitCode: 0 };
+      if (args[0] === 'container' && args[1] === 'inspect') {
+        const found = args[2] === legacyName || args[2] === 'e'.repeat(64) ? this.legacy
+          : args[2] === this.fixture.plan.containerName || args[2] === 'd'.repeat(64) ? this.current : null;
+        return found ? { stdout: JSON.stringify([found]), stderr: '', exitCode: 0 } : { stdout: '', stderr: 'Error: No such container', exitCode: 1 };
+      }
+      if (args[0] === 'container' && args[1] === 'rm') {
+        if (args.at(-1) === 'e'.repeat(64)) this.legacy = null;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (args[0] === 'container' && args[1] === 'create') return { stdout: 'd'.repeat(64) + '\n', stderr: '', exitCode: 0 };
+      if (args[0] === 'container' && args[1] === 'start') { this.current = inspectFor(this.fixture); return { stdout: '', stderr: '', exitCode: 0 }; }
+      if (args[0] === 'container' && args[1] === 'exec') {
+        const nonce = String(args.at(-1) || '');
+        return { stdout: JSON.stringify({ uid: PROJECT_RUNTIME_UID, gid: PROJECT_RUNTIME_GID, cwd: OLLAMA_PROJECT_CONTAINER_ROOT,
+          python: '/usr/bin/python3', shell: '/usr/bin/sh', git: '/usr/bin/git', node: '/usr/bin/node', ripgrep: '/usr/bin/rg',
+          writeReadUnlink: true, evidenceSha256: crypto.createHash('sha256').update(nonce).digest('hex') }), stderr: '', exitCode: 0 };
+      }
+      throw new Error('unexpected command: ' + args.join(' '));
+    }
+  }
+
+  test('launches with the shared 4096 nproc ceiling while keeping the 256 pids cap', () => {
+    const fixture = makeFixture();
+    const args = fixture.plan.createArgs;
+    expect(args[args.indexOf('--pids-limit') + 1]).toBe('256');
+    expect(args).toContain('nproc=4096:4096');
+    expect(args).not.toContain('nproc=256:256');
+    expect(fixture.plan.nprocLimit).toBe(4096);
+    const legacyPlan = buildOllamaProjectRuntimePlan(fixture.context, 'LEGACY_SHARED_NPROC');
+    expect(legacyPlan.containerName).not.toBe(fixture.plan.containerName);
+    expect(legacyPlan.createArgs).toContain('nproc=256:256');
+    expect(() => attestOllamaProjectRuntimeContainer({ inspect: inspectFor(fixture), plan: fixture.plan, requireRunning: true })).not.toThrow();
+    const stale = inspectFor(fixture);
+    stale.HostConfig.Ulimits = [{ Name: 'nofile', Soft: 1024, Hard: 1024 }, { Name: 'nproc', Soft: 256, Hard: 256 }];
+    expect(() => attestOllamaProjectRuntimeContainer({ inspect: stale, plan: fixture.plan, requireRunning: true })).toThrow('ulimits');
+  });
+
+  test('retires the exact pre-ceiling runtime before creating the current one', async () => {
+    const fixture = makeFixture();
+    const executor = new GenerationExecutor(fixture, legacyInspect(fixture));
+    const handle = await new OllamaProjectToolRuntime(executor).ensure(fixture.context);
+    expect(handle.containerName).toBe(fixture.plan.containerName);
+    const removed = executor.calls.filter(({ args }) => args[1] === 'rm').map(({ args }) => args.at(-1));
+    expect(removed).toEqual(['e'.repeat(64)]);
+    expect(executor.calls.some(({ args }) => args[1] === 'create')).toBe(true);
+  });
+
+  test.each([
+    ['a foreign nproc value', { nproc: 512 }],
+    ['an unrelated image', { image: 'sha256:' + 'f'.repeat(64) }],
+  ])('refuses and never removes a legacy-named container with %s', async (_label, change: any) => {
+    const fixture = makeFixture();
+    const foreign = legacyInspect(fixture);
+    if (change.nproc) foreign.HostConfig.Ulimits = [{ Name: 'nofile', Soft: 1024, Hard: 1024 }, { Name: 'nproc', Soft: change.nproc, Hard: change.nproc }];
+    if (change.image) { foreign.Image = change.image; foreign.Config.Image = change.image; }
+    const executor = new GenerationExecutor(fixture, foreign);
+    await expect(new OllamaProjectToolRuntime(executor).ensure(fixture.context)).rejects.toThrow();
+    expect(executor.calls.filter(({ args }) => args[1] === 'rm' || args[1] === 'create')).toEqual([]);
   });
 });

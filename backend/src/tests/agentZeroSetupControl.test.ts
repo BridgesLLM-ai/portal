@@ -28,8 +28,8 @@ function runtimeReady(overrides: Partial<AgentZeroRuntimeStatus> = {}): AgentZer
     installed: true,
     running: true,
     ready: true,
-    version: '2.11',
-    expectedVersion: '2.11',
+    version: '2.14',
+    expectedVersion: '2.14',
     pinnedImage: true,
     loopbackOnly: true,
     persistentData: true,
@@ -47,8 +47,8 @@ function hostBridgeInstalled(overrides: Partial<AgentZeroHostGatewayStatus> = {}
     installed: true,
     running: false,
     ready: false,
-    cliVersion: '2.11',
-    expectedCliVersion: '2.11',
+    cliVersion: '2.14',
+    expectedCliVersion: '2.14',
     gatewayId: 'bridgesllm-portal-host',
     capabilities: {
       scope: 'HOST_OPERATOR',
@@ -85,7 +85,7 @@ describe('Agent Zero owner setup control plane', () => {
     });
 
     expect(value).toMatchObject({
-      testedVersions: { agentZero: '2.11', connector: '0.1.0', hostBridge: '2.11' },
+      testedVersions: { agentZero: '2.14', connector: '0.1.0', hostBridge: '2.14' },
       mainAgentChat: {
         scope: 'HOST_OPERATOR',
         available: true,

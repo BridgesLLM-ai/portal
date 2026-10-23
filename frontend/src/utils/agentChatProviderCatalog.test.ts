@@ -511,7 +511,7 @@ describe('Agent Chat provider catalog cache', () => {
     await expect(backgroundFlight).rejects.toMatchObject({ name: 'AbortError' });
   });
 
-  it('times out a catalog that never settles without creating an unbounded request loop', async () => {
+  it('closes a row that never settles without creating an unbounded request loop', async () => {
     vi.useFakeTimers();
     mocks.get.mockResolvedValue({
       data: { providers: [provider('CODEX', 'checking')] },
@@ -522,15 +522,127 @@ describe('Agent Chat provider catalog cache', () => {
       pollIntervalMs: 10,
       requestTimeoutMs: 10,
     });
+    await vi.advanceTimersByTimeAsync(40);
+    const [codex] = await request;
+
+    expect(codex).toMatchObject({
+      checkTimedOut: true,
+      checking: false,
+      usable: false,
+      availabilityState: 'error',
+    });
+    expect(assessAgentChatProviderAvailability('CODEX', codex)).toMatchObject({
+      canSend: false,
+      retryable: true,
+      message: 'Codex is still being checked. Retry to check again.',
+    });
+    expect(mocks.get.mock.calls.length).toBeGreaterThan(0);
+    expect(mocks.get.mock.calls.length).toBeLessThanOrEqual(4);
+  });
+
+  it('keeps a ready native harness usable when only OpenClaw is still checking at the deadline', async () => {
+    vi.useFakeTimers();
+    mocks.get.mockResolvedValue({
+      data: { providers: [provider('OPENCLAW', 'checking'), provider('CODEX', 'ready')] },
+    });
+
+    // Before this change the whole catalog rejected with TIMEOUT here, so every
+    // awaiting consumer (Settings, UserAvatar, workspace, picker) lost Codex too.
+    const request = loadAgentChatProviderCatalog({ timeoutMs: 30, pollIntervalMs: 10 });
+    await vi.advanceTimersByTimeAsync(40);
+    const [openClaw, codex] = await request;
+
+    expect(codex).toEqual(provider('CODEX', 'ready'));
+    expect(assessAgentChatProviderAvailability('CODEX', codex).canSend).toBe(true);
+    expect(openClaw).toMatchObject({ checkTimedOut: true, usable: false });
+    expect(assessAgentChatProviderAvailability('OPENCLAW', openClaw)).toMatchObject({
+      canSend: false,
+      retryable: true,
+      message: 'OpenClaw is still being checked. Retry to check again.',
+    });
+    // Closed rows are display-only: the next load must fetch fresh evidence.
+    mocks.get.mockResolvedValueOnce({
+      data: { providers: [provider('OPENCLAW', 'ready'), provider('CODEX', 'ready')] },
+    });
+    await expect(loadAgentChatProviderCatalog()).resolves.toEqual([
+      provider('OPENCLAW', 'ready'),
+      provider('CODEX', 'ready'),
+    ]);
+  });
+
+  it('does not let a short status probe cut short a longer OpenClaw wait on the same flight', async () => {
+    vi.useFakeTimers();
+    mocks.get
+      .mockResolvedValueOnce({ data: { providers: [provider('OPENCLAW', 'checking')] } })
+      .mockResolvedValueOnce({ data: { providers: [provider('OPENCLAW', 'checking')] } })
+      .mockResolvedValueOnce({ data: { providers: [provider('OPENCLAW', 'checking')] } })
+      .mockResolvedValue({ data: { providers: [provider('OPENCLAW', 'ready')] } });
+
+    const chatSnapshots: Array<[AgentChatProviderCatalogEntry[], AgentChatProviderCatalogSnapshotMetadata]> = [];
+    // UserAvatar/Settings create the flight with a 10 s budget in production.
+    const statusProbe = loadAgentChatProviderCatalog({ force: true, timeoutMs: 15, pollIntervalMs: 10 });
+    const chatWait = loadAgentChatProviderCatalog({
+      timeoutMs: 100,
+      pollIntervalMs: 10,
+      onSnapshot: (providers, metadata) => chatSnapshots.push([providers, metadata]),
+    });
+
+    await vi.advanceTimersByTimeAsync(16);
+    await expect(statusProbe).resolves.toEqual([
+      expect.objectContaining({ harnessId: 'OPENCLAW', checkTimedOut: true }),
+    ]);
+    await vi.advanceTimersByTimeAsync(30);
+    await expect(chatWait).resolves.toEqual([provider('OPENCLAW', 'ready')]);
+    expect(chatSnapshots.some(([providers]) => providers[0].checkTimedOut)).toBe(false);
+    expect(chatSnapshots.at(-1)).toEqual([
+      [provider('OPENCLAW', 'ready')],
+      expect.objectContaining({ source: 'network', fresh: true }),
+    ]);
+  });
+
+  it('rejects with a typed TIMEOUT only when no row was ever returned', async () => {
+    vi.useFakeTimers();
+    mocks.get.mockReturnValue(new Promise(() => undefined));
+
+    const request = loadAgentChatProviderCatalog({ timeoutMs: 30, requestTimeoutMs: 1_000 });
     const rejection = expect(request).rejects.toEqual(expect.objectContaining({
       name: 'AgentChatProviderCatalogLoadError',
       code: 'TIMEOUT',
     }));
-    await vi.advanceTimersByTimeAsync(40);
+    await vi.advanceTimersByTimeAsync(31);
     await rejection;
+  });
 
-    expect(mocks.get.mock.calls.length).toBeGreaterThan(0);
-    expect(mocks.get.mock.calls.length).toBeLessThanOrEqual(3);
+  it('delivers the closed rows to a snapshot-driven selected-provider revalidation', async () => {
+    vi.useFakeTimers();
+    mocks.get.mockResolvedValue({ data: { providers: [provider('OPENCLAW', 'checking')] } });
+    let state: AgentChatSelectedProviderRevalidationState | null =
+      reduceAgentChatSelectedProviderRevalidation(null, {
+        type: 'begin',
+        provider: 'OPENCLAW',
+        generation: 1,
+        requestVersion: 0,
+      });
+    const request = loadAgentChatProviderCatalog({
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      onSnapshot: (providers, metadata) => {
+        state = reduceAgentChatSelectedProviderRevalidation(state, {
+          type: 'snapshot',
+          provider: 'OPENCLAW',
+          generation: 1,
+          providers,
+          metadata,
+        });
+      },
+    });
+    await vi.advanceTimersByTimeAsync(40);
+    const [openClaw] = await request;
+
+    expect(isAgentChatSelectedProviderRevalidationPending('OPENCLAW', state, 0)).toBe(false);
+    expect(assessAgentChatProviderAvailability('OPENCLAW', openClaw, {
+      loading: isAgentChatSelectedProviderRevalidationPending('OPENCLAW', state, 0),
+    })).toMatchObject({ status: 'error', canSend: false, retryable: true });
   });
 
   it.each([

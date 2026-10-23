@@ -9,15 +9,98 @@ import {
   type NativeCliProviderAdapter,
   type NativeCliTurnContext,
 } from '../types';
-import { nativeSessionMessageCount } from '../../NativeSessionStore';
+import { nativeSessionMessageCount, type NativeSessionData } from '../../NativeSessionStore';
 import { asRecord, extractAbsolutePathDirs } from '../approvalScope';
+import { buildNativeCliEnvironment } from '../NativeCliEnvironment';
 import { redactNativeProviderText } from '../NativeProviderDiagnostics';
 import {
   CLAUDE_CODE_PROJECT_RUNTIME,
   buildClaudeCodeProjectInvocation,
 } from '../projectSandbox/ClaudeCodeProjectSandbox';
+import { CHAT_BRIDGE_SERVER_NAME, CHAT_BRIDGE_TOOL_NAMES, type ChatBridgeTurn } from '../../../chatBridge/contract';
+import { AI_PROVIDER_MAP } from '../../../../config/aiProviders';
+import { ChatImageError } from '../../../../services/chatImages/chatImageModelPolicy';
+import { HOST_AGENT_RUN_STDIN_MAX_BYTES } from '../../../../services/hostAgentRunActivationGate';
 
 const CLAUDE_STRUCTURED_ERROR_MAX_BYTES = 16 * 1024;
+
+/** Every bridge tool (questions, widgets, goal read/update) is always granted
+ * when the bridge is open; `dontAsk` would deny an ungranted one. Claude's own
+ * AskUserQuestion cannot reach a person from `-p` and is withheld. */
+export const CLAUDE_BRIDGE_ALLOWED_TOOLS = Object.freeze(
+  CHAT_BRIDGE_TOOL_NAMES.map((name) => `mcp__${CHAT_BRIDGE_SERVER_NAME}__${name}`),
+);
+
+/**
+ * Models Claude Code itself declares: the `--model` aliases from its own help
+ * ("an alias for the latest model (e.g. 'fable', 'opus', or 'sonnet')") plus
+ * the Portal's declared Claude catalog. Every entry is a Claude model with
+ * image input; anything else (an arbitrary custom id) is refused photos.
+ */
+const CLAUDE_CODE_DECLARED_ALIASES = Object.freeze(['fable', 'opus', 'sonnet', 'haiku']);
+
+function claudeDeclaredImageModels(): Set<string> {
+  const declared = new Set<string>(CLAUDE_CODE_DECLARED_ALIASES);
+  for (const model of AI_PROVIDER_MAP.get('anthropic')?.defaultModels || []) {
+    const id = String(model.id || '').trim();
+    if (!id) continue;
+    declared.add(id);
+    if (id.startsWith('anthropic/')) declared.add(id.slice('anthropic/'.length));
+  }
+  return declared;
+}
+
+/**
+ * The one stdin line `--input-format stream-json` accepts: a user message with
+ * the prompt text followed by base64 JPEG blocks. Deterministic, so the
+ * provider can recompute and compare it.
+ */
+export function encodeClaudeHostStdin(ctx: NativeCliTurnContext): string {
+  const images = ctx.chatImages || [];
+  if (images.length === 0) return ctx.message;
+  const line = `${JSON.stringify({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [
+        { type: 'text', text: validateNativeHostPrompt(ctx.message) },
+        ...images.map((image) => {
+          if (image?.mimeType !== 'image/jpeg' || typeof image.content !== 'string' || !image.content) {
+            throw new Error('Claude photo input is not a prepared JPEG');
+          }
+          return { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image.content } };
+        }),
+      ],
+    },
+  })}\n`;
+  if (Buffer.byteLength(line, 'utf8') > HOST_AGENT_RUN_STDIN_MAX_BYTES) {
+    throw new Error('Claude photo input exceeds the host stdin bound');
+  }
+  return line;
+}
+
+function claudeBridgeMcpConfig(bridge: ChatBridgeTurn): string {
+  const { command, args } = bridge.launch;
+  if (!path.isAbsolute(command) || args.length !== 1 || !path.isAbsolute(args[0])) {
+    throw new Error('Claude chat bridge launch is invalid');
+  }
+  // Command and script path only: the capability token travels in the process
+  // environment Claude hands to its MCP children, never in argv.
+  return JSON.stringify({
+    mcpServers: {
+      [CHAT_BRIDGE_SERVER_NAME]: { type: 'stdio', command, args: [...args] },
+    },
+  });
+}
+
+async function assertClaudeImageModel(session: NativeSessionData): Promise<string> {
+  const model = validateNativeHostModel(session.model);
+  // No override: Claude Code runs its own default, which is one of its
+  // declared Claude models.
+  if (!model) return 'claude-code-default';
+  if (!claudeDeclaredImageModels().has(model)) throw new ChatImageError('IMAGE_MODEL_UNSUPPORTED');
+  return model;
+}
 
 function captureClaudeStructuredError(parsed: any): string | null {
   const errorCode = typeof parsed?.error === 'string'
@@ -190,6 +273,10 @@ export const claudeCodeAdapter: NativeCliProviderAdapter = {
   messageIdPrefix: 'claude-msg',
   initialStatus: 'Claude is thinking…',
   spawnErrorPrefix: 'Failed to spawn claude CLI',
+  supportsChatBridge: true,
+  supportsChatImages: true,
+  assertChatImageModel: assertClaudeImageModel,
+  encodeHostStdin: encodeClaudeHostStdin,
   configureSession: async (_userId: string, config: AgentSessionConfig) => ({
     ...config,
     metadata: {
@@ -223,28 +310,59 @@ export const claudeCodeAdapter: NativeCliProviderAdapter = {
     }
     const hostSessionId = validateNativeHostSessionId(nativeSessionId, true)!;
     const hostModel = validateNativeHostModel(ctx.session.model);
-    const hostPrompt = validateNativeHostPrompt(ctx.message);
+    validateNativeHostPrompt(ctx.message);
+    const stdinText = encodeClaudeHostStdin(ctx);
     const { allowedTools, addDirs } = validateClaudeHostGrants(
       ctx.state.approvedAllowedTools,
       ctx.state.approvedAddDirs,
     );
+    const bridge = ctx.chatBridge || null;
     const args = [
       '-p',
       '--verbose',
       '--output-format', 'stream-json',
       '--include-partial-messages',
-      // Never inherit host CLAUDE.md, skills, hooks, plugins, MCP servers,
-      // permission allowlists, additional directories, or default mode.
-      // `dontAsk` denies ungranted tools so the structured denial can cross
-      // the Portal approval broker and an exact grant can be retried.
-      '--safe-mode',
-      '--disable-slash-commands',
-      '--strict-mcp-config',
-      '--mcp-config', '{"mcpServers":{}}',
-      '--setting-sources', '',
-      '--permission-mode', 'dontAsk',
     ];
-    if (allowedTools.length > 0) args.push('--allowedTools', allowedTools.join(' '));
+    if ((ctx.chatImages || []).length > 0) args.push('--input-format', 'stream-json');
+    let env: NodeJS.ProcessEnv | undefined;
+    if (bridge) {
+      // `--safe-mode` refuses every MCP server, including --mcp-config, so the
+      // bridge replaces it with explicit isolation (probed 2.1.295): no
+      // settings sources, no user/project CLAUDE.md, skills, hooks, plugins,
+      // slash commands or auto-memory, and exactly one MCP server.
+      args.push(
+        '--setting-sources', '',
+        '--strict-mcp-config',
+        '--mcp-config', claudeBridgeMcpConfig(bridge),
+        '--disable-slash-commands',
+        '--settings', '{"autoMemoryEnabled":false}',
+        '--permission-mode', 'dontAsk',
+      );
+      const grants = [...new Set([...CLAUDE_BRIDGE_ALLOWED_TOOLS, ...allowedTools])].sort();
+      args.push('--allowedTools', grants.join(' '));
+      args.push('--disallowedTools', 'AskUserQuestion');
+      env = {
+        ...buildNativeCliEnvironment('CLAUDE_CODE'),
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+        MCP_TOOL_TIMEOUT: String(bridge.launch.toolTimeoutMs),
+        // Host runs deliver this environment over the activation socket only.
+        ...bridge.launch.env,
+      };
+    } else {
+      args.push(
+        // Never inherit host CLAUDE.md, skills, hooks, plugins, MCP servers,
+        // permission allowlists, additional directories, or default mode.
+        // `dontAsk` denies ungranted tools so the structured denial can cross
+        // the Portal approval broker and an exact grant can be retried.
+        '--safe-mode',
+        '--disable-slash-commands',
+        '--strict-mcp-config',
+        '--mcp-config', '{"mcpServers":{}}',
+        '--setting-sources', '',
+        '--permission-mode', 'dontAsk',
+      );
+      if (allowedTools.length > 0) args.push('--allowedTools', allowedTools.join(' '));
+    }
     for (const dir of addDirs) args.push('--add-dir', dir);
     if (ctx.session.metadata?.nativeSessionEstablished === true) {
       args.push('--resume', hostSessionId);
@@ -253,7 +371,7 @@ export const claudeCodeAdapter: NativeCliProviderAdapter = {
     }
     if (hostModel) args.push('--model', hostModel);
     ctx.state.nativeSessionId = hostSessionId;
-    return { command: '/usr/bin/claude', args, stdinText: hostPrompt };
+    return { command: '/usr/bin/claude', args, stdinText, ...(env ? { options: { env } } : {}) };
   },
   handleStdoutLine: (line, ctx) => {
     let parsed: any;

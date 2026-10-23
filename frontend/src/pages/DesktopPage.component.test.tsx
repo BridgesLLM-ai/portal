@@ -213,8 +213,8 @@ describe('DesktopPage Remote Desktop contract', () => {
     });
     renderPage();
 
-    expect(await screen.findByText('Remote Desktop configuration error')).toBeVisible();
-    expect(screen.getByText(/disallowed same-origin path "\/novncevil\/session"/i)).toBeVisible();
+    await waitFor(() => expect(screen.getByText('Remote Desktop configuration error')).toBeVisible());
+    await waitFor(() => expect(screen.getByText(/disallowed same-origin path "\/novncevil\/session"/i)).toBeVisible());
     expect(screen.queryByTitle('Remote desktop session')).not.toBeInTheDocument();
   });
 
@@ -229,8 +229,8 @@ describe('DesktopPage Remote Desktop contract', () => {
       }),
     });
     const { unmount } = renderPage();
-    expect(await screen.findByText('Remote Desktop configuration error')).toBeVisible();
-    expect(screen.getByText(/must use HTTP or HTTPS/i)).toBeVisible();
+    await waitFor(() => expect(screen.getByText('Remote Desktop configuration error')).toBeVisible());
+    await waitFor(() => expect(screen.getByText(/must use HTTP or HTTPS/i)).toBeVisible());
     expect(screen.queryByTitle('Remote desktop session')).not.toBeInTheDocument();
     unmount();
 
@@ -244,7 +244,7 @@ describe('DesktopPage Remote Desktop contract', () => {
       }),
     });
     renderPage();
-    expect(await screen.findByText(/must not contain embedded credentials/i)).toBeVisible();
+    await waitFor(() => expect(screen.getByText(/must not contain embedded credentials/i)).toBeVisible());
     expect(screen.queryByTitle('Remote desktop session')).not.toBeInTheDocument();
   });
 

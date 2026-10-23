@@ -3459,6 +3459,18 @@ describe('Agent Chat execution boundary', () => {
     }, actor, database)).resolves.toBe(false);
   });
 
+  test('refuses native photo references before provider I/O when binary forwarding is unavailable', async () => {
+    const sendMessage = jest.fn();
+    const provider = { providerName: 'OPENCLAW', displayName: 'OpenClaw', sendMessage } as any;
+    const begin = jest.spyOn(openClawHostRunJournal, 'beginOpenClawHostRun');
+    await expect(__gatewayExecutionScopeTest.sendHostOperatorProviderMessage({ provider,
+      sessionId: 'agent:main:portal-owner-main',
+      message: '[portal-chat-image:{"fileId":"11111111-1111-4111-8111-111111111111","revision":"2026-10-20T12:00:00.000Z"}]',
+      sender: { label: 'Owner', userId: 'owner-1', authorizationVersion: 9, requestId: 'photo-unsupported' },
+    })).rejects.toMatchObject({ code: 'IMAGE_TRANSPORT_UNAVAILABLE' });
+    expect(sendMessage).not.toHaveBeenCalled(); expect(begin).not.toHaveBeenCalled();
+  });
+
   test('final host dispatch seam rechecks cached admission before journal and provider I/O', async () => {
     const providerName = 'OPENCLAW';
     const displayName = 'OpenClaw';
@@ -3487,6 +3499,7 @@ describe('Agent Chat execution boundary', () => {
         message: 'hello',
         sender: {
           label: 'owner@example.com',
+          role: 'OWNER',
           userId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
           authorizationVersion: 9,
           requestId: 'route-request-1',

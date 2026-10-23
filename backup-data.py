@@ -6,6 +6,12 @@ verify ARCHIVE        Read and verify an archive without changing installed data
 restore ARCHIVE --confirm
                       Offline data restore into an existing Portal installation.
                       The previous database and directories are retained.
+policy show|set       Read or replace the backup retention/space settings (JSON on
+                      stdin for set). Saving settings never deletes or runs anything.
+cleanup preview       List exactly which backups the keep limits would delete.
+cleanup run --plan TOKEN
+                      Delete exactly the previewed backups, or refuse if anything
+                      changed since the preview.
 """
 import argparse
 import contextlib
@@ -16,6 +22,7 @@ import hmac
 import io
 import json
 import os
+import pwd
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -36,6 +43,10 @@ TRUST = Path("/var/lib/bridgesllm/backup-trust")
 CRYPTO_KEYS = ("JWT_SECRET", "JWT_REFRESH_SECRET", "PORTAL_ENCRYPTION_KEY")
 PERSONALITY_FILES = ("AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md", "TOOLS.md")
 UNITS = ("bridgesllm-product.service", "openclaw-gateway.service")
+OPERATION_LOCK = Path("/run/lock/bridgesllm-portal-installer.lock")
+MAINTENANCE_MARKERS = (Path("/var/lib/bridgesllm-restore/active-restore.json"),
+                       Path("/var/lib/bridgesllm-installer/active-update.json"),
+                       Path("/var/lib/bridgesllm-installer/uninstall/active-uninstall.json"))
 
 
 def now():
@@ -107,6 +118,7 @@ def data_roots(env):
         "hosted-apps": Path(env.get("APPS_ROOT", install / "apps")),
         "assets": Path(env.get("PORTAL_ASSETS_ROOT", install / "assets")),
         "portal-state": data / ".data",
+        "desktop-state": Path("/var/lib/bridgesllm/desktop-project-state"),
     }
 
 
@@ -255,20 +267,30 @@ def literal(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+class Refusal(RuntimeError):
+    """A user-facing refusal. Whatever raised it changed nothing it had not
+    already reported."""
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 @contextlib.contextmanager
 def locks():
     private(STATE, directory=True, create=True)
     handles = []
     try:
-        for name in ("/run/lock/bridgesllm-portal-installer.lock", STATE / "backup.lock"):
+        for name in (OPERATION_LOCK, STATE / "backup.lock"):
             fd = os.open(name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
             handles.append(fd)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        for name in ("/var/lib/bridgesllm-restore/active-restore.json",
-                     "/var/lib/bridgesllm-installer/active-update.json",
-                     "/var/lib/bridgesllm-installer/uninstall/active-uninstall.json"):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refusal("BUSY", "Another backup or Portal maintenance operation is running. "
+                                      "Try again when it finishes.") from None
+        for name in MAINTENANCE_MARKERS:
             if Path(name).exists():
-                raise RuntimeError("Finish the pending Portal maintenance operation first")
+                raise Refusal("MAINTENANCE", "Finish the pending Portal maintenance operation first")
         yield
     finally:
         for fd in reversed(handles):
@@ -283,10 +305,10 @@ def digest(path):
     return value.hexdigest()
 
 
-def base_directory():
+def base_directory(create=True):
     config = Path(os.environ.get("BACKUP_CONFIG_FILE", STATE / "backup-base-path"))
     base = Path(private(config).read_text().strip()) if config.exists() else Path("/root/backups")
-    return private(base, directory=True, create=True)
+    return private(base, directory=True, create=create)
 
 
 def add_tree(archive, source, name):
@@ -388,6 +410,410 @@ def verify_local_receipt(archive):
         raise RuntimeError('Backup receipt authentication failed')
 
 
+# Retention and space policy. This file is the only reader, validator and
+# writer: the Portal backend delegates to the policy/cleanup commands, and the
+# systemd timers run create() here, so no setting is honored by the UI alone.
+POLICY_SCHEMA = "bridgesllm.backup-policy.v1"
+KEEP_RANGE = (1, 100)
+RESERVE_RANGE = (0, 1000)
+GIB = 1024 ** 3
+ARCHIVE_NAME = re.compile(r"portal-(daily|weekly|monthly|comprehensive)-[0-9]{8}-[0-9]{6}-data-[0-9a-f]{8}\.tar\.gz")
+RECEIPT_KEYS = {"schema", "archive", "backupType", "completeness", "archiveSize", "archiveMtimeNs",
+                "manifestHmac", "degradedComponents", "signature"}
+
+
+def default_policy():
+    # Missing settings reproduce the fixed behavior that predates them.
+    return {"keep": {"daily": 7, "weekly": 4, "monthly": 3, "comprehensive": 3},
+            "autoCleanup": False, "reserveGiB": 5}
+
+
+def strict_json(raw):
+    def pairs(items):
+        if len({key for key, _ in items}) != len(items):
+            raise ValueError("duplicate key")
+        return dict(items)
+    def constant(_):
+        raise ValueError("non-finite number")
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+
+
+def normalize_policy(value, stored=True):
+    def count(raw, low, high, message):
+        if type(raw) is not int or not low <= raw <= high:
+            raise Refusal("POLICY_INVALID", message)
+        return raw
+    expected = {"keep", "autoCleanup", "reserveGiB"} | ({"schema"} if stored else set())
+    if not isinstance(value, dict) or set(value) != expected or (stored and value["schema"] != POLICY_SCHEMA):
+        raise Refusal("POLICY_INVALID", "Backup settings must contain exactly keep, autoCleanup and reserveGiB")
+    keep = value["keep"]
+    if not isinstance(keep, dict) or set(keep) != set(TYPES):
+        raise Refusal("POLICY_INVALID", "Keep limits must cover daily, weekly, monthly and comprehensive backups")
+    if type(value["autoCleanup"]) is not bool:
+        raise Refusal("POLICY_INVALID", "Automatic cleanup must be on or off")
+    return {"keep": {kind: count(keep[kind], *KEEP_RANGE, "Keep limits must be whole numbers from 1 to 100")
+                     for kind in TYPES},
+            "autoCleanup": value["autoCleanup"],
+            "reserveGiB": count(value["reserveGiB"], *RESERVE_RANGE,
+                                "Free space to keep must be a whole number of GB from 0 to 1000")}
+
+
+def load_policy():
+    """(policy, source). A present but unreadable file is never guessed at:
+    it returns no policy, and callers then delete nothing."""
+    path = STATE / "policy.json"
+    if not os.path.lexists(path):
+        return default_policy(), "default"
+    try:
+        private(STATE, directory=True)
+        data, _ = read_private(path, 4096)
+        return normalize_policy(strict_json(data)), "saved"
+    except (OSError, ValueError, RuntimeError):
+        return None, "invalid"
+
+
+def save_policy(raw):
+    if len(raw) > 4096:
+        raise Refusal("POLICY_INVALID", "Backup settings are too large")
+    try:
+        value = strict_json(raw)
+    except ValueError:
+        raise Refusal("POLICY_INVALID", "Backup settings must be a JSON object") from None
+    policy = normalize_policy(value, stored=False)
+    private(STATE, directory=True, create=True)
+    write_json(STATE / "policy.json", {"schema": POLICY_SCHEMA, **policy})
+    return policy
+
+
+def read_private(path, limit, mode=None):
+    """Read a small root:root single-link regular file without following links."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1
+                or (info.st_mode & 0o777 != mode if mode is not None else info.st_mode & 0o022)
+                or not 0 < info.st_size <= limit):
+            raise OSError("unsafe private file")
+        data = os.read(fd, limit + 1)
+        if len(data) != info.st_size:
+            raise OSError("private file changed while it was read")
+        return data, info
+    finally:
+        os.close(fd)
+
+
+def storage(path):
+    info = os.statvfs(path)
+    return {"freeBytes": info.f_bavail * info.f_frsize, "totalBytes": info.f_blocks * info.f_frsize}
+
+
+def human(size):
+    # Same 1024-based units the Backups list shows.
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def receipt_key():
+    # Held to the backend's contract; without it nothing authenticates, so
+    # nothing is eligible for cleanup.
+    try:
+        info = os.lstat(TRUST)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or info.st_mode & 0o077 or os.path.realpath(TRUST) != str(TRUST)):
+            return None
+        key, _ = read_private(TRUST / "archive-hmac.key", 32, 0o600)
+        return key if len(key) == 32 else None
+    except OSError:
+        return None
+
+
+def receipt_identity(archive, kind, info, key):
+    """The backend's signed-receipt check for a complete archive, without
+    re-hashing it. Returns the receipt's (dev, ino) only when it authenticates
+    this exact file."""
+    if key is None:
+        return None
+    try:
+        data, receipt = read_private(Path(str(archive) + ".receipt.json"), 16 * 1024, 0o600)
+        record = json.loads(data)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or set(record) != RECEIPT_KEYS:
+        return None
+    size, mtime = record["archiveSize"], record["archiveMtimeNs"]
+    manifest, signature = record["manifestHmac"], record["signature"]
+    if (record["schema"] != "bridgesllm.backup-publication.v1" or record["archive"] != archive.name
+            or record["backupType"] != kind or record["completeness"] != "complete"
+            or record["degradedComponents"] != [] or type(size) is not int or size != info.st_size
+            or not isinstance(mtime, str) or not re.fullmatch(r"[0-9]{1,32}", mtime)
+            or int(mtime) != info.st_mtime_ns
+            or not isinstance(manifest, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest)
+            or not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature)):
+        return None
+    fields = [record["schema"], archive.name, kind, "complete", str(size), mtime, manifest, "0"]
+    expected = hmac.new(key, ("\0".join(fields) + "\0").encode(), hashlib.sha256).hexdigest()
+    return (receipt.st_dev, receipt.st_ino) if hmac.compare_digest(expected, signature) else None
+
+
+def repair_pins(connection):
+    """Archives a live Project dependency repair may still restore from. Same
+    predicate as the backend's delete guard, matched by path or by inode so a
+    pinned file is kept even if its size or timestamps no longer agree."""
+    try:
+        rows = json.loads(connection.sql(
+            'SELECT COALESCE(json_agg(json_build_array("backupPath", "backupDevice", "backupInode")), '
+            "'[]'::json) FROM \"ProjectDependencyRepairOperation\" WHERE \"status\" = 'PROMOTING'"))
+        paths, inodes = set(), set()
+        for path, device, inode in rows:
+            paths.add(str(path))
+            if re.fullmatch(r"[0-9]{1,20}", str(device)) and re.fullmatch(r"[0-9]{1,20}", str(inode)):
+                inodes.add((int(device), int(inode)))
+        return paths, inodes
+    except (RuntimeError, ValueError, TypeError):
+        raise Refusal("PINS_UNAVAILABLE", "Project repair pins could not be read from the Portal database, "
+                                          "so no backups were deleted.") from None
+
+
+def inventory(base, pins):
+    """Own, authenticated, complete portal-data archives. Legacy, partial,
+    degraded, linked or unverifiable files are never candidates."""
+    key = receipt_key()
+    archives, unverified = [], 0
+    for kind in TYPES:
+        directory = base / kind
+        if not os.path.lexists(directory):
+            continue
+        private(directory, directory=True)
+        for name in sorted(os.listdir(directory)):
+            match = ARCHIVE_NAME.fullmatch(name)
+            if not match or match.group(1) != kind:
+                continue
+            path = directory / name
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            receipt = None
+            if (stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_gid == 0
+                    and info.st_nlink == 1 and not info.st_mode & 0o022):
+                receipt = receipt_identity(path, kind, info, key)
+            if receipt is None:
+                unverified += 1
+                continue
+            archives.append({"path": path, "name": name, "kind": kind, "size": info.st_size,
+                             "blocks": info.st_blocks * 512, "mtime": info.st_mtime_ns,
+                             "dev": info.st_dev, "ino": info.st_ino, "receipt": receipt,
+                             "locked": os.path.lexists(str(path) + ".locked"),
+                             "pinned": str(path) in pins[0] or (info.st_dev, info.st_ino) in pins[1]})
+    newest = max(archives, key=lambda a: (a["mtime"], a["name"]), default=None)
+    for archive in archives:
+        # One global recovery point, not one per type: that could exceed a small disk.
+        archive["protected"] = ("newest" if archive is newest else "locked" if archive["locked"]
+                                else "pinned" if archive["pinned"] else None)
+    return archives, unverified
+
+
+def over_limit(archives, keep, kinds=TYPES):
+    plan = []
+    for kind in kinds:
+        ranked = sorted((a for a in archives if a["kind"] == kind),
+                        key=lambda a: (a["mtime"], a["name"]), reverse=True)
+        plan += [a for a in ranked[keep[kind]:] if not a["protected"]]
+    return sorted(plan, key=lambda a: (a["mtime"], a["name"]))
+
+
+def protected_counts(archives):
+    counts = {"newest": 0, "locked": 0, "pinned": 0}
+    for archive in archives:
+        if archive["protected"]:
+            counts[archive["protected"]] += 1
+    return counts
+
+
+def protected_text(archives):
+    counts = protected_counts(archives)
+    parts = ["your newest complete backup"] if counts["newest"] else []
+    parts += [f"{counts['locked']} locked"] if counts["locked"] else []
+    parts += [f"{counts['pinned']} in use by a Project repair"] if counts["pinned"] else []
+    return "Kept: " + ", ".join(parts) + "." if parts else "No backups are protected."
+
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def remove_archive(archive):
+    """Delete one inventoried archive and its receipt; refuse on any drift."""
+    path, receipt = archive["path"], Path(str(archive["path"]) + ".receipt.json")
+    def unchanged():
+        info = os.lstat(path)
+        return (stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_gid == 0 and info.st_nlink == 1
+                and not info.st_mode & 0o022 and (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+                == (archive["dev"], archive["ino"], archive["size"], archive["mtime"]))
+    changed = Refusal("CHANGED", archive["name"] + " changed or was locked, so it was kept.")
+    try:
+        if not unchanged() or os.path.lexists(str(path) + ".locked"):
+            raise changed
+        info = os.lstat(receipt)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (info.st_dev, info.st_ino) != archive["receipt"]:
+            raise changed
+        # Receipt first: a crash can leave an unclassified archive, never a stale
+        # authenticated receipt that could bind to a later file of the same name.
+        os.unlink(receipt)
+        fsync_directory(path.parent)
+        if not unchanged():
+            raise changed
+        os.unlink(path)
+    except FileNotFoundError:
+        raise changed from None
+    fsync_directory(path.parent)
+
+
+def database_bytes(connection):
+    value = connection.sql("SELECT pg_database_size(current_database())")
+    if not re.fullmatch(r"[0-9]{1,20}", value):
+        raise RuntimeError("Could not measure the Portal database for the backup space check")
+    return int(value)
+
+
+def make_room(base, destination, kind, policy, connection):
+    """Opt-in pre-clean: free room for the new archive before writing it, or
+    refuse having deleted nothing. The newest good backup always survives."""
+    archives, _ = inventory(base, repair_pins(connection))
+    newest = lambda items: max(items, key=lambda a: (a["mtime"], a["name"]), default=None)
+    basis = [a["size"] for a in (newest([a for a in archives if a["kind"] == kind]), newest(archives)) if a]
+    if not basis:
+        return None  # Nothing to estimate from, and nothing that could be deleted.
+    device = os.stat(destination).st_dev
+    if os.stat(base).st_dev != device:
+        return "Automatic cleanup was skipped because the backup folders are on different disks."
+    # Archive estimate: the larger recent archive plus 10%. The database dump is
+    # staged beside it, so its live size is added; then the reserve.
+    estimate = (max(basis) * 11 + 9) // 10 + database_bytes(connection)
+    needed = estimate + policy["reserveGiB"] * GIB
+    free = storage(destination)["freeBytes"]
+    if free >= needed:
+        return None
+    plan, reachable = [], free
+    for archive in sorted(archives, key=lambda a: (a["mtime"], a["name"])):
+        if reachable >= needed:
+            break
+        if not archive["protected"] and archive["dev"] == device:
+            plan.append(archive)
+            reachable += archive["blocks"]
+    if reachable < needed:
+        raise Refusal("SPACE", f"Not enough backup space. This backup needs about {human(needed)} free "
+                               f"({human(estimate)} estimated plus {policy['reserveGiB']} GB kept free); "
+                               f"{human(free)} is free and deleting every unprotected backup would only reach "
+                               f"{human(reachable)}. {protected_text(archives)} Nothing was deleted. Lower the "
+                               "free-space setting, unlock old backups, or add storage.")
+    for index, archive in enumerate(plan):
+        try:
+            remove_archive(archive)
+        except Exception as error:
+            raise Refusal("CLEANUP_STOPPED", f"Automatic cleanup stopped after deleting {index} of {len(plan)} "
+                                             f"old backups: {str(error)[:200]} The backup was not started.") from None
+    after = storage(destination)["freeBytes"]
+    note = f"Deleted {len(plan)} old backup{'s' if len(plan) != 1 else ''} to make room ({human(max(0, after - free))} freed)."
+    if after < needed:
+        raise Refusal("SPACE_HELD", note + f" Only {human(after)} is free now; an open download may still hold "
+                                           "the space. Try again later.")
+    return note
+
+
+def apply_retention(base, kind, policy, connection):
+    archives, _ = inventory(base, repair_pins(connection))
+    plan = over_limit(archives, policy["keep"], (kind,))
+    for archive in plan:
+        remove_archive(archive)
+    return (f"Removed {len(plan)} {kind} backup{'s' if len(plan) != 1 else ''} over the keep limit."
+            if plan else None)
+
+
+def cleanup_plan(connection):
+    policy, source = load_policy()
+    if policy is None:
+        raise Refusal("POLICY_INVALID", "Backup settings could not be read. Save them again before cleaning up.")
+    base = base_directory(create=False)
+    archives, unverified = inventory(base, repair_pins(connection))
+    plan = over_limit(archives, policy["keep"])
+    # The token binds the confirmation to these exact files and settings.
+    token = hashlib.sha256(json.dumps({"policy": policy, "delete": [
+        [a["name"], a["dev"], a["ino"], a["size"], a["mtime"], list(a["receipt"])] for a in plan]},
+        sort_keys=True).encode()).hexdigest()
+    return {"policy": policy, "source": source, "base": base, "archives": archives,
+            "unverified": unverified, "plan": plan, "token": token}
+
+
+def cleanup_preview():
+    current = cleanup_plan(database(environment()))
+    return {"token": current["token"], "policySource": current["source"],
+            "archives": [{"name": a["name"], "type": a["kind"], "sizeBytes": a["size"],
+                          "created": dt.datetime.fromtimestamp(a["mtime"] / 1e9, dt.timezone.utc)
+                          .isoformat(timespec="seconds").replace("+00:00", "Z")} for a in current["plan"]],
+            "count": len(current["plan"]), "totalBytes": sum(a["size"] for a in current["plan"]),
+            "protected": protected_counts(current["archives"]),
+            "kept": len(current["archives"]) - len(current["plan"]),
+            "unverified": current["unverified"], "storage": storage(current["base"])}
+
+
+def cleanup_run(token):
+    if not re.fullmatch(r"[0-9a-f]{64}", token or ""):
+        raise Refusal("STALE", "Review the cleanup before deleting backups.")
+    with locks():
+        current = cleanup_plan(database(environment()))
+        if not hmac.compare_digest(current["token"], token):
+            raise Refusal("STALE", "Backups changed since you reviewed them. Nothing was deleted; "
+                                   "review the cleanup again.")
+        before = storage(current["base"])["freeBytes"]
+        deleted = []
+        for archive in current["plan"]:
+            try:
+                remove_archive(archive)
+            except (OSError, Refusal) as error:
+                raise Refusal("PARTIAL", f"Deleted {len(deleted)} of {len(current['plan'])} backups, then "
+                                         f"stopped: {error if isinstance(error, Refusal) else 'a file could not be removed'}. "
+                                         "Review the cleanup again.") from None
+            deleted.append(archive)
+        after = storage(current["base"])
+        # Report what the filesystem actually released; unlinked files that are
+        # still open (for example a running download) keep their space.
+        expected = sum(a["blocks"] for a in deleted)
+        freed = max(0, after["freeBytes"] - before)
+        return {"deleted": [a["name"] for a in deleted], "deletedCount": len(deleted),
+                "deletedBytes": sum(a["size"] for a in deleted), "freedBytes": freed,
+                "heldBytes": max(0, expected - freed), "storage": after}
+
+
+def policy_report():
+    policy, source = load_policy()
+    try:
+        space = storage(base_directory(create=False))
+    except (OSError, RuntimeError):
+        space = None
+    return {"policy": policy, "source": source, "defaults": default_policy(),
+            "limits": {"keep": list(KEEP_RANGE), "reserveGiB": list(RESERVE_RANGE)}, "storage": space}
+
+
+def manage(action, target, plan):
+    if (action, target) == ("policy", "show"):
+        return policy_report()
+    if (action, target) == ("policy", "set"):
+        save_policy(sys.stdin.buffer.read(4097))
+        return policy_report()
+    if (action, target) == ("cleanup", "preview"):
+        return cleanup_preview()
+    if (action, target) == ("cleanup", "run"):
+        return cleanup_run(plan)
+    raise Refusal("USAGE", "Unknown backup management command")
+
+
 def create(kind):
     with locks():
         base = base_directory()
@@ -410,6 +836,7 @@ def create(kind):
         run.update(status="running", pid=os.getpid(), phase="database", phaseLabel="Saving Portal settings and database", phaseIndex=1, phaseTotal=3)
         write_json(STATE / "status.json", run)
         partial = None
+        notes = []
         try:
             env = environment()
             roots = data_roots(env)
@@ -420,16 +847,32 @@ def create(kind):
                     raise RuntimeError("Portal data roots must be canonical directories")
                 if base.is_relative_to(root):
                     raise RuntimeError("Backup storage cannot be inside the data being backed up")
+            policy, source = load_policy()
+            if policy is None:
+                notes.append("Backup settings could not be read, so no old backups were removed.")
+            connection = database(env)
+            if policy and policy["autoCleanup"]:
+                run.update(phase="space", phaseLabel="Making room for the new backup")
+                write_json(STATE / "status.json", run)
+                try:
+                    notes.append(make_room(base, destination, kind, policy, connection))
+                except Refusal:
+                    raise
+                except Exception as error:
+                    raise RuntimeError("Automatic cleanup could not check the backup folders safely, so nothing "
+                                       "was deleted and the backup was not started: " + str(error)[:300]) from None
+                run.update(phase="database", phaseLabel="Saving Portal settings and database")
+                write_json(STATE / "status.json", run)
             with tempfile.TemporaryDirectory(prefix=".portal-data-", dir=base) as work:
                 work = Path(work)
                 dump = work / "database.dump"
                 with dump.open("xb") as out:
-                    database(env).run("pg_dump", ["--format=custom", "--no-owner", "--no-acl", "--schema=public"], stdout=out)
+                    connection.run("pg_dump", ["--format=custom", "--no-owner", "--no-acl", "--schema=public"], stdout=out)
                 manifest = {
                     "schema": SCHEMA, "createdAt": now(), "type": kind,
                     "portalVersion": json.loads((ROOT / "backend/package.json").read_text())["version"],
                     "databaseSha256": digest(dump), "components": {},
-                    "consistency": "PostgreSQL snapshot with live file copy. Pause project edits for a cross-file checkpoint.",
+                    "consistency": "PostgreSQL snapshot with live file copy. Pause project edits and Desktop app writes for a cross-file checkpoint.",
                     "excluded": ["Portal installation", "OS and services", "Mail", "Containers and model downloads", "Provider logins"],
                 }
                 secrets = {key: env[key] for key in CRYPTO_KEYS if key in env}
@@ -461,18 +904,26 @@ def create(kind):
                 os.rename(partial, target)
                 partial = None
                 publish_receipt(target, kind)
-                run.update(status="completed", completedAt=now(), archivePath=str(target), exitCode=0)
-                write_json(STATE / "status.json", run)
-                print(json.dumps({"complete": True, "archive": str(target), "scope": "Portal data", "agentExport": manifest.get("agentExport")}))
-            # Retain only this format's own old archives; locked and legacy files stay.
-            keep = {"daily": 7, "weekly": 4, "monthly": 3, "comprehensive": 3}[kind]
-            old = sorted(destination.glob("portal-" + kind + "-*-data-*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for candidate in old[keep:]:
-                if not Path(str(candidate) + ".locked").exists():
-                    private(candidate).unlink()
-                    Path(str(candidate) + ".receipt.json").unlink(missing_ok=True)
+            # Keep limits for this type. Only authenticated own archives count or
+            # go; locked, repair-pinned, legacy and unverified files stay. A
+            # published backup never turns into a failure here.
+            if policy:
+                try:
+                    notes.append(apply_retention(base, kind, policy, connection))
+                except Exception as error:
+                    notes.append("Old backups were kept: " + str(error)[:200])
+            summary = " ".join(note for note in notes if note)
+            run.update(status="completed", completedAt=now(), archivePath=str(target), exitCode=0)
+            if summary:
+                run["cleanupSummary"] = re.sub(r"[^\x20-\x7e]", " ", summary)[:600]
+            write_json(STATE / "status.json", run)
+            print(json.dumps({"complete": True, "archive": str(target), "scope": "Portal data",
+                              "agentExport": manifest.get("agentExport"), "cleanup": summary or None}))
         except Exception as error:
             run.update(status="failed", completedAt=now(), error=str(error)[:900], exitCode=1)
+            summary = " ".join(note for note in notes if note)
+            if summary:
+                run["cleanupSummary"] = re.sub(r"[^\x20-\x7e]", " ", summary)[:600]
             write_json(STATE / "status.json", run)
             raise
         finally:
@@ -540,6 +991,72 @@ def service(action, unit):
     return subprocess.run(["/usr/bin/systemctl", action] + ([unit] if unit else []), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=90)
 
 
+def require_desktop_apps_stopped(root):
+    """A restored state tree must not race an existing native Desktop writer."""
+    if not root.exists():
+        return
+    for project in root.iterdir():
+        # Project deletion quarantines state through this server-private entry.
+        if project.name == ".bridgesllm-lifecycle-quarantine":
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", project.name):
+            raise RuntimeError("Desktop state has an invalid project identity")
+        result = subprocess.run(["/usr/bin/systemctl", "show", "bridgesllm-project-" + project.name + ".service",
+                                 "--property=LoadState,ActiveState,MainPID"], capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise RuntimeError("Could not verify Desktop app state before restore")
+        properties = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if properties.get("LoadState") == "not-found":
+            continue
+        if properties.get("ActiveState") not in ("inactive", "failed") or properties.get("MainPID") != "0":
+            raise RuntimeError("Stop all Desktop apps in Projects before restoring Desktop data. No Desktop process was stopped by this restore preflight.")
+
+
+def restore_desktop_state_ownership(staged):
+    """Give staged Desktop app data and logs to the current Desktop account.
+
+    Extraction runs as root, and archived numeric owners are never trusted.
+    Each Project's control records (promotion journal, stop marker, retained
+    evidence) stay root-owned; only its data/ and logs/ trees belong to the
+    current bridgesrd account. Links and special files refuse activation.
+    """
+    if not staged.is_dir() or staged.is_symlink():
+        return
+    for directory, dirs, files in os.walk(staged):
+        for name in dirs + files:
+            info = os.lstat(os.path.join(directory, name))
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise RuntimeError("Desktop state contains a link or special file; restore was not activated")
+    projects = [project for project in staged.iterdir() if project.name != ".bridgesllm-lifecycle-quarantine"]
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", project.name) or not project.is_dir() for project in projects):
+        raise RuntimeError("Desktop state has an invalid project identity")
+    try:
+        account = pwd.getpwnam("bridgesrd")
+    except KeyError:
+        account = None
+    for directory, dirs, files in os.walk(staged):
+        for name in [directory, *(os.path.join(directory, child) for child in dirs + files)]:
+            mode = stat.S_IMODE(os.lstat(name).st_mode)
+            os.chown(name, 0, 0, follow_symlinks=False)
+            os.chmod(name, mode & ~0o7022)
+    for project in projects:
+        os.chmod(project, 0o755)
+        if account is None:
+            continue  # No Desktop account: app trees stay root-only until it exists.
+        for tree in ("data", "logs"):
+            root = project / tree
+            if not root.exists():
+                continue
+            for directory, dirs, files in os.walk(root):
+                os.chown(directory, account.pw_uid, account.pw_gid, follow_symlinks=False)
+                os.chmod(directory, 0o700)
+                for name in files:
+                    path = os.path.join(directory, name)
+                    mode = stat.S_IMODE(os.lstat(path).st_mode)
+                    os.chown(path, account.pw_uid, account.pw_gid, follow_symlinks=False)
+                    os.chmod(path, mode & 0o700)
+
+
 def restore(archive, confirmed):
     if not confirmed:
         raise RuntimeError("Restore replaces Portal data. Run with --confirm after saving your current work.")
@@ -566,6 +1083,9 @@ def restore(archive, confirmed):
                     raise RuntimeError("Restore data root cannot be a symbolic link")
                 if target.parent.stat().st_dev != work.stat().st_dev:
                     raise RuntimeError("Restore staging and Portal data must be on the same filesystem")
+            if "desktop-state" in components:
+                require_desktop_apps_stopped(roots["desktop-state"])
+                restore_desktop_state_ownership(work / "data" / "desktop-state")
             keys = json.loads((work / "portal-keys.json").read_text())
             if any(key not in CRYPTO_KEYS or not isinstance(value, str) or "\n" in value or "\r" in value for key, value in keys.items()):
                 raise RuntimeError("Portal key record is invalid")
@@ -696,11 +1216,23 @@ if __name__ == "__main__":
     if os.geteuid() != 0:
         sys.exit("Portal data backup must run as root")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=("create", "verify", "restore"))
+    parser.add_argument("action", choices=("create", "verify", "restore", "policy", "cleanup"))
     parser.add_argument("target")
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--require-receipt", action="store_true")
+    parser.add_argument("--plan", default="")
     args = parser.parse_args()
+    if args.action in ("policy", "cleanup"):
+        # Structured results for the Portal backend: exit 3 is a safe refusal.
+        try:
+            print(json.dumps(manage(args.action, args.target, args.plan)))
+        except Refusal as refusal:
+            print(json.dumps({"code": refusal.code, "error": str(refusal)}))
+            sys.exit(3)
+        except Exception as error:
+            print("Portal data backup: " + str(error)[:300], file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     try:
         if args.action == "create":
             if args.target not in TYPES:

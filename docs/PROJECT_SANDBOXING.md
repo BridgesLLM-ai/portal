@@ -72,7 +72,17 @@ is a mount-free, non-root, read-only proxy sidecar on a separate public network.
 Firewall rules are installed and checked before the workload starts. The proxy
 resolves and validates all DNS answers, pins the approved address, revalidates
 redirects, and requires authenticated proxy credentials. HTTPS tunneling is
-limited to a matching TLS SNI destination.
+limited to a matching TLS SNI destination. Those credentials reach Docker by
+variable name only (`--env NAME`) on these paths: the proxy and Portal App
+workload creates; the OpenClaw, Codex, Claude Code, Antigravity and Agent Zero
+Project runtime creates; and the Codex `docker exec` turns and probes. Each
+value travels only in that docker CLI process's environment, which also gets
+`NO_PROXY=*`. A named credential without its value is refused before spawn, and
+command failure text redacts the values. This keeps the credentials out of argv,
+which any local user can read. It does not hide them from root or the same user
+(process environment, `docker inspect`), it does not cover containers that
+OpenClaw's own Gateway creates, and it does not revoke credentials that earlier
+builds passed on a command line.
 
 The proxy cannot make arbitrary Internet destinations safe by itself; kernel
 network isolation prevents bypass. Both controls are required and attested.

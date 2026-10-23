@@ -192,6 +192,7 @@ function fixture(
     options.gatewayApiUrl || 'http://localhost:18789'
   ));
   return {
+    elapsedMs: () => now,
     getGatewayApiUrl,
     systemctl,
     rootUserSystemctl,
@@ -1331,4 +1332,28 @@ test('migration gate matches the installer and rejects modified files and outsta
     fs.writeFileSync(permit, 'an outstanding installer permit');
     expect(() => gate.attestMigrationPermitDropInFile(dropIn, permit)).toThrow('migration still owns');
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('release admits a cold-start listener after the old 30-second bound while retaining exact ownership', async () => {
+  const active = snapshot({ activeState: 'active', subState: 'running', mainPid: 8124, controlGroup: CONTROL_GROUP });
+  const f = fixture([active, active], { listenerPids: [...Array.from({ length: 470 }, () => [] as number[]), [8124]] });
+  await expect(f.fence.release(true)).resolves.toMatchObject({ active: true, mainPid: 8124 });
+  expect(f.elapsedMs()).toBeGreaterThan(30_000);
+  expect(f.elapsedMs()).toBeLessThanOrEqual(90_000);
+  expect(f.readProcessControlGroup).toHaveBeenCalledWith(8124);
+});
+
+test('release still refuses a listener absent beyond the bounded cold-start deadline', async () => {
+  const active = snapshot({ activeState: 'active', subState: 'running', mainPid: 8125, controlGroup: CONTROL_GROUP });
+  const f = fixture([active, active], { listenerPids: [[]] });
+  await expect(f.fence.release(true)).rejects.toThrow('did not return with an attested systemd listener');
+  expect(f.elapsedMs()).toBeGreaterThanOrEqual(90_000);
+  expect(f.elapsedMs()).toBeLessThanOrEqual(90_100);
+});
+
+test('release rejects an alternate-owner listener even when it appears after 30 seconds', async () => {
+  const active = snapshot({ activeState: 'active', subState: 'running', mainPid: 8126, controlGroup: CONTROL_GROUP });
+  const f = fixture([active, active], { listenerPids: [...Array.from({ length: 470 }, () => [] as number[]), [9999]], listenerControlGroup: '/user.slice/alternate.service' });
+  await expect(f.fence.release(true)).rejects.toThrow('An alternate process owns');
+  expect(f.elapsedMs()).toBeGreaterThan(30_000);
 });

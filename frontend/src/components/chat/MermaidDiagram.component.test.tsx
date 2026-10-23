@@ -11,7 +11,10 @@ describe('Mermaid diagram boundaries', () => {
     render(<MermaidDiagram source={'flowchart LR\n A --> B'} />);
     const frame = await screen.findByTitle('Mermaid diagram');
     await waitFor(() => expect(frame.getAttribute('srcdoc')).toContain('Diagram label'));
-    expect(mocks.initialize).toHaveBeenCalledWith(expect.objectContaining({ htmlLabels: false }));
+    expect(mocks.initialize).toHaveBeenCalledWith(expect.objectContaining({ htmlLabels: false, look: 'classic', securityLevel: 'strict' }));
+    expect(mocks.initialize).toHaveBeenCalledWith(expect.objectContaining({
+      themeVariables: { treeView: expect.objectContaining({ labelColor: '#e2e8f0' }) },
+    }));
     expect(frame.getAttribute('sandbox')).toBe('');
     expect(frame.getAttribute('srcdoc')).toContain("default-src 'none'");
     expect(frame.getAttribute('srcdoc')).not.toMatch(/<script|<foreignObject|<image|javascript:|https:\/\/invalid/);

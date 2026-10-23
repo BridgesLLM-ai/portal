@@ -30,17 +30,18 @@ Choose **Install** on a new server, or **Update / Repair** when Portal is alread
 
 Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · root or sudo. A domain unlocks HTTPS, mail, and public share links.
 
-## Current release: 5.0.9
+## Current release: 5.1.0
 
-Portal 5 brings a unified Project Work surface and broader native-harness support. The latest patch improves installer presentation and recovery, prevents hidden package prompts, and reduces unnecessary Chat work.
+Portal 5.1 updates the AI toolchain and core application while keeping personal provider sign-in, local models, Projects, Apps, mail, and Remote Desktop together.
 
-- **Chat history stays coherent.** Late message echoes do not add duplicate user messages; completed replies stay within their original turns. Tool calls gain their missing output without duplicate blocks, while intentionally repeated messages remain distinct.
-- **Tasks are easier to follow.** Native progress cards show the current chat's plan, completion counts, and a scrollable panel that fits narrow screens. Unknown or stopped work is not presented as completed.
-- **Project Work brings the workspace together.** Use project chat, files, history, preview, and Git in the project-scoped interface. Main Agent Chat remains a separate operator-level surface.
-- **Maintenance is explicit.** Update Portal first, then review **Update Compatible AI Tools** for the release-qualified runtime set. Ordinary Portal updates do not upgrade the host interpreter or OpenClaw core. A supported 9.x question-plugin transition can briefly restart the gateway.
-- **Backups have a clear scope.** Standard backups save Portal data and project files. Comprehensive adds available agent personality and Portal-native history as reference exports—not provider logins, runtime databases, mail, or a whole-server image.
+- **Current AI tools and useful model suggestions.** Compatible-tools maintenance installs the release's pinned runtime set. After sign-in, suggestions come from models the runtime actually reports ready; selecting a default remains your choice.
+- **Richer Chat.** Grouped tool activity, visual image attachments for capable models, agent work controls, and sandboxed interactive widgets stay connected to the active conversation.
+- **Shared browsing.** Hand the shared browser between yourself and your agent, with visible control ownership.
+- **App credentials without readable values.** The owner can add or replace named credentials and restart an App to apply them; saved values are never displayed back in the Portal.
+- **Practical backup controls.** Set schedules and storage limits, review cleanup candidates, and preserve protected backups.
+- **A refreshed workspace.** Updated editor, terminal, charts, document rendering, and dependency families retain the existing upload and Project workflows.
 
-Read the complete [5.0.10 changelog](CHANGELOG.md#5010---2026-09-20), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
+Read the complete [5.1.0 changelog](CHANGELOG.md#510---2026-10-23), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
 
 ## What you get
 

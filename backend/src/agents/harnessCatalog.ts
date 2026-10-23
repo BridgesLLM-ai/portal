@@ -348,7 +348,7 @@ const definitions: HarnessDefinition[] = [
       supportsSessionFork: false,
       supportsLiveText: true,
       supportsReasoning: true,
-      supportsAskUser: false,
+      supportsAskUser: true,
       supportsAttachments: true,
       supportsCancellation: true,
       cancellationMode: 'process-kill',
@@ -401,7 +401,7 @@ const definitions: HarnessDefinition[] = [
       supportsSessionFork: false,
       supportsLiveText: true,
       supportsReasoning: true,
-      supportsAskUser: false,
+      supportsAskUser: true,
       supportsAttachments: true,
       supportsCancellation: true,
       cancellationMode: 'process-kill',
@@ -454,7 +454,14 @@ const definitions: HarnessDefinition[] = [
       supportsSessionFork: false,
       supportsLiveText: true,
       supportsReasoning: true,
-      supportsAskUser: false,
+      // Pinned 1.0.62 negotiates ACP v1 with mcpCapabilities (stdio MCP is
+      // mandatory in ACP v1), and GrokProvider passes the Portal Chat Bridge as
+      // a stdio MCP server, so questions, widgets and goals are offered.
+      // Protocol-negotiated, not model-proven: see
+      // adapters/__fixtures__/grok-1.0.62-acp-unauthenticated-negotiation.json.
+      supportsAskUser: true,
+      // The same initialize answer reports promptCapabilities.image=false, and
+      // GrokProvider refuses images from that answer, so no photos at this pin.
       supportsAttachments: false,
       supportsCancellation: true,
       cancellationMode: 'protocol',
@@ -525,7 +532,7 @@ const definitions: HarnessDefinition[] = [
       implemented: true,
       requiresGateway: false,
       adapterFamily: 'agent-zero-connector',
-      adapterKey: 'agent-zero-v2.11-connector',
+      adapterKey: 'agent-zero-v2.14-connector',
       models: AGENT_ZERO_MODELS,
     }),
   },
@@ -563,7 +570,7 @@ const definitions: HarnessDefinition[] = [
       supportsLiveText: true,
       supportsReasoning: true,
       supportsAskUser: false,
-      supportsAttachments: true,
+      supportsAttachments: false,
       supportsCancellation: true,
       cancellationMode: 'process-kill',
       supportsExecApproval: true,
@@ -615,7 +622,7 @@ const definitions: HarnessDefinition[] = [
       supportsSessionFork: false,
       supportsLiveText: true,
       supportsReasoning: false,
-      supportsAskUser: false,
+      supportsAskUser: true,
       supportsAttachments: true,
       supportsCancellation: true,
       cancellationMode: 'protocol',
@@ -655,7 +662,7 @@ const definitions: HarnessDefinition[] = [
       versionPolicy: {
         kind: 'exact-pin',
         testedVersion: PORTAL_TOOL_VERSIONS.hermes,
-        reason: 'Pinned to Hermes v2026.9.7 (0.21.1), commit 2237be355906fbe6065ce1815711eee52b2d646e, canonical source-tree SHA-256 77aa1e1cabc237bb62b291e77927d99977ac356484a9d16f897bb66cda248773.',
+        reason: 'Pinned to Hermes v0.22.2 (0.22.2), commit d923a5eb487a17c0a68801bba9ef0f56c81040a8, canonical source-tree SHA-256 6bd8d88ce4758357d926967676130eff96427515163608a7c51e4f459891cc89.',
       },
     },
     auth: {
@@ -676,7 +683,7 @@ const definitions: HarnessDefinition[] = [
       supportsSessionFork: true,
       supportsLiveText: true,
       supportsReasoning: true,
-      supportsAskUser: false,
+      supportsAskUser: true,
       supportsAttachments: true,
       supportsCancellation: true,
       cancellationMode: 'protocol',
@@ -715,7 +722,7 @@ const definitions: HarnessDefinition[] = [
       versionPolicy: {
         kind: 'exact-pin',
         testedVersion: PORTAL_TOOL_VERSIONS.openCode,
-        reason: 'Pinned to OpenCode v1.18.29; official glibc Linux x64 baseline asset opencode-linux-x64-baseline.tar.gz SHA-256 03a3f2f063e23477e3e4c3a738eb389f56c5a6ecf54d6a5a6d91caab557f042d.',
+        reason: 'Pinned to OpenCode v1.19.4; official glibc Linux x64 baseline asset opencode-linux-x64-baseline.tar.gz SHA-256 1697ef40558d378bd2f72efa8fafe1bed1f0e664f09247b9357556b95dbc7cbc.',
       },
     },
     auth: {
@@ -734,8 +741,8 @@ const definitions: HarnessDefinition[] = [
       supportsSessionFork: true,
       supportsLiveText: true,
       supportsReasoning: true,
-      supportsAskUser: false,
-      supportsAttachments: false,
+      supportsAskUser: true,
+      supportsAttachments: true,
       supportsCancellation: true,
       cancellationMode: 'protocol',
       supportsExecApproval: true,

@@ -13,7 +13,7 @@ export default function PortalGuideButton({ scopeKey, suggestionKey, disabled, o
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(!suggestionKey);
-  const shownKey = useRef<string | undefined>();
+  const shownKey = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (suggestionKey && shownKey.current === suggestionKey) return;
     shownKey.current = suggestionKey;

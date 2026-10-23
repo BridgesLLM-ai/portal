@@ -3,7 +3,7 @@ import path from 'path';
 import { PassThrough } from 'stream';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const archiver = require('archiver');
+const { ZipArchive } = require('archiver');
 
 const INSTALLER_DIR = path.resolve(__dirname, '../../../installer');
 const BUNDLE_MEMBERS = [
@@ -26,7 +26,7 @@ describe('Remote GPU native Tailscale Serve setup bundle', () => {
   });
 
   it('assembles one zip containing the native setup and no helper runtime', async () => {
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const archive = new ZipArchive({ zlib: { level: 9 } });
     const sink = new PassThrough();
     const chunks: Buffer[] = [];
     sink.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));

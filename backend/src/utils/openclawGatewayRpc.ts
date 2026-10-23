@@ -9,7 +9,7 @@
 import { isOpenClawExecutionCapableGatewayCall } from '../services/openClawExecutionCapableMethods';
 import WebSocket from 'ws';
 import { getOpenClawWsUrl } from '../config/openclaw';
-import { buildSignedDevice, getOrCreateDeviceKeys } from './deviceIdentity';
+import { buildSignedDevice, getOrCreateDeviceKeys, validateGatewayChallenge } from './deviceIdentity';
 import { getGatewayToken } from './gatewayToken';
 import { ensureOpenClawModelDeclaration } from './openclawCli';
 
@@ -39,6 +39,7 @@ interface RpcResponse {
   /** Structured gateway failure fields retained for operator diagnostics. */
   errorCode?: string;
   errorMessage?: string;
+  errorDetails?: unknown;
 }
 
 /** A throwaway connection attempt plus whether no method was dispatched. */
@@ -153,7 +154,7 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
     } catch (err: any) {
       const errorMessage = err?.errorMessage || err?.message || String(err || `${method} RPC failed`);
       const errorCode = typeof err?.errorCode === 'string' ? err.errorCode : undefined;
-      return { ok: false, error: errorMessage, errorCode, errorMessage };
+      return { ok: false, error: errorMessage, errorCode, errorMessage, errorDetails: err?.errorDetails };
     }
   }
 
@@ -181,6 +182,7 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
     error: attempt.error,
     errorCode: attempt.errorCode,
     errorMessage: attempt.errorMessage,
+    errorDetails: attempt.errorDetails,
   };
 }
 
@@ -228,7 +230,7 @@ function openThrowawayGatewayRpc(
     let connectId: string | undefined;
     let methodId: string | undefined;
 
-    const sendConnect = (nonce?: string) => {
+    const sendConnect = (nonce: string, signedAt: number) => {
       messageId++;
       connectId = String(messageId);
       connectSent = true;
@@ -253,6 +255,7 @@ function openThrowawayGatewayRpc(
             scopes: GATEWAY_SCOPES,
             token: getGatewayToken(),
             nonce,
+            signedAt,
           }),
           role: GATEWAY_ROLE,
           scopes: GATEWAY_SCOPES,
@@ -272,8 +275,9 @@ function openThrowawayGatewayRpc(
 
         // Handle connect.challenge event from gateway
         if (msg.type === 'event' && msg.event === 'connect.challenge') {
-          challengeNonce = msg.payload?.nonce;
-          sendConnect(challengeNonce);
+          const challenge = validateGatewayChallenge(msg.payload);
+          challengeNonce = challenge.nonce;
+          sendConnect(challengeNonce, challenge.ts);
           return;
         }
         
@@ -340,11 +344,15 @@ function openThrowawayGatewayRpc(
                 error: errorMessage,
                 errorCode: typeof msg.error?.code === 'string' ? msg.error.code : undefined,
                 errorMessage,
+                errorDetails: msg.error?.details,
               });
             }
           }
         }
-      } catch {}
+      } catch {
+        clearTimeout(timeout);
+        done({ ok: false, retriable: false, error: 'Invalid gateway response', errorCode: 'INVALID_RESPONSE' });
+      }
     });
 
     const failedBeforeDispatch = () => methodId === undefined;
@@ -739,8 +747,8 @@ export async function chatSend(
 /**
  * List available models from the gateway catalog.
  */
-export async function listGatewayModels(): Promise<{ ok: boolean; models?: any[]; error?: string }> {
-  const result = await gatewayRpcCall('models.list', {});
+export async function listGatewayModels(agentId?: string): Promise<{ ok: boolean; models?: any[]; error?: string }> {
+  const result = await gatewayRpcCall('models.list', agentId ? { agentId } : {});
   
   if (result.ok) {
     return { ok: true, models: result.data?.models || [] };

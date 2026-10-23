@@ -689,11 +689,12 @@ function attestLegacyAgent(entry: Record<string, any>, roots: RetirementRoots): 
 
 function configAgentEntries(config: Record<string, any>): Record<string, any>[] {
   const agents = config.agents;
-  // Both qualified runtimes allow a defaults-only configuration with an
-  // implicit main agent. This read-only inventory has no explicit legacy
+  // Qualified runtimes allow an absent agents block or a defaults-only
+  // configuration with an implicit main agent. This read-only inventory has no explicit legacy
   // Project agents to retire; it must not invent a persisted roster/write
   // family. Container/session collision scans still run. Explicit malformed
   // or unknown roster shapes continue through the strict contract below.
+  if (!Object.prototype.hasOwnProperty.call(config, 'agents')) return [];
   if (isRecord(agents)
     && Object.keys(agents).every((key) => key === 'defaults')
     && !Object.prototype.hasOwnProperty.call(agents, 'list')

@@ -2,6 +2,11 @@ import crypto from 'crypto';
 import path from 'path';
 import type { NativeCliInvocation } from '../types';
 import type { ProjectEgressCommandExecutor } from '../../../../services/projectEgressPlane';
+import {
+  dockerArgsCarryProtectedValue,
+  protectedDockerCommandEnvironment,
+  protectedDockerEnvironmentArgs,
+} from '../../../../services/projectDockerSecretEnvironment';
 
 const PRODUCTION_MARKER_ROOT = '/run';
 const RUN_TOKEN_BYTES = 32;
@@ -29,6 +34,7 @@ export interface BuildExactNativeCliProjectInvocationInput {
   readonly executor: ProjectEgressCommandExecutor;
   readonly hostCwd?: string;
   readonly hostEnvironment: NodeJS.ProcessEnv;
+  /** Proxy credentials in it are named on argv; their values go to the docker CLI's environment only. */
   readonly containerEnvironment?: Readonly<Record<string, string>>;
   /** Opt-in bidirectional stdin for long-lived JSON-RPC transports such as ACP. */
   readonly interactiveStdio?: boolean;
@@ -502,15 +508,14 @@ export function buildExactNativeCliProjectInvocation(
   const namespace = requiredNamespace(input.markerNamespace);
   const runId = requiredRunId(input.runId);
   const identity = markerIdentity(PRODUCTION_MARKER_ROOT, namespace, runId);
+  const environment = protectedDockerEnvironmentArgs(input.containerEnvironment || {});
   const args = [
     'container', 'exec',
     ...(input.interactiveStdio ? ['--interactive'] : []),
     '--user', input.containerUser,
     '--workdir', input.containerRoot,
+    ...environment.args,
   ];
-  for (const [key, value] of Object.entries(input.containerEnvironment || {})) {
-    args.push('--env', `${key}=${value}`);
-  }
   args.push(
     input.runtime.containerId,
     'node', '-e', TURN_WRAPPER_SCRIPT,
@@ -521,12 +526,16 @@ export function buildExactNativeCliProjectInvocation(
     input.command,
     ...input.args,
   );
+  if (dockerArgsCarryProtectedValue(args, environment.secretEnvironment)) {
+    throw new Error('Native CLI Project egress credential would reach the Docker command line');
+  }
   return Object.assign({
     command: 'docker',
     args,
     options: {
       ...(input.hostCwd ? { cwd: input.hostCwd } : {}),
-      env: input.hostEnvironment,
+      // The docker CLI reads each named credential from here; argv names it only.
+      env: protectedDockerCommandEnvironment(input.hostEnvironment, args, environment.secretEnvironment),
     },
     abort: () => abortExactNativeCliProjectRun({
       runtime: input.runtime,

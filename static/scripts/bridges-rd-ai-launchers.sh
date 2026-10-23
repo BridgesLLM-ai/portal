@@ -403,12 +403,12 @@ find_runtime_binary() {
 
 runtime_expected_version() {
   case "$1" in
-    claude-code) printf '%s\n' '2.1.260' ;;
-    codex) printf '%s\n' '0.153.2' ;;
-    grok-build) printf '%s\n' '1.0.5' ;;
-    antigravity) printf '%s\n' '1.1.17' ;;
-    hermes) printf '%s\n' '0.20.4' ;;
-    opencode) printf '%s\n' '1.18.19' ;;
+    claude-code) printf '%s\n' '2.1.309' ;;
+    codex) printf '%s\n' '0.163.0' ;;
+    grok-build) printf '%s\n' '1.0.62' ;;
+    antigravity) printf '%s\n' '1.4.3' ;;
+    hermes) printf '%s\n' '0.22.2' ;;
+    opencode) printf '%s\n' '1.19.4' ;;
     ollama) printf '%s\n' 'semver' ;;
     *) return 1 ;;
   esac
@@ -427,6 +427,7 @@ runtime_version_probe() {
   local -a version_args=(--version)
   [[ "$env_spec" == '-' ]] || clean_env+=("$env_spec")
   [[ "$runtime_id" != 'grok-build' ]] || version_args=(--no-auto-update --version)
+  [[ "$runtime_id" != 'hermes' ]] || version_args=(acp --version)
   if [[ "${BRIDGES_RD_SKIP_SYSTEM:-0}" != '1' && "$(id -u)" == '0' && "$RD_USER" != 'root' ]]; then
     /usr/bin/timeout 3 /usr/bin/setpriv --reuid="$RD_USER" --regid="$RD_USER" --init-groups -- \
       /usr/bin/env -i "${clean_env[@]}" "$binary" "${version_args[@]}" 2>&1

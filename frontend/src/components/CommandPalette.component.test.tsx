@@ -205,12 +205,16 @@ describe('CommandPalette global Files and Projects search', () => {
 
   it('shows loading and keeps partial results honest when one source fails', async () => {
     const user = userEvent.setup();
-    paletteMocks.projectSearch.mockRejectedValue(new Error('project search offline'));
+    let rejectSearch!: (error: Error) => void;
+    const search = new Promise<never>((_resolve, reject) => { rejectSearch = reject; });
+    paletteMocks.projectSearch.mockReturnValue(search);
     renderPalette();
 
     await user.type(screen.getByRole('combobox', { name: 'Search commands' }), 'needle');
 
     expect(screen.getByText('Searching Files and Projects…')).toBeInTheDocument();
+    await waitFor(() => expect(paletteMocks.projectSearch).toHaveBeenCalled());
+    await act(async () => { rejectSearch(new Error('project search offline')); });
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Project search is unavailable; showing Files results.',
     );

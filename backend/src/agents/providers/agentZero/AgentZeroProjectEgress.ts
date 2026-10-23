@@ -18,7 +18,16 @@ const DOCKER_USER_CHAIN = 'DOCKER-USER';
 export const AGENT_ZERO_PROJECT_FIREWALL_CHAIN_PREFIX = 'A0P';
 export const AGENT_ZERO_PROJECT_FIREWALL_COMMENT_PREFIX = 'a0p-v3';
 
-export type AgentZeroProjectCommandRunner = (command: string, args: string[]) => string;
+/** `secretEnvironment` carries values that `--env NAME` arguments read; argv never holds them. */
+export interface AgentZeroProjectCommandOptions {
+  secretEnvironment?: Readonly<Record<string, string>>;
+}
+
+export type AgentZeroProjectCommandRunner = (
+  command: string,
+  args: string[],
+  options?: AgentZeroProjectCommandOptions,
+) => string;
 
 interface DockerNetworkInspect {
   Id?: string;

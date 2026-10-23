@@ -176,6 +176,11 @@ const COLLECTION_ROUTE_NAMES = new Set(['clone', 'models', 'upload-zip', 'create
 export async function projectPathSandbox(req: Request, res: Response, next: NextFunction): Promise<void> {
   const projectName = req.params.name || req.params.projectName;
 
+  if (projectName !== undefined && typeof projectName !== 'string') {
+    res.status(400).json({ error: 'Invalid project name' });
+    return;
+  }
+
   // If no project context, skip (non-project routes)
   if (!projectName || COLLECTION_ROUTE_NAMES.has(projectName) || !req.user) {
     next();

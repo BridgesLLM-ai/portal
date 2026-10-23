@@ -1,0 +1,10 @@
+# Installer-admitted Electron runtime for Desktop Projects. Loaded only on hosts
+# that restrict unprivileged user namespaces; Chromium's user-namespace and
+# seccomp sandbox stays enabled. No exception applies to Project paths.
+abi <abi/4.0>,
+include <tunables/global>
+profile bridgesllm-desktop-electron /usr/lib/bridgesllm-desktop/electron/44.9.0-*/electron flags=(unconfined) {
+  userns,
+  /usr/lib/bridgesllm-desktop/electron/44.9.0-*/electron mr,
+  include if exists <local/bridgesllm-desktop-electron>
+}

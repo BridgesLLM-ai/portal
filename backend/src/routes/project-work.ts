@@ -1,4 +1,7 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request as ExpressRequest, Response, NextFunction } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import { randomUUID } from 'crypto';
 import { prisma } from '../config/database';
 import { authenticateToken } from '../middleware/auth';
@@ -135,14 +138,13 @@ export function createProjectWorkRouter(projectRoutes: Router, gatewayRoutes: Ro
     }
     if (action === 'git-status' || action === 'diff') {
       req.body = action === 'diff' ? { action: 'diff', file: value(req.query.path, 4096) } : { action: 'status', details: true };
-      req.query = {}; req.method = 'POST'; req.url = `/${encodeURIComponent(project.projectName)}/git`;
+      req.method = 'POST'; req.url = `/${encodeURIComponent(project.projectName)}/git`;
       withProjectWorkScope({ id: project.id, generation: card.projectGeneration, workspaceOwnerId: card.actorUserId,
         projectName: project.projectName }, () => projectRoutes(req, res, next)); return;
     }
     if (action === 'file' || action === 'files' || action === 'raw') {
       const filePath = typeof req.query.path === 'string' ? req.query.path : '';
-      req.query = { path: filePath };
-      req.url = `/${encodeURIComponent(project.projectName)}/${action === 'files' ? 'tree' : action}`;
+      req.url = `/${encodeURIComponent(project.projectName)}/${action === 'files' ? 'tree' : action}?${new URLSearchParams({ path: filePath })}`;
       withProjectWorkScope({ id: project.id, generation: card.projectGeneration, workspaceOwnerId: card.actorUserId,
         projectName: project.projectName }, () => projectRoutes(req, res, next)); return;
     }
@@ -151,7 +153,7 @@ export function createProjectWorkRouter(projectRoutes: Router, gatewayRoutes: Ro
       const openclawRun = card.provider === 'OPENCLAW' ? await prisma.openClawHostRun.findUnique({ where: { id: card.requestId } }) : null;
       req.body = { provider: card.provider, session: card.sessionId,
         runId: openclawRun?.upstreamRunId || card.requestId };
-      req.query = {}; req.url = '/chat/abort';
+      req.url = '/chat/abort';
       gatewayRoutes(req, res, next); return;
     }
     if (!await claimProjectWork(card)) { res.json({ accepted: false, alreadyDispatched: true }); return; }
@@ -159,7 +161,7 @@ export function createProjectWorkRouter(projectRoutes: Router, gatewayRoutes: Ro
     // provider journals, approval handling and exactly-scoped cancellation.
     // No client-supplied path/session/prompt reaches that dispatch.
     req.body = { provider: card.provider, session: card.sessionId || '', message: projectWorkPrompt(card), model: card.model || undefined };
-    req.query = {}; req.url = '/send';
+    req.url = '/send';
     delete req.headers.accept;
     const originalJson = res.json.bind(res);
     res.json = ((body: any) => {

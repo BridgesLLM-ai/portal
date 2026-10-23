@@ -231,7 +231,10 @@ export interface DiscoveredModel {
   reason: string | null;
 }
 
+export interface ModelSuggestion { id: string; reason: string }
+
 export interface ModelDiscovery {
+  suggestions: ModelSuggestion[];
   models: DiscoveredModel[];
   source: string;
   runtime: string | null;
@@ -284,8 +287,22 @@ export function parseModelDiscovery(payload: unknown): ModelDiscovery {
       reason: readText(row.reason) || (isRecord(row.readiness) ? readText(row.readiness.message) : null),
     });
   }
+  const suggestions: ModelSuggestion[] = [];
+  const suggestedIds = new Set<string>();
+  for (const row of Array.isArray(payload.suggestions) ? payload.suggestions : []) {
+    if (!isRecord(row)) continue;
+    const id = readText(row.id);
+    const reason = readText(row.reason);
+    // Exact discovered routes only; neither presets nor a different provider's
+    // alias can manufacture a selectable recommendation.
+    if (!id || !reason || reason.length > 240 || suggestedIds.has(id)
+      || !models.some(model => model.id === id && model.readiness === 'ready')) continue;
+    suggestedIds.add(id);
+    suggestions.push({ id, reason });
+  }
   return {
     models,
+    suggestions,
     source,
     runtime: readText(payload.runtime),
     warnings: Array.isArray(payload.warnings) ? payload.warnings.filter((warning): warning is string => typeof warning === 'string') : [],

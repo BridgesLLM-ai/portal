@@ -11,6 +11,11 @@ import {
   PROJECT_RUNTIME_USER,
 } from '../../../services/projectRuntimeIdentity';
 import {
+  PROJECT_RUNTIME_LEGACY_NPROC_LIMIT,
+  PROJECT_RUNTIME_PIDS_LIMIT,
+  PROJECT_RUNTIME_SHARED_NPROC_LIMIT,
+} from '../../../services/projectRuntimeProcessLimits';
+import {
   assertProjectRuntimeConfinementReadyForExecution,
   attestProjectRuntimeSecurityOptions,
   projectRuntimeSecurityOptArgs,
@@ -25,7 +30,7 @@ export const OLLAMA_PROJECT_CONTAINER_USER = PROJECT_RUNTIME_USER;
 
 const CONTAINER_MEMORY_BYTES = 1024 * 1024 * 1024;
 const CONTAINER_NANO_CPUS = 2_000_000_000;
-const CONTAINER_PIDS_LIMIT = 256;
+const CONTAINER_PIDS_LIMIT = PROJECT_RUNTIME_PIDS_LIMIT;
 // The pinned node:22.23.1-bookworm-slim base declares these variables in its
 // image config. Docker carries image environment into created containers even
 // when Portal supplies its own --env entries, so make the inherited baseline
@@ -85,6 +90,8 @@ export interface OllamaProjectRuntimePlan {
   runtimeFingerprint: string;
   runtimeImage: string;
   projectRoot: string;
+  /** Shared-UID RLIMIT_NPROC this generation sets; the pids cgroup limit stays per container. */
+  nprocLimit: number;
   expectedEnvironment: Readonly<Record<string, string>>;
   expectedLabels: Readonly<Record<string, string>>;
   createArgs: readonly string[];
@@ -228,7 +235,19 @@ function requireProjectContext(context: ProjectSandboxExecutionContext): string 
   return attested.canonicalRoot;
 }
 
-export function buildOllamaProjectRuntimePlan(context: ProjectSandboxExecutionContext): OllamaProjectRuntimePlan {
+/**
+ * CURRENT carries the finite shared-UID nproc ceiling; LEGACY_SHARED_NPROC is
+ * the exact earlier recipe (per-container nproc 256), rebuilt only to attest
+ * and retire such a container. Its fingerprint, and so its name, is the
+ * pre-ceiling value.
+ */
+export type OllamaProjectRuntimeGeneration = 'CURRENT' | 'LEGACY_SHARED_NPROC';
+
+export function buildOllamaProjectRuntimePlan(
+  context: ProjectSandboxExecutionContext,
+  generation: OllamaProjectRuntimeGeneration = 'CURRENT',
+): OllamaProjectRuntimePlan {
+  const nprocLimit = generation === 'CURRENT' ? PROJECT_RUNTIME_SHARED_NPROC_LIMIT : PROJECT_RUNTIME_LEGACY_NPROC_LIMIT;
   const projectRoot = requireProjectContext(context);
   const runtimeImage = requirePinnedImage(context.runtimeImageDigest);
   const expectedEnvironment = Object.freeze({
@@ -253,6 +272,9 @@ export function buildOllamaProjectRuntimePlan(context: ProjectSandboxExecutionCo
     runtimeImage,
     network: 'none',
     confinementSecurityOptions: projectRuntimeSecurityOptionValues(),
+    ...(generation === 'CURRENT'
+      ? { processLimits: { pids: CONTAINER_PIDS_LIMIT, sharedNproc: PROJECT_RUNTIME_SHARED_NPROC_LIMIT } }
+      : {}),
   });
   const containerName = 'p4ol-' + runtimeFingerprint.slice(0, 24);
   const expectedLabels = Object.freeze({
@@ -276,7 +298,7 @@ export function buildOllamaProjectRuntimePlan(context: ProjectSandboxExecutionCo
     '--memory-swap', String(CONTAINER_MEMORY_BYTES),
     '--cpus', '2',
     '--ulimit', 'nofile=1024:1024',
-    '--ulimit', 'nproc=256:256',
+    '--ulimit', `nproc=${nprocLimit}:${nprocLimit}`,
     '--restart', 'no',
     '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=67108864',
     '--tmpfs', OLLAMA_PROJECT_CONTAINER_HOME + `:rw,noexec,nosuid,nodev,size=16777216,uid=${PROJECT_RUNTIME_UID},gid=${PROJECT_RUNTIME_GID},mode=0700`,
@@ -289,6 +311,7 @@ export function buildOllamaProjectRuntimePlan(context: ProjectSandboxExecutionCo
     runtimeFingerprint,
     runtimeImage,
     projectRoot,
+    nprocLimit,
     expectedEnvironment,
     expectedLabels,
     createArgs: Object.freeze(createArgs),
@@ -312,6 +335,7 @@ function exactJson(left: unknown, right: unknown): boolean {
 
 function exactOllamaProjectUlimits(
   actual: Array<{ Name?: string; Soft?: number; Hard?: number }> | null | undefined,
+  nprocLimit: number,
 ): boolean {
   if (!Array.isArray(actual) || actual.length !== 2) return false;
   const byName = new Map<string, { soft: number; hard: number }>();
@@ -324,8 +348,8 @@ function exactOllamaProjectUlimits(
   }
   return byName.get('nofile')?.soft === 1024
     && byName.get('nofile')?.hard === 1024
-    && byName.get('nproc')?.soft === 256
-    && byName.get('nproc')?.hard === 256;
+    && byName.get('nproc')?.soft === nprocLimit
+    && byName.get('nproc')?.hard === nprocLimit;
 }
 
 function exactOllamaProjectNetworklessState(
@@ -440,7 +464,7 @@ export function attestOllamaProjectRuntimeContainer(input: {
   ) {
     fail('CONTAINER_RESOURCES', 'Ollama Project container resource limits changed');
   }
-  if (!exactOllamaProjectUlimits(host.Ulimits)) {
+  if (!exactOllamaProjectUlimits(host.Ulimits, plan.nprocLimit)) {
     fail('CONTAINER_ULIMITS', 'Ollama Project container ulimits changed');
   }
   const expectedTmpfs = new Map<string, readonly string[]>([
@@ -817,6 +841,12 @@ export class OllamaProjectToolRuntime {
     const plan = buildOllamaProjectRuntimePlan(context);
     const image = await this.executor.run('docker', ['image', 'inspect', '--format', '{{.Id}}', plan.runtimeImage]);
     if (image.stdout.trim().toLowerCase() !== plan.runtimeImage) fail('RUNTIME_IMAGE', 'Installed Ollama Project runtime image identity did not match');
+
+    // An exact pre-ceiling runtime of this same Project retires first; anything
+    // else under its name fails attestation and is never removed.
+    const legacyPlan = buildOllamaProjectRuntimePlan(context, 'LEGACY_SHARED_NPROC');
+    const legacy = await inspectContainer(this.executor, legacyPlan.containerName);
+    if (legacy) await this.removeOwned(legacyPlan, legacy);
 
     let inspect = await inspectContainer(this.executor, plan.containerName);
     if (inspect?.State?.Running === true) {

@@ -12,7 +12,7 @@ import type { MailboxInfo } from './types';
 
 interface MoveToDropdownProps {
   open: boolean;
-  anchorRef: RefObject<HTMLElement>;
+  anchorRef: RefObject<HTMLElement | null>;
   menuId: string;
   mailboxes: MailboxInfo[];
   onMove: (mailboxId: string) => void | Promise<void>;

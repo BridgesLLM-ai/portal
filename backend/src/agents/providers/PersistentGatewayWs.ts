@@ -1,3 +1,4 @@
+import { supportsOpenClawInlineWidgets } from '../../services/openClawCompatibility';
 /**
  * PersistentGatewayWs — Singleton persistent WebSocket connection to OpenClaw gateway.
  * 
@@ -14,7 +15,7 @@
  */
 import WebSocket from 'ws';
 import { createHash } from 'crypto';
-import { buildSignedDevice, getOrCreateDeviceKeys } from '../../utils/deviceIdentity';
+import { buildSignedDevice, getOrCreateDeviceKeys, validateGatewayChallenge } from '../../utils/deviceIdentity';
 import { getOpenClawWsUrl } from '../../config/openclaw';
 import { streamEventBus, type StreamEvent } from '../../services/StreamEventBus';
 import { sanitizeAssistantChunk, sanitizeAssistantText, isControlOnlyAssistantText } from '../../utils/chatText';
@@ -28,6 +29,27 @@ import {
   OpenClawExecutionAdmissionError,
 } from '../../services/openClawExecutionAdmission';
 import { isOpenClawExecutionCapableGatewayCall } from '../../services/openClawExecutionCapableMethods';
+
+import { assembleChatSnapshot, GatewayFrameFence, observeOpenClawHello, clearOpenClawHello, getOpenClawCapabilities } from '../../services/openClawCompatibility';
+import { projectWidgetToolResult } from '../../services/chatWidgetProjection';
+import { openPortalWidgetTurnSocket } from '../../services/portalWidgetTurnSocket';
+import { publishSessionWorkChanged, invalidateSessionWorkRows } from '../../services/openClawSessionWork';
+
+import type { NativeChatImage } from '../../services/chatImages/directChatImages';
+import { assertOpenClawImageInput, ChatImageError } from '../../services/chatImages/chatImageModelPolicy';
+const widgetTurnSockets = new Map<string, { close(): void }>();
+function closeWidgetTurnSocket(key: string): void {
+  widgetTurnSockets.get(key)?.close(); widgetTurnSockets.delete(key);
+}
+function observeSessionWorkEvent(event: string, payload: any): void {
+  if (event === 'progressCard.changed') publishSessionWorkChanged(payload?.sessionKey, ['progress']);
+  if (event === 'sessions.changed') publishSessionWorkChanged(payload?.key || payload?.sessionKey, ['goal', 'status', 'children']);
+  if (['agent', 'session.tool'].includes(event)
+    && ['progress_card', 'sessions_spawn', 'subagents', 'create_goal', 'update_goal'].includes(payload?.data?.name)) {
+    publishSessionWorkChanged(payload?.sessionKey, ['progress', 'goal', 'children']);
+  }
+}
+const gatewayFrameFence = new GatewayFrameFence();
 
 const DEBUG_GATEWAY_WS = process.env.DEBUG_GATEWAY_WS === '1';
 const debugLog = (...args: unknown[]) => {
@@ -559,7 +581,6 @@ function publishArbitratedTextSnapshot(
   lane: 'assistant' | 'chat',
   incomingSnapshot: string,
 ): boolean {
-  if (!incomingSnapshot) return false;
   const state = getTextArbitrationState(sessionKey, runId);
   const nextSegmentText = segmentSnapshotForLane(state, lane, incomingSnapshot);
   const currentSegmentText = state.segmentText;
@@ -1789,6 +1810,7 @@ function cleanupCompletedRun(sessionKey: string, runId?: string): void {
   clearReconnectRunRecovery(sessionKey);
   ambiguousRunReservationsBySession.delete(sessionKey);
   pendingToolRunsBySession.delete(sessionKey);
+  closeWidgetTurnSocket(sessionKey);
   resetRunStreamState(sessionKey);
 }
 
@@ -1877,6 +1899,7 @@ function publishFatalRunError(sessionKey: string, content: string, runId?: strin
   clearReconnectRunRecovery(sessionKey);
   ambiguousRunReservationsBySession.delete(sessionKey);
   pendingToolRunsBySession.delete(sessionKey);
+  closeWidgetTurnSocket(sessionKey);
   resetRunStreamState(sessionKey);
 }
 
@@ -2368,8 +2391,8 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       if (publishArbitratedTextSnapshot(sessionKey, effectiveRunId, 'assistant', text)) {
         markAssistantTextLane(sessionKey, effectiveRunId);
       }
-    } else if (delta) {
-      const nextSeen = assistantLastSeen + delta;
+    } else if (delta || data.replace === true) {
+      const nextSeen = data.replace === true ? delta || '' : assistantLastSeen + delta;
       assistantLastSeenTextMap.set(sessionKey, nextSeen);
       if (publishArbitratedTextSnapshot(sessionKey, effectiveRunId, 'assistant', nextSeen)) {
         markAssistantTextLane(sessionKey, effectiveRunId);
@@ -2509,7 +2532,7 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
         content: `${icon} Using tool: ${toolName}`,
         toolName,
         toolCallId: data.toolCallId,
-        toolArgs: data.input || data.args,
+        toolArgs: toolName === 'show_widget' ? { title: String(((data.input || data.args) as any)?.title || 'Widget').slice(0, 160) } : data.input || data.args,
         runId: effectiveRunId,
       });
     } else if (phase === 'update') {
@@ -2527,7 +2550,8 @@ function handleAgentEvent(payload: Record<string, unknown> | undefined): void {
       }
     } else if (phase === 'result') {
       streamEventBus.updateStreamPhase(sessionKey, { phase: 'streaming', toolName: undefined, runId: effectiveRunId });
-      const output = extractToolResultText(data.output ?? data.result)?.substring(0, 1000);
+      const output = projectWidgetToolResult(toolName, data.toolCallId, data.output ?? data.result)
+        ?? extractToolResultText(data.output ?? data.result)?.substring(0, 1000);
       const resultStatus = String((data.result as any)?.status || data.status || '').toLowerCase();
       const isError = data.isError === true
         || resultStatus === 'failed'
@@ -3046,14 +3070,15 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
       return;
     }
 
-    const deltaText = extractTextFromContent(
+    const assembledText = assembleChatSnapshot(chatLastSeenTextMap.get(sessionKey) || '', payload, extractTextFromContent(
       message?.content ?? payload.text ?? payload.delta ?? payload.content ?? '',
-    );
+    ));
+    chatLastSeenTextMap.set(sessionKey, assembledText);
+    const deltaText = sanitizeAssistantDelta(assembledText);
 
     debugLog(`chat.delta event: session=${sessionKey} runId=${runId || '-'} textLen=${deltaText.length} payloadKeys=${Object.keys(payload).join(',')}`);
-    if (!deltaText || isControlOnlyAssistantText(deltaText)) return;
+    if ((!deltaText && payload.replace !== true) || isControlOnlyAssistantText(deltaText)) return;
 
-    chatLastSeenTextMap.set(sessionKey, deltaText);
     // Prefer a currently-growing assistant lane, but only within this segment
     // and for a short grace period. A tool boundary or lane silence immediately
     // re-enables the cumulative chat.delta fallback.
@@ -3190,6 +3215,7 @@ function handleChatEvent(payload: Record<string, unknown> | undefined): void {
       metadata: { aborted: true },
     });
     if (!streamEventBus.clearStream(sessionKey, effectiveRunId)) return;
+    closeWidgetTurnSocket(sessionKey);
     tombstoneRun(sessionKey, effectiveRunId);
     if (activeRunIds.get(sessionKey) === effectiveRunId) activeRunIds.delete(sessionKey);
     pendingToolRunsBySession.delete(sessionKey);
@@ -3217,7 +3243,7 @@ function connect(): void {
   const keys = getOrCreateDeviceKeys();
   let connectId: string | undefined;
 
-  const sendConnect = (nonce?: string) => {
+  const sendConnect = (nonce: string, signedAt: number) => {
     connectId = nextId();
     const params: Record<string, unknown> = {
         auth: { token: GATEWAY_TOKEN },
@@ -3237,10 +3263,11 @@ function connect(): void {
           scopes: GATEWAY_SCOPES,
           token: GATEWAY_TOKEN,
           nonce,
+          signedAt,
         }),
         role: GATEWAY_ROLE,
         scopes: GATEWAY_SCOPES,
-        caps: ['tool-events'],
+        caps: ['tool-events', 'session-scoped-events'],
         minProtocol: MIN_PROTOCOL_VERSION,
         maxProtocol: MAX_PROTOCOL_VERSION,
       };
@@ -3285,8 +3312,11 @@ function connect(): void {
 
     // Connect challenge
     if (msg.type === 'event' && msg.event === 'connect.challenge') {
-      const nonce = msg.payload?.nonce;
-      sendConnect(nonce);
+      try {
+        const challenge = validateGatewayChallenge(msg.payload);
+        sendConnect(challenge.nonce, challenge.ts);
+      } catch { ws.close(1008, 'Invalid gateway challenge'); }
+
       return;
     }
 
@@ -3306,6 +3336,9 @@ function connect(): void {
             ))
             : [],
         );
+        observeOpenClawHello(msg.payload);
+        gatewayFrameFence.clear();
+        lastSeq = 0;
         isAuthenticated = true;
         isConnecting = false;
         reconnectAttempts = 0;
@@ -3352,9 +3385,11 @@ function connect(): void {
           const rpcError = new Error(errorMessage) as Error & {
             errorCode?: string;
             errorMessage?: string;
+            errorDetails?: unknown;
           };
           if (typeof msg.error?.code === 'string') rpcError.errorCode = msg.error.code;
           rpcError.errorMessage = errorMessage;
+          rpcError.errorDetails = msg.error?.details;
           pending.reject(rpcError);
         }
       }
@@ -3425,6 +3460,11 @@ function connect(): void {
       return;
     }
 
+    if (['agent', 'session.tool', 'chat'].includes(msg.event)
+      && gatewayFrameFence.accept(msg.event, msg.payload) === 'duplicate') return;
+
+    observeSessionWorkEvent(msg.event, msg.payload);
+
     // Agent stream events
     if (msg.event === 'agent' || msg.event === 'session.tool') {
       handleAgentEvent(msg.payload);
@@ -3462,6 +3502,9 @@ function connect(): void {
   });
 
   ws.on('close', (code: number, reason: Buffer) => {
+    clearOpenClawHello();
+    invalidateSessionWorkRows();
+    gatewayFrameFence.clear();
     const reasonStr = reason?.toString() || '';
     debugLog(`WebSocket closed: code=${code} ${reasonStr}`);
 
@@ -3549,6 +3592,10 @@ export function initPersistentGatewayWs(): void {
  * Shutdown the persistent WebSocket connection.
  */
 export function shutdownPersistentGatewayWs(): void {
+  for (const key of widgetTurnSockets.keys()) closeWidgetTurnSocket(key);
+  clearOpenClawHello();
+  invalidateSessionWorkRows();
+  gatewayFrameFence.clear();
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -4738,6 +4785,10 @@ export async function sendChatMessage(
   idempotencyKey: string,
   routeReservationRunId?: string,
   onProviderDispatchAccepted?: (upstreamRunId: string) => Promise<void>,
+  attachments: NativeChatImage[] = [],
+  portalInlineWidgets = false,
+  chatImageModel?: string,
+  revalidateChatImages?: () => Promise<void>,
 ): Promise<{ runId: string }> {
   if (!singletonWs || singletonWs.readyState !== WebSocket.OPEN) {
     throw new Error('Persistent WebSocket not connected');
@@ -4746,12 +4797,55 @@ export async function sendChatMessage(
     throw new Error('Persistent WebSocket not authenticated');
   }
 
+  if (attachments.length && (!chatImageModel || typeof revalidateChatImages !== 'function')) {
+    throw new ChatImageError('IMAGE_AUTHORITY_REQUIRED', 403);
+  }
+
+  // Capability belongs to this originating turn socket, not the singleton.
+  const widgetCaps = getOpenClawCapabilities();
+  const widgetSocket = portalInlineWidgets && supportsOpenClawInlineWidgets(widgetCaps.version)
+    && widgetCaps.methods.includes('canvas.document.view') ? await openPortalWidgetTurnSocket(sessionKey, (event, payload) => {
+    if (event === 'response') {
+      const pending = pendingResponses.get(payload.id);
+      if (!pending) return;
+      pendingResponses.delete(payload.id);
+      if (payload.ok) pending.resolve(payload.payload);
+      else pending.reject(new Error('Widget turn dispatch rejected'));
+    } else if (gatewayFrameFence.accept(event, payload) === 'accept') {
+      observeSessionWorkEvent(event, payload);
+      if (event === 'chat') handleChatEvent(payload);
+      else handleAgentEvent(event === 'session.tool' ? { ...payload, stream: 'tool' } : payload);
+    }
+  }) : null;
   const requestId = nextId();
   const reservationRunId = normalizedRunId(routeReservationRunId) || requestId;
   if (!reserveLogicalRun(sessionKey, reservationRunId)) {
+    widgetSocket?.close();
     throw new Error(`A different run is already active for ${sessionKey}`);
   }
   setPendingRunUserIdempotency(sessionKey, reservationRunId, idempotencyKey);
+  if (widgetSocket) {
+    const previous = widgetTurnSockets.get(sessionKey); previous?.close();
+    widgetTurnSockets.set(sessionKey, widgetSocket);
+  }
+
+  if (attachments.length) {
+    const connection = singletonWs;
+    try {
+      if (await assertOpenClawImageInput(sessionKey) !== chatImageModel) throw new ChatImageError('IMAGE_MODEL_CHANGED');
+      // Keep custody revalidation last: only synchronous dispatch checks and
+      // frame construction may follow before the originating socket write.
+      await revalidateChatImages!();
+      if (!isAuthenticated || singletonWs !== connection || connection?.readyState !== WebSocket.OPEN
+        || activeRunIds.get(sessionKey) !== reservationRunId) {
+        throw new ChatImageError('IMAGE_DISPATCH_CHANGED', 409);
+      }
+    } catch (error) {
+      closeWidgetTurnSocket(sessionKey);
+      failPendingRunReservation(sessionKey, reservationRunId);
+      throw error;
+    }
+  }
 
   // Register this session's run expectation BEFORE sending (prevents race with
   // stale replayed events that arrive between send and response).
@@ -4825,6 +4919,7 @@ export async function sendChatMessage(
           });
           return;
         } else {
+          closeWidgetTurnSocket(sessionKey);
           failPendingRunReservation(sessionKey, reservationRunId);
         }
         reject(err);
@@ -4832,7 +4927,7 @@ export async function sendChatMessage(
     });
 
     try {
-      writeChatSendFrame(singletonWs!, {
+      writeChatSendFrame(widgetSocket || singletonWs!, {
         type: 'req',
         id: requestId,
         method: 'chat.send',
@@ -4841,11 +4936,14 @@ export async function sendChatMessage(
           message,
           idempotencyKey,
           deliver: false,
+          ...(attachments.length ? { attachments: attachments.map(({ type, mimeType, content, fileName }) =>
+            ({ type, mimeType, content, fileName })) } : {}),
         },
       });
     } catch (err: any) {
       clearTimeout(timeoutTimer);
       pendingResponses.delete(requestId);
+      closeWidgetTurnSocket(sessionKey);
       failPendingRunReservation(sessionKey, reservationRunId);
       // Keep the typed 503 (code, retryable) so the client shows maintenance
       // rather than a generic transport failure.

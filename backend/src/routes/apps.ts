@@ -1,4 +1,7 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request as ExpressRequest, Response } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import { captureBoundedMultipartBody } from '../utils/proxyMultipartBody';
 import {
   APP_API_ID_HEADER,
@@ -65,6 +68,7 @@ import {
 } from '../utils/shareLinkPagination';
 import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
 import { portalFeatureUnavailableResponse } from '../utils/portalFeatureCapabilities';
+import { appHtmlHasViteEntry, streamShareHtml } from '../utils/shareHtmlStream';
 import { AppError } from '../middleware/errorHandler';
 import {
   acquireWorkspaceAuthorizationMutationLease,
@@ -101,7 +105,6 @@ export const APPS_DIR = appsStoragePaths.appsDir;
 export const ZIPS_DIR = appsStoragePaths.zipsDir;
 const HOSTED_APPS_DIR = process.env.APPS_ROOT || '/var/www/bridgesllm-apps';
 const MAX_APP_DESCRIPTION_LENGTH = 4_000;
-const MAX_SHARE_HTML_BYTES = 5 * 1024 * 1024;
 const MAX_APPS_PER_USER = 500;
 
 function redactShareLink<T extends { passwordHash?: string | null }>(shareLink: T): Omit<T, 'passwordHash'> {
@@ -631,12 +634,12 @@ export const shareRouter = Router();
 
 const passwordAttemptLimiter = new SharePasswordAttemptLimiter();
 
-function requestIsSecure(req: Request): boolean {
+function requestIsSecure(req: ExpressRequest): boolean {
   return req.secure || String(req.headers['x-forwarded-proto'] || '').toLowerCase().includes('https');
 }
 
 function hasShareGrant(
-  req: Request,
+  req: ExpressRequest,
   link: { id: string; token: string; passwordHash?: string | null },
   kind: 'password' | 'visit',
 ): boolean {
@@ -646,7 +649,7 @@ function hasShareGrant(
 }
 
 function grantShareAccess(
-  req: Request,
+  req: ExpressRequest,
   res: Response,
   link: { id: string; token: string; passwordHash?: string | null },
   kind: 'password' | 'visit',
@@ -727,7 +730,7 @@ async function enforceShareAccessWindow(
 }
 
 function admitResolvedShareLinkRequest(
-  req: Request,
+  req: ExpressRequest,
   res: Response,
   link: { userId: string },
 ): boolean {
@@ -744,7 +747,7 @@ interface PreparedShareVisitor {
 }
 
 function prepareShareVisitor(
-  req: Request,
+  req: ExpressRequest,
   link: { id: string; token: string },
 ): PreparedShareVisitor | null {
   const cookieName = shareGrantCookieName('visit', link.token);
@@ -774,7 +777,7 @@ function prepareShareVisitor(
 }
 
 async function commitShareVisit(
-  req: Request,
+  req: ExpressRequest,
   res: Response,
   link: { id: string; token: string; maxUses: number | null },
   visitor: PreparedShareVisitor,
@@ -815,7 +818,7 @@ async function commitShareVisit(
 }
 
 function preflightShareVisit(
-  req: Request,
+  req: ExpressRequest,
   res: Response,
   link: { id: string; token: string; maxUses: number | null; currentUses: number },
 ): boolean {
@@ -832,7 +835,7 @@ function preflightShareVisit(
 }
 
 async function admitShareRequest(
-  req: Request,
+  req: ExpressRequest,
   res: Response,
   link: {
     id: string;
@@ -1007,7 +1010,7 @@ const SHARE_PASSWORD_STYLESHEET = `
 *{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e27;color:#f0f4f8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}.card{width:100%;max-width:420px;background:rgba(255,255,255,.03);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.08);border-radius:1.25rem;padding:2.5rem;box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}.lock-icon{width:48px;height:48px;margin:0 auto 1rem;display:flex;align-items:center;justify-content:center;background:rgba(16,185,129,.1);border-radius:50%}.lock-icon svg{width:24px;height:24px;color:#10b981}h1{font-size:1.5rem;font-weight:700;text-align:center;margin-bottom:.5rem}.subtitle{color:#94a3b8;text-align:center;margin-bottom:1.5rem;font-size:.9rem}.project-name{color:#818cf8;font-weight:600}input[type=password]{width:100%;padding:.85rem 1rem;border-radius:.75rem;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:#fff;font-size:.95rem;outline:none;transition:border-color .2s}input[type=password]:focus{border-color:rgba(16,185,129,.5)}input[type=password]::placeholder{color:#475569}.btn{width:100%;padding:.85rem;border-radius:.75rem;background:#10b981;color:#fff;border:0;font-size:.95rem;font-weight:600;cursor:pointer;margin-top:1rem;transition:background .2s,opacity .2s}.btn:hover{background:#059669}.btn:disabled{opacity:.5;cursor:not-allowed}.error{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.15);border-radius:.5rem;padding:.75rem;margin-top:.75rem;color:#f87171;font-size:.85rem;text-align:center}
 `;
 
-function isNativeShareAuthForm(req: Request): boolean {
+function isNativeShareAuthForm(req: ExpressRequest): boolean {
   return String(req.headers['content-type'] || '')
     .split(';', 1)[0]
     .trim()
@@ -1015,7 +1018,7 @@ function isNativeShareAuthForm(req: Request): boolean {
 }
 
 function sendShareAuthFailure(
-  req: Request,
+  req: ExpressRequest,
   res: Response,
   status: number,
   message: string,
@@ -1059,13 +1062,14 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
     } else {
       // Guard: if no dist/ and root index.html contains Vite dev markers, refuse to serve it
       const guardIndex = resolveExistingPathWithin(resolvedAppDir, path.join(resolvedAppDir, 'index.html'));
-      if (guardIndex) {
-        if (fs.statSync(guardIndex).size > MAX_SHARE_HTML_BYTES) {
-          res.status(413).send('App HTML is too large to serve safely');
-          return true;
-        }
-        const guardHtml = fs.readFileSync(guardIndex, 'utf-8');
-        if (guardHtml.includes('/src/main.tsx') || guardHtml.includes('/src/main.ts') || guardHtml.includes('/src/main.jsx')) {
+      if (guardIndex && fs.statSync(guardIndex).isFile()) {
+        const controller = new AbortController();
+        const cancel = () => controller.abort();
+        res.once('close', cancel);
+        let hasViteEntry: boolean;
+        try { hasViteEntry = await appHtmlHasViteEntry(guardIndex, controller.signal); }
+        finally { res.off('close', cancel); }
+        if (hasViteEntry) {
           console.error(`[Share] BLOCKED: ${resolvedAppDir}/index.html contains Vite dev entry. Build artifacts (dist/) missing.`);
           res.status(500).send('<html><body style="font-family:sans-serif;padding:2rem;background:#0A0E27;color:#f0f4f8;"><h1>App Not Built</h1><p>This shared app has not been built for production. Please contact the app owner.</p></body></html>');
           return true;
@@ -1102,24 +1106,9 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
       if (!stats.isDirectory()) {
         // Special handling for HTML files - inject <base> tag so relative assets resolve correctly
         if (token && resolvedPath.endsWith('.html')) {
-          if (stats.size > MAX_SHARE_HTML_BYTES) {
-            res.status(413).send('App HTML is too large to serve safely');
-            return true;
-          }
-          const html = fs.readFileSync(resolvedPath, 'utf-8');
-          const baseTag = `<base href="/share/${token}/">`;
-          let modifiedHtml;
-          if (html.includes('<head>')) {
-            modifiedHtml = html.replace('<head>', `<head>\n    ${baseTag}`);
-          } else if (html.includes('<HEAD>')) {
-            modifiedHtml = html.replace('<HEAD>', `<HEAD>\n    ${baseTag}`);
-          } else {
-            modifiedHtml = baseTag + '\n' + html;
-          }
           // The share token is a bearer capability. Never write it to logs.
           console.log(`[Share] Serving HTML with <base> tag: ${resolvedPath}`);
-          res.setHeader('Content-Type', 'text/html; charset=utf-8');
-          res.send(modifiedHtml);
+          await streamShareHtml(resolvedPath, `/share/${encodeURIComponent(token)}/`, res);
         } else {
           console.log(`[Share] Serving file: ${resolvedPath}`);
           await new Promise<void>((resolve) => {
@@ -1157,7 +1146,8 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
     return false;
   } catch (error) {
     console.error('[Share] serveAppFile error:', error);
-    res.status(500).send('Server error');
+    if (!res.headersSent && !res.destroyed) res.status(500).send('Server error');
+    else if (!res.writableEnded && !res.destroyed) res.destroy();
     return true;
   }
 }
@@ -1165,9 +1155,9 @@ async function serveAppFile(app: { zipPath: string }, requestedPath: string, res
 // Share-scoped API proxy.
 // Supports apps that call relative "api/..." under /share/:token/.
 // Uses streaming proxy semantics (no redirect) so methods/bodies/query are preserved.
-shareRouter.all('/:token/api/*', async (req: Request, res: Response) => {
+shareRouter.all('/:token/api/{*apiPath}', async (req: ExpressRequest<{ token: string; apiPath?: string[] }>, res: Response) => {
   const { token } = req.params;
-  const proxiedPath = req.params[0] || '';
+  const proxiedPath = Array.isArray(req.params.apiPath) ? req.params.apiPath.join('/') : '';
   const qsIndex = req.originalUrl.indexOf('?');
   const query = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
   let proxyTimedOut = false;
@@ -1517,7 +1507,7 @@ shareRouter.get('/:token', async (req: Request, res: Response) => {
   }
 });
 
-shareRouter.get('/:token/*', async (req: Request, res: Response) => {
+shareRouter.get('/:token/{*assetPath}', async (req: ExpressRequest<{ token: string; assetPath?: string[] }>, res: Response) => {
   try {
     const { token } = req.params;
     const shareLink = await findShareLink(token);
@@ -1532,7 +1522,7 @@ shareRouter.get('/:token/*', async (req: Request, res: Response) => {
       return;
     }
 
-    const requestedPath = req.params[0];
+    const requestedPath = Array.isArray(req.params.assetPath) ? req.params.assetPath.join('/') : '';
     if (isBlockedAppStaticPath(requestedPath)) {
       res.status(404).send('Not found');
       return;

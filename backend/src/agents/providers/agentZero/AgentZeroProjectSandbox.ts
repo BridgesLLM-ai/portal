@@ -21,6 +21,13 @@ import {
   type ProjectEgressPlaneHandle,
   type ProjectEgressPlaneSpec,
 } from '../../../services/projectEgressPlane';
+import {
+  dockerArgsCarryProtectedValue,
+  protectedDockerCommandEnvironment,
+  protectedDockerEnvironmentArgs,
+  redactProtectedDockerValues,
+  type ProtectedDockerCommand,
+} from '../../../services/projectDockerSecretEnvironment';
 import { PROJECT_EGRESS_POLICY_VERSION } from '../../../services/projectEgressPolicy';
 import {
   AgentZeroAuthSessionManager,
@@ -45,6 +52,9 @@ import {
   AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL,
   AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
   AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
+  AGENT_ZERO_PROJECT_LEGACY_V211_IMAGE_GENERATION,
+  getAgentZeroProjectLegacyV211SourceCommit,
+  getAgentZeroProjectLegacyV211UpstreamImageRef,
   AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION,
   getAgentZeroProjectLegacyV210SourceCommit,
   getAgentZeroProjectLegacyV210UpstreamImageRef,
@@ -63,6 +73,7 @@ import {
   resolveAgentZeroProjectBridgeGatewayIpv4,
   resolveAgentZeroProjectEgressConfig,
   resolveAgentZeroProjectRuntimeIpv4,
+  type AgentZeroProjectCommandOptions,
   type AgentZeroProjectCommandRunner,
   type AgentZeroProjectEgressAttestation,
 } from './AgentZeroProjectEgress';
@@ -86,6 +97,7 @@ import {
   projectRuntimeSecurityOptArgs,
   projectRuntimeSecurityOptionValues,
 } from '../../../services/projectRuntimeConfinement';
+import { PROJECT_RUNTIME_SHARED_NPROC_LIMIT } from '../../../services/projectRuntimeProcessLimits';
 
 export const AGENT_ZERO_PROJECT_RUNTIME = 'agent-zero-project-sandbox-v4';
 export const AGENT_ZERO_PROJECT_POLICY_VERSION = 'agent-zero-project-isolation-v4';
@@ -116,6 +128,8 @@ const MAX_COMMAND_OUTPUT = 4 * 1024 * 1024;
 const RUNTIME_MEMORY_BYTES = 2 * 1024 * 1024 * 1024;
 const RUNTIME_NANO_CPUS = 2_000_000_000;
 const RUNTIME_PIDS_LIMIT = 512;
+// Every runtime created before the shared-UID ceiling set RLIMIT_NPROC 512.
+const RUNTIME_LEGACY_NPROC_LIMIT = 512;
 const PROXY_ENV_KEYS = Object.freeze([
   'HTTP_PROXY',
   'HTTPS_PROXY',
@@ -292,13 +306,38 @@ export interface AgentZeroProjectIdentityRuntimeAttestationInput {
   modelSelection: AgentZeroProjectModelSelection;
 }
 
-function defaultRunCommand(command: string, args: string[]): string {
-  return execFileSync(command, args, {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 15_000,
-    maxBuffer: MAX_COMMAND_OUTPUT,
-  }).trim();
+function defaultRunCommand(
+  command: string,
+  args: string[],
+  options: AgentZeroProjectCommandOptions = {},
+): string {
+  const secretEnvironment = options.secretEnvironment || {};
+  // Refuses an unlisted name, a NUL or a named credential without its value
+  // before spawning; Node's own argument errors would quote the value.
+  const env = protectedDockerCommandEnvironment(process.env, args, secretEnvironment);
+  if (Object.keys(secretEnvironment).length === 0) {
+    return execFileSync(command, args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000,
+      maxBuffer: MAX_COMMAND_OUTPUT,
+    }).trim();
+  }
+  try {
+    return execFileSync(command, args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000,
+      maxBuffer: MAX_COMMAND_OUTPUT,
+      env,
+    }).trim();
+  } catch (error: any) {
+    // Node's failure text quotes the command line and stderr. Keep only a
+    // redacted stderr tail; redaction runs before the cut.
+    const status = typeof error?.status === 'number' ? error.status : 'unknown';
+    const detail = redactProtectedDockerValues(String(error?.stderr || ''), secretEnvironment).trim().slice(-300);
+    throw new Error(`Agent Zero project host command failed with exit code ${status}${detail ? `: ${detail}` : ''}`);
+  }
 }
 
 function resolveAgentZeroProjectImage(
@@ -320,11 +359,15 @@ function expectedDerivedImageIdentity(
 } | null {
   const sourceCommit = generation === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
     ? getAgentZeroProjectLegacyV25SourceCommit(architecture)
-    : generation === AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION
+    : generation === AGENT_ZERO_PROJECT_LEGACY_V211_IMAGE_GENERATION
+      ? getAgentZeroProjectLegacyV211SourceCommit(architecture)
+      : generation === AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION
       ? getAgentZeroProjectLegacyV210SourceCommit(architecture) : getAgentZeroProjectSourceCommit(architecture);
   const upstreamRef = generation === AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
     ? getAgentZeroProjectLegacyV25UpstreamImageRef(architecture)
-    : generation === AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION
+    : generation === AGENT_ZERO_PROJECT_LEGACY_V211_IMAGE_GENERATION
+      ? getAgentZeroProjectLegacyV211UpstreamImageRef(architecture)
+      : generation === AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION
       ? getAgentZeroProjectLegacyV210UpstreamImageRef(architecture) : getAgentZeroProjectUpstreamImageRef(architecture);
   if (!sourceCommit || !upstreamRef) return null;
   const upstreamDigest = upstreamRef.split('@')[1] || '';
@@ -554,7 +597,12 @@ export function buildAgentZeroProjectLegacyRuntimeFingerprint(input: {
   });
 }
 
-export function buildAgentZeroProjectContainerCreateArgs(
+/**
+ * The create argv and the proxy credentials it names. The proxy variables
+ * carry the Project egress token, so argv holds only their names and Docker
+ * reads each value from the command runner's protected subprocess environment.
+ */
+export function buildAgentZeroProjectContainerCreateCommand(
   input: {
     descriptor: AgentZeroProjectRuntimeDescriptor;
     imageRef: string;
@@ -565,7 +613,7 @@ export function buildAgentZeroProjectContainerCreateArgs(
     runtimeIpv4: string;
     modelBridgeCredential: AgentZeroProjectModelBridgeCredential;
   },
-): string[] {
+): ProtectedDockerCommand {
   const {
     descriptor,
     imageRef,
@@ -573,8 +621,8 @@ export function buildAgentZeroProjectContainerCreateArgs(
     runtimeFingerprint,
     bridgeGatewayIpv4,
   } = input;
-  const proxyEnvironment = expectedAgentZeroProxyEnvironment(spec, bridgeGatewayIpv4);
-  return [
+  const environment = protectedDockerEnvironmentArgs(expectedAgentZeroProxyEnvironment(spec, bridgeGatewayIpv4));
+  const args = [
     'container', 'create',
     '--name', descriptor.containerName,
     '--hostname', 'agent-zero-project',
@@ -588,7 +636,7 @@ export function buildAgentZeroProjectContainerCreateArgs(
     '--memory-swap', String(RUNTIME_MEMORY_BYTES),
     '--cpus', '2',
     '--ulimit', 'nofile=1024:1024',
-    '--ulimit', 'nproc=512:512',
+    '--ulimit', `nproc=${PROJECT_RUNTIME_SHARED_NPROC_LIMIT}:${PROJECT_RUNTIME_SHARED_NPROC_LIMIT}`,
     '--restart', 'no',
     '--stop-timeout', '30',
     '--network', input.internalNetworkId,
@@ -607,9 +655,13 @@ export function buildAgentZeroProjectContainerCreateArgs(
     '--label', `${AGENT_ZERO_PROJECT_ID_LABEL}=${descriptor.projectIdentityId}`,
     '--label', `${AGENT_ZERO_PROJECT_ACTOR_LABEL}=${descriptor.actorUserId}`,
     '--label', `${PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL}=${runtimeFingerprint}`,
-    ...Object.entries(proxyEnvironment).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+    ...environment.args,
     imageRef,
   ];
+  if (dockerArgsCarryProtectedValue(args, environment.secretEnvironment, [spec.token])) {
+    throw new Error('Agent Zero project egress credential would reach the Docker command line.');
+  }
+  return { args, secretEnvironment: environment.secretEnvironment };
 }
 
 export function buildAgentZeroProjectVolumeCreateArgs(
@@ -675,6 +727,34 @@ function inspectOptionalAgentZeroContainer(
   } catch (error) {
     if (isDockerContainerNotFound(error)) return null;
     throw error;
+  }
+}
+
+// Remove only the exact, stopped container this call created, carrying this
+// descriptor's identity labels, and never fall back to the name. Ambiguity is
+// a no-op; the caller's original error stays the outcome.
+function removeUnattestedCreatedAgentZeroRuntime(
+  runCommand: CommandRunner,
+  descriptor: AgentZeroProjectRuntimeDescriptor,
+  containerId: string,
+  runtimeFingerprint: string,
+): void {
+  try {
+    const inspect = inspectOptionalAgentZeroContainer(runCommand, containerId);
+    const labels = inspect?.Config?.Labels || {};
+    if (!inspect
+      || exactAgentZeroContainerId(inspect) !== containerId
+      || String(inspect.Name || '').replace(/^\//, '') !== descriptor.containerName
+      || inspect.State?.Running !== false
+      || labels[AGENT_ZERO_PROJECT_KEY_LABEL] !== descriptor.key
+      || labels[AGENT_ZERO_PROJECT_ID_LABEL] !== descriptor.projectIdentityId
+      || labels[AGENT_ZERO_PROJECT_ACTOR_LABEL] !== descriptor.actorUserId
+      || labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL] !== runtimeFingerprint) {
+      return;
+    }
+    runCommand('docker', ['container', 'rm', containerId]);
+  } catch {
+    // Ambiguous cleanup is intentionally a no-op.
   }
 }
 
@@ -971,7 +1051,7 @@ function exactTmpfs(host: Record<string, any>): boolean {
   });
 }
 
-function exactUlimits(host: Record<string, any>): boolean {
+function exactUlimits(host: Record<string, any>, nprocLimit: number): boolean {
   const values = Array.isArray(host.Ulimits) ? host.Ulimits.map((value: any) => ({
     name: String(value?.Name || ''),
     soft: Number(value?.Soft),
@@ -979,7 +1059,7 @@ function exactUlimits(host: Record<string, any>): boolean {
   })).sort((left: any, right: any) => left.name.localeCompare(right.name)) : [];
   return JSON.stringify(values) === JSON.stringify([
     { name: 'nofile', soft: 1024, hard: 1024 },
-    { name: 'nproc', soft: 512, hard: 512 },
+    { name: 'nproc', soft: nprocLimit, hard: nprocLimit },
   ]);
 }
 
@@ -1033,6 +1113,7 @@ function exactContainerIsolation(
   networkGeneration: AgentZeroRuntimeNetworkGeneration,
   confinementGeneration: AgentZeroRuntimeConfinementGeneration = 'CURRENT',
   imageGeneration: AgentZeroProjectImageGeneration = AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
+  nprocLimit: number = PROJECT_RUNTIME_SHARED_NPROC_LIMIT,
 ): boolean {
   const host = inspect.HostConfig || {};
   const labels = inspect.Config?.Labels || {};
@@ -1119,7 +1200,7 @@ function exactContainerIsolation(
     && host.MemorySwap === RUNTIME_MEMORY_BYTES
     && host.NanoCpus === RUNTIME_NANO_CPUS
     && exactTmpfs(host)
-    && exactUlimits(host)
+    && exactUlimits(host, nprocLimit)
     && exactPortContract(inspect, requireRunning)
     && networks.length === 1
     && networks[0] === spec.internalNetworkName
@@ -1431,7 +1512,7 @@ export function probeAgentZeroProjectSandboxRuntime(
   } catch {
     return emptyStatus(
       descriptor,
-      'The isolated Agent Zero v2.11 Project runtime or its controlled-egress identity is unavailable.',
+      'The isolated Agent Zero v2.14 Project runtime or its controlled-egress identity is unavailable.',
     );
   }
 
@@ -1523,7 +1604,7 @@ export function probeAgentZeroProjectSandboxRuntime(
         ? 'Agent Zero Project Sandbox shared egress plane, membership, or ordered firewall is missing or drifted.'
         : !qualified
           ? 'Agent Zero Project Sandbox is isolated but lacks a current exact live public-egress, escape, replay, gateway, and model qualification.'
-          : 'Agent Zero v2.11 Project Sandbox has a current exact live qualification.';
+          : 'Agent Zero v2.14 Project Sandbox has a current exact live qualification.';
 
   return {
     ready: structuralIsolation && volumeProvenance && egressPlaneReady,
@@ -1837,6 +1918,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
   }
   let container: Record<string, any> | null = initialRuntimeInventory.inspections[0] || null;
   let currentContainerId: string | null = null;
+  let createdThisCall: string | null = null;
   let attestCurrentBeforeEgress:
     ((candidate: Record<string, any>) => boolean) | null = null;
   if (container) {
@@ -1882,7 +1964,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       )
       ? AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION
       : existingImageRef
-        ? [AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION, AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION]
+        ? [AGENT_ZERO_PROJECT_LEGACY_V211_IMAGE_GENERATION, AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION, AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION]
           .find((generation) => exactDerivedImageLabels(container?.Config?.Labels, architecture, generation)) || null
         : null;
     if (!existingImageRef || !imageGeneration) {
@@ -1954,7 +2036,29 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       'CURRENT',
       imageGeneration,
     );
-    const legacyImageImmutable = !current
+    // The exact current recipe as created before the shared-UID nproc ceiling.
+    const currentLegacyNproc = !current
+      && imageGeneration === AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION
+      && preflightNetworkBinding.generation === 'CURRENT'
+      && exactContainerIsolation(
+      container,
+      descriptor,
+      existingImageRef,
+      architecture,
+      spec,
+      currentFingerprint,
+      preflightBridgeGatewayIpv4,
+      preflightRuntimeIpv4,
+      modelBridgeCredential,
+      authCredentials,
+      requireRunning,
+      preflightInternalNetworkId,
+      'IMMUTABLE_ID',
+      'CURRENT',
+      imageGeneration,
+      RUNTIME_LEGACY_NPROC_LIMIT,
+    );
+    const legacyImageImmutable = !current && !currentLegacyNproc
       && imageGeneration !== AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION
       && preflightNetworkBinding.generation === 'CURRENT'
       && exactContainerIsolation(
@@ -1973,8 +2077,9 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         'IMMUTABLE_ID',
         'CURRENT',
         imageGeneration,
+        RUNTIME_LEGACY_NPROC_LIMIT,
       );
-    const currentNameMode = !current && !legacyImageImmutable
+    const currentNameMode = !current && !currentLegacyNproc && !legacyImageImmutable
       && preflightNetworkBinding.generation === 'CURRENT'
       && exactContainerIsolation(
       container,
@@ -1992,8 +2097,9 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       'CURRENT_NAME_MODE',
       'CURRENT',
       imageGeneration,
+      RUNTIME_LEGACY_NPROC_LIMIT,
     );
-    const preConfinement = !current && !legacyImageImmutable && !currentNameMode
+    const preConfinement = !current && !currentLegacyNproc && !legacyImageImmutable && !currentNameMode
       && preflightNetworkBinding.generation === 'LEGACY_PRE_CONFINEMENT'
       && exactContainerIsolation(
       container,
@@ -2011,8 +2117,9 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       'DETERMINISTIC_NAME',
       'LEGACY_PRE_CONFINEMENT',
       imageGeneration,
+      RUNTIME_LEGACY_NPROC_LIMIT,
     );
-    const legacy = !current && !legacyImageImmutable && !currentNameMode && !preConfinement
+    const legacy = !current && !currentLegacyNproc && !legacyImageImmutable && !currentNameMode && !preConfinement
       && preflightNetworkBinding.generation === 'LEGACY_PRE_CONFINEMENT'
       && exactContainerIsolation(
       container,
@@ -2030,8 +2137,9 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
       'DETERMINISTIC_NAME',
       'LEGACY_PRE_CONFINEMENT',
       imageGeneration,
+      RUNTIME_LEGACY_NPROC_LIMIT,
     );
-    if (!current && !legacyImageImmutable && !currentNameMode && !preConfinement && !legacy) {
+    if (!current && !currentLegacyNproc && !legacyImageImmutable && !currentNameMode && !preConfinement && !legacy) {
       throw new Error('Existing Agent Zero project container is neither the current nor a recognized legacy generation.');
     }
     currentContainerId = exactAgentZeroContainerId(container);
@@ -2054,22 +2162,22 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         imageGeneration,
       );
     }
-    if (legacyImageImmutable || currentNameMode || preConfinement || legacy) {
-      const retirementFingerprint = legacyImageImmutable || currentNameMode
+    if (currentLegacyNproc || legacyImageImmutable || currentNameMode || preConfinement || legacy) {
+      const retirementFingerprint = currentLegacyNproc || legacyImageImmutable || currentNameMode
         ? currentFingerprint
         : preConfinement
           ? preConfinementFingerprint
           : legacyFingerprint;
       const retirementRuntimeIpv4 = legacy ? null : preflightRuntimeIpv4;
-      const retirementSpec = legacyImageImmutable || currentNameMode ? spec : preConfinementSpec;
+      const retirementSpec = currentLegacyNproc || legacyImageImmutable || currentNameMode ? spec : preConfinementSpec;
       const retirementNetworkGeneration: AgentZeroRuntimeNetworkGeneration
-        = legacyImageImmutable
+        = currentLegacyNproc || legacyImageImmutable
           ? 'IMMUTABLE_ID'
           : currentNameMode
             ? 'CURRENT_NAME_MODE'
             : 'DETERMINISTIC_NAME';
       const retirementConfinement: AgentZeroRuntimeConfinementGeneration
-        = legacyImageImmutable || currentNameMode ? 'CURRENT' : 'LEGACY_PRE_CONFINEMENT';
+        = currentLegacyNproc || legacyImageImmutable || currentNameMode ? 'CURRENT' : 'LEGACY_PRE_CONFINEMENT';
       const beforeStopInventory = inspectExactAgentZeroProjectRuntimeInventory(
         runCommand,
         descriptor,
@@ -2098,6 +2206,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         retirementNetworkGeneration,
         retirementConfinement,
         imageGeneration,
+        RUNTIME_LEGACY_NPROC_LIMIT,
       )) {
         throw new Error('Recognized legacy Agent Zero project container changed before retirement.');
       }
@@ -2121,6 +2230,7 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
         retirementNetworkGeneration,
         retirementConfinement,
         imageGeneration,
+        RUNTIME_LEGACY_NPROC_LIMIT,
       )) {
         throw new Error('Recognized legacy Agent Zero project container changed before retirement.');
       }
@@ -2209,32 +2319,39 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
     if (inspectOptionalAgentZeroContainer(runCommand, descriptor.containerName)) {
       throw new Error('Agent Zero project container name became occupied before exact creation.');
     }
+    const create = buildAgentZeroProjectContainerCreateCommand({
+      descriptor,
+      imageRef,
+      spec,
+      internalNetworkId: handleInternalNetworkId,
+      runtimeFingerprint,
+      bridgeGatewayIpv4,
+      runtimeIpv4,
+      modelBridgeCredential,
+    });
     const createdContainerId = requireCreatedAgentZeroContainerId(
-      runCommand('docker', buildAgentZeroProjectContainerCreateArgs({
-        descriptor,
-        imageRef,
-        spec,
-        internalNetworkId: handleInternalNetworkId,
-        runtimeFingerprint,
-        bridgeGatewayIpv4,
-        runtimeIpv4,
-        modelBridgeCredential,
-      })),
+      runCommand('docker', create.args, { secretEnvironment: create.secretEnvironment }),
     );
-    container = inspectOptionalAgentZeroContainer(runCommand, createdContainerId);
-    if (!container
-      || exactAgentZeroContainerId(container) !== createdContainerId
-      || String(container.Name || '').replace(/^\//, '') !== descriptor.containerName) {
-      throw new Error('Created Agent Zero project container immutable identity changed before attestation.');
-    }
-    const createdInventory = inspectExactAgentZeroProjectRuntimeInventory(runCommand, descriptor);
-    if (createdInventory.ids.length !== 1
-      || createdInventory.ids[0] !== createdContainerId) {
-      throw new Error('Created Agent Zero project container did not own the exact runtime identity.');
-    }
-    const createdByName = inspectOptionalAgentZeroContainer(runCommand, descriptor.containerName);
-    if (!createdByName || exactAgentZeroContainerId(createdByName) !== createdContainerId) {
-      throw new Error('Created Agent Zero project container name changed before attestation.');
+    createdThisCall = createdContainerId;
+    try {
+      container = inspectOptionalAgentZeroContainer(runCommand, createdContainerId);
+      if (!container
+        || exactAgentZeroContainerId(container) !== createdContainerId
+        || String(container.Name || '').replace(/^\//, '') !== descriptor.containerName) {
+        throw new Error('Created Agent Zero project container immutable identity changed before attestation.');
+      }
+      const createdInventory = inspectExactAgentZeroProjectRuntimeInventory(runCommand, descriptor);
+      if (createdInventory.ids.length !== 1
+        || createdInventory.ids[0] !== createdContainerId) {
+        throw new Error('Created Agent Zero project container did not own the exact runtime identity.');
+      }
+      const createdByName = inspectOptionalAgentZeroContainer(runCommand, descriptor.containerName);
+      if (!createdByName || exactAgentZeroContainerId(createdByName) !== createdContainerId) {
+        throw new Error('Created Agent Zero project container name changed before attestation.');
+      }
+    } catch (error) {
+      removeUnattestedCreatedAgentZeroRuntime(runCommand, descriptor, createdContainerId, runtimeFingerprint);
+      throw error;
     }
     currentContainerId = createdContainerId;
   } else {
@@ -2286,6 +2403,11 @@ async function convergeAgentZeroProjectSandboxRuntimeLocked(
     handleInternalNetworkId,
     'IMMUTABLE_ID',
   )) {
+    // A creation whose credentials never arrived must not be resumed by the
+    // next call; it is removed by its immutable ID only.
+    if (createdThisCall) {
+      removeUnattestedCreatedAgentZeroRuntime(runCommand, descriptor, createdThisCall, runtimeFingerprint);
+    }
     throw new Error('Existing Agent Zero project container drifted from the isolation contract.');
   }
   await constrainRuntime({
@@ -3053,3 +3175,7 @@ export function hardAbortAgentZeroProjectRuntime(
     return false;
   }
 }
+
+export const __agentZeroProjectSandboxTest = {
+  defaultRunCommand,
+};

@@ -1,0 +1,37 @@
+#!/usr/bin/python3
+"""Run the signed, pinned desktop bridge without changing system Python packages."""
+import hashlib
+from pathlib import Path
+import stat
+import sys
+
+WHEEL = 'websockify-0.13.0-py3-none-any.whl'
+SHA256 = 'ac497a8dafc7f51d28ca989f01cdf5f8add663a497d425a56b159dcb8d6a314c'
+
+
+def main():
+    root = Path(__file__).absolute().parent
+    for item in (root, Path(__file__), root / WHEEL):
+        metadata = item.lstat()
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022 or stat.S_ISLNK(metadata.st_mode):
+            raise SystemExit('Desktop WebSocket runtime has unsafe ownership or permissions')
+        if item == root and not stat.S_ISDIR(metadata.st_mode):
+            raise SystemExit('Desktop WebSocket runtime directory is invalid')
+        if item != root and not stat.S_ISREG(metadata.st_mode):
+            raise SystemExit('Desktop WebSocket runtime file is invalid')
+    digest = hashlib.sha256()
+    with (root / WHEEL).open('rb') as source:
+        for chunk in iter(lambda: source.read(65536), b''):
+            digest.update(chunk)
+    if digest.hexdigest() != SHA256:
+        raise SystemExit('Desktop WebSocket runtime integrity check failed')
+    sys.path.insert(0, str(root / WHEEL))
+    from websockify.websocketproxy import websockify_init
+    websockify_init()
+
+
+# websockify starts one multiprocessing child per client. Python 3.14 defaults
+# to forkserver, whose server imports this file as __mp_main__ (children inherit
+# the verified sys.path); the bridge must start only in the real entry process.
+if __name__ == '__main__':
+    main()

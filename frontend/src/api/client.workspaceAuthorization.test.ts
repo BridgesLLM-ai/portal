@@ -137,7 +137,7 @@ describe('Axios workspace authorization request identity', () => {
     });
     client.defaults.adapter = adapter as AxiosAdapter;
 
-    const request = client.post('/files/mutate', { value: 'user-1 payload' });
+    const request = client.get('/files', { params: { search: 'user-1 query' } });
     const rejected = expect(request).rejects.toBeInstanceOf(
       StaleWorkspaceAuthorizationResponseError,
     );

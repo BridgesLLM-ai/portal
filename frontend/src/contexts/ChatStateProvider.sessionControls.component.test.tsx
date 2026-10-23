@@ -8,6 +8,7 @@ import {
   ChatStateProvider,
   useChatState,
 } from './ChatStateProvider';
+import { QuestionAttentionProvider, useVisibleQuestionConversations } from './QuestionAttentionContext';
 
 const chatMocks = vi.hoisted(() => ({
   useDirectGateway: false,
@@ -1763,10 +1764,13 @@ describe('ChatStateProvider session-control ownership', () => {
 
     await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
 
-    await waitFor(() => expect(screen.getByTestId('is-running')).toHaveTextContent('idle'));
-    expect(screen.getByTestId('messages')).toHaveTextContent(
+    // The initial state is also idle. Wait for the actual SSE result before
+    // asserting terminal state, otherwise deferred sends can pass that wait
+    // before the stream has even started.
+    await waitFor(() => expect(screen.getByTestId('messages')).toHaveTextContent(
       'Reasoning visible before the SSE outage',
-    );
+    ));
+    await waitFor(() => expect(screen.getByTestId('is-running')).toHaveTextContent('idle'));
     expect(screen.getByTestId('messages')).toHaveTextContent('Raw SSE reasoning before the preamble');
     expect(screen.getByTestId('messages')).not.toHaveTextContent('live view detached');
     expect(screen.getByTestId('messages')).not.toHaveTextContent('may still be working');
@@ -4681,6 +4685,103 @@ describe('ChatStateProvider session-control ownership', () => {
 
     expect(await screen.findByTestId('status-text')).toHaveTextContent('needs more than one answer');
     expect(chatMocks.answerQuestion).not.toHaveBeenCalled();
+  });
+
+  describe('native harness questions (Portal Chat Bridge)', () => {
+    const NATIVE = 'codex-user-1-1760000000000-bridge';
+    const bridgeQuestion = {
+      id: 'askq_bridge_1',
+      sessionKey: NATIVE,
+      surface: 'agent-chat',
+      state: 'pending',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 300_000,
+      questions: [{ id: 'q1', question: 'Continue?', multiSelect: false, isOther: true, options: [] }],
+    };
+
+    async function openNativeChat(user: ReturnType<typeof userEvent.setup>) {
+      await user.click(screen.getByRole('button', { name: 'Switch to Codex' }));
+      await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent(NATIVE));
+      await waitFor(() => expect(chatMocks.pendingQuestions).toHaveBeenCalledWith(NATIVE));
+    }
+
+    function startNativeTurn() {
+      act(() => {
+        PendingWebSocket.instances[0].emit({
+          type: 'text',
+          provider: 'CODEX',
+          sessionKey: NATIVE,
+          runId: 'run-native-question',
+          content: 'I need one detail first.',
+        });
+      });
+    }
+
+    beforeEach(() => {
+      localStorage.setItem('agent-chat-session:CODEX', NATIVE);
+    });
+
+    it('polls the exact native session and answers its waiting question from the composer', async () => {
+      chatMocks.pendingQuestions.mockImplementation(async (session?: string) => ({
+        questions: session === NATIVE ? [{ ...bridgeQuestion, expiresAt: Date.now() + 300_000 }] : [],
+      }));
+      const user = userEvent.setup();
+      await renderReadyHarness();
+      await openNativeChat(user);
+      await waitFor(() => expect(screen.getByTestId('pending-questions')).toHaveTextContent('1'));
+      startNativeTurn();
+      await waitFor(() => expect(screen.getByTestId('is-running')).toHaveTextContent('running'));
+
+      await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+
+      await waitFor(() => expect(chatMocks.answerQuestion).toHaveBeenCalledWith('askq_bridge_1', { q1: 'Yes' }));
+      expect(screen.getByTestId('pending-questions')).toHaveTextContent('0');
+      expect(screen.getByTestId('queue-count')).toHaveTextContent('0');
+      expect(chatMocks.clientPost).not.toHaveBeenCalledWith('/gateway/session-steer', expect.anything());
+    });
+
+    it('queues composer text as a follow-up when no native question is waiting and never steers', async () => {
+      const user = userEvent.setup();
+      await renderReadyHarness();
+      await openNativeChat(user);
+      startNativeTurn();
+      await waitFor(() => expect(screen.getByTestId('is-running')).toHaveTextContent('running'));
+
+      await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+
+      await waitFor(() => expect(screen.getByTestId('queue-count')).toHaveTextContent('1'));
+      expect(chatMocks.answerQuestion).not.toHaveBeenCalled();
+      expect(chatMocks.clientPost).not.toHaveBeenCalledWith('/gateway/session-steer', expect.anything());
+    });
+
+    it('never asks for questions under a native alias before the first turn', async () => {
+      localStorage.setItem('agent-chat-session:CODEX', 'new-1760000000000');
+      const user = userEvent.setup();
+      await renderReadyHarness();
+      await user.click(screen.getByRole('button', { name: 'Switch to Codex' }));
+      await waitFor(() => expect(screen.getByTestId('session')).toHaveTextContent('new-1760000000000'));
+      await act(async () => {});
+      expect(chatMocks.pendingQuestions.mock.calls.every(([session]) => session === 'agent:main:first')).toBe(true);
+    });
+
+    it('marks the open native conversation as visible so its toast stays inline', async () => {
+      function VisibleConversations() {
+        return <output data-testid="visible-conversations">{JSON.stringify(useVisibleQuestionConversations())}</output>;
+      }
+      render(
+        <QuestionAttentionProvider>
+          <ChatStateProvider>
+            <SessionControlsHarness />
+          </ChatStateProvider>
+          <VisibleConversations />
+        </QuestionAttentionProvider>,
+      );
+      await waitFor(() => expect(screen.getByTestId('visible-conversations')).toHaveTextContent('agent:main:first'));
+      const user = userEvent.setup();
+      await openNativeChat(user);
+      await waitFor(() => expect(JSON.parse(screen.getByTestId('visible-conversations').textContent || '[]'))
+        .toEqual([{ surface: 'agent-chat', sessionKey: NATIVE }]));
+    });
   });
 
   it('retries active Agent Chat steering with the same delivery id when no question is pending', async () => {

@@ -20,6 +20,7 @@ import {
   Wrench,
 } from 'lucide-react';
 import client from '../api/client';
+import SharedBrowserPanel from '../components/SharedBrowserPanel';
 import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 
 type RemoteDesktopHealth = 'loading' | 'ready' | 'degraded' | 'unavailable';
@@ -872,7 +873,12 @@ export default function DesktopPage() {
       setTimeout(() => postViewportToIframe('open-shared-browser'), 500);
     } catch (err: any) {
       if (!mountedRef.current) return;
-      setSharedBrowserMessage({ ok: false, text: err?.response?.data?.error || 'Shared Chrome could not be opened.' });
+      if (err?.response?.status === 409) {
+        window.dispatchEvent(new Event('portal:open-shared-browser'));
+        setSharedBrowserMessage({ ok: true, text: 'Shared interactive browser controls opened.' });
+      } else {
+        setSharedBrowserMessage({ ok: false, text: err?.response?.data?.error || 'Shared Chrome could not be opened.' });
+      }
     } finally {
       if (mountedRef.current) {
         setOpeningInDesktop(false);
@@ -900,6 +906,7 @@ export default function DesktopPage() {
       exit={{ opacity: 0 }}
       className={`flex min-h-0 flex-col ${fullscreen ? 'fixed inset-0 z-50 bg-[#0A0E27]' : 'h-full'}`}
     >
+      <SharedBrowserPanel />
       <div className="flex flex-col gap-2 border-b border-white/5 bg-[#0D1130]/80 px-2 py-2 backdrop-blur-xl sm:px-4 sm:py-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex shrink-0 items-center gap-3 min-w-[200px]">
           <Monitor size={16} className="text-emerald-400 flex-shrink-0" />

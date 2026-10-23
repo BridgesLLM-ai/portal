@@ -563,8 +563,44 @@ export type ProjectHostedDeploySuccess = Readonly<{
   buildOutput?: string;
 }>;
 
+export interface DesktopBuildJob {
+  id: string; projectId: string; actorId: string; action: 'check' | 'deploy' | 'build' | 'resolve';
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  phase: string; startedAt: string; finishedAt: string | null; output: string;
+  result?: Record<string, unknown>; error?: string;
+}
+export function validateDesktopBuildJob(value: unknown): DesktopBuildJob {
+  const row = requireRecord(value, 'Desktop build');
+  if (!/^[a-f0-9-]{36}$/.test(String(row.id || '')) || typeof row.projectId !== 'string'
+    || typeof row.actorId !== 'string' || !['check', 'deploy', 'build', 'resolve'].includes(String(row.action))
+    || !['running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(row.status))
+    || typeof row.phase !== 'string' || typeof row.output !== 'string' || row.output.length > 24 * 1024
+    || typeof row.startedAt !== 'string' || (row.finishedAt !== null && typeof row.finishedAt !== 'string')
+    || (row.error !== undefined && typeof row.error !== 'string')) throw new Error('Desktop build receipt is malformed');
+  return Object.freeze(row as unknown as DesktopBuildJob);
+}
+export async function awaitDesktopBuild(name: string, value: unknown, onProgress?: (job: DesktopBuildJob) => void): Promise<any> {
+  if (!value || typeof value !== 'object' || !('desktopJob' in value)) return value;
+  let job = validateDesktopBuildJob((value as any).desktopJob);
+  const id = job.id, projectId = job.projectId, started = Date.now();
+  for (;;) {
+    onProgress?.(job);
+    if (job.status === 'succeeded') {
+      if (!job.result || typeof job.result !== 'object') throw new Error('Desktop build result is missing');
+      return job.result;
+    }
+    if (job.status !== 'running') throw new Error(job.error || 'Desktop build ' + job.status);
+    if (Date.now() - started > 20 * 60_000) throw new Error('Desktop build is still active. Reopen the Project to read its current status; do not submit a duplicate build.');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    const response = await client.get(`/projects/${projectSegment(name)}/desktop-build`, { params: { id } });
+    job = validateDesktopBuildJob(response.data.desktopJob);
+    if (job.id !== id || job.projectId !== projectId) throw new Error('Desktop build identity changed');
+  }
+}
+
 export type ProjectDesktopRuntimeDeploySuccess = Readonly<{
-  message: 'Running on Remote Desktop';
+  message: 'Running on Remote Desktop' | 'Built and opened on Remote Desktop';
+  status?: 'running' | 'stopped' | 'completed' | 'error' | 'unknown';
   appId: string;
   name: string;
   deployType: 'runtime';
@@ -611,7 +647,7 @@ function validateProjectDeploySuccess(
   const commonKeys = ['appId', 'buildOutput', 'deployType', 'message', 'name'];
   const runtimeResponse = record.deployType === 'runtime';
   const allowedKeys = new Set(runtimeResponse
-    ? commonKeys
+    ? [...commonKeys, 'status']
     : [...commonKeys, 'port', 'url']);
   if (
     Object.keys(record).some((key) => !allowedKeys.has(key))
@@ -626,7 +662,8 @@ function validateProjectDeploySuccess(
     || (replay?.action === 'deploy' && replay.expectedDeployType !== record.deployType)
     || (replay?.expectedAppId !== null && replay?.expectedAppId !== undefined && record.appId !== replay.expectedAppId)
     || (runtimeResponse
-      ? record.message !== 'Running on Remote Desktop'
+      ? !['Running on Remote Desktop', 'Built and opened on Remote Desktop'].includes(String(record.message))
+        || (record.status !== undefined && !['running', 'stopped', 'completed', 'error', 'unknown'].includes(String(record.status)))
         || record.url !== undefined
         || record.port !== undefined
       : record.message !== 'Deployed'
@@ -638,7 +675,8 @@ function validateProjectDeploySuccess(
   }
   if (runtimeResponse) {
     return Object.freeze({
-      message: 'Running on Remote Desktop',
+      message: record.message as ProjectDesktopRuntimeDeploySuccess['message'],
+      ...(record.status !== undefined ? { status: record.status as ProjectDesktopRuntimeDeploySuccess['status'] } : {}),
       appId: record.appId as string,
       name: record.name as string,
       deployType: 'runtime',
@@ -674,6 +712,7 @@ export type ProjectRuntimeManagement =
   | 'static';
 
 export type ProjectRuntimeStatusSource =
+  | 'desktop-unit'
   | 'portal-manager'
   | 'persisted-app'
   | 'external-binding'
@@ -690,6 +729,8 @@ export type ProjectLifecycleAction =
   | 'delete-project';
 
 export interface ProjectDeploymentProcessState {
+  desktop?: { sourceState: 'current' | 'changed' | 'unknown'; builtAt: string; generation: string };
+  exitCode?: number | null;
   status: string;
   deployType: string;
   runtimeManagement: ProjectRuntimeManagement;
@@ -751,6 +792,10 @@ export interface ProjectTreeResponse {
   identity: ProjectIdentityProof;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} is malformed`);
@@ -766,6 +811,7 @@ const projectRuntimeManagementValues = new Set<ProjectRuntimeManagement>([
 ]);
 
 const projectRuntimeStatusSourceValues = new Set<ProjectRuntimeStatusSource>([
+  'desktop-unit',
   'portal-manager',
   'persisted-app',
   'external-binding',
@@ -820,7 +866,7 @@ function projectRuntimeMetadataIsCoherent(
   switch (runtimeManagement) {
     case 'external-loopback': return statusSource === 'external-binding';
     case 'static': return statusSource === 'deployment-record';
-    case 'desktop-session': return statusSource === 'persisted-app';
+    case 'desktop-session': return statusSource === 'persisted-app' || statusSource === 'desktop-unit';
     case 'portal-container': return statusSource === 'portal-manager' || statusSource === 'persisted-app';
   }
 }
@@ -1295,7 +1341,10 @@ export function validateProjectDeploymentProcessState(value: unknown): ProjectDe
   const portalSettledState = runtimeManagement === 'portal-container'
     && statusSource === 'persisted-app'
     && !recoveryRequired;
-  const actionsAreCoherent = runtimeManagement !== 'portal-container'
+  const desktopUnitState = runtimeManagement === 'desktop-session' && statusSource === 'desktop-unit';
+  const actionsAreCoherent = desktopUnitState
+    ? projectProcessActionsMatch(supportedActions, portalManagerProcessActions)
+    : runtimeManagement !== 'portal-container'
     ? supportedActions.length === 0
     : portalManagerState
       ? projectProcessActionsMatch(supportedActions, portalManagerProcessActions)
@@ -1304,7 +1353,9 @@ export function validateProjectDeploymentProcessState(value: unknown): ProjectDe
         : portalSettledState
           ? projectProcessActionsMatch(supportedActions, portalSettledProcessActions)
           : false;
-  const runtimeEvidenceIsCoherent = portalManagerState
+  const runtimeEvidenceIsCoherent = desktopUnitState
+    ? record.port === undefined && !recoveryRequired && restartCount === 0
+    : portalManagerState
     ? record.port !== undefined && !recoveryRequired
     : record.port === undefined
       && logs.length === 0
@@ -1342,6 +1393,11 @@ export function validateProjectDeploymentProcessState(value: unknown): ProjectDe
     || (record.lastError !== undefined && typeof record.lastError !== 'string')
     || (record.limitation !== undefined && typeof record.limitation !== 'string')
     || (record.message !== undefined && typeof record.message !== 'string')
+    || (record.desktop !== undefined && (!desktopUnitState || !isRecord(record.desktop)
+      || !['current', 'changed', 'unknown'].includes(record.desktop.sourceState as string)
+      || typeof record.desktop.builtAt !== 'string' || !Number.isFinite(Date.parse(record.desktop.builtAt))
+      || typeof record.desktop.generation !== 'string' || !/^[a-f0-9-]{36}$/.test(record.desktop.generation)))
+    || (record.exitCode !== undefined && record.exitCode !== null && (!Number.isInteger(record.exitCode) || !desktopUnitState))
     || !actionsAreCoherent
     || !runtimeEvidenceIsCoherent
   ) {
@@ -1509,7 +1565,33 @@ export function validateProjectChatHistoryPage(value: unknown): ProjectChatHisto
   return record as unknown as ProjectChatHistoryPage;
 }
 
+export interface DesktopProjectTemplateChoice {
+  id: string; language: 'typescript' | 'rust' | 'python' | 'cpp'; interface: 'terminal' | 'gui'; target: 'desktop';
+}
+/** Installer-recorded host capability; `reason` explains an unavailable toolchain. */
+export interface DesktopToolchainStatus {
+  available: boolean; reason?: string; dependencyPolicy: 'brokered' | 'offline';
+}
+function parseDesktopTemplateCatalog(data: any): { desktop: DesktopProjectTemplateChoice[]; desktopToolchain: DesktopToolchainStatus } {
+  if (!Array.isArray(data?.desktop) || data.desktop.some((row: any) => !row
+    || !['typescript', 'rust', 'python', 'cpp'].includes(row.language)
+    || !['terminal', 'gui'].includes(row.interface) || row.target !== 'desktop'
+    || row.id !== row.language + '-' + row.interface)) throw new Error('Desktop template catalogue is malformed');
+  const toolchain = data.desktopToolchain;
+  if (!toolchain || typeof toolchain.available !== 'boolean' || !['brokered', 'offline'].includes(toolchain.dependencyPolicy)
+    || (!toolchain.available && typeof toolchain.reason !== 'string')) throw new Error('Desktop toolchain status is malformed');
+  return { desktop: data.desktop, desktopToolchain: { available: toolchain.available, dependencyPolicy: toolchain.dependencyPolicy,
+    ...(toolchain.available ? {} : { reason: String(toolchain.reason).slice(0, 500) }) } };
+}
 export const projectsAPI = {
+  templates: async (): Promise<DesktopProjectTemplateChoice[]> => {
+    const { data } = await client.get('/projects/templates', { _silent: true } as any);
+    return parseDesktopTemplateCatalog(data).desktop;
+  },
+  templateCatalog: async () => {
+    const { data } = await client.get('/projects/templates', { _silent: true } as any);
+    return parseDesktopTemplateCatalog(data);
+  },
   list: async () => {
     const { data } = await client.get('/projects', { _silent: true } as any);
     return validateProjectListResponse(data);
@@ -1618,15 +1700,16 @@ export const projectsAPI = {
     const { data } = await client.post(`/projects/${projectSegment(name)}/git`, { action, ...params });
     return data;
   },
-  gitEnhancedLog: async (name: string, branch?: string, limit?: number) => {
-    const { data } = await client.post(`/projects/${projectSegment(name)}/git`, { action: 'log-enhanced', branch, limit });
+  /** `skip` pages older history; the response's `hasMore` says whether more exists. */
+  gitEnhancedLog: async (name: string, branch?: string, limit?: number, skip?: number) => {
+    const { data } = await client.post(`/projects/${projectSegment(name)}/git`, { action: 'log-enhanced', branch, limit, skip });
     return data;
   },
   gitRevert: async (name: string, hash: string) => {
     const { data } = await client.post(`/projects/${projectSegment(name)}/git`, { action: 'revert', hash });
     return data;
   },
-  deploy: async (name: string, recoveryReplay?: ProjectRuntimeRecoveryReplayProof) => {
+  deploy: async (name: string, recoveryReplay?: ProjectRuntimeRecoveryReplayProof, onProgress?: (job: DesktopBuildJob) => void) => {
     const { data } = recoveryReplay
       ? await client.post(
           `/projects/${projectSegment(name)}/deploy`,
@@ -1635,14 +1718,14 @@ export const projectsAPI = {
         )
       : await client.post(
           `/projects/${projectSegment(name)}/deploy`,
-          undefined,
+          { asyncBuild: true },
           { _skipNetworkRetry: true } as any,
         );
     if (recoveryReplay) {
       const completion = projectRuntimeRecoveryCompletion(data, recoveryReplay);
       if (completion) return completion;
     }
-    return validateProjectDeploySuccess(data, recoveryReplay);
+    return validateProjectDeploySuccess(await awaitDesktopBuild(name, data, onProgress), recoveryReplay);
   },
   undeploy: async (name: string) => {
     const { data } = await client.delete(`/projects/${projectSegment(name)}/deploy`);
@@ -1666,6 +1749,18 @@ export const projectsAPI = {
       return validateProjectDeploymentProcessState(statusResponse.data);
     }
     return validateProjectDeploymentProcessState(data);
+  },
+  check: async (name: string, onProgress?: (job: DesktopBuildJob) => void) => {
+    const response = await client.post(`/projects/${projectSegment(name)}/check`, { asyncBuild: true }, { _skipNetworkRetry: true } as any);
+    return awaitDesktopBuild(name, response.data, onProgress);
+  },
+  desktopBuild: async (name: string): Promise<DesktopBuildJob | null> => {
+    const response = await client.get(`/projects/${projectSegment(name)}/desktop-build`);
+    return response.data.desktopJob === null ? null : validateDesktopBuildJob(response.data.desktopJob);
+  },
+  cancelDesktopBuild: async (name: string, id: string) => {
+    const response = await client.post(`/projects/${projectSegment(name)}/desktop-build/cancel`, { id }, { _skipNetworkRetry: true } as any);
+    return response.data;
   },
   checkDeps: async (name: string) => {
     const { data } = await client.get(`/projects/${projectSegment(name)}/check-deps`);

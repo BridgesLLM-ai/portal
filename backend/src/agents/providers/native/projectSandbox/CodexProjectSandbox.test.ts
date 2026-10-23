@@ -9,6 +9,7 @@ import {
   CODEX_PROJECT_CONTAINER_ROOT,
   CODEX_PROJECT_RUNTIME_POLICY_VERSION,
   buildPreviousCodexProjectExecutionContext,
+  codexProjectDockerHostEnvironment,
   type CodexProjectEgressRuntimeHandle,
 } from './CodexProjectEgressRuntime';
 import {
@@ -18,6 +19,7 @@ import {
   CODEX_PROJECT_PROFILE_NAME,
   assertCodexProjectSandboxPathSeparation,
   buildCodexProjectInvocation,
+  buildCodexProjectSandboxVerificationInvocation,
   clearCodexProjectSandboxProbeCacheForTests,
   ensureCodexProjectQualifiedRuntime,
   isSupportedBubblewrapVersionOutput,
@@ -345,8 +347,23 @@ describe('Codex Project sandbox contract', () => {
       expect(invocation.args).not.toContain('--add-dir');
       expect(invocation.args.some((entry) => /^\/run\/portal-project-run-codex-[a-f0-9]{32}\.json$/.test(entry))).toBe(true);
       expect(invocation.abort).toEqual(expect.any(Function));
-      expect(invocation.options?.env).not.toHaveProperty('HTTP_PROXY');
-      expect(invocation.options?.env).not.toHaveProperty('NO_PROXY');
+      // Proxy credentials are named on argv; the docker CLI reads their
+      // values from its own environment and never uses the proxy itself.
+      const proxy = fixture.runtime.proxyEnvironment;
+      expect(invocation.args.some((entry) => entry.includes(proxy.HTTPS_PROXY))).toBe(false);
+      for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+        expect(invocation.args[invocation.args.indexOf(key) - 1]).toBe('--env');
+      }
+      expect(invocation.args).toEqual(expect.arrayContaining(['--env', 'NO_PROXY=', '--env', 'no_proxy=']));
+      expect(invocation.options?.env).toEqual({
+        ...codexProjectDockerHostEnvironment(),
+        HTTP_PROXY: proxy.HTTP_PROXY,
+        HTTPS_PROXY: proxy.HTTPS_PROXY,
+        http_proxy: proxy.http_proxy,
+        https_proxy: proxy.https_proxy,
+        NO_PROXY: '*',
+        no_proxy: '*',
+      });
     }
     expect(fresh.args.slice(-2)).toEqual(['--', prompt]);
     expect(resumed.args).toEqual(expect.arrayContaining(['exec', 'resume']));
@@ -384,10 +401,18 @@ describe('Codex Project sandbox contract', () => {
     const fixture = makeFixture();
     fixtures.push(fixture);
     restoreEnvironment.push(installFixtureEnvironment(fixture));
-    const calls: Array<{ command: string; args: readonly string[] }> = [];
+    const calls: Array<{
+      command: string;
+      args: readonly string[];
+      secretEnvironment?: Readonly<Record<string, string>>;
+    }> = [];
     const executor: ProjectEgressCommandExecutor = {
-      run: jest.fn(async (command: string, args: readonly string[]): Promise<ProjectEgressCommandResult> => {
-        calls.push({ command, args });
+      run: jest.fn(async (
+        command: string,
+        args: readonly string[],
+        options: { secretEnvironment?: Readonly<Record<string, string>> } = {},
+      ): Promise<ProjectEgressCommandResult> => {
+        calls.push({ command, args, secretEnvironment: options.secretEnvironment });
         const isVersion = args.includes('/usr/bin/codex') && args.includes('--version');
         return { stdout: isVersion ? `codex-cli ${CODEX_PROJECT_CLI_VERSION}\n` : '', stderr: '', exitCode: 0 };
       }),
@@ -399,6 +424,20 @@ describe('Codex Project sandbox contract', () => {
       turnId: 'qualification-turn',
       message: 'Qualify and run.',
     }, deps);
+    // Both qualification execs (the version check and the `codex sandbox`
+    // runner) name the proxy credentials and hand the executor their values;
+    // none reaches argv.
+    const proxy = fixture.runtime.proxyEnvironment;
+    const execs = calls.filter(({ args }) => args[0] === 'container' && args[1] === 'exec');
+    expect(execs).toHaveLength(2);
+    for (const exec of execs) {
+      expect(exec.args.some((entry) => entry.includes(proxy.HTTPS_PROXY))).toBe(false);
+      expect(exec.args[exec.args.indexOf('HTTPS_PROXY') - 1]).toBe('--env');
+      expect(exec.secretEnvironment).toEqual({
+        HTTP_PROXY: proxy.HTTP_PROXY, HTTPS_PROXY: proxy.HTTPS_PROXY,
+        http_proxy: proxy.http_proxy, https_proxy: proxy.https_proxy,
+      });
+    }
     const qualification = calls.find(({ args }) => args.includes('node') && args.some((arg) => arg.includes('169.254.169.254')));
     expect(qualification).toBeDefined();
     const encoded = qualification!.args.join('\n');
@@ -409,6 +448,38 @@ describe('Codex Project sandbox contract', () => {
     expect(encoded).toContain('10.255.255.1');
     expect(encoded).toContain('169.254.169.254');
     expect(encoded).toContain('192.168.255.254');
+  });
+
+  test('verification keeps the nested Codex sandbox and names its proxy credentials only', async () => {
+    const fixture = makeFixture();
+    fixtures.push(fixture);
+    restoreEnvironment.push(installFixtureEnvironment(fixture));
+    const invocation = await buildCodexProjectSandboxVerificationInvocation(
+      fixture.context,
+      'test -w .',
+      dependenciesFor(fixture),
+    );
+    expect(invocation.command).toBe('docker');
+    expect(invocation.args).toEqual(expect.arrayContaining([
+      'container', 'exec',
+      fixture.runtime.containerId,
+      '/usr/bin/codex', 'sandbox',
+      '--profile', CODEX_PROJECT_PROFILE_NAME,
+      '--permission-profile', CODEX_PROJECT_PERMISSION_PROFILE,
+      '--cd', CODEX_PROJECT_CONTAINER_ROOT,
+      '/bin/sh', '-c', 'test -w .',
+    ]));
+    const proxy = fixture.runtime.proxyEnvironment;
+    expect(invocation.args.some((entry) => entry.includes(proxy.HTTPS_PROXY))).toBe(false);
+    for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+      expect(invocation.args[invocation.args.indexOf(key) - 1]).toBe('--env');
+    }
+    expect(invocation.options?.env).toEqual({
+      ...codexProjectDockerHostEnvironment(),
+      HTTP_PROXY: proxy.HTTP_PROXY, HTTPS_PROXY: proxy.HTTPS_PROXY,
+      http_proxy: proxy.http_proxy, https_proxy: proxy.https_proxy,
+      NO_PROXY: '*', no_proxy: '*',
+    });
   });
 
   test('fails closed when live qualification fails and does not return an invocation', async () => {

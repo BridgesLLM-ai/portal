@@ -42,7 +42,7 @@ vi.mock('framer-motion', async () => {
   };
 });
 
-vi.mock('xterm', () => ({
+vi.mock('@xterm/xterm', () => ({
   Terminal: class TerminalMock {
     buffer = {
       active: {
@@ -66,7 +66,7 @@ vi.mock('xterm', () => ({
   },
 }));
 
-vi.mock('xterm-addon-fit', () => ({
+vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class FitAddonMock {
     fit = vi.fn();
   },

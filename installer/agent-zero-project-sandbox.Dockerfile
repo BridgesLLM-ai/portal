@@ -1,4 +1,4 @@
-ARG A0_BASE_IMAGE=agent0ai/agent-zero@sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30
+ARG A0_BASE_IMAGE=agent0ai/agent-zero@sha256:307a2ceffc8501ba05a1e7253e8b6e4d656d2e1c3b97f0eb943c18b9c40a30fd
 FROM ${A0_BASE_IMAGE}
 
 ARG A0_BASE_IMAGE
@@ -17,10 +17,10 @@ LABEL com.bridgesllm.agent-zero-project.recipe-sha256="${PORTAL_RECIPE_SHA256}" 
 # process as the same numeric identity that owns Portal projects on the host.
 RUN test "${A0_BASE_IMAGE}" = "agent0ai/agent-zero@${A0_UPSTREAM_DIGEST}" \
   && { \
-       test "${A0_UPSTREAM_DIGEST}" = "sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30" \
-         || test "${A0_UPSTREAM_DIGEST}" = "sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3"; \
+       test "${A0_UPSTREAM_DIGEST}" = "sha256:307a2ceffc8501ba05a1e7253e8b6e4d656d2e1c3b97f0eb943c18b9c40a30fd" \
+         || test "${A0_UPSTREAM_DIGEST}" = "sha256:3b048a33c8698d396688ebd05096daab1f441cf310f299db2ed808a00433bc13"; \
      } \
-  && test "${A0_SOURCE_COMMIT}" = "6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1" \
+  && test "${A0_SOURCE_COMMIT}" = "ff2a5b9c9c4e490ba38dd7c313e779510bb2071a" \
   && printf '%s\n' "${PORTAL_RECIPE_SHA256}" | grep -Eq '^[a-f0-9]{64}$' \
   && test "$(git -C /git/agent-zero rev-parse HEAD)" = "${A0_SOURCE_COMMIT}" \
   && test -x /opt/venv-a0/bin/python \
@@ -30,7 +30,8 @@ RUN test "${A0_BASE_IMAGE}" = "agent0ai/agent-zero@${A0_UPSTREAM_DIGEST}" \
   && rm -rf /a0 \
   && install -d -m 0755 /a0 \
   && cp -a /git/agent-zero/. /a0/ \
-  && rm -rf /a0/.git \
+  && git config --system --add safe.directory /a0 \
+  && install -d -m 0755 /a0/usr/projects /a0/usr/knowledge/main /a0/usr/knowledge/solutions \
   && for seed_dir in \
        /a0/usr/agents \
        /a0/usr/knowledge \
@@ -71,7 +72,9 @@ RUN test "${A0_BASE_IMAGE}" = "agent0ai/agent-zero@${A0_UPSTREAM_DIGEST}" \
          && test ! -L "${runtime_dir}" \
          && test "$(stat -c '%u:%g' "${runtime_dir}")" = "1000:1000"; \
      done \
-  && test ! -e /a0/.git
+  && test -d /a0/.git \
+  && test "$(git -C /a0 rev-parse HEAD)" = "${A0_SOURCE_COMMIT}" \
+  && test "$(stat -c '%u:%g' /a0/.git)" = "0:0"
 
 ENV HOME=/a0/usr/home \
     XDG_CACHE_HOME=/a0/usr/home/.cache \

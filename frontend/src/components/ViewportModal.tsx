@@ -26,7 +26,7 @@ export interface ViewportModalProps {
   /** Classes applied to the full visual-viewport backdrop/layout layer. */
   className?: string;
   zIndex?: number;
-  initialFocusRef?: RefObject<HTMLElement>;
+  initialFocusRef?: RefObject<HTMLElement | null>;
 }
 
 const FOCUSABLE_SELECTOR = [
@@ -64,7 +64,7 @@ type TransientOverlayEntry = {
   ownerLayer: HTMLElement | null;
   suppressed: boolean;
   snapshot: {
-    hidden: boolean;
+    hidden: HTMLElement["hidden"];
     inert: boolean;
     inertAttribute: string | null;
     ariaHidden: string | null;

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } fro
 import { copyTextToClipboard } from '../utils/clipboardCopy';
 import { useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useDropzone } from 'react-dropzone';
+import { ErrorCode, useDropzone } from 'react-dropzone';
 import { filesAPI } from '../api/endpoints';
 import client from '../api/client';
 import { smartUpload, formatBytes, formatSpeed, formatTime, UploadProgress, UploadController } from '../utils/smartUpload';
@@ -581,10 +581,17 @@ export default function FilesPage() {
   }, [loadFiles, addToast, globalUploadStore]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
-    onDrop,
+    // Dropzone 20 accepts the in-limit prefix. Keep our batch overflow policy:
+    // do not start any uploads when this selection exceeds the file limit.
+    onDrop: (accepted, rejections) => {
+      if (!rejections.some(({ errors }) => errors.some(({ code }) => code === ErrorCode.TooManyFiles))) {
+        void onDrop(accepted);
+      }
+    },
+    noPaste: true,
     maxFiles: MAX_FILES_PER_DROP,
     onDropRejected: (rejections) => {
-      addToast('error', rejections.length > MAX_FILES_PER_DROP
+      addToast('error', rejections.some(({ errors }) => errors.some(({ code }) => code === ErrorCode.TooManyFiles))
         ? `Select no more than ${MAX_FILES_PER_DROP} files at a time.`
         : 'One or more files could not be queued for upload.');
     },

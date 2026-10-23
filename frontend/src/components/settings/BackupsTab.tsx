@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Download, Lock, Unlock, Trash2, RefreshCw, HardDrive, Archive, RotateCcw, X, Calendar, Shield, Plus, Clock, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { Download, Lock, Unlock, Trash2, RefreshCw, HardDrive, Archive, RotateCcw, X, Calendar, Shield, Plus, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
 import client from '../../api/client';
 import sounds from '../../utils/sounds';
 import ConfirmDialog from '../ConfirmDialog';
 import { useSettingsMutationCoordinator } from './SettingsMutationContext';
+import { BackupScheduleSection, BackupStorageLimitsSection, type BackupScheduleView } from './BackupAutomation';
 
 interface Backup {
   filename: string;
@@ -31,18 +32,8 @@ interface Summary {
 }
 
 interface CronInfo {
-  schedules: Array<{
-    type: 'daily' | 'monthly' | 'comprehensive';
-    source: 'systemd';
-    timerUnit: string;
-    serviceUnit: string;
-    loaded: boolean;
-    enabled: boolean;
-    active: boolean;
-    onCalendar: string | null;
-    nextRun: string | null;
-    lastRun: string | null;
-  }>;
+  hostTimezone?: string | null;
+  schedules: BackupScheduleView[];
   active: string[];
   disabled: string[];
 }
@@ -62,6 +53,7 @@ interface BackupRunStatus {
   phaseTotal?: number;
   output?: string;
   consecutiveFailures?: number;
+  cleanupSummary?: string;
 }
 
 const typeBadgeColors: Record<string, string> = {
@@ -592,6 +584,9 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
               {(lastRun.failureDetail || lastRun.error) && (
                 <p className="mt-2 text-xs text-red-400">{lastRun.failureDetail || lastRun.error}</p>
               )}
+              {lastRun.cleanupSummary && (
+                <p className="mt-2 text-xs text-slate-400">{lastRun.cleanupSummary}</p>
+              )}
               {lastRun.output && (
                 <details className="mt-2">
                   <summary className="cursor-pointer text-xs text-slate-500 hover:text-slate-400">Show bounded backup log</summary>
@@ -623,42 +618,20 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
         </div>
       )}
 
-      {/* Auto-Backup Schedule Info */}
+      {/* Automatic backup schedules */}
       {(cronInfo || scheduleError) && (
         <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-5">
-          <div className="flex items-center gap-2 mb-3">
-            <Clock size={16} className="text-blue-400" />
-            <h3 className="text-sm font-semibold text-white">Auto-Backup Schedule</h3>
-          </div>
-          {scheduleError ? (
-            <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300">{scheduleError}</div>
-          ) : cronInfo && cronInfo.schedules.length > 0 ? (
-            <div className="space-y-2">
-              {cronInfo.schedules.map(schedule => (
-                <div key={schedule.timerUnit} className="flex items-start gap-3">
-                  <div className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0 ${schedule.loaded && schedule.enabled && schedule.active ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="text-sm capitalize text-slate-200">{schedule.type}</p>
-                      <span className={`rounded px-1.5 py-0.5 text-[10px] ${schedule.loaded && schedule.enabled && schedule.active ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-400'}`}>
-                        {schedule.loaded ? (schedule.enabled && schedule.active ? 'enabled' : 'inactive') : 'unit missing'}
-                      </span>
-                    </div>
-                    <p className="mt-0.5 text-xs text-slate-400">
-                      {schedule.onCalendar || 'No OnCalendar expression reported'}
-                    </p>
-                    <p className="mt-0.5 text-xs text-slate-500">
-                      Next: {schedule.nextRun || 'not scheduled'}
-                      {schedule.lastRun ? ` • Last: ${schedule.lastRun}` : ''}
-                    </p>
-                    <code className="mt-1 block break-all text-[10px] text-slate-600">{schedule.timerUnit}</code>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="text-sm text-slate-500">No installed backup timers were found.</p>
-          )}
+          <BackupScheduleSection
+            schedules={cronInfo?.schedules || []}
+            hostTimezone={cronInfo?.hostTimezone || null}
+            error={scheduleError}
+            claim={claimSettingsMutation}
+            release={releaseSettingsMutation}
+            onSaved={(saved) => setCronInfo((current) => current && {
+              ...current,
+              schedules: current.schedules.map((schedule) => (schedule.type === saved.type ? saved : schedule)),
+            })}
+          />
           {cronInfo && cronInfo.active.length > 0 && (
             <div className="mt-3 border-t border-white/[0.06] pt-3">
               <p className="mb-2 text-xs text-amber-400">Legacy cron entries still present:</p>
@@ -678,9 +651,17 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
               ))}
             </div>
           )}
-          <p className="text-xs text-slate-600 mt-3">Schedules shown above come from the installed systemd timers. Portal updates preserve the selected storage path and reconcile these units.</p>
         </div>
       )}
+
+      {/* Retention limits and reviewed cleanup */}
+      <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-5">
+        <BackupStorageLimitsSection
+          claim={claimSettingsMutation}
+          release={releaseSettingsMutation}
+          onBackupsChanged={fetchBackups}
+        />
+      </div>
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-3">
@@ -813,7 +794,7 @@ export default function BackupsTab({ backupPath, onBackupPathChange, onSaveBacku
         </div>
       </div>
 
-      {restoreHelp && <section role="region" aria-label="Restore instructions" className="rounded-xl border border-sky-400/20 bg-sky-400/5 p-4">
+      {restoreHelp && <section aria-label="Restore instructions" className="rounded-xl border border-sky-400/20 bg-sky-400/5 p-4">
         <div className="flex items-center justify-between"><h3 className="text-sm font-semibold text-white">Restore {restoreHelp.format === 'portal-data' ? 'projects and settings' : 'a legacy backup'}</h3>
           <button type="button" aria-label="Close restore instructions" onClick={() => setRestoreHelp(null)}><X size={16} /></button></div>
         <p className="mt-2 text-xs leading-relaxed text-slate-400">Save your current work first. Restore replaces Portal data and briefly stops Portal and its agents. Run this from your VPS terminal, or ask your agent to help. The previous data is retained for recovery.</p>

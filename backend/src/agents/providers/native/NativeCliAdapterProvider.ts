@@ -61,6 +61,10 @@ import {
   type HostAgentRunHandle,
 } from '../../../services/hostAgentRunJournal';
 import { attestNativeHostCli } from '../../../services/nativeHostCliAdmission';
+import { ChatImageError } from '../../../services/chatImages/chatImageModelPolicy';
+import { stripChatImageReferences } from '../../../services/chatImages/directChatImages';
+import { NativeChatTurnTools } from './NativeChatTurnTools';
+import { removeNativeChatImageFiles, writeNativeChatImageFiles } from './NativeChatImageFiles';
 
 type NativeHostCliIdentity = Readonly<{
   toolId: 'codex' | 'claude-code';
@@ -124,6 +128,8 @@ interface NativeActiveTurn {
   hostRunHandle: HostAgentRunHandle | null;
   unregisterHostRunAbort: (() => void) | null;
   unsubscribeAuthorization: (() => void) | null;
+  /** Portal chat tools (bridge + tool-call record) for the whole logical turn. */
+  chatTools: NativeChatTurnTools;
 }
 
 type NativeTurnOutcome =
@@ -283,6 +289,24 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
     this.providerName = adapter.providerName;
   }
 
+  /** True only when this adapter forwards server-prepared photos natively. */
+  get supportsNativeChatImages(): boolean {
+    return this.adapter.supportsChatImages === true && typeof this.adapter.assertChatImageModel === 'function';
+  }
+
+  /**
+   * Gateway image admission: prove from harness-advertised metadata that this
+   * session's effective model accepts images. Throws ChatImageError otherwise.
+   */
+  async assertChatImageModel(sessionId: AgentSessionId): Promise<string> {
+    if (!this.supportsNativeChatImages || !this.adapter.assertChatImageModel) {
+      throw new ChatImageError('IMAGE_TRANSPORT_UNAVAILABLE', 503);
+    }
+    const session = this.requireSession(sessionId);
+    if (session.executionContext?.scope !== 'HOST_OPERATOR') throw new ChatImageError('IMAGE_SESSION_UNSUPPORTED');
+    return this.adapter.assertChatImageModel(session);
+  }
+
   private idCounter = 0;
 
   protected nextId(): string {
@@ -348,6 +372,15 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
     }
 
     const publishToHostBus = session.executionContext.scope === 'HOST_OPERATOR';
+    const chatImages = publishToHostBus && Array.isArray(sender?.chatImages) ? sender!.chatImages! : [];
+    if (chatImages.length > 0 && !this.supportsNativeChatImages) {
+      throw new ChatImageError('IMAGE_TRANSPORT_UNAVAILABLE', 503);
+    }
+    // Admitted photos arrive as server-prepared bytes; the durable user message
+    // keeps its photo markers so the transcript still shows them after reload.
+    const promptMessage = chatImages.length > 0
+      ? stripChatImageReferences(message) || 'Describe the attached photo.'
+      : message;
     const runId = typeof sender?.requestId === 'string' && sender.requestId.trim()
       ? sender.requestId.trim()
       : randomUUID();
@@ -396,6 +429,7 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
       hostRunHandle,
       unregisterHostRunAbort: null,
       unsubscribeAuthorization: null,
+      chatTools: NativeChatTurnTools.withoutBridge(),
     };
     let ctx: NativeCliTurnContext | null = null;
 
@@ -447,6 +481,8 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
               role: 'assistant',
               content: outcome.text,
               timestamp: new Date().toISOString(),
+              // Agent Chat only; Project Chat transcripts are unchanged.
+              toolCalls: publishToHostBus ? turn.chatTools.toolCalls() : undefined,
             });
             // The terminal event clears status. A blank status callback here
             // would be suppressed by the settlement guard and has no contract.
@@ -529,6 +565,8 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
               role: 'assistant',
               content: `Error: ${safeError.message} Diagnostic ID: ${safeError.diagnosticId}`,
               timestamp: new Date().toISOString(),
+              // Agent Chat only; Project Chat transcripts are unchanged.
+              toolCalls: publishToHostBus ? turn.chatTools.toolCalls() : undefined,
             });
           }
           if (publishToHostBus) {
@@ -561,6 +599,10 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
           }
           rejectResult(safeError);
         } finally {
+          // Every settlement path (success, error, abort, quarantine) ends the
+          // turn's Portal chat capability and its photo files.
+          turn.chatTools.revoke();
+          removeNativeChatImageFiles(runId);
           if (publishToHostBus) {
             try { streamEventBus.softClearStream(portalSessionId, runId); } catch {}
           }
@@ -820,8 +862,15 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
           if (hostCli && invocation.command !== hostCli.executablePath) {
             throw new Error(`${this.adapter.displayName} host invocation did not use its admitted executable`);
           }
-          if (hostCli && invocation.stdinText !== ctx!.message) {
-            throw new Error(`${this.adapter.displayName} host invocation did not isolate its prompt on stdin`);
+          if (hostCli) {
+            // Recompute the adapter-declared encoding of this turn's prompt
+            // (and photos) and accept exactly that stdin, nothing else.
+            const expectedStdin = this.adapter.encodeHostStdin
+              ? this.adapter.encodeHostStdin(ctx!)
+              : ctx!.message;
+            if (invocation.stdinText !== expectedStdin) {
+              throw new Error(`${this.adapter.displayName} host invocation did not isolate its prompt on stdin`);
+            }
           }
           return invocation;
         });
@@ -865,6 +914,12 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
         // an ambient /usr/local interpreter between admission and exec.
         if (hostCli) {
           await attestNativeHostCli(hostCli.toolId, hostCli.executablePath);
+        }
+        if (chatImages.length > 0) {
+          // Fresh ownership/revision/model proof immediately before every
+          // originating dispatch, including approval retries.
+          if (typeof sender?.revalidateChatImages !== 'function') throw new ChatImageError('IMAGE_REVALIDATION_REQUIRED', 503);
+          await sender.revalidateChatImages();
         }
         const gatedLaunch = turn.hostRunHandle && hostRunReservation
           ? await spawnGatedHostAgentRunAttempt({
@@ -1013,10 +1068,26 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
           timestamp: new Date().toISOString(),
         });
 
+        // One bridge capability for the whole logical turn, opened before the
+        // first attempt and reused by approval retries.
+        const chatTools = await NativeChatTurnTools.open({
+          provider: this.adapter.providerName,
+          portalSessionId,
+          runId,
+          sender,
+          bridge: publishToHostBus && this.adapter.supportsChatBridge === true,
+          scopeToolCallIds: publishToHostBus && this.adapter.scopeToolCallIds === true,
+        });
+        if (turn.settlePromise) {
+          chatTools.revoke();
+          return;
+        }
+        turn.chatTools = chatTools;
+
         ctx = {
           session,
           originalSessionId: portalSessionId,
-          message: withPortalGuideReference(message, publishToHostBus && session.messages.length === 1),
+          message: withPortalGuideReference(promptMessage, publishToHostBus && session.messages.length === 1),
           onChunk,
           // Legacy adapter tool/progress callbacks must share the same canonical
           // publication path as emitStatus, even when no immediate HTTP callback
@@ -1049,12 +1120,14 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
           },
           emitStatus: (content, extra) => {
             if (turn.settlePromise) return;
-            const safeEvent = sanitizeNativeProviderEvent<Record<string, unknown>>({
+            // Canonical bridge names, bound widget references and the durable
+            // tool-call record all derive from the one event every consumer sees.
+            const safeEvent = turn.chatTools.project(sanitizeNativeProviderEvent<Record<string, unknown>>({
               type: 'status',
               content,
               ...(extra || {}),
               runId,
-            });
+            }));
             onStatus?.(safeEvent as any);
             if (publishToHostBus) {
               const eventType = typeof safeEvent.type === 'string' ? safeEvent.type : 'status';
@@ -1100,6 +1173,9 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
             updateNativeSessionMetadata(this.adapter.providerName, portalSessionId, metadata);
           },
           stripAnsi,
+          chatBridge: turn.chatTools.bridgeOpen ? turn.chatTools.bridge : null,
+          chatImages,
+          materializeChatImageFiles: () => writeNativeChatImageFiles(runId, chatImages),
         };
 
         const initialStatus = typeof this.adapter.initialStatus === 'function'

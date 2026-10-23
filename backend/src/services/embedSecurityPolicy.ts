@@ -291,6 +291,19 @@ export async function readEmbedSecurityPolicyState(
   return stateForRow(row);
 }
 
+// Shared with HTTP acceptance so the actual Portal header configuration is exercised.
+export function createPortalSecurityHeaders() {
+  const secureOrigin = process.env.CORS_ORIGIN?.startsWith('https') === true;
+  return helmet({
+    // Custom embed origins apply only to isolated app content, never the authenticated Portal.
+    contentSecurityPolicy: { directives: buildPortalContentSecurityPolicyDirectives() },
+    crossOriginEmbedderPolicy: false,
+    // COOP and Origin-Agent-Cluster are omitted on plain HTTP.
+    crossOriginOpenerPolicy: secureOrigin ? { policy: 'same-origin' } : false,
+    originAgentCluster: secureOrigin,
+  });
+}
+
 export function buildPortalContentSecurityPolicyDirectives(
   customFrameOrigins: readonly string[] = [],
 ): Record<string, string[] | null> {

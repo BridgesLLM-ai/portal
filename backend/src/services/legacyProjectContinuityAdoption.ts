@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { buildProjectDesktopRuntimeIdentity } from './projectDesktopRuntime';
 import { prisma } from '../config/database';
 import {
   attestProjectRoot,
@@ -174,12 +175,22 @@ function attestConfiguredDeploymentRoots(
 }
 
 function exactProjectAppPaths(
+  app: ContinuityApp,
   project: ContinuityProject,
   deploymentRoots: readonly AttestedProjectRoot[],
 ): ReadonlySet<string> {
-  return new Set(deploymentRoots.map(({ canonicalRoot }) => (
+  const paths = new Set(deploymentRoots.map(({ canonicalRoot }) => (
     path.join(canonicalRoot, `${project.workspaceOwnerId}-${project.projectName}`)
   )));
+  // Managed Desktop deployments are keyed by the immutable Project identity,
+  // not the hosted-App owner/name convention. Preserve an existing exact link
+  // through update/startup; the caller still attests owner, source inode and
+  // deployment directory. This does not enroll or rebind standalone Apps.
+  if (projectRuntimeManagement(app) === 'desktop-session') {
+    try { paths.add(buildProjectDesktopRuntimeIdentity(project.identity.id, project.projectName).runtimeDir); }
+    catch { /* Invalid identities never expand the admitted path set. */ }
+  }
+  return paths;
 }
 
 function appDeploymentAttestation(
@@ -191,7 +202,7 @@ function appDeploymentAttestation(
     !app.zipPath
     || !path.isAbsolute(app.zipPath)
     || path.resolve(app.zipPath) !== app.zipPath
-    || !exactProjectAppPaths(project, deploymentRoots).has(app.zipPath)
+    || !exactProjectAppPaths(app, project, deploymentRoots).has(app.zipPath)
   ) return null;
   try {
     return attestExactDirectory(app.zipPath, 'A legacy App deployment');
@@ -402,7 +413,7 @@ async function inspectLinkedAppContinuity(input: {
       && app.zipPath
       && path.isAbsolute(app.zipPath)
       && path.resolve(app.zipPath) === app.zipPath
-      && exactProjectAppPaths(project, input.deploymentRoots).has(app.zipPath)
+      && exactProjectAppPaths(app, project, input.deploymentRoots).has(app.zipPath)
     );
     const interruptedLifecycle = identity?.lifecycleStatus === 'RENAMING'
       || identity?.lifecycleStatus === 'DELETING';

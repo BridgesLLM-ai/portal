@@ -15,6 +15,7 @@ import {
 } from '../../../../services/projectEgressPlane';
 import { PROJECT_EGRESS_POLICY_VERSION } from '../../../../services/projectEgressPolicy';
 import {
+  codexProjectRuntimeSecurityOptionValues,
   CODEX_PROJECT_RUNTIME_APPARMOR_PROFILE,
   CODEX_PROJECT_RUNTIME_SECCOMP_PROFILE_PATH,
   PROJECT_RUNTIME_APPARMOR_PROFILE,
@@ -31,10 +32,12 @@ import {
   __codexProjectEgressRuntimeTest,
   attestCodexProjectNamespaceFirewall,
   attestCodexProjectRuntimeContainer,
-  buildCodexProjectDockerExecArgs,
+  buildCodexProjectDockerExecCommand,
   buildCodexProjectRuntimePlan,
   buildPreviousCodexProjectExecutionContext,
   codexProjectDockerHostEnvironment,
+  codexProjectDockerInvocationEnvironment,
+  codexProjectEgressCommandExecutor,
   ensureCodexProjectEgressRuntime,
   stopCodexProjectRuntimesForContext,
   stopCodexProjectRuntimesForRecoveryContext,
@@ -222,7 +225,7 @@ function inspectFor(fixture: Fixture, running = true): any {
       NanoCpus: 2_000_000_000,
       Ulimits: [
         { Name: 'nofile', Soft: 1024, Hard: 1024 },
-        { Name: 'nproc', Soft: 256, Hard: 256 },
+        { Name: 'nproc', Soft: 4096, Hard: 4096 },
       ],
       Devices: [],
       DeviceRequests: [],
@@ -316,6 +319,8 @@ function legacyPreConfinementInspect(fixture: Fixture, running = true): any {
   const inspect = inspectFor(legacyPreConfinementFixture(fixture), running);
   inspect.HostConfig.SecurityOpt = ['no-new-privileges:true'];
   inspect.AppArmorProfile = 'docker-default';
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Soft = 256;
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Hard = 256;
   return inspect;
 }
 
@@ -362,6 +367,8 @@ function sharedV1NoProxyTokenInspect(fixture: Fixture, running = true): any {
     `apparmor=${PROJECT_RUNTIME_APPARMOR_PROFILE}`,
   ];
   inspect.AppArmorProfile = PROJECT_RUNTIME_APPARMOR_PROFILE;
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Soft = 256;
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Hard = 256;
   return inspect;
 }
 
@@ -408,6 +415,8 @@ function sharedV1CurrentInspect(fixture: Fixture, running = true): any {
     `apparmor=${PROJECT_RUNTIME_APPARMOR_PROFILE}`,
   ];
   inspect.AppArmorProfile = PROJECT_RUNTIME_APPARMOR_PROFILE;
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Soft = 256;
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Hard = 256;
   return inspect;
 }
 
@@ -470,6 +479,24 @@ describe('Codex Project controlled-egress runtime policy', () => {
   const fixtures: Fixture[] = [];
   afterEach(() => {
     for (const fixture of fixtures.splice(0)) fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test('recovery: finite shared UID ceiling retains the exact container PID boundary (Codex)', () => {
+    const fixture = makeFixture();
+    fixtures.push(fixture);
+    expect(fixture.plan.createArgs).toEqual(expect.arrayContaining(['--pids-limit', '256', '--ulimit', 'nproc=4096:4096']));
+    for (const limit of [256, -1, 0, 4097]) {
+      const inspect = inspectFor(fixture, true);
+      const nproc = inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc');
+      nproc.Soft = limit;
+      nproc.Hard = limit;
+      expect(() => attestCodexProjectRuntimeContainer({ inspect, plan: fixture.plan, spec: fixture.spec, requireRunning: true }))
+        .toThrow(/ulimits/);
+    }
+    const inspect = inspectFor(fixture, true);
+    inspect.HostConfig.PidsLimit = 0;
+    expect(() => attestCodexProjectRuntimeContainer({ inspect, plan: fixture.plan, spec: fixture.spec, requireRunning: true }))
+      .toThrow(/resource limits/);
   });
 
   test('builds a pinned, non-root, proxy-only runtime with exactly one writable Project bind', () => {
@@ -557,7 +584,7 @@ describe('Codex Project controlled-egress runtime policy', () => {
 
     const dockerSerializedInspect = inspectFor(fixture, true);
     dockerSerializedInspect.HostConfig.Ulimits = [
-      { Name: 'nproc', Hard: 256, Soft: 256 },
+      { Name: 'nproc', Hard: 4096, Soft: 4096 },
       { Name: 'nofile', Hard: 1024, Soft: 1024 },
     ];
     expect(attestCodexProjectRuntimeContainer({
@@ -652,13 +679,29 @@ describe('Codex Project controlled-egress runtime policy', () => {
       }),
       startedAt: '2026-07-19T12:00:00Z',
     };
-    const args = buildCodexProjectDockerExecArgs({ runtime, command: '/usr/bin/codex', args: ['--version'] });
-    expect(args).toEqual(expect.arrayContaining([
-      'container', 'exec', '--user', CODEX_PROJECT_CONTAINER_USER,
-      '--workdir', CODEX_PROJECT_CONTAINER_ROOT, runtime.containerId, '/usr/bin/codex', '--version',
-    ]));
+    const command = buildCodexProjectDockerExecCommand({ runtime, command: '/usr/bin/codex', args: ['--version'] });
+    const { args } = command;
+    expect(args).toEqual([
+      'container', 'exec', '--user', CODEX_PROJECT_CONTAINER_USER, '--workdir', CODEX_PROJECT_CONTAINER_ROOT,
+      '--env', 'HTTP_PROXY', '--env', 'HTTPS_PROXY', '--env', 'http_proxy', '--env', 'https_proxy',
+      '--env', 'NO_PROXY=', '--env', 'no_proxy=',
+      runtime.containerId, '/usr/bin/codex', '--version',
+    ]);
     expect(args.join(' ')).not.toContain('localhost');
     expect(args.join(' ')).not.toContain('host.docker.internal');
+    expect(args.join(' ')).not.toContain('portal:token');
+    expect(command.secretEnvironment).toEqual({
+      HTTP_PROXY: runtime.proxyEnvironment.HTTP_PROXY,
+      HTTPS_PROXY: runtime.proxyEnvironment.HTTPS_PROXY,
+      http_proxy: runtime.proxyEnvironment.http_proxy,
+      https_proxy: runtime.proxyEnvironment.https_proxy,
+    });
+    expect(codexProjectDockerInvocationEnvironment(command)).toEqual({
+      ...codexProjectDockerHostEnvironment(),
+      ...command.secretEnvironment,
+      NO_PROXY: '*',
+      no_proxy: '*',
+    });
     expect(codexProjectDockerHostEnvironment()).toEqual({
       PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
       HOME: '/nonexistent',
@@ -670,13 +713,31 @@ describe('Codex Project controlled-egress runtime policy', () => {
   });
 });
 
+// The docker CLI resolves `--env NAME` from its own environment; a missing
+// value reaches the Engine as a bare name.
+function cliResolvedEnvironment(
+  args: readonly string[],
+  secretEnvironment: Readonly<Record<string, string>> = {},
+): string[] {
+  const entries: string[] = [];
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if (args[index] !== '--env') continue;
+    const entry = args[index + 1];
+    entries.push(entry.includes('=') || !(entry in secretEnvironment) ? entry : `${entry}=${secretEnvironment[entry]}`);
+  }
+  return entries;
+}
+
 class RuntimeExecutor implements ProjectEgressCommandExecutor {
   readonly commands: Array<{ command: string; args: readonly string[] }> = [];
+  readonly createSecretEnvironments: Array<Readonly<Record<string, string>> | undefined> = [];
   readonly staleRuntimes = new Map<string, any>();
   readonly fixture: Fixture;
   exists = false;
   running = false;
   foreignCurrent: any | null = null;
+  createdEnvironment: string[] | null = null;
+  dropSecretEnvironment = false;
 
   constructor(fixture: Fixture) {
     this.fixture = fixture;
@@ -694,7 +755,11 @@ class RuntimeExecutor implements ProjectEgressCommandExecutor {
       || null;
   }
 
-  async run(command: string, args: readonly string[]): Promise<ProjectEgressCommandResult> {
+  async run(
+    command: string,
+    args: readonly string[],
+    options: { secretEnvironment?: Readonly<Record<string, string>> } = {},
+  ): Promise<ProjectEgressCommandResult> {
     this.commands.push({ command, args });
     if (command === 'docker' && args[0] === 'container' && args[1] === 'ls') {
       const ids = [
@@ -730,9 +795,18 @@ class RuntimeExecutor implements ProjectEgressCommandExecutor {
           exitCode: 1,
         };
       }
-      return { stdout: JSON.stringify([inspectFor(this.fixture, this.running)]), stderr: '', exitCode: 0 };
+      const inspect = inspectFor(this.fixture, this.running);
+      if (this.createdEnvironment) {
+        inspect.Config.Env = [...this.createdEnvironment, 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'];
+      }
+      return { stdout: JSON.stringify([inspect]), stderr: '', exitCode: 0 };
     }
     if (command === 'docker' && args[0] === 'container' && args[1] === 'create') {
+      this.createSecretEnvironments.push(options.secretEnvironment);
+      this.createdEnvironment = cliResolvedEnvironment(
+        args,
+        this.dropSecretEnvironment ? {} : options.secretEnvironment,
+      );
       this.exists = true;
       return { stdout: `${'d'.repeat(64)}\n`, stderr: '', exitCode: 0 };
     }
@@ -753,6 +827,7 @@ class RuntimeExecutor implements ProjectEgressCommandExecutor {
     if (command === 'docker' && args[0] === 'container' && args[1] === 'rm') {
       const stale = this.staleRuntime(String(args.at(-1)));
       if (stale) this.staleRuntimes.delete(String(stale.Id || '').toLowerCase());
+      else if (args.at(-1) === 'd'.repeat(64) && this.createdEnvironment) this.exists = false;
     }
     if (command === '/usr/bin/nsenter' && args.includes('-S')) {
       const tool = String(args[4]);
@@ -790,6 +865,54 @@ describe('Codex Project controlled-egress orchestration', () => {
   });
 
   afterEach(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+
+  test.each([true, false])('recovery: old shared-nproc recipe is retirement-only; exact limits=%s', async (exact) => {
+    const fingerprint = crypto.createHash('sha256').update(JSON.stringify({
+      provider: 'CODEX',
+      actorId: fixture.context.userId,
+      projectId: fixture.context.projectId,
+      workspaceOwnerId: fixture.context.workspaceOwnerId,
+      policyFingerprint: fixture.context.policyFingerprint,
+      runtimePolicyVersion: fixture.context.runtimePolicyVersion,
+      egressPolicyVersion: fixture.context.egressPolicyVersion,
+      egressPolicyFingerprint: fixture.spec.policyFingerprint,
+      egressProxyCredentialHash: fixture.spec.tokenHash,
+      runtimeImage: fixture.plan.runtimeImage,
+      projectRoot: fixture.plan.projectRoot,
+      user: CODEX_PROJECT_CONTAINER_USER,
+      confinementSecurityOptions: codexProjectRuntimeSecurityOptionValues(),
+    })).digest('hex');
+    expect(fingerprint).not.toBe(fixture.plan.runtimeFingerprint);
+    const old = inspectFor(fixture, true);
+    old.Id = 'e'.repeat(64);
+    old.Name = `/${'p4cx'}-${fingerprint.slice(0, 24)}`;
+    old.Config.Labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL] = fingerprint;
+    const limit = old.HostConfig.Ulimits.find((value: any) => value.Name === 'nproc');
+    limit.Soft = exact ? 256 : 4096;
+    limit.Hard = exact ? 256 : 4096;
+    const executor = new RuntimeExecutor(fixture);
+    executor.addStaleRuntime(old);
+    const converge = ensureCodexProjectEgressRuntime({
+      context: fixture.context, egress: fixture.egress,
+      retirePreviousManagedState: () => undefined,
+      prepareManagedState: () => ({ authPath: fixture.authPath, profilePath: fixture.profilePath }),
+    }, {
+      executor, buildEgressSpec: buildProjectEgressPlaneSpec,
+      buildPreviousEgressConfig: () => fixture.previousEgress,
+      resolveInternalNetworkBinding: jest.fn(async () => currentNetworkBinding()),
+      ensureEgressPlane: jest.fn(async () => validEgressHandle(fixture)),
+      constrainRuntime: jest.fn(async () => undefined),
+    });
+    if (exact) {
+      await expect(converge).resolves.toMatchObject({ runtimeFingerprint: fixture.plan.runtimeFingerprint });
+      expect(executor.commands.filter(({ args }) => args[1] === 'rm')).toEqual([
+        expect.objectContaining({ args: ['container', 'rm', 'e'.repeat(64)] }),
+      ]);
+    } else {
+      await expect(converge).rejects.toMatchObject({ code: 'RUNTIME_ULIMITS' });
+      expect(executor.commands.some(({ args }) => ['stop', 'rm', 'create'].includes(String(args[1])))).toBe(false);
+    }
+  });
 
   test('attests egress, creates stopped, constrains, starts, firewalls, injects state, and reattests', async () => {
     const executor = new RuntimeExecutor(fixture);
@@ -1775,5 +1898,129 @@ describe('Codex Project controlled-egress orchestration', () => {
       prepareManagedState: () => ({ authPath: fixture.authPath, profilePath: fixture.profilePath }),
     }, { executor })).rejects.toMatchObject({ code: 'EGRESS_IDENTITY' });
     expect(executor.exists).toBe(false);
+  });
+});
+
+describe('Codex Project egress credential custody', () => {
+  let fixture: Fixture;
+
+  beforeEach(() => {
+    fixture = makeFixture();
+  });
+
+  afterEach(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+
+  function converge(executor: RuntimeExecutor) {
+    return ensureCodexProjectEgressRuntime({
+      context: fixture.context,
+      egress: fixture.egress,
+      retirePreviousManagedState: () => undefined,
+      prepareManagedState: () => ({ authPath: fixture.authPath, profilePath: fixture.profilePath }),
+    }, {
+      executor,
+      buildEgressSpec: buildProjectEgressPlaneSpec,
+      buildPreviousEgressConfig: () => fixture.previousEgress,
+      resolveInternalNetworkBinding: jest.fn(async () => currentNetworkBinding()),
+      ensureEgressPlane: jest.fn(async () => validEgressHandle(fixture)),
+      constrainRuntime: jest.fn(async () => undefined),
+    });
+  }
+
+  const tokenOnArgv = (executor: RuntimeExecutor) => executor.commands.some(({ args }) => (
+    args.some((value) => value.includes(fixture.egress.token))));
+
+  test('create names the proxy credentials and hands their values to the executor only', async () => {
+    const executor = new RuntimeExecutor(fixture);
+    await expect(converge(executor)).resolves.toMatchObject({ containerId: 'd'.repeat(64) });
+    const create = executor.commands.find(({ args }) => args[1] === 'create')!;
+    for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+      expect(create.args[create.args.indexOf(key) - 1]).toBe('--env');
+    }
+    expect(create.args).toEqual(expect.arrayContaining(['--env', 'NO_PROXY=', '--env', 'no_proxy=']));
+    expect(tokenOnArgv(executor)).toBe(false);
+    const proxyUrl = `http://portal:${encodeURIComponent(fixture.egress.token)}@${PROXY_ADDRESS}:3128`;
+    expect(executor.createSecretEnvironments).toEqual([{
+      HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, http_proxy: proxyUrl, https_proxy: proxyUrl,
+    }]);
+    expect(executor.commands.some(({ args }) => args[1] === 'rm')).toBe(false);
+  });
+
+  test('a create whose credentials never arrive is refused and removed by its immutable ID only', async () => {
+    const executor = new RuntimeExecutor(fixture);
+    executor.dropSecretEnvironment = true;
+    await expect(converge(executor)).rejects.toMatchObject({ code: 'RUNTIME_ENVIRONMENT' });
+    expect(executor.createdEnvironment).toEqual(expect.arrayContaining(['HTTPS_PROXY']));
+    expect(executor.commands.filter(({ args }) => args[1] === 'rm').map(({ args }) => args))
+      .toEqual([['container', 'rm', 'd'.repeat(64)]]);
+    expect(executor.commands.some(({ args }) => ['start', 'stop'].includes(String(args[1])))).toBe(false);
+    expect(executor.exists).toBe(false);
+    expect(tokenOnArgv(executor)).toBe(false);
+  });
+
+  test('a created runtime that is not this plan\'s is never removed', async () => {
+    const executor = new RuntimeExecutor(fixture);
+    executor.dropSecretEnvironment = true;
+    const original = executor.run.bind(executor);
+    executor.run = async (command, args, options) => {
+      const result = await original(command, args, options);
+      if (args[1] === 'inspect' && args[2] === 'd'.repeat(64) && result.exitCode === 0) {
+        const [inspect] = JSON.parse(result.stdout);
+        inspect.Config.Labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL] = 'f'.repeat(64);
+        return { ...result, stdout: JSON.stringify([inspect]) };
+      }
+      return result;
+    };
+    await expect(converge(executor)).rejects.toBeInstanceOf(CodexProjectEgressRuntimeError);
+    expect(executor.commands.some(({ args }) => args[1] === 'rm')).toBe(false);
+  });
+
+  test('exec names the proxy credentials; the executor delivers them to the CLI environment only', async () => {
+    const canary = `http://portal:${crypto.randomBytes(24).toString('base64url')}@172.31.10.2:3128`;
+    const digest = crypto.createHash('sha256').update(canary).digest('hex');
+    const script = [
+      "const crypto = require('crypto');",
+      "const value = process.env.HTTPS_PROXY || '';",
+      'process.stdout.write(JSON.stringify({',
+      "  match: crypto.createHash('sha256').update(value).digest('hex') === process.argv[3],",
+      '  noProxy: process.env.NO_PROXY, lowerNoProxy: process.env.no_proxy,',
+      '  keys: Object.keys(process.env).sort(),',
+      '}));',
+    ].join('\n');
+    const args = ['-e', script, '--', '--env', 'HTTPS_PROXY', digest];
+    const result = await codexProjectEgressCommandExecutor.run(process.execPath, args, {
+      secretEnvironment: { HTTPS_PROXY: canary },
+    });
+    const observed = JSON.parse(result.stdout);
+    expect(observed.match).toBe(true);
+    expect(observed.noProxy).toBe('*');
+    expect(observed.lowerNoProxy).toBe('*');
+    expect(observed.keys).toEqual([...Object.keys(codexProjectDockerHostEnvironment()), 'HTTPS_PROXY', 'NO_PROXY', 'no_proxy']
+      .sort());
+    expect(args.some((value) => value.includes(canary))).toBe(false);
+  });
+
+  test.each([
+    ['a named credential without its value', () => ({}), 'Project egress protected environment is incomplete'],
+    ['an unlisted name', (value: string) => ({ DOCKER_HOST: value }), 'Project egress protected environment is invalid'],
+    ['a NUL in the value', (value: string) => ({ HTTPS_PROXY: `${value}\0` }), 'Project egress protected environment is invalid'],
+  ])('the executor refuses %s before spawning anything', async (_label, environment, message) => {
+    const canary = `http://portal:${crypto.randomBytes(24).toString('base64url')}@172.31.10.2:3128`;
+    const failure = await codexProjectEgressCommandExecutor.run(
+      '/nonexistent/portal-custody-must-not-spawn',
+      ['container', 'exec', '--env', 'HTTPS_PROXY', 'd'.repeat(64), 'true'],
+      { secretEnvironment: environment(canary) },
+    ).then(() => null, (error: Error) => error);
+    expect(failure?.message).toBe(message);
+    expect(String(failure?.message).includes(canary)).toBe(false);
+  });
+
+  test('a failing command never quotes a protected value', async () => {
+    const canary = `http://portal:${crypto.randomBytes(24).toString('base64url')}@172.31.10.2:3128`;
+    const failure = await codexProjectEgressCommandExecutor.run(
+      process.execPath,
+      ['-e', 'process.stderr.write(String(process.env.HTTPS_PROXY)); process.exit(3)', '--', '--env', 'HTTPS_PROXY'],
+      { secretEnvironment: { HTTPS_PROXY: canary } },
+    ).then(() => null, (error: Error) => error);
+    expect(failure?.message).toBe('Codex Project host command failed with exit code 3');
   });
 });

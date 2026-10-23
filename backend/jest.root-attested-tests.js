@@ -8,10 +8,13 @@ const rootAttestedTests = [
   'src/agents/providers/native/projectSandbox/NativeCliProjectManagedState.test.ts',
   'src/agents/providers/native/projectSandbox/NativeCliProjectProviders.test.ts',
   'src/cli/projectRuntimeUninstallPreflight.test.ts',
+  // App credential directories are owned by the App user (chown 1000:1000).
+  'src/services/appCredentials/projection.test.ts',
   'src/services/hostAgentRunActivationGate.test.ts',
   'src/services/openClawGatewayAuthorizationFence.test.ts',
   'src/services/openclawProjectQualification.test.ts',
   'src/services/projectRuntimeOwnership.test.ts',
+  'src/services/projectWorkloadRuntime.credentials.test.ts',
   'src/services/remoteDesktopOpenPath.test.ts',
   'src/tests/agentZeroProjectSandbox.test.ts',
   'src/tests/agentZeroSetupControl.test.ts',

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, type Variants } from 'framer-motion';
 import {
   Puzzle, Search, RefreshCw, CheckCircle, AlertCircle, XCircle,
   ChevronDown, ChevronUp, Loader2, Package, Folder, Box, Plug, Store, Wrench, TrendingUp, Clock, Star
@@ -61,7 +61,7 @@ type MarketSort = 'trending' | 'newest' | 'downloads';
 /* ─── Animation Variants ────────────────────────────────── */
 
 const container = { hidden: {}, show: { transition: { staggerChildren: 0.04 } } };
-const cardVariant = {
+const cardVariant: Variants = {
   hidden: { opacity: 0, y: 16, scale: 0.97 },
   show: { opacity: 1, y: 0, scale: 1, transition: { type: 'spring', stiffness: 220, damping: 22 } },
 };

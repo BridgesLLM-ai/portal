@@ -51,6 +51,8 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../api/endpoints', () => ({
   projectsAPI: {
+    templates: vi.fn(async () => ['typescript', 'rust', 'python', 'cpp'].flatMap(language => ['terminal', 'gui'].map(kind => ({ id: language + '-' + kind, language, interface: kind, target: 'desktop' })))),
+    templateCatalog: vi.fn(async () => ({ desktop: ['typescript', 'rust', 'python', 'cpp'].flatMap(language => ['terminal', 'gui'].map(kind => ({ id: language + '-' + kind, language, interface: kind, target: 'desktop' }))), desktopToolchain: { available: true, dependencyPolicy: 'brokered' } })),
     list: mocks.listProjects,
     getTree: mocks.getTree,
     readFile: mocks.readFile,
@@ -65,6 +67,9 @@ vi.mock('../api/endpoints', () => ({
     undeploy: mocks.undeploy,
     appProcess: mocks.appProcess,
     checkDeps: mocks.checkDeps,
+    desktopBuild: vi.fn(async () => null),
+    cancelDesktopBuild: vi.fn(async () => ({ cancelled: true })),
+    check: vi.fn(async () => ({ ok: true, language: 'typescript', output: 'Checked', errors: [] })),
     activeDependencyRepairs: mocks.activeDependencyRepairs,
     dependencyRepairStatus: mocks.dependencyRepairStatus,
     forceForwardDependencyRepair: mocks.forceForwardDependencyRepair,
@@ -81,6 +86,15 @@ vi.mock('../api/projectRuntimeImageRepair', () => ({
   projectRuntimeImageRepairAPI: {
     status: mocks.runtimeRepairStatus,
     repair: mocks.runtimeRepair,
+  },
+}));
+
+vi.mock('../api/appCredentials', () => ({
+  appCredentialsAPI: {
+    list: vi.fn(async (appId: string) => ({ app: { id: appId, name: 'Fixture' }, revision: 0, slots: [],
+      limits: { maxSlots: 16, maxBytes: 65536 }, containerDirectory: '/portal/credentials',
+      runtime: { running: false, restartRequired: false } })),
+    set: vi.fn(), remove: vi.fn(),
   },
 }));
 
@@ -978,7 +992,7 @@ describe('AppsPage share action ownership', () => {
 
     await user.click(deployButton);
 
-    await waitFor(() => expect(mocks.deploy).toHaveBeenCalledWith('alpha'));
+    await waitFor(() => expect(mocks.deploy).toHaveBeenCalledWith('alpha', undefined, expect.any(Function)));
     await waitFor(() => expect(mocks.appProcess).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('ready-new-app')).toBeVisible();
     expect(screen.queryByText('old-app-status')).not.toBeInTheDocument();
@@ -3289,7 +3303,7 @@ describe('AppsPage share action ownership', () => {
     });
 
     await waitFor(() => expect(mocks.deploy).toHaveBeenCalledTimes(1));
-    expect(mocks.deploy).toHaveBeenCalledWith('alpha');
+    expect(mocks.deploy).toHaveBeenCalledWith('alpha', undefined, expect.any(Function));
     expect(await screen.findByRole('button', { name: 'Deploying…' })).toHaveAttribute('aria-busy', 'true');
     expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page');
     expect(mocks.getTree).not.toHaveBeenCalledWith('beta');
@@ -3338,7 +3352,7 @@ describe('AppsPage share action ownership', () => {
     });
 
     await waitFor(() => expect(mocks.deploy).toHaveBeenCalledTimes(1));
-    expect(mocks.deploy).toHaveBeenCalledWith('alpha');
+    expect(mocks.deploy).toHaveBeenCalledWith('alpha', undefined, expect.any(Function));
     expect(screen.getByRole('button', { name: 'alpha' })).toHaveAttribute('aria-current', 'page');
 
     await act(async () => {
@@ -3518,6 +3532,91 @@ describe('AppsPage share action ownership', () => {
     expect(await within(dialog).findByText(/new commit: revert/)).toBeVisible();
     expect(within(dialog).getByRole('button', { name: 'Close' })).toBeEnabled();
     expect(logReads).toBeGreaterThanOrEqual(2);
+  });
+
+  describe('Projects Git history', () => {
+    const historyCommit = (index: number) => ({
+      hash: `${index.toString(16).padStart(2, '0')}${'c'.repeat(38)}`, short: `c${index}`, author: 'BridgesLLM Project Assistant',
+      email: 'project-assistant@localhost', date: '2026-10-08T12:00:00.000Z', relativeDate: '1 hour ago',
+      message: `History commit ${index}`, refs: '',
+      stats: { filesChanged: 0, insertions: 0, deletions: 0, files: [] },
+    });
+
+    async function openHistory() {
+      renderApps();
+      await waitForAlphaFile();
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'Git' }));
+      await user.click(await screen.findByRole('tab', { name: 'History' }));
+      return user;
+    }
+
+    it('pages older commits with the repository offset until the history ends', async () => {
+      const firstPage = Array.from({ length: 30 }, (_, index) => historyCommit(index));
+      mocks.gitEnhancedLog.mockImplementation(async (_name: string, _branch?: string, _limit?: number, skip?: number) => (
+        skip ? { commits: [historyCommit(29), historyCommit(30)], hasMore: false } : { commits: firstPage, hasMore: true }
+      ));
+      const user = await openHistory();
+
+      expect(await screen.findByRole('button', { name: /History commit 29/ })).toBeVisible();
+      expect(mocks.gitEnhancedLog).toHaveBeenLastCalledWith('alpha', undefined, 30, 0);
+      await user.click(screen.getByRole('button', { name: 'Load older commits' }));
+
+      expect(await screen.findByRole('button', { name: /History commit 30/ })).toBeVisible();
+      expect(mocks.gitEnhancedLog).toHaveBeenLastCalledWith('alpha', undefined, 30, 30);
+      // The overlapping commit is listed once.
+      expect(screen.getAllByRole('button', { name: /History commit 29/ })).toHaveLength(1);
+      expect(screen.queryByRole('button', { name: 'Load older commits' })).toBeNull();
+    });
+
+    it('shows a failed history read inline instead of an empty history, then retries it', async () => {
+      mocks.gitEnhancedLog.mockRejectedValueOnce(new Error('enhanced failed'))
+        .mockResolvedValue({ commits: [historyCommit(1)], hasMore: false });
+      const defaultGit = mocks.git.getMockImplementation()!;
+      mocks.git.mockImplementation(async (projectName: string, action: string, params?: unknown) => {
+        if (action === 'log') throw Object.assign(new Error('Request failed'), {
+          response: { status: 500, data: { output: "fatal: bad revision 'main'" } },
+        });
+        return defaultGit(projectName, action, params);
+      });
+      const user = await openHistory();
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent("Couldn't load commit history.");
+      expect(alert).toHaveTextContent("fatal: bad revision 'main'");
+      expect(screen.queryByText('No commits yet')).toBeNull();
+      expect(mocks.git).toHaveBeenCalledWith('alpha', 'log', { branch: undefined, limit: 30, skip: 0 });
+
+      await user.click(within(alert).getByRole('button', { name: 'Retry' }));
+      expect(await screen.findByRole('button', { name: /History commit 1/ })).toBeVisible();
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('renders the basic fallback list, quoted revert subjects included, when only the enhanced read fails', async () => {
+      mocks.gitEnhancedLog.mockRejectedValue(new Error('enhanced failed'));
+      const defaultGit = mocks.git.getMockImplementation()!;
+      mocks.git.mockImplementation(async (projectName: string, action: string, params?: unknown) => (action === 'log'
+        ? { commits: [{ hash: 'f'.repeat(40), short: 'fffffff', author: 'Owner', email: 'owner@example.invalid',
+          date: '2026-10-08T12:00:00.000Z', message: 'Revert "Add rate notes"' }], hasMore: false }
+        : defaultGit(projectName, action, params)));
+      await openHistory();
+
+      expect(await screen.findByText('Revert "Add rate notes"')).toBeVisible();
+      expect(screen.queryByText('No commits yet')).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it("offers the repository's own branches, not a fixed main", async () => {
+      const defaultGit = mocks.git.getMockImplementation()!;
+      mocks.git.mockImplementation(async (projectName: string, action: string, params?: unknown) => (action === 'branches'
+        ? { branches: [{ name: 'master', current: true, remote: false }, { name: 'origin/master', current: false, remote: true }] }
+        : defaultGit(projectName, action, params)));
+      await openHistory();
+
+      const filter = screen.getByRole('combobox', { name: 'Filter commits by branch' });
+      await waitFor(() => expect(within(filter).getAllByRole('option').map((option) => option.textContent))
+        .toEqual(['All branches', 'master']));
+    });
   });
 
   it('keeps project deletion progress solely in its confirmation dialog', async () => {

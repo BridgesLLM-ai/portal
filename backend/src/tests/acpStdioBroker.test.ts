@@ -7,7 +7,7 @@ import {
   OPENCODE_ACP_PROFILE,
   OPENCODE_ACP_VERSION,
 } from '../agents/providers/native/acp/AcpHarnessProfiles';
-import { AcpStdioBroker } from '../agents/providers/native/acp/AcpStdioBroker';
+import { AcpStdioBroker, safeToolName } from '../agents/providers/native/acp/AcpStdioBroker';
 
 const HERMES_SESSION_ID = 'hermes-session-123';
 const OPENCODE_SESSION_ID = 'opencode-session-456';
@@ -120,6 +120,18 @@ const OPENCODE_AUTH_METHODS = [
   { id: 'opencode-login', name: 'Login with opencode' },
 ];
 
+describe('ACP tool naming', () => {
+  test('keeps specific kinds, maps execute to shell, and titles generic kinds', () => {
+    expect(safeToolName('read', 'Read src/a.ts', 'x-tool')).toBe('read');
+    expect(safeToolName('execute', 'Run tests', 'x-tool')).toBe('shell');
+    expect(safeToolName('other', 'todowrite', 'x-tool')).toBe('todowrite');
+    expect(safeToolName('think', 'task', 'x-tool')).toBe('task');
+    expect(safeToolName('switch_mode', 'Plan mode', 'x-tool')).toBe('Plan mode');
+    expect(safeToolName('other', '', 'x-tool')).toBe('other');
+    expect(safeToolName('', '', 'x-tool')).toBe('x-tool');
+  });
+});
+
 describe('shared ACP stdio broker', () => {
   test('attests Hermes authentication and lifecycle without creating a readiness session', async () => {
     const runtime = fakeAcpProcess((message, process) => {
@@ -151,6 +163,7 @@ describe('shared ACP stdio broker', () => {
       agentVersion: HERMES_ACP_VERSION,
       protocolVersion: 1,
       authenticationMethodId: 'openrouter',
+      promptImages: false,
     });
     expect(runtime.received.map((entry) => entry.method)).toEqual(['initialize', 'authenticate']);
     await broker.dispose();

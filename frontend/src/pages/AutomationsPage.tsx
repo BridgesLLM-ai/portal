@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { motion } from 'framer-motion';
+import { motion, type Variants } from 'framer-motion';
 import {
   Timer, Plus, Play, Trash2, Edit2, Clock,
   Calendar, RefreshCw, X, AlertCircle,
@@ -179,11 +179,11 @@ function normalizeRun(raw: any): CronRun {
 /* ─── Animation Variants ────────────────────────────────── */
 
 const container = { hidden: {}, show: { transition: { staggerChildren: 0.05 } } };
-const cardVariant = {
+const cardVariant: Variants = {
   hidden: { opacity: 0, y: 20, scale: 0.95 },
   show: { opacity: 1, y: 0, scale: 1, transition: { type: 'spring', stiffness: 200, damping: 20 } },
 };
-const modalVariant = {
+const modalVariant: Variants = {
   hidden: { opacity: 0, scale: 0.95 },
   show: { opacity: 1, scale: 1, transition: { type: 'spring', stiffness: 300, damping: 30 } },
 };

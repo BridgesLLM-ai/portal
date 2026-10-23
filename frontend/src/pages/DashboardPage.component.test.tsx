@@ -816,7 +816,7 @@ describe('dashboard role-aware loading', () => {
     expect(screen.getByRole('progressbar', { name: 'Portal update progress' })).not.toHaveAttribute('aria-valuenow');
     expect(screen.getByRole('progressbar', { name: 'Portal update progress' }).firstElementChild).toHaveClass('typed-confirmation-progress-sweep');
 
-    expect(screen.getByText('Applying the verified Portal bundle and database migrations.')).toBeVisible();
+    await waitFor(() => expect(screen.getByText('Applying the verified Portal bundle and database migrations.')).toBeVisible());
     fireEvent.click(reviewButton);
     expect(screen.getByRole('dialog', { name: 'Updating Portal to v4.1.0' })).toBeVisible();
 

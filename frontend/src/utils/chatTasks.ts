@@ -27,7 +27,7 @@ export function latestChatPlan(messages: ChatMessage[]): ChatTask[] {
       const call = calls[t];
       if (call.status === 'error') continue;
       const name = call.name.toLowerCase().split(/[./:]|__/).pop()?.replace(/_/g, '');
-      if (!['updateplan', 'todowrite', 'writeplan', 'plan', 'progresscard'].includes(name || '')) continue;
+      if (!['updateplan', 'todowrite', 'writetodos', 'writeplan', 'plan', 'progresscard'].includes(name || '')) continue;
       let args = call.arguments;
       if (typeof args === 'string') { try { args = JSON.parse(args); } catch { continue; } }
       const items = args?.plan ?? args?.todos ?? args?.entries;

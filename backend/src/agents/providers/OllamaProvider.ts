@@ -1,3 +1,5 @@
+import { prepareChatImages } from '../../services/chatImages/directChatImages';
+import { assertImageInputModality } from '../../services/chatImages/chatImageModelPolicy';
 import { randomUUID } from 'crypto';
 import { TextDecoder } from 'node:util';
 import { prisma } from '../../config/database';
@@ -39,6 +41,9 @@ import {
 import {
   NATIVE_OLLAMA_STREAM_COMPLETE,
 } from '../../services/nativeOllamaTransport';
+import { NativeChatTurnTools } from './native/NativeChatTurnTools';
+import { CHAT_BRIDGE_SERVER_NAME, CHAT_BRIDGE_TOOL_NAMES, type ChatBridgeToolName } from '../chatBridge/contract';
+import { CHAT_BRIDGE_TOOLS } from '../chatBridge/mcpServer';
 
 const OLLAMA_HOST_TURN_TIMEOUT_MS = 10 * 60_000;
 const OLLAMA_HOST_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
@@ -46,6 +51,10 @@ const OLLAMA_HOST_MAX_STREAM_LINE_BYTES = 2 * 1024 * 1024;
 const OLLAMA_HOST_MAX_STREAM_RECORDS = 100_000;
 const OLLAMA_HOST_MAX_TOOL_CALLS = 64;
 const OLLAMA_HOST_MAX_TOOL_ARGUMENT_BYTES = 1024 * 1024;
+/** Model rounds per turn when the model drives Portal chat tools; the last offers no tools. */
+const OLLAMA_HOST_TOOL_ROUNDS_MAX = 8;
+const OLLAMA_HOST_TOOL_RESULT_MAX_BYTES = 32 * 1024;
+const OLLAMA_PLAN_STEPS_MAX = 100;
 const OLLAMA_HOST_METRIC_KEYS = Object.freeze([
   'total_duration',
   'load_duration',
@@ -491,6 +500,75 @@ class OllamaHostChatStreamAccumulator {
   }
 }
 
+type OllamaPortalToolName = ChatBridgeToolName | 'update_plan';
+
+const OLLAMA_UPDATE_PLAN_TOOL = Object.freeze({
+  type: 'function',
+  function: {
+    name: 'update_plan',
+    description: 'Record or update your step-by-step plan for this task so the person can follow progress. '
+      + 'Send the whole plan each time, marking steps pending, in_progress or completed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        explanation: { type: 'string', description: 'Optional short note about the change.' },
+        plan: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              step: { type: 'string' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+            },
+            required: ['step', 'status'],
+          },
+        },
+      },
+      required: ['plan'],
+    },
+  },
+});
+
+/** Only Portal chat tools: never host tools, files or shell. */
+function ollamaPortalTools(bridgeOpen: boolean): unknown[] {
+  const bridgeTools = bridgeOpen
+    ? CHAT_BRIDGE_TOOLS.map((tool) => ({
+        type: 'function',
+        function: { name: tool.name, description: tool.description, parameters: tool.inputSchema },
+      }))
+    : [];
+  return [...bridgeTools, OLLAMA_UPDATE_PLAN_TOOL];
+}
+
+function boundedToolText(value: string): string {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length <= OLLAMA_HOST_TOOL_RESULT_MAX_BYTES) return value;
+  return `${bytes.subarray(0, OLLAMA_HOST_TOOL_RESULT_MAX_BYTES).toString('utf8').replace(/\uFFFD$/u, '')}…`;
+}
+
+function normalizePlan(args: Record<string, unknown>): Array<{ step: string; status: string }> | null {
+  if (!Array.isArray(args.plan)) return null;
+  const plan = args.plan.slice(0, OLLAMA_PLAN_STEPS_MAX).flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const step = typeof record.step === 'string' ? record.step.trim().slice(0, 2_000) : '';
+    const status = ['pending', 'in_progress', 'completed'].includes(String(record.status))
+      ? String(record.status)
+      : 'pending';
+    return step ? [{ step, status }] : [];
+  });
+  return plan;
+}
+
+/** Replayed assistant tool calls never resend widget HTML the Portal already stored. */
+function replayableToolCalls(calls: readonly OllamaHostToolCall[]): unknown[] {
+  return calls.map((call) => {
+    if (call.function.name !== 'show_widget') return { function: call.function };
+    const { widget_code: _code, html: _html, ...rest } = call.function.arguments as Record<string, unknown>;
+    return { function: { name: call.function.name, arguments: { ...rest, widget_code: '(rendered in the chat; omitted)' } } };
+  });
+}
+
 type OllamaHostRunOutcome = 'running' | 'completed' | 'aborted' | 'failed';
 
 interface OllamaHostActiveRun {
@@ -511,6 +589,7 @@ function exactRunId(sender?: SenderIdentity): string {
 }
 
 export class OllamaProvider implements AgentProvider {
+  readonly supportsNativeChatImages = true;
   readonly displayName = 'Ollama';
   readonly providerName: AgentProviderName = 'OLLAMA';
   private readonly activeRuns = new Map<AgentSessionId, OllamaHostActiveRun>();
@@ -589,9 +668,22 @@ export class OllamaProvider implements AgentProvider {
     // Reserve the logical run before the first await. Two calls entering in the
     // same event-loop turn therefore cannot both reach model resolution/fetch.
     this.activeRuns.set(sessionId, active);
-    const runTimeout = setTimeout(() => active.controller.abort(), OLLAMA_HOST_TURN_TIMEOUT_MS);
-    runTimeout.unref?.();
+    // The turn timeout bounds model streaming. It is re-armed for every model
+    // round and paused while a Portal question waits for a person.
+    let runTimeout: ReturnType<typeof setTimeout> | null = null;
+    const armRunTimeout = () => {
+      if (runTimeout) clearTimeout(runTimeout);
+      runTimeout = setTimeout(() => active.controller.abort(), OLLAMA_HOST_TURN_TIMEOUT_MS);
+      runTimeout.unref?.();
+    };
+    const pauseRunTimeout = () => {
+      if (runTimeout) clearTimeout(runTimeout);
+      runTimeout = null;
+    };
+    armRunTimeout();
     let protocolComplete = false;
+    let chatTools = NativeChatTurnTools.withoutBridge();
+    const emitStatus: OnStatusCallback = (event) => onStatus?.(chatTools.project(event));
 
     try {
       const resolved = await resolveOllamaBackendAuthority();
@@ -613,33 +705,97 @@ export class OllamaProvider implements AgentProvider {
       // Keep the turn provisional until Ollama reaches a valid terminal frame.
       // Cancellation, malformed NDJSON, and upstream failures must not leave a
       // durable one-sided user turn behind.
-      const prompt = buildTranscriptPrompt(session.messages, message);
-      const stream = new OllamaHostChatStreamAccumulator();
-      await streamResolvedOllama(resolved, {
-        path: '/api/chat',
-        method: 'POST',
-        json: {
-          model: session.model,
-          messages: [{ role: 'user', content: prompt }],
-          stream: true,
-          think: false,
-        },
-        timeoutMs: OLLAMA_HOST_TURN_TIMEOUT_MS,
-        maxResponseBytes: OLLAMA_HOST_MAX_RESPONSE_BYTES,
-        ...(resolved.authority.selectedModelDigest
-          ? { expectedModelDigest: resolved.authority.selectedModelDigest }
-          : {}),
-        signal: active.controller.signal,
-      }, (chunk) => {
-        if (active.controller.signal.aborted) throw new AgentAbortError();
-        return stream.push(chunk, onChunk)
-          ? NATIVE_OLLAMA_STREAM_COMPLETE
-          : undefined;
-      });
-
-      const streamed = stream.finish(onChunk);
+      const photos = await prepareChatImages({ message, sender, assertModel: async () => {
+        const current = requireSession(sessionId);
+        if (current.model !== session.model) throw new Error('Photo model selection changed.');
+        const { value } = await requestResolvedOllamaJson<{ capabilities?: string[] }>(resolved, {
+          path: '/api/show', method: 'POST', json: { model: session.model }, timeoutMs: 5_000,
+          maxResponseBytes: 8 * 1024 * 1024,
+        });
+        assertImageInputModality(value.capabilities?.includes('vision') ? ['text', 'image'] : ['text']);
+        return session.model!;
+      } });
+      const prompt = buildTranscriptPrompt(session.messages, photos?.message || message);
+      // Portal chat tools only for models whose own /api/show advertises tools.
+      const toolCapable = await this.modelAdvertisesTools(resolved, session.model);
+      if (toolCapable) {
+        chatTools = await NativeChatTurnTools.open({
+          provider: 'OLLAMA',
+          portalSessionId: sessionId,
+          runId: active.runId,
+          sender,
+          bridge: true,
+        });
+      }
+      const tools = toolCapable ? ollamaPortalTools(chatTools.bridgeOpen) : null;
+      if (photos) await photos.revalidate();
+      if (active.controller.signal.aborted) throw new AgentAbortError();
+      const conversation: Array<Record<string, unknown>> = [
+        { role: 'user', content: prompt, ...(photos ? { images: photos.images.map(image => image.content) } : {}) },
+      ];
+      const scope = NativeChatTurnTools.runScope(active.runId);
+      const textParts: string[] = [];
+      let streamed: OllamaHostStreamResult | null = null;
+      for (let round = 1; round <= (tools ? OLLAMA_HOST_TOOL_ROUNDS_MAX : 1); round += 1) {
+        // The last round offers no tools, so a tool-happy model must answer.
+        const offerTools = Boolean(tools) && round < OLLAMA_HOST_TOOL_ROUNDS_MAX;
+        const separate = textParts.length > 0;
+        let separatorSent = false;
+        const onRoundChunk: OnChunkCallback = (chunk) => {
+          if (separate && !separatorSent) {
+            separatorSent = true;
+            onChunk?.('\n\n');
+          }
+          onChunk?.(chunk);
+        };
+        const stream = new OllamaHostChatStreamAccumulator();
+        armRunTimeout();
+        await streamResolvedOllama(resolved, {
+          path: '/api/chat',
+          method: 'POST',
+          json: {
+            model: session.model,
+            messages: conversation,
+            ...(offerTools ? { tools } : {}),
+            stream: true,
+            think: false,
+          },
+          timeoutMs: OLLAMA_HOST_TURN_TIMEOUT_MS,
+          maxResponseBytes: OLLAMA_HOST_MAX_RESPONSE_BYTES,
+          ...(resolved.authority.selectedModelDigest
+            ? { expectedModelDigest: resolved.authority.selectedModelDigest }
+            : {}),
+          signal: active.controller.signal,
+        }, (chunk) => {
+          if (active.controller.signal.aborted) throw new AgentAbortError();
+          return stream.push(chunk, onRoundChunk)
+            ? NATIVE_OLLAMA_STREAM_COMPLETE
+            : undefined;
+        });
+        streamed = stream.finish(onRoundChunk);
+        if (streamed.fullText) textParts.push(streamed.fullText);
+        if (!offerTools || streamed.toolCalls.length === 0) break;
+        conversation.push({
+          role: 'assistant',
+          content: streamed.fullText,
+          tool_calls: replayableToolCalls(streamed.toolCalls),
+        });
+        for (const [index, call] of streamed.toolCalls.entries()) {
+          if (active.controller.signal.aborted) throw new AgentAbortError();
+          const toolCallId = `ollama-${scope}-r${round}-c${index + 1}`;
+          const result = await this.runPortalTool(
+            call,
+            toolCallId,
+            chatTools,
+            emitStatus,
+            active.controller.signal,
+            { pause: pauseRunTimeout, resume: armRunTimeout },
+          );
+          conversation.push({ role: 'tool', content: result, tool_name: call.function.name });
+        }
+      }
       protocolComplete = true;
-      const fullText = streamed.fullText;
+      const fullText = textParts.join('\n\n');
       const completedAt = new Date().toISOString();
       appendNativeMessages(session, [
         {
@@ -653,6 +809,7 @@ export class OllamaProvider implements AgentProvider {
           role: 'assistant',
           content: fullText,
           timestamp: completedAt,
+          toolCalls: chatTools.toolCalls(),
         },
       ]);
       active.outcome = 'completed';
@@ -664,9 +821,10 @@ export class OllamaProvider implements AgentProvider {
           model: session.model,
           backend: resolved.authority.kind.toLowerCase(),
           backendGeneration: resolved.authority.generation,
-          ...(streamed.doneReason ? { doneReason: streamed.doneReason } : {}),
-          ...(streamed.metrics ? { metrics: streamed.metrics } : {}),
-          ...(streamed.toolCalls.length > 0 ? { toolCalls: streamed.toolCalls } : {}),
+          ...(streamed?.doneReason ? { doneReason: streamed.doneReason } : {}),
+          ...(streamed?.metrics ? { metrics: streamed.metrics } : {}),
+          ...(!tools && streamed && streamed.toolCalls.length > 0 ? { toolCalls: streamed.toolCalls } : {}),
+          ...(tools ? { portalChatTools: true } : {}),
         },
       };
     } catch (error: any) {
@@ -684,7 +842,9 @@ export class OllamaProvider implements AgentProvider {
       active.outcome = 'failed';
       throw error;
     } finally {
-      clearTimeout(runTimeout);
+      pauseRunTimeout();
+      // Every settlement path (success, error, abort) ends the capability.
+      chatTools.revoke();
       try {
         onStatus?.({ type: 'status', content: '' });
       } catch {
@@ -695,6 +855,79 @@ export class OllamaProvider implements AgentProvider {
         active.resolveCompletion();
       }
     }
+  }
+
+  /** The model's own /api/show capability list decides whether chat tools are offered. */
+  private async modelAdvertisesTools(
+    resolved: ResolvedOllamaBackendAuthority,
+    model: string | undefined,
+  ): Promise<boolean> {
+    if (!model) return false;
+    try {
+      const { value } = await requestResolvedOllamaJson<{ capabilities?: unknown }>(resolved, {
+        path: '/api/show', method: 'POST', json: { model }, timeoutMs: 5_000,
+        maxResponseBytes: 8 * 1024 * 1024,
+      });
+      return Array.isArray(value.capabilities) && value.capabilities.includes('tools');
+    } catch {
+      // No proof of tool support: keep plain chat exactly as before.
+      return false;
+    }
+  }
+
+  /** Execute one model tool call in-process; never host tools. Returns the tool message text. */
+  private async runPortalTool(
+    call: OllamaHostToolCall,
+    toolCallId: string,
+    chatTools: NativeChatTurnTools,
+    emitStatus: OnStatusCallback,
+    signal: AbortSignal,
+    timer: { pause(): void; resume(): void },
+  ): Promise<string> {
+    const name = call.function.name as OllamaPortalToolName;
+    const args = call.function.arguments;
+    const bridgeTool = (CHAT_BRIDGE_TOOL_NAMES as readonly string[]).includes(name)
+      && chatTools.bridgeOpen && chatTools.bridge
+      ? chatTools.bridge
+      : null;
+    // Bridge calls are reported under their MCP name so the shared projector
+    // canonicalises, binds and records them exactly as for every harness.
+    const toolName = bridgeTool ? `mcp__${CHAT_BRIDGE_SERVER_NAME}__${name}` : name;
+    const emit = (event: Record<string, unknown>) => emitStatus({ ...event, toolCallId, toolName } as any);
+    emit({ type: 'tool_start', content: `Using ${name}`, toolArgs: name === 'show_widget' ? { title: args.title } : args });
+    let text: string;
+    let isError = false;
+    if (name === 'update_plan') {
+      const plan = normalizePlan(args);
+      if (!plan) {
+        text = 'update_plan needs a "plan" array of {step, status} entries.';
+        isError = true;
+      } else {
+        text = 'Plan updated.';
+        // The normalised plan is what the Portal shows and persists.
+        emit({
+          type: 'tool_update',
+          content: 'Updated task plan',
+          toolArgs: { plan, ...(typeof args.explanation === 'string' ? { explanation: args.explanation.slice(0, 2_000) } : {}) },
+        });
+      }
+    } else if (bridgeTool) {
+      if (name === 'ask_user') timer.pause();
+      try {
+        const outcome = await bridgeTool.call(name as ChatBridgeToolName, args, signal);
+        text = outcome.text;
+        isError = outcome.isError;
+      } finally {
+        if (name === 'ask_user') timer.resume();
+      }
+      if (signal.aborted) throw new AgentAbortError();
+    } else {
+      text = `Tool ${name} is not available in this chat.`;
+      isError = true;
+    }
+    const bounded = boundedToolText(text);
+    emit({ type: 'tool_end', content: bounded, toolResult: bounded, isError, status: isError ? 'error' : 'completed' });
+    return bounded;
   }
 
   async getHistory(sessionId: AgentSessionId): Promise<AgentMessage[]> {

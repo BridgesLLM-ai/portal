@@ -18,7 +18,6 @@ import {
   serializeAppApiRequestBody,
   streamAppApiResponse,
 } from './utils/appApiProxy';
-import helmet from 'helmet';
 import path from 'path';
 import fs from 'fs';
 import { config } from './config/env';
@@ -32,7 +31,7 @@ import {
   isVendorBrandingSurface,
   resolvePortalBrandingLogoPath,
 } from './services/portalBranding';
-import { createSpaStaticAssetMiddleware } from './services/spaStaticAssets';
+import { createSpaStaticAssetMiddleware, mountMutableAssetNotFound } from './services/spaStaticAssets';
 import authRoutes from './routes/auth';
 import fileRoutes, { initializeFileStorage } from './routes/files';
 import appsRoutes, { initializeAppsStorage, shareRouter } from './routes/apps';
@@ -56,7 +55,11 @@ import {
 import aiRoutes from './routes/ai';
 import terminalRoutes from './routes/terminal';
 // Legacy Guacamole routes removed — noVNC/Xtigervnc is the active remote desktop stack.
-import gatewayRoutes, { attachPortalWebSocket } from './routes/gateway';
+import gatewayRoutes, { attachPortalWebSocket, authorizeChatWidgetSession, mutateAgentSessionWork } from './routes/gateway';
+import { createAgentWorkRouter } from './routes/agentWork';
+import { createChatWidgetsRouter } from './routes/chatWidgets';
+import { pauseNativeGoalsAfterRestart } from './services/nativeSessionWork';
+import { nativeChatBridgeRootDirectory } from './agents/providers/NativeSessionStore';
 import alertsRoutes from './routes/alerts';
 import systemStatsRoutes from './routes/system-stats';
 import systemMaintenanceRoutes from './routes/system-maintenance';
@@ -84,8 +87,10 @@ import {
 } from './services/remoteDesktopOpenPath';
 import { provisionAgentZeroDesktopLauncherSecret } from './services/agentZeroDesktopLaunch';
 import agentBrowserRoutes, { attachAgentBrowserWebSocket } from './routes/agentBrowser';
+import sharedBrowserRoutes, { attachSharedBrowserDesktop, startPortalSharedBrowserBroker, stopPortalSharedBrowserBroker } from './routes/sharedBrowser';
 import systemRemediationRoutes from './routes/system-remediation';
 import mailRoutes from './routes/mail';
+import appCredentialRoutes, { appCredentialBodyLimit } from './routes/project-app-credentials';
 import automationsRoutes from './routes/automations';
 import skillsRoutes, { mountHostExtensionMutationFence } from './routes/skills';
 import { requireSetupComplete } from './middleware/requireSetupComplete';
@@ -131,6 +136,7 @@ import { startTelemetryService, stopTelemetryService } from './services/telemetr
 import { startAudioProxy, stopAudioProxy } from './services/audioProxy';
 import { isExactWebSocketPath, normalizeAudioProxyPort } from './services/remoteDesktopPolicy';
 import { initializeBackupConfiguration } from './services/backup.service';
+import { recoverInterruptedBackupScheduleChange } from './services/backupSchedule.service';
 import {
   isBlockedAppStaticPath,
   isPathWithin,
@@ -192,7 +198,7 @@ import {
 } from './services/startupStatusServer';
 import {
   applyAppContentEmbedSecurityHeaders,
-  buildPortalContentSecurityPolicyDirectives,
+  createPortalSecurityHeaders,
   initializeEmbedSecurityPolicy,
   preserveAppContentSecurityHeadersOnProxy,
 } from './services/embedSecurityPolicy';
@@ -371,20 +377,11 @@ onAgentJobStatus((event) => {
 // Caddy/Cloudflare ingress reaches the Portal through loopback. Never trust a
 // caller-selected first forwarding hop from an exposed interface.
 app.set('trust proxy', 'loopback');
+// Preserve the public nested-query contract across Express 5's changed default.
+app.set('query parser', 'extended');
 
 // Security middleware
-app.use(helmet({
-  contentSecurityPolicy: {
-    // Custom embed origins are deliberately absent here. They apply only to
-    // the isolated app-content origin below, never to the authenticated Portal.
-    directives: buildPortalContentSecurityPolicyDirectives() as any,
-  },
-  crossOriginEmbedderPolicy: false,
-  // Disable COOP and Origin-Agent-Cluster on plain HTTP — they're ignored by
-  // browsers and just spam the console with warnings on non-secure origins.
-  crossOriginOpenerPolicy: process.env.CORS_ORIGIN?.startsWith('https') ? { policy: 'same-origin' } : false,
-  originAgentCluster: process.env.CORS_ORIGIN?.startsWith('https'),
-}));
+app.use(createPortalSecurityHeaders());
 
 // Compression middleware with SSE exclusion
 // SSE responses MUST NOT be compressed because:
@@ -438,35 +435,23 @@ if (PORTAL_UPDATE_VALIDATION_MODE) {
 app.use(corsConfig);
 
 // Proxy + auth imports
-import { createProxyMiddleware } from 'http-proxy-middleware';
+import { createProxyMiddleware } from './utils/portalProxy';
+import { stripHostedPortalCookies } from './utils/hostedProxyHeaders';
+import { createDesktopWebSocketProxy } from './services/remoteDesktopTransport';
 import { authenticateToken, browserAuthRedirect } from './middleware/auth';
 import { requireAdmin } from './middleware/requireAdmin';
 import { mountGlobalApiRateLimit } from './middleware/rateLimitPolicy';
+import { scheduleOpenClawExecutionAdmissionPrewarm } from './services/openClawExecutionAdmission';
 
 // noVNC architecture (March 2026 fix):
 // - Static files served directly by Express from vendored /static/novnc/ (version-pinned)
-// - WebSocket proxy for /novnc/websockify → host websockify on port 6080
+// - Authenticated /novnc/websockify → private host Unix socket
 // - Websockify no longer serves static files (--web flag removed)
 // - Docker novnc-bridge container removed (was racing for port 6080)
 // The authenticated Portal bridge is deliberately local-only. External
 // desktops use their own explicit iframe URL and must never receive Portal
 // cookies through a configurable reverse-proxy target.
-const novncWsTarget = 'http://127.0.0.1:6080';
-const novncWsProxy = createProxyMiddleware({
-  target: novncWsTarget,
-  ws: true,
-  changeOrigin: true,
-  pathRewrite: { '^/novnc/websockify': '/' },
-  on: {
-    error: (err: Error, _req: any, res: any) => {
-      console.error('[noVNC WS] Proxy error:', err.message);
-      if (res && typeof res.writeHead === 'function') {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end('noVNC websocket bridge unavailable');
-      }
-    },
-  },
-} as any);
+const novncWsProxy = createDesktopWebSocketProxy();
 
 // Remote Desktop Audio WebSocket proxy → audio proxy on a configurable localhost port
 const audioWsPort = normalizeAudioProxyPort(process.env.RD_AUDIO_PORT);
@@ -601,6 +586,8 @@ mountHostNativeRuntimeMutationFence(app, {
 // hosted/share route after its access check has passed. Security and the exact
 // disabled-extension fence above run before parsers so rejected request bodies
 // cannot become unauthenticated parser diagnostics.
+// Masked App credential values never reach generic parser error diagnostics.
+app.use('/api/app-credentials', appCredentialBodyLimit);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
@@ -669,9 +656,7 @@ app.use('/static-assets', express.static(STATIC_ASSETS_ROOT, {
 }));
 
 // Do not let SPA fallback return HTML for missing user-uploaded assets.
-app.get(['/static-assets/avatars/*', '/static-assets/branding/*'], (_req, res) => {
-  res.status(404).json({ error: 'Asset not found' });
-});
+mountMutableAssetNotFound(app);
 
 // Hosted apps - serve static files from /var/www/bridgesllm-apps/{id}/
 const HOSTED_APPS_DIR = process.env.APPS_ROOT || '/var/www/bridgesllm-apps';
@@ -933,13 +918,13 @@ async function requireHostedAppAccess(req: any, res: any, next: any): Promise<vo
 
 // Hosted apps — API proxy: route /hosted/:deployId/api/* to the app-bound
 // backend after isolated-origin capability validation.
-app.use('/hosted/:deployId/api/*', requireHostedAppAccess, async (req: any, res: any) => {
+app.use('/hosted/:deployId/api/{*apiPath}', requireHostedAppAccess, async (req: any, res: any) => {
   if (!(await captureBoundedMultipartBody(req, res))) {
     settleWorkspaceAuthorizationRequest(req);
     return;
   }
 
-  const proxiedPath = req.params[0] || '';
+  const proxiedPath = Array.isArray(req.params.apiPath) ? req.params.apiPath.join('/') : '';
   const qsIndex = req.originalUrl.indexOf('?');
   const query = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
   const hostedApp = req.hostedApp as HostedAppRecord;
@@ -1041,6 +1026,7 @@ app.use('/hosted/:deployId', requireHostedAppAccess, async (req: any, res: any, 
     ? getAppTarget(deployId)
     : null;
   if (appTarget) {
+    stripHostedPortalCookies(req.headers, hostedAccessCookieName(deployId));
     const proxy = createProxyMiddleware({
       target: appTarget,
       changeOrigin: true,
@@ -1049,20 +1035,6 @@ app.use('/hosted/:deployId', requireHostedAppAccess, async (req: any, res: any, 
       proxyTimeout: 60_000,
       on: {
         proxyReq: (proxyReq: any) => {
-          const cookieName = hostedAccessCookieName(deployId);
-          const portalCookieNames = new Set([cookieName, 'accessToken', 'refreshToken']);
-          const filteredCookie = String(req.headers.cookie || '')
-            .split(';')
-            .map((value) => value.trim())
-            .filter((value) => {
-              if (!value) return false;
-              const separator = value.indexOf('=');
-              const name = separator >= 0 ? value.slice(0, separator).trim() : value;
-              return !portalCookieNames.has(name) && !name.startsWith('share_password_') && !name.startsWith('share_visit_');
-            })
-            .join('; ');
-          if (filteredCookie) proxyReq.setHeader('cookie', filteredCookie);
-          else proxyReq.removeHeader('cookie');
           proxyReq.once('error', () => settleWorkspaceAuthorizationRequest(req));
         },
         proxyRes: (proxyRes: any) => {
@@ -1483,6 +1455,8 @@ app.use('/api/terminal', terminalRoutes);
 // which requires a signed-in user for everything it owns.
 app.use('/api/gateway/ask-user', askUserPluginRoutes);
 app.use('/api/gateway', gatewayRoutes);
+app.use('/api/agent-work', createAgentWorkRouter({ authorize: authorizeChatWidgetSession, mutate: mutateAgentSessionWork }));
+app.use('/api/chat-widgets', createChatWidgetsRouter(authorizeChatWidgetSession));
 app.use('/api/alerts', alertsRoutes);
 app.use('/api/system/stats', systemStatsRoutes);
 app.use('/api/system/maintenance', systemMaintenanceRoutes);
@@ -1499,9 +1473,11 @@ app.use('/api/agent-runtime', agentRuntimeRoutes);
 app.use('/api/ollama', ollamaRoutes);
 app.use('/api/remote-desktop', remoteDesktopRoutes);
 app.use('/api/mail', mailRoutes);
+app.use('/api/app-credentials', appCredentialRoutes);
 app.use('/api/automations', automationsRoutes);
 app.use('/api/skills', skillsRoutes);
 app.use('/api/agent-browser', agentBrowserRoutes);
+app.use('/api/shared-browser', sharedBrowserRoutes);
 
 // In production, serve built frontend from Express (single-process deployment).
 if (config.nodeEnv === 'production') {
@@ -1656,7 +1632,7 @@ if (config.nodeEnv === 'production') {
     // navigation must pass through renderSpaHtml so custom icons and metadata
     // are present in the first response, before React or a browser paint.
     app.use(createSpaStaticAssetMiddleware(frontendDist));
-    app.get('*', async (req, res, next) => {
+    app.get('/{*spaPath}', async (req, res, next) => {
       const nonSpaPrefixes = ['/api', '/share', '/hosted', '/novnc', '/static-assets', '/assets'];
       if (nonSpaPrefixes.some(prefix => req.path === prefix || req.path.startsWith(`${prefix}/`))) {
         return next();
@@ -1802,6 +1778,7 @@ const shutdownHandler = async (signal: string) => {
   stopTelemetryService();
   stopAudioProxy();
   try {
+    await stopPortalSharedBrowserBroker();
     ollamaPullManager.cancelAll();
     setupLocalOllamaPullManager.cancelAll();
     await shutdownProjectChatRestartRecoveryRuntime();
@@ -2051,6 +2028,13 @@ export const startServer = async () => {
     } catch (error) {
       console.error('[Backups] Backup storage configuration is invalid; scheduled backups will remain fail-closed:', error);
     }
+    try {
+      if (await recoverInterruptedBackupScheduleChange()) {
+        console.warn('[Backups] Restored the backup schedule after an interrupted change');
+      }
+    } catch (error) {
+      console.error('[Backups] An interrupted backup schedule change could not be restored:', error);
+    }
 
     // Load blocked IPs from database
     await loadBlockedIPs();
@@ -2103,6 +2087,10 @@ export const startServer = async () => {
 
     // Attach agent browser live-view WebSocket
     attachAgentBrowserWebSocket(httpServer);
+    attachSharedBrowserDesktop(httpServer);
+    await startPortalSharedBrowserBroker().catch(error => {
+      console.error('[shared-browser] Opt-in broker unavailable:', error.message);
+    });
 
     // Attach WebSocket upgrade handlers to HTTP server
     httpServer.on('upgrade', (req, socket, head) => {
@@ -2137,6 +2125,9 @@ export const startServer = async () => {
       scheduleLegacyOpenClawProjectMigration(1_000);
       if (process.env.PORTAL_DISABLE_OPENCLAW_BACKGROUND !== '1') {
         initializeProjectChatRestartRecoveryRuntime();
+        // Pay the cold OpenClaw attestation once after boot instead of on the
+        // first Agent Chat visit; restart still re-attests from scratch.
+        scheduleOpenClawExecutionAdmissionPrewarm();
       }
       void reconcilePortalVisibleBrowserDefaults();
       void reconcileRemoteDesktopLauncherAssets();
@@ -2146,6 +2137,12 @@ export const startServer = async () => {
       void retireInternalProjectIdentityDebris().catch((error) => {
         console.warn('[project-identity] internal-directory debris sweep failed:', (error as Error)?.message);
       });
+      // No native turn survives a restart; an "active" Portal-managed goal must say so.
+      try {
+        pauseNativeGoalsAfterRestart(nativeChatBridgeRootDirectory());
+      } catch (error) {
+        console.warn('[agent-work] native goal restart sweep failed:', (error as Error)?.message);
+      }
       // The updater deliberately retains its host-operation flock through
       // restart and health verification. Run repair-pin retirement only after
       // the real listener is healthy; the asynchronous worker then joins that

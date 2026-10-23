@@ -98,7 +98,7 @@ afterEach(() => {
   }
 });
 
-function makeFixture(mountFormatVersion: 3 | 4 | 5 = 4): Fixture {
+function makeFixture(mountFormatVersion: 3 | 4 | 5 | 6 = 4): Fixture {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-project-sandbox-'));
   tempRoots.push(tempRoot);
   const projectRoot = path.join(tempRoot, 'projects', 'actor', 'project-a');
@@ -219,12 +219,12 @@ function makeInspect(
         [OPENCLAW_PROJECT_IDENTITY_LABEL]: hashOpenClawProjectLabelIdentity(plan.projectIdentityId),
         [OPENCLAW_PROJECT_AGENT_LABEL]: plan.agentId,
         'openclaw.createdAtMs': '123456789',
-        'openclaw.mountFormatVersion': String(plan.mountFormatVersion === 5 ? 4 : plan.mountFormatVersion),
+        'openclaw.mountFormatVersion': String(plan.mountFormatVersion >= 5 ? 4 : plan.mountFormatVersion),
         ...(plan.mountFormatVersion >= 4 ? { 'openclaw.createArgsEpoch': '2026-08-25-container-env-file' } : {}),
         'openclaw.configHash': plan.configHash,
         [PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]: plan.runtimeFingerprint,
       },
-      WorkingDir: plan.mountFormatVersion === 5 ? '/workspace' : '/workspace/project',
+      WorkingDir: plan.mountFormatVersion >= 5 ? '/workspace' : '/workspace/project',
       ExposedPorts: null,
       Volumes: null,
     },
@@ -267,7 +267,7 @@ function makeInspect(
       NanoCpus: 2_000_000_000,
       Ulimits: [
         { Name: 'nofile', Soft: 1024, Hard: 1024 },
-        { Name: 'nproc', Soft: 256, Hard: 256 },
+        { Name: 'nproc', Soft: 4096, Hard: 4096 },
       ],
       Devices: null,
       DeviceRequests: null,
@@ -285,8 +285,8 @@ function makeInspect(
         Type: 'bind',
         Source: plan.sandboxWorkspaceDir,
         Destination: '/workspace',
-        Mode: plan.mountFormatVersion === 5 ? 'z' : 'ro,z',
-        RW: plan.mountFormatVersion === 5,
+        Mode: plan.mountFormatVersion >= 5 ? 'z' : 'ro,z',
+        RW: plan.mountFormatVersion >= 5,
         Propagation: 'rprivate',
       },
       {
@@ -297,7 +297,7 @@ function makeInspect(
         RW: true,
         Propagation: 'rprivate',
       },
-      ...(plan.mountFormatVersion === 5 ? [{
+      ...(plan.mountFormatVersion >= 5 ? [{
         Type: 'bind',
         Source: path.join(plan.sandboxWorkspaceDir, 'skills'),
         Destination: '/workspace/skills',
@@ -337,6 +337,7 @@ function legacyPreConfinementFixture(fixture: Fixture): Fixture {
     workdir: '/workspace/project',
     seccompProfile: '',
     apparmorProfile: '',
+    ulimits: { nofile: { soft: 1024, hard: 1024 }, nproc: { soft: 256, hard: 256 } },
   };
   const configHash = computeOpenClawProjectConfigHash({
     docker: desiredDocker,
@@ -378,6 +379,8 @@ function makeLegacyPreConfinementInspect(fixture: Fixture, running = true): Reco
   const inspect = makeInspect(legacyPreConfinementFixture(fixture), running);
   inspect.HostConfig.SecurityOpt = ['no-new-privileges:true'];
   inspect.AppArmorProfile = 'docker-default';
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Soft = 256;
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Hard = 256;
   return inspect;
 }
 
@@ -467,6 +470,24 @@ class RuntimeInventoryExecutor implements ProjectEgressCommandExecutor {
 }
 
 describe('OpenClaw Project sandbox desired policy', () => {
+  test('recovery: finite shared UID ceiling retains the exact container PID boundary (OpenClaw)', () => {
+    const fixture = makeFixture();
+    expect(fixture.plan.desiredDocker.pidsLimit).toBe(256);
+    expect(fixture.plan.desiredDocker.ulimits.nproc).toEqual({ soft: 4096, hard: 4096 });
+    for (const limit of [256, -1, 0, 4097]) {
+      const inspect = makeInspect(fixture, true);
+      const nproc = inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc');
+      nproc.Soft = limit;
+      nproc.Hard = limit;
+      expect(() => attestOpenClawProjectContainer({ inspect, plan: fixture.plan, spec: fixture.spec, requireRunning: true }))
+        .toThrow(/ulimits/);
+    }
+    const inspect = makeInspect(fixture, true);
+    inspect.HostConfig.PidsLimit = 0;
+    expect(() => attestOpenClawProjectContainer({ inspect, plan: fixture.plan, spec: fixture.spec, requireRunning: true }))
+      .toThrow(/resource limits/);
+  });
+
   test('builds one project-writable bind, a pinned image, proxy-only networking, and no host web/media tools', () => {
     const fixture = makeFixture();
     const { plan, spec } = fixture;
@@ -517,7 +538,7 @@ describe('OpenClaw Project sandbox desired policy', () => {
     const destinations = [plan.desiredDocker.workdir, ...plan.desiredDocker.binds.map((bind: string) => bind.split(':')[1])];
     expect(destinations).toEqual(['/workspace', '/workspace/project']);
     expect(new Set(destinations).size).toBe(destinations.length);
-    const args = __openClawProjectSandboxTest.buildContainerCreateArgs(plan, 123);
+    const args = __openClawProjectSandboxTest.buildContainerCreateCommand(plan, 123).args;
     expect(args).toContain('--init');
     expect(args).toContain('openclaw.mountFormatVersion=4');
     expect(args).toContain('openclaw.createArgsEpoch=2026-08-25-container-env-file');
@@ -525,7 +546,7 @@ describe('OpenClaw Project sandbox desired policy', () => {
       `${plan.sandboxWorkspaceDir}:/workspace:ro,z`, `${plan.projectRoot}:/workspace/project:rw`,
     ]);
     const legacy = makeFixture(3).plan;
-    const legacyArgs = __openClawProjectSandboxTest.buildContainerCreateArgs(legacy, 123);
+    const legacyArgs = __openClawProjectSandboxTest.buildContainerCreateCommand(legacy, 123).args;
     expect(legacyArgs).not.toContain('--init');
     expect(legacyArgs).toContain('openclaw.mountFormatVersion=3');
     expect(legacy.mountFormatVersion).toBe(3);
@@ -582,7 +603,7 @@ describe('OpenClaw Project sandbox desired policy', () => {
 
   test('builds an OpenClaw-compatible hardened Docker create invocation', () => {
     const fixture = makeFixture();
-    const args = __openClawProjectSandboxTest.buildContainerCreateArgs(fixture.plan, 123456789);
+    const args = __openClawProjectSandboxTest.buildContainerCreateCommand(fixture.plan, 123456789).args;
     expect(args.slice(0, 4)).toEqual(['container', 'create', '--name', fixture.plan.containerName]);
     expect(args).toEqual(expect.arrayContaining([
       '--read-only',
@@ -704,6 +725,8 @@ describe('OpenClaw Project runtime attestation', () => {
     }, 'RUNTIME_CONFINEMENT'],
     ['wrong AppArmor profile', (inspect) => {
       inspect.AppArmorProfile = 'docker-default';
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Soft = 256;
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Hard = 256;
     }, 'RUNTIME_CONFINEMENT'],
     ['unconfined profile', (inspect) => { inspect.HostConfig.SecurityOpt.push('seccomp=unconfined'); }, 'RUNTIME_UNCONFINED'],
     ['privileged mode', (inspect) => { inspect.HostConfig.Privileged = true; }, 'RUNTIME_PRIVILEGED'],
@@ -956,6 +979,56 @@ describe('OpenClaw config convergence', () => {
 });
 
 describe('OpenClaw Project sandbox orchestration', () => {
+  test('recovery: a current format-6 runtime is recognized and kept on re-ensure', async () => {
+    const fixture = makeFixture(6);
+    expect(fixture.plan.desiredDocker.ulimits.nproc).toEqual({ soft: 4096, hard: 4096 });
+    const current = makeInspect(fixture, true);
+    const executor = new RuntimeInventoryExecutor(fixture);
+    executor.add(current);
+    const rpc = jest.fn().mockResolvedValue(rpcResult({ agents: explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) }));
+    await expect(ensureOpenClawProjectSandbox({ context: fixture.context, agentId: AGENT_ID,
+      sessionKey: SESSION_KEY, openClawHome: fixture.openClawHome, egress: fixture.egress }, {
+      rpc, executor, readRuntimeVersion: () => [2026, 10, 5] as const,
+      buildEgressSpec: () => fixture.spec, resolveInternalNetworkBinding: currentNetworkResolver(fixture),
+      ensureEgressPlane: async () => fixture.handle, constrainRuntime: jest.fn(async () => undefined),
+    })).resolves.toMatchObject({ runtimeFingerprint: fixture.plan.runtimeFingerprint });
+    expect(executor.calls.filter(({ args }) => args[1] === 'rm')).toEqual([]);
+  });
+
+  test.each([3, 4, 5, 6] as const)('recovery: exact old nproc generation format %s retires before replacement', async (format) => {
+    const fixture = makeFixture(format);
+    const docker = deepClone(fixture.plan.desiredDocker);
+    docker.ulimits.nproc = { soft: 256, hard: 256 };
+    const configHash = computeOpenClawProjectConfigHash({ docker,
+      sandboxWorkspaceDir: fixture.plan.sandboxWorkspaceDir,
+      agentWorkspaceDir: fixture.plan.agentWorkspaceDir, mountFormatVersion: format });
+    const runtimeFingerprint = __openClawProjectSandboxTest.stableHash({
+      provider: 'OPENCLAW', actorId: fixture.context.userId, projectId: fixture.context.projectId,
+      workspaceOwnerId: fixture.context.workspaceOwnerId, policyFingerprint: fixture.context.policyFingerprint,
+      runtimePolicyVersion: fixture.context.runtimePolicyVersion, egressPolicyVersion: fixture.context.egressPolicyVersion,
+      egressPolicyFingerprint: fixture.spec.policyFingerprint, runtimeImageDigest: RUNTIME_IMAGE,
+      agentId: fixture.plan.agentId, sessionKey: fixture.plan.sessionKey, configHash,
+    });
+    const oldFixture = { ...fixture, plan: { ...fixture.plan, desiredDocker: docker, configHash, runtimeFingerprint } };
+    const old = makeInspect(oldFixture, true);
+    old.Id = 'e'.repeat(64);
+    const limit = old.HostConfig.Ulimits.find((value: any) => value.Name === 'nproc');
+    limit.Soft = 256; limit.Hard = 256;
+    const executor = new RuntimeInventoryExecutor(fixture);
+    executor.add(old);
+    const rpc = jest.fn().mockResolvedValue(rpcResult({ agents: format === 3 ? { list: [{ id: 'main', default: true }, fixture.plan.desiredAgent] }
+      : explicitAgentRoster([{ id: 'main' }, fixture.plan.desiredAgent]) }));
+    await expect(ensureOpenClawProjectSandbox({ context: fixture.context, agentId: AGENT_ID,
+      sessionKey: SESSION_KEY, openClawHome: fixture.openClawHome, egress: fixture.egress }, {
+      rpc, executor, readRuntimeVersion: () => format === 6 ? [2026, 10, 5] as const : format === 5 ? [2026, 9, 6] as const : format === 4 ? [2026, 9, 1] as const : [2026, 7, 1] as const,
+      buildEgressSpec: () => fixture.spec, resolveInternalNetworkBinding: currentNetworkResolver(fixture),
+      ensureEgressPlane: async () => fixture.handle, constrainRuntime: jest.fn(async () => undefined),
+    })).resolves.toMatchObject({ runtimeFingerprint: fixture.plan.runtimeFingerprint });
+    expect(executor.calls.filter(({ args }) => args[1] === 'rm')).toEqual([
+      expect.objectContaining({ args: ['container', 'rm', 'e'.repeat(64)] }),
+    ]);
+  });
+
   test('attests full runtime/config on convergence and again on the healthy-container fast path', async () => {
     const fixture = makeFixture();
     let inspect: Record<string, any> | null = null;
@@ -1919,7 +1992,7 @@ describe('OpenClaw 2026.9.2 workspace-qualified runtime (format 5)', () => {
 
   test('create args label the qualified scope key, keep --init and start in /workspace', () => {
     const f = makeFixture(5);
-    const args = __openClawProjectSandboxTest.buildContainerCreateArgs(f.plan, 1_700_000_000_000);
+    const args = __openClawProjectSandboxTest.buildContainerCreateCommand(f.plan, 1_700_000_000_000).args;
     expect(args).toContain(`openclaw.sessionKey=${f.plan.runtimeScopeKey}`);
     expect(args).toContain('openclaw.mountFormatVersion=4');
     expect(args).toContain('openclaw.createArgsEpoch=2026-08-25-container-env-file');
@@ -2057,4 +2130,200 @@ describe('qualification reconstructs the attested sandbox recipe', () => {
     expectSandboxCode(() => buildOpenClawProjectSandboxPlanForRuntime({ ...input,
       runtime: { configHash: 'unknown', runtimeFingerprint: 'unknown' } }), 'RUNTIME_FINGERPRINT');
   });
+});
+
+describe('OpenClaw Project runtime egress credential custody', () => {
+  // The docker CLI resolves `--env NAME` from its own environment; a missing
+  // value reaches the Engine as a bare name.
+  function cliResolvedEnvironment(args: readonly string[], secretEnvironment: Readonly<Record<string, string>> = {}) {
+    const entries: string[] = [];
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (args[index] !== '--env') continue;
+      const entry = args[index + 1];
+      entries.push(entry.includes('=') || !(entry in secretEnvironment) ? entry : `${entry}=${secretEnvironment[entry]}`);
+    }
+    return entries;
+  }
+
+  class CustodyExecutor implements ProjectEgressCommandExecutor {
+    readonly calls: Array<{ args: readonly string[]; secretEnvironment?: Readonly<Record<string, string>> }> = [];
+    created: Record<string, any> | null = null;
+    dropSecretEnvironment = false;
+    startCreated = false;
+
+    constructor(readonly fixture: Fixture) {}
+
+    async run(
+      command: string,
+      args: readonly string[],
+      options: { secretEnvironment?: Readonly<Record<string, string>> } = {},
+    ) {
+      this.calls.push({ args, secretEnvironment: options.secretEnvironment });
+      const ok = (stdout = '') => ({ stdout, stderr: '', exitCode: 0 });
+      if (command !== 'docker') return ok();
+      const created = this.created;
+      if (args[0] === 'container' && args[1] === 'inspect') {
+        const reference = String(args[2]);
+        return created && (reference === created.Id || reference === this.fixture.plan.containerName)
+          ? ok(JSON.stringify([created]))
+          : { stdout: '', stderr: `Error: No such container: ${reference}`, exitCode: 1 };
+      }
+      if (args[0] === 'container' && args[1] === 'ls') return ok(created ? `${created.Id}\n` : '');
+      if (args[0] === 'container' && args[1] === 'create') {
+        const inspect = makeInspect(this.fixture, this.startCreated);
+        inspect.Config.Env = [
+          'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+          ...cliResolvedEnvironment(args, this.dropSecretEnvironment ? {} : options.secretEnvironment),
+        ];
+        this.created = inspect;
+        return ok(`${inspect.Id}\n`);
+      }
+      if (created && args[0] === 'container' && args[1] === 'start') {
+        created.State.Running = true;
+        created.NetworkSettings.Networks[this.fixture.spec.internalNetworkName].NetworkID =
+          this.fixture.handle.internalNetworkId;
+      }
+      if (created && args[0] === 'container' && args[1] === 'stop') created.State.Running = false;
+      if (created && args[0] === 'container' && args[1] === 'rm' && args.at(-1) === created.Id) this.created = null;
+      return ok();
+    }
+  }
+
+  const proxyCredentials = (fixture: Fixture) => Object.fromEntries(
+    ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'].map((key) => [key, fixture.plan.desiredDocker.env[key]]),
+  );
+  const tokenOnArgv = (executor: CustodyExecutor, fixture: Fixture) => executor.calls.some(({ args }) => (
+    args.some((value) => value.includes(fixture.spec.token))));
+  const ensure = (fixture: Fixture, executor: CustodyExecutor) => __openClawProjectSandboxTest.ensureExactRuntime({
+    plan: fixture.plan,
+    spec: fixture.spec,
+    executor,
+    constrainRuntime: jest.fn(async () => undefined),
+    now: new Date(123456789),
+  });
+
+  test('the create command names proxy credentials and carries their values separately', () => {
+    const fixture = makeFixture(5);
+    const command = __openClawProjectSandboxTest.buildContainerCreateCommand(fixture.plan, 123);
+    for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+      expect(command.args[command.args.indexOf(key) - 1]).toBe('--env');
+    }
+    expect(command.args).toEqual(expect.arrayContaining(['--env', 'NO_PROXY=', '--env', 'no_proxy=', '--env', 'OPENCLAW_CLI=1']));
+    expect(command.args.some((value) => value.includes(fixture.spec.token))).toBe(false);
+    expect(command.secretEnvironment).toEqual(proxyCredentials(fixture));
+  });
+
+  test('a created runtime receives its credentials through the executor and attests', async () => {
+    const fixture = makeFixture();
+    const executor = new CustodyExecutor(fixture);
+    await expect(ensure(fixture, executor)).resolves.toBe('d'.repeat(64));
+    const creates = executor.calls.filter(({ args }) => args[1] === 'create');
+    expect(creates).toHaveLength(1);
+    expect(creates[0].secretEnvironment).toEqual(proxyCredentials(fixture));
+    expect(tokenOnArgv(executor, fixture)).toBe(false);
+    expect(executor.calls.some(({ args }) => args[1] === 'rm')).toBe(false);
+  });
+
+  test('a create whose credentials never arrive is refused and removed by its immutable ID only', async () => {
+    const fixture = makeFixture();
+    const executor = new CustodyExecutor(fixture);
+    executor.dropSecretEnvironment = true;
+    await expect(ensure(fixture, executor)).rejects.toMatchObject({ code: 'RUNTIME_ENVIRONMENT' });
+    expect(executor.calls.filter(({ args }) => args[1] === 'rm').map(({ args }) => args))
+      .toEqual([['container', 'rm', 'd'.repeat(64)]]);
+    expect(executor.calls.some(({ args }) => ['start', 'stop'].includes(String(args[1])))).toBe(false);
+    expect(executor.created).toBeNull();
+    expect(tokenOnArgv(executor, fixture)).toBe(false);
+  });
+
+  test('a running object under the created ID is never removed', async () => {
+    const fixture = makeFixture();
+    const executor = new CustodyExecutor(fixture);
+    executor.dropSecretEnvironment = true;
+    executor.startCreated = true;
+    await expect(ensure(fixture, executor)).rejects.toThrow();
+    expect(executor.calls.some(({ args }) => args[1] === 'rm')).toBe(false);
+    expect(executor.created).not.toBeNull();
+  });
+
+  test('the executor delivers named credentials, refuses missing values and redacts failure text', async () => {
+    const run = __openClawProjectSandboxTest.commandExecutor.run;
+    const token = crypto.randomBytes(24).toString('base64url');
+    const canary = `http://portal:${token}@172.31.10.2:3128`;
+    const digest = crypto.createHash('sha256').update(canary).digest('hex');
+    const script = [
+      "const crypto = require('crypto');",
+      "const value = process.env.HTTPS_PROXY || '';",
+      'process.stdout.write(JSON.stringify({',
+      "  match: crypto.createHash('sha256').update(value).digest('hex') === process.argv[3],",
+      '  noProxy: process.env.NO_PROXY, lang: process.env.LANG, dockerHost: process.env.DOCKER_HOST ?? null,',
+      '}));',
+    ].join('\n');
+    const observed = JSON.parse((await run(process.execPath, ['-e', script, '--', '--env', 'HTTPS_PROXY', digest], {
+      secretEnvironment: { HTTPS_PROXY: canary },
+    })).stdout);
+    expect(observed).toEqual({ match: true, noProxy: '*', lang: 'C', dockerHost: null });
+
+    const refusal = await run('/nonexistent/portal-custody-must-not-spawn', ['container', 'create', '--env', 'HTTPS_PROXY', 'image'])
+      .then(() => null, (error: Error) => error);
+    expect(refusal?.message).toBe('Project egress protected environment is incomplete');
+
+    // The child echoes the value and its password from its own environment.
+    const echo = [
+      'const value = String(process.env.HTTPS_PROXY);',
+      "process.stderr.write('daemon echoed ' + value + ' and ' + decodeURIComponent(new URL(value).password));",
+      'process.exit(3);',
+    ].join('\n');
+    const failure = await run(process.execPath, ['-e', echo], { secretEnvironment: { HTTPS_PROXY: canary } })
+      .then(() => null, (error: Error) => error);
+    expect(failure?.message).toContain('[redacted]');
+    expect(failure?.message.includes(token)).toBe(false);
+  });
+});
+
+describe('Public 9.9 implicit-main bootstrap', () => {
+  test('makes the attested implicit main explicit before writing the first Project agent', async () => {
+    const fixture = makeFixture();
+    const workspace = path.join(fixture.openClawHome, 'workspace-main');
+    let persisted: any = { gateway: { mode: 'local' } };
+    let materialized: any = { ...persisted, agents: { entries: { main: {} } } };
+    const patches: any[] = [];
+    const rpc = jest.fn(async (method: string, params: any) => {
+      if (method === 'config.get') return { ok: true, data: { config: materialized, parsed: persisted, valid: true, exists: true, includedPaths: [], agentRosterIncludeOwned: false, hash: `hash-${patches.length}` } };
+      if (method === 'status') return { ok: true, data: { runtimeVersion: '2026.9.9' } };
+      if (method === 'config.schema') return { ok: true, data: { version: '2026.9.9', schema: { properties: { agents: { type: 'object', additionalProperties: false, properties: {
+        defaults: { properties: { systemAgent: { type: 'object', properties: { agentId: { type: 'string' } } } } },
+        entries: { type: 'object', additionalProperties: { type: 'object', properties: { workspace: { type: 'string' } } } },
+        ownership: { const: 'explicit' },
+      } } } } } };
+      if (method === 'agents.files.list') return { ok: true, data: { agentId: 'main', workspace } };
+      if (method === 'agents.list') return { ok: true, data: { defaultId: 'main', ownership: 'explicit', selectionRequired: false } };
+      if (method === 'config.patch') {
+        const patch = JSON.parse(params.raw); patches.push(patch);
+        // Both shipping writes carry the desired exact agents config.
+        persisted = { ...persisted, agents: { ...persisted.agents, ...patch.agents,
+          defaults: { ...persisted.agents?.defaults, ...patch.agents.defaults },
+          entries: { ...persisted.agents?.entries, ...patch.agents.entries } } };
+        materialized = structuredClone(persisted);
+        return { ok: true, data: {} };
+      }
+      throw new Error(`Unexpected RPC ${method}`);
+    });
+    await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc, () => [2026, 9, 9]);
+    expect(patches).toHaveLength(2);
+    expect(patches[0].agents).toEqual({ ownership: 'explicit', defaults: { systemAgent: { agentId: 'main' } }, entries: { main: { workspace } } });
+    expect(persisted.agents.entries.main).toEqual({ workspace });
+    expect(persisted.agents.entries[fixture.plan.agentId]).toBeDefined();
+    expect(persisted.gateway).toEqual({ mode: 'local' });
+  });
+});
+
+test('does not bootstrap an empty persisted roster without a matching qualified running package', async () => {
+  const fixture = makeFixture();
+  const rpc = jest.fn(async (method: string) => method === 'config.get'
+    ? { ok: true, data: { hash: 'h', parsed: {}, config: { agents: { entries: { main: {} } } }, valid: true } }
+    : { ok: true, data: { runtimeVersion: '2026.9.9' } });
+  await expect(__openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc, () => [2026, 9, 3]))
+    .rejects.toMatchObject({ code: 'CONFIG_AGENT_BOOTSTRAP_UNATTESTED' });
+  expect(rpc.mock.calls.some(call => call[0] === 'config.patch')).toBe(false);
 });

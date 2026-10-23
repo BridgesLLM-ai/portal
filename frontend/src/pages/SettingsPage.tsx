@@ -43,6 +43,7 @@ import {
 } from '../components/settings/SettingsMutationContext';
 import {
   SETTINGS_TAB_ACCESS,
+  SETTINGS_TABS,
   nextTabIndex,
   resolveSettingsTab,
   settingsTabIdsForRole,
@@ -118,15 +119,15 @@ interface TabDef {
 }
 
 const allTabs: TabDef[] = [
-  { id: 'general', label: 'General', icon: Palette, access: SETTINGS_TAB_ACCESS.general },
-  { id: 'email', label: 'Email', icon: Mail, access: SETTINGS_TAB_ACCESS.email },
-  { id: 'security', label: 'Security', icon: ShieldCheck, access: SETTINGS_TAB_ACCESS.security },
-  { id: 'agents', label: 'Harnesses', icon: Bot, access: SETTINGS_TAB_ACCESS.agents },
-  { id: 'system', label: 'System', icon: Server, access: SETTINGS_TAB_ACCESS.system },
-  { id: 'ai-providers', label: 'Model Providers', icon: Cpu, access: SETTINGS_TAB_ACCESS['ai-providers'] },
-  { id: 'readiness', label: 'Feature Readiness', icon: Wrench, access: SETTINGS_TAB_ACCESS.readiness },
-  { id: 'backups', label: 'Backups', icon: Database, access: SETTINGS_TAB_ACCESS.backups },
-  { id: 'profile', label: 'Profile', icon: User, access: SETTINGS_TAB_ACCESS.profile },
+  { id: 'general', label: SETTINGS_TABS['general'].label, icon: Palette, access: SETTINGS_TAB_ACCESS.general },
+  { id: 'email', label: SETTINGS_TABS['email'].label, icon: Mail, access: SETTINGS_TAB_ACCESS.email },
+  { id: 'security', label: SETTINGS_TABS['security'].label, icon: ShieldCheck, access: SETTINGS_TAB_ACCESS.security },
+  { id: 'agents', label: SETTINGS_TABS['agents'].label, icon: Bot, access: SETTINGS_TAB_ACCESS.agents },
+  { id: 'system', label: SETTINGS_TABS['system'].label, icon: Server, access: SETTINGS_TAB_ACCESS.system },
+  { id: 'ai-providers', label: SETTINGS_TABS['ai-providers'].label, icon: Cpu, access: SETTINGS_TAB_ACCESS['ai-providers'] },
+  { id: 'readiness', label: SETTINGS_TABS['readiness'].label, icon: Wrench, access: SETTINGS_TAB_ACCESS.readiness },
+  { id: 'backups', label: SETTINGS_TABS['backups'].label, icon: Database, access: SETTINGS_TAB_ACCESS.backups },
+  { id: 'profile', label: SETTINGS_TABS['profile'].label, icon: User, access: SETTINGS_TAB_ACCESS.profile },
 ];
 
 const ACCENT_PRESETS = [

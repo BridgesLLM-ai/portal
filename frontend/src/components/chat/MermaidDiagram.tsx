@@ -9,6 +9,10 @@ function loadRenderer() {
   if (!renderer) renderer = import('mermaid').then(({ default: mermaid }) => {
     mermaid.initialize({
       startOnLoad: false, securityLevel: 'strict', theme: 'dark',
+      // Mermaid 12 defaults several families to neo; retain Portal's classic look.
+      look: 'classic',
+      // Tree view's upstream fallback is black even under the dark theme.
+      themeVariables: { treeView: { labelColor: '#e2e8f0', lineColor: '#94a3b8', iconColor: '#94a3b8', descriptionColor: '#94a3b8' } },
       maxTextSize: 50_000, maxEdges: 500,
       // Global SVG labels survive sanitization; per-diagram settings are insufficient.
       htmlLabels: false,

@@ -20,7 +20,6 @@
         <value type="int" value="5"/>
         <value type="int" value="6"/>
         <value type="int" value="8"/>
-        <value type="int" value="9"/>
         <value type="int" value="10"/>
         <value type="int" value="11"/>
         <value type="int" value="12"/>
@@ -69,7 +68,6 @@
       <property name="show-notifications" type="bool" value="true"/>
       <property name="known-players" type="string" value="Chrome"/>
     </property>
-    <property name="plugin-9" type="string" value="power-manager-plugin"/>
     <property name="plugin-10" type="string" value="notification-plugin"/>
     <property name="plugin-11" type="string" value="separator">
       <property name="style" type="uint" value="0"/>

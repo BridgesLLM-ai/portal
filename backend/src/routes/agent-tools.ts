@@ -1,4 +1,7 @@
-import { Router, type Application, type Request, type RequestHandler, type Response } from 'express';
+import { Router, type Application, type Request as ExpressRequest, type RequestHandler, type Response } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import { exec } from 'child_process';
 import { z } from 'zod';
 import { authenticateToken } from '../middleware/auth';

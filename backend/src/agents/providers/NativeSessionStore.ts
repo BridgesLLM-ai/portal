@@ -13,12 +13,14 @@ import {
   readSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'fs';
 import path from 'path';
 import { createHash, randomUUID } from 'crypto';
+import { sanitizeNativeToolCalls } from '../chatBridge/toolCallRecorder';
 import type {
   AgentExecutionContext,
   AgentMessage,
@@ -128,6 +130,38 @@ function sessionPath(provider: AgentProviderName, sessionId: string): string {
 
 function sessionHistoryPath(provider: AgentProviderName, sessionId: string): string {
   return path.join(providerDir(provider), `${safeSessionId(sessionId)}.history.jsonl`);
+}
+
+const CHAT_BRIDGE_WIDGET_ROOT_NAME = 'chat-bridge-widgets';
+
+/** Root of every native session's Portal Chat Bridge state directory. */
+export function nativeChatBridgeRootDirectory(): string {
+  return path.resolve(BASE_DIR, CHAT_BRIDGE_WIDGET_ROOT_NAME);
+}
+
+/** Root-only directory holding this session's bridge state: widget documents and goal. */
+export function nativeChatBridgeWidgetDirectory(provider: AgentProviderName, sessionId: string): string {
+  const providerName = path.basename(providerDir(provider));
+  const root = path.resolve(BASE_DIR, CHAT_BRIDGE_WIDGET_ROOT_NAME);
+  const directory = path.join(root, providerName, safeSessionId(sessionId));
+  if (path.dirname(path.dirname(directory)) !== root) {
+    throw new Error('Native agent widget path is invalid');
+  }
+  return directory;
+}
+
+/** Durable copy: bounded tool activity, nothing else added. */
+function durableNativeMessage(message: AgentMessage): AgentMessage {
+  const { toolCalls, ...rest } = message;
+  const bounded = message.role === 'assistant' ? sanitizeNativeToolCalls(toolCalls) : undefined;
+  return bounded ? { ...rest, toolCalls: bounded } : rest;
+}
+
+/** Runtime-context copy: prompts never need tool activity, so keep memory lean. */
+function contextNativeMessage(message: AgentMessage): AgentMessage {
+  if (!message.toolCalls) return message;
+  const { toolCalls: _omitted, ...rest } = message;
+  return rest;
 }
 
 function ensureProviderDir(provider: AgentProviderName): void {
@@ -731,7 +765,7 @@ export function loadNativeSession(provider: AgentProviderName, sessionId: string
     session.messages = selectNewestWholeHistoryRecords(
       page.lines,
       NATIVE_CONTEXT_MESSAGE_LIMIT,
-    ).messages;
+    ).messages.map(contextNativeMessage);
   }
   return session;
 }
@@ -850,7 +884,8 @@ export function appendNativeMessages(
 ): NativeSessionData {
   const historyFile = ensureHistorySidecar(data);
   const committedSize = statSync(historyFile).size;
-  const record = encodeHistoryRecord(messages);
+  const durable = messages.map(durableNativeMessage);
+  const record = encodeHistoryRecord(durable);
   try {
     (dependencies.appendHistory ?? defaultAppendHistory)(historyFile, record);
     chmodSync(historyFile, 0o600);
@@ -870,14 +905,14 @@ export function appendNativeMessages(
     }
     throw error;
   }
-  data.messages.push(...messages);
+  data.messages.push(...durable.map(contextNativeMessage));
   if (data.messages.length > NATIVE_CONTEXT_MESSAGE_LIMIT) {
     data.messages.splice(0, data.messages.length - NATIVE_CONTEXT_MESSAGE_LIMIT);
   }
   data.historyMessageCount =
     Math.max(0, Number(data.historyMessageCount || 0)) + messages.length;
   data.historyByteLength = statSync(historyFile).size;
-  for (const message of messages) updateHistorySummary(data, message);
+  for (const message of durable) updateHistorySummary(data, message);
   data.lastActivityAt = new Date().toISOString();
   saveNativeSession(data);
   return data;
@@ -1199,11 +1234,15 @@ export function deleteNativeSession(provider: AgentProviderName, sessionId: stri
     unlinkSync(file);
     fsyncProviderDir(provider);
   }
+  // Widget documents are display-only derivatives of the retired transcript.
+  const widgets = nativeChatBridgeWidgetDirectory(provider, sessionId);
+  if (pathEntryExists(widgets)) rmSync(widgets, { recursive: true, force: true });
 }
 
 export function nativeSessionArtifactsPresent(provider: AgentProviderName, sessionId: string): boolean {
   return pathEntryExists(sessionPath(provider, sessionId))
     || pathEntryExists(sessionHistoryPath(provider, sessionId))
+    || pathEntryExists(nativeChatBridgeWidgetDirectory(provider, sessionId))
     || listNativeSessionTemporaryArtifacts(provider, sessionId).length > 0;
 }
 

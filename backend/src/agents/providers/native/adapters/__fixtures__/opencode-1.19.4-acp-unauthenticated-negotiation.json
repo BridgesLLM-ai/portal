@@ -1,0 +1,50 @@
+{
+  "provenance": {
+    "artifact": "https://github.com/anomalyco/opencode/releases/download/v1.19.4/opencode-linux-x64-baseline.tar.gz",
+    "archiveSha256": "1697ef40558d378bd2f72efa8fafe1bed1f0e664f09247b9357556b95dbc7cbc",
+    "binarySha256": "538fcb1b6408c8d4608822acee19f7ff5b3a3eb3383c0633c4f06170857312a7",
+    "releaseDigestCrossCheck": "GitHub release v1.19.4 asset digests (published 2026-10-22, not prerelease) match both archives",
+    "capturedAt": "2026-10-23",
+    "conditions": "unauthenticated; empty HOME; private network namespace with loopback only; no prompt sent",
+    "command": "opencode acp --pure --hostname 127.0.0.1 --port 0 --no-mdns",
+    "proves": "protocol negotiation only (initialize + session/new with a stdio MCP server); not model behaviour"
+  },
+  "initialize": {
+    "protocolVersion": 1,
+    "agentCapabilities": {
+      "loadSession": true,
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "promptCapabilities": {
+        "embeddedContext": true,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "close": {},
+        "fork": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "authMethods": [
+      {
+        "description": "Run `opencode auth login` in the terminal",
+        "name": "Login with opencode",
+        "id": "opencode-login"
+      }
+    ],
+    "agentInfo": {
+      "name": "OpenCode",
+      "version": "1.19.4"
+    }
+  },
+  "sessionNewWithStdioMcpServer": {
+    "accepted": true,
+    "configOptionIds": [
+      "model",
+      "mode"
+    ]
+  }
+}

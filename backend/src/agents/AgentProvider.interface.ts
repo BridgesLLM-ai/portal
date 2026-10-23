@@ -1,3 +1,6 @@
+import type { NativeChatImage } from '../services/chatImages/directChatImages';
+import type { NativePersistedToolCall } from './chatBridge/contract';
+
 /**
  * Agent Provider Interface
  *
@@ -95,6 +98,8 @@ export interface AgentMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: string; // ISO-8601
+  /** Bounded tool activity a native harness reported for this assistant turn. */
+  toolCalls?: NativePersistedToolCall[];
 }
 
 /** Callback invoked for each incremental text chunk during streaming. */
@@ -108,6 +113,13 @@ export type OnExecApprovalCallback = (approval: any) => void;
 
 /** Identifies the authenticated human sender for this message. */
 export interface SenderIdentity {
+  /** Server-prepared, scanned photo bytes; never accepted from a browser payload. */
+  chatImages?: NativeChatImage[];
+  chatImageModel?: string;
+  /** Await immediately before originating native dispatch, including reconnect retries. */
+  revalidateChatImages?(): Promise<void>;
+  /** Server-admitted originating Host turn only; never browser-controlled. */
+  portalInlineWidgets?: boolean;
   /** Human-readable label shown in agent context (e.g. "robert@example.com") */
   label: string;
   /** Stable user ID from the auth system */
@@ -202,6 +214,8 @@ export interface AttestedProjectRuntimeCleanup {
 // ── Interface ───────────────────────────────────────────────────────────────
 
 export interface AgentProvider {
+  /** True only when this adapter forwards binary image parts without text degradation. */
+  readonly supportsNativeChatImages?: boolean;
   /** Human-readable name shown in UI. */
   readonly displayName: string;
 

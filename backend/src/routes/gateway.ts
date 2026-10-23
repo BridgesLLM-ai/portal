@@ -1,3 +1,10 @@
+import { parseChatImageReferences, prepareChatImages } from '../services/chatImages/directChatImages';
+import { assertOpenClawImageInput, ChatImageError, hasNativeChatImageModelGate } from '../services/chatImages/chatImageModelPolicy';
+import { withPortalHostTurnAuthority } from '../services/portalHostTurnAuthority';
+import { isCanonicalOpenClawSessionKey } from '../services/openClawCanonicalSessionKey';
+import { expandNativeNestedToolHistory, projectWidgetToolResult } from '../services/chatWidgetProjection';
+import { resolveSessionOwnershipRoot, describeSessionWork, sessionParentKey, subscribeSessionWorkChanges } from '../services/openClawSessionWork';
+import { isOpenClawExecutionCapableGatewayCall } from '../services/openClawExecutionCapableMethods';
 import { bindProjectWorkHostSession, currentProjectWork, trackProjectWorkDispatch } from '../services/projectWorkHost';
 import { adoptProjectWorkDraft } from '../services/projectWorkDraft';
 import { Router, Request, Response } from 'express';
@@ -32,6 +39,18 @@ import {
   AskUserQuestionError,
   readPendingAskUserQuestionForActor,
 } from '../services/askUserQuestionBroker';
+import {
+  answerBridgeQuestion,
+  dismissBridgeQuestion,
+  isBridgeQuestion,
+  listBridgeQuestions,
+} from '../agents/chatBridge/questions';
+import { resolveOwnedNativeSession } from '../agents/chatBridge/nativeSessionOwnership';
+import {
+  notifyNativeTurnSettled,
+  registerNativeGoalDispatcher,
+  type NativeGoalDispatchResult,
+} from '../services/nativeSessionWork';
 import {
   resolveAskUserQuestionRunOwner,
 } from '../services/askUserQuestionSessionOwner';
@@ -111,10 +130,11 @@ import {
   type AgentChatDiagnosticEvent,
 } from '../services/AgentChatDiagnosticHistory';
 import { verifyAccessToken, JwtPayload } from '../utils/jwt';
-import { buildSignedDevice, getOrCreateDeviceKeys } from '../utils/deviceIdentity';
+import { buildSignedDevice, getOrCreateDeviceKeys, validateGatewayChallenge } from '../utils/deviceIdentity';
 import { prisma } from '../config/database';
 import { getOpenClawApiUrl } from '../config/openclaw';
 import { shouldIsolateUser } from '../utils/workspaceScope';
+import { labelSelectorProjectAgents } from '../services/projectAgentDirectory';
 import {
   extractTextFromContent as extractSanitizedText,
   isControlOnlyAssistantText,
@@ -123,6 +143,7 @@ import {
 } from '../utils/chatText';
 import { canUseInteractivePortal, isElevatedRole, isOwnerRole } from '../utils/authz';
 import {
+  classifyOpenClawSessionLane,
   openClawSessionActorId,
   isOpenClawSessionActorScopedTo,
 } from '../agents/openclawSessionOwnership';
@@ -265,13 +286,58 @@ function confirmedOpenClawAbortRunIds(
 }
 
 async function sendHostOperatorProviderMessage(input: HostOperatorProviderSend): Promise<AgentSendResult> {
-  return trackProjectWorkDispatch(input, () => sendUntrackedHostOperatorProviderMessage(input));
+  // Every settled native host turn lets a Portal-managed goal decide whether to continue.
+  const settled = (outcome: 'success' | 'error' | 'aborted', error?: unknown) => {
+    if (input.provider.providerName === 'OPENCLAW') return;
+    try {
+      notifyNativeTurnSettled({
+        provider: input.provider.providerName,
+        sessionId: input.sessionId,
+        outcome,
+        errorText: error ? redactNativeProviderText((error as any)?.message || String(error)) || undefined : undefined,
+      });
+    } catch { /* goal bookkeeping never changes the turn's own outcome */ }
+  };
+  try {
+    const result = await trackProjectWorkDispatch(input, () => sendUntrackedHostOperatorProviderMessage(input));
+    settled('success');
+    return result;
+  } catch (error) {
+    settled(error instanceof AgentAbortError ? 'aborted' : 'error', error);
+    throw error;
+  }
 }
 
 async function sendUntrackedHostOperatorProviderMessage(
   input: HostOperatorProviderSend,
 ): Promise<AgentSendResult> {
   assertQualifiedNativeBinaryProvider(input.provider.providerName);
+  if (parseChatImageReferences(input.message).length) {
+    if (!input.provider.supportsNativeChatImages) throw new ChatImageError('IMAGE_TRANSPORT_UNAVAILABLE', 503);
+    if (input.provider.providerName === 'OPENCLAW') {
+      const photos = await prepareChatImages({ message: input.message, sender: input.sender,
+        assertModel: () => assertOpenClawImageInput(input.sessionId) });
+      if (!photos) throw new ChatImageError('IMAGE_REFERENCE_INVALID', 400);
+      input = { ...input, message: photos.message, sender: { ...input.sender!, chatImages: photos.images,
+        chatImageModel: photos.model, revalidateChatImages: photos.revalidate } };
+    } else if (input.provider.providerName === 'OLLAMA') {
+      // Ollama prepares photos itself against the model's own /api/show capabilities.
+    } else if (hasNativeChatImageModelGate(input.provider)) {
+      // Native harnesses with an image transport: the model check uses the
+      // harness's own advertised capability, never a model-name guess. The
+      // durable transcript keeps the photo markers; the provider receives the
+      // prepared bytes and strips the markers from what the harness sees.
+      const gate = input.provider;
+      const sessionId = input.sessionId;
+      const photos = await prepareChatImages({ message: input.message, sender: input.sender,
+        assertModel: () => gate.assertChatImageModel(sessionId) });
+      if (!photos) throw new ChatImageError('IMAGE_REFERENCE_INVALID', 400);
+      input = { ...input, sender: { ...input.sender!, chatImages: photos.images,
+        chatImageModel: photos.model, revalidateChatImages: photos.revalidate } };
+    } else {
+      throw new ChatImageError('IMAGE_TRANSPORT_UNAVAILABLE', 503);
+    }
+  }
   if (input.provider.providerName !== 'OPENCLAW') {
     // Native Host Operator providers enforce their durable systemd-scope run
     // boundary inside the provider.
@@ -326,6 +392,8 @@ async function sendAdmittedOpenClawHostOperatorMessage(
   let dispatchAccepted = false;
   const sender: SenderIdentity = {
     ...input.sender!,
+    portalInlineWidgets: classifyOpenClawSessionLane(input.sessionId) === 'direct'
+      && !/^agent:(?:p4oc-|portal(?:-|:))/i.test(input.sessionId),
     onProviderDispatchAccepted: async (upstreamRunId: string) => {
       await markOpenClawHostRunDispatchAccepted(handle, upstreamRunId);
       dispatchAccepted = true;
@@ -333,7 +401,7 @@ async function sendAdmittedOpenClawHostOperatorMessage(
   };
 
   try {
-    const result = await input.provider.sendMessage(
+    const dispatch = () => input.provider.sendMessage(
       input.sessionId,
       input.message,
       input.onChunk,
@@ -341,6 +409,9 @@ async function sendAdmittedOpenClawHostOperatorMessage(
       input.onExecApproval,
       sender,
     );
+    const result = sender.portalInlineWidgets
+      ? await withPortalHostTurnAuthority(handle, sender.role, dispatch)
+      : await dispatch();
     if (!dispatchAccepted) {
       throw new Error('OpenClaw provider settled without durable dispatch acceptance');
     }
@@ -1207,6 +1278,7 @@ async function probeOpenClawVersionStatusWithDependencies(
     'gateway-rpc-unavailable',
     'gateway-runtime-mismatch',
     'codex-plugin-mismatch',
+    'codex-plugin-inspect-timeout',
   ].includes(blocker.code));
   const testedPairReason = testedPairReady
     ? null
@@ -2269,12 +2341,13 @@ async function assertGatewaySessionAccess(
  * on the Portal broker, where request/host-run admission owns the mutation
  * lease.
  */
-async function assertExistingGatewaySessionAccess(
+export async function assertExistingGatewaySessionAccess(
   sessionKey: string,
   user: JwtPayload,
   options?: {
     providerName?: AgentProviderName | string | undefined;
     database?: ProjectActivityScopeDatabase;
+    inspectNativeLineage?: boolean;
   },
 ): Promise<void> {
   const providerName = String(options?.providerName || 'OPENCLAW').trim().toUpperCase();
@@ -2301,9 +2374,116 @@ async function assertExistingGatewaySessionAccess(
   if (isPortalAgentChatSessionKeyForUser(sessionKey, user)) return;
   const ownerUserId = await findOpenClawAgentSessionOwner(sessionKey, database);
   // Match the Owner's host-session list and send admission without writing a
-  // claim during history/stream delivery. An existing other-user claim wins.
-  if (!ownerUserId && isOwnerRole(user.role)) return;
-  if (ownerUserId !== user.userId) throw new Error('Admin access required');
+  // claim during history/stream delivery. An existing other-user claim wins,
+  // in any legacy form of the same OpenClaw session (B536-ALIAS-03).
+  if (await hasForeignEquivalentOpenClawClaim(sessionKey, user.userId, database)) {
+    throw new Error('Admin access required');
+  }
+  if (ownerUserId) {
+    if (ownerUserId !== user.userId) throw new Error('Admin access required');
+    return;
+  }
+  // Preserve the existing generic host-history contract. Rich retrieval opts
+  // into full native lineage; subagent stop/read paths always attest lineage.
+  if (!options?.inspectNativeLineage && classifyOpenClawSessionLane(sessionKey) !== 'subagent') {
+    if (isOwnerRole(user.role)) return;
+    throw new Error('Admin access required');
+  }
+  // Only native write-once lineage fields can confer access to an unclaimed child.
+  const root = await resolveSessionOwnershipRoot(sessionKey, {
+    hasOwner: async key => Boolean(openClawSessionActorId(key)
+      || await findOpenClawAgentSessionOwner(key, database)
+      // Stop at a Project boundary even when it has no AgentSession owner.
+      // A malformed ancestor cycle must never fall back to OWNER host visibility.
+      || await isProjectChatActivitySession(key, database, user.userId)),
+    describe: key => describeSessionWork(key),
+  });
+  if (!root) throw new Error('Admin access required');
+  if (root.inherited) {
+    await assertExistingGatewaySessionAccess(root.root, user, options);
+    return;
+  }
+  // Explicit OWNER visibility of unclaimed host/system sessions is unchanged.
+  if (isOwnerRole(user.role)) return;
+  throw new Error('Admin access required');
+}
+
+/** Native work mutations are narrow broker operations, never direct-proxy methods. */
+export async function mutateAgentSessionWork(
+  key: string, user: JwtPayload, method: string, params: Record<string, any>,
+): ReturnType<typeof gatewayRpcCall> {
+  if (!['sessions.goal.update', 'sessions.goal.clear', 'chat.send', 'progressCard.refresh'].includes(method)
+    || params.sessionKey !== key) {
+    throw Object.assign(new Error('Invalid work operation scope'), { statusCode: 400, code: 'WORK_OPERATION_INVALID' });
+  }
+  const release = acquireWorkspaceAuthorizationMutationLease(user.userId);
+  let releaseHere = true;
+  try {
+    await authorizeChatWidgetSession(key, user);
+    if (!isOpenClawExecutionCapableGatewayCall(method, params)) return await gatewayRpcCall(method, params);
+    requireHostOperatorExecutionContext(user);
+    await assertOpenClawExecutionAdmitted();
+    // Children inherit read/stop authority, not a new durable HOST_OPERATOR claim.
+    // Start/resume from the owning root's existing send/control path instead.
+    const row = await describeSessionWork(key);
+    if (row && sessionParentKey(row)) {
+      const error = new Error('Child work must be started from its owning root') as Error & { code: string; statusCode: number };
+      error.code = 'CHILD_EXECUTION_UNSUPPORTED'; error.statusCode = 409; throw error;
+    }
+    await assertGatewaySessionAccess(key, user);
+    assertCachedOpenClawExecutionAdmitted();
+    return await bindAdmittedOpenClawDispatch(async () => {
+      const handle: OpenClawHostRunHandle = {
+        id: randomUUID(), actorUserId: user.userId, actorAuthorizationVersion: Number(user.authorizationVersion),
+        provider: 'OPENCLAW', executionScope: 'HOST_OPERATOR', sessionKey: key,
+      };
+      await beginOpenClawHostRun(handle);
+      // Subscribe before IO: a fast terminal can precede the admission receipt.
+      const terminals = new Map<string, StreamEvent>();
+      let acceptedRun: string | null = null;
+      let terminalHandler: ((event: StreamEvent) => void) | null = null;
+      const unsubscribe = streamEventBus.subscribe(key, event => {
+        if ((event.type !== 'done' && !(event.type === 'error' && event.terminal === true)) || typeof event.runId !== 'string') return;
+        terminals.set(event.runId, event);
+        if (terminals.size > 16) terminals.delete(terminals.keys().next().value!);
+        if (acceptedRun === event.runId) terminalHandler?.(event);
+      }, { role: 'route-terminal' });
+      try {
+        const result = await gatewayRpcCall(method, params);
+        if (!result.ok || typeof result.data?.runId !== 'string') {
+          // A rejected operation did not necessarily prove the Gateway stayed idle.
+          await quarantineOpenClawHostRun(handle, result.errorCode || 'work admission unconfirmed');
+          unsubscribe(); return result;
+        }
+        const runId = result.data.runId;
+        await markOpenClawHostRunDispatchAccepted(handle, runId);
+        releaseHere = false;
+        let settled = false;
+        const finish = async (event?: StreamEvent) => {
+          if (settled) return; settled = true; clearTimeout(timer); unsubscribe();
+          try {
+            if (event) await markOpenClawHostRunVisibleSettled(handle, event.type === 'done' ? 'completed' : 'error');
+            else await quarantineOpenClawHostRun(handle, 'Native work terminal not observed within bounded window');
+            release();
+          } catch {
+            console.error('[agent-work] Retaining authorization lease: native work custody could not settle');
+          }
+        };
+        const timer = setTimeout(() => { void finish(); }, 10 * 60_000); timer.unref?.();
+        terminalHandler = event => { void finish(event); };
+        acceptedRun = runId;
+        const terminal = terminals.get(runId);
+        if (terminal) terminalHandler(terminal);
+        subscribeBackendToLiveSessionEvents(key);
+        return result;
+      } catch (error) {
+        unsubscribe();
+        try { await quarantineOpenClawHostRun(handle, error); }
+        catch { releaseHere = false; }
+        throw error;
+      }
+    });
+  } finally { if (releaseHere) release(); }
 }
 
 const NATIVE_AGENT_SESSION_PROVIDERS: readonly AgentProviderName[] = Object.freeze([
@@ -2367,6 +2547,28 @@ async function findOpenClawAgentSessionOwner(
     select: { userId: true },
   });
   return existing?.userId || null;
+}
+
+async function hasForeignEquivalentOpenClawClaim(
+  sessionKey: string,
+  actorUserId: string,
+  database: ProjectActivityScopeDatabase,
+): Promise<boolean> {
+  if (isOpenClawSessionActorScopedTo(sessionKey, actorUserId)) return false;
+  const sessionName = /^agent:[^:]+:(.+)$/.exec(sessionKey)?.[1];
+  if (!sessionName) return true;
+  const foreign = await database.agentSession.findFirst({
+    where: {
+      provider: 'OPENCLAW',
+      userId: { not: actorUserId },
+      OR: [
+        { externalId: { equals: sessionKey, mode: 'insensitive' } },
+        { externalId: { equals: sessionName, mode: 'insensitive' } },
+      ],
+    },
+    select: { id: true },
+  });
+  return Boolean(foreign);
 }
 
 function isPrismaUniqueConstraintError(error: unknown): boolean {
@@ -7111,7 +7313,7 @@ function readSessionMessagesEnhancedWithMetadata(
             role: 'toolResult',
             toolCallId: entry.message.toolCallId,
             toolName: entry.message.toolName,
-            content: extractText(content),
+            content: projectWidgetToolResult(entry.message.toolName, entry.message.toolCallId, entry.message) ?? extractText(content),
             timestamp: entry.timestamp,
           };
         }
@@ -7348,7 +7550,7 @@ function projectOpenClawGatewayHistoryMessage(message: any): any | null {
       ...message,
       id,
       role: 'toolResult',
-      content: extractText(message.content ?? message.text ?? ''),
+      content: projectWidgetToolResult(message.toolName, message.toolCallId, message) ?? extractText(message.content ?? message.text ?? ''),
       timestamp,
     };
   }
@@ -7371,7 +7573,7 @@ function projectOpenClawGatewayHistoryMessages(
   enhanced: boolean,
 ): any[] {
   const projected = stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(
-    messages.map(projectOpenClawGatewayHistoryMessage).filter(Boolean),
+    expandNativeNestedToolHistory(messages).map(projectOpenClawGatewayHistoryMessage).filter(Boolean),
   ));
   const finalized = enhanced
     ? finalizeEnhancedHistoryMessages(sessionKey, projected, Math.max(limit, 1))
@@ -7381,7 +7583,7 @@ function projectOpenClawGatewayHistoryMessages(
 
 function projectOpenClawGatewayHistoryWindow(messages: any[]): any[] {
   return stripMessageDeliveryArtifactsFromHistory(hydrateHistoryToolCalls(
-    messages.map(projectOpenClawGatewayHistoryMessage).filter(Boolean),
+    expandNativeNestedToolHistory(messages).map(projectOpenClawGatewayHistoryMessage).filter(Boolean),
   ));
 }
 
@@ -11195,8 +11397,121 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
   }
 });
 
+/**
+ * Server-initiated turn for a Portal-managed native goal. Same admission,
+ * session-access, host-run journal and stream-bus path as a non-streaming
+ * browser send; the actor's current account state is re-read for every turn.
+ */
+async function dispatchNativeGoalTurn(input: {
+  provider: AgentProviderName;
+  sessionId: string;
+  userId: string;
+  message: string;
+}): Promise<NativeGoalDispatchResult> {
+  if (input.provider === 'OPENCLAW') return 'refused';
+  const { prisma } = await import('../config/database');
+  const actor = await prisma.user.findUnique({
+    where: { id: input.userId },
+    select: { id: true, email: true, role: true, accountStatus: true, isActive: true, authorizationVersion: true },
+  });
+  if (!actor?.isActive || actor.accountStatus !== 'ACTIVE' || !isElevatedRole(actor.role)) return 'refused';
+  const user: JwtPayload = {
+    userId: actor.id,
+    email: actor.email,
+    role: actor.role,
+    accountStatus: actor.accountStatus,
+    authorizationVersion: actor.authorizationVersion,
+  };
+  let releaseLease: () => void;
+  try {
+    releaseLease = acquireWorkspaceAuthorizationMutationLease(user.userId);
+  } catch {
+    return 'refused';
+  }
+  let leaseHandedToRun = false;
+  try {
+    const executionContext = requireHostOperatorExecutionContext(user);
+    await assertHostOperatorProviderExecutionAvailable(input.provider);
+    assertProviderExecutionContext(input.provider, executionContext);
+    const provider = await AgentRegistry.getAsync(input.provider);
+    await assertGatewaySessionAccess(input.sessionId, user, { providerName: provider.providerName });
+    const provenance = harnessTurnProvenance(provider.providerName);
+    const providerPublishesStream = providerPublishesHostStream(provider.providerName);
+    const usesBus = providerUsesHostStreamBus(provider.providerName);
+    const runId = randomUUID();
+    const matcher = createHostStreamRunMatcher(provider.providerName, runId);
+    let sawTerminal = false;
+    let terminalUnsub: (() => void) | null = null;
+    if (usesBus) {
+      if (!reserveHostStreamRoute({ sessionId: input.sessionId, runId, provenance })) return 'busy';
+      terminalUnsub = streamEventBus.subscribe(input.sessionId, (event: StreamEvent) => {
+        if (matcher.matches(event) && (event.type === 'done' || event.type === 'error')) sawTerminal = true;
+      }, { role: 'route-terminal' });
+    }
+    leaseHandedToRun = true;
+    let releaseSafe = true;
+    void (async () => {
+      try {
+        const result = await sendHostOperatorProviderMessage({
+          provider,
+          sessionId: input.sessionId,
+          message: input.message,
+          onChunk: providerPublishesStream ? undefined : (chunk: string) => {
+            if (!chunk) return;
+            publishRouteOwnedHostStreamEvent({ sessionId: input.sessionId, runId, provenance, event: { type: 'text', content: chunk } });
+          },
+          onStatus: providerPublishesStream ? undefined : (event: { type?: string; content?: string; [key: string]: unknown }) => {
+            publishRouteOwnedHostStreamEvent({ sessionId: input.sessionId, runId, provenance, event });
+          },
+          onExecApproval: undefined,
+          sender: {
+            label: user.email,
+            userId: user.userId,
+            role: user.role,
+            authorizationVersion: Number(user.authorizationVersion ?? 1),
+            requestId: runId,
+          },
+          onQuarantinePersistenceFailure: () => { releaseSafe = false; },
+        });
+        if (usesBus && !sawTerminal) {
+          publishRouteOwnedHostStreamDone({ sessionId: input.sessionId, runId: matcher.currentRunId(), provenance, result });
+        }
+      } catch (error: any) {
+        if (usesBus && !sawTerminal) {
+          if (error instanceof AgentAbortError) {
+            publishRouteOwnedHostStreamDone({
+              sessionId: input.sessionId,
+              runId: matcher.currentRunId(),
+              provenance,
+              result: { fullText: '', metadata: {} },
+              aborted: true,
+            });
+          } else {
+            publishRouteOwnedHostStreamError({
+              sessionId: input.sessionId,
+              runId: matcher.currentRunId(),
+              content: redactNativeProviderText(error?.message || String(error)) || 'Agent error',
+            });
+          }
+        }
+      } finally {
+        terminalUnsub?.();
+        if (releaseSafe) releaseLease();
+        else console.error('[gateway] Retaining the workspace authorization lease after an unquarantined goal turn');
+      }
+    })();
+    return 'started';
+  } catch {
+    return 'refused';
+  } finally {
+    if (!leaseHandedToRun) releaseLease();
+  }
+}
+
+registerNativeGoalDispatcher(dispatchNativeGoalTurn);
+
 /* GET /api/gateway/agents — list OpenClaw sub-agents */
-router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res: Response) => {
+router.get('/agents', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
     const raw = await listOpenClawAgentsForSelector();
 
@@ -11238,7 +11553,8 @@ router.get('/agents', authenticateToken, requireAdmin, async (_req: Request, res
           avatarUrl: subAgentAvatarMap[id] || undefined,
         };
       });
-    res.json({ agents });
+    // Generated Project Chat agents get the caller's authorized Project name.
+    res.json({ agents: await labelSelectorProjectAgents(agents, req.user!) });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to list agents', detail: err.message });
   }
@@ -11343,6 +11659,10 @@ router.post('/chat/inject', authenticateToken, requireApproved, async (req: Requ
     res.status(400).json({ error: 'text required' });
     return;
   }
+  if (text.includes('[portal-chat-image:')) {
+    res.status(409).json({ error: 'Send photos as a new turn after the active response finishes.', code: 'IMAGE_NEW_TURN_REQUIRED' });
+    return;
+  }
   try {
     await assertOpenClawExecutionAdmitted();
     const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
@@ -11408,6 +11728,10 @@ router.post('/answer-user-input', authenticateToken, requireApproved, async (req
     res.status(400).json({ error: 'message, runId, and requestId are required' });
     return;
   }
+  if (message.includes('[portal-chat-image:')) {
+    res.status(409).json({ error: 'Send photos as a new turn after the active response finishes.', code: 'IMAGE_NEW_TURN_REQUIRED' });
+    return;
+  }
   try {
     await assertOpenClawExecutionAdmitted();
     const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
@@ -11441,6 +11765,10 @@ router.post('/session-steer', authenticateToken, requireApproved, async (req: Re
   const requestId = typeof req.body?.requestId === 'string' ? req.body.requestId.trim() : undefined;
   if (!message || !expectedRunId) {
     res.status(400).json({ error: 'message and expectedRunId are required' });
+    return;
+  }
+  if (message.includes('[portal-chat-image:')) {
+    res.status(409).json({ error: 'Send photos as a new turn after the active response finishes.', code: 'IMAGE_NEW_TURN_REQUIRED' });
     return;
   }
   try {
@@ -11744,6 +12072,17 @@ function wsSend(ws: WebSocket, data: any) {
 interface GatewayWebSocketAuthorizationBinding {
   revoked: boolean;
   dispose?: () => void;
+}
+
+/** Rich retrieval uses the same lineage/role rules, never crosses a Project boundary. */
+export async function authorizeChatWidgetSession(key: string, user: JwtPayload): Promise<void> {
+  // Project bindings are exact-key lookups; native history normalizes aliases.
+  // Refuse aliases before authorization/RPC, preserving opaque peer ID case.
+  if (!isCanonicalOpenClawSessionKey(key)) throw new Error('Canonical session key required');
+  await assertGatewayActorIsCurrent(user);
+  if (await isProjectChatActivitySession(key, prisma, user.userId) || isSandboxProjectSessionKeyForUser(key, user))
+    throw new Error('Project widgets are outside the existing Project contract');
+  await assertExistingGatewaySessionAccess(key, user, { inspectNativeLineage: true });
 }
 
 async function assertGatewayActorIsCurrent(user: JwtPayload): Promise<void> {
@@ -12878,6 +13217,10 @@ async function handleWsInject(ws: WebSocket, msg: any, user?: JwtPayload) {
     return;
   }
   const actor = user;
+  if (text.includes('[portal-chat-image:')) {
+    wsSend(ws, { type: 'inject_result', ok: false, error: 'Send photos as a new turn after the active response finishes.' });
+    return;
+  }
   try {
     await assertOpenClawExecutionAdmitted();
     const sessionKey = await resolveOpenClawSessionKey(msg.session, actor);
@@ -13192,6 +13535,29 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
     });
   });
 
+  const unsubWork = subscribeSessionWorkChanges(signal => {
+    void enqueueOrderedSessionDelivery(globalDeliveryChains, signal.sessionKey, async () => {
+      let release: (() => void) | undefined;
+      try {
+        release = acquireWorkspaceAuthorizationMutationLease(user.userId);
+        await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+        if (resolveOwnedNativeSession(signal.sessionKey, user.userId)) {
+          // Native harness work (Portal-managed goal/status) has no OpenClaw row.
+          if (ws.readyState === WebSocket.OPEN) wsSend(ws, signal);
+          return;
+        }
+        await assertExistingGatewaySessionAccess(signal.sessionKey, user);
+        const row = await describeSessionWork(signal.sessionKey);
+        const parentKey = row && sessionParentKey(row);
+        if (parentKey) await assertExistingGatewaySessionAccess(parentKey, user);
+        await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
+        if (ws.readyState !== WebSocket.OPEN) return;
+        wsSend(ws, signal);
+        if (parentKey) wsSend(ws, { type: 'work.changed', v: 1, sessionKey: parentKey, parts: ['children'] });
+      } catch { /* Unauthorized or revoked signals are silent. */ } finally { release?.(); }
+    });
+  });
+
   ws.on('message', async (raw: Buffer | string) => {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { wsSend(ws, { type: 'error', content: 'Invalid JSON' }); return; }
@@ -13236,6 +13602,7 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
   ws.on('close', () => {
     clearInterval(pingTimer);
     unsubGlobal();
+    unsubWork();
     portalWsClients.delete(ws);
     debugLog(`[gateway-ws] Client disconnected: ${user.email}`);
   });
@@ -13433,6 +13800,8 @@ function buildDirectProxyConnectFrame(
   }
   const token = dependencies.getToken();
   const nonce = browserFrame.params.nonce;
+  const signedAt = browserFrame.__receivedChallengeTs;
+  if (!Number.isSafeInteger(signedAt) || signedAt <= 0) throw new Error('Gateway challenge was not received');
   const scopes = getDirectProxyScopes();
   return {
     type: 'req',
@@ -13456,6 +13825,7 @@ function buildDirectProxyConnectFrame(
         scopes,
         token,
         nonce,
+        signedAt,
       }),
       role: DIRECT_PROXY_ROLE,
       scopes,
@@ -13546,6 +13916,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
 
   const gatewayUrl = getOpenClawWsUrl();
   let gatewayWs: WebSocket | null = null;
+  let receivedChallenge: { nonce: string; ts: number } | null = null;
   let browserClosed = false;
   let gatewayClosed = false;
 
@@ -13656,6 +14027,7 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
       const str = data.toString();
       const msg = JSON.parse(str);
       if (msg.type === 'event') {
+        if (msg.event === 'connect.challenge') receivedChallenge = validateGatewayChallenge(msg.payload);
         const allowed = await withAuthorizationLease(
           () => isDirectGatewayEventAllowed(msg, user),
         );
@@ -13825,7 +14197,10 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
         browserRequestId: frame.id,
       });
 
-      const fullFrame = buildDirectProxyConnectFrame(frame, user);
+      if (!receivedChallenge || frame.params.nonce !== receivedChallenge.nonce) throw new Error('Gateway challenge mismatch');
+      validateGatewayChallenge(receivedChallenge);
+      const fullFrame = buildDirectProxyConnectFrame({ ...frame, __receivedChallengeTs: receivedChallenge.ts }, user);
+      receivedChallenge = null;
 
       const serialized = JSON.stringify(fullFrame);
       debugLog(`[gateway-direct] CONNECT frame forwarding: readyState=${gatewayWs.readyState} bufferedAmount=${gatewayWs.bufferedAmount} id=${stringId} client=${DIRECT_PROXY_CLIENT_ID} scopeCount=${getDirectProxyScopes().length}`);
@@ -13866,6 +14241,13 @@ function handleDirectProxyConnection(browserWs: WebSocket, user: JwtPayload) {
     }
 
     const frameMethod = typeof frame.method === 'string' ? frame.method : '';
+    if ((frameMethod === 'chat.send' || frameMethod === 'sessions.steer')
+      && (String(frame.params?.message || '').includes('[portal-chat-image:')
+        || Array.isArray(frame.params?.attachments) && frame.params.attachments.length > 0)) {
+      browserWs.send(JSON.stringify({ type: 'res', id: frame.id, ok: false,
+        error: { code: 'IMAGE_BROKER_REQUIRED', message: 'Send photos through the Portal photo input broker.' } }));
+      return;
+    }
     let frameSessionKey = typeof frame.params?.sessionKey === 'string' && frame.params.sessionKey.trim()
       ? frame.params.sessionKey.trim()
       : (typeof frame.params?.key === 'string' && frame.params.key.trim()
@@ -14324,7 +14706,21 @@ export const __gatewayAskUserTest = {
 
 router.get('/ask-user/pending', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    await assertOpenClawExecutionAdmitted();
+    const bridgeActorUserId = req.user?.userId || '';
+    const rawSession = typeof req.query.session === 'string' ? req.query.session.trim() : '';
+    // Native harness questions arrive through the Portal Chat Bridge, not OpenClaw.
+    if (rawSession && resolveOwnedNativeSession(rawSession, bridgeActorUserId)) {
+      res.json({ questions: listBridgeQuestions(bridgeActorUserId, rawSession), actorUserId: bridgeActorUserId });
+      return;
+    }
+    try {
+      await assertOpenClawExecutionAdmitted();
+    } catch (error) {
+      if (rawSession) throw error;
+      // A host without a ready OpenClaw still shows native harness questions.
+      res.json({ questions: listBridgeQuestions(bridgeActorUserId), actorUserId: bridgeActorUserId });
+      return;
+    }
     const actorUserId = req.user?.userId || '';
     const actorAuthorizationVersion = Number(req.user?.authorizationVersion ?? 1);
     const requestedSession = typeof req.query.session === 'string' && req.query.session.trim()
@@ -14343,9 +14739,18 @@ router.get('/ask-user/pending', authenticateToken, requireApproved, async (req: 
 
 router.post('/ask-user/answer', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    await assertOpenClawExecutionAdmitted();
     const id = String(req.body?.id || '');
     const actorUserId = req.user?.userId || '';
+    if (isBridgeQuestion(id)) {
+      const record = answerBridgeQuestion({
+        id,
+        actorUserId,
+        answers: (req.body?.answers && typeof req.body.answers === 'object') ? req.body.answers : {},
+      });
+      res.json({ ok: true, id: record.id, state: record.state, idempotentReplay: false });
+      return;
+    }
+    await assertOpenClawExecutionAdmitted();
     readPendingAskUserQuestionForActor(id, actorUserId);
     const { record, idempotentReplay } = await deliverAskUserQuestionAnswer({
       id,
@@ -14360,9 +14765,14 @@ router.post('/ask-user/answer', authenticateToken, requireApproved, async (req: 
 
 router.post('/ask-user/dismiss', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
-    await assertOpenClawExecutionAdmitted();
     const id = String(req.body?.id || '');
     const actorUserId = req.user?.userId || '';
+    if (isBridgeQuestion(id)) {
+      dismissBridgeQuestion({ id, actorUserId });
+      res.json({ ok: true, idempotentReplay: false });
+      return;
+    }
+    await assertOpenClawExecutionAdmitted();
     const { idempotentReplay } = await deliverAskUserQuestionDismissal({
       id,
       actorUserId,

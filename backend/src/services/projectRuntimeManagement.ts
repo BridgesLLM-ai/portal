@@ -13,6 +13,7 @@ export type ProjectRuntimeManagement =
   | 'static';
 
 export type ProjectRuntimeStatusSource =
+  | 'desktop-unit'
   | 'portal-manager'
   | 'persisted-app'
   | 'external-binding'

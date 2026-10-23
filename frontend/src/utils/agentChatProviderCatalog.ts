@@ -51,6 +51,11 @@ export interface AgentChatHarnessCatalogEntry {
   availabilityState?: AgentChatProviderAvailabilityState;
   checking?: boolean;
   stale?: boolean;
+  /**
+   * Client-side closure: the row was still checking when this consumer's wait
+   * ended. It is never usable, and it never closes any other row.
+   */
+  checkTimedOut?: boolean;
   checkedAt?: string;
   lastKnownUsable?: boolean;
   unavailableReason?: string;
@@ -118,6 +123,8 @@ export interface AgentChatProviderCatalogSnapshotMetadata {
   source: 'cache' | 'network';
   fresh: boolean;
   fetchedAt: number;
+  /** Rows still checking at the consumer deadline were closed individually. */
+  partial?: boolean;
 }
 
 export interface AgentChatProviderCatalogLoadOptions {
@@ -189,13 +196,21 @@ interface ProviderCatalogFlight {
   >;
   promise: Promise<AgentChatProviderCatalogEntry[]>;
   settled: boolean;
-  timeoutMs: number;
+  /** Latest consumer deadline; a consumer that needs longer extends it. */
+  deadlineAt: number;
   pollIntervalMs: number;
   requestTimeoutMs: number;
+  latest: { providers: AgentChatProviderCatalogEntry[]; fetchedAt: number } | null;
 }
 
 const PROVIDER_CATALOG_CACHE_TTL_MS = 5_000;
 const PROVIDER_CATALOG_SETTLE_TIMEOUT_MS = 45_000;
+/**
+ * The backend keeps one serialized OpenClaw readiness collection for up to
+ * 100 s (AgentRegistry OPENCLAW_CATALOG_PROBE_DEADLINE_MS). A consumer waiting
+ * on the OpenClaw row itself outlasts that by one request and one poll.
+ */
+export const OPENCLAW_PROVIDER_CATALOG_SETTLE_TIMEOUT_MS = 110_000;
 const PROVIDER_CATALOG_POLL_INTERVAL_MS = 750;
 const PROVIDER_CATALOG_REQUEST_TIMEOUT_MS = 5_000;
 let cachedCatalog: CachedProviderCatalog | null = null;
@@ -347,6 +362,54 @@ function markCachedCatalogUntrusted(): void {
   if (cachedCatalog) cachedCatalog = { ...cachedCatalog, trusted: false };
 }
 
+/**
+ * Close only the rows that were still checking when a wait ended. Settled rows
+ * keep their exact evidence, so a slow OpenClaw check can never disable a ready
+ * native harness, and vice versa. A closed row is unusable and retryable.
+ */
+export function closeUnsettledProviderCatalogRows(
+  providers: AgentChatProviderCatalogEntry[],
+): AgentChatProviderCatalogEntry[] {
+  return providers.map((entry) => {
+    if (!isAgentChatProviderCatalogEntryChecking(entry)) return entry;
+    const displayName = entry.displayName || entry.harnessId || entry.name;
+    return {
+      ...entry,
+      usable: false,
+      checking: false,
+      stale: false,
+      availabilityState: 'error',
+      checkTimedOut: true,
+      reason: `${displayName} is still being checked. Retry to check again.`,
+    };
+  });
+}
+
+function partialCatalogTimeoutError(): AgentChatProviderCatalogLoadError {
+  return new AgentChatProviderCatalogLoadError(
+    'TIMEOUT',
+    'Provider availability checks did not settle before the deadline.',
+  );
+}
+
+function finishCatalogFlightAtDeadline(
+  flight: ProviderCatalogFlight,
+): AgentChatProviderCatalogEntry[] {
+  markCachedCatalogUntrusted();
+  // No row was ever returned: there is no per-row evidence to keep.
+  if (!flight.latest) throw partialCatalogTimeoutError();
+  const providers = closeUnsettledProviderCatalogRows(flight.latest.providers);
+  // Display-only: untrusted, so the next load fetches fresh evidence.
+  cachedCatalog = { providers, fetchedAt: flight.latest.fetchedAt, trusted: false };
+  publishSnapshot(flight, providers, {
+    source: 'network',
+    fresh: true,
+    fetchedAt: flight.latest.fetchedAt,
+    partial: true,
+  });
+  return providers;
+}
+
 function waitForNextPoll(signal: AbortSignal, delayMs: number): Promise<void> {
   if (signal.aborted) return Promise.reject(createAbortError());
   return new Promise((resolve, reject) => {
@@ -366,30 +429,22 @@ function waitForNextPoll(signal: AbortSignal, delayMs: number): Promise<void> {
 async function runCatalogFlight(
   flight: ProviderCatalogFlight,
 ): Promise<AgentChatProviderCatalogEntry[]> {
-  const startedAt = Date.now();
-
   while (true) {
     if (flight.controller.signal.aborted) throw createAbortError();
-    const elapsedBeforeRequest = Date.now() - startedAt;
-    if (elapsedBeforeRequest >= flight.timeoutMs) {
-      markCachedCatalogUntrusted();
-      throw new AgentChatProviderCatalogLoadError(
-        'TIMEOUT',
-        'Provider availability checks did not settle before the deadline.',
-      );
-    }
+    const remainingBeforeRequest = flight.deadlineAt - Date.now();
+    if (remainingBeforeRequest <= 0) return finishCatalogFlightAtDeadline(flight);
 
     try {
-      const remainingMs = Math.max(1, flight.timeoutMs - elapsedBeforeRequest);
       const providers = await requestHarnessCatalog(
         flight.controller.signal,
-        Math.max(1, Math.min(flight.requestTimeoutMs, remainingMs)),
+        Math.max(1, Math.min(flight.requestTimeoutMs, remainingBeforeRequest)),
       );
       cachedCatalog = {
         providers,
         fetchedAt: Date.now(),
         trusted: true,
       };
+      flight.latest = { providers, fetchedAt: cachedCatalog.fetchedAt };
       publishSnapshot(flight, providers, {
         source: 'network',
         fresh: true,
@@ -409,14 +464,8 @@ async function runCatalogFlight(
       );
     }
 
-    const remainingMs = flight.timeoutMs - (Date.now() - startedAt);
-    if (remainingMs <= 0) {
-      markCachedCatalogUntrusted();
-      throw new AgentChatProviderCatalogLoadError(
-        'TIMEOUT',
-        'Provider availability checks did not settle before the deadline.',
-      );
-    }
+    const remainingMs = flight.deadlineAt - Date.now();
+    if (remainingMs <= 0) return finishCatalogFlightAtDeadline(flight);
     await waitForNextPoll(
       flight.controller.signal,
       Math.max(0, Math.min(flight.pollIntervalMs, remainingMs)),
@@ -437,9 +486,10 @@ function createCatalogFlight(options: AgentChatProviderCatalogLoadOptions): Prov
     >(),
     promise: Promise.resolve([] as AgentChatProviderCatalogEntry[]),
     settled: false,
-    timeoutMs: normalizePositiveDuration(options.timeoutMs, PROVIDER_CATALOG_SETTLE_TIMEOUT_MS),
+    deadlineAt: Date.now() + consumerSettleTimeoutMs(options),
     pollIntervalMs: normalizePositiveDuration(options.pollIntervalMs, PROVIDER_CATALOG_POLL_INTERVAL_MS),
     requestTimeoutMs: normalizePositiveDuration(options.requestTimeoutMs, PROVIDER_CATALOG_REQUEST_TIMEOUT_MS),
+    latest: null,
   };
   flight.promise = runCatalogFlight(flight)
     .finally(() => {
@@ -454,12 +504,21 @@ function createCatalogFlight(options: AgentChatProviderCatalogLoadOptions): Prov
   return flight;
 }
 
+function consumerSettleTimeoutMs(options: AgentChatProviderCatalogLoadOptions): number {
+  return normalizePositiveDuration(options.timeoutMs, PROVIDER_CATALOG_SETTLE_TIMEOUT_MS);
+}
+
 function attachCatalogConsumer(
   flight: ProviderCatalogFlight,
   options: AgentChatProviderCatalogLoadOptions,
 ): Promise<AgentChatProviderCatalogEntry[]> {
   const consumerId = Symbol('provider-catalog-consumer');
   flight.consumers.add(consumerId);
+  // Each consumer keeps its own wait. A short status probe (UserAvatar,
+  // Settings) must not cut short the longer wait of a consumer that joins the
+  // same flight; the flight polls until the latest consumer deadline.
+  const consumerDeadlineAt = Date.now() + consumerSettleTimeoutMs(options);
+  flight.deadlineAt = Math.max(flight.deadlineAt, consumerDeadlineAt);
   if (options.onSnapshot) {
     flight.snapshotListeners.set(consumerId, options.onSnapshot);
     if (cachedCatalog?.trusted && !options.force) {
@@ -476,9 +535,11 @@ function attachCatalogConsumer(
 
   return new Promise<AgentChatProviderCatalogEntry[]>((resolve, reject) => {
     let finished = false;
+    let deadlineTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
     const finish = (callback: () => void) => {
       if (finished) return;
       finished = true;
+      if (deadlineTimer !== undefined) globalThis.clearTimeout(deadlineTimer);
       options.signal?.removeEventListener('abort', handleAbort);
       flight.consumers.delete(consumerId);
       flight.snapshotListeners.delete(consumerId);
@@ -489,12 +550,34 @@ function attachCatalogConsumer(
       }
     };
     const handleAbort = () => finish(() => reject(createAbortError()));
+    const handleDeadline = () => finish(() => {
+      if (!flight.latest) {
+        reject(partialCatalogTimeoutError());
+        return;
+      }
+      const providers = closeUnsettledProviderCatalogRows(flight.latest.providers);
+      try {
+        options.onSnapshot?.(providers, {
+          source: 'network',
+          fresh: true,
+          fetchedAt: flight.latest.fetchedAt,
+          partial: true,
+        });
+      } catch {
+        // Match the shared publish boundary: render callbacks are isolated.
+      }
+      resolve(providers);
+    });
 
     if (options.signal?.aborted) {
       handleAbort();
       return;
     }
     options.signal?.addEventListener('abort', handleAbort, { once: true });
+    deadlineTimer = globalThis.setTimeout(
+      handleDeadline,
+      Math.max(0, consumerDeadlineAt - Date.now()),
+    );
     flight.promise.then(
       (providers) => finish(() => resolve(providers)),
       (error) => finish(() => reject(error)),

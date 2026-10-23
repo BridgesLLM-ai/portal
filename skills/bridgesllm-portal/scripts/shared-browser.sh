@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Explicit commissioning retires legacy exec control; it never reuses these cookies.
+if [[ -e /etc/bridges-shared-browser.enabled ]]; then
+  echo 'Use the Portal Shared interactive browser with target host and profile portal-shared.' >&2
+  exit 77
+fi
 set -euo pipefail
 
 # Shared Browser Control — CDP interface to the shared desktop Chrome on port 18801

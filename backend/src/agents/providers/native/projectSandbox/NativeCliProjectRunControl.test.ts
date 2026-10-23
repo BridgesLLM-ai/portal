@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -6,6 +7,7 @@ import type { ProjectEgressCommandExecutor } from '../../../../services/projectE
 import {
   __nativeCliProjectRunControlTest,
   abortExactNativeCliProjectRun,
+  buildExactNativeCliProjectInvocation,
   type ExactNativeCliProjectRunIdentity,
 } from './NativeCliProjectRunControl';
 
@@ -297,5 +299,55 @@ describe('exact Native CLI Project in-container run control', () => {
       executor: hardStopExecutor,
     })).rejects.toThrow('control exec failed');
     expect(hardStopExecutor.run).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('exact Native CLI Project invocation credential custody', () => {
+  const hostEnvironment = Object.freeze({ PATH: '/usr/bin:/bin', HOME: '/nonexistent', DOCKER_HOST: 'unix:///var/run/docker.sock' });
+  const executor: ProjectEgressCommandExecutor = { run: async () => ({ stdout: '', stderr: '', exitCode: 0 }) };
+  const proxyUrl = () => `http://portal:${crypto.randomBytes(24).toString('base64url')}@172.31.10.2:3128`;
+  const build = (containerEnvironment: Record<string, string>, args: readonly string[] = ['exec', '--', 'hello']) => (
+    buildExactNativeCliProjectInvocation({
+      runtime: { containerId: CONTAINER_ID, startedAt: STARTED_AT },
+      containerUser: '1000:1000',
+      containerRoot: '/workspace/project',
+      markerNamespace: 'codex',
+      command: '/usr/bin/codex',
+      args,
+      runId: 'custody-turn',
+      executor,
+      hostEnvironment,
+      containerEnvironment,
+    }));
+
+  test('names proxy credentials on argv and puts their values only in the docker CLI environment', () => {
+    const url = proxyUrl();
+    const invocation = build({
+      HTTP_PROXY: url, HTTPS_PROXY: url, http_proxy: url, https_proxy: url, NO_PROXY: '', no_proxy: '',
+    });
+    const head = invocation.args.slice(0, invocation.args.indexOf(CONTAINER_ID));
+    expect(head).toEqual([
+      'container', 'exec', '--user', '1000:1000', '--workdir', '/workspace/project',
+      '--env', 'HTTP_PROXY', '--env', 'HTTPS_PROXY', '--env', 'http_proxy', '--env', 'https_proxy',
+      '--env', 'NO_PROXY=', '--env', 'no_proxy=',
+    ]);
+    expect(invocation.args.some((value) => value.includes(url) || value.includes(new URL(url).password))).toBe(false);
+    expect(invocation.options?.env).toEqual({
+      ...hostEnvironment, HTTP_PROXY: url, HTTPS_PROXY: url, http_proxy: url, https_proxy: url, NO_PROXY: '*', no_proxy: '*',
+    });
+  });
+
+  test('non-credential container settings stay inline and leave the host environment untouched', () => {
+    const invocation = build({ NO_COLOR: '1', DISABLE_TELEMETRY: '1' });
+    expect(invocation.args).toEqual(expect.arrayContaining([
+      '--env', 'NO_COLOR=1', '--env', 'DISABLE_TELEMETRY=1',
+    ]));
+    expect(invocation.options?.env).toBe(hostEnvironment);
+  });
+
+  test('refuses an invocation that would still carry a credential on argv', () => {
+    const url = proxyUrl();
+    expect(() => build({ HTTPS_PROXY: url }, ['exec', '--', `use ${url}`]))
+      .toThrow('Native CLI Project egress credential would reach the Docker command line');
   });
 });

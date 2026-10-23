@@ -21,8 +21,8 @@ export const AGENT_ZERO_CAPABILITIES_URL =
   `http://${AGENT_ZERO_LOOPBACK_HOST}:${AGENT_ZERO_HOST_PORT}${AGENT_ZERO_CONNECTOR_PATH}/capabilities`;
 
 export const AGENT_ZERO_IMAGE_DIGESTS = {
-  amd64: 'sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30',
-  arm64: 'sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3',
+  amd64: 'sha256:307a2ceffc8501ba05a1e7253e8b6e4d656d2e1c3b97f0eb943c18b9c40a30fd',
+  arm64: 'sha256:3b048a33c8698d396688ebd05096daab1f441cf310f299db2ed808a00433bc13',
 } as const;
 
 export type AgentZeroArchitecture = keyof typeof AGENT_ZERO_IMAGE_DIGESTS;
@@ -210,7 +210,7 @@ function probeAgentZeroRuntimeUncached(options: AgentZeroRuntimeProbeOptions): A
     }
     inspect = raw[0];
   } catch {
-    return failedStatus('Managed Agent Zero v2.11 container is not installed.', architecture, expectedImageRef);
+    return failedStatus('Managed Agent Zero v2.14 container is not installed.', architecture, expectedImageRef);
   }
 
   const imageRef = typeof inspect.Config?.Image === 'string' ? inspect.Config.Image : undefined;
@@ -245,12 +245,12 @@ function probeAgentZeroRuntimeUncached(options: AgentZeroRuntimeProbeOptions): A
 
   const checks: Array<[boolean, string]> = [
     [running, 'container is stopped'],
-    [pinnedImage, 'container image is outside the Portal-tested v2.11 digest'],
+    [pinnedImage, 'container image is outside the Portal-tested v2.14 digest'],
     [loopbackOnly, 'container port is not bound exclusively to 127.0.0.1:50001'],
     [mounts.persistentData, 'container does not use the managed persistent /a0/usr volume'],
     [protectedAuth, 'root-owned private Agent Zero authentication is not mounted'],
     [restartPolicy, 'container restart policy is not unless-stopped'],
-    [protocolCompatible, 'Agent Zero v2.11 public connector protocol readiness failed'],
+    [protocolCompatible, 'Agent Zero v2.14 public connector protocol readiness failed'],
   ];
   const failure = checks.find(([ok]) => !ok)?.[1];
 
@@ -269,7 +269,7 @@ function probeAgentZeroRuntimeUncached(options: AgentZeroRuntimeProbeOptions): A
     protectedAuth,
     restartPolicy,
     protocolCompatible,
-    reason: failure || 'Managed Agent Zero v2.11 runtime is protocol-ready; protected session authentication is checked separately.',
+    reason: failure || 'Managed Agent Zero v2.14 runtime is protocol-ready; protected session authentication is checked separately.',
   };
 }
 
@@ -323,7 +323,7 @@ async function probeAgentZeroRuntimeUncachedAsync(): Promise<AgentZeroRuntimeSta
     inspect = raw[0];
   } catch {
     return failedStatus(
-      'Managed Agent Zero v2.11 container is not installed.',
+      'Managed Agent Zero v2.14 container is not installed.',
       architecture,
       expectedImageRef,
     );
@@ -361,12 +361,12 @@ async function probeAgentZeroRuntimeUncachedAsync(): Promise<AgentZeroRuntimeSta
 
   const checks: Array<[boolean, string]> = [
     [running, 'container is stopped'],
-    [pinnedImage, 'container image is outside the Portal-tested v2.11 digest'],
+    [pinnedImage, 'container image is outside the Portal-tested v2.14 digest'],
     [loopbackOnly, 'container port is not bound exclusively to 127.0.0.1:50001'],
     [mounts.persistentData, 'container does not use the managed persistent /a0/usr volume'],
     [protectedAuth, 'root-owned private Agent Zero authentication is not mounted'],
     [restartPolicy, 'container restart policy is not unless-stopped'],
-    [protocolCompatible, 'Agent Zero v2.11 public connector protocol readiness failed'],
+    [protocolCompatible, 'Agent Zero v2.14 public connector protocol readiness failed'],
   ];
   const failure = checks.find(([ok]) => !ok)?.[1];
 
@@ -385,7 +385,7 @@ async function probeAgentZeroRuntimeUncachedAsync(): Promise<AgentZeroRuntimeSta
     protectedAuth,
     restartPolicy,
     protocolCompatible,
-    reason: failure || 'Managed Agent Zero v2.11 runtime is protocol-ready; protected session authentication is checked separately.',
+    reason: failure || 'Managed Agent Zero v2.14 runtime is protocol-ready; protected session authentication is checked separately.',
   };
 }
 

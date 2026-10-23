@@ -1,4 +1,7 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import {
   PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL,
   PROJECT_EGRESS_PROXY_IMAGE_TAG,
@@ -15,6 +18,7 @@ import {
   derivePreConfinementProjectEgressPolicyFingerprint,
   ensureProjectEgressPlane,
   issueProjectEgressProxyToken,
+  projectEgressCommandExecutor,
   resolvePinnedProjectEgressProxyImage,
   type ProjectEgressCommandExecutor,
   type ProjectEgressCommandResult,
@@ -994,9 +998,17 @@ describe('project egress plane specification and attestation', () => {
     ))).toBe(false);
   });
 
-  test('replaces a rotated-token proxy by immutable ID before creating the new credential generation', async () => {
+  test.each([
+    ['running name-primary rotated-token', true, false, false],
+    ['stopped name-primary rotated-token', false, false, false],
+    ['stopped name-primary current-token', false, true, false],
+    ['running ID-primary rotated-token', true, false, true],
+    ['stopped ID-primary rotated-token', false, false, true],
+  ])('replaces a %s proxy by immutable ID before ID-primary recreation', async (
+    _label, running, sameToken, idPrimary,
+  ) => {
     const previous = spec();
-    const rotatedToken = 'Z'.repeat(43);
+    const rotatedToken = sameToken ? previous.token : 'Z'.repeat(43);
     const current = buildProjectEgressPlaneSpec({
       identity: previous.identity,
       proxyImage: previous.proxyImage,
@@ -1004,8 +1016,17 @@ describe('project egress plane specification and attestation', () => {
       extraDeniedCidrs: ['203.0.114.7/32'],
     });
     expect(current.policyFingerprint).toBe(previous.policyFingerprint);
-    expect(current.tokenHash).not.toBe(previous.tokenHash);
-    let proxy: any = proxyInspect(previous, true);
+    expect(current.tokenHash === previous.tokenHash).toBe(sameToken);
+    let proxy: any = proxyInspect(previous, running);
+    if (idPrimary) proxy.HostConfig.NetworkMode = 'e'.repeat(64);
+    const clearStoppedAttachments = () => {
+      for (const attachment of Object.values(proxy.NetworkSettings.Networks) as any[]) {
+        attachment.NetworkID = '';
+        attachment.IPAddress = '';
+        attachment.EndpointID = '';
+      }
+    };
+    if (!running) clearStoppedAttachments();
     let proxyExists = true;
     const commands: Array<{ command: string; args: readonly string[] }> = [];
     const internalNetwork = {
@@ -1047,6 +1068,7 @@ describe('project egress plane specification and attestation', () => {
         if (command === 'docker' && args[0] === 'container' && args[1] === 'stop') {
           expect(args.at(-1)).toBe('c'.repeat(64));
           proxy.State.Running = false;
+          clearStoppedAttachments();
         }
         if (command === 'docker' && args[0] === 'container' && args[1] === 'rm') {
           expect(args).toEqual(['container', 'rm', 'c'.repeat(64)]);
@@ -1054,10 +1076,13 @@ describe('project egress plane specification and attestation', () => {
         }
         if (command === 'docker' && args[0] === 'container' && args[1] === 'create') {
           expect(proxyExists).toBe(false);
+          expect(args[args.indexOf('--network') + 1]).toBe(publicNetwork.Id);
+          expect(args[args.indexOf('--ip') + 1]).toBe('172.29.0.2');
           proxy = proxyInspect(current, false);
           proxy.Id = '1'.repeat(64);
           proxy.HostConfig.NetworkMode = publicNetwork.Id;
           delete proxy.NetworkSettings.Networks[current.internalNetworkName];
+          clearStoppedAttachments();
           proxyExists = true;
           return { stdout: `${proxy.Id}\n`, stderr: '', exitCode: 0 };
         }
@@ -1065,7 +1090,7 @@ describe('project egress plane specification and attestation', () => {
           proxy.NetworkSettings.Networks[current.internalNetworkName] = {
             IPAddress: '',
             Aliases: [current.proxyAlias],
-            NetworkID: 'd'.repeat(64),
+            NetworkID: '',
           };
         }
         if (command === 'docker' && args[0] === 'network' && args[1] === 'inspect') {
@@ -1102,93 +1127,143 @@ describe('project egress plane specification and attestation', () => {
     expect(removeIndex).toBeGreaterThanOrEqual(0);
     expect(createIndex).toBeGreaterThan(removeIndex);
     expect(commands.some(({ args }) => args.includes('--force'))).toBe(false);
+    expect(commands.filter(({ args }) => args[0] === 'container' && args[1] === 'stop'))
+      .toHaveLength(running ? 1 : 0);
+    expect(commands.some(({ args }) => args[0] === 'container' && args[1] === 'start')).toBe(false);
+    expect(() => attestProjectEgressProxyContainer(
+      current, proxy, false, true, publicNetwork.Id, internalNetwork.Id, '172.29.0.2',
+    )).not.toThrow();
   });
 
-  test.each([
-    ['image', (value: any) => {
-      value.Config.Image = `sha256:${'9'.repeat(64)}`;
-      value.Image = `sha256:${'9'.repeat(64)}`;
-    }],
-    ['command', (value: any) => { value.Config.Cmd = ['node', '/tmp/foreign.js']; }],
-    ['denied CIDRs', (value: any) => {
-      value.Config.Env = value.Config.Env.map((entry: string) => (
-        entry.startsWith('PROJECT_EGRESS_DENY_CIDRS=')
-          ? 'PROJECT_EGRESS_DENY_CIDRS=["203.0.113.9/32"]'
-          : entry
-      ));
-    }],
-    ['namespace join', (value: any) => {
-      value.HostConfig.IpcMode = `container:${'f'.repeat(64)}`;
-    }],
-    ['capability add', (value: any) => { value.HostConfig.CapAdd = ['NET_ADMIN']; }],
-    ['Node runtime option', (value: any) => {
-      value.Config.Env.push('NODE_OPTIONS=--inspect=0.0.0.0:9229');
-    }],
-  ])('never rotates a current-policy old-token proxy with hostile %s drift', async (_label, mutate) => {
-    const previous = spec();
-    const current = buildProjectEgressPlaneSpec({
-      identity: previous.identity,
-      proxyImage: previous.proxyImage,
-      token: 'Z'.repeat(43),
-      extraDeniedCidrs: ['203.0.114.7/32'],
-    });
-    const proxy = proxyInspect(previous, true);
-    mutate(proxy);
-    const commands: Array<{ command: string; args: readonly string[] }> = [];
-    const internalNetwork = {
-      Id: 'd'.repeat(64),
-      Name: current.internalNetworkName,
-      Driver: 'bridge',
-      Internal: true,
-      Labels: labelsFor(current, 'internal'),
-      Containers: {},
-    };
-    const publicNetwork = {
-      Id: 'e'.repeat(64),
-      Name: current.publicNetworkName,
-      Driver: 'bridge',
-      Internal: false,
-      Labels: labelsFor(current, 'proxy-public'),
-      Containers: {},
-      IPAM: { Config: [{ Subnet: '172.29.0.0/24', Gateway: '172.29.0.1' }] },
-    };
-    const executor: ProjectEgressCommandExecutor = {
-      run: async (command, args) => {
-        commands.push({ command, args });
-        if (command === 'docker' && args[0] === 'container' && args[1] === 'ls') {
-          return { stdout: `${proxy.Id}\n`, stderr: '', exitCode: 0 };
+  describe.each([
+    ['running rotated-token', true, false],
+    ['stopped rotated-token', false, false],
+    ['stopped current-token', false, true],
+  ])('name-primary %s retirement admission', (_scenario, running, sameToken) => {
+    test.each([
+      ['wrong static IP', (value: any, input: ProjectEgressPlaneSpec) => {
+        value.NetworkSettings.Networks[input.publicNetworkName].IPAMConfig.IPv4Address = '172.29.0.9';
+        value.NetworkSettings.Networks[input.publicNetworkName].IPAddress = running ? '172.29.0.9' : '';
+      }],
+      ['wrong public network ID', (value: any, input: ProjectEgressPlaneSpec) => {
+        value.NetworkSettings.Networks[input.publicNetworkName].NetworkID = 'f'.repeat(64);
+      }],
+      ['wrong internal network ID', (value: any, input: ProjectEgressPlaneSpec) => {
+        value.NetworkSettings.Networks[input.internalNetworkName].NetworkID = 'f'.repeat(64);
+      }],
+      ['missing alias', (value: any, input: ProjectEgressPlaneSpec) => {
+        value.NetworkSettings.Networks[input.internalNetworkName].Aliases = [];
+      }],
+      ['extra attachment', (value: any) => { value.NetworkSettings.Networks.bridge = {}; }],
+      ['wrong primary name', (value: any) => { value.HostConfig.NetworkMode = 'foreign'; }],
+      ['wrong container name', (value: any) => { value.Name = '/foreign'; }],
+      ['wrong identity', (value: any) => {
+        value.Config.Labels[__projectEgressPlaneTest.labels.LABEL_ACTOR_ID] = 'foreign';
+      }],
+      ['wrong network role', (_value: any, _input: ProjectEgressPlaneSpec, network: any) => {
+        network.Internal = false;
+      }],
+      ['wrong network identity', (_value: any, _input: ProjectEgressPlaneSpec, _internal: any, network: any) => {
+        network.Labels[__projectEgressPlaneTest.labels.LABEL_IDENTITY] = 'f'.repeat(64);
+      }],
+      ['image', (value: any) => {
+        value.Config.Image = `sha256:${'9'.repeat(64)}`;
+        value.Image = `sha256:${'9'.repeat(64)}`;
+      }],
+      ['command', (value: any) => { value.Config.Cmd = ['node', '/tmp/foreign.js']; }],
+      ['denied CIDRs', (value: any) => {
+        value.Config.Env = value.Config.Env.map((entry: string) => (
+          entry.startsWith('PROJECT_EGRESS_DENY_CIDRS=')
+            ? 'PROJECT_EGRESS_DENY_CIDRS=["203.0.113.9/32"]'
+            : entry
+        ));
+      }],
+      ['namespace join', (value: any) => {
+        value.HostConfig.IpcMode = `container:${'f'.repeat(64)}`;
+      }],
+      ['capability add', (value: any) => { value.HostConfig.CapAdd = ['NET_ADMIN']; }],
+      ['Node runtime option', (value: any) => {
+        value.Config.Env.push('NODE_OPTIONS=--inspect=0.0.0.0:9229');
+      }],
+    ])('never retires a current-policy proxy with hostile %s drift', async (_label, mutate) => {
+      const previous = spec();
+      const current = buildProjectEgressPlaneSpec({
+        identity: previous.identity,
+        proxyImage: previous.proxyImage,
+        token: sameToken ? previous.token : 'Z'.repeat(43),
+        extraDeniedCidrs: ['203.0.114.7/32'],
+      });
+      const proxy = proxyInspect(previous, running);
+      if (!running) {
+        for (const attachment of Object.values(proxy.NetworkSettings.Networks) as any[]) {
+          attachment.NetworkID = '';
+          attachment.IPAddress = '';
+          attachment.EndpointID = '';
         }
-        if (command === 'docker' && args[0] === 'container' && args[1] === 'inspect') {
-          return { stdout: JSON.stringify([proxy]), stderr: '', exitCode: 0 };
-        }
-        if (command === 'docker' && args[0] === 'network' && args[1] === 'ls') {
-          return {
-            stdout: `${internalNetwork.Id}\n${publicNetwork.Id}\n`,
-            stderr: '',
-            exitCode: 0,
-          };
-        }
-        if (command === 'docker' && args[0] === 'network' && args[1] === 'inspect') {
-          const reference = String(args[2]);
-          return {
-            stdout: JSON.stringify([
-              [current.internalNetworkName, internalNetwork.Id].includes(reference)
-                ? internalNetwork
-                : publicNetwork,
-            ]),
-            stderr: '',
-            exitCode: 0,
-          };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      },
-    };
+      }
+      const commands: Array<{ command: string; args: readonly string[] }> = [];
+      const internalNetwork = {
+        Id: 'd'.repeat(64),
+        Name: current.internalNetworkName,
+        Driver: 'bridge',
+        Internal: true,
+        Labels: labelsFor(current, 'internal'),
+        Containers: {},
+      };
+      const publicNetwork = {
+        Id: 'e'.repeat(64),
+        Name: current.publicNetworkName,
+        Driver: 'bridge',
+        Internal: false,
+        Labels: labelsFor(current, 'proxy-public'),
+        Containers: {},
+        IPAM: { Config: [{ Subnet: '172.29.0.0/24', Gateway: '172.29.0.1' }] },
+      };
+      mutate(proxy, current, internalNetwork, publicNetwork);
+      const executor: ProjectEgressCommandExecutor = {
+        run: async (command, args) => {
+          commands.push({ command, args });
+          if (command === 'docker' && args[0] === 'container' && args[1] === 'ls') {
+            return { stdout: `${proxy.Id}\n`, stderr: '', exitCode: 0 };
+          }
+          if (command === 'docker' && args[0] === 'container' && args[1] === 'inspect') {
+            return { stdout: JSON.stringify([proxy]), stderr: '', exitCode: 0 };
+          }
+          if (command === 'docker' && args[0] === 'network' && args[1] === 'ls') {
+            return {
+              stdout: `${internalNetwork.Id}\n${publicNetwork.Id}\n`,
+              stderr: '',
+              exitCode: 0,
+            };
+          }
+          if (command === 'docker' && args[0] === 'network' && args[1] === 'inspect') {
+            const reference = String(args[2]);
+            return {
+              stdout: JSON.stringify([
+                [current.internalNetworkName, internalNetwork.Id].includes(reference)
+                  ? internalNetwork
+                  : publicNetwork,
+              ]),
+              stderr: '',
+              exitCode: 0,
+            };
+          }
+          return { stdout: '', stderr: '', exitCode: 0 };
+        },
+      };
 
-    await expect(__projectEgressPlaneTest.ensureProxyContainer(executor, current))
-      .rejects.toBeInstanceOf(ProjectEgressAttestationError);
-    expect(commands.some(({ args }) => (
-      args[0] === 'container' && ['stop', 'rm', 'create'].includes(String(args[1]))
-    ))).toBe(false);
+      await expect((async () => {
+        const candidate = await __projectEgressPlaneTest.ensureProxyContainer(executor, current);
+        // An unrecognized current-token mode is not a retirement candidate;
+        // it must still fail the unchanged execution admission before start.
+        attestProjectEgressProxyContainer(
+          current, candidate, running, true, publicNetwork.Id, internalNetwork.Id, '172.29.0.2',
+        );
+      })()).rejects.toBeInstanceOf(ProjectEgressAttestationError);
+      expect(commands.some(({ args }) => (
+        args[0] === 'container' && ['stop', 'rm', 'create'].includes(String(args[1]))
+      ))).toBe(false);
+    });
   });
 
   test.each([
@@ -1258,6 +1333,18 @@ describe('project egress plane specification and attestation', () => {
     const value = proxyInspect(input);
     mutate(value, input);
     expect(() => attestProjectEgressProxyContainer(input, value)).toThrow(ProjectEgressAttestationError);
+  });
+
+  test.each([true, false])('does not execute a name-primary proxy with blank attachment IDs (running=%s)', (running) => {
+    const input = spec();
+    const proxy = proxyInspect(input, running);
+    for (const attachment of Object.values(proxy.NetworkSettings.Networks) as any[]) {
+      attachment.NetworkID = '';
+      attachment.IPAddress = '';
+    }
+    expect(() => attestProjectEgressProxyContainer(
+      input, proxy, running, true, 'e'.repeat(64), 'd'.repeat(64), '172.29.0.2',
+    )).toThrow(ProjectEgressAttestationError);
   });
 
   test('attests a stopped project runtime on only its private network and bound identity', () => {
@@ -2184,5 +2271,267 @@ describe('project egress plane orchestration', () => {
       extraDeniedCidrs: ['203.0.114.7/32'],
     }, executor)).rejects.toThrow(ProjectEgressAttestationError);
     expect(executor.running).toBe(false);
+  });
+});
+
+describe('protected Docker environment custody', () => {
+  // Synthetic credentials only. Assertions compare through booleans, so a
+  // failure never prints a protected value.
+  const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+  // The stand-in subprocess reports digests and booleans, never the value.
+  const REPORT = [
+    "const fs=require('fs');const c=require('crypto');",
+    'const name=process.argv[1];const value=process.env[name];',
+    "const cmdline=fs.readFileSync('/proc/self/cmdline','utf8');",
+    'const read=(key)=>(process.env[key]===undefined?null:process.env[key]);',
+    'process.stdout.write(JSON.stringify({',
+    "digest:value===undefined?null:c.createHash('sha256').update(value).digest('hex'),",
+    'inCmdline:Boolean(value)&&cmdline.includes(value),',
+    "noProxy:read('NO_PROXY'),lowerNoProxy:read('no_proxy'),",
+    "sentinel:read('PROJECT_EGRESS_CUSTODY_SENTINEL')}));",
+  ].join('');
+  const touched = ['PROJECT_EGRESS_CUSTODY_SENTINEL', 'NO_PROXY', 'no_proxy'];
+  const saved = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const key of touched) saved.set(key, process.env[key]);
+    process.env.PROJECT_EGRESS_CUSTODY_SENTINEL = 'inherited';
+    delete process.env.NO_PROXY;
+    delete process.env.no_proxy;
+  });
+
+  afterEach(() => {
+    for (const key of touched) {
+      const value = saved.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  async function failureOf(promise: Promise<unknown>): Promise<Error> {
+    try {
+      await promise;
+    } catch (error) {
+      return error as Error;
+    }
+    throw new Error('Expected the operation to fail');
+  }
+
+  function envArguments(args: readonly string[]): string[] {
+    return args.flatMap((value, index) => (value === '--env' ? [String(args[index + 1])] : []));
+  }
+
+  // Docker's `--env NAME`: a bare name takes that variable's value from the
+  // CLI's own environment, and a name the CLI does not have never arrives.
+  function receivedEnvironment(
+    args: readonly string[],
+    secretEnvironment?: Readonly<Record<string, string>>,
+  ): string[] {
+    return envArguments(args).flatMap((entry) => {
+      if (entry.includes('=')) return [entry];
+      return secretEnvironment && Object.prototype.hasOwnProperty.call(secretEnvironment, entry)
+        ? [`${entry}=${secretEnvironment[entry]}`] : [];
+    });
+  }
+
+  test('passes a protected value only through the subprocess environment', async () => {
+    const token = issueProjectEgressProxyToken();
+    const result = await projectEgressCommandExecutor.run(
+      process.execPath,
+      ['-e', REPORT, 'PROJECT_EGRESS_PROXY_TOKEN'],
+      { secretEnvironment: { PROJECT_EGRESS_PROXY_TOKEN: token } },
+    );
+    const report = JSON.parse(result.stdout);
+    expect(report.digest === digest(token)).toBe(true);
+    expect(report.inCmdline).toBe(false);
+    expect(report.noProxy).toBe('*');
+    expect(report.lowerNoProxy).toBe('*');
+    expect(report.sentinel).toBe('inherited');
+    expect(result.stdout.includes(token) || result.stderr.includes(token)).toBe(false);
+
+    const unprotected = await projectEgressCommandExecutor.run(
+      process.execPath,
+      ['-e', REPORT, 'PROJECT_EGRESS_PROXY_TOKEN'],
+    );
+    expect(JSON.parse(unprotected.stdout)).toEqual({
+      digest: null, inCmdline: false, noProxy: null, lowerNoProxy: null, sentinel: 'inherited',
+    });
+  });
+
+  test('redacts protected values and proxy URL passwords from failure text', async () => {
+    const token = issueProjectEgressProxyToken();
+    const url = `http://portal:${token}@portal-project-egress:3128`;
+    const echoed = await failureOf(projectEgressCommandExecutor.run(process.execPath, [
+      '-e',
+      "process.stderr.write('refused '+process.env.HTTPS_PROXY+' password '"
+        + '+new URL(process.env.HTTPS_PROXY).password);process.exit(3);',
+    ], { secretEnvironment: { HTTPS_PROXY: url } }));
+    expect(echoed.message).toContain('exit code 3');
+    expect(echoed.message).toContain('refused [redacted] password [redacted]');
+    expect(echoed.message.includes(token)).toBe(false);
+
+    const bare = await failureOf(projectEgressCommandExecutor.run(process.execPath, [
+      '-e', "process.stderr.write('token '+process.env.PROJECT_EGRESS_PROXY_TOKEN);process.exit(4);",
+    ], { secretEnvironment: { PROJECT_EGRESS_PROXY_TOKEN: token } }));
+    expect(bare.message).toContain('exit code 4');
+    expect(bare.message).toContain('token [redacted]');
+    expect(bare.message.includes(token)).toBe(false);
+  });
+
+  test('refuses an unlisted name or a NUL before spawning, without quoting the value', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p4e-custody-'));
+    try {
+      const marker = path.join(directory, 'spawned');
+      const touch = ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, '')`];
+      const token = issueProjectEgressProxyToken();
+      const refused: Array<Record<string, string>> = [
+        { HOME: token },
+        { DOCKER_HOST: token },
+        { NO_PROXY: token },
+        { PROJECT_EGRESS_PROXY_TOKEN: `${token}\0` },
+      ];
+      for (const secretEnvironment of refused) {
+        const failure = await failureOf(projectEgressCommandExecutor.run(
+          process.execPath,
+          touch,
+          { secretEnvironment },
+        ));
+        expect(failure.message).toBe('Project egress protected environment is invalid');
+        expect(fs.existsSync(marker)).toBe(false);
+      }
+      // Node's own refusal of a NUL argument quotes it; the executor does not.
+      const spawnRefusal = await failureOf(projectEgressCommandExecutor.run(
+        process.execPath,
+        [...touch, `${token}\0`],
+      ));
+      expect(spawnRefusal.message).toBe('Project egress host command failed to start');
+      expect(fs.existsSync(marker)).toBe(false);
+      expect([...__projectEgressPlaneTest.PROTECTED_DOCKER_ENVIRONMENT_NAMES].sort()).toEqual([
+        'HTTPS_PROXY', 'HTTP_PROXY', 'PROJECT_EGRESS_PROXY_TOKEN', 'http_proxy', 'https_proxy',
+      ]);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  class ProxyCreationExecutor implements ProjectEgressCommandExecutor {
+    readonly calls: Array<{ args: readonly string[]; secretEnvironment?: Readonly<Record<string, string>> }> = [];
+    readonly input: ProjectEgressPlaneSpec;
+    proxy: any = null;
+    honorSecretEnvironment = true;
+    runningAtCleanup = false;
+    refuseCreate = false;
+    private createdInspections = 0;
+
+    constructor(input: ProjectEgressPlaneSpec) {
+      this.input = input;
+    }
+
+    async run(
+      command: string,
+      args: readonly string[],
+      options: { secretEnvironment?: Readonly<Record<string, string>> } = {},
+    ): Promise<ProjectEgressCommandResult> {
+      this.calls.push({ args, secretEnvironment: options.secretEnvironment });
+      const ok = (stdout = '') => ({ stdout, stderr: '', exitCode: 0 });
+      if (command !== 'docker') return ok();
+      if (args[0] === 'container' && args[1] === 'ls') return ok(this.proxy ? `${this.proxy.Id}\n` : '');
+      if (args[0] === 'network' && args[1] === 'ls') return ok(`${'d'.repeat(64)}\n${'e'.repeat(64)}\n`);
+      if (args[0] === 'network' && args[1] === 'inspect') {
+        const internal = [this.input.internalNetworkName, 'd'.repeat(64)].includes(String(args[2]));
+        return ok(JSON.stringify([internal ? {
+          Id: 'd'.repeat(64), Name: this.input.internalNetworkName, Driver: 'bridge', Internal: true,
+          Labels: labelsFor(this.input, 'internal'), Containers: {},
+        } : {
+          Id: 'e'.repeat(64), Name: this.input.publicNetworkName, Driver: 'bridge', Internal: false,
+          Labels: labelsFor(this.input, 'proxy-public'), Containers: {},
+          IPAM: { Config: [{ Subnet: '172.29.0.0/24', Gateway: '172.29.0.1' }] },
+        }]));
+      }
+      if (args[0] === 'container' && args[1] === 'inspect') {
+        if (!this.proxy) return { stdout: '', stderr: 'Error: No such container', exitCode: 1 };
+        this.createdInspections += 1;
+        if (this.runningAtCleanup && this.createdInspections === 2) this.proxy.State.Running = true;
+        return ok(JSON.stringify([this.proxy]));
+      }
+      if (args[0] === 'container' && args[1] === 'create') {
+        if (this.refuseCreate) {
+          throw new Error('Project egress host command failed with exit code 125 (docker container create --name x …)');
+        }
+        this.proxy = proxyInspect(this.input, false);
+        this.proxy.Id = '1'.repeat(64);
+        this.proxy.HostConfig.NetworkMode = 'e'.repeat(64);
+        delete this.proxy.NetworkSettings.Networks[this.input.internalNetworkName];
+        this.proxy.Config.Env = [
+          ...this.proxy.Config.Env.slice(0, 3),
+          ...receivedEnvironment(args, this.honorSecretEnvironment ? options.secretEnvironment : undefined),
+        ];
+        return ok(`${this.proxy.Id}\n`);
+      }
+      if (args[0] === 'network' && args[1] === 'connect') {
+        this.proxy.NetworkSettings.Networks[this.input.internalNetworkName] = {
+          IPAddress: '', Aliases: [this.input.proxyAlias], NetworkID: 'd'.repeat(64),
+        };
+      }
+      if (args[0] === 'container' && args[1] === 'rm') this.proxy = null;
+      return ok();
+    }
+  }
+
+  test('names the proxy token on argv and delivers it only through the protected environment', async () => {
+    const input = spec();
+    const executor = new ProxyCreationExecutor(input);
+    await expect(__projectEgressPlaneTest.ensureProxyContainer(executor, input))
+      .resolves.toMatchObject({ Id: '1'.repeat(64) });
+    const create = executor.calls.find(({ args }) => args[0] === 'container' && args[1] === 'create')!;
+    expect(envArguments(create.args)).toEqual([
+      'PROJECT_EGRESS_PROXY_TOKEN',
+      `PROJECT_EGRESS_PROXY_PORT=${input.proxyPort}`,
+      `PROJECT_EGRESS_DENY_CIDRS=${JSON.stringify(input.deniedCidrs)}`,
+    ]);
+    expect(Object.keys(create.secretEnvironment || {})).toEqual(['PROJECT_EGRESS_PROXY_TOKEN']);
+    expect(create.secretEnvironment?.PROJECT_EGRESS_PROXY_TOKEN === input.token).toBe(true);
+    expect(executor.calls.some(({ args }) => args.some((value) => value.includes(input.token)))).toBe(false);
+    // Resolving the bare name gives back, entry for entry, what argv carried inline.
+    expect(JSON.stringify(receivedEnvironment(create.args, create.secretEnvironment)) === JSON.stringify([
+      `PROJECT_EGRESS_PROXY_TOKEN=${input.token}`,
+      `PROJECT_EGRESS_PROXY_PORT=${input.proxyPort}`,
+      `PROJECT_EGRESS_DENY_CIDRS=${JSON.stringify(input.deniedCidrs)}`,
+    ])).toBe(true);
+    expect(executor.calls.some(({ args }) => args[0] === 'container' && args[1] === 'rm')).toBe(false);
+  });
+
+  test('removes the exact unstarted proxy it created when the token never arrives', async () => {
+    const input = spec();
+    const executor = new ProxyCreationExecutor(input);
+    executor.honorSecretEnvironment = false;
+    const failure = await failureOf(__projectEgressPlaneTest.ensureProxyContainer(executor, input));
+    expect(failure).toBeInstanceOf(ProjectEgressAttestationError);
+    expect((failure as ProjectEgressAttestationError).code).toBe('STALE_PROXY_ENVIRONMENT');
+    expect(failure.message.includes(input.token)).toBe(false);
+    expect(executor.calls.filter(({ args }) => args[0] === 'container' && args[1] === 'rm')
+      .map(({ args }) => args)).toEqual([['container', 'rm', '1'.repeat(64)]]);
+    expect(executor.calls.some(({ args }) => args[0] === 'network' && args[1] === 'connect')).toBe(false);
+    expect(executor.proxy).toBeNull();
+  });
+
+  test('keeps the original failure and never removes a created proxy found running', async () => {
+    const input = spec();
+    const executor = new ProxyCreationExecutor(input);
+    executor.honorSecretEnvironment = false;
+    executor.runningAtCleanup = true;
+    await expect(__projectEgressPlaneTest.ensureProxyContainer(executor, input))
+      .rejects.toMatchObject({ code: 'STALE_PROXY_ENVIRONMENT' });
+    expect(executor.calls.some(({ args }) => args[0] === 'container' && ['rm', 'stop'].includes(String(args[1]))))
+      .toBe(false);
+  });
+
+  test('a refused create leaves nothing to remove', async () => {
+    const input = spec();
+    const executor = new ProxyCreationExecutor(input);
+    executor.refuseCreate = true;
+    await expect(__projectEgressPlaneTest.ensureProxyContainer(executor, input))
+      .rejects.toThrow('exit code 125');
+    expect(executor.calls.some(({ args }) => args[0] === 'container' && args[1] === 'rm')).toBe(false);
   });
 });

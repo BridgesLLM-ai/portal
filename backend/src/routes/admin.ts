@@ -1,4 +1,7 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request as ExpressRequest, Response, NextFunction } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import { z } from 'zod';
 import crypto from 'crypto';
 import { NativeOllamaBackendBindingState, Prisma } from '@prisma/client';

@@ -13,8 +13,8 @@ import { OpenClawExecutionAdmissionError } from '../services/openClawExecutionAd
 const userId = '00000000-0000-4000-8000-000000000001';
 const sessionKey = `agent:main:portal-${userId}-chat`;
 
-function routeHandler(): (req: any, res: any) => Promise<void> {
-  const layer = (gatewayRouter as any).stack.find((entry: any) => entry.route?.path === '/session-steer');
+function routeHandler(route = '/session-steer'): (req: any, res: any) => Promise<void> {
+  const layer = (gatewayRouter as any).stack.find((entry: any) => entry.route?.path === route);
   if (!layer) throw new Error('gateway /session-steer route not found');
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
@@ -53,6 +53,16 @@ describe('Agent Chat exact-run steering route', () => {
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  test.each(['/session-steer', '/answer-user-input', '/chat/inject'])('refuses photo markers on the text-only %s lane', async route => {
+    const response = responseDouble();
+    const photo = '[portal-chat-image:{"fileId":"11111111-1111-4111-8111-111111111111","revision":"2026-10-20T12:00:00.000Z"}]';
+    await routeHandler(route)({ body: { session: sessionKey, expectedRunId: 'run-r1', runId: 'run-r1',
+      requestId: 'r1', message: photo, text: photo }, user: { userId, role: 'OWNER' } }, response);
+    expect(response.status).toHaveBeenCalledWith(409);
+    expect(response.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'IMAGE_NEW_TURN_REQUIRED' }));
+    expect(assertOpenClawExecutionAdmittedMock).not.toHaveBeenCalled();
   });
 
   test('requires the browser-observed run identity', async () => {

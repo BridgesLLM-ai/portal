@@ -5,7 +5,7 @@ let audioCtx: AudioContext | null = null;
 
 function getCtx(): AudioContext | null {
   try {
-    if (!audioCtx) audioCtx = new AudioContext();
+    if (!audioCtx || audioCtx.state === 'closed') audioCtx = new AudioContext();
     if (audioCtx.state === 'suspended') {
       // Best effort only — browsers may reject resume() until they decide a
       // gesture is valid. Sound failures should be silent, not throw or spam.
@@ -49,6 +49,8 @@ function gain(ctx: AudioContext, volume: number = masterVolume): GainNode {
 }
 
 export const sounds = {
+  // Warm/resume Web Audio during a real user gesture, without playing a tone.
+  unlock: () => { if (isSoundEnabled()) getCtx(); },
   // Nav click - soft blip (two-tone rising)
   click: () => {
     if (!isSoundEnabled()) return;
@@ -140,35 +142,44 @@ export const sounds = {
     if (!isSoundEnabled()) return;
     const ctx = getCtx();
     if (!ctx) return;
-    const start = ctx.currentTime;
-    // C5 - E5 - G5, each brief, overlapping just enough to read as one chord.
-    [523.25, 659.25, 783.99].forEach((frequency, index) => {
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      const at = start + (index * 0.055);
-      g.gain.setValueAtTime(0, at);
-      g.gain.linearRampToValueAtTime(0.16 * masterVolume, at + 0.012);
-      g.gain.exponentialRampToValueAtTime(0.0001, at + 0.42);
-      g.connect(ctx.destination);
-      osc.type = 'triangle';
-      osc.frequency.value = frequency;
-      osc.connect(g);
-      osc.start(at);
-      osc.stop(at + 0.45);
-    });
-    // A quiet octave above the last note so the tail shimmers instead of thuds.
-    const bloom = ctx.createOscillator();
-    const bloomGain = ctx.createGain();
-    const bloomAt = start + 0.11;
-    bloomGain.gain.setValueAtTime(0, bloomAt);
-    bloomGain.gain.linearRampToValueAtTime(0.05 * masterVolume, bloomAt + 0.03);
-    bloomGain.gain.exponentialRampToValueAtTime(0.0001, bloomAt + 0.55);
-    bloomGain.connect(ctx.destination);
-    bloom.type = 'sine';
-    bloom.frequency.value = 1567.98;
-    bloom.connect(bloomGain);
-    bloom.start(bloomAt);
-    bloom.stop(bloomAt + 0.58);
+    const play = () => {
+      if (!isSoundEnabled() || ctx.state !== 'running') return;
+      const start = ctx.currentTime;
+      // C5 - E5 - G5, each brief, overlapping just enough to read as one chord.
+      [523.25, 659.25, 783.99].forEach((frequency, index) => {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        const at = start + (index * 0.055);
+        g.gain.setValueAtTime(0, at);
+        g.gain.linearRampToValueAtTime(0.16 * masterVolume, at + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, at + 0.42);
+        g.connect(ctx.destination);
+        osc.type = 'triangle';
+        osc.frequency.value = frequency;
+        osc.connect(g);
+        osc.start(at);
+        osc.stop(at + 0.45);
+      });
+      // A quiet octave above the last note so the tail shimmers instead of thuds.
+      const bloom = ctx.createOscillator();
+      const bloomGain = ctx.createGain();
+      const bloomAt = start + 0.11;
+      bloomGain.gain.setValueAtTime(0, bloomAt);
+      bloomGain.gain.linearRampToValueAtTime(0.05 * masterVolume, bloomAt + 0.03);
+      bloomGain.gain.exponentialRampToValueAtTime(0.0001, bloomAt + 0.55);
+      bloomGain.connect(ctx.destination);
+      bloom.type = 'sine';
+      bloom.frequency.value = 1567.98;
+      bloom.connect(bloomGain);
+      bloom.start(bloomAt);
+      bloom.stop(bloomAt + 0.58);
+    };
+    if (ctx.state === 'running') play();
+    else {
+      // Schedule relative to the resumed clock, not before the browser grants
+      // playback. Failed/blocked audio must not block the question controls.
+      void ctx.resume().then(play).catch(() => {});
+    }
   },
 
   // Notification - gentle ping (like a message received)

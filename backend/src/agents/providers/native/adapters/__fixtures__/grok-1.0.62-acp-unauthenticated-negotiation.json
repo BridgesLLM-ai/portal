@@ -1,0 +1,53 @@
+{
+  "provenance": {
+    "artifact": "https://x.ai/cli/grok-1.0.62-linux-x86_64",
+    "sha256": "2a46d9e4d7ebd7a9cff7f95716714b19dad5f21dd2a497822400b1fb128969aa",
+    "capturedAt": "2026-10-23",
+    "conditions": "unauthenticated; empty HOME; no network namespace (unshare -n); no prompt sent",
+    "command": "grok --no-auto-update agent stdio",
+    "proves": "protocol negotiation only (initialize + session/new auth gate); not model behaviour"
+  },
+  "initialize": {
+    "protocolVersion": 1,
+    "agentCapabilities": {
+      "loadSession": true,
+      "promptCapabilities": {
+        "image": false,
+        "audio": false,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "sessionCapabilities": {
+        "list": {},
+        "resume": {},
+        "close": {}
+      },
+      "auth": {}
+    },
+    "authMethods": [
+      {
+        "id": "grok.com",
+        "name": "Grok",
+        "description": "Sign in with Grok"
+      }
+    ]
+  },
+  "sessionNewWithStdioMcpServer": {
+    "setupPhases": [
+      "auth",
+      "resolve_workspace",
+      "folder_trust",
+      "plugin_registry",
+      "mcp_merge",
+      "persistence_init"
+    ],
+    "error": {
+      "code": -32000,
+      "message": "Authentication required",
+      "data": "no auth method id provided"
+    }
+  }
+}

@@ -2,6 +2,10 @@ import http from 'http';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import bcrypt from 'bcrypt';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { createHash } from 'crypto';
 import { issueShareGrant, shareGrantCookieName, shareGrantTtlMs } from '../utils/shareAccessSecurity';
 
 const findFirstMock = jest.fn();
@@ -33,7 +37,13 @@ jest.mock('../services/shareConcurrentUse', () => ({
   startShareConcurrentUseHeartbeat: startShareConcurrentUseHeartbeatMock,
 }));
 
-import { shareRouter } from '../routes/apps';
+// Fixture Apps must never land in a real Portal data root on the test host.
+const testAppsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'share-app-routes-apps-'));
+process.env.PORTAL_APPS_ROOT = testAppsRoot;
+
+import { shareRouter, APPS_DIR } from '../routes/apps';
+
+afterAll(() => { fs.rmSync(testAppsRoot, { recursive: true, force: true }); });
 
 type TestResponse = { status: number; headers: http.IncomingHttpHeaders; body: string };
 
@@ -161,6 +171,76 @@ describe('share app routes', () => {
     if (originalSecret === undefined) delete process.env.APP_API_SECRET_APP_123;
     else process.env.APP_API_SECRET_APP_123 = originalSecret;
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test.each(['root', 'dist'])('streams large non-passworded %s shares without weakening revocation', async (layout) => {
+    expect(APPS_DIR).toBe(testAppsRoot);
+    fs.mkdirSync(APPS_DIR, { recursive: true });
+    const directory = fs.mkdtempSync(path.join(APPS_DIR, 'large-open-share-test-'));
+    const content = layout === 'dist' ? path.join(directory, 'dist') : directory;
+    fs.mkdirSync(content, { recursive: true });
+    const html = '<!doctype html><head></head><body><!--' + 'x'.repeat(6 * 1024 * 1024)
+      + '--><p>COMPLETE-OPEN-APP</p></body>';
+    fs.writeFileSync(path.join(content, 'index.html'), html);
+    const link = { ...makeLink(), isPublic: true, passwordHash: null, maxUses: null,
+      app: { ...makeLink().app, zipPath: directory, port: null } };
+    findFirstMock.mockResolvedValue(link);
+    findUniqueMock.mockResolvedValue(link);
+    try {
+      for (const suffix of ['', '/index.html', '/nested/page']) {
+        const response = await request(server, `/${token}${suffix}`);
+        expect(response.status).toBe(200);
+        expect(response.body).toBe(html.replace('<head>', `<head><base href="/share/${token}/">`));
+      }
+      findFirstMock.mockResolvedValue(null);
+      expect((await request(server, `/${token}`)).status).toBe(404);
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test.each(['root', 'dist'])('serves large %s HTML only after the actual password exchange, including SPA and assets', async (layout) => {
+    expect(APPS_DIR).toBe(testAppsRoot);
+    fs.mkdirSync(APPS_DIR, { recursive: true });
+    const directory = fs.mkdtempSync(path.join(APPS_DIR, 'large-share-test-'));
+    const content = layout === 'dist' ? path.join(directory, 'dist') : directory;
+    fs.mkdirSync(content, { recursive: true });
+    const html = '<!doctype html><head><title>Large share</title></head><body>'
+      + '<!--' + 'x'.repeat(6 * 1024 * 1024) + '--><script src="asset.js"></script><p>END-OF-LARGE-APP</p></body>';
+    fs.writeFileSync(path.join(content, 'index.html'), html);
+    fs.writeFileSync(path.join(content, 'asset.js'), 'window.largeShareAssetLoaded=true;');
+    const password = 'large share fixture password';
+    const link = { ...makeLink(), isPublic: false, passwordHash: await bcrypt.hash(password, 4), maxUses: null,
+      app: { ...makeLink().app, zipPath: directory, port: null } };
+    findFirstMock.mockResolvedValue(link);
+    findUniqueMock.mockResolvedValue(link);
+    try {
+      const landing = await request(server, `/${token}`);
+      expect(landing.body).toContain('Password Required');
+      expect(landing.body).not.toContain('END-OF-LARGE-APP');
+      const wrong = await request(server, `/${token}/auth`, undefined, {}, 'POST', { password: 'incorrect' });
+      expect(wrong.status).toBe(401);
+      const auth = await request(server, `/${token}/auth`, undefined, {}, 'POST', { password });
+      expect(auth.status).toBe(200);
+      const cookies = (auth.headers['set-cookie'] || []).map(value => value.split(';', 1)[0]).join('; ');
+      for (const suffix of ['', '/index.html', '/nested/page']) {
+        const response = await request(server, `/${token}${suffix}`, cookies);
+        expect(response.status).toBe(200);
+        expect(createHash('sha256').update(response.body).digest('hex')).toBe(createHash('sha256')
+          .update(html.replace('<head>', `<head><base href="/share/${token}/">`)).digest('hex'));
+      }
+      const asset = await request(server, `/${token}/asset.js`, cookies);
+      expect(asset.status).toBe(200);
+      expect(asset.body).toBe('window.largeShareAssetLoaded=true;');
+      const lockedAsset = await request(server, `/${token}/asset.js`);
+      expect(lockedAsset.status).toBe(401);
+      findFirstMock.mockResolvedValue({ ...link, id: 'other-link', token: 'otherToken0123456789A' });
+      const other = await request(server, '/otherToken0123456789A/index.html', cookies);
+      expect(other.status).toBe(200);
+      expect(other.body).toContain('Password Required');
+      expect(other.body).not.toContain('END-OF-LARGE-APP');
+      expect((await request(server, '/otherToken0123456789A/asset.js', cookies)).status).toBe(401);
+      findFirstMock.mockResolvedValue(null);
+      expect((await request(server, `/${token}/index.html`, cookies)).status).toBe(404);
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
   test('binds target and secret to the App row and atomically counts one browser visit', async () => {

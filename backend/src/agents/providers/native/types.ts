@@ -10,6 +10,8 @@ import type {
 } from '../../AgentProvider.interface';
 import type { NativeCliApprovalDecision, NativeCliApprovalDraft } from '../../nativeCliApprovals';
 import type { NativeSessionData } from '../NativeSessionStore';
+import type { ChatBridgeTurn } from '../../chatBridge/contract';
+import type { NativeChatImage } from '../../../services/chatImages/directChatImages';
 
 const NATIVE_HOST_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$/;
 const NATIVE_HOST_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,511}$/;
@@ -135,6 +137,19 @@ export interface NativeCliTurnContext {
   requestApproval: (approval: Omit<NativeCliApprovalDraft, 'providerName' | 'sessionId' | 'cwd'> & { cwd?: string }) => Promise<NativeCliApprovalDecision>;
   updateSessionMetadata: (metadata: Record<string, unknown>) => void;
   stripAnsi: (text: string) => string;
+  /**
+   * Portal Chat Bridge capability for this logical turn (HOST_OPERATOR only),
+   * shared by every attempt including approval retries. Null runs the harness
+   * exactly as before, without Portal chat tools.
+   */
+  chatBridge?: ChatBridgeTurn | null;
+  /** Server-prepared photos for this turn; empty unless the gateway admitted them. */
+  chatImages?: readonly NativeChatImage[];
+  /**
+   * Write this turn's photos as root-only files for harnesses that take image
+   * paths. The provider removes them on every settlement path.
+   */
+  materializeChatImageFiles?: () => string[];
 }
 
 export interface NativeCliProviderAdapter {
@@ -151,6 +166,28 @@ export interface NativeCliProviderAdapter {
    */
   acceptedExitCodes?: readonly number[];
   configureSession?: (userId: string, config: AgentSessionConfig) => AgentSessionConfig | Promise<AgentSessionConfig>;
+  /** The adapter wires the Portal Chat Bridge into HOST_OPERATOR invocations. */
+  supportsChatBridge?: boolean;
+  /** The adapter forwards server-prepared photos as native image input. */
+  supportsChatImages?: boolean;
+  /**
+   * The harness restarts its tool-call ids every turn (Codex `item_N`). The
+   * provider then scopes every emitted id to the run so persisted tool cards
+   * and per-session widget bindings never collide across turns.
+   */
+  scopeToolCallIds?: boolean;
+  /**
+   * Resolve the session's effective model and prove from harness-advertised
+   * metadata (never a model-name guess) that it accepts image input. Throws a
+   * ChatImageError when it does not. Returns the model identity checked.
+   */
+  assertChatImageModel?: (session: NativeSessionData) => Promise<string>;
+  /**
+   * Deterministic host stdin encoding of this turn's prompt (and photos).
+   * Host invocations must place exactly this on stdin; the provider recomputes
+   * it and refuses anything else. Defaults to the prompt text itself.
+   */
+  encodeHostStdin?: (ctx: NativeCliTurnContext) => string;
   buildInvocation: (ctx: NativeCliTurnContext) => NativeCliInvocation | Promise<NativeCliInvocation>;
   handleStdoutLine: (line: string, ctx: NativeCliTurnContext) => void;
   handleStdoutRemainder?: (text: string, ctx: NativeCliTurnContext) => void;

@@ -37,6 +37,8 @@ export interface BuildSignedDeviceParams {
   scopes: string[];
   token: string;
   nonce?: string;
+  /** Validated timestamp from the received connect.challenge. */
+  signedAt?: number;
 }
 
 export interface SignedDevicePayload {
@@ -139,7 +141,8 @@ export function getOrCreateDeviceKeys(options: DeviceIdentityStorageOptions = {}
 
 export function buildSignedDevice(params: BuildSignedDeviceParams): SignedDevicePayload {
   const { keys, clientId, clientMode, role, scopes, token, nonce } = params;
-  const signedAt = Date.now();
+  const signedAt = params.signedAt ?? Date.now();
+  if (!Number.isSafeInteger(signedAt) || signedAt <= 0) throw new Error('Invalid gateway challenge timestamp');
 
   // Must match gateway's buildDeviceAuthPayload format exactly
   const version = nonce ? 'v2' : 'v1';
@@ -175,4 +178,15 @@ export function buildSignedDevice(params: BuildSignedDeviceParams): SignedDevice
     signedAt,
     ...(nonce ? { nonce } : {}),
   };
+}
+
+/** All transports sign the server challenge, never a browser-supplied timestamp. */
+export function validateGatewayChallenge(payload: unknown, now = Date.now()): { nonce: string; ts: number } {
+  const value = payload as any;
+  if (typeof value?.nonce !== 'string' || value.nonce.length < 16 || value.nonce.length > 512
+    || /[\u0000-\u001f\u007f]/.test(value.nonce)
+    || !Number.isSafeInteger(value.ts) || value.ts <= 0 || Math.abs(now - value.ts) > 5 * 60_000) {
+    throw new Error('Invalid or expired gateway connect challenge');
+  }
+  return { nonce: value.nonce, ts: value.ts };
 }

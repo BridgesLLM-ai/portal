@@ -3,7 +3,7 @@ import { DEFAULT_OLLAMA_MODEL } from '../utils/ollamaRecommendations';
 import { normalizeAgentZeroProjectSandboxImageId } from '../agents/providers/agentZero/AgentZeroProjectImage';
 import { resolveLocalOllamaEndpoint } from '../utils/localOllamaEndpoint';
 
-dotenv.config();
+dotenv.config({ quiet: true });
 
 export const config = {
   // Server
@@ -44,6 +44,14 @@ export const config = {
   ollamaProjectSandboxImageId: process.env.OLLAMA_PROJECT_SANDBOX_IMAGE_ID || '',
   agentZeroProjectSandboxImageId: process.env.AGENT_ZERO_PROJECT_SANDBOX_IMAGE_ID || '',
   portalProjectRuntimeImageId: process.env.PORTAL_PROJECT_RUNTIME_IMAGE_ID || '',
+  // Desktop toolchain: installer-built image, admitted GUI runtime root, and the
+  // recorded capability state (`installed` or `unavailable:<reason>`).
+  portalDesktopRuntimeImageId: process.env.PORTAL_DESKTOP_RUNTIME_IMAGE_ID || '',
+  portalDesktopElectronRoot: process.env.PORTAL_DESKTOP_ELECTRON_ROOT || '',
+  portalDesktopToolchainState: process.env.PORTAL_DESKTOP_TOOLCHAIN_STATE || '',
+  // `brokered` fetches dependencies through the Project egress proxy; `offline`
+  // allows only the toolchain's warm caches.
+  portalDesktopDependencyPolicy: process.env.PORTAL_DESKTOP_DEPENDENCY_POLICY || 'brokered',
 
   // Project Sandbox egress. Both values are installer-owned and intentionally
   // independent from JWT/cookie signing secrets.
@@ -90,11 +98,20 @@ for (const [label, imageId] of [
   ['OLLAMA_PROJECT_SANDBOX_IMAGE_ID', config.ollamaProjectSandboxImageId],
   ['AGENT_ZERO_PROJECT_SANDBOX_IMAGE_ID', config.agentZeroProjectSandboxImageId],
   ['PORTAL_PROJECT_RUNTIME_IMAGE_ID', config.portalProjectRuntimeImageId],
+  ['PORTAL_DESKTOP_RUNTIME_IMAGE_ID', config.portalDesktopRuntimeImageId],
   ['PROJECT_EGRESS_PROXY_IMAGE_ID', config.projectEgressProxyImageId],
 ] as const) {
   if (imageId && !/^sha256:[a-f0-9]{64}$/i.test(imageId)) {
     throw new Error(`${label} must be an immutable Docker sha256 image ID`);
   }
+}
+
+if (config.portalDesktopElectronRoot
+  && !/^\/usr\/lib\/bridgesllm-desktop\/electron\/44\.9\.0-[a-f0-9]{12}$/.test(config.portalDesktopElectronRoot)) {
+  throw new Error('PORTAL_DESKTOP_ELECTRON_ROOT must be an installer-managed Desktop runtime path');
+}
+if (!['brokered', 'offline'].includes(config.portalDesktopDependencyPolicy)) {
+  throw new Error('PORTAL_DESKTOP_DEPENDENCY_POLICY must be brokered or offline');
 }
 
 if (config.projectEgressTokenSecret && !/^[A-Za-z0-9_-]{43,256}$/.test(config.projectEgressTokenSecret)) {

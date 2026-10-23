@@ -1,4 +1,7 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request as ExpressRequest, Response } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import type { Server as SocketIOServer } from 'socket.io';
 import fs from 'fs';
 import { isIP } from 'net';
@@ -816,8 +819,8 @@ router.get(
     );
 
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const archiver = require('archiver');
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const { ZipArchive } = require('archiver');
+    const archive = new ZipArchive({ zlib: { level: 9 } });
     const abortArchive = () => {
       if (!res.writableEnded) archive.abort();
     };

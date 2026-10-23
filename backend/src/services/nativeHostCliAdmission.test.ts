@@ -187,8 +187,8 @@ describe('native host CLI admission', () => {
     const catalog = __nativeHostCliAdmissionTest.catalog;
     expect(Object.isFrozen(catalog)).toBe(true);
     expect(Object.isFrozen(catalog.tools.codex.versions)).toBe(true);
-    expect(Object.keys(catalog.tools.codex.versions).sort()).toEqual(['0.145.0', '0.149.0', '0.153.2']);
-    expect(Object.keys(catalog.tools['claude-code'].versions).sort()).toEqual(['2.1.220', '2.1.228', '2.1.260']);
+    expect(Object.keys(catalog.tools.codex.versions).sort()).toEqual(['0.145.0', '0.149.0', '0.153.2', '0.153.4', '0.163.0']);
+    expect(Object.keys(catalog.tools['claude-code'].versions).sort()).toEqual(['2.1.220', '2.1.228', '2.1.260', '2.1.263', '2.1.304', '2.1.309']);
     expect(catalog.tools.clawhub.versions['0.23.1'].admission).toBe('status-only');
     expect(catalog.tools.clawhub.versions['0.23.3'].admission).toBe('full');
     expect(catalog.tools.clawhub.executables).toEqual({

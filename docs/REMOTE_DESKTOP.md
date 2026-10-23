@@ -13,9 +13,9 @@ Authenticated OWNER or SUB_ADMIN browser
   +-- /novnc/vnc_portal.html -----------> signed noVNC files served by Portal
   |
   +-- /novnc/websockify ----------------> authenticated Portal WebSocket bridge
-  |                                        127.0.0.1:6080 (websockify)
+  |                                        /run/bridges-rd/transport/websockify.sock
   |                                          |
-  |                                          +--> 127.0.0.1:5901 (Xtigervnc :1)
+  |                                          +--> /run/bridges-rd/transport/vnc.sock (:1)
   |
   +-- /novnc/audio ----------------------> authenticated Portal WebSocket bridge
                                            127.0.0.1:4714 by default
@@ -38,9 +38,9 @@ The noVNC client always uses the exact same-origin `/novnc/websockify` and `/nov
 | Component | Identity | Listener or display | Managed by |
 |---|---|---|---|
 | Portal backend | `root` | `127.0.0.1:4001` | `bridgesllm-product.service` |
-| Xtigervnc launcher | service starts as `root`; XFCE and PulseAudio run as `bridgesrd` | display `:1`, `127.0.0.1:5901` | `bridges-rd-xtigervnc.service` |
+| Xtigervnc launcher | supervisor starts as `root`; VNC, XFCE and PulseAudio run as `bridgesrd` | display `:1`, private `vnc.sock` | `bridges-rd-xtigervnc.service` |
 | XFCE session guard | `root`, controlling only the dedicated `bridgesrd` session | semantic checks on display `:1` | supervised inside `bridges-rd-xtigervnc.service` |
-| Websockify | `bridgesrd` | `127.0.0.1:6080` -> `127.0.0.1:5901` | `bridges-rd-websockify.service` |
+| Websockify | `bridgesrd` | `websockify.sock` -> `vnc.sock` (private Unix sockets) | `bridges-rd-websockify.service` |
 | Out-of-process health recovery | `root` | semantic check and bounded restart every 30 seconds | `bridges-rd-healthcheck.timer` -> `bridges-rd-healthcheck.service` |
 | Audio bridge | Portal process; `parec` runs as `bridgesrd` | `127.0.0.1:4714` by default | Portal process |
 | Shared Browser CDP | `bridgesrd` | optional `127.0.0.1:18801` while running | Shared Browser launcher |
@@ -49,16 +49,20 @@ The noVNC client always uses the exact same-origin `/novnc/websockify` and `/nov
 
 The old `bridges-rd-vnc.service`, every stock display-1 alias (`tigervncserver@:1.service`, `tigervncserver@1.service`, `vncserver@:1.service`, and `vncserver@1.service`), and the Docker noVNC bridge are disabled because they race the managed display or bypass Portal authentication. An exact Portal-owned legacy `rc.local` desktop stack is archived and stopped; an unknown administrator-owned `rc.local` is never edited.
 
-Xtigervnc uses `-SecurityTypes None` only on its loopback listener. Portal authentication and the elevated-role gate protect the public path. X11 itself keeps access control enabled: the launcher creates `/home/bridgesrd/.Xauthority`, passes `-auth`, and never uses `-ac`.
+Xtigervnc uses `-SecurityTypes None` only on its mode-0600 Unix socket inside a desktop-owned mode-0700 directory. `-rfbport -1` disables its TCP listener; websockify also uses a private Unix socket. Unrelated local accounts cannot attach to either transport. Portal authentication and the elevated-role gate protect the public path. X11 itself keeps access control enabled: the launcher creates `/home/bridgesrd/.Xauthority`, passes `-auth`, and never uses `-ac`.
+
+The signed release includes Websockify 0.13.0 because the Ubuntu package can lack Unix-listener support. Its hash-checked module runs in isolated Python mode from `/usr/local/lib/bridges-rd-websockify`, without replacing system packages or downloading code at desktop startup.
 
 ## Accounts, files, and permissions
 
-The dedicated desktop account is `bridgesrd`. Product launchers refuse to run a browser as another non-root account, and a root invocation immediately drops to `bridgesrd`.
+This is a shared operator desktop for OWNER and SUB_ADMIN, not an isolated per-user workspace. The dedicated desktop account is `bridgesrd`. Product launchers refuse to run a browser as another non-root account, and a root invocation immediately drops to `bridgesrd`.
 
 The account intentionally has no interactive desktop password, so every lock path is disabled. Signed XFCE policy maps the lock command and Ctrl+Alt+L to `/bin/true`, removes the panel lock action, disables idle blanking/DPMS, and installs XDG autostart tombstones for the common locker daemons.
 
 | Path | Purpose | Expected owner/mode |
 |---|---|---|
+| `/run/bridges-rd/transport` | private VNC/WebSocket directory | `bridgesrd:bridgesrd`, `0700` |
+| `/run/bridges-rd/transport/{vnc,websockify}.sock` | private desktop transport | `bridgesrd:bridgesrd`, `0600` |
 | `/home/bridgesrd/.Xauthority` | X11 authentication cookie | `bridgesrd:bridgesrd`, `0600` |
 | `/home/bridgesrd/.bridges-rd-env` | canonical desktop environment | `bridgesrd:bridgesrd`, `0640` |
 | `/tmp/bridges-rd-runtime` | private runtime sockets, including PulseAudio | `bridgesrd:bridgesrd`, `0700` |
@@ -124,7 +128,7 @@ Fresh install, signed update, and `POST /api/remote-desktop/auto-setup` use the 
 - Install the signed launchers and desktop entries.
 - Provision only exact, version-attested Claude Code, Codex, Hermes, OpenCode, and Ollama terminal runtimes. Missing optional runtimes receive no shortcut. Agent Zero receives no shortcut until Portal can issue a short-lived, single-use exchange bound to the active Portal user. Re-running setup reconciles signed assets only after proving ownership; it never overwrites or removes a same-name foreign replacement.
 - Generate a fresh Xauthority cookie and the canonical desktop environment.
-- Bind VNC, websockify, the audio bridge, and browser debugging listeners to loopback only.
+- Keep VNC and websockify on private Unix sockets. Audio and optional browser debugging remain loopback-only; they are separate local-host boundaries, not multi-user desktop isolation.
 - Enable `bridges-rd-xtigervnc.service`, `bridges-rd-websockify.service`, and the 30-second `bridges-rd-healthcheck.timer`.
 - Wait for `xfce4-session`, `xfwm4`, and `xfdesktop`; refuse READY while a locker/greeter is present; then supervise that semantic policy with systemd watchdog heartbeats.
 - Verify live listeners, process arguments, the real lock-free XFCE session, guard supervision, X11 access control, file ownership, modes, and signed-file parity before reporting success.
@@ -174,9 +178,11 @@ systemctl is-active bridges-rd-healthcheck.timer
 /usr/local/bin/bridges-rd-ai-launchers.sh verify
 cat /run/bridges-rd/health-state.json
 
-ss -H -ltn | grep -E '127\.0\.0\.1:(4001|5901|6080|4714|18801|18802)'
+ss -H -ltn | grep -E '127\.0\.0\.1:(4001|4714|18801|18802)'
 ps -eo user:32=,args= | grep '[X]tigervnc :1'
-ps -eo user:32=,args= | grep '[w]ebsockify 127.0.0.1:6080 127.0.0.1:5901'
+ss -H -lx | grep '/run/bridges-rd/transport/'
+stat -c '%U:%G:%a' /run/bridges-rd/transport /run/bridges-rd/transport/*.sock
+ps -eww -o user:64=,args= | grep '[w]ebsockify --unix-listen='
 pgrep -u bridgesrd -af 'xfce4-screensaver|light-locker|xscreensaver|xss-lock' && echo 'unexpected locker' || true
 
 stat -c '%U:%G:%a %n' \
@@ -191,7 +197,7 @@ curl -fsS http://127.0.0.1:4001/health
 curl -fsS -b portal-cookie-jar http://127.0.0.1:4001/api/remote-desktop/status
 ```
 
-Ports `18801` and `18802` are expected to be absent while their browsers are idle. Every listener that is present must remain loopback-only. A healthy Xtigervnc command contains `-localhost=1` and `-auth /home/bridgesrd/.Xauthority`, and does not contain `-ac`.
+Ports `18801` and `18802` are expected to be absent while their browsers are idle. Every listener that is present must remain loopback-only. A healthy Xtigervnc command contains `-rfbport -1`, `-rfbunixpath /run/bridges-rd/transport/vnc.sock`, `-rfbunixmode 0600`, `-localhost=1` and `-auth /home/bridgesrd/.Xauthority`, and does not contain `-ac`.
 
 ## Troubleshooting
 
@@ -210,3 +216,24 @@ tail -n 150 /home/bridgesrd/.config/bridges-agent-browser/logs/launcher.log
 Use the authenticated recovery endpoint or the Desktop page's recovery control first; harmless lock/idle drift is repaired without disconnecting the user. Only its confirmed restart fallback and auto-setup interrupt active desktop work. Use auto-setup when packages, signed launchers, units, or permissions need repair.
 
 Do not expose ports 5901, 6080, 4714, 18801, or 18802; remove the Portal auth gate; restore the legacy service; disable X11 access control; or weaken the browser sandbox as a troubleshooting shortcut.
+
+## Desktop Projects (Python, TypeScript, Rust, C++)
+
+Projects → New offers Desktop starters in four languages, each as a **terminal tool** or a **graphical app**: Python (plain/Tkinter), TypeScript (Node/Electron), Rust (standard library/egui) and C++ (CMake/Qt Widgets). They are Linux apps that open on the Remote Desktop, not hosted web Apps.
+
+- **Check** compiles or validates the saved source inside the Desktop toolchain container.
+- **Run** builds the saved source, keeps the previous build if anything fails, and opens the new build on the Remote Desktop.
+- **Open** focuses the running window or starts the last successful build; **Restart** reuses that build without compiling. Use Run after editing.
+- Status shows whether the running build matches the saved source, plus recent output and the last exit code. Build progress and Cancel survive reloading the page.
+
+`portal-project.json` (version 1, target `desktop`) names the language, interface, framework and the relative entry file or binary. Keep it, `package-lock.json` and `Cargo.lock` with the source; Check and Run install exactly the locked versions. **Install dependencies** creates a missing lockfile. Projects without the descriptor keep their previous web behaviour; a Cargo project needs the descriptor to pick its binary.
+
+Apps write their data under the directory in `BRIDGESLLM_APP_DATA`. That data is kept across Run, Restart and Portal updates, is included in Portal backups, and is removed when the Project is deleted.
+
+**Who can use it.** Any approved user can create and edit Desktop Projects. Check, Run, Cancel and the app controls need an Owner or Sub-Admin, and are re-checked while a build runs and before it is promoted.
+
+**Containment.** Builds run in the same locked-down Project container as other Project jobs: non-root, read-only system files, no added privileges, bounded CPU, memory, processes, time and output. Apps run as the shared Remote Desktop account, so the Remote Desktop is not a per-Project security boundary. Electron apps use the server-managed Electron 44.9.0 with Chromium's sandbox enabled.
+
+**Dependencies.** By default (`PORTAL_DESKTOP_DEPENDENCY_POLICY=brokered`) builds download packages from npm, crates.io and PyPI through the per-Project egress proxy, which only reaches public addresses; the toolchain's caches for the built-in starters make first builds fast. Set `offline` to allow only those caches.
+
+**Toolchain.** The installer builds the toolchain image locally (about 3 GB: Node 22, Rust 1.90, CMake/Qt 6, Python 3.11 with Tkinter and PyInstaller 6.16, Electron 44.9.0, each download pinned by SHA-256) and installs Electron's runtime under `/usr/lib/bridgesllm-desktop`. It needs an x86_64 server with glibc 2.36 or newer (Debian 12, Ubuntu 24.04 or later), unprivileged user namespaces, the Remote Desktop, and about 10 GB of free Docker disk. On Ubuntu releases that restrict user namespaces, the installer loads a narrow AppArmor profile for that Electron binary only. If the host does not qualify, or the installer ran with `--skip-desktop-toolchain`, the rest of the Portal works normally and Desktop Check/Run show the reason. Existing installs add it with `install.sh --install-desktop-toolchain`; Portal updates keep whatever was recorded. Uninstall removes the toolchain; it removes built Desktop apps and their data only when you choose to delete data.

@@ -6,6 +6,7 @@ export interface PersistedChatAttachment {
   type: 'image' | 'text' | 'other';
   textContent?: string;
   fileId?: string;
+  fileRevision?: string;
   serverPath?: string;
   toolUrl?: string;
   uploadStatus?: 'uploading' | 'done' | 'error';
@@ -30,10 +31,18 @@ function deferredPortalReference(fileId: string | undefined): string | null {
  */
 export function buildPersistedChatAttachmentText(
   attachments: readonly PersistedChatAttachment[],
+  options: { nativeImages?: boolean } = {},
 ): string {
   if (attachments.length === 0) return '';
   const parts: string[] = [];
   for (const attachment of attachments) {
+    if (options.nativeImages && attachment.type === 'image') {
+      if (attachment.uploadStatus !== 'done' || !attachment.fileId || !attachment.fileRevision) {
+        throw new Error('Wait for the photo upload to finish, or remove the failed photo.');
+      }
+      parts.push(`[portal-chat-image:${JSON.stringify({ fileId: attachment.fileId, revision: attachment.fileRevision })}]`);
+      continue;
+    }
     const portalReference = deferredPortalReference(attachment.fileId);
     const diskPathLine = attachment.serverPath
       ? `- server_path: ${attachment.serverPath}`
@@ -96,4 +105,15 @@ export function buildPersistedChatAttachmentText(
     ].filter(Boolean).join('\n'));
   }
   return `${parts.join('\n\n')}\n\n`;
+}
+
+/** Render persisted references as ordinary authorized Files links, never opaque protocol JSON. */
+export function presentChatImageReferences(content: string): string {
+  return content.replace(/^\[portal-chat-image:(\{[^\r\n]{1,256}\})\]$/gm, (marker, json: string) => {
+    try {
+      const ref = JSON.parse(json);
+      if (!/^[a-f0-9-]{36}$/i.test(ref.fileId) || typeof ref.revision !== 'string') return marker;
+      return `[Attached photo](/api/files/${encodeURIComponent(ref.fileId)})`;
+    } catch { return marker; }
+  });
 }

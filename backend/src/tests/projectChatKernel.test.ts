@@ -158,7 +158,7 @@ describe('Project Chat provider capabilities', () => {
       supportsAbort: false,
       supportsReset: false,
       requiresOAuth: false,
-      reason: expect.stringContaining('detection-only'),
+      reason: expect.stringContaining('Project Sandbox execution is not available'),
     });
     expect(unsupportedProviders.find((entry) => entry.provider === 'GROK')).toMatchObject({
       supportsAttachments: false,
@@ -234,7 +234,7 @@ describe('Project Chat provider capabilities', () => {
         expiresAt: null,
         evidenceFingerprint: null,
       });
-      expect(matrix.GEMINI.reason).toMatch(/detection-only/i);
+      expect(matrix.GEMINI.reason).toMatch(/Project Sandbox execution is not available/i);
     } finally {
       config.openclawProjectSandboxImageId = previousOpenClawImage;
       config.antigravityProjectSandboxImageId = previousAntigravityImage;
@@ -356,7 +356,7 @@ describe('Project Chat sandbox binding', () => {
     })).toThrow('Server-owned project identity does not match the requested workspace project');
   });
 
-  test('binds qualified native foundations while Antigravity remains detection-only', () => {
+  test('binds qualified native foundations while Antigravity remains Host Operator-only', () => {
     const previousClaudeImage = config.claudeCodeProjectSandboxImageId;
     const previousAntigravityImage = config.antigravityProjectSandboxImageId;
     const previousAgentZeroImage = config.agentZeroProjectSandboxImageId;
@@ -382,7 +382,7 @@ describe('Project Chat sandbox binding', () => {
         runtimeImageDigest: config.claudeCodeProjectSandboxImageId,
       });
       expect(() => buildUnqualifiedAntigravityProjectSandboxExecutionContext(input))
-        .toThrow(/detection-only/i);
+        .toThrow(/Project Sandbox execution is not available/i);
       expect(agentZero).toMatchObject({
         runtimePolicyVersion: AGENT_ZERO_PROJECT_POLICY_VERSION,
         runtimeImageDigest: config.agentZeroProjectSandboxImageId,

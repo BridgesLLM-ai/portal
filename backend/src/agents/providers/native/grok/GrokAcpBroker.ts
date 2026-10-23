@@ -8,8 +8,12 @@ import {
   type AcpPermissionDecision,
   type AcpPermissionOption,
   type AcpPermissionRequest,
+  type AcpAttestationResult,
+  type AcpStdioMcpServer,
+  type AcpToolIdentityInput,
   type SpawnImplementation,
 } from '../acp/AcpStdioBroker';
+import type { NativeChatImage } from '../../../../services/chatImages/directChatImages';
 
 export const GROK_ACP_AGENT_VERSION = GROK_ACP_PROFILE.expectedAgentVersion;
 export const GROK_ACP_PROTOCOL_VERSION = GROK_ACP_PROFILE.protocolVersion;
@@ -36,7 +40,9 @@ export interface GrokAcpBrokerOptions {
   nativeSessionId?: string | null;
   onChunk?: (chunk: string) => void;
   onStatus?: OnStatusCallback;
-  onPermission: (request: GrokAcpPermissionRequest) => Promise<GrokAcpPermissionDecision>;
+  onPermission?: (request: GrokAcpPermissionRequest) => Promise<GrokAcpPermissionDecision>;
+  mcpServers?: readonly AcpStdioMcpServer[];
+  resolveToolName?: (input: AcpToolIdentityInput) => string | null;
   spawnImpl?: SpawnImplementation;
   controlTimeoutMs?: number;
   promptTimeoutMs?: number;
@@ -57,6 +63,8 @@ export class GrokAcpBroker {
       onChunk: options.onChunk,
       onStatus: options.onStatus,
       onPermission: options.onPermission,
+      mcpServers: options.mcpServers,
+      resolveToolName: options.resolveToolName,
       spawnImpl: options.spawnImpl,
       controlTimeoutMs: options.controlTimeoutMs,
       promptTimeoutMs: options.promptTimeoutMs,
@@ -72,12 +80,20 @@ export class GrokAcpBroker {
     return this.broker.wasAborted;
   }
 
+  get supportsPromptImages(): boolean {
+    return this.broker.supportsPromptImages;
+  }
+
+  attest(): Promise<AcpAttestationResult> {
+    return this.broker.attest();
+  }
+
   async start(): Promise<string> {
     return (await this.broker.start()).nativeSessionId;
   }
 
-  async prompt(message: string): Promise<GrokAcpTurnResult> {
-    const result = await this.broker.prompt(message);
+  async prompt(message: string, images: readonly NativeChatImage[] = []): Promise<GrokAcpTurnResult> {
+    const result = await this.broker.prompt(message, images);
     return {
       fullText: result.fullText,
       nativeSessionId: result.nativeSessionId,
@@ -94,5 +110,9 @@ export class GrokAcpBroker {
 
   close(): void {
     void this.broker.dispose();
+  }
+
+  dispose(): Promise<void> {
+    return this.broker.dispose();
   }
 }

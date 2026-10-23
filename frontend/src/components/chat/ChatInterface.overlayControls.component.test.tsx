@@ -7,9 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '../../contexts/AuthContext';
 import { gatewayAPI } from '../../api/endpoints';
 import {
-  AGENT_CHAT_ASK_USER_SUPERVISOR_REASON,
+  AgentPendingQuestions,
   AgentSettingsDrawer,
-  isAskUserResponseDisabled,
   isAgentChatPositiveApprovalBlocked,
   ModelPicker,
   SessionControls,
@@ -134,12 +133,18 @@ describe('Agent Chat viewport-owned controls', () => {
     expect(isAgentChatPositiveApprovalBlocked('native-opencode-1')).toBe(false);
   });
 
-  it('keeps every Agent Chat ask-user response read-only across provider switches', () => {
-    expect(isAskUserResponseDisabled('agent-chat', true)).toBe(true);
-    expect(isAskUserResponseDisabled('agent-chat', false)).toBe(true);
-    expect(isAskUserResponseDisabled('project-chat', true)).toBe(false);
-    expect(isAskUserResponseDisabled('project-chat', false)).toBe(true);
-    expect(AGENT_CHAT_ASK_USER_SUPERVISOR_REASON).toMatch(/not bound to a supervised native provider run/i);
+  it('lets a pending Agent Chat question use its request-bound answer channel', async () => {
+    const answer = vi.spyOn(gatewayAPI, 'answerQuestion').mockResolvedValue({ ok: true, id: 'askq-inline', state: 'answered' } as any);
+    const settled = vi.fn();
+    render(<AgentPendingQuestions questions={[{
+      id: 'askq-inline', expiresAt: Date.now() + 300_000, sessionKey: 'agent:main:portal-owner', surface: 'agent-chat',
+      questions: [{ id: 'db', question: 'Choose a database', options: [{ label: 'SQLite' }] }],
+    } as any]} onSettled={settled} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'SQLite' }));
+    await user.click(screen.getByRole('button', { name: /send answer/i }));
+    expect(answer).toHaveBeenCalledWith('askq-inline', expect.anything());
+    expect(settled).toHaveBeenCalledWith('askq-inline');
   });
 
   it('keeps fenced model and session controls inert in the browser', async () => {

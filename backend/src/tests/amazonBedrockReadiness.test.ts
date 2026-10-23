@@ -4,6 +4,7 @@ import {
   probeAmazonBedrockReadiness,
   type ReadOnlyOpenClawResult,
   type ReadOnlyOpenClawRunner,
+  openClawConfigUsesAmazonBedrock,
 } from '../services/amazonBedrockReadiness';
 
 function cliResult(overrides: Partial<ReadOnlyOpenClawResult> = {}): ReadOnlyOpenClawResult {
@@ -137,5 +138,18 @@ describe('Amazon Bedrock read-only readiness', () => {
     expect(refreshed.cached).toBe(false);
     expect(refreshed.checkedAt).toBe(new Date(nowMs).toISOString());
     expect(runner).toHaveBeenCalledTimes(4);
+  });
+  it.each([
+    [{}, false],
+    [{ agents: { defaults: { model: { primary: 'openai/gpt-5', fallbacks: ['xai/grok-4'] } } } }, false],
+    [{ plugins: { entries: { 'amazon-bedrock': { enabled: false } } } }, false],
+    [{ agents: { defaults: { model: { primary: 'amazon-bedrock/us.test-model' } } } }, true],
+    [{ agents: { defaults: { model: { primary: 'openai/gpt-5', fallbacks: ['amazon-bedrock/us.b'] } } } }, true],
+    [{ agents: { defaults: { models: { 'amazon-bedrock/us.c': {} } } } }, true],
+    [{ agents: { list: [{ id: 'main', model: 'amazon-bedrock/us.d' }] } }, true],
+    [{ plugins: { entries: { 'amazon-bedrock': { enabled: true } } } }, true],
+    [{ models: { providers: { 'amazon-bedrock': { region: 'us-east-1' } } } }, true],
+  ])('detects whether OpenClaw is configured to use Bedrock (%j)', (config, expected) => {
+    expect(openClawConfigUsesAmazonBedrock(config)).toBe(expected);
   });
 });

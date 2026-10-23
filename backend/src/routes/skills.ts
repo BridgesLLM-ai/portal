@@ -1,4 +1,7 @@
-import { Router, type Application, type Request, type Response } from 'express';
+import { Router, type Application, type Request as ExpressRequest, type Response } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { requireApproved } from '../middleware/requireApproved';

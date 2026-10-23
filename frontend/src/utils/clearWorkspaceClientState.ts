@@ -11,6 +11,7 @@ const WORKSPACE_STORAGE_PREFIXES = [
   'project-chat-confirmed-send:v1:',
   'agent-active-',
   'agent-model-',
+  'agent-work-goal-op:v1:',
 ];
 
 const TRANSIENT_WORKSPACE_STORAGE_KEYS = new Set([
@@ -28,6 +29,7 @@ const TRANSIENT_WORKSPACE_STORAGE_KEYS = new Set([
 ]);
 
 const TRANSIENT_WORKSPACE_STORAGE_PREFIXES = [
+  'agent-work-goal-op:v1:',
   'portal:workspace-navigation:',
 ];
 

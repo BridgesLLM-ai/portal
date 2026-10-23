@@ -276,7 +276,7 @@ describe('SetupWizardPage mutation ownership', () => {
     expect(window.dispatchEvent(new Event('beforeunload', { cancelable: true }))).toBe(true);
 
     await userEvent.click(screen.getByRole('button', { name: /Skip for now/i }));
-    expect(await screen.findByRole('heading', { name: 'AI setup' })).toBeVisible();
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'AI setup' })).toBeVisible());
   });
 
   it('presents Tailnet HTTPS as experimental private access, not a configured public domain', async () => {
@@ -457,7 +457,7 @@ describe('SetupWizardPage mutation ownership', () => {
 
     renderWizard(6);
     expect(await screen.findByText('OpenCode')).toBeVisible();
-    expect(screen.getByText(/Setup cannot change an individual native runtime.*Admin > Maintenance after Setup/i)).toBeVisible();
+    await waitFor(() => expect(screen.getByText(/Setup cannot change an individual native runtime.*Admin > Maintenance after Setup/i)).toBeVisible());
     expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
     expect(setupMocks.post).not.toHaveBeenCalledWith('/setup/install-coding-tool', expect.anything());
 
@@ -522,8 +522,8 @@ describe('SetupWizardPage mutation ownership', () => {
 
     renderWizard(6);
 
-    expect(await screen.findByText(/Read-only status/i)).toBeVisible();
-    expect(screen.getByText(/Setup cannot change an individual native runtime.*Admin > Maintenance after Setup/i)).toBeVisible();
+    await waitFor(() => expect(screen.getByText(/Read-only status/i)).toBeVisible());
+    await waitFor(() => expect(screen.getByText(/Setup cannot change an individual native runtime.*Admin > Maintenance after Setup/i)).toBeVisible());
     expect(screen.getByText(/Coding-tool status is read-only during Setup.*Fresh installs receive the exact bundle automatically.*Update Compatible AI Tools.*availability still depends on each account's credentials/i)).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
     expect(setupMocks.post).not.toHaveBeenCalledWith('/setup/install-coding-tool', expect.anything());
@@ -554,7 +554,7 @@ describe('SetupWizardPage mutation ownership', () => {
 
     await userEvent.click(screen.getByRole('button', { name: /Skip for now/i }));
     await userEvent.click(await screen.findByRole('button', { name: /Skip for now/i }));
-    expect(await screen.findByText('Remote GPU: Setup queued after launch')).toBeVisible();
+    await waitFor(() => expect(screen.getByText('Remote GPU: Setup queued after launch')).toBeVisible());
 
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));

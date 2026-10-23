@@ -13,6 +13,8 @@ readonly BRIDGE_USER='bridgesllm-a0-bridge'
 readonly BRIDGE_GROUP='bridgesllm-a0-bridge'
 readonly BRIDGE_PORT='18991'
 readonly BRIDGE_PRIVATE_PARENT='/var/lib/bridgesllm'
+# Desktop provisioning (projectDesktopDeployment) may add this account's search entry.
+readonly BRIDGE_DESKTOP_ACCOUNT='bridgesrd'
 readonly BRIDGE_STATE_ROOT="${BRIDGE_PRIVATE_PARENT}/agent-zero-project-model-bridge"
 readonly BRIDGE_CREDENTIAL_ROOT="${BRIDGE_STATE_ROOT}/credentials"
 readonly BRIDGE_RUNTIME_ROOT="${BRIDGE_STATE_ROOT}/runtime"
@@ -37,7 +39,7 @@ readonly A0_LOOPBACK_PORT='50001'
 # Keep in lockstep with Portal's tested Codex CLI pin and the managed Agent Zero
 # runtime lifecycle. The managed Agent Zero image has no compatible Codex
 # binary from which to infer the Portal-qualified client version.
-readonly A0_CODEX_CLIENT_VERSION='0.153.4'
+readonly A0_CODEX_CLIENT_VERSION='0.163.0'
 
 log() { printf '[Agent Zero Project model bridge] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -475,11 +477,45 @@ ensure_identity_and_directories() {
   fi
   [[ "$(id -gn "$BRIDGE_USER")" == "$BRIDGE_GROUP" ]] \
     || die 'Managed bridge user has an unexpected primary group.'
-  ensure_managed_directory "$BRIDGE_PRIVATE_PARENT" 0700 root root
+  # Never chmod an accepted Desktop search grant away (chmod rewrites the mask).
+  bridge_private_parent_has_desktop_search "$BRIDGE_PRIVATE_PARENT" \
+    || ensure_managed_directory "$BRIDGE_PRIVATE_PARENT" 0700 root root
   ensure_managed_directory "$BRIDGE_STATE_ROOT" 0750 root "$BRIDGE_GROUP"
   ensure_managed_directory "$BRIDGE_CREDENTIAL_ROOT" 2750 root "$BRIDGE_GROUP"
   ensure_managed_directory "$BRIDGE_RUNTIME_ROOT" 0750 root "$BRIDGE_GROUP"
   ensure_managed_directory /etc/bridgesllm 0750 root root
+}
+
+# Exact accepted shapes of the shared root-owned parent: the protected
+# predecessors 0700/0755 without extended ACL, or the same with only the Desktop
+# account's search entry and its matching mask (what projectDesktopDeployment
+# adds; 0700 then reads as 0710). Other named users or groups, default ACLs,
+# wider entries, non-root ownership and links are refused.
+bridge_private_parent_contract_ok() {
+  local parent="$1" acl uid candidate
+  [[ -d "$parent" && ! -L "$parent" && "$(stat -c '%u:%g' "$parent")" == '0:0' ]] || return 1
+  if ! command -v getfacl >/dev/null 2>&1; then
+    case "$(stat -c '%a' "$parent")" in 700|755) return 0 ;; *) return 1 ;; esac
+  fi
+  acl="$(getfacl -cpnE -- "$parent" 2>/dev/null | sed '/^$/d' | LC_ALL=C sort)" || return 1
+  uid="$(id -u "$BRIDGE_DESKTOP_ACCOUNT" 2>/dev/null || true)"
+  for candidate in \
+    $'group::---\nother::---\nuser::rwx' \
+    $'group::r-x\nother::r-x\nuser::rwx'; do
+    [[ "$acl" == "$candidate" ]] && return 0
+  done
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" != 0 ]] || return 1
+  for candidate in \
+    "$(printf 'group::---\nmask::--x\nother::---\nuser::rwx\nuser:%s:--x' "$uid" | LC_ALL=C sort)" \
+    "$(printf 'group::r-x\nmask::r-x\nother::r-x\nuser::rwx\nuser:%s:--x' "$uid" | LC_ALL=C sort)"; do
+    [[ "$acl" == "$candidate" ]] && return 0
+  done
+  return 1
+}
+
+bridge_private_parent_has_desktop_search() {
+  bridge_private_parent_contract_ok "$1" \
+    && getfacl -cpnE -- "$1" 2>/dev/null | grep -Eq '^user:[0-9]+:--x$'
 }
 
 verify_bridge_directories() {
@@ -490,11 +526,7 @@ verify_bridge_directories() {
   # still needs traversal if the surrounding Portal transaction rolls back.
   # Both modes prohibit non-root writes; the private mount view hides siblings
   # from the refreshed service, and credential/runtime leaf checks stay exact.
-  [[ -d "$BRIDGE_PRIVATE_PARENT" && ! -L "$BRIDGE_PRIVATE_PARENT" ]] || return 1
-  case "$(stat -c '%U:%G:%a' "$BRIDGE_PRIVATE_PARENT")" in
-    root:root:700|root:root:755) ;;
-    *) return 1 ;;
-  esac
+  bridge_private_parent_contract_ok "$BRIDGE_PRIVATE_PARENT" || return 1
   local spec directory expected
   for spec in "$BRIDGE_STATE_ROOT|root:${BRIDGE_GROUP}:750" \
     "$BRIDGE_RUNTIME_ROOT|root:${BRIDGE_GROUP}:750" \

@@ -10,6 +10,7 @@ import { buildFileDeepLink } from '../utils/workspaceNavigation';
 import ViewportModal from './ViewportModal';
 import { isRouteOperationOwned } from '../contexts/RouteOperationContext';
 import { usePublicSettings } from '../hooks/usePublicSettings';
+import { buildSettingsSearchIndex, parseSearchQuery, scoreSearchText, searchSettings, type SearchableText } from '../utils/settingsSearch';
 import {
   WORKSPACE_AUTHORIZATION_CHANGED_EVENT,
   type WorkspaceAuthorizationChangeDetail,
@@ -21,7 +22,8 @@ interface CommandItem {
   description?: string;
   icon: React.ReactNode;
   action: () => void;
-  category: 'navigation' | 'project' | 'project file' | 'library file' | 'action' | 'recent';
+  category: 'navigation' | 'project' | 'project file' | 'library file' | 'action' | 'recent' | 'setting';
+  to?: string;
   keywords?: string[];
 }
 
@@ -42,8 +44,10 @@ export function dynamicCommandId(kind: string, ...parts: string[]): string {
 
 export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const filteredQueryRef = useRef('');
   const [filteredCommands, setFilteredCommands] = useState<CommandItem[]>([]);
+  const selectedIndex = Math.max(0, filteredCommands.findIndex((item) => item.id === selectedId));
   const [dynamicItems, setDynamicItems] = useState<CommandItem[]>([]);
   const [searchStatus, setSearchStatus] = useState<null | {
     kind: 'loading' | 'error' | 'notice';
@@ -85,6 +89,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       label: 'Go to Dashboard',
       icon: <Layout size={16} />,
       action: () => navigate('/dashboard'),
+      to: '/dashboard',
       category: 'navigation' as const,
       keywords: ['home', 'overview', 'main'],
     },
@@ -93,6 +98,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       label: 'Go to Projects',
       icon: <Folder size={16} />,
       action: () => navigate('/projects'),
+      to: '/projects',
       category: 'navigation' as const,
       keywords: ['code', 'repos', 'deploy', 'share', 'hosted', 'apps'],
     }, {
@@ -100,6 +106,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       label: 'Go to Files',
       icon: <File size={16} />,
       action: () => navigate('/files'),
+      to: '/files',
       category: 'navigation' as const,
       keywords: ['browse', 'explorer'],
     }, {
@@ -116,6 +123,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
           : 'Open Mail to view its current availability.',
       icon: <Mail size={16} />,
       action: () => navigate('/mail'),
+      to: '/mail',
       category: 'navigation' as const,
       keywords: ['email', 'inbox', 'messages', 'unavailable', 'availability'],
     }] : []),
@@ -125,6 +133,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
           label: 'Go to Agent Chats',
           icon: <MessageCircle size={16} />,
           action: () => navigate('/agent-chats'),
+          to: '/agent-chats',
           category: 'navigation' as const,
           keywords: ['chat', 'agents', 'openclaw'],
         },
@@ -133,6 +142,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
           label: 'Go to Agent Tools',
           icon: <Wrench size={16} />,
           action: () => navigate('/agent-tools'),
+          to: '/agent-tools',
           category: 'navigation' as const,
           keywords: ['automations', 'skills', 'tasks', 'usage'],
         },
@@ -141,6 +151,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
           label: 'Go to Terminal',
           icon: <Terminal size={16} />,
           action: () => navigate('/terminal'),
+          to: '/terminal',
           category: 'navigation' as const,
           keywords: ['shell', 'console', 'command'],
         },
@@ -149,6 +160,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
           label: 'Go to Admin Maintenance',
           icon: <Shield size={16} />,
           action: () => navigate('/admin?tab=maintenance'),
+          to: '/admin?tab=maintenance',
           category: 'navigation' as const,
           keywords: ['admin', 'maintenance', 'security', 'updates', 'drift'],
         }]
@@ -158,10 +170,20 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       label: 'Go to Settings',
       icon: <Settings size={16} />,
       action: () => navigate('/settings'),
+      to: '/settings',
       category: 'navigation' as const,
       keywords: ['config', 'preferences'],
     },
   ], [mailAvailability, navigate, user]);
+
+  // Settings and Admin destinations this role may open. Built
+  // from the static navigation catalogue; matching never waits on the network.
+  const settingsIndex = useMemo(() => buildSettingsSearchIndex(user?.role), [user?.role]);
+  const navigationSearchTexts = useMemo(() => new Map<string, SearchableText>(commands.map((cmd) => [cmd.id, {
+    label: cmd.label.replace(/^Go to /, ''),
+    keywords: cmd.keywords,
+    summary: cmd.description,
+  }])), [commands]);
 
   // Search both actor-scoped Portal workspaces. Project traversal is performed
   // by one bounded backend operation; Ctrl+K must not recursively fan out into
@@ -279,8 +301,9 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
   // Filter commands based on query
   useEffect(() => {
     if (!query.trim()) {
+      filteredQueryRef.current = query;
       setFilteredCommands(commands);
-      setSelectedIndex(0);
+      setSelectedId(null);
       return;
     }
 
@@ -292,25 +315,56 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       return labelMatch || descMatch || keywordMatch;
     });
 
-    setFilteredCommands([...dynamicItems, ...filtered]);
-    setSelectedIndex(0);
-  }, [commands, dynamicItems, query]);
+    // Static destinations rank together and stay ahead of Files/Projects
+    // results, which arrive later. A tab already offered as navigation is not
+    // listed twice; topics inside it still are.
+    const parsed = parseSearchQuery(query);
+    const navigationTargets = new Set(filtered.map((cmd) => cmd.to));
+    const ranked = [
+      ...filtered.map((cmd) => {
+        const text = navigationSearchTexts.get(cmd.id);
+        return { item: cmd, score: (parsed && text && scoreSearchText(text, parsed)) || 0 };
+      }),
+      ...searchSettings(settingsIndex, query)
+        .filter(({ entry }) => !(entry.kind === 'page' && navigationTargets.has(entry.to)))
+        .map(({ entry, score }) => ({
+          score,
+          item: {
+            id: `setting-${entry.id}`,
+            label: entry.label,
+            description: entry.location ? `${entry.location} · ${entry.summary}` : entry.summary,
+            icon: entry.surface === 'admin' ? <Shield size={16} /> : <Settings size={16} />,
+            action: () => navigate(entry.to),
+            category: 'setting' as const,
+            to: entry.to,
+          },
+        })),
+    ].map((result, order) => ({ ...result, order }))
+      .sort((a, b) => b.score - a.score || a.order - b.order)
+      .map(({ item }) => item);
+    setFilteredCommands([...ranked, ...dynamicItems]);
+    // A new query starts at the top; late results for the same query keep the highlight.
+    if (filteredQueryRef.current !== query) {
+      filteredQueryRef.current = query;
+      setSelectedId(null);
+    }
+  }, [commands, dynamicItems, navigate, navigationSearchTexts, query, settingsIndex]);
 
   // Focus input when opened
   useEffect(() => {
     if (!isOpen) return;
     setQuery('');
-    setSelectedIndex(0);
+    setSelectedId(null);
   }, [isOpen]);
 
   // Keyboard navigation
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      if (filteredCommands.length > 0) setSelectedIndex(prev => Math.min(filteredCommands.length - 1, prev + 1));
+      if (filteredCommands.length > 0) setSelectedId(filteredCommands[Math.min(filteredCommands.length - 1, selectedIndex + 1)].id);
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      setSelectedIndex(prev => Math.max(0, prev - 1));
+      if (filteredCommands.length > 0) setSelectedId(filteredCommands[Math.max(0, selectedIndex - 1)].id);
     } else if (e.key === 'Enter') {
       e.preventDefault();
       if (filteredCommands[selectedIndex]) {

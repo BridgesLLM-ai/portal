@@ -16,6 +16,8 @@ import { buildOpenClawCliEnv, extractJsonFromCliOutput, normalizePortalModelId }
 import {
   createAmazonBedrockReadiness,
   getAmazonBedrockReadiness,
+  openClawConfigUsesAmazonBedrock,
+  peekAmazonBedrockReadiness,
   type ProviderReadiness,
 } from './amazonBedrockReadiness';
 
@@ -25,7 +27,7 @@ export const CONFIG_PATH = path.join(OPENCLAW_HOME, 'openclaw.json');
 export const AUTH_PROFILES_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'auth-profiles.json');
 export const MODELS_JSON_PATH = path.join(OPENCLAW_HOME, 'agents', 'main', 'agent', 'models.json');
 export const CODEX_EXTERNAL_CLI_PROFILE_ID = 'openai:codex-cli';
-export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.9.3';
+export const OPENCLAW_CODEX_PLUGIN_VERSION = process.env.PORTAL_OPENCLAW_CODEX_PLUGIN_VERSION || '2026.10.6';
 export const LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION = '2026.7.1-1';
 const LEGACY_OPENCLAW_HOME = path.join(HOME_DIR, '.clawdbot');
 const LEGACY_PLUGIN_INSTALLS_PATH = path.join(OPENCLAW_HOME, 'plugins', 'installs.json');
@@ -2296,13 +2298,24 @@ export async function getProviderStatusesAsync(options: {
   const nativeAuthEntriesPromise = Promise.all(nativeProviders.map(async (provider) => (
     [provider, await getNativeCliAuthStatusAsync(provider)] as const
   )));
-  const bedrockReadinessPromise = getAmazonBedrockReadiness({
-    force: options.forceProviderReadiness,
-  }).catch(() => createAmazonBedrockReadiness(
-    'probe_error',
-    Date.now(),
-    'Portal could not complete the read-only Bedrock readiness check. No configuration was changed; use Check again.',
-  ));
+  // The Bedrock probe loads OpenClaw's plugin registry twice (9 s each at most),
+  // which a busy 2 vCPU host cannot finish. Run it only when OpenClaw is set up
+  // to use Bedrock or a person explicitly re-checks; otherwise the row keeps the
+  // truthful "not checked yet" state (or a still-fresh earlier result).
+  const bedrockReadinessPromise: Promise<ProviderReadiness | null> = (
+    options.forceProviderReadiness || openClawConfigUsesAmazonBedrock(readOpenClawConfig())
+  )
+    ? getAmazonBedrockReadiness({
+        force: options.forceProviderReadiness,
+      }).catch(() => createAmazonBedrockReadiness(
+        'probe_error',
+        Date.now(),
+        'Portal could not complete the read-only Bedrock readiness check. No configuration was changed; use Check again.',
+      ))
+    : Promise.resolve(peekAmazonBedrockReadiness());
+  const bedrockProviderReadiness = (readiness: ProviderReadiness | null) => (
+    readiness ? { 'amazon-bedrock': readiness } : {}
+  );
 
   try {
     const [authStoreProfiles, nativeAuthEntries, bedrockReadiness] = await Promise.all([
@@ -2314,7 +2327,7 @@ export async function getProviderStatusesAsync(options: {
       authStoreProfiles,
       authStoreError: null,
       nativeAuthStatuses: Object.fromEntries(nativeAuthEntries),
-      providerReadiness: { 'amazon-bedrock': bedrockReadiness },
+      providerReadiness: bedrockProviderReadiness(bedrockReadiness),
     });
   } catch (error: any) {
     const [nativeAuthEntries, bedrockReadiness] = await Promise.all([
@@ -2325,7 +2338,7 @@ export async function getProviderStatusesAsync(options: {
       authStoreProfiles: {},
       authStoreError: error?.message || 'OpenClaw xAI auth store is unavailable.',
       nativeAuthStatuses: Object.fromEntries(nativeAuthEntries),
-      providerReadiness: { 'amazon-bedrock': bedrockReadiness },
+      providerReadiness: bedrockProviderReadiness(bedrockReadiness),
     });
   }
 }

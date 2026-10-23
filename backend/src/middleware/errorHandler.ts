@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
+import { ZodError } from 'zod';
 import { logRequestError } from '../utils/errorLogger';
 
 export class AppError extends Error {
@@ -18,6 +19,11 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
+  if (res.headersSent) {
+    _next(err);
+    return;
+  }
+
   // Log all errors to activity (non-blocking)
   const severity = (err instanceof AppError && err.statusCode < 500) ? 'ERROR' : 'CRITICAL' as const;
   logRequestError(err, req, { severity }).catch(() => {});
@@ -30,11 +36,21 @@ export function errorHandler(
     return;
   }
 
-  if (err.constructor?.name === 'ZodError') {
+  if (err instanceof ZodError) {
     res.status(400).json({
       error: 'Validation error',
-      details: (err as any).errors,
+      details: err.issues,
     });
+    return;
+  }
+
+  // Preserve client-facing parser failures without exposing raw input or internals.
+  if (err instanceof URIError || (err instanceof SyntaxError && 'status' in err && err.status === 400)) {
+    res.status(400).json({ error: 'Invalid request' });
+    return;
+  }
+  if ('type' in err && err.type === 'entity.too.large') {
+    res.status(413).json({ error: 'Request body is too large' });
     return;
   }
 

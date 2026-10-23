@@ -13,10 +13,12 @@ import {
   registerProviderRuntimeModels,
   removeInvalidRuntimeOnlyModelProviderConfigs,
 } from '../services/openclawConfigManager';
+import { TESTED_OPENCLAW_CORE_PACKAGE_VERSION } from '../services/openclawSetupReadiness';
 
 describe('openclawConfigManager Claude CLI helpers', () => {
   test('defaults to the exact Portal-tested Codex plugin package revision', () => {
-    expect(OPENCLAW_CODEX_PLUGIN_VERSION).toBe('2026.9.3');
+    // Readiness admits only @openclaw/codex@<exact core>; the default must track it.
+    expect(OPENCLAW_CODEX_PLUGIN_VERSION).toBe(TESTED_OPENCLAW_CORE_PACKAGE_VERSION);
     expect(LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION).toBe('2026.7.1-1');
   });
 
@@ -612,18 +614,75 @@ describe('openclawConfigManager OpenClaw auth store bridge', () => {
     expect(execFileMock.mock.calls.filter(([cmd, args]) => (
       cmd === 'openclaw' && args.join(' ').startsWith('models auth ')
     ))).toHaveLength(1);
+    // Bedrock is not configured here: no plugin-registry probe at all, and the
+    // row keeps the truthful not-checked state.
     expect(execFileMock.mock.calls.filter(([cmd, args]) => (
       cmd === 'openclaw' && args.join(' ') === 'plugins info amazon-bedrock --json'
-    ))).toHaveLength(1);
+    ))).toHaveLength(0);
     expect(execFileMock.mock.calls.filter(([cmd, args]) => (
       cmd === 'openclaw' && args.join(' ') === 'models list --provider amazon-bedrock --json'
-    ))).toHaveLength(1);
+    ))).toHaveLength(0);
     expect(execFileMock.mock.calls.filter(([cmd]) => cmd === 'agy').length).toBeLessThanOrEqual(1);
     for (const statuses of [first, second, third]) {
       expect(statuses.find((status: any) => status.id === 'xai')).toMatchObject({
         status: 'configured',
         profileId: 'xai:portal-oauth-test',
         authType: 'oauth',
+      });
+      expect(statuses.find((status: any) => status.id === 'amazon-bedrock')).toMatchObject({
+        status: 'manual',
+        warning: expect.stringMatching(/Readiness has not been checked yet/),
+      });
+    }
+  });
+
+  test.each([
+    {
+      name: 'probes Bedrock once for concurrent reads when OpenClaw uses a Bedrock model',
+      config: { agents: { defaults: { model: { primary: 'amazon-bedrock/us.test-model' } } } },
+      force: false,
+    },
+    {
+      name: 'probes an unconfigured Bedrock only on an explicit re-check',
+      config: {},
+      force: true,
+    },
+  ])('$name', async ({ config, force }) => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-openclaw-bedrock-gate-'));
+    process.env.OPENCLAW_HOME = tempDir;
+    fs.writeFileSync(path.join(tempDir, 'openclaw.json'), JSON.stringify(config), { mode: 0o600 });
+    const execFileMock = jest.fn((cmd: string, args: string[], _options: any, callback: Function) => {
+      const command = args.join(' ');
+      if (cmd === 'openclaw' && command === 'plugins info amazon-bedrock --json') {
+        setImmediate(() => callback(null, JSON.stringify({
+          plugin: { id: 'amazon-bedrock', enabled: true, status: 'loaded' },
+        }), ''));
+      } else if (cmd === 'openclaw' && command === 'models list --provider amazon-bedrock --json') {
+        setImmediate(() => callback(null, JSON.stringify({
+          count: 1,
+          models: [{ key: 'amazon-bedrock/us.test-model', available: true, missing: false }],
+        }), ''));
+      } else {
+        setImmediate(() => callback(new Error('sign-in required'), '', 'Please sign in'));
+      }
+    });
+    jest.resetModules();
+    jest.doMock('child_process', () => ({
+      execFile: execFileMock,
+      execFileSync: jest.fn(() => ''),
+    }));
+
+    const manager = require('../services/openclawConfigManager');
+    const results = await Promise.all([1, 2, 3].map(() => manager.getProviderStatusesAsync(
+      force ? { forceProviderReadiness: true } : {},
+    )));
+
+    expect(execFileMock.mock.calls.filter(([cmd, args]) => (
+      cmd === 'openclaw' && args.join(' ') === 'plugins info amazon-bedrock --json'
+    ))).toHaveLength(1);
+    for (const statuses of results) {
+      expect(statuses.find((status: any) => status.id === 'amazon-bedrock')).toMatchObject({
+        status: 'configured',
       });
     }
   });

@@ -298,6 +298,18 @@ export default function Layout() {
   const { active: routeOperationActive } = useRouteOperationGuard();
 
   useEffect(() => {
+    // Browser audio must be unlocked by an actual interaction, not the async
+    // question poll. No tone is played merely for unlocking the context.
+    const unlock = () => sounds.unlock?.();
+    window.addEventListener('pointerdown', unlock, { capture: true, passive: true });
+    window.addEventListener('keydown', unlock, { capture: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock, true);
+      window.removeEventListener('keydown', unlock, true);
+    };
+  }, []);
+
+  useEffect(() => {
     initGlobalErrorHandlers();
     return subscribeErrors((errors: StoredError[]) => setErrorCount(errors.length));
   }, []);

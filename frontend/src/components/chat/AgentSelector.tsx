@@ -5,10 +5,11 @@
  * Uses harness avatars from public appearance settings and sub-agent avatars
  * from authenticated operator settings or the authenticated agent catalog.
  */
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { ChevronDown, Check, Users, Radio, Loader2, History, X, Search } from 'lucide-react';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, useId } from 'react';
+import { ChevronDown, ChevronRight, Check, Users, Radio, Loader2, History, X, Search, FolderKanban } from 'lucide-react';
 import client from '../../api/client';
 import { useAuthStore } from '../../contexts/AuthContext';
+import type { User } from '../../types';
 import { getShortModelLabel } from '../../utils/modelId';
 import {
   formatAgentChatProviderCatalogLoadError,
@@ -35,7 +36,7 @@ function DropdownSheet({
   open: boolean;
   onClose: () => void;
   children: React.ReactNode;
-  anchorRef: React.RefObject<HTMLButtonElement>;
+  anchorRef: React.RefObject<HTMLButtonElement | null>;
   width: number;
   align: 'start' | 'end';
   title: string;
@@ -98,6 +99,12 @@ interface OpenClawAgent {
   model?: string;
   workspace?: string;
   avatarUrl?: string;
+  /**
+   * Set by the server on generated Project Chat agents. `projectName` is the
+   * caller's authorized Project name, null when the Project is unavailable,
+   * and absent when this row has not been described (cached rows).
+   */
+  projectAgent?: { projectName?: string | null; ownChat?: boolean };
 }
 
 interface GatewaySession {
@@ -187,6 +194,82 @@ function getAgentLabel(agent: OpenClawAgent, assistantName?: string): string {
   return agent.id.charAt(0).toUpperCase() + agent.id.slice(1);
 }
 
+/** Generated Project Chat agent ids: `p4oc-` plus a one-way hash, never a name. */
+const PROJECT_AGENT_ID_PREFIX = /^p4oc-/i;
+
+function isProjectAgentId(agentId?: string): boolean {
+  return Boolean(agentId && PROJECT_AGENT_ID_PREFIX.test(agentId));
+}
+
+function isProjectAgent(agent: OpenClawAgent): boolean {
+  return Boolean(agent.projectAgent) || isProjectAgentId(agent.id);
+}
+
+function hasProjectDescription(agent?: OpenClawAgent): boolean {
+  return Boolean(agent?.projectAgent && 'projectName' in agent.projectAgent);
+}
+
+/** The agents cache is shared by everyone who signs in on this browser, so Project names stay in memory. */
+function withoutProjectName(agent: OpenClawAgent): OpenClawAgent {
+  return agent.projectAgent ? { ...agent, projectAgent: {} } : agent;
+}
+
+/**
+ * Who a Project name was read for: the actor and its authorization generation
+ * (with the role and sandbox they were granted under). Empty when signed out.
+ */
+function projectNameScopeKey(isAuthenticated: boolean, user: User | null): string {
+  if (!isAuthenticated || !user?.id) return '';
+  return JSON.stringify([user.id, Number(user.authorizationVersion ?? 1), user.role, Boolean(user.sandboxEnabled)]);
+}
+
+/** In-memory agent rows, tagged with the scope their Project names were read under. */
+interface ScopedAgentRows {
+  scope: string;
+  agents: OpenClawAgent[];
+}
+
+function rowsForScope(rows: ScopedAgentRows, scope: string): ScopedAgentRows {
+  return rows.scope === scope ? rows : { scope, agents: rows.agents.map(withoutProjectName) };
+}
+
+interface ProjectAgentEntry {
+  agent: OpenClawAgent;
+  label: string;
+  detail: string;
+  search: string;
+}
+
+/**
+ * Labels come only from the server's authorized Project lookup. Two agents can
+ * share one (two members chatting in one Project, or several unavailable
+ * Projects), so a shared label gets a short, stable suffix.
+ */
+function buildProjectAgentEntries(projectAgents: OpenClawAgent[]): Map<string, ProjectAgentEntry> {
+  const described = projectAgents.map((agent) => {
+    const rawName = agent.projectAgent?.projectName;
+    const projectName = typeof rawName === 'string' ? rawName.trim() : '';
+    const baseLabel = projectName || (hasProjectDescription(agent) ? 'Unavailable Project' : 'Project agent');
+    return { agent, projectName, baseLabel, ownChat: Boolean(projectName && agent.projectAgent?.ownChat) };
+  });
+  const labelCounts = new Map<string, number>();
+  for (const { baseLabel } of described) {
+    const key = baseLabel.toLocaleLowerCase();
+    labelCounts.set(key, (labelCounts.get(key) || 0) + 1);
+  }
+  return new Map(described.map(({ agent, projectName, baseLabel, ownChat }) => {
+    const shared = (labelCounts.get(baseLabel.toLocaleLowerCase()) || 0) > 1;
+    const label = shared
+      ? `${baseLabel} · ${ownChat ? 'yours' : agent.id.replace(PROJECT_AGENT_ID_PREFIX, '').slice(0, 6)}`
+      : baseLabel;
+    const detail = projectName
+      ? (ownChat ? 'Your Project Chat' : 'Another member’s Project Chat')
+      : hasProjectDescription(agent) ? 'Project removed or outside your workspace' : 'Project Chat agent';
+    const search = `${label} ${projectName} ${detail} Project agents ${agent.id}`.toLowerCase();
+    return [agent.id, { agent, label, detail, search }];
+  }));
+}
+
 function formatTime(dateStr?: string): string {
   if (!dateStr) return '';
   try {
@@ -224,6 +307,7 @@ function getHarnessStatusLabel(harness: HarnessInfo): string {
   if (harness.availabilityState === 'stale') {
     return harness.checking ? 'Rechecking' : 'Stale';
   }
+  if (harness.checkTimedOut === true) return 'Still checking';
   if (harness.availabilityState === 'error') return 'Unavailable';
   if (harness.selectable === false) return 'Unavailable';
   if (!harness.implemented) return 'Not implemented';
@@ -246,7 +330,11 @@ function getSessionKey(s: GatewaySession): string {
   return s.key || s.sessionId || s.id || '';
 }
 
-function getSessionLabel(s: GatewaySession, rawActivityTitle?: unknown): string {
+function getSessionLabel(
+  s: GatewaySession,
+  rawActivityTitle?: unknown,
+  projectAgentLabel?: { id: string; label: string },
+): string {
   const activityTitle = sanitizeThinkingSubject(rawActivityTitle);
   if (activityTitle) return activityTitle;
 
@@ -268,19 +356,21 @@ function getSessionLabel(s: GatewaySession, rawActivityTitle?: unknown): string 
   const parts = key.split(':');
   const agentName = parts[1] || 'main';
   const sessionName = parts[parts.length - 1] || 'main';
+  // A generated Project agent id is a hash, so its sessions use the agent's label.
+  const agentLabel = projectAgentLabel?.id === agentName ? projectAgentLabel.label : agentName;
 
   if (sessionName === 'main') {
-    return agentName === 'main' ? 'Main session' : `${agentName} / main session`;
+    return agentName === 'main' ? 'Main session' : `${agentLabel} / main session`;
   }
 
   const newSessionLabel = formatNewSessionSlug(sessionName);
   if (newSessionLabel) {
-    return agentName === 'main' ? newSessionLabel : `${agentName} / ${newSessionLabel}`;
+    return agentName === 'main' ? newSessionLabel : `${agentLabel} / ${newSessionLabel}`;
   }
 
   return agentName === 'main'
     ? `Session ${sessionName.slice(0, 8)}`
-    : `${agentName} / ${sessionName.slice(0, 8)}`;
+    : `${agentLabel} / ${sessionName.slice(0, 8)}`;
 }
 
 /** Small circular avatar — image or fallback initials/emoji */
@@ -327,6 +417,7 @@ function SessionDropdown({
   currentSessionActive,
   activityTitles = {},
   disabled = false,
+  projectAgentLabel,
 }: {
   sessions: GatewaySession[];
   loading?: boolean;
@@ -342,6 +433,7 @@ function SessionDropdown({
   currentSessionActive?: boolean;
   activityTitles?: Readonly<Record<string, string>>;
   disabled?: boolean;
+  projectAgentLabel?: { id: string; label: string };
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [query, setQuery] = useState('');
@@ -349,6 +441,10 @@ function SessionDropdown({
   const [visibleCount, setVisibleCount] = useState(20);
 
   useEffect(() => { setVisibleCount(20); }, [query, runningOnly]);
+
+  const labelFor = (session: GatewaySession, activityTitle?: unknown) => (
+    getSessionLabel(session, activityTitle, projectAgentLabel)
+  );
 
   const sessionHasActiveRun = (session: GatewaySession): boolean => {
     const key = getSessionKey(session);
@@ -364,7 +460,7 @@ function SessionDropdown({
     .filter((session) => {
       const key = getSessionKey(session);
       return key && (!search || [
-        getSessionLabel(session, activityTitles[key]), session.title,
+        labelFor(session, activityTitles[key]), session.title,
         session.preview, key, session.channel,
       ].some((value) => typeof value === 'string' && value.toLocaleLowerCase().includes(search)));
     });
@@ -378,14 +474,14 @@ function SessionDropdown({
     ? activityTitles[currentSessionKey]
     : undefined;
   const fallbackCurrentLabel = currentSessionKey
-    ? getSessionLabel({ key: currentSessionKey }, currentActivityTitle)
+    ? labelFor({ key: currentSessionKey }, currentActivityTitle)
     : '';
   const headerLabel = currentActivityTitle
-    ? getSessionLabel(matchedCurrentSession || { key: currentSessionKey }, currentActivityTitle)
+    ? labelFor(matchedCurrentSession || { key: currentSessionKey }, currentActivityTitle)
     : typeof currentSessionLabel === 'string' && currentSessionLabel.trim()
       ? currentSessionLabel.trim()
       : matchedCurrentSession
-        ? getSessionLabel(matchedCurrentSession)
+        ? labelFor(matchedCurrentSession)
       : (fallbackCurrentLabel || (hasLoaded ? 'History' : 'Chat history'));
 
   return (
@@ -495,7 +591,7 @@ function SessionDropdown({
 
           {visibleSessions.map((session) => {
             const key = getSessionKey(session);
-            const label = getSessionLabel(session, activityTitles[key]);
+            const label = labelFor(session, activityTitles[key]);
             const running = sessionHasActiveRun(session);
             const selected = key === currentSessionKey;
             return (
@@ -558,12 +654,43 @@ export default function AgentSelector({
   openConversationsRequest = 0,
 }: AgentSelectorProps) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+  const projectNameScope = useAuthStore((state) => projectNameScopeKey(state.isAuthenticated, state.user));
   const [providers, setProviders] = useState<HarnessInfo[]>([]);
-  const [agents, setAgents] = useState<OpenClawAgent[]>([]);
+  const [agentRows, setAgentRows] = useState<ScopedAgentRows>({ scope: '', agents: [] });
+  // A sign-in or authorization change can keep this selector mounted. Names
+  // read for anyone else render as unnamed rows from that very render on.
+  const agents = useMemo(() => (
+    projectNameScope && agentRows.scope === projectNameScope
+      ? agentRows.agents
+      : agentRows.agents.map(withoutProjectName)
+  ), [agentRows, projectNameScope]);
   const [sessions, setSessions] = useState<GatewaySession[]>([]);
   const [open, setOpen] = useState(false);
   const [agentQuery, setAgentQuery] = useState('');
-  useEffect(() => { if (!open) setAgentQuery(''); }, [open]);
+  // Project agents start collapsed every time the picker opens.
+  const [projectAgentsExpanded, setProjectAgentsExpanded] = useState(false);
+  const projectAgentsGroupId = useId();
+  const agentListRef = useRef<HTMLDivElement>(null);
+  const projectToggleRef = useRef<HTMLButtonElement>(null);
+  const projectGroupRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (open) return;
+    setAgentQuery('');
+    setProjectAgentsExpanded(false);
+  }, [open]);
+  // The group sits at the end of the list, so opening it would add rows below
+  // the fold. Scroll just far enough to show them, never past the group header.
+  // scrollTop is set directly: scrollIntoView can also scroll the Portal shell.
+  useLayoutEffect(() => {
+    const list = agentListRef.current;
+    const toggle = projectToggleRef.current;
+    const group = projectGroupRef.current;
+    if (!projectAgentsExpanded || !list || !toggle || !group) return;
+    const listBox = list.getBoundingClientRect();
+    const hiddenBelow = group.getBoundingClientRect().bottom - listBox.bottom;
+    const headerOffset = toggle.getBoundingClientRect().top - listBox.top;
+    if (hiddenBelow > 0 && headerOffset > 0) list.scrollTop += Math.min(hiddenBelow, headerOffset);
+  }, [projectAgentsExpanded]);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
@@ -639,10 +766,26 @@ export default function AgentSelector({
     };
   }, [disabled, open, onViewSession, providerRefreshNonce, value]);
 
+  // A selected Project agent names the closed trigger, so it cannot wait for the picker to open.
+  const selectedOpenClawAgentId = value === 'OPENCLAW' ? normalizeOpenClawAgentId(agentId) : undefined;
+  const fetchSelectedProjectName = !open && isProjectAgentId(selectedOpenClawAgentId)
+    && !hasProjectDescription(agents.find((agent) => agent.id === selectedOpenClawAgentId));
+
   // Fetch OpenClaw sub-agents lazily when the selector opens. Cache still seeds the
   // UI immediately, but we do not spend first-load bandwidth on hidden dropdown data.
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    // Every lookup and retry belongs to the scope that started it. A scope
+    // change re-runs this effect, which cancels them; a signed-in scope that
+    // needs names then asks again.
+    const requestScope = projectNameScope;
+    const stop = () => {
+      cancelled = true;
+      clearTimeout(retryTimer);
+      controller.abort();
+    };
 
     function loadCachedAgents(): OpenClawAgent[] | null {
       try {
@@ -656,39 +799,45 @@ export default function AgentSelector({
 
     function saveCachedAgents(list: OpenClawAgent[]) {
       try {
-        localStorage.setItem(AGENTS_CACHE_KEY, JSON.stringify(list));
+        localStorage.setItem(AGENTS_CACHE_KEY, JSON.stringify(list.map(withoutProjectName)));
       } catch {}
     }
 
     async function fetchAgents(attempt = 1): Promise<void> {
       if (attempt === 1) setAgentsLoading(true);
       try {
-        const { data } = await client.get('/gateway/agents');
+        const { data } = await client.get('/gateway/agents', { signal: controller.signal });
         if (!cancelled && data.agents) {
-          setAgents(data.agents);
+          setAgentRows({ scope: requestScope, agents: data.agents });
           saveCachedAgents(data.agents);
         }
         if (!cancelled) setAgentsLoading(false);
       } catch {
         if (!cancelled) {
           if (attempt < 2) {
-            setTimeout(() => { if (!cancelled) fetchAgents(attempt + 1); }, 1500);
+            retryTimer = setTimeout(() => { if (!cancelled) fetchAgents(attempt + 1); }, 1500);
             return;
           }
           const cached = loadCachedAgents();
-          setAgents(cached || [{ id: 'main', identity: '🤖' }]);
+          // Names read earlier for this same scope are kept; the cache never holds them.
+          setAgentRows((current) => (current.agents.length > 0
+            ? rowsForScope(current, requestScope)
+            : { scope: requestScope, agents: cached || [{ id: 'main', identity: '🤖' }] }));
           setAgentsLoading(false);
         }
       }
     }
 
     const cached = loadCachedAgents();
-    if (cached) setAgents(cached);
-    if (!open || disabled) return () => { cancelled = true; };
+    // Names read for an earlier scope leave memory here, not just the screen.
+    setAgentRows((current) => (current.agents.length === 0 && cached
+      ? { scope: requestScope, agents: cached }
+      : rowsForScope(current, requestScope)));
+    if ((!open && !fetchSelectedProjectName) || disabled || !requestScope) return stop;
 
     void fetchAgents();
-    return () => { cancelled = true; };
-  }, [disabled, open]);
+    return stop;
+  }, [disabled, open, fetchSelectedProjectName, projectNameScope]);
 
   // Fetch session lists only when the session picker is opened.
   // The chat header stays usable without this metadata, so we avoid paying
@@ -803,15 +952,22 @@ export default function AgentSelector({
   let displayBg: string;
   let displayTextClass: string;
 
-  const effectiveAgentId = value === 'OPENCLAW' ? normalizeOpenClawAgentId(agentId) : undefined;
+  const effectiveAgentId = selectedOpenClawAgentId;
   const openClawAgents = agents.filter((agent) => agent.id !== 'main');
+  const regularOpenClawAgents = openClawAgents.filter((agent) => !isProjectAgent(agent));
+  const projectAgentEntries = buildProjectAgentEntries(openClawAgents.filter(isProjectAgent));
   const hasOpenClawProvider = providers.some((harness) => (
     harness.harnessId === 'OPENCLAW' || harness.name === 'OPENCLAW'
   ));
 
   if (value === 'OPENCLAW' && effectiveAgentId) {
     const matchedAgent = agents.find(a => a.id === effectiveAgentId);
-    displayLabel = matchedAgent ? getAgentLabel(matchedAgent, assistantName) : (effectiveAgentId.charAt(0).toUpperCase() + effectiveAgentId.slice(1));
+    const projectEntry = projectAgentEntries.get(effectiveAgentId);
+    displayLabel = projectEntry
+      ? projectEntry.label
+      : isProjectAgentId(effectiveAgentId)
+        ? 'Project agent'
+        : matchedAgent ? getAgentLabel(matchedAgent, assistantName) : (effectiveAgentId.charAt(0).toUpperCase() + effectiveAgentId.slice(1));
     displayAvatarUrl = matchedAgent ? getSubAgentAvatarUrl(matchedAgent) : subAgentAvatars[effectiveAgentId];
     displayFallback = matchedAgent ? getAgentEmoji(matchedAgent) : (AGENT_IDENTITY_FALLBACK[effectiveAgentId] || '🤖');
     displayBg = currentMeta.avatarBg;
@@ -925,26 +1081,44 @@ export default function AgentSelector({
     && openClawProvider.implemented !== false && (value === 'OPENCLAW' || (!providerLoadError
       && openClawProvider.usable === true && !openClawProvider.checking && !openClawProvider.stale
       && !['checking', 'stale', 'error'].includes(openClawProvider.availabilityState || ''))));
+  const renderOpenClawAgent = (agent: OpenClawAgent, label: string, detail: string, title?: string) => (
+    <button key={agent.id} type="button" disabled={disabled || !canSelectOpenClawAgent} title={title}
+      onClick={() => handleSelect('OPENCLAW', agent.id)}
+      className={`flex w-full items-center gap-2.5 px-4 py-2.5 text-sm transition-colors disabled:opacity-50 ${value === 'OPENCLAW' && effectiveAgentId === agent.id ? 'accent-active' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
+      <AvatarCircle src={getSubAgentAvatarUrl(agent)} fallback={getAgentEmoji(agent)} size="sm" bgClass="bg-white/[0.06]" textClass="text-slate-300" />
+      <span className="min-w-0 flex-1 text-left"><span className="block truncate font-medium">{label}</span>
+        <span className="block truncate text-[10px] text-slate-500">{detail}</span></span>
+      {value === 'OPENCLAW' && effectiveAgentId === agent.id && <Check size={13} className="accent-text shrink-0" />}
+    </button>
+  );
+  const agentSearch = agentQuery.trim().toLowerCase();
   const directory = [
     ...providers.map((entry) => {
       const harness = entry.harnessId || entry.name;
       const label = harness === 'OPENCLAW' ? assistantName || 'OpenClaw' : HARNESS_META[harness]?.label || entry.displayName;
       return { key: harness, label, search: `${label} ${harness} ${entry.displayName}`, render: () => renderProvider(entry) };
     }),
-    ...(hasOpenClawProvider ? openClawAgents.map((agent) => ({
+    ...(hasOpenClawProvider ? regularOpenClawAgents.map((agent) => ({
       key: `OPENCLAW:${agent.id}`, label: getAgentLabel(agent, assistantName),
       search: `${getAgentLabel(agent, assistantName)} ${agent.id} OpenClaw ${agent.model || ''}`,
-      render: () => <button key={agent.id} type="button" disabled={disabled || !canSelectOpenClawAgent}
-        onClick={() => handleSelect('OPENCLAW', agent.id)}
-        className={`flex w-full items-center gap-2.5 px-4 py-2.5 text-sm transition-colors disabled:opacity-50 ${value === 'OPENCLAW' && effectiveAgentId === agent.id ? 'accent-active' : 'text-slate-300 hover:bg-white/[0.04]'}`}>
-        <AvatarCircle src={getSubAgentAvatarUrl(agent)} fallback={getAgentEmoji(agent)} size="sm" bgClass="bg-white/[0.06]" textClass="text-slate-300" />
-        <span className="min-w-0 flex-1 text-left"><span className="block truncate font-medium">{getAgentLabel(agent, assistantName)}</span>
-          <span className="block truncate text-[10px] text-slate-500">OpenClaw · Configured agent{agent.model ? ` · ${getShortModelLabel(agent.model)}` : ''}</span></span>
-        {value === 'OPENCLAW' && effectiveAgentId === agent.id && <Check size={13} className="accent-text shrink-0" />}
-      </button>,
+      render: () => renderOpenClawAgent(
+        agent,
+        getAgentLabel(agent, assistantName),
+        `OpenClaw · Configured agent${agent.model ? ` · ${getShortModelLabel(agent.model)}` : ''}`,
+      ),
     })) : []),
-  ].filter((entry) => entry.search.toLowerCase().includes(agentQuery.trim().toLowerCase()))
+  ].filter((entry) => entry.search.toLowerCase().includes(agentSearch))
     .sort((a, b) => a.label.localeCompare(b.label));
+  // Generated Project agents sit in one group that stays collapsed until asked
+  // for; a search lists its matches directly.
+  const projectAgentRows = hasOpenClawProvider
+    ? [...projectAgentEntries.values()]
+      .filter((entry) => entry.search.includes(agentSearch))
+      .sort((a, b) => a.label.localeCompare(b.label) || a.agent.id.localeCompare(b.agent.id))
+    : [];
+  const projectAgentCount = hasOpenClawProvider ? projectAgentEntries.size : 0;
+  const selectedProjectAgentHidden = Boolean(effectiveAgentId && projectAgentEntries.has(effectiveAgentId))
+    && !projectAgentsExpanded;
 
   return (
     <div className="flex items-center gap-1.5">
@@ -994,7 +1168,7 @@ export default function AgentSelector({
               <Search size={14} /><input type="search" aria-label="Find an agent" placeholder="Search agents or harnesses…" value={agentQuery} onChange={(event) => setAgentQuery(event.target.value)} className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none" />
             </label>
           </div>
-          <div className="min-h-0 max-h-[420px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
+          <div ref={agentListRef} className="min-h-0 max-h-[420px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
             {/* ── HARNESSES Section ────────────────────────────────── */}
             <div className="px-3 pt-3 pb-1">
               <div className="flex items-center gap-1.5 text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
@@ -1038,7 +1212,42 @@ export default function AgentSelector({
             )}
 
             {directory.map((entry) => <div key={entry.key}>{entry.render()}</div>)}
-            {!loading && !providerLoadError && providers.length > 0 && directory.length === 0 && <p className="px-4 py-6 text-xs text-slate-400">No agents match this search.</p>}
+            {agentSearch ? (
+              projectAgentRows.length > 0 && (
+                <div role="group" aria-labelledby={`${projectAgentsGroupId}-heading`} className="mt-1 border-t border-white/[0.06]">
+                  <div id={`${projectAgentsGroupId}-heading`} className="flex items-center gap-1.5 px-4 pb-1 pt-2.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                    <FolderKanban size={10} aria-hidden="true" />
+                    Project agents
+                  </div>
+                  {projectAgentRows.map((entry) => renderOpenClawAgent(entry.agent, entry.label, entry.detail, entry.label))}
+                </div>
+              )
+            ) : projectAgentCount > 0 && (
+              <div className="mt-1 border-t border-white/[0.06]">
+                <button
+                  ref={projectToggleRef}
+                  type="button"
+                  aria-expanded={projectAgentsExpanded}
+                  aria-controls={projectAgentsExpanded ? projectAgentsGroupId : undefined}
+                  onClick={() => setProjectAgentsExpanded((expanded) => !expanded)}
+                  className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-xs font-medium text-slate-300 transition-colors hover:bg-white/[0.04] hover:text-white"
+                >
+                  <ChevronRight size={13} aria-hidden="true" className={`shrink-0 text-slate-500 transition-transform duration-200 ${projectAgentsExpanded ? 'rotate-90' : ''}`} />
+                  <FolderKanban size={13} aria-hidden="true" className="shrink-0 text-slate-400" />
+                  <span className="min-w-0 flex-1 truncate">Project agents</span>
+                  {selectedProjectAgentHidden && (
+                    <span className="rounded-full border border-sky-400/30 px-1.5 py-0.5 text-[10px] text-sky-200">Current</span>
+                  )}
+                  <span className="rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[10px] tabular-nums text-slate-400">{projectAgentCount}</span>
+                </button>
+                {projectAgentsExpanded && (
+                  <div ref={projectGroupRef} id={projectAgentsGroupId} role="group" aria-label="Project agents">
+                    {projectAgentRows.map((entry) => renderOpenClawAgent(entry.agent, entry.label, entry.detail, entry.label))}
+                  </div>
+                )}
+              </div>
+            )}
+            {!loading && !providerLoadError && providers.length > 0 && directory.length === 0 && projectAgentRows.length === 0 && <p className="px-4 py-6 text-xs text-slate-400">No agents match this search.</p>}
 
 
             <div className="h-1.5" />
@@ -1059,6 +1268,7 @@ export default function AgentSelector({
           onOpenChange={setSessionsOpen}
           onViewSession={handleSessionClick}
           providerLabel={displayLabel}
+          projectAgentLabel={effectiveAgentId && isProjectAgentId(effectiveAgentId) ? { id: effectiveAgentId, label: displayLabel } : undefined}
           currentSessionKey={currentSessionKey}
           currentSessionLabel={currentSessionLabel}
           currentSessionActive={currentSessionActive}

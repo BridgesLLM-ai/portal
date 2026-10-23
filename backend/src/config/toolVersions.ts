@@ -1,13 +1,13 @@
 export const PORTAL_TOOL_VERSIONS = Object.freeze({
-  openClaw: '2026.9.3',
-  codexCli: '0.153.4',
-  claudeCode: '2.1.263',
+  openClaw: '2026.10.6',
+  codexCli: '0.163.0',
+  claudeCode: '2.1.309',
   clawhub: '0.23.3',
-  antigravity: '1.1.27',
-  grokBuild: '1.0.13',
-  ollama: '0.33.3',
-  hermes: '0.21.1',
-  openCode: '1.18.29',
+  antigravity: '1.4.3',
+  grokBuild: '1.0.62',
+  ollama: '0.40.6',
+  hermes: '0.22.2',
+  openCode: '1.19.4',
 });
 
 export const ANTIGRAVITY_NO_UPDATE_ENV = 'AGY_CLI_DISABLE_AUTO_UPDATE=true';

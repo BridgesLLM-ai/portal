@@ -5,7 +5,7 @@ import AnchoredPopover from '../AnchoredPopover';
 interface SlashCommandMenuProps {
   id: string;
   open: boolean;
-  anchorRef: RefObject<HTMLElement>;
+  anchorRef: RefObject<HTMLElement | null>;
   commands: SlashCommand[];
   selectedIndex: number;
   onNavigate: (index: number) => void;

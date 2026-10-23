@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import archiver from 'archiver';
+import { ZipArchive, type Archiver } from 'archiver';
 import {
   PROJECT_ZIP_LIMITS,
   UnsafeZipError,
@@ -23,12 +23,12 @@ describe('safe ZIP extraction', () => {
 
   async function createZip(
     fileName: string,
-    build: (archive: archiver.Archiver) => void,
+    build: (archive: Archiver) => void,
     options: { store?: boolean } = {},
   ): Promise<string> {
     const zipPath = path.join(tempRoot, fileName);
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip', { zlib: { level: 9 }, store: options.store });
+    const archive = new ZipArchive({ zlib: { level: 9 }, store: options.store });
     const finished = new Promise<void>((resolve, reject) => {
       output.once('close', resolve);
       output.once('error', reject);

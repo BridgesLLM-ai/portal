@@ -13,7 +13,7 @@ export interface GestureConfig {
 }
 
 export function useGestures(
-  ref: RefObject<HTMLElement>,
+  ref: RefObject<HTMLElement | null>,
   config: GestureConfig,
   enabled = true
 ) {

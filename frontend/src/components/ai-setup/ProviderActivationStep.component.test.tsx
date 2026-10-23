@@ -97,6 +97,33 @@ describe('ProviderActivationStep', () => {
     mocks.post.mockReset();
   });
 
+  it('shows ready current suggestions first without selecting them or changing an existing default', async () => {
+    const saved = 'anthropic/claude-opus-5';
+    mockServer({ initialStatus: statusPayload({ defaultModel: saved }), models: {
+      source: 'native', models: [
+        { id: saved, name: 'Saved model', readiness: 'ready', registered: true },
+        { id: 'anthropic/claude-sonnet-5-5', name: 'Claude Sonnet 5.5', readiness: 'ready', registered: false },
+        { id: 'anthropic/claude-opus-5-5', name: 'Claude Opus 5.5', readiness: 'unavailable', registered: false },
+      ], suggestions: [
+        { id: 'anthropic/claude-sonnet-5-5', reason: 'Balanced Claude work' },
+        { id: 'anthropic/claude-opus-5-5', reason: 'Must not recommend unavailable' },
+      ],
+    } });
+    render(<ProviderActivationStep provider={anthropic} apiBase="/ai-setup" mode="post-login" onClose={vi.fn()} />);
+    const suggested = await screen.findByRole('radio', { name: /Claude Sonnet 5.5/i });
+    expect(screen.getAllByRole('radio')[0]).toBe(suggested);
+    expect(within(suggested).getByText('Suggested')).toBeInTheDocument();
+    expect(within(suggested).getByText('Balanced Claude work')).toBeInTheDocument();
+    expect(suggested).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByRole('radio', { name: /Saved model/i })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('radio', { name: /Claude Opus 5.5/i })).toBeDisabled();
+    expect(screen.queryByText('Must not recommend unavailable')).not.toBeInTheDocument();
+    expect(mocks.post).not.toHaveBeenCalled();
+    fireEvent.click(suggested);
+    expect(suggested).toHaveAttribute('aria-checked', 'true');
+    expect(mocks.post).not.toHaveBeenCalled();
+  });
+
   it('verifies the login, registers the chosen ready model, sets it as default, and only reports success after the server readback agrees', async () => {
     mockServer({
       readbackStatus: statusPayload({ defaultModel: 'anthropic/claude-opus-5', anthropicStatus: 'configured' }),

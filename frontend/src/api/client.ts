@@ -311,7 +311,13 @@ client.interceptors.response.use(
     // Network error retry for non-auth requests
     // ─────────────────────────────────────────────────────────────────────────
     
-    if (isTransientNetworkError(error) && !originalRequest._retry && !originalRequest._skipNetworkRetry) {
+    // A lost response does not prove a mutation failed. In particular,
+    // ensure-session and install-deps can commit before transport disconnects.
+    // Their callers must reconcile operation state, never replay implicitly.
+    const networkRetrySafe = ['get', 'head', 'options'].includes(
+      String(originalRequest?.method || 'get').toLowerCase(),
+    );
+    if (networkRetrySafe && isTransientNetworkError(error) && !originalRequest._retry && !originalRequest._skipNetworkRetry) {
       const retryCount = originalRequest._retryCount || 0;
       if (retryCount < 2) {
         originalRequest._retryCount = retryCount + 1;

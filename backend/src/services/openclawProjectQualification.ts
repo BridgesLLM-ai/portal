@@ -42,7 +42,7 @@ import {
 import {
   attestOnlyCodexProjectIdentityRuntime,
   attestCodexProjectRuntimeContainer,
-  buildCodexProjectDockerExecArgs,
+  buildCodexProjectDockerExecCommand,
   buildCodexProjectRuntimePlan,
   type CodexProjectEgressRuntimeHandle,
 } from '../agents/providers/native/projectSandbox/CodexProjectEgressRuntime';
@@ -2134,7 +2134,7 @@ async function runDefaultCodexModelProbe(input: {
     '--sandbox', 'read-only',
     '--cd', '/tmp',
   ];
-  const invocationArgs = buildCodexProjectDockerExecArgs({
+  const invocation = buildCodexProjectDockerExecCommand({
     runtime: input.runtime,
     command: '/usr/bin/timeout',
     args: [
@@ -2157,7 +2157,9 @@ async function runDefaultCodexModelProbe(input: {
   let sawTool = false;
   let result;
   try {
-    result = await input.executor.run('docker', invocationArgs);
+    result = await input.executor.run('docker', invocation.args, {
+      secretEnvironment: invocation.secretEnvironment,
+    });
   } catch {
     fail('MODEL_PROBE_RUNTIME', 'Codex qualification model roundtrip failed');
   }

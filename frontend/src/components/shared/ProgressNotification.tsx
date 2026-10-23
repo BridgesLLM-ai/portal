@@ -8,6 +8,7 @@ export interface ProgressNotificationProps {
   id: string;
   title: string; // "Installing Dependencies" / "Deploying Project" / "Building..."
   status: 'pending' | 'active' | 'complete' | 'error';
+  indeterminate?: boolean;
   progress: number; // 0-100
   statusText: string; // Current step: "pip install pygame..."
   logs?: string[]; // Live log lines
@@ -21,6 +22,7 @@ function ProgressNotificationCard({
   title,
   status,
   progress,
+  indeterminate = false,
   statusText,
   logs = [],
   error,
@@ -148,7 +150,7 @@ function ProgressNotificationCard({
               ) : isPending ? (
                 <span className="text-sm font-medium text-slate-400">...</span>
               ) : (
-                <span className="text-lg font-bold tabular-nums">{pct}%</span>
+                <span className="text-lg font-bold tabular-nums">{indeterminate ? '…' : `${pct}%`}</span>
               )}
             </div>
           </div>
@@ -182,7 +184,7 @@ function ProgressNotificationCard({
                   isComplete ? 'bg-emerald-500' : 
                   'bg-gradient-to-r from-emerald-500 to-blue-500'
                 }`}
-                animate={{ width: `${pct}%` }}
+                animate={{ width: indeterminate ? '100%' : `${pct}%` }}
                 transition={{ duration: 0.3, ease: 'easeOut' }}
               />
             </div>

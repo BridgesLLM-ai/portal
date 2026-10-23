@@ -1248,9 +1248,32 @@ def validate_v3_environment(payload: bytes) -> dict[str, str]:
     return values
 
 
+PROJECT_EGRESS_ROOT_NAMES = ("PROJECT_EGRESS_TOKEN_SECRET", "PROJECT_EGRESS_TOKEN_GENERATION")
+
+
+def project_egress_generation(values: dict[str, str]) -> int:
+    raw = values.get("PROJECT_EGRESS_TOKEN_GENERATION", "")
+    return int(raw) if re.fullmatch(r"[1-9][0-9]{0,3}", raw) else 0
+
+
 def merge_v3_environment(archived_payload: bytes, current_payload: bytes) -> bytes:
     archived_values = validate_v3_environment(archived_payload)
     current_values = parse_environment(current_payload)
+    # The installed Project egress credential root wins when it is a newer
+    # generation: an archive from before a rotation must not bring back a
+    # root whose derived tokens were exposed.
+    carried_names = (
+        set(PROJECT_EGRESS_ROOT_NAMES)
+        if project_egress_generation(current_values) >= 2
+        and project_egress_generation(current_values) > project_egress_generation(archived_values)
+        and current_values.get("PROJECT_EGRESS_TOKEN_SECRET")
+        else set()
+    )
+    current_carried_lines = [
+        (name, raw)
+        for name, raw in environment_assignment_lines(current_payload)
+        if name in carried_names
+    ]
     current_openclaw_lines = [
         (name, raw)
         for name, raw in environment_assignment_lines(current_payload)
@@ -1258,8 +1281,9 @@ def merge_v3_environment(archived_payload: bytes, current_payload: bytes) -> byt
     ]
     current_openclaw_names = {name for name, _ in current_openclaw_lines}
     merged_lines = [
-        raw for _, raw in environment_assignment_lines(archived_payload)
-    ] + [raw for _, raw in current_openclaw_lines]
+        raw for name, raw in environment_assignment_lines(archived_payload)
+        if name not in carried_names
+    ] + [raw for _, raw in current_carried_lines] + [raw for _, raw in current_openclaw_lines]
     merged = ("\n".join(merged_lines) + "\n").encode("utf-8")
     if len(merged) > MAX_MANIFEST_BYTES:
         fail("merged Portal environment is oversized")
@@ -1267,9 +1291,10 @@ def merge_v3_environment(archived_payload: bytes, current_payload: bytes) -> byt
     if any(
         verified_values.get(name) != value
         for name, value in archived_values.items()
+        if name not in carried_names
     ) or any(
         verified_values.get(name) != current_values[name]
-        for name in current_openclaw_names
+        for name in current_openclaw_names | {name for name, _ in current_carried_lines}
     ):
         fail("merged Portal environment changed recovery authority")
     return merged

@@ -1,4 +1,5 @@
 import multer from 'multer';
+import type { RequestHandler } from 'express';
 import path from 'path';
 import fs from 'fs';
 import sharp from 'sharp';
@@ -130,7 +131,7 @@ export type CropParams = {
   previewSize: number;
 };
 
-export function createImageUpload(fieldName = 'image') {
+export function createImageUpload(fieldName = 'image'): RequestHandler {
   return multer({
     storage: multer.diskStorage({
       destination: (_req: any, _file: any, cb: any) => {

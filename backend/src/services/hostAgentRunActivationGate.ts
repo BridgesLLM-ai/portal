@@ -3,14 +3,31 @@ import fs from 'fs';
 import net from 'net';
 import path from 'path';
 import { ensureRuntimeDirectory } from '../utils/runtimeDirectory';
+import { IMAGE_RASTER_LIMITS } from './chatImages/imageRasterContract';
+import { NATIVE_HOST_PROMPT_MAX_BYTES } from '../agents/providers/native/types';
 
 export const HOST_AGENT_RUN_RUNTIME_ROOT = '/run/bridgesllm/host-agent-runs';
 
 const ACTIVATION_HANDSHAKE_TIMEOUT_MS = 30_000;
 const UNIX_SOCKET_PATH_MAX_BYTES = 100;
 const TARGET_ENVIRONMENT_MAX_BYTES = 256 * 1024;
-export const HOST_AGENT_RUN_STDIN_MAX_BYTES = 256 * 1024;
-const TARGET_PAYLOAD_MAX_ENCODED_BYTES = 1024 * 1024;
+const base64Bytes = (bytes: number): number => 4 * Math.ceil(bytes / 3);
+/** Most photos one Agent Chat turn may carry (parseChatImageReferences). */
+const HOST_AGENT_RUN_STDIN_PHOTO_MAX = 4;
+/**
+ * Host stdin is either the prompt text (<= NATIVE_HOST_PROMPT_MAX_BYTES) or
+ * one structured message (Claude `--input-format stream-json`): the prompt
+ * JSON-escaped (at most 6 bytes per input byte), up to four prepared photos as
+ * base64 JPEG (each <= IMAGE_RASTER_LIMITS.outputBytes) and a small envelope.
+ * Nothing larger is admitted; this is the bound four photos need, not more.
+ */
+export const HOST_AGENT_RUN_STDIN_MAX_BYTES = NATIVE_HOST_PROMPT_MAX_BYTES * 6
+  + HOST_AGENT_RUN_STDIN_PHOTO_MAX * base64Bytes(IMAGE_RASTER_LIMITS.outputBytes)
+  + 4 * 1024;
+/** base64(JSON{environment, stdinBase64}) for the bounds above. */
+const TARGET_PAYLOAD_MAX_ENCODED_BYTES = base64Bytes(
+  TARGET_ENVIRONMENT_MAX_BYTES + base64Bytes(HOST_AGENT_RUN_STDIN_MAX_BYTES) + 1024,
+);
 const SCOPE_UNIT_PATTERN = /^bridgesllm-host-agent-([0-9a-f]{32})\.scope$/;
 const SCOPE_TAG_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -52,7 +69,7 @@ socket.on('data', (chunk) => {
       const header = inbound.subarray(0, newline).toString('ascii');
       if (!/^T[1-9][0-9]{0,7}$/.test(header)) return failClosed();
       expectedTargetBytes = Number(header.slice(1));
-      if (!Number.isSafeInteger(expectedTargetBytes) || expectedTargetBytes > 1048576) {
+      if (!Number.isSafeInteger(expectedTargetBytes) || expectedTargetBytes > ${TARGET_PAYLOAD_MAX_ENCODED_BYTES}) {
         return failClosed();
       }
       inbound = inbound.subarray(newline + 1);
@@ -93,7 +110,7 @@ socket.on('data', (chunk) => {
         targetStdin = Buffer.from(parsed.stdinBase64, 'base64');
         if (
           targetStdin.length < 1
-          || targetStdin.length > 262144
+          || targetStdin.length > ${HOST_AGENT_RUN_STDIN_MAX_BYTES}
           || targetStdin.toString('base64') !== parsed.stdinBase64
         ) return failClosed();
       }

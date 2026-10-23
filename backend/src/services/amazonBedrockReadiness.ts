@@ -199,6 +199,37 @@ export function invalidateAmazonBedrockReadinessCache(): void {
   readinessCache = null;
 }
 
+/** A still-fresh result from an earlier check, without starting a probe. */
+export function peekAmazonBedrockReadiness(nowMs = Date.now()): ProviderReadiness | null {
+  if (!readinessCache?.expiresAt || readinessCache.expiresAt <= nowMs) return null;
+  return { ...readinessCache.result, cached: true };
+}
+
+/**
+ * Whether OpenClaw is configured to use Bedrock: an explicit plugin entry or
+ * provider block, or any configured default/fallback/per-agent model ref.
+ */
+export function openClawConfigUsesAmazonBedrock(config: any): boolean {
+  const pluginEntry = config?.plugins?.entries?.['amazon-bedrock'];
+  if (pluginEntry && typeof pluginEntry === 'object' && pluginEntry.enabled !== false) return true;
+  if (config?.models?.providers?.['amazon-bedrock']) return true;
+  const refs: unknown[] = [];
+  const collectModel = (model: unknown) => {
+    if (typeof model === 'string') refs.push(model);
+    else if (model && typeof model === 'object') {
+      refs.push((model as any).primary);
+      if (Array.isArray((model as any).fallbacks)) refs.push(...(model as any).fallbacks);
+    }
+  };
+  collectModel(config?.agents?.defaults?.model);
+  const defaultModels = config?.agents?.defaults?.models;
+  if (defaultModels && typeof defaultModels === 'object') refs.push(...Object.keys(defaultModels));
+  if (Array.isArray(config?.agents?.list)) {
+    for (const agent of config.agents.list) collectModel(agent?.model);
+  }
+  return refs.some((ref) => typeof ref === 'string' && ref.trim().toLowerCase().startsWith('amazon-bedrock/'));
+}
+
 export async function getAmazonBedrockReadiness(options: {
   force?: boolean;
   runner?: ReadOnlyOpenClawRunner;

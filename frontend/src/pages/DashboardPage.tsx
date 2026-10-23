@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense, useContext } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, type Variants } from 'framer-motion';
 import { UNSAFE_NavigationContext } from 'react-router-dom';
 // Link removed — onboarding cards removed
 import { io, Socket } from 'socket.io-client';
@@ -308,7 +308,7 @@ function formatReleaseDate(value: string): string {
 /* ─── animation variants ───────────────────────────────── */
 
 const container = { hidden: {}, show: { transition: { staggerChildren: 0.06 } } };
-const cardVariant = {
+const cardVariant: Variants = {
   hidden: { opacity: 0, y: 20, scale: 0.95 },
   show: { opacity: 1, y: 0, scale: 1, transition: { type: 'spring', stiffness: 200, damping: 20 } },
 };

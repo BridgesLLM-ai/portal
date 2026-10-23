@@ -16,6 +16,9 @@ import {
   type ProjectEgressPlaneSpec,
   type ProjectEgressWorkloadConsumerKind,
 } from './projectEgressPlane';
+import { APP_CREDENTIALS_CONTAINER_DIRECTORY, APP_CREDENTIALS_ENVIRONMENT_KEY } from './appCredentials/policy';
+import { attestAppCredentialDirectory, removeAppCredentialDirectory, removeAppCredentialProjections,
+  type AppCredentialAttachment } from './appCredentials/projection';
 
 const WORKLOAD_POLICY_VERSION = 'portal-project-workload-v1';
 const LABEL_PREFIX = 'com.bridgesllm.project-workload';
@@ -47,6 +50,8 @@ export interface PortalProjectWorkloadContainerOptions {
   nanoCpus: number;
   tmpfsSize: string;
   applicationPort?: number;
+  /** Resident Project App only: read-only tmpfs credential directory. */
+  credentialAttachment?: AppCredentialAttachment;
 }
 
 export interface PortalProjectWorkloadPlan extends PortalProjectWorkloadContainerOptions {
@@ -267,6 +272,21 @@ export async function buildPortalProjectWorkloadPlan(
     throw new Error('Portal workload application port is invalid');
   }
 
+  if (options.credentialAttachment) {
+    // Only the App's own resident container: never lifecycle jobs, Git or
+    // another App's workload.
+    const credentials = options.credentialAttachment;
+    if (identity.consumerKind !== 'PORTAL_APP' || credentials.appId !== identity.workloadId
+      || credentials.containerDirectory !== APP_CREDENTIALS_CONTAINER_DIRECTORY
+      || options.environment[APP_CREDENTIALS_ENVIRONMENT_KEY] !== APP_CREDENTIALS_CONTAINER_DIRECTORY
+      || /[,\u0000\r\n]/.test(credentials.sourceDirectory)) {
+      throw new Error('Portal App credential attachment identity is invalid');
+    }
+    attestAppCredentialDirectory(credentials);
+  } else if (options.environment[APP_CREDENTIALS_ENVIRONMENT_KEY]) {
+    throw new Error('Portal App credential path requires an attested attachment');
+  }
+
   let egressSpec: ProjectEgressPlaneSpec | null = null;
   let egressHandle: ProjectEgressPlaneHandle | null = null;
   if (options.networked) {
@@ -298,6 +318,9 @@ export async function buildPortalProjectWorkloadPlan(
     nanoCpus: options.nanoCpus,
     tmpfsSize: options.tmpfsSize,
     applicationPort: options.applicationPort || null,
+    // Names, revision and directory inode only; nothing derived from a value.
+    // Absent without credentials, so existing workload fingerprints hold.
+    ...(options.credentialAttachment ? { credentialAttachment: options.credentialAttachment } : {}),
   });
   return Object.freeze({
     ...options,
@@ -316,7 +339,20 @@ export async function buildPortalProjectWorkloadPlan(
   });
 }
 
+/** Argv only: a networked plan also needs the command's `secretEnvironment`. */
 export function buildPortalProjectWorkloadCreateArgs(plan: PortalProjectWorkloadPlan): string[] {
+  return buildPortalProjectWorkloadCreateCommand(plan).args;
+}
+
+/**
+ * The create argv and the egress credentials it names. The proxy variables
+ * carry the Project egress token, so argv holds only their names and Docker
+ * reads each value from the executor's protected subprocess environment.
+ */
+export function buildPortalProjectWorkloadCreateCommand(plan: PortalProjectWorkloadPlan): {
+  args: string[];
+  secretEnvironment: Readonly<Record<string, string>>;
+} {
   if (Boolean(plan.egressSpec) !== Boolean(plan.egressHandle)) {
     fail('EGRESS_NETWORK_IDENTITY', 'Portal workload egress plan is incomplete');
   }
@@ -341,6 +377,8 @@ export function buildPortalProjectWorkloadCreateArgs(plan: PortalProjectWorkload
     // is rejected by the daemon and broke every project git/workload run.
     // Bind mounts are read-write by default.
     '--mount', `type=bind,src=${plan.workspace},dst=/workspace/project`,
+    ...(plan.credentialAttachment ? ['--mount',
+      `type=bind,src=${plan.credentialAttachment.sourceDirectory},dst=${APP_CREDENTIALS_CONTAINER_DIRECTORY},readonly`] : []),
     '--read-only',
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges:true',
@@ -351,9 +389,25 @@ export function buildPortalProjectWorkloadCreateArgs(plan: PortalProjectWorkload
     '--restart', 'no',
     ...labelArgs(workloadLabels(plan)),
   ];
-  for (const entry of environmentEntries(plan.environment)) args.push('--env', entry);
+  const credentialNames = new Set(Object.entries(plan.egressHandle?.proxyEnvironment || {})
+    .filter(([, value]) => value !== '')
+    .map(([key]) => key));
+  const secretEnvironment: Record<string, string> = {};
+  for (const entry of environmentEntries(plan.environment)) {
+    const key = entry.slice(0, entry.indexOf('='));
+    if (credentialNames.has(key)) {
+      secretEnvironment[key] = plan.environment[key];
+      args.push('--env', key);
+    } else {
+      args.push('--env', entry);
+    }
+  }
   args.push(plan.image, plan.command, ...plan.args);
-  return args;
+  const token = plan.egressSpec?.token;
+  if (token && args.some((value) => value.includes(token))) {
+    fail('EGRESS_SECRET_ARGV', 'Portal workload egress credential would reach the Docker command line');
+  }
+  return { args, secretEnvironment: Object.freeze(secretEnvironment) };
 }
 
 function parseInspect(result: string): ContainerInspect | null {
@@ -423,11 +477,26 @@ export function attestPortalProjectWorkloadContainer(
   if (!['nosuid', 'nodev', 'noexec', `size=${plan.tmpfsSize}`].every((flag) => tmpfs.split(',').includes(flag))) {
     fail('CONTAINER_TMPFS', 'Portal workload temporary filesystem policy did not match');
   }
-  const writableMounts = (inspect.Mounts || []).filter((mount) => mount.RW === true);
-  if ((inspect.Mounts || []).length !== 1 || writableMounts.length !== 1
+  if (plan.credentialAttachment) {
+    if (plan.identity.consumerKind !== 'PORTAL_APP' || plan.credentialAttachment.appId !== plan.identity.workloadId) {
+      fail('APP_CREDENTIAL_ATTACHMENT', 'Portal App credential mount has no resident App');
+    }
+    try { attestAppCredentialDirectory(plan.credentialAttachment); }
+    catch { fail('APP_CREDENTIAL_MOUNT_SOURCE', 'Portal App credential directory changed'); }
+  }
+  const mounts = inspect.Mounts || [];
+  const writableMounts = mounts.filter((mount) => mount.RW === true);
+  if (mounts.length !== (plan.credentialAttachment ? 2 : 1) || writableMounts.length !== 1
     || writableMounts[0].Type !== 'bind' || writableMounts[0].Source !== plan.workspace
     || writableMounts[0].Destination !== '/workspace/project') {
     fail('CONTAINER_MOUNTS', 'Portal workload must have exactly one writable project bind');
+  }
+  if (plan.credentialAttachment) {
+    const credentialMounts = mounts.filter((mount) => mount.Destination === APP_CREDENTIALS_CONTAINER_DIRECTORY);
+    if (credentialMounts.length !== 1 || credentialMounts[0].Type !== 'bind' || credentialMounts[0].RW !== false
+      || credentialMounts[0].Source !== plan.credentialAttachment.sourceDirectory) {
+      fail('CONTAINER_MOUNTS', 'Portal App credential mount did not match');
+    }
   }
   const bindings = host.PortBindings || {};
   const activeBindings = inspect.NetworkSettings?.Ports || {};
@@ -460,6 +529,32 @@ export function attestPortalProjectWorkloadContainer(
   }
 }
 
+function hasAppCredentialMount(inspect: ContainerInspect): boolean {
+  return (inspect.Mounts || []).some((mount) => mount.Destination === APP_CREDENTIALS_CONTAINER_DIRECTORY);
+}
+
+// Remove the existing container of this exact workload identity (its
+// deterministic name and durable labels) before a fresh create.
+async function removeWorkloadForCredentialReplacement(
+  plan: PortalProjectWorkloadPlan,
+  inspect: ContainerInspect,
+  executor: ProjectEgressCommandExecutor,
+): Promise<void> {
+  const labels = inspect.Config?.Labels || {};
+  if (String(inspect.Name || '').replace(/^\//, '') !== plan.containerName
+    || labels[LABEL_POLICY] !== WORKLOAD_POLICY_VERSION
+    || labels[LABEL_ACTOR] !== plan.identity.actorId
+    || labels[LABEL_PROJECT] !== plan.identity.projectId
+    || labels[LABEL_KIND] !== plan.identity.consumerKind
+    || labels[LABEL_WORKLOAD] !== plan.identity.workloadId) {
+    fail('CONTAINER_REPLACEMENT_IDENTITY', 'Portal workload identity changed before replacement');
+  }
+  await executor.run('docker', ['container', 'rm', '--force', plan.containerName]);
+  if (await inspectContainer(plan.containerName, executor)) {
+    fail('CONTAINER_REPLACEMENT_VERIFY', 'Portal workload container remained before replacement');
+  }
+}
+
 export async function preparePortalProjectWorkloadContainer(
   options: PortalProjectWorkloadContainerOptions,
   input: { allowExisting?: boolean; executor?: ProjectEgressCommandExecutor } = {},
@@ -469,6 +564,13 @@ export async function preparePortalProjectWorkloadContainer(
   let inspect = await inspectContainer(plan.containerName, executor);
   let created = false;
   try {
+    if (inspect && input.allowExisting && (plan.credentialAttachment || hasAppCredentialMount(inspect))) {
+      // Each start writes a fresh credential directory, so a container from
+      // an earlier start (for example one that survived a Portal crash)
+      // cannot carry this one, or still mounts a removed one: replace it.
+      await removeWorkloadForCredentialReplacement(plan, inspect, executor);
+      inspect = null;
+    }
     if (inspect) {
       if (!input.allowExisting) fail('CONTAINER_EXISTS', 'A Portal workload container with this identity already exists');
       if (inspect.State?.Running) {
@@ -476,7 +578,8 @@ export async function preparePortalProjectWorkloadContainer(
         inspect = await inspectContainer(plan.containerName, executor);
       }
     } else {
-      await executor.run('docker', buildPortalProjectWorkloadCreateArgs(plan));
+      const create = buildPortalProjectWorkloadCreateCommand(plan);
+      await executor.run('docker', create.args, { secretEnvironment: create.secretEnvironment });
       created = true;
       inspect = await inspectContainer(plan.containerName, executor);
     }
@@ -545,6 +648,18 @@ export async function removePreparedPortalProjectWorkloadContainer(
   plan: PortalProjectWorkloadPlan,
   executor: ProjectEgressCommandExecutor = projectEgressCommandExecutor,
 ): Promise<void> {
+  try {
+    await removePreparedWorkloadContainer(plan, executor);
+  } finally {
+    // Every removal attempt ends this container's credential access.
+    if (plan.credentialAttachment) removeAppCredentialDirectory(plan.credentialAttachment.sourceDirectory);
+  }
+}
+
+async function removePreparedWorkloadContainer(
+  plan: PortalProjectWorkloadPlan,
+  executor: ProjectEgressCommandExecutor,
+): Promise<void> {
   const inspect = await inspectContainer(plan.containerName, executor);
   if (inspect) {
     const labels = inspect.Config?.Labels || {};
@@ -569,6 +684,20 @@ export async function removePortalProjectWorkloadByIdentity(
 ): Promise<void> {
   const identity = workloadIdentity(identityInput);
   const containerName = requireContainerName(containerNameInput);
+  try {
+    await removeWorkloadByIdentity(identity, containerName, executor);
+  } finally {
+    // Durable cleanup (restart, Project deletion) knows only the identity: end
+    // every credential directory of this App, whichever start created it.
+    if (identity.consumerKind === 'PORTAL_APP') removeAppCredentialProjections(identity.workloadId);
+  }
+}
+
+async function removeWorkloadByIdentity(
+  identity: Readonly<PortalProjectWorkloadIdentity>,
+  containerName: string,
+  executor: ProjectEgressCommandExecutor,
+): Promise<void> {
   const inspect = await inspectContainer(containerName, executor);
   if (inspect) {
     const labels = inspect.Config?.Labels || {};

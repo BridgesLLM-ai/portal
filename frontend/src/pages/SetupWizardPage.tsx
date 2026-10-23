@@ -2314,7 +2314,7 @@ export default function SetupWizardPage({ onSetupResolved }: { onSetupResolved?:
               </p>
               <ul className="mt-3 space-y-1 text-xs text-slate-500">
                 <li className="flex items-center gap-1.5"><Check className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" /> Xtigervnc + Xfce4 desktop</li>
-                <li className="flex items-center gap-1.5"><Check className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" /> noVNC web client (port 6080)</li>
+                <li className="flex items-center gap-1.5"><Check className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" /> noVNC web client (private transport)</li>
                 <li className="flex items-center gap-1.5"><Check className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" /> systemd services (auto-restart)</li>
                 <li className="flex items-center gap-1.5"><Check className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" /> Portal authentication gates access</li>
               </ul>

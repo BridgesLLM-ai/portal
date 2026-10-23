@@ -1,7 +1,12 @@
 import crypto from 'crypto';
+import {
+  PROJECT_RUNTIME_PIDS_LIMIT,
+  PROJECT_RUNTIME_SHARED_NPROC_LIMIT,
+  PROJECT_RUNTIME_LEGACY_NPROC_LIMIT,
+} from './projectRuntimeProcessLimits';
 import fs from 'fs';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import type { ProjectSandboxExecutionContext } from '../agents/AgentProvider.interface';
 import { attestProjectRoot } from './projectIdentity';
 import { gatewayRpcCall } from '../utils/openclawGatewayRpc';
@@ -18,6 +23,13 @@ import {
   type ProjectEgressInternalNetworkBinding,
   type ProjectEgressPlaneSpec,
 } from './projectEgressPlane';
+import {
+  dockerArgsCarryProtectedValue,
+  protectedDockerCommandEnvironment,
+  protectedDockerEnvironmentArgs,
+  redactProtectedDockerValues,
+  type ProtectedDockerCommand,
+} from './projectDockerSecretEnvironment';
 import { PROJECT_EGRESS_POLICY_VERSION } from './projectEgressPolicy';
 import { OPENCLAW_PROJECT_EMBEDDED_RUNTIME_MODEL_KEYS } from './openclawProjectModel';
 import {
@@ -29,6 +41,7 @@ import {
 } from './openclawAgentConfigContract';
 import {
   computeOpenClaw92SandboxConfigHash,
+  computeOpenClaw99SandboxConfigHash,
   formatOpenClawManagedWorkspaceBind,
   formatOpenClawReadOnlySkillMountHashState,
   resolveOpenClawReadOnlySkillMounts,
@@ -65,7 +78,7 @@ const OPENCLAW_CURRENT_CREATE_ARGS_EPOCH = '2026-08-25-container-env-file';
 //    runtime by session key + agent workspace path, mounts the sandbox
 //    workspace rw plus a read-only skills overlay, and adopts a pre-created
 //    container only when name and configHash match its own derivation.
-type SandboxMountVersion = 3 | 4 | 5;
+type SandboxMountVersion = 3 | 4 | 5 | 6;
 const OPENCLAW_WORKSPACE_QUALIFIED_RUNTIME_MIN_VERSION = [2026, 9, 2] as const;
 const OPENCLAW_INSTALLED_PACKAGE_JSON = '/usr/lib/node_modules/openclaw/package.json';
 const OPENCLAW_PROJECT_WORKDIR = '/workspace';
@@ -75,7 +88,7 @@ const OPENCLAW_PROJECT_CWD = OPENCLAW_PROJECT_MOUNT;
 const OPENCLAW_CONTAINER_USER = '1000:1000';
 const OPENCLAW_CONTAINER_MEMORY_BYTES = 1024 * 1024 * 1024;
 const OPENCLAW_CONTAINER_NANO_CPUS = 2_000_000_000;
-const OPENCLAW_CONTAINER_PIDS_LIMIT = 256;
+const OPENCLAW_CONTAINER_PIDS_LIMIT = PROJECT_RUNTIME_PIDS_LIMIT;
 const MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024;
 const CONFIG_RPC_TIMEOUT_MS = 15_000;
 
@@ -187,6 +200,7 @@ export interface OpenClawProjectSandboxDependencies {
 interface OpenClawConfigSnapshot {
   config: Record<string, any>;
   hash: string;
+  payload: Record<string, any>;
 }
 
 export interface OpenClawProjectSandboxPlan {
@@ -438,6 +452,19 @@ function valuesEqual(left: unknown, right: unknown): boolean {
   return stableSerialize(left) === stableSerialize(right);
 }
 
+function firstConfigDifferencePath(left: unknown, right: unknown, prefix = 'agents', depth = 0): string {
+  if (valuesEqual(left, right) || depth >= 12) return prefix;
+  if (!isRecord(left) || !isRecord(right)) return prefix;
+  for (const key of new Set([...Object.keys(left), ...Object.keys(right)])) {
+    if (!Object.prototype.hasOwnProperty.call(left, key)
+      || !Object.prototype.hasOwnProperty.call(right, key)
+      || !valuesEqual(left[key], right[key])) {
+      return firstConfigDifferencePath(left[key], right[key], `${prefix}.${key}`, depth + 1);
+    }
+  }
+  return prefix;
+}
+
 function createConfigMergePatch(base: unknown, target: unknown): unknown {
   if (!isRecord(base) || !isRecord(target)) return structuredClone(target);
   const patch: Record<string, unknown> = {};
@@ -643,6 +670,7 @@ function buildDesiredDocker(input: {
   projectRoot: string;
   proxyEnvironment: Readonly<Record<string, string>>;
   mountFormatVersion?: SandboxMountVersion;
+  sharedNprocLimit?: typeof PROJECT_RUNTIME_SHARED_NPROC_LIMIT | typeof PROJECT_RUNTIME_LEGACY_NPROC_LIMIT;
 }): Record<string, any> {
   const confinementPolicy = resolveProjectRuntimeConfinementPolicy();
   return {
@@ -674,7 +702,7 @@ function buildDesiredDocker(input: {
     cpus: 2,
     ulimits: {
       nofile: { soft: 1024, hard: 1024 },
-      nproc: { soft: 256, hard: 256 },
+      nproc: { soft: input.sharedNprocLimit ?? PROJECT_RUNTIME_SHARED_NPROC_LIMIT, hard: input.sharedNprocLimit ?? PROJECT_RUNTIME_SHARED_NPROC_LIMIT },
     },
     // Empty strings/arrays intentionally override unsafe global defaults.
     seccompProfile: PROJECT_RUNTIME_SECCOMP_PROFILE_PATH,
@@ -698,7 +726,7 @@ function buildLegacyPreConfinementDesiredDocker(input: {
   proxyEnvironment: Readonly<Record<string, string>>;
 }): Record<string, any> {
   return {
-    ...buildDesiredDocker(input),
+    ...buildDesiredDocker({ ...input, sharedNprocLimit: PROJECT_RUNTIME_LEGACY_NPROC_LIMIT }),
     // Exact values written by the legacy pre-confinement generation.
     // Docker itself supplied the engine-default seccomp/AppArmor profiles.
     seccompProfile: '',
@@ -809,6 +837,24 @@ export function computeOpenClawProjectConfigHash(input: {
   agentWorkspaceDir: string;
   mountFormatVersion?: SandboxMountVersion;
 }): string {
+  if (input.mountFormatVersion === 6) {
+    // Native 9.9 inserts managed workspace/skill binds first, then the exact
+    // custom project bind. This constrained recipe has no target overrides,
+    // resource mounts, or remote Docker namespace translation.
+    return computeOpenClaw99SandboxConfigHash({
+      docker: input.docker,
+      workspaceAccess: 'none',
+      workspaceDir: input.sandboxWorkspaceDir,
+      agentWorkspaceDir: input.agentWorkspaceDir,
+      managedMounts: [
+        formatOpenClawManagedWorkspaceBind(input.sandboxWorkspaceDir, OPENCLAW_PROJECT_WORKDIR, false),
+        ...resolveOpenClawReadOnlySkillMounts({
+          sandboxWorkspaceDir: input.sandboxWorkspaceDir, workdir: OPENCLAW_PROJECT_WORKDIR,
+        }).map((mount) => formatOpenClawManagedWorkspaceBind(mount.hostPath, mount.containerPath, true)),
+        ...(input.docker.binds || []),
+      ],
+    });
+  }
   if (input.mountFormatVersion === 5) {
     // Exact 9.2 Gateway derivation; anything else makes the Gateway discard the
     // pre-created runtime and provision an unattested one at turn start.
@@ -900,7 +946,7 @@ function buildRuntimePaths(input: {
   let runtimeScopeKey = input.sessionKey;
   let containerName = `${input.containerPrefix}${slugifyOpenClawProjectSessionKey(input.sessionKey)}`.slice(0, 63);
   let sandboxWorkspaceDir: string;
-  if (input.mountFormatVersion === 5) {
+  if (input.mountFormatVersion >= 5) {
     const identity = resolveOpenClawWorkspaceQualifiedRuntime({
       sessionKey: input.sessionKey,
       agentWorkspaceDir,
@@ -1010,7 +1056,7 @@ export function buildOpenClawProjectSandboxPlan(input: {
     configHash,
     runtimeFingerprint,
     mountFormatVersion,
-    expectedBinds: Object.freeze(mountFormatVersion === 5
+    expectedBinds: Object.freeze(mountFormatVersion >= 5
       ? [
         formatOpenClawManagedWorkspaceBind(paths.sandboxWorkspaceDir, OPENCLAW_PROJECT_WORKDIR, false),
         `${projectRoot}:${OPENCLAW_PROJECT_MOUNT}:rw`,
@@ -1038,7 +1084,7 @@ export function buildOpenClawProjectSandboxPlanForRuntime(
     runtime: Pick<OpenClawProjectSandboxResult, 'configHash' | 'runtimeFingerprint'>;
   },
 ): OpenClawProjectSandboxPlan {
-  for (const mountFormatVersion of [5, 4, 3] as const) {
+  for (const mountFormatVersion of [6, 5, 4, 3] as const) {
     const plan = buildOpenClawProjectSandboxPlan({ ...input, mountFormatVersion });
     if (plan.configHash === input.runtime.configHash
       && plan.runtimeFingerprint === input.runtime.runtimeFingerprint) return plan;
@@ -1058,7 +1104,7 @@ async function readOpenClawConfig(
   if (!isRecord(config) || !hash) {
     fail('CONFIG_GET_INVALID', 'OpenClaw Project config response was incomplete');
   }
-  return { config, hash };
+  return { config, hash, payload: response.data };
 }
 
 function readAgentContract(config: Record<string, any>): OpenClawAgentConfigContract {
@@ -1067,6 +1113,232 @@ function readAgentContract(config: Record<string, any>): OpenClawAgentConfigCont
   } catch (error) {
     fail('CONFIG_AGENT_ENTRIES_INVALID', String((error as Error)?.message || error));
   }
+}
+
+/**
+ * Runtimes whose write contract for an installer-default config is pinned from
+ * package evidence. The installer persists no agents roster; 2026.9.6/9.9 then
+ * materializes the implicit main agent in every derived config.get view and
+ * persists the keyed agents.entries roster under explicit ownership. No other
+ * runtime is bootstrapped: its implicit-main write behavior is not source-supported.
+ */
+const OPENCLAW_IMPLICIT_MAIN_BOOTSTRAP_RUNTIMES: ReadonlySet<string> = new Set(['2026.9.6', '2026.9.9', '2026.10.5', '2026.10.6']);
+const OPENCLAW_OWNER_AGENT_ID = 'main';
+
+function hasOwnKey(value: Record<string, any>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+/**
+ * Only `parsed` shows what the config file persists. `config`, `resolved` and
+ * `sourceConfig` all carry the implicit main agent as a keyed entry, so a merge
+ * patch computed against them would treat main as already persisted. A config
+ * with no persisted roster is therefore classified from `parsed` and handled
+ * only by the attested bootstrap. Snapshots without a persisted view keep the
+ * strict contract; an invalid snapshot never proves an empty roster.
+ */
+function persistedRosterIsImplicitMain(snapshot: OpenClawConfigSnapshot): boolean {
+  if (snapshot.payload?.valid === false) {
+    fail('CONFIG_AGENT_ENTRIES_INVALID', 'OpenClaw reported the persisted configuration as invalid');
+  }
+  const persisted = snapshot.payload?.parsed;
+  if (!isRecord(persisted)) return false;
+  if (!hasOwnKey(persisted, 'agents')) return true;
+  const agents = persisted.agents;
+  if (!isRecord(agents) || hasOwnKey(agents, 'list') || hasOwnKey(agents, 'entries')) return false;
+  if (!Object.keys(agents).every((key) => key === 'defaults')
+    || (hasOwnKey(agents, 'defaults') && !isRecord(agents.defaults))) {
+    fail('CONFIG_AGENT_ENTRIES_INVALID', 'OpenClaw agents config persisted settings without a canonical roster');
+  }
+  return true;
+}
+
+/** Running Gateway version when it equals the installed package; '' otherwise. */
+async function readAttestedRuntimeVersion(
+  rpc: OpenClawProjectSandboxDependencies['rpc'],
+  readRuntimeVersion: OpenClawProjectSandboxDependencies['readRuntimeVersion'],
+): Promise<string> {
+  const installed = readRuntimeVersion();
+  const status = await rpc('status', { includeChannelSummary: false }, CONFIG_RPC_TIMEOUT_MS);
+  const running = status?.ok
+    ? /^(\d{4}\.\d+\.\d+)(?:-\d+)?$/.exec(String(status.data?.runtimeVersion ?? ''))?.[1] || ''
+    : '';
+  return installed && running === installed.join('.') ? running : '';
+}
+
+/**
+ * The write contract of an unpersisted roster is selected only when the
+ * running Gateway, the installed package and the Gateway's own schema all
+ * attest a qualified runtime. Config metadata and roster shape never select it.
+ */
+async function attestImplicitMainBootstrapRuntime(
+  rpc: OpenClawProjectSandboxDependencies['rpc'],
+  readRuntimeVersion: OpenClawProjectSandboxDependencies['readRuntimeVersion'],
+): Promise<string> {
+  const running = await readAttestedRuntimeVersion(rpc, readRuntimeVersion);
+  if (!OPENCLAW_IMPLICIT_MAIN_BOOTSTRAP_RUNTIMES.has(running)) {
+    const installed = readRuntimeVersion();
+    fail(
+      'CONFIG_AGENT_BOOTSTRAP_UNATTESTED',
+      `OpenClaw Gateway runtime ${running || 'unattested'} with installed package ${installed ? installed.join('.') : 'unknown'} has no attested write contract for a config without an agents roster`,
+    );
+  }
+  const schema = await rpc('config.schema', {}, CONFIG_RPC_TIMEOUT_MS);
+  const agents = schema.ok ? schema.data?.schema?.properties?.agents : undefined;
+  const properties = isRecord(agents?.properties) ? agents.properties : {};
+  const entry = properties.entries?.additionalProperties;
+  const systemAgent = properties.defaults?.properties?.systemAgent;
+  if (
+    schema.data?.version !== running
+    || agents?.type !== 'object'
+    || agents.additionalProperties !== false
+    || Object.keys(properties).sort().join(',') !== 'defaults,entries,ownership'
+    || properties.entries?.type !== 'object'
+    || !isRecord(entry) || entry.type !== 'object' || !isRecord(entry.properties) || hasOwnKey(entry.properties, 'id')
+    || properties.ownership?.const !== 'explicit'
+    || systemAgent?.type !== 'object'
+    || !isRecord(systemAgent.properties)
+    || Object.keys(systemAgent.properties).join(',') !== 'agentId'
+  ) {
+    fail('CONFIG_AGENT_BOOTSTRAP_UNATTESTED', 'OpenClaw Gateway schema did not attest the keyed explicit-ownership agent roster');
+  }
+  return running;
+}
+
+/**
+ * 2026.9.6 may record heartbeat and talk ownership and bind unbound ambient
+ * channels to the owner when a roster first becomes explicit; it does so at
+ * the latest when the roster first holds a second agent. Accept exactly that
+ * synthesis, the owner entry exactly as the bootstrap wrote it, and every
+ * other persisted section unchanged.
+ */
+function bootstrapMismatchPath(
+  before: Record<string, any>,
+  after: unknown,
+  ownerWorkspace: string,
+): string | null {
+  if (!isRecord(after)) return 'config';
+  const beforeAgents = isRecord(before.agents) ? before.agents : {};
+  const beforeDefaults = isRecord(beforeAgents.defaults) ? beforeAgents.defaults : {};
+  const agents = after.agents;
+  if (!isRecord(agents) || Object.keys(agents).sort().join(',') !== 'defaults,entries,ownership') return 'agents';
+  if (agents.ownership !== 'explicit') return 'agents.ownership';
+  if (!isRecord(agents.entries) || Object.keys(agents.entries).join(',') !== OPENCLAW_OWNER_AGENT_ID) {
+    return 'agents.entries';
+  }
+  if (!valuesEqual(agents.entries[OPENCLAW_OWNER_AGENT_ID], { workspace: ownerWorkspace })) {
+    return `agents.entries.${OPENCLAW_OWNER_AGENT_ID}`;
+  }
+  const expectedDefaults = { ...beforeDefaults, systemAgent: { agentId: OPENCLAW_OWNER_AGENT_ID } };
+  const withHeartbeat = { ...expectedDefaults, heartbeat: { agentId: OPENCLAW_OWNER_AGENT_ID } };
+  if (!valuesEqual(agents.defaults, expectedDefaults)
+    && (beforeDefaults.heartbeat !== undefined || !valuesEqual(agents.defaults, withHeartbeat))) {
+    return firstConfigDifferencePath(agents.defaults, expectedDefaults, 'agents.defaults');
+  }
+  const talk = before.talk;
+  const ownedTalk = talk === undefined || (isRecord(talk) && !hasOwnKey(talk, 'agentId'))
+    ? { ...(isRecord(talk) ? talk : {}), agentId: OPENCLAW_OWNER_AGENT_ID }
+    : talk;
+  if (!valuesEqual(after.talk, talk) && !valuesEqual(after.talk, ownedTalk)) return 'talk';
+  const priorBindings = Array.isArray(before.bindings) ? before.bindings : [];
+  if (after.bindings !== undefined || before.bindings !== undefined) {
+    const bindings = after.bindings;
+    if (!Array.isArray(bindings) || bindings.length < priorBindings.length
+      || !valuesEqual(bindings.slice(0, priorBindings.length), priorBindings)) return 'bindings';
+    const channels = bindings.slice(priorBindings.length).map((binding) => (
+      isRecord(binding) && binding.agentId === OPENCLAW_OWNER_AGENT_ID && isRecord(binding.match)
+        && Object.keys(binding).sort().join(',') === 'agentId,match'
+        && Object.keys(binding.match).sort().join(',') === 'accountId,channel'
+        && binding.match.accountId === '*' && typeof binding.match.channel === 'string'
+        ? binding.match.channel : ''
+    ));
+    if (channels.some((channel) => !channel) || new Set(channels).size !== channels.length) return 'bindings';
+  }
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (['agents', 'meta', 'talk', 'bindings'].includes(key)) continue;
+    if (!valuesEqual(before[key], after[key])) return key;
+  }
+  return null;
+}
+
+async function readOwnerWorkspace(rpc: OpenClawProjectSandboxDependencies['rpc']): Promise<string> {
+  const response = await rpc('agents.files.list', { agentId: OPENCLAW_OWNER_AGENT_ID }, CONFIG_RPC_TIMEOUT_MS);
+  const workspace = response.ok && response.data?.agentId === OPENCLAW_OWNER_AGENT_ID
+    ? response.data?.workspace : undefined;
+  if (typeof workspace !== 'string' || !path.isAbsolute(workspace) || workspace.includes('\0')) {
+    fail('CONFIG_AGENT_BOOTSTRAP_UNATTESTED', 'OpenClaw Gateway did not report the implicit main workspace');
+  }
+  return workspace;
+}
+
+/**
+ * Make the implicit main agent the explicit system owner before any Project
+ * agent exists. The first explicit roster decides which agent owns unscoped
+ * work, and a non-owner resolves to a different default workspace, so main is
+ * written with the workspace the Gateway resolves for it now. The Project
+ * entry is added only after this CAS write, a strict re-read of the persisted
+ * file and the Gateway's own owner and workspace resolution all agree.
+ */
+async function bootstrapImplicitMainOwner(
+  snapshot: OpenClawConfigSnapshot,
+  rpc: OpenClawProjectSandboxDependencies['rpc'],
+  readRuntimeVersion: OpenClawProjectSandboxDependencies['readRuntimeVersion'],
+): Promise<OpenClawConfigSnapshot> {
+  await attestImplicitMainBootstrapRuntime(rpc, readRuntimeVersion);
+  const payload = snapshot.payload;
+  const before = payload.parsed as Record<string, any>;
+  const beforeDefaults = isRecord(before.agents?.defaults) ? before.agents.defaults : {};
+  const materialized = snapshot.config.agents;
+  if (
+    payload.exists !== true
+    || !Array.isArray(payload.includedPaths) || payload.includedPaths.length > 0
+    || payload.agentRosterIncludeOwned !== false
+    || !isRecord(materialized) || hasOwnKey(materialized, 'ownership')
+    || !valuesEqual(materialized.entries, { [OPENCLAW_OWNER_AGENT_ID]: {} })
+  ) {
+    fail('CONFIG_AGENT_BOOTSTRAP_UNATTESTED', 'OpenClaw did not report only its implicit main agent for a config without an agents roster');
+  }
+  const authoredOwner = beforeDefaults.systemAgent;
+  if (authoredOwner !== undefined && !valuesEqual(authoredOwner, { agentId: OPENCLAW_OWNER_AGENT_ID })) {
+    fail('CONFIG_AGENT_OWNERSHIP_INVALID', 'OpenClaw system agent ownership was authored for another agent before Project registration');
+  }
+  const ownerWorkspace = await readOwnerWorkspace(rpc);
+  const response = await rpc('config.patch', {
+    raw: JSON.stringify({
+      agents: {
+        ownership: 'explicit',
+        defaults: { systemAgent: { agentId: OPENCLAW_OWNER_AGENT_ID } },
+        entries: { [OPENCLAW_OWNER_AGENT_ID]: { workspace: ownerWorkspace } },
+      },
+    }),
+    baseHash: snapshot.hash,
+    replacePaths: [],
+  }, CONFIG_RPC_TIMEOUT_MS);
+  if (!response.ok) {
+    failGateway('CONFIG_PATCH_FAILED', 'OpenClaw implicit main owner could not be made explicit', response);
+  }
+  const reread = await readOpenClawConfig(rpc);
+  if (reread.payload?.valid !== true) {
+    fail('CONFIG_BOOTSTRAP_MISMATCH', 'OpenClaw configuration was not valid after the main owner became explicit');
+  }
+  const mismatch = bootstrapMismatchPath(before, reread.payload.parsed, ownerWorkspace);
+  if (mismatch) {
+    fail('CONFIG_BOOTSTRAP_MISMATCH', `OpenClaw explicit main ownership did not persist exactly at ${mismatch}`);
+  }
+  const contract = readAgentContract(reread.config);
+  if (contract.storage !== 'entries' || !exactOpenClawAgent(contract, OPENCLAW_OWNER_AGENT_ID)) {
+    fail('CONFIG_BOOTSTRAP_MISMATCH', 'OpenClaw runtime roster did not contain the explicit main owner');
+  }
+  // While main is the only entry the Gateway reports it as the sole owner.
+  const selection = await rpc('agents.list', {}, CONFIG_RPC_TIMEOUT_MS);
+  if (!selection.ok || selection.data?.defaultId !== OPENCLAW_OWNER_AGENT_ID
+    || !['sole', 'explicit'].includes(selection.data?.ownership) || selection.data?.selectionRequired !== false) {
+    fail('CONFIG_BOOTSTRAP_MISMATCH', 'OpenClaw Gateway did not resolve main as the explicit system owner');
+  }
+  if (await readOwnerWorkspace(rpc) !== ownerWorkspace) {
+    fail('CONFIG_BOOTSTRAP_MISMATCH', 'OpenClaw main workspace changed when its ownership became explicit');
+  }
+  return reread;
 }
 
 /**
@@ -1146,16 +1418,35 @@ function desiredCurrentAgentsConfig(
   };
 }
 
+/** 9.6 adds a main-owner heartbeat when config.patch persists a roster that
+ * did not author heartbeat settings. Accept only that exact post-patch shape;
+ * the Project entry and every other host default still compare exactly. */
+function expectedCurrentAgentsAfterPatch(
+  desired: Record<string, any>,
+  context: { patched: boolean; coreVersion: string },
+): Record<string, any> {
+  const defaults = desired.defaults;
+  if (!context.patched || !OPENCLAW_IMPLICIT_MAIN_BOOTSTRAP_RUNTIMES.has(context.coreVersion)
+    || !isRecord(defaults) || Object.prototype.hasOwnProperty.call(defaults, 'heartbeat')
+    || defaults.systemAgent?.agentId !== 'main') return desired;
+  return { ...desired, defaults: { ...defaults, heartbeat: { agentId: 'main' } } };
+}
+
 async function ensureExactOpenClawAgentConfig(
   plan: OpenClawProjectSandboxPlan,
   rpc: OpenClawProjectSandboxDependencies['rpc'],
+  readRuntimeVersion: OpenClawProjectSandboxDependencies['readRuntimeVersion'] = readInstalledOpenClawRuntimeVersion,
 ): Promise<void> {
   let snapshot = await readOpenClawConfig(rpc);
+  if (persistedRosterIsImplicitMain(snapshot)) {
+    snapshot = await bootstrapImplicitMainOwner(snapshot, rpc, readRuntimeVersion);
+  }
   let contract = readAgentContract(snapshot.config);
   let current = exactOpenClawAgent(contract, plan.agentId);
   const desiredAgents = contract.storage === 'list'
     ? { ...contract.agentsConfig, list: desiredLegacyAgentList(contract, plan.desiredAgent) }
     : desiredCurrentAgentsConfig(contract, plan.desiredAgent);
+  let patchApplied = false;
   if (!current || !valuesEqual(current, plan.desiredAgent) || !valuesEqual(contract.agentsConfig, desiredAgents)) {
     const currentEntry = current
       ? contract.storage === 'list'
@@ -1180,6 +1471,7 @@ async function ensureExactOpenClawAgentConfig(
     if (!response.ok) {
       failGateway('CONFIG_PATCH_FAILED', 'OpenClaw Project config could not be patched', response);
     }
+    patchApplied = true;
     snapshot = await readOpenClawConfig(rpc);
     contract = readAgentContract(snapshot.config);
     current = exactOpenClawAgent(contract, plan.agentId);
@@ -1191,8 +1483,19 @@ async function ensureExactOpenClawAgentConfig(
     if (!valuesEqual(contract.agentsConfig.list, desiredAgents.list)) {
       fail('CONFIG_REREAD_MISMATCH', 'OpenClaw 2026.7.1 agent list changed during synchronous re-read');
     }
-  } else if (!valuesEqual(contract.agentsConfig, desiredAgents)) {
-    fail('CONFIG_REREAD_MISMATCH', 'OpenClaw 2026.9.1 agent entries changed during synchronous re-read');
+  } else {
+    // The heartbeat synthesis belongs to the runtime that performed the
+    // write, so only the attested running Gateway can admit it. The Portal's
+    // tested-version setting is not evidence of what is running.
+    const expectedReread = patchApplied && !valuesEqual(contract.agentsConfig, desiredAgents)
+      ? expectedCurrentAgentsAfterPatch(desiredAgents, {
+        patched: true,
+        coreVersion: await readAttestedRuntimeVersion(rpc, readRuntimeVersion),
+      })
+      : desiredAgents;
+    if (!valuesEqual(contract.agentsConfig, expectedReread)) {
+      fail('CONFIG_REREAD_MISMATCH', `OpenClaw 2026.9.1 agent entries changed during synchronous re-read at ${firstConfigDifferencePath(contract.agentsConfig, expectedReread)}`);
+    }
   }
   const effectiveDocker = resolveEffectiveDocker(snapshot.config, current);
   if (!valuesEqual(effectiveDocker, plan.desiredDocker)) {
@@ -1297,6 +1600,7 @@ function attestTmpfs(tmpfs: Record<string, string> | null | undefined): void {
 }
 
 function attestUlimits(
+  nprocLimit: number,
   values: Array<{ Name?: string; Soft?: number; Hard?: number }> | null | undefined,
 ): void {
   const normalized = (values || []).map((entry) => ({
@@ -1306,7 +1610,7 @@ function attestUlimits(
   })).sort((left, right) => left.name.localeCompare(right.name));
   const expected = [
     { name: 'nofile', soft: 1024, hard: 1024 },
-    { name: 'nproc', soft: 256, hard: 256 },
+    { name: 'nproc', soft: nprocLimit, hard: nprocLimit },
   ];
   if (!valuesEqual(normalized, expected)) {
     fail('RUNTIME_ULIMITS', 'OpenClaw Project runtime ulimits did not match');
@@ -1317,7 +1621,7 @@ function attestUlimits(
  * Attests the complete desired/actual container policy. Any missing field is a
  * failure; callers may not infer safety from a partial Docker inspection.
  */
-type OpenClawRuntimeConfinementGeneration = 'CURRENT' | 'LEGACY_PRE_CONFINEMENT';
+type OpenClawRuntimeConfinementGeneration = 'CURRENT' | 'LEGACY_SHARED_NPROC' | 'LEGACY_PRE_CONFINEMENT';
 
 function attestOpenClawProjectContainerForGeneration(input: {
   plan: OpenClawProjectSandboxPlan;
@@ -1351,7 +1655,7 @@ function attestOpenClawProjectContainerForGeneration(input: {
     [OPENCLAW_PROJECT_ACTOR_LABEL]: hashOpenClawProjectLabelIdentity(plan.actorUserId),
     [OPENCLAW_PROJECT_IDENTITY_LABEL]: hashOpenClawProjectLabelIdentity(plan.projectIdentityId),
     [OPENCLAW_PROJECT_AGENT_LABEL]: plan.agentId,
-    'openclaw.mountFormatVersion': String(plan.mountFormatVersion === 5 ? 4 : plan.mountFormatVersion),
+    'openclaw.mountFormatVersion': String(plan.mountFormatVersion >= 5 ? 4 : plan.mountFormatVersion),
     ...(plan.mountFormatVersion >= 4 ? { 'openclaw.createArgsEpoch': OPENCLAW_CURRENT_CREATE_ARGS_EPOCH } : {}),
     'openclaw.configHash': plan.configHash,
     [PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]: plan.runtimeFingerprint,
@@ -1373,7 +1677,7 @@ function attestOpenClawProjectContainerForGeneration(input: {
   if (inspect.Config?.User !== OPENCLAW_CONTAINER_USER) {
     fail('RUNTIME_USER', 'OpenClaw Project runtime must run as a non-root numeric user');
   }
-  if (inspect.Config?.WorkingDir !== (plan.mountFormatVersion === 5 ? OPENCLAW_PROJECT_WORKDIR : OPENCLAW_PROJECT_CWD)) {
+  if (inspect.Config?.WorkingDir !== (plan.mountFormatVersion >= 5 ? OPENCLAW_PROJECT_WORKDIR : OPENCLAW_PROJECT_CWD)) {
     fail('RUNTIME_WORKDIR', 'OpenClaw Project runtime working directory did not match');
   }
   if (!valuesEqual(inspect.Config?.Cmd, ['sleep', 'infinity'])) {
@@ -1436,7 +1740,8 @@ function attestOpenClawProjectContainerForGeneration(input: {
   ) {
     fail('RUNTIME_RESOURCE_POLICY', 'OpenClaw Project runtime resource limits did not match');
   }
-  attestUlimits(host.Ulimits);
+  attestUlimits(input.confinementGeneration === 'CURRENT'
+    ? PROJECT_RUNTIME_SHARED_NPROC_LIMIT : PROJECT_RUNTIME_LEGACY_NPROC_LIMIT, host.Ulimits);
   attestTmpfs(host.Tmpfs);
   requireEmpty(host.Mounts, 'RUNTIME_MOUNT_CONFIG', 'OpenClaw Project runtime has undeclared mount objects');
   requireEmpty(host.Devices, 'RUNTIME_DEVICES', 'OpenClaw Project runtime has host devices');
@@ -1475,7 +1780,7 @@ function attestOpenClawProjectContainerForGeneration(input: {
     fail('RUNTIME_BINDS', 'OpenClaw Project runtime bind configuration did not match');
   }
   const mounts = inspect.Mounts || [];
-  const workspaceQualified = plan.mountFormatVersion === 5;
+  const workspaceQualified = plan.mountFormatVersion >= 5;
   const expectedSkillMounts = workspaceQualified
     ? resolveOpenClawReadOnlySkillMounts({ sandboxWorkspaceDir: plan.sandboxWorkspaceDir, workdir: OPENCLAW_PROJECT_WORKDIR })
     : [];
@@ -1521,10 +1826,15 @@ export function attestOpenClawProjectContainer(input: {
   });
 }
 
-function buildContainerCreateArgs(
+/**
+ * The create argv and the proxy credentials it names. The proxy variables
+ * carry the Project egress token, so argv holds only their names and Docker
+ * reads each value from the executor's protected subprocess environment.
+ */
+function buildContainerCreateCommand(
   plan: OpenClawProjectSandboxPlan,
   createdAtMs: number,
-): string[] {
+): ProtectedDockerCommand {
   const docker = plan.desiredDocker;
   const args = ['container', 'create', '--name', plan.containerName];
   const labels: Record<string, string> = {
@@ -1536,7 +1846,7 @@ function buildContainerCreateArgs(
     'openclaw.createdAtMs': String(createdAtMs),
     // The Gateway itself labels 9.2 runtimes mountFormatVersion=4; v5 is
     // Portal's name for the workspace-qualified identity of that format.
-    'openclaw.mountFormatVersion': String(plan.mountFormatVersion === 5 ? 4 : plan.mountFormatVersion),
+    'openclaw.mountFormatVersion': String(plan.mountFormatVersion >= 5 ? 4 : plan.mountFormatVersion),
     ...(plan.mountFormatVersion >= 4 ? { 'openclaw.createArgsEpoch': OPENCLAW_CURRENT_CREATE_ARGS_EPOCH } : {}),
     'openclaw.configHash': plan.configHash,
     [PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]: plan.runtimeFingerprint,
@@ -1547,7 +1857,8 @@ function buildContainerCreateArgs(
   for (const tmpfs of docker.tmpfs) args.push('--tmpfs', tmpfs);
   args.push('--network', plan.networkMode);
   args.push('--user', docker.user);
-  for (const [key, value] of Object.entries<string>(docker.env)) args.push('--env', `${key}=${value}`);
+  const environment = protectedDockerEnvironmentArgs(docker.env);
+  args.push(...environment.args);
   args.push('--env', 'OPENCLAW_CLI=1');
   for (const cap of docker.capDrop) args.push('--cap-drop', cap);
   args.push(...projectRuntimeSecurityOptArgs());
@@ -1559,9 +1870,12 @@ function buildContainerCreateArgs(
     args.push('--ulimit', `${name}=${value.soft}:${value.hard}`);
   }
   for (const bind of plan.expectedBinds) args.push('-v', bind);
-  args.push('--workdir', plan.mountFormatVersion === 5 ? OPENCLAW_PROJECT_WORKDIR : OPENCLAW_PROJECT_CWD);
+  args.push('--workdir', plan.mountFormatVersion >= 5 ? OPENCLAW_PROJECT_WORKDIR : OPENCLAW_PROJECT_CWD);
   args.push(docker.image, 'sleep', 'infinity');
-  return args;
+  if (dockerArgsCarryProtectedValue(args, environment.secretEnvironment)) {
+    fail('RUNTIME_SECRET_ARGV', 'OpenClaw Project egress credential would reach the Docker command line');
+  }
+  return { args, secretEnvironment: environment.secretEnvironment };
 }
 
 function parseInspect(stdout: string): DockerContainerInspect | null {
@@ -1670,6 +1984,7 @@ async function ensureExactRuntime(input: {
 }): Promise<string> {
   const { plan, spec, executor } = input;
   let containerId: string | null = null;
+  let unattestedCreatedId: string | null = null;
   try {
     let inspect = await strictInspectContainer(executor, plan.containerName);
     if (inspect && isUnadoptedGatewayProvisionedRuntime(plan, inspect)) {
@@ -1690,12 +2005,14 @@ async function ensureExactRuntime(input: {
       inspect = null;
     }
     if (!inspect) {
-      const created = await executor.run('docker', buildContainerCreateArgs(plan, input.now.getTime()));
-      const createdContainerId = created.stdout.trim();
-      if (!/^[a-f0-9]{64}$/.test(createdContainerId)) {
+      const create = buildContainerCreateCommand(plan, input.now.getTime());
+      const created = await executor.run('docker', create.args, { secretEnvironment: create.secretEnvironment });
+      const createdId = created.stdout.trim();
+      if (!/^[a-f0-9]{64}$/.test(createdId)) {
         fail('RUNTIME_CREATE_ID', 'OpenClaw Project Docker create did not return one full immutable container identity');
       }
-      inspect = await strictInspectContainer(executor, createdContainerId);
+      unattestedCreatedId = createdId;
+      inspect = await strictInspectContainer(executor, createdId);
       if (!inspect) fail('RUNTIME_CREATE', 'OpenClaw Project runtime could not be inspected after creation');
       const attested = attestOpenClawProjectContainer({
         plan,
@@ -1703,9 +2020,10 @@ async function ensureExactRuntime(input: {
         inspect,
         requireRunning: false,
       });
-      if (attested.containerId !== createdContainerId) {
+      if (attested.containerId !== createdId) {
         fail('RUNTIME_CREATE_ID', 'OpenClaw Project runtime identity did not match Docker create output');
       }
+      unattestedCreatedId = null;
     }
     const requireRunning = inspect.State?.Running === true;
     const initial = attestOpenClawProjectContainer({
@@ -1768,8 +2086,41 @@ async function ensureExactRuntime(input: {
         plan,
         spec,
       });
+    } else if (unattestedCreatedId) {
+      await removeUnattestedCreatedRuntime({ executor, containerId: unattestedCreatedId, plan });
     }
     throw error;
+  }
+}
+
+// A runtime this call created but could not attest, for example one whose
+// proxy credentials never arrived, must not survive the failure: the next call
+// would find it by name and fail its attestation every time. Remove only that
+// exact, stopped object with this plan's identity labels and never fall back
+// to the name; the original error stays the outcome.
+async function removeUnattestedCreatedRuntime(input: {
+  executor: ProjectEgressCommandExecutor;
+  containerId: string;
+  plan: OpenClawProjectSandboxPlan;
+}): Promise<void> {
+  const { executor, containerId, plan } = input;
+  try {
+    const inspect = await strictInspectContainer(executor, containerId);
+    const labels = inspect?.Config?.Labels || {};
+    if (!inspect
+      || String(inspect.Id || '').toLowerCase() !== containerId
+      || String(inspect.Name || '').replace(/^\//, '') !== plan.containerName
+      || inspect.State?.Running !== false
+      || labels[OPENCLAW_PROJECT_ACTOR_LABEL] !== hashOpenClawProjectLabelIdentity(plan.actorUserId)
+      || labels[OPENCLAW_PROJECT_IDENTITY_LABEL] !== hashOpenClawProjectLabelIdentity(plan.projectIdentityId)
+      || labels[OPENCLAW_PROJECT_AGENT_LABEL] !== plan.agentId
+      || labels['openclaw.configHash'] !== plan.configHash
+      || labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL] !== plan.runtimeFingerprint) {
+      return;
+    }
+    await executor.run('docker', ['container', 'rm', containerId]);
+  } catch {
+    // Ambiguous cleanup is intentionally a no-op.
   }
 }
 
@@ -1777,7 +2128,7 @@ function isUnadoptedGatewayProvisionedRuntime(
   plan: OpenClawProjectSandboxPlan,
   inspect: DockerContainerInspect,
 ): boolean {
-  if (plan.mountFormatVersion !== 5) return false;
+  if (plan.mountFormatVersion < 5) return false;
   const labels = inspect.Config?.Labels || {};
   const portalLabels = [
     OPENCLAW_PROJECT_ACTOR_LABEL,
@@ -1816,21 +2167,36 @@ function usesWorkspaceQualifiedRuntime(version: readonly [number, number, number
 const commandExecutor: ProjectEgressCommandExecutor = {
   run(command, args, options = {}) {
     return new Promise((resolve, reject) => {
-      const childEnv: NodeJS.ProcessEnv = { ...process.env, LC_ALL: 'C', LANG: 'C' };
-      delete childEnv.DOCKER_HOST;
-      delete childEnv.DOCKER_CONTEXT;
-      delete childEnv.DOCKER_TLS_VERIFY;
-      delete childEnv.DOCKER_CERT_PATH;
-      delete childEnv.DOCKER_CONFIG;
-      delete childEnv.SSH_AUTH_SOCK;
+      const baseEnv: NodeJS.ProcessEnv = { ...process.env, LC_ALL: 'C', LANG: 'C' };
+      delete baseEnv.DOCKER_HOST;
+      delete baseEnv.DOCKER_CONTEXT;
+      delete baseEnv.DOCKER_TLS_VERIFY;
+      delete baseEnv.DOCKER_CERT_PATH;
+      delete baseEnv.DOCKER_CONFIG;
+      delete baseEnv.SSH_AUTH_SOCK;
+      const secretEnvironment = options.secretEnvironment || {};
+      let childEnv: NodeJS.ProcessEnv;
+      try {
+        childEnv = protectedDockerCommandEnvironment(baseEnv, args, secretEnvironment);
+      } catch (error) {
+        reject(error);
+        return;
+      }
       const commandArgs = command === 'docker'
         ? ['--host', 'unix:///var/run/docker.sock', ...args]
         : [...args];
-      const child = spawn(command, commandArgs, {
-        shell: false,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: childEnv,
-      });
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        child = spawn(command, commandArgs, {
+          shell: false,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: childEnv,
+        });
+      } catch {
+        // Node's synchronous argument errors quote the offending value.
+        reject(new Error('OpenClaw Project command failed to start'));
+        return;
+      }
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let outputBytes = 0;
@@ -1859,7 +2225,8 @@ const commandExecutor: ProjectEgressCommandExecutor = {
         if (!allowed.includes(exitCode)) {
           // Keep the command shape and a bounded stderr excerpt: a bare exit
           // code makes real-host qualification failures undiagnosable.
-          const detail = Buffer.concat(stderr).toString('utf8').trim().slice(0, 400);
+          const detail = redactProtectedDockerValues(Buffer.concat(stderr).toString('utf8'), secretEnvironment)
+            .trim().slice(0, 400);
           const commandSummary = [command, ...args.slice(0, 4)].join(' ');
           finish(new Error(
             `OpenClaw Project command failed with exit code ${exitCode} (${commandSummary}${args.length > 4 ? ' …' : ''})${detail ? `: ${detail}` : ''}`,
@@ -2062,6 +2429,7 @@ function staleRuntimeAttestationPlan(input: {
     network: input.spec.internalNetworkName,
     projectRoot: input.plan.projectRoot,
     proxyEnvironment,
+    sharedNprocLimit: PROJECT_RUNTIME_LEGACY_NPROC_LIMIT,
   });
   const currentConfigHash = computeOpenClawProjectConfigHash({
     docker: currentDesiredDocker,
@@ -2105,7 +2473,7 @@ function staleRuntimeAttestationPlan(input: {
   }).fingerprint;
   const currentV4Docker = buildDesiredDocker({ image, containerPrefix,
     network: input.spec.internalNetworkName, projectRoot: input.plan.projectRoot,
-    proxyEnvironment, mountFormatVersion: 4 });
+    proxyEnvironment, mountFormatVersion: 4, sharedNprocLimit: PROJECT_RUNTIME_LEGACY_NPROC_LIMIT });
   const currentV4Hash = computeOpenClawProjectConfigHash({ docker: currentV4Docker,
     sandboxWorkspaceDir: agentSlugWorkspaceDir, agentWorkspaceDir: input.plan.agentWorkspaceDir,
     mountFormatVersion: 4 });
@@ -2114,26 +2482,56 @@ function staleRuntimeAttestationPlan(input: {
     sessionKey: input.plan.sessionKey, configHash: currentV4Hash }).fingerprint;
   const currentV5Docker = buildDesiredDocker({ image, containerPrefix,
     network: input.spec.internalNetworkName, projectRoot: input.plan.projectRoot,
-    proxyEnvironment, mountFormatVersion: 5 });
+    proxyEnvironment, mountFormatVersion: 5, sharedNprocLimit: PROJECT_RUNTIME_LEGACY_NPROC_LIMIT });
   const currentV5Hash = computeOpenClawProjectConfigHash({ docker: currentV5Docker,
     sandboxWorkspaceDir: workspaceQualified.sandboxWorkspaceDir, agentWorkspaceDir: input.plan.agentWorkspaceDir,
     mountFormatVersion: 5 });
   const currentV5Fingerprint = buildOpenClawRuntimeFingerprint({ context: candidateContext,
     egressPolicyFingerprint: input.spec.policyFingerprint, image, agentId: input.plan.agentId,
     sessionKey: input.plan.sessionKey, configHash: currentV5Hash }).fingerprint;
+  // Native 9.9+ (format 6) runtimes were created with the per-container nproc
+  // value before the shared-UID ceiling; they must retire, not fail closed.
+  const currentV6Docker = buildDesiredDocker({ image, containerPrefix,
+    network: input.spec.internalNetworkName, projectRoot: input.plan.projectRoot,
+    proxyEnvironment, mountFormatVersion: 6, sharedNprocLimit: PROJECT_RUNTIME_LEGACY_NPROC_LIMIT });
+  const currentV6Hash = computeOpenClawProjectConfigHash({ docker: currentV6Docker,
+    sandboxWorkspaceDir: workspaceQualified.sandboxWorkspaceDir, agentWorkspaceDir: input.plan.agentWorkspaceDir,
+    mountFormatVersion: 6 });
+  const currentV6Fingerprint = buildOpenClawRuntimeFingerprint({ context: candidateContext,
+    egressPolicyFingerprint: input.spec.policyFingerprint, image, agentId: input.plan.agentId,
+    sessionKey: input.plan.sessionKey, configHash: currentV6Hash }).fingerprint;
+  // The finite shared-UID ceiling is a new immutable recipe. Recognize every
+  // exact supported mount format, including format-4 -> format-5 retirement.
+  const boundedCandidates = ([3, 4, 5, 6] as const).map((mountFormatVersion) => {
+    const desiredDocker = buildDesiredDocker({ image, containerPrefix,
+      network: input.spec.internalNetworkName, projectRoot: input.plan.projectRoot,
+      proxyEnvironment, mountFormatVersion });
+    const hash = computeOpenClawProjectConfigHash({ docker: desiredDocker,
+      sandboxWorkspaceDir: mountFormatVersion >= 5 ? workspaceQualified.sandboxWorkspaceDir : agentSlugWorkspaceDir,
+      agentWorkspaceDir: input.plan.agentWorkspaceDir, mountFormatVersion });
+    const fingerprint = buildOpenClawRuntimeFingerprint({ context: candidateContext,
+      egressPolicyFingerprint: input.spec.policyFingerprint, image, agentId: input.plan.agentId,
+      sessionKey: input.plan.sessionKey, configHash: hash }).fingerprint;
+    return { desiredDocker, hash, fingerprint, mountFormatVersion };
+  });
+  const boundedMatch = boundedCandidates.find((entry) => entry.hash === configHash && entry.fingerprint === runtimeFingerprint);
   const candidate = runtimeFingerprint === legacyFingerprint && configHash === legacyConfigHash
     ? {
       desiredDocker: legacyDesiredDocker,
       confinementGeneration: 'LEGACY_PRE_CONFINEMENT' as const,
     }
+    : boundedMatch
+      ? { desiredDocker: boundedMatch.desiredDocker, confinementGeneration: 'CURRENT' as const }
     : runtimeFingerprint === currentV4Fingerprint && configHash === currentV4Hash
-      ? { desiredDocker: currentV4Docker, confinementGeneration: 'CURRENT' as const }
+      ? { desiredDocker: currentV4Docker, confinementGeneration: 'LEGACY_SHARED_NPROC' as const }
     : runtimeFingerprint === currentV5Fingerprint && configHash === currentV5Hash
-      ? { desiredDocker: currentV5Docker, confinementGeneration: 'CURRENT' as const }
+      ? { desiredDocker: currentV5Docker, confinementGeneration: 'LEGACY_SHARED_NPROC' as const }
+    : runtimeFingerprint === currentV6Fingerprint && configHash === currentV6Hash
+      ? { desiredDocker: currentV6Docker, confinementGeneration: 'LEGACY_SHARED_NPROC' as const }
     : runtimeFingerprint === currentFingerprint && configHash === currentConfigHash
       ? {
         desiredDocker: currentDesiredDocker,
-        confinementGeneration: 'CURRENT' as const,
+        confinementGeneration: 'LEGACY_SHARED_NPROC' as const,
       }
       : null;
   if (!candidate) {
@@ -2152,9 +2550,12 @@ function staleRuntimeAttestationPlan(input: {
         'STALE_RUNTIME_NETWORK',
         'Managed OpenClaw Project stale runtime network mode is not a recognized generation',
       );
-  const staleMountFormatVersion: SandboxMountVersion = configHash === currentV5Hash ? 5
+  const staleMountFormatVersion: SandboxMountVersion = boundedMatch
+    ? boundedMatch.mountFormatVersion
+    : configHash === currentV6Hash ? 6
+    : configHash === currentV5Hash ? 5
     : configHash === currentV4Hash ? 4 : 3;
-  if ((staleMountFormatVersion === 5) !== (containerName === workspaceQualified.containerName)) {
+  if ((staleMountFormatVersion >= 5) !== (containerName === workspaceQualified.containerName)) {
     fail('STALE_RUNTIME_GENERATION', 'Managed OpenClaw Project stale runtime name and recipe generation disagree');
   }
   const stalePlan = Object.freeze({
@@ -2166,7 +2567,7 @@ function staleRuntimeAttestationPlan(input: {
     runtimeFingerprint,
     desiredDocker: candidate.desiredDocker,
     mountFormatVersion: staleMountFormatVersion,
-    expectedBinds: Object.freeze(staleMountFormatVersion === 5
+    expectedBinds: Object.freeze(staleMountFormatVersion >= 5
       ? [
         formatOpenClawManagedWorkspaceBind(staleSandboxWorkspaceDir, OPENCLAW_PROJECT_WORKDIR, false),
         `${input.plan.projectRoot}:${OPENCLAW_PROJECT_MOUNT}:rw`,
@@ -2413,8 +2814,10 @@ export async function ensureOpenClawProjectSandbox(
     const configFamily = readAgentContract((await readOpenClawConfig(dependencies.rpc)).config);
     // Keyed agent entries arrived with 2026.9.1 (format 4); 2026.9.2 keys the
     // runtime by workspace as well (format 5). Older runtimes keep format 3.
+    const coreVersion = dependencies.readRuntimeVersion();
     const mountFormatVersion: SandboxMountVersion = configFamily.storage !== 'entries' ? 3
-      : usesWorkspaceQualifiedRuntime(dependencies.readRuntimeVersion()) ? 5 : 4;
+      : ['2026.9.9', '2026.10.5', '2026.10.6'].includes(coreVersion?.join('.') || '') ? 6
+      : usesWorkspaceQualifiedRuntime(coreVersion) ? 5 : 4;
     const preflightNetworkBinding = await dependencies.resolveInternalNetworkBinding(
       dependencies.executor,
       spec,
@@ -2463,7 +2866,7 @@ export async function ensureOpenClawProjectSandbox(
         // The cache is only a latency hint. Re-read the exact agent entry (which
         // also repairs config drift) and attest the complete live Docker policy;
         // labels/image/running alone cannot prove a safe execution boundary.
-        await ensureExactOpenClawAgentConfig(fastPathPlan, dependencies.rpc);
+        await ensureExactOpenClawAgentConfig(fastPathPlan, dependencies.rpc, dependencies.readRuntimeVersion);
         try {
           const current = attestOpenClawProjectContainer({
             plan: fastPathPlan,
@@ -2548,7 +2951,7 @@ export async function ensureOpenClawProjectSandbox(
       context: input.context,
       spec,
     });
-    await ensureExactOpenClawAgentConfig(plan, dependencies.rpc);
+    await ensureExactOpenClawAgentConfig(plan, dependencies.rpc, dependencies.readRuntimeVersion);
     assertProjectContext(input.context);
     const runtimeContainerId = await ensureExactRuntime({
       plan,
@@ -2612,7 +3015,8 @@ export async function ensureOpenClawProjectSandbox(
 }
 
 export const __openClawProjectSandboxTest = {
-  buildContainerCreateArgs,
+  buildContainerCreateCommand,
+  commandExecutor,
   usesWorkspaceQualifiedRuntime,
   isUnadoptedGatewayProvisionedRuntime,
   ensureExactOpenClawAgentConfig,

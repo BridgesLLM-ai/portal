@@ -1,3 +1,9 @@
+import { useTextareaDictation } from '../../hooks/useDictation';
+import { WidgetPresentationProvider, useWidgetPresentation } from './richContent/WidgetPresentationContext';
+import { rewriteWidgetDirectives, widgetPresentationFor } from './richContent/widgetPresentation';
+import { ChatWidgetCard } from './richContent/ChatWidgetCard';
+import { AgentWorkButton, AgentWorkStrip, useAgentWorkSurface } from './agentWork/AgentWorkSurface';
+import { openClawTaskConversation } from '../../utils/taskConversation';
 /**
  * ChatInterface — iMessage-style chat with per-agent contacts.
  *
@@ -8,7 +14,7 @@
  * 3. Dictation / Speech-to-text button
  * 4. File attachment button with chip previews
  * 5. Stream status shown through the shared status rail
- * 6. Tool use as centered iMessage-style system notification pills
+ * 6. Guarded tool cards and grouped activity with standalone attention rows
  */
 import { AskQuestionCard, AskQuestionAnswerProvider, parseAskQuestionPayload, useAskQuestionAnswer } from './AskQuestionCard';
 import AskUserQuestionCard from './AskUserQuestionCard';
@@ -43,6 +49,7 @@ import { useAuthStore } from '../../contexts/AuthContext';
 import { isElevated, isOwner } from '../../utils/authz';
 import { workspaceAuthorizedFetch } from '../../utils/workspaceAuthorizedFetch';
 import { buildPersistedChatAttachmentText } from '../../utils/chatAttachmentPersistence';
+import { harnessAcceptsNativePhotos, nativePhotoAdmissionError } from '../../utils/chatPhotoAdmission';
 import {
   agentToolsAPI,
   toolInstallConfirmationPhrase,
@@ -73,8 +80,11 @@ import {
   isKnownOpenClawCatalogModelId,
 } from '../../utils/modelId';
 import ComposerStatusBadge from './ComposerStatusBadge';
-import ToolGlyph from './ToolGlyph';
-import { getToolPresentation, getToolSummary, isAskQuestionTool, isCompactionNotice } from '../../utils/toolPresentation';
+import { ToolCard } from './toolCards/ToolCard';
+import { ToolActivityGroup } from './toolActivity/ToolActivityGroup';
+import { ToolActivityScope } from './toolActivity/toolActivityDisclosure';
+import { buildActivityUnits, describeActivityTool, selectNewestActivityUnits, type ActivityEntry, type ActivityUnit } from './toolActivity/toolActivityModel';
+import { isAskQuestionTool, isCompactionNotice } from '../../utils/toolPresentation';
 import { anchoredScrollTop, selectNewestWindow } from '../../utils/timelineWindow';
 import { supportsAgentChatStop } from '../../utils/agentChatRunLifecycle';
 import {
@@ -95,6 +105,7 @@ import {
   isAgentChatSelectedProviderRevalidationPending,
   isAgentChatProviderCatalogAbortError,
   loadAgentChatProviderCatalog,
+  OPENCLAW_PROVIDER_CATALOG_SETTLE_TIMEOUT_MS,
   reduceAgentChatSelectedProviderRevalidation,
   type AgentChatProviderAvailabilityAssessment,
   type AgentChatProviderCatalogEntry,
@@ -435,6 +446,8 @@ interface ProviderCapabilities {
   supportsInTurnSteering?: boolean;
   supportsQueuedFollowUps?: boolean;
   followUpMode?: 'interrupt_and_send' | 'queued_follow_up' | string;
+  /** Native image input for composer photos (harness catalog). */
+  supportsAttachments?: boolean;
 }
 
 export function ProviderAvailabilityBarrier({
@@ -548,7 +561,7 @@ function ModelPickerDropdown({
   open: boolean;
   onClose: () => void;
   children: React.ReactNode;
-  anchorRef: React.RefObject<HTMLButtonElement>;
+  anchorRef: React.RefObject<HTMLButtonElement | null>;
   id: string;
 }) {
   const [isMobile, setIsMobile] = useState(false);
@@ -1813,7 +1826,7 @@ export function AgentSettingsDrawer({ open, onClose, onAiProviderSetupComplete, 
   );
 }
 
-/* ─── Fix #6: Tool Call as centered iMessage system notification pill ───── */
+/* ─── Guarded tool cards ──────────────────────────────────────────────── */
 
 const ToolCallBlock = React.memo(function ToolCallBlock({ tool }: { tool: ToolCall }) {
   const onAnswerQuestion = useAskQuestionAnswer();
@@ -1823,7 +1836,6 @@ const ToolCallBlock = React.memo(function ToolCallBlock({ tool }: { tool: ToolCa
   );
   // Tool arguments can become valid partway through a stream. Keep every hook
   // above the conditional return so that transition cannot change hook order.
-  const [expanded, setExpanded] = useState(false);
   // The owner-scoped pending card beside the composer is the only answer
   // surface while the tool is running. Rendering the streamed arguments as a
   // second live form creates two competing submissions with different answer
@@ -1839,107 +1851,103 @@ const ToolCallBlock = React.memo(function ToolCallBlock({ tool }: { tool: ToolCa
       </div>
     );
   }
-  const duration = tool.endedAt ? ((tool.endedAt - tool.startedAt) / 1000).toFixed(1) : null;
-  const hasDetails = !!(tool.result || tool.arguments);
-  const summary = getToolSummary(tool);
-  const presentation = getToolPresentation(tool.name);
-
-  return (
-    <motion.div
-      data-tool-call-block
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      transition={{ duration: 0.2 }}
-      className="flex justify-center px-4 py-1"
-    >
-      <div className="flex flex-col items-center max-w-md w-full">
-        <button
-          onClick={() => hasDetails && setExpanded(!expanded)}
-          className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full border transition-colors text-[11px] text-slate-400 ${presentation.surfaceClass}`}
-        >
-          <span className={`inline-flex h-5 w-5 items-center justify-center rounded-full border ${presentation.iconBadgeClass}`}>
-            <ToolGlyph toolName={tool.name} size={11} className={presentation.iconClass} />
-          </span>
-          <span className="text-slate-200">
-            {summary}
-          </span>
-          {tool.status === 'running' ? (
-            <Loader2 size={10} className={`animate-spin ${presentation.iconClass}`} />
-          ) : null}
-          {duration && (
-            <span className="text-slate-500">· {duration}s</span>
-          )}
-          {hasDetails && (
-            <ChevronRight size={10} className={`text-slate-600 transition-transform ${expanded ? 'rotate-90' : ''}`} />
-          )}
-        </button>
-        <AnimatePresence>
-          {expanded && hasDetails && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className="overflow-hidden w-full"
-            >
-              {tool.arguments && (
-                <div className="mt-1.5 px-3 py-2 rounded-xl bg-slate-800/40 border border-white/[0.04] text-[11px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[120px] overflow-y-auto text-left">
-                  <span className="text-slate-500 text-[10px] block mb-1">Arguments:</span>
-                  {typeof tool.arguments === 'string' ? tool.arguments : JSON.stringify(tool.arguments, null, 2)}
-                </div>
-              )}
-              {tool.result && (
-                <div className="mt-1.5 px-3 py-2 rounded-xl bg-black/20 border border-white/[0.04] text-[11px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[120px] overflow-y-auto text-left">
-                  <span className="text-slate-500 text-[10px] block mb-1">Result:</span>
-                  {tool.result}
-                </div>
-              )}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-    </motion.div>
-  );
+  if (tool.name === 'show_widget') return <div className="px-4 py-1"><ChatWidgetCard tool={tool} /></div>;
+  // Every other tool renders through the guarded card registry; unknown or
+  // malformed calls degrade to a generic card that still names the tool.
+  return <ToolCard tool={tool} />;
 });
+
+/* ─── Grouped tool activity ─────────────────────────────────────────────── */
+
+function renderAgentGroupMember(tool: ToolCall): React.ReactNode {
+  return <ToolCallBlock tool={tool} />;
+}
+
+/**
+ * Render display units in transcript order. Standalone calls (widgets,
+ * questions, progress, media, unsettled failures) keep their own row; runs of
+ * ordinary calls share one collapsed disclosure with their original IDs.
+ */
+function renderAgentActivityUnit<B>(
+  unit: ActivityUnit<ToolCall, B>,
+  keyPrefix: string,
+  renderBoundary: (value: B, key: string) => React.ReactNode,
+): React.ReactNode {
+  if (unit.kind === 'boundary') return renderBoundary(unit.value, unit.key);
+  if (unit.kind === 'tool') return <ToolCallBlock key={`${keyPrefix}-${unit.key}`} tool={unit.tool} />;
+  return (
+    <ToolActivityGroup
+      key={`${keyPrefix}-${unit.key}`}
+      groupKey={unit.key}
+      tools={unit.tools}
+      surface="agent"
+      renderTool={renderAgentGroupMember}
+      describeTool={describeActivityTool}
+    />
+  );
+}
+
+const AFTER_FIRST_BOUNDARY = 'after-first-tool';
 
 const BoundedToolCallList = React.memo(function BoundedToolCallList({
   tools,
   messageKey,
   className = '',
   renderAfterFirst,
+  renderAfterFirstIsProse = true,
+  proseFollows = false,
 }: {
   tools: readonly ToolCall[];
   messageKey: string;
   className?: string;
   renderAfterFirst?: React.ReactNode;
+  /** Whether the content after the first call includes assistant prose. */
+  renderAfterFirstIsProse?: boolean;
+  /** Whether assistant prose renders after this list. */
+  proseFollows?: boolean;
 }) {
   const [revealedEarlier, setRevealedEarlier] = useState(0);
   useEffect(() => setRevealedEarlier(0), [messageKey]);
+  const hasAfterFirst = Boolean(renderAfterFirst);
+  const units = useMemo(() => {
+    const entries: ActivityEntry<ToolCall, null>[] = [];
+    tools.forEach((tool, index) => {
+      entries.push({ kind: 'tool', tool });
+      if (index === 0 && hasAfterFirst) {
+        entries.push({ kind: 'boundary', key: AFTER_FIRST_BOUNDARY, value: null, prose: renderAfterFirstIsProse });
+      }
+    });
+    return buildActivityUnits(entries, { proseFollows });
+  }, [hasAfterFirst, proseFollows, renderAfterFirstIsProse, tools]);
   const windowed = useMemo(
-    () => selectNewestWindow(tools, TOOL_WINDOW_SIZE, revealedEarlier),
-    [revealedEarlier, tools],
+    () => selectNewestActivityUnits(units, TOOL_WINDOW_SIZE, revealedEarlier),
+    [revealedEarlier, units],
   );
 
   if (tools.length === 0) return null;
 
+  // Text placed after the first call stays readable even when that call is
+  // behind the earlier-tools window.
+  const afterFirstHidden = hasAfterFirst && windowed.hiddenBoundaries > 0;
+
   return (
     <div className={className}>
-      {windowed.hiddenCount > 0 ? (
+      {windowed.hiddenUnits > 0 ? (
         <div className="flex justify-center px-4 py-1">
           <button
             type="button"
             onClick={() => setRevealedEarlier((current) => current + TOOL_WINDOW_SIZE)}
             className="rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200"
           >
-            Show earlier tools · {windowed.hiddenCount} hidden
+            Show earlier tools · {windowed.hiddenTools} hidden
           </button>
         </div>
       ) : null}
-      {windowed.items.map((tool, index) => (
-        <React.Fragment key={`${messageKey}-${tool.id}`}>
-          <ToolCallBlock tool={tool} />
-          {index === 0 ? renderAfterFirst : null}
-        </React.Fragment>
+      {afterFirstHidden ? renderAfterFirst : null}
+      {windowed.units.map((unit) => renderAgentActivityUnit(
+        unit,
+        messageKey,
+        (_value, key) => <React.Fragment key={`${messageKey}-${key}`}>{renderAfterFirst}</React.Fragment>,
       ))}
     </div>
   );
@@ -2180,142 +2188,6 @@ function CopyMessageButton({ text }: { text: string }) {
   );
 }
 
-/* ─── Fix #3: Speech Recognition hook with proper cleanup ─────────────── */
-
-interface SpeechRecognitionHook {
-  isListening: boolean;
-  transcript: string;
-  isSupported: boolean;
-  startListening: () => void;
-  stopListening: () => void;
-}
-
-function useSpeechRecognition(onTranscript: (text: string) => void): SpeechRecognitionHook {
-  const [isListening, setIsListening] = useState(false);
-  const [transcript, setTranscript] = useState('');
-  const recognitionRef = useRef<any>(null);
-  const onTranscriptRef = useRef(onTranscript);
-  // Track whether the user explicitly stopped vs browser auto-ended on silence
-  const intentionalStopRef = useRef(false);
-  // Accumulate finalized transcript across recognition restarts
-  const accumulatedRef = useRef('');
-
-  // Keep callback ref updated to avoid stale closures
-  useEffect(() => {
-    onTranscriptRef.current = onTranscript;
-  }, [onTranscript]);
-
-  const SpeechRecognition =
-    typeof window !== 'undefined'
-      ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
-      : null;
-  const isSupported = !!SpeechRecognition;
-
-  const startListening = useCallback(() => {
-    if (!SpeechRecognition) return;
-    
-    intentionalStopRef.current = false;
-    accumulatedRef.current = '';
-    
-    // Clean up any existing recognition
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-    }
-
-    function createRecognition() {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      recognition.onresult = (event: any) => {
-        let finalTranscript = '';
-        let interimTranscript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript;
-          } else {
-            interimTranscript += event.results[i][0].transcript;
-          }
-        }
-        // When we get finalized text, accumulate it
-        if (finalTranscript) {
-          accumulatedRef.current += (accumulatedRef.current ? ' ' : '') + finalTranscript;
-        }
-        // Show accumulated + current interim
-        const fullText = accumulatedRef.current + (interimTranscript ? (accumulatedRef.current ? ' ' : '') + interimTranscript : '');
-        setTranscript(fullText);
-        onTranscriptRef.current(fullText);
-      };
-
-      recognition.onend = () => {
-        // Chrome fires onend after silence even in continuous mode.
-        // Auto-restart unless the user explicitly clicked stop.
-        if (!intentionalStopRef.current) {
-          try {
-            const newRecognition = createRecognition();
-            newRecognition.start();
-            recognitionRef.current = newRecognition;
-          } catch {
-            // If restart fails, give up gracefully
-            setIsListening(false);
-          }
-        } else {
-          setIsListening(false);
-        }
-      };
-
-      recognition.onerror = (event: any) => {
-        // 'no-speech' is normal during silence — don't stop
-        if (event.error === 'no-speech') return;
-        // 'aborted' happens during restart — don't stop
-        if (event.error === 'aborted') return;
-        setIsListening(false);
-        intentionalStopRef.current = true;
-      };
-
-      return recognition;
-    }
-
-    const recognition = createRecognition();
-    recognition.start();
-    recognitionRef.current = recognition;
-    setIsListening(true);
-  }, [SpeechRecognition]);
-
-  const stopListening = useCallback(() => {
-    intentionalStopRef.current = true;
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-    }
-    setIsListening(false);
-  }, []);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {
-          // ignore
-        }
-        recognitionRef.current = null;
-      }
-    };
-  }, []);
-
-  return { isListening, transcript, isSupported, startListening, stopListening };
-}
-
 /* ─── Fix #4: Attachment types ─────────────────────────────────────────── */
 
 interface PendingAttachment {
@@ -2327,6 +2199,7 @@ interface PendingAttachment {
   previewUrl?: string;
   textContent?: string;
   fileId?: string;
+  fileRevision?: string;
   /** Server-side path after upload (when the backend exposes one) */
   serverPath?: string;
   /** Signed direct URL for cross-host tool access */
@@ -2548,8 +2421,13 @@ export const AssistantBubble = React.memo(function AssistantBubble({
   const liveStatusPlaceholder = isCurrentlyStreaming && !hasContent && !hasThinkingPresentation
     ? String(liveStatusText || '').trim()
     : '';
-  const visibleMessageContent = hasContent ? message.content : liveStatusPlaceholder;
+  const widgetPresentation = useWidgetPresentation();
+  const rawMessageContent = hasContent ? message.content : liveStatusPlaceholder;
+  const visibleMessageContent = useMemo(() => rewriteWidgetDirectives(rawMessageContent,
+    placement => widgetPresentation.refs.has(placement.ref)), [rawMessageContent, widgetPresentation]);
   const hasVisibleMessageContent = !!visibleMessageContent.trim();
+  if (rawMessageContent !== visibleMessageContent && !hasVisibleMessageContent
+    && !hasThinkingPresentation && toolCalls.length === 0) return null;
 
   return (
     <div
@@ -2580,6 +2458,7 @@ export const AssistantBubble = React.memo(function AssistantBubble({
             tools={toolCalls}
             messageKey={message.id}
             className="mb-2 -ml-3 -mr-3"
+            proseFollows={hasVisibleMessageContent}
           />
         )}
 
@@ -2606,6 +2485,7 @@ export const AssistantBubble = React.memo(function AssistantBubble({
             ) : (
               <div className={isCurrentlyStreaming ? 'streaming-cursor text-slate-300/95' : undefined}>
                 <MarkdownRenderer
+                  assistantArtifacts
                   content={visibleMessageContent}
                   isStreaming={isCurrentlyStreaming}
                   hostFileContext={hostFileContext}
@@ -2778,6 +2658,7 @@ const ActivityTimeline = React.memo(function ActivityTimeline({
   agent,
   avatarUrl,
   hostFileContext,
+  proseFollows = false,
 }: {
   messageId: string;
   segments: readonly TimelineSegmentLike[];
@@ -2786,6 +2667,8 @@ const ActivityTimeline = React.memo(function ActivityTimeline({
   agent: AgentIdentity;
   avatarUrl?: string;
   hostFileContext?: HostFileLinkContext;
+  /** Whether assistant prose renders after this timeline (the final bubble). */
+  proseFollows?: boolean;
 }) {
   const [revealedEarlier, setRevealedEarlier] = useState(0);
   const timeline = useMemo<TimelineActivity[]>(() => {
@@ -2816,28 +2699,45 @@ const ActivityTimeline = React.memo(function ActivityTimeline({
     return [...segmentItems, ...toolItems]
       .sort(compareActivityTimelineItems);
   }, [fallbackTimestamp, segments, toolCalls]);
+  // Segments (prose and thinking) are boundaries; consecutive ordinary calls
+  // between them share one disclosure.
+  const units = useMemo(() => buildActivityUnits(
+    timeline.map((item): ActivityEntry<ToolCall, Extract<TimelineActivity, { kind: 'segment' }>> => (
+      item.kind === 'segment'
+        ? {
+            kind: 'boundary',
+            key: `timeline-segment-${messageId}-${item.segmentIndex}-${item.ts}`,
+            value: item,
+            prose: item.segment.kind !== 'thinking' && Boolean(String(item.segment.text || '').trim()),
+          }
+        : { kind: 'tool', tool: item.tool }
+    )),
+    { proseFollows },
+  ), [messageId, proseFollows, timeline]);
   const windowed = useMemo(
-    () => selectNewestWindow(timeline, TIMELINE_WINDOW_SIZE, revealedEarlier),
-    [revealedEarlier, timeline],
+    () => selectNewestActivityUnits(units, TIMELINE_WINDOW_SIZE, revealedEarlier),
+    [revealedEarlier, units],
   );
 
   return (
     <>
-      {windowed.hiddenCount > 0 ? (
+      {windowed.hiddenUnits > 0 ? (
         <div className="mx-auto flex max-w-3xl justify-center px-4 py-2">
           <button
             type="button"
             onClick={() => setRevealedEarlier((current) => current + TIMELINE_WINDOW_SIZE)}
             className="rounded-full border border-white/[0.08] bg-white/[0.03] px-3 py-1.5 text-[11px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200"
           >
-            Show earlier activity · {windowed.hiddenCount} hidden
+            Show earlier activity · {windowed.hiddenTools + windowed.hiddenBoundaries} hidden
           </button>
         </div>
       ) : null}
-      {windowed.items.map((item) => (
-        item.kind === 'segment' ? (
+      {windowed.units.map((unit) => renderAgentActivityUnit(
+        unit,
+        `timeline-${messageId}`,
+        (item, key) => (
           <TimelineSegmentBubble
-            key={`timeline-segment-${messageId}-${item.segmentIndex}-${item.ts}`}
+            key={key}
             segment={item.segment}
             segmentIndex={item.segmentIndex}
             timestamp={item.ts}
@@ -2846,13 +2746,257 @@ const ActivityTimeline = React.memo(function ActivityTimeline({
             avatarUrl={avatarUrl}
             hostFileContext={hostFileContext}
           />
-        ) : (
-          <ToolCallBlock key={`timeline-tool-${messageId}-${item.tool.id}`} tool={item.tool} />
-        )
+        ),
       ))}
     </>
   );
 });
+
+/**
+ * One assistant turn in the Agent Chat transcript: the live or persisted
+ * activity timeline (or the position-based reconstruction) and then the final
+ * bubble. Exported so each real transcript path can be exercised directly.
+ */
+export function AgentAssistantTurn({
+  msg,
+  agent,
+  avatarUrl,
+  hostFileContext,
+  isStreamingAssistant,
+  streamSegments,
+  thinkingContent,
+  thinkingSubject,
+  isRunning,
+  statusText,
+  isLast,
+  onRetry,
+}: {
+  msg: ChatMessage;
+  agent: AgentIdentity;
+  avatarUrl?: string;
+  hostFileContext?: HostFileLinkContext;
+  isStreamingAssistant: boolean;
+  streamSegments: readonly TimelineSegmentLike[];
+  thinkingContent?: string;
+  thinkingSubject?: string;
+  isRunning: boolean;
+  statusText?: string | null;
+  isLast: boolean;
+  onRetry?: () => void;
+}) {
+  return (
+    <>
+      {/* Interleaved timeline: graduated segments + tool calls in chronological order.
+          For streaming: use live streamSegments with timestamps.
+          For history: use msg.segments with position info to reconstruct the timeline. */}
+      {(() => {
+        const toolCalls = msg.toolCalls || [];
+        const isLiveTimeline = isStreamingAssistant && streamSegments.length > 0;
+        const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
+
+        if (!isLiveTimeline && !hasHistorySegments) return null;
+
+        // Mid-turn reloads can persist a partial snapshot of a thought that the
+        // live/resumed stream then carries in grown form. Drop history thinking
+        // segments that are strict prefixes of the current live thinking so the
+        // same thought never renders twice.
+        const liveThinkingForDedupe = isStreamingAssistant ? (thinkingContent || '').trim() : '';
+        const dropStalePartialThoughts = (segs: NonNullable<typeof msg.segments>) => (
+          liveThinkingForDedupe
+            ? segs.filter((seg) => !(
+                seg.kind === 'thinking'
+                && seg.text.trim()
+                && seg.text.trim() !== liveThinkingForDedupe
+                && liveThinkingForDedupe.startsWith(seg.text.trim())
+              ))
+            : segs
+        );
+        // Mirrors the final bubble below: its text counts as prose after the
+        // tools unless the timeline already rendered it. Failures stay visible
+        // on their own until assistant prose follows them.
+        const finalBubbleText = (msg.content || '').trim();
+        const proseAfter = (renderedSegments: readonly TimelineSegmentLike[]) => (
+          Boolean(finalBubbleText)
+          && !isAssistantContentRepresentedByTimeline(finalBubbleText, renderedSegments)
+        );
+
+        if (isLiveTimeline) {
+          return (
+            <ActivityTimeline
+              key={`live-activity-${msg.id}`}
+              messageId={msg.id}
+              segments={streamSegments}
+              toolCalls={toolCalls}
+              fallbackTimestamp={msg.createdAt.getTime()}
+              agent={agent}
+              avatarUrl={avatarUrl}
+              hostFileContext={hostFileContext}
+              proseFollows={proseAfter(streamSegments)}
+            />
+          );
+        } else {
+          // History/finalized turn: prefer timestamped segments from the live stream,
+          // then fall back to position-based reconstruction from durable history.
+          const segments = dropStalePartialThoughts(msg.segments || []);
+          const hasTimestampedSegments = segments.some((seg) => typeof seg.ts === 'number' && Number.isFinite(seg.ts));
+
+          if (hasTimestampedSegments) {
+            return (
+              <ActivityTimeline
+                key={`history-activity-${msg.id}`}
+                messageId={msg.id}
+                segments={segments}
+                toolCalls={toolCalls}
+                fallbackTimestamp={msg.createdAt.getTime()}
+                agent={agent}
+                avatarUrl={avatarUrl}
+                hostFileContext={hostFileContext}
+                proseFollows={proseAfter(msg.segments || [])}
+              />
+            );
+          }
+
+          const beforeSegs = segments.filter(s => s.position === 'before');
+          const betweenSegs = segments.filter(s => s.position === 'between');
+          const betweenHasProse = betweenSegs.some((seg) => seg.kind !== 'thinking' && Boolean(seg.text.trim()));
+          return (
+            <>
+              {beforeSegs.map((seg, i) => (
+                <AssistantBubble
+                  key={`hist-before-${msg.id}-${i}`}
+                  message={{
+                    id: `hist-before-${msg.id}-${i}`,
+                    role: 'assistant' as const,
+                    content: seg.kind === 'thinking' ? '' : seg.text,
+                    thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
+                    thinkingSubject: seg.kind === 'thinking' ? seg.subject : undefined,
+                    createdAt: msg.createdAt,
+                  }}
+                  agent={agent}
+                  avatarUrl={avatarUrl}
+                  isLast={false}
+                  isStreaming={false}
+                  hostFileContext={hostFileContext}
+                />
+              ))}
+              <BoundedToolCallList
+                tools={toolCalls}
+                messageKey={`history-${msg.id}`}
+                renderAfterFirst={toolCalls.length > 1 && betweenSegs.length > 0 ? betweenSegs.map((seg, i) => (
+                  <AssistantBubble
+                    key={`hist-between-${msg.id}-${i}`}
+                    message={{
+                      id: `hist-between-${msg.id}-${i}`,
+                      role: 'assistant' as const,
+                      content: seg.kind === 'thinking' ? '' : seg.text,
+                      thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
+                      thinkingSubject: seg.kind === 'thinking' ? seg.subject : undefined,
+                      createdAt: msg.createdAt,
+                    }}
+                    agent={agent}
+                    avatarUrl={avatarUrl}
+                    isLast={false}
+                    isStreaming={false}
+                    hostFileContext={hostFileContext}
+                  />
+                )) : undefined}
+                renderAfterFirstIsProse={betweenHasProse}
+                proseFollows={proseAfter((msg.segments || []).filter((segment) => segment.position === 'before'))}
+              />
+              {/* Text after tool calls (main response) — rendered by the AssistantBubble below */}
+            </>
+          );
+        }
+      })()}
+      {/* Current/final bubble — shows live text OR historical content after tools */}
+      {(() => {
+        const isLiveTimeline = isStreamingAssistant && streamSegments.length > 0;
+        const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
+        const renderedBeforeSegments = isLiveTimeline
+          ? streamSegments
+          : ((msg.segments || []).some((segment) => typeof segment.ts === 'number' && Number.isFinite(segment.ts))
+              ? (msg.segments || [])
+              : (msg.segments || []).filter((segment) => segment.position === 'before'));
+        const bubbleMessage = (isLiveTimeline || hasHistorySegments)
+          ? { ...msg, toolCalls: undefined, segments: undefined }
+          : msg;
+        const bubbleContent = bubbleMessage.content?.trim() || '';
+        const bubbleThinking = bubbleMessage.thinkingContent?.trim() || '';
+        const bubbleThinkingSubject = bubbleMessage.thinkingSubject?.trim() || '';
+        const lastRenderedThinkingSegment = [...renderedBeforeSegments]
+          .reverse()
+          .find((segment) => (
+            segment.kind === 'thinking'
+            && (segment.text.trim() || segment.subject)
+          ));
+        const bubbleContentDuplicatesTimeline = isAssistantContentRepresentedByTimeline(
+          bubbleContent,
+          renderedBeforeSegments,
+        );
+        // A thought grows as cumulative snapshots. A mid-turn reload can leave a
+        // partially flushed copy in durable history while the live/resumed stream
+        // carries the grown version of the SAME thought — treat prefix matches in
+        // either direction as the same thought, not two bubbles.
+        const isSameGrowingThought = (a: string, b: string) => Boolean(a) && Boolean(b)
+          && (a === b || a.startsWith(b) || b.startsWith(a));
+        const lastRenderedThinkingText = lastRenderedThinkingSegment?.text.trim() || '';
+        const lastRenderedThinkingSubject = lastRenderedThinkingSegment?.subject?.trim() || '';
+        const bubbleThinkingDuplicatesTimeline = Boolean(bubbleThinking || bubbleThinkingSubject)
+          && Boolean(lastRenderedThinkingSegment)
+          && (!bubbleThinking || isSameGrowingThought(lastRenderedThinkingText, bubbleThinking))
+          && (!bubbleThinkingSubject || lastRenderedThinkingSubject === bubbleThinkingSubject);
+        const liveThinkingValue = isStreamingAssistant ? thinkingContent : undefined;
+        const liveThinkingSubjectValue = isStreamingAssistant ? thinkingSubject : undefined;
+        const liveThinkingText = liveThinkingValue?.trim() || '';
+        const liveThinkingSubjectText = liveThinkingSubjectValue?.trim() || '';
+        const liveThinkingAlreadyRendered = Boolean(liveThinkingText || liveThinkingSubjectText)
+          && Boolean(lastRenderedThinkingSegment)
+          && (!liveThinkingText || isSameGrowingThought(lastRenderedThinkingText, liveThinkingText))
+          && (!liveThinkingSubjectText || lastRenderedThinkingSubject === liveThinkingSubjectText);
+        const effectiveBubbleMessage = (bubbleContentDuplicatesTimeline || bubbleThinkingDuplicatesTimeline)
+          ? {
+              ...bubbleMessage,
+              content: bubbleContentDuplicatesTimeline ? '' : bubbleMessage.content,
+              thinkingContent: bubbleThinkingDuplicatesTimeline ? undefined : bubbleMessage.thinkingContent,
+              thinkingSubject: bubbleThinkingDuplicatesTimeline ? undefined : bubbleMessage.thinkingSubject,
+            }
+          : bubbleMessage;
+        const effectiveLiveThinkingContent = liveThinkingAlreadyRendered ? undefined : liveThinkingValue;
+        const effectiveLiveThinkingSubject = liveThinkingAlreadyRendered ? undefined : liveThinkingSubjectValue;
+        const effectiveLiveStatusText = isStreamingAssistant && isRunning
+          ? String(statusText || '').trim()
+          : '';
+        const hasVisibleBubble = Boolean(
+          effectiveBubbleMessage.content?.trim()
+          || effectiveBubbleMessage.thinkingContent?.trim()
+          || effectiveBubbleMessage.thinkingSubject
+          || effectiveLiveThinkingContent?.trim()
+          || effectiveLiveThinkingSubject
+          || effectiveLiveStatusText
+          || (effectiveBubbleMessage.toolCalls || []).length > 0,
+        );
+        if (!hasVisibleBubble && (isLiveTimeline || hasHistorySegments)) {
+          return null;
+        }
+        return (
+          <AssistantBubble
+            message={effectiveBubbleMessage}
+            agent={agent}
+            avatarUrl={avatarUrl}
+            isLast={isLast}
+            isLive={isStreamingAssistant}
+            isStreaming={isRunning && isStreamingAssistant}
+            liveThinkingContent={effectiveLiveThinkingContent}
+            liveThinkingSubject={effectiveLiveThinkingSubject}
+            liveStatusText={effectiveLiveStatusText}
+            hostFileContext={hostFileContext}
+            onRetry={onRetry}
+          />
+        );
+      })()}
+    </>
+  );
+}
 
 /* ─── Main Component ────────────────────────────────────────────────────── */
 
@@ -3082,6 +3226,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       force,
       signal: controller.signal,
       onSnapshot: applySnapshot,
+      // A cold OpenClaw attestation can outlast the default wait; every other
+      // row still settles (and releases its own harness) as soon as it is ready.
+      ...(targetProvider === 'OPENCLAW'
+        ? { timeoutMs: OPENCLAW_PROVIDER_CATALOG_SETTLE_TIMEOUT_MS }
+        : {}),
     })
       .then(() => {
         if (cancelled) return;
@@ -3422,9 +3571,12 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
           supportsCustomModelInput: true,
           modelCatalogKind: 'dynamic' as const,
           supportsInTurnSteering: true,
+          supportsAttachments: true,
         },
       }
     : {});
+  // Photos become native image input only where the harness advertises it.
+  const nativePhotoInput = harnessAcceptsNativePhotos(providerMeta.capabilities);
   const availableModels = useMemo(
     () => providerModels[provider] || [],
     [provider, providerModels],
@@ -3566,6 +3718,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     isUserScrolledUp.current = scrolledUp;
   }, []);
 
+  const recheckReaderPosition = useCallback(() => {
+    requestAnimationFrame(handleScroll);
+    window.setTimeout(handleScroll, 220);
+  }, [handleScroll]);
+
   const scrollToBottom = useCallback((smooth = true) => {
     const el = scrollRef.current;
     if (!el) return;
@@ -3597,10 +3754,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
       const data = await resp.json();
       const fileId = typeof data?.id === 'string' ? data.id : undefined;
+      const fileRevision = typeof data?.updatedAt === 'string' ? data.updatedAt : undefined;
       const serverPath = typeof data?.diskPath === 'string' ? data.diskPath : undefined;
       const toolUrl = typeof data?.toolUrl === 'string' ? data.toolUrl : undefined;
       setPendingAttachments(prev => prev.map(a =>
-        a.id === attachId ? { ...a, fileId, serverPath, toolUrl, uploadStatus: 'done' as const } : a
+        a.id === attachId ? { ...a, fileId, fileRevision, serverPath, toolUrl, uploadStatus: 'done' as const } : a
       ));
     } catch (err: any) {
       setPendingAttachments(prev => prev.map(a =>
@@ -3616,6 +3774,14 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     for (const file of fileList) {
       const id = `attach-${Date.now()}-${Math.random()}`;
       const isImage = file.type.startsWith('image/');
+      const photoError = isImage && nativePhotoInput
+        ? nativePhotoAdmissionError(file, pendingAttachments.filter(item => item.type === 'image').length
+          + newAttachments.filter(item => item.type === 'image').length)
+        : null;
+      if (photoError) {
+        setModelSelectionError(photoError);
+        continue;
+      }
       const isText =
         file.type.startsWith('text/') ||
         /\.(js|ts|tsx|jsx|py|rb|go|rs|java|c|cpp|h|css|html|json|yaml|yml|md|sh|bash|zsh|fish|toml|ini|env)$/i.test(
@@ -3632,7 +3798,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
       if (isImage) {
         attachment.previewUrl = URL.createObjectURL(file);
-        // Upload images too — agent needs server path for image analysis
+        // Upload canonical bytes; native image input is authorized on the server.
         attachment.uploadStatus = 'uploading';
       }
 
@@ -3657,7 +3823,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         uploadFileToServer(att.file, att.id);
       }
     }
-  }, [uploadFileToServer]);
+  }, [uploadFileToServer, nativePhotoInput, pendingAttachments]);
 
   const handlePasteAttachments = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(e.clipboardData?.items || []);
@@ -4234,27 +4400,12 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     });
   }, [chatState, handleModelChange, localSlashCommandCoordinator, provider, providerSlashCommands, startNewSession]);
 
-  // Fix #3: Speech recognition
-  const handleTranscript = useCallback((text: string) => {
-    if (!composerInputRef.current) return;
-    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLTextAreaElement.prototype,
-      'value',
-    )?.set;
-    nativeInputValueSetter?.call(composerInputRef.current, text);
-    composerInputRef.current.dispatchEvent(new Event('input', { bubbles: true }));
-  }, []);
-
-  const { isListening, isSupported: speechSupported, startListening, stopListening } =
-    useSpeechRecognition(handleTranscript);
-
-  const handleMicToggle = useCallback(() => {
-    if (isListening) {
-      stopListening();
-    } else {
-      startListening();
-    }
-  }, [isListening, startListening, stopListening]);
+  // Browser dictation owns only the current draft; it never submits a turn.
+  const dictation = useTextareaDictation(composerInputRef);
+  const { isListening } = dictation;
+  const handleMicToggle = dictation.toggle;
+  const stopDictation = dictation.stop;
+  useEffect(() => { stopDictation(); }, [session, provider, stopDictation]);
 
   useEffect(() => {
     if (provider !== 'AGENT_ZERO') {
@@ -4366,8 +4517,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
 
   // Build attachment text to prepend to message
   const buildAttachmentText = useCallback(
-    () => buildPersistedChatAttachmentText(pendingAttachments),
-    [pendingAttachments],
+    () => buildPersistedChatAttachmentText(pendingAttachments, { nativeImages: nativePhotoInput }),
+    [pendingAttachments, nativePhotoInput],
   );
 
   // Intercept send to prepend attachments
@@ -4376,7 +4527,9 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     // Block send while any file is still uploading
     const stillUploading = pendingAttachments.some(a => a.uploadStatus === 'uploading');
     if (stillUploading) return false;
-    const attachText = buildAttachmentText();
+    let attachText: string;
+    try { attachText = buildAttachmentText(); }
+    catch (error: any) { setModelSelectionError(error.message); return false; }
     if (!composerInputRef.current) return false;
     const current = composerInputRef.current.value;
     const combined = attachText + current;
@@ -4410,7 +4563,34 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     requestAnimationFrame(() => composerInputRef.current?.form?.requestSubmit());
   }, []);
 
+  // Work for every harness; the surface keeps OpenClaw-only sections to OpenClaw.
+  const agentWork = useAgentWorkSurface({
+    enabled: isAdmin && Boolean(user?.id),
+    provider,
+    session,
+    wsManager: chatState.wsManager,
+    userId: user?.id ?? null,
+  });
+  const openAgentWorkSession = useCallback((sessionKey: string) => {
+    const target = openClawTaskConversation(sessionKey);
+    if (!target || target.session === sessionRef.current) return;
+    if (blockForChatContextMutation('opening another conversation')) return;
+    if (modelSwitchInFlightRef.current) {
+      setModelSelectionError('Wait for the current model change to finish before opening another session.');
+      return;
+    }
+    resolvedSessionRef.current = null;
+    // Same order as task navigation: bind the conversation's agent, then open its exact key.
+    if (target.agentId !== (agentIdRef.current || 'main')) chatState.selectProviderAgent('OPENCLAW', target.agentId);
+    void chatState.selectSession(target.session);
+  }, [blockForChatContextMutation, chatState]);
+
+  // Widget receipts arrive the same way for every harness (bound tool results).
+  const widgetPresentation = useMemo(() => widgetPresentationFor(messages, streamSegments),
+    [messages, streamSegments]);
+
   return (
+    <WidgetPresentationProvider value={widgetPresentation}>
     <AskQuestionAnswerProvider value={submitAskQuestionAnswer}>
     <AssistantRuntimeProvider runtime={runtime}>
       <div className="flex h-full overflow-hidden bg-[#0A0E27]">
@@ -4475,6 +4655,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     : undefined}
                 />
               )}
+              {isAdmin && provider === 'OPENCLAW' && <a href="/desktop?panel=browser" className="text-xs text-slate-300 hover:text-white" title="Open the opt-in shared interactive browser and select this conversation">Shared browser</a>}
               <SessionControls
                 loading={sessionControlsLoading || currentProviderModelsLoading}
                 thinkingLevel={thinkingLevel}
@@ -4544,7 +4725,9 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               >
                 {newSessionPending ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <PenSquare size={16} />}
               </button>
-              {isAdmin && <ChatTasksButton projectWork={projectWork.cards} provider={provider} session={session} messages={messages} isRunning={isRunning || Boolean(projectWork.activity)} />}
+              {isAdmin && (agentWork.enabled
+                ? <AgentWorkButton surface={agentWork} messages={messages} projectWork={projectWork.cards} isChatRunning={isRunning} onOpenSession={openAgentWorkSession} />
+                : <ChatTasksButton projectWork={projectWork.cards} provider={provider} session={session} messages={messages} isRunning={isRunning || Boolean(projectWork.activity)} />)}
               <StreamReconnectButton
                 visible={showConnectionLost}
                 onReconnect={reconnectSocket}
@@ -4699,6 +4882,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               className="flex-1 overflow-y-auto"
               onScroll={handleChatScroll}
             >
+              <ToolActivityScope scope={`agent:${provider}:${session || ''}`} onDisclosureChange={recheckReaderPosition}>
               {isLoadingHistory && messages.length === 0 && projectWork.cards.length === 0 ? (
                 /* Initial loading skeleton */
                 <LoadingSkeletonList />
@@ -4866,223 +5050,40 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                             onRemoveQueued={isQueuedUserMessage ? () => removeQueuedMessage(msg.id) : undefined}
                           />
                         ) : msg.role === 'assistant' ? (
-                          <>
-                            {/* Interleaved timeline: graduated segments + tool calls in chronological order.
-                                For streaming: use live streamSegments with timestamps.
-                                For history: use msg.segments with position info to reconstruct the timeline. */}
-                            {(() => {
-                              const toolCalls = msg.toolCalls || [];
-                              const isLiveTimeline = isStreamingAssistant && streamSegments.length > 0;
-                              const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
-                              
-                              if (!isLiveTimeline && !hasHistorySegments) return null;
-
-                              // Mid-turn reloads can persist a partial snapshot of a thought that the
-                              // live/resumed stream then carries in grown form. Drop history thinking
-                              // segments that are strict prefixes of the current live thinking so the
-                              // same thought never renders twice.
-                              const liveThinkingForDedupe = isStreamingAssistant ? (thinkingContent || '').trim() : '';
-                              const dropStalePartialThoughts = (segs: NonNullable<typeof msg.segments>) => (
-                                liveThinkingForDedupe
-                                  ? segs.filter((seg) => !(
-                                      seg.kind === 'thinking'
-                                      && seg.text.trim()
-                                      && seg.text.trim() !== liveThinkingForDedupe
-                                      && liveThinkingForDedupe.startsWith(seg.text.trim())
-                                    ))
-                                  : segs
-                              );
-                              
-                              if (isLiveTimeline) {
-                                return (
-                                  <ActivityTimeline
-                                    key={`live-activity-${msg.id}`}
-                                    messageId={msg.id}
-                                    segments={streamSegments}
-                                    toolCalls={toolCalls}
-                                    fallbackTimestamp={msg.createdAt.getTime()}
-                                    agent={agent}
-                                    avatarUrl={agentAvatars[agent.providerName]}
-                                    hostFileContext={agentHostFileContext}
-                                  />
-                                );
-                              } else {
-                                // History/finalized turn: prefer timestamped segments from the live stream,
-                                // then fall back to position-based reconstruction from durable history.
-                                const segments = dropStalePartialThoughts(msg.segments || []);
-                                const hasTimestampedSegments = segments.some((seg) => typeof seg.ts === 'number' && Number.isFinite(seg.ts));
-
-                                if (hasTimestampedSegments) {
-                                  return (
-                                    <ActivityTimeline
-                                      key={`history-activity-${msg.id}`}
-                                      messageId={msg.id}
-                                      segments={segments}
-                                      toolCalls={toolCalls}
-                                      fallbackTimestamp={msg.createdAt.getTime()}
-                                      agent={agent}
-                                      avatarUrl={agentAvatars[agent.providerName]}
-                                      hostFileContext={agentHostFileContext}
-                                    />
-                                  );
-                                }
-
-                                const beforeSegs = segments.filter(s => s.position === 'before');
-                                const betweenSegs = segments.filter(s => s.position === 'between');
-                                return (
-                                  <>
-                                    {beforeSegs.map((seg, i) => (
-                                      <AssistantBubble
-                                        key={`hist-before-${msg.id}-${i}`}
-                                        message={{
-                                          id: `hist-before-${msg.id}-${i}`,
-                                          role: 'assistant' as const,
-                                          content: seg.kind === 'thinking' ? '' : seg.text,
-                                          thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
-                                          thinkingSubject: seg.kind === 'thinking' ? seg.subject : undefined,
-                                          createdAt: msg.createdAt,
-                                        }}
-                                        agent={agent}
-                                        avatarUrl={agentAvatars[agent.providerName]}
-                                        isLast={false}
-                                        isStreaming={false}
-                                        hostFileContext={agentHostFileContext}
-                                      />
-                                    ))}
-                                    <BoundedToolCallList
-                                      tools={toolCalls}
-                                      messageKey={`history-${msg.id}`}
-                                      renderAfterFirst={toolCalls.length > 1 && betweenSegs.length > 0 ? betweenSegs.map((seg, i) => (
-                                        <AssistantBubble
-                                          key={`hist-between-${msg.id}-${i}`}
-                                          message={{
-                                            id: `hist-between-${msg.id}-${i}`,
-                                            role: 'assistant' as const,
-                                            content: seg.kind === 'thinking' ? '' : seg.text,
-                                            thinkingContent: seg.kind === 'thinking' ? seg.text : undefined,
-                                            thinkingSubject: seg.kind === 'thinking' ? seg.subject : undefined,
-                                            createdAt: msg.createdAt,
-                                          }}
-                                          agent={agent}
-                                          avatarUrl={agentAvatars[agent.providerName]}
-                                          isLast={false}
-                                          isStreaming={false}
-                                          hostFileContext={agentHostFileContext}
-                                        />
-                                      )) : undefined}
-                                    />
-                                    {/* Text after tool calls (main response) — rendered by the AssistantBubble below */}
-                                  </>
-                                );
-                              }
-                            })()}
-                            {/* Current/final bubble — shows live text OR historical content after tools */}
-                            {(() => {
-                              const isLiveTimeline = isStreamingAssistant && streamSegments.length > 0;
-                              const hasHistorySegments = !isLiveTimeline && msg.segments && msg.segments.length > 0;
-                              const renderedBeforeSegments = isLiveTimeline
-                                ? streamSegments
-                                : ((msg.segments || []).some((segment) => typeof segment.ts === 'number' && Number.isFinite(segment.ts))
-                                    ? (msg.segments || [])
-                                    : (msg.segments || []).filter((segment) => segment.position === 'before'));
-                              const bubbleMessage = (isLiveTimeline || hasHistorySegments)
-                                ? { ...msg, toolCalls: undefined, segments: undefined }
-                                : msg;
-                              const bubbleContent = bubbleMessage.content?.trim() || '';
-                              const bubbleThinking = bubbleMessage.thinkingContent?.trim() || '';
-                              const bubbleThinkingSubject = bubbleMessage.thinkingSubject?.trim() || '';
-                              const lastRenderedThinkingSegment = [...renderedBeforeSegments]
-                                .reverse()
-                                .find((segment) => (
-                                  segment.kind === 'thinking'
-                                  && (segment.text.trim() || segment.subject)
-                                ));
-                              const bubbleContentDuplicatesTimeline = isAssistantContentRepresentedByTimeline(
-                                bubbleContent,
-                                renderedBeforeSegments,
-                              );
-                              // A thought grows as cumulative snapshots. A mid-turn reload can leave a
-                              // partially flushed copy in durable history while the live/resumed stream
-                              // carries the grown version of the SAME thought — treat prefix matches in
-                              // either direction as the same thought, not two bubbles.
-                              const isSameGrowingThought = (a: string, b: string) => Boolean(a) && Boolean(b)
-                                && (a === b || a.startsWith(b) || b.startsWith(a));
-                              const lastRenderedThinkingText = lastRenderedThinkingSegment?.text.trim() || '';
-                              const lastRenderedThinkingSubject = lastRenderedThinkingSegment?.subject?.trim() || '';
-                              const bubbleThinkingDuplicatesTimeline = Boolean(bubbleThinking || bubbleThinkingSubject)
-                                && Boolean(lastRenderedThinkingSegment)
-                                && (!bubbleThinking || isSameGrowingThought(lastRenderedThinkingText, bubbleThinking))
-                                && (!bubbleThinkingSubject || lastRenderedThinkingSubject === bubbleThinkingSubject);
-                              const liveThinkingValue = isStreamingAssistant ? thinkingContent : undefined;
-                              const liveThinkingSubjectValue = isStreamingAssistant ? thinkingSubject : undefined;
-                              const liveThinkingText = liveThinkingValue?.trim() || '';
-                              const liveThinkingSubjectText = liveThinkingSubjectValue?.trim() || '';
-                              const liveThinkingAlreadyRendered = Boolean(liveThinkingText || liveThinkingSubjectText)
-                                && Boolean(lastRenderedThinkingSegment)
-                                && (!liveThinkingText || isSameGrowingThought(lastRenderedThinkingText, liveThinkingText))
-                                && (!liveThinkingSubjectText || lastRenderedThinkingSubject === liveThinkingSubjectText);
-                              const effectiveBubbleMessage = (bubbleContentDuplicatesTimeline || bubbleThinkingDuplicatesTimeline)
-                                ? {
-                                    ...bubbleMessage,
-                                    content: bubbleContentDuplicatesTimeline ? '' : bubbleMessage.content,
-                                    thinkingContent: bubbleThinkingDuplicatesTimeline ? undefined : bubbleMessage.thinkingContent,
-                                    thinkingSubject: bubbleThinkingDuplicatesTimeline ? undefined : bubbleMessage.thinkingSubject,
+                          <AgentAssistantTurn
+                            msg={msg}
+                            agent={agent}
+                            avatarUrl={agentAvatars[agent.providerName]}
+                            hostFileContext={agentHostFileContext}
+                            isStreamingAssistant={isStreamingAssistant}
+                            streamSegments={streamSegments}
+                            thinkingContent={thinkingContent}
+                            thinkingSubject={thinkingSubject}
+                            isRunning={isRunning}
+                            statusText={statusText}
+                            isLast={idx === messages.length - 1}
+                            onRetry={
+                              idx === messages.length - 1 && lastUserMessage
+                                ? () => {
+                                    if (composerInputRef.current) {
+                                      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                        window.HTMLTextAreaElement.prototype,
+                                        'value',
+                                      )?.set;
+                                      nativeInputValueSetter?.call(
+                                        composerInputRef.current,
+                                        lastUserMessage.content,
+                                      );
+                                      composerInputRef.current.dispatchEvent(
+                                        new Event('input', { bubbles: true }),
+                                      );
+                                      composerInputRef.current.focus();
+                                    }
                                   }
-                                : bubbleMessage;
-                              const effectiveLiveThinkingContent = liveThinkingAlreadyRendered ? undefined : liveThinkingValue;
-                              const effectiveLiveThinkingSubject = liveThinkingAlreadyRendered ? undefined : liveThinkingSubjectValue;
-                              const effectiveLiveStatusText = isStreamingAssistant && isRunning
-                                ? String(statusText || '').trim()
-                                : '';
-                              const hasVisibleBubble = Boolean(
-                                effectiveBubbleMessage.content?.trim()
-                                || effectiveBubbleMessage.thinkingContent?.trim()
-                                || effectiveBubbleMessage.thinkingSubject
-                                || effectiveLiveThinkingContent?.trim()
-                                || effectiveLiveThinkingSubject
-                                || effectiveLiveStatusText
-                                || (effectiveBubbleMessage.toolCalls || []).length > 0,
-                              );
-                              if (!hasVisibleBubble && (isLiveTimeline || hasHistorySegments)) {
-                                return null;
-                              }
-                              return (
-                                <AssistantBubble
-                                  message={effectiveBubbleMessage}
-                                  agent={agent}
-                                  avatarUrl={agentAvatars[agent.providerName]}
-                                  isLast={idx === messages.length - 1}
-                                  isLive={isStreamingAssistant}
-                                  isStreaming={isRunning && isStreamingAssistant}
-                                  liveThinkingContent={effectiveLiveThinkingContent}
-                                  liveThinkingSubject={effectiveLiveThinkingSubject}
-                                  liveStatusText={effectiveLiveStatusText}
-                                  hostFileContext={agentHostFileContext}
-                                  onRetry={
-                                    idx === messages.length - 1 && lastUserMessage
-                                      ? () => {
-                                          if (composerInputRef.current) {
-                                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                              window.HTMLTextAreaElement.prototype,
-                                              'value',
-                                            )?.set;
-                                            nativeInputValueSetter?.call(
-                                              composerInputRef.current,
-                                              lastUserMessage.content,
-                                            );
-                                            composerInputRef.current.dispatchEvent(
-                                              new Event('input', { bubbles: true }),
-                                            );
-                                            composerInputRef.current.focus();
-                                          }
-                                        }
-                                      : undefined
-                                  }
-                                />
-                              );
-                            })()}
-                          </>
-) : msg.role === 'system' ? (
+                                : undefined
+                            }
+                          />
+                        ) : msg.role === 'system' ? (
                           isCompactionNotice(msg.content) ? null : (
                             <div className="flex justify-center px-4 py-2 max-w-3xl mx-auto w-full">
                               <div className="max-w-xl rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-[12px] text-slate-300 whitespace-pre-wrap">
@@ -5099,6 +5100,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 </div>
                 </>
               )}
+              </ToolActivityScope>
             </div>
 
             {/* Fix #2: Scroll-to-bottom button — only visible when scrolled up */}
@@ -5150,21 +5152,9 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 : 'border-white/[0.06] bg-[#0D1130]/30'
             } backdrop-blur-sm`}>
               <div className="px-2 sm:px-4 pt-2 pb-3 pb-safe max-w-3xl mx-auto">
+                <AgentWorkStrip surface={agentWork} />
                 {projectWork.activeCards.map(card => <ProjectWorkAttention key={card.id} card={card} active={true} />)}
-                {pendingUserQuestions.map((request) => (
-                  <AskUserQuestionCard
-                    key={request.id}
-                    request={request}
-                    onSettled={settlePendingUserQuestion}
-                    responseDisabled={isAskUserResponseDisabled(
-                      request.surface,
-                      currentProviderAvailability.canSend,
-                    )}
-                    disabledReason={request.surface === 'agent-chat'
-                      ? AGENT_CHAT_ASK_USER_SUPERVISOR_REASON
-                      : currentProviderAvailability.message || undefined}
-                  />
-                ))}
+                <AgentPendingQuestions questions={pendingUserQuestions} onSettled={settlePendingUserQuestion} />
 
                 <ProjectWorkComposer work={projectWork} />
                 {!projectWork.selected && <>
@@ -5191,7 +5181,12 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     </span>
                   )}
                 </div>
-                <ComposerPrimitive.Root className="relative flex items-end gap-1.5 sm:gap-2">
+                {dictation.message && (
+                  <p role={dictation.phase === 'error' ? 'alert' : 'status'} className="mb-2 text-xs text-slate-300">
+                    {dictation.message}
+                  </p>
+                )}
+                <ComposerPrimitive.Root onSubmitCapture={dictation.stop} className="relative flex items-end gap-1.5 sm:gap-2">
                   {/* Fix #4: Attachment button (hidden during streaming) */}
                   {!isRunning && (
                   <button
@@ -5317,6 +5312,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                       // On mobile: Enter always inserts newline (submitMode="none" handles this)
                       // On desktop: Shift+Enter inserts newline, plain Enter submits
                       if (!isMobileDevice && e.key === 'Enter' && !e.shiftKey) {
+                        dictation.stop();
                         if (maybeExecuteSlashCommand(e)) {
                           return;
                         }
@@ -5339,17 +5335,18 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   />
 
                   {/* Fix #3: Dictation / mic button */}
-                  {speechSupported && (
+                  {(
                     <button
                       type="button"
-                      aria-label={isListening ? 'Stop dictation' : 'Start dictation'}
+                      aria-label={dictation.isActive ? 'Stop dictation' : 'Start dictation'}
+                      aria-pressed={dictation.isActive}
                       onClick={handleMicToggle}
                       className={`flex-shrink-0 p-2 sm:p-2.5 rounded-xl transition-all duration-200 mb-0.5 touch-target ${
                         isListening
                           ? 'bg-red-500/20 text-red-400 border border-red-500/30 scale-110 shadow-lg shadow-red-500/20'
                           : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.06]'
                       }`}
-                      title={isListening ? 'Stop recording' : 'Dictate message'}
+                      title={dictation.isActive ? 'Stop dictation' : 'Dictate message'}
                     >
                       <Mic size={18} className={`sm:w-[18px] sm:h-[18px] w-4 h-4 ${isListening ? 'animate-pulse' : ''}`} />
                     </button>
@@ -5360,6 +5357,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     <ComposerPrimitive.Send asChild>
                       <button
                         onClick={(e) => {
+                          dictation.stop();
                           if (maybeExecuteSlashCommand(e)) {
                             return;
                           }
@@ -5464,14 +5462,18 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
       </div>
     </AssistantRuntimeProvider>
     </AskQuestionAnswerProvider>
+    </WidgetPresentationProvider>
   );
 }
-export const AGENT_CHAT_ASK_USER_SUPERVISOR_REASON =
-  'Agent Chat question responses remain unavailable because this question channel is not bound to a supervised native provider run.';
-
-export function isAskUserResponseDisabled(
-  surface: string | undefined,
-  currentProviderCanSend: boolean,
-): boolean {
-  return surface === 'agent-chat' || !currentProviderCanSend;
+/** The same actor/request-bound answer form used by the global notification.
+ * Do not gate a pending answer on the ability to start a new provider run.
+ * The endpoint reattests the actor, session, run and question on every submit.
+ */
+export function AgentPendingQuestions({ questions, onSettled }: {
+  questions: React.ComponentProps<typeof AskUserQuestionCard>['request'][];
+  onSettled: (id: string) => void;
+}) {
+  return <>{questions.map((request) => (
+    <AskUserQuestionCard key={request.id} request={request} onSettled={onSettled} />
+  ))}</>;
 }

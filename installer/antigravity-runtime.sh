@@ -4,12 +4,12 @@ set -Eeuo pipefail
 # Portal-tested Google Antigravity CLI runtime. The upstream bootstrapper uses
 # a mutable latest manifest and intentionally leaves an existing binary alone,
 # so it cannot converge or roll back a Portal compatibility pair. These URLs
-# and SHA-512 values are copied from Google's official release manifest for 1.1.27.
-readonly ANTIGRAVITY_TESTED_VERSION="1.1.27"
-readonly ANTIGRAVITY_SHA512_X86_64="793d4b9ea2c08d9a7e50bafa02cfc8c19424bd60d6e83f91408d45f9c6d4ce79a5d576fede5bef164d823abf84f81359a14b4ca665952c47b0a7cfd743bb69c0"
-readonly ANTIGRAVITY_SHA512_AARCH64="ed45f6930785aa4b42f14e07ace1c9d91a94fb76e760f54acbd7d3d3951e1f957fd456a0dae2a3124dd9a3b689bf7afb7c9303a3e4ba95037fc10063424d9bf9"
-readonly ANTIGRAVITY_URL_X86_64="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.1.27-5211191891591168/linux-x64/cli_linux_x64.tar.gz"
-readonly ANTIGRAVITY_URL_AARCH64="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.1.27-5211191891591168/linux-arm/cli_linux_arm64.tar.gz"
+# and SHA-512 values are copied from Google's official release manifest for 1.4.3.
+readonly ANTIGRAVITY_TESTED_VERSION="1.4.3"
+readonly ANTIGRAVITY_SHA512_X86_64="9b726b86280a56e8ffa84b3b3a1c00d19972833a1f6c0b21d85c5fc6e408af6492e4c61353cad9b500bee599af264c92cfc2ead1f5048ab9525328e1e4199c40"
+readonly ANTIGRAVITY_SHA512_AARCH64="a906ef290e077871b333cb6f13d4d76ccdfc03ad15f012d6b745c02fa471edc27c10bc3059b87142bf6de0bacd64328f62e608d5736655524b97e8d4b4a0882a"
+readonly ANTIGRAVITY_URL_X86_64="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.4.3-4577820882632704/linux-x64/cli_linux_x64.tar.gz"
+readonly ANTIGRAVITY_URL_AARCH64="https://storage.googleapis.com/antigravity-public/antigravity-cli/1.4.3-4577820882632704/linux-arm/cli_linux_arm64.tar.gz"
 readonly ANTIGRAVITY_MAX_ARCHIVE_BYTES=$((128 * 1024 * 1024))
 
 # Only the exercised Linux x86-64 Host Operator runtime is released here.

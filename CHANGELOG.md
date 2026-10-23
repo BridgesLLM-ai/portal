@@ -2,6 +2,51 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.1.0] - 2026-10-23
+
+### Added
+- **Desktop Projects:** create Python, TypeScript, Rust and C++ terminal or graphical apps, then Check, Run, Stop, Restart and focus their windows on the shared Remote Desktop. Builds keep app data separate from replaceable code and retain the previous successful deployment when a new build fails.
+- **Readable chat artifacts:** assistant JSON has a lossless tree/raw view and exact-source copy, including duplicate keys and large numbers. Tables support TSV copy and an accessible expanded view.
+- **Project-agent groups:** the agent picker groups Project agents under readable, actor-scoped names.
+- **The same chat features on every harness:** questions, sandboxed widgets, the Work panel with goals, tool cards that survive a reload, and photo input now work in Agent Chat with Claude Code, Codex, OpenCode, Hermes and tool-capable Ollama models, not only OpenClaw. A Portal-owned chat bridge gives each harness these tools for one turn at a time. Grok 1.0.62 negotiates the bridge tools, but its ACP runtime reports no image input, so photos stay off. Antigravity and Agent Zero retain their current chat features; Antigravity tool activity is still recorded. Feature labels distinguish usable runtime support from provider sign-in and model access.
+- **Richer conversations:** grouped tool activity, question attention, agent work controls, and sandboxed interactive widgets. Visual attachments reach models whose runtime advertises image support; unsupported routes fail clearly instead of silently dropping the image.
+- **Shared-browser handover:** the owner and agent can work in the same browser with explicit control ownership.
+- **Owner-managed App credentials:** encrypted named credential slots, write-only values, revision-checked changes, and per-App file projection. Restart the App to apply changes.
+- **Backup management:** editable schedules and storage limits, cleanup previews, and protection for retained backups.
+- **Faster navigation:** settings search and the command palette index the available public Portal controls.
+
+### Changed
+- **Current compatible AI tools:** updated release pins and retained-state migration support, with exact package/source verification. Newer model suggestions after sign-in are limited to the runtime's ready catalog; they do not change the selected default or imply account entitlement.
+- **Modernized application dependencies:** updated React, charting, terminal, document rendering, diagrams, CSS tooling, backend web/database libraries, and other supported dependency families. The editor is bundled locally rather than selected from a remote CDN at runtime.
+- **Complete Project downloads:** interrupted archive streams fail instead of appearing to be complete downloads; ZIP consumers and extraction retain their safety checks.
+
+### Fixed
+- **Harness readiness:** a slow OpenClaw check no longer turns settled picker rows into errors. OpenClaw waits through the server's bounded check, prewarms after Portal starts, and distinguishes an inspection timeout from a plugin mismatch.
+- **Reliable editing:** microphone dictation asks for permission, preserves the existing draft, and stops when the draft or selected conversation changes. Git history can load older commits and retry failed pages without appearing empty.
+- **Large HTML shares:** stream shared documents without the former 5 MiB cap while retaining share authorization and bounded buffering.
+- **Project process limits:** distinguish the shared-user process ceiling from each container's PID limit so concurrent Project runtimes do not prematurely exhaust a 256-task user allowance.
+- Preserve visible reasoning when a stream ends and saved history refreshes before React commits the last update.
+- Preserve all-or-none file-count overflow behavior when updating upload handling; existing selected files are not silently discarded.
+- Improve PDF loading, editor input compatibility, and asynchronous control readiness after the frontend upgrades.
+
+### Security
+- Lost network responses never silently replay POST, PUT, PATCH or DELETE mutations. Safe reads retain their bounded retry.
+- Project ZIP downloads exclude nested environment and credential files by path segment while preserving ordinary source names such as `.gitignore` and `.github`.
+- Failed sign-in tracking expires old entries and has a finite source-count bound.
+- Desktop builds use the existing Project sandbox and public-address-only dependency proxy. Desktop app execution is administrator-only on the shared Remote Desktop; it is not a per-Project runtime isolation boundary.
+- Chat-bridge tools are authorized per turn and revoked when the turn settles; their credential never appears in process arguments. Claude Code bridge turns load no user settings, hooks, plugins, memory or other MCP servers.
+- Database and Project runtime credentials no longer travel in child-process arguments. App credential values are not returned by metadata APIs or placed in runtime command arguments, environment variables, or labels.
+- Updating from an older Portal rotates the Project egress credential root once. Managed Project runtimes take the new credential generation when recreated; older backup restores preserve a newer installed root.
+- Prisma runtime verification attests the executable compiler wrapper, encoded compiler module, and WASM bytes, including supported predecessor recovery.
+- Remote Desktop transport uses private Unix sockets; interactive content and shared-browser control retain their existing user/session boundaries.
+
+### Upgrade notes
+- Desktop requires a qualifying x86_64 Linux host and the locally built toolchain. Existing installations enable it with `install.sh --install-desktop-toolchain`; unsupported or skipped hosts retain the other Portal features and show the reason. See [Remote Desktop](docs/REMOTE_DESKTOP.md).
+- Update Portal first, then use **Update Compatible AI Tools** for the pinned AI runtime bundle. Portal-only updates do not silently replace the shared Node interpreter or every AI tool.
+- Existing personal provider setup, Ollama, Agent Zero, mail, Projects, and Apps remain available. Package readiness is separate from provider authentication and model access.
+- New App credential values take effect on the next App restart. Backup scope and recovery limits remain documented in [Backup and Recovery](docs/BACKUP_AND_RECOVERY.md).
+- Hermes questions and widgets need its MCP support, which the Portal update or **Update Compatible AI Tools** installs once by refreshing the Hermes runtime.
+
 ## [5.0.10] - 2026-09-20
 
 ### Fixed

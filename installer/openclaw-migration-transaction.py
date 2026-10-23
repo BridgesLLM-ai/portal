@@ -1652,13 +1652,32 @@ def record_codex_gateway_start(args) -> None:
 
 def core_gateway_known_identity(value, identity) -> bool:
     core = value["core"]
-    if identity == core["gatewayCurrentUnitIdentity"]:
+    def same_owned_generation(known):
+        if identity == known:
+            return True
+        # systemd can clear ExecStart's historical telemetry on daemon-reload
+        # without replacing the running process. Keep command, unit, boot and
+        # every kernel/invocation generation field exact; ignore only that
+        # property's explicitly parsed telemetry suffix.
+        if known is None or not identity["active"] or not known["active"] \
+                or value["createdBootId"] != current_boot_id() \
+                or any(identity[field] != known[field]
+                       for field in GATEWAY_IDENTITY_FIELDS - {"execStart"}):
+            return False
+        telemetry = (r"(.* ; ignore_errors=(?:yes|no))"
+                     r" ; start_time=\[[^\]\r\n]*\] ; stop_time=\[[^\]\r\n]*\]"
+                     r" ; pid=[0-9]+ ; code=[^;{}\r\n]+ ; status=[^;{}\r\n]+ \}")
+        left = re.fullmatch(telemetry, known["execStart"])
+        right = re.fullmatch(telemetry, identity["execStart"])
+        return left is not None and right is not None and left[1] == right[1]
+
+    if same_owned_generation(core["gatewayCurrentUnitIdentity"]):
         return True
     codex = value["codex"]
     if codex["phase"] == "unarmed":
         return False
     gateway = codex["gateway"]
-    return any(identity == gateway.get(field) for field in (
+    return any(same_owned_generation(gateway.get(field)) for field in (
         "baselineUnitIdentity", "forwardStartUnitIdentity", "forwardUnitIdentity",
         "rollbackStartUnitIdentity", "rollbackUnitIdentity",
     ))
@@ -2913,6 +2932,37 @@ def fresh_core_removal(args) -> None:
     )))
 
 
+def validate_generated_state_deletion(root: Path) -> None:
+    """Validate disposable generated state, never a sealed snapshot authority.
+
+    Native skill links are deletion leaves, including dangling/external links.
+    Their POSIX mode is not a target permission. Never traverse or validate the
+    targets; rmtree must use its fd-based symlink-attack-resistant implementation.
+    Ownership, writable-directory/file and hardlink checks remain fail-closed.
+    """
+    if not shutil.rmtree.avoids_symlink_attacks:
+        fail("safe generated-state deletion is unavailable on this platform")
+    safe_directory(root.parent)
+
+    def walk(target: Path) -> None:
+        info = os.lstat(target)
+        if info.st_uid != 0 or info.st_gid != 0:
+            fail(f"unsafe generated-state owner: {target}")
+        if stat.S_ISLNK(info.st_mode):
+            if info.st_nlink != 1:
+                fail(f"unsupported generated-state hardlink: {target}")
+            return
+        if info.st_mode & 0o022:
+            fail(f"unsafe generated-state permissions: {target}")
+        if stat.S_ISDIR(info.st_mode):
+            for entry in sorted(target.iterdir(), key=lambda item: item.name):
+                walk(entry)
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            fail(f"unsupported generated-state artifact: {target}")
+
+    walk(root)
+
+
 def restore_state_absence(args) -> None:
     value = load_ledger(Path(args.ledger))
     if value["phase"] not in {
@@ -2943,7 +2993,7 @@ def restore_state_absence(args) -> None:
         if not os.path.lexists(state_root):
             return
         safe_directory(state_root)
-        validate_snapshot_tree(state_root)
+        validate_generated_state_deletion(state_root)
         fault("state-absence-before-root-delete")
         shutil.rmtree(state_root)
         fault("state-absence-after-root-delete")
@@ -2962,9 +3012,9 @@ def restore_state_absence(args) -> None:
             continue
         # Validate only what is being deleted. The preserved media cache may
         # contain independently managed content and is outside this rollback.
-        tree_sha256(entry)
+        validate_generated_state_deletion(entry)
         fault("state-absence-before-entry-delete")
-        if entry.is_dir():
+        if stat.S_ISDIR(os.lstat(entry).st_mode):
             shutil.rmtree(entry)
         else:
             entry.unlink()
@@ -3076,7 +3126,7 @@ def validate_migration_manifest_constraints(value):
     if (
         document.get("contractVersion") != 2
         or document.get("packageName") != "openclaw"
-        or document.get("packageVersion") not in {"2026.9.1", "2026.9.3"}
+        or document.get("packageVersion") not in {"2026.9.1", "2026.9.3", "2026.9.9", "2026.10.5", "2026.10.6"}
         or Path(str(document.get("manifestPath", ""))) != target
         or Path(str(document.get("stateDir", ""))) != state_dir
         or Path(str(document.get("configPath", ""))) != config_path
@@ -4844,8 +4894,15 @@ def prepare_retained_chat(args, ledger):
 def validate_retained_chat(value, ledger):
     chat = value['retainedChat']
     if {p.name for p in ledger.parent.iterdir()} - {'transaction.json', 'openclaw-migration-transaction.py',
-            'migrate-openclaw-2026.9.1.mjs', 'openclaw-stable-plugins.sh'}:
+            'migrate-openclaw-2026.9.1.mjs', 'openclaw-stable-plugins.sh',
+            HELPER_SUCCESSOR_NAME, HELPER_SUCCESSION_RECORD_NAME}:
         fail('unknown retained Chat owner artifact; preserve evidence')
+    # The same attested succession artifacts as legacy recovery, not new
+    # migration authority. A copy without its record is inert crash evidence.
+    successor = ledger.parent / HELPER_SUCCESSOR_NAME
+    if os.path.lexists(successor):
+        safe_file(successor, mode=0o600, maximum=4 * 1024 * 1024)
+    load_helper_succession_record(value, ledger)
     if not isinstance(chat, dict) or set(chat) != {'package', 'runtime', 'portal', 'before', 'accepted', 'execution',
                                                   'armedReceiptSha256', 'decisionSha256'} \
             or value['phase'] not in RETAINED_PHASES or value['codex']['phase'] != 'unarmed' \
@@ -5217,6 +5274,7 @@ def main() -> None:
         if raw.get("schema") == RETAINED_CHAT_SCHEMA and args.handler not in {
             retained_chat, inspect, cleanup, gateway_status, core_gateway_authority,
             arm_core_gateway_action, record_core_gateway_result, adopt_core_gateway_identity,
+            record_helper_succession,
         }:
             fail("legacy operation is not authorized by a retained Chat owner")
     args.handler(args)

@@ -183,8 +183,8 @@ def install_script(tool_id: str, portal: Path = PORTAL, lock_fds: tuple[int, ...
     refuse_shadowed(target.name, {target})
     if exists(target):
         raise InstallError('This CLI is already installed. Refresh its status and continue to sign in. No files were replaced.')
-    existing_root = {'hermes': '/opt/bridgesllm/tools/hermes/0.21.1',
-                     'opencode': '/opt/bridgesllm/tools/opencode/1.18.29'}.get(tool_id)
+    existing_root = {'hermes': '/usr/local/lib/bridgesllm-runtimes/hermes/0.22.2',
+                     'opencode': '/usr/local/lib/bridgesllm-runtimes/opencode/1.19.4'}.get(tool_id)
     if existing_root and exists(Path(existing_root)):
         raise InstallError('This CLI has an incomplete existing installation. Use Maintenance to repair it; no existing files were replaced.')
     helper = portal / 'installer' / script

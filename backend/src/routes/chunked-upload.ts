@@ -1,4 +1,7 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request as ExpressRequest, Response } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';

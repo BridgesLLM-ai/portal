@@ -10,6 +10,7 @@ import {
 } from '../config/unqualifiedNativeBinaryLane';
 import { getProviderStatuses } from '../services/openclawConfigManager';
 import type { AgentProviderName } from './AgentProvider.interface';
+import { hermesBridgeFeatureGap, readHermesRuntimeAttestation } from './hermesRuntimeAttestation';
 import {
   REGISTERED_AGENT_HARNESS_IDS,
   requireHarnessDefinition,
@@ -619,6 +620,11 @@ function buildDetectedProviderAvailability(
         : name === 'HERMES' || name === 'OPENCODE'
           ? `${nativeAuth?.message || `${requireHarnessDefinition(name).displayName} is authenticated on this server.`} Uses the exact-pinned ACP stdio transport with attested identity/version, native text, reasoning, tool, permission, cancellation, dynamic model, and persisted-session events.`
         : (nativeAuth?.message || 'Runs natively via local provider CLI');
+  // Hermes reaches the Portal Chat Bridge only with its MCP extra. Label the
+  // reduced feature set honestly instead of advertising questions it ignores.
+  const bridgeFeatureGap = name === 'HERMES'
+    ? hermesBridgeFeatureGap(readHermesRuntimeAttestation())
+    : null;
 
   return {
     name,
@@ -628,14 +634,16 @@ function buildDetectedProviderAvailability(
     native: def.native,
     command,
     version,
-    reason: `${reason}${driftNote}`,
+    reason: `${reason}${driftNote}${bridgeFeatureGap ? ` ${bridgeFeatureGap}` : ''}`,
     versionDrift,
     nativeAuthStatus: nativeAuth?.status,
     nativeAuthMessage: nativeAuth?.message,
     nativeAuthLoginCommand: nativeAuth?.loginCommand,
     requiresSeparateNativeLogin: nativeAuth?.requiresSeparateLogin,
     linkedOpenClawProviders: linkedProviderStatuses,
-    capabilities: def.capabilities,
+    capabilities: bridgeFeatureGap
+      ? { ...def.capabilities, supportsAskUser: false }
+      : def.capabilities,
   };
 }
 

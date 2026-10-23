@@ -45,7 +45,7 @@ async function request(method: string, path: string, body?: unknown) {
 function payload(extra: object = {}) { return { id: randomUUID(), originProvider: 'OPENCLAW', originSessionKey: 'agent:main:one', projectIdentityId: 'project-a', projectGeneration: 1, provider: 'CODEX', prompt: 'Build the contact form', ...extra }; }
 beforeAll(async () => {
   const app = express(); app.use(express.json()); const project = Router(); const gateway = Router();
-  project.all('/:name/*', async (req, res) => { await Promise.resolve(); assertProjectWorkScope(mockProject); res.json({ name: req.params.name, action: req.params[0], query: req.query, ...(req.params[0] === 'git' ? { method: req.method, body: req.body } : {}) }); });
+  project.all('/:name/*action', async (req, res) => { await Promise.resolve(); assertProjectWorkScope(mockProject); res.json({ name: req.params.name, action: req.params.action.join('/'), query: req.query, ...(req.params.action.join('/') === 'git' ? { method: req.method, body: req.body } : {}) }); });
   gateway.post('/send', async (req, res) => { await Promise.resolve(); const card = currentProjectWork(); const data = { body: req.body, workId: card?.id, requestId: card?.requestId }; dispatched.push(data); res.json(data); });
   gateway.post('/chat/abort', (req, res) => res.json(req.body));
   app.use('/work', createProjectWorkRouter(project, gateway));

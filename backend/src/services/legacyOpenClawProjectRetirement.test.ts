@@ -771,15 +771,16 @@ describe('Portal 4.0 legacy OpenClaw Project retirement', () => {
       && ['container stop', 'container rm'].includes(call.name))).toBe(false);
   });
 
-  test('accepts the real defaults-only roster without skipping scoped runtime collision checks', async () => {
-    const config = { agents: { defaults: { workspace: path.join(openClawHome, 'workspace') } } };
+  test.each(['absent', 'empty', 'defaults'])('accepts the real %s implicit-main roster without skipping scoped runtime collision checks', async (shape) => {
+    const config = shape === 'absent' ? {} : shape === 'empty' ? { agents: {} }
+      : { agents: { defaults: { workspace: path.join(openClawHome, 'workspace') } } };
     const dependencies = { ...fixture.dependencies, readConfig: async () => config };
     await expect(assertNoLegacyOpenClawProjectCreationCollision({
       workspaceOwnerId: USER_ID, projectName: 'Demo', projectRoot: projectSource,
     }, { ...options(), dependencies })).resolves.toBeUndefined();
     expect(fixture.calls.some((call) => call.kind === 'docker')).toBe(true);
     expect(fixture.calls.some((call) => ['sessions.delete', 'agents.delete'].includes(call.name))).toBe(false);
-    for (const agents of [{ defaults: {}, list: null }, { defaults: {}, entries: null }, { defaults: {}, roster: {} }]) {
+    for (const agents of [null, [], false, 'invalid', { defaults: {}, list: null }, { defaults: {}, entries: null }, { defaults: {}, roster: {} }]) {
       expect(() => discoverLegacyOpenClawProjectAgents({ agents }, {
         portalProjectsRoot: projectsRoot, openClawHome,
       })).toThrow(expect.objectContaining({ code: 'CONFIG_SHAPE' }));

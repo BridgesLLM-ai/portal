@@ -34,8 +34,13 @@ export interface AskUserQuestion {
   options: AskUserQuestionOption[];
 }
 
+export type AskUserQuestionChannel = 'openclaw' | 'bridge';
+
 export interface AskUserQuestionRecord {
   id: string;
+  /** `bridge` records belong to a native harness turn's Portal Chat Bridge and
+   * settle only through the Portal; OpenClaw runtime reconciliation never touches them. */
+  channel: AskUserQuestionChannel;
   sessionKey: string;
   runId: string;
   toolCallId: string;
@@ -201,8 +206,10 @@ export function registerAskUserQuestion(input: {
   waitMs?: number;
   createdAt?: number;
   expiresAt?: number;
+  channel?: AskUserQuestionChannel;
 }): AskUserQuestionRecord {
   expireOverdue();
+  const channel: AskUserQuestionChannel = input.channel === 'bridge' ? 'bridge' : 'openclaw';
   const sessionKey = boundedText(input.sessionKey, 512);
   if (!sessionKey) {
     throw new AskUserQuestionError('ASK_USER_SESSION_REQUIRED', 'A session key is required.');
@@ -284,6 +291,7 @@ export function registerAskUserQuestion(input: {
       recordIdsByCallIdentity.delete(identityKey);
     } else {
       const sameRequest = existing.ownerUserId === ownerUserId
+        && existing.channel === channel
         && existing.surface === input.surface
         && existing.authorityId === authorityId
         && existing.actorAuthorizationVersion === actorAuthorizationVersion
@@ -307,6 +315,7 @@ export function registerAskUserQuestion(input: {
   }
   const record: AskUserQuestionRecord = {
     id: `askq_${crypto.randomBytes(12).toString('hex')}`,
+    channel,
     sessionKey,
     runId,
     toolCallId,
@@ -605,6 +614,7 @@ export function cancelAskUserQuestion(input: { id: string; actorUserId: string }
 export function listPendingAskUserQuestions(input: {
   actorUserId: string;
   sessionKey?: string;
+  channel?: AskUserQuestionChannel;
 }): AskUserQuestionPublicRecord[] {
   expireOverdue();
   const actorUserId = boundedText(input.actorUserId, 128);
@@ -612,6 +622,7 @@ export function listPendingAskUserQuestions(input: {
   return Array.from(records.values())
     .filter((record) => record.state === 'pending')
     .filter((record) => record.ownerUserId === actorUserId)
+    .filter((record) => !input.channel || record.channel === input.channel)
     .filter((record) => !input.sessionKey || record.sessionKey === input.sessionKey)
     .sort((a, b) => a.createdAt - b.createdAt)
     .map(toPublic);
@@ -636,13 +647,19 @@ export function reconcilePendingAskUserQuestions(input: {
   )));
   for (const record of records.values()) {
     if (
-      record.state !== 'pending'
+      record.channel !== 'openclaw'
+      || record.state !== 'pending'
       || record.ownerUserId !== actorUserId
       || (sessionKey && record.sessionKey !== sessionKey)
       || deliveryReservations.has(record.id)
     ) continue;
     if (!active.has(callIdentityKey(record))) settle(record, 'cancelled');
   }
+}
+
+/** Channel of a known record, or null. Owner checks stay with the caller. */
+export function readAskUserQuestionChannel(id: string): AskUserQuestionChannel | null {
+  return records.get(id)?.channel ?? null;
 }
 
 export function subscribeAskUserQuestions(

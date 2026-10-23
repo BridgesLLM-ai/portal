@@ -10,7 +10,7 @@ const clientMocks = vi.hoisted(() => ({
 
 vi.mock('./client', () => ({ default: clientMocks }));
 
-import { appsAPI, projectsAPI } from './endpoints';
+import { appsAPI, projectsAPI, validateProjectDeploymentProcessState } from './endpoints';
 
 describe('Projects API route contract', () => {
   beforeEach(() => {
@@ -476,7 +476,7 @@ describe('Projects API route contract', () => {
     await projectsAPI.deploy('alpha beta');
     expect(clientMocks.post).toHaveBeenLastCalledWith(
       '/projects/alpha%20beta/deploy',
-      undefined,
+      { asyncBuild: true },
       { _skipNetworkRetry: true },
     );
   });
@@ -1402,5 +1402,42 @@ describe('Projects API route contract', () => {
     expect(projectsAPI).not.toHaveProperty('chatSaveMessage');
     expect(projectsAPI).not.toHaveProperty('chatSaveMessages');
     expect(projectsAPI).not.toHaveProperty('agentSaveMemory');
+  });
+});
+
+
+describe('managed Desktop process evidence', () => {
+  const state = () => ({ status: 'running', deployType: 'runtime', runtimeManagement: 'desktop-session',
+    statusSource: 'desktop-unit', supportedActions: ['start', 'stop', 'restart', 'status', 'logs'],
+    logs: ['actual desktop stdout'], restartCount: 0, recoveryRequired: false });
+  it('accepts live Desktop status and logs without inventing an HTTP port', () => {
+    expect(validateProjectDeploymentProcessState(state()).statusSource).toBe('desktop-unit');
+  });
+  it('carries saved-source comparison and actual exit evidence only on a managed Desktop unit', () => {
+    const desktop = { sourceState: 'changed', builtAt: '2026-10-17T14:00:00Z', generation: '11111111-1111-4111-8111-111111111111' };
+    expect(validateProjectDeploymentProcessState({ ...state(), desktop, status: 'completed', exitCode: 0 }).desktop?.sourceState).toBe('changed');
+    expect(() => validateProjectDeploymentProcessState({ ...state(), desktop: { ...desktop, sourceState: 'probably' } })).toThrow();
+    expect(() => validateProjectDeploymentProcessState({ ...state(), desktop: { ...desktop, generation: '../wrong' } })).toThrow();
+    expect(() => validateProjectDeploymentProcessState({ ...state(), exitCode: '0' })).toThrow();
+  });
+  it('refuses web-port evidence on a Desktop unit', () => {
+    expect(() => validateProjectDeploymentProcessState({ ...state(), port: 3000 })).toThrow();
+  });
+  it('does not let old saved Desktop status authorize live process actions', () => {
+    expect(() => validateProjectDeploymentProcessState({ ...state(), statusSource: 'persisted-app' })).toThrow();
+  });
+});
+
+describe('Desktop template catalogue', () => {
+  it('requires a truthful toolchain status and bounds its reason', async () => {
+    const rows = [{ id: 'rust-gui', language: 'rust', interface: 'gui', target: 'desktop' }];
+    clientMocks.get.mockResolvedValueOnce({ data: { desktop: rows, desktopToolchain: { available: false, reason: 'x'.repeat(900), dependencyPolicy: 'offline' } } });
+    const catalog = await projectsAPI.templateCatalog();
+    expect(catalog.desktop).toEqual(rows);
+    expect(catalog.desktopToolchain).toEqual({ available: false, reason: 'x'.repeat(500), dependencyPolicy: 'offline' });
+    clientMocks.get.mockResolvedValueOnce({ data: { desktop: rows } });
+    await expect(projectsAPI.templateCatalog()).rejects.toThrow('Desktop toolchain status is malformed');
+    clientMocks.get.mockResolvedValueOnce({ data: { desktop: rows, desktopToolchain: { available: false, dependencyPolicy: 'brokered' } } });
+    await expect(projectsAPI.templateCatalog()).rejects.toThrow('Desktop toolchain status is malformed');
   });
 });

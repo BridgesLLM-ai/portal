@@ -59,7 +59,7 @@ interface ComputeAnchoredPopoverLayoutInput {
 
 interface AnchoredPopoverProps {
   open: boolean;
-  anchorRef: RefObject<HTMLElement>;
+  anchorRef: RefObject<HTMLElement | null>;
   children: ReactNode;
   onDismiss: (reason: 'escape' | 'outside') => void;
   width?: number;

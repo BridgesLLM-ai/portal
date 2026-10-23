@@ -1,0 +1,200 @@
+[
+  {
+    "role": "user",
+    "content": "Run the synthetic widget-original tool fixture.",
+    "timestamp": 1791753684184,
+    "idempotencyKey": "c28a351e-2480-4fae-96ab-258d4893911a:user",
+    "__openclaw": {
+      "senderId": "gateway-owner",
+      "senderIdentity": {
+        "type": "profile",
+        "id": "gateway-owner"
+      },
+      "transport": {
+        "clients": [
+          {
+            "id": "webchat",
+            "mode": "webchat"
+          }
+        ]
+      },
+      "id": "400c3c99-c6a8-4a27-8aa4-67b9a0d97825",
+      "idempotencyKey": "c28a351e-2480-4fae-96ab-258d4893911a:user",
+      "recordTimestampMs": 1791753686949,
+      "transcriptPosition": {
+        "source": "GnRmQVMrnE1oo-4japg92b055ale5VWDC7sVy1dBE3k",
+        "rawSeq": 1
+      },
+      "seq": 1,
+      "senderProfileAvatarUrl": "/api/users/gateway-owner/avatar?v=1791753608578"
+    }
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "toolCall",
+        "id": "call_20dd6578899e4053bdf7f2deaacce421",
+        "name": "tool_call",
+        "arguments": {
+          "id": "openclaw:core:show_widget",
+          "args": {
+            "title": "Synthetic counter",
+            "widget_code": "<p>Count: <strong id=\"n\">0</strong></p><button onclick=\"document.getElementById('n').textContent=+document.getElementById('n').textContent+1\">Increment</button>"
+          }
+        }
+      }
+    ],
+    "api": "openai-completions",
+    "provider": "fixture",
+    "model": "probe",
+    "usage": {
+      "input": 0,
+      "output": 0,
+      "totalTokens": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "cost": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 0
+      }
+    },
+    "stopReason": "toolUse",
+    "timestamp": 1791753689334,
+    "responseId": "fixture-cf42f828-6828-4066-8b0b-d7fa67c1f5b2",
+    "__openclaw": {
+      "runId": "c28a351e-2480-4fae-96ab-258d4893911a",
+      "id": "c183e9b9-6c0b-4f43-aac5-437954beb5c0",
+      "recordTimestampMs": 1791753689794,
+      "transcriptPosition": {
+        "source": "GnRmQVMrnE1oo-4japg92b055ale5VWDC7sVy1dBE3k",
+        "rawSeq": 4
+      },
+      "seq": 2
+    }
+  },
+  {
+    "role": "custom",
+    "customType": "openclaw.nested-tool.v1",
+    "display": true,
+    "excludeFromContext": true,
+    "content": [
+      {
+        "type": "toolCall",
+        "id": "tool_call:call_20dd6578899e4053bdf7f2deaacce421:show_widget:1",
+        "runId": "c28a351e-2480-4fae-96ab-258d4893911a",
+        "name": "show_widget",
+        "arguments": {
+          "title": "Synthetic counter",
+          "widget_code": "<p>Count: <strong id=\"n\">0</strong></p><button onclick=\"document.getElementById('n').textContent=+document.getElementById('n').textContent+1\">Increment</button>"
+        },
+        "parentToolCallId": "call_20dd6578899e4053bdf7f2deaacce421",
+        "timestamp": 1791753689823
+      },
+      {
+        "runId": "c28a351e-2480-4fae-96ab-258d4893911a",
+        "scopeId": "1e9950a7-5ce7-4c3c-ad40-90ca763effb0",
+        "afterEntryId": "c183e9b9-6c0b-4f43-aac5-437954beb5c0",
+        "startOrder": 0,
+        "parentToolCallId": "call_20dd6578899e4053bdf7f2deaacce421",
+        "toolCallId": "tool_call:call_20dd6578899e4053bdf7f2deaacce421:show_widget:1",
+        "toolName": "show_widget",
+        "isError": false,
+        "startedAt": 1791753689823,
+        "timestamp": 1791753689896,
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"kind\": \"canvas\",\n  \"presentation\": {\n    \"target\": \"assistant_message\",\n    \"title\": \"Synthetic counter\",\n    \"sandbox\": \"scripts\"\n  },\n  \"view\": {\n    \"id\": \"cv_4c37c65ae43b4f228f676e1735fd4a1d\",\n    \"url\": \"/__openclaw__/canvas/documents/cv_4c37c65ae43b4f228f676e1735fd4a1d/index.html\"\n  },\n  \"text\": \"Widget hosted at /__openclaw__/canvas/documents/cv_4c37c65ae43b4f228f676e1735fd4a1d/index.html\"\n}"
+          }
+        ],
+        "type": "toolResult",
+        "role": "toolResult"
+      }
+    ],
+    "timestamp": 1791753689823,
+    "idempotencyKey": "1e9950a7-5ce7-4c3c-ad40-90ca763effb0:tool_call:call_20dd6578899e4053bdf7f2deaacce421:show_widget:1",
+    "__openclaw": {
+      "id": "5db29582-4af0-4e2a-bab7-f4f4cb74dd7e",
+      "idempotencyKey": "1e9950a7-5ce7-4c3c-ad40-90ca763effb0:tool_call:call_20dd6578899e4053bdf7f2deaacce421:show_widget:1",
+      "recordTimestampMs": 1791753689902,
+      "transcriptPosition": {
+        "source": "GnRmQVMrnE1oo-4japg92b055ale5VWDC7sVy1dBE3k",
+        "rawSeq": 5,
+        "activity": {
+          "afterRawSeq": 4,
+          "scopeId": "1e9950a7-5ce7-4c3c-ad40-90ca763effb0",
+          "startOrder": 0
+        }
+      },
+      "seq": 3,
+      "runId": "c28a351e-2480-4fae-96ab-258d4893911a"
+    },
+    "runId": "c28a351e-2480-4fae-96ab-258d4893911a"
+  },
+  {
+    "role": "toolResult",
+    "toolCallId": "call_20dd6578899e4053bdf7f2deaacce421",
+    "toolName": "tool_call",
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"tool\": {\n    \"id\": \"openclaw:core:show_widget\",\n    \"name\": \"show_widget\",\n    \"source\": \"openclaw\"\n  },\n  \"result\": {\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"{\\n  \\\"kind\\\": \\\"canvas\\\",\\n  \\\"presentation\\\": {\\n    \\\"target\\\": \\\"assistant_message\\\",\\n    \\\"title\\\": \\\"Synthetic counter\\\",\\n    \\\"sandbox\\\": \\\"scripts\\\"\\n  },\\n  \\\"view\\\": {\\n    \\\"id\\\": \\\"cv_4c37c65ae43b4f228f676e1735fd4a1d\\\",\\n    \\\"url\\\": \\\"/__openclaw__/canvas/documents/cv_4c37c65ae43b4f228f676e1735fd4a1d/index.html\\\"\\n  },\\n  \\\"text\\\": \\\"Widget hosted at /__openclaw__/canvas/documents/cv_4c37c65ae43b4f228f676e1735fd4a1d/index.html\\\"\\n}\"\n      }\n    ],\n    \"details\": {\n      \"kind\": \"canvas\",\n      \"presentation\": {\n        \"target\": \"assistant_message\",\n        \"title\": \"Synthetic counter\",\n        \"sandbox\": \"scripts\"\n      },\n      \"view\": {\n        \"id\": \"cv_4c37c65ae43b4f228f676e1735fd4a1d\",\n        \"url\": \"/__openclaw__/canvas/documents/cv_4c37c65ae43b4f228f676e1735fd4a1d/index.html\"\n      },\n      \"text\": \"Widget hosted at /__openclaw__/canvas/documents/cv_4c37c65ae43b4f228f676e1735fd4a1d/index.html\"\n    }\n  }\n}"
+      }
+    ],
+    "isError": false,
+    "timestamp": 1791753689927,
+    "__openclaw": {
+      "runId": "c28a351e-2480-4fae-96ab-258d4893911a",
+      "id": "c1755901-e726-470b-97c5-b48bcfebf0ad",
+      "recordTimestampMs": 1791753689931,
+      "transcriptPosition": {
+        "source": "GnRmQVMrnE1oo-4japg92b055ale5VWDC7sVy1dBE3k",
+        "rawSeq": 6
+      },
+      "seq": 4
+    }
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "SYNTHETIC_FIXTURE_FINISHED"
+      }
+    ],
+    "api": "openai-completions",
+    "provider": "fixture",
+    "model": "probe",
+    "usage": {
+      "input": 0,
+      "output": 0,
+      "totalTokens": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "cost": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 0
+      }
+    },
+    "stopReason": "stop",
+    "timestamp": 1791753689955,
+    "responseId": "fixture-c6f22792-ffa1-4bf2-827b-acfe16af8327",
+    "__openclaw": {
+      "runId": "c28a351e-2480-4fae-96ab-258d4893911a",
+      "id": "f13056a7-f616-4c1f-8e6c-bd25f59c97e9",
+      "recordTimestampMs": 1791753689985,
+      "transcriptPosition": {
+        "source": "GnRmQVMrnE1oo-4japg92b055ale5VWDC7sVy1dBE3k",
+        "rawSeq": 8
+      },
+      "seq": 5
+    }
+  }
+]

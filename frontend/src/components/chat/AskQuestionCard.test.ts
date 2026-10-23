@@ -95,6 +95,13 @@ describe('parseAskQuestionPayload', () => {
     expect(parsed?.questions).toHaveLength(1);
     expect(parsed?.questions[0].options).toEqual([]);
   });
+
+  it('accepts the single top-level question the Portal Chat Bridge also takes', () => {
+    const parsed = parseAskQuestionPayload({ question: 'Deploy now?', multi_select: true, options: [{ label: 'Yes' }, { label: 'Later' }] });
+    expect(parsed?.questions).toEqual([{ question: 'Deploy now?', multiSelect: true, options: [{ label: 'Yes' }, { label: 'Later' }] }]);
+    // An explicit questions field still decides, even when it is unusable.
+    expect(parseAskQuestionPayload({ questions: [], question: 'Deploy now?' })).toBeNull();
+  });
 });
 
 describe('formatAskQuestionAnswer', () => {
@@ -131,8 +138,14 @@ describe('isUnansweredAskQuestionResult', () => {
     expect(isUnansweredAskQuestionResult('  The user did not answer the question  ')).toBe(true);
   });
 
+  it('recognizes Portal questions that were dismissed or ended with the turn', () => {
+    expect(isUnansweredAskQuestionResult('The user dismissed the question without answering.')).toBe(true);
+    expect(isUnansweredAskQuestionResult('The question was withdrawn because the turn ended.')).toBe(true);
+  });
+
   it('does not relabel a real answer', () => {
     expect(isUnansweredAskQuestionResult('Use the durable fix.')).toBe(false);
+    expect(isUnansweredAskQuestionResult('The user dismissed the question without answering, then said yes.')).toBe(false);
     expect(isUnansweredAskQuestionResult(undefined)).toBe(false);
   });
 });

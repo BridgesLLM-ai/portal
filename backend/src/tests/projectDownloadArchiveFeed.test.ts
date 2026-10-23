@@ -8,7 +8,7 @@ import {
 } from '../services/projectDownloadSnapshot';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const archiver = require('archiver');
+const { ZipArchive } = require('archiver');
 
 describe('project download archive feed', () => {
   let sandbox: string;
@@ -36,7 +36,7 @@ describe('project download archive feed', () => {
     put(plan[0], 'hello\n'.repeat(500));
     put(plan[1], Buffer.alloc(100_000, 7));
     put(plan[2], '#!/bin/sh\n');
-    const archive = archiver('zip', { zlib: { level: 6 } });
+    const archive = new ZipArchive({ zlib: { level: 6 } });
     const names: string[] = [];
     archive.on('entry', (data: { name: string }) => names.push(data.name));
     const { sink, bytes } = collect();
@@ -67,7 +67,7 @@ describe('project download archive feed', () => {
   test('leaves out a name the archive would reject, without ever opening its file', async () => {
     const plan = [entry('ok.txt'), entry('C:'), entry('after.txt')];
     for (const planned of plan) put(planned, 'x');
-    const archive = archiver('zip');
+    const archive = new ZipArchive();
     const errors: unknown[] = [];
     archive.on('error', (error: unknown) => errors.push(error));
     const { sink } = collect();
@@ -89,7 +89,7 @@ describe('project download archive feed', () => {
     const plan = [entry('ok.txt'), entry('vanished.txt'), entry('never.txt')];
     put(plan[0], 'x');
     put(plan[2], 'x');
-    const archive = archiver('zip');
+    const archive = new ZipArchive();
     archive.on('error', () => undefined);
     const { sink } = collect();
     archive.pipe(sink);
@@ -116,7 +116,7 @@ describe('project download archive feed', () => {
     const plan = [entry('big.bin', { store: true }), entry('next.txt')];
     put(plan[0], Buffer.alloc(24 * 1024 * 1024));
     put(plan[1], 'x');
-    const archive = archiver('zip');
+    const archive = new ZipArchive();
     archive.on('error', () => undefined);
     // Accepts a little, then never calls back again: backpressure, for good.
     let taken = 0;
@@ -152,7 +152,7 @@ describe('project download archive feed', () => {
   test('hands back a source that would not close, so its snapshot stays owned', async () => {
     const plan = [entry('slow.bin')];
     put(plan[0], Buffer.alloc(1024));
-    const archive = archiver('zip');
+    const archive = new ZipArchive();
     archive.on('error', () => undefined);
     const { sink } = collect();
     archive.pipe(sink);

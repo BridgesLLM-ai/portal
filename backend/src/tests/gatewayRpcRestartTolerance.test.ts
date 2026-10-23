@@ -26,7 +26,7 @@ class FakeGatewaySocket extends EventEmitter {
     this.emit('message', Buffer.from(JSON.stringify({
       type: 'event',
       event: 'connect.challenge',
-      payload: { nonce: 'test-nonce' },
+      payload: { nonce: 'fixture-gateway-challenge-nonce', ts: Date.now() },
     })));
   }
 
@@ -75,6 +75,7 @@ jest.mock('ws', () => ({
 jest.mock('../config/openclaw', () => ({ getOpenClawWsUrl: () => 'ws://127.0.0.1:18789' }));
 jest.mock('../utils/gatewayToken', () => ({ getGatewayToken: () => 'test-token', hasGatewayToken: () => true }));
 jest.mock('../utils/deviceIdentity', () => ({
+  ...jest.requireActual('../utils/deviceIdentity'),
   getOrCreateDeviceKeys: () => ({ publicKey: 'pk', privateKey: 'sk' }),
   buildSignedDevice: () => ({ id: 'device', signature: 'sig' }),
 }));

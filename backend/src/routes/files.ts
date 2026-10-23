@@ -1,4 +1,7 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request as ExpressRequest, Response, NextFunction } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -38,6 +41,7 @@ import {
   admitWorkspaceAuthorizationRequest,
   settleWorkspaceAuthorizationRequestIfResponseEnded,
 } from '../services/workspaceAuthorizationBarrier';
+import { OPENCLAW_MEDIA_MIRROR_BASE } from '../services/openclawMediaMirror';
 
 const router = Router();
 
@@ -52,26 +56,7 @@ function getUserUploadDir(userId: string): string {
   return directory;
 }
 
-function resolveOpenClawMediaMirrorBase(): string {
-  const candidates = [
-    process.env.OPENCLAW_STATE_DIR?.trim(),
-    path.join(os.homedir(), '.openclaw'),
-    '/root/.openclaw',
-  ].filter((value): value is string => Boolean(value && value.trim()));
-
-  for (const candidate of candidates) {
-    const normalized = path.resolve(candidate);
-    if (fs.existsSync(normalized)) {
-      return path.join(normalized, 'media', 'portal-files');
-    }
-  }
-
-  return path.join(path.join(os.homedir(), '.openclaw'), 'media', 'portal-files');
-}
-
-export const OPENCLAW_MEDIA_MIRROR_BASE = path.resolve(
-  process.env.PORTAL_OPENCLAW_MEDIA_MIRROR_ROOT || resolveOpenClawMediaMirrorBase(),
-);
+export { OPENCLAW_MEDIA_MIRROR_BASE };
 
 export interface FileStorageOptions {
   baseUploadDir?: string;

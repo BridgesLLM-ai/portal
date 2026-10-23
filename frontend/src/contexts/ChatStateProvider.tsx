@@ -13,6 +13,7 @@ import React, {
   useRef,
   useState,
 } from 'react';
+import { useVisibleQuestionConversation } from './QuestionAttentionContext';
 import client from '../api/client';
 import { authoredHistoryText, isInternalHistoryUser } from '../utils/historyProvenance';
 import { gatewayAPI } from '../api/endpoints';
@@ -87,6 +88,8 @@ import {
 } from '../utils/execApprovalQueue';
 import { getToolStatusText, resolveToolName, isCompactionNotice } from '../utils/toolPresentation';
 import { providerUsesPortalStreamBus } from '../utils/agentChatTransport';
+import { nativeAgentChatSessionId } from '../utils/nativeAgentSession';
+import { recoverPersistedToolArguments } from '../utils/persistedToolArguments';
 import {
   collapseGatewayInjectedAbortMirrors,
   isAbortedDoneEvent,
@@ -629,7 +632,8 @@ function normalizeToolCalls(toolCalls: any, defaultStatus: ToolCall['status'] = 
       return {
         id: typeof tc.id === 'string' && tc.id.trim() ? tc.id : nextId(),
         name: tc.name,
-        arguments: tc.arguments,
+        // Native transcripts may hold a bounded preview of oversized arguments.
+        arguments: recoverPersistedToolArguments(tc.arguments),
         startedAt,
         endedAt,
         result: typeof tc.result === 'string' ? tc.result : undefined,
@@ -3950,6 +3954,17 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     return sessionKey;
   }, []);
   resolveOpenClawSessionKeyRef.current = resolveOpenClawSessionKey;
+  /** Broker session a pending question for the open conversation carries: the
+   * concrete OpenClaw key, or the exact Portal session id of a native harness
+   * (Portal Chat Bridge questions). Empty while a native chat has no saved session. */
+  const resolveQuestionSessionKey = useCallback((rawSession?: string | null): string => {
+    if (providerRef.current === 'OPENCLAW') return resolveOpenClawSessionKey(rawSession);
+    const sessionKey = typeof rawSession === 'string' ? rawSession.trim() : '';
+    return nativeAgentChatSessionId(providerRef.current, sessionKey) || '';
+  }, [resolveOpenClawSessionKey]);
+  useVisibleQuestionConversation('agent-chat', provider === 'OPENCLAW'
+    ? (session ? toConcreteOpenClawSessionKey(session, agentId) : null)
+    : nativeAgentChatSessionId(provider, session));
 
   const replacePendingUserQuestions = useCallback((questions: GatewayPendingQuestion[]) => {
     pendingUserQuestionsRef.current = questions;
@@ -3967,15 +3982,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   }, [replacePendingUserQuestions]);
 
   const refreshPendingUserQuestions = useCallback(async () => {
-    if (providerRef.current !== 'OPENCLAW') return;
-    const requestedSession = resolveOpenClawSessionKey(sessionRef.current);
+    const requestedProvider = providerRef.current;
+    const requestedSession = resolveQuestionSessionKey(sessionRef.current);
     if (!requestedSession) return;
     const generation = pendingQuestionPollGenerationRef.current;
     const data = await gatewayAPI.pendingQuestions(requestedSession);
     if (
       generation !== pendingQuestionPollGenerationRef.current
-      || providerRef.current !== 'OPENCLAW'
-      || resolveOpenClawSessionKey(sessionRef.current) !== requestedSession
+      || providerRef.current !== requestedProvider
+      || resolveQuestionSessionKey(sessionRef.current) !== requestedSession
     ) return;
     const now = Date.now();
     const questions = (Array.isArray(data?.questions) ? data.questions : []).filter((entry) => (
@@ -3986,7 +4001,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     ));
     pendingUserQuestionsReadyRef.current = true;
     replacePendingUserQuestions(questions);
-  }, [replacePendingUserQuestions, resolveOpenClawSessionKey]);
+  }, [replacePendingUserQuestions, resolveQuestionSessionKey]);
 
   useEffect(() => {
     pendingQuestionPollGenerationRef.current += 1;
@@ -3994,7 +4009,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     pendingActiveSteerRef.current = null;
     pendingUserQuestionsReadyRef.current = false;
     replacePendingUserQuestions([]);
-    if (provider !== 'OPENCLAW' || !session) return undefined;
+    // Native harness questions arrive through the Portal Chat Bridge for the
+    // exact saved session; an unsaved native chat (`main`, `new-…`) has none yet.
+    if (!session || (provider !== 'OPENCLAW' && !nativeAgentChatSessionId(provider, session))) return undefined;
 
     let cancelled = false;
     let timer: number | null = null;
@@ -4547,14 +4564,20 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       || interruptedSnapshot.toolCalls.length > 0,
     );
     if (interruptedAssistantId && hasVisibleLiveState) {
-      setMessages(prev => prev.map((message) => {
+      const preserve = (message: ChatMessage) => {
         if (message.id !== interruptedAssistantId) return message;
         return preserveInterruptedLiveTurnSnapshot(
           message,
           interruptedSnapshot,
           options?.terminal ? null : LIVE_VIEW_DETACHED_MARKER,
         );
-      }));
+      };
+      // A terminal SSE frame can start history reconciliation in the same
+      // batch, before React commits this state update. Publish its preserved
+      // snapshot to that reader now, or a lagging empty history drops the
+      // still-blank assistant row and erases already-received reasoning.
+      messagesRef.current = messagesRef.current.map(preserve);
+      setMessages(prev => prev.map(preserve));
     }
   }, [clearActiveStreamState]);
 
@@ -7932,9 +7955,32 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const sendMessage = useCallback(async (text: string) => {
     const normalized = String(text || '').trim();
     if (!normalized) return;
+    const hasNativePhotos = normalized.includes('[portal-chat-image:');
+    const questionProvider = providerRef.current;
 
-    let shouldAnswerPendingQuestion = providerRef.current === 'OPENCLAW' && isStreamActiveRef.current;
-    let expectedActiveRunId = shouldAnswerPendingQuestion
+    // A native harness turn blocked on a Portal Chat Bridge question takes the
+    // composer text as its answer, like OpenClaw. With no question waiting the
+    // text is queued as a follow-up exactly as before: native turns never steer.
+    const nativeQuestionSession = questionProvider !== 'OPENCLAW' && isStreamActiveRef.current
+      ? resolveQuestionSessionKey(sessionRef.current || '')
+      : '';
+    if (nativeQuestionSession && !pendingUserQuestionsReadyRef.current) {
+      try {
+        await refreshPendingUserQuestions();
+      } catch {
+        // Unverified: the text falls through to the follow-up queue below.
+      }
+    }
+    const nativeQuestionWaiting = Boolean(nativeQuestionSession)
+      && pendingUserQuestionsRef.current.some((entry) => (
+        entry.sessionKey === nativeQuestionSession
+        && entry.state === 'pending'
+        && entry.expiresAt > Date.now()
+      ));
+
+    let shouldAnswerPendingQuestion = (questionProvider === 'OPENCLAW' && isStreamActiveRef.current)
+      || nativeQuestionWaiting;
+    let expectedActiveRunId = shouldAnswerPendingQuestion && !nativeQuestionWaiting
       ? normalizeRunId(currentRunIdRef.current)
       : null;
 
@@ -7961,8 +8007,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    if (shouldAnswerPendingQuestion && hasNativePhotos) {
+      setStatusText('Wait for the active response to finish before sending a photo.');
+      return;
+    }
     if (shouldAnswerPendingQuestion) {
-      const currentSession = resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main';
+      const currentSession = nativeQuestionWaiting
+        ? nativeQuestionSession
+        : resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main';
       if (!pendingUserQuestionsReadyRef.current) {
         try {
           await refreshPendingUserQuestions();
@@ -7976,6 +8028,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         && entry.state === 'pending'
         && entry.expiresAt > Date.now()
       ));
+      if (pendingRequests.length === 0 && nativeQuestionWaiting) {
+        // Steering is OpenClaw-only; a native question settled meanwhile.
+        setStatusText('That question was already settled. Send the text again to queue it as a follow-up.');
+        return;
+      }
       if (pendingRequests.length === 0) {
         let existingSteer = pendingActiveSteerRef.current;
         if (existingSteer && existingSteer.sessionKey !== currentSession) {
@@ -8088,8 +8145,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           throw new Error('Portal did not confirm this exact answer.');
         }
         if (
-          providerRef.current !== 'OPENCLAW'
-          || resolveOpenClawSessionKey(sessionRef.current || 'main') !== currentSession
+          providerRef.current !== questionProvider
+          || resolveQuestionSessionKey(sessionRef.current || 'main') !== currentSession
           || !pendingUserQuestionsRef.current.some((entry) => entry.id === request.id)
         ) {
           throw new Error('The active question changed before the answer was confirmed.');
@@ -8215,7 +8272,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     resetStreamWatchdog();
 
     let directClient = directClientRef.current;
-    if (useDirectGateway && providerRef.current === 'OPENCLAW') {
+    if (useDirectGateway && !hasNativePhotos && providerRef.current === 'OPENCLAW') {
       setDirectGatewayDemanded(true);
       if (!directClient?.isConnected) {
         setStatusText('Connecting directly to OpenClaw…');
@@ -8226,7 +8283,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     // For OPENCLAW with direct gateway enabled, use the direct client.
     // Wait briefly on the first user-initiated run so direct mode does not
     // silently route the initial message through the portal WS fallback.
-    if (useDirectGateway && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+    if (useDirectGateway && !hasNativePhotos && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
       const currentSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
       try {
         streamTransportRef.current = 'direct';
@@ -8386,7 +8443,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
       }
     }
-  }, [appendLocalMessage, applyOpenClawActiveStreamSnapshot, clearPendingTextRender, clearPostTurnHistorySync, handleActiveTurnConflict, markStreamRecovery, normalizeAgentError, preserveLiveTurnThenClear, refreshPendingUserQuestions, replacePendingUserQuestions, resetDirectSnapshotCursor, resetLiveThinkingTimeline, resetStreamWatchdog, resolveOpenClawSessionKey, schedulePostTurnHistorySync, settlePendingUserQuestion, useDirectGateway, waitForDirectGatewayClient]);
+  }, [appendLocalMessage, applyOpenClawActiveStreamSnapshot, clearPendingTextRender, clearPostTurnHistorySync, handleActiveTurnConflict, markStreamRecovery, normalizeAgentError, preserveLiveTurnThenClear, refreshPendingUserQuestions, replacePendingUserQuestions, resetDirectSnapshotCursor, resetLiveThinkingTimeline, resetStreamWatchdog, resolveOpenClawSessionKey, resolveQuestionSessionKey, schedulePostTurnHistorySync, settlePendingUserQuestion, useDirectGateway, waitForDirectGatewayClient]);
 
   const drainNextQueuedMessage = useCallback(() => {
     if (isStreamActiveRef.current || isQueueDrainActiveRef.current) return;

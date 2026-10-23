@@ -141,3 +141,11 @@ Never pass a host absolute path, signed Portal URL, /api/files URL, or another p
 Installations can relocate Portal data with environment/configuration. The common surfaces include a File library root, Project root, Apps root, upload/chunk staging, PostgreSQL, and external service state, but paths are not part of the user API.
 
 For normal work, discover through Portal responses. For operator diagnosis, inspect the active service environment without printing secrets. Do not assume /portal, /opt/bridgesllm, or /var/portal-files is universal.
+
+## Desktop Projects
+
+`GET /api/projects/templates` lists the Desktop starters (TypeScript, Rust, Python, C++; terminal or graphical) and `desktopToolchain`, which says whether this server can build them and why not. Keep `portal-project.json` (version 1, target `desktop`) in source: it selects language, interface, framework and a relative entry or binary, and grants no host commands, mounts, secrets or network access.
+
+Use the Project APIs for dependency setup, Check and Run; never run npm, Cargo, CMake or pip on the Portal host. Builds follow the lockfiles (`package-lock.json`, `Cargo.lock`, pinned `requirements.txt`) and fetch new packages only through the Project egress proxy when the server policy is `brokered`. Commit generated lockfiles.
+
+Run builds saved source and opens the app on the Remote Desktop; app-process `start` opens the last build and `restart` reuses it without compiling. Read live status and logs, and treat the `desktop.sourceState` field as the only signal that the deployed build matches saved source. Write persistent data under `BRIDGESLLM_APP_DATA`. Desktop controls are Owner/Sub-Admin only; never kill by process name, disable the Electron sandbox, or widen the shared desktop's access.

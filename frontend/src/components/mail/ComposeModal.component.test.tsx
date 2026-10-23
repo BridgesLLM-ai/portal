@@ -72,7 +72,7 @@ describe('ComposeModal signature isolation', () => {
       .mockImplementationOnce(() => new Promise(() => {}));
 
     const view = render(<ComposeModal {...baseProps} account="alice" accountEmail="alice@example.com" />);
-    expect(await screen.findByText(/Alice signature/)).toBeVisible();
+    await waitFor(() => expect(screen.getByText(/Alice signature/)).toBeVisible());
 
     view.rerender(<ComposeModal {...baseProps} account="bob" accountEmail="bob@example.com" />);
     await waitFor(() => expect(screen.queryByText(/Alice signature/)).not.toBeInTheDocument());
@@ -83,7 +83,7 @@ describe('ComposeModal signature isolation', () => {
 
     render(<ComposeModal {...baseProps} account="alice" accountEmail="alice@example.com" />);
 
-    expect(await screen.findByText('Signature service unavailable')).toBeVisible();
+    await waitFor(() => expect(screen.getByText('Signature service unavailable')).toBeVisible());
   });
 });
 
@@ -179,7 +179,7 @@ describe.each([
     fireEvent.click(modalLayer!);
 
     expect(baseProps.onClose).not.toHaveBeenCalled();
-    expect(screen.getByRole('dialog', { name: 'New Email' })).toBeVisible();
+    await waitFor(() => expect(screen.getByRole('dialog', { name: 'New Email' })).toBeVisible());
 
     await act(async () => {
       pending.resolve({});
@@ -240,7 +240,7 @@ describe.each([
     });
     expect((await screen.findAllByText('Signature update could not be committed')).length).toBeGreaterThan(0);
     expect(screen.getByRole('button', { name: saveName })).toBeEnabled();
-    expect(screen.getByRole('dialog', { name: 'New Email' })).toBeVisible();
+    await waitFor(() => expect(screen.getByRole('dialog', { name: 'New Email' })).toBeVisible());
 
     await userEvent.click(screen.getByRole('button', { name: saveName }));
     await waitFor(() => expect(saveAttempts).toBe(2));

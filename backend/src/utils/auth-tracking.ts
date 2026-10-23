@@ -145,19 +145,54 @@ export function lookupGeo(ip: string, headers?: Request['headers']): GeoInfo {
 }
 
 // ─── Failed login tracking ───
-const failedAttempts = new Map<string, { count: number; lastAttempt: number }>();
+// One entry per source IP; it expires 15 minutes after that source's last
+// failed attempt. The table is also bounded, so a sign-in flood from many
+// distinct addresses cannot grow it without limit. Thresholds and the window
+// are unchanged.
+const failedAttempts = new Map<string, { count: number; lastAttempt: number; limit: number }>();
 const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 min
 const MAX_FAILED_ATTEMPTS = 10;
+export const MAX_TRACKED_FAILED_LOGIN_SOURCES = 50_000;
+const EVICTION_SCAN_LIMIT = 1_000;
+
+function isExpired(entry: { lastAttempt: number }, now: number): boolean {
+  return (now - entry.lastAttempt) > RATE_LIMIT_WINDOW;
+}
+
+/** Entries are re-inserted on every attempt, so the map stays in last-attempt
+ * order and expired entries sit at its head. */
+function sweepExpiredFailedAttempts(now: number): void {
+  for (const [ip, entry] of failedAttempts) {
+    if (!isExpired(entry, now)) return;
+    failedAttempts.delete(ip);
+  }
+}
+
+/** Make room for one new source. A currently blocked source is released only
+ * if none of the oldest EVICTION_SCAN_LIMIT entries is unblocked. */
+function evictForNewSource(): void {
+  let oldest: string | undefined;
+  let scanned = 0;
+  for (const [ip, entry] of failedAttempts) {
+    oldest ??= ip;
+    if (entry.count < entry.limit) {
+      failedAttempts.delete(ip);
+      return;
+    }
+    if (++scanned >= EVICTION_SCAN_LIMIT) break;
+  }
+  if (oldest !== undefined) failedAttempts.delete(oldest);
+}
 
 export function recordFailedAttempt(ip: string, maxFailedAttempts = MAX_FAILED_ATTEMPTS): { blocked: boolean; attempts: number } {
   const now = Date.now();
-  const entry = failedAttempts.get(ip);
-  if (entry && (now - entry.lastAttempt) > RATE_LIMIT_WINDOW) {
-    failedAttempts.delete(ip);
-  }
-  const current = failedAttempts.get(ip) || { count: 0, lastAttempt: now };
-  current.count++;
-  current.lastAttempt = now;
+  sweepExpiredFailedAttempts(now);
+  const existing = failedAttempts.get(ip);
+  const entry = existing && !isExpired(existing, now) ? existing : undefined;
+  if (existing && !entry) failedAttempts.delete(ip);
+  if (!entry && failedAttempts.size >= MAX_TRACKED_FAILED_LOGIN_SOURCES) evictForNewSource();
+  const current = { count: (entry?.count || 0) + 1, lastAttempt: now, limit: maxFailedAttempts };
+  failedAttempts.delete(ip);
   failedAttempts.set(ip, current);
   return { blocked: current.count >= maxFailedAttempts, attempts: current.count };
 }
@@ -167,14 +202,21 @@ export function clearFailedAttempts(ip: string): void {
 }
 
 export function isRateLimited(ip: string, maxFailedAttempts = MAX_FAILED_ATTEMPTS): boolean {
+  const now = Date.now();
+  sweepExpiredFailedAttempts(now);
   const entry = failedAttempts.get(ip);
   if (!entry) return false;
-  if ((Date.now() - entry.lastAttempt) > RATE_LIMIT_WINDOW) {
+  if (isExpired(entry, now)) {
     failedAttempts.delete(ip);
     return false;
   }
   return entry.count >= maxFailedAttempts;
 }
+
+export const __failedLoginTrackingTest = Object.freeze({
+  size: () => failedAttempts.size,
+  reset: () => failedAttempts.clear(),
+});
 
 // ─── Build rich metadata from request ───
 export interface TrackingMetadata {

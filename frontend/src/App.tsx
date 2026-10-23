@@ -295,7 +295,7 @@ export default function App() {
     sessionRestoreRetryable,
     abandonQuarantinedSession,
   } = useAuthStore();
-  const heartbeatRef = useRef<ReturnType<typeof setInterval>>();
+  const heartbeatRef = useRef<ReturnType<typeof setInterval>>(undefined);
   const [setupChecked, setSetupChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState<boolean>(false);
   const [isReinstall, setIsReinstall] = useState<boolean>(false);

@@ -1,4 +1,7 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request as ExpressRequest, Response } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import fs from 'fs';
 import { authenticateToken } from '../middleware/auth';
 import { requireOwner } from '../middleware/requireAdmin';
@@ -14,18 +17,30 @@ import {
   isBackupReferencedByLiveDependencyRepair,
   isRepairOwnedBackupLockMarker,
   listBackupFiles,
-  readBackupSchedules,
   readBackupStatus,
   readLegacyBackupCron,
   assertBackupMutationLockLease,
   startBackupUnit,
   withBackupMutationLock,
 } from '../services/backup.service';
+import {
+  BackupManagementError,
+  previewBackupCleanup,
+  readBackupPolicy,
+  runBackupCleanup,
+  saveBackupPolicy,
+} from '../services/backupManagement.service';
+import {
+  BackupScheduleError,
+  readBackupScheduleSettings,
+  updateBackupSchedule,
+} from '../services/backupSchedule.service';
 
 const router = Router();
 const CHUNK_SIZE = 4 * 1024 * 1024;
 const MAX_CHUNK_INDEX = 1_000_000;
 const activeBackupMutations = new Set<string>();
+const activeManagementChanges = new Set<string>();
 
 router.use(authenticateToken, requireOwner);
 
@@ -213,7 +228,14 @@ router.post('/lock/:filename', async (req: Request, res: Response) => {
       const lockPath = `${found.fullPath}.locked`;
       if (found.locked) {
         const stat = fs.lstatSync(lockPath);
-        if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('Invalid backup lock file');
+        if (stat.isSymbolicLink() || !stat.isFile()) {
+          res.status(409).json({
+            error: 'This backup is held by an unexpected lock entry, so it stays locked. '
+              + 'Remove the lock on the server to unlock it.',
+            code: 'BACKUP_LOCK_UNEXPECTED',
+          });
+          return;
+        }
         assertBackupMutationLockLease(lease);
         fs.unlinkSync(lockPath);
       } else {
@@ -343,10 +365,11 @@ router.get('/status', async (_req: Request, res: Response) => {
 
 router.get('/cron-info', async (_req: Request, res: Response) => {
   try {
-    const [schedules, legacy] = await Promise.all([readBackupSchedules(), readLegacyBackupCron()]);
+    const [settings, legacy] = await Promise.all([readBackupScheduleSettings(), readLegacyBackupCron()]);
     res.setHeader('Cache-Control', 'no-store');
     res.json({
-      schedules,
+      hostTimezone: settings.hostTimezone,
+      schedules: settings.schedules,
       active: legacy.active,
       disabled: legacy.disabled,
       legacyCron: legacy,
@@ -355,6 +378,125 @@ router.get('/cron-info', async (_req: Request, res: Response) => {
     console.error('Backup schedule error:', error);
     res.status(500).json({ error: 'Failed to read installed backup schedules' });
   }
+});
+
+function sendManagementError(res: Response, error: unknown, fallback: string): void {
+  if (error instanceof BackupManagementError || error instanceof BackupScheduleError) {
+    res.status(error.status).json({ error: error.message, code: error.code });
+    return;
+  }
+  console.error(`${fallback}:`, error);
+  res.status(500).json({ error: fallback });
+}
+
+// One owner-level change at a time per kind; backup-data.py also takes the
+// installer and backup locks before it deletes anything.
+async function exclusively(key: string, res: Response, work: () => Promise<void>): Promise<void> {
+  if (activeManagementChanges.has(key)) {
+    res.status(409).json({ error: 'Another change to backup settings is still running', code: 'BUSY' });
+    return;
+  }
+  activeManagementChanges.add(key);
+  try {
+    await work();
+  } finally {
+    activeManagementChanges.delete(key);
+  }
+}
+
+router.get('/settings', async (_req: Request, res: Response) => {
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(await readBackupPolicy());
+  } catch (error) {
+    sendManagementError(res, error, 'Backup settings could not be read');
+  }
+});
+
+// Saving settings only records them. Nothing is deleted or started here; the
+// limits apply after the next backup or through the reviewed cleanup below.
+router.put('/settings', async (req: Request, res: Response) => {
+  await exclusively('settings', res, async () => {
+    try {
+      const saved = await saveBackupPolicy(req.body);
+      await prisma.activityLog.create({
+        data: {
+          userId: req.user!.userId,
+          action: 'BACKUP_SETTINGS_UPDATED',
+          resource: 'backup',
+          severity: 'INFO',
+          metadata: { policy: saved.policy },
+        },
+      }).catch((error) => console.error('Failed to record backup settings activity:', error));
+      res.json(saved);
+    } catch (error) {
+      sendManagementError(res, error, 'Backup settings could not be saved');
+    }
+  });
+});
+
+router.get('/cleanup/preview', async (_req: Request, res: Response) => {
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(await previewBackupCleanup());
+  } catch (error) {
+    sendManagementError(res, error, 'Backup cleanup could not be previewed');
+  }
+});
+
+router.post('/cleanup', async (req: Request, res: Response) => {
+  if (req.body?.confirm !== true || typeof req.body?.planToken !== 'string') {
+    res.status(400).json({ error: 'Review the cleanup and confirm it before deleting backups', code: 'STALE' });
+    return;
+  }
+  await exclusively('cleanup', res, async () => {
+    try {
+      const result = await runBackupCleanup(req.body.planToken);
+      await prisma.activityLog.create({
+        data: {
+          userId: req.user!.userId,
+          action: 'BACKUP_CLEANUP',
+          resource: 'backup',
+          severity: 'INFO',
+          metadata: {
+            deleted: Array.isArray(result?.deleted) ? result.deleted.slice(0, 200) : [],
+            deletedBytes: result?.deletedBytes ?? null,
+            freedBytes: result?.freedBytes ?? null,
+          },
+        },
+      }).catch((error) => console.error('Failed to record backup cleanup activity:', error));
+      res.json(result);
+    } catch (error) {
+      sendManagementError(res, error, 'Backup cleanup failed');
+    }
+  });
+});
+
+router.put('/schedules/:type', async (req: Request, res: Response) => {
+  await exclusively(`schedule:${req.params.type}`, res, async () => {
+    try {
+      const schedule = await updateBackupSchedule(req.params.type, req.body);
+      await prisma.activityLog.create({
+        data: {
+          userId: req.user!.userId,
+          action: 'BACKUP_SCHEDULE_UPDATED',
+          resource: 'backup',
+          resourceId: schedule.type,
+          severity: 'INFO',
+          metadata: {
+            type: schedule.type,
+            enabled: schedule.enabled,
+            time: schedule.time,
+            weekday: schedule.weekday,
+            dayOfMonth: schedule.dayOfMonth,
+          },
+        },
+      }).catch((error) => console.error('Failed to record backup schedule activity:', error));
+      res.json({ schedule });
+    } catch (error) {
+      sendManagementError(res, error, 'Backup schedule could not be changed');
+    }
+  });
 });
 
 router.get('/chunk/:filename', async (req: Request, res: Response) => {

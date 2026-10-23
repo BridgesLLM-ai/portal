@@ -52,7 +52,10 @@ export function parseAskQuestionPayload(rawArguments: unknown): AskQuestionPaylo
     }
   }
   if (!parsed || typeof parsed !== 'object') return null;
-  const rawQuestions = Array.isArray(parsed.questions) ? parsed.questions : null;
+  // The Portal Chat Bridge ask_user also accepts one top-level question.
+  const rawQuestions = Array.isArray(parsed.questions)
+    ? parsed.questions
+    : parsed.questions === undefined && typeof parsed.question === 'string' ? [parsed] : null;
   if (!rawQuestions || rawQuestions.length === 0) return null;
 
   const questions: AskQuestionItem[] = [];
@@ -72,7 +75,7 @@ export function parseAskQuestionPayload(rawArguments: unknown): AskQuestionPaylo
     questions.push({
       question,
       header: boundedText(raw.header, 24) || undefined,
-      multiSelect: raw.multiSelect === true,
+      multiSelect: raw.multiSelect === true || raw.multi_select === true,
       options,
     });
   }
@@ -97,10 +100,16 @@ export function formatAskQuestionAnswer(
   return parts.join('\n\n');
 }
 
-/** Claude Code's headless native prompt can settle without a human response. */
+/**
+ * Results that settled without a human answer: Claude Code's headless native
+ * prompt, and Portal questions the user dismissed or that ended with the turn.
+ */
 export function isUnansweredAskQuestionResult(value: unknown): boolean {
   if (typeof value !== 'string') return false;
-  return /^the user did not answer the questions?\.?$/i.test(value.trim());
+  const text = value.trim();
+  return /^the user did not answer the questions?\.?$/i.test(text)
+    || /^the user dismissed the questions? without answering\.?$/i.test(text)
+    || /^the questions? (?:was|were) withdrawn because the turn ended\.?$/i.test(text);
 }
 
 export function AskQuestionCard({

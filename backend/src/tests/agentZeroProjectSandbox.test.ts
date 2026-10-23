@@ -23,7 +23,8 @@ import {
   AGENT_ZERO_PROJECT_RUNTIME_GID,
   AGENT_ZERO_PROJECT_RUNTIME_UID,
   attestOnlyAgentZeroProjectIdentityRuntime,
-  buildAgentZeroProjectContainerCreateArgs,
+  __agentZeroProjectSandboxTest,
+  buildAgentZeroProjectContainerCreateCommand,
   buildAgentZeroProjectLegacyRuntimeFingerprint,
   buildAgentZeroProjectRuntimeIdentity,
   buildAgentZeroProjectRuntimeFingerprint,
@@ -44,6 +45,8 @@ import {
   AGENT_ZERO_PROJECT_SANDBOX_IMAGE_ENV,
   AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION,
   AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION,
+  AGENT_ZERO_PROJECT_LEGACY_V211_SOURCE_COMMITS,
+  AGENT_ZERO_PROJECT_LEGACY_V211_UPSTREAM_IMAGE_DIGESTS,
   AGENT_ZERO_PROJECT_LEGACY_V210_SOURCE_COMMITS,
   AGENT_ZERO_PROJECT_LEGACY_V210_UPSTREAM_IMAGE_DIGESTS,
   AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS,
@@ -288,7 +291,7 @@ function fixture() {
       NanoCpus: 2_000_000_000,
       Ulimits: [
         { Name: 'nofile', Soft: 1024, Hard: 1024 },
-        { Name: 'nproc', Soft: 512, Hard: 512 },
+        { Name: 'nproc', Soft: 4096, Hard: 4096 },
       ],
       Tmpfs: {
         '/tmp': 'rw,noexec,nosuid,nodev,size=256m,mode=1777',
@@ -536,6 +539,14 @@ function fixture() {
       container.HostConfig.SecurityOpt = securityOptions;
       container.AppArmorProfile = appArmorOption?.slice('apparmor='.length) || '';
       container.HostConfig.NetworkMode = args[networkIndex + 1];
+      // Docker records exactly the requested ulimits; a retired predecessor's values never carry over.
+      container.HostConfig.Ulimits = args.flatMap((value, index) => (
+        value === '--ulimit' ? [String(args[index + 1])] : []
+      )).map((value) => {
+        const [name, limits] = value.split('=');
+        const [soft, hard] = limits.split(':').map(Number);
+        return { Name: name, Soft: soft, Hard: hard };
+      });
       container.Id = 'a'.repeat(64);
       container.Image = imageRef;
       container.Config.Image = imageRef;
@@ -667,7 +678,7 @@ function qualification(input: ReturnType<typeof fixture>): AgentZeroProjectQuali
     dataVolumeMountpoint: input.volume.Mountpoint,
     protocol: 'a0-connector.v1',
     connectorVersion: '0.1.0',
-    agentZeroVersion: '2.11',
+    agentZeroVersion: '2.14',
     modelBridgePolicyVersion: AGENT_ZERO_PROJECT_MODEL_BRIDGE_POLICY_VERSION,
     modelBridgePort: AGENT_ZERO_PROJECT_MODEL_BRIDGE_PORT,
     modelBridgeGatewayIpv4: BRIDGE_GATEWAY_IPV4,
@@ -807,7 +818,16 @@ function buildExactLegacyPreConfinementStaticRuntimeFingerprint(
   })).digest('hex');
 }
 
+// Every runtime created before the shared-UID ceiling carries RLIMIT_NPROC 512.
+function usePredecessorNproc(container: Record<string, any>): void {
+  container.HostConfig.Ulimits = [
+    { Name: 'nofile', Soft: 1024, Hard: 1024 },
+    { Name: 'nproc', Soft: 512, Hard: 512 },
+  ];
+}
+
 function installExactLegacyPreConfinementRuntime(input: ReturnType<typeof fixture>): void {
+  usePredecessorNproc(input.container);
   const predecessorSpec = {
     ...input.spec,
     policyFingerprint: derivePreConfinementProjectEgressPolicyFingerprint(input.spec),
@@ -821,16 +841,17 @@ function installExactLegacyPreConfinementRuntime(input: ReturnType<typeof fixtur
   input.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
 }
 
-function installExactLegacyV25Image(input: ReturnType<typeof fixture>, version: '2.5' | '2.10' = '2.5'): {
+function installExactLegacyV25Image(input: ReturnType<typeof fixture>, version: '2.5' | '2.10' | '2.11' = '2.5'): {
   imageRef: string;
   image: Record<string, any>;
   runCommand: AgentZeroProjectCommandRunner;
 } {
+  usePredecessorNproc(input.container);
   const legacyImageRef = `sha256:${'7'.repeat(64)}`;
   const legacyLabels = {
     [AGENT_ZERO_PROJECT_IMAGE_RECIPE_LABEL]: '8'.repeat(64),
-    [AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL]: (version === '2.10' ? AGENT_ZERO_PROJECT_LEGACY_V210_SOURCE_COMMITS : AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS).amd64,
-    [AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL]: (version === '2.10' ? AGENT_ZERO_PROJECT_LEGACY_V210_UPSTREAM_IMAGE_DIGESTS : AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS).amd64,
+    [AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL]: (version === '2.11' ? AGENT_ZERO_PROJECT_LEGACY_V211_SOURCE_COMMITS : version === '2.10' ? AGENT_ZERO_PROJECT_LEGACY_V210_SOURCE_COMMITS : AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS).amd64,
+    [AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL]: (version === '2.11' ? AGENT_ZERO_PROJECT_LEGACY_V211_UPSTREAM_IMAGE_DIGESTS : version === '2.10' ? AGENT_ZERO_PROJECT_LEGACY_V210_UPSTREAM_IMAGE_DIGESTS : AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS).amd64,
     [AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER_LABEL]: AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER,
   };
   const legacyImage = {
@@ -872,6 +893,7 @@ function installExactSharedV1CurrentNameModeRuntime(
     blankNetworkId?: boolean;
   } = {},
 ): void {
+  usePredecessorNproc(input.container);
   input.container.HostConfig.NetworkMode = input.spec.internalNetworkName;
   if (options.stopped) {
     input.container.State.Running = false;
@@ -903,7 +925,7 @@ function qualificationClient(overrides: {
     getCapabilities: jest.fn(async () => ({
       protocol: 'a0-connector.v1',
       connectorVersion: '0.1.0',
-      agentZeroVersion: '2.11',
+      agentZeroVersion: '2.14',
       auth: ['session'],
       authRequired: true,
       transports: ['http', 'websocket'],
@@ -998,16 +1020,16 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
     })).toThrow(/not protected/i);
   });
 
-  test('pins both upstream architectures to the same audited v2.11 source commit', () => {
+  test('pins both upstream architectures to the same audited v2.14 source commit', () => {
     expect(AGENT_ZERO_PROJECT_UPSTREAM_IMAGE_DIGESTS).toEqual({
-      amd64: 'sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30',
-      arm64: 'sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3',
+      amd64: 'sha256:307a2ceffc8501ba05a1e7253e8b6e4d656d2e1c3b97f0eb943c18b9c40a30fd',
+      arm64: 'sha256:3b048a33c8698d396688ebd05096daab1f441cf310f299db2ed808a00433bc13',
     });
     expect(AGENT_ZERO_PROJECT_SOURCE_COMMITS).toEqual({
-      amd64: '6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1',
-      arm64: '6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1',
+      amd64: 'ff2a5b9c9c4e490ba38dd7c313e779510bb2071a',
+      arm64: 'ff2a5b9c9c4e490ba38dd7c313e779510bb2071a',
     });
-    expect(AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION).toBe('agent-zero-v2.11');
+    expect(AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION).toBe('agent-zero-v2.14');
     expect(AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION).toBe('agent-zero-v2.5');
     expect(AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS).toEqual({
       amd64: 'sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb',
@@ -1017,7 +1039,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       amd64: 'd1d48bc9c0e6e253e87c354ce757c518820c6e25',
       arm64: 'd1d48bc9c0e6e253e87c354ce757c518820c6e25',
     });
-    expect(getAgentZeroProjectUpstreamImageRef('amd64')).toContain('@sha256:9b65805');
+    expect(getAgentZeroProjectUpstreamImageRef('amd64')).toContain('@sha256:307a2ce');
     expect(getAgentZeroProjectSourceCommit('aarch64')).toBe(AGENT_ZERO_PROJECT_SOURCE_COMMITS.arm64);
     expect(getAgentZeroProjectLegacyV25UpstreamImageRef('arm64')).toContain('@sha256:da107b6');
     expect(getAgentZeroProjectLegacyV25SourceCommit('x86_64'))
@@ -1040,7 +1062,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
 
   test('derives a project-only runtime with proxy-only networking and a local managed volume', () => {
     const value = fixture();
-    const containerArgs = buildAgentZeroProjectContainerCreateArgs({
+    const containerCommand = buildAgentZeroProjectContainerCreateCommand({
       descriptor: value.descriptor,
       imageRef: value.imageRef,
       spec: value.spec,
@@ -1050,6 +1072,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       runtimeIpv4: RUNTIME_IPV4,
       modelBridgeCredential: value.modelBridgeCredential,
     });
+    const containerArgs = containerCommand.args;
     const volumeArgs = buildAgentZeroProjectVolumeCreateArgs(value.descriptor);
 
     expect(value.descriptor.containerName).toMatch(/^bridgesllm-a0p-[a-f0-9]{24}$/);
@@ -1060,7 +1083,8 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       '--user', AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER,
       '--read-only',
       '--cap-drop', 'ALL',
-      '--env', `HTTPS_PROXY=${expectedAgentZeroProxyEnvironment(value.spec).HTTPS_PROXY}`,
+      // Proxy credentials are named only; the runner's environment carries them.
+      '--env', 'HTTPS_PROXY',
       '--env', `NO_PROXY=${BRIDGE_GATEWAY_IPV4}`,
       '--env-file', value.descriptor.authFile,
       '--env-file', value.descriptor.modelBridgeEnvFile,
@@ -1068,6 +1092,12 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       `type=bind,source=${value.descriptor.canonicalProjectRoot},target=${AGENT_ZERO_PROJECT_ROOT},bind-propagation=rprivate`,
     ]));
     expect(containerArgs).not.toContain(`type=bind,source=${value.descriptor.authFile},target=/a0/.env,readonly`);
+    expect(containerArgs.some((entry) => entry.includes(value.spec.token))).toBe(false);
+    const proxy = expectedAgentZeroProxyEnvironment(value.spec, BRIDGE_GATEWAY_IPV4);
+    expect(containerCommand.secretEnvironment).toEqual({
+      HTTP_PROXY: proxy.HTTP_PROXY, HTTPS_PROXY: proxy.HTTPS_PROXY,
+      http_proxy: proxy.http_proxy, https_proxy: proxy.https_proxy,
+    });
     expect(containerArgs.join(' ')).not.toMatch(/docker\.sock|host-gateway|--privileged|--network host|--network bridge|\/root\/.openclaw/);
     expect(volumeArgs).toEqual(expect.arrayContaining([
       '--driver', 'local',
@@ -1697,7 +1727,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
     ))).toBe(false);
   });
 
-  test.each(['2.5', '2.10'] as const)('recognizes exact Agent Zero %s only as a predecessor and migrates it to required v2.11', async (version) => {
+  test.each(['2.5', '2.10', '2.11'] as const)('recognizes exact Agent Zero %s only as a predecessor and migrates it to required v2.14', async (version) => {
     const value = fixture();
     const predecessor = installExactLegacyV25Image(value, version);
     const originalVolume = JSON.parse(JSON.stringify(value.volume));
@@ -1724,7 +1754,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       egressExecutor: { run: jest.fn() },
     })).resolves.toMatchObject({
       ready: true,
-      // A migrated runtime still requires a fresh v2.11 live qualification.
+      // A migrated runtime still requires a fresh v2.14 live qualification.
       selectable: false,
       imageRef: value.imageRef,
       containerId: 'a'.repeat(64),
@@ -1809,6 +1839,67 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
     expect(value.calls.some(({ args }) => (
       args[0] === 'container' && (args[1] === 'stop' || args[1] === 'rm')
     ))).toBe(false);
+  });
+
+  function convergeOptions(value: ReturnType<typeof fixture>) {
+    return {
+      stateRoot,
+      architecture: 'amd64',
+      egress: value.egress,
+      runCommand: value.runCommand,
+      resolveInternalNetworkBinding: recognizedInternalNetworkBinding(value),
+      ensureEgressPlane: jest.fn(async () => exactEgressHandle(value)),
+      constrainRuntime: jest.fn(async () => undefined),
+      egressExecutor: { run: jest.fn() },
+    };
+  }
+
+  function mutatingCalls(value: ReturnType<typeof fixture>) {
+    return value.calls.filter(({ command, args }) => (
+      command === 'docker' && args[0] === 'container' && ['stop', 'rm', 'create'].includes(args[1])
+    ));
+  }
+
+  test('keeps an exact current runtime that already carries the shared-UID nproc ceiling', async () => {
+    const value = fixture();
+    expect(value.container.HostConfig.PidsLimit).toBe(512);
+    expect(value.container.HostConfig.Ulimits).toContainEqual({ Name: 'nproc', Soft: 4096, Hard: 4096 });
+    await expect(convergeAgentZeroProjectSandboxRuntime(value.executionContext, convergeOptions(value)))
+      .resolves.toMatchObject({ ready: true, containerId: value.containerId, runtimeFingerprint: value.runtimeFingerprint });
+    // The same container is kept (egress attachment may restart it); it is never replaced.
+    expect(mutatingCalls(value).filter(({ args }) => args[1] !== 'stop')).toEqual([]);
+  });
+
+  test('retires the exact current recipe created before the shared-UID nproc ceiling and keeps its identity', async () => {
+    const value = fixture();
+    usePredecessorNproc(value.container);
+    await expect(convergeAgentZeroProjectSandboxRuntime(value.executionContext, convergeOptions(value)))
+      .resolves.toMatchObject({ ready: true, containerId: 'a'.repeat(64), runtimeFingerprint: value.runtimeFingerprint });
+    expect(value.calls).toContainEqual({ command: 'docker', args: ['container', 'rm', value.containerId] });
+    const createCall = value.calls.find(({ command, args }) => (
+      command === 'docker' && args[0] === 'container' && args[1] === 'create'
+    ));
+    expect(createCall?.args[(createCall?.args.indexOf('--pids-limit') ?? -2) + 1]).toBe('512');
+    expect(createCall?.args).toContain('nproc=4096:4096');
+    expect(createCall?.args).not.toContain('nproc=512:512');
+    expect(value.container.Config.Labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL]).toBe(value.runtimeFingerprint);
+
+    await expect(convergeAgentZeroProjectSandboxRuntime(value.executionContext, convergeOptions(value)))
+      .resolves.toMatchObject({ ready: true, containerId: 'a'.repeat(64) });
+    expect(value.calls.filter(({ command, args }) => (
+      command === 'docker' && args[0] === 'container' && args[1] === 'rm'
+    ))).toHaveLength(1);
+  });
+
+  test.each([1024, 256])('refuses a runtime with a foreign nproc %s ceiling without mutation', async (nproc) => {
+    const value = fixture();
+    value.container.HostConfig.Ulimits = [
+      { Name: 'nofile', Soft: 1024, Hard: 1024 },
+      { Name: 'nproc', Soft: nproc, Hard: nproc },
+    ];
+    await expect(convergeAgentZeroProjectSandboxRuntime(value.executionContext, convergeOptions(value)))
+      .rejects.toThrow(/neither the current nor a recognized legacy/i);
+    expect(mutatingCalls(value)).toEqual([]);
   });
 
   test('migrates the exact running shared-v1 current-name runtime to immutable network-ID mode idempotently', async () => {
@@ -1959,6 +2050,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
     installExactSharedV1CurrentNameModeRuntime(value);
     value.container.HostConfig.SecurityOpt = ['no-new-privileges:true'];
     value.container.AppArmorProfile = 'docker-default';
+    usePredecessorNproc(value.container);
     const ensureEgressPlane = jest.fn(async () => exactEgressHandle(value));
 
     await expect(convergeAgentZeroProjectSandboxRuntime(value.executionContext, {
@@ -2079,6 +2171,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       = buildExactLegacyPreConfinementStaticRuntimeFingerprint(value);
     value.container.HostConfig.SecurityOpt = ['no-new-privileges:true'];
     value.container.AppArmorProfile = 'docker-default';
+    usePredecessorNproc(value.container);
     value.container.HostConfig.NetworkMode = value.spec.internalNetworkName;
     value.internalNetwork.Labels = egressLabels(predecessorSpec, 'internal');
     value.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
@@ -2172,6 +2265,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       });
     value.container.HostConfig.SecurityOpt = ['no-new-privileges:true'];
     value.container.AppArmorProfile = 'docker-default';
+    usePredecessorNproc(value.container);
     value.container.HostConfig.NetworkMode = value.spec.internalNetworkName;
     delete value.container.NetworkSettings.Networks[value.spec.internalNetworkName].IPAMConfig;
     value.internalNetwork.Labels = egressLabels(predecessorSpec, 'internal');
@@ -2210,6 +2304,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
     value.container.Config.Labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL] = '8'.repeat(64);
     value.container.HostConfig.SecurityOpt = ['no-new-privileges:true'];
     value.container.AppArmorProfile = 'docker-default';
+    usePredecessorNproc(value.container);
     value.container.HostConfig.NetworkMode = value.spec.internalNetworkName;
     value.internalNetwork.Labels = egressLabels(predecessorSpec, 'internal');
     value.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
@@ -2275,6 +2370,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       = buildExactLegacyPreConfinementStaticRuntimeFingerprint(value);
     value.container.HostConfig.SecurityOpt = ['no-new-privileges:true'];
     value.container.AppArmorProfile = 'docker-default';
+    usePredecessorNproc(value.container);
     value.container.HostConfig.NetworkMode = value.spec.internalNetworkName;
     value.internalNetwork.Labels = egressLabels(predecessorSpec, 'internal');
     value.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
@@ -2307,6 +2403,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       = buildExactLegacyPreConfinementStaticRuntimeFingerprint(value);
     value.container.HostConfig.SecurityOpt = ['no-new-privileges:true'];
     value.container.AppArmorProfile = 'docker-default';
+    usePredecessorNproc(value.container);
     value.container.HostConfig.NetworkMode = '9'.repeat(64);
     value.internalNetwork.Labels = egressLabels(predecessorSpec, 'internal');
     value.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
@@ -2474,6 +2571,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       = buildExactLegacyPreConfinementStaticRuntimeFingerprint(value);
     value.container.HostConfig.SecurityOpt = ['no-new-privileges:true'];
     value.container.AppArmorProfile = 'docker-default';
+    usePredecessorNproc(value.container);
     value.container.HostConfig.NetworkMode = value.spec.internalNetworkName;
     value.internalNetwork.Labels = egressLabels(predecessorSpec, 'internal');
     value.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
@@ -2535,6 +2633,7 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       = buildExactLegacyPreConfinementStaticRuntimeFingerprint(value);
     value.container.HostConfig.SecurityOpt = ['no-new-privileges:true'];
     value.container.AppArmorProfile = 'docker-default';
+    usePredecessorNproc(value.container);
     value.container.HostConfig.NetworkMode = value.spec.internalNetworkName;
     value.internalNetwork.Labels = egressLabels(predecessorSpec, 'internal');
     value.publicNetwork.Labels = egressLabels(predecessorSpec, 'proxy-public');
@@ -2851,6 +2950,103 @@ describe('Agent Zero Project Sandbox controlled-egress v2', () => {
       selectable: false,
       executionScope: null,
       runtime: AGENT_ZERO_PROJECT_RUNTIME,
+    });
+  });
+
+  describe('egress credential custody', () => {
+    // The docker CLI resolves `--env NAME` from its own environment; a missing
+    // value reaches the Engine as a bare name.
+    function recordingRunner(value: ReturnType<typeof fixture>, dropSecretEnvironment: boolean) {
+      const creates: Array<{ args: string[]; secretEnvironment?: Readonly<Record<string, string>> }> = [];
+      const runCommand: AgentZeroProjectCommandRunner = (command, args, options) => {
+        const output = value.runCommand(command, args);
+        if (command === 'docker' && args[0] === 'container' && args[1] === 'create') {
+          creates.push({ args: [...args], secretEnvironment: options?.secretEnvironment });
+          if (dropSecretEnvironment) {
+            const named = args.filter((entry, index) => args[index - 1] === '--env' && !entry.includes('='));
+            value.container.Config.Env = value.container.Config.Env
+              .filter((entry: string) => !named.includes(entry.split('=')[0]))
+              .concat(named);
+          }
+        }
+        return output;
+      };
+      return { runCommand, creates };
+    }
+
+    function converge(value: ReturnType<typeof fixture>, runCommand: AgentZeroProjectCommandRunner) {
+      return convergeAgentZeroProjectSandboxRuntime(value.executionContext, {
+        stateRoot,
+        architecture: 'amd64',
+        egress: value.egress,
+        runCommand,
+        resolveInternalNetworkBinding: recognizedInternalNetworkBinding(value),
+        ensureEgressPlane: jest.fn(async () => exactEgressHandle(value)),
+        constrainRuntime: jest.fn(async () => undefined),
+        egressExecutor: { run: jest.fn() },
+      });
+    }
+
+    test('a recreated runtime receives its proxy credentials through the runner only', async () => {
+      const value = fixture();
+      installExactSharedV1CurrentNameModeRuntime(value);
+      const recording = recordingRunner(value, false);
+      await expect(converge(value, recording.runCommand)).resolves.toMatchObject({ ready: true });
+      expect(recording.creates).toHaveLength(1);
+      const proxy = expectedAgentZeroProxyEnvironment(value.spec, BRIDGE_GATEWAY_IPV4);
+      expect(recording.creates[0].secretEnvironment).toEqual({
+        HTTP_PROXY: proxy.HTTP_PROXY, HTTPS_PROXY: proxy.HTTPS_PROXY,
+        http_proxy: proxy.http_proxy, https_proxy: proxy.https_proxy,
+      });
+      expect(value.calls.some(({ args }) => args.some((entry) => entry.includes(value.spec.token)))).toBe(false);
+    });
+
+    test('a creation whose credentials never arrive is refused and removed by its immutable ID only', async () => {
+      const value = fixture();
+      installExactSharedV1CurrentNameModeRuntime(value);
+      const recording = recordingRunner(value, true);
+      await expect(converge(value, recording.runCommand)).rejects.toThrow(/drifted from the isolation contract/i);
+      const removals = value.calls.filter(({ command, args }) => command === 'docker' && args[1] === 'rm');
+      // The first removal retires the predecessor; the second removes the failed creation.
+      expect(removals.map(({ args }) => args)).toEqual([
+        ['container', 'rm', value.containerId],
+        ['container', 'rm', 'a'.repeat(64)],
+      ]);
+      expect(value.calls.some(({ args }) => args[1] === 'start')).toBe(false);
+      expect(value.calls.some(({ args }) => args.some((entry) => entry.includes(value.spec.token)))).toBe(false);
+    });
+
+    test('the default runner delivers named credentials, refuses a missing value and keeps failure text clean', () => {
+      const run = __agentZeroProjectSandboxTest.defaultRunCommand;
+      const canary = `http://portal:${crypto.randomBytes(24).toString('base64url')}@172.31.0.2:3128`;
+      const digest = crypto.createHash('sha256').update(canary).digest('hex');
+      const script = [
+        "const crypto = require('crypto');",
+        "const value = process.env.HTTPS_PROXY || '';",
+        'process.stdout.write(JSON.stringify({',
+        "  match: crypto.createHash('sha256').update(value).digest('hex') === process.argv[3],",
+        '  noProxy: process.env.NO_PROXY,',
+        '}));',
+      ].join('\n');
+      expect(JSON.parse(run(process.execPath, ['-e', script, '--', '--env', 'HTTPS_PROXY', digest], {
+        secretEnvironment: { HTTPS_PROXY: canary },
+      }))).toEqual({ match: true, noProxy: '*' });
+      expect(() => run('/nonexistent/portal-custody-must-not-spawn', ['container', 'create', '--env', 'HTTPS_PROXY', 'image']))
+        .toThrow('Project egress protected environment is incomplete');
+      // The child echoes the value and its password from its own environment.
+      const echo = [
+        'const value = String(process.env.HTTPS_PROXY);',
+        "process.stderr.write('daemon echoed ' + value + ' and ' + decodeURIComponent(new URL(value).password));",
+        'process.exit(3);',
+      ].join('\n');
+      let failure: Error | null = null;
+      try {
+        run(process.execPath, ['-e', echo], { secretEnvironment: { HTTPS_PROXY: canary } });
+      } catch (error) {
+        failure = error as Error;
+      }
+      expect(failure?.message).toMatch(/^Agent Zero project host command failed with exit code 3: daemon echoed \[redacted\]/);
+      expect(failure?.message.includes(new URL(canary).password)).toBe(false);
     });
   });
 });

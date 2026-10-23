@@ -17,7 +17,7 @@ case "${STRICT_MODE}" in
 esac
 
 case "${REQUIRED_PACKAGE_VERSION}" in
-  "${LEGACY_SUPPORTED_PACKAGE_VERSION}"|"${NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION}"|"${NATIVE_QUESTION_LATEST_PACKAGE_VERSION}") ;;
+  "${LEGACY_SUPPORTED_PACKAGE_VERSION}"|"${NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION}"|"${NATIVE_QUESTION_LATEST_PACKAGE_VERSION}"|"2026.9.9"|"2026.10.5"|"2026.10.6") ;;
   *)
     echo "unsupported OpenClaw relay hotfix package version: ${REQUIRED_PACKAGE_VERSION}; this binary hotfix is fenced to ${LEGACY_SUPPORTED_PACKAGE_VERSION}, ${NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION} or ${NATIVE_QUESTION_LATEST_PACKAGE_VERSION}" >&2
     exit 2
@@ -45,7 +45,7 @@ if package.get("name") != "openclaw" or package.get("version") != expected:
     )
 PY
 
-if [[ "${REQUIRED_PACKAGE_VERSION}" == "${NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION}" || "${REQUIRED_PACKAGE_VERSION}" == "${NATIVE_QUESTION_LATEST_PACKAGE_VERSION}" ]]; then
+if [[ "${REQUIRED_PACKAGE_VERSION}" == "${NATIVE_QUESTION_SUPPORTED_PACKAGE_VERSION}" || "${REQUIRED_PACKAGE_VERSION}" == "${NATIVE_QUESTION_LATEST_PACKAGE_VERSION}" || "${REQUIRED_PACKAGE_VERSION}" == "2026.9.9" || "${REQUIRED_PACKAGE_VERSION}" == "2026.10.5" || "${REQUIRED_PACKAGE_VERSION}" == "2026.10.6" ]]; then
   helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/installer/patch-openclaw-${REQUIRED_PACKAGE_VERSION}-portal-contract.mjs"
   if [[ ! -f "${helper}" || -L "${helper}" ]]; then
     echo "OpenClaw ${REQUIRED_PACKAGE_VERSION} Portal-contract patch helper is missing or unsafe: ${helper}" >&2

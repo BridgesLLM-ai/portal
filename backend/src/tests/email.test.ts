@@ -44,7 +44,7 @@ describe('email service', () => {
     else process.env.INSTALL_PROFILE = originalInstallProfile;
   });
 
-  test('sends through Nodemailer 9 with external file and URL access disabled', async () => {
+  test('sends through Nodemailer with external file and URL access disabled', async () => {
     await sendEmail({
       to: 'owner@example.test',
       subject: 'Test',

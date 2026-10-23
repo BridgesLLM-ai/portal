@@ -1,8 +1,15 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* Utilities stay unlayered to retain the legacy stylesheet/theme cascade:
+   low-specificity element resets must not override utility spacing or color. */
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/preflight.css" layer(base);
+@import "tailwindcss/utilities.css" source(none);
+@import "./styles/tailwind-compat.css";
+@import "./styles/tailwind-spacing-compat.css";
+@config "../tailwind.config.js";
+@source "../index.html";
+@source "./";
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 

@@ -11,6 +11,8 @@ export const OPENCLAW_EXECUTION_CAPABLE_GATEWAY_METHODS: ReadonlySet<string> = n
   'agent',
   'chat.send',
   'sessions.steer',
+  'sessions.goal.update',
+  'progressCard.refresh',
   'cron.run',
   // Creating or changing an automation can enable it, and an enabled
   // automation is execution the scheduler starts on its own.
@@ -39,6 +41,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  */
 export function isOpenClawExecutionCapableGatewayCall(method: unknown, params: unknown): boolean {
   if (!isOpenClawExecutionCapableGatewayMethod(method)) return false;
+  if (method === 'sessions.goal.update') return !isPlainRecord(params) || !['edit', 'pause', 'block', 'complete'].includes(String(params.action));
   if (method === 'cron.add') return !(isPlainRecord(params) && params.enabled === false);
   if (method === 'cron.update') {
     return !(isPlainRecord(params) && isPlainRecord(params.patch) && params.patch.enabled === false);

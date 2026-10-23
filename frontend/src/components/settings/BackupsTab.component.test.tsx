@@ -180,7 +180,7 @@ describe('BackupsTab mutation admission', () => {
 
     await waitFor(() => expect(screen.getByRole('button', { name: 'Leave Settings' })).toBeEnabled());
     expect(screen.getByRole('button', { name: 'Creating Backup...' })).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByText(/standard backups temporarily take Portal and agent services offline/i)).toBeVisible();
+    expect(screen.getByText(/Portal stays online during backup/i)).toBeVisible();
     expect(mocks.get.mock.calls.some(([url]) => url === '/backups/status')).toBe(true);
     unmount();
   });
@@ -225,8 +225,8 @@ describe('BackupsTab mutation admission', () => {
     expect(screen.getByText('Backing up PostgreSQL')).toBeVisible();
     expect(screen.getByRole('progressbar', { name: 'Backup progress' })).toHaveAttribute('aria-valuenow', '6');
     expect(screen.getByRole('button', { name: 'Creating Backup...' })).toHaveAttribute('aria-busy', 'true');
-    expect(screen.getByText(/temporarily takes portal and agent services offline/i)).toBeVisible();
-    expect(screen.getByText(/live progress pauses during that window/i)).toBeVisible();
+    expect(screen.getByText(/Portal stays online during backup/i)).toBeVisible();
+    expect(screen.getByText(/Pause project edits for a consistent file checkpoint/i)).toBeVisible();
     unmount();
   });
 

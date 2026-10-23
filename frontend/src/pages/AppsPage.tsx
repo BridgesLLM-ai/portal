@@ -1,4 +1,5 @@
 import ProjectWorkHistory from '../components/projects/ProjectWorkHistory';
+import ProjectAppCredentials from '../components/projects/ProjectAppCredentials';
 import { projectWorkLink } from '../utils/projectWorkNavigation';
 import {
   Component,
@@ -15,12 +16,15 @@ import {
 } from 'react';
 import { UNSAFE_NavigationContext, useLocation, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useDropzone } from 'react-dropzone';
+import { ErrorCode, useDropzone } from 'react-dropzone';
 import {
   projectsAPI,
   aiAPI,
   projectRuntimeRecoveryCompletion,
   type ProjectIdentityProof,
+  type DesktopBuildJob,
+  type DesktopProjectTemplateChoice,
+  type DesktopToolchainStatus,
   type ProjectDeploymentProcessState,
   type ProjectDependencyRepairStatus,
   type ProjectLifecycleAction,
@@ -137,6 +141,21 @@ interface EnhancedCommit {
 }
 type ShareLink = ProjectShareLink;
 interface ActivityEntry { id: string; action: string; resource: string; resourceId?: string; severity: string; createdAt: string; }
+
+const GIT_HISTORY_PAGE_SIZE = 30;
+
+/** Appended pages can overlap when a commit lands between reads. */
+function appendCommits<T extends { hash: string }>(loaded: T[], page: T[]): T[] {
+  const seen = new Set(loaded.map((commit) => commit.hash));
+  return [...loaded, ...page.filter((commit) => !seen.has(commit.hash))];
+}
+
+/** The Git route reports a failed command as `{ output }` with Git's own text. */
+function gitHistoryLoadError(error: unknown): string {
+  const output = (error as { response?: { data?: { output?: unknown } } })?.response?.data?.output;
+  const text = typeof output === 'string' && output.trim() ? output.trim() : extractError(error).message;
+  return text.length > 400 ? `${text.slice(0, 400)}…` : text;
+}
 
 type RuntimeImageRepairRetryAction = 'deploy' | 'start' | 'restart';
 type RuntimeImageRepairReplayOutcome = 'completed' | 'stale' | 'indeterminate' | 'failed';
@@ -429,6 +448,7 @@ function runtimeManagementLabel(value: ProjectRuntimeManagement): string {
 function runtimeStatusSourceLabel(value: ProjectRuntimeStatusSource): string {
   switch (value) {
     case 'portal-manager': return 'Portal runtime manager';
+    case 'desktop-unit': return 'Live Desktop process';
     case 'persisted-app': return 'Saved deployment state';
     case 'external-binding': return 'External routing';
     case 'deployment-record': return 'Deployment record';
@@ -1123,6 +1143,7 @@ export default function AppsPage() {
   const [deployStatus, setDeployStatus] = useState<'idle' | 'deploying' | 'success' | 'failed'>('idle');
   const [isRuntimeProject, setIsRuntimeProject] = useState(false);
   const [checkingProject, setCheckingProject] = useState(false);
+  const [desktopBuildJob, setDesktopBuildJob] = useState<DesktopBuildJob | null>(null);
   const [deploymentProcess, setDeploymentProcess] = useState<ProjectDeploymentProcessState | null>(null);
   const [deploymentControlBusy, setDeploymentControlBusy] = useState<'start' | 'stop' | 'restart' | 'refresh' | 'undeploy' | null>(null);
   const [deploymentControlError, setDeploymentControlError] = useState<DeploymentControlFailure | null>(null);
@@ -1167,12 +1188,41 @@ export default function AppsPage() {
       : [],
   );
 
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setDesktopBuildJob(null);
+    if (!selectedProject || !isRuntimeProject || !canLaunchProjectRuntimeDemo(useAuthStore.getState().user?.role)) return;
+    const read = async () => {
+      try {
+        const job = await projectsAPI.desktopBuild(selectedProject);
+        if (disposed) return;
+        setDesktopBuildJob(job);
+        if (job?.status === 'running') timer = setTimeout(() => { void read(); }, 1500);
+      } catch { /* Live controls remain authoritative if a prior receipt is unavailable. */ }
+    };
+    void read();
+    return () => { disposed = true; if (timer) clearTimeout(timer); };
+  }, [selectedProject, isRuntimeProject]);
+
   // Create dialog
   const [showCreate, setShowCreate] = useState(false);
   const [createMode, setCreateMode] = useState<'template' | 'clone' | 'zip'>('template');
   const [newName, setNewName] = useState('');
   const [cloneUrl, setCloneUrl] = useState('');
   const [template, setTemplate] = useState('static-html');
+  const [desktopTemplates, setDesktopTemplates] = useState<DesktopProjectTemplateChoice[]>([]);
+  const [desktopToolchain, setDesktopToolchain] = useState<DesktopToolchainStatus | null>(null);
+  const [desktopTemplateError, setDesktopTemplateError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!showCreate) return;
+    let cancelled = false;
+    projectsAPI.templateCatalog().then(catalog => {
+      if (!cancelled) { setDesktopTemplates(catalog.desktop); setDesktopToolchain(catalog.desktopToolchain); setDesktopTemplateError(null); }
+    }).catch(error => { if (!cancelled) setDesktopTemplateError(extractError(error, 'Desktop templates could not be loaded').message); });
+    return () => { cancelled = true; };
+  }, [showCreate]);
+
   const [creating, setCreating] = useState(false);
   const [zipFile, setZipFile] = useState<File | null>(null);
   const [zipUploading, setZipUploading] = useState(false);
@@ -1213,6 +1263,9 @@ export default function AppsPage() {
   const fullscreenExitButtonRef = useRef<HTMLButtonElement>(null);
   const fileSearchInputRef = useRef<HTMLInputElement>(null);
   const [logBranchFilter, setLogBranchFilter] = useState<string>('');
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  // `skip` is the offset of the read that failed, so Retry repeats exactly it.
+  const [historyLoadError, setHistoryLoadError] = useState<{ message: string; skip: number } | null>(null);
 
 
   // Project Chat
@@ -1341,7 +1394,7 @@ export default function AppsPage() {
   const projectsRef = useRef<Project[]>(projects);
   const selectedProjectRef = useRef<string | null>(selectedProject);
   const openFileRef = useRef<typeof openFile>(openFile);
-  const openFileHandlerRef = useRef<(filePath: string, preserveDeepLink?: boolean) => Promise<void>>();
+  const openFileHandlerRef = useRef<(filePath: string, preserveDeepLink?: boolean) => Promise<void>>(undefined);
   const editorContentRef = useRef(editorContent);
   const editorRevisionRef = useRef(0);
   const projectInventoryLoadGenerationRef = useRef(0);
@@ -2215,6 +2268,9 @@ export default function AppsPage() {
     setGitStatus(null);
     setCommitLog([]);
     setEnhancedCommits([]);
+    setHistoryHasMore(false);
+    setHistoryLoadError(null);
+    setLogBranchFilter('');
     setBranches([]);
     setShares([]);
     setShareRefreshError(null);
@@ -2386,32 +2442,46 @@ export default function AppsPage() {
     } finally { endGitLoading(); }
   }, [beginGitLoading, endGitLoading, selectedProject, showErrorToast]);
 
-  const loadCommitLog = useCallback(async () => {
+  /** `skip` > 0 appends the next older page to what is already listed. */
+  const loadCommitLog = useCallback(async (skip = 0) => {
     if (!selectedProject) return;
     const projectName = selectedProject;
     const requestGeneration = ++gitLogGenerationRef.current;
+    const current = () => selectedProjectRef.current === projectName && gitLogGenerationRef.current === requestGeneration;
+    const branch = logBranchFilter || undefined;
     beginGitLoading();
     try {
-      const data = await projectsAPI.gitEnhancedLog(projectName, logBranchFilter || undefined);
-      if (selectedProjectRef.current !== projectName || gitLogGenerationRef.current !== requestGeneration) return;
-      setEnhancedCommits(data.commits || []);
-      // Also keep basic log for backwards compat
-      setCommitLog((data.commits || []).map((c: EnhancedCommit) => ({ hash: c.hash, short: c.short, author: c.author, email: c.email, date: c.date, message: c.message })));
+      const data = await projectsAPI.gitEnhancedLog(projectName, branch, GIT_HISTORY_PAGE_SIZE, skip);
+      if (!current()) return;
+      const page = (data.commits || []) as EnhancedCommit[];
+      // commitLog always mirrors every loaded commit, so a later fallback page can
+      // switch the list to the basic view without losing earlier pages.
+      const basic = page.map((c) => ({ hash: c.hash, short: c.short, author: c.author, email: c.email, date: c.date, message: c.message }));
+      setEnhancedCommits((loaded) => skip > 0 ? appendCommits(loaded, page) : page);
+      setCommitLog((loaded) => skip > 0 ? appendCommits(loaded, basic) : basic);
+      setHistoryHasMore(data.hasMore === true);
+      setHistoryLoadError(null);
     } catch {
-      if (selectedProjectRef.current !== projectName || gitLogGenerationRef.current !== requestGeneration) return;
-      // Fallback to basic log
+      if (!current()) return;
+      // Fallback to basic log: same branch and page.
       try {
-        const data = await projectsAPI.git(projectName, 'log');
-        if (selectedProjectRef.current !== projectName || gitLogGenerationRef.current !== requestGeneration) return;
-        setCommitLog(data.commits || []);
+        const data = await projectsAPI.git(projectName, 'log', { branch, limit: GIT_HISTORY_PAGE_SIZE, skip });
+        if (!current()) return;
+        const page = (data.commits || []) as CommitEntry[];
+        setCommitLog((loaded) => skip > 0 ? appendCommits(loaded, page) : page);
         setEnhancedCommits([]);
+        setHistoryHasMore(data.hasMore === true);
+        setHistoryLoadError(null);
       } catch (err2) {
-        if (selectedProjectRef.current === projectName && gitLogGenerationRef.current === requestGeneration) {
-          showErrorToast(err2, 'Loading commit log');
+        if (current()) {
+          // Shown inline in History (an alert), not also as a toast: a failed read
+          // must not look like an empty history, and is announced once.
+          logError(err2, 'Loading commit log');
+          setHistoryLoadError({ message: gitHistoryLoadError(err2), skip });
         }
       }
     } finally { endGitLoading(); }
-  }, [beginGitLoading, endGitLoading, logBranchFilter, selectedProject, showErrorToast]);
+  }, [beginGitLoading, endGitLoading, logBranchFilter, selectedProject]);
 
   const loadBranches = useCallback(async () => {
     if (!selectedProject) return;
@@ -2526,10 +2596,12 @@ export default function AppsPage() {
   const loadDeploymentProcess = useCallback(async (
     requestedProject = selectedProjectRef.current,
     ownerOperation?: ProjectOperation,
+    quiet = false,
   ) => {
     const projectName = requestedProject;
     if (!projectName) return;
     if (selectedProjectRef.current !== projectName) return;
+    if (quiet && deploymentStatusReadRef.current) return;
     const activeOperation = projectOperationRef.current;
     if (activeOperation && activeOperation !== ownerOperation) return;
     const projectGeneration = projectLoadGenerationRef.current;
@@ -2551,8 +2623,7 @@ export default function AppsPage() {
     // A newly admitted status read is authoritative for this exact App. Drop
     // the previous snapshot synchronously so a failed refresh can never leave
     // stale process controls or logs actionable in the panel.
-    deploymentProcessOwnerRef.current = null;
-    setDeploymentProcess(null);
+    if (!quiet) { deploymentProcessOwnerRef.current = null; setDeploymentProcess(null); }
     deploymentStatusReadRef.current = read;
     const readIsCurrent = () => (
       mountedRef.current
@@ -2563,7 +2634,7 @@ export default function AppsPage() {
       && projectsRef.current.find((project) => project.name === read.projectName)?.deployment?.appId
         === read.appId
     );
-    setDeploymentControlBusy((current) => current || 'refresh');
+    if (!quiet) setDeploymentControlBusy((current) => current || 'refresh');
     setDeploymentControlError((current) => (
       current?.recoveryAction === 'UNDEPLOY_CURRENT_DEPLOYMENT'
         ? current
@@ -2580,6 +2651,7 @@ export default function AppsPage() {
       setDeploymentProcess(status);
     } catch (error) {
       if (!readIsCurrent()) return;
+      deploymentProcessOwnerRef.current = null; setDeploymentProcess(null);
       setDeploymentControlError((current) => (
         current?.recoveryAction === 'UNDEPLOY_CURRENT_DEPLOYMENT'
           ? current
@@ -2604,6 +2676,14 @@ export default function AppsPage() {
     if (activePanel === 'activity' && selectedProject) loadActivity();
     if (activePanel === 'deployment' && selectedProject) void loadDeploymentProcess(selectedProject);
   }, [activePanel, gitTab, loadActivity, loadBranches, loadCommitLog, loadDeploymentProcess, loadGitStatus, loadShares, selectedProject]);
+
+  useEffect(() => {
+    if (activePanel !== 'deployment' || !selectedProject || !isRuntimeProject) return;
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') void loadDeploymentProcess(selectedProject, undefined, true);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [activePanel, selectedProject, isRuntimeProject, loadDeploymentProcess]);
 
   const viewFileDiff = async (filePath: string) => {
     if (!selectedProject) return;
@@ -2655,6 +2735,8 @@ export default function AppsPage() {
         date: commit.date,
         message: commit.message,
       })));
+      setHistoryHasMore(freshLog?.hasMore === true);
+      setHistoryLoadError(null);
       await refreshTree(operation.projectName);
       setRevertResult({ success: true, message: `Reverted "${target.message}" — new commit: ${newHash.substring(0, 7)}` });
     } catch (e: any) {
@@ -3947,7 +4029,7 @@ export default function AppsPage() {
         title: operation.runtime ? 'Running Project' : 'Deploying Project',
         status: 'active',
         progress: 20,
-        statusText: operation.runtime ? 'Launching on desktop...' : 'Building and deploying...',
+        statusText: operation.runtime ? 'Resolving offline dependencies, building, and opening on Desktop...' : 'Building and deploying...',
         onDismiss: () => {
           if (!projectOperationRef.current) setProgressNotification(null);
         },
@@ -3958,7 +4040,15 @@ export default function AppsPage() {
             operation.projectName,
             expectedRetryOwner.recoveryReplay,
           ))
-        : await projectsAPI.deploy(operation.projectName);
+        : await projectsAPI.deploy(operation.projectName, undefined, job => {
+            if (!operationIsCurrent()) return;
+            setDesktopBuildJob(job);
+            setProgressNotification(previous => previous ? { ...previous, progress: job.status === 'succeeded' ? 100 : 0,
+              statusText: job.phase, logs: job.output.split('\n'), indeterminate: job.status === 'running',
+              onCancel: job.status === 'running' ? () => {
+                void projectsAPI.cancelDesktopBuild(operation.projectName, job.id).catch(error => showErrorToast(error, 'Cancelling build'));
+              } : undefined } : previous);
+          });
       if (!operationIsCurrent()) return false;
       const deploySuccess = 'deployType' in data ? data : null;
       const recoveredCompletion = expectedRetryOwner
@@ -4171,12 +4261,12 @@ export default function AppsPage() {
       || processOwner.projectGeneration !== projectLoadGenerationRef.current
       || processOwner.appId !== inventory.deployment.appId
     ) return;
-    await executeDeploymentProcessAction({
-      action,
-      projectName,
-      projectGeneration: projectLoadGenerationRef.current,
-      appId: inventory.deployment.appId,
+    const generation = projectLoadGenerationRef.current;
+    const completed = await executeDeploymentProcessAction({
+      action, projectName, projectGeneration: generation, appId: inventory.deployment.appId,
     });
+    if (completed && action === 'start' && inventory.deployment.deployType === 'runtime'
+      && selectedProjectRef.current === projectName && projectLoadGenerationRef.current === generation) navigate('/desktop');
   };
 
   const undeployProject = async () => {
@@ -4496,13 +4586,11 @@ export default function AppsPage() {
     if (!selectedProject) return;
     setCheckingProject(true);
     try {
-      const res = await workspaceAuthorizedFetch(`${import.meta.env.VITE_API_URL || '/api'}/projects/${encodeURIComponent(selectedProject)}/check`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
+      const projectName = selectedProject;
+      const data = await projectsAPI.check(projectName, job => {
+        if (selectedProjectRef.current === projectName) setDesktopBuildJob(job);
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `Project check failed with HTTP ${res.status}`);
+      if (selectedProjectRef.current !== projectName) return;
       if (data.ok) {
         showToast(`✅ No syntax errors (${data.language})`, 'success');
       } else {
@@ -5112,12 +5200,19 @@ export default function AppsPage() {
   // react-dropzone for upload dialog (works on iPad)
   const { getRootProps: getUploadRootProps, getInputProps: getUploadInputProps, isDragActive: uploadIsDragActive } = useDropzone({
     disabled: uploadingFiles,
-    onDrop: (acceptedFiles) => {
-      setUploadFiles(prev => [...prev, ...acceptedFiles]);
+    onDrop: (acceptedFiles, rejections) => {
+      // Preserve reject-all on batch overflow instead of accepting the first 50.
+      if (!rejections.some(({ errors }) => errors.some(({ code }) => code === ErrorCode.TooManyFiles))) {
+        setUploadFiles(prev => [...prev, ...acceptedFiles]);
+      }
     },
     onDropRejected: (rejections) => {
-      showToast(`${rejections.length} file(s) were rejected. Files must be 100MB or smaller.`, 'error');
+      const overflow = rejections.some(({ errors }) => errors.some(({ code }) => code === ErrorCode.TooManyFiles));
+      showToast(overflow
+        ? 'Select no more than 50 files at a time. No files from this selection were added.'
+        : `${rejections.length} file(s) were rejected. Files must be 100MB or smaller.`, 'error');
     },
+    noPaste: true,
     maxFiles: 50,
     maxSize: 100 * 1024 * 1024,
     noClick: false,
@@ -5717,6 +5812,19 @@ export default function AppsPage() {
           {modified && <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 flex items-center gap-1 flex-shrink-0 hidden md:flex"><span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" /> Unsaved</span>}
         </div>
         <div className="flex items-center gap-1 md:gap-1.5 flex-shrink-0">
+                  {selectedProject && isRuntimeProject && desktopBuildJob && (
+                    <details className="relative text-xs text-slate-300">
+                      <summary className="cursor-pointer" aria-live="polite">Build: {desktopBuildJob.phase}</summary>
+                      <div className="absolute right-0 z-40 mt-2 w-96 max-w-[80vw] rounded-lg border border-white/10 bg-slate-900 p-3 shadow-xl">
+                        <p>{desktopBuildJob.action} · {desktopBuildJob.status}</p>
+                        {desktopBuildJob.error && <p className="mt-2 text-red-300">{desktopBuildJob.error}</p>}
+                        <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap text-[11px]">{desktopBuildJob.output || 'Preparing offline dependencies…'}</pre>
+                        {desktopBuildJob.status === 'running' && <button className="mt-2 rounded bg-red-500/20 px-3 py-1.5 text-red-200"
+                          onClick={() => { const name = selectedProject; if (name) void projectsAPI.cancelDesktopBuild(name, desktopBuildJob.id).catch(error => showErrorToast(error, 'Cancelling build')); }}>Cancel build</button>}
+                      </div>
+                    </details>
+                  )}
+
           {/* === MOBILE: Only Save + Deploy/Run + Overflow Menu === */}
           {isMobile && selectedProject && (
             <>
@@ -5731,7 +5839,7 @@ export default function AppsPage() {
               {canRedeployCurrentProject && (
                 <button
                   onClick={() => { void deployProject(); }}
-                  disabled={deploying || deploymentControlBusy !== null}
+                  disabled={deploying || deploymentControlBusy !== null || desktopBuildJob?.status === 'running'}
                   aria-label={deploying ? (isRuntimeProject ? 'Starting project…' : 'Deploying project…') : (isRuntimeProject ? 'Run project' : 'Deploy project')}
                   aria-busy={deploying}
                   className={`flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium min-w-[44px] min-h-[44px] justify-center ${
@@ -5751,7 +5859,7 @@ export default function AppsPage() {
                 ] : []),
                 // Show Check for runtime, Preview for others
                 ...(isRuntimeProject 
-                  ? [{ label: 'Check Syntax', icon: <CheckCircle size={16} />, onClick: checkProject, disabled: checkingProject }]
+                  ? [{ label: 'Check project', icon: <CheckCircle size={16} />, onClick: checkProject, disabled: checkingProject }]
                   : [{ label: 'Preview', icon: <Eye size={16} />, onClick: () => setShowPreview(!showPreview), active: showPreview }]
                 ),
                 { label: 'Git', icon: <GitBranch size={16} />, onClick: () => toggleActivePanel('git'), active: activePanel === 'git', disabled: shareActionActive && activePanel === 'share' },
@@ -5807,7 +5915,7 @@ export default function AppsPage() {
                   {['OWNER', 'SUB_ADMIN'].includes(user?.role || '') && <button type="button" onClick={openProjectWork} disabled={!currentProjectAvailable} className="flex items-center gap-1.5 rounded-lg border border-cyan-300/20 bg-cyan-300/10 px-3 py-1.5 text-xs text-cyan-100 transition-colors hover:bg-cyan-300/20 disabled:opacity-40"><Bot size={12} /> Work in Agent Chat</button>}
                   {/* Preview button for static/fullstack, Check button for runtime */}
                   {isRuntimeProject ? (
-                    <button onClick={checkProject} disabled={checkingProject}
+                    <button onClick={checkProject} disabled={checkingProject || desktopBuildJob?.status === 'running'}
                       aria-busy={checkingProject}
                       className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${checkingProject ? 'bg-blue-500/20 text-blue-300' : 'bg-blue-500/10 text-blue-400 hover:bg-blue-500/20'}`}>
                       {checkingProject ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle size={12} />} {checkingProject ? 'Checking…' : 'Check'}
@@ -5845,7 +5953,7 @@ export default function AppsPage() {
                   )}
                   {/* Deploy button for static/fullstack, Run button for runtime */}
                   {canRedeployCurrentProject && (
-                    <button onClick={() => { void deployProject(); }} disabled={deploying || deploymentControlBusy !== null}
+                    <button onClick={() => { void deployProject(); }} disabled={deploying || deploymentControlBusy !== null || desktopBuildJob?.status === 'running'}
                       aria-busy={deploying}
                       className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors font-medium ${
                         deployStatus === 'success' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' :
@@ -5856,7 +5964,7 @@ export default function AppsPage() {
                        deployStatus === 'success' ? <CheckCircle size={12} /> :
                        deployStatus === 'failed' ? <AlertCircle size={12} /> :
                        isRuntimeProject ? <Play size={12} /> : <Upload size={12} />}
-                      {deploying ? (isRuntimeProject ? 'Starting…' : 'Deploying…') :
+                      {deploying ? (isRuntimeProject ? 'Building and starting…' : 'Deploying…') :
                        deployStatus === 'success' ? (isRuntimeProject ? 'Running!' : 'Deployed!') :
                        deployStatus === 'failed' ? 'Failed' :
                        isRuntimeProject ? 'Run' : 'Deploy'}
@@ -6330,13 +6438,26 @@ export default function AppsPage() {
                       <select aria-label="Filter commits by branch" value={logBranchFilter} onChange={e => setLogBranchFilter(e.target.value)}
                         className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-[10px] text-slate-300 focus:outline-none focus:border-orange-500/30">
                         <option value="">All branches</option>
+                        {/* The repository's own branches only (it may use master, main or neither). */}
                         {branches.filter(b => !b.remote).map(b => <option key={b.name} value={b.name}>{b.name}</option>)}
-                        <option value="main">main</option>
+                        {logBranchFilter && !branches.some(b => !b.remote && b.name === logBranchFilter) && (
+                          <option value={logBranchFilter}>{logBranchFilter}</option>
+                        )}
                       </select>
                     </div>
                     <div className="divide-y divide-white/5">
+                      {historyLoadError && historyLoadError.skip === 0 && (
+                        <div role="alert" className="px-3 py-3 text-xs text-red-300 bg-red-500/5">
+                          <p className="font-medium">Couldn&apos;t load commit history.</p>
+                          <p className="mt-1 text-[11px] text-red-300/80 break-words font-mono">{historyLoadError.message}</p>
+                          <button type="button" onClick={() => loadCommitLog(0)} disabled={gitLoading}
+                            className="mt-2 px-2.5 py-1 rounded bg-white/5 text-[11px] text-slate-200 hover:bg-white/10 disabled:opacity-30">
+                            Retry
+                          </button>
+                        </div>
+                      )}
                       {enhancedCommits.length === 0 && commitLog.length === 0 ? (
-                        <div className="text-center py-8 text-slate-500 text-xs">No commits yet</div>
+                        historyLoadError ? null : <div className="text-center py-8 text-slate-500 text-xs">No commits yet</div>
                       ) : (enhancedCommits.length > 0 ? enhancedCommits : []).map(c => {
                         const isExpanded = expandedCommit === c.hash;
                         const maxBar = Math.max(...c.stats.files.map(f => f.additions + f.deletions), 1);
@@ -6423,6 +6544,22 @@ export default function AppsPage() {
                           <p className="text-[10px] text-slate-600 mt-0.5">{c.author}</p>
                         </button>
                       ))}
+                      {historyLoadError && historyLoadError.skip > 0 && (
+                        <div role="alert" className="px-3 py-3 text-xs text-red-300 bg-red-500/5">
+                          <p className="font-medium">Couldn&apos;t load older commits.</p>
+                          <p className="mt-1 text-[11px] text-red-300/80 break-words font-mono">{historyLoadError.message}</p>
+                          <button type="button" onClick={() => loadCommitLog(historyLoadError.skip)} disabled={gitLoading}
+                            className="mt-2 px-2.5 py-1 rounded bg-white/5 text-[11px] text-slate-200 hover:bg-white/10 disabled:opacity-30">
+                            Retry
+                          </button>
+                        </div>
+                      )}
+                      {historyHasMore && !historyLoadError && (
+                        <button type="button" onClick={() => loadCommitLog(commitLog.length)} disabled={gitLoading}
+                          className="w-full px-3 py-2.5 text-[11px] text-slate-300 hover:bg-white/5 transition-colors disabled:opacity-30">
+                          Load older commits
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}
@@ -6692,6 +6829,23 @@ export default function AppsPage() {
                   )}
                 </div>
 
+                {ownedDeploymentProcess?.desktop && (
+                  <div className="rounded-lg border border-white/10 p-3 text-xs text-slate-300">
+                    <p>Built {new Date(ownedDeploymentProcess.desktop.builtAt).toLocaleString()}</p>
+                    <p className="mt-1">{ownedDeploymentProcess.desktop.sourceState === 'changed'
+                      ? 'Source changed since this build. Run builds and opens the updated app; Open and Restart use the last successful build.'
+                      : ownedDeploymentProcess.desktop.sourceState === 'current'
+                        ? 'This build matches the saved source.' : 'Source comparison is unavailable. Run to rebuild from saved source.'}</p>
+                    <p className="mt-1 text-slate-400">App data is retained separately when rebuilding this deployment, and removed when the Project is deleted.</p>
+                    {ownedDeploymentProcess.exitCode !== null && ownedDeploymentProcess.exitCode !== undefined && <p className="mt-1">Last exit code: {ownedDeploymentProcess.exitCode}</p>}
+                  </div>
+                )}
+
+                {displayedRuntimeManagement === 'portal-container' && currentProject.deployment.appId && (
+                  <ProjectAppCredentials key={`credentials-${currentProject.deployment.appId}`}
+                    appId={currentProject.deployment.appId} canManage={userIsOwner} />
+                )}
+
                 {displayedRuntimeManagement === 'external-loopback' && (
                   <div className="space-y-1 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] leading-relaxed text-amber-100">
                     <p className="font-medium">
@@ -6729,11 +6883,11 @@ export default function AppsPage() {
                     {deploymentSupportedActions.includes('start') && (
                       <button
                         onClick={() => { void controlDeploymentProcess('start'); }}
-                        disabled={deploymentControlBusy !== null || displayedDeploymentStatus === 'running'}
+                        disabled={deploymentControlBusy !== null || (displayedDeploymentStatus === 'running' && deploymentProcess?.deployType !== 'runtime')}
                         aria-busy={deploymentControlBusy === 'start'}
                         className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg bg-emerald-500/10 text-xs text-emerald-300 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
                       >
-                        {deploymentControlBusy === 'start' ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Start
+                        {deploymentControlBusy === 'start' ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} {deploymentProcess?.deployType === 'runtime' && displayedDeploymentStatus === 'running' ? 'Open on Desktop' : 'Start'}
                       </button>
                     )}
                     {deploymentSupportedActions.includes('stop') && (
@@ -7529,25 +7683,58 @@ export default function AppsPage() {
               </div>
 
               {createMode === 'template' ? (
-                <fieldset>
-                  <legend className="text-xs text-slate-400 block mb-1">Template</legend>
-                  <div className="grid grid-cols-5 gap-2">
-                    {[
-                      { id: 'static-html', label: 'HTML', icon: '🌐', desc: 'Static site' },
-                      { id: 'react', label: 'React', icon: '⚛️', desc: 'React SPA' },
-                      { id: 'node-api', label: 'Node.js', icon: '🟢', desc: 'API server' },
-                      { id: 'python', label: 'Python', icon: '🐍', desc: 'Script/app' },
-                      { id: 'cpp', label: 'C++', icon: '⚙️', desc: 'Compiled' },
-                    ].map(t => (
-                      <button key={t.id} aria-pressed={template === t.id} onClick={() => setTemplate(t.id)}
-                        className={`p-3 rounded-xl text-center text-xs transition-all border ${template === t.id ? 'accent-active' : 'bg-white/5 border-white/10 text-slate-400 hover:border-white/20'}`}>
-                        <span className="text-lg block mb-1">{t.icon}</span>
-                        {t.label}
-                        <span className="block text-[9px] text-slate-600 mt-0.5">{t.desc}</span>
-                      </button>
-                    ))}
-                  </div>
-                </fieldset>
+                <div className="space-y-4">
+                  <fieldset>
+                    <legend className="text-xs text-slate-400 mb-2">Web app</legend>
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { id: 'static-html', label: 'HTML', desc: 'Static site' },
+                        { id: 'react', label: 'React', desc: 'Interactive web page' },
+                        { id: 'node-api', label: 'Node.js', desc: 'API server' },
+                      ].map(choice => (
+                        <button key={choice.id} type="button" disabled={creating} aria-pressed={template === choice.id}
+                          onClick={() => setTemplate(choice.id)}
+                          className={`p-3 rounded-xl text-center text-xs border ${template === choice.id ? 'accent-active' : 'bg-white/5 border-white/10 text-slate-400'}`}>
+                          {choice.label}<span className="block text-[10px] mt-1">{choice.desc}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </fieldset>
+                  <fieldset>
+                    <legend className="text-xs text-slate-400 mb-2">Desktop app — language</legend>
+                    {desktopTemplateError && <p role="alert" className="text-xs text-red-300">{desktopTemplateError}</p>}
+                    {!desktopTemplateError && desktopTemplates.length === 0 && <p role="status" className="text-xs text-slate-400">Loading Desktop templates…</p>}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {[...new Set(desktopTemplates.map(choice => choice.language))].map(language => (
+                        <button key={language} type="button" disabled={creating} aria-pressed={template.startsWith(language + '-')}
+                          onClick={() => setTemplate(language + (template.endsWith('-gui') ? '-gui' : '-terminal'))}
+                          className={`p-3 rounded-xl text-xs border ${template.startsWith(language + '-') ? 'accent-active' : 'bg-white/5 border-white/10 text-slate-400'}`}>
+                          {{ typescript: 'TypeScript', rust: 'Rust', python: 'Python', cpp: 'C++' }[language]}
+                        </button>
+                      ))}
+                    </div>
+                  </fieldset>
+                  {desktopTemplates.some(choice => choice.id === template) && (
+                    <fieldset>
+                      <legend className="text-xs text-slate-400 mb-2">Desktop interface</legend>
+                      <div className="grid grid-cols-2 gap-2">
+                        {(['terminal', 'gui'] as const).map(kind => (
+                          <button key={kind} type="button" disabled={creating} aria-pressed={template.endsWith('-' + kind)}
+                            onClick={() => setTemplate(template.split('-')[0] + '-' + kind)}
+                            className={`p-3 rounded-xl text-xs border ${template.endsWith('-' + kind) ? 'accent-active' : 'bg-white/5 border-white/10 text-slate-400'}`}>
+                            {kind === 'terminal' ? 'Terminal tool' : 'Graphical desktop app'}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-2">Opens on Remote Desktop. The starter includes a saved-message example that survives rebuilding.</p>
+                      {desktopToolchain && (desktopToolchain.available
+                        ? <p className="text-[11px] text-slate-400 mt-1">{desktopToolchain.dependencyPolicy === 'offline'
+                          ? 'Dependencies come only from the toolchain cache on this server.'
+                          : 'Dependencies download through the Portal egress proxy; keep lockfiles with the source.'}</p>
+                        : <p role="status" className="text-[11px] text-amber-300 mt-1">You can create and edit this Project. Check and Run are unavailable on this server: {desktopToolchain.reason}</p>)}
+                    </fieldset>
+                  )}
+                </div>
               ) : createMode === 'clone' ? (
                 <div>
                   <label htmlFor="new-project-repository" className="text-xs text-slate-400 block mb-1">Repository URL</label>

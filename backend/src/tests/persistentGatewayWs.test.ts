@@ -2843,3 +2843,20 @@ describe('PersistentGatewayWs Codex idle timeout handling', () => {
     }
   });
 });
+
+describe('PersistentGatewayWs native 9.9 incremental frames', () => {
+  it('publishes each native deltaText once and honors replacement snapshots', () => {
+    const sessionKey = 'native99-deltas';
+    const runId = 'native99-run';
+    const events: StreamEvent[] = [];
+    const unsubscribe = streamEventBus.subscribe(sessionKey, event => events.push(event));
+    try {
+      __persistentGatewayWsTest.registerRun(sessionKey, runId);
+      __persistentGatewayWsTest.handleChatEvent({ sessionKey, runId, state: 'delta', deltaText: 'Hello' });
+      __persistentGatewayWsTest.handleChatEvent({ sessionKey, runId, state: 'delta', deltaText: ' world' });
+      expect(events.filter(event => event.type === 'text').map(event => event.content)).toEqual(['Hello', ' world']);
+      __persistentGatewayWsTest.handleChatEvent({ sessionKey, runId, state: 'delta', deltaText: 'Rewritten', replace: true });
+      expect(events.filter(event => event.type === 'text').at(-1)?.content).toBe('Rewritten');
+    } finally { unsubscribe(); __persistentGatewayWsTest.resetSession(sessionKey); }
+  });
+});

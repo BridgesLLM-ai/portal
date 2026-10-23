@@ -24,9 +24,29 @@ not turn a saved project backup into a failure.
 Archives contain private files and Portal settings keys. Keep a private,
 encrypted off-server copy. Do not attach an archive to an issue.
 
-Retention keeps seven daily, four weekly, three monthly, and three comprehensive
-data backups. A retention lock keeps a backup until you explicitly unlock it.
-Legacy archives are not pruned by the new runner.
+After each successful backup, Portal keeps at most seven daily, four weekly, three
+monthly, and three comprehensive data backups of that type, unless you change these
+limits under **Settings → Backups → Storage limits**. Saving limits deletes nothing.
+**Clean up old backups** lists exactly which backups are over the limits and deletes
+them only after you confirm that list; if anything changed meanwhile it deletes
+nothing and asks you to review again.
+
+**Make room automatically** (off by default) lets a backup first delete the oldest
+backups when there is not enough space for it plus the free space you choose to keep.
+The estimate is the newest backup of that type or the newest backup overall,
+whichever is larger, plus 10%, plus the current database size.
+If deleting every eligible backup would still not be enough, the backup stops with
+the reason and deletes nothing. Limits are maximums, not promises: on a small disk
+fewer backups may remain.
+
+Cleanup never deletes your newest complete backup, a locked backup, a backup that a
+Project repair is using, or legacy, unverified or partial files. A retention lock
+keeps a backup until you explicitly unlock it. Anything named `<backup>.locked` beside
+an archive counts as a lock; if it is not a plain file, remove it on the server.
+
+**Automatic backups** in the same tab turns each schedule on or off and sets its day
+and time in the server's time zone. Saving a schedule never starts a backup, and
+Portal updates keep your schedules and paused state.
 
 ## Verify
 

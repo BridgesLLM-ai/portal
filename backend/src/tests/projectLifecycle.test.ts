@@ -6,6 +6,19 @@ const spawnMock = jest.fn();
 const prepareWorkloadMock = jest.fn();
 const removeWorkloadMock = jest.fn();
 const resolveImageMock = jest.fn();
+const startWorkloadMock = jest.fn();
+const readCredentialsMock = jest.fn();
+const materializeCredentialsMock = jest.fn();
+const removeCredentialDirectoryMock = jest.fn();
+
+jest.mock('../services/appCredentials/store', () => ({
+  readAppCredentialsForProjection: readCredentialsMock,
+}));
+
+jest.mock('../services/appCredentials/projection', () => ({
+  materializeAppCredentials: materializeCredentialsMock,
+  removeAppCredentialDirectory: removeCredentialDirectoryMock,
+}));
 
 jest.mock('child_process', () => ({
   execFile: execFileMock,
@@ -18,7 +31,7 @@ jest.mock('../services/projectWorkloadRuntime', () => ({
   removePortalProjectWorkloadByIdentity: jest.fn(),
   removePreparedPortalProjectWorkloadContainer: removeWorkloadMock,
   resolvePinnedProjectRuntimeImage: resolveImageMock,
-  startPreparedPortalProjectWorkloadContainer: jest.fn(),
+  startPreparedPortalProjectWorkloadContainer: startWorkloadMock,
 }));
 
 import {
@@ -50,6 +63,7 @@ import {
   prepareProjectChatLifecycleWorkspace,
   runProjectLifecycleCommand,
   spawnProjectLifecycleCommand,
+  startProjectAppContainer,
 } from '../services/project-lifecycle.service';
 
 const SCOPE = { actorId: 'actor-1', projectId: 'project-1' };
@@ -89,6 +103,60 @@ describe('project lifecycle sandbox', () => {
       egressSpec: options.networked ? { internalNetworkName: 'egress-internal' } : null,
     }));
     removeWorkloadMock.mockResolvedValue(undefined);
+    readCredentialsMock.mockResolvedValue(null);
+  });
+
+  it('projects named App credentials into the resident App container only, as a path, never as values', async () => {
+    const workspace = makeWorkspace();
+    startWorkloadMock.mockResolvedValue({ containerId: 'a'.repeat(64), networkAddress: '10.77.0.2' });
+    const attachment = { appId: 'credential-app', revision: 7, slots: ['api-token'], sourceDirectory: '/run/bridgesllm/app-credentials/x',
+      containerDirectory: '/portal/credentials', directory: { device: '1', inode: '2' } };
+    readCredentialsMock.mockResolvedValue({ revision: 7, entries: [{ slot: 'api-token', value: 'DUMMY-NOT-A-REAL-SECRET' }] });
+    materializeCredentialsMock.mockReturnValue(attachment);
+    try {
+      const started = await startProjectAppContainer({ ...SCOPE, workspace, command: 'npm', args: ['start'],
+        workloadId: 'credential-app', port: 5001 });
+      expect(readCredentialsMock).toHaveBeenCalledWith({ appId: 'credential-app', actorId: SCOPE.actorId, projectId: SCOPE.projectId });
+      expect(materializeCredentialsMock).toHaveBeenCalledWith({ appId: 'credential-app', revision: 7,
+        entries: [{ slot: 'api-token', value: 'DUMMY-NOT-A-REAL-SECRET' }] });
+      const options = prepareWorkloadMock.mock.calls[0][0];
+      expect(options.credentialAttachment).toBe(attachment);
+      expect(options.environment.PORTAL_CREDENTIALS_DIR).toBe('/portal/credentials');
+      expect(JSON.stringify(options.environment)).not.toContain('DUMMY-NOT-A-REAL-SECRET');
+      expect(started.plan.credentialAttachment).toBe(attachment);
+
+      // A container that fails to be prepared never keeps its credential directory.
+      prepareWorkloadMock.mockRejectedValueOnce(new Error('CONTAINER_MOUNTS'));
+      await expect(startProjectAppContainer({ ...SCOPE, workspace, command: 'npm', args: ['start'],
+        workloadId: 'credential-app', port: 5001 })).rejects.toThrow('CONTAINER_MOUNTS');
+      expect(removeCredentialDirectoryMock).toHaveBeenCalledWith(attachment.sourceDirectory);
+
+      // Lifecycle jobs (install/build) never read or receive App credentials.
+      readCredentialsMock.mockClear();
+      materializeCredentialsMock.mockClear();
+      prepareWorkloadMock.mockClear();
+      const child = makeChild();
+      spawnMock.mockReturnValueOnce(child);
+      const job = runProjectLifecycleCommand({ ...SCOPE, workspace, command: 'npm', args: ['install'], workloadId: 'credential-app' });
+      await new Promise((resolve) => setImmediate(resolve));
+      child.emit('close', 0, null);
+      await job;
+      expect(readCredentialsMock).not.toHaveBeenCalled();
+      expect(materializeCredentialsMock).not.toHaveBeenCalled();
+      expect(prepareWorkloadMock.mock.calls[0][0].credentialAttachment).toBeUndefined();
+      expect(prepareWorkloadMock.mock.calls[0][0].environment.PORTAL_CREDENTIALS_DIR).toBeUndefined();
+    } finally { rmSync(workspace, { recursive: true, force: true }); }
+  });
+
+  it('refuses to start an App whose stored credentials cannot be read', async () => {
+    const workspace = makeWorkspace();
+    readCredentialsMock.mockRejectedValue(Object.assign(new Error('The App credential "api-token" could not be decrypted'), { code: 'APP_CREDENTIAL_UNREADABLE' }));
+    try {
+      await expect(startProjectAppContainer({ ...SCOPE, workspace, command: 'npm', args: ['start'], workloadId: 'credential-app', port: 5001 }))
+        .rejects.toMatchObject({ code: 'APP_CREDENTIAL_UNREADABLE' });
+      expect(prepareWorkloadMock).not.toHaveBeenCalled();
+      expect(startWorkloadMock).not.toHaveBeenCalled();
+    } finally { rmSync(workspace, { recursive: true, force: true }); }
   });
 
   it('prepares Project Chat ownership asynchronously without using synchronous chown', async () => {

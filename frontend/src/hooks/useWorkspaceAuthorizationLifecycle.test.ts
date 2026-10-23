@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-import React, { StrictMode } from 'react';
 import {
   act,
   cleanup,
@@ -387,12 +386,9 @@ describe('workspace authorization quarantine', () => {
   });
 
   it('cleans the first StrictMode socket and leaves one live lifecycle', () => {
-    const wrapper = ({ children }: { children: React.ReactNode }) => (
-      React.createElement(StrictMode, null, children)
-    );
     const { unmount } = renderHook(
       () => useWorkspaceAuthorizationLifecycle(vi.fn()),
-      { wrapper },
+      { reactStrictMode: true },
     );
 
     expect(socketHarness.io).toHaveBeenCalledTimes(2);

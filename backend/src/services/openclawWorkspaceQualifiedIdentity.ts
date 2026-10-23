@@ -207,3 +207,28 @@ export function computeOpenClaw92SandboxConfigHash(input: {
 export function isOpenClawWorkspaceQualifiedScopeKey(value: string): boolean {
   return WORKSPACE_SCOPE_SUFFIX_RE.test(String(value || '').trim());
 }
+
+/** OpenClaw 2026.9.9 hashes the complete ordered native mount plan, not
+ * 9.2's read-only skills subset. Keep the historical function byte-compatible
+ * so existing Portal-labelled generations can still be attested and retired.
+ * The caller supplies Portal's constrained local-Docker plan; no remote-daemon
+ * namespace translation or arbitrary resource mounts are admitted here. */
+export function computeOpenClaw99SandboxConfigHash(input: {
+  docker: Record<string, unknown>;
+  workspaceAccess: 'none';
+  workspaceDir: string;
+  agentWorkspaceDir: string;
+  managedMounts: readonly string[];
+  dockerEnvPolicyEpoch?: string;
+}): string {
+  return sha256Hex(JSON.stringify(normalizeOpenClawHashInput({
+    docker: input.docker,
+    dockerEnvPolicyEpoch: input.dockerEnvPolicyEpoch,
+    workspaceAccess: input.workspaceAccess,
+    workspaceDir: input.workspaceDir,
+    agentWorkspaceDir: input.agentWorkspaceDir,
+    mountFormatVersion: OPENCLAW_92_SANDBOX_MOUNT_FORMAT_VERSION,
+    createArgsEpoch: OPENCLAW_92_SANDBOX_CREATE_ARGS_EPOCH,
+    managedMounts: [...input.managedMounts],
+  })));
+}

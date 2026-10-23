@@ -16,6 +16,10 @@ jest.mock('../../utils/openclawGatewayRpc', () => ({
   deleteSession: jest.fn(),
 }));
 
+jest.mock('../providerAvailability', () => ({
+  getProviderCapabilities: () => ({ supportedExecutionScopes: ['HOST_OPERATOR'] }),
+}));
+
 jest.mock('./PersistentGatewayWs', () => ({
   sendChatMessage: jest.fn(),
   isConnected: jest.fn(() => true),
@@ -306,4 +310,27 @@ describe('OpenClawProvider run-bound abort settlement', () => {
     )).rejects.toThrow('dispatch journal unavailable');
     streamEventBus.clearStream(sessionId);
   });
+});
+
+test.each([false, true])('forwards the server-owned inline-widget flag and image custody through both provider helpers (photos=%s)', async (photos) => {
+  const sessionId = 'agent:main:portal-dddddddd-dddd-4ddd-8ddd-dddddddddddd-widget';
+  persistentGateway.sendChatMessage.mockReset();
+  persistentGateway.sendChatMessage.mockImplementation(async () => ({ runId: 'widget-run' }));
+  const images: import('../../services/chatImages/directChatImages').NativeChatImage[] = photos ? [{
+    type: 'image', mimeType: 'image/jpeg', content: '/9j/fixture', fileName: 'photo.jpg',
+    sizeBytes: 3, width: 1, height: 1,
+  }] : [];
+  const model = photos ? 'fixture/vision' : undefined;
+  const revalidate = photos ? jest.fn(async () => {}) : undefined;
+  const provider = new OpenClawProvider();
+  expect(provider.supportsNativeChatImages).toBe(true);
+  const send = provider.sendMessage(sessionId, 'make a widget', undefined, undefined, undefined, {
+    label: 'fixture owner', userId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', portalInlineWidgets: true,
+    ...(photos ? { chatImages: images, chatImageModel: model, revalidateChatImages: revalidate } : {}),
+  });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(persistentGateway.sendChatMessage.mock.calls[0].slice(5)).toEqual([images, true, model, revalidate]);
+  streamEventBus.publish(sessionId, { type: 'done', content: 'created', runId: 'widget-run' });
+  await expect(send).resolves.toMatchObject({ fullText: 'created' });
+  streamEventBus.clearStream(sessionId);
 });

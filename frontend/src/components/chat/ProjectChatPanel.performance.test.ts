@@ -46,7 +46,6 @@ describe('Project Chat long-run browser performance contract', () => {
 
   it('uses bounded projections and coalesced live text/thinking renders', () => {
     expect(source).toContain('selectNewestWindow(messages, PROJECT_CHAT_MESSAGE_WINDOW_SIZE');
-    expect(source).toContain('<BoundedProjectToolCalls tools={toolCalls} messageKey={msg.id} />');
 
     const thinkingHandler = source.slice(
       source.indexOf("case 'thinking':"),

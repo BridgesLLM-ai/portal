@@ -112,6 +112,13 @@ export default function ProviderActivationStep({ provider, apiBase, mode, onClos
     [discovery, selectedId],
   );
   const readyModels = useMemo(() => discovery?.models.filter((model) => model.readiness === 'ready') || [], [discovery]);
+  const suggestedReasons = useMemo(() => new Map(discovery?.suggestions.map(model => [model.id, model.reason]) || []), [discovery]);
+  const orderedModels = useMemo(() => {
+    if (!discovery) return [];
+    const rank = new Map(discovery.suggestions.map((model, index) => [model.id, index]));
+    return [...discovery.models].sort((left, right) =>
+      (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER));
+  }, [discovery]);
 
   const apply = async () => {
     if (!selected || mutationRef.current || pendingWrite) return;
@@ -281,7 +288,7 @@ export default function ProviderActivationStep({ provider, apiBase, mode, onClos
               ) : null}
 
               <div className="space-y-2" role="radiogroup" aria-label="OpenClaw models">
-                {discovery.models.map((model) => {
+                {orderedModels.map((model) => {
                   const active = selectedId === model.id;
                   const selectable = model.readiness === 'ready';
                   return (
@@ -302,6 +309,9 @@ export default function ProviderActivationStep({ provider, apiBase, mode, onClos
                     >
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium text-white">{model.name}</span>
+                        {suggestedReasons.has(model.id) ? (
+                          <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] text-sky-200">Suggested</span>
+                        ) : null}
                         <span className="rounded-full border border-slate-700 bg-slate-800/70 px-2 py-0.5 text-[11px] text-slate-300">{model.id}</span>
                         <span className={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${
                           model.readiness === 'ready'
@@ -319,6 +329,7 @@ export default function ProviderActivationStep({ provider, apiBase, mode, onClos
                           <span className="rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-2 py-0.5 text-[11px] text-fuchsia-200">Current default</span>
                         ) : null}
                       </div>
+                      {suggestedReasons.has(model.id) ? <p className="mt-2 text-sm text-sky-200">{suggestedReasons.get(model.id)}</p> : null}
                       {model.description ? <p className="mt-2 text-sm text-slate-400">{model.description}</p> : null}
                       {model.reason ? <p className="mt-1 text-xs text-slate-500">{model.reason}</p> : null}
                     </button>

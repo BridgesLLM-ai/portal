@@ -1,4 +1,7 @@
+import { randomUUID } from 'crypto';
 import { withPortalGuideReference } from '../../../../services/portalOperatingGuide';
+import { ChatImageError } from '../../../../services/chatImages/chatImageModelPolicy';
+import { stripChatImageReferences } from '../../../../services/chatImages/directChatImages';
 import type {
   AgentProviderName,
   AgentSendResult,
@@ -26,6 +29,11 @@ import { buildAcpHarnessEnvironment } from './AcpHarnessEnvironment';
 import type { AcpHarnessProfile, AcpPermissionRequest } from './AcpStdioBroker';
 import { AcpStdioBroker } from './AcpStdioBroker';
 import { recordAcpModelCatalog } from './AcpModelCatalog';
+import { NativeChatTurnTools } from '../NativeChatTurnTools';
+import { acpBridgeMcpServers, acpBridgeToolResolver } from './AcpChatBridge';
+
+/** How long one attested `promptCapabilities.image` answer is reused for admission. */
+const ACP_PROMPT_IMAGE_ATTESTATION_TTL_MS = 10 * 60_000;
 
 type PortalAcpProviderName = Extract<AgentProviderName, 'HERMES' | 'OPENCODE'>;
 
@@ -62,6 +70,48 @@ function renderPermissionCommand(request: AcpPermissionRequest): string {
 export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
   private readonly activeBrokers = new Map<AgentSessionId, ActiveAcpRun>();
   private readonly reservations = new Set<AgentSessionId>();
+  private promptImageAttestation: { at: number; images: boolean; identity: string } | null = null;
+
+  /** Photos are offered; each agent's initialize answer decides (promptCapabilities.image). */
+  override get supportsNativeChatImages(): boolean {
+    return true;
+  }
+
+  /**
+   * Gateway image admission from the agent's own ACP `initialize` answer
+   * (`agentCapabilities.promptCapabilities.image`), attested on a fresh,
+   * session-less process and reused briefly. The turn re-checks it on the
+   * process that actually receives the photos.
+   */
+  override async assertChatImageModel(sessionId: AgentSessionId): Promise<string> {
+    const session = this.requireSession(sessionId);
+    assertExecutionContextBinding(session.executionContext, session.userId, 'HOST_OPERATOR');
+    const cached = this.promptImageAttestation;
+    let attestation = cached && Date.now() - cached.at < ACP_PROMPT_IMAGE_ATTESTATION_TTL_MS ? cached : null;
+    if (!attestation) {
+      await this.assertReady();
+      const broker = (this.acp.brokerFactory || ((options) => new AcpStdioBroker(options)))({
+        profile: this.acp.profile,
+        cwd: session.cwd,
+        environment: buildAcpHarnessEnvironment(this.acp.providerName),
+      });
+      try {
+        const attested = await broker.attest();
+        attestation = {
+          at: Date.now(),
+          images: attested.promptImages,
+          identity: `${attested.agentName}@${attested.agentVersion}`,
+        };
+        this.promptImageAttestation = attestation;
+      } catch {
+        throw new ChatImageError('IMAGE_MODEL_UNAVAILABLE', 503);
+      } finally {
+        await broker.dispose();
+      }
+    }
+    if (!attestation.images) throw new ChatImageError('IMAGE_MODEL_UNSUPPORTED');
+    return `${attestation.identity}:${session.model || 'default'}`;
+  }
 
   protected constructor(private readonly acp: AcpAgentProviderConfig) {
     super(acp.adapter);
@@ -77,6 +127,7 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
     onExecApproval?: OnExecApprovalCallback,
     sender?: SenderIdentity,
     requestedModel?: string | null,
+    chatTools?: NativeChatTurnTools,
   ): ActiveAcpRun {
     const session = this.requireSession(sessionId);
     const approvalAbort = new AbortController();
@@ -88,6 +139,10 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
       nativeSessionId: typeof session.metadata?.nativeSessionId === 'string'
         ? session.metadata.nativeSessionId
         : null,
+      ...(chatTools ? {
+        mcpServers: acpBridgeMcpServers(chatTools),
+        resolveToolName: acpBridgeToolResolver(chatTools),
+      } : {}),
       onChunk,
       onStatus,
       onPermission: async (request) => {
@@ -123,7 +178,7 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
     return { broker, approvalAbort, completion, resolveCompletion };
   }
 
-  private async assertReady(): Promise<void> {
+  protected async assertReady(): Promise<void> {
     const availability = getProviderAvailability(this.acp.providerName);
     if (!availability.usable) {
       throw new Error(availability.reason || `${this.displayName} is not ready on this server.`);
@@ -145,7 +200,17 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
       throw new Error(`A ${this.displayName} turn is already active for this session.`);
     }
     this.reservations.add(sessionId);
+    let chatTools = NativeChatTurnTools.withoutBridge();
     try {
+      const runId = typeof sender?.requestId === 'string' && sender.requestId.trim()
+        ? sender.requestId.trim()
+        : randomUUID();
+      const chatImages = Array.isArray(sender?.chatImages) ? sender!.chatImages! : [];
+      // The durable user message keeps its photo markers; the agent receives
+      // the photos as image blocks instead.
+      const promptMessage = chatImages.length > 0
+        ? stripChatImageReferences(message) || 'Describe the attached photo.'
+        : message;
       await this.assertReady();
       const session = this.requireSession(sessionId);
       assertExecutionContextBinding(session.executionContext, session.userId, 'HOST_OPERATOR');
@@ -159,7 +224,17 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
         timestamp: new Date().toISOString(),
       });
 
-      const active = this.createBroker(sessionId, onChunk, onStatus, onExecApproval, sender);
+      chatTools = await NativeChatTurnTools.open({
+        provider: this.acp.providerName,
+        portalSessionId: sessionId,
+        runId,
+        sender,
+        bridge: true,
+      });
+      const tools = chatTools;
+      // Every tool event is canonicalised, widget-bound and recorded once.
+      const projectStatus: OnStatusCallback = (event) => onStatus?.(tools.project(event));
+      const active = this.createBroker(sessionId, onChunk, projectStatus, onExecApproval, sender, undefined, tools);
       this.activeBrokers.set(sessionId, active);
       onStatus?.({
         type: 'status',
@@ -189,7 +264,15 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
         session.metadata = metadata;
         updateNativeSessionMetadata(this.acp.providerName, session.sessionId, metadata);
 
-        const result = await active.broker.prompt(withPortalGuideReference(message, session.messages.length === 1));
+        if (chatImages.length > 0) {
+          if (!active.broker.supportsPromptImages) throw new ChatImageError('IMAGE_MODEL_UNSUPPORTED');
+          if (typeof sender?.revalidateChatImages !== 'function') throw new ChatImageError('IMAGE_REVALIDATION_REQUIRED', 503);
+          await sender.revalidateChatImages();
+        }
+        const result = await active.broker.prompt(
+          withPortalGuideReference(promptMessage, session.messages.length === 1),
+          chatImages,
+        );
         recordAcpModelCatalog(this.acp.providerName, result.modelState);
         session.metadata = {
           ...(session.metadata || {}),
@@ -206,6 +289,7 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
           role: 'assistant',
           content: result.fullText,
           timestamp: new Date().toISOString(),
+          toolCalls: chatTools.toolCalls(),
         });
         onStatus?.({ type: 'status', content: '', provider: this.acp.profile.providerTag });
         return {
@@ -240,6 +324,7 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
           role: 'assistant',
           content: `Error: ${errorText}`,
           timestamp: new Date().toISOString(),
+          toolCalls: chatTools.toolCalls(),
         });
         throw error;
       } finally {
@@ -252,6 +337,8 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
         }
       }
     } finally {
+      // Every settlement path (success, error, abort) ends the capability.
+      chatTools.revoke();
       this.reservations.delete(sessionId);
     }
   }

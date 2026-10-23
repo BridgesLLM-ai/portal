@@ -21,7 +21,6 @@ import {
 
 const router = Router();
 
-const CDP_HTTP_URL = 'http://127.0.0.1:18801/json/list';
 const CDP_WS_BASE = 'ws://127.0.0.1:18801/devtools/page';
 const SCREENSHOT_INTERVAL_MS = 500;
 const SCREENSHOT_TIMEOUT_MS = 4000;
@@ -54,8 +53,8 @@ function getTargetWsUrl(target: Pick<CdpTarget, 'id' | 'webSocketDebuggerUrl'>):
   return target.webSocketDebuggerUrl || `${CDP_WS_BASE}/${encodeURIComponent(target.id)}`;
 }
 
-async function fetchCdpTargets(): Promise<CdpTarget[]> {
-  const response = await fetch(CDP_HTTP_URL, { signal: AbortSignal.timeout(2500) });
+export async function fetchCdpTargets(cdpBase = 'http://127.0.0.1:18801'): Promise<CdpTarget[]> {
+  const response = await fetch(`${cdpBase}/json/list`, { signal: AbortSignal.timeout(2500) });
   if (!response.ok) {
     throw new Error(`CDP list request failed (${response.status})`);
   }
@@ -82,8 +81,8 @@ function sendJson(ws: WebSocket, payload: unknown) {
   }
 }
 
-async function captureScreenshotFromTarget(target: CdpTarget): Promise<Buffer> {
-  const wsUrl = getTargetWsUrl(target);
+export async function captureScreenshotFromTarget(target: CdpTarget, cdpBase?: string): Promise<Buffer> {
+  const wsUrl = cdpBase ? `${cdpBase.replace(/^http/, 'ws')}/devtools/page/${encodeURIComponent(target.id)}` : getTargetWsUrl(target);
 
   return await new Promise<Buffer>((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
@@ -174,6 +173,12 @@ async function captureScreenshotFromTarget(target: CdpTarget): Promise<Buffer> {
 }
 
 router.use(authenticateToken);
+router.use((_req, res, next) => {
+  if (fs.existsSync('/etc/bridges-shared-browser.enabled')) {
+    res.status(409).json({ error: 'Use the commissioned Shared interactive browser panel' }); return;
+  }
+  next();
+});
 router.use((req, res, next) => {
   if (!req.user || !isElevatedRole(req.user.role)) {
     res.status(403).json({ error: 'Admin role required' });
@@ -352,6 +357,7 @@ export function attachAgentBrowserWebSocket(httpServer: import('http').Server) {
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = req.url || '';
     if (!isExactWebSocketPath(url, '/api/agent-browser/stream')) return;
+    if (fs.existsSync('/etc/bridges-shared-browser.enabled')) { socket.destroy(); return; }
 
     const origin = req.headers.origin;
     if (!isAllowedWebSocketOrigin(origin, req.headers.host)) {

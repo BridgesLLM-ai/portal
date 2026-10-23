@@ -14,6 +14,7 @@ export type ToolVisualKind =
   | 'session'
   | 'browser'
   | 'weather'
+  | 'bridgesllm'
   | 'generic';
 
 export interface ToolPresentation {
@@ -25,6 +26,13 @@ export interface ToolPresentation {
 }
 
 const TOOL_PRESENTATIONS: Record<ToolVisualKind, ToolPresentation> = {
+  bridgesllm: {
+    key: 'bridgesllm',
+    label: 'BridgesLLM',
+    surfaceClass: 'bg-[rgba(16,185,129,0.08)] border-[rgba(16,185,129,0.22)] hover:bg-[rgba(16,185,129,0.14)]',
+    iconBadgeClass: 'border-emerald-400/25 bg-emerald-400/10',
+    iconClass: 'text-emerald-300',
+  },
   read: {
     key: 'read',
     label: 'Read',
@@ -240,16 +248,47 @@ export function resolveToolName(...candidates: unknown[]): string {
   return 'tool';
 }
 
-export function getToolPresentation(name: string): ToolPresentation {
+/** Presentation only: branding is never an authorization or trust signal. */
+export function isBridgesLLMTool(name: string, toolArguments?: unknown): boolean {
+  const branded = (value: unknown) => typeof value === 'string'
+    && value.length <= 2048
+    && /(?:^|[.:/_-])bridgesllm(?:$|[.:/_-])/i.test(value);
+  if (branded(normalizeToolName(name))) return true;
+  const canonical = canonicalToolName(name).split('__').pop() || '';
+  const isSkill = ['skill', 'slash_command', 'skill_workshop', 'skills', 'skills_read', 'skills_load'].includes(canonical)
+    || /(?:^|[.:])skills[.:](?:read|load)$/.test(name);
+  const isRead = ['read', 'read_file', 'view_file'].includes(canonical);
+  if (!isSkill && !isRead) return false;
+  let args = toolArguments;
+  if (typeof args === 'string' && args.length <= 65536) {
+    try { args = JSON.parse(args); } catch { return false; }
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
+  const record = args as Record<string, unknown>;
+  if (isSkill && ['skill', 'skillName', 'skill_name', 'skillId', 'skill_id', 'name', 'package', 'packageId', 'package_id', 'resource']
+    .some((key) => branded(record[key]))) return true;
+  // Reading the bundled guide is how file-based harnesses invoke skills.
+  return ['path', 'file_path', 'filePath', 'resource'].some((key) => {
+    const value = record[key];
+    return typeof value === 'string' && value.length <= 2048
+      && /(?:^|\/)skills\/bridgesllm(?:[-_][a-z0-9_-]+)?\/(?:SKILL\.md|references\/[a-z0-9_./-]+\.md)$/i.test(value);
+  });
+}
+
+export function getToolPresentation(name: string, toolArguments?: unknown): ToolPresentation {
+  if (isBridgesLLMTool(name, toolArguments)) return TOOL_PRESENTATIONS.bridgesllm;
   const canonical = canonicalToolName(name);
 
-  if (canonical === 'read' || canonical === 'read_file' || canonical === 'list_directory' || canonical === 'read_many_files' || canonical === 'notebook_read') return TOOL_PRESENTATIONS.read;
-  if (canonical === 'write' || canonical === 'write_file') return TOOL_PRESENTATIONS.write;
-  if (canonical === 'edit' || canonical === 'edit_file' || canonical === 'patch' || canonical === 'apply_patch' || canonical === 'replace' || canonical === 'multi_edit' || canonical === 'notebook_edit') return TOOL_PRESENTATIONS.edit;
+  if (canonical === 'read' || canonical === 'read_file' || canonical === 'list_directory' || canonical === 'read_many_files' || canonical === 'notebook_read'
+    || canonical === 'view_file' || canonical === 'list_dir') return TOOL_PRESENTATIONS.read;
+  if (canonical === 'write' || canonical === 'write_file' || canonical === 'write_to_file') return TOOL_PRESENTATIONS.write;
+  if (canonical === 'edit' || canonical === 'edit_file' || canonical === 'patch' || canonical === 'apply_patch' || canonical === 'replace' || canonical === 'multi_edit' || canonical === 'notebook_edit'
+    || canonical === 'file_change' || canonical === 'replace_file_content' || canonical === 'multi_replace_file_content') return TOOL_PRESENTATIONS.edit;
   if (canonical === 'process' || canonical === 'bash_output' || canonical === 'task_output' || canonical === 'kill_shell' || canonical === 'task_stop') return TOOL_PRESENTATIONS.process;
-  if (canonical === 'exec' || canonical === 'execute' || canonical === 'bash' || canonical === 'shell' || canonical === 'run_shell_command' || canonical === 'skill' || canonical === 'slash_command') return TOOL_PRESENTATIONS.exec;
-  if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query' || canonical === 'find' || canonical === 'finance' || canonical === 'sports' || canonical === 'time' || canonical === 'grep_search' || canonical === 'glob' || canonical === 'grep' || canonical === 'search_file_content' || canonical === 'google_web_search' || canonical === 'tool_search') return TOOL_PRESENTATIONS.search;
-  if (canonical === 'web_fetch' || canonical === 'fetch' || canonical === 'open' || canonical === 'click' || canonical === 'screenshot') return TOOL_PRESENTATIONS.fetch;
+  if (canonical === 'exec' || canonical === 'execute' || canonical === 'bash' || canonical === 'shell' || canonical === 'run_shell_command' || canonical === 'run_command' || canonical === 'skill' || canonical === 'slash_command') return TOOL_PRESENTATIONS.exec;
+  if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query' || canonical === 'find' || canonical === 'finance' || canonical === 'sports' || canonical === 'time' || canonical === 'grep_search' || canonical === 'glob' || canonical === 'grep' || canonical === 'search_file_content' || canonical === 'google_web_search' || canonical === 'tool_search'
+    || canonical === 'find_by_name' || canonical === 'search_web' || canonical === 'codebase_search') return TOOL_PRESENTATIONS.search;
+  if (canonical === 'web_fetch' || canonical === 'fetch' || canonical === 'open' || canonical === 'click' || canonical === 'screenshot' || canonical === 'read_url_content') return TOOL_PRESENTATIONS.fetch;
   if (canonical === 'browser' || canonical === 'canvas' || canonical === 'nodes') return TOOL_PRESENTATIONS.browser;
   if (canonical === 'gateway' || canonical === 'cron') return TOOL_PRESENTATIONS.gateway;
   if (
@@ -258,6 +297,7 @@ export function getToolPresentation(name: string): ToolPresentation {
     || canonical === 'save_memory'
     || canonical === 'update_plan'
     || canonical === 'todo_write'
+    || canonical === 'write_todos'
     || canonical === 'task_create'
     || canonical === 'task_update'
     || canonical === 'task_get'

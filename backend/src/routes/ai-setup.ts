@@ -1,7 +1,10 @@
 import { requireAdmin } from '../middleware/requireAdmin';
 import { ProviderActivationService } from '../services/providerActivation';
 import { ProviderSetupWizard } from '../services/providerSetupWizard';
-import express, { Request, Response, Router } from 'express';
+import express, { Request as ExpressRequest, Response, Router } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import fs from 'fs';
 import path from 'path';
 import { execFileSync, execSync } from 'child_process';

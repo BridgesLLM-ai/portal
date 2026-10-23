@@ -1,0 +1,25 @@
+{
+  "version": "2026.9.9",
+  "commit": "bcfc88812a35243893585dbeca87ca41b48272ca",
+  "node": ">=24.16.0 <25 || >=26.1.0",
+  "targets": [
+    {
+      "id": "activeRuns",
+      "filename": "runs-Bd-iWuBN.mjs",
+      "stockSha256": "0c29108abc170e073d328d46765cfce21ffe6ed707304935189eb03e1b25ee44",
+      "bridgedSha256": "0c29108abc170e073d328d46765cfce21ffe6ed707304935189eb03e1b25ee44"
+    },
+    {
+      "id": "deleteSchema",
+      "filename": "src-D2gvuSyP.mjs",
+      "stockSha256": "8f5ed8aa897a9d6a23dcfb597a071d875650a96d6346c63da291308999eaea53",
+      "bridgedSha256": "6222346d8cc335c0725a0492329030a8228bdf145b8285d60beab5d784404a01"
+    },
+    {
+      "id": "deleteHandler",
+      "filename": "sessions-delete-kmpH72WT.mjs",
+      "stockSha256": "e650fdd4e685d17af95739ce6367029805d7a6a74470072d7fcdb0e6ce21c50b",
+      "bridgedSha256": "ca98b95c1f6ee88063a4da46e223789b31d68632cbfd70e673bcd28d891530c8"
+    }
+  ]
+}

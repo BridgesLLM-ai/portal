@@ -767,6 +767,7 @@ export function buildOpenClawMaintenanceComponent(
     'gateway-rpc-unavailable',
     'gateway-runtime-mismatch',
     'codex-plugin-mismatch',
+    'codex-plugin-inspect-timeout',
   ]);
   const pairBlockers = readiness.blockers
     .filter((blocker) => pairBlockerCodes.has(blocker.code))

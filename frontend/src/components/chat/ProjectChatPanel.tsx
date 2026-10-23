@@ -1,3 +1,4 @@
+import { useDictation } from '../../hooks/useDictation';
 /**
  * ProjectChatPanel — Self-contained chat panel for project agents.
  * 
@@ -62,7 +63,10 @@ import {
 } from '../../utils/liveTurnProjector';
 import { normalizePortalStreamEventFromTurnEvent } from '../../utils/runtimeTurnEvents';
 import ComposerStatusBadge from './ComposerStatusBadge';
-import ToolGlyph from './ToolGlyph';
+import { ToolCard } from './toolCards/ToolCard';
+import { ToolActivityGroup } from './toolActivity/ToolActivityGroup';
+import { ToolActivityScope } from './toolActivity/toolActivityDisclosure';
+import { buildActivityUnits, describeActivityTool, selectNewestActivityUnits, type ActivityEntry, type ActivityUnit } from './toolActivity/toolActivityModel';
 import ProjectProviderMenu, {
   normalizeProjectQualificationRetryAt,
   projectQualificationAuthRecoveryAction,
@@ -73,7 +77,7 @@ import ProjectProviderMenu, {
 import AnchoredPopover from '../AnchoredPopover';
 import ViewportModal from '../ViewportModal';
 import { getRailSafeStatusText, resolveMaintenanceRailStatus } from './maintenanceRailLifecycle';
-import { getToolPresentation, getToolStatusText, getToolSummary, isAskQuestionTool, isCompactionNotice, resolveToolName } from '../../utils/toolPresentation';
+import { getToolStatusText, isAskQuestionTool, isCompactionNotice, resolveToolName } from '../../utils/toolPresentation';
 import {
   pruneExpiredExecApprovals,
   removeExecApproval,
@@ -110,6 +114,7 @@ import { useAuthStore } from '../../contexts/AuthContext';
 import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
 import { AskQuestionCard, AskQuestionAnswerProvider, parseAskQuestionPayload, useAskQuestionAnswer } from './AskQuestionCard';
 import AskUserQuestionCard from './AskUserQuestionCard';
+import { useVisibleQuestionConversation } from '../../contexts/QuestionAttentionContext';
 import type { AskUserQuestionRequest } from './AskUserQuestionCard';
 import { isAskUserQuestionNoLongerOpenError } from '../../utils/askUserQuestionError';
 
@@ -1384,7 +1389,6 @@ function getProjectProviderLabel(provider: ProjectChatProviderName): string {
 /* ═══ Sub-components ═══ */
 
 const ToolCallPill = React.memo(function ToolCallPill({ tool }: { tool: ToolCall }) {
-  const [expanded, setExpanded] = useState(false);
   const onAnswerQuestion = useAskQuestionAnswer();
   const askPayload = useMemo(
     () => (isAskQuestionTool(tool.name) ? parseAskQuestionPayload(tool.arguments) : null),
@@ -1404,94 +1408,70 @@ const ToolCallPill = React.memo(function ToolCallPill({ tool }: { tool: ToolCall
       </div>
     );
   }
-  const duration = tool.endedAt ? ((tool.endedAt - tool.startedAt) / 1000).toFixed(1) : null;
-  const hasDetails = !!(tool.result || tool.arguments);
-  const summary = getToolSummary(tool);
-  const presentation = getToolPresentation(tool.name);
-
-  return (
-    <motion.div
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      transition={{ duration: 0.2 }}
-      className="flex justify-center px-2 py-0.5"
-    >
-      <div className="flex flex-col items-center max-w-sm w-full">
-        <button
-          onClick={() => hasDetails && setExpanded(!expanded)}
-          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border transition-colors text-[10px] text-slate-400 ${presentation.surfaceClass}`}
-        >
-          <span className={`inline-flex h-4 w-4 items-center justify-center rounded-full border ${presentation.iconBadgeClass}`}>
-            <ToolGlyph toolName={tool.name} size={10} className={presentation.iconClass} />
-          </span>
-          <span className="text-slate-200">{summary}</span>
-          {tool.status === 'running' ? (
-            <Loader2 aria-label="Tool turn running" size={9} className={`animate-spin ${presentation.iconClass}`} />
-          ) : null}
-          {duration && <span className="text-slate-500">· {duration}s</span>}
-          {hasDetails && (
-            <ChevronRight size={9} className={`text-slate-600 transition-transform ${expanded ? 'rotate-90' : ''}`} />
-          )}
-        </button>
-        <AnimatePresence>
-          {expanded && hasDetails && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              className="overflow-hidden w-full"
-            >
-              {tool.arguments && (
-                <div className="mt-1 px-2.5 py-1.5 rounded-lg bg-slate-800/40 border border-white/[0.04] text-[10px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[100px] overflow-y-auto text-left">
-                  <span className="text-slate-500 text-[9px] block mb-0.5">Args:</span>
-                  {typeof tool.arguments === 'string' ? tool.arguments : JSON.stringify(tool.arguments, null, 2)}
-                </div>
-              )}
-              {tool.result && (
-                <div className="mt-1 px-2.5 py-1.5 rounded-lg bg-black/20 border border-white/[0.04] text-[10px] text-slate-400 font-mono leading-relaxed whitespace-pre-wrap max-h-[100px] overflow-y-auto text-left">
-                  <span className="text-slate-500 text-[9px] block mb-0.5">Result:</span>
-                  {tool.result}
-                </div>
-              )}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-    </motion.div>
-  );
+  return <ToolCard tool={tool} />;
 });
 
-const BoundedProjectToolCalls = React.memo(function BoundedProjectToolCalls({
+function renderProjectGroupMember(tool: ToolCall): React.ReactNode {
+  return <ToolCallPill tool={tool} />;
+}
+
+/** Same unit rules as Agent Chat: standalone rows stay put, ordinary runs group. */
+function renderProjectActivityUnit<B>(
+  unit: ActivityUnit<ToolCall, B>,
+  keyPrefix: string,
+  renderBoundary: (value: B, key: string) => React.ReactNode,
+): React.ReactNode {
+  if (unit.kind === 'boundary') return renderBoundary(unit.value, unit.key);
+  if (unit.kind === 'tool') return <ToolCallPill key={`${keyPrefix}-${unit.key}`} tool={unit.tool} />;
+  return (
+    <ToolActivityGroup
+      key={`${keyPrefix}-${unit.key}`}
+      groupKey={unit.key}
+      tools={unit.tools}
+      surface="project"
+      renderTool={renderProjectGroupMember}
+      describeTool={describeActivityTool}
+    />
+  );
+}
+
+export const BoundedProjectToolCalls = React.memo(function BoundedProjectToolCalls({
   tools,
   messageKey,
+  proseFollows = false,
 }: {
   tools: readonly ToolCall[];
   messageKey: string;
+  /** Whether assistant prose renders after this list. */
+  proseFollows?: boolean;
 }) {
   const [revealedEarlier, setRevealedEarlier] = useState(0);
   useEffect(() => setRevealedEarlier(0), [messageKey]);
+  const units = useMemo(
+    () => buildActivityUnits<ToolCall, null>(tools.map((tool) => ({ kind: 'tool', tool })), { proseFollows }),
+    [proseFollows, tools],
+  );
   const windowed = useMemo(
-    () => selectNewestWindow(tools, PROJECT_CHAT_TOOL_WINDOW_SIZE, revealedEarlier),
-    [revealedEarlier, tools],
+    () => selectNewestActivityUnits(units, PROJECT_CHAT_TOOL_WINDOW_SIZE, revealedEarlier),
+    [revealedEarlier, units],
   );
 
   if (tools.length === 0) return null;
 
   return (
     <div className="mb-1">
-      {windowed.hiddenCount > 0 ? (
+      {windowed.hiddenUnits > 0 ? (
         <div className="flex justify-center px-2 py-1">
           <button
             type="button"
             onClick={() => setRevealedEarlier((current) => current + PROJECT_CHAT_TOOL_WINDOW_SIZE)}
             className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-[10px] text-slate-400 transition-colors hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-slate-200"
           >
-            Show earlier tools · {windowed.hiddenCount} hidden
+            Show earlier tools · {windowed.hiddenTools} hidden
           </button>
         </div>
       ) : null}
-      {windowed.items.map((tool) => <ToolCallPill key={tool.id} tool={tool} />)}
+      {windowed.units.map((unit) => renderProjectActivityUnit(unit, messageKey, () => null))}
     </div>
   );
 });
@@ -1608,16 +1588,19 @@ export function reconcileProjectPresentationSegments(
   return segments;
 }
 
-const ProjectActivityTimeline = React.memo(function ProjectActivityTimeline({
+export const ProjectActivityTimeline = React.memo(function ProjectActivityTimeline({
   messageId,
   projectName,
   segments,
   tools,
+  proseFollows = false,
 }: {
   messageId: string;
   projectName: string;
   segments: NonNullable<ChatMessage['segments']>;
   tools: readonly ToolCall[];
+  /** Whether assistant prose renders after this timeline. */
+  proseFollows?: boolean;
 }) {
   const timeline = useMemo(() => [
     ...segments.map((segment, index) => ({
@@ -1645,31 +1628,43 @@ const ProjectActivityTimeline = React.memo(function ProjectActivityTimeline({
   }), [segments, tools]);
   const [revealedEarlier, setRevealedEarlier] = useState(0);
   useEffect(() => setRevealedEarlier(0), [messageId]);
+  // Segments are boundaries; consecutive ordinary calls between them group.
+  const units = useMemo(() => buildActivityUnits(
+    timeline.map((item): ActivityEntry<ToolCall, Extract<typeof item, { kind: 'segment' }>> => (
+      item.kind === 'segment'
+        ? {
+            kind: 'boundary',
+            key: item.key,
+            value: item,
+            prose: item.segment.kind !== 'thinking' && Boolean(String(item.segment.text || '').trim()),
+          }
+        : { kind: 'tool', tool: item.tool }
+    )),
+    { proseFollows },
+  ), [proseFollows, timeline]);
   const windowed = useMemo(
-    () => selectNewestWindow(timeline, 80, revealedEarlier),
-    [revealedEarlier, timeline],
+    () => selectNewestActivityUnits(units, 80, revealedEarlier),
+    [revealedEarlier, units],
   );
   return (
     <div className="space-y-1">
-      {windowed.hiddenCount > 0 ? (
+      {windowed.hiddenUnits > 0 ? (
         <div className="flex justify-center px-2 py-1">
           <button
             type="button"
             onClick={() => setRevealedEarlier((current) => current + 80)}
             className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 text-[10px] text-slate-400"
           >
-            Show earlier activity · {windowed.hiddenCount} hidden
+            Show earlier activity · {windowed.hiddenTools + windowed.hiddenBoundaries} hidden
           </button>
         </div>
       ) : null}
-      {windowed.items.map((item) => item.kind === 'tool' ? (
-        <ToolCallPill key={`${messageId}-${item.key}`} tool={item.tool} />
-      ) : (
-        <div key={`${messageId}-${item.key}`} className="flex gap-2 items-start px-3 py-1">
+      {windowed.units.map((unit) => renderProjectActivityUnit(unit, messageId, (item, key) => (
+        <div key={`${messageId}-${key}`} className="flex gap-2 items-start px-3 py-1">
           <div className={`w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 text-[8px] font-bold ${item.segment.kind === 'thinking' ? 'bg-violet-500/20 text-violet-300' : 'bg-emerald-500/20 text-emerald-400'}`}>
             {item.segment.kind === 'thinking' ? <Sparkles size={10} /> : 'AI'}
           </div>
-          <div className={`flex-1 min-w-0 max-w-[90%] rounded-2xl rounded-bl-sm border px-3 py-2 ${item.segment.kind === 'thinking' ? 'border-violet-400/15 bg-violet-500/[0.08]' : 'border-white/[0.08] bg-white/[0.06]'}`}>
+          <div className={`flex-1 min-w-0 rounded-2xl rounded-bl-sm border px-3 py-2 ${item.segment.kind === 'thinking' ? 'border-violet-400/15 bg-violet-500/[0.08]' : 'border-white/[0.08] bg-white/[0.06]'}`}>
             {item.segment.kind === 'thinking' ? (
               <div className="mb-1 text-[9px] font-medium uppercase tracking-wide text-violet-200/75">
                 thinking{item.segment.subject ? ` · ${item.segment.subject}` : ''}
@@ -1678,6 +1673,7 @@ const ProjectActivityTimeline = React.memo(function ProjectActivityTimeline({
             {item.segment.text ? (
               <div className="text-[11px] leading-relaxed">
                 <MarkdownRenderer
+                  assistantArtifacts={item.segment.kind !== 'thinking'}
                   content={item.segment.text}
                   isStreaming={false}
                   hostFileContext={{ source: 'project', project: projectName }}
@@ -1686,7 +1682,7 @@ const ProjectActivityTimeline = React.memo(function ProjectActivityTimeline({
             ) : null}
           </div>
         </div>
-      ))}
+      )))}
     </div>
   );
 });
@@ -1817,7 +1813,7 @@ function ModelPickerDropdown({
 }: {
   open: boolean;
   onClose: () => void;
-  anchorRef: React.RefObject<HTMLButtonElement>;
+  anchorRef: React.RefObject<HTMLButtonElement | null>;
   children: React.ReactNode;
 }) {
   return (
@@ -2032,6 +2028,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
   const [sessionKey, setSessionKey] = useState<string | null>(null);
   const [agentId, setAgentId] = useState<string | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<ProjectChatProviderName>('OPENCLAW');
+  useVisibleQuestionConversation('project-chat', selectedProvider === 'OPENCLAW' ? sessionKey : null);
   const [serverSelectedProvider, setServerSelectedProvider] = useState<ProjectChatProviderName | null>(null);
   const [projectIdentityId, setProjectIdentityId] = useState<string | null>(null);
   const [projectChatStateVersion, setProjectChatStateVersion] = useState<number | null>(null);
@@ -3300,6 +3297,11 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     messageWindow.hiddenCount,
     revealEarlierMessages,
   ]);
+
+  const recheckReaderPosition = useCallback(() => {
+    requestAnimationFrame(handleScroll);
+    window.setTimeout(handleScroll, 220);
+  }, [handleScroll]);
 
   const scrollToBottom = useCallback((smooth = true) => {
     const el = scrollRef.current;
@@ -7043,37 +7045,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
     await mutateProjectSessionControl('fastMode', !previous, previous);
   }, [mutateProjectSessionControl]);
 
-  // ── Speech recognition ──
-  const [isListening, setIsListening] = useState(false);
-  const recognitionRef = useRef<any>(null);
-  const SpeechRecognition = typeof window !== 'undefined' ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition : null;
-  const speechSupported = !!SpeechRecognition;
-
-  const toggleMic = useCallback(() => {
-    if (!SpeechRecognition) return;
-    if (isListening) {
-      recognitionRef.current?.stop();
-      setIsListening(false);
-    } else {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.onresult = (event: any) => {
-        const transcript = Array.from(event.results).map((r: any) => r[0].transcript).join('');
-        setInput(transcript);
-      };
-      recognition.onerror = () => setIsListening(false);
-      recognition.onend = () => setIsListening(false);
-      recognition.start();
-      recognitionRef.current = recognition;
-      setIsListening(true);
-    }
-  }, [SpeechRecognition, isListening]);
-
-  // Cleanup recognition on unmount
-  useEffect(() => {
-    return () => { recognitionRef.current?.stop(); };
-  }, []);
+  // Same permission, error, and draft-preservation behavior as main chat.
+  const dictation = useDictation(() => inputRef.current?.value ?? input, setInput);
+  const { isListening } = dictation;
+  const toggleMic = dictation.toggle;
+  const stopDictation = dictation.stop;
+  useEffect(() => { stopDictation(); }, [projectName, sessionKey, selectedProvider, stopDictation]);
 
   // ── Drag & drop ──
   const [dragOver, setDragOver] = useState(false);
@@ -7846,6 +7823,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
 
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 overflow-auto" onScroll={handleScroll}>
+        <ToolActivityScope scope={`project:${projectName}:${selectedProvider}:${sessionKey || ''}`} onDisclosureChange={recheckReaderPosition}>
         {isLoadingHistory && messages.length > 0 && (
           <div className="sticky top-0 z-[5] flex justify-center pt-2 px-3 pointer-events-none">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/[0.06] border border-white/[0.08] text-[10px] text-slate-400 backdrop-blur-sm">
@@ -7991,9 +7969,10 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                         projectName={projectName}
                         segments={orderedSegments}
                         tools={toolCalls}
+                        proseFollows={hasAssistantContent}
                       />
                     ) : (
-                      <BoundedProjectToolCalls tools={toolCalls} messageKey={msg.id} />
+                      <BoundedProjectToolCalls tools={toolCalls} messageKey={msg.id} proseFollows={hasAssistantContent} />
                     )}
 
                     {(hasThinkingPresentation || showMessageBubble) && (
@@ -8043,6 +8022,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
                               ) : (
                                 <div className={`text-[11px] leading-relaxed ${isCurrentlyStreaming ? 'streaming-cursor' : ''}`}>
                                   <MarkdownRenderer
+                                    assistantArtifacts
                                     content={visibleContent}
                                     isStreaming={isCurrentlyStreaming}
                                     hostFileContext={{ source: 'project', project: projectName }}
@@ -8074,6 +8054,7 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
             <div className="h-2" />
           </div>
         )}
+        </ToolActivityScope>
       </div>
 
       {/* Scroll to bottom */}
@@ -8155,7 +8136,12 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="flex items-end gap-1.5">
+          {dictation.message && (
+            <p role={dictation.phase === 'error' ? 'alert' : 'status'} className="mb-2 text-xs text-slate-300">
+              {dictation.message}
+            </p>
+          )}
+          <form onSubmitCapture={dictation.stop} onSubmit={handleSubmit} className="flex items-end gap-1.5">
             {/* Attach button */}
             {!isRunning && providerSendAllowed && providerSupportsAttachments && (
               <button
@@ -8290,15 +8276,16 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
             </div>
 
             {/* Mic button */}
-            {speechSupported && (
+            {(
               <button
                 type="button"
-                aria-label={isListening ? 'Stop dictation' : 'Start dictation'}
+                aria-label={dictation.isActive ? 'Stop dictation' : 'Start dictation'}
+                aria-pressed={dictation.isActive}
                 onClick={toggleMic}
                 className={`flex-shrink-0 p-2 rounded-lg transition-all ${
                   isListening ? 'bg-red-500/20 text-red-400 animate-pulse' : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.06]'
                 }`}
-                title={isListening ? 'Stop recording' : 'Dictate'}
+                title={dictation.isActive ? 'Stop dictation' : 'Dictate'}
               >
                 {isListening ? <MicOff size={13} /> : <Mic size={13} />}
               </button>

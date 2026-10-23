@@ -6,6 +6,7 @@ import { prisma } from '../config/database';
 import fs from 'fs';
 import path from 'path';
 import net from 'net';
+import { desktopSocketIsPrivate, desktopSocketReady } from '../services/remoteDesktopTransport';
 import { createHash } from 'crypto';
 import { exec as cpExec, execFile, spawn } from 'child_process';
 import { getGatewayToken } from '../utils/gatewayToken';
@@ -782,24 +783,24 @@ async function attemptSelfHeal(reason: string, allowRestart = false): Promise<Re
   try {
     const attestRuntime = async () => {
       const [
-        vncPortOpen,
-        novncPortOpen,
+        vncSocketReady,
+        novncSocketReady,
         vncServiceActive,
         websockifyServiceActive,
-        vncLoopbackOnly,
-        novncLoopbackOnly,
+        vncTransportPrivate,
+        novncTransportPrivate,
         processPolicy,
         websockifyPolicy,
         desktopSessionPolicy,
         sessionGuardSupervised,
         healthcheckTimerActive,
       ] = await Promise.all([
-        checkTcpPort(5901),
-        checkTcpPort(6080),
+        desktopSocketReady('vnc'),
+        desktopSocketReady('websockify'),
         checkSystemdUnitActive('bridges-rd-xtigervnc.service'),
         checkSystemdUnitActive('bridges-rd-websockify.service'),
-        checkLoopbackOnlyListeningPort(5901),
-        checkLoopbackOnlyListeningPort(6080),
+        desktopSocketIsPrivate('vnc'),
+        desktopSocketIsPrivate('websockify'),
         inspectVncProcessPolicy(),
         inspectWebsockifyProcessPolicy(),
         inspectDesktopSessionPolicy(),
@@ -817,21 +818,21 @@ async function attemptSelfHeal(reason: string, allowRestart = false): Promise<Re
         && !automaticHealth.suppressed
         && ['healthy', 'recovered'].includes(automaticHealth.status),
       );
-      const ok = vncPortOpen && novncPortOpen && vncServiceActive && websockifyServiceActive
-        && vncLoopbackOnly && novncLoopbackOnly && processPolicy.hardened
+      const ok = vncSocketReady && novncSocketReady && vncServiceActive && websockifyServiceActive
+        && vncTransportPrivate && novncTransportPrivate && processPolicy.hardened
         && websockifyPolicy.hardened && desktopSessionPolicy.healthy && sessionGuardSupervised
         && healthcheckTimerActive && healthcheckScriptCurrent && automaticHealthReady;
       return {
         ok,
         failures: [
-          !vncPortOpen ? 'VNC port 5901 is unavailable' : null,
-          !novncPortOpen ? 'websockify port 6080 is unavailable' : null,
+          !vncSocketReady ? 'VNC private socket is unavailable' : null,
+          !novncSocketReady ? 'websockify private socket is unavailable' : null,
           !vncServiceActive ? 'VNC service is inactive' : null,
           !websockifyServiceActive ? 'websockify service is inactive' : null,
-          !vncLoopbackOnly ? 'VNC listener is not loopback-only' : null,
-          !novncLoopbackOnly ? 'websockify listener is not loopback-only' : null,
+          !vncTransportPrivate ? 'VNC socket permissions are unsafe' : null,
+          !novncTransportPrivate ? 'websockify socket permissions are unsafe' : null,
           !processPolicy.hardened ? 'live VNC process lacks Xauthority/access-control hardening' : null,
-          !websockifyPolicy.hardened ? 'live websockify process does not match the loopback bridge policy' : null,
+          !websockifyPolicy.hardened ? 'live websockify process does not match the private socket bridge policy' : null,
           !desktopSessionPolicy.healthy ? desktopSessionPolicy.note || 'desktop session policy is unhealthy' : null,
           !sessionGuardSupervised ? 'desktop session guard is not supervised by the VNC service' : null,
           !healthcheckTimerActive ? 'automatic Remote Desktop recovery timer is inactive' : null,
@@ -1048,6 +1049,9 @@ async function inspectVncProcessPolicy(): Promise<{ command: string; hardened: b
   const command = result.ok ? result.stdout : '';
   const hardened = Boolean(command)
     && /(?:^|\s)-localhost=1(?:\s|$)/.test(command)
+    && /(?:^|\s)-rfbport\s+-1(?:\s|$)/.test(command)
+    && /(?:^|\s)-rfbunixpath\s+\/run\/bridges-rd\/transport\/vnc\.sock(?:\s|$)/.test(command)
+    && /(?:^|\s)-rfbunixmode\s+0600(?:\s|$)/.test(command)
     && /(?:^|\s)-auth\s+\/home\/bridgesrd\/\.Xauthority(?:\s|$)/.test(command)
     && !/(?:^|\s)-ac(?:\s|$)/.test(command);
   return { command: command.slice(0, 1000), hardened };
@@ -1055,13 +1059,13 @@ async function inspectVncProcessPolicy(): Promise<{ command: string; hardened: b
 
 async function inspectWebsockifyProcessPolicy(): Promise<{ command: string; hardened: boolean }> {
   const result = await runShell(
-    "ps -eww -o user:64=,args= | awk '$1 == \"bridgesrd\" && $0 ~ /[w]ebsockify 127.0.0.1:6080 127.0.0.1:5901/ { $1=\"\"; sub(/^ +/, \"\"); print; exit }'",
+    "ps -eww -o user:64=,args= | awk '$1 == \"bridgesrd\" && $0 ~ /[w]ebsockify --unix-listen=\\/run\\/bridges-rd\\/transport\\/websockify.sock --unix-listen-mode=0600 --unix-target=\\/run\\/bridges-rd\\/transport\\/vnc.sock/ { $1=\"\"; sub(/^ +/, \"\"); print; exit }'",
     2500,
   );
   const command = result.ok ? result.stdout : '';
   return {
     command: command.slice(0, 1000),
-    hardened: /(?:^|\s)127\.0\.0\.1:6080\s+127\.0\.0\.1:5901(?:\s|$)/.test(command),
+    hardened: /(?:^|\s)--unix-listen=\/run\/bridges-rd\/transport\/websockify\.sock\s+--unix-listen-mode=0600\s+--unix-target=\/run\/bridges-rd\/transport\/vnc\.sock(?:\s|$)/.test(command),
   };
 }
 
@@ -1081,15 +1085,15 @@ router.get('/status', async (_req: Request, res: Response) => {
     );
 
     const [
-      novncPortOpen,
-      vncPortOpen,
+      novncSocketReady,
+      vncSocketReady,
       sharedChromeDebugPortOpen,
       audioProxyPortOpen,
       vncServiceActive,
       websockifyServiceActive,
       sharedChromeDebugLoopbackOnly,
-      vncLoopbackOnly,
-      novncLoopbackOnly,
+      vncTransportPrivate,
+      novncTransportPrivate,
       audioLoopbackOnly,
       vncProcessPolicy,
       websockifyProcessPolicy,
@@ -1098,15 +1102,15 @@ router.get('/status', async (_req: Request, res: Response) => {
       healthcheckTimerActive,
       clipboardTool,
     ] = await Promise.all([
-      checkTcpPort(6080),
-      checkTcpPort(5901),
+      desktopSocketReady('websockify'),
+      desktopSocketReady('vnc'),
       checkTcpPort(18801),
       checkTcpPort(RD_AUDIO_PORT),
       checkSystemdUnitActive('bridges-rd-xtigervnc.service'),
       checkSystemdUnitActive('bridges-rd-websockify.service'),
       checkLoopbackOnlyListeningPort(18801),
-      checkLoopbackOnlyListeningPort(5901),
-      checkLoopbackOnlyListeningPort(6080),
+      desktopSocketIsPrivate('vnc'),
+      desktopSocketIsPrivate('websockify'),
       checkLoopbackOnlyListeningPort(RD_AUDIO_PORT),
       inspectVncProcessPolicy(),
       inspectWebsockifyProcessPolicy(),
@@ -1118,7 +1122,7 @@ router.get('/status', async (_req: Request, res: Response) => {
     const clipboardToolPresent = Boolean(clipboardTool);
 
     // websockify no longer serves static files (March 2026) — Express serves them directly.
-    // HTTP check removed; only TCP port checks matter now.
+    // HTTP check removed; the private sockets must be permission-checked and connectable.
 
     const systemdServiceHints = {
       vnc: '/etc/systemd/system/bridges-rd-xtigervnc.service',
@@ -1216,13 +1220,13 @@ router.get('/status', async (_req: Request, res: Response) => {
         hasConfiguredUrl,
         configuredPathAllowed,
         externalUrlSafe,
-        novncPortOpen,
-        vncPortOpen,
+        novncSocketReady,
+        vncSocketReady,
         vncServiceActive,
         websockifyServiceActive,
         healthcheckTimerActive,
-        vncLoopbackOnly,
-        novncLoopbackOnly,
+        vncTransportPrivate,
+        novncTransportPrivate,
         audioLoopbackOnly,
         vncProcessHardened: vncProcessPolicy.hardened,
         websockifyProcessHardened: websockifyProcessPolicy.hardened,
@@ -1276,7 +1280,7 @@ router.get('/status', async (_req: Request, res: Response) => {
       },
       remediation: [
         'Check systemd units: bridges-rd-xtigervnc.service, bridges-rd-websockify.service, and bridges-rd-healthcheck.timer.',
-        `Verify host ports: 5901 (VNC), 6080 (websockify), ${RD_AUDIO_PORT} (audio bridge), and 18801 (optional shared Chrome debug).`,
+        `Verify private sockets in /run/bridges-rd/transport; host ports ${RD_AUDIO_PORT} (audio) and 18801 (optional Chrome debug).`,
         'Verify portal noVNC assets exist: static/novnc/vnc_portal.html and static/novnc/core/rfb.js.',
         'Verify desktop clipboard bridge tools are installed: xclip or xsel.',
         'Re-run Remote Desktop setup if Shared Browser/OpenClaw Web UI launchers or noVNC assets are missing.',
@@ -1288,14 +1292,14 @@ router.get('/status', async (_req: Request, res: Response) => {
     let message = 'Remote Desktop is not available.';
 
     const desktopUnhealthyReason = [
-      !vncPortOpen ? 'VNC 5901 down' : null,
-      !novncPortOpen ? 'noVNC 6080 down' : null,
+      !vncSocketReady ? 'VNC private socket unavailable' : null,
+      !novncSocketReady ? 'noVNC private socket unavailable' : null,
       !vncServiceActive ? 'VNC service inactive' : null,
       !websockifyServiceActive ? 'websockify service inactive' : null,
-      !vncLoopbackOnly ? 'VNC is not attested loopback-only' : null,
-      !novncLoopbackOnly ? 'websockify is not attested loopback-only' : null,
+      !vncTransportPrivate ? 'VNC socket privacy is not attested' : null,
+      !novncTransportPrivate ? 'websockify socket privacy is not attested' : null,
       !vncProcessPolicy.hardened ? 'live VNC process lacks Xauthority/access-control hardening' : null,
-      !websockifyProcessPolicy.hardened ? 'live websockify process does not match the loopback bridge policy' : null,
+      !websockifyProcessPolicy.hardened ? 'live websockify process does not match the private socket bridge policy' : null,
       !desktopSessionPolicy.healthy ? desktopSessionPolicy.note || 'desktop session is not semantically healthy' : null,
       !sessionGuardSupervised ? 'desktop session guard is not supervised by the VNC service' : null,
       !healthcheckTimerActive ? 'automatic recovery timer is inactive' : null,
@@ -1344,8 +1348,8 @@ router.get('/status', async (_req: Request, res: Response) => {
       message = 'An external Remote Desktop URL is configured. The Portal can load it, but cannot attest its VNC session, authentication, or availability.';
     } else if (hasConfiguredUrl && !configuredPathAllowed) {
       message = `Remote Desktop is unavailable because ${configuredPath || 'the configured path'} is outside the approved Remote Desktop path prefixes.`;
-    } else if (hasConfiguredUrl && novncPortOpen && vncPortOpen && vncServiceActive && websockifyServiceActive
-      && vncLoopbackOnly && novncLoopbackOnly && vncProcessPolicy.hardened
+    } else if (hasConfiguredUrl && novncSocketReady && vncSocketReady && vncServiceActive && websockifyServiceActive
+      && vncTransportPrivate && novncTransportPrivate && vncProcessPolicy.hardened
       && websockifyProcessPolicy.hardened
       && desktopSessionPolicy.healthy && sessionGuardSupervised
       && novncPortalHtmlPresent && novncCoreBundlePresent && vncLauncherCurrent
@@ -1367,10 +1371,10 @@ router.get('/status', async (_req: Request, res: Response) => {
         status = 'ready';
         message = 'Remote Desktop is ready, including Shared Browser, audio, and clipboard.';
       }
-    } else if (hasConfiguredUrl && novncPortOpen && vncPortOpen
+    } else if (hasConfiguredUrl && novncSocketReady && vncSocketReady
       && (!desktopSessionPolicy.healthy || !sessionGuardSupervised)) {
       message = `Remote Desktop transport is connected, but the graphical session is unusable: ${desktopUnhealthyReason || 'semantic desktop health failed'}. Use POST /api/remote-desktop/recover to repair it.`;
-    } else if (hasConfiguredUrl && (novncPortOpen || vncPortOpen)) {
+    } else if (hasConfiguredUrl && (novncSocketReady || vncSocketReady)) {
       status = 'degraded';
       message = `Remote Desktop is partially available: ${desktopUnhealthyReason || 'desktop setup incomplete'}. Use POST /api/remote-desktop/recover to attempt recovery.`;
     } else if (hasConfiguredUrl) {
@@ -1842,13 +1846,31 @@ export async function runRemoteDesktopAutoSetup(): Promise<{
       steps.push({ step: 'Configure desktop theme', ok: false, message: `Non-fatal: ${err?.message?.slice(0, 200)}` });
     }
 
-    // Step 3: VNC auth — Xtigervnc runs with -SecurityTypes None on localhost only.
+    // Step 3: VNC auth — private Unix sockets restrict transport to the desktop UID and Portal.
     // Portal authentication (httpOnly cookie) gates all noVNC access, so no VNC-level password is needed.
-    steps.push({ step: 'VNC auth mode', ok: true, message: 'Portal-authenticated noVNC (Xtigervnc localhost-only, no VNC password needed)' });
+    steps.push({ step: 'VNC auth mode', ok: true, message: 'Portal-authenticated noVNC (private Unix sockets, no VNC TCP listener)' });
 
     // Step 4: Write launcher scripts, branded icons, and desktop entries.
+    const webRuntime = '/usr/local/lib/bridges-rd-websockify';
+    if (fs.existsSync(webRuntime) && fs.lstatSync(webRuntime).isSymbolicLink()) {
+      throw new Error('Remote Desktop WebSocket runtime directory is unsafe');
+    }
+    fs.mkdirSync(webRuntime, { recursive: true, mode: 0o755 });
+    const webRuntimeStat = fs.lstatSync(webRuntime);
+    if (!webRuntimeStat.isDirectory() || webRuntimeStat.uid !== 0 || (webRuntimeStat.mode & 0o022) !== 0) {
+      throw new Error('Remote Desktop WebSocket runtime directory is unsafe');
+    }
+    for (const member of ['websockify', 'websockify-0.13.0-py3-none-any.whl', 'COPYING', 'NOTICE.md']) {
+      const target = path.join(webRuntime, member);
+      const targetStat = fs.lstatSync(target, { throwIfNoEntry: false });
+      if ((targetStat && (!targetStat.isFile() || targetStat.isSymbolicLink() || targetStat.nlink !== 1
+          || targetStat.uid !== 0 || (targetStat.mode & 0o022) !== 0))
+        || !copyBundledStaticFile(`installer/desktop-websockify/${member}`, target, 0o644)) {
+        throw new Error('Signed Remote Desktop WebSocket runtime is missing or unsafe');
+      }
+    }
     const webLauncher = '/usr/local/bin/bridges-rd-websockify-launcher.sh';
-    const webScript = '#!/usr/bin/env bash\nset -euo pipefail\n# WebSocket-only mode — static files served by Express\n# Bind loopback only so raw websockify never bypasses portal auth.\nexec websockify 127.0.0.1:6080 127.0.0.1:5901\n';
+    const webScript = '#!/usr/bin/env bash\nset -euo pipefail\n# WebSocket-only mode — static files served by Express\n# Private Unix sockets prevent unrelated local accounts bypassing Portal auth.\nexec /usr/bin/python3 -I /usr/local/lib/bridges-rd-websockify/websockify --unix-listen=/run/bridges-rd/transport/websockify.sock --unix-listen-mode=0600 --unix-target=/run/bridges-rd/transport/vnc.sock\n';
     fs.writeFileSync(webLauncher, webScript, { mode: 0o755 });
 
     const sharedChromeLauncher = '/usr/local/bin/bridges-rd-shared-chrome.sh';
@@ -1902,7 +1924,7 @@ StartupNotify=true
     }
 
     // Step 5: Write systemd units (Xtigervnc + websockify)
-    // This is the PRODUCTION launcher — runs Xtigervnc as root, XFCE as bridgesrd user,
+    // This is the canonical launcher — runs VNC and XFCE as the bridgesrd user,
     // uses xdpyinfo to wait for display, disables screensaver, proper logging.
     // Window-fit watcher: clamps windows back into the visible desktop after
     // the client resizes the VNC screen (viewing from a different device left
@@ -1963,6 +1985,7 @@ Requires=bridges-rd-xtigervnc.service
 Type=simple
 User=bridgesrd
 Group=bridgesrd
+WorkingDirectory=/run/bridges-rd/transport
 ExecStart=${webLauncher}
 Restart=always
 RestartSec=2
@@ -2122,13 +2145,13 @@ done`, 30000);
 
     // Step 11: Verify core ports and Shared Chrome contract
     await new Promise((r) => setTimeout(r, 3000));
-    const vncOk = await checkTcpPort(5901);
-    const novncOk = await checkTcpPort(6080);
+    const vncOk = await desktopSocketReady('vnc');
+    const novncOk = await desktopSocketReady('websockify');
     const audioOk = await checkTcpPort(RD_AUDIO_PORT);
     const sharedChromeDebugOpen = await checkTcpPort(18801);
-    const [vncLoopbackOnly, novncLoopbackOnly, audioLoopbackOnly, sharedChromeDebugLoopbackOnly, processPolicy, websockifyPolicy, desktopSessionPolicy, sessionGuardSupervised, healthcheckTimerActive, clipboardTool] = await Promise.all([
-      checkLoopbackOnlyListeningPort(5901),
-      checkLoopbackOnlyListeningPort(6080),
+    const [vncTransportPrivate, novncTransportPrivate, audioLoopbackOnly, sharedChromeDebugLoopbackOnly, processPolicy, websockifyPolicy, desktopSessionPolicy, sessionGuardSupervised, healthcheckTimerActive, clipboardTool] = await Promise.all([
+      desktopSocketIsPrivate('vnc'),
+      desktopSocketIsPrivate('websockify'),
       checkLoopbackOnlyListeningPort(RD_AUDIO_PORT),
       checkLoopbackOnlyListeningPort(18801),
       inspectVncProcessPolicy(),
@@ -2138,15 +2161,15 @@ done`, 30000);
       checkSystemdUnitActive(REMOTE_DESKTOP_HEALTHCHECK_TIMER),
       resolveDesktopClipboardTool(),
     ]);
-    steps.push({ step: 'Verify VNC port 5901', ok: vncOk, message: vncOk ? 'Listening' : 'Not listening — check bridges-rd-xtigervnc.service logs' });
-    steps.push({ step: 'Verify noVNC port 6080', ok: novncOk, message: novncOk ? 'Listening' : 'Not listening — check bridges-rd-websockify.service logs' });
-    steps.push({ step: 'Verify VNC listener boundary', ok: vncLoopbackOnly, message: vncLoopbackOnly ? 'Loopback-only' : 'Missing or exposed beyond loopback' });
-    steps.push({ step: 'Verify noVNC listener boundary', ok: novncLoopbackOnly, message: novncLoopbackOnly ? 'Loopback-only' : 'Missing or exposed beyond loopback' });
+    steps.push({ step: 'Verify VNC private socket', ok: vncOk, message: vncOk ? 'Listening' : 'Not listening — check bridges-rd-xtigervnc.service logs' });
+    steps.push({ step: 'Verify noVNC private socket', ok: novncOk, message: novncOk ? 'Listening' : 'Not listening — check bridges-rd-websockify.service logs' });
+    steps.push({ step: 'Verify VNC listener boundary', ok: vncTransportPrivate, message: vncTransportPrivate ? 'Private Unix socket' : 'Missing or unsafe socket permissions' });
+    steps.push({ step: 'Verify noVNC listener boundary', ok: novncTransportPrivate, message: novncTransportPrivate ? 'Private Unix socket' : 'Missing or unsafe socket permissions' });
     steps.push({ step: 'Verify audio bridge', ok: audioOk && audioLoopbackOnly, message: !audioOk ? `Port ${RD_AUDIO_PORT} is not listening` : audioLoopbackOnly ? 'Listening on loopback only' : 'Exposed beyond loopback' });
     steps.push({ step: 'Verify clipboard bridge', ok: Boolean(clipboardTool), message: clipboardTool ? `${clipboardTool.name} is available` : 'xclip/xsel is unavailable' });
     steps.push({ step: 'Verify Shared Chrome debug boundary', ok: !sharedChromeDebugOpen || sharedChromeDebugLoopbackOnly, message: !sharedChromeDebugOpen ? 'Browser is idle; no debug listener expected' : sharedChromeDebugLoopbackOnly ? 'Loopback-only' : 'Exposed beyond loopback' });
     steps.push({ step: 'Verify live VNC X11 policy', ok: processPolicy.hardened, message: processPolicy.hardened ? 'Xauthority enforced; -ac absent' : 'Live process does not match the hardened policy' });
-    steps.push({ step: 'Verify live websockify policy', ok: websockifyPolicy.hardened, message: websockifyPolicy.hardened ? 'Exact loopback VNC bridge' : 'Live process does not match the loopback bridge policy' });
+    steps.push({ step: 'Verify live websockify policy', ok: websockifyPolicy.hardened, message: websockifyPolicy.hardened ? 'Private permission-checked VNC bridge' : 'Live process does not match the private socket bridge policy' });
     steps.push({ step: 'Verify graphical desktop session', ok: desktopSessionPolicy.healthy, message: desktopSessionPolicy.healthy ? 'XFCE session is usable and lock-free' : desktopSessionPolicy.note });
     steps.push({ step: 'Verify session-guard supervision', ok: sessionGuardSupervised, message: sessionGuardSupervised ? 'Guard is running inside the managed VNC service' : 'Guard is not supervised by the managed VNC service' });
     steps.push({ step: 'Verify automatic recovery timer', ok: healthcheckTimerActive, message: healthcheckTimerActive ? 'Active' : 'Inactive' });

@@ -1,13 +1,13 @@
 {
   "schema": 1,
-  "version": "5.0.10",
-  "releasedAt": "2026-09-20",
-  "releaseClass": "hotfix",
+  "version": "5.1.0",
+  "releasedAt": "2026-10-23",
+  "releaseClass": "feature",
   "highlights": [
-    "Agent Chat no longer stalls, or reports OpenClaw as unavailable, while the gateway is only busy: runtime verification moved off the chat request path.",
-    "Replies from Claude CLI models appear once instead of two or three times.",
-    "An open Chat tab stops sweeping every agent's sessions and pauses its background checks while hidden.",
-    "Project downloads start sooner and no longer freeze the Portal while the archive is prepared.",
-    "Smoother streaming under load: status checks no longer block the Portal while they run."
+    "Current compatible AI tools, retained-state upgrades, and account-ready model suggestions after sign-in.",
+    "Richer Chat with grouped tool activity, visual image input, agent work controls, and sandboxed interactive widgets.",
+    "Owner-controlled App credentials, reviewed backup cleanup, and shared-browser handover.",
+    "Modernized editor, terminal, charts, document rendering, and application dependencies.",
+    "More reliable streaming and Project downloads, with stronger credential handling and runtime verification."
   ]
 }

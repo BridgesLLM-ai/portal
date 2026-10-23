@@ -42,19 +42,7 @@ export interface BackupStatus {
   phaseTotal?: number;
   output?: string;
   consecutiveFailures?: number;
-}
-
-export interface BackupSchedule {
-  type: Exclude<BackupType, 'weekly'>;
-  source: 'systemd';
-  timerUnit: string;
-  serviceUnit: string;
-  loaded: boolean;
-  enabled: boolean;
-  active: boolean;
-  onCalendar: string | null;
-  nextRun: string | null;
-  lastRun: string | null;
+  cleanupSummary?: string;
 }
 
 const execFileAsync = promisify(execFile);
@@ -105,16 +93,6 @@ export class BackupRequestPublicError extends Error {
     if (cause !== undefined) (this as Error & { cause?: unknown }).cause = cause;
   }
 }
-
-const TIMER_UNITS: Array<{
-  type: Exclude<BackupType, 'weekly'>;
-  timerUnit: string;
-  serviceUnit: string;
-}> = [
-  { type: 'daily', timerUnit: 'bridgesllm-backup-daily.timer', serviceUnit: 'bridgesllm-backup@daily.service' },
-  { type: 'comprehensive', timerUnit: 'bridgesllm-backup-comprehensive.timer', serviceUnit: 'bridgesllm-backup@comprehensive.service' },
-  { type: 'monthly', timerUnit: 'bridgesllm-backup-monthly.timer', serviceUnit: 'bridgesllm-backup@monthly.service' },
-];
 
 const BROAD_FORBIDDEN_ROOTS = new Set([
   '/', '/bin', '/boot', '/dev', '/etc', '/home', '/lib', '/lib64', '/media',
@@ -1107,14 +1085,14 @@ export function listBackupFiles(root: string, options: { readOnly?: boolean } = 
             || stat.nlink !== 1n || (stat.mode & 0o022n) !== 0n) continue;
           const realPath = fs.realpathSync(fullPath);
           if (!isWithin(realPath, realDirectory)) continue;
-          const lockPath = `${fullPath}.locked`;
-          let locked = false;
+          // Anything at the lock path keeps the backup. A marker of an
+          // unexpected type, owner or mode must never read as unlocked.
+          let locked = true;
           try {
-            const lockStat = fs.lstatSync(lockPath);
-            locked = lockStat.isFile() && !lockStat.isSymbolicLink()
-              && lockStat.uid === expectedOwnerUid() && lockStat.gid === expectedOwnerGid()
-              && lockStat.nlink === 1 && (lockStat.mode & 0o077) === 0;
-          } catch {}
+            fs.lstatSync(`${fullPath}.locked`);
+          } catch (error: any) {
+            if (error?.code === 'ENOENT') locked = false;
+          }
           files.push({
             filename,
             fullPath,
@@ -1237,6 +1215,7 @@ export function parseBackupStatus(raw: string): BackupStatus | null {
       || !/^BACKUP_[A-Z0-9_]{1,56}$/.test(parsed.failureCode)
     )) return null;
     if (parsed.failureDetail !== undefined && !boundedText(parsed.failureDetail, 1000)) return null;
+    if (parsed.cleanupSummary !== undefined && !boundedText(parsed.cleanupSummary, 1000)) return null;
     if (parsed.consecutiveFailures !== undefined && (
       !Number.isSafeInteger(parsed.consecutiveFailures)
       || (parsed.consecutiveFailures as number) < 0
@@ -1821,42 +1800,6 @@ export function parseSystemctlProperties(raw: string): Record<string, string> {
 export function parseOnCalendar(value: string): string | null {
   const match = value.match(/OnCalendar=([^;}]*)/);
   return match?.[1]?.trim() || null;
-}
-
-function systemdTimestamp(value: string | undefined): string | null {
-  const normalized = String(value || '').trim();
-  return normalized && normalized !== 'n/a' ? normalized : null;
-}
-
-export async function readBackupSchedules(): Promise<BackupSchedule[]> {
-  return Promise.all(TIMER_UNITS.map(async ({ type, timerUnit, serviceUnit }) => {
-    let properties: Record<string, string> = {};
-    try {
-      const result = await execFileAsync('systemctl', [
-        'show', timerUnit, '--no-pager',
-        '--property=LoadState',
-        '--property=ActiveState',
-        '--property=UnitFileState',
-        '--property=NextElapseUSecRealtime',
-        '--property=LastTriggerUSec',
-        '--property=TimersCalendar',
-      ], { timeout: 5_000, maxBuffer: 128 * 1024, encoding: 'utf8' });
-      properties = parseSystemctlProperties(result.stdout);
-    } catch {}
-
-    return {
-      type,
-      source: 'systemd' as const,
-      timerUnit,
-      serviceUnit,
-      loaded: properties.LoadState === 'loaded',
-      enabled: ['enabled', 'enabled-runtime', 'static'].includes(properties.UnitFileState),
-      active: properties.ActiveState === 'active',
-      onCalendar: parseOnCalendar(properties.TimersCalendar || ''),
-      nextRun: systemdTimestamp(properties.NextElapseUSecRealtime),
-      lastRun: systemdTimestamp(properties.LastTriggerUSec),
-    };
-  }));
 }
 
 export async function readLegacyBackupCron(): Promise<{ active: string[]; disabled: string[] }> {

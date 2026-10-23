@@ -10,23 +10,26 @@ export const AGENT_ZERO_PROJECT_IMAGE_SOURCE_COMMIT_LABEL = 'com.bridgesllm.agen
 export const AGENT_ZERO_PROJECT_IMAGE_UPSTREAM_DIGEST_LABEL = 'com.bridgesllm.agent-zero-project.upstream-digest';
 export const AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER_LABEL = 'com.bridgesllm.agent-zero-project.runtime-user';
 export const AGENT_ZERO_PROJECT_IMAGE_RUNTIME_USER = '1000:1000';
-export const AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION = 'agent-zero-v2.11' as const;
+export const AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION = 'agent-zero-v2.14' as const;
 export const AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION = 'agent-zero-v2.10' as const;
 export const AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION = 'agent-zero-v2.5' as const;
 
+export const AGENT_ZERO_PROJECT_LEGACY_V211_IMAGE_GENERATION = 'agent-zero-v2.11' as const;
+
 export type AgentZeroProjectImageGeneration =
+  | typeof AGENT_ZERO_PROJECT_LEGACY_V211_IMAGE_GENERATION
   | typeof AGENT_ZERO_PROJECT_CURRENT_IMAGE_GENERATION
   | typeof AGENT_ZERO_PROJECT_LEGACY_V25_IMAGE_GENERATION
   | typeof AGENT_ZERO_PROJECT_LEGACY_V210_IMAGE_GENERATION;
 
 /**
- * Both immutable v2.11 architecture images were inspected at their registry
- * manifests. Their /git/agent-zero checkout points at the peeled v2.11 commit.
+ * Both immutable v2.14 architecture images were inspected at their registry
+ * manifests. Their /git/agent-zero checkout points at the peeled v2.14 commit.
  * The derived image build re-verifies this value before copying any source.
  */
 export const AGENT_ZERO_PROJECT_SOURCE_COMMITS: Readonly<Record<AgentZeroArchitecture, string>> = Object.freeze({
-  amd64: '6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1',
-  arm64: '6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1',
+  amd64: 'ff2a5b9c9c4e490ba38dd7c313e779510bb2071a',
+  arm64: 'ff2a5b9c9c4e490ba38dd7c313e779510bb2071a',
 });
 
 export const AGENT_ZERO_PROJECT_UPSTREAM_IMAGE_DIGESTS = AGENT_ZERO_IMAGE_DIGESTS;
@@ -34,7 +37,7 @@ export const AGENT_ZERO_PROJECT_UPSTREAM_IMAGE_DIGESTS = AGENT_ZERO_IMAGE_DIGEST
 /**
  * The immediately preceding Portal-supported Project image generation. These
  * pins are migration authority only: v2.5 may be recognized and retired while
- * converging a project to v2.11, but it is never selectable or qualified for a
+ * converging a project to v2.14, but it is never selectable or qualified for a
  * new turn.
  */
 export const AGENT_ZERO_PROJECT_LEGACY_V25_SOURCE_COMMITS: Readonly<Record<AgentZeroArchitecture, string>> = Object.freeze({
@@ -46,6 +49,22 @@ export const AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS: Readonly<Reco
   amd64: 'sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb',
   arm64: 'sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c',
 });
+
+// Exact previously qualified 2.11 generation; maintenance/migration only.
+export const AGENT_ZERO_PROJECT_LEGACY_V211_SOURCE_COMMITS = Object.freeze({
+  amd64: '6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1', arm64: '6a6cecff8527b164668c7a6ab2f76b6b1ed7cfa1',
+});
+export const AGENT_ZERO_PROJECT_LEGACY_V211_UPSTREAM_IMAGE_DIGESTS = Object.freeze({
+  amd64: 'sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30', arm64: 'sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3',
+});
+export function getAgentZeroProjectLegacyV211SourceCommit(architecture: string): string | null {
+  const normalized = normalizeAgentZeroArchitecture(architecture);
+  return normalized ? AGENT_ZERO_PROJECT_LEGACY_V211_SOURCE_COMMITS[normalized] : null;
+}
+export function getAgentZeroProjectLegacyV211UpstreamImageRef(architecture: string): string | null {
+  const normalized = normalizeAgentZeroArchitecture(architecture);
+  return normalized ? `agent0ai/agent-zero@${AGENT_ZERO_PROJECT_LEGACY_V211_UPSTREAM_IMAGE_DIGESTS[normalized]}` : null;
+}
 
 // Exact 5.0 predecessor, accepted only for migration/retirement.
 export const AGENT_ZERO_PROJECT_LEGACY_V210_SOURCE_COMMITS = Object.freeze({
@@ -93,6 +112,7 @@ export function normalizeAgentZeroProjectSandboxImageId(value: unknown): string 
   // even though both happen to share Docker's sha256:<hex> syntax.
   if ([
     ...Object.values(AGENT_ZERO_PROJECT_UPSTREAM_IMAGE_DIGESTS),
+    ...Object.values(AGENT_ZERO_PROJECT_LEGACY_V211_UPSTREAM_IMAGE_DIGESTS),
     ...Object.values(AGENT_ZERO_PROJECT_LEGACY_V25_UPSTREAM_IMAGE_DIGESTS),
     ...Object.values(AGENT_ZERO_PROJECT_LEGACY_V210_UPSTREAM_IMAGE_DIGESTS),
   ]

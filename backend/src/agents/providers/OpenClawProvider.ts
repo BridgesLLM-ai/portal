@@ -1,3 +1,5 @@
+import type { NativeChatImage } from '../../services/chatImages/directChatImages';
+import { expandNativeNestedToolHistory, projectWidgetToolResult } from '../../services/chatWidgetProjection';
 import {
   AgentProvider,
   AgentProviderName,
@@ -107,7 +109,7 @@ function projectGatewayHistoryMessage(entry: any, index: number): AgentMessage |
         : null;
   if (!role) return null;
 
-  const content = extractText(entry.content ?? entry.text ?? '');
+  const content = projectWidgetToolResult(entry.toolName, entry.toolCallId, entry) ?? extractText(entry.content ?? entry.text ?? '');
   const contentToolCalls = Array.isArray(entry.content)
     ? entry.content.flatMap((block: any) => {
         if (!block || typeof block !== 'object') return [];
@@ -158,6 +160,10 @@ function sendMessageViaPersistentWs(
   onStatus?: (statusEvent: { type: string; content: string; [key: string]: any }) => void,
   onExecApproval?: OnExecApprovalCallback,
   inactivityTimeoutMs = OPENCLAW_STREAM_INACTIVITY_TIMEOUT_MS,
+  attachments: NativeChatImage[] = [],
+  portalInlineWidgets = false,
+  chatImageModel?: string,
+  revalidateChatImages?: () => Promise<void>,
 ): Promise<AgentSendResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -297,6 +303,10 @@ function sendMessageViaPersistentWs(
       idempotencyKey,
       routeReservationRunId,
       onProviderDispatchAccepted,
+      attachments,
+      portalInlineWidgets,
+      chatImageModel,
+      revalidateChatImages,
     )
       .then(async ({ runId }) => {
         debugLog(`chat.send accepted: sessionKey=${sessionId} runId=${runId}`);
@@ -384,6 +394,7 @@ function normalizeSessionTimestamp(value: unknown): string {
 
 export class OpenClawProvider implements AgentProvider {
   readonly displayName = 'OpenClaw';
+  readonly supportsNativeChatImages = true;
   readonly providerName: AgentProviderName = 'OPENCLAW';
 
   async startSession(userId: string, config: AgentSessionConfig): Promise<AgentSessionId> {
@@ -474,6 +485,10 @@ export class OpenClawProvider implements AgentProvider {
       onStatus,
       onExecApproval,
       OPENCLAW_STREAM_INACTIVITY_TIMEOUT_MS,
+      sender?.chatImages || [],
+      sender?.portalInlineWidgets === true,
+      sender?.chatImageModel,
+      sender?.revalidateChatImages,
     );
   }
 
@@ -482,7 +497,7 @@ export class OpenClawProvider implements AgentProvider {
     if (!history.ok || !history.data) {
       throw new Error(history.error || 'OpenClaw chat.history failed');
     }
-    return history.data.messages
+    return expandNativeNestedToolHistory(history.data.messages)
       .map(projectGatewayHistoryMessage)
       .filter((message): message is AgentMessage => Boolean(message));
   }

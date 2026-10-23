@@ -3,17 +3,17 @@ set -Eeuo pipefail
 
 # Portal-tested OpenCode runtime. Portal installs immutable upstream release
 # archives directly; it never runs the mutable npm/npx installer path.
-readonly OPENCODE_TESTED_VERSION="1.18.29"
+readonly OPENCODE_TESTED_VERSION="1.19.4"
 # The x64 baseline build is intentional: it trades newer CPU instructions for
 # a wider host compatibility floor. Its archive is distinct from the ordinary
 # opencode-linux-x64.tar.gz asset even though both contain one `opencode`
 # binary and have nearly identical sizes.
 readonly OPENCODE_ASSET_X86_64="opencode-linux-x64-baseline.tar.gz"
 readonly OPENCODE_ASSET_AARCH64="opencode-linux-arm64.tar.gz"
-readonly OPENCODE_SHA256_X86_64="03a3f2f063e23477e3e4c3a738eb389f56c5a6ecf54d6a5a6d91caab557f042d"
-readonly OPENCODE_SHA256_AARCH64="70baf769395ca4e7a68924026530c390eace194f3b7e4919d4efcb2aa2eed3c0"
-readonly OPENCODE_BINARY_SHA256_X86_64="ca6c0e1f42be3120595bf6848937e7586ec862c87fa7aa111e89c7cc6e9a4650"
-readonly OPENCODE_BINARY_SHA256_AARCH64="e94d9ebec16ce2611eae94026afe8ec87f2e2dcc66db40bc4f889955b026eb75"
+readonly OPENCODE_SHA256_X86_64="1697ef40558d378bd2f72efa8fafe1bed1f0e664f09247b9357556b95dbc7cbc"
+readonly OPENCODE_SHA256_AARCH64="8568230ccd847dc93e95b9f6894379077d3e014a16b48040743573e77c23e85f"
+readonly OPENCODE_BINARY_SHA256_X86_64="538fcb1b6408c8d4608822acee19f7ff5b3a3eb3383c0633c4f06170857312a7"
+readonly OPENCODE_BINARY_SHA256_AARCH64="eba0da50d9cc22f2dd062c32e0e7e58d7ece301aa50aabdad1e9dba4ffbf25b4"
 readonly OPENCODE_URL_X86_64="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_TESTED_VERSION}/${OPENCODE_ASSET_X86_64}"
 readonly OPENCODE_URL_AARCH64="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_TESTED_VERSION}/${OPENCODE_ASSET_AARCH64}"
 readonly OPENCODE_MAX_ARCHIVE_BYTES=$((128 * 1024 * 1024))
@@ -72,7 +72,7 @@ opencode_target() {
 }
 
 opencode_root() {
-  printf '%s\n' "${OPENCODE_RUNTIME_ROOT:-/opt/bridgesllm/tools/opencode}"
+  printf '%s\n' "${OPENCODE_RUNTIME_ROOT:-/usr/local/lib/bridgesllm-runtimes/opencode}"
 }
 
 opencode_version_root() {
@@ -111,6 +111,32 @@ with tarfile.open(archive, "r:gz") as tf:
 PY
 }
 
+# The Desktop user (bridgesrd) runs this CLI through the alias, so the runtime
+# must sit outside the private /opt/bridgesllm ancestor and be world read/execute
+# whatever the installer's umask. It holds no secrets; state stays private.
+opencode_runtime_publicly_executable() {
+  local path="$1"
+  [[ -x "${path}" ]] || return 1
+  while [[ "${path}" != "/" ]]; do
+    # Every directory must be traversable and the file readable/executable by others.
+    (( ( 0$(stat -c '%a' -- "${path}") & 05 ) == 05 )) || return 1
+    path="$(dirname -- "${path}")"
+  done
+}
+
+# Narrow migration from the previous private layout: only a direct alias to an
+# exact legacy managed generation (root-owned regular file) may be replaced. The
+# legacy tree is never modified; the alias moves only after a verified install.
+opencode_legacy_managed_alias() {
+  local target="$1" link resolved rest legacy_root="${OPENCODE_LEGACY_RUNTIME_ROOT:-/opt/bridgesllm/tools/opencode}"
+  link="$(readlink -- "${target}" 2>/dev/null || true)"
+  resolved="$(readlink -f -- "${target}" 2>/dev/null || true)"
+  [[ -n "${resolved}" && "${link}" == "${resolved}" ]] || return 1
+  rest="${resolved#"${legacy_root}/"}"
+  [[ "${resolved}" == "${legacy_root}/${rest}" && "${rest}" =~ ^[0-9]+\.[0-9]+\.[0-9]+/opencode$ ]] || return 1
+  [[ -f "${resolved}" && ! -L "${resolved}" && "$(stat -c '%u' -- "${resolved}")" == "0" ]]
+}
+
 verify_opencode_runtime() {
   local target managed resolved arch expected actual
   target="$(opencode_target)"
@@ -122,6 +148,7 @@ verify_opencode_runtime() {
   expected="$(opencode_binary_sha256 "${arch}")" || return 1
   actual="$(sha256sum "${managed}" | awk '{print $1}')"
   [[ "${actual}" == "${expected}" ]] || return 1
+  opencode_runtime_publicly_executable "${managed}" || return 1
   verify_opencode_binary "${target}"
 }
 
@@ -146,7 +173,7 @@ opencode_converge() {
   target="${bin_dir}/opencode"
   state_dir="${OPENCODE_STATE_DIR:-/var/lib/bridgesllm/opencode}"
 
-  if [[ "${root}" == "/opt/bridgesllm/tools/opencode" || "${bin_dir}" == "/usr/local/bin" || "${state_dir}" == "/var/lib/bridgesllm/opencode" ]]; then
+  if [[ "${root}" == "/usr/local/lib/bridgesllm-runtimes/opencode" || "${bin_dir}" == "/usr/local/bin" || "${state_dir}" == "/var/lib/bridgesllm/opencode" ]]; then
     [[ "${EUID}" -eq 0 ]] || {
       printf 'Installing the system OpenCode runtime requires root.\n' >&2
       return 1
@@ -165,8 +192,12 @@ opencode_converge() {
     case "$(readlink -f -- "${target}" 2>/dev/null || true)" in
       "${root}"/*/opencode) ;;
       *)
-        printf 'Refusing to replace an unmanaged OpenCode symlink at %s.\n' "${target}" >&2
-        return 1
+        if opencode_legacy_managed_alias "${target}"; then
+          printf 'Migrating the OpenCode alias from the legacy private runtime.\n' >&2
+        else
+          printf 'Refusing to replace an unmanaged OpenCode symlink at %s.\n' "${target}" >&2
+          return 1
+        fi
         ;;
     esac
   fi
@@ -174,7 +205,20 @@ opencode_converge() {
   arch="$(opencode_arch)" || return 1
   url="$(opencode_url "${arch}")" || return 1
   expected="$(opencode_sha256 "${arch}")" || return 1
-  install -d -m 0755 "${root}" "${bin_dir}"
+  # Existing ancestors may protect unrelated files; never chmod them.
+  # Missing parents follow the umask in some install implementations (uutils 0.8
+  # creates them 0700 under umask 077; GNU uses 0755), so only this public creation
+  # runs under umask 022. State keeps the caller umask and its explicit 0700.
+  local existing_ancestor
+  existing_ancestor="$(dirname -- "${root}")"
+  while [[ ! -e "${existing_ancestor}" && ! -L "${existing_ancestor}" ]]; do
+    existing_ancestor="$(dirname -- "${existing_ancestor}")"
+  done
+  if ! opencode_runtime_publicly_executable "${existing_ancestor}"; then
+    printf 'Refusing the private or inaccessible OpenCode runtime ancestor at %s.\n' "${existing_ancestor}" >&2
+    return 1
+  fi
+  ( umask 022; install -d -m 0755 "${root}" "${bin_dir}" )
   install -d -m 0700 "${state_dir}"
   work_dir="$(mktemp -d "${root}/.install-${OPENCODE_TESTED_VERSION}.XXXXXX")"
   archive="${work_dir}/opencode.tar.gz"
@@ -205,6 +249,7 @@ opencode_converge() {
     mv -- "${version_root}" "${backup_root}"
   fi
   mv -- "${stage_root}" "${version_root}"
+  chmod -R u+rwX,go+rX,go-w -- "${version_root}"
   ln -s "${managed}" "${work_dir}/opencode.link"
   mv -Tf -- "${work_dir}/opencode.link" "${target}"
   if ! verify_opencode_runtime; then

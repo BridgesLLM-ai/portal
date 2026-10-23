@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
 import { AI_PROVIDER_MAP } from '../config/aiProviders';
 import type {
   AgentHarnessId,
@@ -82,7 +85,7 @@ describe('agent harness catalog', () => {
       command: {
         executable: 'hermes',
         args: ['acp'],
-        versionPolicy: { kind: 'exact-pin', testedVersion: '0.20.4' },
+        versionPolicy: { kind: 'exact-pin', testedVersion: PORTAL_TOOL_VERSIONS.hermes },
       },
       models: {
         selectionMode: 'session',
@@ -97,6 +100,8 @@ describe('agent harness catalog', () => {
         supportsModelReadback: true,
         supportsSessionResume: true,
         supportsSessionFork: true,
+        // The Portal Chat Bridge reaches Hermes via the installer's mcp extra.
+        supportsAskUser: true,
         supportsLiveText: true,
         supportsReasoning: true,
         supportsAttachments: true,
@@ -156,7 +161,7 @@ describe('agent harness catalog', () => {
       command: {
         executable: 'opencode',
         args: ['acp', '--pure', '--hostname', '127.0.0.1', '--port', '0', '--no-mdns'],
-        versionPolicy: { kind: 'exact-pin', testedVersion: '1.18.19' },
+        versionPolicy: { kind: 'exact-pin', testedVersion: PORTAL_TOOL_VERSIONS.openCode },
       },
       auth: {
         owner: 'harness-local-login',
@@ -179,7 +184,7 @@ describe('agent harness catalog', () => {
     expect(hermes.capabilities.supportedExecutionScopes).not.toContain('PROJECT_SANDBOX');
     expect(openCode.capabilities.supportedExecutionScopes).not.toContain('PROJECT_SANDBOX');
     expect(openCode.command.versionPolicy.reason).toContain('opencode-linux-x64-baseline.tar.gz');
-    expect(openCode.command.versionPolicy.reason).toContain('0acea3a0e22d4b6bcf7068580def4e151e413a7a4c3f03eba638568b3fababa5');
+    expect(openCode.command.versionPolicy.reason).toContain('1697ef40558d378bd2f72efa8fafe1bed1f0e664f09247b9357556b95dbc7cbc');
     expect(openCode.command.versionPolicy.reason).not.toMatch(/(?:^|\s)opencode-linux-x64\.tar\.gz/u);
   });
 
@@ -205,5 +210,50 @@ describe('agent harness catalog', () => {
     expect(REGISTERED_AGENT_HARNESS_IDS.every((id) => (
       requireHarnessDefinition(id).compatibilityProviderId === id
     ))).toBe(true);
+  });
+  test('keeps Grok labels bound to the pinned 1.0.62 ACP negotiation evidence', () => {
+    const fixture = JSON.parse(fs.readFileSync(path.join(
+      __dirname,
+      'providers/native/adapters/__fixtures__/grok-1.0.62-acp-unauthenticated-negotiation.json',
+    ), 'utf8'));
+    const helper = fs.readFileSync(path.resolve(__dirname, '../../../installer/grok-build-runtime.sh'), 'utf8');
+    const grok = requireHarnessDefinition('GROK');
+
+    // The evidence is for exactly the artifact the installer pins.
+    expect(grok.command.versionPolicy).toMatchObject({ kind: 'exact-pin', testedVersion: '1.0.62' });
+    expect(helper).toContain('readonly GROK_BUILD_TESTED_VERSION="1.0.62"');
+    expect(helper).toContain(`readonly GROK_BUILD_SHA256_X86_64="${fixture.provenance.sha256}"`);
+    expect(fixture.initialize.protocolVersion).toBe(1);
+    // Photos follow the agent's own promptCapabilities.image answer.
+    expect(grok.capabilities.supportsAttachments)
+      .toBe(fixture.initialize.agentCapabilities.promptCapabilities.image === true);
+    // ACP v1 requires stdio MCP; the pin also negotiates MCP and merges servers
+    // into session/new before its auth gate. The bridge is a stdio MCP server.
+    expect(fixture.initialize.agentCapabilities.mcpCapabilities).toEqual({ http: true, sse: true });
+    expect(fixture.sessionNewWithStdioMcpServer.setupPhases).toContain('mcp_merge');
+    expect(fixture.sessionNewWithStdioMcpServer.error.message).toBe('Authentication required');
+    expect(grok.capabilities.supportsAskUser).toBe(true);
+  });
+  test('keeps OpenCode labels bound to the pinned 1.19.4 ACP negotiation evidence', () => {
+    const fixture = JSON.parse(fs.readFileSync(path.join(
+      __dirname,
+      'providers/native/adapters/__fixtures__/opencode-1.19.4-acp-unauthenticated-negotiation.json',
+    ), 'utf8'));
+    const helper = fs.readFileSync(path.resolve(__dirname, '../../../installer/opencode-runtime.sh'), 'utf8');
+    const openCode = requireHarnessDefinition('OPENCODE');
+
+    expect(PORTAL_TOOL_VERSIONS.openCode).toBe('1.19.4');
+    expect(fixture.initialize.agentInfo).toEqual({ name: 'OpenCode', version: PORTAL_TOOL_VERSIONS.openCode });
+    expect(helper).toContain(`readonly OPENCODE_TESTED_VERSION="${PORTAL_TOOL_VERSIONS.openCode}"`);
+    expect(helper).toContain(`readonly OPENCODE_SHA256_X86_64="${fixture.provenance.archiveSha256}"`);
+    expect(helper).toContain(`readonly OPENCODE_BINARY_SHA256_X86_64="${fixture.provenance.binarySha256}"`);
+    expect(openCode.command.versionPolicy.reason).toContain(fixture.provenance.archiveSha256);
+    expect(fixture.initialize.protocolVersion).toBe(1);
+    expect(openCode.capabilities.supportsAttachments)
+      .toBe(fixture.initialize.agentCapabilities.promptCapabilities.image === true);
+    expect(openCode.capabilities.supportsSessionFork)
+      .toBe(Boolean(fixture.initialize.agentCapabilities.sessionCapabilities.fork));
+    expect(fixture.sessionNewWithStdioMcpServer.accepted).toBe(true);
+    expect(openCode.capabilities.supportsAskUser).toBe(true);
   });
 });

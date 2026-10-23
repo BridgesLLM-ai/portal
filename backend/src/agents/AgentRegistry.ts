@@ -114,10 +114,15 @@ const PROVIDER_CATALOG_TTL_MS = 60_000;
 const PROVIDER_CATALOG_FAILURE_RETRY_MS = 10_000;
 const PROVIDER_CATALOG_RESPONSE_BUDGET_MS = 250;
 const PROVIDER_CATALOG_PROBE_DEADLINE_MS = 35_000;
-// OpenClaw serializes bounded CLI checks (4s + 15s + 25s + 25s, plus a 25s
-// discovery fallback when gateway status omits the version): up to ~96.5s
-// including package discovery. The catalog must not discard that result at
-// 35s. HTTP callers still receive a checking row within 250ms.
+// OpenClaw admission serializes bounded CLI checks: --version 4s, gateway status
+// 15s, an optional 25s discovery, the Codex plugin inspect 60s and the auth
+// store 25s, then the question-runtime inspect 60s plus gateway RPCs. A typical
+// cold collection on a contended 2 vCPU host is ~60-100s, and the worst case is
+// longer than this deadline. The deadline only bounds the catalog wait: the
+// attestation collection keeps running, publishes into the shared cache, and a
+// re-probe after the failure retry joins it instead of starting another chain.
+// HTTP callers still receive a checking row within 250ms, and the Agent Chat
+// client waits OPENCLAW_PROVIDER_CATALOG_SETTLE_TIMEOUT_MS (110s) for this row.
 const OPENCLAW_CATALOG_PROBE_DEADLINE_MS = 100_000;
 
 interface ProviderCatalogCacheEntry {

@@ -1,3 +1,4 @@
+import { suggestReadyModels } from './currentModelSuggestions';
 import { isDeepStrictEqual } from 'util';
 import { gatewayRpcCall } from '../utils/openclawGatewayRpc';
 import { assertOpenClawGatewayAuthorizationFenceReleased } from './openClawGatewayAuthorizationFence';
@@ -69,7 +70,7 @@ export class ProviderActivationService {
     return { config, hash: result.data.hash as string };
   }
 
-  async discover(provider?: string, refresh = false): Promise<{ models: ProviderModel[]; source: string }> {
+  async discover(provider?: string, refresh = false): Promise<{ models: ProviderModel[]; source: string; suggestions: Array<{ id: string; reason: string }> }> {
     const [snapshot, result, detected, cliCatalogs] = await Promise.all([
       this.config(),
       this.rpc('models.list', { view: 'all', ...(refresh ? { refresh: true } : {}) }, 30_000),
@@ -84,6 +85,7 @@ export class ProviderActivationService {
       : provider === 'google-gemini-cli' ? 'google-gemini-cli' : null;
     const candidates: any[] = detected.ok && Array.isArray(detected.data?.candidates) ? detected.data.candidates : [];
     const models = new Map<string, ProviderModel>();
+    const nativeReadySuggestions = new Set<string>();
     for (const entry of result.data.models) {
       if (!record(entry) || typeof entry.id !== 'string' || typeof entry.provider !== 'string') continue;
       const id = canonicalNativeModelRef(entry.id.startsWith(entry.provider + '/') ? entry.id : entry.provider + '/' + entry.id);
@@ -120,6 +122,11 @@ export class ProviderActivationService {
         available = true;
       }
       if (subscriptionRuntime && runtime !== subscriptionRuntime) available = false;
+      // A supported local CLI login can preserve a legacy activation route,
+      // but a preset plus login is not account-specific model availability.
+      // Recommendations require the native catalog itself to report ready.
+      if (entry.available === true && available === true) nativeReadySuggestions.add(id);
+      else nativeReadySuggestions.delete(id);
       models.set(id, {
         id, name: typeof entry.name === 'string' ? entry.name : id, provider: id.split('/')[0],
         runtime, ready: available === true,
@@ -127,7 +134,8 @@ export class ProviderActivationService {
         registered: Object.prototype.hasOwnProperty.call(configured, id),
       });
     }
-    return { models: [...models.values()], source: 'native' };
+    const discovered = [...models.values()];
+    return { models: discovered, source: 'native', suggestions: suggestReadyModels(discovered.filter(model => nativeReadySuggestions.has(model.id))) };
   }
 
   async probe(provider: string) {

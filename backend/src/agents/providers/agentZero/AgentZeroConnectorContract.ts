@@ -3,7 +3,7 @@ export const AGENT_ZERO_CONNECTOR_VERSION = '0.1.0';
 export const AGENT_ZERO_CONNECTOR_PATH = '/api/plugins/_a0_connector/v1';
 export const AGENT_ZERO_WEBSOCKET_NAMESPACE = '/ws';
 export const AGENT_ZERO_WEBSOCKET_HANDLER = 'plugins/_a0_connector/ws_connector';
-export const AGENT_ZERO_VERSION = '2.11';
+export const AGENT_ZERO_VERSION = '2.14';
 export const AGENT_ZERO_DEFAULT_BASE_URL = 'http://127.0.0.1:50001';
 
 export interface AgentZeroConnectorCapabilities {
@@ -87,7 +87,7 @@ export function normalizeAgentZeroVersion(value: unknown): typeof AGENT_ZERO_VER
 }
 
 /**
- * Validate the exact connector contract published by Agent Zero v2.11.
+ * Validate the exact connector contract published by Agent Zero v2.14.
  *
  * The capabilities endpoint is intentionally public. Authentication is proved
  * separately by a protected `chats_list` request using a browser-style session.

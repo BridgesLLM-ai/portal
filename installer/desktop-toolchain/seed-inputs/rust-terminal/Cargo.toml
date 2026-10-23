@@ -1,0 +1,9 @@
+[package]
+name = "desktop-starter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+
+[[bin]]
+name = "desktop-starter"
+path = "src/main.rs"

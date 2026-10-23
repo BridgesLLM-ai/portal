@@ -15,7 +15,11 @@ import os from 'os';
 import path from 'path';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/database';
+import { APP_CREDENTIALS_CONTAINER_DIRECTORY, APP_CREDENTIALS_ENVIRONMENT_KEY } from './appCredentials/policy';
+import { materializeAppCredentials, removeAppCredentialDirectory, type AppCredentialAttachment } from './appCredentials/projection';
+import { readAppCredentialsForProjection } from './appCredentials/store';
 import { config } from '../config/env';
+import { desktopToolchainAvailability, DesktopToolchainUnavailableError } from './projectDesktopToolchain';
 import {
   projectEgressCommandExecutor,
   type ProjectEgressCommandExecutor,
@@ -100,6 +104,15 @@ export async function assertProjectRuntimeImageAvailable(
   });
 }
 
+/** Fails closed with the installer-recorded reason when the toolchain is absent. */
+async function resolveDesktopToolchainImage(executor: ProjectEgressCommandExecutor): Promise<string> {
+  const availability = desktopToolchainAvailability();
+  if (!availability.available) throw new DesktopToolchainUnavailableError(availability.reason);
+  return resolvePinnedProjectRuntimeImage(process.env.PORTAL_DESKTOP_RUNTIME_IMAGE_ID || '', executor).catch(() => {
+    throw new DesktopToolchainUnavailableError('The recorded Desktop toolchain image is missing from Docker. An administrator can rebuild it with install.sh --install-desktop-toolchain.');
+  });
+}
+
 const DOCKER_BIN = '/usr/bin/docker';
 const PROJECT_MOUNT = '/workspace/project';
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
@@ -126,6 +139,10 @@ export interface ProjectLifecycleCommand {
   nameHint?: string;
   port?: number;
   production?: boolean;
+  /** Server-selected Desktop toolchain image; never an HTTP-supplied image. */
+  desktopBuild?: boolean;
+  signal?: AbortSignal;
+  onOutput?: (chunk: string) => void;
   /** Public package/build traffic is brokered through the Portal proxy. */
   network?: boolean;
   /** Stable only for long-lived apps; one-shot jobs generate a unique value. */
@@ -324,13 +341,17 @@ async function prepareLifecyclePlan(
   executor: ProjectEgressCommandExecutor = projectEgressCommandExecutor,
 ): Promise<PortalProjectWorkloadPlan> {
   assertAllowedCommand(options.command);
+  if (options.desktopBuild && mode !== 'job') throw new Error('Desktop toolchain images are only admitted for build jobs');
+  if (options.signal?.aborted) throw new Error('Project operation cancelled');
   const workspace = prepareProjectLifecycleWorkspace(options.workspace);
   const workloadId = options.workloadId || crypto.randomUUID();
   const containerName = projectContainerName(
     mode === 'app' ? 'bridgesllm-project-app' : 'bridgesllm-project-job',
     `${options.actorId}\0${options.projectId}\0${mode}\0${workloadId}`,
   );
-  const image = await assertProjectRuntimeImageAvailable(executor);
+  const image = options.desktopBuild
+    ? await resolveDesktopToolchainImage(executor)
+    : await assertProjectRuntimeImageAvailable(executor);
   const environment: Record<string, string> = {
     HOME: '/tmp/project-home',
     CI: 'true',
@@ -345,26 +366,47 @@ async function prepareLifecyclePlan(
     environment.PORT = String(options.port);
     environment.HOST = '0.0.0.0';
   }
-  return preparePortalProjectWorkloadContainer({
-    identity: {
+  // Named App credentials reach only this App's resident container, as files
+  // in a fresh read-only tmpfs directory; the environment carries the path.
+  let credentialAttachment: AppCredentialAttachment | null = null;
+  if (mode === 'app') {
+    const credentials = await readAppCredentialsForProjection({
+      appId: workloadId,
       actorId: options.actorId,
       projectId: options.projectId,
-      consumerKind: mode === 'app' ? 'PORTAL_APP' : 'PORTAL_LIFECYCLE',
-      workloadId,
-    },
-    containerName,
-    workspace,
-    image,
-    command: options.command,
-    args: options.args,
-    environment,
-    networked: options.network === true || mode === 'app',
-    pidsLimit: 256,
-    memoryBytes: mode === 'app' ? 1536 * 1024 * 1024 : 2048 * 1024 * 1024,
-    nanoCpus: mode === 'app' ? 1_500_000_000 : 2_000_000_000,
-    tmpfsSize: '512m',
-    applicationPort: options.port,
-  }, { allowExisting: mode === 'app', executor });
+    });
+    if (credentials) {
+      credentialAttachment = materializeAppCredentials({ appId: workloadId, ...credentials });
+      environment[APP_CREDENTIALS_ENVIRONMENT_KEY] = APP_CREDENTIALS_CONTAINER_DIRECTORY;
+    }
+  }
+  try {
+    return await preparePortalProjectWorkloadContainer({
+      identity: {
+        actorId: options.actorId,
+        projectId: options.projectId,
+        consumerKind: mode === 'app' ? 'PORTAL_APP' : 'PORTAL_LIFECYCLE',
+        workloadId,
+      },
+      containerName,
+      workspace,
+      image,
+      command: options.command,
+      args: options.args,
+      environment,
+      networked: options.network === true || mode === 'app',
+      pidsLimit: 256,
+      memoryBytes: mode === 'app' ? 1536 * 1024 * 1024 : 2048 * 1024 * 1024,
+      nanoCpus: mode === 'app' ? 1_500_000_000 : 2_000_000_000,
+      tmpfsSize: '512m',
+      applicationPort: options.port,
+      ...(credentialAttachment ? { credentialAttachment } : {}),
+    }, { allowExisting: mode === 'app', executor });
+  } catch (error) {
+    // A container that failed to be prepared never keeps its credentials.
+    if (credentialAttachment) removeAppCredentialDirectory(credentialAttachment.sourceDirectory);
+    throw error;
+  }
 }
 
 export async function spawnProjectLifecycleCommand(options: ProjectLifecycleCommand): Promise<ProjectLifecycleProcess> {
@@ -398,6 +440,10 @@ export async function spawnProjectLifecycleCommand(options: ProjectLifecycleComm
 
 export async function runProjectLifecycleCommand(options: ProjectLifecycleCommand): Promise<string> {
   const job = await spawnProjectLifecycleCommand(options);
+  const abort = () => job.cancel();
+  options.signal?.addEventListener('abort', abort, { once: true });
+  if (options.signal?.aborted) abort();
+  let observerError: Error | null = null;
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   let bytes = 0;
@@ -405,7 +451,13 @@ export async function runProjectLifecycleCommand(options: ProjectLifecycleComman
     const value = Buffer.from(chunk);
     bytes += value.length;
     if (bytes > MAX_OUTPUT_BYTES) job.cancel();
-    else target.push(value);
+    else {
+      target.push(value);
+      try { options.onOutput?.(value.toString('utf8')); } catch (error) {
+        observerError = error instanceof Error ? error : new Error(String(error));
+        job.cancel();
+      }
+    }
   };
   job.process.stdout?.on('data', (chunk) => collect(stdout, chunk));
   job.process.stderr?.on('data', (chunk) => collect(stderr, chunk));
@@ -414,8 +466,10 @@ export async function runProjectLifecycleCommand(options: ProjectLifecycleComman
   const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     job.process.once('error', reject);
     job.process.once('close', (code, signal) => resolve({ code, signal }));
-  }).finally(() => clearTimeout(timeout));
+  }).finally(() => { clearTimeout(timeout); options.signal?.removeEventListener('abort', abort); });
   await job.cleanup;
+  if (options.signal?.aborted) throw new Error('Project operation cancelled');
+  if (observerError) throw observerError;
   const output = Buffer.concat(stdout).toString('utf8');
   const errorOutput = Buffer.concat(stderr).toString('utf8');
   if (bytes > MAX_OUTPUT_BYTES) throw Object.assign(new Error('Project lifecycle command output limit exceeded'), { stdout: output, stderr: errorOutput });
@@ -612,7 +666,7 @@ export function readProjectAppLogs(containerName: string, lines = 50): string[] 
   }
 }
 
-export function createProjectLifecycleWorkspace(sourceDir: string): ProjectLifecycleWorkspace {
+export function createProjectLifecycleWorkspace(sourceDir: string, options: { desktop?: boolean } = {}): ProjectLifecycleWorkspace {
   const source = assertSafeWorkspace(sourceDir);
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgesllm-project-job-'));
   fs.cpSync(source, workspace, {
@@ -622,7 +676,7 @@ export function createProjectLifecycleWorkspace(sourceDir: string): ProjectLifec
       const relative = path.relative(source, sourcePath);
       if (!relative) return true;
       const first = relative.split(path.sep)[0];
-      return first !== '.git' && first !== 'node_modules' && first !== '.venv';
+      return !['.git', 'node_modules', '.venv', ...(options.desktop ? ['target', '.portal-build-cache', '.desktop-out', 'build'] : [])].includes(first);
     },
   });
   return {

@@ -2,7 +2,7 @@
 
 The Portal updater deliberately does not replace the host's shared Node.js
 runtime during an update. A host on Node.js `22.16.0` or `22.22.2` is valid for
-older Portal 3.26.1 releases but is below the current OpenClaw-compatible floor.
+older Portal 3.26.1 releases but is below the current Portal-only floor.
 The update refuses before it opens a transaction, installs a boot fence, or
 stops the Portal.
 
@@ -10,18 +10,18 @@ stops the Portal.
 
 Portal-only updates retain the existing host interpreter and support these
 previously qualified ranges: `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`.
-Installing Portal 5.0.x does **not** require replacing a supported Node 22
+Installing Portal 5.1.x does **not** require replacing a supported Node 22
 interpreter and does not upgrade OpenClaw in the same action.
 
-## OpenClaw 2026.9.3 and compatible-tools maintenance
+## OpenClaw 2026.10.6 and compatible-tools maintenance
 
-The pinned upstream package requires `>=24.16.0 <25 || >=26.1.0`.
-The qualified LTS target is **Node 24.20.0**. Node 22 and Node 25 cannot run this
+The pinned upstream package requires `>=24.22.1 <25 || >=26.12.1`.
+The minimum Node 24 LTS target is **Node 24.22.1**. Node 22 and Node 25 cannot run this
 OpenClaw release, even when they remain usable for Portal-only updates.
 
 The compatible-tools action checks this prerequisite before stopping services
 or staging packages. It never replaces the host interpreter under an unrelated
-OpenClaw rollback journal. On existing Node 22 hosts, upgrade Node in a separate
+OpenClaw rollback journal. On existing hosts below these floors, upgrade Node in a separate
 host-maintenance window, preserving the installed package for rollback, then
 verify Portal, native module loading, and the retained gateway before running
 compatible-tools maintenance. Do not point a service at an unmanaged second

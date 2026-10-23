@@ -6,6 +6,8 @@ import {
 import { StringDecoder } from 'string_decoder';
 import type { OnStatusCallback } from '../../../AgentProvider.interface';
 import { AgentAbortError } from '../../../AgentProvider.interface';
+import type { NativeChatImage } from '../../../../services/chatImages/directChatImages';
+import { ChatImageError } from '../../../../services/chatImages/chatImageModelPolicy';
 
 export const ACP_PROTOCOL_VERSION = 1;
 export const ACP_MAX_LINE_BYTES = 8 * 1024 * 1024;
@@ -36,6 +38,22 @@ export interface AcpPermissionOption {
   optionId: string;
   name: string;
   kind: 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always';
+}
+
+/** ACP stdio MCP server (session/new, session/load). Env travels over the JSON-RPC pipe. */
+export interface AcpStdioMcpServer {
+  name: string;
+  command: string;
+  args: string[];
+  env: Array<{ name: string; value: string }>;
+}
+
+/** What an ACP agent reports about one tool call, for presentation-only naming. */
+export interface AcpToolIdentityInput {
+  kind: string;
+  title: string;
+  meta: UnknownRecord;
+  rawInput: unknown;
 }
 
 export interface AcpPermissionRequest {
@@ -73,6 +91,8 @@ export interface AcpAttestationResult {
   agentVersion: string;
   protocolVersion: number;
   authenticationMethodId: string | null;
+  /** initialize advertised `agentCapabilities.promptCapabilities.image`. */
+  promptImages: boolean;
 }
 
 export interface AcpTurnResult extends AcpSessionStartResult {
@@ -117,6 +137,13 @@ export interface AcpStdioBrokerOptions {
   onChunk?: (chunk: string) => void;
   onStatus?: OnStatusCallback;
   onPermission?: (request: AcpPermissionRequest) => Promise<AcpPermissionDecision>;
+  /** MCP servers offered to the agent in session/new and session/load. */
+  mcpServers?: readonly AcpStdioMcpServer[];
+  /**
+   * Presentation name for a tool call when the caller recognises it (the
+   * Portal Chat Bridge); null keeps the agent's own kind/title naming.
+   */
+  resolveToolName?: (input: AcpToolIdentityInput) => string | null;
   spawnImpl?: SpawnImplementation;
   controlTimeoutMs?: number;
   promptTimeoutMs?: number;
@@ -139,6 +166,8 @@ interface PendingRequest {
 
 interface ToolState {
   id: string;
+  /** Caller-recognised presentation name, fixed once recognised. */
+  resolvedName?: string | null;
   name: string;
   title: string;
   rawInput?: unknown;
@@ -221,10 +250,15 @@ function permissionOutcome(
   return { outcome: { outcome: 'cancelled' } };
 }
 
-function safeToolName(kind: unknown, title: unknown, fallback: string): string {
+/** ACP kinds that say nothing about which tool ran; the agent's title does. */
+const GENERIC_ACP_TOOL_KINDS = new Set(['other', 'think', 'switch_mode']);
+
+export function safeToolName(kind: unknown, title: unknown, fallback: string): string {
   const normalized = cleanString(kind, 128).trim();
+  const titled = cleanString(title, 128).trim();
+  if (normalized && GENERIC_ACP_TOOL_KINDS.has(normalized) && titled) return titled;
   if (normalized) return normalized === 'execute' ? 'shell' : normalized;
-  return cleanString(title, 128).trim() || fallback;
+  return titled || fallback;
 }
 
 function jsonRpcError(code: number, message: string): UnknownRecord {
@@ -343,6 +377,7 @@ export class AcpStdioBroker {
   private agentName = '';
   private agentVersion = '';
   private authenticationMethodId: string | null = null;
+  private promptImages = false;
   private modelState: AcpModelState = { currentModelId: null, availableModels: [] };
   private initialModelId: string | null = null;
   private cancelTimer: ReturnType<typeof setTimeout> | null = null;
@@ -395,6 +430,11 @@ export class AcpStdioBroker {
     return this.aborted;
   }
 
+  /** True once initialize advertised `promptCapabilities.image`. */
+  get supportsPromptImages(): boolean {
+    return this.promptImages;
+  }
+
   get currentModelState(): AcpModelState {
     return {
       currentModelId: this.modelState.currentModelId,
@@ -414,7 +454,17 @@ export class AcpStdioBroker {
       agentVersion: this.agentVersion,
       protocolVersion: this.profile.protocolVersion,
       authenticationMethodId: this.authenticationMethodId,
+      promptImages: this.promptImages,
     };
+  }
+
+  private sessionMcpServers(): UnknownRecord[] {
+    return (this.options.mcpServers || []).map((server) => ({
+      name: server.name,
+      command: server.command,
+      args: [...server.args],
+      env: server.env.map((entry) => ({ name: entry.name, value: entry.value })),
+    }));
   }
 
   async start(): Promise<AcpSessionStartResult> {
@@ -429,12 +479,12 @@ export class AcpStdioBroker {
         sessionResult = await this.request('session/load', {
           sessionId: this.nativeSessionId,
           cwd: this.options.cwd,
-          mcpServers: [],
+          mcpServers: this.sessionMcpServers(),
         }, this.controlTimeoutMs);
       } else {
         sessionResult = await this.request('session/new', {
           cwd: this.options.cwd,
-          mcpServers: [],
+          mcpServers: this.sessionMcpServers(),
         }, this.controlTimeoutMs);
         const createdSessionId = isRecord(sessionResult)
           ? this.normalizeSessionId(sessionResult.sessionId)
@@ -501,6 +551,10 @@ export class AcpStdioBroker {
         },
       }, this.controlTimeoutMs);
       this.validateInitialize(initializeResult);
+      const advertised = isRecord(initializeResult) && isRecord(initializeResult.agentCapabilities)
+        ? initializeResult.agentCapabilities.promptCapabilities
+        : undefined;
+      this.promptImages = isRecord(advertised) && advertised.image === true;
       this.authenticationMethodId = this.resolveAuthenticationMethod(initializeResult);
       if (this.authenticationMethodId) {
         const authenticated = await this.request('authenticate', {
@@ -517,10 +571,21 @@ export class AcpStdioBroker {
     }
   }
 
-  async prompt(message: string): Promise<AcpTurnResult> {
+  async prompt(message: string, images: readonly NativeChatImage[] = []): Promise<AcpTurnResult> {
     const start = await this.start();
     if (this.promptActive) throw new Error(`A ${this.profile.displayName} ACP prompt is already active`);
     if (!String(message || '').trim()) throw new Error(`${this.profile.displayName} ACP prompt cannot be empty`);
+    if (images.length > 0 && !this.promptImages) {
+      // The agent did not advertise image prompts; never degrade a photo to text.
+      throw new ChatImageError('IMAGE_MODEL_UNSUPPORTED');
+    }
+    const prompt: UnknownRecord[] = [{ type: 'text', text: message }];
+    for (const image of images) {
+      if (image?.mimeType !== 'image/jpeg' || typeof image.content !== 'string' || !image.content) {
+        throw new Error(`${this.profile.displayName} photo input is not a prepared JPEG`);
+      }
+      prompt.push({ type: 'image', mimeType: 'image/jpeg', data: image.content });
+    }
 
     this.fullText = '';
     this.fullTextBytes = 0;
@@ -531,7 +596,7 @@ export class AcpStdioBroker {
     try {
       result = await this.request('session/prompt', {
         sessionId: start.nativeSessionId,
-        prompt: [{ type: 'text', text: message }],
+        prompt,
       }, this.promptTimeoutMs);
     } finally {
       this.promptActive = false;
@@ -586,7 +651,7 @@ export class AcpStdioBroker {
       const loaded = await this.request('session/load', {
         sessionId,
         cwd: this.options.cwd,
-        mcpServers: [],
+        mcpServers: this.sessionMcpServers(),
       }, this.controlTimeoutMs);
       readback = parseModelState(loaded, this.profile);
     }
@@ -1026,9 +1091,12 @@ export class AcpStdioBroker {
       this.failProtocol(new Error(`${this.profile.displayName} ACP exceeded the tool-state bound`));
       return;
     }
+    const resolvedName = existing?.resolvedName ?? this.resolveToolName(update);
     const next: ToolState = {
       id,
-      name: safeToolName(update.kind ?? existing?.name, update.title ?? existing?.title, `${this.profile.providerTag}-tool`),
+      resolvedName,
+      name: resolvedName
+        || safeToolName(update.kind ?? existing?.name, update.title ?? existing?.title, `${this.profile.providerTag}-tool`),
       title: cleanString(update.title ?? existing?.title, 512).trim()
         || existing?.title
         || `${this.profile.displayName} tool`,
@@ -1051,6 +1119,9 @@ export class AcpStdioBroker {
         toolCallId: id,
         toolName: next.name,
         toolResult: cleanString(next.rawOutput),
+        // Structured result for recognised tools (widget binding); the
+        // Portal strips it before publication.
+        ...(next.resolvedName ? { rawResult: next.rawOutput } : {}),
         status: next.status,
         provider: this.profile.providerTag,
       });
@@ -1065,6 +1136,21 @@ export class AcpStdioBroker {
       status: next.status || 'pending',
       provider: this.profile.providerTag,
     });
+  }
+
+  private resolveToolName(update: UnknownRecord): string | null {
+    if (!this.options.resolveToolName) return null;
+    try {
+      const resolved = this.options.resolveToolName({
+        kind: cleanString(update.kind, 128).trim(),
+        title: cleanString(update.title, 512).trim(),
+        meta: isRecord(update._meta) ? update._meta : {},
+        rawInput: update.rawInput,
+      });
+      return typeof resolved === 'string' && resolved.trim() ? cleanString(resolved, 160).trim() : null;
+    } catch {
+      return null;
+    }
   }
 
   private failProtocol(error: Error): void {

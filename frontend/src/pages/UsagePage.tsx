@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, type Variants } from 'framer-motion';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from 'recharts';
@@ -38,7 +38,7 @@ function truncateSessionKey(key: string, maxLen = 24): string {
 /* ─── animation variants ────────────────────────────────── */
 
 const container = { hidden: {}, show: { transition: { staggerChildren: 0.06 } } };
-const cardVariant = {
+const cardVariant: Variants = {
   hidden: { opacity: 0, y: 20, scale: 0.95 },
   show: { opacity: 1, y: 0, scale: 1, transition: { type: 'spring', stiffness: 200, damping: 20 } },
 };
@@ -175,7 +175,8 @@ function ModelBreakdown({ data, loading }: ModelBreakdownProps) {
                 padding: '8px 12px',
               }}
               labelStyle={{ color: '#fff', fontWeight: 600 }}
-              formatter={(value: number) => [`${value} sessions`, 'Count']}
+              itemStyle={{ color: '#E2E8F0' }}
+              formatter={(value) => [`${value ?? 0} sessions`, 'Count']}
             />
             <Bar dataKey="sessions" radius={[0, 4, 4, 0]}>
               {chartData.map((_, index) => (

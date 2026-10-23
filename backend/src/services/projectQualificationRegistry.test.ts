@@ -7,6 +7,7 @@ import { AgentRegistry } from '../agents';
 import type { AgentProvider } from '../agents/AgentProvider.interface';
 import type { ProjectEgressCommandExecutor, ProjectEgressCommandResult } from './projectEgressPlane';
 import { buildProjectEgressPlaneSpec } from './projectEgressPlane';
+import { buildOpenClawProjectSandboxPlan } from './openclawProjectSandbox';
 import type { CodexProjectEgressRuntimeHandle } from '../agents/providers/native/projectSandbox/CodexProjectEgressRuntime';
 import {
   CODEX_PROJECT_RUNTIME_POLICY_VERSION,
@@ -187,17 +188,43 @@ function qualificationRuntimeOverrides(
     [identityMethod]: identityBarrier,
   };
   if (provider === 'OPENCLAW') {
-    common.ensureSandbox = jest.fn(async () => ({
-      agentId: 'p4oc-qualified-agent',
-      sessionKey: 'agent:p4oc-qualified-agent:portal-project',
-      containerId: '6'.repeat(64),
-      containerStartedAt: NOW.toISOString(),
-      containerName: 'qualified-openclaw-runtime',
-      configHash: '4'.repeat(64),
-      runtimeFingerprint: '5'.repeat(64),
-      egressPolicyFingerprint: buildProjectEgressPlaneSpec(egressConfig).policyFingerprint,
-      attestedAt: NOW.toISOString(),
-    }));
+    // Use a valid pinned runtime recipe so the race tests reach their identity
+    // barriers. Placeholder hashes fail earlier and never exercise those guards.
+    common.ensureSandbox = jest.fn(async (input: {
+      context: ReturnType<typeof context>; agentId: string; sessionKey: string; openClawHome?: string;
+    }) => {
+      const spec = buildProjectEgressPlaneSpec(egressConfig);
+      const proxyUrl = `http://portal:${encodeURIComponent(spec.token)}@${spec.proxyAlias}:${spec.proxyPort}`;
+      const plan = buildOpenClawProjectSandboxPlan({
+        ...input,
+        mountFormatVersion: 6,
+        egressSpec: spec,
+        egressHandle: {
+          policyVersion: ctx.egressPolicyVersion,
+          policyFingerprint: spec.policyFingerprint,
+          internalNetworkName: spec.internalNetworkName,
+          internalNetworkId: exactQualificationPlane().internalNetworkId,
+          publicNetworkName: spec.publicNetworkName,
+          proxyContainerName: spec.proxyContainerName,
+          proxyUrl,
+          proxyEnvironment: {
+            HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl,
+            http_proxy: proxyUrl, https_proxy: proxyUrl, NO_PROXY: '', no_proxy: '',
+          },
+        },
+      });
+      return {
+        agentId: plan.agentId,
+        sessionKey: plan.sessionKey,
+        containerId: '6'.repeat(64),
+        containerStartedAt: NOW.toISOString(),
+        containerName: plan.containerName,
+        configHash: plan.configHash,
+        runtimeFingerprint: plan.runtimeFingerprint,
+        egressPolicyFingerprint: spec.policyFingerprint,
+        attestedAt: NOW.toISOString(),
+      };
+    });
   } else if (provider === 'CODEX') {
     common.ensureCodexRuntime = jest.fn(async () => ({
       containerId: '6'.repeat(64),
@@ -405,6 +432,7 @@ describe('Project qualification provider registry', () => {
         context: ctx,
         egress: egressConfig,
         sender,
+        openClawHome: path.join(root, 'openclaw'),
         dependencies: deps,
       })).rejects.toMatchObject({ code: 'RUNTIME_IDENTITY_INVENTORY' });
       expect(identityBarrier).toHaveBeenCalledWith(expect.objectContaining({
@@ -456,6 +484,7 @@ describe('Project qualification provider registry', () => {
         context: ctx,
         egress: egressConfig,
         sender,
+        openClawHome: path.join(root, 'openclaw'),
         dependencies: deps,
       })).rejects.toMatchObject({ code: 'PLANE_IDENTITY_RACE' });
       expect(planeBarrier).toHaveBeenCalledTimes(2);
@@ -506,6 +535,7 @@ describe('Project qualification provider registry', () => {
         context: ctx,
         egress: egressConfig,
         sender,
+        openClawHome: path.join(root, 'openclaw'),
         dependencies: deps,
       })).rejects.toMatchObject({ code: 'RUNTIME_IDENTITY_RACE' });
       expect(executor.run).toHaveBeenCalledWith(
@@ -1271,10 +1301,18 @@ describe('Codex Project live model challenge', () => {
   });
 
   function executorWithResponse(response: string, options: { tool?: boolean } = {}) {
-    const calls: Array<{ command: string; args: readonly string[] }> = [];
+    const calls: Array<{
+      command: string;
+      args: readonly string[];
+      secretEnvironment?: Readonly<Record<string, string>>;
+    }> = [];
     const executor: ProjectEgressCommandExecutor = {
-      run: jest.fn(async (command: string, args: readonly string[]): Promise<ProjectEgressCommandResult> => {
-        calls.push({ command, args });
+      run: jest.fn(async (
+        command: string,
+        args: readonly string[],
+        runOptions: { secretEnvironment?: Readonly<Record<string, string>> } = {},
+      ): Promise<ProjectEgressCommandResult> => {
+        calls.push({ command, args, secretEnvironment: runOptions.secretEnvironment });
         const events = [
           { type: 'thread.started', thread_id: '019f0000-0000-7000-8000-000000000777', model: 'gpt-5.5' },
           ...(options.tool ? [{ type: 'item.started', item: { type: 'command_execution', command: 'pwd' } }] : []),
@@ -1315,6 +1353,15 @@ describe('Codex Project live model challenge', () => {
     ]));
     expect(calls[0].args.join('\n')).toContain(expected);
     expect(calls[0].args.join('\n')).not.toContain(ACTOR);
+    // The proxy credentials are named on argv; the executor carries their values.
+    expect(calls[0].args.join('\n')).not.toContain('portal:token');
+    expect(calls[0].args).toEqual(expect.arrayContaining(['--env', 'HTTPS_PROXY', '--env', 'NO_PROXY=']));
+    expect(calls[0].secretEnvironment).toEqual({
+      HTTP_PROXY: runtime.proxyEnvironment.HTTP_PROXY,
+      HTTPS_PROXY: runtime.proxyEnvironment.HTTPS_PROXY,
+      http_proxy: runtime.proxyEnvironment.http_proxy,
+      https_proxy: runtime.proxyEnvironment.https_proxy,
+    });
   });
 
   test('fails closed on a wrong answer or tool attempt without persisting a probe thread', async () => {

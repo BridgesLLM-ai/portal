@@ -1,8 +1,13 @@
 import crypto from 'crypto';
+import {
+  PROJECT_RUNTIME_PIDS_LIMIT,
+  PROJECT_RUNTIME_SHARED_NPROC_LIMIT,
+  PROJECT_RUNTIME_LEGACY_NPROC_LIMIT,
+} from '../../../../services/projectRuntimeProcessLimits';
 import fs from 'fs';
 import net from 'net';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import type {
   AgentProviderName,
   ProjectSandboxExecutionContext,
@@ -25,6 +30,11 @@ import {
   type ProjectEgressInternalNetworkBinding,
   type ProjectEgressPlaneSpec,
 } from '../../../../services/projectEgressPlane';
+import {
+  dockerArgsCarryProtectedValue,
+  protectedDockerCommandEnvironment,
+  protectedDockerEnvironmentArgs,
+} from '../../../../services/projectDockerSecretEnvironment';
 import { PROJECT_EGRESS_POLICY_VERSION } from '../../../../services/projectEgressPolicy';
 import {
   PROJECT_RUNTIME_GID,
@@ -58,7 +68,7 @@ export const NATIVE_CLI_PROJECT_CONTAINER_HOME = '/home/project-agent';
 
 const CONTAINER_MEMORY_BYTES = 1024 * 1024 * 1024;
 const CONTAINER_NANO_CPUS = 2_000_000_000;
-const CONTAINER_PIDS_LIMIT = 256;
+const CONTAINER_PIDS_LIMIT = PROJECT_RUNTIME_PIDS_LIMIT;
 const PROXY_PORT = 3128;
 const MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024;
 const RUNTIME_LABEL_PREFIX = 'com.bridgesllm.native-cli-project';
@@ -222,7 +232,9 @@ export interface NativeCliProjectRuntimePlan {
   readonly expectedLabels: Readonly<Record<string, string>>;
   readonly internalNetworkId: string | null;
   readonly networkMode: string;
+  /** Proxy credentials are named only; their values travel in createSecretEnvironment. */
   readonly createArgs: readonly string[];
+  readonly createSecretEnvironment: Readonly<Record<string, string>>;
 }
 
 export class NativeCliProjectEgressRuntimeError extends Error {
@@ -609,7 +621,7 @@ export function buildNativeCliProjectRuntimePlan(input: {
     '--memory-swap', String(CONTAINER_MEMORY_BYTES),
     '--cpus', '2',
     '--ulimit', 'nofile=1024:1024',
-    '--ulimit', 'nproc=256:256',
+    '--ulimit', `nproc=${PROJECT_RUNTIME_SHARED_NPROC_LIMIT}:${PROJECT_RUNTIME_SHARED_NPROC_LIMIT}`,
     '--restart', 'no',
     // docker-init is the PID-1 subreaper for detached provider process trees.
     // Without it, an interrupted docker-exec wrapper can leave exited children
@@ -620,8 +632,12 @@ export function buildNativeCliProjectRuntimePlan(input: {
     '--tmpfs', `${NATIVE_CLI_PROJECT_CONTAINER_HOME}:rw,noexec,nosuid,nodev,size=268435456,uid=${NATIVE_CLI_PROJECT_CONTAINER_UID},gid=${NATIVE_CLI_PROJECT_CONTAINER_GID},mode=0700`,
     '--volume', `${projectRoot}:${NATIVE_CLI_PROJECT_CONTAINER_ROOT}:rw,rprivate`,
   );
-  for (const [key, value] of Object.entries(expectedEnvironment)) createArgs.push('--env', `${key}=${value}`);
+  const createEnvironment = protectedDockerEnvironmentArgs(expectedEnvironment);
+  createArgs.push(...createEnvironment.args);
   createArgs.push('--entrypoint', 'node', runtimeImage, '-e', IDLE_SCRIPT);
+  if (dockerArgsCarryProtectedValue(createArgs, createEnvironment.secretEnvironment, [input.spec.token])) {
+    fail('RUNTIME_SECRET_ARGV', `${input.profile.displayName} Project egress credential would reach the Docker command line`);
+  }
   return Object.freeze({
     profile: input.profile,
     containerName,
@@ -633,11 +649,12 @@ export function buildNativeCliProjectRuntimePlan(input: {
     internalNetworkId,
     networkMode,
     createArgs: Object.freeze(createArgs),
+    createSecretEnvironment: createEnvironment.secretEnvironment,
   });
 }
 
-type NativeCliRuntimeFingerprintGeneration = 'CURRENT' | 'LEGACY_PRE_CONFINEMENT';
-type NativeCliRuntimeConfinementGeneration = 'CURRENT' | 'LEGACY_PRE_CONFINEMENT';
+type NativeCliRuntimeFingerprintGeneration = 'CURRENT' | 'LEGACY_SHARED_NPROC' | 'LEGACY_PRE_CONFINEMENT';
+type NativeCliRuntimeConfinementGeneration = 'CURRENT' | 'LEGACY_SHARED_NPROC' | 'LEGACY_PRE_CONFINEMENT';
 
 function buildNativeCliRuntimeFingerprint(input: {
   context: ProjectSandboxExecutionContext;
@@ -680,6 +697,7 @@ function buildNativeCliRuntimeFingerprint(input: {
     projectRoot: input.projectRoot,
     user: NATIVE_CLI_PROJECT_CONTAINER_USER,
     confinementSecurityOptions: projectRuntimeSecurityOptionValues(),
+    ...(input.generation === 'CURRENT' ? { processLimits: { pids: CONTAINER_PIDS_LIMIT, sharedNproc: PROJECT_RUNTIME_SHARED_NPROC_LIMIT } } : {}),
   });
 }
 
@@ -759,7 +777,9 @@ function attestNativeCliProjectRuntimeContainerForGeneration(input: {
   }
   const expectedUlimits = [
     { name: 'nofile', soft: 1024, hard: 1024 },
-    { name: 'nproc', soft: 256, hard: 256 },
+    { name: 'nproc',
+      soft: input.confinementGeneration === 'CURRENT' ? PROJECT_RUNTIME_SHARED_NPROC_LIMIT : PROJECT_RUNTIME_LEGACY_NPROC_LIMIT,
+      hard: input.confinementGeneration === 'CURRENT' ? PROJECT_RUNTIME_SHARED_NPROC_LIMIT : PROJECT_RUNTIME_LEGACY_NPROC_LIMIT },
   ];
   // Docker preserves the values but does not promise the insertion order of
   // HostConfig.Ulimits. Attest the exact set after canonicalization so an
@@ -1045,13 +1065,35 @@ class NativeCliProjectCommandExecutor implements ProjectEgressCommandExecutor {
   async run(
     command: string,
     args: readonly string[],
-    options: { allowExitCodes?: readonly number[]; input?: string } = {},
+    options: {
+      allowExitCodes?: readonly number[];
+      input?: string;
+      secretEnvironment?: Readonly<Record<string, string>>;
+    } = {},
   ): Promise<ProjectEgressCommandResult> {
     return new Promise((resolve, reject) => {
-      const child = spawn(command, [...args], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: nativeCliProjectDockerHostEnvironment(),
-      });
+      let environment: NodeJS.ProcessEnv;
+      try {
+        environment = protectedDockerCommandEnvironment(
+          nativeCliProjectDockerHostEnvironment(),
+          args,
+          options.secretEnvironment,
+        );
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        child = spawn(command, [...args], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: environment,
+        });
+      } catch {
+        // Node's synchronous argument errors quote the offending value.
+        reject(new Error('Native CLI Project host command failed to start'));
+        return;
+      }
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let outputBytes = 0;
@@ -1274,6 +1316,19 @@ function staleRuntimeAttestationPlan(input: {
       }),
       egressPolicyFingerprint: input.spec.policyFingerprint,
       confinementGeneration: 'CURRENT',
+    },
+    {
+      runtimeFingerprint: buildNativeCliRuntimeFingerprint({
+        context: candidateContext,
+        profile: input.plan.profile,
+        spec: input.spec,
+        runtimeImage: inspectedImage,
+        projectRoot: input.plan.projectRoot,
+        generation: 'LEGACY_SHARED_NPROC',
+        tokenHash: inspectedTokenHash,
+      }),
+      egressPolicyFingerprint: input.spec.policyFingerprint,
+      confinementGeneration: 'LEGACY_SHARED_NPROC',
     },
   ];
   const candidate = candidates.find((entry) => (
@@ -1556,6 +1611,65 @@ export async function attestOnlyNativeCliProjectIdentityRuntime(input: {
   }
 }
 
+// Create the exact runtime, stopped. A creation that this call cannot attest,
+// for example one whose proxy credentials never arrived, is removed: the next
+// call would otherwise find it by name and fail its attestation every time.
+async function createExactNativeCliProjectRuntime(input: {
+  executor: ProjectEgressCommandExecutor;
+  plan: NativeCliProjectRuntimePlan;
+  spec: ProjectEgressPlaneSpec;
+}): Promise<DockerContainerInspect> {
+  const { executor, plan, spec } = input;
+  const createResult = await executor.run('docker', plan.createArgs, {
+    secretEnvironment: plan.createSecretEnvironment,
+  });
+  const createdId = createResult.stdout.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(createdId)) {
+    fail('RUNTIME_CREATE_ID', 'Docker returned an invalid Native CLI Project runtime creation ID');
+  }
+  try {
+    const created = await strictInspectContainer(executor, createdId);
+    if (!created) fail('RUNTIME_CREATE', `${plan.profile.displayName} Project runtime could not be inspected after creation`);
+    const attested = attestNativeCliProjectRuntimeContainer({
+      inspect: created,
+      plan,
+      spec,
+      requireRunning: false,
+    });
+    if (attested.containerId.toLowerCase() !== createdId) {
+      fail('RUNTIME_CREATE_ID', `${plan.profile.displayName} Project runtime creation identity changed`);
+    }
+    return created;
+  } catch (error) {
+    await removeUnattestedCreatedRuntime({ executor, containerId: createdId, plan });
+    throw error;
+  }
+}
+
+// Remove only the exact, stopped object this call created, carrying this
+// plan's labels, and never fall back to the name; the original error stays
+// the outcome.
+async function removeUnattestedCreatedRuntime(input: {
+  executor: ProjectEgressCommandExecutor;
+  containerId: string;
+  plan: NativeCliProjectRuntimePlan;
+}): Promise<void> {
+  try {
+    const inspect = await strictInspectContainer(input.executor, input.containerId);
+    const labels = inspect?.Config?.Labels || {};
+    if (!inspect
+      || String(inspect.Id || '').toLowerCase() !== input.containerId
+      || String(inspect.Name || '').replace(/^\//, '') !== input.plan.containerName
+      || inspect.State?.Running !== false
+      || Object.entries(input.plan.expectedLabels).some(([key, value]) => labels[key] !== value)) {
+      return;
+    }
+    await input.executor.run('docker', ['container', 'rm', input.containerId]);
+  } catch {
+    // Ambiguous cleanup is intentionally a no-op.
+  }
+}
+
 async function stopExactCurrentRuntimeAfterFailure(input: {
   executor: ProjectEgressCommandExecutor;
   containerId: string;
@@ -1738,22 +1852,7 @@ async function ensureRuntimeLocked(input: {
   const { dependencies, plan, spec, proxyAddress, proxyEnvironment, files } = input;
   let existing = await strictInspectContainer(dependencies.executor, plan.containerName);
   if (!existing) {
-    const createResult = await dependencies.executor.run('docker', plan.createArgs);
-    const createdId = createResult.stdout.trim().toLowerCase();
-    if (!/^[a-f0-9]{64}$/.test(createdId)) {
-      fail('RUNTIME_CREATE_ID', 'Docker returned an invalid Native CLI Project runtime creation ID');
-    }
-    existing = await strictInspectContainer(dependencies.executor, createdId);
-    if (!existing) fail('RUNTIME_CREATE', `${plan.profile.displayName} Project runtime could not be inspected after creation`);
-    const created = attestNativeCliProjectRuntimeContainer({
-      inspect: existing,
-      plan,
-      spec,
-      requireRunning: false,
-    });
-    if (created.containerId.toLowerCase() !== createdId) {
-      fail('RUNTIME_CREATE_ID', `${plan.profile.displayName} Project runtime creation identity changed`);
-    }
+    existing = await createExactNativeCliProjectRuntime({ executor: dependencies.executor, plan, spec });
   }
   if (typeof existing.State?.Running !== 'boolean') {
     fail('RUNTIME_STATE', `${plan.profile.displayName} Project runtime state is ambiguous`);

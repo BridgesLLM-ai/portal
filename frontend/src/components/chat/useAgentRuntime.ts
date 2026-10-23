@@ -68,7 +68,7 @@ export function useAgentRuntime(options: {
   const cancelStream = ctx.cancelStream;
   const canSend = options.canSend !== false;
   const onSendBlocked = options.onSendBlocked;
-  const prevSessionRef = useRef<string | undefined>();
+  const prevSessionRef = useRef<string | undefined>(undefined);
   const onSessionResolvedRef = useRef(options.onSessionResolved);
   onSessionResolvedRef.current = options.onSessionResolved;
 

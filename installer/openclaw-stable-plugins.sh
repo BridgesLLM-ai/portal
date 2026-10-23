@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # package records. Portal qualifies this exact stable set. ACPX is required for
 # the Portal ACP compatibility surface; the other plugins are converged only
 # when the operator already has them installed.
-readonly OPENCLAW_STABLE_PLUGIN_VERSION="2026.9.3"
+readonly OPENCLAW_STABLE_PLUGIN_VERSION="2026.10.6"
 readonly OPENCLAW_PLUGIN_MAX_ARCHIVE_BYTES=$((96 * 1024 * 1024))
 readonly OPENCLAW_PLUGIN_MAX_EXPANDED_BYTES=$((384 * 1024 * 1024))
 openclaw_plugin_managed_entry_bound=250000
@@ -41,17 +41,17 @@ openclaw_stable_plugin_rows() {
   if [[ "${OPENCLAW_STABLE_PLUGIN_CATALOG:-default}" == "codex" \
     || "${OPENCLAW_STABLE_PLUGIN_CATALOG:-default}" == "portal" ]]; then
     cat <<'EOF'
-codex|@openclaw/codex|2026.9.3|sha512-nj9zeQzdkW3g4O7fYpaaHIiZRHjjVp94qyWnj0ZWZFYvMPiVtdB8WQjShygq0kmDi0Gn1iybR9CYJJPPBRR8Yg==|required
+codex|@openclaw/codex|2026.10.6|sha512-TxcJYkPQyjPOa+/nrx/2LsAlHKNgE7PpI13HM1CZiDmpqO7aJYWeIjjgpkl8Z9nHcJ6OV4ChTM4qnoHkFPotqg==|required
 EOF
     [[ "${OPENCLAW_STABLE_PLUGIN_CATALOG}" == "codex" ]] && return
   fi
   [[ "${OPENCLAW_STABLE_PLUGIN_CATALOG:-default}" == "default" \
     || "${OPENCLAW_STABLE_PLUGIN_CATALOG:-default}" == "portal" ]] || return 1
   cat <<'EOF'
-acpx|@openclaw/acpx|2026.9.3|sha512-0YZN0YZmYbe/8GzbTj8jsYBE1fgJxF703CVfS4RX6nrVKdTdJgAUgo2Q3eJCvQnBK1/bnvlw5mSJDbsEsHzpYQ==|required
-brave|@openclaw/brave-plugin|2026.9.3|sha512-xemLgmXRyv83Rrj33AKgb9ZeFVIZF5vGv2/zf6uGuUSGuNTNgesnyZmUZkP7J/OLEWWQrp88+Ko7UxwmPZn8zg==|existing
-discord|@openclaw/discord|2026.9.3|sha512-m6V9wg6OljheSXwOJlT+ZZlyfYrzkNGAA5gky0PfwSg64aEsjdkSEqsPg3acCuufHlyBVerToEpmK4PVc7rrgw==|existing
-voice-call|@openclaw/voice-call|2026.9.3|sha512-PdlZo6GUimxpLgfB4nOSNK18MGHFC0iBqviSPWUOifYa83JVztMYYbYPHuv7F1FGLKyIt9SnlfEY9B29AosapQ==|existing
+acpx|@openclaw/acpx|2026.10.6|sha512-cBnaxpIwwdlnqd5kSqWwHh79OiMlEwaO1RSelwt6R0Elr8aHImaQjk+cmLVdxWYsC2QjasntIXUBCzqeohe1dg==|required
+brave|@openclaw/brave-plugin|2026.10.6|sha512-9FCXTn7udMMGDbv9+6LhdUb1khPWXA8evKCtJ3lV0jFoQhLX8DFbxDJs3p0KzF1Hc0j3aoDP0HrH2+/9dVEMWQ==|existing
+discord|@openclaw/discord|2026.10.6|sha512-SBvSV5sVgG9OTRy8BRtWufHdq55/3lJvB7bM1bNsYZH+/fHczUV6vLb190XPJVnOZjLMAxJrPxKHml+95nAD7Q==|existing
+voice-call|@openclaw/voice-call|2026.10.6|sha512-u30wwKLU/MLh9ztx9b9O3LOOtIGP/q0MCUFwzupT6+y5JpQeO+ezKLrf/mk33zEnbDxzHXps078Fd94Bi01S6g==|existing
 EOF
 }
 
@@ -681,6 +681,121 @@ byte_limit = int(sys.argv[6])
 def fail(message):
     raise SystemExit(message)
 
+
+# Hardlink authority is the complete, closed set of aliases in this managed
+# root, never merely matching bytes. Stable path groups survive cp -a while
+# device/inode values remain private to this one observation.
+def managed_file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+def native_capture_aliases(root, groups):
+    """Prove closure across managed files and pinned native retained aliases.
+
+    Capture names are derived cache, not extra rollback data. Their shared
+    inode is verified here; only managed-root alias topology is snapshotted.
+    No link is removed or followed, and unexplained aliases still refuse.
+    """
+    import re
+    needed = {key: members for key, members in groups.items()
+              if len(members) != members[0][2][5]}
+    if not needed:
+        return {}
+    config = pathlib.Path(os.environ.get('OPENCLAW_CONFIG_PATH',
+                           str(pathlib.Path.home() / '.openclaw/openclaw.json')))
+    state = pathlib.Path(os.environ.get('OPENCLAW_STATE_DIR', str(config.parent)))
+    if (not state.is_absolute() or state.resolve() != state
+            or root not in (state / 'npm', state / '.bridgesllm-stable-plugins-npm-rollback-current')):
+        raise SystemExit('native hardlink custody is outside the managed state root')
+    core = pathlib.Path('/usr/lib/node_modules/openclaw')
+    native = {
+        '2026.9.9': ('installed-plugin-index-store-D6QbxMVF.mjs', '5611075c71b8d0f930902bc22602e3ea47171c42eb86c42c3e8ad58821cb874e'),
+        '2026.10.5': ('installed-plugin-index-store-write-DAlSa4fr.mjs', '7b4ebd06f4958a50fdb1722658f36d8246559cde22ec5f6a7a362927f39585ba'),
+        '2026.10.6': ('installed-plugin-index-store-write-1Cj2OpRp.mjs', '126c13d679b3c4cb21700865089a20413b3c70eea8abdac1605c2f99ec3ffbb7'),
+    }.get(json.loads((core / 'package.json').read_text()).get('version'))
+    if not native or hashlib.sha256((core / 'dist' / native[0]).read_bytes()).hexdigest() != native[1]:
+        raise SystemExit('native hardlink runtime identity is not pinned')
+    for members in needed.values():
+        for relative, row, identity in members:
+            parts = pathlib.PurePosixPath(relative).parts
+            if len(parts) < 4 or parts[0] != 'projects' or parts[2] != 'node_modules':
+                raise SystemExit('external aliases on an unowned managed npm path')
+            allowed = ['openclaw-' + name + '-' + hashlib.sha256(('@openclaw/' + name).encode()).hexdigest()[:10]
+                       for name in ('codex', 'acpx')]
+            # Native isPluginNpmProjectDir owns both the original package project
+            # and its generation-specific successors. Closure rules are identical.
+            if not any(re.fullmatch(re.escape(name) + r'(?:__openclaw-generation__g-[a-f0-9]{16})?', parts[1])
+                       for name in allowed):
+                raise SystemExit('external aliases on an unowned managed project')
+    captures = state / 'tmp/plugin-captures'
+    def directory(path):
+        info = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != owner or info.st_gid != group
+                or stat.S_IMODE(info.st_mode) & 0o022 or path.resolve() != path):
+            raise SystemExit('unsafe native capture directory')
+    for path in (state, state / 'tmp', captures):
+        directory(path)
+    aliases, observed = {}, 0
+    for generation in sorted(captures.iterdir()):
+        if not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', generation.name):
+            continue
+        directory(generation)
+        native = generation / 'native'
+        if not native.exists():
+            continue
+        directory(native)
+        for admission in sorted(native.iterdir()):
+            if not re.fullmatch(r'admission-[A-Za-z0-9]{6}', admission.name):
+                continue
+            directory(admission)
+            content = admission / 'content'
+            directory(content)
+            for current, dirs, files in os.walk(content, followlinks=False):
+                dirs.sort(); files.sort()
+                directory(pathlib.Path(current))
+                observed += len(dirs) + len(files) + 1
+                if observed > entry_limit:
+                    raise SystemExit('native capture alias inventory exceeds bound')
+                for name in dirs:
+                    directory(pathlib.Path(current) / name)
+                for name in files:
+                    path = pathlib.Path(current) / name
+                    info = path.lstat()
+                    key = (info.st_dev, info.st_ino)
+                    if key not in needed:
+                        continue
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner
+                            or info.st_gid != group or stat.S_IMODE(info.st_mode) & 0o022
+                            or managed_file_identity(info) != needed[key][0][2]):
+                        raise SystemExit('native capture alias identity drift')
+                    aliases.setdefault(key, []).append(path)
+    for key, members in needed.items():
+        expected = members[0][2]
+        if len(members) + len(aliases.get(key, [])) != expected[5]:
+            raise SystemExit('managed npm hardlinks escape native closure: ' + members[0][0])
+        for path in aliases.get(key, []):
+            if managed_file_identity(path.lstat()) != expected:
+                raise SystemExit('native capture alias changed during inventory')
+    return aliases
+
+
+def seal_managed_hardlinks(root, groups):
+    aliases = native_capture_aliases(root, groups)
+    for members in groups.values():
+        expected = members[0][2]
+        key = (expected[0], expected[1])
+        if len(members) + len(aliases.get(key, [])) != expected[5]:
+            raise SystemExit("managed npm hardlinks escape inventory: " + members[0][0])
+        paths = sorted(member[0] for member in members)
+        group_digest = hashlib.sha256(json.dumps(paths, separators=(",", ":")).encode()).hexdigest()
+        for relative, row, identity in members:
+            if identity != expected or managed_file_identity((root / relative).lstat()) != expected:
+                raise SystemExit("managed npm file changed during inventory: " + relative)
+            if len(paths) > 1:
+                row["hardlinkGroup"] = group_digest
+                row["hardlinkCount"] = len(paths)
+
 if not root.is_absolute() or not output.is_absolute():
     fail("inventory paths must be absolute")
 if root.is_symlink():
@@ -701,6 +816,7 @@ else:
         os.close(root_fd)
         fail("managed npm root changed while it was opened")
     records = []
+    hardlinks = {}
     byte_count = 0
     try:
         for current, directories, files in os.walk(root, topdown=True, followlinks=False):
@@ -737,16 +853,13 @@ else:
                         os.close(descriptor)
                     record["type"] = "dir"
                 elif stat.S_ISREG(metadata.st_mode):
-                    if metadata.st_nlink != 1:
-                        fail(f"managed npm regular file has ambiguous hardlinks: {relative}")
                     byte_count += metadata.st_size
                     if byte_count > byte_limit:
                         fail("managed npm tree exceeds byte bound")
                     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
                     try:
                         held = os.fstat(descriptor)
-                        if ((held.st_dev, held.st_ino) != (metadata.st_dev, metadata.st_ino)
-                                or held.st_nlink != 1):
+                        if managed_file_identity(held) != managed_file_identity(metadata):
                             fail(f"managed npm file changed while opened: {relative}")
                         digest = hashlib.sha512()
                         while True:
@@ -754,10 +867,14 @@ else:
                             if not chunk:
                                 break
                             digest.update(chunk)
+                        if managed_file_identity(os.fstat(descriptor)) != managed_file_identity(metadata):
+                            fail(f"managed npm file changed while read: {relative}")
                     finally:
                         os.close(descriptor)
                     record.update(type="file", size=metadata.st_size,
                                   sha512=digest.hexdigest())
+                    hardlinks.setdefault((metadata.st_dev, metadata.st_ino), []).append(
+                        (relative, record, managed_file_identity(metadata)))
                 elif stat.S_ISLNK(metadata.st_mode):
                     parts = pathlib.PurePosixPath(relative).parts
                     target = os.readlink(path)
@@ -778,8 +895,7 @@ else:
                         target_stat = resolved.stat()
                         if (not stat.S_ISREG(target_stat.st_mode)
                                 or target_stat.st_uid != owner or target_stat.st_gid != group
-                                or stat.S_IMODE(target_stat.st_mode) & 0o022
-                                or target_stat.st_nlink != 1):
+                                or stat.S_IMODE(target_stat.st_mode) & 0o022):
                             fail(f"managed npm executable link target is ambiguous: {relative}")
                     elif len(parts) >= 2 and parts[-2:] == ("node_modules", "openclaw"):
                         target_stat = resolved.stat()
@@ -791,7 +907,7 @@ else:
                             package = json.loads((resolved / "package.json").read_text(encoding="utf-8"))
                         except Exception:
                             fail(f"managed npm peer link target has no valid package manifest: {relative}")
-                        if package.get("name") != "openclaw" or package.get("version") not in {"2026.9.1", "2026.9.2", "2026.9.3"}:
+                        if package.get("name") != "openclaw" or package.get("version") not in {"2026.9.1", "2026.9.2", "2026.9.3", "2026.9.6", "2026.9.9", "2026.10.5", "2026.10.6"}:
                             fail(f"managed npm peer link target is not the pinned OpenClaw package: {relative}")
                     elif not os.path.isabs(target):
                         try:
@@ -802,9 +918,7 @@ else:
                         if (not (stat.S_ISDIR(target_stat.st_mode)
                                  or stat.S_ISREG(target_stat.st_mode))
                                 or target_stat.st_uid != owner or target_stat.st_gid != group
-                                or stat.S_IMODE(target_stat.st_mode) & 0o022
-                                or (stat.S_ISREG(target_stat.st_mode)
-                                    and target_stat.st_nlink != 1)):
+                                or stat.S_IMODE(target_stat.st_mode) & 0o022):
                             fail(f"managed npm relative link target is ambiguous: {relative}")
                     else:
                         fail(f"unexpected managed npm symlink: {relative}")
@@ -814,6 +928,7 @@ else:
                 records.append(record)
                 if len(records) > entry_limit:
                     fail("managed npm tree exceeds entry bound")
+        seal_managed_hardlinks(root, hardlinks)
     finally:
         os.close(root_fd)
     records.sort(key=lambda row: row["path"])
@@ -944,6 +1059,121 @@ if not 0 <= verified <= attempted <= len(plan_order) or attempted - verified > 1
     raise SystemExit("transaction progress receipts are inconsistent")
 unverified_package = plan_order[verified] if attempted == verified + 1 else None
 
+
+# Hardlink authority is the complete, closed set of aliases in this managed
+# root, never merely matching bytes. Stable path groups survive cp -a while
+# device/inode values remain private to this one observation.
+def managed_file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+def native_capture_aliases(root, groups):
+    """Prove closure across managed files and pinned native retained aliases.
+
+    Capture names are derived cache, not extra rollback data. Their shared
+    inode is verified here; only managed-root alias topology is snapshotted.
+    No link is removed or followed, and unexplained aliases still refuse.
+    """
+    import re
+    needed = {key: members for key, members in groups.items()
+              if len(members) != members[0][2][5]}
+    if not needed:
+        return {}
+    config = pathlib.Path(os.environ.get('OPENCLAW_CONFIG_PATH',
+                           str(pathlib.Path.home() / '.openclaw/openclaw.json')))
+    state = pathlib.Path(os.environ.get('OPENCLAW_STATE_DIR', str(config.parent)))
+    if (not state.is_absolute() or state.resolve() != state
+            or root not in (state / 'npm', state / '.bridgesllm-stable-plugins-npm-rollback-current')):
+        raise SystemExit('native hardlink custody is outside the managed state root')
+    core = pathlib.Path('/usr/lib/node_modules/openclaw')
+    native = {
+        '2026.9.9': ('installed-plugin-index-store-D6QbxMVF.mjs', '5611075c71b8d0f930902bc22602e3ea47171c42eb86c42c3e8ad58821cb874e'),
+        '2026.10.5': ('installed-plugin-index-store-write-DAlSa4fr.mjs', '7b4ebd06f4958a50fdb1722658f36d8246559cde22ec5f6a7a362927f39585ba'),
+        '2026.10.6': ('installed-plugin-index-store-write-1Cj2OpRp.mjs', '126c13d679b3c4cb21700865089a20413b3c70eea8abdac1605c2f99ec3ffbb7'),
+    }.get(json.loads((core / 'package.json').read_text()).get('version'))
+    if not native or hashlib.sha256((core / 'dist' / native[0]).read_bytes()).hexdigest() != native[1]:
+        raise SystemExit('native hardlink runtime identity is not pinned')
+    for members in needed.values():
+        for relative, row, identity in members:
+            parts = pathlib.PurePosixPath(relative).parts
+            if len(parts) < 4 or parts[0] != 'projects' or parts[2] != 'node_modules':
+                raise SystemExit('external aliases on an unowned managed npm path')
+            allowed = ['openclaw-' + name + '-' + hashlib.sha256(('@openclaw/' + name).encode()).hexdigest()[:10]
+                       for name in ('codex', 'acpx')]
+            # Native isPluginNpmProjectDir owns both the original package project
+            # and its generation-specific successors. Closure rules are identical.
+            if not any(re.fullmatch(re.escape(name) + r'(?:__openclaw-generation__g-[a-f0-9]{16})?', parts[1])
+                       for name in allowed):
+                raise SystemExit('external aliases on an unowned managed project')
+    captures = state / 'tmp/plugin-captures'
+    def directory(path):
+        info = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != owner or info.st_gid != group
+                or stat.S_IMODE(info.st_mode) & 0o022 or path.resolve() != path):
+            raise SystemExit('unsafe native capture directory')
+    for path in (state, state / 'tmp', captures):
+        directory(path)
+    aliases, observed = {}, 0
+    for generation in sorted(captures.iterdir()):
+        if not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', generation.name):
+            continue
+        directory(generation)
+        native = generation / 'native'
+        if not native.exists():
+            continue
+        directory(native)
+        for admission in sorted(native.iterdir()):
+            if not re.fullmatch(r'admission-[A-Za-z0-9]{6}', admission.name):
+                continue
+            directory(admission)
+            content = admission / 'content'
+            directory(content)
+            for current, dirs, files in os.walk(content, followlinks=False):
+                dirs.sort(); files.sort()
+                directory(pathlib.Path(current))
+                observed += len(dirs) + len(files) + 1
+                if observed > entry_limit:
+                    raise SystemExit('native capture alias inventory exceeds bound')
+                for name in dirs:
+                    directory(pathlib.Path(current) / name)
+                for name in files:
+                    path = pathlib.Path(current) / name
+                    info = path.lstat()
+                    key = (info.st_dev, info.st_ino)
+                    if key not in needed:
+                        continue
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner
+                            or info.st_gid != group or stat.S_IMODE(info.st_mode) & 0o022
+                            or managed_file_identity(info) != needed[key][0][2]):
+                        raise SystemExit('native capture alias identity drift')
+                    aliases.setdefault(key, []).append(path)
+    for key, members in needed.items():
+        expected = members[0][2]
+        if len(members) + len(aliases.get(key, [])) != expected[5]:
+            raise SystemExit('managed npm hardlinks escape native closure: ' + members[0][0])
+        for path in aliases.get(key, []):
+            if managed_file_identity(path.lstat()) != expected:
+                raise SystemExit('native capture alias changed during inventory')
+    return aliases
+
+
+def seal_managed_hardlinks(root, groups):
+    aliases = native_capture_aliases(root, groups)
+    for members in groups.values():
+        expected = members[0][2]
+        key = (expected[0], expected[1])
+        if len(members) + len(aliases.get(key, [])) != expected[5]:
+            raise SystemExit("managed npm hardlinks escape inventory: " + members[0][0])
+        paths = sorted(member[0] for member in members)
+        group_digest = hashlib.sha256(json.dumps(paths, separators=(",", ":")).encode()).hexdigest()
+        for relative, row, identity in members:
+            if identity != expected or managed_file_identity((root / relative).lstat()) != expected:
+                raise SystemExit("managed npm file changed during inventory: " + relative)
+            if len(paths) > 1:
+                row["hardlinkGroup"] = group_digest
+                row["hardlinkCount"] = len(paths)
+
 def inventory(root):
     if root.is_symlink():
         raise SystemExit("managed npm root became a symlink")
@@ -962,6 +1192,7 @@ def inventory(root):
         os.close(root_fd)
         raise SystemExit("managed npm root changed while opened")
     rows, total = [], 0
+    hardlinks = {}
     try:
       for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
         dirs.sort(); files.sort()
@@ -990,23 +1221,25 @@ def inventory(root):
                     os.close(descriptor)
                 row["type"] = "dir"
             elif stat.S_ISREG(metadata.st_mode):
-                if metadata.st_nlink != 1: raise SystemExit(f"hardlink in managed npm root: {rel}")
                 total += metadata.st_size
                 if total > byte_limit: raise SystemExit("managed npm tree exceeds byte bound")
                 digest = hashlib.sha512()
                 descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
                 try:
                     held = os.fstat(descriptor)
-                    if ((held.st_dev, held.st_ino) != (metadata.st_dev, metadata.st_ino)
-                            or held.st_nlink != 1):
+                    if managed_file_identity(held) != managed_file_identity(metadata):
                         raise SystemExit(f"file changed while opened: {rel}")
                     while True:
                         chunk = os.read(descriptor, 1024 * 1024)
                         if not chunk: break
                         digest.update(chunk)
+                    if managed_file_identity(os.fstat(descriptor)) != managed_file_identity(metadata):
+                        raise SystemExit(f"file changed while read: {rel}")
                 finally:
                     os.close(descriptor)
                 row.update(type="file", size=metadata.st_size, sha512=digest.hexdigest())
+                hardlinks.setdefault((metadata.st_dev, metadata.st_ino), []).append(
+                    (rel, row, managed_file_identity(metadata)))
             elif stat.S_ISLNK(metadata.st_mode):
                 parts = pathlib.PurePosixPath(rel).parts
                 target = os.readlink(path)
@@ -1025,8 +1258,7 @@ def inventory(root):
                     target_stat = resolved.stat()
                     if (not stat.S_ISREG(target_stat.st_mode)
                             or target_stat.st_uid != owner or target_stat.st_gid != group
-                            or stat.S_IMODE(target_stat.st_mode) & 0o022
-                            or target_stat.st_nlink != 1):
+                            or stat.S_IMODE(target_stat.st_mode) & 0o022):
                         raise SystemExit(f"ambiguous executable link target: {rel}")
                 elif len(parts) >= 2 and parts[-2:] == ("node_modules", "openclaw"):
                     target_stat = resolved.stat()
@@ -1036,7 +1268,7 @@ def inventory(root):
                         raise SystemExit(f"foreign OpenClaw peer link target: {rel}")
                     try: package = json.loads((resolved / "package.json").read_text(encoding="utf-8"))
                     except Exception: raise SystemExit(f"invalid OpenClaw peer link target: {rel}")
-                    if package.get("name") != "openclaw" or package.get("version") not in {"2026.9.1", "2026.9.2", "2026.9.3"}:
+                    if package.get("name") != "openclaw" or package.get("version") not in {"2026.9.1", "2026.9.2", "2026.9.3", "2026.9.6", "2026.9.9", "2026.10.5", "2026.10.6"}:
                         raise SystemExit(f"unpinned OpenClaw peer link target: {rel}")
                 elif not os.path.isabs(target):
                     try: resolved.relative_to(root.resolve(strict=True))
@@ -1046,9 +1278,7 @@ def inventory(root):
                     if (not (stat.S_ISDIR(target_stat.st_mode)
                             or stat.S_ISREG(target_stat.st_mode))
                             or target_stat.st_uid != owner or target_stat.st_gid != group
-                            or stat.S_IMODE(target_stat.st_mode) & 0o022
-                            or (stat.S_ISREG(target_stat.st_mode)
-                                and target_stat.st_nlink != 1)):
+                            or stat.S_IMODE(target_stat.st_mode) & 0o022):
                         raise SystemExit(f"ambiguous relative link target: {rel}")
                 else:
                     raise SystemExit(f"unexpected symlink in managed npm root: {rel}")
@@ -1056,6 +1286,7 @@ def inventory(root):
             else: raise SystemExit(f"special file in managed npm root: {rel}")
             rows.append(row)
             if len(rows) > entry_limit: raise SystemExit("managed npm tree exceeds entry bound")
+      seal_managed_hardlinks(root, hardlinks)
     finally:
         os.close(root_fd)
     return {"present": True, "records": sorted(rows, key=lambda row: row["path"])}
@@ -1159,12 +1390,27 @@ def load(path, present):
     if not isinstance(value, dict): raise SystemExit("OpenClaw config is not an object")
     return value
 
+def json_equal(left, right):
+    # JSON booleans are not numbers: Python's True == 1 must not authorize
+    # foreign configuration changes, including nested lists and objects.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
 baseline = load(baseline_path, baseline_present == "true")
 current_exists = pathlib.Path(current_path).is_file() and not pathlib.Path(current_path).is_symlink()
 current = load(current_path, current_exists)
-if baseline == current: raise SystemExit(0)
+if json_equal(baseline, current): raise SystemExit(0)
 
-def normalized(value):
+def normalized(value, *, is_current=False):
     value = copy.deepcopy(value)
     plugins = value.get("plugins")
     if isinstance(plugins, dict):
@@ -1178,17 +1424,18 @@ def normalized(value):
             if not plugins["allow"]: plugins.pop("allow", None)
         # The normal stable-plugin transaction owns the aggregate activation
         # switch.  A Codex projection transaction deliberately does not: it
-        # owns only Codex's entry/allow membership and deterministic 9.1
+        # owns only Codex's entry/allow membership and pinned-core
         # bookkeeping, so a concurrent owner cannot be silently overwritten.
         if not projection:
             plugins.pop("enabled", None)
         if not plugins: value.pop("plugins", None)
     # A first plugin command may materialize these exact core-owned migration
     # receipts even when openclaw.json was absent. They are deterministic
-    # OpenClaw 2026.9.1 bookkeeping, not user configuration.
+    # pinned OpenClaw bookkeeping, not user configuration.
     meta = value.get("meta")
     if isinstance(meta, dict):
-        if meta.get("lastTouchedVersion") in {"2026.9.1", "2026.9.3"}:
+        touched_version = meta.get("lastTouchedVersion")
+        if touched_version in {"2026.9.1", "2026.9.3", "2026.9.6", "2026.9.9", "2026.10.5", "2026.10.6"}:
             # The pinned core replaces the previous receipt on its first
             # plugin write. Compare against that exact recorded receipt;
             # dropping only the new value rejects retained-runtime upgrades.
@@ -1201,17 +1448,27 @@ def normalized(value):
         if isinstance(migrations, dict):
             if migrations.get("modelPolicyAllowlist") is True:
                 migrations.pop("modelPolicyAllowlist", None)
+            previous_meta = (baseline or {}).get("meta")
+            previous_migrations = previous_meta.get("migrations") if isinstance(previous_meta, dict) else None
+            # Pinned 2026.9.6 and 2026.9.9 add this literal receipt on a
+            # config write. Keep a baseline marker so its deletion/change
+            # remains drift.
+            if (is_current and touched_version in {"2026.9.6", "2026.9.9", "2026.10.5", "2026.10.6"}
+                    and migrations.get("utilityModelSeparation") is True
+                    and (not isinstance(previous_migrations, dict)
+                         or "utilityModelSeparation" not in previous_migrations)):
+                migrations.pop("utilityModelSeparation")
             if not migrations: meta.pop("migrations", None)
         if not meta: value.pop("meta", None)
     return value
 
 if baseline is None:
-    if current is not None and normalized(current) == {}:
+    if current is not None and normalized(current, is_current=True) == {}:
         raise SystemExit(0)
     raise SystemExit("OpenClaw config creation includes foreign drift")
 if current is None:
     raise SystemExit("OpenClaw config disappeared during plugin convergence")
-if normalized(baseline) != normalized(current):
+if not json_equal(normalized(baseline), normalized(current, is_current=True)):
     raise SystemExit("foreign OpenClaw config drift")
 PY
 }
@@ -1222,6 +1479,7 @@ openclaw_stable_plugins_restore_installed_index() {
   python3 - "${database}" "${baseline}" "${manifest}" "$(id -u)" "${mode}" <<'PY'
 import copy
 import json
+import re
 import pathlib
 import sqlite3
 import stat
@@ -1329,6 +1587,131 @@ def plugin_row_is_owned(row):
     version = str(row.get("packageVersion", ""))
     return valid_version(version) if plugin_id == unverified_id else version in plan["versions"]
 
+# The pinned 9.9 lifecycle materializes these exact package-build projections
+# after the first managed install. Snapshot serialization omits them. Accept
+# additions only: removals, changed values, unknown fields and all foreign plugin
+# identities still compare strictly. This never writes a normalized value.
+BUNDLED_99_BUILD_ADDITIONS = {'agentsapi': {'package': '@openclaw/agentsapi', 'fields': {'openclawVersion': 'e3733ed0dafb50c3f974661bf720bc9080ecd066b35ad66c498c3885a1ddd6c6'}}, 'apple-fm': {'package': '@openclaw/apple-fm-provider', 'fields': {'openclawVersion': 'e3733ed0dafb50c3f974661bf720bc9080ecd066b35ad66c498c3885a1ddd6c6', 'staticAssets': '775b3d4efb38a9b52e2d248ab1d39b8dfd2c1c0e715118e491d6ae5b0ef16975'}}, 'code-mode-quickjs': {'package': '@openclaw/code-mode-quickjs', 'fields': {'staticAssets': '2f942dedbf4c512a6d069ffd4dca67b3ba582a094b897aafb8a22236d26eb0de', 'workerEntries': '243e5a1caf771cde357298852a89c6df36dd669cc4edb70bc7d7e0e039022cc9'}}, 'crabbox': {'package': '@openclaw/crabbox-provider', 'fields': {'staticAssets': '5cabfc6da7edc00e1e045d4d0d67bc96c1cf6068bc24521fe0a458ddcd9238df'}}, 'cua-computer': {'package': '@openclaw/cua-computer', 'fields': {'openclawVersion': 'e3733ed0dafb50c3f974661bf720bc9080ecd066b35ad66c498c3885a1ddd6c6'}}, 'document-extract': {'package': '@openclaw/document-extract-plugin', 'fields': {'workerEntries': 'f443de8afa4075108a6c09cd4422895f61f6ba91e2679d7e0bcd5dbf932ccda8'}}, 'geolocation': {'package': '@openclaw/geolocation-plugin', 'fields': {'openclawVersion': 'e3733ed0dafb50c3f974661bf720bc9080ecd066b35ad66c498c3885a1ddd6c6'}}, 'logbook': {'package': '@openclaw/logbook', 'fields': {'openclawVersion': 'e3733ed0dafb50c3f974661bf720bc9080ecd066b35ad66c498c3885a1ddd6c6', 'workerEntries': 'e5bbc90948cab5f0d6b5068307907ce07c696568e3aca7840ff9c1f0597b0bee'}}, 'memory-core': {'package': '@openclaw/memory-core', 'fields': {'workerEntries': '5ba94bf96be331b5e8b9195c4485c22c637796c2e4a7ea0903a0e898c55ec550'}}, 'memory-wiki': {'package': '@openclaw/memory-wiki', 'fields': {'openclawVersion': 'e3733ed0dafb50c3f974661bf720bc9080ecd066b35ad66c498c3885a1ddd6c6'}}, 'onepassword': {'package': '@openclaw/onepassword', 'fields': {'openclawVersion': 'e3733ed0dafb50c3f974661bf720bc9080ecd066b35ad66c498c3885a1ddd6c6', 'staticAssets': '56ba53b43bd2d2f8d6c35573e04dfff911367e72c89c382eb91135ec9af6ba60'}}, 'openai': {'package': '@openclaw/openai-provider', 'fields': {'workerEntries': 'f2ec436d23377a1616fbca67d1fd11ba04801c130f705dbd0b30adcec3b910ca'}}, 'opencode-go': {'package': '@openclaw/opencode-go-provider', 'fields': {'openclawVersion': 'e3733ed0dafb50c3f974661bf720bc9080ecd066b35ad66c498c3885a1ddd6c6'}}, 'vault': {'package': '@openclaw/vault', 'fields': {'staticAssets': 'd0a0bbb2f0e521f45144eb2a7a03937c37e5f4e1bb3b53139a24e14150b00396'}}, 'workboard': {'package': '@openclaw/workboard', 'fields': {'workerEntries': '19ded3e2d867ff7bda672040037c0733d342f481ec2b2a4472575fc7448dfcfd'}}}
+
+def native_receipt(value):
+    """Validate the 10.5 receipt wire shape, not its native admission authority."""
+    def string(v):
+        return isinstance(v, str) and bool(v)
+    def sha(v):
+        return isinstance(v, str) and re.fullmatch('[a-f0-9]{64}', v) is not None
+    def size(v):
+        return type(v) is int and 0 <= v <= 9007199254740991
+    def fields(v, required, optional={}):
+        return (isinstance(v, dict) and required.keys() <= v.keys()
+                and v.keys() <= required.keys() | optional.keys()
+                and all(check(v[k]) for k, check in required.items())
+                and all(optional[k](v[k]) for k in v.keys() - required.keys()))
+    def records(check):
+        return lambda v: isinstance(v, dict) and all(isinstance(k, str) and check(x) for k, x in v.items())
+    member = lambda v: fields(v, dict(source=string, sourceIdentity=string,
+        capturedIdentity=string, boundaryChecked=lambda x: type(x) is bool),
+        dict(contentHash=sha, sizeBytes=size))
+    namespace = lambda v: fields(v, dict(sourceDirectory=string, capturedRoot=string,
+        managed=lambda x: type(x) is bool, members=records(member)), dict(referenceRoot=string))
+    artifact = lambda v: fields(v, dict(sourceIdentity=string, contentHash=sha,
+        sizeBytes=size, capturedPath=string, namespace=string, capturedIdentity=string))
+    return fields(value, dict(signature=string, sourceDigest=sha,
+        nativeArtifacts=records(artifact), nativeNamespaces=records(namespace)))
+
+def foreign_projection(before_raw, after_raw):
+    """Permit only the observed 10.5 schema projection and additive native receipt.
+
+    Install identity, roots, hashes, configuration, diagnostics and install records
+    still compare exactly. Existing receipts cannot disappear or change. A newly
+    published receipt is not installer authority: preserve it value-for-value in
+    the foreign row, leaving its interpretation/capture custody to native code.
+    """
+    before = copy.deepcopy(before_raw)
+    after = copy.deepcopy(after_raw)
+    if not before or not after or any(v.get('index', {}).get('hostContractVersion') not in ('2026.10.5', '2026.10.6')
+                                     for v in (before, after)):
+        return before_raw, after_raw
+    def rows(value):
+        result = {}
+        for entry in value['index']['plugins']:
+            if not isinstance(entry, dict) or not isinstance(entry.get('pluginId'), str) or entry['pluginId'] in result:
+                raise SystemExit('invalid or duplicate native plugin row')
+            result[entry['pluginId']] = entry
+        return result
+    previous, current = rows(before), rows(after)
+    for identity, old in previous.items():
+        new = current.get(identity)
+        if new is None or identity in ids:
+            continue
+        # The 10.5 persisted reader projects build hints to bundledDist only.
+        # Permit only known predecessor hints, never arbitrary package metadata.
+        build = old.get('packageBuild')
+        if isinstance(build, dict) and build.keys() <= {'openclawVersion', 'staticAssets', 'workerEntries', 'bundledDist'}:
+            valid = ('openclawVersion' not in build or build['openclawVersion'] in ('2026.10.5', '2026.10.6'))
+            valid = valid and ('bundledDist' not in build or type(build['bundledDist']) is bool)
+            valid = valid and ('workerEntries' not in build or isinstance(build['workerEntries'], list)
+                and all(isinstance(x, str) for x in build['workerEntries']))
+            valid = valid and ('staticAssets' not in build or isinstance(build['staticAssets'], list)
+                and all(isinstance(x, dict) and set(x) == {'source', 'output'}
+                        and all(isinstance(v, str) for v in x.values()) for x in build['staticAssets']))
+            projected = {k: v for k, v in build.items() if k == 'bundledDist'}
+            if valid and new.get('packageBuild') == projected:
+                old['packageBuild'] = projected
+        if old.get('sourceAdmissions') == new.get('sourceAdmissions'):
+            continue
+        key = str(old.get('rootDir')) + '\0'
+        receipts = new.get('sourceAdmissions')
+        if ('sourceAdmissions' in old or not old.get('installRecordHash')
+                or not isinstance(receipts, dict) or set(receipts) != {key}
+                or not native_receipt(receipts[key])):
+            raise SystemExit('foreign source admission drift')
+        old['sourceAdmissions'] = receipts
+    return before, after
+
+
+def index_matches_baseline(current_raw, baseline_raw):
+    current_value = normalize(current_raw)
+    baseline_value = normalize(baseline_raw)
+    baseline_value, current_value = foreign_projection(baseline_value, current_value)
+    if current_value == baseline_value:
+        return True
+    if not isinstance(current_value, dict) or not isinstance(baseline_value, dict):
+        return False
+    current_index = current_value.get("index")
+    baseline_index = baseline_value.get("index")
+    if not isinstance(current_index, dict) or not isinstance(baseline_index, dict):
+        return False
+    current_rows = current_index.get("plugins")
+    baseline_rows = baseline_index.get("plugins")
+    if not isinstance(current_rows, list) or not isinstance(baseline_rows, list):
+        return False
+    if len(current_rows) != len(baseline_rows):
+        return False
+    import hashlib
+    for current_row, baseline_row in zip(current_rows, baseline_rows):
+        if not isinstance(current_row, dict) or not isinstance(baseline_row, dict):
+            continue
+        plugin_id = current_row.get("pluginId")
+        allowed = BUNDLED_99_BUILD_ADDITIONS.get(plugin_id) if isinstance(plugin_id, str) else None
+        if (allowed is None or plugin_id in ids or baseline_row.get("pluginId") != plugin_id
+                or current_row.get("origin") != "bundled" or baseline_row.get("origin") != "bundled"
+                or current_row.get("installOwner") not in (None, "")
+                or baseline_row.get("installOwner") not in (None, "")
+                or current_row.get("packageName") != allowed["package"]
+                or baseline_row.get("packageName") != allowed["package"]):
+            continue
+        current_build = current_row.get("packageBuild")
+        baseline_build = baseline_row.get("packageBuild")
+        if not isinstance(current_build, dict) or not isinstance(baseline_build, dict):
+            continue
+        for field, expected in allowed["fields"].items():
+            if field not in baseline_build and field in current_build:
+                actual = hashlib.sha256(json.dumps(current_build[field], sort_keys=True,
+                                        separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+                if actual == expected:
+                    del current_build[field]
+    return current_value == baseline_value
+
 connection = sqlite3.connect(str(database), timeout=10, isolation_level=None)
 try:
     connection.execute("PRAGMA busy_timeout=10000")
@@ -1353,7 +1736,7 @@ try:
         current = row[0] if row else None
     baseline_raw = baseline.get("valueJson") if baseline.get("rowPresent") else None
     if current != baseline_raw:
-        if baseline_raw is not None and normalize(current) != normalize(baseline_raw):
+        if baseline_raw is not None and not index_matches_baseline(current, baseline_raw):
             raise SystemExit("foreign installed-plugin index drift")
         if baseline_raw is None and current is not None:
             # A missing row may be materialized by the first managed install.
@@ -1386,11 +1769,25 @@ try:
     if "config_machine_state" not in tables:
         if baseline.get("rowPresent"): raise SystemExit("installed-index table disappeared")
     elif baseline.get("rowPresent"):
+        restored_raw = baseline["valueJson"]
+        saved_value = json.loads(restored_raw)
+        current_value = json.loads(current) if current is not None else None
+        if (isinstance(current_value, dict)
+                and saved_value.get("index", {}).get("hostContractVersion") in ("2026.10.5", "2026.10.6")
+                and current_value.get("index", {}).get("hostContractVersion") in ("2026.10.5", "2026.10.6")):
+            # Keep every current foreign row, including native capture authority.
+            # Only this sealed plan's owned rows are restored from its snapshot.
+            foreign = [row for row in current_value["index"]["plugins"]
+                       if not plugin_row_is_owned(row)]
+            owned = [row for row in saved_value["index"]["plugins"]
+                     if plugin_row_is_owned(row)]
+            saved_value["index"]["plugins"] = foreign + owned
+            restored_raw = json.dumps(saved_value, separators=(",", ":"))
         connection.execute(
             "INSERT INTO config_machine_state(state_key,value_json,updated_at_ms) "
             "VALUES('plugins.installedIndex',?,?) ON CONFLICT(state_key) DO UPDATE SET "
             "value_json=excluded.value_json,updated_at_ms=excluded.updated_at_ms",
-            (baseline["valueJson"], baseline["updatedAtMs"]),
+            (restored_raw, baseline["updatedAtMs"]),
         )
     else:
         connection.execute("DELETE FROM config_machine_state WHERE state_key='plugins.installedIndex'")
@@ -1976,10 +2373,25 @@ def load(path):
         raise SystemExit("OpenClaw config projection is not an object")
     return value, metadata
 
+def json_equal(left, right):
+    # JSON booleans are not numbers: Python's True == 1 must not authorize
+    # foreign configuration changes, including nested lists and objects.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
 baseline, _ = load(baseline_path)
 current, current_metadata = load(current_path)
 
-def normalized(value):
+def normalized(value, *, is_current=False):
     value = copy.deepcopy(value)
     plugins = value.get("plugins")
     if isinstance(plugins, dict):
@@ -1998,7 +2410,8 @@ def normalized(value):
             value.pop("plugins", None)
     meta = value.get("meta")
     if isinstance(meta, dict):
-        if meta.get("lastTouchedVersion") in {"2026.9.1", "2026.9.3"}:
+        touched_version = meta.get("lastTouchedVersion")
+        if touched_version in {"2026.9.1", "2026.9.3", "2026.9.6", "2026.9.9", "2026.10.5", "2026.10.6"}:
             # The pinned core replaces the previous receipt on its first
             # plugin write. Compare against that exact recorded receipt;
             # dropping only the new value rejects retained-runtime upgrades.
@@ -2011,13 +2424,23 @@ def normalized(value):
         if isinstance(migrations, dict):
             if migrations.get("modelPolicyAllowlist") is True:
                 migrations.pop("modelPolicyAllowlist", None)
+            previous_meta = (baseline or {}).get("meta")
+            previous_migrations = previous_meta.get("migrations") if isinstance(previous_meta, dict) else None
+            # Pinned 2026.9.6 and 2026.9.9 add this literal receipt on a
+            # config write. Keep a baseline marker so its deletion/change
+            # remains drift.
+            if (is_current and touched_version in {"2026.9.6", "2026.9.9", "2026.10.5", "2026.10.6"}
+                    and migrations.get("utilityModelSeparation") is True
+                    and (not isinstance(previous_migrations, dict)
+                         or "utilityModelSeparation" not in previous_migrations)):
+                migrations.pop("utilityModelSeparation")
             if not migrations:
                 meta.pop("migrations", None)
         if not meta:
             value.pop("meta", None)
     return value
 
-if normalized(baseline) != normalized(current):
+if not json_equal(normalized(baseline), normalized(current, is_current=True)):
     raise SystemExit("foreign OpenClaw config drift blocks Codex projection rollback")
 
 parent_fd = os.open(current_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

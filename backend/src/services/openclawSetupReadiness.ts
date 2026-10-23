@@ -11,13 +11,15 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-export const TESTED_OPENCLAW_CORE_PACKAGE_VERSION = process.env.PORTAL_OPENCLAW_CORE_PACKAGE_VERSION || '2026.9.3';
-export const TESTED_OPENCLAW_RUNTIME_VERSION = process.env.PORTAL_OPENCLAW_RUNTIME_VERSION || '2026.9.3';
+export const OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS = 60_000;
+
+export const TESTED_OPENCLAW_CORE_PACKAGE_VERSION = process.env.PORTAL_OPENCLAW_CORE_PACKAGE_VERSION || '2026.10.6';
+export const TESTED_OPENCLAW_RUNTIME_VERSION = process.env.PORTAL_OPENCLAW_RUNTIME_VERSION || '2026.10.6';
 export const LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION = '2026.7.1-2';
 export const LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION = '2026.7.1';
 
 // The family names identify API contracts, not every compatible patch release.
-export const QUALIFIED_OPENCLAW_NATIVE_PATCHES: readonly string[] = Object.freeze(['2026.9.1', '2026.9.2', '2026.9.3']);
+export const QUALIFIED_OPENCLAW_NATIVE_PATCHES: readonly string[] = Object.freeze(['2026.9.1', '2026.9.2', '2026.9.3', '2026.9.9', '2026.10.5', '2026.10.6']);
 
 export type OpenClawTestedRuntimeFamily = 'legacy-2026.7.1' | 'current-2026.9.1';
 
@@ -62,6 +64,15 @@ interface OpenClawCliResult {
   stdout: string;
   stderr: string;
   error?: string;
+  /** The bounded CLI call was killed at its timeout (a busy host, not a verdict). */
+  timedOut?: boolean;
+}
+
+/** execFile kills the child at `timeout` and reports `killed` with a signal. */
+export function isOpenClawCliTimeout(error: any): boolean {
+  return error?.killed === true
+    && Boolean(error?.signal)
+    && error?.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
 }
 
 interface OpenClawPackageMetadata {
@@ -79,6 +90,7 @@ export interface OpenClawSetupReadinessBlocker {
     | 'gateway-token-missing'
     | 'gateway-token-mismatch'
     | 'codex-plugin-mismatch'
+    | 'codex-plugin-inspect-timeout'
     | 'auth-store-unavailable'
     | 'credential-store-not-writable';
   message: string;
@@ -183,6 +195,7 @@ async function runOpenClawCli(args: string[], timeoutMs = 10_000): Promise<OpenC
       ok: false,
       stdout: String(error?.stdout || '').trim(),
       stderr: String(error?.stderr || error?.message || '').trim(),
+      ...(isOpenClawCliTimeout(error) ? { timedOut: true } : {}),
     };
   }
 }
@@ -475,9 +488,12 @@ async function collectOpenClawSetupReadinessUncached(
   // loaded production host they measured ~7s at rest, ~15s cold, and ~21s under
   // CLI contention while still succeeding, so the former 10s budget reported a
   // healthy credential store as `auth-store-unavailable`, which also fails
-  // OpenClaw execution admission (Agent Chat sends). Use the same 25s bound
-  // as discovery; the 60s cache and in-flight dedup keep the cost bounded.
-  const codexPluginResult = await dependencies.runOpenClawCli(['plugins', 'inspect', 'codex', '--json'], 25_000);
+  // OpenClaw execution admission (Agent Chat sends). The auth store keeps the
+  // 25s discovery bound; the plugin inspect gets OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS
+  // (registry loads measured 20-37s on a contended 2 vCPU host). A killed
+  // inspect is reported as a timeout, never as a version mismatch. The shared
+  // attestation cache and in-flight dedup keep the cost bounded.
+  const codexPluginResult = await dependencies.runOpenClawCli(['plugins', 'inspect', 'codex', '--json'], OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS);
   const authStoreResult = await dependencies.runOpenClawCli(['models', 'auth', '--agent', 'main', 'list', '--json'], 25_000);
   const packageMetadata = await dependencies.resolvePackageMetadata();
 
@@ -579,10 +595,19 @@ async function collectOpenClawSetupReadinessUncached(
     blockers.push({ code: 'gateway-token-mismatch', message: 'The configured gateway token did not authenticate to the running OpenClaw gateway.' });
   }
   if (!codexPluginExact) {
-    blockers.push({
-      code: 'codex-plugin-mismatch',
-      message: `The Codex plugin must be the pinned npm install ${expectedCodexPluginSpec}; detected ${codexPluginInstallSpec || codexPluginVersion || 'unknown'}.`,
-    });
+    // A killed inspect carries no evidence about the plugin; say so instead of
+    // reporting a version mismatch that was never observed. Still not ready.
+    blockers.push(codexPluginResult.timedOut
+      ? {
+          code: 'codex-plugin-inspect-timeout',
+          message: `OpenClaw did not finish inspecting the Codex plugin within ${Math.round(OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS / 1000)} s; the host may be busy. Retry shortly.`,
+        }
+      : {
+          code: 'codex-plugin-mismatch',
+          message: codexPluginResult.ok
+            ? `The Codex plugin must be the pinned npm install ${expectedCodexPluginSpec}; detected ${codexPluginInstallSpec || codexPluginVersion || 'unknown'}.`
+            : `OpenClaw could not inspect the Codex plugin (expected ${expectedCodexPluginSpec}): ${String(codexPluginResult.stderr || codexPluginResult.error || 'unknown error').slice(0, 300)}`,
+        });
   }
   if (!credentialStoreReady) {
     blockers.push({ code: 'auth-store-unavailable', message: 'OpenClaw could not verify its saved authentication store.' });

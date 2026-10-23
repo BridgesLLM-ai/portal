@@ -5,15 +5,15 @@ set -Eeuo pipefail
 # main and can install optional components lazily. Portal instead installs one
 # exact release-commit source tree, one exact uv release, one exact Python
 # patch, and the repository's frozen dependency lock into a versioned root.
-readonly HERMES_TESTED_VERSION="0.21.1"
-readonly HERMES_TESTED_TAG="v2026.9.7"
-readonly HERMES_TESTED_COMMIT="2237be355906fbe6065ce1815711eee52b2d646e"
-readonly HERMES_SOURCE_URL="https://api.github.com/repos/NousResearch/hermes-agent/tarball/2237be355906fbe6065ce1815711eee52b2d646e"
+readonly HERMES_TESTED_VERSION="0.22.2"
+readonly HERMES_TESTED_TAG="v0.22.2"
+readonly HERMES_TESTED_COMMIT="d923a5eb487a17c0a68801bba9ef0f56c81040a8"
+readonly HERMES_SOURCE_URL="https://api.github.com/repos/NousResearch/hermes-agent/tarball/d923a5eb487a17c0a68801bba9ef0f56c81040a8"
 # GitHub regenerates auto-generated tag/commit tarballs: the gzip bytes and
 # root directory can change while the exact commit tree remains identical.
 # Pin a canonical SHA-256 over every regular file's relative path, executable
 # mode, size and bytes instead of a mutable transport archive hash.
-readonly HERMES_SOURCE_TREE_SHA256="77aa1e1cabc237bb62b291e77927d99977ac356484a9d16f897bb66cda248773"
+readonly HERMES_SOURCE_TREE_SHA256="6bd8d88ce4758357d926967676130eff96427515163608a7c51e4f459891cc89"
 readonly HERMES_SOURCE_MAX_BYTES=$((96 * 1024 * 1024))
 readonly HERMES_SOURCE_MAX_EXPANDED_BYTES=$((512 * 1024 * 1024))
 
@@ -23,7 +23,11 @@ readonly HERMES_UV_SHA256_AARCH64="9bf43b4d1a07665bf64d4c4e710930b382321a785e0eb
 readonly HERMES_UV_URL_X86_64="https://github.com/astral-sh/uv/releases/download/0.12.5/uv-x86_64-unknown-linux-gnu.tar.gz"
 readonly HERMES_UV_URL_AARCH64="https://github.com/astral-sh/uv/releases/download/0.12.5/uv-aarch64-unknown-linux-gnu.tar.gz"
 readonly HERMES_UV_MAX_BYTES=$((64 * 1024 * 1024))
-readonly HERMES_PYTHON_VERSION="3.11.15"
+readonly HERMES_PYTHON_VERSION="3.14.7"
+readonly HERMES_PYTHON_BUILD="20260901"
+readonly HERMES_PYTHON_SHA256_X86_64="0ab3305457051cd3e7c031857e005f1bda17c218a1990567dacaaac6dd1d14f0"
+readonly HERMES_PYTHON_SHA256_AARCH64="30f1cc489be654477d895b441e196bb080738bf0456da82080ad4ab66a22d80f"
+readonly HERMES_PYTHON_MAX_BYTES=$((160 * 1024 * 1024))
 readonly HERMES_ATTESTATION_NAME=".portal-runtime-attestation-v1"
 
 hermes_arch() {
@@ -63,7 +67,7 @@ hermes_uv_member() {
 }
 
 hermes_root() {
-  printf '%s\n' "${HERMES_RUNTIME_ROOT:-/opt/bridgesllm/tools/hermes}"
+  printf '%s\n' "${HERMES_RUNTIME_ROOT:-/usr/local/lib/bridgesllm-runtimes/hermes}"
 }
 
 hermes_version_root() {
@@ -83,6 +87,9 @@ upstream_commit=${HERMES_TESTED_COMMIT}
 source_tree_sha256=${HERMES_SOURCE_TREE_SHA256}
 uv_version=${HERMES_UV_VERSION}
 python_version=${HERMES_PYTHON_VERSION}
+python_build=${HERMES_PYTHON_BUILD}
+install_stamp_update_mechanism=external
+extras=acp,mcp
 EOF
 }
 
@@ -215,12 +222,91 @@ with tarfile.open(archive, "r:gz") as tf:
 PY
 }
 
+hermes_python_url() {
+  case "$1" in
+    x86_64|aarch64) printf 'https://github.com/astral-sh/python-build-standalone/releases/download/%s/cpython-%s+%s-%s-unknown-linux-gnu-install_only.tar.gz\n' \
+      "${HERMES_PYTHON_BUILD}" "${HERMES_PYTHON_VERSION}" "${HERMES_PYTHON_BUILD}" "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+hermes_python_sha256() {
+  case "$1" in
+    x86_64) printf '%s\n' "${HERMES_PYTHON_SHA256_X86_64}" ;;
+    aarch64) printf '%s\n' "${HERMES_PYTHON_SHA256_AARCH64}" ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_hermes_python_archive() {
+  local archive="$1" expected="$2"
+  verify_hermes_download "${archive}" "${expected}" "${HERMES_PYTHON_MAX_BYTES}" "Python" || return 1
+  python3 - "${archive}" <<'PYTHON'
+import pathlib
+import posixpath
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "r:gz") as tf:
+    members = tf.getmembers()
+    if not members or len(members) > 20000:
+        raise SystemExit("Python archive entry count is outside the allowed range")
+    seen = set()
+    expanded = 0
+    for member in members:
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "python" or "\\" in member.name:
+            raise SystemExit("Python archive contains an unsafe path")
+        if member.name in seen or not (member.isfile() or member.isdir() or member.issym()):
+            raise SystemExit("Python archive contains a duplicate or unsupported entry")
+        seen.add(member.name)
+        expanded += member.size
+        if member.size < 0 or expanded > 768 * 1024 * 1024:
+            raise SystemExit("Python archive expanded size is outside the allowed range")
+        if member.issym():
+            target = pathlib.PurePosixPath(posixpath.normpath(posixpath.join(str(path.parent), member.linkname)))
+            if pathlib.PurePosixPath(member.linkname).is_absolute() or not target.parts or target.parts[0] != "python":
+                raise SystemExit("Python archive contains an escaping symlink")
+    if "python/bin/python3.14" not in seen:
+        raise SystemExit("Python archive is missing the interpreter")
+PYTHON
+}
+
+hermes_write_install_stamp() {
+  local root="$1"
+  # An archive nested beneath another checkout must not inherit that checkout's
+  # branch/dirty identity. The admitted commit/tree, not ambient Git, is authority.
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    GIT_CEILING_DIRECTORIES="$(dirname "${root}")" \
+    "${root}/.portal-tools/python/bin/python3" "${root}/scripts/write_install_stamp.py" \
+    --output "${root}/install-stamp.json" --base-version "${HERMES_TESTED_VERSION}" \
+    --commit "${HERMES_TESTED_COMMIT}" --branch "${HERMES_TESTED_TAG}" --distance 0 --source local --update-mechanism external
+}
+
+verify_hermes_install_stamp() {
+  python3 - "$1/install-stamp.json" "${HERMES_TESTED_VERSION}" "${HERMES_TESTED_COMMIT}" <<'PYTHON'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        stamp = json.load(f)
+    valid = (stamp.get("schemaVersion") == 2 and stamp.get("baseVersion") == sys.argv[2]
+             and stamp.get("commit") == sys.argv[3] and stamp.get("distance") == 0
+             and stamp.get("updateMechanism") == "external" and stamp.get("source") == "local"
+             and not stamp.get("dirty"))
+except (OSError, ValueError, AttributeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PYTHON
+}
+
 hermes_binary_version() {
   local binary="$1" probe output
   [[ -x "${binary}" ]] || return 1
   probe="$(mktemp -d)"
   mkdir -p "${probe}/home" "${probe}/state"
   output="$(
+    /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin \
     HOME="${probe}/home" \
     HERMES_HOME="${probe}/state" \
     HERMES_DISABLE_LAZY_INSTALLS=1 \
@@ -242,6 +328,7 @@ hermes_acp_check() {
   probe="$(mktemp -d)"
   mkdir -p "${probe}/home" "${probe}/state"
   output="$(
+    /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin \
     HOME="${probe}/home" \
     HERMES_HOME="${probe}/state" \
     HERMES_DISABLE_LAZY_INSTALLS=1 \
@@ -264,6 +351,32 @@ hermes_uv_version() {
   printf '%s\n' "${HERMES_UV_VERSION}"
 }
 
+# The Desktop user (bridgesrd) runs this CLI through the alias, so the runtime
+# must sit outside the private /opt/bridgesllm ancestor and be world read/execute
+# whatever the installer's umask. It holds no secrets; state stays private.
+hermes_runtime_publicly_executable() {
+  local path="$1"
+  [[ -x "${path}" ]] || return 1
+  while [[ "${path}" != "/" ]]; do
+    # Every directory must be traversable and the file readable/executable by others.
+    (( ( 0$(stat -c '%a' -- "${path}") & 05 ) == 05 )) || return 1
+    path="$(dirname -- "${path}")"
+  done
+}
+
+# Narrow migration from the previous private layout: only a direct alias to an
+# exact legacy managed generation (root-owned regular file) may be replaced. The
+# legacy tree is never modified; the alias moves only after a verified install.
+hermes_legacy_managed_alias() {
+  local target="$1" link resolved rest legacy_root="${HERMES_LEGACY_RUNTIME_ROOT:-/opt/bridgesllm/tools/hermes}"
+  link="$(readlink -- "${target}" 2>/dev/null || true)"
+  resolved="$(readlink -f -- "${target}" 2>/dev/null || true)"
+  [[ -n "${resolved}" && "${link}" == "${resolved}" ]] || return 1
+  rest="${resolved#"${legacy_root}/"}"
+  [[ "${resolved}" == "${legacy_root}/${rest}" && "${rest}" =~ ^[0-9]+\.[0-9]+\.[0-9]+/\.venv/bin/hermes$ ]] || return 1
+  [[ -f "${resolved}" && ! -L "${resolved}" && "$(stat -c '%u' -- "${resolved}")" == "0" ]]
+}
+
 verify_hermes_runtime() {
   local root target resolved expected_attestation actual_attestation python_version
   root="$(hermes_version_root)"
@@ -271,10 +384,13 @@ verify_hermes_runtime() {
   [[ -L "${target}" ]] || return 1
   resolved="$(readlink -f -- "${target}" 2>/dev/null || true)"
   [[ "${resolved}" == "${root}/.venv/bin/hermes" ]] || return 1
+  hermes_runtime_publicly_executable "${resolved}" || return 1
+  hermes_runtime_publicly_executable "$(readlink -f -- "${root}/.venv/bin/python")" || return 1
   [[ -x "${root}/.portal-tools/uv" && -f "${root}/${HERMES_ATTESTATION_NAME}" ]] || return 1
   expected_attestation="$(hermes_attestation)"
   actual_attestation="$(<"${root}/${HERMES_ATTESTATION_NAME}")"
   [[ "${actual_attestation}" == "${expected_attestation}" ]] || return 1
+  verify_hermes_install_stamp "${root}" || return 1
   [[ "$(hermes_uv_version "${root}/.portal-tools/uv" || true)" == "${HERMES_UV_VERSION}" ]] || return 1
   python_version="$("${root}/.venv/bin/python" --version 2>&1 | awk '{print $2}')"
   [[ "${python_version}" == "${HERMES_PYTHON_VERSION}" ]] || return 1
@@ -295,14 +411,14 @@ hermes_verify() {
 
 hermes_converge() {
   local root version_root bin_dir target state_dir arch uv_url uv_sha uv_member
-  local work_dir source_archive uv_archive source_stage uv_binary previous_link="" backup_root=""
+  local work_dir source_archive uv_archive source_stage uv_binary python_archive previous_link="" backup_root=""
   root="$(hermes_root)"
   version_root="$(hermes_version_root)"
   bin_dir="${HERMES_BIN_DIR:-/usr/local/bin}"
   target="${bin_dir}/hermes"
   state_dir="${HERMES_STATE_DIR:-/var/lib/bridgesllm/hermes}"
 
-  if [[ "${root}" == "/opt/bridgesllm/tools/hermes" || "${bin_dir}" == "/usr/local/bin" || "${state_dir}" == "/var/lib/bridgesllm/hermes" ]]; then
+  if [[ "${root}" == "/usr/local/lib/bridgesllm-runtimes/hermes" || "${bin_dir}" == "/usr/local/bin" || "${state_dir}" == "/var/lib/bridgesllm/hermes" ]]; then
     [[ "${EUID}" -eq 0 ]] || {
       printf 'Installing the system Hermes runtime requires root.\n' >&2
       return 1
@@ -321,8 +437,12 @@ hermes_converge() {
     case "$(readlink -f -- "${target}" 2>/dev/null || true)" in
       "${root}"/*/.venv/bin/hermes) ;;
       *)
-        printf 'Refusing to replace an unmanaged Hermes symlink at %s.\n' "${target}" >&2
-        return 1
+        if hermes_legacy_managed_alias "${target}"; then
+          printf 'Migrating the Hermes alias from the legacy private runtime.\n' >&2
+        else
+          printf 'Refusing to replace an unmanaged Hermes symlink at %s.\n' "${target}" >&2
+          return 1
+        fi
         ;;
     esac
   fi
@@ -331,11 +451,25 @@ hermes_converge() {
   uv_url="$(hermes_uv_url "${arch}")" || return 1
   uv_sha="$(hermes_uv_sha256 "${arch}")" || return 1
   uv_member="$(hermes_uv_member "${arch}")" || return 1
-  install -d -m 0755 "${root}" "${bin_dir}"
+  # Existing ancestors may protect unrelated files; never chmod them.
+  # Missing parents follow the umask in some install implementations (uutils 0.8
+  # creates them 0700 under umask 077; GNU uses 0755), so only this public creation
+  # runs under umask 022. State keeps the caller umask and its explicit 0700.
+  local existing_ancestor
+  existing_ancestor="$(dirname -- "${root}")"
+  while [[ ! -e "${existing_ancestor}" && ! -L "${existing_ancestor}" ]]; do
+    existing_ancestor="$(dirname -- "${existing_ancestor}")"
+  done
+  if ! hermes_runtime_publicly_executable "${existing_ancestor}"; then
+    printf 'Refusing the private or inaccessible Hermes runtime ancestor at %s.\n' "${existing_ancestor}" >&2
+    return 1
+  fi
+  ( umask 022; install -d -m 0755 "${root}" "${bin_dir}" )
   install -d -m 0700 "${state_dir}"
   work_dir="$(mktemp -d "${root}/.install-${HERMES_TESTED_VERSION}.XXXXXX")"
   source_archive="${work_dir}/hermes.tar.gz"
   uv_archive="${work_dir}/uv.tar.gz"
+  python_archive="${work_dir}/python.tar.gz"
   source_stage="${work_dir}/source"
   uv_binary="${work_dir}/uv"
   mkdir -p "${source_stage}"
@@ -353,6 +487,14 @@ hermes_converge() {
       --output "${uv_archive}" "${uv_url}" \
     || ! verify_hermes_uv_archive "${uv_archive}" "${uv_sha}" "${uv_member}"; then
     printf 'Could not acquire the pinned uv artifact for Hermes.\n' >&2
+    rm -rf -- "${work_dir}"
+    return 1
+  fi
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --connect-timeout 20 --max-time 900 --max-filesize "${HERMES_PYTHON_MAX_BYTES}" \
+      --output "${python_archive}" "$(hermes_python_url "${arch}")" \
+    || ! verify_hermes_python_archive "${python_archive}" "$(hermes_python_sha256 "${arch}")"; then
+    printf 'Could not acquire the pinned Python artifact for Hermes.\n' >&2
     rm -rf -- "${work_dir}"
     return 1
   fi
@@ -376,16 +518,16 @@ hermes_converge() {
 
   if ! (
     export UV_CACHE_DIR="${work_dir}/uv-cache"
-    export UV_PYTHON_INSTALL_DIR="${version_root}/.portal-tools/python"
-    export UV_MANAGED_PYTHON=1
     export UV_NO_PROGRESS=1
     export UV_NO_CONFIG=1
-    "${version_root}/.portal-tools/uv" python install \
-      "${HERMES_PYTHON_VERSION}" --no-bin --no-registry
+    tar --no-same-owner --no-same-permissions -xzf "${python_archive}" -C "${version_root}/.portal-tools"
+    [[ "$("${version_root}/.portal-tools/python/bin/python3" --version 2>&1)" == "Python ${HERMES_PYTHON_VERSION}" ]] || exit 1
+    hermes_write_install_stamp "${version_root}" || exit 1
+    verify_hermes_install_stamp "${version_root}" || exit 1
     UV_PYTHON_DOWNLOADS=never "${version_root}/.portal-tools/uv" sync \
       --project "${version_root}" \
-      --python "${HERMES_PYTHON_VERSION}" \
-      --frozen --no-dev --no-default-groups --extra acp --compile-bytecode
+      --python "${version_root}/.portal-tools/python/bin/python3" \
+      --frozen --no-dev --no-default-groups --extra acp --extra mcp --compile-bytecode
   ); then
     printf 'Hermes dependency convergence failed; restoring the previous runtime.\n' >&2
     rm -rf -- "${version_root}"
@@ -395,6 +537,7 @@ hermes_converge() {
   fi
   hermes_attestation > "${version_root}/${HERMES_ATTESTATION_NAME}"
   chmod 0644 "${version_root}/${HERMES_ATTESTATION_NAME}"
+  chmod -R u+rwX,go+rX,go-w -- "${version_root}"
 
   if [[ "$(hermes_binary_version "${version_root}/.venv/bin/hermes" || true)" != "${HERMES_TESTED_VERSION}" ]] \
     || ! hermes_acp_check "${version_root}/.venv/bin/hermes"; then

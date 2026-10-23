@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '../../test/setup';
 import React from 'react';
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ProjectChatPanel, {
@@ -448,6 +448,39 @@ describe('ProjectChatPanel rendered provider contract', () => {
       }
       throw new Error(`Unexpected GET ${url}`);
     });
+  });
+
+  it('dictates into the real Project composer without erasing its draft or hiding a service failure', async () => {
+    projectMocks.projectChatProviders.mockResolvedValue(capabilities());
+    let speech: any;
+    const stopTrack = vi.fn();
+    vi.stubGlobal('isSecureContext', true);
+    vi.stubGlobal('SpeechRecognition', class {
+      start = vi.fn(); abort = vi.fn();
+      constructor() {
+        // eslint-disable-next-line @typescript-eslint/no-this-alias -- the test drives the instance the component constructed
+        speech = this;
+      }
+    });
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true,
+      value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: stopTrack }] }) } });
+    render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
+    const input = await screen.findByRole('textbox', { name: /message/i });
+    await waitFor(() => expect(projectMocks.clientPost).toHaveBeenCalled());
+    await act(async () => {});
+    fireEvent.change(input, { target: { value: 'Keep my draft' } });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Start dictation' })); });
+    expect(stopTrack).toHaveBeenCalledOnce();
+    expect(screen.getByRole('status').textContent).toContain('Starting');
+    act(() => { speech.onstart(); });
+    expect(screen.getByRole('button', { name: 'Stop dictation' }).className).toContain('bg-red-500');
+    act(() => { speech.onresult({ results: [[{ transcript: 'spoken words' }]] }); });
+    expect(input).toHaveValue('Keep my draft spoken words');
+    act(() => { speech.onerror({ error: 'network' }); });
+    expect(screen.getByRole('alert')).toHaveTextContent('speech-recognition service is unavailable or blocked');
+    expect(screen.getByRole('button', { name: 'Start dictation' }).className).not.toContain('bg-red-500');
+    expect(input).toHaveValue('Keep my draft spoken words');
+    expect(projectMocks.agentMessageStatus).not.toHaveBeenCalled();
   });
 
   it('adopts a persisted Codex provider without restarting bootstrap admission', async () => {
@@ -4503,8 +4536,14 @@ describe('ProjectChatPanel rendered provider contract', () => {
 
     await screen.findByText('Before compatibility tools.');
     await screen.findByText('Calling the compatibility path.');
+    const group = await screen.findByRole('button', { name: /Tool activity: 2 tool calls/ });
+    expect(group).toHaveAttribute('aria-expanded', 'false');
+    expect(view.container.querySelectorAll('[data-tool-call-id]')).toHaveLength(0);
+    await userEvent.setup().click(group);
     await waitFor(() => expect(screen.getAllByText('Run command')).toHaveLength(2));
-    expect(screen.queryByLabelText('Tool turn running')).not.toBeInTheDocument();
+    const cards = [...view.container.querySelectorAll('[data-tool-call-id]')];
+    expect(new Set(cards.map(card => card.getAttribute('data-tool-call-id'))).size).toBe(2);
+    expect(screen.queryByLabelText('Running')).not.toBeInTheDocument();
 
     const rendered = view.container.textContent || '';
     expect(rendered.indexOf('Before compatibility tools.')).toBeLessThan(rendered.indexOf('Calling the compatibility path.'));

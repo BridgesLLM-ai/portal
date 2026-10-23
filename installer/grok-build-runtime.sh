@@ -4,9 +4,9 @@ set -Eeuo pipefail
 # Portal-tested native Grok Build runtime. The upstream installer is convenient
 # for interactive work, but it does not publish a checksum or provide rollback.
 # Portal therefore converges the two supported Linux artifacts directly.
-readonly GROK_BUILD_TESTED_VERSION="1.0.13"
-readonly GROK_BUILD_SHA256_X86_64="edf79521581bb5e6b95abef848491a6a742e860da3e237ebe86a280d30dce4c1"
-readonly GROK_BUILD_SHA256_AARCH64="b926fc5308374396e260e7efbd6107231a8dae13c084ddaf0fe89b7ebb3edd25"
+readonly GROK_BUILD_TESTED_VERSION="1.0.62"
+readonly GROK_BUILD_SHA256_X86_64="2a46d9e4d7ebd7a9cff7f95716714b19dad5f21dd2a497822400b1fb128969aa"
+readonly GROK_BUILD_SHA256_AARCH64="0b808a2209728788d2e37c34ea1846d460b41528a9fc7edc7698b9e7dec12fe1"
 readonly GROK_BUILD_DOWNLOAD_ROOT="https://x.ai/cli"
 
 # Only the exercised Linux x86-64 Host Operator runtime is released here.

@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { prisma } from '../config/database';
 import { hashPassword, comparePassword, validatePasswordStrength } from '../utils/password';
 import { normalizeRegistrationMode } from '../utils/registrationMode';
@@ -145,7 +145,7 @@ const twoFactorEmailRecoveryLimiter = rateLimit({
       : '';
     return /^[A-Za-z0-9_-]{43}$/.test(pendingToken)
       ? `challenge:${digestAuthToken('2fa-recovery-rate-limit', pendingToken)}`
-      : `ip:${req.ip || 'unknown'}`;
+      : `ip:${ipKeyGenerator(req.ip || 'unknown')}`;
   },
   skip: (_req) => process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test',
 });

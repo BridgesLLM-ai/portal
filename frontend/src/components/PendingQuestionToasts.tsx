@@ -4,6 +4,7 @@ import ViewportOverlay from './ViewportOverlay';
 import AskUserQuestionCard from './chat/AskUserQuestionCard';
 import type { GatewayPendingQuestion } from '../api/endpoints';
 import sounds from '../utils/sounds';
+import { useVisibleQuestionConversations } from '../contexts/QuestionAttentionContext';
 
 /**
  * . A paused agent run is the one notification that must not depend on
@@ -28,6 +29,7 @@ export default function PendingQuestionToasts({
   questions: GatewayPendingQuestion[];
   onSettled: (id: string) => void;
 }) {
+  const conversations = useVisibleQuestionConversations();
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [hiddenIds, setHiddenIds] = useState<readonly string[]>([]);
   const announcedRef = useRef<readonly string[]>([]);
@@ -40,8 +42,8 @@ export default function PendingQuestionToasts({
     // Retain only ids that are still open so neither list can grow without end.
     announcedRef.current = liveIds;
     if (arrived.length > 0) {
-      // The alert is the point; the sound is decoration. A missing or failing
-      // audio path must never keep a paused run from surfacing.
+      // Announce arrivals before filtering the visual stack: viewing the
+      // asking conversation suppresses its toast, never its question sound.
       try {
         sounds.question?.();
       } catch {
@@ -56,7 +58,9 @@ export default function PendingQuestionToasts({
   }, [liveIds]);
 
   const visible = questions
-    .filter((question) => !hiddenIds.includes(question.id))
+    .filter((question) => !hiddenIds.includes(question.id) && !conversations.some((conversation) => (
+      conversation.surface === question.surface && conversation.sessionKey === question.sessionKey
+    )))
     .slice(0, MAX_VISIBLE);
 
   const hide = useCallback((id: string) => {

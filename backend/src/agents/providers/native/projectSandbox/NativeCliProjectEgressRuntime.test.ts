@@ -1,3 +1,4 @@
+import { projectRuntimeSecurityOptionValues } from '../../../../services/projectRuntimeConfinement';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -27,6 +28,7 @@ import {
   buildNativeCliProjectRuntimePlan,
   ensureNativeCliProjectEgressRuntime,
   nativeCliProjectDockerHostEnvironment,
+  nativeCliProjectEgressCommandExecutor,
   stopNativeCliProjectRuntimesForContext,
   stopNativeCliProjectRuntimesForRecoveryContext,
   type NativeCliProjectRuntimePlan,
@@ -210,7 +212,7 @@ function inspectFor(fixture: Fixture, running = true): any {
       NanoCpus: 2_000_000_000,
       Ulimits: [
         { Name: 'nofile', Soft: 1024, Hard: 1024 },
-        { Name: 'nproc', Soft: 256, Hard: 256 },
+        { Name: 'nproc', Soft: 4096, Hard: 4096 },
       ],
       Devices: [],
       DeviceRequests: [],
@@ -280,6 +282,8 @@ function legacyPreConfinementInspect(fixture: Fixture, running = true): any {
   const inspect = inspectFor(legacyPreConfinementFixture(fixture), running);
   inspect.HostConfig.SecurityOpt = ['no-new-privileges:true'];
   inspect.AppArmorProfile = 'docker-default';
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Soft = 256;
+  inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc').Hard = 256;
   return inspect;
 }
 
@@ -324,6 +328,24 @@ describe('shared native CLI Project controlled-egress runtime policy', () => {
   const fixtures: Fixture[] = [];
   afterEach(() => {
     for (const fixture of fixtures.splice(0)) fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test('recovery: finite shared UID ceiling retains the exact container PID boundary (Native CLI)', () => {
+    const fixture = makeFixture();
+    fixtures.push(fixture);
+    expect(fixture.plan.createArgs).toEqual(expect.arrayContaining(['--pids-limit', '256', '--ulimit', 'nproc=4096:4096']));
+    for (const limit of [256, -1, 0, 4097]) {
+      const inspect = inspectFor(fixture, true);
+      const nproc = inspect.HostConfig.Ulimits.find((entry: any) => entry.Name === 'nproc');
+      nproc.Soft = limit;
+      nproc.Hard = limit;
+      expect(() => attestNativeCliProjectRuntimeContainer({ inspect, plan: fixture.plan, spec: fixture.spec, requireRunning: true }))
+        .toThrow(/ulimits/);
+    }
+    const inspect = inspectFor(fixture, true);
+    inspect.HostConfig.PidsLimit = 0;
+    expect(() => attestNativeCliProjectRuntimeContainer({ inspect, plan: fixture.plan, spec: fixture.spec, requireRunning: true }))
+      .toThrow(/resource limits/);
   });
 
   test('builds a pinned, non-root runtime with one Project bind and no host resource', () => {
@@ -547,11 +569,29 @@ describe('shared native CLI Project controlled-egress runtime policy', () => {
   });
 });
 
+// The docker CLI resolves `--env NAME` from its own environment; a missing
+// value reaches the Engine as a bare name.
+function cliResolvedEnvironment(
+  args: readonly string[],
+  secretEnvironment: Readonly<Record<string, string>> = {},
+): string[] {
+  const entries: string[] = [];
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if (args[index] !== '--env') continue;
+    const entry = args[index + 1];
+    entries.push(entry.includes('=') || !(entry in secretEnvironment) ? entry : `${entry}=${secretEnvironment[entry]}`);
+  }
+  return entries;
+}
+
 class RuntimeExecutor implements ProjectEgressCommandExecutor {
   readonly commands: Array<{ command: string; args: readonly string[]; input?: string }> = [];
+  readonly createSecretEnvironments: Array<Readonly<Record<string, string>> | undefined> = [];
   readonly staleRuntimes = new Map<string, any>();
   exists = false;
   running = false;
+  createdEnvironment: string[] | null = null;
+  dropSecretEnvironment = false;
 
   constructor(readonly fixture: Fixture) {}
 
@@ -568,7 +608,11 @@ class RuntimeExecutor implements ProjectEgressCommandExecutor {
   async run(
     command: string,
     args: readonly string[],
-    options: { allowExitCodes?: readonly number[]; input?: string } = {},
+    options: {
+      allowExitCodes?: readonly number[];
+      input?: string;
+      secretEnvironment?: Readonly<Record<string, string>>;
+    } = {},
   ): Promise<ProjectEgressCommandResult> {
     this.commands.push({ command, args, input: options.input });
     if (command === 'docker' && args[0] === 'container' && args[1] === 'ls') {
@@ -609,9 +653,18 @@ class RuntimeExecutor implements ProjectEgressCommandExecutor {
           exitCode: 1,
         };
       }
-      return { stdout: JSON.stringify([inspectFor(this.fixture, this.running)]), stderr: '', exitCode: 0 };
+      const inspect = inspectFor(this.fixture, this.running);
+      if (this.createdEnvironment) {
+        inspect.Config.Env = [...this.createdEnvironment, 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'];
+      }
+      return { stdout: JSON.stringify([inspect]), stderr: '', exitCode: 0 };
     }
     if (command === 'docker' && args[0] === 'container' && args[1] === 'create') {
+      this.createSecretEnvironments.push(options.secretEnvironment);
+      this.createdEnvironment = cliResolvedEnvironment(
+        args,
+        this.dropSecretEnvironment ? {} : options.secretEnvironment,
+      );
       this.exists = true;
       return { stdout: `${'d'.repeat(64)}\n`, stderr: '', exitCode: 0 };
     }
@@ -628,6 +681,7 @@ class RuntimeExecutor implements ProjectEgressCommandExecutor {
     if (command === 'docker' && args[0] === 'container' && args[1] === 'rm') {
       const stale = this.staleRuntime(String(args.at(-1)));
       if (stale) this.staleRuntimes.delete(String(stale.Name || '').replace(/^\//, ''));
+      else if (args.at(-1) === 'd'.repeat(64) && this.createdEnvironment) this.exists = false;
     }
     if (command === '/usr/bin/nsenter' && args.includes('-S')) {
       const tool = String(args[4]);
@@ -783,6 +837,45 @@ describe('shared native CLI Project runtime orchestration', () => {
       expect(executor.running).toBe(false);
     } finally {
       fs.rmSync(providerFixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([true, false])('recovery: old shared-nproc recipe is retirement-only; exact limits=%s', async (exact) => {
+    const fingerprint = crypto.createHash('sha256').update(JSON.stringify({
+      provider: fixture.plan.profile.provider,
+      profile: fixture.plan.profile,
+      actorId: fixture.context.userId,
+      projectId: fixture.context.projectId,
+      workspaceOwnerId: fixture.context.workspaceOwnerId,
+      policyFingerprint: fixture.context.policyFingerprint,
+      runtimePolicyVersion: fixture.context.runtimePolicyVersion,
+      egressPolicyVersion: fixture.context.egressPolicyVersion,
+      egressPolicyFingerprint: fixture.spec.policyFingerprint,
+      egressProxyCredentialHash: fixture.spec.tokenHash,
+      runtimeImage: fixture.plan.runtimeImage,
+      projectRoot: fixture.plan.projectRoot,
+      user: NATIVE_CLI_PROJECT_CONTAINER_USER,
+      confinementSecurityOptions: projectRuntimeSecurityOptionValues(),
+    })).digest('hex');
+    expect(fingerprint).not.toBe(fixture.plan.runtimeFingerprint);
+    const old = inspectFor(fixture, true);
+    old.Id = 'e'.repeat(64);
+    old.Name = `/${fixture.plan.profile.containerNamePrefix}-${fingerprint.slice(0, 24)}`;
+    old.Config.Labels[PROJECT_EGRESS_RUNTIME_FINGERPRINT_LABEL] = fingerprint;
+    const limit = old.HostConfig.Ulimits.find((value: any) => value.Name === 'nproc');
+    limit.Soft = exact ? 256 : 4096;
+    limit.Hard = exact ? 256 : 4096;
+    const executor = new RuntimeExecutor(fixture);
+    executor.addStaleRuntime(old);
+    const converge = ensureNativeCliProjectEgressRuntime(managedStateInput(), orchestrationDependencies(executor));
+    if (exact) {
+      await expect(converge).resolves.toMatchObject({ runtimeFingerprint: fixture.plan.runtimeFingerprint });
+      expect(executor.commands.filter(({ args }) => args[1] === 'rm')).toEqual([
+        expect.objectContaining({ args: ['container', 'rm', 'e'.repeat(64)] }),
+      ]);
+    } else {
+      await expect(converge).rejects.toMatchObject({ code: 'RUNTIME_ULIMITS' });
+      expect(executor.commands.some(({ args }) => ['stop', 'rm', 'create'].includes(String(args[1])))).toBe(false);
     }
   });
 
@@ -1507,5 +1600,88 @@ describe('shared native CLI Project runtime orchestration', () => {
       prepareManagedState: () => [],
     }, { executor })).rejects.toMatchObject({ code: 'EGRESS_IDENTITY' });
     expect(executor.exists).toBe(false);
+  });
+
+  describe('egress credential custody', () => {
+    const tokenOnArgv = (executor: RuntimeExecutor) => executor.commands.some(({ args }) => (
+      args.some((value) => value.includes(fixture.egress.token))));
+
+    test('create names the proxy credentials and hands their values to the executor only', async () => {
+      const executor = new RuntimeExecutor(fixture);
+      await expect(ensureNativeCliProjectEgressRuntime(managedStateInput(), orchestrationDependencies(executor)))
+        .resolves.toMatchObject({ containerId: 'd'.repeat(64) });
+      const create = executor.commands.find(({ args }) => args[1] === 'create')!;
+      for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+        expect(create.args[create.args.indexOf(key) - 1]).toBe('--env');
+      }
+      expect(create.args).toEqual(expect.arrayContaining(['--env', 'NO_PROXY=', '--env', 'no_proxy=']));
+      expect(tokenOnArgv(executor)).toBe(false);
+      const proxyUrl = `http://portal:${encodeURIComponent(fixture.egress.token)}@${PROXY_ADDRESS}:3128`;
+      expect(executor.createSecretEnvironments).toEqual([{
+        HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, http_proxy: proxyUrl, https_proxy: proxyUrl,
+      }]);
+      expect(executor.commands.some(({ args }) => args[1] === 'rm')).toBe(false);
+    });
+
+    test('a create whose credentials never arrive is refused and removed by its immutable ID only', async () => {
+      const executor = new RuntimeExecutor(fixture);
+      executor.dropSecretEnvironment = true;
+      await expect(ensureNativeCliProjectEgressRuntime(managedStateInput(), orchestrationDependencies(executor)))
+        .rejects.toMatchObject({ code: 'RUNTIME_ENVIRONMENT' });
+      expect(executor.createdEnvironment).toEqual(expect.arrayContaining(['HTTPS_PROXY']));
+      expect(executor.commands.filter(({ args }) => args[1] === 'rm').map(({ args }) => args))
+        .toEqual([['container', 'rm', 'd'.repeat(64)]]);
+      expect(executor.commands.some(({ args }) => ['start', 'stop'].includes(String(args[1])))).toBe(false);
+      expect(executor.exists).toBe(false);
+      expect(tokenOnArgv(executor)).toBe(false);
+    });
+
+    test('a running object under the created ID is never removed', async () => {
+      const executor = new RuntimeExecutor(fixture);
+      executor.dropSecretEnvironment = true;
+      const originalRun = executor.run.bind(executor);
+      executor.run = async (command, args, options) => {
+        const result = await originalRun(command, args, options);
+        if (args[1] === 'create') executor.running = true;
+        return result;
+      };
+      await expect(ensureNativeCliProjectEgressRuntime(managedStateInput(), orchestrationDependencies(executor)))
+        .rejects.toBeInstanceOf(NativeCliProjectEgressRuntimeError);
+      expect(executor.commands.some(({ args }) => args[1] === 'rm')).toBe(false);
+    });
+
+    test('the executor delivers named credentials to the CLI environment only and refuses a missing value', async () => {
+      const canary = `http://portal:${crypto.randomBytes(24).toString('base64url')}@172.31.20.2:3128`;
+      const digest = crypto.createHash('sha256').update(canary).digest('hex');
+      const script = [
+        "const crypto = require('crypto');",
+        "const value = process.env.HTTPS_PROXY || '';",
+        'process.stdout.write(JSON.stringify({',
+        "  match: crypto.createHash('sha256').update(value).digest('hex') === process.argv[3],",
+        '  noProxy: process.env.NO_PROXY, keys: Object.keys(process.env).sort(),',
+        '}));',
+      ].join('\n');
+      const args = ['-e', script, '--', '--env', 'HTTPS_PROXY', digest];
+      const result = await nativeCliProjectEgressCommandExecutor.run(process.execPath, args, {
+        secretEnvironment: { HTTPS_PROXY: canary },
+      });
+      const observed = JSON.parse(result.stdout);
+      expect(observed.match).toBe(true);
+      expect(observed.noProxy).toBe('*');
+      expect(observed.keys).toEqual([
+        ...Object.keys(nativeCliProjectDockerHostEnvironment()), 'HTTPS_PROXY', 'NO_PROXY', 'no_proxy',
+      ].sort());
+      const refusal = await nativeCliProjectEgressCommandExecutor.run(
+        '/nonexistent/portal-custody-must-not-spawn',
+        ['container', 'create', '--env', 'HTTPS_PROXY', 'image'],
+      ).then(() => null, (error: Error) => error);
+      expect(refusal?.message).toBe('Project egress protected environment is incomplete');
+      const failure = await nativeCliProjectEgressCommandExecutor.run(
+        process.execPath,
+        ['-e', 'process.stderr.write(String(process.env.HTTPS_PROXY)); process.exit(3)', '--', '--env', 'HTTPS_PROXY'],
+        { secretEnvironment: { HTTPS_PROXY: canary } },
+      ).then(() => null, (error: Error) => error);
+      expect(failure?.message).toBe('Native CLI Project host command failed with exit code 3');
+    });
   });
 });

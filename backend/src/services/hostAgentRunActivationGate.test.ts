@@ -6,6 +6,8 @@ import { spawn } from 'child_process';
 import {
   createHostAgentRunActivationGate,
   hostAgentRunGatePath,
+  HOST_AGENT_RUN_STDIN_MAX_BYTES,
+  __hostAgentRunActivationGateTest,
 } from './hostAgentRunActivationGate';
 import { __hostAgentRunJournalTest } from './hostAgentRunJournal';
 
@@ -104,6 +106,43 @@ describe('host agent parent-bound activation gate', () => {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   });
 
+  test('delivers a maximum four-photo stdin byte-exact through the real wrapper', async () => {
+    const { unit, tag } = identity('95');
+    const gate = await createHostAgentRunActivationGate(unit, tag);
+    // Worst case the bound admits: the full stdin bound of base64-like bytes.
+    const stdinText = 'Q'.repeat(HOST_AGENT_RUN_STDIN_MAX_BYTES - 1) + '\n';
+    const environment = { PATH: process.env.PATH, PORTAL_TARGET_ENV_TEST: 'x'.repeat(64 * 1024) };
+    gate.prepareTarget({ environment, stdinText });
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'host-run-gate-photos-'));
+    const targetMarker = path.join(temporaryRoot, 'received');
+    const wrapper = spawn(process.execPath, [
+      '-e',
+      __hostAgentRunJournalTest.ACTIVATION_WRAPPER_SOURCE,
+      '--',
+      gate.socketPath,
+      tag,
+      process.execPath,
+      '-e',
+      `const fs=require('fs');const c=[];process.stdin.on('data',d=>c.push(d));process.stdin.on('end',()=>{fs.writeFileSync(${JSON.stringify(targetMarker)},Buffer.concat(c));process.exit(0);});`,
+    ], { cwd: temporaryRoot, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      wrapper.once('error', reject);
+      wrapper.once('close', (code, signal) => resolve({ code, signal }));
+    });
+    const started = Date.now();
+    await gate.ready;
+    await gate.release();
+    await expect(closed).resolves.toEqual({ code: 0, signal: null });
+    expect(Date.now() - started).toBeLessThan(10_000);
+    const received = fs.readFileSync(targetMarker);
+    expect(received.length).toBe(HOST_AGENT_RUN_STDIN_MAX_BYTES);
+    expect(received.equals(Buffer.from(stdinText, 'utf8'))).toBe(true);
+    expect(__hostAgentRunActivationGateTest.TARGET_PAYLOAD_MAX_ENCODED_BYTES).toBeGreaterThan(
+      4 * Math.ceil((4 * Math.ceil(HOST_AGENT_RUN_STDIN_MAX_BYTES / 3)) / 3),
+    );
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  });
+
   test('authenticates the wrapper and emits exactly one release byte', async () => {
     const { unit, tag } = identity('a1');
     const gate = await createHostAgentRunActivationGate(unit, tag);
@@ -136,7 +175,7 @@ describe('host agent parent-bound activation gate', () => {
   test.each([
     '',
     'contains\0nul',
-    'a'.repeat((256 * 1024) + 1),
+    'a'.repeat(HOST_AGENT_RUN_STDIN_MAX_BYTES + 1),
   ])('rejects invalid sensitive stdin before any wrapper can receive it', async (stdinText) => {
     const { unit, tag } = identity(`d${stdinText.length % 10}`);
     const gate = await createHostAgentRunActivationGate(unit, tag);

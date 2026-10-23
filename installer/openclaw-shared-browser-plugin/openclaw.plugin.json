@@ -1,0 +1,38 @@
+{
+  "id": "bridgesllm-shared-browser",
+  "name": "Portal Shared Interactive Browser",
+  "description": "Root-local Portal lease gate for one explicit desktop browser; not a boundary against root exec.",
+  "enabledByDefault": false,
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "shared_browser_select",
+      "shared_browser_handover"
+    ]
+  },
+  "toolMetadata": {
+    "shared_browser_select": {
+      "optional": true
+    },
+    "shared_browser_handover": {
+      "optional": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "agentIds": {
+        "type": "array",
+        "maxItems": 32,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        }
+      }
+    }
+  }
+}

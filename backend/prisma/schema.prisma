@@ -8,7 +8,6 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -215,9 +214,39 @@ model App {
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   projectIdentity ProjectIdentity? @relation(fields: [projectIdentityId], references: [id], onDelete: Cascade)
   shareLinks      AppShareLink[]
+  credentialSet   ProjectAppCredentialSet?
 
   @@index([userId])
   @@index([isPublic, isActive])
+}
+
+// Named App credentials, delivered only into the App's own resident container
+// as read-only files. Values are Portal-encrypted (portal-secret:v1) and
+// write-only: no API returns them, and no hash of them is stored. Deleting the
+// App deletes both models.
+model ProjectAppCredentialSet {
+  appId     String   @id
+  // Bumped by every set, replace and removal, so a revision is never reused.
+  revision  Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  app         App                    @relation(fields: [appId], references: [id], onDelete: Cascade)
+  credentials ProjectAppCredential[]
+}
+
+model ProjectAppCredential {
+  appId             String
+  slot              String
+  ciphertext        String   @db.Text
+  revision          Int
+  updatedAt         DateTime @updatedAt
+  // Null for the root operator import CLI (updatedByOperator).
+  updatedByUserId   String?
+  updatedByOperator Boolean  @default(false)
+
+  set ProjectAppCredentialSet @relation(fields: [appId], references: [appId], onDelete: Cascade)
+
+  @@id([appId, slot])
 }
 
 model AppShareLink {

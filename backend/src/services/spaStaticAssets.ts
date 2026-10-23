@@ -1,4 +1,4 @@
-import express, { type RequestHandler } from 'express';
+import express, { type Express, type RequestHandler } from 'express';
 
 /**
  * Serve only immutable/static frontend files. SPA HTML deliberately falls
@@ -11,4 +11,11 @@ export function createSpaStaticAssetMiddleware(frontendDist: string): RequestHan
     if (req.path === '/index.html') return next();
     return serveFrontendStatic(req, res, next);
   };
+}
+
+/** Keep missing user-uploaded images out of the branded SPA HTML fallback. */
+export function mountMutableAssetNotFound(app: Pick<Express, 'get'>): void {
+  app.get(['/static-assets/avatars/{*assetPath}', '/static-assets/branding/{*assetPath}'], (_req, res) => {
+    res.status(404).json({ error: 'Asset not found' });
+  });
 }

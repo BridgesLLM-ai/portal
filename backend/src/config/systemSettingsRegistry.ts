@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-type StringRule = z.ZodType<string, z.ZodTypeDef, string>;
+type StringRule = z.ZodType<string, string>;
 
 const booleanString = z.enum(['true', 'false']);
 const registrationMode = z.enum(['open', 'approval', 'closed']);

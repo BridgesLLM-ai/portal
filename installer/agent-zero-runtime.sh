@@ -7,10 +7,10 @@ set -Eeuo pipefail
 # pinned container lifecycle so later setup/streaming work cannot inherit an
 # unpinned, unauthenticated, publicly-bound Docker deployment.
 
-readonly A0_VERSION="2.11"
+readonly A0_VERSION="2.14"
 readonly A0_IMAGE_REPOSITORY="agent0ai/agent-zero"
-readonly A0_AMD64_DIGEST="sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30"
-readonly A0_ARM64_DIGEST="sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3"
+readonly A0_AMD64_DIGEST="sha256:307a2ceffc8501ba05a1e7253e8b6e4d656d2e1c3b97f0eb943c18b9c40a30fd"
+readonly A0_ARM64_DIGEST="sha256:3b048a33c8698d396688ebd05096daab1f441cf310f299db2ed808a00433bc13"
 readonly A0_CONTAINER="bridgesllm-agent-zero"
 readonly A0_ROLLBACK_CONTAINER="bridgesllm-agent-zero-rollback"
 readonly A0_VOLUME="bridgesllm-agent-zero-usr"
@@ -29,20 +29,20 @@ readonly A0_CONNECTOR_VERSION="0.1.0"
 # discovery for omitting client_version. Keep this aligned with Portal's tested
 # Codex CLI compatibility pin and converge it into the persistent _oauth plugin
 # configuration without installing another mutable CLI inside the container.
-readonly A0_CODEX_CLIENT_VERSION="0.153.4"
+readonly A0_CODEX_CLIENT_VERSION="0.163.0"
 
-# Official Agent Zero A0 CLI v2.11 host-gateway component. The release has no
+# Official Agent Zero A0 CLI v2.14 host-gateway component. The release has no
 # uploaded binary assets, so Portal installs the official source archive into a
 # dedicated venv only after verifying the archive and both official hashed
 # dependency locks. The provider then verifies this provenance again at runtime.
-readonly A0_CLI_VERSION="2.11"
-readonly A0_CLI_TAG="v2.11"
-readonly A0_CLI_COMMIT="7a5095f356a8c317c219e54796a3c294e967ce77"
-readonly A0_CLI_ARCHIVE_URL="https://api.github.com/repos/agent0ai/a0-connector/tarball/7a5095f356a8c317c219e54796a3c294e967ce77"
-readonly A0_CLI_ARCHIVE_SHA256="898d3eb0776c9b58fc22fa36c153a5d9de162cf4fef183197e43de5995df219a"
-readonly A0_CLI_RUNTIME_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/7a5095f356a8c317c219e54796a3c294e967ce77/constraints/a0-runtime.txt"
-readonly A0_CLI_RUNTIME_CONSTRAINTS_SHA256="e19e4907251ef75d7cca3f500a9f0ba476bcb4d20451751e2ebed8c08a3ccc71"
-readonly A0_CLI_BUILD_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/7a5095f356a8c317c219e54796a3c294e967ce77/constraints/a0-build.txt"
+readonly A0_CLI_VERSION="2.14"
+readonly A0_CLI_TAG="v2.14"
+readonly A0_CLI_COMMIT="3741c8809f1f99b4efee2ed1a24234a98bf896d4"
+readonly A0_CLI_ARCHIVE_URL="https://api.github.com/repos/agent0ai/a0-connector/tarball/3741c8809f1f99b4efee2ed1a24234a98bf896d4"
+readonly A0_CLI_ARCHIVE_SHA256="aeacaa5e2b3c77edcaa84b19fc8f1441e69ab459a2addcb5ad304447a2c0e03f"
+readonly A0_CLI_RUNTIME_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/3741c8809f1f99b4efee2ed1a24234a98bf896d4/constraints/a0-runtime.txt"
+readonly A0_CLI_RUNTIME_CONSTRAINTS_SHA256="af13891c1c9714ff6e2b51763357739ea156862ab6f3254a037647dccbf03d76"
+readonly A0_CLI_BUILD_CONSTRAINTS_URL="https://raw.githubusercontent.com/agent0ai/a0-connector/3741c8809f1f99b4efee2ed1a24234a98bf896d4/constraints/a0-build.txt"
 readonly A0_CLI_BUILD_CONSTRAINTS_SHA256="701698e7490e500313195ea676b2c1925117709541a0ee4913636405a932371d"
 readonly A0_CLI_ROOT="${A0_STATE_DIR}/a0-cli"
 readonly A0_CLI_ROLLBACK_ROOT="${A0_STATE_DIR}/a0-cli-rollback"
@@ -365,6 +365,7 @@ create_container() {
 managed_image_version() {
   case "$(normalized_architecture):$1" in
     "amd64:${A0_IMAGE_REPOSITORY}@${A0_AMD64_DIGEST}"|"arm64:${A0_IMAGE_REPOSITORY}@${A0_ARM64_DIGEST}") printf '%s\n' "$A0_VERSION" ;;
+    amd64:agent0ai/agent-zero@sha256:9b65805d59b3dab7e14a5e732f6738621546070ec847441da2e75c368adaae30|arm64:agent0ai/agent-zero@sha256:c077d255821f9b974c71ee5840c9019c9a8b5c73e83f7d18de6abf4db645c6d3) printf '2.11\n' ;;
     amd64:agent0ai/agent-zero@sha256:892c60c533e4ffe1a7e36a7a087abe9671e3e5860b797f96887af14d4d66e3b0|arm64:agent0ai/agent-zero@sha256:e10e2e0d3c1709574442919455d2fa446b413952ed1936c3f8a4eb6ad62553c8) printf '2.10\n' ;;
     amd64:agent0ai/agent-zero@sha256:9b48534c1279fb831513b8c970e2d9004e7a2a6708a4d53a91a76d24a4f9f7eb|arm64:agent0ai/agent-zero@sha256:da107b689828124369d83f017b9664493c0699c60e57809fbd32f647078de49c) printf '2.5\n' ;;
     *) return 1 ;;
@@ -1084,8 +1085,8 @@ Commands:
   resume                Start the attested primary container if it is stopped
   uninstall             Remove only the attested managed runtime and all data
   credentials-reload    Reload an atomically replaced protected auth file
-  host-bridge-status     Verify the immutable official A0 CLI v2.11 bridge
-  host-bridge-reconcile  Install/update only the immutable A0 CLI v2.11 bridge
+  host-bridge-status     Verify the immutable official A0 CLI v2.14 bridge
+  host-bridge-reconcile  Install/update only the immutable A0 CLI v2.14 bridge
   host-bridge-rollback   Restore the previous A0 CLI host-bridge installation
 
 Before reconcile, create /etc/bridgesllm/agent-zero.env as root with mode 600

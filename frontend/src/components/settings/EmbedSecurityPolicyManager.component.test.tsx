@@ -200,7 +200,7 @@ describe('EmbedSecurityPolicyManager', () => {
     renderManager();
 
     const panel = await screen.findByRole('region', { name: 'Hosted content embeds' });
-    expect(within(panel).getByText(/removable defaults/i)).toBeVisible();
+    expect(await within(panel).findByText(/removable defaults/i)).toBeVisible();
     expect(within(panel).getByRole('textbox', { name: 'Origin 1' })).toHaveValue('https://www.youtube.com');
     expect(within(panel).getByRole('textbox', { name: 'Origin 2' })).toHaveValue('https://www.youtube-nocookie.com');
 
@@ -383,7 +383,7 @@ describe('EmbedSecurityPolicyManager', () => {
     renderManager();
 
     const panel = await screen.findByRole('region', { name: 'Hosted content embeds' });
-    expect(within(panel).getByRole('alert')).toHaveTextContent('saved embed-origin policy is invalid');
+    expect(await within(panel).findByRole('alert')).toHaveTextContent('saved embed-origin policy is invalid');
     await userEvent.click(within(panel).getByRole('button', { name: 'Save embed policy' }));
 
     expect(mocks.updatePolicy).toHaveBeenCalledWith({

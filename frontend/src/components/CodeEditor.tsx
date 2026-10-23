@@ -1,5 +1,7 @@
 import React, { useRef, useEffect } from 'react';
-import { Editor } from '@monaco-editor/react';
+import { Editor, type Monaco, type OnMount } from '@monaco-editor/react';
+import type { editor as MonacoEditor } from 'monaco-editor';
+import '../lib/monaco';
 import { motion } from 'framer-motion';
 import { Loader2 } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
@@ -13,7 +15,7 @@ interface CodeEditorProps {
   readOnly?: boolean;
 }
 
-function configurePortalThemes(monaco: any) {
+function configurePortalThemes(monaco: Monaco) {
   monaco.editor.defineTheme('portal-dark', {
     base: 'vs-dark',
     inherit: true,
@@ -70,7 +72,7 @@ export default function CodeEditor({
   theme,
   readOnly = false
 }: CodeEditorProps) {
-  const editorRef = useRef<any>(null);
+  const editorRef = useRef<{ editor: MonacoEditor.IStandaloneCodeEditor; monaco: Monaco } | null>(null);
   const { resolvedTheme } = useTheme();
   const effectiveTheme = theme || (resolvedTheme === 'light' ? 'portal-light' : 'portal-dark');
 
@@ -82,7 +84,7 @@ export default function CodeEditor({
     }
   }, [effectiveTheme]);
 
-  const handleEditorDidMount = (editor: any, monaco: any) => {
+  const handleEditorDidMount: OnMount = (editor, monaco) => {
     editorRef.current = { editor, monaco };
     
     // Configure editor options
@@ -134,6 +136,8 @@ export default function CodeEditor({
           </div>
         }
         options={{
+          // Keep controlled-value input on the stable textarea implementation.
+          editContext: false,
           readOnly,
           automaticLayout: true,
           scrollBeyondLastLine: false,

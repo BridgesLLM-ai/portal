@@ -74,8 +74,25 @@ describe('provider-neutral ask-user route admission', () => {
     });
   });
 
+  test('/ask-user/pending keeps only native bridge questions visible while OpenClaw is fenced', async () => {
+    assertOpenClawExecutionAdmittedMock.mockRejectedValue(
+      new OpenClawExecutionAdmissionError(unavailableAdmission),
+    );
+    const response = responseDouble();
+
+    await routeHandler('/ask-user/pending')({
+      query: {},
+      user: { userId: 'user-1', authorizationVersion: 7 },
+    }, response);
+
+    // Native harness questions do not depend on OpenClaw; OpenClaw's own
+    // question runtime is still never consulted while it is fenced.
+    expect(response.status).not.toHaveBeenCalled();
+    expect(response.json).toHaveBeenCalledWith({ questions: [], actorUserId: 'user-1' });
+    expect(syncAskUserQuestionsForActorMock).not.toHaveBeenCalled();
+  });
+
   test.each([
-    ['/ask-user/pending', { query: {} }],
     ['/ask-user/answer', { body: { id: 'askq_project', answers: { database: 'PostgreSQL' } } }],
     ['/ask-user/dismiss', { body: { id: 'askq_project' } }],
   ])('%s fails closed before broker or runtime I/O', async (path, request) => {

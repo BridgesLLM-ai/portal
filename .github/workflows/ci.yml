@@ -8,12 +8,19 @@ on:
 
 jobs:
   build:
+    name: Build/check (${{ matrix.lane }}, Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Match the installer/OpenClaw runtime contract. Node 20 and 23 are
-        # intentionally unsupported and must not appear green in public CI.
-        node-version: [22.22.3, 24.15.0, 25.9.0]
+        include:
+          # Qualified release compiler, not a managed OpenClaw runtime.
+          - node-version: 22.22.3
+            lane: release-compiler
+          # Tested managed-runtime baseline. OpenClaw 2026.10.6 requires
+          # >=24.22.1 <25 || >=26.12.1; no Node 25/26 qualification is claimed.
+          # This job builds/checks Portal; it does not boot OpenClaw.
+          - node-version: 24.22.1
+            lane: managed-runtime-baseline
 
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +56,7 @@ jobs:
 
       - name: Lint frontend
         working-directory: ./frontend
-        run: npx eslint src --max-warnings=0
+        run: npm run lint
 
       - name: Build frontend
         working-directory: ./frontend

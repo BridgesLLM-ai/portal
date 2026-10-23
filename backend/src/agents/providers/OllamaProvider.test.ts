@@ -260,6 +260,36 @@ describe('Ollama host Agent Chat lifecycle', () => {
     expect(mockStreamResolvedOllama).toHaveBeenCalledTimes(1);
   });
 
+  test('forwards photo bytes only to a runtime-advertised vision model', async () => {
+    const service = require('../../services/chatImages/directChatImages') as typeof import('../../services/chatImages/directChatImages');
+    const sharp = require('sharp');
+    const jpeg = await sharp({ create: { width: 2, height: 2, channels: 3, background: 'red' } }).jpeg().toBuffer();
+    const content = jpeg.toString('base64');
+    const photoInput = jest.spyOn(service, 'prepareChatImages').mockImplementation(async input => {
+      const model = await input.assertModel();
+      return { message: 'What color?', model, images: [{ type: 'image', mimeType: 'image/jpeg', content,
+        fileName: 'photo.jpg', sizeBytes: jpeg.length, width: 2, height: 2 }],
+        revalidate: async () => { await input.assertModel(); } };
+    });
+    mockRequestConfiguredOllamaJson.mockResolvedValue({ capabilities: ['completion', 'vision'] });
+    mockStreamResolvedOllama.mockImplementation(async (input, onChunk) => {
+      expect(input.json.messages[0].images).toEqual([content]);
+      expect(input.json.messages[0].content).toContain('What color?');
+      expect(input.json.messages[0].content).not.toContain('portal-chat-image');
+      await onChunk(streamLine({ message: { role: 'assistant', content: 'red' }, done: true }));
+    });
+    const provider = new OllamaProvider();
+    await expect(provider.sendMessage(createSession(), '[portal-chat-image:fixture]', undefined, undefined, undefined, sender('photo')))
+      .resolves.toMatchObject({ fullText: 'red' });
+    expect(mockRequestConfiguredOllamaJson).toHaveBeenCalledWith(expect.objectContaining({ path: '/api/show', json: { model: 'qwen3.5:4b' } }));
+    mockStreamResolvedOllama.mockClear();
+    mockRequestConfiguredOllamaJson.mockResolvedValue({ capabilities: ['completion'] });
+    await expect(provider.sendMessage(createSession(), '[portal-chat-image:fixture]', undefined, undefined, undefined, sender('text-only')))
+      .rejects.toMatchObject({ code: 'IMAGE_MODEL_UNSUPPORTED' });
+    expect(mockStreamResolvedOllama).not.toHaveBeenCalled();
+    photoInput.mockRestore();
+  });
+
   test('streams split UTF-8 chat deltas and preserves tool calls, final metrics, and history', async () => {
     const sessionId = createSession();
     mockStreamResolvedOllama.mockImplementation(async (_input, onChunk) => {
@@ -621,6 +651,8 @@ describe('Ollama host Agent Chat lifecycle', () => {
     );
 
     await expect(overlapping).rejects.toThrow(/already has an active turn/i);
+    // Dispatch follows the model capability probe; the overlap was refused before either.
+    await waitFor(() => mockStreamResolvedOllama.mock.calls.length > 0, 'first dispatch');
     expect(mockStreamResolvedOllama).toHaveBeenCalledTimes(1);
     expect(sessionStore.readAllNativeSessionHistory('OLLAMA', sessionId)).toEqual([]);
     await expect(provider.abortActiveRun(sessionId, 'first-run')).resolves.toBe(true);
@@ -781,6 +813,122 @@ describe('Ollama host Agent Chat lifecycle', () => {
       undefined,
       sender('generation-two'),
     )).rejects.toThrow(/backend changed after this session was created/i);
+    expect(mockStreamResolvedOllama).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Ollama Portal chat tools', () => {
+  const fs = require('fs') as typeof import('fs');
+  const os = require('os') as typeof import('os');
+  const path = require('path') as typeof import('path');
+  const bridgeModule = require('../chatBridge') as typeof import('../chatBridge');
+  const bridgeListener = require('../chatBridge/listener') as typeof import('../chatBridge/listener');
+  const bridgeRegistry = require('../chatBridge/registry') as typeof import('../chatBridge/registry');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ollama-chat-tools-'));
+  const toolSender = (requestId: string): SenderIdentity => ({ ...sender(requestId), authorizationVersion: 1 });
+
+  beforeAll(() => {
+    fs.writeFileSync(path.join(root, 'mcpServer.js'), '// stand-in\n');
+    bridgeModule.__configureChatBridgeForTests({ serverPath: path.join(root, 'mcpServer.js'), listener: async () => path.join(root, 'bridge.sock') });
+    bridgeListener.__configureChatBridgeListenerForTests({ verifyActor: async () => true });
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockRequestConfiguredOllamaJson.mockReset();
+    mockStreamResolvedOllama.mockReset();
+  });
+
+  afterAll(() => {
+    bridgeModule.__configureChatBridgeForTests({ serverPath: null, listener: null });
+    bridgeRegistry.__resetChatBridgeRegistryForTests();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test('runs a bounded loop of Portal tools only for a tool-capable model and persists the activity', async () => {
+    mockRequestConfiguredOllamaJson.mockImplementation(async (input: any) => (
+      input.path === '/api/show' ? { capabilities: ['completion', 'tools'] } : {}
+    ));
+    const requests: any[] = [];
+    mockStreamResolvedOllama.mockImplementation(async (input: any, onChunk: any) => {
+      requests.push(JSON.parse(JSON.stringify(input.json)));
+      if (requests.length === 1) {
+        await onChunk(streamLine({
+          message: {
+            role: 'assistant',
+            content: 'Working on it.',
+            tool_calls: [
+              { function: { name: 'update_plan', arguments: { plan: [{ step: 'Draw chart', status: 'in_progress' }] } } },
+              { function: { name: 'show_widget', arguments: { title: 'Chart', widget_code: '<p>chart</p>' } } },
+              { function: { name: 'run_shell', arguments: { command: 'id' } } },
+            ],
+          },
+          done: true,
+        }));
+        return;
+      }
+      await onChunk(streamLine({ message: { role: 'assistant', content: 'Done.' }, done: true }));
+    });
+    const statuses: any[] = [];
+    const chunks: string[] = [];
+    const sessionId = createSession();
+    const result = await new OllamaProvider().sendMessage(
+      sessionId, 'draw a chart', (chunk) => chunks.push(chunk), (event) => statuses.push(event), undefined, toolSender('ollama-tools'),
+    );
+    expect(result.fullText).toBe('Working on it.\n\nDone.');
+    expect(chunks.join('')).toBe('Working on it.\n\nDone.');
+    // Only Portal chat tools are offered; never host tools.
+    expect(requests[0].tools.map((tool: any) => tool.function.name))
+      .toEqual(['ask_user', 'show_widget', 'get_goal', 'update_goal', 'update_plan']);
+    // The replayed call never resends widget HTML; every call gets a tool message.
+    expect(requests[1].messages[1].tool_calls[1].function.arguments.widget_code).toMatch(/omitted/);
+    expect(requests[1].messages.filter((message: any) => message.role === 'tool').map((message: any) => message.tool_name))
+      .toEqual(['update_plan', 'show_widget', 'run_shell']);
+    expect(requests[1].messages.find((message: any) => message.tool_name === 'run_shell').content).toMatch(/not available/);
+    const widgetEnd = statuses.find((event) => event.type === 'tool_end' && event.toolName === 'show_widget');
+    expect(JSON.parse(widgetEnd.toolResult)).toMatchObject({ schema: 'bridgesllm.widget-ref.v1', toolCallId: widgetEnd.toolCallId, title: 'Chart' });
+    expect(widgetEnd.toolCallId).toMatch(/^ollama-[0-9a-f]{12}-r1-c2$/);
+    const history = sessionStore.readAllNativeSessionHistory('OLLAMA', sessionId);
+    const assistant = history.find((entry) => entry.role === 'assistant')!;
+    expect(assistant.toolCalls!.map((call) => [call.name, call.status])).toEqual([
+      ['update_plan', 'done'], ['show_widget', 'done'], ['run_shell', 'error'],
+    ]);
+    expect(assistant.toolCalls![0].arguments).toEqual({ plan: [{ step: 'Draw chart', status: 'in_progress' }] });
+  });
+
+  test('routes goal tools through the bridge instead of refusing them', async () => {
+    mockRequestConfiguredOllamaJson.mockImplementation(async (input: any) => (
+      input.path === '/api/show' ? { capabilities: ['completion', 'tools'] } : {}
+    ));
+    const requests: any[] = [];
+    mockStreamResolvedOllama.mockImplementation(async (input: any, onChunk: any) => {
+      requests.push(JSON.parse(JSON.stringify(input.json)));
+      if (requests.length === 1) {
+        await onChunk(streamLine({
+          message: { role: 'assistant', content: '', tool_calls: [{ function: { name: 'get_goal', arguments: {} } }] },
+          done: true,
+        }));
+        return;
+      }
+      await onChunk(streamLine({ message: { role: 'assistant', content: 'Done.' }, done: true }));
+    });
+    const sessionId = createSession();
+    await new OllamaProvider().sendMessage(
+      sessionId, 'check the goal', () => {}, () => {}, undefined, toolSender('ollama-goal'),
+    );
+    const toolMessage = requests[1].messages.find((message: any) => message.role === 'tool');
+    expect(toolMessage.tool_name).toBe('get_goal');
+    expect(toolMessage.content).toBe('No Portal goal is set for this conversation.');
+  });
+
+  test('keeps plain chat for models whose /api/show does not advertise tools', async () => {
+    mockRequestConfiguredOllamaJson.mockImplementation(async () => ({ capabilities: ['completion'] }));
+    mockStreamResolvedOllama.mockImplementation(async (input: any, onChunk: any) => {
+      expect(input.json.tools).toBeUndefined();
+      await onChunk(streamLine({ message: { role: 'assistant', content: 'plain' }, done: true }));
+    });
+    await expect(new OllamaProvider().sendMessage(createSession(), 'hi', undefined, undefined, undefined, toolSender('ollama-plain')))
+      .resolves.toMatchObject({ fullText: 'plain' });
     expect(mockStreamResolvedOllama).toHaveBeenCalledTimes(1);
   });
 });

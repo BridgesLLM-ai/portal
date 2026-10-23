@@ -217,6 +217,34 @@ describe('OpenClaw exact question-runtime readiness', () => {
     });
   });
 
+  it.each([
+    {
+      name: 'a killed inspect as a timeout',
+      inspect: { ok: false, stdout: '', stderr: '', error: 'Command failed', timedOut: true },
+      issue: /did not finish inspecting the runtime-guard plugin within 60 s/,
+      timedOut: true,
+    },
+    {
+      name: 'a failed inspect with its CLI error',
+      inspect: { ok: false, stdout: '', stderr: 'plugin registry failed to load', error: 'Command failed' },
+      issue: /^OpenClaw could not inspect the runtime-guard plugin: plugin registry failed to load$/,
+      timedOut: undefined,
+    },
+  ])('reports $name, never as a plugin mismatch', async ({ inspect, issue, timedOut }) => {
+    const deps = dependencies(nativeReport());
+    const answer = deps.runCli;
+    deps.runCli = jest.fn(async (args: string[], timeoutMs?: number) => (
+      args[0] === 'plugins' ? inspect : answer(args, timeoutMs)
+    ));
+
+    const result = await getOpenClawQuestionPluginReadiness(setupReadiness('current-2026.9.1'), deps);
+
+    expect(result.ready).toBe(false);
+    expect(result.issue).toMatch(issue);
+    expect(result.issue).not.toMatch(/steer-only/);
+    expect(result.inspectTimedOut).toBe(timedOut);
+  });
+
   it('keeps the retained 3.3 question surface exact and rejects retired cron methods on it', async () => {
     const result = await getOpenClawQuestionPluginReadiness(
       setupReadiness('legacy-2026.7.1'),
@@ -253,7 +281,11 @@ describe('OpenClaw exact question-runtime readiness', () => {
     expect(questionAuthorityForOpenClawVersion('2026.7.1-2')).toBe('legacy-custom');
     expect(questionAuthorityForOpenClawVersion('2026.9.1')).toBe('native');
     expect(questionAuthorityForOpenClawVersion('2026.9.2')).toBe('native');
-    expect(questionAuthorityForOpenClawVersion('2026.9.3')).toBeNull();
+    expect(questionAuthorityForOpenClawVersion('2026.9.3')).toBe('native');
+    expect(questionAuthorityForOpenClawVersion('2026.9.9')).toBe('native');
+    expect(questionAuthorityForOpenClawVersion('2026.10.5')).toBe('native');
+    expect(questionAuthorityForOpenClawVersion('2026.10.6')).toBe('native');
+    expect(questionAuthorityForOpenClawVersion('2026.10.7')).toBeNull();
     expect(questionAuthorityForOpenClawVersion('2026.7.1-3')).toBeNull();
     expect(questionAuthorityForOpenClawVersion('2026.9.1-1')).toBeNull();
   });
@@ -326,7 +358,7 @@ describe('OpenClaw exact question-runtime readiness', () => {
     expect(deps.runCli).toHaveBeenCalledTimes(1);
     expect(deps.runCli).toHaveBeenCalledWith(
       ['plugins', 'inspect', 'bridgesllm-ask-user', '--json', '--runtime'],
-      12_000,
+      60_000,
     );
     expect(deps.callGatewayRpc).toHaveBeenCalledWith('question.list', {}, 10_000);
     expect(deps.callGatewayRpc).toHaveBeenCalledWith(

@@ -5,6 +5,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import PendingQuestionToasts from './PendingQuestionToasts';
+import { QuestionAttentionProvider, useVisibleQuestionConversation } from '../contexts/QuestionAttentionContext';
 import type { GatewayPendingQuestion } from '../api/endpoints';
 
 const gatewayMocks = vi.hoisted(() => ({
@@ -53,6 +54,11 @@ function pendingQuestion(overrides: Partial<GatewayPendingQuestion> = {}): Gatew
     }],
     ...overrides,
   } as GatewayPendingQuestion;
+}
+
+function Conversation({ session, surface = 'agent-chat' }: { session: string | null; surface?: 'agent-chat' | 'project-chat' }) {
+  useVisibleQuestionConversation(surface, session);
+  return null;
 }
 
 describe('pending question notifications', () => {
@@ -134,4 +140,35 @@ describe('pending question notifications', () => {
     expect(await screen.findByText('Project chat is waiting on you')).toBeVisible();
     expect(screen.getAllByRole('status')).toHaveLength(3);
   });
+  it('sounds in the active conversation without a toast, and shows it when switching away', async () => {
+    const question = pendingQuestion();
+    const tree = (session: string | null) => <QuestionAttentionProvider>
+      <Conversation session={session} />
+      <PendingQuestionToasts questions={[question]} onSettled={vi.fn()} />
+    </QuestionAttentionProvider>;
+    const view = render(tree(question.sessionKey));
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    expect(soundMocks.question).toHaveBeenCalledTimes(1);
+    view.rerender(tree('agent:main:other'));
+    expect(await screen.findByText('Agent chat is waiting on you')).toBeVisible();
+    expect(soundMocks.question).toHaveBeenCalledTimes(1);
+    view.rerender(tree(question.sessionKey));
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    view.rerender(tree(null));
+    expect(await screen.findByText('Agent chat is waiting on you')).toBeVisible();
+    expect(soundMocks.question).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not suppress a different conversation or surface while a Project chat is visible', async () => {
+    const same = pendingQuestion({ id: 'project', surface: 'project-chat' });
+    const other = pendingQuestion({ id: 'agent' });
+    render(<QuestionAttentionProvider>
+      <Conversation session={same.sessionKey} surface="project-chat" />
+      <PendingQuestionToasts questions={[same, other]} onSettled={vi.fn()} />
+    </QuestionAttentionProvider>);
+    await waitFor(() => expect(screen.queryByText('Project chat is waiting on you')).not.toBeInTheDocument());
+    expect(screen.getByText('Agent chat is waiting on you')).toBeVisible();
+    expect(soundMocks.question).toHaveBeenCalledTimes(1);
+  });
+
 });

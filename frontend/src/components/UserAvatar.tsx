@@ -39,6 +39,10 @@ export function resolveAssistantHarnessIndicator(
   if (!entry || entry.checking === true || entry.availabilityState === 'checking') {
     return { state: 'checking', label: `${displayName}: Checking readiness…` };
   }
+  if (entry.checkTimedOut === true) {
+    // The row was still checking when this wait ended; the next poll repaints it.
+    return { state: 'checking', label: `${displayName}: Still checking readiness…` };
+  }
   if (entry.implemented !== true || entry.selectable !== true) {
     return {
       state: 'unavailable',

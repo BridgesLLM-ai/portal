@@ -1,4 +1,16 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request as ExpressRequest, Response, NextFunction } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+import { fingerprintDesktopSource } from '../services/projectDesktopSource';
+import { beginDesktopJob, readDesktopJob, updateDesktopJob, finishDesktopJob, cancelDesktopJob, DESKTOP_BUILD_JOB_ROOT } from '../services/projectDesktopJobs';
+import { DESKTOP_PROJECT_TEMPLATES, DESKTOP_PROJECT_CATALOG } from '../services/projectDesktopTemplates';
+import { readDesktopProjectDescriptor, hasCargoProject } from '../services/projectDesktopContract';
+import { buildDesktopProject } from '../services/projectDesktopBuild';
+import { promoteDesktopBuild, desktopProcessStatus, startDesktopProject, stopDesktopProject, readDesktopDeployment, DESKTOP_PROJECT_STATE_ROOT, DesktopLaunchCancelledError } from '../services/projectDesktopDeployment';
+import { desktopToolchainAvailability, DesktopToolchainUnavailableError } from '../services/projectDesktopToolchain';
+import { durableDesktopDispatchGate } from '../services/projectDesktopLaunchAuthority';
+import { establishLongLivedAccessAuthorization, authorizeAccessTokenPayload } from '../services/accessTokenAuthorization';
+
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
@@ -84,6 +96,13 @@ import {
   runPreparedProjectGitCommand,
   runProjectGitCommand,
 } from '../services/project-git.service';
+import {
+  PROJECT_GIT_BASIC_LOG_FORMAT,
+  parseProjectGitBasicLog,
+  projectGitHistoryPage,
+  projectGitHistoryRangeArgs,
+  projectGitHistoryResult,
+} from '../services/projectGitHistoryPage';
 import { getDefaultModel, getProviderStatusesAsync } from '../services/openclawConfigManager';
 import {
   acquireProjectDownloadPermit,
@@ -96,6 +115,7 @@ import {
   type ProjectDownloadArchiveEntry,
   type ProjectDownloadPermit,
 } from '../services/projectDownloadSnapshot';
+import { isProjectDownloadPathExcluded, type ProjectDownloadMode } from '../services/projectDownloadExclusions';
 import {
   assertCachedOpenClawExecutionAdmitted,
   assertOpenClawExecutionAdmitted,
@@ -3839,6 +3859,7 @@ async function getAssistantName(): Promise<string> {
 }
 // Template definitions
 const TEMPLATES: Record<string, { files: Record<string, string> }> = {
+  ...DESKTOP_PROJECT_TEMPLATES,
   'static-html': {
     files: {
       'index.html': `<!DOCTYPE html>
@@ -3955,6 +3976,21 @@ clean:
     },
   },
 };
+
+// One server-owned catalogue for language/interface creation choices, with the
+// installer-recorded reason when this host cannot build Desktop Projects.
+router.get('/templates', authenticateToken, requireApproved, (_req: Request, res: Response) => {
+  const availability = desktopToolchainAvailability();
+  res.json({ desktop: DESKTOP_PROJECT_CATALOG, desktopToolchain: availability.available
+    ? { available: true, dependencyPolicy: availability.dependencyPolicy }
+    : { available: false, reason: availability.reason, dependencyPolicy: availability.dependencyPolicy } });
+});
+
+function desktopDependencySummary(): string {
+  return desktopToolchainAvailability().dependencyPolicy === 'offline'
+    ? 'Dependencies come only from the toolchain cache on this server.'
+    : 'Dependencies download through the Portal egress proxy and follow the lockfile.';
+}
 
 // GET /api/projects - list projects
 router.get('/', authenticateToken, requireApproved, async (req: Request, res: Response) => {
@@ -4452,6 +4488,7 @@ router.post('/clone', authenticateToken, requireApproved, async (req: Request, r
       network: true,
       signal: abortController.signal,
     });
+    readDesktopProjectDescriptor(stagingDir);
 
     await assertNoLegacyOpenClawProjectCreationCollision({
       workspaceOwnerId: ownerId,
@@ -5034,32 +5071,32 @@ router.post('/:name/git', authenticateToken, requireApproved, async (req: Reques
       }
 
       case 'log': {
-        const limit = Math.max(1, Math.min(Number.parseInt(String(req.body.limit || 50), 10) || 50, 100));
+        const page = projectGitHistoryPage(req.body, 50);
+        if (!page) { res.status(400).json({ error: 'Valid history offset required' }); return; }
         const branchFilter = req.body.branch;
         if (branchFilter && !isSafeProjectGitRef(branchFilter)) { res.status(400).json({ error: 'Valid branch name required' }); return; }
         const raw = await git([
           'log',
           branchFilter || '--all',
-          '--format={"hash":"%H","short":"%h","author":"%an","email":"%ae","date":"%aI","relativeDate":"%ar","message":"%s","refs":"%D","parent":"%P"}',
-          `-${limit}`,
+          PROJECT_GIT_BASIC_LOG_FORMAT,
+          ...projectGitHistoryRangeArgs(page),
         ]);
-        const commits = raw.split('\n').filter(Boolean).map((line) => {
-          try { return JSON.parse(line); } catch { return null; }
-        }).filter(Boolean);
-        res.json({ commits });
+        const { commits, hasMore } = projectGitHistoryResult(parseProjectGitBasicLog(raw), page);
+        res.json({ commits: commits.filter(Boolean), hasMore });
         return;
       }
 
       case 'log-enhanced': {
-        const limit = Math.max(1, Math.min(Number.parseInt(String(req.body.limit || 30), 10) || 30, 100));
+        const page = projectGitHistoryPage(req.body, 30);
+        if (!page) { res.status(400).json({ error: 'Valid history offset required' }); return; }
         const branchFilter = req.body.branch;
         if (branchFilter && !isSafeProjectGitRef(branchFilter)) { res.status(400).json({ error: 'Valid branch name required' }); return; }
         const raw = await git([
           'log', branchFilter || '--all',
           '--format=COMMIT_START%n%H|%h|%an|%ae|%aI|%ar|%s|%D|%P',
-          '--stat', '--no-ext-diff', '--no-textconv', `-${limit}`,
+          '--stat', '--no-ext-diff', '--no-textconv', ...projectGitHistoryRangeArgs(page),
         ], { maxOutputBytes: 5 * 1024 * 1024 });
-        const blocks = raw.split('COMMIT_START\n').filter(Boolean);
+        const { commits: blocks, hasMore } = projectGitHistoryResult(raw.split('COMMIT_START\n').filter(Boolean), page);
         const enhancedCommits = blocks.map((block) => {
           const lines = block.trim().split('\n');
           const parts = lines[0].split('|');
@@ -5102,7 +5139,7 @@ router.post('/:name/git', authenticateToken, requireApproved, async (req: Reques
             },
           };
         }).filter(Boolean);
-        res.json({ commits: enhancedCommits });
+        res.json({ commits: enhancedCommits, hasMore });
         return;
       }
 
@@ -5391,7 +5428,11 @@ router.post('/upload-zip', authenticateToken, requireApproved, zipUpload.single(
     let detectedType = 'unknown';
     let suggestedCommand = '';
     const files = listProjectRootRegularFiles(stagingDir);
-    if (files.includes('package.json')) {
+    const desktop = readDesktopProjectDescriptor(stagingDir);
+    if (desktop) {
+      detectedType = desktop.language;
+      suggestedCommand = 'Use Check, then Run on Desktop (' + desktop.interface + '). ' + desktopDependencySummary();
+    } else if (files.includes('package.json')) {
       detectedType = 'node';
       try {
         const pkg = readProjectPackageJson(stagingDir);
@@ -5401,7 +5442,7 @@ router.post('/upload-zip', authenticateToken, requireApproved, zipUpload.single(
       detectedType = 'python';
       suggestedCommand = files.includes('app.py') ? 'python app.py' : 'python main.py';
     } else if (files.includes('Cargo.toml')) {
-      detectedType = 'rust'; suggestedCommand = 'cargo run';
+      detectedType = 'rust'; suggestedCommand = 'Choose the binary and terminal/graphical target in portal-project.json, then Check and Run on Desktop.';
     } else if (files.includes('index.html')) {
       detectedType = 'static'; suggestedCommand = 'npx serve .';
     } else if (files.includes('go.mod')) {
@@ -5552,7 +5593,11 @@ router.post('/create-from-upload', authenticateToken, requireApproved, async (re
     let detectedType = 'unknown';
     let suggestedCommand = '';
     const files = listProjectRootRegularFiles(stagingDir);
-    if (files.includes('package.json')) {
+    const desktop = readDesktopProjectDescriptor(stagingDir);
+    if (desktop) {
+      detectedType = desktop.language;
+      suggestedCommand = 'Use Check, then Run on Desktop (' + desktop.interface + '). ' + desktopDependencySummary();
+    } else if (files.includes('package.json')) {
       detectedType = 'node';
       try {
         const pkg = readProjectPackageJson(stagingDir);
@@ -5562,7 +5607,7 @@ router.post('/create-from-upload', authenticateToken, requireApproved, async (re
       detectedType = 'python';
       suggestedCommand = files.includes('app.py') ? 'python app.py' : 'python main.py';
     } else if (files.includes('Cargo.toml')) {
-      detectedType = 'rust'; suggestedCommand = 'cargo run';
+      detectedType = 'rust'; suggestedCommand = 'Choose the binary and terminal/graphical target in portal-project.json, then Check and Run on Desktop.';
     } else if (files.includes('index.html')) {
       detectedType = 'static'; suggestedCommand = 'npx serve .';
     } else if (files.includes('go.mod')) {
@@ -6127,6 +6172,18 @@ async function completeAdmittedProjectDeletion(input: {
     expectedIdentity: desktopRuntime.identity || undefined,
     sourceMustBeAbsent: !desktopRuntime.identity,
   });
+  // Desktop app data, logs, promotion journals and build receipts belong to this
+  // Project identity only; they never outlive it.
+  for (const [root, key] of [[DESKTOP_PROJECT_STATE_ROOT, 'desktop-state'], [DESKTOP_BUILD_JOB_ROOT, 'desktop-jobs']] as const) {
+    const directory = path.join(root, projectIdentity.id);
+    const identity = managedPathExists(directory) ? attestProjectRoot(directory) : null;
+    await removeDirectoryThroughAttestedQuarantine({
+      sourceRoot: directory,
+      quarantineKey: `${key}:${projectIdentity.id}`,
+      expectedIdentity: identity || undefined,
+      sourceMustBeAbsent: !identity,
+    });
+  }
 
   if (!initialDeployAttestation && managedPathExists(deployPath)) {
     throw new ProjectIdentityLifecycleError(
@@ -7515,6 +7572,38 @@ router.patch('/:name/rename', authenticateToken, requireApproved, async (req: Re
   }
 });
 
+// Durable Desktop job receipts are scoped to the current immutable Project.
+router.get('/:name/desktop-build', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    if (!canUseDesktopRuntimeDeployment(req.user?.role, req.user?.accountStatus, undefined)) {
+      res.status(403).json({ error: 'Desktop build access requires an Owner or Sub-Admin' }); return;
+    }
+    const ownerId = await getScopedOwnerId(req), root = getExistingProjectPathReadOnly(ownerId, req.params.name);
+    const identity = await readProjectIdentity({ workspaceOwnerId: ownerId, projectName: req.params.name, projectRoot: root });
+    if (!identity || identity.lifecycleStatus !== 'ACTIVE') { res.status(404).json({ error: 'Project not found' }); return; }
+    const id = req.query.id === undefined ? undefined : String(req.query.id);
+    if (id && !/^[a-f0-9-]{36}$/.test(id)) { res.status(400).json({ error: 'Invalid Desktop job identity' }); return; }
+    const job = readDesktopJob(identity.id, id);
+    if (id && !job) { res.status(404).json({ error: 'Desktop build receipt has been superseded' }); return; }
+    res.json({ desktopJob: job });
+  } catch (error: any) { res.status(error?.code === 'ENOENT' ? 404 : 503).json({ error: 'Desktop build status is unavailable' }); }
+});
+router.post('/:name/desktop-build/cancel', authenticateToken, requireApproved, async (req: Request, res: Response) => {
+  try {
+    const authority = await authorizeAccessTokenPayload(req.user!);
+    if (!authority.ok || !canUseDesktopRuntimeDeployment(authority.identity.role, authority.identity.accountStatus, undefined)) {
+      res.status(403).json({ error: 'Desktop build cancellation is not authorized' }); return;
+    }
+    const ownerId = await getScopedOwnerId(req), root = getExistingProjectPathReadOnly(ownerId, req.params.name);
+    const identity = await readProjectIdentity({ workspaceOwnerId: ownerId, projectName: req.params.name, projectRoot: root });
+    if (!identity || identity.lifecycleStatus !== 'ACTIVE') { res.status(404).json({ error: 'Project not found' }); return; }
+    const id = String(req.body?.id || '');
+    if (!/^[a-f0-9-]{36}$/.test(id)) { res.status(400).json({ error: 'Invalid Desktop job identity' }); return; }
+    res.json({ cancelled: cancelDesktopJob(identity.id, id), desktopJob: readDesktopJob(identity.id, id) });
+  } catch { res.status(503).json({ error: 'Desktop build cancellation could not be confirmed' }); }
+});
+
 // POST /api/projects/:name/check - syntax/compile check for runtime projects
 router.post('/:name/check', authenticateToken, requireApproved, async (req: Request, res: Response) => {
   try {
@@ -7532,6 +7621,51 @@ router.post('/:name/check', authenticateToken, requireApproved, async (req: Requ
     let output = '';
     const errors: string[] = [];
 
+    const descriptor = readDesktopProjectDescriptor(projectDir);
+    if (descriptor) {
+      const controller = new AbortController();
+      const authority = await establishLongLivedAccessAuthorization({ payload: req.user!, authorize: identity => canUseDesktopRuntimeDeployment(identity.role, identity.accountStatus, undefined), onRevoke: () => controller.abort() });
+      if (!authority.ok) { res.status(403).json({ error: 'Project check authorization is no longer valid' }); return; }
+      let held: (() => void) | null = null;
+      let workspace: ReturnType<typeof createProjectLifecycleWorkspace> | null = null;
+      let jobStarted = false;
+      let releaseWorkerLease: (() => void) | null = null;
+      try {
+        const availability = desktopToolchainAvailability();
+        if (!availability.available) throw new DesktopToolchainUnavailableError(availability.reason);
+        // A 202 ends the request's mutation admission; the detached worker keeps
+        // its own lease so authorization fences wait for it to settle.
+        releaseWorkerLease = acquireWorkspaceAuthorizationMutationLease(req.user!.userId);
+        held = await acquireProjectDeletionLock(projectDeletionLockKey(ownerId, req.params.name));
+        const currentRoot = getExistingProjectPathReadOnly(ownerId, req.params.name);
+        const currentIdentity = await readProjectIdentity({ workspaceOwnerId: ownerId, projectName: req.params.name, projectRoot: currentRoot });
+        if (!currentIdentity || currentIdentity.id !== projectIdentity.id || currentIdentity.generation !== projectIdentity.generation) throw new Error('Project changed before Check was admitted');
+        const job = beginDesktopJob({ projectId: projectIdentity.id, actorId: req.user!.userId, action: 'check', controller });
+        jobStarted = true;
+        if (req.body?.asyncBuild === true) res.status(202).json({ desktopJob: job });
+        workspace = createProjectLifecycleWorkspace(currentRoot, { desktop: true });
+        updateDesktopJob(projectIdentity.id, 'Checking ' + descriptor.language + (availability.dependencyPolicy === 'offline' ? ' with cached dependencies' : ' with brokered dependencies'));
+        const result = await buildDesktopProject({ actorId: req.user!.userId, projectId: projectIdentity.id,
+          workspace: workspace.path, descriptor, phase: 'check', signal: controller.signal,
+          onOutput: chunk => updateDesktopJob(projectIdentity.id, undefined, chunk) });
+        const response = { ok: true, language: descriptor.language, output: result.output.slice(-24 * 1024) || 'Check passed', errors: [] };
+        jobStarted = false;
+        finishDesktopJob(projectIdentity.id, response);
+        if (!res.headersSent) res.json(response);
+      } catch (error: any) {
+        if (jobStarted) {
+          jobStarted = false;
+          try { finishDesktopJob(projectIdentity.id, undefined, error); }
+          catch (receiptError) { console.error('[Desktop] Could not persist job outcome:', receiptError); }
+        }
+        if (!res.headersSent) res.status(error.statusCode || 200).json({ ok: false, language: descriptor.language, output: error.message, errors: [error.message] });
+      } finally { authority.dispose(); workspace?.cleanup(); held?.(); releaseWorkerLease?.(); }
+      return;
+    }
+    if (hasCargoProject(projectDir)) {
+      res.status(422).json({ ok: false, language: 'rust', error: 'Select the Cargo binary and Desktop interface in portal-project.json before checking or deploying this import.' });
+      return;
+    }
     const files = listProjectRootRegularFiles(projectDir);
 
     // Detect project type and set check command
@@ -7572,7 +7706,7 @@ router.post('/:name/check', authenticateToken, requireApproved, async (req: Requ
     }
 
     if (!checkCommand) {
-      res.json({ ok: true, language, output: 'No checkable files found.', errors: [] });
+      res.status(422).json({ ok: false, language, output: 'No supported check target was found. Add an explicit project entry point.', errors: ['No checkable files found.'] });
       return;
     }
 
@@ -7611,7 +7745,7 @@ router.post('/:name/check', authenticateToken, requireApproved, async (req: Requ
     }
   } catch (error: any) {
     console.error('Check error:', error);
-    res.status(500).json({ error: 'Failed to check project', detail: error.message });
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to check project', detail: error.message });
   }
 });
 
@@ -7744,7 +7878,10 @@ const CPP_STDLIB = new Set([
 
 interface DependencyCheckResult {
   needsInstall: boolean;
-  language: 'python' | 'cpp' | 'node' | null;
+  language: 'python' | 'cpp' | 'node' | 'typescript' | 'rust' | null;
+  resolution?: 'desktop-build';
+  verification?: 'pending-build';
+  message?: string;
   packages: string[];
   installedPackages?: string[];
   command?: string;
@@ -7755,6 +7892,17 @@ const PROJECT_DEPENDENCY_SCAN_MAX_FILE_BYTES = 256 * 1024;
 const PROJECT_DEPENDENCY_MAX_PACKAGES = 256;
 
 async function detectDependencies(projectDir: string): Promise<DependencyCheckResult> {
+  const desktop = readDesktopProjectDescriptor(projectDir);
+  if (desktop) {
+    // No host installer. Check/Run resolves the actual dependency graph inside the
+    // Desktop toolchain workload; this is a plan, never an installed assertion.
+    const lockfile = desktop.language === 'typescript' ? 'package-lock.json' : desktop.language === 'rust' ? 'Cargo.lock' : null;
+    const missingLock = lockfile && readProjectTextFile(projectDir, lockfile, { optional: true, maxBytes: 8 * 1024 * 1024 }) === null;
+    return { needsInstall: Boolean(missingLock), language: desktop.language, packages: missingLock ? [lockfile!] : [],
+      command: missingLock ? 'Resolve pinned dependencies into ' + lockfile : undefined,
+      resolution: 'desktop-build', verification: 'pending-build',
+      message: 'Dependencies are verified inside the Desktop toolchain during Check or Run. ' + desktopDependencySummary() };
+  }
   const files = listProjectRootRegularFiles(projectDir);
   
   // Check for Python project
@@ -9133,6 +9281,44 @@ router.post('/:name/install-deps', authenticateToken, requireApproved, async (re
 
     const result = await detectDependencies(projectDir);
 
+    if (result.resolution === 'desktop-build') {
+      if (!canUseDesktopRuntimeDeployment(req.user?.role, req.user?.accountStatus, undefined)) {
+        res.status(403).json({ error: 'Desktop dependency setup requires an Owner or Sub-Admin' }); return;
+      }
+      if (!result.needsInstall) { res.json({ success: true, resolution: result.resolution, verification: result.verification, message: result.message, packages: [] }); return; }
+      const availability = desktopToolchainAvailability();
+      if (!availability.available) { res.status(503).json({ code: 'DESKTOP_TOOLCHAIN_UNAVAILABLE', error: availability.reason }); return; }
+      const descriptor = readDesktopProjectDescriptor(projectDir)!;
+      const controller = new AbortController();
+      const authority = await establishLongLivedAccessAuthorization({ payload: req.user!, authorize: identity => canUseDesktopRuntimeDeployment(identity.role, identity.accountStatus, undefined), onRevoke: () => controller.abort() });
+      if (!authority.ok) { res.status(403).json({ error: 'Desktop dependency authorization is no longer valid' }); return; }
+      let workspace: ReturnType<typeof createProjectLifecycleWorkspace> | null = null, jobStarted = false;
+      const close = () => { if (!res.writableEnded) controller.abort(); };
+      const event = (name: string, data: unknown) => { if (!res.destroyed && !res.writableEnded) res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`); };
+      try {
+        beginDesktopJob({ projectId: projectIdentity.id, actorId: req.user!.userId, action: 'resolve', controller }); jobStarted = true;
+        res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.flushHeaders(); res.once('close', close);
+        event('start', { packages: result.packages, command: result.command });
+        const sourceRevision = await fingerprintDesktopSource(projectDir, controller.signal);
+        workspace = createProjectLifecycleWorkspace(projectDir, { desktop: true });
+        await buildDesktopProject({ actorId: req.user!.userId, projectId: projectIdentity.id, workspace: workspace.path, descriptor, phase: 'resolve', signal: controller.signal,
+          onOutput: chunk => { updateDesktopJob(projectIdentity.id, undefined, chunk); event('log', { text: chunk }); } });
+        const current = await authorizeAccessTokenPayload(req.user!);
+        if (controller.signal.aborted || !current.ok || !canUseDesktopRuntimeDeployment(current.identity.role, current.identity.accountStatus, undefined)) throw new Error('Dependency setup authorization was revoked');
+        if (await fingerprintDesktopSource(projectDir, controller.signal) !== sourceRevision) throw new Error('Project source changed during dependency resolution; no lockfile was written. Retry setup.');
+        const lockfile = descriptor.language === 'typescript' ? 'package-lock.json' : 'Cargo.lock';
+        const content = readProjectTextFile(workspace.path, lockfile, { maxBytes: 8 * 1024 * 1024 });
+        if (!content) throw new Error('Dependency resolution did not produce a lockfile');
+        writeProjectRuntimeOwnedFileAtomic(projectDir, lockfile, content, { exclusive: true, maxBytes: 8 * 1024 * 1024 });
+        const response = { success: true, message: 'Created ' + lockfile + '. Keep it with the source; Check and Run install exactly these versions.', packages: [lockfile] };
+        jobStarted = false; finishDesktopJob(projectIdentity.id, response); event('complete', response);
+      } catch (error: any) {
+        if (jobStarted) { try { finishDesktopJob(projectIdentity.id, undefined, error); } catch (receiptError) { console.error('[Desktop] Dependency receipt failure:', receiptError); } }
+        if (!res.headersSent) res.status(error.statusCode || 422).json({ error: error.message });
+        else event('error', { success: false, message: error.message });
+      } finally { res.removeListener('close', close); authority.dispose(); workspace?.cleanup(); if (res.headersSent && !res.writableEnded && !res.destroyed) res.end(); }
+      return;
+    }
     if (!result.needsInstall || !result.command || result.packages.length === 0) {
       res.json({ success: true, message: 'No dependencies to install', packages: [] });
       return;
@@ -9330,6 +9516,15 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
         return;
       }
       throw error;
+    }
+
+    if (req.body?.asyncBuild === true && canUseDesktopRuntimeDeployment(req.user?.role, req.user?.accountStatus, undefined)) {
+      const identity = await readProjectIdentity({ workspaceOwnerId: ownerId, projectName: req.params.name, projectRoot: projectDir });
+      const job = identity ? readDesktopJob(identity.id) : null;
+      if (job?.status === 'running') {
+        if (job.action !== 'deploy') { res.status(409).json({ error: 'Wait for the active Desktop check to finish, or cancel it before Run.' }); return; }
+        res.status(202).json({ desktopJob: job }); return;
+      }
     }
 
     releaseProjectNameLock = await acquireProjectDeletionLock(
@@ -9583,6 +9778,78 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
     
     // For runtime apps: copy to bridgesrd user's projects directory and launch in xterm
     if (deployType === 'runtime') {
+      const descriptor = readDesktopProjectDescriptor(projectDir);
+      if (descriptor) {
+        const availability = desktopToolchainAvailability();
+        if (!availability.available) {
+          res.status(503).json({ code: 'DESKTOP_TOOLCHAIN_UNAVAILABLE', error: availability.reason, deployType: 'runtime', previousDeploymentRetained: true });
+          return;
+        }
+        const controller = new AbortController();
+        const authority = await establishLongLivedAccessAuthorization({ payload: req.user!, authorize: identity => canUseDesktopRuntimeDeployment(identity.role, identity.accountStatus, undefined), onRevoke: () => controller.abort() });
+        if (!authority.ok) { res.status(403).json({ error: 'Desktop deployment authorization is no longer valid' }); return; }
+        let workspace: ReturnType<typeof createProjectLifecycleWorkspace> | null = null;
+        let jobStarted = false;
+        let releaseWorkerLease: (() => void) | null = null;
+        try {
+          // Held through finally: the 202 below releases the request's admission.
+          releaseWorkerLease = acquireWorkspaceAuthorizationMutationLease(req.user!.userId);
+          const job = beginDesktopJob({ projectId: projectIdentity.id, actorId: req.user!.userId, action: 'deploy', controller });
+          jobStarted = true;
+          if (req.body?.asyncBuild === true) res.status(202).json({ desktopJob: job });
+          workspace = createProjectLifecycleWorkspace(projectDir, { desktop: true });
+          updateDesktopJob(projectIdentity.id, 'Building ' + descriptor.language + (availability.dependencyPolicy === 'offline' ? ' with cached dependencies' : ' with brokered dependencies'));
+          const sourceRevision = await fingerprintDesktopSource(workspace.path, controller.signal);
+          const built = await buildDesktopProject({ actorId: req.user!.userId, projectId: projectIdentity.id,
+            workspace: workspace.path, descriptor, phase: 'build', signal: controller.signal,
+            onOutput: chunk => updateDesktopJob(projectIdentity.id, undefined, chunk) });
+          updateDesktopJob(projectIdentity.id, 'Promoting built application');
+          let savedApp = existingProjectApp;
+          const result = await promoteDesktopBuild({ projectId: projectIdentity.id, projectName: appName,
+            workspace: workspace.path, receipt: built.receipt!, sourceRevision, signal: controller.signal,
+            dispatch: durableDesktopDispatchGate({ payload: req.user!, signal: controller.signal, onDenied: () => controller.abort() }),
+            beforePromotion: async () => {
+              const current = await authorizeAccessTokenPayload(req.user!);
+              if (controller.signal.aborted || !current.ok || !canUseDesktopRuntimeDeployment(current.identity.role, current.identity.accountStatus, undefined)) {
+                throw new Error('Desktop deployment authorization was revoked before promotion');
+              }
+              await advanceProjectDeploymentLifecycleRevision({ ownerUserId: ownerId,
+                projectIdentityId: projectIdentity.id, projectIdentityGeneration: projectIdentity.generation,
+                expectedDeploymentRevision: originalDeploymentRevision! });
+            },
+            persist: async (_deployment, status) => {
+              if (controller.signal.aborted) throw new Error('Desktop deployment authorization was revoked');
+              const data = { projectIdentityId: projectIdentity.id,
+                zipPath: buildProjectDesktopRuntimeIdentity(projectIdentity.id, appName).runtimeDir,
+                isActive: status.status === 'running', deployType: 'runtime', port: null, processStatus: status.status };
+              savedApp = savedApp ? await prisma.app.update({ where: { id: savedApp.id }, data })
+                : await prisma.app.create({ data: { ...data, userId: ownerId, name: appName,
+                  description: descriptor.language + ' ' + descriptor.interface + ' Desktop project' } });
+            },
+          });
+          await prisma.activityLog.create({ data: { userId: ownerId, action: 'PROJECT_DEPLOY', resource: 'project',
+            resourceId: projectIdentity.id, severity: 'INFO', metadata: { projectName: appName, deployType: 'runtime',
+              appId: savedApp!.id, generation: result.deployment.generation, language: descriptor.language, interface: descriptor.interface } } }).catch(error => console.warn('[Desktop] Activity log write failed:', error.code));
+          const response = { message: 'Built and opened on Remote Desktop', appId: savedApp!.id, name: appName,
+            deployType: 'runtime', status: result.status.status, buildOutput: built.output.slice(-24 * 1024) };
+          jobStarted = false;
+          finishDesktopJob(projectIdentity.id, response);
+          if (!res.headersSent) res.json(response);
+        } catch (error: any) {
+          if (jobStarted) {
+            jobStarted = false;
+            try { finishDesktopJob(projectIdentity.id, undefined, error); }
+            catch (receiptError) { console.error('[Desktop] Could not persist job outcome:', receiptError); }
+          }
+          if (!res.headersSent) res.status(error.statusCode || 422).json({ code: error.code === 'DESKTOP_TOOLCHAIN_UNAVAILABLE' ? error.code : 'DESKTOP_BUILD_OR_START_FAILED', error: error.message,
+            deployType: 'runtime', previousDeploymentRetained: error.previousDeploymentRetained === true });
+        } finally { authority.dispose(); workspace?.cleanup(); releaseWorkerLease?.(); }
+        return;
+      }
+      if (hasCargoProject(projectDir)) {
+        res.status(422).json({ error: 'Select the Cargo binary and Desktop interface in portal-project.json before deploying this import.', deployType: 'runtime' });
+        return;
+      }
       await advanceProjectDeploymentLifecycleRevision({
         ownerUserId: ownerId,
         projectIdentityId: projectIdentity.id,
@@ -9987,6 +10254,7 @@ router.post('/:name/deploy', authenticateToken, requireApproved, async (req: Req
       }
     }
     console.error('Deploy error:', error);
+    if (res.headersSent) return;
     if (recoveryError) console.error('Deploy recovery error:', recoveryError);
     if (sendProjectRuntimeRecoveryReplayError(res, error)) return;
     if (error instanceof ProjectDeploymentReplayStaleError) {
@@ -10406,6 +10674,45 @@ router.post('/:name/app-process', authenticateToken, requireApproved, async (req
           ? ['start', 'stop', 'status']
           : ['start', 'status'];
 
+    if (app.deployType === 'runtime' && app.projectIdentityId && readDesktopDeployment(app.projectIdentityId)) {
+      if (!canUseDesktopRuntimeDeployment(req.user?.role, req.user?.accountStatus, undefined)) {
+        res.status(403).json({ error: 'Desktop controls require an Owner or Sub-Admin' }); return;
+      }
+      if (mutatingAction) {
+        // Authority must hold for the whole awaited control path, not one read:
+        // revocation aborts before the next step and before any host launch.
+        const controller = new AbortController();
+        const authority = await establishLongLivedAccessAuthorization({ payload: req.user!, authorize: identity => canUseDesktopRuntimeDeployment(identity.role, identity.accountStatus, undefined), onRevoke: () => controller.abort() });
+        if (!authority.ok) { res.status(403).json({ error: 'Desktop control authorization is no longer valid' }); return; }
+        const assertAuthorized = () => { if (controller.signal.aborted) throw new DesktopLaunchCancelledError(); };
+        try {
+          if (!projectIdentity) throw new ProjectIdentityLifecycleError('Desktop controls require immutable Project identity');
+          const revision = await readProjectDeploymentLifecycleRevision({ ownerUserId: ownerId,
+            projectIdentityId: projectIdentity.id, projectIdentityGeneration: projectIdentity.generation });
+          assertAuthorized();
+          await advanceProjectDeploymentLifecycleRevision({ ownerUserId: ownerId,
+            projectIdentityId: projectIdentity.id, projectIdentityGeneration: projectIdentity.generation,
+            expectedDeploymentRevision: revision.deploymentRevision });
+          assertAuthorized();
+          if (action === 'stop' || action === 'restart') await stopDesktopProject(app.projectIdentityId);
+          if (action === 'start' || action === 'restart') await startDesktopProject(app.projectIdentityId, appName, { signal: controller.signal,
+            dispatch: durableDesktopDispatchGate({ payload: req.user!, signal: controller.signal, onDenied: () => controller.abort() }) });
+        } catch (error) {
+          if (!(error instanceof DesktopLaunchCancelledError)) throw error;
+          res.status(403).json({ error: 'Desktop control authorization is no longer valid' }); return;
+        } finally { authority.dispose(); }
+      }
+      const state = await desktopProcessStatus(app.projectIdentityId, action === 'logs' || action === 'status');
+      if (mutatingAction) await prisma.app.update({ where: { id: app.id }, data: { isActive: state.status === 'running', processStatus: state.status } });
+      const deployment = readDesktopDeployment(app.projectIdentityId)!;
+      let sourceState: 'current' | 'changed' | 'unknown' = 'unknown';
+      if (deployment.sourceRevision) {
+        try { sourceState = await fingerprintDesktopSource(projectDir) === deployment.sourceRevision ? 'current' : 'changed'; } catch { /* A status read cannot certify unavailable source. */ }
+      }
+      res.json({ ...state, desktop: { sourceState, builtAt: deployment.builtAt, generation: deployment.generation }, persistedStatus: app.processStatus, recoveryRequired: false,
+        deployType: 'runtime', runtimeManagement: 'desktop-session', supportedActions: [...acceptedActions], restartCount: 0 });
+      return;
+    }
     if (app.deployType !== 'fullstack') {
       if (action === 'status') {
         res.json({
@@ -12273,7 +12580,7 @@ type ProjectQualificationRateLimitRequest = Request & {
 };
 
 function requireProjectQualificationRateLimitIdentity(
-  req: Request,
+  req: ExpressRequest,
 ): Readonly<ProjectQualificationRateLimitIdentity> {
   const admitted = (req as ProjectQualificationRateLimitRequest)[
     PROJECT_QUALIFICATION_RATE_LIMIT_IDENTITY
@@ -14220,6 +14527,8 @@ router.get('/:name/chat/session-status', authenticateToken, requireApproved, asy
 
 // Helper: detect project type
 function detectProjectType(projectDir: string): string {
+  const desktop = readDesktopProjectDescriptor(projectDir);
+  if (desktop) return `${desktop.language} ${desktop.interface === 'gui' ? 'graphical' : 'terminal'} Desktop (${desktop.framework}). Use portal-project.json and BRIDGESLLM_APP_DATA; Check/Run build in the Desktop toolchain and keep lockfiles current, Restart reuses deployed code. Do not run host installers or change the network policy.`;
   const hasPackageJson = fs.existsSync(path.join(projectDir, 'package.json'));
   const hasIndexHtml = fs.existsSync(path.join(projectDir, 'index.html'));
   if (hasPackageJson) {
@@ -16792,62 +17101,14 @@ router.get('/:name/download', authenticateToken, requireApproved, async (req: Re
       return;
     }
 
-    // Files to always exclude
-    const alwaysExclude = [
-      '.assistant-*',
-      '.agent-*',
-      '.marcus-*',
-      '.portal-project.json',
-      '.portal/attachments/**',
-      '.git/**',
-      'node_modules/**',
-      '.venv/**',
-      '.deps-installed',
-      '.env',
-      '.env.local',
-      '.env.*.local',
-      '__pycache__/**',
-      '*.pyc',
-      '.pytest_cache/**',
-      '.DS_Store',
-      'Thumbs.db',
-      '.cache/**',
-      '.turbo/**',
-    ];
-
-    // Additional excludes for clean modes (clean & stripped - not full)
-    const cleanExclude = [
-      ...alwaysExclude,
-      'dist/**',
-      'build/**',
-      '.next/**',
-      '.nuxt/**',
-      'coverage/**',
-      '.vscode/**',
-      '.idea/**',
-      'Agent.md',           // Agent documentation
-      'agent.md',           // Lowercase variant
-      'README.md',          // Markdown readme
-      'readme.md',          // Lowercase markdown readme
-      'Readme.md',          // Mixed case variant
-      // Note: readme.txt is NOT excluded (kept in clean exports)
-    ];
-
-    const excludePatterns = (mode === 'full') ? alwaysExclude : cleanExclude;
+    // Generated, Portal-internal and credential entries (any `.env` except
+    // templates, `.ssh/`, `.aws/`, ...) never leave the server in any mode;
+    // clean modes also drop build output. Matched by whole path segment at
+    // any depth, never by substring (projectDownloadExclusions.ts).
     const stripComments = (mode === 'stripped');
-    const isExcludedArchivePath = (relativePath: string): boolean => {
-      for (const pattern of excludePatterns) {
-        const patternPath = pattern.replace(/\/\*\*$/, '');
-        const entryName = path.basename(relativePath);
-        if (relativePath === patternPath
-            || relativePath.startsWith(`${patternPath}/`)
-            || (pattern.includes('**') && relativePath.includes(patternPath.replace('/**', '')))
-            || (pattern.endsWith('*') && !pattern.includes('/') && entryName.startsWith(pattern.slice(0, -1)))) {
-          return true;
-        }
-      }
-      return false;
-    };
+    const isExcludedArchivePath = (relativePath: string): boolean => (
+      isProjectDownloadPathExcluded(relativePath, mode as ProjectDownloadMode)
+    );
 
     // Archive an inert snapshot. Project workloads can mutate their workspace
     // concurrently, so the snapshot is taken through pinned descriptors: no
@@ -16897,10 +17158,10 @@ router.get('/:name/download', authenticateToken, requireApproved, async (req: Re
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
 
     // Import archiver
-    const archiver = require('archiver');
+    const { ZipArchive } = require('archiver');
     // Level 9 spent several times the CPU of the default for about a percent
     // of size, all before the browser received a byte.
-    const archive = archiver('zip', { zlib: { level: 6 } });
+    const archive = new ZipArchive({ zlib: { level: 6 } });
     const abortArchive = () => {
       if (!res.writableEnded) archive.abort();
     };
@@ -17055,6 +17316,13 @@ router.get('/:name/download', authenticateToken, requireApproved, async (req: Re
       onSourceClosed: () => { activeArchiveSource = null; },
       onSourceError: (error) => exportLifecycle.abort(error),
     });
+    // A close timeout may return failed without firing onSourceError. Never
+    // finalize a partial archive into a valid-looking, incomplete download.
+    if (fed.failed || exportLifecycle.signal.aborted) {
+      if (!exportLifecycle.signal.aborted) exportLifecycle.abort(new Error('Project archive source did not finish'));
+      if (!res.destroyed) res.destroy();
+      return;
+    }
     if (fed.skipped > 0) {
       console.warn(`[Download] Left out ${fed.skipped} entr${fed.skipped === 1 ? 'y' : 'ies'} whose name cannot be stored in a ZIP archive`);
     }

@@ -1455,7 +1455,7 @@ describe('SettingsPage synchronous action ownership', () => {
     );
 
     const manager = await screen.findByRole('region', { name: 'Hosted content embeds' });
-    await userEvent.click(within(manager).getByRole('button', { name: 'Add origin' }));
+    await userEvent.click(await within(manager).findByRole('button', { name: 'Add origin' }));
     const origin = within(manager).getByRole('textbox', { name: 'Origin 1' });
     await userEvent.type(origin, 'https://draft.example.com');
 
@@ -1502,7 +1502,7 @@ describe('SettingsPage synchronous action ownership', () => {
     const manager = await within(panel).findByRole('region', { name: 'Hosted content embeds' });
 
     await userEvent.click(within(panel).getByRole('button', { name: /closed/i }));
-    await userEvent.click(within(manager).getByRole('button', { name: 'Add origin' }));
+    await userEvent.click(await within(manager).findByRole('button', { name: 'Add origin' }));
     await userEvent.type(
       within(manager).getByRole('textbox', { name: 'Origin 1' }),
       'https://draft.example.com',
@@ -1523,7 +1523,7 @@ describe('SettingsPage synchronous action ownership', () => {
     const panel = await screen.findByRole('tabpanel');
     const manager = await within(panel).findByRole('region', { name: 'Hosted content embeds' });
 
-    await userEvent.click(within(manager).getByRole('button', { name: 'Add origin' }));
+    await userEvent.click(await within(manager).findByRole('button', { name: 'Add origin' }));
     const origin = within(manager).getByRole('textbox', { name: 'Origin 1' });
     await userEvent.type(origin, 'https://embed.example.com');
     const save = within(manager).getByRole('button', { name: 'Save embed policy' });

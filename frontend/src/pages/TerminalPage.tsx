@@ -5,8 +5,8 @@ import {
   Search, Command, AlertTriangle, Play, Loader2, Sparkles,
   ShieldAlert, Zap, ToggleLeft, ToggleRight, Trash2, Plus, XCircle
 } from 'lucide-react';
-import { Terminal } from 'xterm';
-import { FitAddon } from 'xterm-addon-fit';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
 import { io, Socket } from 'socket.io-client';
 import { terminalAPI, gatewayAPI } from '../api/endpoints';
 import { captureError } from '../utils/errorHandler';
@@ -33,7 +33,7 @@ import {
 import AnchoredPopover from '../components/AnchoredPopover';
 import ViewportModal from '../components/ViewportModal';
 import { useIsMobile } from '../hooks/useIsMobile';
-import 'xterm/css/xterm.css';
+import '@xterm/xterm/css/xterm.css';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 const TERMINAL_STATE_STORAGE_KEY = 'portal:terminal-state:v1';

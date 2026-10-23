@@ -1,7 +1,12 @@
 import crypto from 'crypto';
 import net from 'net';
 import os from 'os';
-import { spawn } from 'child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import {
+  PROTECTED_DOCKER_ENVIRONMENT_NAMES,
+  protectedDockerCommandEnvironment,
+  redactProtectedDockerValues,
+} from './projectDockerSecretEnvironment';
 import {
   PROJECT_EGRESS_BLOCKED_IPV4_CIDRS,
   PROJECT_EGRESS_BLOCKED_IPV6_CIDRS,
@@ -123,7 +128,16 @@ export interface ProjectEgressCommandExecutor {
   run(
     command: string,
     args: readonly string[],
-    options?: { allowExitCodes?: readonly number[]; input?: string },
+    options?: {
+      allowExitCodes?: readonly number[];
+      input?: string;
+      /**
+       * Container credentials that a docker CLI subprocess reads by name
+       * (`--env NAME`). Only that subprocess's environment carries the values;
+       * they never reach argv, and failure text redacts them.
+       */
+      secretEnvironment?: Readonly<Record<string, string>>;
+    },
   ): Promise<ProjectEgressCommandResult>;
 }
 
@@ -786,10 +800,29 @@ class SpawnCommandExecutor implements ProjectEgressCommandExecutor {
   async run(
     command: string,
     args: readonly string[],
-    options: { allowExitCodes?: readonly number[]; input?: string } = {},
+    options: {
+      allowExitCodes?: readonly number[];
+      input?: string;
+      secretEnvironment?: Readonly<Record<string, string>>;
+    } = {},
   ): Promise<ProjectEgressCommandResult> {
     return new Promise((resolve, reject) => {
-      const child = spawn(command, [...args], { stdio: ['pipe', 'pipe', 'pipe'] });
+      const secretEnvironment = options.secretEnvironment || {};
+      let environment: NodeJS.ProcessEnv;
+      try {
+        environment = protectedDockerCommandEnvironment(process.env, args, secretEnvironment);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        child = spawn(command, [...args], { stdio: ['pipe', 'pipe', 'pipe'], env: environment });
+      } catch {
+        // Node's synchronous argument errors quote the offending value.
+        reject(new Error('Project egress host command failed to start'));
+        return;
+      }
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let outputBytes = 0;
@@ -817,7 +850,7 @@ class SpawnCommandExecutor implements ProjectEgressCommandExecutor {
           // and iptables invocations, and a bare exit code has repeatedly
           // proven undiagnosable on live hosts.
           const summary = [command, ...args.slice(0, 4)].join(' ');
-          const detail = result.stderr.trim().slice(-300);
+          const detail = redactProtectedDockerValues(result.stderr, secretEnvironment).trim().slice(-300);
           reject(new Error(`Project egress host command failed with exit code ${exitCode} (${summary}${args.length > 4 ? ' …' : ''})${detail ? `: ${detail}` : ''}`));
           return;
         }
@@ -2037,23 +2070,35 @@ function attestManagedProxyForRetirement(input: {
     fail('STALE_PROXY_STATIC_ADDRESS', 'Managed Project egress proxy static public address did not match');
   }
   const networkMode = String(host.NetworkMode || '').toLowerCase();
+  const internalNetworkId = String(networks[spec.internalNetworkName]?.NetworkID || '').toLowerCase();
+  const publicNetworkId = String(publicAttachment?.NetworkID || '').toLowerCase();
+  // Docker clears stopped attachments' IDs, including historical name-primary
+  // proxies. Admit that shape only for exact retirement, bound to both attested
+  // immutable networks and their derived static IP; never for execution.
+  const stoppedNamePrimary = inspect.State?.Running === false
+    && networkMode === spec.publicNetworkName
+    && publicNetworkId === ''
+    && internalNetworkId === ''
+    && /^[a-f0-9]{64}$/.test(input.expectedPublicNetworkId || '')
+    && /^[a-f0-9]{64}$/.test(input.expectedInternalNetworkId || '')
+    && net.isIPv4(input.expectedPublicIpv4 || '');
   const networkModeMatches = input.expectedPublicNetworkId
     ? networkMode === input.expectedPublicNetworkId
       || (networkMode === spec.publicNetworkName
-        && String(publicAttachment?.NetworkID || '').toLowerCase() === input.expectedPublicNetworkId)
+        && (publicNetworkId === input.expectedPublicNetworkId || stoppedNamePrimary))
     : networkMode === spec.publicNetworkName
       || (/^[a-f0-9]{64}$/i.test(networkMode)
         && String(publicAttachment?.NetworkID || '').toLowerCase() === networkMode);
-  const internalNetworkId = String(networks[spec.internalNetworkName]?.NetworkID || '').toLowerCase();
-  const publicNetworkId = String(publicAttachment?.NetworkID || '').toLowerCase();
   if (!networkModeMatches
     || (input.expectedPublicNetworkId
       && publicNetworkId !== input.expectedPublicNetworkId
+      && !stoppedNamePrimary
       && !(networkMode === input.expectedPublicNetworkId
         && !input.requireRunning
         && publicNetworkId === ''))
     || (input.expectedInternalNetworkId
       && internalNetworkId !== input.expectedInternalNetworkId
+      && !stoppedNamePrimary
       && !(networkMode === input.expectedPublicNetworkId
         && !input.requireRunning
         && internalNetworkId === ''))
@@ -2659,7 +2704,9 @@ async function ensureProxyContainer(
     JSON.stringify(Object.keys(candidate.NetworkSettings?.Networks || {}))
       === JSON.stringify([spec.publicNetworkName])
   );
-  if (inspect && matchesCurrentSpec(inspect) && hasStaticPublicAddress(inspect)
+  const stoppedNamePrimary = inspect?.State?.Running === false
+    && String(inspect.HostConfig?.NetworkMode || '').toLowerCase() === spec.publicNetworkName;
+  if (inspect && !stoppedNamePrimary && matchesCurrentSpec(inspect) && hasStaticPublicAddress(inspect)
     && onlyPublicNetworkAttached(inspect)) {
     const networks = await getExactNetworks();
     const containerId = requireImmutableDockerId(inspect.Id, 'Managed Project egress proxy');
@@ -2688,10 +2735,11 @@ async function ensureProxyContainer(
       expectedPublicIpv4: networks.proxyPublicIpv4,
     });
   }
-  if (inspect && (!hasStaticPublicAddress(inspect) || !matchesCurrentSpec(inspect))) {
-    // Only a current-policy, static-address proxy with an inspected prior
-    // token is a recognized retirement generation here. Older address-policy
-    // generations require explicit administrator repair.
+  if (inspect && (!hasStaticPublicAddress(inspect) || !matchesCurrentSpec(inspect) || stoppedNamePrimary)) {
+    // Recognize only current-policy, static-address proxies for token rotation
+    // or stopped name-primary canonicalization. Recreate the latter ID-primary
+    // even with the current token; do not relax current execution attestation.
+    // Older address-policy generations require explicit administrator repair.
     if (!hasStaticPublicAddress(inspect)) {
       fail('STALE_PROXY_GENERATION', 'Managed Project egress proxy lacks the exact current static-address contract');
     }
@@ -2710,6 +2758,7 @@ async function ensureProxyContainer(
       confinementGeneration: 'CURRENT',
       expectedPublicNetworkId: networks.publicNetworkId,
       expectedInternalNetworkId: networks.internalId,
+      expectedPublicIpv4: networks.proxyPublicIpv4,
     });
     if ((await listExactIdentityProxyIds(executor, spec)).length !== 0
       || await strictInspectOne<DockerContainerInspect>(
@@ -2721,87 +2770,121 @@ async function ensureProxyContainer(
     }
     inspect = null;
   }
-  if (!inspect) {
-    const networks = await getExactNetworks();
-    const staticIpv4 = deriveStaticProxyIpv4(networks.publicNetwork);
-    const createResult = await executor.run('docker', [
-      'container', 'create',
-      '--name', spec.proxyContainerName,
-      '--network', networks.publicNetworkId,
-      '--ip', staticIpv4,
-      '--read-only',
-      '--cap-drop', 'ALL',
-      ...projectRuntimeSecurityOptArgs(),
-      '--user', '65532:65532',
-      '--pids-limit', '128',
-      '--memory', '256m',
-      '--cpus', '0.50',
-      '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
-      '--restart', 'no',
-      ...labelArgs({
-        ...policyLabels(spec, 'proxy'),
-        [LABEL_TOKEN_HASH]: spec.tokenHash,
-      }),
-      '--env', `PROJECT_EGRESS_PROXY_TOKEN=${spec.token}`,
-      '--env', `PROJECT_EGRESS_PROXY_PORT=${spec.proxyPort}`,
-      '--env', `PROJECT_EGRESS_DENY_CIDRS=${JSON.stringify(spec.deniedCidrs)}`,
-      spec.proxyImage,
-      ...spec.proxyCommand,
-    ]);
-    const createdContainerId = requireImmutableDockerId(
-      createResult.stdout.trim(),
-      'Created Project egress proxy',
-    );
-    const preConnectInspect = await strictInspectOne<DockerContainerInspect>(
-      executor,
-      'container',
-      createdContainerId,
-    );
-    if (!preConnectInspect
-      || requireImmutableDockerId(preConnectInspect.Id, 'Created Project egress proxy') !== createdContainerId
-      || requireDockerName(preConnectInspect.Name, 'Created Project egress proxy') !== spec.proxyContainerName) {
-      fail('PROXY_IDENTITY', 'Created Project egress proxy identity changed before network attachment');
+  let createdContainerId: string | null = null;
+  try {
+    if (!inspect) {
+      const networks = await getExactNetworks();
+      const staticIpv4 = deriveStaticProxyIpv4(networks.publicNetwork);
+      const createResult = await executor.run('docker', [
+        'container', 'create',
+        '--name', spec.proxyContainerName,
+        '--network', networks.publicNetworkId,
+        '--ip', staticIpv4,
+        '--read-only',
+        '--cap-drop', 'ALL',
+        ...projectRuntimeSecurityOptArgs(),
+        '--user', '65532:65532',
+        '--pids-limit', '128',
+        '--memory', '256m',
+        '--cpus', '0.50',
+        '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
+        '--restart', 'no',
+        ...labelArgs({
+          ...policyLabels(spec, 'proxy'),
+          [LABEL_TOKEN_HASH]: spec.tokenHash,
+        }),
+        // Name only: Docker reads the token from the CLI's protected environment.
+        '--env', 'PROJECT_EGRESS_PROXY_TOKEN',
+        '--env', `PROJECT_EGRESS_PROXY_PORT=${spec.proxyPort}`,
+        '--env', `PROJECT_EGRESS_DENY_CIDRS=${JSON.stringify(spec.deniedCidrs)}`,
+        spec.proxyImage,
+        ...spec.proxyCommand,
+      ], { secretEnvironment: { PROJECT_EGRESS_PROXY_TOKEN: spec.token } });
+      createdContainerId = requireImmutableDockerId(
+        createResult.stdout.trim(),
+        'Created Project egress proxy',
+      );
+      const preConnectInspect = await strictInspectOne<DockerContainerInspect>(
+        executor,
+        'container',
+        createdContainerId,
+      );
+      if (!preConnectInspect
+        || requireImmutableDockerId(preConnectInspect.Id, 'Created Project egress proxy') !== createdContainerId
+        || requireDockerName(preConnectInspect.Name, 'Created Project egress proxy') !== spec.proxyContainerName) {
+        fail('PROXY_IDENTITY', 'Created Project egress proxy identity changed before network attachment');
+      }
+      const preConnectIdentityIds = await listExactIdentityProxyIds(executor, spec);
+      if (preConnectIdentityIds.length !== 1 || preConnectIdentityIds[0] !== createdContainerId) {
+        fail('PROXY_IDENTITY_INVENTORY', 'Created Project egress proxy did not own the exact identity before network attachment');
+      }
+      attestProjectEgressProxyContainer(
+        spec,
+        preConnectInspect,
+        false,
+        false,
+        networks.publicNetworkId,
+        undefined,
+        networks.proxyPublicIpv4,
+      );
+      await executor.run('docker', [
+        'network', 'connect', '--alias', spec.proxyAlias,
+        networks.internalId, createdContainerId,
+      ]);
+      inspect = await strictInspectOne<DockerContainerInspect>(executor, 'container', createdContainerId);
+      if (inspect
+        && (requireImmutableDockerId(inspect.Id, 'Created Project egress proxy') !== createdContainerId
+          || requireDockerName(inspect.Name, 'Created Project egress proxy') !== spec.proxyContainerName)) {
+        fail('PROXY_IDENTITY', 'Created Project egress proxy name changed before attestation');
+      }
+      if (inspect) attestProjectEgressProxyContainer(
+        spec,
+        inspect,
+        false,
+        true,
+        networks.publicNetworkId,
+        networks.internalId,
+        networks.proxyPublicIpv4,
+      );
     }
-    const preConnectIdentityIds = await listExactIdentityProxyIds(executor, spec);
-    if (preConnectIdentityIds.length !== 1 || preConnectIdentityIds[0] !== createdContainerId) {
-      fail('PROXY_IDENTITY_INVENTORY', 'Created Project egress proxy did not own the exact identity before network attachment');
+    if (!inspect) fail('PROXY_CREATE', 'Project egress proxy container could not be created');
+    const createdId = requireImmutableDockerId(inspect.Id, 'Managed Project egress proxy');
+    const finalIdentityIds = await listExactIdentityProxyIds(executor, spec);
+    if (finalIdentityIds.length !== 1 || finalIdentityIds[0] !== createdId) {
+      fail('PROXY_IDENTITY_INVENTORY', 'Project egress proxy creation did not reach an exact identity inventory');
     }
-    attestProjectEgressProxyContainer(
-      spec,
-      preConnectInspect,
-      false,
-      false,
-      networks.publicNetworkId,
-      undefined,
-      networks.proxyPublicIpv4,
-    );
-    await executor.run('docker', [
-      'network', 'connect', '--alias', spec.proxyAlias,
-      networks.internalId, createdContainerId,
-    ]);
-    inspect = await strictInspectOne<DockerContainerInspect>(executor, 'container', createdContainerId);
-    if (inspect
-      && (requireImmutableDockerId(inspect.Id, 'Created Project egress proxy') !== createdContainerId
-        || requireDockerName(inspect.Name, 'Created Project egress proxy') !== spec.proxyContainerName)) {
-      fail('PROXY_IDENTITY', 'Created Project egress proxy name changed before attestation');
-    }
-    if (inspect) attestProjectEgressProxyContainer(
-      spec,
-      inspect,
-      false,
-      true,
-      networks.publicNetworkId,
-      networks.internalId,
-      networks.proxyPublicIpv4,
-    );
+    return inspect;
+  } catch (error) {
+    if (createdContainerId) await removeUnstartedCreatedProxy(executor, spec, createdContainerId);
+    throw error;
   }
-  if (!inspect) fail('PROXY_CREATE', 'Project egress proxy container could not be created');
-  const createdId = requireImmutableDockerId(inspect.Id, 'Managed Project egress proxy');
-  const finalIdentityIds = await listExactIdentityProxyIds(executor, spec);
-  if (finalIdentityIds.length !== 1 || finalIdentityIds[0] !== createdId) {
-    fail('PROXY_IDENTITY_INVENTORY', 'Project egress proxy creation did not reach an exact identity inventory');
+}
+
+async function removeUnstartedCreatedProxy(
+  executor: ProjectEgressCommandExecutor,
+  spec: ProjectEgressPlaneSpec,
+  containerId: string,
+): Promise<void> {
+  // A proxy this call created, for example one whose protected token never
+  // arrived, must not survive the failure: the next call would resume it.
+  // Remove only that exact, stopped object with this generation's labels and
+  // never fall back to the name; the original error stays the outcome.
+  try {
+    const inspect = await strictInspectOne<DockerContainerInspect>(executor, 'container', containerId);
+    if (!inspect
+      || requireImmutableDockerId(inspect.Id, 'Created Project egress proxy') !== containerId
+      || requireDockerName(inspect.Name, 'Created Project egress proxy') !== spec.proxyContainerName
+      || inspect.State?.Running !== false) {
+      return;
+    }
+    assertExactLabels(inspect.Config?.Labels, {
+      ...policyLabels(spec, 'proxy'),
+      [LABEL_TOKEN_HASH]: spec.tokenHash,
+    }, 'PROXY_LABELS');
+    await executor.run('docker', ['container', 'rm', containerId]);
+  } catch {
+    // Ambiguous cleanup is intentionally a no-op.
   }
-  return inspect;
 }
 
 async function ensureFirewallFamily(
@@ -3437,6 +3520,7 @@ export const __projectEgressPlaneTest = {
   removeStaleNetwork,
   ensureNetworks,
   ensureProxyContainer,
+  PROTECTED_DOCKER_ENVIRONMENT_NAMES,
   labels: {
     LABEL_POLICY,
     LABEL_FINGERPRINT,

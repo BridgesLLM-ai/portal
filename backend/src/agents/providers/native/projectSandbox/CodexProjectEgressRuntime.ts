@@ -1,8 +1,13 @@
 import crypto from 'crypto';
+import {
+  PROJECT_RUNTIME_PIDS_LIMIT,
+  PROJECT_RUNTIME_SHARED_NPROC_LIMIT,
+  PROJECT_RUNTIME_LEGACY_NPROC_LIMIT,
+} from '../../../../services/projectRuntimeProcessLimits';
 import fs from 'fs';
 import net from 'net';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import type { ProjectSandboxExecutionContext } from '../../../AgentProvider.interface';
 import { assertExecutionContextBinding } from '../../../executionScope';
 import { attestProjectRoot } from '../../../../services/projectIdentity';
@@ -21,6 +26,12 @@ import {
   type ProjectEgressInternalNetworkBinding,
   type ProjectEgressPlaneSpec,
 } from '../../../../services/projectEgressPlane';
+import {
+  dockerArgsCarryProtectedValue,
+  protectedDockerCommandEnvironment,
+  protectedDockerEnvironmentArgs,
+  type ProtectedDockerCommand,
+} from '../../../../services/projectDockerSecretEnvironment';
 import { PROJECT_EGRESS_POLICY_VERSION } from '../../../../services/projectEgressPolicy';
 import {
   PROJECT_RUNTIME_GID,
@@ -47,7 +58,7 @@ export const CODEX_PROJECT_CONTAINER_CODEX_HOME = `${CODEX_PROJECT_CONTAINER_HOM
 
 const CONTAINER_MEMORY_BYTES = 1024 * 1024 * 1024;
 const CONTAINER_NANO_CPUS = 2_000_000_000;
-const CONTAINER_PIDS_LIMIT = 256;
+const CONTAINER_PIDS_LIMIT = PROJECT_RUNTIME_PIDS_LIMIT;
 const PROXY_PORT = 3128;
 const MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024;
 const RUNTIME_LABEL_PREFIX = 'com.bridgesllm.codex-project';
@@ -511,15 +522,18 @@ export interface CodexProjectRuntimePlan {
   expectedLabels: Readonly<Record<string, string>>;
   internalNetworkId: string | null;
   networkMode: string;
+  /** Proxy credentials are named only; their values travel in createSecretEnvironment. */
   createArgs: readonly string[];
+  createSecretEnvironment: Readonly<Record<string, string>>;
 }
 
 type CodexRuntimeFingerprintGeneration =
   | 'CURRENT'
+  | 'CODEX_V1_SHARED_NPROC'
   | 'SHARED_V1_CURRENT'
   | 'SHARED_V1_NO_PROXY_TOKEN'
   | 'LEGACY_PRE_CONFINEMENT';
-type CodexRuntimeConfinementGeneration = 'CODEX_V1' | 'SHARED_V1' | 'LEGACY_PRE_CONFINEMENT';
+type CodexRuntimeConfinementGeneration = 'CODEX_V1' | 'CODEX_V1_SHARED_NPROC' | 'SHARED_V1' | 'LEGACY_PRE_CONFINEMENT';
 
 function buildCodexRuntimeFingerprint(input: {
   context: ProjectSandboxExecutionContext;
@@ -542,7 +556,7 @@ function buildCodexRuntimeFingerprint(input: {
     egressPolicyVersion: input.context.egressPolicyVersion,
     egressPolicyFingerprint,
   };
-  if (input.generation === 'CURRENT') {
+  if (input.generation === 'CURRENT' || input.generation === 'CODEX_V1_SHARED_NPROC') {
     return stableHash({
       ...common,
       egressProxyCredentialHash: input.tokenHash || input.spec.tokenHash,
@@ -550,6 +564,7 @@ function buildCodexRuntimeFingerprint(input: {
       projectRoot: input.projectRoot,
       user: CODEX_PROJECT_CONTAINER_USER,
       confinementSecurityOptions: codexProjectRuntimeSecurityOptionValues(),
+      ...(input.generation === 'CURRENT' ? { processLimits: { pids: CONTAINER_PIDS_LIMIT, sharedNproc: PROJECT_RUNTIME_SHARED_NPROC_LIMIT } } : {}),
     });
   }
   if (input.generation === 'SHARED_V1_CURRENT') {
@@ -639,7 +654,7 @@ function buildCodexProjectRuntimePlanForPolicy(input: {
     '--memory-swap', String(CONTAINER_MEMORY_BYTES),
     '--cpus', '2',
     '--ulimit', 'nofile=1024:1024',
-    '--ulimit', 'nproc=256:256',
+    '--ulimit', `nproc=${PROJECT_RUNTIME_SHARED_NPROC_LIMIT}:${PROJECT_RUNTIME_SHARED_NPROC_LIMIT}`,
     '--restart', 'no',
     // Keep an actual subreaper at PID 1 so an interrupted docker-exec wrapper
     // cannot strand exited Codex descendants in the persistent container.
@@ -649,8 +664,12 @@ function buildCodexProjectRuntimePlanForPolicy(input: {
     '--tmpfs', `${CODEX_PROJECT_CONTAINER_CODEX_HOME}:rw,noexec,nosuid,nodev,size=67108864,uid=${PROJECT_RUNTIME_UID},gid=${PROJECT_RUNTIME_GID},mode=0700`,
     '--volume', `${projectRoot}:${CODEX_PROJECT_CONTAINER_ROOT}:rw,rprivate`,
   );
-  for (const [key, value] of Object.entries(expectedEnvironment)) createArgs.push('--env', `${key}=${value}`);
+  const createEnvironment = protectedDockerEnvironmentArgs(expectedEnvironment);
+  createArgs.push(...createEnvironment.args);
   createArgs.push('--entrypoint', 'node', runtimeImage, '-e', IDLE_SCRIPT);
+  if (dockerArgsCarryProtectedValue(createArgs, createEnvironment.secretEnvironment, [input.spec.token])) {
+    fail('RUNTIME_SECRET_ARGV', 'Codex Project egress credential would reach the Docker command line');
+  }
   return Object.freeze({
     containerName,
     runtimeFingerprint,
@@ -661,6 +680,7 @@ function buildCodexProjectRuntimePlanForPolicy(input: {
     internalNetworkId,
     networkMode,
     createArgs: Object.freeze(createArgs),
+    createSecretEnvironment: createEnvironment.secretEnvironment,
   });
 }
 
@@ -763,7 +783,9 @@ function attestCodexProjectRuntimeContainerForGeneration(input: {
   }
   const expectedUlimits = [
     { name: 'nofile', soft: 1024, hard: 1024 },
-    { name: 'nproc', soft: 256, hard: 256 },
+    { name: 'nproc',
+      soft: input.confinementGeneration === 'CODEX_V1' ? PROJECT_RUNTIME_SHARED_NPROC_LIMIT : PROJECT_RUNTIME_LEGACY_NPROC_LIMIT,
+      hard: input.confinementGeneration === 'CODEX_V1' ? PROJECT_RUNTIME_SHARED_NPROC_LIMIT : PROJECT_RUNTIME_LEGACY_NPROC_LIMIT },
   ];
   const actualUlimits = (Array.isArray(host.Ulimits) ? host.Ulimits : [])
     .map((entry: { Name?: string; Soft?: number; Hard?: number }) => ({
@@ -1005,20 +1027,35 @@ class CodexProjectCommandExecutor implements ProjectEgressCommandExecutor {
   async run(
     command: string,
     args: readonly string[],
-    options: { allowExitCodes?: readonly number[]; input?: string } = {},
+    options: {
+      allowExitCodes?: readonly number[];
+      input?: string;
+      secretEnvironment?: Readonly<Record<string, string>>;
+    } = {},
   ): Promise<ProjectEgressCommandResult> {
     return new Promise((resolve, reject) => {
-      const child = spawn(command, [...args], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: {
-          PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-          HOME: '/nonexistent',
-          DOCKER_CONFIG: '/nonexistent',
-          DOCKER_HOST: 'unix:///var/run/docker.sock',
-          LANG: 'C.UTF-8',
-          LC_ALL: 'C.UTF-8',
-        },
-      });
+      let environment: NodeJS.ProcessEnv;
+      try {
+        environment = protectedDockerCommandEnvironment(
+          codexProjectDockerHostEnvironment(),
+          args,
+          options.secretEnvironment,
+        );
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        child = spawn(command, [...args], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: environment,
+        });
+      } catch {
+        // Node's synchronous argument errors quote the offending value.
+        reject(new Error('Codex Project host command failed to start'));
+        return;
+      }
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let outputBytes = 0;
@@ -1246,6 +1283,18 @@ function staleRuntimeAttestationPlan(input: {
         }),
         egressPolicyFingerprint: candidateSpec.policyFingerprint,
         confinementGeneration: 'CODEX_V1',
+      },
+      {
+        runtimeFingerprint: buildCodexRuntimeFingerprint({
+          context: candidateContext,
+          spec: candidateSpec,
+          runtimeImage: inspectedImage,
+          projectRoot: candidatePlan.projectRoot,
+          generation: 'CODEX_V1_SHARED_NPROC',
+          tokenHash: inspectedTokenHash,
+        }),
+        egressPolicyFingerprint: candidateSpec.policyFingerprint,
+        confinementGeneration: 'CODEX_V1_SHARED_NPROC',
       },
     ];
   const candidate = candidates.find((entry) => (
@@ -1503,6 +1552,64 @@ export async function attestOnlyCodexProjectIdentityRuntime(input: {
     ids,
   )) {
     fail('RUNTIME_IDENTITY_INVENTORY', 'Codex Project runtime identity changed during attestation');
+  }
+}
+
+// Create the exact runtime, stopped. A creation that this call cannot attest,
+// for example one whose proxy credentials never arrived, is removed: the next
+// call would otherwise find it by name and fail its attestation every time.
+async function createExactCodexProjectRuntime(input: {
+  executor: ProjectEgressCommandExecutor;
+  plan: CodexProjectRuntimePlan;
+  spec: ProjectEgressPlaneSpec;
+}): Promise<DockerContainerInspect> {
+  const createResult = await input.executor.run('docker', input.plan.createArgs, {
+    secretEnvironment: input.plan.createSecretEnvironment,
+  });
+  const createdId = createResult.stdout.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(createdId)) {
+    fail('RUNTIME_CREATE_ID', 'Docker returned an invalid Codex Project runtime creation ID');
+  }
+  try {
+    const created = await strictInspectContainer(input.executor, createdId);
+    if (!created) fail('RUNTIME_CREATE', 'Codex Project runtime could not be inspected after creation');
+    const attested = attestCodexProjectRuntimeContainer({
+      inspect: created,
+      plan: input.plan,
+      spec: input.spec,
+      requireRunning: false,
+    });
+    if (attested.containerId.toLowerCase() !== createdId) {
+      fail('RUNTIME_CREATE_ID', 'Codex Project runtime creation identity changed before attestation');
+    }
+    return created;
+  } catch (error) {
+    await removeUnattestedCreatedRuntime({ executor: input.executor, containerId: createdId, plan: input.plan });
+    throw error;
+  }
+}
+
+// Remove only the exact, stopped object this call created, carrying this
+// plan's labels, and never fall back to the name; the original error stays
+// the outcome.
+async function removeUnattestedCreatedRuntime(input: {
+  executor: ProjectEgressCommandExecutor;
+  containerId: string;
+  plan: CodexProjectRuntimePlan;
+}): Promise<void> {
+  try {
+    const inspect = await strictInspectContainer(input.executor, input.containerId);
+    const labels = inspect?.Config?.Labels || {};
+    if (!inspect
+      || String(inspect.Id || '').toLowerCase() !== input.containerId
+      || String(inspect.Name || '').replace(/^\//, '') !== input.plan.containerName
+      || inspect.State?.Running !== false
+      || Object.entries(input.plan.expectedLabels).some(([key, value]) => labels[key] !== value)) {
+      return;
+    }
+    await input.executor.run('docker', ['container', 'rm', input.containerId]);
+  } catch {
+    // Ambiguous cleanup is intentionally a no-op.
   }
 }
 
@@ -1774,22 +1881,7 @@ export async function ensureCodexProjectEgressRuntime(
     const profilePath = assertManagedStateFile(managedState.profilePath, plan.projectRoot, 'Codex permission profile');
     let existing = await strictInspectContainer(dependencies.executor, plan.containerName);
     if (!existing) {
-      const createResult = await dependencies.executor.run('docker', plan.createArgs);
-      const createdId = createResult.stdout.trim().toLowerCase();
-      if (!/^[a-f0-9]{64}$/.test(createdId)) {
-        fail('RUNTIME_CREATE_ID', 'Docker returned an invalid Codex Project runtime creation ID');
-      }
-      existing = await strictInspectContainer(dependencies.executor, createdId);
-      if (!existing) fail('RUNTIME_CREATE', 'Codex Project runtime could not be inspected after creation');
-      const created = attestCodexProjectRuntimeContainer({
-        inspect: existing,
-        plan,
-        spec,
-        requireRunning: false,
-      });
-      if (created.containerId.toLowerCase() !== createdId) {
-        fail('RUNTIME_CREATE_ID', 'Codex Project runtime creation identity changed before attestation');
-      }
+      existing = await createExactCodexProjectRuntime({ executor: dependencies.executor, plan, spec });
     }
     if (typeof existing.State?.Running !== 'boolean') {
       fail('RUNTIME_STATE', 'Codex Project runtime state is ambiguous');
@@ -1918,24 +2010,41 @@ export async function ensureCodexProjectEgressRuntime(
   return runtime;
 }
 
-export function buildCodexProjectDockerExecArgs(input: {
+/**
+ * The exec argv and the proxy credentials it names. Run it with both parts:
+ * `executor.run('docker', args, { secretEnvironment })`, or spawn it with
+ * `codexProjectDockerInvocationEnvironment(command)`. A name whose value is
+ * missing would reach Docker bare, so executors refuse that before spawn.
+ */
+export function buildCodexProjectDockerExecCommand(input: {
   runtime: CodexProjectEgressRuntimeHandle;
   command: string;
   args: readonly string[];
-}): string[] {
+}): ProtectedDockerCommand {
   if (!/^[a-f0-9]{64}$/i.test(input.runtime.containerId)) {
     fail('RUNTIME_ID', 'Codex Project runtime ID is invalid at invocation boundary');
   }
+  const environment = protectedDockerEnvironmentArgs(input.runtime.proxyEnvironment);
   const args = [
     'container', 'exec',
     '--user', CODEX_PROJECT_CONTAINER_USER,
     '--workdir', CODEX_PROJECT_CONTAINER_ROOT,
+    ...environment.args,
+    input.runtime.containerId, input.command, ...input.args,
   ];
-  for (const [key, value] of Object.entries(input.runtime.proxyEnvironment)) {
-    args.push('--env', `${key}=${value}`);
+  if (dockerArgsCarryProtectedValue(args, environment.secretEnvironment)) {
+    fail('RUNTIME_SECRET_ARGV', 'Codex Project egress credential would reach the Docker command line');
   }
-  args.push(input.runtime.containerId, input.command, ...input.args);
-  return args;
+  return { args, secretEnvironment: environment.secretEnvironment };
+}
+
+/** The docker CLI environment for spawning a Codex exec command directly. */
+export function codexProjectDockerInvocationEnvironment(command: ProtectedDockerCommand): NodeJS.ProcessEnv {
+  return protectedDockerCommandEnvironment(
+    codexProjectDockerHostEnvironment(),
+    command.args,
+    command.secretEnvironment,
+  );
 }
 
 export function codexProjectDockerHostEnvironment(): NodeJS.ProcessEnv {

@@ -52,6 +52,12 @@ jest.mock('../config/database', () => ({
 
 jest.mock('../services/project-lifecycle.service', () => lifecycleMock);
 
+const credentialProjectionMock = {
+  removeAppCredentialDirectory: jest.fn(),
+  sweepAppCredentialProjections: jest.fn(() => 0),
+};
+jest.mock('../services/appCredentials/projection', () => credentialProjectionMock);
+
 import {
   __appProcessTest,
   allocatePort,
@@ -61,6 +67,7 @@ import {
   initializeAppProcessRuntime,
   preflightAppProcessRuntimeRestoration,
   restartApp as restartAppWithAdmission,
+  runningAppCredentialState,
   shutdownAll,
   startApp as startAppWithAdmission,
   stopApp,
@@ -936,6 +943,73 @@ describe('app-process.service', () => {
       portalInstanceId: expect.not.stringMatching('dead-portal'),
       port: 5001,
     }));
+  });
+
+  it('sweeps every App credential directory at boot, before any App is restored', async () => {
+    const deployDir = makeDeployDir();
+    const appId = 'app-credential-boot';
+    prismaMock.app.findMany.mockResolvedValue([{
+      id: appId, userId: APP_IDENTITY.actorId, projectIdentityId: APP_IDENTITY.projectId,
+      name: APP_PROJECT_NAME, zipPath: deployDir, port: 5029,
+      deployType: 'fullstack', processStatus: 'running',
+    }]);
+    prismaMock.projectIdentity.findUnique.mockResolvedValue({
+      id: APP_IDENTITY.projectId, workspaceOwnerId: APP_IDENTITY.actorId,
+      projectName: APP_PROJECT_NAME, lifecycleStatus: 'ACTIVE',
+    });
+    try {
+      await initializeAppProcessRuntime();
+      expect(credentialProjectionMock.sweepAppCredentialProjections).toHaveBeenCalledTimes(1);
+      expect(credentialProjectionMock.sweepAppCredentialProjections.mock.invocationCallOrder[0])
+        .toBeLessThan(lifecycleMock.startProjectAppContainer.mock.invocationCallOrder[0]);
+    } finally {
+      rmSync(deployDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a failed boot sweep is reported without its path and does not keep Apps down', async () => {
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    credentialProjectionMock.sweepAppCredentialProjections.mockImplementationOnce(() => {
+      throw Object.assign(new Error('EACCES /run/bridgesllm/app-credentials/x'), { code: 'EACCES' });
+    });
+    prismaMock.app.findMany.mockResolvedValue([]);
+    try {
+      await expect(initializeAppProcessRuntime()).resolves.toBeUndefined();
+      expect(consoleError).toHaveBeenCalledWith('[AppProcess] App credential boot sweep failed:', 'EACCES');
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it('an App container found exited or missing loses its credential directory; a running one keeps it', async () => {
+    const deployDir = makeDeployDir();
+    const appId = 'app-credential-exit';
+    const deployId = 'deploy-credential-exit';
+    const attachment = { appId, revision: 3, slots: ['api-token'], sourceDirectory: `/run/bridgesllm/app-credentials/${appId}-0123456789abcdef`,
+      containerDirectory: '/portal/credentials', directory: { device: '1', inode: '2' } };
+    const originalStart = lifecycleMock.startProjectAppContainer.getMockImplementation()!;
+    lifecycleMock.startProjectAppContainer.mockImplementationOnce((input: any) => {
+      const started = originalStart(input) as any;
+      return { ...started, plan: { ...started.plan, credentialAttachment: attachment } };
+    });
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await startApp(appId, deployId, deployDir, 5014, APP_IDENTITY);
+      await flushManagedPersistence(deployId);
+      expect(runningAppCredentialState(appId)).toEqual({ running: true, revision: 3, slots: ['api-token'] });
+      expect(runningAppCredentialState('another-app')).toEqual({ running: false, revision: 0, slots: [] });
+      expect(getAppStatus(deployId)).toEqual(expect.objectContaining({ status: 'running' }));
+      expect(credentialProjectionMock.removeAppCredentialDirectory).not.toHaveBeenCalled();
+
+      lifecycleMock.inspectProjectAppContainer.mockReturnValue({ running: false, status: 'exited', exitCode: 1, restartCount: 0, error: '' });
+      expect(getAppStatus(deployId)).toEqual(expect.objectContaining({ status: 'error' }));
+      expect(credentialProjectionMock.removeAppCredentialDirectory).toHaveBeenCalledWith(attachment.sourceDirectory);
+      expect(runningAppCredentialState(appId).running).toBe(false);
+      await flushManagedPersistence(deployId);
+    } finally {
+      consoleError.mockRestore();
+      rmSync(deployDir, { recursive: true, force: true });
+    }
   });
 
   it('restores graceful-shutdown intent without allowing an old startup timer to overwrite it', async () => {

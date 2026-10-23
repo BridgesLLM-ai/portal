@@ -1053,6 +1053,8 @@ describe('native host-operator adapter invocations', () => {
         '--model',
         'gpt-5.6',
         '-c',
+        'tools.update_plan.enabled=true',
+        '-c',
         'model_reasoning_effort="medium"',
         '-c',
         'model_reasoning_summary="auto"',
@@ -1076,6 +1078,8 @@ describe('native host-operator adapter invocations', () => {
         '--json',
         '--dangerously-bypass-approvals-and-sandbox',
         '-c',
+        'tools.update_plan.enabled=true',
+        '-c',
         'model_reasoning_effort="medium"',
         '-c',
         'model_reasoning_summary="auto"',
@@ -1098,6 +1102,8 @@ describe('native host-operator adapter invocations', () => {
         '--json',
         '-c',
         'sandbox_mode="workspace-write"',
+        '-c',
+        'tools.update_plan.enabled=true',
         '-c',
         'model_reasoning_effort="medium"',
         '-c',
@@ -1260,4 +1266,147 @@ test('legacy session announcements stay on the immediate callback and never reac
     if (previous === undefined) delete process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR;
     else process.env.PORTAL_RUNTIME_TURN_EVENT_HISTORY_DIR = previous;
   }
+});
+
+describe('Portal Chat Bridge turn lifecycle', () => {
+  const bridgeModule = require('../../chatBridge') as typeof import('../../chatBridge');
+  const bridgeRegistry = require('../../chatBridge/registry') as typeof import('../../chatBridge/registry');
+  const fakeServer = path.join(sessionsDir, 'bridge-server.js');
+
+  beforeAll(() => {
+    fs.writeFileSync(fakeServer, '// bridge server stand-in\n');
+    bridgeModule.__configureChatBridgeForTests({ serverPath: fakeServer, listener: async () => path.join(sessionsDir, 'bridge.sock') });
+  });
+
+  afterAll(() => {
+    bridgeModule.__configureChatBridgeForTests({ serverPath: null, listener: null });
+    bridgeRegistry.__resetChatBridgeRegistryForTests();
+  });
+
+  test('opens one capability per logical turn, reuses it on retry, persists toolCalls and revokes at settlement', async () => {
+    const firstChild = queueChild();
+    const secondChild = queueChild();
+    const bridges: Array<unknown> = [];
+    const provider = new TestNativeProvider(adapter({
+      supportsChatBridge: true,
+      buildInvocation: (ctx) => {
+        bridges.push(ctx.chatBridge);
+        return { command: '/usr/bin/codex', args: [], stdinText: ctx.message };
+      },
+      handleStdoutLine: (line, ctx) => {
+        if (line === 'tool') {
+          ctx.emitStatus('using', { type: 'tool_start', toolCallId: 'call-1', toolName: 'mcp__bridgesllm__ask_user', toolArgs: { question: 'Go?' } });
+          ctx.emitStatus('Yes', { type: 'tool_end', toolCallId: 'call-1', toolName: 'mcp__bridgesllm__ask_user', toolResult: 'Yes' });
+          return;
+        }
+        ctx.appendFullText(line);
+      },
+      finalizeTurn: (ctx) => {
+        if (ctx.state.turnAttempt === 1) ctx.state.retryRequested = true;
+      },
+    }));
+    const sessionId = createSession();
+    const published: any[] = [];
+    const unsubscribe = streamEventBus.subscribe(sessionId, (event) => published.push(event));
+    try {
+      const send = provider.sendMessage(sessionId, 'bridge turn');
+      await waitFor(() => spawnMock.mock.calls.length === 1, 'first child was not spawned');
+      firstChild.emit('close', 0, null);
+      await waitFor(() => spawnMock.mock.calls.length === 2, 'retry child was not spawned');
+      secondChild.stdout.emit('data', Buffer.from('tool\nanswered\n'));
+      secondChild.emit('close', 0, null);
+      await expect(send).resolves.toMatchObject({ fullText: 'answered' });
+
+      expect(bridges).toHaveLength(2);
+      expect(bridges[0]).toBeTruthy();
+      expect(bridges[1]).toBe(bridges[0]);
+      const turn = bridges[0] as import('../../chatBridge').ChatBridgeTurn;
+      expect(bridgeRegistry.resolveChatBridgeToken(turn.launch.env.BRIDGESLLM_CHAT_BRIDGE_TOKEN)).toBeNull();
+      // Canonical name on the bus and in the durable assistant record.
+      expect(published.find((event) => event.type === 'tool_start')).toMatchObject({ toolName: 'ask_user', toolCallId: 'call-1' });
+      const assistant = sessionStore.readAllNativeSessionHistory('CODEX', sessionId).find((entry) => entry.role === 'assistant');
+      expect(assistant?.toolCalls).toEqual([expect.objectContaining({ id: 'call-1', name: 'ask_user', status: 'done', result: 'Yes' })]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  test('revokes the capability when the turn fails or is aborted', async () => {
+    const failing = queueChild();
+    const opened: any[] = [];
+    const provider = new TestNativeProvider(adapter({
+      supportsChatBridge: true,
+      buildInvocation: (ctx) => {
+        opened.push(ctx.chatBridge);
+        return { command: '/usr/bin/codex', args: [], stdinText: ctx.message };
+      },
+    }));
+    const sessionId = createSession();
+    const send = provider.sendMessage(sessionId, 'will fail');
+    await waitFor(() => spawnMock.mock.calls.length === 1, 'child was not spawned');
+    failing.emit('close', 3, null);
+    await expect(send).rejects.toBeTruthy();
+    expect(bridgeRegistry.resolveChatBridgeToken(opened[0].launch.env.BRIDGESLLM_CHAT_BRIDGE_TOKEN)).toBeNull();
+
+    const aborted = queueChild();
+    aborted.pid = 4242;
+    const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const abortSession = createSession();
+      const pending = provider.sendMessage(abortSession, 'will abort').catch((error) => error);
+      await waitFor(() => spawnMock.mock.calls.length === 2, 'abort child was not spawned');
+      const abort = provider.abortActiveRun(abortSession);
+      aborted.emit('close', null, 'SIGTERM');
+      await abort;
+      expect(await pending).toBeInstanceOf(AgentAbortError);
+      expect(bridgeRegistry.resolveChatBridgeToken(opened[1].launch.env.BRIDGESLLM_CHAT_BRIDGE_TOKEN)).toBeNull();
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  test('host stdin must equal the adapter-declared encoding of this turn', async () => {
+    const provider = new TestNativeProvider({
+      providerName: 'CLAUDE_CODE',
+      displayName: 'Encoder Test',
+      cliCommand: '/usr/bin/claude',
+      messageIdPrefix: 'encoder-test',
+      encodeHostStdin: (ctx) => `encoded:${ctx.message}`,
+      buildInvocation: () => ({ command: '/usr/bin/claude', args: [], stdinText: 'arbitrary bytes' }),
+      handleStdoutLine: () => undefined,
+    });
+    const sessionId = createClaudeSession();
+    // The refusal surfaces as the provider's safe diagnostic; nothing is reserved or spawned.
+    await expect(provider.sendMessage(sessionId, 'prompt')).rejects.toBeInstanceOf(Error);
+    expect(hostRunJournal.reserveHostAgentRunAttempt).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+
+    const child = queueChild();
+    const accepted = new TestNativeProvider({
+      providerName: 'CLAUDE_CODE',
+      displayName: 'Encoder Test',
+      cliCommand: '/usr/bin/claude',
+      messageIdPrefix: 'encoder-test',
+      encodeHostStdin: (ctx) => `encoded:${ctx.message}`,
+      buildInvocation: (ctx) => ({ command: '/usr/bin/claude', args: [], stdinText: `encoded:${ctx.message}` }),
+      handleStdoutLine: (line, ctx) => ctx.appendFullText(line),
+      getResultText: (ctx) => ctx.fullText,
+    });
+    const send = accepted.sendMessage(createClaudeSession(), 'prompt');
+    await waitFor(() => spawnMock.mock.calls.length === 1, 'encoded child was not spawned');
+    expect(hostRunJournal.spawnGatedHostAgentRunAttempt).toHaveBeenLastCalledWith(expect.objectContaining({ stdinText: expect.stringMatching(/^encoded:/) }));
+    child.stdout.emit('data', Buffer.from('ok\n'));
+    child.emit('close', 0, null);
+    await expect(send).resolves.toMatchObject({ fullText: 'ok' });
+  });
+
+  test('refuses photos for an adapter without a native image transport', async () => {
+    const provider = new TestNativeProvider(adapter());
+    const sessionId = createSession();
+    await expect(provider.sendMessage(sessionId, 'photo', undefined, undefined, undefined, {
+      label: 'owner', userId: 'owner-1', authorizationVersion: 7, requestId: 'photo-run',
+      chatImages: [{ type: 'image', mimeType: 'image/jpeg', content: '/9j/', fileName: 'p.jpg', sizeBytes: 3, width: 1, height: 1 }],
+    })).rejects.toMatchObject({ code: 'IMAGE_TRANSPORT_UNAVAILABLE' });
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
 });

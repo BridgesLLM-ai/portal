@@ -6,9 +6,12 @@
  * Rate limited on send operations.
  */
 
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request as ExpressRequest, Response, NextFunction } from 'express';
+// These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
+type Request = ExpressRequest<Record<string, string>>;
+
 import multer from 'multer';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -66,7 +69,7 @@ const credentialRevealLimiter = rateLimit({
   limit: 5,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.userId || req.ip || 'unknown',
+  keyGenerator: (req) => req.user?.userId || ipKeyGenerator(req.ip || 'unknown'),
   message: { error: 'Too many credential reveal attempts. Try again later.' },
 });
 
@@ -280,7 +283,7 @@ router.use(authenticateToken, requireApproved, (req: Request, res: Response, nex
   next();
 });
 
-router.param('id', (_req: Request, res: Response, next: NextFunction, value: string) => {
+router.param('id', (_req: ExpressRequest, res: Response, next: NextFunction, value: string) => {
   if (typeof value !== 'string' || value.length < 1 || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
     res.status(400).json({ error: 'Message identifier is invalid' });
     return;

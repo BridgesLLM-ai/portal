@@ -17,7 +17,7 @@ describe('Portal-tested native tool matrix', () => {
     expect(antigravity?.install).toEqual([]);
     expect(antigravity?.detect?.command).toBe("test -x /usr/local/bin/agy && printf '%s\\n' detected");
     expect(antigravity?.commands).toEqual([]);
-    expect(antigravity?.description).toContain('detection-only');
+    expect(antigravity?.description).toContain('Host Operator chats are supported on Linux x86-64');
     expect(getToolAdapter('openclaw')?.install).toEqual([]);
     expect(ANTIGRAVITY_PROJECT_CLI_VERSION).toBe(PORTAL_TOOL_VERSIONS.antigravity);
 

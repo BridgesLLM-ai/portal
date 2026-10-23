@@ -24,7 +24,9 @@ import {
   type ProjectAppRuntimeIdentity,
 } from './project-lifecycle.service';
 import type { PortalProjectWorkloadPlan } from './projectWorkloadRuntime';
+import { removeAppCredentialDirectory, sweepAppCredentialProjections } from './appCredentials/projection';
 import { PROJECT_METADATA_MAX_BYTES, readProjectTextFile } from './projectSurfacePolicy';
+import { hasCargoProject, readDesktopProjectDescriptor } from './projectDesktopContract';
 import { projectRuntimeManagement } from './projectRuntimeManagement';
 import {
   assertHeldProjectDeletionLockLease,
@@ -240,6 +242,7 @@ async function waitForRuntimeReadiness(app: ManagedApp): Promise<void> {
  * - 'static': HTML/React apps served as static files
  */
 export function detectDeployType(projectDir: string): 'static' | 'fullstack' | 'runtime' {
+  if (readDesktopProjectDescriptor(projectDir) || hasCargoProject(projectDir)) return 'runtime';
   const files = fs.readdirSync(projectDir, { withFileTypes: true })
     .filter((entry) => entry.isFile())
     .map((entry) => entry.name);
@@ -907,12 +910,23 @@ function retireManagedApp(
   }
 }
 
+/** A container that is gone or has exited keeps no credential directory. */
+function releaseStoppedAppCredentials(app: ManagedApp): void {
+  const attachment = app.runtimePlan.credentialAttachment;
+  if (!attachment) return;
+  try { removeAppCredentialDirectory(attachment.sourceDirectory); }
+  catch (error) {
+    console.error(`[AppProcess] Could not remove App credential directory for ${app.deployId}:`, (error as NodeJS.ErrnoException)?.code || 'Error');
+  }
+}
+
 function reconcileManagedApp(app: ManagedApp, persist = true): AppProcessStatus {
   if (!managedPersistenceGenerationIsActive(app)) return app.status;
   const state = inspectProjectAppContainer(app.containerName);
   if (!state) {
     app.status = app.desiredStatus === 'running' ? 'error' : 'stopped';
     app.lastError = 'Project app container is not present';
+    releaseStoppedAppCredentials(app);
   } else {
     const restartDelta = Math.max(0, state.restartCount - app.containerRestartCount);
     app.restartCount += restartDelta;
@@ -931,6 +945,7 @@ function reconcileManagedApp(app: ManagedApp, persist = true): AppProcessStatus 
         || (app.restartCount >= MAX_RESTART_ATTEMPTS
           ? `Container crashed ${app.restartCount} times and exhausted its restart budget`
           : `Container exited with code ${state.exitCode}`);
+      if (!state.running) releaseStoppedAppCredentials(app);
     }
   }
 
@@ -1859,10 +1874,27 @@ export async function restoreRunningApps(): Promise<void> {
  * Idempotent Portal-start hook. Call after the database health check and before
  * accepting HTTP traffic that proxies to hosted apps.
  */
+/** Credentials the App's live container was started with (names and revision only). */
+export function runningAppCredentialState(appId: string): { running: boolean; revision: number; slots: readonly string[] } {
+  const managed = Array.from(runningApps.values()).find((app) => app.appId === appId);
+  if (!managed || (managed.status !== 'running' && managed.status !== 'starting')) return { running: false, revision: 0, slots: [] };
+  const attachment = managed.runtimePlan.credentialAttachment;
+  return { running: true, revision: attachment?.revision ?? 0, slots: attachment?.slots ?? [] };
+}
+
 export async function initializeAppProcessRuntime(): Promise<void> {
   shuttingDown = false;
   if (!startupPromise) {
-    startupPromise = restoreRunningApps().catch((error) => {
+    startupPromise = (async () => {
+      // Restoration starts every App afresh and replaces a container that
+      // carries a credential mount, so no credential directory may outlive
+      // the boot.
+      try { sweepAppCredentialProjections(); }
+      catch (error) {
+        console.error('[AppProcess] App credential boot sweep failed:', (error as NodeJS.ErrnoException)?.code || 'Error');
+      }
+      await restoreRunningApps();
+    })().catch((error) => {
       startupPromise = null;
       throw error;
     });

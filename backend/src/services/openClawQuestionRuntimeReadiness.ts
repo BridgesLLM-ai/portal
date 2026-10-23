@@ -9,7 +9,9 @@ import {
   LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
   LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION,
   TESTED_OPENCLAW_RUNTIME_VERSION,
+  OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS,
   QUALIFIED_OPENCLAW_NATIVE_PATCHES,
+  isOpenClawCliTimeout,
   type OpenClawSetupReadiness,
 } from './openclawSetupReadiness';
 
@@ -136,13 +138,15 @@ export interface OpenClawQuestionPluginReadiness {
   questionAuthority: OpenClawQuestionAuthority | null;
   expectedPluginVersion: string | null;
   issue: string | null;
+  /** The runtime-guard inspect was killed at its timeout: no plugin evidence. */
+  inspectTimedOut?: boolean;
 }
 
 export interface OpenClawQuestionPluginReadinessDependencies {
   runCli: (
     args: string[],
     timeoutMs?: number,
-  ) => Promise<{ ok: boolean; stdout: string; stderr: string; error?: string }>;
+  ) => Promise<{ ok: boolean; stdout: string; stderr: string; error?: string; timedOut?: boolean }>;
   readBundledVersion: () => string;
   callGatewayRpc: (
     method: string,
@@ -213,7 +217,7 @@ function failedSemanticReadiness(
 async function runOpenClawCli(
   args: string[],
   timeoutMs = 12_000,
-): Promise<{ ok: boolean; stdout: string; stderr: string; error?: string }> {
+): Promise<{ ok: boolean; stdout: string; stderr: string; error?: string; timedOut?: boolean }> {
   try {
     const result = await execFileAsync('openclaw', args, {
       encoding: 'utf8',
@@ -232,6 +236,7 @@ async function runOpenClawCli(
       stdout: String(error?.stdout || '').trim(),
       stderr: String(error?.stderr || error?.message || '').trim(),
       error: error?.message || String(error),
+      ...(isOpenClawCliTimeout(error) ? { timedOut: true } : {}),
     };
   }
 }
@@ -293,7 +298,7 @@ export async function getOpenClawQuestionPluginReadiness(
 
   const inspection = await dependencies.runCli(
     ['plugins', 'inspect', 'bridgesllm-ask-user', '--json', '--runtime'],
-    12_000,
+    OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS,
   );
   const report = inspection.ok ? strictJson(inspection.stdout) : null;
   const expectedRoot = path.join(
@@ -309,13 +314,20 @@ export async function getOpenClawQuestionPluginReadiness(
     resolveRealPath: dependencies.resolveRealPath,
   });
   if (!metadataReady) {
+    // Only an inspect that answered can show a mismatch; a killed or failed
+    // inspect says nothing about the plugin surface. All three stay not ready.
     return {
       ready: false,
       questionAuthority,
       expectedPluginVersion,
-      issue: questionAuthority === 'native'
-        ? 'OpenClaw native-question runtimes must run the exact 4.0 steer-only plugin surface with no second question authority.'
-        : 'Retained OpenClaw 2026.7.1 must run the exact 3.3 legacy question plugin surface.',
+      ...(inspection.timedOut ? { inspectTimedOut: true } : {}),
+      issue: inspection.timedOut
+        ? `OpenClaw did not finish inspecting the runtime-guard plugin within ${Math.round(OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS / 1000)} s; the host may be busy. Retry shortly.`
+        : !inspection.ok
+          ? `OpenClaw could not inspect the runtime-guard plugin: ${String(inspection.stderr || inspection.error || 'unknown error').slice(0, 300)}`
+          : questionAuthority === 'native'
+            ? 'OpenClaw native-question runtimes must run the exact 4.0 steer-only plugin surface with no second question authority.'
+            : 'Retained OpenClaw 2026.7.1 must run the exact 3.3 legacy question plugin surface.',
     };
   }
 

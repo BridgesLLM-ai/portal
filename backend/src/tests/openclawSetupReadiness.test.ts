@@ -3,8 +3,11 @@ import {
   getOpenClawSetupReadiness,
   __openClawSetupReadinessCacheTest,
   invalidateOpenClawSetupReadinessCache,
+  isOpenClawCliTimeout,
+  OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS,
   type OpenClawSetupReadinessDependencies,
 } from '../services/openclawSetupReadiness';
+
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -29,6 +32,7 @@ function makeDependencies(options: {
   pluginResolvedVersion?: string | null;
   pluginSource?: string;
   pluginRecordedVersion?: string;
+  pluginInspect?: CliResponse & { timedOut?: boolean };
   authStore?: CliResponse;
   gatewayToken?: string | null;
   credentialStoreWritable?: boolean;
@@ -63,6 +67,7 @@ function makeDependencies(options: {
         }));
       }
       if (command === 'plugins inspect codex --json') {
+        if (options.pluginInspect) return options.pluginInspect;
         // Mirrors the real record: `spec` is what was requested, the resolved*
         // fields are what is actually installed.
         return ok(JSON.stringify({
@@ -271,7 +276,7 @@ describe('OpenClaw setup readiness', () => {
     expect(commands).toEqual([
       '--version@4000',
       'gateway status --require-rpc --timeout 10000 --json@15000',
-      'plugins inspect codex --json@25000',
+      `plugins inspect codex --json@${OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS}`,
       'models auth --agent main list --json@25000',
     ]);
   });
@@ -280,8 +285,8 @@ describe('OpenClaw setup readiness', () => {
     // Production measurement 2026-09-09: `models auth --agent main list` succeeded
     // in ~7s at rest, ~15s cold, and ~21s under CLI contention, and `plugins
     // inspect codex` measured ~7s. A 10s budget produced the false
-    // `auth-store-unavailable` blocker on a healthy host. Keep both at the same
-    // 25s bound as gateway discovery.
+    // `auth-store-unavailable` blocker on a healthy host. The auth store keeps
+    // the 25s discovery bound; the plugin inspect has its own registry budget.
     const base = makeDependencies();
     const budgets = new Map<string, number | undefined>();
     const status = await getOpenClawSetupReadiness({
@@ -295,7 +300,9 @@ describe('OpenClaw setup readiness', () => {
     expect(status.credentialStoreReady).toBe(true);
     expect(status.blockers).not.toContainEqual(expect.objectContaining({ code: 'auth-store-unavailable' }));
     expect(budgets.get('models auth --agent main list --json')).toBe(25_000);
-    expect(budgets.get('plugins inspect codex --json')).toBe(25_000);
+    // The plugin registry load measured 20-37 s on a contended 2 vCPU host.
+    expect(budgets.get('plugins inspect codex --json')).toBe(OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS);
+    expect(OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS).toBe(60_000);
   });
 
   it('deduplicates shared callers, reuses a fresh result, and honors a forced refresh', async () => {
@@ -636,6 +643,42 @@ describe('OpenClaw setup readiness', () => {
 
     expect(status.ready).toBe(false);
     expect(status.blockers).toContainEqual(expect.objectContaining({ code: 'codex-plugin-mismatch' }));
+  });
+
+  it('reports a killed Codex plugin inspect as a timeout, not a version mismatch', async () => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({
+      pluginInspect: { ok: false, stdout: '', stderr: 'Command failed', timedOut: true },
+    }));
+
+    expect(status.ready).toBe(false);
+    expect(status.testedPairReady).toBe(false);
+    const codes = status.blockers.map((blocker) => blocker.code);
+    expect(codes).toContain('codex-plugin-inspect-timeout');
+    expect(codes).not.toContain('codex-plugin-mismatch');
+    expect(status.blockers.find((blocker) => blocker.code === 'codex-plugin-inspect-timeout')?.message)
+      .toMatch(/did not finish inspecting the Codex plugin within 60 s/);
+  });
+
+  it('surfaces a failed Codex plugin inspect error instead of inventing a detected version', async () => {
+    const status = await getOpenClawSetupReadiness(makeDependencies({
+      pluginInspect: failed('plugin registry failed to load'),
+    }));
+
+    expect(status.ready).toBe(false);
+    expect(status.blockers).toContainEqual({
+      code: 'codex-plugin-mismatch',
+      message: 'OpenClaw could not inspect the Codex plugin (expected @openclaw/codex@2026.9.1): plugin registry failed to load',
+    });
+  });
+
+  it('classifies only an execFile timeout kill as a CLI timeout', () => {
+    expect(isOpenClawCliTimeout({ killed: true, signal: 'SIGTERM' })).toBe(true);
+    expect(isOpenClawCliTimeout({ killed: false, code: 1 })).toBe(false);
+    expect(isOpenClawCliTimeout({
+      killed: true,
+      signal: 'SIGTERM',
+      code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+    })).toBe(false);
   });
 
   it('rejects an unavailable or unwritable credential control plane', async () => {

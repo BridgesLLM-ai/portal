@@ -1,3 +1,4 @@
+import { presentChatImageReferences } from '../../utils/chatAttachmentPersistence';
 /**
  * MarkdownRenderer — Enhanced markdown rendering with:
  * - Syntax-highlighted code blocks (highlight.js via rehype-highlight)
@@ -27,6 +28,8 @@ import rehypeHighlight from 'rehype-highlight';
 // breaking layout and creating XSS vectors. Code blocks handle HTML rendering safely.
 import DOMPurify from 'dompurify';
 import MermaidDiagram from './MermaidDiagram';
+import { AssistantJson, MarkdownTable } from './TranscriptArtifacts';
+import { inspectJson, jsonFenceBody } from './jsonPresentation';
 import { marked } from 'marked';
 import { Copy, Check, Eye, EyeOff, Maximize2, Minimize2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -547,14 +550,8 @@ const components = {
       </code>
     );
   },
-  table({ children, ...props }: any) {
-    return (
-      <div className="overflow-x-auto my-2 rounded-lg border border-white/[0.06]">
-        <table className="w-full text-sm" {...props}>
-          {children}
-        </table>
-      </div>
-    );
+  table({ children }: any) {
+    return <MarkdownTable>{children}</MarkdownTable>;
   },
   thead({ children, ...props }: any) {
     return (
@@ -627,6 +624,8 @@ interface MarkdownRendererProps {
   className?: string;
   isStreaming?: boolean;
   hostFileContext?: HostFileLinkContext;
+  /** Only authored assistant content may gain a structured JSON surface. */
+  assistantArtifacts?: boolean;
 }
 
 function closeUnclosedBacktickFence(content: string, isStreaming: boolean): string {
@@ -756,9 +755,10 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
   className,
   isStreaming = false,
   hostFileContext,
+  assistantArtifacts = false,
 }: MarkdownRendererProps) {
   const renderContent = useMemo(
-    () => closeUnclosedBacktickFence(wrapBareHtmlInFences(content), isStreaming),
+    () => closeUnclosedBacktickFence(wrapBareHtmlInFences(presentChatImageReferences(content)), isStreaming),
     [content, isStreaming]
   );
   const workspaceUrlTransform = useCallback(
@@ -773,10 +773,16 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
         {children}
       </PortalMarkdownLink>
     ),
-    pre: ({ children, ...props }: any) => {
+    pre: ({ children, node, ...props }: any) => {
       const childArray = Children.toArray(children);
       const codeChild = childArray.find((child) => isValidElement(child)) as any;
       const className = codeChild?.props?.className;
+      if (assistantArtifacts && getLanguage(className) === 'json') {
+        // Node offsets index the string ReactMarkdown parsed (renderContent), not the raw prop.
+        const source = renderContent.slice(node?.position?.start?.offset, node?.position?.end?.offset);
+        const raw = jsonFenceBody(source, isStreaming) ?? extractTextContent(codeChild?.props?.children);
+        return <AssistantJson raw={raw} isStreaming={isStreaming} />;
+      }
       if (getLanguage(className) === 'mermaid') {
         return <MermaidDiagram source={extractTextContent(codeChild?.props?.children)} isStreaming={isStreaming} />;
       }
@@ -786,7 +792,19 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
         </PreviewableCodeBlock>
       );
     },
-  }), [hostFileContext, isStreaming]);
+  }), [hostFileContext, isStreaming, assistantArtifacts, renderContent]);
+
+  const wholeJson = useMemo(() => {
+    if (!assistantArtifacts) return null;
+    const fenced = jsonFenceBody(content, isStreaming);
+    if (fenced !== null) return fenced;
+    if (!/^\s*[\[{]/.test(content)) return null;
+    const inspected = inspectJson(content);
+    // Markdown links also begin with '['. Invalid ordinary prose stays Markdown.
+    if (inspected.tree || inspected.reason?.includes('exceeds')) return content;
+    return isStreaming && /^\s*(?:\{\s*(?:"|$)|\[\s*(?:[\[{"\d-]|$))/.test(content) ? content : null;
+  }, [content, isStreaming, assistantArtifacts]);
+  if (wholeJson !== null) return <AssistantJson raw={wholeJson} isStreaming={isStreaming} />;
 
   return (
     <div className={`text-sm text-slate-200 leading-relaxed ${className || ''}`}>

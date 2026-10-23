@@ -51,17 +51,25 @@ function declaredCatalogProviderModels(
 }
 
 const OPENCLAW_VISIBLE_MODEL_IDS = [
+  'openai/gpt-6.1-sol',
+  'openai/gpt-6-sol',
+  'openai/gpt-6-luna',
+  'openai/gpt-6-astra',
   'openai/gpt-5.6-sol',
   'openai/gpt-5.6-terra',
   'openai/gpt-5.6-luna',
   'openai/gpt-5.5',
+  'google/gemini-4-argon',
   'google/gemini-3.1-pro-preview',
   'google/gemini-3-flash-preview',
   'google/gemini-3.1-flash-lite',
+  'anthropic/claude-sonnet-5-5',
+  'anthropic/claude-opus-5-5',
   'anthropic/claude-fable-5-1',
   'anthropic/claude-fable-5',
   'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-8',
+  'anthropic/claude-haiku-5-5',
   'anthropic/claude-haiku-4-5',
 ];
 

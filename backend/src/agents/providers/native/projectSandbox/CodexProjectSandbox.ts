@@ -18,9 +18,10 @@ import {
   CODEX_PROJECT_CONTAINER_HOME,
   CODEX_PROJECT_CONTAINER_ROOT,
   CODEX_PROJECT_CONTAINER_USER,
-  buildCodexProjectDockerExecArgs,
+  buildCodexProjectDockerExecCommand,
   codexProjectEgressCommandExecutor,
   codexProjectDockerHostEnvironment,
+  codexProjectDockerInvocationEnvironment,
   ensureCodexProjectEgressRuntime,
   type CodexProjectEgressRuntimeDependencies,
   type CodexProjectEgressRuntimeHandle,
@@ -490,16 +491,24 @@ function publicEgressProbeUrl(): string {
   return parsed.url.toString();
 }
 
+function runCodexProjectExec(
+  executor: CodexProjectEgressRuntimeDependencies['executor'],
+  input: Parameters<typeof buildCodexProjectDockerExecCommand>[0],
+) {
+  const command = buildCodexProjectDockerExecCommand(input);
+  return executor.run('docker', command.args, { secretEnvironment: command.secretEnvironment });
+}
+
 async function runCodexProjectQualification(
   _context: ProjectSandboxExecutionContext,
   runtime: CodexProjectEgressRuntimeHandle,
   executor: CodexProjectEgressRuntimeDependencies['executor'],
 ): Promise<void> {
-  const versionResult = await executor.run('docker', buildCodexProjectDockerExecArgs({
+  const versionResult = await runCodexProjectExec(executor, {
     runtime,
     command: '/usr/bin/codex',
     args: ['--version'],
-  }));
+  });
   if (!exactVersion(versionResult.stdout, CODEX_PROJECT_CLI_VERSION)) {
     throw new Error(`Codex Project runtime requires the Portal-tested CLI ${CODEX_PROJECT_CLI_VERSION}`);
   }
@@ -542,11 +551,11 @@ if (result.stderr) process.stderr.write(result.stderr);
 if (result.error || result.signal) process.exit(124);
 process.exit(result.status == null ? 125 : result.status);
 `;
-  await executor.run('docker', buildCodexProjectDockerExecArgs({
+  await runCodexProjectExec(executor, {
     runtime,
     command: 'node',
     args: ['-e', runner],
-  }));
+  });
 }
 
 const defaultInvocationDependencies: CodexProjectInvocationDependencies = {
@@ -680,21 +689,22 @@ export async function buildCodexProjectSandboxVerificationInvocation(
 ): Promise<NativeCliInvocation> {
   assertExecutionContextBinding(executionContext, executionContext.userId, 'PROJECT_SANDBOX');
   const runtime = await prepareQualifiedRuntime(executionContext, overrides);
+  const command = buildCodexProjectDockerExecCommand({
+    runtime,
+    command: '/usr/bin/codex',
+    args: ['sandbox',
+    '--profile', CODEX_PROJECT_PROFILE_NAME,
+    '--permission-profile', CODEX_PROJECT_PERMISSION_PROFILE,
+    '--cd', CODEX_PROJECT_CONTAINER_ROOT,
+    '/bin/sh', '-c', shellScript,
+    ],
+  });
   return {
     command: 'docker',
-    args: buildCodexProjectDockerExecArgs({
-      runtime,
-      command: '/usr/bin/codex',
-      args: ['sandbox',
-      '--profile', CODEX_PROJECT_PROFILE_NAME,
-      '--permission-profile', CODEX_PROJECT_PERMISSION_PROFILE,
-      '--cd', CODEX_PROJECT_CONTAINER_ROOT,
-      '/bin/sh', '-c', shellScript,
-      ],
-    }),
+    args: command.args,
     options: {
       cwd: executionContext.canonicalRoot,
-      env: codexProjectDockerHostEnvironment(),
+      env: codexProjectDockerInvocationEnvironment(command),
     },
   };
 }

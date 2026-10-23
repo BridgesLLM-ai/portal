@@ -356,7 +356,7 @@ function PdfViewer({ blob, name: _name }: { blob: Blob; name: string }) {
     ro.observe(containerRef.current);
     setContainerWidth(containerRef.current.clientWidth);
     return () => ro.disconnect();
-  }, []);
+  }, [pdfData]);
 
   if (!pdfData && !error) {
     return (
@@ -370,6 +370,7 @@ function PdfViewer({ blob, name: _name }: { blob: Blob; name: string }) {
   return (
     <div ref={containerRef} className="h-full overflow-auto bg-theme-surface-strong">
       <Document
+        suspense={false}
         file={pdfData}
         onLoadSuccess={({ numPages: n }) => setNumPages(n)}
         onLoadError={(err) => setError(err.message || 'Failed to load PDF')}

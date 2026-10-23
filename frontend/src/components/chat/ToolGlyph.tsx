@@ -20,16 +20,20 @@ import { getToolPresentation } from '../../utils/toolPresentation';
 
 export default function ToolGlyph({
   toolName,
+  toolArguments,
   size = 12,
   className,
 }: {
   toolName: string;
+  toolArguments?: unknown;
   size?: number;
   className?: string;
 }) {
-  const presentation = getToolPresentation(toolName);
+  const presentation = getToolPresentation(toolName, toolArguments);
 
   switch (presentation.key) {
+    case 'bridgesllm':
+      return <img src="/favicon-192.png" alt="BridgesLLM" width={size} height={size} className={`shrink-0 object-contain ${className || ''}`} />;
     case 'read':
       return <FileText size={size} className={className} />;
     case 'write':

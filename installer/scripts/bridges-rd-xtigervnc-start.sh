@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # Bridges Remote Desktop — Xtigervnc + XFCE wrapper
-# Starts Xtigervnc on :1 with no VNC auth (portal JWT handles auth)
+# Starts Xtigervnc on :1 behind a private Unix socket (Portal handles auth)
 # Then launches XFCE desktop as bridgesrd user
 
 DISPLAY_NUM=:1
-VNC_PORT=5901
+TRANSPORT_DIR="/run/bridges-rd/transport"
 GEOMETRY=1280x1024
 DEPTH=24
 RD_USER=bridgesrd
@@ -58,6 +58,30 @@ fi
 # guard removes only stale :1 locks after proving their recorded owner is gone.
 "$SESSION_GUARD" prepare
 
+# The desktop user and Portal (root) alone may reach the RFB/WS transport.
+# Loopback is not an authorization boundary against other local accounts.
+python3 - <<'TRANSPORT_PY'
+import os
+from pathlib import Path
+import pwd
+import stat
+
+account = pwd.getpwnam('bridgesrd')
+parent = Path('/run/bridges-rd')
+if not parent.exists() and not parent.is_symlink():
+    parent.mkdir(mode=0o755)
+metadata = parent.lstat()
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022:
+    raise SystemExit('Refusing unsafe Remote Desktop state directory')
+transport = parent / 'transport'
+if not transport.exists() and not transport.is_symlink():
+    transport.mkdir(mode=0o700)
+    os.chown(transport, account.pw_uid, account.pw_gid)
+metadata = transport.lstat()
+if not stat.S_ISDIR(metadata.st_mode) or (metadata.st_uid, metadata.st_gid) != (account.pw_uid, account.pw_gid) or stat.S_IMODE(metadata.st_mode) != 0o700:
+    raise SystemExit('Refusing unsafe Remote Desktop transport directory')
+TRANSPORT_PY
+
 # Create log directory (not in /tmp, avoids protected_regular issues)
 mkdir -p "$LOG_DIR"
 chown "$RD_USER:$RD_USER" "$LOG_DIR"
@@ -91,17 +115,43 @@ chmod 0640 "$ENV_FILE"
 
 # Authenticate local X11 clients instead of disabling X access control. This
 # prevents unrelated host processes from attaching to the operator desktop.
-install -o "$RD_USER" -g "$RD_USER" -m 0600 /dev/null "$XAUTHORITY_FILE"
-XAUTH_COOKIE="$(mcookie)"
-run_as_rd xauth -f "$XAUTHORITY_FILE" add "$DISPLAY_NUM" . "$XAUTH_COOKIE"
+# Generate the cookie in-process: no secret in shell variables or process argv.
+run_as_rd python3 - "$XAUTHORITY_FILE" "$DISPLAY_NUM" <<'XAUTH_PY'
+import os
+from pathlib import Path
+import socket
+import struct
+import sys
+import tempfile
 
-# Start Xtigervnc as root (it manages its own display)
-/usr/bin/Xtigervnc "$DISPLAY_NUM" \
+target = Path(sys.argv[1])
+display = sys.argv[2].lstrip(':').split('.')[0].encode('ascii')
+def field(value):
+    return struct.pack('>H', len(value)) + value
+record = struct.pack('>H', 256) + b''.join(field(value) for value in (
+    socket.gethostname().encode(), display, b'MIT-MAGIC-COOKIE-1', os.urandom(16)))
+fd, temporary = tempfile.mkstemp(prefix='.Xauthority-', dir=target.parent)
+try:
+    with os.fdopen(fd, 'wb') as output:
+        output.write(record)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, target)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+XAUTH_PY
+
+# The virtual display needs no root privileges. No RFB TCP listener is created.
+run_as_rd /usr/bin/Xtigervnc "$DISPLAY_NUM" \
   -UseBlacklist=0 \
   -localhost=1 \
+  -nolisten tcp \
   -AcceptSetDesktopSize=1 \
   -desktop "BridgesLLM Remote Desktop" \
-  -rfbport "$VNC_PORT" \
+  -rfbport -1 \
+  -rfbunixpath "$TRANSPORT_DIR/vnc.sock" \
+  -rfbunixmode 0600 \
   -SecurityTypes None \
   -geometry "$GEOMETRY" \
   -depth "$DEPTH" \

@@ -113,7 +113,7 @@ describe('OpenClaw dashboard version probe', () => {
     expect(calls).toEqual([
       { command: '--version', timeoutMs: 4000 },
       { command: 'gateway status --require-rpc --timeout 10000 --json', timeoutMs: 15000 },
-      { command: 'plugins inspect codex --json', timeoutMs: 25000 },
+      { command: 'plugins inspect codex --json', timeoutMs: 60000 },
       { command: 'models auth --agent main list --json', timeoutMs: 25000 },
       { command: 'update status --json --timeout 3', timeoutMs: 9000 },
     ]);

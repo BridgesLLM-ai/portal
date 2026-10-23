@@ -26,7 +26,8 @@ describe('Remote Desktop release contract', () => {
     expect(server).toContain("isExactWebSocketPath(req.url, '/novnc/audio')");
     expect(server).not.toContain("req.url?.startsWith('/novnc/websockify')");
     expect(server).not.toContain("req.url?.startsWith('/novnc/audio')");
-    expect(server).toContain("const novncWsTarget = 'http://127.0.0.1:6080'");
+    expect(server).toContain("const novncWsProxy = createDesktopWebSocketProxy()");
+    expect(readRepo('backend/src/services/remoteDesktopTransport.ts')).toContain("socketPath = DESKTOP_WEBSOCKET_SOCKET");
     expect(server).not.toContain('process.env.RD_NOVNC_TARGET');
     expect(server).not.toContain('process.env.RD_AUDIO_TARGET');
     expect(server).toContain("frame-ancestors 'self'");
@@ -116,8 +117,8 @@ describe('Remote Desktop release contract', () => {
     expect(route).toContain('Signed Remote Desktop browser launchers are missing from the installed Portal bundle');
     expect(installer).not.toContain('--no-sandbox');
     expect(route).not.toContain('--no-sandbox');
-    expect(installer).toContain('User=bridgesrd\nGroup=bridgesrd\nExecStart=/usr/bin/python3 /usr/bin/websockify');
-    expect(route).toContain('User=bridgesrd\nGroup=bridgesrd\nExecStart=${webLauncher}');
+    expect(installer).toContain('User=bridgesrd\nGroup=bridgesrd\nWorkingDirectory=/run/bridges-rd/transport\nExecStart=/usr/bin/python3 -I /usr/local/lib/bridges-rd-websockify/websockify --unix-listen=');
+    expect(route).toContain('User=bridgesrd\nGroup=bridgesrd\nWorkingDirectory=/run/bridges-rd/transport\nExecStart=${webLauncher}');
     expect(installer).toContain('NoNewPrivileges=true');
     expect(route).toContain('NoNewPrivileges=true');
     expect(installer).toContain('NotifyAccess=main');

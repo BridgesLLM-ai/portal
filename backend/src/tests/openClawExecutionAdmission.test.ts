@@ -11,6 +11,7 @@ import {
   captureAdmittedOpenClawDispatchBinding,
   getCachedOpenClawExecutionAdmission,
   getOpenClawExecutionAdmission,
+  scheduleOpenClawExecutionAdmissionPrewarm,
   type OpenClawDurableEvidence,
   type OpenClawExecutionAdmissionDependencies,
 } from '../services/openClawExecutionAdmission';
@@ -205,6 +206,46 @@ describe('OpenClaw execution admission', () => {
       ready: false,
       reason: question.issue,
       readinessBlockers: ['ask-user-plugin-mismatch'],
+    });
+  });
+
+  it('prewarms the shared attestation once after boot without surfacing a failure', async () => {
+    jest.useFakeTimers();
+    try {
+      const admit = jest.fn(async () => {
+        throw new Error('gateway still starting');
+      });
+      scheduleOpenClawExecutionAdmissionPrewarm({ delayMs: 5_000, admit });
+
+      jest.advanceTimersByTime(4_999);
+      expect(admit).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(admit).toHaveBeenCalledTimes(1);
+      jest.advanceTimersByTime(60_000);
+      expect(admit).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps a timed-out question inspect unavailable under its own blocker code', async () => {
+    const result = await getOpenClawExecutionAdmission(dependencies({
+      getQuestionRuntimeReadiness: async () => ({
+        ready: false,
+        questionAuthority: 'native',
+        expectedPluginVersion: '4.0.0',
+        inspectTimedOut: true,
+        issue: 'OpenClaw did not finish inspecting the runtime-guard plugin within 60 s; the host may be busy. Retry shortly.',
+      }),
+    }));
+
+    expect(result).toMatchObject({
+      state: 'unavailable',
+      ready: false,
+      reason: expect.stringMatching(/did not finish inspecting/),
+      readinessBlockers: ['ask-user-plugin-inspect-timeout'],
     });
   });
 

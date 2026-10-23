@@ -686,7 +686,9 @@ function readinessAdmission(
         || 'OpenClaw question-runtime readiness could not be attested.',
       checkedAt,
       evidence,
-      ['ask-user-plugin-mismatch'],
+      [attestation.questionRuntime?.inspectTimedOut
+        ? 'ask-user-plugin-inspect-timeout'
+        : 'ask-user-plugin-mismatch'],
     );
   }
   return admission(
@@ -742,6 +744,25 @@ export async function getOpenClawExecutionAdmission(
     dependencies.now(),
     finalSnapshot.evidence,
   );
+}
+
+/**
+ * Collect the shared attestation once after boot, so the first Agent Chat visit
+ * does not pay the cold serialized CLI chain (~60-100s on a contended 2 vCPU
+ * host). It fills the same evidence-bound cache a request would, through the
+ * same in-flight dedup; it never authorizes anything a request would not.
+ */
+export function scheduleOpenClawExecutionAdmissionPrewarm(options: {
+  delayMs?: number;
+  admit?: () => Promise<unknown>;
+} = {}): NodeJS.Timeout {
+  const admit = options.admit || (() => getOpenClawExecutionAdmission());
+  const timer = setTimeout(() => {
+    // Never awaited; a failed prewarm is just a cold first request.
+    void Promise.resolve().then(admit).catch(() => undefined);
+  }, options.delayMs ?? 5_000);
+  timer.unref?.();
+  return timer;
 }
 
 export function getCachedOpenClawExecutionAdmission(
