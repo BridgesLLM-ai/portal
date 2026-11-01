@@ -1,4 +1,4 @@
-import { PORTAL_TOOL_VERSIONS } from '../../../../config/toolVersions';
+import { PORTAL_TOOL_FLOORS, PORTAL_TOOL_VERSIONS } from '../../../../config/toolVersions';
 import type { AcpHarnessProfile } from './AcpStdioBroker';
 
 export const HERMES_ACP_VERSION = PORTAL_TOOL_VERSIONS.hermes;
@@ -21,6 +21,7 @@ export const GROK_ACP_PROFILE: AcpHarnessProfile = Object.freeze({
   },
   protocolVersion: 1,
   expectedAgentVersion: PORTAL_TOOL_VERSIONS.grokBuild,
+  minimumAgentVersion: PORTAL_TOOL_FLOORS.grokBuild,
   agentVersionSource: 'meta-agent-version',
   requiredCapabilities: ['loadSession'],
   authentication: { kind: 'none' },
@@ -46,6 +47,7 @@ export const HERMES_ACP_PROFILE: AcpHarnessProfile = Object.freeze({
   protocolVersion: 1,
   expectedAgentName: 'hermes-agent',
   expectedAgentVersion: HERMES_ACP_VERSION,
+  minimumAgentVersion: PORTAL_TOOL_FLOORS.hermes,
   agentVersionSource: 'agent-info',
   requiredCapabilities: [
     'loadSession',
@@ -79,6 +81,7 @@ export const OPENCODE_ACP_PROFILE: AcpHarnessProfile = Object.freeze({
   protocolVersion: 1,
   expectedAgentName: 'OpenCode',
   expectedAgentVersion: OPENCODE_ACP_VERSION,
+  minimumAgentVersion: PORTAL_TOOL_FLOORS.openCode,
   agentVersionSource: 'agent-info',
   requiredCapabilities: [
     'loadSession',

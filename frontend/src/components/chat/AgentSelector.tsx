@@ -290,6 +290,8 @@ function getHarnessSummary(harness: HarnessInfo): string {
     return 'Preview — not available for chat in this release.';
   }
   if (harness.checking || harness.availabilityState === 'checking') return 'Checking your connection…';
+  // A runtime refused for its version needs an update first, whatever its login says (as Maintenance says).
+  if (!harness.usable && harness.versionRefused === true) return `Update ${harness.displayName} in Admin → Maintenance.`;
   if (harness.nativeAuthStatus === 'needs_login') return `Connect your ${harness.displayName} account in Model Providers.`;
   if (harness.installed === false) return 'Set up this harness in Agent Tools to get started.';
   if (harness.usable) {
@@ -312,6 +314,8 @@ function getHarnessStatusLabel(harness: HarnessInfo): string {
   if (harness.selectable === false) return 'Unavailable';
   if (!harness.implemented) return 'Not implemented';
   if (!harness.installed) return 'Not installed';
+  // Maintenance says "Update required" for a version below the minimum; the login comes after that update.
+  if (!harness.usable && harness.versionRefused === true) return 'Update required';
   if (harness.native && harness.nativeAuthStatus === 'needs_login') return 'Needs login';
   if (harness.usable && (harness.harnessId || harness.name) === 'OPENCLAW') return 'Gateway online';
   return harness.usable ? 'Ready' : 'Unavailable';

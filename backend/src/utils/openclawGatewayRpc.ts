@@ -6,12 +6,16 @@
  * 
  * Protocol: JSON-RPC over WebSocket with connect handshake.
  */
+import crypto from 'crypto';
 import { isOpenClawExecutionCapableGatewayCall } from '../services/openClawExecutionCapableMethods';
 import WebSocket from 'ws';
 import { getOpenClawWsUrl } from '../config/openclaw';
 import { buildSignedDevice, getOrCreateDeviceKeys, validateGatewayChallenge } from './deviceIdentity';
 import { getGatewayToken } from './gatewayToken';
-import { ensureOpenClawModelDeclaration } from './openclawCli';
+import { capabilitiesFromHello, getOpenClawCapabilities, type OpenClawCapabilities } from '../services/openClawCompatibility';
+import { recordOpenClawHelloSnapshot } from './openclawHelloSnapshot';
+import { openClawSessionModelAllowed } from '../services/openclawSessionModelPolicy';
+import { OPENCLAW_PLAIN_TEXT_CHAT_PARAMS } from '../services/openclawChatCommandAuthority';
 
 const GATEWAY_WS_URL = getOpenClawWsUrl();
 const MIN_PROTOCOL_VERSION = 3;
@@ -186,10 +190,39 @@ export async function gatewayRpcCall(method: string, params: Record<string, any>
   };
 }
 
+/**
+ * The authenticated hello of the configured Gateway, for the readiness
+ * contract check. A connected persistent socket already holds it; opening a
+ * second socket would displace that one, so it is only read. Otherwise one
+ * throwaway connection performs the same signed connect plus a read-only
+ * `status` call and reports the hello it was granted.
+ */
+export async function probeGatewayHelloCapabilities(
+  timeoutMs = 10_000,
+): Promise<{ ok: true; capabilities: OpenClawCapabilities } | { ok: false; error: string }> {
+  let PGW: any = null;
+  try {
+    PGW = await import('../agents/providers/PersistentGatewayWs');
+  } catch {
+    PGW = null;
+  }
+  if (PGW?.isConnected?.()) {
+    const observed = getOpenClawCapabilities();
+    if (observed.version) return { ok: true, capabilities: observed };
+  }
+  let hello: unknown = null;
+  const attempt = await openThrowawayGatewayRpc('status', { includeChannelSummary: false }, timeoutMs, (payload) => {
+    hello = payload;
+  });
+  if (hello) return { ok: true, capabilities: capabilitiesFromHello(hello) };
+  return { ok: false, error: attempt.error || 'The OpenClaw Gateway did not complete an authenticated hello.' };
+}
+
 function openThrowawayGatewayRpc(
   method: string,
   params: Record<string, any>,
   timeoutMs: number,
+  onHello?: (hello: unknown) => void,
 ): Promise<RpcAttempt> {
   // Captured here, in the caller's context: the method frame is written from a
   // socket callback, and the guard must judge the dispatch that asked for it.
@@ -297,6 +330,8 @@ function openThrowawayGatewayRpc(
               });
               return;
             }
+            onHello?.(msg.payload);
+            void recordOpenClawHelloSnapshot(msg.payload);
             const grantedScopes = Array.isArray(msg.payload?.auth?.scopes)
               ? msg.payload.auth.scopes.filter((scope: unknown): scope is string => (
                 typeof scope === 'string'
@@ -390,39 +425,68 @@ export interface OpenClawSessionCreationDefaults {
   reasoningLevel?: 'off' | 'on' | 'stream';
 }
 
+export const OPENCLAW_MODEL_NOT_ENABLED_MESSAGE =
+  "This model isn't enabled on this server. An admin can enable it in Model Providers.";
+
+export type OpenClawSessionModelPatchResult = {
+  ok: boolean;
+  resolved?: { modelProvider: string; model: string; agentRuntime?: { id?: string; source?: string } };
+  error?: string;
+  code?: 'MODEL_NOT_ENABLED';
+};
+
+/**
+ * The plain refusal for a session model outside this server's enabled models,
+ * or null when `model` may be sent. Every Portal route that sends a session
+ * model to OpenClaw checks it before the native call (clearing, null, is never
+ * refused).
+ */
+export function openClawSessionModelRefusal(
+  sessionKey: string,
+  model: string | null | undefined,
+): OpenClawSessionModelPatchResult | null {
+  if (!model || openClawSessionModelAllowed(sessionAgentIdOrNull(sessionKey), model)) return null;
+  console.warn(`[Gateway RPC] Refused session model ${model}: not enabled on this server`);
+  return { ok: false, error: OPENCLAW_MODEL_NOT_ENABLED_MESSAGE, code: 'MODEL_NOT_ENABLED' };
+}
+
+/**
+ * OpenClaw's own refusal (a policy the Portal cannot read, such as one in an
+ * included config file): "model not allowed", or since 2026.8.1 'Model
+ * override "x" is not allowed by agents.defaults.modelPolicy.allow'.
+ */
+export function isOpenClawModelPolicyRefusal(error: unknown): boolean {
+  return /model not allowed|not allowed by agents\.[\w.-]*modelPolicy/i.test(String(error || ''));
+}
+
 export async function patchSessionModelWithinMutation(
   sessionKey: string,
   model: string | null,
   creationDefaults?: OpenClawSessionCreationDefaults,
-): Promise<{ ok: boolean; resolved?: { modelProvider: string; model: string; agentRuntime?: { id?: string; source?: string } }; error?: string }> {
+): Promise<OpenClawSessionModelPatchResult> {
   // sessions.patch can take noticeably longer than chat.send on a busy gateway,
   // especially right after auth/profile changes or when materializing a fresh
   // session. Keep a generous busy-gateway latency budget so model switching
   // does not fail spuriously during normal runtime contention.
+  // A session model change only selects among models the host has enabled,
+  // for every role: the Portal checks the server's configuration itself first
+  // (OpenClaw 2026.10.6 accepted an operator patch outside it), and a refused
+  // model is never declared into the host-wide config from here. Admins enable
+  // models in Model Providers.
+  const refusal = openClawSessionModelRefusal(sessionKey, model);
+  if (refusal) return refusal;
+
   const patch = {
     key: sessionKey,
     model,
     ...(creationDefaults?.thinkingLevel ? { thinkingLevel: creationDefaults.thinkingLevel } : {}),
     ...(creationDefaults?.reasoningLevel ? { reasoningLevel: creationDefaults.reasoningLevel } : {}),
   };
-  let result = await gatewayRpcCall('sessions.patch', patch, 20000);
+  const result = await gatewayRpcCall('sessions.patch', patch, 20000);
 
-  // OpenClaw validates sessions.patch against the agents.defaults.models
-  // allowlist. Catalog models that were never declared (for example newly
-  // supported models on an install that authenticated before they existed)
-  // fail with "model not allowed" — self-heal by declaring the model and
-  // retrying once after the gateway reloads its config.
-  if (model && !result.ok && /model not allowed/i.test(String(result.error || ''))) {
-    try {
-      const declaration = ensureOpenClawModelDeclaration(model);
-      if (declaration.changed) {
-        console.log(`[Gateway RPC] Declared ${declaration.model} in agents.defaults.models; retrying sessions.patch`);
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        result = await gatewayRpcCall('sessions.patch', patch, 20000);
-      }
-    } catch (err: any) {
-      console.warn(`[Gateway RPC] Model declaration self-heal failed: ${err?.message || err}`);
-    }
+  if (model && !result.ok && isOpenClawModelPolicyRefusal(result.error)) {
+    console.warn(`[Gateway RPC] Refused session model ${model}: not enabled on this server`);
+    return { ok: false, error: OPENCLAW_MODEL_NOT_ENABLED_MESSAGE, code: 'MODEL_NOT_ENABLED' };
   }
 
   if (result.ok) {
@@ -439,7 +503,7 @@ export async function patchSessionModel(
   sessionKey: string,
   model: string | null,
   creationDefaults?: OpenClawSessionCreationDefaults,
-): Promise<{ ok: boolean; resolved?: { modelProvider: string; model: string; agentRuntime?: { id?: string; source?: string } }; error?: string }> {
+): Promise<OpenClawSessionModelPatchResult> {
   return withOpenClawSessionMutation(sessionKey, () => (
     patchSessionModelWithinMutation(sessionKey, model, creationDefaults)
   ));
@@ -465,6 +529,14 @@ export async function createSession(sessionKey: string, agentId?: string): Promi
 
   console.error(`[Gateway RPC] Failed to create session: ${result.error}`);
   return { ok: false, error: String(result.error) };
+}
+
+function sessionAgentIdOrNull(sessionKey: string): string | null {
+  try {
+    return localSessionAgentId(sessionKey);
+  } catch {
+    return null;
+  }
 }
 
 function localSessionAgentId(sessionKey: string): string {
@@ -629,12 +701,101 @@ export function isGatewayTransportError(error?: string): boolean {
 }
 
 /**
+ * `sessions.delete` parameters that remove a transcript without leaving an
+ * archive. Stock OpenClaw 9.9 through 10.9 has neither: its params schema is
+ * closed, so sending one is an INVALID_REQUEST. `purgeTranscript` is the name
+ * proposed upstream (not shipped); `deleteTranscriptWithoutArchive` belongs to
+ * the retired Portal core patch. Only a positive probe of the running Gateway
+ * may select one.
+ */
+export const OPENCLAW_SESSION_PURGE_PARAMETERS = Object.freeze([
+  'purgeTranscript',
+  'deleteTranscriptWithoutArchive',
+] as const);
+
+export type OpenClawSessionPurgeParameter = typeof OPENCLAW_SESSION_PURGE_PARAMETERS[number];
+
+function isOpenClawSessionPurgeParameter(value: unknown): value is OpenClawSessionPurgeParameter {
+  return OPENCLAW_SESSION_PURGE_PARAMETERS.includes(value as OpenClawSessionPurgeParameter);
+}
+
+export type OpenClawSessionPurgeProbe = Readonly<{
+  result: 'accepted' | 'rejected' | 'unknown';
+  detail: string;
+}>;
+
+const SESSION_PURGE_PROBE_KEY_PREFIX = 'bridgesllm-purge-probe-';
+
+/**
+ * OC-PURGE: learn whether the running Gateway accepts a purge parameter without
+ * mutating anything. The key is a fresh random session key and the CAS guards
+ * name a random transcript, so no session can match:
+ * - a closed (stock) params schema rejects the parameter during validation,
+ *   before any handler runs ("unexpected property '<name>'");
+ * - a Gateway that accepts the parameter reaches the handler's first CAS
+ *   check, which refuses a missing entry ("changed before deletion") before
+ *   any lifecycle drain or store write.
+ * Every other answer is "unknown"; callers must not infer either capability.
+ */
+export async function probeSessionPurgeParameter(
+  parameter: OpenClawSessionPurgeParameter,
+  rawAgentId: string,
+): Promise<OpenClawSessionPurgeProbe> {
+  if (!isOpenClawSessionPurgeParameter(parameter)) {
+    return { result: 'unknown', detail: 'unrecognized purge parameter' };
+  }
+  const agentId = String(rawAgentId || '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(agentId)) {
+    return { result: 'unknown', detail: 'invalid agent identity' };
+  }
+  const probeKey = `agent:${agentId}:${SESSION_PURGE_PROBE_KEY_PREFIX}${crypto.randomUUID()}`;
+  const response = await gatewayRpcCall('sessions.delete', {
+    key: probeKey,
+    agentId,
+    expectedSessionId: crypto.randomUUID(),
+    expectedSessionUpdatedAt: 0,
+    [parameter]: true,
+  }, 10000);
+  if (response.ok) {
+    if (
+      response.data?.ok === true
+      && response.data?.deleted === false
+      && Array.isArray(response.data?.archived)
+      && response.data.archived.length === 0
+    ) {
+      return { result: 'accepted', detail: 'parameter accepted; probe key not found' };
+    }
+    return { result: 'unknown', detail: 'unexpected sessions.delete probe receipt' };
+  }
+  const code = String(response.errorCode || '');
+  const message = String(response.errorMessage || response.error || '');
+  if (
+    code === 'INVALID_REQUEST'
+    && message.includes('invalid sessions.delete params')
+    && message.includes(`unexpected property '${parameter}'`)
+  ) {
+    return { result: 'rejected', detail: 'closed sessions.delete params schema' };
+  }
+  if (
+    code === 'INVALID_REQUEST'
+    && message.includes(`Session ${probeKey} changed before deletion`)
+  ) {
+    return { result: 'accepted', detail: 'parameter accepted; CAS refused the probe key' };
+  }
+  return {
+    result: 'unknown',
+    detail: `${code || 'NO_CODE'}: ${message}`.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200),
+  };
+}
+
+/**
  * Delete/end an OpenClaw session.
  */
 export type DeleteOpenClawSessionOptions = {
   agentId?: string;
   deleteTranscript?: boolean;
-  deleteTranscriptWithoutArchive?: boolean;
+  /** Set only from an `accepted` probeSessionPurgeParameter() of this Gateway. */
+  purgeParameter?: OpenClawSessionPurgeParameter;
   expectedSessionId?: string | null;
   archivedOnly?: boolean;
   emitLifecycleHooks?: boolean;
@@ -657,6 +818,15 @@ export async function deleteSession(
   const agentId = options.agentId === undefined ? inferredAgentId : String(options.agentId).trim();
   if (agentId !== inferredAgentId) {
     return { ok: false, error: 'OpenClaw deletion agent identity does not match the session key' };
+  }
+  if (options.purgeParameter !== undefined) {
+    if (!isOpenClawSessionPurgeParameter(options.purgeParameter)) {
+      return { ok: false, error: 'OpenClaw transcript purge parameter is not recognized' };
+    }
+    // Both purge contracts refuse an archive request in the same mutation.
+    if (options.deleteTranscript !== undefined || options.archivedOnly !== undefined) {
+      return { ok: false, error: 'OpenClaw transcript purge cannot be combined with archive options' };
+    }
   }
   const described = await getSessionInfo(sessionKey);
   if (!described.ok) {
@@ -689,9 +859,7 @@ export async function deleteSession(
     expectedSessionId: describedSessionId,
     expectedSessionUpdatedAt: updatedAt,
     ...(options.deleteTranscript !== undefined ? { deleteTranscript: options.deleteTranscript } : {}),
-    ...(options.deleteTranscriptWithoutArchive !== undefined
-      ? { deleteTranscriptWithoutArchive: options.deleteTranscriptWithoutArchive }
-      : {}),
+    ...(options.purgeParameter !== undefined ? { [options.purgeParameter]: true } : {}),
     ...(options.archivedOnly !== undefined ? { archivedOnly: options.archivedOnly } : {}),
     ...(options.emitLifecycleHooks !== undefined ? { emitLifecycleHooks: options.emitLifecycleHooks } : {}),
   }, 20000);
@@ -733,6 +901,9 @@ export async function chatSend(
     sessionKey,
     message,
     idempotencyKey,
+    // This helper knows no sender, so the text never runs OpenClaw chat
+    // commands (services/openclawChatCommandAuthority.ts).
+    ...OPENCLAW_PLAIN_TEXT_CHAT_PARAMS,
   }, 15000);
   
   if (result.ok) {

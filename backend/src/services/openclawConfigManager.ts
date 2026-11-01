@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -1269,7 +1270,7 @@ export function readOpenClawAuthStoreProfiles(
   }
 
   try {
-    const raw = execFileSync('openclaw', buildOpenClawAuthListArgs(normalizedProvider), {
+    const raw = execFileSync(...openClawDiagnosticCommand('openclaw', buildOpenClawAuthListArgs(normalizedProvider)), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -1316,7 +1317,7 @@ export async function readOpenClawAuthStoreProfilesAsync(
   }
 
   const execute = new Promise<Record<string, AuthProfile>>((resolve, reject) => {
-    execFile('openclaw', buildOpenClawAuthListArgs(normalizedProvider), {
+    execFile(...openClawDiagnosticCommand('openclaw', buildOpenClawAuthListArgs(normalizedProvider)), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       timeout: 10_000,
@@ -1709,7 +1710,7 @@ export function saveProviderApiKeyToOpenClawAuthStore(
   }
 
   try {
-    execFileSync('openclaw', [
+    execFileSync(...openClawDiagnosticCommand('openclaw', [
       'models',
       'auth',
       '--agent',
@@ -1719,7 +1720,7 @@ export function saveProviderApiKeyToOpenClawAuthStore(
       normalizedProvider,
       '--profile-id',
       normalizedProfileId,
-    ], {
+    ]), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       input: `${normalizedKey}\n`,
@@ -1800,7 +1801,7 @@ export function clearProviderAuthOrder(provider: string): void {
   if (!normalizedProvider) throw new Error('Provider is required to clear authentication order.');
 
   try {
-    const orderOutput = execFileSync('openclaw', [
+    const orderOutput = execFileSync(...openClawDiagnosticCommand('openclaw', [
       'models',
       'auth',
       '--agent',
@@ -1810,7 +1811,7 @@ export function clearProviderAuthOrder(provider: string): void {
       '--provider',
       normalizedProvider,
       '--json',
-    ], {
+    ]), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1821,7 +1822,7 @@ export function clearProviderAuthOrder(provider: string): void {
     // OpenClaw 2026.7.1 treats clearing an absent order as an error instead of
     // an idempotent no-op. Only issue the mutation when an override exists.
     if (Array.isArray(currentOrder) && currentOrder.length > 0) {
-      execFileSync('openclaw', [
+      execFileSync(...openClawDiagnosticCommand('openclaw', [
         'models',
         'auth',
         '--agent',
@@ -1830,7 +1831,7 @@ export function clearProviderAuthOrder(provider: string): void {
         'clear',
         '--provider',
         normalizedProvider,
-      ], {
+      ]), {
         encoding: 'utf8',
         env: buildOpenClawCliEnv(),
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -1863,7 +1864,7 @@ export function clearProviderAuthOrder(provider: string): void {
   // can overwrite an unrelated gateway or CLI update that lands in between.
   const configPath = `auth.order[${JSON.stringify(normalizedProvider)}]`;
   try {
-    execFileSync('openclaw', ['config', 'unset', configPath], {
+    execFileSync(...openClawDiagnosticCommand('openclaw', ['config', 'unset', configPath]), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],

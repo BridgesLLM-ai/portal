@@ -1,0 +1,24 @@
+# BridgesLLM Portal toolctl identity manifest v1
+#
+# Append-only ledger of installer/tools/bridgesllm-toolctl.py, which the
+# enabled bridgesllm-tools-reconcile.service and the bridgesllm-tools@.service
+# template run. Each row names the exact toolctl bytes one signed build
+# installs: <version> <size> <sha256> <git blob>, tab-separated. toolctl
+# changes between signed builds of one version, so a version may have several
+# rows. Do not rewrite or delete a row: a host keeps the toolctl it was given
+# until its next update, and that update must still admit it. Append the next
+# row before a signed build ships a changed toolctl, and when the installer
+# VERSION changes (the same bytes under the new version if toolctl did not
+# change). The installer prune guard set PORTAL_TOOLCTL_RELEASES must list
+# exactly these identities.
+#
+# 5.2.0 pre-release build 1.
+5.2.0	571954	58104ce59c268fbf75fa1544d58e7f8f5fc8a74bfd14381c20ca753e487dd13c	cc432fc40eec351370bbd6bcb07c117c2c72ef44
+# 5.2.0 pre-release build 2.
+5.2.0	583261	2cbcc18e3e8c9b08999c5995d80742f988b5029bbda6ca62fc0cb44989c49c06	04fe62874a3e5a5fdee914aa0414ea06c1b1a829
+# 5.2.0 pre-release build 3.
+5.2.0	600913	58c37259a2da21c93f4f0ce1d36f9b46fa4e0e85863642ee6250c6184648d7d7	50691dfba93a7f802fee15b8c832c33e8cada670
+# 5.2.0 pre-release build 4.
+5.2.0	610363	83cf9ce402abb90f709968dd94ae108819fb2c708b6e2fba35473c1d74430f90	b869c906c1f96a946d3a73b044738e68010ae809
+# 5.2.0 release.
+5.2.0	609956	71c0cf61ec681894b80daa1fa651103a5ba6a6b40a587d22778f7d2477ac7cef	2bd59e89009ec454dad58c376a5c26d589542d99

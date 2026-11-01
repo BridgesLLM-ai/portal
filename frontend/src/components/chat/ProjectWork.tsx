@@ -41,14 +41,30 @@ export interface Replay {
 const options = { _silent: true, _skipNetworkRetry: true } as any;
 const problem = (error: any) => error?.response?.data?.error || error?.message || 'Could not load project work.';
 export function mergeProjectWorkTimeline<T extends { createdAt: Date }>(messages: T[], cards: WorkCard[], replays: Record<string, Replay> = {}) {
-  return [
-    ...messages.map((message) => ({ kind: 'message' as const, message, at: message.createdAt.getTime() })),
-    ...cards.flatMap((card) => [
-      { kind: 'work' as const, card, at: new Date(card.createdAt).getTime() },
-      ...projectWorkActivity(replays[card.id]?.events || [], replays[card.id]?.text || '', card.createdAt)
-        .map(activity => ({ kind: 'work-activity' as const, card, activity, at: activity.at })),
-    ]),
-  ].sort((a, b) => a.at - b.at);
+  const workItems = cards.flatMap((card) => [
+    { kind: 'work' as const, card, at: new Date(card.createdAt).getTime() },
+    ...projectWorkActivity(replays[card.id]?.events || [], replays[card.id]?.text || '', card.createdAt)
+      .map(activity => ({ kind: 'work-activity' as const, card, activity, at: activity.at })),
+  ]).sort((a, b) => (
+    (Number.isFinite(a.at) ? a.at : Number.POSITIVE_INFINITY)
+    - (Number.isFinite(b.at) ? b.at : Number.POSITIVE_INFINITY)
+  ));
+  type Item = { kind: 'message'; message: T; at: number } | typeof workItems[number];
+  const result: Item[] = [];
+  let workIndex = 0;
+  let messageBoundary = Number.NEGATIVE_INFINITY;
+  for (const message of messages) {
+    const at = message.createdAt.getTime();
+    if (Number.isFinite(at)) messageBoundary = Math.max(messageBoundary, at);
+    // Messages already have authoritative transcript/turn order. Only weave
+    // independently timestamped project activity into that sequence; a full
+    // sort would undo history reconciliation and put a reply above its prompt.
+    while (workIndex < workItems.length && workItems[workIndex].at < messageBoundary) {
+      result.push(workItems[workIndex++]);
+    }
+    result.push({ kind: 'message', message, at });
+  }
+  return [...result, ...workItems.slice(workIndex)];
 }
 
 export function useProjectWork(originProvider: string, originSessionKey: string, originModel = '') {
@@ -314,7 +330,7 @@ export function ProjectWorkCard({ card, work }: { card: WorkCard; work: ProjectW
     finally { setStopping(false); }
   };
   const project = work.projects.find((item) => item.identity.id === card.projectIdentityId);
-  return <motion.article initial={reducedMotion ? false : { opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} data-testid="project-work-card" data-work-id={card.id} className="mx-auto my-4 w-[calc(100%-1.5rem)] max-w-[46rem] overflow-hidden rounded-2xl border border-[var(--accent-border)] bg-[var(--accent-bg-subtle)] shadow-sm">
+  return <motion.article initial={reducedMotion ? false : { opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} data-testid="project-work-card" data-work-id={card.id} className="mx-auto my-4 w-[calc(100%-1.5rem)] max-w-[86rem] overflow-hidden rounded-2xl border border-[var(--accent-border)] bg-[var(--accent-bg-subtle)] shadow-sm">
     <header className="flex items-start gap-3 border-b border-white/[0.05] px-4 py-3">
       <span className="rounded-xl bg-[var(--accent-bg)] p-2 text-[var(--accent-light)]"><FolderOpen size={17} /></span>
       <div className="min-w-0 flex-1"><h3 className="truncate text-sm font-semibold text-white">{card.projectName}</h3><p className="mt-0.5 flex items-center gap-1 text-[11px] text-slate-400"><FolderOpen size={11} />Project workspace <span className="px-1">·</span>{projectWorkerLabel(card.provider, card.originProvider, card.originSessionKey)}</p></div>
@@ -396,7 +412,7 @@ function ProjectWorkerPicker({ value, onChange, openclawLabel }: { value: Projec
 
 export function ProjectWorkActivity({ card, activity, active }: { card: WorkCard; activity: WorkActivity; active: boolean }) {
   const identity = projectWorkerLabel(card.provider, card.originProvider, card.originSessionKey);
-  return <article data-testid="project-work-activity" data-project-activity={card.id} className="mx-auto flex w-full max-w-3xl gap-3 px-4 py-3">
+  return <article data-testid="project-work-activity" data-project-activity={card.id} className="mx-auto flex w-full max-w-[88rem] gap-3 px-4 py-3">
     <span className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-bg)] text-[var(--accent-light)]"><Bot size={15}/></span>
     <div className="min-w-0 flex-1">
       <p className="mb-2 flex flex-wrap items-center gap-x-2 text-[11px] text-slate-500"><span className="font-medium text-slate-300">{identity}</span><span>·</span><span>{card.projectName}</span></p>

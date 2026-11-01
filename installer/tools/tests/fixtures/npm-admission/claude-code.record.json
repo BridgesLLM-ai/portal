@@ -1,0 +1,35 @@
+{
+  "admittedAt": "2026-10-30T22:40:00.000Z",
+  "admittedBy": "requalify:0b6c2f1e-4a59-4d38-9d0e-2a7f5c1b9e01",
+  "criticalFiles": {
+    "bin/claude.exe": "5df47a0bc0f92f2b216212db08cf488d926e9e0099bb04474a97f37df716112f",
+    "node_modules/@anthropic-ai/claude-code-linux-x64/claude": "5df47a0bc0f92f2b216212db08cf488d926e9e0099bb04474a97f37df716112f",
+    "node_modules/@anthropic-ai/claude-code-linux-x64/package.json": "95360e0fbbf389c8da71bb3da24573bad55b26eea24d2fcecb4c7a306ef742a5",
+    "package.json": "0cf8e45157339bbb0321170895bab654db8c73ed204b317455c5f89d3ea10fad"
+  },
+  "hardlinkGroups": [
+    [
+      "bin/claude.exe",
+      "node_modules/@anthropic-ai/claude-code-linux-x64/claude"
+    ]
+  ],
+  "packageName": "@anthropic-ai/claude-code",
+  "packageRoot": "/usr/lib/node_modules/@anthropic-ai/claude-code",
+  "platform": "linux-x64-gnu",
+  "platformBinRelative": "claude",
+  "platformPackageName": "@anthropic-ai/claude-code-linux-x64",
+  "platformPackageRelative": "node_modules/@anthropic-ai/claude-code-linux-x64",
+  "platformPackageVersion": "2.1.320",
+  "schema": "bridgesllm.tools.admission.v1",
+  "source": {
+    "integrity": "sha512-JvX8leKobW29ScvfY/wjFw+ADFWVcgnoRbf/VB3NPFDPOIekL5Vk44Jk27Kqnqqslffy5eH60XxL2erPMAxsAw==",
+    "kind": "npm-registry",
+    "provenance": "unavailable",
+    "signatures": "verified",
+    "tarball": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.320.tgz",
+    "verifier": "npm-audit-signatures"
+  },
+  "toolId": "claude-code",
+  "treeSha256": "6075301a150e1d5fcac2117d5ab1a84f1c79ecadc74f7c30ff31a04dd9f7236e",
+  "version": "2.1.320"
+}

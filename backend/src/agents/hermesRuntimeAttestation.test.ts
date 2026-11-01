@@ -62,4 +62,19 @@ describe('Hermes runtime attestation (MCP extra)', () => {
     const pinned = helper.match(/^readonly HERMES_TESTED_VERSION="([^"]+)"$/m)?.[1];
     expect(hermesRuntimeAttestationPath('/r', pinned)).toBe(hermesRuntimeAttestationPath('/r'));
   });
+
+  test('reads the attestation of the installed floor-pinned version and refuses a version that cannot name a directory', () => {
+    const reads: string[] = [];
+    const content = 'schema=bridgesllm-hermes-runtime-v1\nproduct_version=0.22.5\nextras=acp,mcp\n';
+    expect(readHermesRuntimeAttestation({
+      version: '0.22.5',
+      readFile: (filePath) => { reads.push(filePath); return content; },
+    })).toBe('bridge-ready');
+    expect(reads).toEqual([hermesRuntimeAttestationPath(undefined, '0.22.5')]);
+    // The installed version must also be the attested product version.
+    expect(readHermesRuntimeAttestation({ version: '0.22.6', readFile: () => content })).toBe('version-mismatch');
+    for (const version of ['../0.22.5', '0.22.5/x', 'v0.22.5', '']) {
+      expect(readHermesRuntimeAttestation({ version, readFile: () => content })).toBe('unreadable');
+    }
+  });
 });

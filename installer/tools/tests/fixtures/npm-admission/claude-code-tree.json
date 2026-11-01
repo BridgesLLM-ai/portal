@@ -1,0 +1,25 @@
+{
+  "comment": "Synthetic installed Claude Code tree shared by test_toolctl_npm.py (writes claude-code.record.json) and backend nativeHostCliAdmissionRecordToolctl.test.ts (reads it). Not vendor bytes.",
+  "toolId": "claude-code",
+  "version": "2.1.320",
+  "packageRoot": "/usr/lib/node_modules/@anthropic-ai/claude-code",
+  "platform": "linux-x64-gnu",
+  "admittedAt": "2026-10-30T22:40:00.000Z",
+  "admittedBy": "requalify:0b6c2f1e-4a59-4d38-9d0e-2a7f5c1b9e01",
+  "integrity": "sha512-JvX8leKobW29ScvfY/wjFw+ADFWVcgnoRbf/VB3NPFDPOIekL5Vk44Jk27Kqnqqslffy5eH60XxL2erPMAxsAw==",
+  "entries": [
+    {"path": "bin", "kind": "directory", "mode": 493},
+    {"path": "node_modules", "kind": "directory", "mode": 493},
+    {"path": "node_modules/@anthropic-ai", "kind": "directory", "mode": 493},
+    {"path": "node_modules/@anthropic-ai/claude-code-linux-x64", "kind": "directory", "mode": 493},
+    {"path": "node_modules/.bin", "kind": "directory", "mode": 493},
+    {"path": "package.json", "kind": "file", "mode": 420, "text": "{\"name\":\"@anthropic-ai/claude-code\",\"version\":\"2.1.320\",\"bin\":{\"claude\":\"bin/claude.exe\"},\"scripts\":{\"postinstall\":\"node install.cjs\"}}\n"},
+    {"path": "install.cjs", "kind": "file", "mode": 420, "text": "// fixture postinstall\n"},
+    {"path": "cli-wrapper.cjs", "kind": "file", "mode": 420, "text": "// fixture wrapper\n"},
+    {"path": "README.md", "kind": "file", "mode": 420, "text": "fixture readme é\n"},
+    {"path": "node_modules/@anthropic-ai/claude-code-linux-x64/package.json", "kind": "file", "mode": 420, "text": "{\"name\":\"@anthropic-ai/claude-code-linux-x64\",\"version\":\"2.1.320\",\"os\":[\"linux\"],\"cpu\":[\"x64\"]}\n"},
+    {"path": "node_modules/@anthropic-ai/claude-code-linux-x64/claude", "kind": "file", "mode": 493, "text": "fixture-native-claude-binary\n"},
+    {"path": "bin/claude.exe", "kind": "hardlink", "target": "node_modules/@anthropic-ai/claude-code-linux-x64/claude"},
+    {"path": "node_modules/.bin/claude-native", "kind": "symlink", "target": "../@anthropic-ai/claude-code-linux-x64/claude"}
+  ]
+}

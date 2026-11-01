@@ -7,7 +7,10 @@ import { gatewayRpcCall, getSessionHistory } from '../utils/openclawGatewayRpc';
 import { readOwnedWidgetDocument, WidgetReadError } from '../services/chatWidgetDocument';
 import { WIDGET_SANDBOX_HTML, WIDGET_SHELL_CSP } from '../services/chatWidgetSandbox';
 import { acquireWorkspaceAuthorizationMutationLease } from '../services/workspaceAuthorizationBarrier';
-import { WIDGET_REFERENCE_SCHEMA } from '../services/chatWidgetProjection';
+import { BOARD_NAME_PATTERN, WIDGET_REFERENCE_SCHEMA } from '../services/chatWidgetProjection';
+import { readBoardWidgetHtml, readLiveWidgetDocument } from '../services/chatWidgetLive';
+import { getOpenClawCapabilities } from '../services/openClawCompatibility';
+import { getOpenClawApiUrl } from '../config/openclaw';
 import { resolveOwnedNativeSession } from '../agents/chatBridge/nativeSessionOwnership';
 import { readChatBridgeWidgetDocument } from '../agents/chatBridge/widgetStore';
 export function createChatWidgetsRouter(authorize: (key: string, user: JwtPayload) => Promise<void>) {
@@ -57,6 +60,33 @@ export function createChatWidgetsRouter(authorize: (key: string, user: JwtPayloa
         authorize: () => authorize(key, req.user!),
         history: offset => getSessionHistory(key, { limit: 250, offset }),
         view: docId => gatewayRpcCall('canvas.document.view', { docId }),
+      });
+      res.set('Cache-Control', 'private, no-store').json(result);
+    } catch (error) {
+      const typed = error instanceof WidgetReadError ? error : new WidgetReadError(404, 'WIDGET_NOT_FOUND');
+      res.status(typed.status).json({ code: typed.code, error: 'Widget unavailable. Reload or ask the agent to recreate it.' });
+    } finally { release?.(); }
+  });
+  // Live (pinned) widget: the newest version carrying this board name, under
+  // the same owner check, attested transcript read and opaque sandbox.
+  router.get('/sessions/:key/boards/:boardName/document', async (req, res) => {
+    const { key, boardName } = req.params;
+    if (Object.keys(req.query).length || !key || key.length > 512 || /[\u0000-\u001f\u007f]/.test(key)
+      || !BOARD_NAME_PATTERN.test(boardName || '')) { res.status(400).json({ code: 'WIDGET_INVALID' }); return; }
+    const capabilities = getOpenClawCapabilities();
+    if (!capabilities.liveWidgets) {
+      res.status(409).json({ code: 'WIDGET_LIVE_UNAVAILABLE',
+        error: capabilities.disabledReasons.liveWidgets || 'This OpenClaw Gateway does not offer live widgets.' });
+      return;
+    }
+    let release: (() => void) | undefined;
+    try {
+      release = acquireWorkspaceAuthorizationMutationLease(req.user!.userId);
+      const result = await readLiveWidgetDocument(boardName, {
+        authorize: () => authorize(key, req.user!),
+        history: offset => getSessionHistory(key, { limit: 250, offset }),
+        view: docId => gatewayRpcCall('canvas.document.view', { docId }),
+        board: () => readBoardWidgetHtml(key, boardName, { rpc: gatewayRpcCall, gatewayHttpBase: getOpenClawApiUrl() }),
       });
       res.set('Cache-Control', 'private, no-store').json(result);
     } catch (error) {

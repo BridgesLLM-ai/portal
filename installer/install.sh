@@ -36,7 +36,7 @@ if [[ -z "${HOME:-}" ]]; then
   export HOME
 fi
 
-readonly VERSION="5.1.0"
+readonly VERSION="5.2.0"
 
 # Prisma's CLI spawns a detached telemetry ("checkpoint") process that
 # outlives the command. Attested database operations prove their recursive
@@ -87,15 +87,15 @@ readonly LEGACY_OPENCLAW_GATEWAY_PERMIT_DRIFT_HELPER_SHA256="16a86a2144f0d2c36e3
 # Helper succession (5.0.4+; 5.0.6 adds the 5.0.4 helper 677c8464 as a
 # predecessor). An open OpenClaw migration transaction always
 # runs the helper sealed into its ledger. When that sealed helper is one of
-# these predecessor releases needs corrected recovery logic, explicit rescue
-# or --recover for retained Chat may record this release's helper as its
-# attested successor. The sealed bytes and the ledger pin
+# these predecessor releases needs corrected recovery logic, explicit rescue,
+# retained-Chat --recover, or ordinary recovery of the published 5.1.0 helper
+# may record this release's helper as its attested successor. The sealed bytes and the ledger pin
 # are never rewritten; the successor lives beside them and the loader
 # re-verifies both on every call. The successor digest is the sha256 of this
 # release's installer/openclaw-migration-transaction.py and is enforced by
 # scripts/validation/openclaw-migration-helper-identity-static.py.
-readonly OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S="34fda5b3c4dc5ca6b4586e4211890464620ee6d38b028b2c8861fbe0d4c2c184,5183363eba478c34a84712ef3b9b4e6d7cc819e77a8d1c601adc5c447a45a819,8fdc3bc1b5a17683a190306a60d16c0ad1863bf391c265df9a6cf2dc36bd1a44,6b871fcbf7d54ff485b66d1841af33dcbbef1bdcb7dbcd568c477f816a774f07,28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9,677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5,4d1f3e4ca51191348161b8e4d8be6e92a2f97061ee40b90060db95c2dc7cd15a,2d4f9877628a62e7cf12a49c724a517e7b19f9b0e979485c32f425f560757500"
-readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="c2050119aabcf61e197861da20947c934343981cf88a6d6955f61c0c537a4fe9"
+readonly OPENCLAW_MIGRATION_TRANSACTION_PREDECESSOR_HELPER_SHA256S="34fda5b3c4dc5ca6b4586e4211890464620ee6d38b028b2c8861fbe0d4c2c184,5183363eba478c34a84712ef3b9b4e6d7cc819e77a8d1c601adc5c447a45a819,8fdc3bc1b5a17683a190306a60d16c0ad1863bf391c265df9a6cf2dc36bd1a44,6b871fcbf7d54ff485b66d1841af33dcbbef1bdcb7dbcd568c477f816a774f07,28bfe4462bbc8b4ceb6df4062eb456d1ad08ca13b4e29145b5a6b14260b188d9,677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5,4d1f3e4ca51191348161b8e4d8be6e92a2f97061ee40b90060db95c2dc7cd15a,2d4f9877628a62e7cf12a49c724a517e7b19f9b0e979485c32f425f560757500,c2050119aabcf61e197861da20947c934343981cf88a6d6955f61c0c537a4fe9"
+readonly OPENCLAW_MIGRATION_TRANSACTION_SUCCESSOR_HELPER_SHA256="47da0179309ad7ff4042d42459b0951f1a733a265f9aa071651c59c4601dfbc7"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR="/root/.config/systemd/user/openclaw-gateway.service.d"
 readonly OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN="${OPENCLAW_GATEWAY_ROOT_USER_AUTHORIZATION_FENCE_DROPIN_DIR}/20-bridgesllm-authorization-fence.conf"
 readonly RETAINED_INSTALL_MARKER="${INSTALL_ROOT}/.retained-install-v1.json"
@@ -619,15 +619,17 @@ if len(matches) == 1:
 PY
     )"
   fi
+  # Report only, never a refusal: OpenClaw updates itself natively (updater
+  # v2), so any version, including one newer than every pin this release
+  # knows, is kept exactly as found.
   if [[ -z "${package_version}" && -z "${binary}" ]]; then
     printf '%s\n' "  OpenClaw: absent (unchanged by Portal update)"
-  elif [[ "${package_version}" == "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" \
-    && "${binary}" == "/usr/bin/openclaw" ]]; then
+  elif [[ "${package_version}" =~ ^[0-9]+(\.[0-9]+){1,3}([-+][0-9A-Za-z.-]+)?$ ]]; then
     printf '%s\n' \
-      "  OpenClaw: exact ${PIN_OPENCLAW_CORE_PACKAGE_VERSION} pin (unchanged by Portal update)"
+      "  OpenClaw: ${package_version} (unchanged by Portal update; update it from the Maintenance page)"
   else
     printf '%s\n' \
-      "  OpenClaw: drifted or unavailable (unchanged; use separate reviewed host maintenance)"
+      "  OpenClaw: installed, version unreadable (unchanged by Portal update)"
   fi
 }
 
@@ -9505,8 +9507,10 @@ succeed_openclaw_migration_transaction_helper() {
   # predecessor. The loader decides whether the shipped bytes may run for the
   # succession verb; this only routes. Idempotent once recorded.
   local sealed pin installer_sha256=""
-  local succession_reason="successor verb required: reconcile-rescued-gateway"
-  if ${RECOVER_ONLY:-false}; then
+  local succession_reason="ordinary interrupted migration recovery"
+  if ${RECONCILE_RESCUED_GATEWAY:-false}; then
+    succession_reason="successor verb required: reconcile-rescued-gateway"
+  elif ${RECOVER_ONLY:-false}; then
     succession_reason="explicit migration recovery"
   fi
   sealed="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-migration-transaction.py"
@@ -9787,6 +9791,76 @@ PY
   fi
   node --input-type=module - "$@" <&${helper_fd}
   local result=$?
+  exec {helper_fd}<&-
+  return "${result}"
+}
+
+acquire_openclaw_diagnostic_lease() {
+  # Shared Portal CLI leases drain before any native package/state changes.
+  # This descriptor lives through the installer's EXIT/recovery handlers. Never
+  # unlink the lock: doing so would create two independent lease domains.
+  [[ -z "${OPENCLAW_DIAGNOSTIC_LEASE_FD:-}" ]] || return 0
+  local lock_path="${UPDATE_STATE_ROOT}/openclaw-diagnostic-readers.lock" identity opened lease_fd
+  identity="$(python3 -I - "${UPDATE_STATE_ROOT}" "${lock_path}" <<'PYLEASE'
+import os, pathlib, stat, sys
+root, lock = map(pathlib.Path, sys.argv[1:])
+for entry in root.parents:
+    s = entry.lstat()
+    if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_mode & 0o022:
+        raise SystemExit('unsafe diagnostic lease directory')
+try:
+    root.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+s = root.lstat()
+if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or stat.S_IMODE(s.st_mode) != 0o700:
+    raise SystemExit('unsafe diagnostic lease root')
+fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+try:
+    s = os.fstat(fd)
+    if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_nlink != 1 or s.st_size != 0 or s.st_mode & 0o022:
+        raise SystemExit('unsafe diagnostic lease inode')
+    os.fchmod(fd, 0o600)
+    print(f'{s.st_dev}:{s.st_ino}')
+finally:
+    os.close(fd)
+PYLEASE
+)" || return 1
+  exec {lease_fd}<>"${lock_path}" || return 1
+  opened="$(stat -Lc '%d:%i' "/proc/$$/fd/${lease_fd}")" || { exec {lease_fd}>&-; return 1; }
+  [[ "${opened}" == "${identity}" && ! -L "${lock_path}" ]] || { exec {lease_fd}>&-; return 1; }
+  flock --exclusive --wait 75 "${lease_fd}" || {
+    printf '%s\n' 'OpenClaw maintenance could not drain Portal diagnostic readers within 75 seconds. No gateway shutdown or native mutation was started; wait for ongoing diagnostics to finish and retry.' >> "${LOG_FILE}"
+    exec {lease_fd}>&-
+    return 1
+  }
+  OPENCLAW_DIAGNOSTIC_LEASE_FD="${lease_fd}"
+}
+
+# Read-only, while the gateway still runs and before any transaction, fence or
+# stop exists: refuse the path, agent layout, plugin payload link, free-space
+# and outside SQLite reader conditions the stopped snapshot would refuse. The
+# running gateway's own unit may hold its databases; nothing is signalled.
+preflight_openclaw_state_migration() {
+  local helper="${PORTAL_DIR}/installer/migrate-openclaw-${PIN_OPENCLAW_CORE_PACKAGE_VERSION}.mjs"
+  local package_dir gateway_cgroup="" helper_fd result=0
+  # Only the 2026.10.6 migrator carries the preflight verb.
+  [[ "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.10.6" ]] || return 0
+  [[ -f "${helper}" && ! -L "${helper}" ]] || return 1
+  package_dir="$(openclaw_core_package_dir)" || return 1
+  if systemctl is-active --quiet openclaw-gateway.service; then
+    gateway_cgroup="$(systemctl show -p ControlGroup --value openclaw-gateway.service 2>/dev/null || true)"
+    [[ "${gateway_cgroup}" == /* ]] || return 1
+  fi
+  local -a command=(
+    preflight --manifest "${OPENCLAW_MIGRATION_2026_9_1_MANIFEST}"
+    --state-dir /root/.openclaw --config /root/.openclaw/openclaw.json
+    --package-dir "${package_dir}"
+  )
+  [[ -z "${gateway_cgroup}" ]] || command+=(--gateway-cgroup "${gateway_cgroup}")
+  exec {helper_fd}<"${helper}" || return 1
+  node --input-type=module - "${command[@]}" <&${helper_fd} >> "${LOG_FILE}" 2>&1 \
+    || result=$?
   exec {helper_fd}<&-
   return "${result}"
 }
@@ -10579,6 +10653,16 @@ sys.exit(not (
 ' "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}"
 }
 
+openclaw_published_510_recovery_successor_required() {
+  # Selection only, before the old helper can write an unloadable STOP journal.
+  # The descriptor-backed loader still authenticates the sealed ledger, exact
+  # predecessor and signed successor before admitting any succession write.
+  local sealed="${OPENCLAW_MIGRATION_TRANSACTION_ROOT}/openclaw-migration-transaction.py"
+  [[ -f "${sealed}" && ! -L "${sealed}" ]] || return 1
+  [[ "$(sha256sum -- "${sealed}" 2>/dev/null | awk '{print $1}')" == \
+    "c2050119aabcf61e197861da20947c934343981cf88a6d6955f61c0c537a4fe9" ]]
+}
+
 reconcile_openclaw_migration_transaction() {
   if openclaw_native_chat_transaction_present; then
     [[ -d "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
@@ -10596,11 +10680,12 @@ reconcile_openclaw_migration_transaction() {
   fi
   [[ -e "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" \
     || -L "${OPENCLAW_MIGRATION_TRANSACTION_ROOT}" ]] || return 0
-  # The explicit rescue operation must reach a transaction sealed to a
-  # predecessor helper before that helper is asked anything it cannot do.
-  # Ordinary updates keep running exactly the sealed bytes. Explicit recovery
-  # may also reach the R10 fresh-state cleanup fix through authenticated succession.
+  acquire_openclaw_diagnostic_lease || return 1
+  # The published 5.1.0 helper can strand its own forward STOP in recovery.
+  # Succeed it before the first inspect/advance, including ordinary update and
+  # maintenance admission. Other historical owners retain their prior routing.
   if $RECONCILE_RESCUED_GATEWAY \
+    || openclaw_published_510_recovery_successor_required \
     || { ${RECOVER_ONLY:-false} && { retained_chat_update_owner_present \
       || openclaw_state_absence_recovery_owner_present; }; }; then
     # Selection is not authority: the loader validates the sealed predecessor,
@@ -10760,6 +10845,10 @@ let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () 
       "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" recovery-pending || return 1
   fi
   if [[ "${OPENCLAW_MIGRATION_TRANSACTION_PHASE}" == "recovery-pending" ]]; then
+    # A forward STOP armed before recovery began is carried here, bound to
+    # its exact generation. Finish or attest that stop before any restore;
+    # a pending START is never executed by this step.
+    reconcile_openclaw_core_gateway_action_without_start >/dev/null || return 1
     reconcile_openclaw_codex_transaction || return 1
     if [[ -e "${OPENCLAW_MIGRATION_2026_9_1_MANIFEST}" \
       || -L "${OPENCLAW_MIGRATION_2026_9_1_MANIFEST}" ]]; then
@@ -11685,6 +11774,8 @@ admit_retained_openclaw_runtime_before_native_staging() {
 
 converge_openclaw_core_package() {
   $SKIP_OPENCLAW && return 0
+  acquire_openclaw_diagnostic_lease \
+    || fail "OpenClaw diagnostic readers could not be quiesced before runtime convergence."
   command -v npm >/dev/null 2>&1 || fail "npm is required to install the tested OpenClaw runtime."
 
   if [[ ( "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.9.9" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.10.5" || "${PIN_OPENCLAW_CORE_PACKAGE_VERSION}" == "2026.10.6" ) ]] \
@@ -11762,6 +11853,9 @@ converge_openclaw_core_package() {
       fi
     elif $OPENCLAW_GATEWAY_WAS_ENABLED; then
       fail "The existing OpenClaw gateway is enabled but not running; refusing to replace ${current_package_version} without a safe live rollback baseline."
+    fi
+    if $OPENCLAW_STATE_CONFIG_PREEXISTED && ! preflight_openclaw_state_migration; then
+      fail "OpenClaw state is not ready for migration; the gateway was not stopped and nothing was changed. The reason is in ${LOG_FILE}."
     fi
     if ! stage_openclaw_rollback_package "${current_package_version}"; then
       fail "Could not preserve an exact local rollback package for OpenClaw ${current_package_version}."
@@ -12069,20 +12163,21 @@ ollama_server_version() {
 }
 
 verify_ollama_client_server_parity() {
-  local timeout_secs="${1:-60}" waited=0 client_version server_version
+  # $2: the version expected (toolctl's verified release); default the frozen pin.
+  local timeout_secs="${1:-60}" expected="${2:-${PIN_OLLAMA_VERSION}}" waited=0 client_version server_version
   while (( waited < timeout_secs )); do
     client_version="$(ollama_client_version || true)"
     server_version="$(ollama_server_version || true)"
     if systemctl is-active --quiet ollama \
-      && [[ "${client_version}" == "${PIN_OLLAMA_VERSION}" \
-        && "${server_version}" == "${PIN_OLLAMA_VERSION}" ]]; then
+      && [[ "${client_version}" == "${expected}" \
+        && "${server_version}" == "${expected}" ]]; then
       ok "Ollama ${client_version} exact client/server pin verified"
       return 0
     fi
     sleep 2
     waited=$((waited + 2))
   done
-  warn "Ollama exact pin mismatch after restart (expected ${PIN_OLLAMA_VERSION}; client: ${client_version:-unknown}, server: ${server_version:-unavailable})."
+  warn "Ollama exact pin mismatch after restart (expected ${expected}; client: ${client_version:-unknown}, server: ${server_version:-unavailable})."
   return 1
 }
 
@@ -13103,9 +13198,51 @@ ensure_ollama_service_account() {
   fi
 }
 
+# Prints the version toolctl's admission record admits when it names exactly
+# this binary (path and sha256) at or above the frozen pin and its bytes were
+# verified by an install (a re-check reads only GitHub's record); fails otherwise.
+ollama_admitted_version() {
+  local binary="$1"
+  local record="${BRIDGESLLM_TOOLS_ADMISSION_DIR:-/var/lib/bridgesllm/tools/admission}/ollama.json"
+  [[ -f "${record}" && ! -L "${record}" ]] || return 1
+  python3 -I - "${record}" "${binary}" "${PIN_OLLAMA_VERSION}" <<'PY'
+import hashlib, json, re, sys
+
+record_path, binary, floor = sys.argv[1:4]
+key = lambda version: tuple(int(part) for part in version.split("."))
+try:
+    with open(record_path, "rb") as handle:
+        record = json.loads(handle.read(65536))
+    version = record["version"]
+    entry = record["executables"]["ollama"]
+    if record["schema"] != "bridgesllm.tools.harness-admission.v1" or record["toolId"] != "ollama" \
+            or not re.fullmatch(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", version) or key(version) < key(floor) \
+            or entry["path"] != binary or record["source"]["bytesVerified"] is not True:
+        raise ValueError("record does not admit this binary")
+    digest = hashlib.sha256()
+    with open(binary, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != entry["sha256"]:
+        raise ValueError("binary differs from the admitted one")
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+print(version)
+PY
+}
+
+# With no arguments: the frozen pin. With <version> <sha256> <size>: that
+# official GitHub release, as toolctl verified it (do_toolctl_ollama_update);
+# the same sealed transaction, cutover, rollback and parity check either way.
 install_or_update_ollama() {
   $SKIP_OLLAMA && return 0
 
+  local target="${PIN_OLLAMA_VERSION}" target_sha256="" target_size=""
+  if (( $# > 0 )); then
+    [[ "$#" -eq 3 && "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$2" =~ ^[a-f0-9]{64}$ && "$3" =~ ^[1-9][0-9]*$ ]] \
+      || fail "The Ollama release to install is malformed."
+    target="$1" target_sha256="$2" target_size="$3"
+  fi
   local binary library unit transaction transaction_parent nv_tegra
   local arch asset_url asset_sha256 asset_size asset_record
   local previous_version prepare archive staged_binary staged_unit
@@ -13123,7 +13260,7 @@ install_or_update_ollama() {
     fail "An interrupted Ollama transaction could not be restored exactly. The service remains stopped and the private transaction journal was preserved."
   fi
   if [[ -e "${nv_tegra}" || -L "${nv_tegra}" ]]; then
-    fail "Managed Ollama ${PIN_OLLAMA_VERSION} installation is unavailable on NVIDIA JetPack until the release's supplemental JetPack archive hashes are frozen."
+    fail "Managed Ollama ${target} installation is unavailable on NVIDIA JetPack until the release's supplemental JetPack archive hashes are frozen."
   fi
   ollama_transaction_action cleanup-retired \
     "${transaction}" "${binary}" "${library}" "${unit}" \
@@ -13133,8 +13270,15 @@ install_or_update_ollama() {
   fi
 
   previous_version="$(ollama_client_version || true)"
-  if [[ "${previous_version}" == "${PIN_OLLAMA_VERSION}" ]] \
-    && verify_ollama_client_server_parity 4; then
+  if [[ "${previous_version}" == "${target}" ]] \
+    && verify_ollama_client_server_parity 4 "${target}"; then
+    return 0
+  fi
+  # A newer official release that Maintenance (toolctl) verified, installed and
+  # admitted is kept, not converged back to the frozen pin (the floor here).
+  if [[ -z "${target_sha256}" && -n "${previous_version}" ]] \
+    && [[ "$(ollama_admitted_version "${binary}" || true)" == "${previous_version}" ]] \
+    && verify_ollama_client_server_parity 4 "${previous_version}"; then
     return 0
   fi
   if [[ ! -e "${binary}" && ! -L "${binary}" ]] \
@@ -13144,9 +13288,14 @@ install_or_update_ollama() {
   fi
 
   arch="$(ollama_release_arch)" \
-    || fail "Ollama ${PIN_OLLAMA_VERSION} has no qualified asset for architecture $(uname -m)."
-  asset_record="$(ollama_release_asset "${arch}")" \
-    || fail "Could not select the frozen Ollama ${PIN_OLLAMA_VERSION} release asset."
+    || fail "Ollama ${target} has no qualified asset for architecture $(uname -m)."
+  if [[ -n "${target_sha256}" ]]; then
+    asset_record="$(printf 'https://github.com/ollama/ollama/releases/download/v%s/ollama-linux-%s.tar.zst\t%s\t%s\n' \
+      "${target}" "${arch}" "${target_sha256}" "${target_size}")"
+  else
+    asset_record="$(ollama_release_asset "${arch}")" \
+      || fail "Could not select the frozen Ollama ${target} release asset."
+  fi
   IFS=$'\t' read -r asset_url asset_sha256 asset_size <<< "${asset_record}"
   [[ "${asset_sha256}" =~ ^[a-f0-9]{64}$ && "${asset_size}" =~ ^[1-9][0-9]*$ ]] \
     || fail "The frozen Ollama release metadata is malformed."
@@ -13160,17 +13309,17 @@ install_or_update_ollama() {
   if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
     -fsSL "${asset_url}" -o "${archive}"; then
     ollama_discard_unsealed_prepare "${prepare}" "${transaction_parent}" || true
-    fail "The frozen Ollama ${PIN_OLLAMA_VERSION} ${arch} archive could not be downloaded."
+    fail "The frozen Ollama ${target} ${arch} archive could not be downloaded."
   fi
   if ! ollama_transaction_action extract \
     "${prepare}" "${archive}" "${asset_size}" "${asset_sha256}"; then
     ollama_discard_unsealed_prepare "${prepare}" "${transaction_parent}" || true
-    fail "The Ollama ${PIN_OLLAMA_VERSION} archive failed checksum, size, path, type, or expansion validation."
+    fail "The Ollama ${target} archive failed checksum, size, path, type, or expansion validation."
   fi
   staged_binary="${prepare}/staged/bin/ollama"
-  if [[ "$(ollama_binary_version "${staged_binary}" || true)" != "${PIN_OLLAMA_VERSION}" ]]; then
+  if [[ "$(ollama_binary_version "${staged_binary}" || true)" != "${target}" ]]; then
     ollama_discard_unsealed_prepare "${prepare}" "${transaction_parent}" || true
-    fail "The authenticated Ollama archive did not contain the exact ${PIN_OLLAMA_VERSION} client."
+    fail "The authenticated Ollama archive did not contain the exact ${target} client."
   fi
   staged_unit="${prepare}/staged/ollama.service"
   {
@@ -13225,17 +13374,38 @@ install_or_update_ollama() {
   if ! systemctl daemon-reload >> "${LOG_FILE}" 2>&1 \
     || ! systemctl enable ollama >> "${LOG_FILE}" 2>&1 \
     || ! systemctl restart ollama >> "${LOG_FILE}" 2>&1 \
-    || ! verify_ollama_client_server_parity 60; then
+    || ! verify_ollama_client_server_parity 60 "${target}"; then
     recover_pending_ollama_transaction || true
-    fail "Ollama ${PIN_OLLAMA_VERSION} did not pass exact client/server verification; the prior runtime was restored when possible."
+    fail "Ollama ${target} did not pass exact client/server verification; the prior runtime was restored when possible."
   fi
   if ! ollama_transaction_action retire \
     "${transaction}" "${binary}" "${library}" "${unit}"; then
-    fail "Ollama ${PIN_OLLAMA_VERSION} is healthy, but its durable transaction commit could not be recorded. If the active journal remains, the next installer run will conservatively restore the previous runtime."
+    fail "Ollama ${target} is healthy, but its durable transaction commit could not be recorded. If the active journal remains, the next installer run will conservatively restore the previous runtime."
   fi
   ollama_transaction_action cleanup-retired \
     "${transaction}" "${binary}" "${library}" "${unit}" \
-    || warn "Ollama ${PIN_OLLAMA_VERSION} committed successfully, but retired private rollback files could not be removed safely."
+    || warn "Ollama ${target} committed successfully, but retired private rollback files could not be removed safely."
+}
+
+# Updater v2 (d.4): toolctl's Ollama update runs only install_or_update_ollama,
+# fed the GitHub release toolctl verified (version, asset sha256 and size). Its
+# sealed transaction journal, cutover, rollback and client/server parity check
+# are reused; only ollama.service restarts and model files are never touched.
+# toolctl holds the Portal operation lock for its whole run: this entry refuses
+# to run unless that lock is held, and never takes it itself.
+do_toolctl_ollama_update() {
+  [[ "$#" -eq 4 && "$1" == "--toolctl-ollama-update" ]] \
+    || fail "--toolctl-ollama-update is a dedicated operation: --toolctl-ollama-update <version> <sha256> <size>."
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Must update Ollama as root."
+  command -v zstd >/dev/null 2>&1 \
+    || fail "zstd is not installed, so the Ollama release archive cannot be unpacked; nothing was changed."
+  [[ -e "${PORTAL_OPERATION_LOCK_PATH}" ]] && ! flock -n "${PORTAL_OPERATION_LOCK_PATH}" true 2>/dev/null \
+    || fail "Run this only from the Portal tools runner, which holds the Portal operation lock."
+  mkdir -p "$LOG_DIR"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  install_or_update_ollama "$2" "$3" "$4"
+  ok "Ollama $2 is installed and its client and server agree."
 }
 
 converge_grok_build() {
@@ -15180,10 +15350,14 @@ with tarfile.open(artifact_path, "r:gz") as archive:
         } for part in relative_parts):
             raise SystemExit("archive contains private or non-runtime paths")
         lowered = name.lower()
+        # The Portal's own OpenClaw plugins ship packed beside their manifest (release inventory; toolctl PF-13 checks
+        # each archive against it before use). No other archive is admitted.
+        portal_plugin_archive = member.isfile() and re.fullmatch(
+            r"portal/installer/plugins/bridgesllm-[a-z0-9]+(?:-[a-z0-9]+)*-[0-9]+\.[0-9]+\.[0-9]+\.tgz", name) is not None
         if lowered.endswith((
             ".bak", ".db", ".d.ts", ".log", ".map", ".orig", ".rej",
             ".sqlite", ".sqlite3", ".tar.gz", ".tgz",
-        )):
+        )) and not portal_plugin_archive:
             raise SystemExit("archive contains private or generated residue")
         basename = path.name.lower()
         if basename == ".env" or basename.startswith(".env."):
@@ -17564,12 +17738,14 @@ PORTAL_RUNTIME_REPAIR_LAUNCHER_RELEASES = {
 OPENCLAW_MIGRATION_HELPER = (
     "/opt/bridgesllm/portal/installer/openclaw-migration-transaction.py"
 )
-OPENCLAW_MIGRATION_HELPER_CURRENT = (278377, "c2050119aabcf61e197861da20947c934343981cf88a6d6955f61c0c537a4fe9")
+OPENCLAW_MIGRATION_HELPER_CURRENT = (280653, "47da0179309ad7ff4042d42459b0951f1a733a265f9aa071651c59c4601dfbc7")
 OPENCLAW_MIGRATION_HELPER_RELEASES = {
     (276940, "34fda5b3c4dc5ca6b4586e4211890464620ee6d38b028b2c8861fbe0d4c2c184"),
     (276481, "5183363eba478c34a84712ef3b9b4e6d7cc819e77a8d1c601adc5c447a45a819"),
     (275361, "8fdc3bc1b5a17683a190306a60d16c0ad1863bf391c265df9a6cf2dc36bd1a44"),
     OPENCLAW_MIGRATION_HELPER_CURRENT,
+    # Portal 5.1.0 helper (OpenClaw 2026.10.6 pin); predecessor of the 5.1.1 helper.
+    (278377, "c2050119aabcf61e197861da20947c934343981cf88a6d6955f61c0c537a4fe9"),
     # Portal 5.1.0 helper (OpenClaw 2026.10.5 pin); predecessor of the 10.6 helper.
     (278364, "2d4f9877628a62e7cf12a49c724a517e7b19f9b0e979485c32f425f560757500"),
     (275336, "6b871fcbf7d54ff485b66d1841af33dcbbef1bdcb7dbcd568c477f816a774f07"),
@@ -17579,6 +17755,24 @@ OPENCLAW_MIGRATION_HELPER_RELEASES = {
     (194643, "677c8464fa74e826b25d144f69639ca8f78d5063a5e4a1e5a0f385af83b006c5"),
     # Published Portal 5.0.6 helper.
     (196185, "4d1f3e4ca51191348161b8e4d8be6e92a2f97061ee40b90060db95c2dc7cd15a"),
+}
+# Portal 5.2.0 enables bridgesllm-tools-reconcile.service and installs the
+# bridgesllm-tools@.service template. Both run the Portal's AI tools runner
+# (toolctl) with python3 -I, so every later --update and --repair scans it as
+# a scheduled helper, and it is larger than the generic 128 KiB helper bound.
+# Attest its exact shipped bytes at its exact path instead of parsing it or
+# raising the bound. installer/toolctl-identities.tsv is the append-only,
+# version-labelled ledger of the toolctl every signed build installs;
+# scripts/validation/portal-toolctl-identity-static.py fails the build unless
+# this set matches that ledger exactly and its last row is the toolctl this
+# release ships, so no host is left unable to update or repair.
+PORTAL_TOOLCTL = "/opt/bridgesllm/portal/installer/tools/bridgesllm-toolctl.py"
+PORTAL_TOOLCTL_RELEASES = {
+    (571954, "58104ce59c268fbf75fa1544d58e7f8f5fc8a74bfd14381c20ca753e487dd13c"),
+    (583261, "2cbcc18e3e8c9b08999c5995d80742f988b5029bbda6ca62fc0cb44989c49c06"),
+    (600913, "58c37259a2da21c93f4f0ce1d36f9b46fa4e0e85863642ee6250c6184648d7d7"),
+    (610363, "83cf9ce402abb90f709968dd94ae108819fb2c708b6e2fba35473c1d74430f90"),
+    (609956, "71c0cf61ec681894b80daa1fa651103a5ba6a6b40a587d22778f7d2477ac7cef"),
 }
 LEGACY = b'13 0 * * * root docker image prune -af --filter "until=24h"\n'
 SEPARATORS = {";", "&", "&&", "|", "||"}
@@ -19521,6 +19715,84 @@ def is_audited_openclaw_migration_helper(logical_path, path, metadata):
     return True
 
 
+def is_audited_portal_toolctl(logical_path, path, metadata):
+    # Exact logical path and exact resolved path: a link at toolctl's path or
+    # a link elsewhere pointing at toolctl's bytes is not the Portal's toolctl.
+    if (
+        os.path.normpath(logical_path) != PORTAL_TOOLCTL
+        or display(path) != PORTAL_TOOLCTL
+    ):
+        return False
+    if metadata.st_size > PORTAL_AUDITED_HELPER_LIMIT:
+        fail(
+            "scheduled Portal AI tools runner exceeds its 1 MiB audited "
+            "release limit"
+        )
+    if metadata.st_size not in {
+        release_size for release_size, _ in PORTAL_TOOLCTL_RELEASES
+    }:
+        fail(
+            "scheduled Portal AI tools runner does not match a known shipped "
+            "BridgesLLM release; restore it through a signed update before "
+            "retrying"
+        )
+    # Releases ship toolctl 0755; 0700 is the same file under a private umask.
+    payload, current = read_root_file(
+        path,
+        modes={0o700, 0o755},
+        single_link=True,
+        require_root_group=True,
+    )
+    expected_identity = (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode,
+        metadata.st_uid, metadata.st_gid, metadata.st_nlink,
+        metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+    current_identity = (
+        current.st_dev, current.st_ino, current.st_mode,
+        current.st_uid, current.st_gid, current.st_nlink,
+        current.st_size, current.st_mtime_ns, current.st_ctime_ns,
+    )
+    if current_identity != expected_identity:
+        fail(
+            "scheduled Portal AI tools runner changed before release "
+            "attestation"
+        )
+    digest = hashlib.sha256(payload).hexdigest()
+    if (
+        os.environ.get("BRIDGESLLM_INSTALLER_SOURCE_ONLY") == "1"
+        and root != "/"
+        and os.environ.get("BRIDGESLLM_DOCKER_PRUNE_TEST_HOOK", "")
+        == "portal-helper-post-read-replacement"
+    ):
+        replacement = path + ".test-replacement"
+        displaced = path + ".test-old"
+        if os.path.lexists(displaced) or not os.path.isfile(replacement):
+            fail("Portal helper replacement fixture is incomplete")
+        os.rename(path, displaced)
+        os.rename(replacement, path)
+    final = lstat_or_none(path)
+    if final is None:
+        fail("scheduled Portal AI tools runner disappeared after attestation")
+    final_identity = (
+        final.st_dev, final.st_ino, final.st_mode,
+        final.st_uid, final.st_gid, final.st_nlink,
+        final.st_size, final.st_mtime_ns, final.st_ctime_ns,
+    )
+    if final_identity != expected_identity:
+        fail(
+            "scheduled Portal AI tools runner changed during release "
+            "attestation"
+        )
+    if (metadata.st_size, digest) not in PORTAL_TOOLCTL_RELEASES:
+        fail(
+            "scheduled Portal AI tools runner does not match a known shipped "
+            "BridgesLLM release; restore it through a signed update before "
+            "retrying"
+        )
+    return True
+
+
 class HelperBudget:
     def __init__(self, scheduler_entries, scheduler_directories):
         self.files = 0
@@ -19555,6 +19827,7 @@ class HelperBudget:
             or is_audited_openclaw_migration_helper(
                 logical_path, path, metadata
             )
+            or is_audited_portal_toolctl(logical_path, path, metadata)
         ):
             # This exact release helper is always attested, even after generic
             # helper work has reached a soft ceiling. Its exact bytes are
@@ -22471,6 +22744,8 @@ SVCEOF
   systemctl daemon-reload
   systemctl enable bridgesllm-product >> "$LOG_FILE" 2>&1
   ok "Portal service created"
+  # Updater v2: the per-tool runner units; a failure only warns.
+  install_tools_runner_units_or_warn
 
   # Caddy / direct local access
   if use_local_profile; then
@@ -31355,10 +31630,23 @@ openclaw_gateway_require_inactive_unit_definition() {
   printf '%s\n' "${current}"
 }
 
+openclaw_gateway_stop_refused() {
+  # One named line per refused stop sub-check. A failed systemctl command is
+  # reported separately from proof that the old generation is still alive.
+  OPENCLAW_GATEWAY_STOP_FAILURE="$1"
+  printf 'OpenClaw gateway stop attestation failed: %s\n' "$1" >> "${LOG_FILE}"
+  return 1
+}
+
 stop_openclaw_gateway_if_identity_matches() {
-  local expected current after matched="" candidate
-  current="$(openclaw_gateway_systemd_identity)" || return 1
-  openclaw_gateway_identity_is_active "${current}" || return 1
+  local expected current after matched="" candidate stop_status=0
+  OPENCLAW_GATEWAY_STOP_FAILURE=""
+  current="$(openclaw_gateway_systemd_identity)" \
+    || openclaw_gateway_stop_refused "unit identity could not be read before stop" \
+    || return 1
+  openclaw_gateway_identity_is_active "${current}" \
+    || openclaw_gateway_stop_refused "unit is not active before stop" \
+    || return 1
   for candidate in "$@"; do
     [[ -n "${candidate}" ]] || continue
     if json_documents_equal "${candidate}" "${current}"; then
@@ -31366,15 +31654,29 @@ stop_openclaw_gateway_if_identity_matches() {
       break
     fi
   done
-  [[ -n "${matched}" ]] || return 1
+  [[ -n "${matched}" ]] \
+    || openclaw_gateway_stop_refused "running generation is not the expected identity" \
+    || return 1
   # This is the last possible userspace re-attestation before the named
   # systemd stop. A different PID, process start tick, InvocationID, unit
   # definition, fragment, cgroup, or ExecStart serialization fails closed.
-  openclaw_gateway_require_exact_identity "${matched}" >/dev/null || return 1
-  systemctl stop openclaw-gateway.service >> "${LOG_FILE}" 2>&1 || return 1
-  after="$(openclaw_gateway_systemd_identity)" || return 1
-  ! openclaw_gateway_identity_is_active "${after}" || return 1
-  openclaw_gateway_unit_definition_equal "${matched}" "${after}"
+  openclaw_gateway_require_exact_identity "${matched}" >/dev/null \
+    || openclaw_gateway_stop_refused "generation changed during final re-attestation" \
+    || return 1
+  systemctl stop openclaw-gateway.service >> "${LOG_FILE}" 2>&1 || stop_status=$?
+  after="$(openclaw_gateway_systemd_identity)" \
+    || openclaw_gateway_stop_refused "unit identity could not be read after stop (systemctl exit ${stop_status})" \
+    || return 1
+  if openclaw_gateway_identity_is_active "${after}"; then
+    openclaw_gateway_stop_refused "unit is still active after stop (systemctl exit ${stop_status})"
+    return 1
+  fi
+  openclaw_gateway_unit_definition_equal "${matched}" "${after}" \
+    || openclaw_gateway_stop_refused "unit definition changed during stop (systemctl exit ${stop_status})" \
+    || return 1
+  (( stop_status == 0 )) \
+    || openclaw_gateway_stop_refused "systemctl stop exited ${stop_status} although the unit is now inactive" \
+    || return 1
 }
 
 openclaw_gateway_migration_authority_exists() {
@@ -32034,9 +32336,11 @@ entry = entries.get("bridgesllm-ask-user") if isinstance(entries, dict) else Non
 if not isinstance(entry, dict) or entry.get("enabled") is not True:
     raise SystemExit(1)
 allow = plugins.get("allow")
+# Missing and empty allowlists are both unrestricted in OpenClaw and the
+# registrar keeps them that way; only a nonempty list must name the plugin.
 if allow is not None and (
     not isinstance(allow, list)
-    or "bridgesllm-ask-user" not in allow
+    or (allow and "bridgesllm-ask-user" not in allow)
 ):
     raise SystemExit(1)
 agents = value.get("agents")
@@ -32071,13 +32375,17 @@ verify_bridgesllm_ask_user_plugin_runtime() {
   local output_path="$2"
   local question_authority=""
   question_authority="$(bridgesllm_ask_user_question_authority)" \
+    || bridgesllm_ask_user_verify_failed "plugin runtime question authority for ${PIN_OPENCLAW_RUNTIME_VERSION:-unset}" \
     || return 1
-  if ! OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect \
+  local inspect_status=0
+  OPENCLAW_ALLOW_ROOT=1 openclaw plugins inspect \
       bridgesllm-ask-user --json --runtime > "${output_path}" \
-      2>> "${LOG_FILE}"; then
-    return 1
+      2>> "${LOG_FILE}" || inspect_status=$?
+  if (( inspect_status != 0 )); then
+    bridgesllm_ask_user_verify_failed "plugin runtime inspect command (exit ${inspect_status})" || true
+    return "${inspect_status}"
   fi
-  python3 - \
+  if ! python3 - \
     "${output_path}" \
     "${target_dir}" \
     "${PIN_BRIDGESLLM_ASK_USER_PLUGIN_VERSION}" \
@@ -32151,6 +32459,10 @@ if (
 ):
     raise SystemExit(1)
 PY
+  then
+    bridgesllm_ask_user_verify_failed "plugin runtime report contract"
+    return 1
+  fi
 }
 
 verify_bridgesllm_ask_user_gateway_method() {
@@ -32158,14 +32470,17 @@ verify_bridgesllm_ask_user_gateway_method() {
   local mode="${2:-full}"
   local config_path="${3:-/root/.openclaw/openclaw.json}"
   local nonce session_key run_id request_id question_id question_authority
-  local method params probe_kind rpc_status expect_failure
+  local method params probe_kind rpc_status expect_failure rpc_timeout_ms
   case "${mode}" in
     full|bootstrap) ;;
-    *) return 1 ;;
+    *) bridgesllm_ask_user_verify_failed "gateway unsupported mode ${mode}"; return 1 ;;
   esac
   question_authority="$(bridgesllm_ask_user_question_authority)" \
+    || bridgesllm_ask_user_verify_failed "gateway question authority for ${PIN_OPENCLAW_RUNTIME_VERSION:-unset}" \
     || return 1
-  nonce="$(rand_hex 12)" || return 1
+  nonce="$(rand_hex 12)" \
+    || bridgesllm_ask_user_verify_failed "gateway probe nonce" \
+    || return 1
   session_key="agent:main:bridgesllm-install-probe-${nonce}"
   run_id="bridgesllm-install-probe-${nonce}"
   request_id="bridgesllm-install-request-${nonce}"
@@ -32175,11 +32490,14 @@ verify_bridgesllm_ask_user_gateway_method() {
   # testing either authority surface. Never normalize arbitrary package suffixes
   # into a supported runtime: only the retained 7.1 identities and exact 9.1
   # identity have compatibility evidence.
-  if ! run_local_openclaw_gateway_rpc "${config_path}" call status \
+  local status_rpc_exit=0
+  run_local_openclaw_gateway_rpc "${config_path}" call status \
       --json --timeout 10000 \
       --params '{"includeChannelSummary":false}' \
-      > "${output_path}" 2>> "${LOG_FILE}"; then
-    return 1
+      > "${output_path}" 2>> "${LOG_FILE}" || status_rpc_exit=$?
+  if (( status_rpc_exit != 0 )); then
+    bridgesllm_ask_user_verify_failed "gateway status RPC (exit ${status_rpc_exit})" || true
+    return "${status_rpc_exit}"
   fi
   if ! python3 - "${output_path}" "${PIN_OPENCLAW_RUNTIME_VERSION}" <<'PY'
 import json
@@ -32200,6 +32518,7 @@ if raw not in allowed.get(expected, {expected}):
     raise SystemExit(1)
 PY
   then
+    bridgesllm_ask_user_verify_failed "gateway status runtimeVersion (expected ${PIN_OPENCLAW_RUNTIME_VERSION})"
     return 1
   fi
 
@@ -32220,10 +32539,15 @@ PY
 
   for probe_kind in "${probe_kinds[@]}"; do
     expect_failure=false
+    rpc_timeout_ms=10000
     case "${probe_kind}" in
       tool-catalog)
         method="tools.catalog"
         params='{"agentId":"main","includePlugins":true}'
+        # The first catalog after boot loads the plugin tool registry inside
+        # the gateway. Native 2026.10.6 with 13 agents took 13.9 s for it
+        # (TEST, 2026-10-29). Every other probe keeps its 10 s budget.
+        rpc_timeout_ms=30000
         ;;
       question-list)
         method="question.list"
@@ -32269,13 +32593,17 @@ PY
     run_local_openclaw_gateway_rpc "${config_path}" call \
         "${method}" \
         --json \
-        --timeout 10000 \
+        --timeout "${rpc_timeout_ms}" \
         --params "${params}" > "${output_path}" 2>> "${LOG_FILE}" \
       || rpc_status=$?
     if $expect_failure; then
-      (( rpc_status != 0 )) || return 1
+      (( rpc_status != 0 )) \
+        || bridgesllm_ask_user_verify_failed "gateway ${probe_kind} (${method}) RPC succeeded; a refusal was expected" \
+        || return 1
     else
-      (( rpc_status == 0 )) || return 1
+      (( rpc_status == 0 )) \
+        || bridgesllm_ask_user_verify_failed "gateway ${probe_kind} (${method}) RPC exit ${rpc_status}" \
+        || return 1
     fi
     if ! python3 - \
       "${output_path}" "${probe_kind}" "${request_id}" "${mode}" \
@@ -32364,9 +32692,44 @@ if not valid:
     raise SystemExit(1)
 PY
     then
+      bridgesllm_ask_user_verify_failed "gateway ${probe_kind} (${method}) response contract"
       return 1
     fi
   done
+}
+
+bridgesllm_ask_user_verify_failed() {
+  # One named line per failed stage or probe; the caller keeps its output.
+  BRIDGESLLM_ASK_USER_VERIFY_FAILURE="$1"
+  printf 'ask-user tested-pair verification failed at: %s\n' "$1" >> "${LOG_FILE}"
+  return 1
+}
+
+retain_bridgesllm_ask_user_verify_evidence() {
+  # The failing stage's raw output stays root-only on this host for diagnosis;
+  # it is never published. Retention is bounded to the newest 40 records.
+  local output_path="$1" stage="$2"
+  local state_root="${UPDATE_STATE_ROOT:-}" target slug stale
+  local directory="${state_root}/ask-user-verify-evidence"
+  [[ -s "${output_path}" && "${state_root}" == /* ]] || return 0
+  [[ "$(stat -c '%u:%g:%a' -- "${state_root}" 2>/dev/null || true)" == "0:0:700" \
+    && ! -L "${state_root}" ]] || return 0
+  # Never chmod/chown an existing leaf: install -d follows directory symlinks.
+  # The protected parent admits exclusive creation only; foreign leaves refuse.
+  if [[ ! -e "${directory}" && ! -L "${directory}" ]]; then
+    ( umask 077 && mkdir -- "${directory}" ) 2>/dev/null || return 0
+  fi
+  [[ -d "${directory}" && ! -L "${directory}" \
+    && "$(stat -c '%u:%g:%a' -- "${directory}" 2>/dev/null || true)" == "0:0:700" ]] || return 0
+  slug="$(printf '%s' "${stage}" | tr -c 'A-Za-z0-9.-' '-' | cut -c1-80)"
+  BRIDGESLLM_ASK_USER_VERIFY_EVIDENCE_SEQ=$(( ${BRIDGESLLM_ASK_USER_VERIFY_EVIDENCE_SEQ:-0} + 1 ))
+  target="${directory}/${TIMESTAMP:-unknown}-$$-${BRIDGESLLM_ASK_USER_VERIFY_EVIDENCE_SEQ}-${slug}.out"
+  ( umask 077 && head -c 4194304 -- "${output_path}" > "${target}" ) 2>/dev/null || return 0
+  printf 'ask-user tested-pair evidence retained privately: %s\n' "${target}" >> "${LOG_FILE}"
+  find "${directory}" -maxdepth 1 -type f -name '*.out' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | tail -n +41 | cut -d' ' -f2- \
+    | while IFS= read -r stale; do rm -f -- "${stale}"; done || true
+  return 0
 }
 
 verify_bridgesllm_ask_user_tested_pair() {
@@ -32374,18 +32737,49 @@ verify_bridgesllm_ask_user_tested_pair() {
   local mode="${2:-full}"
   local target_dir="${openclaw_state_dir}/extensions/bridgesllm-ask-user"
   local config_path="${openclaw_state_dir}/openclaw.json"
-  local output_path status=0
+  local output_path status=0 started=${SECONDS}
+  BRIDGESLLM_ASK_USER_VERIFY_FAILURE=""
   output_path="$(mktemp /tmp/bridgesllm-ask-user-verify.XXXXXX)" \
     || return 1
   chmod 600 "${output_path}" 2>/dev/null || true
-  verify_bridgesllm_ask_user_plugin_config "${config_path}" \
+  { verify_bridgesllm_ask_user_plugin_config "${config_path}" \
+      || bridgesllm_ask_user_verify_failed "plugin config contract"; } \
     && verify_bridgesllm_ask_user_plugin_runtime \
       "${target_dir}" "${output_path}" \
     && verify_bridgesllm_ask_user_gateway_method \
       "${output_path}" "${mode}" "${config_path}" \
     || status=$?
+  printf 'ask-user tested-pair mode=%s exit=%s elapsedSeconds=%s check=%s (stderr retained in this log)\n' \
+    "${mode}" "${status}" "$(( SECONDS - started ))" "${BRIDGESLLM_ASK_USER_VERIFY_FAILURE:-passed}" >> "${LOG_FILE}"
+  if (( status != 0 )); then
+    [[ -n "${BRIDGESLLM_ASK_USER_VERIFY_FAILURE}" ]] \
+      || bridgesllm_ask_user_verify_failed "unnamed stage (exit ${status})" || true
+    retain_bridgesllm_ask_user_verify_evidence \
+      "${output_path}" "${BRIDGESLLM_ASK_USER_VERIFY_FAILURE}"
+  fi
   rm -f -- "${output_path}"
   return "${status}"
+}
+
+# Gateway RPC readiness can precede agent preparation on large retained state.
+# Every probe is read-only, so the attestation is retried for a bounded window;
+# each failed attempt is named and its output retained. A config contract
+# failure is deterministic and is not retried. The window is 20 s wider than
+# the original 90 s because the tool-catalog probe now waits 20 s longer. A first
+# attempt that spends that whole budget still gets the retry it had before.
+verify_bridgesllm_ask_user_tested_pair_when_ready() {
+  local deadline=$(( SECONDS + ${BRIDGESLLM_ASK_USER_READINESS_SECONDS:-110} )) attempt=0
+  while :; do
+    attempt=$(( attempt + 1 ))
+    verify_bridgesllm_ask_user_tested_pair "$@" && return 0
+    if [[ "${BRIDGESLLM_ASK_USER_VERIFY_FAILURE}" == "plugin config contract" ]] \
+      || (( SECONDS >= deadline )); then
+      printf 'ask-user tested-pair not attested after %s attempt(s); last failure: %s\n' \
+        "${attempt}" "${BRIDGESLLM_ASK_USER_VERIFY_FAILURE}" >> "${LOG_FILE}"
+      return 1
+    fi
+    sleep 5
+  done
 }
 
 write_bridgesllm_ask_user_transaction_manifest() {
@@ -32527,7 +32921,7 @@ openclaw_question_index_transaction() {
     helper="${script_dir}/openclaw-question-index.py"
     # Read once, verify the signed installer's pin, then execute those bytes.
     # No installed helper/config/ledger replacement or succession is needed.
-    python3 -I - "${helper}" "64c2a99292d46831562cd715004e2ff41c5dfbb854fc6c852c6018cfb8c1be94" "$@" <<'PYQUESTION'
+    python3 -I - "${helper}" "ea57e5885462ed9c15eb818fe498bdceb795c3ba14b8da7a013bfe3bca56f634" "$@" <<'PYQUESTION'
 import hashlib
 from pathlib import Path
 import sys
@@ -33032,6 +33426,10 @@ let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () 
       "${gateway_identity}" >/dev/null || return 1
   fi
   if [[ "${mutation_required}" == "true" ]]; then
+    # The held-plugin helper logs nothing while it runs, and each step can
+    # take many minutes. Print a fixed line before each step so the user sees
+    # progress (TEST 2026-10-29: about 30 s per plugin check, dozens of checks).
+    info "OpenClaw plugin step 1 of 3: saving rollback copies. This can take many minutes; do not restart the server."
     run_durable_openclaw_codex_plugin_helper prepare-held \
       >> "${LOG_FILE}" 2>&1 || return 1
     binding="$(run_durable_openclaw_codex_plugin_helper held-binding \
@@ -33039,6 +33437,7 @@ let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () 
     advance_openclaw_codex_transaction preparing rollback-ready \
       --journal-binding "${binding}" || return 1
     advance_openclaw_codex_transaction rollback-ready install-pending || return 1
+    info "OpenClaw plugin step 2 of 3: installing and checking plugins. This can take many minutes; do not restart the server."
     run_durable_openclaw_codex_plugin_helper apply-held \
       >> "${LOG_FILE}" 2>&1 || return 1
     advance_openclaw_codex_transaction \
@@ -33078,6 +33477,9 @@ let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () 
     --ledger "${OPENCLAW_MIGRATION_TRANSACTION_LEDGER}" \
     --role forward --identity-json "${forward_identity}" \
     >> "${LOG_FILE}" 2>&1 || return 1
+  if [[ -n "${binding}" ]]; then
+    info "OpenClaw plugin step 3 of 3: re-checking plugins with the gateway running. This can take several minutes."
+  fi
   proof="$(write_openclaw_codex_gateway_proof forward "${binding}" "${baseline}")" \
     || return 1
   IFS='|' read -r proof_pid proof_invocation proof_started proof_digest \
@@ -33552,6 +33954,8 @@ prepare_openclaw_runtime_for_portal() {
     info "Skipping OpenClaw runtime compatibility checks (--skip-openclaw)"
     return 0
   fi
+  acquire_openclaw_diagnostic_lease \
+    || fail "OpenClaw diagnostic readers could not be quiesced before runtime preparation."
   if ! prepare_openclaw_upgrade_state; then
     fail "OpenClaw upgrade stopped before the first new gateway restart because legacy state could not be proven safe. No data was deleted and openclaw doctor --fix was not run."
   fi
@@ -33593,7 +33997,11 @@ prepare_openclaw_runtime_for_portal() {
   repair_openclaw_portal_model_config
   # Authentication belongs to OpenClaw and its native providers. Never rebuild
   # legacy profiles or copy another harness's login after native migration.
-  if ! enforce_openclaw_update_pin_policy; then
+  # Updater v2 (DESIGN h.7): a fresh install no longer writes
+  # update.checkOnStart / update.auto.enabled, and existing values stay as the
+  # owner left them. Only the legacy exact-tuple --maintain-tools (servers
+  # without the per-tool runner) still pins the tested runtime.
+  if $MAINTAIN_TOOLS && ! enforce_openclaw_update_pin_policy; then
     fail "OpenClaw automatic update policy could not be pinned before gateway startup. The compatibility-bundle rollback remains armed."
   fi
   if ! prepare_openclaw_native_chat; then
@@ -33605,15 +34013,15 @@ prepare_openclaw_runtime_for_portal() {
   if ! ensure_openclaw_gateway_matches_cli; then
     fail "OpenClaw gateway version/RPC readiness could not be verified. The updater will restore the previous OpenClaw runtime when applicable. Check: systemctl status openclaw-gateway"
   fi
-  if ! verify_bridgesllm_ask_user_tested_pair /root/.openclaw bootstrap; then
-    fail "The replacement ask-user tool or one of its live settlement methods failed base semantic attestation before native Claude question routing could be changed."
+  if ! verify_bridgesllm_ask_user_tested_pair_when_ready /root/.openclaw bootstrap; then
+    fail "The replacement ask-user tool or one of its live settlement methods failed base semantic attestation before native Claude question routing could be changed. Failed check: ${BRIDGESLLM_ASK_USER_VERIFY_FAILURE:-unknown}."
   fi
   OPENCLAW_ASK_USER_BASE_ATTESTED=true
   auto_apply_openclaw_compatibility_hotfix
   if ! ensure_openclaw_gateway_boots_cleanly \
     || ! ensure_openclaw_gateway_matches_cli \
-    || ! verify_bridgesllm_ask_user_tested_pair; then
-    fail "OpenClaw did not retain the complete ask-user bridge after compatibility activation. The tested-pair rollback remains armed."
+    || ! verify_bridgesllm_ask_user_tested_pair_when_ready; then
+    fail "OpenClaw did not retain the complete ask-user bridge after compatibility activation. The tested-pair rollback remains armed. Failed check: ${BRIDGESLLM_ASK_USER_VERIFY_FAILURE:-gateway boot or version readiness}."
   fi
   OPENCLAW_ASK_USER_LIVE_ATTESTED=true
   if $OPENCLAW_PACKAGE_UPDATED || [[ -n "${OPENCLAW_UPGRADE_STATE_MANIFEST:-}" ]]; then
@@ -33629,7 +34037,7 @@ prepare_openclaw_runtime_for_portal() {
   if ! apply_openclaw_codex_plugin_pending_input_hotfix; then
     fail "OpenClaw Codex is installed, but its active provider bundle could not be prepared for exact ask-question delivery. The previous plugin was restored when possible."
   fi
-  if ! verify_openclaw_update_pin_policy; then
+  if $MAINTAIN_TOOLS && ! verify_openclaw_update_pin_policy; then
     fail "OpenClaw automatic update policy changed after preparation; refusing to commit the tested runtime. The compatibility-bundle rollback remains armed."
   fi
   if ! commit_openclaw_tested_pair; then
@@ -33654,6 +34062,163 @@ configure_backup_data_entrypoint() {
   systemctl daemon-reload >> "${LOG_FILE}" 2>&1
 }
 
+# Updater v2 per-tool runner (DESIGN a.2-a.5). toolctl and the tool policy ship
+# inside the Portal tree; its two units are copied from the same tree into the
+# system unit directory. The Portal offers per-tool runs only when toolctl and
+# the run template are both present (backend/src/services/toolsStatus.ts
+# readToolsRunnerState), so the template is published last.
+readonly TOOLS_RUNNER_STATE_ROOT="/var/lib/bridgesllm/tools"
+readonly TOOLS_RUNNER_UNIT_DIR="/etc/systemd/system"
+readonly TOOLS_RUNNER_RUN_UNIT="bridgesllm-tools@.service"
+readonly TOOLS_RUNNER_RECONCILE_UNIT="bridgesllm-tools-reconcile.service"
+TOOLS_RUNNER_INSTALL_REASON=""
+
+tools_runner_path_is_root_controlled() {
+  # A regular file or real directory owned by root that group and others
+  # cannot write: root runs toolctl from here with python3 -I.
+  local path="$1" kind="$2" metadata
+  [[ ! -L "${path}" ]] || return 1
+  case "${kind}" in
+    file) [[ -f "${path}" ]] || return 1 ;;
+    directory) [[ -d "${path}" ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  metadata="$(stat -c '%u:%a' -- "${path}" 2>/dev/null)" || return 1
+  [[ "${metadata}" =~ ^0:[0-7]?[0-7][0145][0145]$ ]]
+}
+
+tools_runner_installed() {
+  # Same two facts readToolsRunnerState checks: toolctl in the Portal tree and
+  # the run template in the system unit directory.
+  [[ -f "${PORTAL_DIR}/installer/tools/bridgesllm-toolctl.py" \
+    && -f "${TOOLS_RUNNER_UNIT_DIR}/${TOOLS_RUNNER_RUN_UNIT}" ]]
+}
+
+tools_runner_install_refused() {
+  TOOLS_RUNNER_INSTALL_REASON="$1"
+  printf 'Per-tool AI updater: %s\n' "$1" >> "${LOG_FILE}" 2>/dev/null || true
+  return 1
+}
+
+install_tools_runner_unit_file() {
+  # root:root 0644, published by rename so systemd never reads a partial
+  # unit. An identical root-owned unit is left alone. A link or other
+  # non-file at the target (for example a masked unit) is refused, never
+  # replaced. A failed copy removes its temporary file.
+  local source="$1" target="$2" temporary
+  if ! tools_runner_path_is_root_controlled "${source}" file; then
+    tools_runner_install_refused "${source} is missing, a link, or writable by a non-root user"
+    return 1
+  fi
+  if [[ -e "${target}" || -L "${target}" ]]; then
+    if [[ ! -f "${target}" || -L "${target}" ]]; then
+      tools_runner_install_refused "${target} exists and is not a regular file (masked or replaced by the owner); it was left unchanged"
+      return 1
+    fi
+    if cmp -s -- "${source}" "${target}" \
+      && [[ "$(stat -c '%u:%g:%a' -- "${target}" 2>/dev/null)" == "0:0:644" ]]; then
+      return 0
+    fi
+  fi
+  temporary="$(mktemp "${TOOLS_RUNNER_UNIT_DIR}/.bridgesllm-tools.XXXXXX")" || {
+    tools_runner_install_refused "a temporary unit file could not be created in ${TOOLS_RUNNER_UNIT_DIR}"
+    return 1
+  }
+  if cat -- "${source}" > "${temporary}" \
+    && chown 0:0 -- "${temporary}" \
+    && chmod 0644 -- "${temporary}"; then
+    sync -- "${temporary}" 2>/dev/null || true
+    if mv -f -- "${temporary}" "${target}"; then
+      return 0
+    fi
+  fi
+  rm -f -- "${temporary}"
+  tools_runner_install_refused "${target} could not be written"
+  return 1
+}
+
+install_tools_runner_units() {
+  # Idempotent; runs on every fresh install and every committed Portal
+  # update. It installs and enables, and never starts, stops or restarts a
+  # unit. The boot-time reconcile is enabled here; it is deliberately not run
+  # by the installer (see install_tools_runner_units_or_warn).
+  TOOLS_RUNNER_INSTALL_REASON=""
+  local path state_parent
+  command -v systemctl >/dev/null 2>&1 \
+    || { tools_runner_install_refused "systemd is not available on this server"; return 1; }
+  [[ -x /usr/bin/python3 ]] \
+    || { tools_runner_install_refused "/usr/bin/python3 is not available"; return 1; }
+  for path in "$(dirname -- "${INSTALL_ROOT}")" "${INSTALL_ROOT}" "${PORTAL_DIR}" \
+    "${PORTAL_DIR}/installer" "${PORTAL_DIR}/installer/tools" \
+    "${PORTAL_DIR}/installer/systemd" "${TOOLS_RUNNER_UNIT_DIR}"; do
+    if ! tools_runner_path_is_root_controlled "${path}" directory; then
+      tools_runner_install_refused "${path} is missing, a link, or writable by a non-root user"
+      return 1
+    fi
+  done
+  for path in "${PORTAL_DIR}/installer/tools/bridgesllm-toolctl.py" \
+    "${PORTAL_DIR}/installer/tools/tool-policy.v2.json"; do
+    if ! tools_runner_path_is_root_controlled "${path}" file; then
+      tools_runner_install_refused "${path} is missing, a link, or writable by a non-root user"
+      return 1
+    fi
+  done
+
+  # State root per DESIGN a.4: root:root 0700 (toolctl attests the same).
+  state_parent="$(dirname -- "${TOOLS_RUNNER_STATE_ROOT}")"
+  if [[ ! -e "${state_parent}" && ! -L "${state_parent}" ]]; then
+    install -d -m 0755 -o root -g root -- "${state_parent}" \
+      || { tools_runner_install_refused "${state_parent} could not be created"; return 1; }
+  fi
+  tools_runner_path_is_root_controlled "${state_parent}" directory \
+    || { tools_runner_install_refused "${state_parent} is a link, not a directory, or writable by a non-root user"; return 1; }
+  if [[ ! -e "${TOOLS_RUNNER_STATE_ROOT}" && ! -L "${TOOLS_RUNNER_STATE_ROOT}" ]]; then
+    install -d -m 0700 -o root -g root -- "${TOOLS_RUNNER_STATE_ROOT}" \
+      || { tools_runner_install_refused "${TOOLS_RUNNER_STATE_ROOT} could not be created"; return 1; }
+  fi
+  if [[ ! -d "${TOOLS_RUNNER_STATE_ROOT}" || -L "${TOOLS_RUNNER_STATE_ROOT}" \
+    || "$(stat -c '%u:%g' -- "${TOOLS_RUNNER_STATE_ROOT}" 2>/dev/null)" != "0:0" ]]; then
+    tools_runner_install_refused "${TOOLS_RUNNER_STATE_ROOT} is a link, not a directory, or not owned by root"
+    return 1
+  fi
+  chmod 0700 -- "${TOOLS_RUNNER_STATE_ROOT}" \
+    || { tools_runner_install_refused "${TOOLS_RUNNER_STATE_ROOT} could not be made private"; return 1; }
+
+  # A temporary left by an interrupted earlier copy; the operation lock
+  # rules out a concurrent installer.
+  find "${TOOLS_RUNNER_UNIT_DIR}" -maxdepth 1 -type f -name '.bridgesllm-tools.??????' \
+    -delete 2>/dev/null || true
+  install_tools_runner_unit_file \
+    "${PORTAL_DIR}/installer/systemd/${TOOLS_RUNNER_RECONCILE_UNIT}" \
+    "${TOOLS_RUNNER_UNIT_DIR}/${TOOLS_RUNNER_RECONCILE_UNIT}" || return 1
+  install_tools_runner_unit_file \
+    "${PORTAL_DIR}/installer/systemd/${TOOLS_RUNNER_RUN_UNIT}" \
+    "${TOOLS_RUNNER_UNIT_DIR}/${TOOLS_RUNNER_RUN_UNIT}" || return 1
+  systemctl daemon-reload >> "${LOG_FILE}" 2>&1 \
+    || { tools_runner_install_refused "systemd could not reload its unit files"; return 1; }
+  systemctl enable "${TOOLS_RUNNER_RECONCILE_UNIT}" >> "${LOG_FILE}" 2>&1 \
+    || { tools_runner_install_refused "systemd could not enable ${TOOLS_RUNNER_RECONCILE_UNIT} for boot"; return 1; }
+}
+
+install_tools_runner_units_or_warn() {
+  # The Portal works without the runner; the Maintenance page then keeps the
+  # AI tools read-only and says why. A failure here never fails the install
+  # or a committed update. Reconcile is not run here: a Portal update holds
+  # the operation lock and changes no tool, while reconcile may settle an
+  # interrupted tool swap and retire gateway drop-ins (host changes). The
+  # enabled boot unit and the Portal's own start-up call run it instead.
+  if [[ ! -e "${PORTAL_DIR}/installer/tools/bridgesllm-toolctl.py" \
+    && ! -L "${PORTAL_DIR}/installer/tools/bridgesllm-toolctl.py" ]]; then
+    info "This Portal release has no per-tool AI updater; AI tool updates stay as before."
+    return 0
+  fi
+  if install_tools_runner_units; then
+    ok "Per-tool AI updater installed (Maintenance page)"
+    return 0
+  fi
+  warn "The per-tool AI updater could not be fully installed: ${TOOLS_RUNNER_INSTALL_REASON:-unknown reason}. The Portal works; until a later update or repair finishes it, the Maintenance page may keep the AI tools read-only. Details: ${LOG_FILE}"
+  return 0
+}
 configure_backup_timers() {
   CURRENT_STEP="backup automation"
 
@@ -38222,8 +38787,11 @@ prepare_update_transaction() {
     caddy_snapshot_required=true
   fi
   ${REPAIR_REINSTALL:-false} && repair_reinstall=true
+  # Updater v2: a Portal update has no OpenClaw participant, so it binds the
+  # plain Portal-only contract. portal-retained-chat-v1 receipts written by
+  # older releases still resume through their existing recovery cases.
   [[ "${PORTAL_ONLY_UPDATE:-false}" == "true" ]] \
-    && operation_contract="portal-retained-chat-v1"
+    && operation_contract="portal-only-v1"
   if [[ "${PORTAL_ONLY_UPDATE:-false}" != "true" ]] \
     && command -v openclaw >/dev/null 2>&1; then
     openclaw_package_preexisted=true
@@ -38877,7 +39445,10 @@ complete_committed_update_transaction() {
   )" || return 1
   case "${operation_contract}" in
     portal-only-v1|portal-retained-chat-v1)
+      # The per-tool runner units follow the committed tree; that step only
+      # warns, so it never blocks the commit.
       configure_backup_data_entrypoint \
+        && install_tools_runner_units_or_warn \
         && complete_update_transaction cutover committed
       ;;
     legacy-host-integration-v1)
@@ -39894,11 +40465,15 @@ do_update() {
     active database_migration_pending database_migrated \
     || fail "Could not commit the database migration phase."
 
+  # Updater v2: the Portal update never changes OpenClaw, its plugins or its
+  # gateway. The retained-core Chat repair for 2026.9.2/9.3 stopped and
+  # restarted the gateway, so it no longer runs here; OpenClaw is updated per
+  # tool from the Maintenance page. Both phases stay journaled for receipt
+  # compatibility.
   advance_update_transaction_phase \
     active database_migrated openclaw_update_pending \
     || fail "Could not record the retained Chat preparation phase."
-  prepare_retained_chat_update \
-    || fail "The exact retained-core Chat repair could not be applied and activated safely; recovery will restore its baseline."
+  info "OpenClaw and the AI tools are left exactly as found; update them from the Maintenance page."
   advance_update_transaction_phase \
     active openclaw_update_pending openclaw_updated \
     || fail "Could not commit the retained Chat preparation phase."
@@ -40439,6 +41014,63 @@ remove_portal_backup_automation() {
   systemctl daemon-reload >/dev/null 2>&1 \
     || fail "Systemd could not forget removed Portal backup automation; uninstall was aborted."
   systemctl reset-failed "${service_units[@]}" >/dev/null 2>&1 || true
+}
+
+tools_runner_running_units() {
+  # Prints every bridgesllm-tools@<runId>.service instance that is not
+  # inactive or failed (running, starting or stopping). Fails when systemd
+  # cannot list them, so callers refuse instead of guessing.
+  local listing
+  listing="$(systemctl list-units --all --plain --no-legend --no-pager \
+    --type=service 'bridgesllm-tools@*.service' 2>/dev/null)" || return 1
+  awk '$1 ~ /^bridgesllm-tools@[^[:space:]]+[.]service$/ && $3 != "inactive" && $3 != "failed" { print $1 }' \
+    <<< "${listing}"
+}
+
+refuse_uninstall_during_tools_run() {
+  # Updater v2: uninstall never stops a running per-tool AI update. Read-only
+  # refusal before any question is asked, without fail(): nothing changed.
+  local running message next_action
+  if ! running="$(tools_runner_running_units)"; then
+    message="The installer could not check whether an AI tools update is running, so the uninstall did not start. Nothing was changed."
+    next_action="Make sure systemd is running, then run the uninstall again."
+  elif [[ -n "${running}" ]]; then
+    message="An AI tools update is still running (${running//$'\n'/, }). Uninstall never stops it, so the uninstall did not start. Nothing was changed."
+    next_action="Let the update finish on the Portal's Maintenance page, then run the uninstall again."
+  else
+    return 0
+  fi
+  echo "" >&2
+  echo -e "  ${YELLOW}${BOLD}Uninstall not started:${NC} ${message}" >&2
+  terminal_final_state "Nothing changed" "${message}" "${next_action}"
+  exit 1
+}
+
+remove_portal_tools_runner() {
+  # The per-tool AI updater's units run toolctl from the Portal tree that
+  # uninstall removes; left behind, the enabled reconcile unit would fail at
+  # every boot. A running tools update is never stopped: the uninstall stops
+  # here with its journal kept and resumes on the next installer run. Run
+  # history, admission records and recovery state under
+  # TOOLS_RUNNER_STATE_ROOT stay in both modes, like the npm CLI transaction
+  # journals: uninstall leaves the AI tools themselves installed.
+  local running
+  running="$(tools_runner_running_units)" \
+    || fail "AI tools update state could not be verified; uninstall was paused before the AI tools runner was removed."
+  [[ -z "${running}" ]] \
+    || fail "An AI tools update is still running (${running//$'\n'/, }); uninstall was paused before the AI tools runner was removed. Let it finish, then run the installer again to resume the uninstall."
+  systemctl disable "${TOOLS_RUNNER_RECONCILE_UNIT}" >/dev/null 2>&1 || true
+  rm -f -- \
+    "${TOOLS_RUNNER_UNIT_DIR}/multi-user.target.wants/${TOOLS_RUNNER_RECONCILE_UNIT}" \
+    "${TOOLS_RUNNER_UNIT_DIR}/${TOOLS_RUNNER_RECONCILE_UNIT}" \
+    "${TOOLS_RUNNER_UNIT_DIR}/${TOOLS_RUNNER_RUN_UNIT}" \
+    || fail "The AI tools runner unit files could not be removed; uninstall was aborted."
+  find "${TOOLS_RUNNER_UNIT_DIR}" -maxdepth 1 -type f -name '.bridgesllm-tools.??????' \
+    -delete 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 \
+    || fail "Systemd could not forget the removed AI tools runner; uninstall was aborted."
+  systemctl reset-failed "${TOOLS_RUNNER_RECONCILE_UNIT}" 'bridgesllm-tools@*.service' \
+    >/dev/null 2>&1 || true
 }
 
 portal_remote_desktop_account_matches_contract() {
@@ -46779,6 +47411,7 @@ resume_active_uninstall_transaction() {
         ;;
       remote_desktop_removed)
         remove_portal_backup_automation
+        remove_portal_tools_runner
         advance_uninstall_transaction_phase remote_desktop_removed backup_automation_removed || return 1
         ;;
       backup_automation_removed)
@@ -47077,6 +47710,7 @@ do_uninstall() {
   fi
   echo -e "  ${DIM}Retained for safe npm CLI recovery: unsettled transaction journals/prestate,${NC}"
   echo -e "  ${DIM}immutable helper runtime receipts/generations, and required rollback/cache authority.${NC}"
+  echo -e "  ${DIM}AI tools run history, admission records and recovery state stay in ${TOOLS_RUNNER_STATE_ROOT}.${NC}"
   echo ""
 }
 
@@ -47172,6 +47806,18 @@ maintain_additional_ai_harnesses() {
   ok "Additional supported harness runtimes verified; provider sign-in and model access remain separate account checks."
 }
 
+refuse_maintain_tools_on_runner_host() {
+  # Updater v2: on a server with the per-tool runner the exact-tuple
+  # orchestration never runs. Read-only refusal without fail(): no recovery
+  # engine, no Dashboard update progress, nothing changed.
+  local message="AI tools now update one at a time from the Portal's Maintenance page. This server has the per-tool AI updater, so --maintain-tools no longer updates them together. Nothing was changed."
+  echo "" >&2
+  echo -e "  ${YELLOW}${BOLD}--maintain-tools is not used on this server:${NC} ${message}" >&2
+  terminal_final_state "Nothing changed" "${message}" \
+    "Open Admin > Maintenance in the Portal and update each AI tool there."
+  exit 1
+}
+
 do_maintain_compatible_ai_tools() {
   PORTAL_ONLY_UPDATE=false
   CURRENT_STEP="compatible AI tools"
@@ -47185,6 +47831,8 @@ do_maintain_compatible_ai_tools() {
   admit_existing_node_runtime_for_compatible_ai_tools \
     || fail "The existing Node.js runtime is outside the Portal-qualified compatibility contract; nothing was changed."
   admit_retained_openclaw_runtime_before_native_staging
+  acquire_openclaw_diagnostic_lease \
+    || fail "OpenClaw diagnostic readers could not be quiesced before native staging."
 
   terminal_operation_update progress \
     "Opening the native runtime safety fence" \
@@ -47403,21 +48051,27 @@ print_dry_run_plan() {
 
   case "${action}" in
     maintain-tools)
-      echo "  A real run would:"
-      echo "    ${BULLET} Verify the installed signed Portal and exact compatibility catalog"
-      echo "    ${BULLET} Stage checksum- and SRI-bound Codex, Claude Code, and ClawHub trees"
-      echo "    ${BULLET} Fence new native launches and migrate OpenClaw under one combined decision"
-      echo "    ${BULLET} Commit the core tuple or restore the complete prior tuple"
-      echo "    ${BULLET} Separately verify and update Ollama and supported native chat harnesses"
-      echo "    ${BULLET} Update configured Agent Zero through its managed, data-preserving lifecycle"
-      echo "    ${BULLET} Stop on any tool failure; earlier verified tool updates remain installed"
+      if tools_runner_installed; then
+        echo "  A real run would change nothing: this server has the per-tool AI updater,"
+        echo "  so AI tools update one at a time from the Portal's Maintenance page."
+      else
+        echo "  A real run would:"
+        echo "    ${BULLET} Verify the installed signed Portal and exact compatibility catalog"
+        echo "    ${BULLET} Stage checksum- and SRI-bound Codex, Claude Code, and ClawHub trees"
+        echo "    ${BULLET} Fence new native launches and migrate OpenClaw under one combined decision"
+        echo "    ${BULLET} Commit the core tuple or restore the complete prior tuple"
+        echo "    ${BULLET} Separately verify and update Ollama and supported native chat harnesses"
+        echo "    ${BULLET} Update configured Agent Zero through its managed, data-preserving lifecycle"
+        echo "    ${BULLET} Stop on any tool failure; earlier verified tool updates remain installed"
+      fi
       ;;
     uninstall)
       echo "  A real run would:"
       echo "    ${BULLET} Ask whether to keep Portal data or remove the local clean slate"
       echo "    ${BULLET} On a clean slate with helperless leftovers, ask for Safe cleanup or Complete wipe"
       echo "    ${BULLET} Require an exact uninstall confirmation"
-      echo "    ${BULLET} Stop Portal, then remove its service, Remote Desktop, and backup automation"
+      echo "    ${BULLET} Stop Portal, then remove its service, Remote Desktop, backup automation, and AI tools runner"
+      echo "    ${BULLET} Refuse while an AI tools update is running; it is never stopped"
       echo "    ${BULLET} Preserve or remove only the data selected at confirmation time"
       ;;
     update)
@@ -47457,6 +48111,10 @@ main() {
   # known: malformed invocations must never trigger unrelated host recovery.
   PORTAL_ONLY_UPDATE=true
   terminal_prescan_display_mode "$@"
+  if [[ "${1:-}" == "--toolctl-ollama-update" ]]; then
+    do_toolctl_ollama_update "$@"
+    exit $?
+  fi
   parse_args "$@"
   if $INSTALL_DESKTOP_TOOLCHAIN; then
     do_install_desktop_toolchain "$@"
@@ -47560,6 +48218,7 @@ main() {
   fi
 
   if $MAINTAIN_TOOLS; then
+    tools_runner_installed && refuse_maintain_tools_on_runner_host
     mkdir -p "$LOG_DIR"
     touch "$LOG_FILE"
     chmod 600 "$LOG_FILE"
@@ -47575,6 +48234,7 @@ main() {
 
   # Uninstall mode
   if $UNINSTALL_MODE; then
+    refuse_uninstall_during_tools_run
     mkdir -p "$LOG_DIR"
     touch "$LOG_FILE"
     chmod 600 "$LOG_FILE"

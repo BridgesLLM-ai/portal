@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { CheckCircle2, Circle, ListTodo, Loader2, X, XCircle } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import NativeProgressNote from './NativeProgressNote';
+import { latestNativeProgress } from '../../utils/nativeProgress';
 import AnchoredPopover from '../AnchoredPopover';
 import client from '../../api/client';
 import type { WorkCard } from './ProjectWork';
@@ -22,6 +24,7 @@ export default function ChatTasksButton({ provider, session, messages, projectWo
   const [scope, setScope] = useState<'session' | 'harness'>('session');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const nativeProgress = useMemo(() => latestNativeProgress(messages), [messages]);
   const plan = useMemo(() => latestChatPlan(messages), [messages]);
   useEffect(() => { setOpenContext(null); setAllTasks([]); setError(''); setLoading(false); setScope('session'); }, [provider, session]);
   useEffect(() => {
@@ -73,7 +76,7 @@ export default function ChatTasksButton({ provider, session, messages, projectWo
       {ownCounts.total > 0 && <span aria-hidden="true" className="text-[10px] font-semibold tabular-nums">{ownCounts.done}/{ownCounts.total}</span>}
       {ownCounts.running > 0 && <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-sky-300 motion-safe:animate-pulse" />}
     </button>
-    <AnchoredPopover open={open} anchorRef={anchor} onDismiss={close} width={384} ariaLabel="Chat tasks" className="overflow-hidden rounded-2xl border border-white/10 bg-[#11182b] shadow-2xl">
+    <AnchoredPopover open={open} anchorRef={anchor} onDismiss={close} width={384} ariaLabel="Chat tasks" className="overflow-hidden rounded-2xl border border-white/10 bg-[var(--color-surface)] shadow-2xl">
       <motion.section role="dialog" aria-label="Chat tasks" className="flex min-h-0 max-h-full flex-col"
         initial={reducedMotion ? false : { opacity: 0, y: -7 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.16 }}>
         <header className="shrink-0 border-b border-white/5 px-4 py-3">
@@ -90,7 +93,8 @@ export default function ChatTasksButton({ provider, session, messages, projectWo
         </header>
         <div className="min-h-0 max-h-80 overflow-y-auto overscroll-contain px-4 py-3">
           {error && <p role="status" className="mb-3 text-xs text-amber-300">{error}</p>}
-          {!tasks.length && <p className="py-4 text-center text-xs text-slate-400">{loading ? 'Loading tasks…' : scope === 'harness' ? 'No tasks reported by OpenClaw.' : 'No plan or tasks reported for this chat yet.'}</p>}
+          {scope === 'session' && nativeProgress && <NativeProgressNote progress={nativeProgress} />}
+          {!tasks.length && (scope !== 'session' || (!nativeProgress?.note && !nativeProgress?.measure)) && <p className="py-4 text-center text-xs text-slate-400">{loading ? 'Loading tasks…' : scope === 'harness' ? 'No tasks reported by OpenClaw.' : 'No plan or tasks reported for this chat yet.'}</p>}
           <ul className="space-y-3">{tasks.map(task => {
             const href = taskConversationHref(task.sessionKey);
             const statusLabel = ({ pending: 'Pending', running: 'In progress', done: 'Completed', failed: 'Failed', cancelled: 'Stopped', unknown: 'Status unavailable' })[task.status] || 'Status unavailable';

@@ -195,6 +195,57 @@ describe('AgentSelector', () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
+  it('points a version-refused harness at Maintenance instead of Model Providers (TEST F7)', async () => {
+    const row = (id: string, displayName: string, extra: Record<string, unknown>) => ({
+      id, displayName, implemented: true, selectable: true, installed: true, releaseStage: 'stable', transport: 'connector', ...extra,
+    });
+    mocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/harnesses') {
+        return {
+          data: {
+            harnesses: [
+              row('OPENCLAW', 'OpenClaw', { usable: true, transport: 'gateway' }),
+              row('OLLAMA', 'Ollama', { usable: false, versionRefused: true, version: 'ollama version is 0.33.3',
+                reason: "Portal refuses this Ollama runtime: version 0.33.3 is older than the Portal's supported floor 0.40.6." }),
+              row('GROK', 'Grok Build', { usable: false, reason: 'Probe failed.' }),
+              // Hermes below its minimum and not logged in reads what Maintenance says, not "Needs login".
+              row('HERMES', 'Hermes', { usable: false, native: true, nativeAuthStatus: 'needs_login', versionRefused: true,
+                reason: "Portal refuses this Hermes runtime: version 0.21.1 is older than the Portal's supported floor 0.22.2." }),
+              row('CODEX', 'Codex', { usable: false, native: true, nativeAuthStatus: 'needs_login' }),
+            ],
+          },
+        };
+      }
+      if (url === '/gateway/agents') return { data: { agents: [] } };
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<AgentSelector value="OPENCLAW" onChange={onChange} />);
+
+    await user.click(screen.getByRole('button', { name: 'Choose agent' }));
+    const ollama = await screen.findByRole('button', { name: /Ollama/i });
+    expect(ollama).toBeDisabled();
+    expect(within(ollama).getByText('Update required')).toBeInTheDocument();
+    expect(ollama).toHaveTextContent('Update Ollama in Admin → Maintenance.');
+    expect(ollama).not.toHaveTextContent('Check Model Providers');
+    const hermes = screen.getByRole('button', { name: /Hermes/i });
+    expect(within(hermes).getByText('Update required')).toBeInTheDocument();
+    expect(hermes).toHaveTextContent('Update Hermes in Admin → Maintenance.');
+    expect(hermes).not.toHaveTextContent('Needs login');
+    expect(hermes).not.toHaveTextContent('Connect your Hermes account');
+    // A login alone still asks for the login.
+    const codex = screen.getByRole('button', { name: /Codex/i });
+    expect(within(codex).getByText('Needs login')).toBeInTheDocument();
+    expect(codex).toHaveTextContent('Connect your Codex account in Model Providers.');
+    // Any other unusable row keeps its previous wording.
+    const grok = screen.getByRole('button', { name: /Grok Build/i });
+    expect(within(grok).getByText('Unavailable')).toBeInTheDocument();
+    expect(grok).toHaveTextContent('Connection unavailable. Check Model Providers for details.');
+    await user.click(ollama);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
   it('updates a cold checking provider row in place when shared polling settles it', async () => {
     let providerRequestCount = 0;
     mocks.clientGet.mockImplementation(async (url: string) => {

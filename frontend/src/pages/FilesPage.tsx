@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, Suspense } from 'react';
+import { lazyWithRecovery } from '../utils/moduleRecovery';
 import { copyTextToClipboard } from '../utils/clipboardCopy';
 import { useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -81,7 +82,7 @@ function getDisplayName(file: FileEntry): string {
   return name.replace(/-\d{13}-\d+(?=\.[^.]+$)/, '');
 }
 
-const LazyMediaViewer = lazy(() => import('../components/MediaViewer'));
+const LazyMediaViewer = lazyWithRecovery(() => import('../components/MediaViewer'));
 
 const MIME_FILTERS = [
   { label: 'All', value: '' },

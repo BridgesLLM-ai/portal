@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { withPortalGuideReference } from '../../../../services/portalOperatingGuide';
+import { withSenderResponsePreference } from '../../../../services/chatResponseCapabilities';
 import { ChatImageError } from '../../../../services/chatImages/chatImageModelPolicy';
 import { stripChatImageReferences } from '../../../../services/chatImages/directChatImages';
 import type {
@@ -270,7 +271,7 @@ export abstract class AcpAgentProvider extends NativeCliAdapterProvider {
           await sender.revalidateChatImages();
         }
         const result = await active.broker.prompt(
-          withPortalGuideReference(promptMessage, session.messages.length === 1),
+          withPortalGuideReference(withSenderResponsePreference(promptMessage, this.acp.providerName, sender), session.messages.length === 1),
           chatImages,
         );
         recordAcpModelCatalog(this.acp.providerName, result.modelState);

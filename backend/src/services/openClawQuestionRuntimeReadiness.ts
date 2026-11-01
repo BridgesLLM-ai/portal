@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { execFile } from 'child_process';
 import { randomUUID } from 'crypto';
 import { readFileSync, realpathSync } from 'fs';
@@ -6,14 +7,12 @@ import { promisify } from 'util';
 import { buildOpenClawCliEnv, extractJsonFromCliOutput } from '../utils/openclawCli';
 import { gatewayRpcCall } from '../utils/openclawGatewayRpc';
 import {
-  LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-  LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION,
-  TESTED_OPENCLAW_RUNTIME_VERSION,
   OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS,
-  QUALIFIED_OPENCLAW_NATIVE_PATCHES,
   isOpenClawCliTimeout,
   type OpenClawSetupReadiness,
 } from './openclawSetupReadiness';
+import { isOpenClawExecutionCapableGatewayMethod } from './openClawExecutionCapableMethods';
+import { openClawRuntimeFamilyForVersion } from './openClawRuntimeContract';
 
 const execFileAsync = promisify(execFile);
 
@@ -46,6 +45,44 @@ function expectedGatewayMethodsForProfile(
     && expectedVersion === RETAINED_LEGACY_BRIDGESLLM_ASK_USER_PLUGIN_VERSION
     ? RETAINED_LEGACY_ASK_USER_GATEWAY_METHODS
     : null;
+}
+
+/**
+ * The native plugin must provide its steer method and must not grow a second
+ * question authority or another execution-capable surface. Additive read-only
+ * methods (a status read, say) are not a reason to refuse every chat.
+ */
+const SECOND_QUESTION_AUTHORITY_METHODS: ReadonlySet<string> = new Set([
+  'bridgesllm.ask_user.probe',
+  'bridgesllm.ask_user.pending',
+  'bridgesllm.ask_user.answer',
+  'bridgesllm.ask_user.dismiss',
+]);
+
+function deniedNativeGatewayMethod(method: string, expected: Set<string>): boolean {
+  if (expected.has(method)) return false;
+  return method.startsWith('question.')
+    || SECOND_QUESTION_AUTHORITY_METHODS.has(method)
+    || isOpenClawExecutionCapableGatewayMethod(method);
+}
+
+function nativeGatewayMethodsAreSafeSuperset(methods: unknown[], expected: Set<string>): boolean {
+  if (!methods.every((method) => typeof method === 'string')) return false;
+  const actual = new Set(methods as string[]);
+  return [...expected].every((method) => actual.has(method))
+    && ![...actual].some((method) => deniedNativeGatewayMethod(method, expected));
+}
+
+/** Tools that would make the plugin a second question authority beside native `ask_user`. */
+function nativeToolNamesAreSafe(toolNames: unknown[]): boolean {
+  return toolNames.every((name) => typeof name === 'string'
+    && !/^ask_user/i.test(name)
+    && !/question/i.test(name));
+}
+
+/** A tool-call interceptor is how the retained legacy plugin took over questions. */
+function nativeTypedHooksAreSafe(typedHooks: unknown[]): boolean {
+  return typedHooks.every((hook: any) => typeof hook?.name === 'string' && hook.name !== 'before_tool_call');
 }
 
 function gatewayMethodSetIsExact(methods: unknown[], expected: Set<string>): boolean {
@@ -106,10 +143,9 @@ export function askUserRuntimeReportIsReady(params: {
     && Array.isArray(typedHooks)
     && Array.isArray(gatewayMethods)
     && (questionAuthority === 'native'
-      ? toolNames.length === 0
-        && plugin?.hookCount === 0
-        && typedHooks.length === 0
-        && gatewayMethodSetIsExact(gatewayMethods, expectedGatewayMethods)
+      ? nativeToolNamesAreSafe(toolNames)
+        && nativeTypedHooksAreSafe(typedHooks)
+        && nativeGatewayMethodsAreSafeSuperset(gatewayMethods, expectedGatewayMethods)
       : toolNames.length === 1
         && toolNames[0] === 'ask_user_question'
         && plugin?.hookCount === 1
@@ -121,16 +157,13 @@ export function askUserRuntimeReportIsReady(params: {
   );
 }
 
+/** Retained 2026.7.1 keeps its plugin authority; the floor family uses native questions. */
 export function questionAuthorityForOpenClawVersion(
   version: unknown,
 ): OpenClawQuestionAuthority | null {
-  const normalized = typeof version === 'string' ? version.trim() : '';
-  if (
-    normalized === LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION
-    || normalized === LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION
-  ) return 'legacy-custom';
-  if (normalized === TESTED_OPENCLAW_RUNTIME_VERSION || QUALIFIED_OPENCLAW_NATIVE_PATCHES.includes(normalized)) return 'native';
-  return null;
+  const family = openClawRuntimeFamilyForVersion(typeof version === 'string' ? version.trim() : '');
+  if (family === 'legacy-2026.7.1') return 'legacy-custom';
+  return family === 'current-2026.9.1' ? 'native' : null;
 }
 
 export interface OpenClawQuestionPluginReadiness {
@@ -219,7 +252,7 @@ async function runOpenClawCli(
   timeoutMs = 12_000,
 ): Promise<{ ok: boolean; stdout: string; stderr: string; error?: string; timedOut?: boolean }> {
   try {
-    const result = await execFileAsync('openclaw', args, {
+    const result = await execFileAsync(...openClawDiagnosticCommand('openclaw', args), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       timeout: timeoutMs,
@@ -273,7 +306,7 @@ export async function getOpenClawQuestionPluginReadiness(
       ready: false,
       questionAuthority: null,
       expectedPluginVersion: null,
-      issue: 'OpenClaw question authority has no exact tested runtime family.',
+      issue: 'OpenClaw question authority needs an admitted OpenClaw runtime (see the OpenClaw readiness blockers).',
     };
   }
 
@@ -326,7 +359,7 @@ export async function getOpenClawQuestionPluginReadiness(
         : !inspection.ok
           ? `OpenClaw could not inspect the runtime-guard plugin: ${String(inspection.stderr || inspection.error || 'unknown error').slice(0, 300)}`
           : questionAuthority === 'native'
-            ? 'OpenClaw native-question runtimes must run the exact 4.0 steer-only plugin surface with no second question authority.'
+            ? 'OpenClaw native-question runtimes must run the bundled 4.0 runtime-guard plugin with its steer method and no second question authority.'
             : 'Retained OpenClaw 2026.7.1 must run the exact 3.3 legacy question plugin surface.',
     };
   }
@@ -429,10 +462,13 @@ export async function getOpenClawQuestionPluginReadiness(
     };
   }
 
+  // A cold native 10.6 catalog took 12.4 s on installed TEST despite a
+  // healthy gateway. Match the installer's bounded catalog allowance; the
+  // semantic tool/authority checks and other RPC budgets remain unchanged.
   const toolCatalog = await dependencies.callGatewayRpc('tools.catalog', {
     agentId: 'main',
     includePlugins: true,
-  }, 10_000);
+  }, 30_000);
   if (!nativeAskUserToolCatalogIsReady(toolCatalog)) {
     return failedSemanticReadiness(
       questionAuthority,

@@ -7,9 +7,12 @@ import {
 import { prisma } from '../config/database';
 import {
   deleteSession as deleteOpenClawSession,
+  probeSessionPurgeParameter,
   readGatewaySessionIdentityStrict,
   type DeleteOpenClawSessionOptions,
   type LocalOpenClawSessionIdentity,
+  type OpenClawSessionPurgeParameter,
+  type OpenClawSessionPurgeProbe,
 } from '../utils/openclawGatewayRpc';
 import {
   forgetAppRuntime,
@@ -35,6 +38,7 @@ import {
   buildOpenClawRetirementIdentityAttestation,
   captureLegacyOpenClawSessionPrivacyTarget,
   hardDeleteLegacyOpenClawSessionPrivacyArtifacts,
+  OpenClawLegacySessionPrivacyError,
   resolveLegacyOpenClawSessionPrivacyTarget,
   type LegacyOpenClawSessionPrivacyTarget,
   type OpenClawRetirementSessionIdentity,
@@ -53,8 +57,15 @@ import {
   isQualifiableProjectProvider,
 } from './projectChatProviderRegistry';
 import { deleteUserMailboxByUserId } from './userMailService';
+import {
+  forgetOpenClawSessionMemory,
+  type OpenClawMemoryForgetOutcome,
+  type OpenClawMemoryForgetTarget,
+} from './openClawMemoryForget';
 
 const APP_STATE_PREFIX = 'portal.app-process.state.';
+const OPENCLAW_PRIVACY_OUTCOME_PREFIX = 'portal.user-retirement.openclaw-privacy.v1.';
+const MAX_OPENCLAW_PRIVACY_OUTCOMES = 10_000;
 const NATIVE_SESSION_PROVIDERS = Object.freeze([
   'CLAUDE_CODE',
   'CODEX',
@@ -67,6 +78,42 @@ const NATIVE_SESSION_PROVIDERS = Object.freeze([
 ] as const satisfies readonly AgentProviderName[]);
 
 type ExternalStateDatabase = typeof prisma;
+
+/**
+ * How a current-family OpenClaw session leaves the Gateway, chosen by the
+ * OC-PURGE probe (DESIGN §e.4), strongest first:
+ * - stock-purge: an upstream no-archive delete (`purgeTranscript`; not shipped yet);
+ * - patched-purge: the retired Portal core patch, still installed on this host;
+ * - stock-archive: stock OpenClaw keeps the transcript as an archive (a SQLite
+ *   row plus a published file) that only OpenClaw's archive retention removes.
+ *   The Portal never unlinks those files or rows itself.
+ */
+export type OpenClawRetirementPurgeMode = 'stock-purge' | 'patched-purge' | 'stock-archive';
+
+const OPENCLAW_PURGE_PROBE_ORDER: ReadonlyArray<readonly [
+  OpenClawSessionPurgeParameter,
+  Exclude<OpenClawRetirementPurgeMode, 'stock-archive'>,
+]> = Object.freeze([
+  ['purgeTranscript', 'stock-purge'],
+  ['deleteTranscriptWithoutArchive', 'patched-purge'],
+] as const);
+
+/**
+ * What retirement actually did to one OpenClaw session, for the Owner. A
+ * transcript is "purged" only when the Gateway's no-archive receipt (or the
+ * legacy file-level absence check) proves it; stock OpenClaw always keeps an
+ * archive that only its own retention removes.
+ */
+export type OpenClawSessionRetirementOutcome = Readonly<{
+  agentSessionId: string;
+  agentId: string;
+  sessionId: string;
+  purgeMode: OpenClawRetirementPurgeMode | 'legacy-file';
+  session: 'deleted' | 'already-absent';
+  transcript: 'purged' | 'archive-retained' | 'unverified-after-resume';
+  archiveCount: number;
+  memory: OpenClawMemoryForgetOutcome;
+}>;
 
 export type AdminUserRetirementExternalStateDependencies = {
   database?: ExternalStateDatabase;
@@ -84,6 +131,11 @@ export type AdminUserRetirementExternalStateDependencies = {
     error?: string;
   }>;
   readGatewaySession?(sessionKey: string): Promise<LocalOpenClawSessionIdentity | null>;
+  probeOpenClawSessionPurge?(
+    parameter: OpenClawSessionPurgeParameter,
+    agentId: string,
+  ): Promise<OpenClawSessionPurgeProbe>;
+  forgetOpenClawSessionMemory?(target: OpenClawMemoryForgetTarget): Promise<OpenClawMemoryForgetOutcome>;
   attestOpenClawRuntimeFamily?(): Promise<OpenClawRetirementRuntimeFamily>;
   resolveLegacyOpenClawSession?(input: OpenClawRetirementSessionIdentity): LegacyOpenClawSessionPrivacyTarget;
   captureLegacyOpenClawSession?(input: OpenClawRetirementSessionIdentity): LegacyOpenClawSessionPrivacyTarget;
@@ -240,9 +292,14 @@ async function attestManifestOpenClawRuntimeFamily(
   if (!manifest.agentSessions.some((session) => session.provider === 'OPENCLAW')) return null;
   try {
     return await dependencies.attestOpenClawRuntimeFamily();
-  } catch {
-    fail('OpenClaw retirement runtime family could not be attested exactly');
+  } catch (error) {
+    fail(`OpenClaw retirement runtime family could not be attested exactly${runtimeRefusalReason(error)}`);
   }
+}
+
+/** The gate's own plain-words refusal; other errors stay generic. */
+function runtimeRefusalReason(error: unknown): string {
+  return error instanceof OpenClawLegacySessionPrivacyError ? `: ${error.message}` : '';
 }
 
 async function assertOpenClawRuntimeFamilyStable(
@@ -252,12 +309,184 @@ async function assertOpenClawRuntimeFamilyStable(
   let current: OpenClawRetirementRuntimeFamily;
   try {
     current = await dependencies.attestOpenClawRuntimeFamily();
-  } catch {
-    fail('OpenClaw retirement runtime family could not be re-attested exactly');
+  } catch (error) {
+    fail(`OpenClaw retirement runtime family could not be re-attested exactly${runtimeRefusalReason(error)}`);
   }
   if (current !== expected) {
     fail('OpenClaw retirement runtime family changed during retirement');
   }
+}
+
+async function probeOpenClawPurgeMode(
+  agentId: string,
+  context: AdminUserRetirementRunnerContext,
+  dependencies: ReturnType<typeof productionDependencies>,
+): Promise<OpenClawRetirementPurgeMode> {
+  for (const [parameter, mode] of OPENCLAW_PURGE_PROBE_ORDER) {
+    let probe: OpenClawSessionPurgeProbe;
+    try {
+      probe = await withRetirementLease(
+        context,
+        () => dependencies.probeOpenClawSessionPurge(parameter, agentId),
+      );
+    } catch (error) {
+      if (error instanceof AdminUserRetirementIntegrityError) throw error;
+      fail('OpenClaw purge capability could not be confirmed');
+    }
+    if (probe?.result === 'accepted') return mode;
+    if (probe?.result !== 'rejected') fail('OpenClaw purge capability could not be confirmed');
+  }
+  return 'stock-archive';
+}
+
+/**
+ * Resolves the purge mode for every OpenClaw agent store in the manifest
+ * before this phase mutates anything, so an unconfirmed capability refuses
+ * instead of leaving a partially retired account.
+ */
+async function resolveManifestOpenClawPurgeModes(
+  manifest: AdminUserRetirementManifestV1,
+  family: OpenClawRetirementRuntimeFamily | null,
+  context: AdminUserRetirementRunnerContext,
+  dependencies: ReturnType<typeof productionDependencies>,
+): Promise<ReadonlyMap<string, OpenClawRetirementPurgeMode>> {
+  const modes = new Map<string, OpenClawRetirementPurgeMode>();
+  if (family !== 'current-2026.9.1') return modes;
+  for (const session of manifest.agentSessions) {
+    if (session.provider !== 'OPENCLAW') continue;
+    const agentId = localGatewayIdentityFromManifest(session).agentId;
+    if (!modes.has(agentId)) {
+      modes.set(agentId, await probeOpenClawPurgeMode(agentId, context, dependencies));
+    }
+  }
+  return modes;
+}
+
+function openClawPrivacyOutcomeKey(retirementId: string): string {
+  const id = String(retirementId || '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) fail('Retirement identity is invalid');
+  return `${OPENCLAW_PRIVACY_OUTCOME_PREFIX}${id}`;
+}
+
+function parseOpenClawPrivacyOutcomes(raw: string): OpenClawSessionRetirementOutcome[] {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (parsed?.version !== 1 || !Array.isArray(parsed.sessions)) return [];
+  return parsed.sessions
+    .slice(0, MAX_OPENCLAW_PRIVACY_OUTCOMES)
+    .filter((entry: any) => (
+      entry
+      && typeof entry.agentSessionId === 'string'
+      && typeof entry.agentId === 'string'
+      && typeof entry.sessionId === 'string'
+      && ['stock-purge', 'patched-purge', 'stock-archive', 'legacy-file'].includes(entry.purgeMode)
+      && ['deleted', 'already-absent'].includes(entry.session)
+      && ['purged', 'archive-retained', 'unverified-after-resume'].includes(entry.transcript)
+      && Number.isSafeInteger(entry.archiveCount)
+      && ['forgotten', 'forgotten-residual', 'failed', 'unavailable'].includes(entry.memory?.status)
+    ));
+}
+
+/** The recorded per-session OpenClaw outcome of one retirement, if any. */
+export async function readAdminUserRetirementOpenClawPrivacy(
+  retirementId: string,
+  database: Pick<ExternalStateDatabase, 'systemSetting'> = prisma,
+): Promise<OpenClawSessionRetirementOutcome[] | null> {
+  const row = await database.systemSetting.findUnique({
+    where: { key: openClawPrivacyOutcomeKey(retirementId) },
+    select: { value: true },
+  });
+  return row ? parseOpenClawPrivacyOutcomes(row.value) : null;
+}
+
+/**
+ * Owner-facing summary of the recorded OpenClaw outcome. Counts only what
+ * the record proves; archives retained by stock OpenClaw are never "purged".
+ */
+export function summarizeAdminUserRetirementOpenClawPrivacy(
+  outcomes: readonly OpenClawSessionRetirementOutcome[] | null,
+) {
+  if (!outcomes) return null;
+  const count = (predicate: (outcome: OpenClawSessionRetirementOutcome) => boolean) => (
+    outcomes.filter(predicate).length
+  );
+  return {
+    sessions: outcomes.length,
+    transcriptsPurged: count((outcome) => outcome.transcript === 'purged'),
+    transcriptArchivesRetained: count((outcome) => outcome.transcript === 'archive-retained'),
+    transcriptsUnverified: count((outcome) => outcome.transcript === 'unverified-after-resume'),
+    memoryForgotten: count((outcome) => outcome.memory.status === 'forgotten'),
+    memoryResidual: count((outcome) => outcome.memory.status === 'forgotten-residual'),
+    memoryFailed: count((outcome) => outcome.memory.status === 'failed'),
+    memoryUnavailable: count((outcome) => outcome.memory.status === 'unavailable'),
+    archiveRetentionNote: outcomes.some((outcome) => outcome.transcript === 'archive-retained')
+      ? 'OpenClaw keeps deleted-chat archives until its own archive retention removes them.'
+      : null,
+    details: outcomes.slice(0, 200).map((outcome) => ({
+      agentSessionId: outcome.agentSessionId,
+      purgeMode: outcome.purgeMode,
+      session: outcome.session,
+      transcript: outcome.transcript,
+      memory: outcome.memory.status,
+      memoryFailedStep: outcome.memory.failedStep || null,
+    })),
+  };
+}
+
+async function persistOpenClawPrivacyOutcomes(
+  database: ExternalStateDatabase,
+  retirementId: string,
+  outcomes: ReadonlyMap<string, OpenClawSessionRetirementOutcome>,
+): Promise<void> {
+  const key = openClawPrivacyOutcomeKey(retirementId);
+  const value = JSON.stringify({
+    version: 1,
+    sessions: [...outcomes.values()].sort((left, right) => (
+      left.agentSessionId.localeCompare(right.agentSessionId)
+    )),
+  });
+  await database.systemSetting.upsert({
+    where: { key },
+    create: { key, value },
+    update: { value },
+  });
+}
+
+/**
+ * H0 (DESIGN §e.3): forget memory derived from the retired session. A
+ * failure is recorded, never fatal: the account still retires and the Owner
+ * sees which sub-step failed. Lease loss still aborts the phase.
+ */
+async function forgetRetiredOpenClawSessionMemory(
+  identity: OpenClawRetirementSessionIdentity,
+  context: AdminUserRetirementRunnerContext,
+  dependencies: ReturnType<typeof productionDependencies>,
+): Promise<OpenClawMemoryForgetOutcome> {
+  await context.renewLease();
+  let memory: OpenClawMemoryForgetOutcome;
+  try {
+    memory = await dependencies.forgetOpenClawSessionMemory({
+      agentId: identity.agentId,
+      sessionId: identity.sessionId,
+      sessionKey: identity.sessionKey,
+    });
+  } catch {
+    memory = { status: 'failed', failedStep: 'preview', detail: 'memory forget could not run' };
+  }
+  await context.assertHeld();
+  return memory;
+}
+
+function purgeDeleteOptions(
+  mode: OpenClawRetirementPurgeMode,
+): Pick<DeleteOpenClawSessionOptions, 'deleteTranscript' | 'purgeParameter'> {
+  if (mode === 'stock-purge') return { purgeParameter: 'purgeTranscript' };
+  if (mode === 'patched-purge') return { purgeParameter: 'deleteTranscriptWithoutArchive' };
+  return { deleteTranscript: true };
 }
 
 function currentNativeSessions(
@@ -322,6 +551,8 @@ function productionDependencies(
       }),
     deleteGatewaySession: overrides.deleteGatewaySession || deleteOpenClawSession,
     readGatewaySession: overrides.readGatewaySession || readGatewaySessionIdentityStrict,
+    probeOpenClawSessionPurge: overrides.probeOpenClawSessionPurge || probeSessionPurgeParameter,
+    forgetOpenClawSessionMemory: overrides.forgetOpenClawSessionMemory || forgetOpenClawSessionMemory,
     attestOpenClawRuntimeFamily: overrides.attestOpenClawRuntimeFamily
       || attestOpenClawRetirementRuntimeFamily,
     resolveLegacyOpenClawSession: overrides.resolveLegacyOpenClawSession
@@ -556,6 +787,7 @@ async function retireNativeAndGatewaySessions(
   context: AdminUserRetirementRunnerContext,
   dependencies: ReturnType<typeof productionDependencies>,
   openClawRuntimeFamily: OpenClawRetirementRuntimeFamily | null,
+  openClawPurgeModes: ReadonlyMap<string, OpenClawRetirementPurgeMode>,
 ): Promise<void> {
   const current = currentNativeSessions(manifest.target.id, dependencies.listNativeSessions);
   assertNativeSessionsMatchManifest(manifest, current);
@@ -569,6 +801,14 @@ async function retireNativeAndGatewaySessions(
   if (remaining.length !== 0) fail('Native agent sessions remain after retirement');
 
   await assertDatabaseAgentSessionsMatchManifest(manifest, dependencies.database);
+  const privacyOutcomes = new Map<string, OpenClawSessionRetirementOutcome>();
+  if (manifest.agentSessions.some((session) => session.provider === 'OPENCLAW')) {
+    const recorded = await readAdminUserRetirementOpenClawPrivacy(
+      context.retirementId,
+      dependencies.database,
+    );
+    for (const outcome of recorded || []) privacyOutcomes.set(outcome.agentSessionId, outcome);
+  }
   for (const session of manifest.agentSessions) {
     if (session.provider === 'OPENCLAW') {
       if (!openClawRuntimeFamily) fail('OpenClaw retirement runtime family was not attested');
@@ -583,18 +823,20 @@ async function retireNativeAndGatewaySessions(
       if (openClawRuntimeFamily === 'legacy-2026.7.1' && currentLocal) {
         dependencies.captureLegacyOpenClawSession(expectedLocal);
       }
+      const purgeMode = openClawRuntimeFamily === 'legacy-2026.7.1'
+        ? null
+        : openClawPurgeModes.get(expectedLocal.agentId);
+      if (openClawRuntimeFamily !== 'legacy-2026.7.1' && !purgeMode) {
+        fail(`OpenClaw session ${session.id} has no confirmed purge mode`);
+      }
       const deleted = await withRetirementLease(
         context,
         () => dependencies.deleteGatewaySession(session.externalId, {
           agentId: expectedLocal.agentId,
           expectedSessionId: expectedLocal.sessionId,
-          ...(openClawRuntimeFamily === 'legacy-2026.7.1'
-            ? { deleteTranscript: true }
-            : {
-                // The Portal-patched 9.1 Gateway performs the transcript
-                // removal inside the same CAS-guarded session mutation.
-                deleteTranscriptWithoutArchive: true,
-              }),
+          // Purge modes remove the transcript inside the same CAS-guarded
+          // session mutation; stock archives it for OpenClaw's retention.
+          ...(purgeMode ? purgeDeleteOptions(purgeMode) : { deleteTranscript: true }),
         }),
       );
       if (!deleted.ok && !/session not found|not found/i.test(String(deleted.error || ''))) {
@@ -619,14 +861,42 @@ async function retireNativeAndGatewaySessions(
             archivedPaths: deleted.archived!,
           }),
         );
-      } else if (deleted.archived.length !== 0) {
+      } else if (purgeMode !== 'stock-archive' && deleted.archived.length !== 0) {
         fail(`OpenClaw session ${session.id} produced an archive during atomic hard deletion`);
       }
+      // stock-archive: the returned archive paths are reported, never unlinked.
+      // On 10.x the transcript also lives in OpenClaw's archive table, so a
+      // Portal-side unlink would not be a purge and would fight its publisher.
       await assertOpenClawRuntimeFamilyStable(openClawRuntimeFamily, dependencies);
       await verifyOpenClawSessionAbsent(session, dependencies);
       if (openClawRuntimeFamily === 'legacy-2026.7.1') {
         dependencies.assertLegacyOpenClawSessionAbsent(expectedLocal);
       }
+      const memory = await forgetRetiredOpenClawSessionMemory(expectedLocal, context, dependencies);
+      const prior = privacyOutcomes.get(session.id);
+      const mode = purgeMode || 'legacy-file';
+      const deletedNow = Boolean(currentLocal);
+      privacyOutcomes.set(session.id, Object.freeze({
+        agentSessionId: session.id,
+        agentId: expectedLocal.agentId,
+        sessionId: expectedLocal.sessionId,
+        purgeMode: mode,
+        session: deletedNow ? 'deleted' : prior?.session || 'already-absent',
+        // Stock never purges a deleted transcript; purge modes are proven by
+        // their no-archive receipt, legacy by the file-level absence check.
+        transcript: mode === 'stock-archive'
+          ? 'archive-retained'
+          : mode === 'legacy-file' || deletedNow
+            ? 'purged'
+            : prior?.transcript || 'unverified-after-resume',
+        archiveCount: deletedNow ? deleted.archived.length : prior?.archiveCount || 0,
+        memory,
+      }));
+      await withRetirementLease(context, () => persistOpenClawPrivacyOutcomes(
+        dependencies.database,
+        context.retirementId,
+        privacyOutcomes,
+      ));
       continue;
     }
     const provider = providerName(session.provider);
@@ -741,6 +1011,12 @@ export async function retireAdminUserExternalState(
       dependencies.captureLegacyOpenClawSession(expected);
     }
   }
+  const openClawPurgeModes = await resolveManifestOpenClawPurgeModes(
+    manifest,
+    openClawRuntimeFamily,
+    context,
+    dependencies,
+  );
   await retireApps(manifest, context, dependencies);
 
   await withRetirementLease(context, () => dependencies.initializeJobs());
@@ -762,6 +1038,7 @@ export async function retireAdminUserExternalState(
     context,
     dependencies,
     openClawRuntimeFamily,
+    openClawPurgeModes,
   );
 
   for (const username of manifest.mailboxes.usernames) {

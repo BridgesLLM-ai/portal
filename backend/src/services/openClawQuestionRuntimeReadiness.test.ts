@@ -218,6 +218,25 @@ describe('OpenClaw exact question-runtime readiness', () => {
   });
 
   it.each([
+    { latency: 12_418, ready: true },
+    { latency: 30_001, ready: false },
+  ])('bounds native 10.6 cold catalog admission at $latency ms', async ({ latency, ready }) => {
+    const deps = dependencies(nativeReport());
+    const healthy = (deps.callGatewayRpc as jest.Mock).getMockImplementation()!;
+    deps.callGatewayRpc = jest.fn(async (method, params, timeoutMs) => {
+      if (method === 'tools.catalog' && latency > (timeoutMs || 0)) {
+        return { ok: false, error: 'tools.catalog RPC timeout' };
+      }
+      return healthy(method, params, timeoutMs);
+    });
+    const setup = { ...setupReadiness('current-2026.9.1'),
+      version: '2026.10.6', runningVersion: '2026.10.6', corePackageVersion: '2026.10.6' };
+    const result = await getOpenClawQuestionPluginReadiness(setup, deps);
+    expect(result.ready).toBe(ready);
+    if (!ready) expect(result.issue).toContain('native ask_user tool catalog: tools.catalog RPC timeout');
+  });
+
+  it.each([
     {
       name: 'a killed inspect as a timeout',
       inspect: { ok: false, stdout: '', stderr: '', error: 'Command failed', timedOut: true },
@@ -276,18 +295,16 @@ describe('OpenClaw exact question-runtime readiness', () => {
     expect(methods.some((method) => method.startsWith('bridgesllm.portal.cron.'))).toBe(false);
   });
 
-  it('accepts only exact tested runtime identities for question authority', () => {
+  it('derives question authority from the legacy tuple or the floor family', () => {
     expect(questionAuthorityForOpenClawVersion('2026.7.1')).toBe('legacy-custom');
     expect(questionAuthorityForOpenClawVersion('2026.7.1-2')).toBe('legacy-custom');
-    expect(questionAuthorityForOpenClawVersion('2026.9.1')).toBe('native');
-    expect(questionAuthorityForOpenClawVersion('2026.9.2')).toBe('native');
-    expect(questionAuthorityForOpenClawVersion('2026.9.3')).toBe('native');
-    expect(questionAuthorityForOpenClawVersion('2026.9.9')).toBe('native');
-    expect(questionAuthorityForOpenClawVersion('2026.10.5')).toBe('native');
-    expect(questionAuthorityForOpenClawVersion('2026.10.6')).toBe('native');
-    expect(questionAuthorityForOpenClawVersion('2026.10.7')).toBeNull();
+    for (const version of ['2026.9.1', '2026.9.2', '2026.9.3', '2026.9.9', '2026.9.36', '2026.10.5', '2026.10.6', '2026.10.7', '2026.10.9', '2026.9.1-1']) {
+      expect(questionAuthorityForOpenClawVersion(version)).toBe('native');
+    }
     expect(questionAuthorityForOpenClawVersion('2026.7.1-3')).toBeNull();
-    expect(questionAuthorityForOpenClawVersion('2026.9.1-1')).toBeNull();
+    expect(questionAuthorityForOpenClawVersion('2026.8.30')).toBeNull();
+    expect(questionAuthorityForOpenClawVersion('not-a-version')).toBeNull();
+    expect(questionAuthorityForOpenClawVersion(undefined)).toBeNull();
   });
 
   it.each([
@@ -344,7 +361,7 @@ describe('OpenClaw exact question-runtime readiness', () => {
     expect(healthyGatewayRpc).toHaveBeenCalledWith(
       'tools.catalog',
       { agentId: 'main', includePlugins: true },
-      10_000,
+      30_000,
     );
   });
 
@@ -406,17 +423,40 @@ describe('OpenClaw exact question-runtime readiness', () => {
     });
   });
 
-  it('rejects duplicate gateway methods that conceal a missing exact method', async () => {
+  it('never lets duplicate or additive methods stand in for the missing steer method', async () => {
     const report = nativeReport({
-      gatewayMethods: [
-        nativeMethods[0],
-        nativeMethods[0],
-      ],
+      gatewayMethods: ['bridgesllm.ask_user.steerStatus', 'bridgesllm.ask_user.steerStatus'],
     });
     await expect(getOpenClawQuestionPluginReadiness(
       setupReadiness('current-2026.9.1'),
       dependencies(report),
     )).resolves.toMatchObject({ ready: false });
+  });
+
+  it.each([
+    ['an additive read-only method', { gatewayMethods: [...nativeMethods, 'bridgesllm.ask_user.steerStatus'] }],
+    ['a duplicate listing of steer', { gatewayMethods: [...nativeMethods, ...nativeMethods] }],
+    ['a tool that is not a question authority', { plugin: { toolNames: ['bridgesllm_runtime_status'] } }],
+    ['a typed hook that cannot intercept tool calls', { typedHooks: [{ name: 'session_start' }], plugin: { hookCount: 1 } }],
+  ])('stays ready when the plugin surface grows %s', async (_label, overrides) => {
+    await expect(getOpenClawQuestionPluginReadiness(
+      setupReadiness('current-2026.9.1'),
+      dependencies(nativeReport(overrides)),
+    )).resolves.toMatchObject({ ready: true, issue: null });
+  });
+
+  it.each([
+    ['a second question method', { gatewayMethods: [...nativeMethods, 'bridgesllm.ask_user.answer'] }],
+    ['a native question method', { gatewayMethods: [...nativeMethods, 'question.resolve'] }],
+    ['an execution-capable method', { gatewayMethods: [...nativeMethods, 'chat.send'] }],
+    ['a question tool', { plugin: { toolNames: ['ask_user_question'] } }],
+    ['a tool-call interceptor', { typedHooks: [{ name: 'before_tool_call' }], plugin: { hookCount: 1 } }],
+    ['a non-string method', { gatewayMethods: [...nativeMethods, 42] }],
+  ])('refuses a native plugin surface with %s', async (_label, overrides) => {
+    await expect(getOpenClawQuestionPluginReadiness(
+      setupReadiness('current-2026.9.1'),
+      dependencies(nativeReport(overrides)),
+    )).resolves.toMatchObject({ ready: false, issue: expect.stringMatching(/no second question authority/) });
   });
 
   it('fails closed for unknown runtime families and an invalid native bundle', async () => {

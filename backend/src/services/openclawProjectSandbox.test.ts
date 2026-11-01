@@ -2327,3 +2327,62 @@ test('does not bootstrap an empty persisted roster without a matching qualified 
     .rejects.toMatchObject({ code: 'CONFIG_AGENT_BOOTSTRAP_UNATTESTED' });
   expect(rpc.mock.calls.some(call => call[0] === 'config.patch')).toBe(false);
 });
+
+describe('implicit-main bootstrap above the floor', () => {
+  async function bootstrap(version: string, extra: { agents?: Record<string, any>; systemAgent?: Record<string, any> } = {}) {
+    const fixture = makeFixture();
+    const workspace = path.join(fixture.openClawHome, 'workspace-main');
+    let persisted: any = { gateway: { mode: 'local' } };
+    let materialized: any = { ...persisted, agents: { entries: { main: {} } } };
+    const patches: any[] = [];
+    const rpc = jest.fn(async (method: string, params: any) => {
+      if (method === 'config.get') return { ok: true, data: { config: materialized, parsed: persisted, valid: true, exists: true, includedPaths: [], agentRosterIncludeOwned: false, hash: `hash-${patches.length}` } };
+      if (method === 'status') return { ok: true, data: { runtimeVersion: version } };
+      if (method === 'config.schema') return { ok: true, data: { version, schema: { properties: { agents: { type: 'object', additionalProperties: false, properties: {
+        defaults: { properties: { systemAgent: { type: 'object', properties: { agentId: { type: 'string' }, ...extra.systemAgent } } } },
+        entries: { type: 'object', additionalProperties: { type: 'object', properties: { workspace: { type: 'string' } } } },
+        ownership: { const: 'explicit' },
+        ...extra.agents,
+      } } } } } };
+      if (method === 'agents.files.list') return { ok: true, data: { agentId: 'main', workspace } };
+      if (method === 'agents.list') return { ok: true, data: { defaultId: 'main', ownership: 'explicit', selectionRequired: false } };
+      if (method === 'config.patch') {
+        const patch = JSON.parse(params.raw); patches.push(patch);
+        persisted = { ...persisted, agents: { ...persisted.agents, ...patch.agents,
+          defaults: { ...persisted.agents?.defaults, ...patch.agents.defaults },
+          entries: { ...persisted.agents?.entries, ...patch.agents.entries } } };
+        materialized = structuredClone(persisted);
+        return { ok: true, data: {} };
+      }
+      throw new Error(`Unexpected RPC ${method}`);
+    });
+    await __openClawProjectSandboxTest.ensureExactOpenClawAgentConfig(fixture.plan, rpc, () => version.split('.').map(Number) as unknown as readonly [number, number, number]);
+    return { patches, persisted, fixture };
+  }
+
+  test.each(['2026.9.6', '2026.10.9', '2027.1.1'])('bootstraps on %s, an unlisted release at or above 2026.9.6', async (version) => {
+    const { patches, persisted, fixture } = await bootstrap(version);
+    expect(patches).toHaveLength(2);
+    expect(persisted.agents.entries[fixture.plan.agentId]).toBeDefined();
+  });
+
+  test('tolerates schema properties a newer OpenClaw adds beside the ones the bootstrap writes', async () => {
+    const { patches } = await bootstrap('2026.10.9', {
+      agents: { routing: { type: 'object' } },
+      systemAgent: { pinnedModel: { type: 'string' } },
+    });
+    expect(patches).toHaveLength(2);
+  });
+
+  test.each([
+    ['2026.9.3', 'below the bootstrap floor'],
+    ['2026.8.9', 'below the runtime floor'],
+  ])('refuses %s (%s) before reading the schema', async (version) => {
+    await expect(bootstrap(version)).rejects.toMatchObject({ code: 'CONFIG_AGENT_BOOTSTRAP_UNATTESTED' });
+  });
+
+  test('still refuses a schema whose systemAgent.agentId is not a string', async () => {
+    await expect(bootstrap('2026.10.9', { systemAgent: { agentId: { type: 'number' } } }))
+      .rejects.toMatchObject({ code: 'CONFIG_AGENT_BOOTSTRAP_UNATTESTED' });
+  });
+});

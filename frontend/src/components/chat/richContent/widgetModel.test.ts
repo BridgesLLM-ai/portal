@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { acceptWidgetMessage, parseWidgetReference, widgetDocumentPath, WIDGET_CHANNEL } from './widgetModel';
+import { acceptWidgetMessage, liveWidgetDocumentPath, parseWidgetReference, widgetDocumentPath, WIDGET_CHANNEL } from './widgetModel';
 const reference = { schema: 'bridgesllm.widget-ref.v1', toolCallId: 'call-owned', title: 'Counter', mode: 'inline' };
 describe('widget reference and bridge boundary', () => {
   it('restores the deliberately projected receipt, never raw HTML or arbitrary native text', () => {
@@ -8,6 +8,21 @@ describe('widget reference and bridge boundary', () => {
     expect(parseWidgetReference('show_widget', 'call-foreign', JSON.stringify(reference))).toBeNull();
     expect(parseWidgetReference('show_widget', 'call-owned', '<button>raw source</button>')).toBeNull();
     expect(parseWidgetReference('show_widget', 'call-owned', JSON.stringify({ ...reference, docId: 'foreign' }))).toBeNull();
+  });
+  it('accepts a live widget board name on inline and pinned-only references only', () => {
+    const live = { ...reference, presentationRef: 'cv_owned', boardName: 'build-timer' };
+    expect(parseWidgetReference('show_widget', 'call-owned', JSON.stringify(live))).toEqual(live);
+    const pinnedOnly = { ...reference, mode: 'dashboard', boardName: 'build-timer' };
+    expect(parseWidgetReference('show_widget', 'call-owned', JSON.stringify(pinnedOnly))).toEqual(pinnedOnly);
+    for (const value of ['', 'Build', '../x', 'a/b', 'x'.repeat(65), 7, null])
+      expect(parseWidgetReference('show_widget', 'call-owned', JSON.stringify({ ...live, boardName: value }))).toBeNull();
+    expect(parseWidgetReference('show_widget', 'call-owned', JSON.stringify({ ...reference, mode: 'unsupported', boardName: 'build-timer' }))).toBeNull();
+    expect(parseWidgetReference('show_widget', 'call-owned', JSON.stringify({ ...live, board: 'build-timer' }))).toBeNull();
+  });
+  it('reads a live widget only from the OpenClaw owner-checked board-name route', () => {
+    expect(liveWidgetDocumentPath('agent:main:portal-x', 'build-timer')).toBe('/chat-widgets/sessions/agent%3Amain%3Aportal-x/boards/build-timer/document');
+    expect(liveWidgetDocumentPath('codex-abc', 'build-timer', 'CODEX')).toBeNull();
+    expect(liveWidgetDocumentPath('agent:main:portal-x', '../x')).toBeNull();
   });
   it('accepts only bounded inline presentation correlation, never a fetch target', () => {
     const bound = { ...reference, presentationRef: 'cv_owned' };

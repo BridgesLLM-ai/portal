@@ -9,6 +9,7 @@ import { getOpenClawCapabilities } from '../services/openClawCompatibility';
 import { describeSessionWork, listSessionWorkRows, projectSessionWorkRow, readSessionWork, sessionRowKey, validWorkSessionKey, publishSessionWorkChanged, type WorkRpc } from '../services/openClawSessionWork';
 import { goalControlSchema, goalControlTimeError, goalControlParams, mapGoalControlFailure } from '../services/openClawGoalControl';
 import { isOwnerRole } from '../utils/authz';
+import { classifyOpenClawSessionLane } from '../agents/openclawSessionOwnership';
 import { acquireWorkspaceAuthorizationMutationLease } from '../services/workspaceAuthorizationBarrier';
 import {
   NativeWorkError,
@@ -19,6 +20,11 @@ import {
 } from '../services/nativeSessionWork';
 export interface AgentWorkDependencies {
   authorize(key: string, user: JwtPayload): Promise<void>;
+  /**
+   * Generic host-history contract without native lineage. Used only to answer
+   * a direct chat the gateway has not stored yet; omit to keep the plain 404.
+   */
+  authorizeUnstarted?(key: string, user: JwtPayload): Promise<void>;
   /** Existing Portal execution admission wrapper, not an unrestricted proxy. */
   mutate(key: string, user: JwtPayload, method: string, params: Record<string, any>): ReturnType<WorkRpc>;
   rpc?: WorkRpc;
@@ -52,6 +58,22 @@ export function createAgentWorkRouter(dependencies: AgentWorkDependencies): Rout
     if (error instanceof NativeWorkError) { res.status(error.status).json({ v: 1, code: error.code }); return; }
     res.status(502).json({ v: 1, code: 'WORK_UNAVAILABLE', error: 'Session work unavailable' });
   };
+  // A fresh main session, or a new chat before its first turn lands, has no
+  // gateway row yet: there is no work and no native lineage to attest. Answer
+  // it as "not started" instead of a 404 every time chat opens.
+  const unstarted = (res: Response, key: string) => {
+    const caps = getOpenClawCapabilities();
+    res.set('Cache-Control', 'private, no-store').json({ v: 1, sessionKey: key, fetchedAt: new Date().toISOString(),
+      caps: { goals: caps.goals, progress: caps.progress }, started: false, session: null, goal: null, progress: null, children: [] });
+  };
+  // Lineage refuses a key it cannot describe. Only a direct chat the gateway
+  // does not know yet falls back to the generic contract, checked before any
+  // native read so a foreign key stays indistinguishable from a missing one.
+  const unstartedVisible = async (key: string, user: JwtPayload): Promise<boolean> => {
+    if (!dependencies.authorizeUnstarted || classifyOpenClawSessionLane(key) !== 'direct') return false;
+    try { await dependencies.authorizeUnstarted(key, user); } catch { return false; }
+    return (await describeSessionWork(key, rpc)) === null;
+  };
   router.get('/sessions/:key/work', async (req, res) => {
     const native = nativeKey(req);
     if (native) {
@@ -59,11 +81,22 @@ export function createAgentWorkRouter(dependencies: AgentWorkDependencies): Rout
       catch (error) { nativeFail(res, error); }
       return;
     }
-    const key = await keyFor(req, res); if (!key) return;
+    const key = req.params.key;
+    if (!validWorkSessionKey(key)) { res.status(404).json({ v: 1, code: 'SESSION_NOT_FOUND' }); return; }
+    try { await dependencies.authorize(key, req.user!); } catch {
+      let visible = false;
+      try { visible = await unstartedVisible(key, req.user!); } catch { /* Gateway unreadable: keep the plain 404. */ }
+      if (visible) unstarted(res, key); else res.status(404).json({ v: 1, code: 'SESSION_NOT_FOUND' });
+      return;
+    }
     try {
       const work = await readSessionWork(key, target => dependencies.authorize(target, req.user!), rpc);
-      if (!work) { res.status(404).json({ v: 1, code: 'SESSION_NOT_FOUND' }); return; }
       await dependencies.authorize(key, req.user!);
+      if (!work) {
+        if (classifyOpenClawSessionLane(key) === 'direct') unstarted(res, key);
+        else res.status(404).json({ v: 1, code: 'SESSION_NOT_FOUND' });
+        return;
+      }
       res.set('Cache-Control', 'private, no-store').json(work);
     } catch (error) { fail(res, error); }
   });

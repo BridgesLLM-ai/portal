@@ -12,6 +12,8 @@ const WORKSPACE_STORAGE_PREFIXES = [
   'agent-active-',
   'agent-model-',
   'agent-work-goal-op:v1:',
+  'portal.agentWorkspace.v1:',
+  'portal.floatingWidgets.v1:',
 ];
 
 const TRANSIENT_WORKSPACE_STORAGE_KEYS = new Set([

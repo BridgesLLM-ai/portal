@@ -16,6 +16,12 @@ readonly HERMES_SOURCE_URL="https://api.github.com/repos/NousResearch/hermes-age
 readonly HERMES_SOURCE_TREE_SHA256="6bd8d88ce4758357d926967676130eff96427515163608a7c51e4f459891cc89"
 readonly HERMES_SOURCE_MAX_BYTES=$((96 * 1024 * 1024))
 readonly HERMES_SOURCE_MAX_EXPANDED_BYTES=$((512 * 1024 * 1024))
+# Members (files and directories) of the source tarball; toolctl's
+# HERMES_SOURCE_MAX_ENTRIES is the same number. v0.22.5 (bf0203a794a0) has
+# 22,045 (20,799 files, 87 MB compressed, 232 MB expanded). 60,000 is 2.7x that,
+# so the byte limits above stay the first limit a growing release meets, while
+# the archive's member index and the unpacked tree stay small.
+readonly HERMES_SOURCE_MAX_ENTRIES=60000
 
 readonly HERMES_UV_VERSION="0.12.5"
 readonly HERMES_UV_SHA256_X86_64="68a509da24b06b4223a1c0175fb5eb5bc79342b76cbeff0cfe51ac3f5b17b6b2"
@@ -78,13 +84,19 @@ hermes_target() {
   printf '%s/hermes\n' "${HERMES_BIN_DIR:-/usr/local/bin}"
 }
 
+hermes_source_url() {
+  printf 'https://api.github.com/repos/NousResearch/hermes-agent/tarball/%s\n' "$1"
+}
+
+# [version tag commit tree-sha256]: the tested release by default, or one
+# generation that Maintenance staged (hermes_stage) and admitted.
 hermes_attestation() {
   cat <<EOF
 schema=bridgesllm-hermes-runtime-v1
-product_version=${HERMES_TESTED_VERSION}
-upstream_tag=${HERMES_TESTED_TAG}
-upstream_commit=${HERMES_TESTED_COMMIT}
-source_tree_sha256=${HERMES_SOURCE_TREE_SHA256}
+product_version=${1:-${HERMES_TESTED_VERSION}}
+upstream_tag=${2:-${HERMES_TESTED_TAG}}
+upstream_commit=${3:-${HERMES_TESTED_COMMIT}}
+source_tree_sha256=${4:-${HERMES_SOURCE_TREE_SHA256}}
 uv_version=${HERMES_UV_VERSION}
 python_version=${HERMES_PYTHON_VERSION}
 python_build=${HERMES_PYTHON_BUILD}
@@ -110,7 +122,7 @@ verify_hermes_download() {
 
 hermes_source_tree_sha256() {
   local archive="$1"
-  python3 - "${archive}" "${HERMES_SOURCE_MAX_EXPANDED_BYTES}" <<'PY'
+  python3 - "${archive}" "${HERMES_SOURCE_MAX_EXPANDED_BYTES}" "${HERMES_SOURCE_MAX_ENTRIES}" <<'PY'
 import hashlib
 import pathlib
 import posixpath
@@ -119,6 +131,7 @@ import tarfile
 
 archive = pathlib.Path(sys.argv[1])
 expanded_limit = int(sys.argv[2])
+entry_limit = int(sys.argv[3])
 required = {"pyproject.toml", "uv.lock", "hermes", "acp_adapter"}
 roots: set[str] = set()
 seen: set[str] = set()
@@ -127,7 +140,7 @@ expanded = 0
 
 with tarfile.open(archive, "r:gz") as tf:
     members = tf.getmembers()
-    if not members or len(members) > 20000:
+    if not members or len(members) > entry_limit:
         raise SystemExit("Hermes archive entry count is outside the allowed range")
     for member in members:
         name = member.name
@@ -182,16 +195,16 @@ PY
 }
 
 verify_hermes_source_archive() {
-  local archive="$1" actual size
+  local archive="$1" expected="${2:-${HERMES_SOURCE_TREE_SHA256}}" actual size
   size="$(stat -c '%s' "${archive}")"
   (( size > 0 && size <= HERMES_SOURCE_MAX_BYTES )) || {
     printf 'Hermes archive size is outside the allowed range.\n' >&2
     return 1
   }
   actual="$(hermes_source_tree_sha256 "${archive}")" || return 1
-  [[ "${actual}" == "${HERMES_SOURCE_TREE_SHA256}" ]] || {
+  [[ "${actual}" == "${expected}" ]] || {
     printf 'Hermes source tree checksum mismatch (expected %s, received %s).\n' \
-      "${HERMES_SOURCE_TREE_SHA256}" "${actual}" >&2
+      "${expected}" "${actual}" >&2
     return 1
   }
 }
@@ -272,19 +285,19 @@ with tarfile.open(sys.argv[1], "r:gz") as tf:
 PYTHON
 }
 
-hermes_write_install_stamp() {
+hermes_write_install_stamp() {  # root [version tag commit]
   local root="$1"
   # An archive nested beneath another checkout must not inherit that checkout's
   # branch/dirty identity. The admitted commit/tree, not ambient Git, is authority.
   env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
     GIT_CEILING_DIRECTORIES="$(dirname "${root}")" \
     "${root}/.portal-tools/python/bin/python3" "${root}/scripts/write_install_stamp.py" \
-    --output "${root}/install-stamp.json" --base-version "${HERMES_TESTED_VERSION}" \
-    --commit "${HERMES_TESTED_COMMIT}" --branch "${HERMES_TESTED_TAG}" --distance 0 --source local --update-mechanism external
+    --output "${root}/install-stamp.json" --base-version "${2:-${HERMES_TESTED_VERSION}}" \
+    --commit "${4:-${HERMES_TESTED_COMMIT}}" --branch "${3:-${HERMES_TESTED_TAG}}" --distance 0 --source local --update-mechanism external
 }
 
-verify_hermes_install_stamp() {
-  python3 - "$1/install-stamp.json" "${HERMES_TESTED_VERSION}" "${HERMES_TESTED_COMMIT}" <<'PYTHON'
+verify_hermes_install_stamp() {  # root [version commit]
+  python3 - "$1/install-stamp.json" "${2:-${HERMES_TESTED_VERSION}}" "${3:-${HERMES_TESTED_COMMIT}}" <<'PYTHON'
 import json
 import sys
 try:
@@ -300,8 +313,8 @@ raise SystemExit(0 if valid else 1)
 PYTHON
 }
 
-hermes_binary_version() {
-  local binary="$1" probe output
+hermes_binary_version() {  # binary [expected version]
+  local binary="$1" expected="${2:-${HERMES_TESTED_VERSION}}" probe output
   [[ -x "${binary}" ]] || return 1
   probe="$(mktemp -d)"
   mkdir -p "${probe}/home" "${probe}/state"
@@ -318,8 +331,8 @@ hermes_binary_version() {
     return 1
   }
   rm -rf -- "${probe}"
-  [[ "${output}" =~ ^${HERMES_TESTED_VERSION//./\.}([[:space:]]*)$ ]] || return 1
-  printf '%s\n' "${HERMES_TESTED_VERSION}"
+  [[ "${output}" =~ ^${expected//./\.}([[:space:]]*)$ ]] || return 1
+  printf '%s\n' "${expected}"
 }
 
 hermes_acp_check() {
@@ -377,24 +390,79 @@ hermes_legacy_managed_alias() {
   [[ -f "${resolved}" && ! -L "${resolved}" && "$(stat -c '%u' -- "${resolved}")" == "0" ]]
 }
 
+# Maintenance (installer/tools/bridgesllm-toolctl.py) stages newer official
+# releases into this same layout (hermes_stage), probes them, switches the alias
+# and records each one in its admission record. Such a runtime is kept as it is
+# instead of being converged back to the tested version, which acts as the floor.
+hermes_admission_record() {
+  printf '%s\n' "${HERMES_ADMISSION_RECORD:-/var/lib/bridgesllm/tools/admission/hermes.json}"
+}
+
+# Prints "<version> <tag> <commit> <tree-sha256>" when the record names exactly
+# this alias target (path and sha256) and its generation's attestation (sha256)
+# at or above the tested version, from an update that verified the source bytes
+# (a re-check record never keeps a non-tested generation); fails otherwise.
+hermes_admitted_identity() {
+  local resolved="$1" record
+  record="$(hermes_admission_record)"
+  [[ -f "${record}" && ! -L "${record}" ]] || return 1
+  python3 -I - "${record}" "${resolved}" "${HERMES_TESTED_VERSION}" "$(hermes_root)" "${HERMES_ATTESTATION_NAME}" <<'PY'
+import hashlib, json, re, sys
+
+record_path, resolved, floor, root, attestation_name = sys.argv[1:6]
+key = lambda version: tuple(int(part) for part in version.split("."))
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+try:
+    with open(record_path, "rb") as handle:
+        record = json.loads(handle.read(65536))
+    version, entry, source = record["version"], record["executables"]["hermes"], record["source"]
+    generation = "%s/%s" % (root, version)
+    if record["schema"] != "bridgesllm.tools.harness-admission.v1" or record["toolId"] != "hermes" \
+            or not re.fullmatch(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", version) or key(version) < key(floor) \
+            or entry["path"] != resolved or resolved != generation + "/.venv/bin/hermes" or source["tag"] != "v" + version \
+            or source.get("bytesVerified") is not True \
+            or not re.fullmatch(r"[0-9a-f]{40}", source["commit"]) or not re.fullmatch(r"[0-9a-f]{64}", source["treeSha256"]):
+        raise ValueError("record does not admit this runtime")
+    if sha256(resolved) != entry["sha256"] or sha256(generation + "/" + attestation_name) != record["attestationSha256"]:
+        raise ValueError("runtime differs from the admitted one")
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+print(version, source["tag"], source["commit"], source["treeSha256"])
+PY
+}
+
 verify_hermes_runtime() {
-  local root target resolved expected_attestation actual_attestation python_version
-  root="$(hermes_version_root)"
+  local root target resolved identity expected_attestation actual_attestation python_version
+  local version="${HERMES_TESTED_VERSION}" tag="${HERMES_TESTED_TAG}" commit="${HERMES_TESTED_COMMIT}" tree="${HERMES_SOURCE_TREE_SHA256}"
   target="$(hermes_target)"
   [[ -L "${target}" ]] || return 1
   resolved="$(readlink -f -- "${target}" 2>/dev/null || true)"
+  if [[ "${resolved}" != "$(hermes_version_root)/.venv/bin/hermes" ]]; then
+    identity="$(hermes_admitted_identity "${resolved}")" || return 1
+    read -r version tag commit tree <<< "${identity}"
+  fi
+  root="$(hermes_root)/${version}"
   [[ "${resolved}" == "${root}/.venv/bin/hermes" ]] || return 1
   hermes_runtime_publicly_executable "${resolved}" || return 1
   hermes_runtime_publicly_executable "$(readlink -f -- "${root}/.venv/bin/python")" || return 1
   [[ -x "${root}/.portal-tools/uv" && -f "${root}/${HERMES_ATTESTATION_NAME}" ]] || return 1
-  expected_attestation="$(hermes_attestation)"
+  expected_attestation="$(hermes_attestation "${version}" "${tag}" "${commit}" "${tree}")"
   actual_attestation="$(<"${root}/${HERMES_ATTESTATION_NAME}")"
   [[ "${actual_attestation}" == "${expected_attestation}" ]] || return 1
-  verify_hermes_install_stamp "${root}" || return 1
+  verify_hermes_install_stamp "${root}" "${version}" "${commit}" || return 1
   [[ "$(hermes_uv_version "${root}/.portal-tools/uv" || true)" == "${HERMES_UV_VERSION}" ]] || return 1
   python_version="$("${root}/.venv/bin/python" --version 2>&1 | awk '{print $2}')"
   [[ "${python_version}" == "${HERMES_PYTHON_VERSION}" ]] || return 1
-  [[ "$(hermes_binary_version "${target}" || true)" == "${HERMES_TESTED_VERSION}" ]] || return 1
+  [[ "$(hermes_binary_version "${target}" "${version}" || true)" == "${version}" ]] || return 1
   hermes_acp_check "${target}"
 }
 
@@ -402,16 +470,123 @@ hermes_verify() {
   local target
   target="$(hermes_target)"
   verify_hermes_runtime || {
-    printf 'Hermes is missing or is not the Portal-qualified %s runtime at %s.\n' \
+    printf 'Hermes is missing or is neither the Portal-qualified %s runtime nor an admitted newer release at %s.\n' \
       "${HERMES_TESTED_VERSION}" "${target}" >&2
     return 1
   }
-  printf 'Hermes %s is verified at %s.\n' "${HERMES_TESTED_VERSION}" "${target}"
+  printf 'Hermes is verified at %s.\n' "${target}"
+}
+
+# Downloads into <work_dir> and verifies the source tree of <commit> (canonical
+# tree <tree-sha256>), the pinned uv and the pinned Python; unpacks the source
+# (<work_dir>/source) and uv (<work_dir>/uv). Shared by converge and stage.
+# Callers test its status (set -e does not apply there), so every step checks.
+hermes_fetch_artifacts() {
+  local work_dir="$1" arch="$2" commit="$3" tree="$4" uv_url uv_sha uv_member
+  uv_url="$(hermes_uv_url "${arch}")" || return 1
+  uv_sha="$(hermes_uv_sha256 "${arch}")" || return 1
+  uv_member="$(hermes_uv_member "${arch}")" || return 1
+  mkdir -p "${work_dir}/source" || return 1
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --connect-timeout 20 --max-time 900 --max-filesize "${HERMES_SOURCE_MAX_BYTES}" \
+      --output "${work_dir}/hermes.tar.gz" "$(hermes_source_url "${commit}")" \
+    || ! verify_hermes_source_archive "${work_dir}/hermes.tar.gz" "${tree}"; then
+    printf 'Could not acquire the pinned Hermes source artifact.\n' >&2
+    return 1
+  fi
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --connect-timeout 20 --max-time 600 --max-filesize "${HERMES_UV_MAX_BYTES}" \
+      --output "${work_dir}/uv.tar.gz" "${uv_url}" \
+    || ! verify_hermes_uv_archive "${work_dir}/uv.tar.gz" "${uv_sha}" "${uv_member}"; then
+    printf 'Could not acquire the pinned uv artifact for Hermes.\n' >&2
+    return 1
+  fi
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --connect-timeout 20 --max-time 900 --max-filesize "${HERMES_PYTHON_MAX_BYTES}" \
+      --output "${work_dir}/python.tar.gz" "$(hermes_python_url "${arch}")" \
+    || ! verify_hermes_python_archive "${work_dir}/python.tar.gz" "$(hermes_python_sha256 "${arch}")"; then
+    printf 'Could not acquire the pinned Python artifact for Hermes.\n' >&2
+    return 1
+  fi
+  if ! tar --no-same-owner --no-same-permissions -xzf "${work_dir}/hermes.tar.gz" \
+      --strip-components=1 -C "${work_dir}/source" \
+    || ! tar -xOzf "${work_dir}/uv.tar.gz" "${uv_member}" > "${work_dir}/uv" || ! chmod 0755 "${work_dir}/uv"; then
+    printf 'The verified Hermes source or uv archive could not be unpacked.\n' >&2
+    return 1
+  fi
+  [[ "$(hermes_uv_version "${work_dir}/uv" || true)" == "${HERMES_UV_VERSION}" ]] || {
+    printf 'Pinned uv artifact failed exact version verification.\n' >&2
+    return 1
+  }
+}
+
+# Turns fetched artifacts into the absent runtime generation <version_root>:
+# source, pinned uv and Python, install stamp, frozen-lock venv, attestation,
+# then the exact product version and ACP check. Removes it on failure.
+hermes_install_generation() {
+  local version_root="$1" work_dir="$2" version="$3" tag="$4" commit="$5" tree="$6"
+  mv -- "${work_dir}/source" "${version_root}" || return 1
+  if ! (
+    export UV_CACHE_DIR="${work_dir}/uv-cache"
+    export UV_NO_PROGRESS=1
+    export UV_NO_CONFIG=1
+    install -d -m 0755 "${version_root}/.portal-tools" || exit 1
+    install -m 0755 "${work_dir}/uv" "${version_root}/.portal-tools/uv" || exit 1
+    tar --no-same-owner --no-same-permissions -xzf "${work_dir}/python.tar.gz" -C "${version_root}/.portal-tools" || exit 1
+    [[ "$("${version_root}/.portal-tools/python/bin/python3" --version 2>&1)" == "Python ${HERMES_PYTHON_VERSION}" ]] || exit 1
+    hermes_write_install_stamp "${version_root}" "${version}" "${tag}" "${commit}" || exit 1
+    verify_hermes_install_stamp "${version_root}" "${version}" "${commit}" || exit 1
+    UV_PYTHON_DOWNLOADS=never "${version_root}/.portal-tools/uv" sync \
+      --project "${version_root}" \
+      --python "${version_root}/.portal-tools/python/bin/python3" \
+      --frozen --no-dev --no-default-groups --extra acp --extra mcp --compile-bytecode
+  ); then
+    printf 'Hermes dependency convergence failed; restoring the previous runtime.\n' >&2
+    rm -rf -- "${version_root}"
+    return 1
+  fi
+  if ! hermes_attestation "${version}" "${tag}" "${commit}" "${tree}" > "${version_root}/${HERMES_ATTESTATION_NAME}" \
+    || ! chmod 0644 "${version_root}/${HERMES_ATTESTATION_NAME}" || ! chmod -R u+rwX,go+rX,go-w -- "${version_root}" \
+    || [[ "$(hermes_binary_version "${version_root}/.venv/bin/hermes" "${version}" || true)" != "${version}" ]] \
+    || ! hermes_acp_check "${version_root}/.venv/bin/hermes"; then
+    printf 'Installed Hermes failed exact product/ACP verification; restoring the previous runtime.\n' >&2
+    rm -rf -- "${version_root}"
+    return 1
+  fi
+}
+
+# Maintenance's candidate build: `stage <dir> <version> <tag> <commit> <tree-sha256>`
+# builds the generation exactly like converge does, from the source tree of
+# <commit> that toolctl resolved from <tag> and verified (<tree-sha256>), with
+# the pinned uv and Python. A venv is not relocatable, so <dir> must be the
+# generation's final path <root>/<version> and must not exist yet. The alias and
+# every other generation are left alone; toolctl probes <dir> and switches.
+hermes_stage() {
+  local dir="${1:-}" version="${2:-}" tag="${3:-}" commit="${4:-}" tree="${5:-}" arch work_dir
+  if [[ "$#" -ne 5 || ! "${version}" =~ ^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ || "${tag}" != "v${version}" \
+      || ! "${commit}" =~ ^[0-9a-f]{40}$ || ! "${tree}" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'Usage: stage <root>/<x.y.z> <x.y.z> v<x.y.z> <40-hex commit> <64-hex tree sha256>\n' >&2
+    return 2
+  fi
+  if [[ "${dir}" != "$(hermes_root)/${version}" || -e "${dir}" || -L "${dir}" || ! -d "$(hermes_root)" ]]; then
+    printf 'Refusing to stage Hermes %s at %s: it must be the absent generation %s/%s.\n' \
+      "${version}" "${dir}" "$(hermes_root)" "${version}" >&2
+    return 1
+  fi
+  arch="$(hermes_arch)" || return 1
+  work_dir="$(mktemp -d "$(hermes_root)/.install-${version}.XXXXXX")"
+  if ! hermes_fetch_artifacts "${work_dir}" "${arch}" "${commit}" "${tree}" \
+    || ! hermes_install_generation "${dir}" "${work_dir}" "${version}" "${tag}" "${commit}" "${tree}"; then
+    rm -rf -- "${work_dir}"
+    printf 'Hermes %s could not be staged at %s.\n' "${version}" "${dir}" >&2
+    return 1
+  fi
+  rm -rf -- "${work_dir}"
+  printf 'Hermes %s staged and verified at %s.\n' "${version}" "${dir}"
 }
 
 hermes_converge() {
-  local root version_root bin_dir target state_dir arch uv_url uv_sha uv_member
-  local work_dir source_archive uv_archive source_stage uv_binary python_archive previous_link="" backup_root=""
+  local root version_root bin_dir target state_dir arch work_dir previous_link="" backup_root=""
   root="$(hermes_root)"
   version_root="$(hermes_version_root)"
   bin_dir="${HERMES_BIN_DIR:-/usr/local/bin}"
@@ -425,7 +600,7 @@ hermes_converge() {
     }
   fi
   if verify_hermes_runtime; then
-    printf 'Hermes %s is already verified at %s.\n' "${HERMES_TESTED_VERSION}" "${target}"
+    printf 'Hermes is already verified at %s.\n' "${target}"
     return 0
   fi
   if [[ -e "${target}" && ! -L "${target}" ]]; then
@@ -448,9 +623,7 @@ hermes_converge() {
   fi
 
   arch="$(hermes_arch)" || return 1
-  uv_url="$(hermes_uv_url "${arch}")" || return 1
-  uv_sha="$(hermes_uv_sha256 "${arch}")" || return 1
-  uv_member="$(hermes_uv_member "${arch}")" || return 1
+  hermes_uv_url "${arch}" >/dev/null || return 1
   # Existing ancestors may protect unrelated files; never chmod them.
   # Missing parents follow the umask in some install implementations (uutils 0.8
   # creates them 0700 under umask 077; GNU uses 0755), so only this public creation
@@ -467,82 +640,16 @@ hermes_converge() {
   ( umask 022; install -d -m 0755 "${root}" "${bin_dir}" )
   install -d -m 0700 "${state_dir}"
   work_dir="$(mktemp -d "${root}/.install-${HERMES_TESTED_VERSION}.XXXXXX")"
-  source_archive="${work_dir}/hermes.tar.gz"
-  uv_archive="${work_dir}/uv.tar.gz"
-  python_archive="${work_dir}/python.tar.gz"
-  source_stage="${work_dir}/source"
-  uv_binary="${work_dir}/uv"
-  mkdir -p "${source_stage}"
-
-  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-      --connect-timeout 20 --max-time 900 --max-filesize "${HERMES_SOURCE_MAX_BYTES}" \
-      --output "${source_archive}" "${HERMES_SOURCE_URL}" \
-    || ! verify_hermes_source_archive "${source_archive}"; then
-    printf 'Could not acquire the pinned Hermes source artifact.\n' >&2
+  if ! hermes_fetch_artifacts "${work_dir}" "${arch}" "${HERMES_TESTED_COMMIT}" "${HERMES_SOURCE_TREE_SHA256}"; then
     rm -rf -- "${work_dir}"
     return 1
   fi
-  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-      --connect-timeout 20 --max-time 600 --max-filesize "${HERMES_UV_MAX_BYTES}" \
-      --output "${uv_archive}" "${uv_url}" \
-    || ! verify_hermes_uv_archive "${uv_archive}" "${uv_sha}" "${uv_member}"; then
-    printf 'Could not acquire the pinned uv artifact for Hermes.\n' >&2
-    rm -rf -- "${work_dir}"
-    return 1
-  fi
-  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-      --connect-timeout 20 --max-time 900 --max-filesize "${HERMES_PYTHON_MAX_BYTES}" \
-      --output "${python_archive}" "$(hermes_python_url "${arch}")" \
-    || ! verify_hermes_python_archive "${python_archive}" "$(hermes_python_sha256 "${arch}")"; then
-    printf 'Could not acquire the pinned Python artifact for Hermes.\n' >&2
-    rm -rf -- "${work_dir}"
-    return 1
-  fi
-  tar --no-same-owner --no-same-permissions -xzf "${source_archive}" \
-    --strip-components=1 -C "${source_stage}"
-  tar -xOzf "${uv_archive}" "${uv_member}" > "${uv_binary}"
-  chmod 0755 "${uv_binary}"
-  [[ "$(hermes_uv_version "${uv_binary}" || true)" == "${HERMES_UV_VERSION}" ]] || {
-    printf 'Pinned uv artifact failed exact version verification.\n' >&2
-    rm -rf -- "${work_dir}"
-    return 1
-  }
-
   if [[ -e "${version_root}" ]]; then
     backup_root="${work_dir}/previous-runtime"
     mv -- "${version_root}" "${backup_root}"
   fi
-  mv -- "${source_stage}" "${version_root}"
-  install -d -m 0755 "${version_root}/.portal-tools"
-  install -m 0755 "${uv_binary}" "${version_root}/.portal-tools/uv"
-
-  if ! (
-    export UV_CACHE_DIR="${work_dir}/uv-cache"
-    export UV_NO_PROGRESS=1
-    export UV_NO_CONFIG=1
-    tar --no-same-owner --no-same-permissions -xzf "${python_archive}" -C "${version_root}/.portal-tools"
-    [[ "$("${version_root}/.portal-tools/python/bin/python3" --version 2>&1)" == "Python ${HERMES_PYTHON_VERSION}" ]] || exit 1
-    hermes_write_install_stamp "${version_root}" || exit 1
-    verify_hermes_install_stamp "${version_root}" || exit 1
-    UV_PYTHON_DOWNLOADS=never "${version_root}/.portal-tools/uv" sync \
-      --project "${version_root}" \
-      --python "${version_root}/.portal-tools/python/bin/python3" \
-      --frozen --no-dev --no-default-groups --extra acp --extra mcp --compile-bytecode
-  ); then
-    printf 'Hermes dependency convergence failed; restoring the previous runtime.\n' >&2
-    rm -rf -- "${version_root}"
-    [[ -z "${backup_root}" ]] || mv -- "${backup_root}" "${version_root}"
-    rm -rf -- "${work_dir}"
-    return 1
-  fi
-  hermes_attestation > "${version_root}/${HERMES_ATTESTATION_NAME}"
-  chmod 0644 "${version_root}/${HERMES_ATTESTATION_NAME}"
-  chmod -R u+rwX,go+rX,go-w -- "${version_root}"
-
-  if [[ "$(hermes_binary_version "${version_root}/.venv/bin/hermes" || true)" != "${HERMES_TESTED_VERSION}" ]] \
-    || ! hermes_acp_check "${version_root}/.venv/bin/hermes"; then
-    printf 'Installed Hermes failed exact product/ACP verification; restoring the previous runtime.\n' >&2
-    rm -rf -- "${version_root}"
+  if ! hermes_install_generation "${version_root}" "${work_dir}" "${HERMES_TESTED_VERSION}" "${HERMES_TESTED_TAG}" \
+      "${HERMES_TESTED_COMMIT}" "${HERMES_SOURCE_TREE_SHA256}"; then
     [[ -z "${backup_root}" ]] || mv -- "${backup_root}" "${version_root}"
     rm -rf -- "${work_dir}"
     return 1
@@ -572,7 +679,8 @@ hermes_main() {
   case "${1:-status}" in
     converge|install|update) hermes_converge ;;
     verify|status) hermes_verify ;;
-    *) printf 'Usage: %s {converge|verify|status}\n' "${0##*/}" >&2; return 2 ;;
+    stage) shift; hermes_stage "$@" ;;
+    *) printf 'Usage: %s {converge|verify|status|stage <dir> <version> <tag> <commit> <tree-sha256>}\n' "${0##*/}" >&2; return 2 ;;
   esac
 }
 

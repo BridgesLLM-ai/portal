@@ -56,8 +56,8 @@ function isRecord(value) {
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
-  if (!['snapshot', 'prepare', 'restore', 'commit'].includes(command)) {
-    fail('usage: migrate-openclaw-2026.10.6.mjs <snapshot|prepare|restore|commit> --manifest PATH [--state-dir PATH --config PATH --package-dir PATH]');
+  if (!['preflight', 'snapshot', 'prepare', 'restore', 'commit'].includes(command)) {
+    fail('usage: migrate-openclaw-2026.10.6.mjs <preflight|snapshot|prepare|restore|commit> --manifest PATH [--state-dir PATH --config PATH --package-dir PATH] [--gateway-cgroup PATH]');
   }
   const values = { command };
   for (let index = 0; index < rest.length; index += 2) {
@@ -65,21 +65,22 @@ function parseArgs(argv) {
     const value = rest[index + 1];
     if (!flag?.startsWith('--') || value === undefined) fail(`invalid argument: ${flag ?? ''}`);
     const name = flag.slice(2);
-    if (!['manifest', 'state-dir', 'config', 'package-dir'].includes(name) || values[name] !== undefined) {
+    if (!['manifest', 'state-dir', 'config', 'package-dir', 'gateway-cgroup'].includes(name) || values[name] !== undefined) {
       fail(`unsupported or repeated argument: ${flag}`);
     }
     values[name] = value;
   }
   if (!values.manifest) fail('--manifest is required');
-  if (['snapshot', 'prepare'].includes(command) && (!values['state-dir'] || !values.config || !values['package-dir'])) {
+  if (['preflight', 'snapshot', 'prepare'].includes(command) && (!values['state-dir'] || !values.config || !values['package-dir'])) {
     fail(`${command} requires --state-dir, --config, and --package-dir`);
   }
-  for (const key of ['manifest', 'state-dir', 'config', 'package-dir']) {
+  for (const key of ['manifest', 'state-dir', 'config', 'package-dir', 'gateway-cgroup']) {
     const value = values[key];
     if (value !== undefined && (!path.isAbsolute(value) || path.normalize(value) !== value)) {
       fail(`--${key} must be a canonical absolute path`);
     }
   }
+  if (values['gateway-cgroup'] !== undefined && command !== 'preflight') fail('--gateway-cgroup is only accepted by preflight');
   return values;
 }
 
@@ -120,8 +121,22 @@ function assertSecureParent(target, label) {
   return parent;
 }
 
+// Stream through a fixed buffer: a whole-file read fails above Node's 2 GiB
+// buffer limit, and retained agent databases and their backups can be larger.
 function sha256File(target) {
-  return crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+  const hash = crypto.createHash('sha256');
+  const descriptor = fs.openSync(target, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const read = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (read === 0) break;
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return hash.digest('hex');
 }
 
 function sha256Content(content) {
@@ -347,7 +362,7 @@ function assertIndependentCodexHomeBoundary(target) {
   if (!stat.isDirectory()) fail(`OpenClaw independent Codex home is not a directory: ${target}`);
 }
 
-function collectAuthorityTree(stateDir, relativeRoot, entries) {
+function collectAuthorityTree(stateDir, relativeRoot, entries, { hash = true } = {}) {
   const root = statePathFromRelative(stateDir, relativeRoot);
   if (!fs.existsSync(root)) return;
   const credentialTree = relativeRoot === 'credentials' || isAgentCredentialRoot(relativeRoot);
@@ -372,7 +387,7 @@ function collectAuthorityTree(stateDir, relativeRoot, entries) {
     if (stat.uid !== process.getuid() || stat.nlink !== 1) {
       fail(`OpenClaw authority file has unsafe ownership or hard links: ${target}`);
     }
-    entries.push({ relativePath, kind: 'file', mode: stat.mode & 0o777, sha256: sha256File(target), size: stat.size });
+    entries.push({ relativePath, kind: 'file', mode: stat.mode & 0o777, sha256: hash ? sha256File(target) : null, size: stat.size });
   };
   walk(root, relativeRoot);
 }
@@ -648,12 +663,15 @@ function removePreflightTree(target) {
 // Stopping one systemd unit is not proof that another CLI/setup process has
 // closed the same WAL/SHM set. Even read-only SQLite connections can rewrite
 // SHM. Refuse before snapshot or rollback; never weaken the saved byte checks.
-function assertNoSqliteUsers(stateDir) {
-  const identities = new Set(listOpenClawSqliteFiles(stateDir).map((relative) => {
+// Holders are named (process, command, cgroup) but never signalled.
+function sqliteHolders(stateDir) {
+  const identities = new Map(listOpenClawSqliteFiles(stateDir).map((relative) => {
     const stat = fs.statSync(statePathFromRelative(stateDir, relative));
-    return `${stat.dev}:${stat.ino}`;
+    return [`${stat.dev}:${stat.ino}`, relative];
   }));
-  if (identities.size === 0) return;
+  const holders = [];
+  if (identities.size === 0) return holders;
+  const read = (target) => { try { return fs.readFileSync(target, 'utf8'); } catch { return ''; } };
   for (const pid of fs.readdirSync('/proc').filter((name) => /^\d+$/.test(name) && Number(name) !== process.pid)) {
     let descriptors;
     try { descriptors = fs.readdirSync(`/proc/${pid}/fd`); }
@@ -662,9 +680,84 @@ function assertNoSqliteUsers(stateDir) {
       let stat;
       try { stat = fs.statSync(`/proc/${pid}/fd/${descriptor}`); }
       catch (error) { if (['ENOENT', 'ESRCH'].includes(error.code)) continue; throw error; }
-      if (stat.isFile() && identities.has(`${stat.dev}:${stat.ino}`)) fail(`OpenClaw SQLite authority is still open by process ${pid}; quiesce its owner before migration`);
+      const relativePath = stat.isFile() ? identities.get(`${stat.dev}:${stat.ino}`) : undefined;
+      if (relativePath === undefined) continue;
+      const cgroup = (read(`/proc/${pid}/cgroup`).split('\n').find((line) => line.startsWith('0::')) || '').slice(3);
+      holders.push({ pid: Number(pid), command: read(`/proc/${pid}/comm`).trim().slice(0, 64), cgroup, relativePath });
+      break;
     }
   }
+  return holders;
+}
+
+function describeSqliteHolders(holders) {
+  return holders.map((holder) => `process ${holder.pid} (${holder.command || 'unknown'}, cgroup ${holder.cgroup || 'unknown'}) holds ${holder.relativePath}`).join('; ');
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+// A short-lived diagnostic started before maintenance began may still finish
+// its read; wait a bounded time for holders to exit, then refuse with their
+// identities. Long-lived external readers must be paused by their owner.
+function assertNoSqliteUsers(stateDir, { exclude = () => false, graceMs = readerGraceMs() } = {}) {
+  const deadline = Date.now() + graceMs;
+  for (;;) {
+    const holders = sqliteHolders(stateDir).filter((holder) => !exclude(holder));
+    if (holders.length === 0) return;
+    if (Date.now() >= deadline) {
+      fail(`OpenClaw SQLite authority is still open: ${describeSqliteHolders(holders)}. Stop or pause that process's service (for example with systemctl stop <unit>) and retry; maintenance never terminates external readers`);
+    }
+    sleepSync(Math.min(1000, Math.max(1, deadline - Date.now())));
+  }
+}
+
+function readerGraceMs() {
+  const configured = process.env.PORTAL_OPENCLAW_MIGRATION_READER_GRACE_MS;
+  if (configured === undefined) return 60_000;
+  if (!/^\d{1,6}$/.test(configured)) fail('PORTAL_OPENCLAW_MIGRATION_READER_GRACE_MS must be a millisecond count');
+  return Number(configured);
+}
+
+// SQLite re-applies the database owner to its WAL when root opens it, which
+// moves only ctime. Everything else, including the exact bytes, must hold.
+function sqliteFileIdentity(target) {
+  if (!fs.existsSync(target)) return null;
+  const stat = fs.lstatSync(target, { bigint: true });
+  if (!stat.isFile()) fail(`OpenClaw SQLite path is not a regular file: ${target}`);
+  return [stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.nlink, stat.size, stat.mtimeNs, sha256File(target)].join(':');
+}
+
+// Once no process holds the authority, let SQLite itself bring every existing
+// WAL index (-shm) to its steady state through read-only connections. Read-only
+// connections never checkpoint or write the database or WAL; a stale index left
+// by an unclean shutdown is rebuilt, and a second read must leave it unchanged.
+// The sealed snapshot then still compares every DB/WAL/SHM byte exactly.
+function prepareQuiescentSqliteIndexes(stateDir) {
+  let prepared = 0;
+  for (const relativePath of listOpenClawSqliteFiles(stateDir).filter((name) => name.endsWith('.sqlite'))) {
+    const database = statePathFromRelative(stateDir, relativePath);
+    const shm = `${database}-shm`;
+    if (!fs.existsSync(shm) || fs.existsSync(`${database}-journal`)) continue;
+    const before = [database, `${database}-wal`, shm].map((target) => fs.existsSync(target));
+    const stable = () => [sqliteFileIdentity(database), sqliteFileIdentity(`${database}-wal`)].join('|');
+    const identity = stable();
+    const read = () => {
+      const connection = new DatabaseSync(database, { readOnly: true });
+      try { connection.prepare('SELECT count(*) AS tables FROM sqlite_master').get(); } finally { connection.close(); }
+    };
+    read();
+    const first = sha256File(shm);
+    read();
+    const after = [database, `${database}-wal`, shm].map((target) => fs.existsSync(target));
+    if (stable() !== identity || JSON.stringify(after) !== JSON.stringify(before)) {
+      fail(`read-only SQLite preparation changed ${relativePath} or its WAL; refusing to snapshot`);
+    }
+    if (sha256File(shm) !== first) fail(`the SQLite shared-memory index for ${relativePath} is not stable; another reader may be active`);
+    prepared += 1;
+  }
+  return prepared;
 }
 
 function assertGatewayStopped(stateDir) {
@@ -724,16 +817,28 @@ function assertRetainedSourcePackage(packageDir) {
 }
 
 // The agent database registry is relative to the standard state root. A custom
-// agentDir would keep authority this custody cannot restore; refuse it.
-function assertStandardAgentLayout(config) {
+// agentDir would keep authority this custody cannot restore; refuse it. An
+// entry's explicit agentDir is admitted only when it is exactly the directory
+// native resolution would choose without it: <state>/agents/<id>/agent for a
+// canonical lower-case id. Both resolve identically, so custody is unchanged.
+function defaultEquivalentAgentDir(stateDir, id, agentDir) {
+  return typeof agentDir === 'string'
+    && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id)
+    && path.isAbsolute(agentDir)
+    && path.normalize(agentDir) === agentDir
+    && agentDir === path.join(stateDir, 'agents', id, 'agent');
+}
+
+function assertStandardAgentLayout(config, stateDir) {
   const agents = isRecord(config.agents) ? config.agents : {};
   if ('list' in agents) fail('the retained configuration still carries a legacy agents.list roster');
-  const scopes = [['agents.defaults', agents.defaults]];
-  for (const [id, entry] of Object.entries(isRecord(agents.entries) ? agents.entries : {})) {
-    scopes.push([`agents.entries.${id}`, entry]);
+  if (isRecord(agents.defaults) && agents.defaults.agentDir !== undefined) {
+    fail('agents.defaults.agentDir is outside the supported standard state layout');
   }
-  for (const [label, scope] of scopes) {
-    if (isRecord(scope) && scope.agentDir !== undefined) fail(`${label}.agentDir is outside the supported standard state layout`);
+  for (const [id, entry] of Object.entries(isRecord(agents.entries) ? agents.entries : {})) {
+    if (isRecord(entry) && entry.agentDir !== undefined && !defaultEquivalentAgentDir(stateDir, id, entry.agentDir)) {
+      fail(`agents.entries.${id}.agentDir is outside the supported standard state layout`);
+    }
   }
 }
 
@@ -790,26 +895,100 @@ function assertRetainedSchemas(snapshot, preflightRoot, mode) {
   return { state: state.contentVersion, agents };
 }
 
+// npm installs leave ordinary relative links (node_modules/.bin/*, deduplicated
+// packages) inside a plugin payload. The private copy links to the validated
+// intra-plugin target using a portable relative path, never source-root-dependent
+// link text. Absolute, dangling, escaping and plugin-directory links still refuse.
+function pluginPayloadLink(from, source) {
+  const parts = path.relative(source, from).split(path.sep);
+  const target = fs.readlinkSync(from);
+  if (parts.length < 2 || !target || path.isAbsolute(target)) fail(`OpenClaw plugin payload contains a symlink: ${from}`);
+  const pluginRoot = fs.realpathSync(path.join(source, parts[0]));
+  let resolved;
+  try { resolved = fs.realpathSync(from); } catch { fail(`OpenClaw plugin payload link does not resolve: ${from}`); }
+  if (!resolved.startsWith(`${pluginRoot}${path.sep}`)) fail(`OpenClaw plugin payload link escapes its plugin: ${from}`);
+  // A source-confined link may climb to / and return to the source by name.
+  // Keeping that text after relocation would read live state from the rehearsal.
+  return path.relative(path.dirname(from), resolved);
+}
+
+// With preflightStateDir null this only applies the copy rules and measures.
 function copyPluginPayloads(sourceStateDir, preflightStateDir) {
   const source = path.join(sourceStateDir, 'extensions');
-  if (!fs.existsSync(source)) return 0;
+  if (!fs.existsSync(source)) return preflightStateDir ? 0 : { files: 0, bytes: 0n };
   assertNoSymlinkComponents(source);
   lstatDirectory(source, 'OpenClaw extensions directory');
   let files = 0;
+  let bytes = 0n;
   const walk = (from, to) => {
     const stat = fs.lstatSync(from);
-    if (stat.isSymbolicLink()) fail(`OpenClaw plugin payload contains a symlink: ${from}`);
+    if (stat.isSymbolicLink()) {
+      const target = pluginPayloadLink(from, source);
+      if (to) fs.symlinkSync(target, to);
+      return;
+    }
     if (stat.isDirectory()) {
-      makeDirectoryTree(to, stat.mode & 0o755);
-      for (const child of fs.readdirSync(from).sort()) walk(path.join(from, child), path.join(to, child));
+      if (to) makeDirectoryTree(to, stat.mode & 0o755);
+      for (const child of fs.readdirSync(from).sort()) walk(path.join(from, child), to && path.join(to, child));
       return;
     }
     if (!stat.isFile()) fail(`OpenClaw plugin payload contains an unsupported entry: ${from}`);
-    copyExclusive(from, to, stat.mode & 0o755);
+    if (to) copyExclusive(from, to, stat.mode & 0o755);
     files += 1;
+    bytes += BigInt(stat.size);
   };
-  walk(source, path.join(preflightStateDir, 'extensions'));
-  return files;
+  walk(source, preflightStateDir && path.join(preflightStateDir, 'extensions'));
+  return preflightStateDir ? files : { files, bytes };
+}
+
+// The copied shared database carries the native installed-plugin index (10.5
+// and 10.6 share its writer), which records global plugins under the live
+// extensions root. The 10.6 reader then finds one plugin id at its persisted
+// live path and at its copied discovery path and refuses a valid configuration.
+// Only in the private copy, rebase the native location fields (plugin rows,
+// diagnostics, install records) that resolve inside the payload root copied
+// above. The mapping is one-to-one, so genuine duplicates still refuse; npm,
+// bundled, workspace and external paths, every hash, free text and the
+// identity-bound source-admission receipts stay exact.
+const PLUGIN_INDEX_PATH_KEYS = new Set(['rootDir', 'source', 'setupSource', 'manifestPath', 'installPath', 'sourcePath']);
+
+function rebaseCopiedPluginIndex(sourceStateDir, preflightStateDir) {
+  const database = statePathFromRelative(preflightStateDir, path.join('state', 'openclaw.sqlite'));
+  if (!fs.existsSync(database)) return 0;
+  const from = path.resolve(sourceStateDir, 'extensions');
+  const to = path.resolve(preflightStateDir, 'extensions');
+  let rebased = 0;
+  const rebase = (value, key) => {
+    if (typeof value === 'string') {
+      if (!PLUGIN_INDEX_PATH_KEYS.has(key) || !path.isAbsolute(value)) return value;
+      const resolved = path.resolve(value);
+      if (resolved !== from && !resolved.startsWith(`${from}${path.sep}`)) return value;
+      rebased += 1;
+      return `${to}${resolved.slice(from.length)}`;
+    }
+    if (Array.isArray(value)) return value.map((item) => rebase(item));
+    if (!isRecord(value)) return value;
+    return Object.fromEntries(Object.entries(value)
+      .map(([name, item]) => [name, name === 'sourceAdmissions' ? item : rebase(item, name)]));
+  };
+  const connection = new DatabaseSync(database);
+  try {
+    const table = connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'").get();
+    if (!table) return 0;
+    const row = connection.prepare('SELECT value_json FROM config_machine_state WHERE state_key = ?').get('plugins.installedIndex');
+    if (!row || typeof row.value_json !== 'string') return 0;
+    // An unreadable index is the reader's own missing/invalid case; leave it.
+    let value;
+    try { value = JSON.parse(row.value_json); } catch { return 0; }
+    const relocated = rebase(value);
+    if (rebased > 0) {
+      connection.prepare('UPDATE config_machine_state SET value_json = ? WHERE state_key = ?')
+        .run(JSON.stringify(relocated), 'plugins.installedIndex');
+    }
+    return rebased;
+  } finally {
+    connection.close();
+  }
 }
 
 // Report setting paths only: upstream validation messages can quote values.
@@ -824,6 +1003,7 @@ function runCopiedConfigValidation(cli, snapshot, sourceStateDir, configPath, pr
   makeDirectoryTree(preflightStateDir, 0o700);
   materializeAuthoritySnapshot(snapshot, sourceStateDir, preflightStateDir, false);
   const pluginFiles = copyPluginPayloads(sourceStateDir, preflightStateDir);
+  const pluginIndexReferencesRebased = rebaseCopiedPluginIndex(sourceStateDir, preflightStateDir);
   copyExclusive(configPath, preflightConfigPath, 0o600);
   const result = spawnSync(process.execPath, [cli, 'config', 'validate', '--json'], {
     encoding: 'utf8', env: buildEnvironment(preflightStateDir, preflightConfigPath), maxBuffer: 16 * 1024 * 1024, timeout: 180_000,
@@ -838,7 +1018,7 @@ function runCopiedConfigValidation(cli, snapshot, sourceStateDir, configPath, pr
     fail(`the ${REQUIRED_PACKAGE_VERSION} CLI rejected the retained configuration on a copied state${paths.length ? ` (${paths.join(', ')})` : ''}; nothing was migrated and Doctor was not run`);
   }
   const warnings = [...(Array.isArray(report.warnings) ? report.warnings : []), ...issues];
-  return { valid: true, pluginPayloadFiles: pluginFiles, warningPaths: issuePaths(warnings) };
+  return { valid: true, pluginPayloadFiles: pluginFiles, pluginIndexReferencesRebased, warningPaths: issuePaths(warnings) };
 }
 
 function assertManifestBytesWithinContract(bytes, manifestPath) {
@@ -890,6 +1070,82 @@ function snapshot(args) {
   return sealSnapshot(args, `retained-${source.version}`);
 }
 
+function treeBytes(root) {
+  if (!fs.existsSync(root)) return 0n;
+  let bytes = 0n;
+  const walk = (target) => {
+    const stat = fs.lstatSync(target);
+    if (stat.isDirectory()) for (const child of fs.readdirSync(target)) walk(path.join(target, child));
+    else if (stat.isFile()) bytes += BigInt(stat.size);
+  };
+  walk(root);
+  return bytes;
+}
+
+function nearestExistingDirectory(target) {
+  let cursor = path.resolve(target);
+  while (!fs.existsSync(cursor)) cursor = path.dirname(cursor);
+  return cursor;
+}
+
+// Read-only, while the gateway still runs: every predictable condition the
+// stopped snapshot/prepare would refuse is checked first, so a refusal never
+// costs a gateway stop. Nothing is hashed, copied, written or signalled.
+function preflight(args) {
+  const stateDir = args['state-dir'];
+  const configPath = args.config;
+  const manifestPath = args.manifest;
+  if (configPath !== path.join(stateDir, 'openclaw.json')) fail('config path is not the standard state config');
+  if (fs.existsSync(manifestPath)) fail('preflight runs only before a migration generation exists');
+  assertNoSymlinkComponents(stateDir);
+  lstatDirectory(stateDir, 'OpenClaw state directory');
+  assertNoSymlinkComponents(configPath);
+  const configStat = lstatRegularFile(configPath, 'OpenClaw config');
+  if (configStat.uid !== process.getuid() || configStat.nlink !== 1) fail('OpenClaw config is not a single file owned by the current user');
+  const source = assertRetainedSourcePackage(args['package-dir']);
+  assertStandardAgentLayout(readJson(configPath, 'OpenClaw config'), stateDir);
+  const roots = listManagedAuthorityRoots(stateDir).filter((relative) => fs.existsSync(statePathFromRelative(stateDir, relative)));
+  const entries = [];
+  for (const relative of roots) collectAuthorityTree(stateDir, relative, entries, { hash: false });
+  const covered = (relative) => roots.some((root) => relative === root || relative.startsWith(`${root}${path.sep}`));
+  for (const relative of listOpenClawSqliteFiles(stateDir)) {
+    if (covered(relative)) continue;
+    const stat = lstatRegularFile(statePathFromRelative(stateDir, relative), 'OpenClaw SQLite file');
+    if (stat.uid !== process.getuid() || stat.nlink !== 1) fail(`OpenClaw SQLite file has unsafe ownership or hard links: ${relative}`);
+    entries.push({ kind: 'file', size: stat.size });
+  }
+  const snapshotBytes = entries.filter((entry) => entry.kind === 'file').reduce((total, entry) => total + BigInt(entry.size), 0n);
+  const payload = copyPluginPayloads(stateDir, null);
+  // The durable snapshot, its copied-state rehearsal and the payload copy use
+  // the manifest filesystem; the stable-plugin rollback copy of the managed
+  // npm tree is written beside the state.
+  const backupDirectory = nearestExistingDirectory(path.dirname(manifestPath));
+  const free = (target) => { const value = fs.statfsSync(target, { bigint: true }); return value.bavail * value.bsize; };
+  const backupRequired = (snapshotBytes * 2n) + payload.bytes + (512n * 1024n * 1024n);
+  const npmRequired = treeBytes(path.join(stateDir, 'npm'));
+  const shared = fs.statSync(backupDirectory).dev === fs.statSync(stateDir).dev;
+  const space = shared
+    ? [[backupDirectory, backupRequired + npmRequired]]
+    : [[backupDirectory, backupRequired], [stateDir, npmRequired]];
+  for (const [target, required] of space) {
+    const available = free(target);
+    if (available < required) {
+      fail(`insufficient free space on ${target} for the OpenClaw snapshot, copied-state rehearsal and plugin rollback (${String(available)} < ${String(required)} bytes); nothing was stopped or changed`);
+    }
+  }
+  // The running gateway's own unit may hold its databases; any other holder
+  // must be paused by its owner before the gateway is stopped.
+  const gatewayCgroup = args['gateway-cgroup'];
+  assertNoSqliteUsers(stateDir, {
+    exclude: (holder) => gatewayCgroup !== undefined
+      && (holder.cgroup === gatewayCgroup || holder.cgroup.startsWith(`${gatewayCgroup}/`)),
+  });
+  return {
+    state: 'preflight-passed', phase: 'preflight', mode: `retained-${source.version}`, generationId: null,
+    snapshotBytes: String(snapshotBytes), pluginPayloadFiles: payload.files,
+  };
+}
+
 function sealSnapshot(args, mode) {
   const stateDir = args['state-dir'];
   const configPath = args.config;
@@ -921,7 +1177,10 @@ function sealSnapshot(args, mode) {
   const source = assertRetainedSourcePackage(packageDir);
   if (`retained-${source.version}` !== mode) fail('snapshot mode differs from the source package');
   assertSecureParent(manifestPath, 'migration manifest');
-  assertStandardAgentLayout(readJson(configPath, 'OpenClaw config'));
+  assertStandardAgentLayout(readJson(configPath, 'OpenClaw config'), stateDir);
+  const prepared = prepareQuiescentSqliteIndexes(stateDir);
+  if (prepared > 0) process.stderr.write(`prepared ${prepared} SQLite shared-memory index(es) read-only before the snapshot\n`);
+  assertNoSqliteUsers(stateDir, { graceMs: 0 });
   const configBackupPath = `${manifestPath}.openclaw.json.before`;
   copyExclusive(configPath, configBackupPath, 0o600);
   const configBeforeSha256 = sha256File(configPath);
@@ -1308,10 +1567,13 @@ function commit(args) {
 
 try {
   const args = parseArgs(process.argv.slice(2));
-  const result = args.command === 'snapshot' ? snapshot(args)
-    : args.command === 'prepare' ? prepare(args)
-      : args.command === 'restore' ? restore(args) : commit(args);
-  process.stdout.write(`${JSON.stringify({ state: result.state, phase: result.phase, mode: result.mode, generationId: result.generationId })}\n`);
+  const result = args.command === 'preflight' ? preflight(args)
+    : args.command === 'snapshot' ? snapshot(args)
+      : args.command === 'prepare' ? prepare(args)
+        : args.command === 'restore' ? restore(args) : commit(args);
+  const measured = args.command === 'preflight'
+    ? { snapshotBytes: result.snapshotBytes, pluginPayloadFiles: result.pluginPayloadFiles } : {};
+  process.stdout.write(`${JSON.stringify({ state: result.state, phase: result.phase, mode: result.mode, generationId: result.generationId, ...measured })}\n`);
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = 1;

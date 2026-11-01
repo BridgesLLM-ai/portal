@@ -1,39 +1,34 @@
-# Updating Portal and compatible AI tools
+# Updating Portal and AI tools
 
-This guide describes **Portal 5.1.0**. For later releases, check [release notes](https://github.com/BridgesLLM-ai/portal/releases/latest) and the exact pins in that release's [installer](../installer/install.sh). Publication makes an update available; it does not update an existing server automatically.
+Publication makes an update available; it does not update an existing server automatically. Check the [release notes](https://github.com/BridgesLLM-ai/portal/releases/latest) for what a release changes.
 
 ## Two separate actions
 
 | Action | Scope |
 | --- | --- |
-| Dashboard **Update**, or installer `--update` | Signed Portal files and owned database/schema changes; preserves existing data and AI runtime versions. A narrow compatible question-plugin repair may reconnect the gateway, as described below. |
-| Dashboard **Update Compatible AI Tools**, or installer `--maintain-tools` | Explicit maintenance of the release-qualified OpenClaw/native CLI bundle, followed by supported additional harnesses. Review host prerequisites and allow a maintenance window. |
+| Dashboard **Update**, or installer `--update` | Signed Portal files and owned database/schema changes. OpenClaw, the AI tools, their versions and their data stay as they are, apart from the narrow question-plugin repair described below. |
+| **Admin > Maintenance**, one card per AI tool | Updates one AI tool at a time: Codex CLI, Claude Code, ClawHub, OpenCode, Hermes, Grok Build, Antigravity, Ollama and a configured Agent Zero. OpenClaw shows its versions; updating it from Maintenance comes in a later release. |
 
 Update Portal first. Save work and verify a recoverable [data backup](BACKUP_AND_RECOVERY.md). These backups are not a host snapshot: mail, AI runtime databases/installations, and provider sign-ins are excluded. Take a VPS snapshot if you need whole-server rollback.
 
-A Portal update stages its candidate before cutover and verifies readiness; it does not promise zero downtime. On supported OpenClaw 2026.9.1/9.2/9.3 installations with the obsolete 3.3.0 question plugin, 5.0.7 and later install the native 4.0.0 question plugin before promoting Portal. This can briefly restart the gateway, with plugin rollback if the transition fails. OpenClaw core, provider configuration, sessions, and databases are not upgraded by this repair. Already-compatible installations and the retained 2026.7.1 lane do not receive that repair.
+A Portal update stages its candidate before cutover and verifies readiness; it does not promise zero downtime. On supported OpenClaw 2026.9.1/9.2/9.3 installations with the obsolete 3.3.0 question plugin, the update installs the native 4.0.0 question plugin before promoting Portal. This can briefly restart the gateway, with plugin rollback if the transition fails. Nothing else in OpenClaw changes.
 
-## Compatible tool targets in 5.1.0
+## Updating AI tools from Maintenance
 
-These are the release's installation/maintenance targets, not a claim that every existing server already runs them.
+Each card shows the installed version and the version this Portal release recommends; Codex CLI, Claude Code and ClawHub also show the newest published version, which you can choose to install. Other tools update only to the recommended version. A recommended version marked "(not yet qualified)" has not yet passed the release's qualification checks.
 
-| Tool | Version |
-| --- | --- |
-| OpenClaw core and official plugin bundle | 2026.10.6 |
-| Portal question plugin | 4.0.0 |
-| Codex CLI | 0.163.0 |
-| Claude Code | 2.1.309 |
-| ClawHub | 0.23.3 |
-| Antigravity | 1.4.3 |
-| Grok Build | 1.0.62 |
-| OpenCode | 1.19.4 |
-| Hermes | 0.22.2 |
-| Agent Zero and official host connector | 2.14 |
-| Ollama | 0.40.6 |
+- **Owner only, one tool per run.** Only the Owner can start a run. Every update and repair asks for confirmation; a Re-check installs nothing and starts at once.
+- **Verified and reversible.** A run verifies what it downloads before installing it, keeps the previous version so a failed check can undo the update, and shows the result and its report on the page.
+- **OpenClaw is not updated from Maintenance in this release.** OpenClaw keeps working, and this Portal works with OpenClaw 2026.9.1 and newer. The OpenClaw card shows **Needs a later Portal release** and offers no update; a later Portal release adds the OpenClaw update.
+- **Other tools never restart OpenClaw.** Codex CLI, Claude Code, ClawHub and the other harnesses are replaced without touching the gateway. Ollama restarts only its own model server.
 
-Configured Agent Zero follows the installer's pinned image and managed lifecycle; an unconfigured instance is not installed by maintenance. Runtime availability still depends on platform, credentials, and account/model access. A package update does not sign a provider in or create an entitlement. The native DeepSeek harness remains disabled; provider-based DeepSeek API models are a different path.
+If an OpenClaw run is interrupted, or OpenClaw cannot confirm a safe return, the page shows "Recovery required" with a repair button, and no other update is offered until the repair is done. The repair finishes or safely undoes the interrupted update; it never installs a new version. For any other tool the button is that tool's Re-check, which confirms what is installed now, and if the updater's background service stopped during a run, the button is Check interrupted update. Do not delete run records, fence markers, or saved authentication to make a retry pass.
 
-The OpenClaw/Codex/Claude Code/ClawHub bundle is staged and rolled back as a tested unit. Subsequent Ollama and additional-harness updates use separate verified checkpoints. A later harness failure stops the action but does not undo every earlier successful update. Preserve the reported evidence and resolve that specific failure before retrying.
+Fresh installations start on the AI tool versions the release was tested with. Update them later from Maintenance. When Codex CLI, Claude Code, ClawHub, Ollama, OpenCode, Hermes, Grok Build or Antigravity is not installed, its card offers the Owner **Install** with the version this Portal recommends, using the same download checks as an update; if a check fails after installing, what was installed is removed again. Agent Zero needs its own setup first.
+
+Servers first installed with Portal 5.0.x keep their older AI tool versions through later Portal updates. After updating to this release, Maintenance marks the tools below its minimum versions "Update required" and offers their updates. OpenClaw keeps its version. OpenCode and Hermes installed under `/opt/bridgesllm/tools` move to the current layout with their update, and the old copy is removed once the new version passes its checks.
+
+On servers with the per-tool updater, the legacy installer option `--maintain-tools` no longer updates the tools together. It changes nothing and points to the Maintenance page.
 
 ## Model suggestions after sign-in
 
@@ -43,9 +38,7 @@ The Portal suggests newer models only when the signed-in runtime reports the exa
 
 Portal-only updates retain supported Node interpreters in these ranges: `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`.
 
-The pinned OpenClaw 2026.10.6 package requires `>=24.22.1 <25 || >=26.12.1`. The qualified LTS target is **Node 24.22.1**; updates converge Node before the OpenClaw package is replaced. A Node 22 or Node 25 host can therefore pass Portal-only checks but fail compatible-tools prerequisites.
-
-The Portal updater does not silently replace the shared host interpreter. Plan a separate host-maintenance window where necessary and follow [Node runtime guidance](PORTAL_NODE_RUNTIME_REMEDIATION.md). Do not bypass the engine check or redirect a service to an unmanaged interpreter.
+OpenClaw sets its own Node.js requirement, which can be stricter, so a host can pass Portal-only checks and still need a newer Node.js for a newer OpenClaw. If you update OpenClaw yourself, follow the [Node runtime guidance](PORTAL_NODE_RUNTIME_REMEDIATION.md). Do not bypass the engine check or redirect a service to an unmanaged interpreter.
 
 ## Project credential refresh
 
@@ -61,7 +54,7 @@ The first update from a release without a Project credential generation marker c
 - For a previously interrupted OpenClaw migration or manually rescued gateway, consult the installed signed installer's recovery help and the [5.0.4 recovery notes](../CHANGELOG.md#504---2026-09-09). The explicit root-only recovery requires the recorded evidence; an ordinary retry cannot replace it.
 - A pre-5.0.7 Dashboard may reject a current data backup using its old verifier. See the [5.0.7 upgrade notes](../CHANGELOG.md#507---2026-09-10). Do not treat bypassing backup verification as the standard update procedure.
 
-After maintenance, check Dashboard health, provider readiness, and a real conversation using the intended harness/model. A healthy package probe is not proof of account access or a working agent turn.
+After an update, check Dashboard health, provider readiness, and a real conversation using the intended harness/model. A healthy package probe is not proof of account access or a working agent turn.
 
 ## Reading installation progress
 

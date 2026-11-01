@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
@@ -8,56 +9,45 @@ import {
   LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION,
   OPENCLAW_CODEX_PLUGIN_VERSION,
 } from './openclawConfigManager';
+import { gatewayRpcCall, probeGatewayHelloCapabilities } from '../utils/openclawGatewayRpc';
+import type { OpenClawCapabilities } from './openClawCompatibility';
+import {
+  evaluateOpenClawGatewayContract,
+  OPENCLAW_LEGACY_CORE_PACKAGE_VERSION,
+  OPENCLAW_LEGACY_RUNTIME_VERSION,
+  OPENCLAW_QUALIFIED_RELEASES,
+  OPENCLAW_RUNTIME_FLOOR,
+  openClawCurrentFamilyAdmits,
+  openClawReleaseDenial,
+  openClawRuntimeMatchesPackage,
+  openClawStrictTuplesEnabled,
+  openClawVersionMeetsFloor,
+  type OpenClawRuntimeFamily,
+} from './openClawRuntimeContract';
 
 const execFileAsync = promisify(execFile);
 
 export const OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS = 60_000;
+/**
+ * `plugins.inspect` is answered by the running Gateway from its loaded plugin
+ * registry, so it skips the 45-60 s cold CLI registry load. Since 2026.8.
+ */
+export const OPENCLAW_CODEX_PLUGIN_RPC_TIMEOUT_MS = 30_000;
 
+/** Newest qualified release: the recommended target shown next to the floor. */
 export const TESTED_OPENCLAW_CORE_PACKAGE_VERSION = process.env.PORTAL_OPENCLAW_CORE_PACKAGE_VERSION || '2026.10.6';
 export const TESTED_OPENCLAW_RUNTIME_VERSION = process.env.PORTAL_OPENCLAW_RUNTIME_VERSION || '2026.10.6';
-export const LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION = '2026.7.1-2';
-export const LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION = '2026.7.1';
+export const LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION = OPENCLAW_LEGACY_CORE_PACKAGE_VERSION;
+export const LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION = OPENCLAW_LEGACY_RUNTIME_VERSION;
 
-// The family names identify API contracts, not every compatible patch release.
-export const QUALIFIED_OPENCLAW_NATIVE_PATCHES: readonly string[] = Object.freeze(['2026.9.1', '2026.9.2', '2026.9.3', '2026.9.9', '2026.10.5', '2026.10.6']);
+/**
+ * Releases a Portal build was qualified on. Readiness and user retirement no
+ * longer consult this list (the floor and the capability contract do); only
+ * the strict rollback switch still pins to it.
+ */
+export const QUALIFIED_OPENCLAW_NATIVE_PATCHES: readonly string[] = OPENCLAW_QUALIFIED_RELEASES;
 
-export type OpenClawTestedRuntimeFamily = 'legacy-2026.7.1' | 'current-2026.9.1';
-
-interface OpenClawTestedTuple {
-  family: OpenClawTestedRuntimeFamily;
-  corePackageVersion: string;
-  runtimeVersions: readonly string[];
-  codexPluginVersion: string;
-}
-
-const TESTED_OPENCLAW_TUPLES: readonly OpenClawTestedTuple[] = Object.freeze([
-  Object.freeze({
-    family: 'legacy-2026.7.1',
-    corePackageVersion: LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-    runtimeVersions: Object.freeze([
-      LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION,
-      LEGACY_TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-    ]),
-    codexPluginVersion: LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION,
-  }),
-  Object.freeze({
-    family: 'current-2026.9.1',
-    corePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-    runtimeVersions: Object.freeze(Array.from(new Set([
-      TESTED_OPENCLAW_RUNTIME_VERSION,
-      TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-    ]))),
-    codexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
-  }),
-  ...QUALIFIED_OPENCLAW_NATIVE_PATCHES
-    .filter((version) => version !== TESTED_OPENCLAW_CORE_PACKAGE_VERSION)
-    .map((version): OpenClawTestedTuple => Object.freeze({
-      family: 'current-2026.9.1',
-      corePackageVersion: version,
-      runtimeVersions: Object.freeze([version]),
-      codexPluginVersion: version,
-    })),
-]);
+export type OpenClawTestedRuntimeFamily = OpenClawRuntimeFamily;
 
 interface OpenClawCliResult {
   ok: boolean;
@@ -87,6 +77,8 @@ export interface OpenClawSetupReadinessBlocker {
     | 'cli-runtime-mismatch'
     | 'gateway-rpc-unavailable'
     | 'gateway-runtime-mismatch'
+    | 'gateway-contract-mismatch'
+    | 'gateway-contract-unverified'
     | 'gateway-token-missing'
     | 'gateway-token-mismatch'
     | 'codex-plugin-mismatch'
@@ -116,6 +108,8 @@ export interface OpenClawSetupReadiness {
   testedRuntimeVersion: string;
   testedCodexPluginVersion: string;
   testedRuntimeFamily?: OpenClawTestedRuntimeFamily | null;
+  /** Lowest OpenClaw release of the current contract family. */
+  runtimeFloor?: string;
   testedPairReady: boolean;
   ready: boolean;
   blockers: OpenClawSetupReadinessBlocker[];
@@ -127,6 +121,10 @@ export interface OpenClawSetupReadinessDependencies {
   resolvePackageMetadata: () => Promise<OpenClawPackageMetadata | null>;
   readGatewayToken: () => string | null;
   credentialStoreWritable: () => boolean;
+  /** The configured Gateway's authenticated hello (methods, events, protocol, version). */
+  readGatewayHello: () => Promise<{ ok: true; capabilities: OpenClawCapabilities } | { ok: false; error: string }>;
+  /** Gateway `plugins.inspect {pluginId:'codex'}`. */
+  inspectCodexPluginRpc: () => Promise<{ ok: boolean; data?: any; error?: string; timedOut?: boolean }>;
 }
 
 export interface OpenClawSetupReadinessOptions {
@@ -153,20 +151,72 @@ function parseOpenClawVersion(raw: unknown): string | null {
   return match?.[1] || null;
 }
 
+/** The contract family an installed core package belongs to, if any. */
+export function runtimeFamilyForCorePackage(corePackageVersion: string | null): OpenClawRuntimeFamily | null {
+  if (!corePackageVersion) return null;
+  if (corePackageVersion === OPENCLAW_LEGACY_CORE_PACKAGE_VERSION) return 'legacy-2026.7.1';
+  return openClawCurrentFamilyAdmits(corePackageVersion) ? 'current-2026.9.1' : null;
+}
+
+/** True when a runtime version could belong to an admitted install (legacy tuple or floor family). */
 export function matchesTestedRuntime(version: string | null): boolean {
   if (!version) return false;
-  return TESTED_OPENCLAW_TUPLES.some((tuple) => tuple.runtimeVersions.includes(version));
+  return version === OPENCLAW_LEGACY_RUNTIME_VERSION
+    || version === OPENCLAW_LEGACY_CORE_PACKAGE_VERSION
+    || openClawCurrentFamilyAdmits(version);
 }
 
-function testedTupleForCore(corePackageVersion: string | null): OpenClawTestedTuple | null {
-  if (!corePackageVersion) return null;
-  return TESTED_OPENCLAW_TUPLES.find(
-    (tuple) => tuple.corePackageVersion === corePackageVersion,
-  ) || null;
+/**
+ * OpenClaw publishes `@openclaw/codex` in lockstep with core. A package
+ * republish (`-N`) may carry either its own version or its release's.
+ */
+function expectedCodexPluginVersions(family: OpenClawRuntimeFamily | null, corePackageVersion: string | null): string[] {
+  if (family === 'legacy-2026.7.1') return [LEGACY_OPENCLAW_CODEX_PLUGIN_VERSION];
+  if (family !== 'current-2026.9.1' || !corePackageVersion) return [OPENCLAW_CODEX_PLUGIN_VERSION];
+  return [...new Set([corePackageVersion, corePackageVersion.replace(/-\d{1,4}$/, '')])];
 }
 
-function runtimeMatchesTuple(version: string | null, tuple: OpenClawTestedTuple | null): boolean {
-  return Boolean(version && tuple?.runtimeVersions.includes(version));
+/**
+ * Maps `plugins.inspect` onto the CLI report shape the checks below read. The
+ * Gateway reports `source.spec` as the install record's resolved spec (falling
+ * back to the requested one), so the resolved identity is what is compared.
+ */
+async function inspectCodexPluginOverRpc(
+  dependencies: OpenClawSetupReadinessDependencies,
+  authenticatedRpc: boolean,
+): Promise<OpenClawCliResult> {
+  if (!authenticatedRpc) {
+    return { ok: false, stdout: '', stderr: 'the OpenClaw gateway did not pass an authenticated RPC probe' };
+  }
+  const result = await dependencies.inspectCodexPluginRpc();
+  if (!result.ok) {
+    return { ok: false, stdout: '', stderr: result.error || 'plugins.inspect failed', ...(result.timedOut ? { timedOut: true } : {}) };
+  }
+  const plugin = result.data?.plugin;
+  const source = result.data?.source;
+  const spec = typeof source?.spec === 'string' ? source.spec : null;
+  const specVersion = spec?.startsWith('@openclaw/codex@') ? spec.slice('@openclaw/codex@'.length) : null;
+  const report = {
+    plugin: { version: typeof plugin?.version === 'string' ? plugin.version : null },
+    install: plugin?.installed === true && source
+      ? {
+          source: source.kind,
+          ...(spec ? { resolvedSpec: spec } : {}),
+          ...(specVersion ? { resolvedVersion: specVersion } : {}),
+        }
+      : null,
+  };
+  return { ok: true, stdout: JSON.stringify(report), stderr: '' };
+}
+
+function corePackageRefusal(corePackageVersion: string | null): string {
+  const detected = corePackageVersion || 'unknown';
+  const denial = corePackageVersion ? openClawReleaseDenial(corePackageVersion) : null;
+  if (denial) return `OpenClaw ${detected} is refused by the Portal: ${denial}`;
+  if (corePackageVersion && openClawVersionMeetsFloor(corePackageVersion) && openClawStrictTuplesEnabled()) {
+    return `Strict tested-release mode admits only ${OPENCLAW_QUALIFIED_RELEASES.join(', ')}; detected ${detected}.`;
+  }
+  return `OpenClaw core must be ${OPENCLAW_RUNTIME_FLOOR} or newer (or the retained ${OPENCLAW_LEGACY_CORE_PACKAGE_VERSION}); detected ${detected}.`;
 }
 
 function parseJsonOutput(raw: string): any | null {
@@ -179,7 +229,7 @@ function parseJsonOutput(raw: string): any | null {
 
 async function runOpenClawCli(args: string[], timeoutMs = 10_000): Promise<OpenClawCliResult> {
   try {
-    const result = await execFileAsync('openclaw', args, {
+    const result = await execFileAsync(...openClawDiagnosticCommand('openclaw', args), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       timeout: timeoutMs,
@@ -296,6 +346,16 @@ const defaultDependencies: OpenClawSetupReadinessDependencies = {
   resolvePackageMetadata: resolveOpenClawPackageMetadata,
   readGatewayToken: getGatewayToken,
   credentialStoreWritable: isOpenClawCredentialStoreWritable,
+  readGatewayHello: () => probeGatewayHelloCapabilities(10_000),
+  inspectCodexPluginRpc: async () => {
+    const result = await gatewayRpcCall('plugins.inspect', { pluginId: 'codex' }, OPENCLAW_CODEX_PLUGIN_RPC_TIMEOUT_MS);
+    const error = String(result.errorMessage || result.error || '');
+    return {
+      ok: result.ok,
+      data: result.data,
+      ...(result.ok ? {} : { error, ...(/\bRPC timeout\b/i.test(error) ? { timedOut: true } : {}) }),
+    };
+  },
 };
 
 // Each CLI invocation boots a full Node process. Running all of them in
@@ -493,9 +553,21 @@ async function collectOpenClawSetupReadinessUncached(
   // (registry loads measured 20-37s on a contended 2 vCPU host). A killed
   // inspect is reported as a timeout, never as a version mismatch. The shared
   // attestation cache and in-flight dedup keep the cost bounded.
-  const codexPluginResult = await dependencies.runOpenClawCli(['plugins', 'inspect', 'codex', '--json'], OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS);
   const authStoreResult = await dependencies.runOpenClawCli(['models', 'auth', '--agent', 'main', 'list', '--json'], 25_000);
   const packageMetadata = await dependencies.resolvePackageMetadata();
+  const family = runtimeFamilyForCorePackage(packageMetadata?.version || null);
+  // The current family is admitted by capability, not by release number: the
+  // configured Gateway's own authenticated hello must carry the methods,
+  // events and protocol the Portal uses. The retained legacy tuple is exact.
+  const gatewayHello = authenticatedRpc && family === 'current-2026.9.1'
+    ? await dependencies.readGatewayHello()
+    : null;
+  // The current family asks the running Gateway (`plugins.inspect`, same
+  // install record and resolved spec as the CLI report). The retained 2026.7.1
+  // predates that method and keeps the CLI inspect.
+  const codexPluginResult = family === 'current-2026.9.1'
+    ? await inspectCodexPluginOverRpc(dependencies, authenticatedRpc)
+    : await dependencies.runOpenClawCli(['plugins', 'inspect', 'codex', '--json'], OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS);
 
   const version = parseOpenClawVersion(cliVersionResult.stdout);
   const gatewayProbe = gatewayProbeResult ? parseJsonOutput(gatewayProbeResult.stdout) : null;
@@ -528,13 +600,16 @@ async function collectOpenClawSetupReadinessUncached(
     String(statusError || gatewayStatusResult.stderr || gatewayStatusResult.error || ''),
   );
   const codexPlugin = parseJsonOutput(codexPluginResult.stdout);
+  const codexPluginTimeoutSeconds = Math.round((family === 'current-2026.9.1'
+    ? OPENCLAW_CODEX_PLUGIN_RPC_TIMEOUT_MS
+    : OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS) / 1000);
   const authStorePayload = parseJsonOutput(authStoreResult.stdout);
   const hasToken = Boolean(dependencies.readGatewayToken());
   const tokenParity = hasToken && authenticatedRpc;
   const credentialStoreWritable = dependencies.credentialStoreWritable();
   const credentialStoreReady = authStoreResult.ok && authStorePayload !== null;
-  const testedTuple = testedTupleForCore(packageMetadata?.version || null);
-  const expectedCodexPluginVersion = testedTuple?.codexPluginVersion || OPENCLAW_CODEX_PLUGIN_VERSION;
+  const expectedCodexPluginVersionList = expectedCodexPluginVersions(family, packageMetadata?.version || null);
+  const expectedCodexPluginVersion = expectedCodexPluginVersionList[0];
   const expectedCodexPluginSpec = `@openclaw/codex@${expectedCodexPluginVersion}`;
   const codexPluginVersion = typeof codexPlugin?.plugin?.version === 'string' ? codexPlugin.plugin.version : null;
   // What matters is the identity that was actually resolved and installed, not
@@ -557,37 +632,54 @@ async function collectOpenClawSetupReadinessUncached(
       ? codexPlugin.install.version
       : null;
   const codexPluginExact = codexPluginResult.ok
-    && Boolean(testedTuple)
-    && codexPluginVersion === expectedCodexPluginVersion
+    && Boolean(family)
+    && typeof codexPluginVersion === 'string'
+    && expectedCodexPluginVersionList.includes(codexPluginVersion)
     && codexPlugin?.install?.source === 'npm'
-    && codexPluginInstallSpec === expectedCodexPluginSpec
-    && codexPluginInstalledVersion === expectedCodexPluginVersion;
+    && codexPluginInstallSpec === `@openclaw/codex@${codexPluginVersion}`
+    && codexPluginInstalledVersion === codexPluginVersion;
+  const corePackage = packageMetadata?.version || null;
+  const cliMatchesPackage = Boolean(family) && openClawRuntimeMatchesPackage(version, corePackage);
+  const gatewayMatchesPackage = Boolean(family) && openClawRuntimeMatchesPackage(runningVersion, corePackage);
+  const helloVersion = gatewayHello?.ok ? gatewayHello.capabilities.version : null;
+  // The backend's own connection must reach the same installed runtime the CLI reported.
+  const helloMatchesPackage = helloVersion === null || openClawRuntimeMatchesPackage(helloVersion, corePackage);
+  const gatewayContract = gatewayHello?.ok ? evaluateOpenClawGatewayContract(gatewayHello.capabilities) : null;
+  const gatewayContractReady = family === 'legacy-2026.7.1'
+    || (family === 'current-2026.9.1' && gatewayContract?.ok === true && helloMatchesPackage);
   const installed = cliVersionResult.ok && Boolean(version) && Boolean(packageMetadata);
   const blockers: OpenClawSetupReadinessBlocker[] = [];
 
   if (!installed) {
     blockers.push({ code: 'not-installed', message: 'OpenClaw is not installed as a verifiable global package.' });
   }
-  if (!testedTuple) {
-    blockers.push({
-      code: 'core-package-mismatch',
-      message: `OpenClaw core must match a supported version (${TESTED_OPENCLAW_TUPLES.map((tuple) => tuple.corePackageVersion).join(', ')}); detected ${packageMetadata?.version || 'unknown'}.`,
-    });
+  if (!family) {
+    blockers.push({ code: 'core-package-mismatch', message: corePackageRefusal(corePackage) });
   }
-  if (!runtimeMatchesTuple(version, testedTuple)) {
+  if (!cliMatchesPackage) {
     blockers.push({
       code: 'cli-runtime-mismatch',
-      message: `OpenClaw CLI runtime did not match the installed tested core family; detected ${version || 'unknown'} for core ${packageMetadata?.version || 'unknown'}.`,
+      message: `OpenClaw CLI runtime does not match the installed core; detected ${version || 'unknown'} for core ${corePackage || 'unknown'}.`,
     });
   }
   if (!authenticatedRpc) {
     blockers.push({ code: 'gateway-rpc-unavailable', message: 'The OpenClaw gateway did not pass an authenticated RPC probe.' });
   }
-  if (!runtimeMatchesTuple(runningVersion, testedTuple)) {
+  if (!gatewayMatchesPackage || !helloMatchesPackage) {
     blockers.push({
       code: 'gateway-runtime-mismatch',
-      message: `OpenClaw gateway runtime did not match the installed tested core family; detected ${runningVersion || 'unknown'} for core ${packageMetadata?.version || 'unknown'}.`,
+      message: `OpenClaw gateway runtime does not match the installed core; detected ${(helloMatchesPackage ? runningVersion : helloVersion) || 'unknown'} for core ${corePackage || 'unknown'}. Restart the OpenClaw gateway.`,
     });
+  }
+  if (family === 'current-2026.9.1' && authenticatedRpc) {
+    if (gatewayHello && !gatewayHello.ok) {
+      blockers.push({
+        code: 'gateway-contract-unverified',
+        message: `The Portal could not read the OpenClaw Gateway capabilities: ${String(gatewayHello.error).slice(0, 300)}`,
+      });
+    } else if (gatewayContract && !gatewayContract.ok) {
+      blockers.push({ code: 'gateway-contract-mismatch', message: gatewayContract.issue || 'The OpenClaw Gateway does not provide the Portal contract.' });
+    }
   }
   if (!hasToken) {
     blockers.push({ code: 'gateway-token-missing', message: 'The OpenClaw gateway token is not configured.' });
@@ -600,7 +692,7 @@ async function collectOpenClawSetupReadinessUncached(
     blockers.push(codexPluginResult.timedOut
       ? {
           code: 'codex-plugin-inspect-timeout',
-          message: `OpenClaw did not finish inspecting the Codex plugin within ${Math.round(OPENCLAW_PLUGIN_INSPECT_TIMEOUT_MS / 1000)} s; the host may be busy. Retry shortly.`,
+          message: `OpenClaw did not finish inspecting the Codex plugin within ${codexPluginTimeoutSeconds} s; the host may be busy. Retry shortly.`,
         }
       : {
           code: 'codex-plugin-mismatch',
@@ -617,23 +709,25 @@ async function collectOpenClawSetupReadinessUncached(
   }
 
   const testedPairReady = installed
-    && Boolean(testedTuple)
-    && runtimeMatchesTuple(version, testedTuple)
-    && runtimeMatchesTuple(runningVersion, testedTuple)
+    && Boolean(family)
+    && cliMatchesPackage
+    && gatewayMatchesPackage
     && authenticatedRpc
+    && gatewayContractReady
     && codexPluginExact;
   const ready = testedPairReady
     && tokenParity
     && credentialStoreReady
     && credentialStoreWritable
     && blockers.length === 0;
-  // The Portal supports a retained 7.1 tuple during a Portal-only update as
-  // well as the current 9.1 tuple. Report the tuple that actually admitted
-  // this host; reporting the default 9.1 constants for a healthy retained
-  // 7.1 host makes the dashboard contradict `testedPairReady`.
-  const reportedTestedTuple = testedTuple || TESTED_OPENCLAW_TUPLES.find(
-    (tuple) => tuple.corePackageVersion === TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-  )!;
+  // Report the versions that admitted this host: the installed release for the
+  // floor family, the exact tuple for retained 7.1, and the newest qualified
+  // release as the recommendation when nothing was admitted.
+  const reportedCore = family ? corePackage! : TESTED_OPENCLAW_CORE_PACKAGE_VERSION;
+  const reportedRuntime = family === 'legacy-2026.7.1'
+    ? LEGACY_TESTED_OPENCLAW_RUNTIME_VERSION
+    : family ? corePackage! : TESTED_OPENCLAW_RUNTIME_VERSION;
+  const reportedCodex = family ? (codexPluginExact ? codexPluginVersion! : expectedCodexPluginVersion) : OPENCLAW_CODEX_PLUGIN_VERSION;
 
   return {
     installed,
@@ -651,10 +745,11 @@ async function collectOpenClawSetupReadinessUncached(
     codexPluginInstallSpec,
     credentialStoreReady,
     credentialStoreWritable,
-    testedCorePackageVersion: reportedTestedTuple.corePackageVersion,
-    testedRuntimeVersion: reportedTestedTuple.runtimeVersions[0],
-    testedCodexPluginVersion: reportedTestedTuple.codexPluginVersion,
-    testedRuntimeFamily: testedTuple?.family || null,
+    testedCorePackageVersion: reportedCore,
+    testedRuntimeVersion: reportedRuntime,
+    testedCodexPluginVersion: reportedCodex,
+    testedRuntimeFamily: family,
+    runtimeFloor: OPENCLAW_RUNTIME_FLOOR,
     testedPairReady,
     ready,
     blockers,

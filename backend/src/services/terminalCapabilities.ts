@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { execFile } from 'child_process';
 import { constants as fsConstants } from 'fs';
 import { access, mkdtemp, readdir, rm } from 'fs/promises';
@@ -645,9 +646,16 @@ async function probeTool(spec: TerminalToolSpec, probeEnv: NodeJS.ProcessEnv): P
   };
   if (!executable) return base;
 
+  // Each probe is its own async call, so a lease refused by maintenance after
+  // the first child started settles here instead of orphaning that child's
+  // promise (an unhandled rejection exits the backend).
+  const probe = async (args: readonly string[]) => execFileAsync(
+    ...openClawDiagnosticCommand(executable, args),
+    { cwd: probeEnv.HOME, timeout: PROBE_TIMEOUT_MS, maxBuffer: MAX_HELP_BYTES, env: probeEnv },
+  );
   const [versionResult, helpResult] = await Promise.allSettled([
-    execFileAsync(executable, spec.versionArgs, { cwd: probeEnv.HOME, timeout: PROBE_TIMEOUT_MS, maxBuffer: MAX_HELP_BYTES, env: probeEnv }),
-    execFileAsync(executable, spec.helpArgs, { cwd: probeEnv.HOME, timeout: PROBE_TIMEOUT_MS, maxBuffer: MAX_HELP_BYTES, env: probeEnv }),
+    probe(spec.versionArgs),
+    probe(spec.helpArgs),
   ]);
   if (versionResult.status === 'fulfilled') {
     base.version = compactProbeOutput(String(versionResult.value.stdout || ''), String(versionResult.value.stderr || ''));

@@ -866,7 +866,24 @@ def load_ledger(ledger: Path):
     if not ledger.is_absolute() or Path(os.path.normpath(ledger)) != ledger:
         fail("transaction ledger path must be canonical and absolute")
     safe_directory(ledger.parent, exact_mode=0o700)
-    value = read_json(ledger)
+    return validate_ledger(read_json(ledger), ledger)
+
+
+def publish_ledger(ledger: Path, value) -> None:
+    """Validate the exact candidate bytes with the loader's rules, then write.
+
+    A transition must never publish a journal that the next call refuses to
+    load: the on-disk ledger stays at its previous valid phase instead.
+    """
+    candidate = json.loads(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    try:
+        validate_ledger(candidate, ledger)
+    except ContractError as error:
+        fail(f"refusing to publish an unloadable transaction ledger: {error}")
+    atomic_json(ledger, value)
+
+
+def validate_ledger(value, ledger: Path):
     retained = isinstance(value, dict) and value.get("schema") == RETAINED_CHAT_SCHEMA
     if not isinstance(value, dict) or set(value) != ({
         "schema", "generation", "phase", "paths", "prepared", "core", "codex", "commit",
@@ -1091,7 +1108,18 @@ def load_ledger(ledger: Path):
                 "core-rollback-pending", "core-restored", "core-remove-pending",
                 "core-removed", "restored-cleanup",
             }
-            if (pending_gateway["purpose"] == "baseline-restore") \
+            # A forward STOP armed before recovery began stays bound to its
+            # exact generation into recovery-pending only. Recovery must attest
+            # that generation's exit before any later phase; a forward START
+            # is never carried into recovery.
+            carried_forward_stop = (
+                pending_gateway["purpose"] == "forward"
+                and pending_gateway["action"] == "stop"
+                and value["phase"] == "recovery-pending"
+                and value.get("recoveryFrom") in PHASES - recovery_phases
+            )
+            if not carried_forward_stop \
+                    and (pending_gateway["purpose"] == "baseline-restore") \
                     != (value["phase"] in recovery_phases):
                 fail("core gateway action purpose is not admitted in this phase")
     if rescue is not None:
@@ -1732,7 +1760,7 @@ def arm_core_gateway_action(args) -> None:
         "beforeSha256": canonical_json_sha256(identity),
         "expectedActive": args.action == "start",
     }
-    atomic_json(ledger, value)
+    publish_ledger(ledger, value)
     print(json.dumps(core["gatewayPendingAction"], sort_keys=True, separators=(",", ":")))
 
 
@@ -1772,13 +1800,27 @@ def record_core_gateway_result(args) -> None:
         rescue["stopResult"] = identity
         rescue["stopResultSha256"] = canonical_json_sha256(identity)
         rescue["stoppedAt"] = utc_now()
+    if pending["purpose"] == "forward" and pending["action"] == "stop" \
+            and value["phase"] == "recovery-pending":
+        # A forward STOP carried into recovery is attested only by the kernel
+        # exit of exactly its armed generation. systemd may keep or clear the
+        # invocation and start clock after a real stop; any other value is a
+        # later start, which is never this stop's result.
+        if identity["controlGroup"] != "":
+            fail("carried forward gateway stop: the unit control group is still populated")
+        if identity["invocationId"] not in {"", before["invocationId"]} \
+                or identity["execMainStartTimestampMonotonic"] \
+                    not in {0, before["execMainStartTimestampMonotonic"]}:
+            fail("carried forward gateway stop: a different gateway invocation was observed")
+        if not owned_gateway_generation_exited(before):
+            fail("carried forward gateway stop: the armed generation has not exited")
     core["gatewayCurrentUnitIdentity"] = identity
     core["gatewayCurrentUnitIdentitySha256"] = canonical_json_sha256(identity)
     if value.get('retainedChat',{}).get('execution',{}).get('kind')==NODE_INDEX_KIND:
         node_index_process(value)
         if pending['action']=='start':verify_retained_targets(value,committed=pending['purpose']=='forward')
     core["gatewayPendingAction"] = None
-    atomic_json(ledger, value)
+    publish_ledger(ledger, value)
     print(json.dumps(identity, sort_keys=True, separators=(",", ":")))
 
 
@@ -1949,7 +1991,7 @@ def adopt_core_gateway_identity(args) -> None:
              + ",".join(changed))
     core["gatewayCurrentUnitIdentity"] = identity
     core["gatewayCurrentUnitIdentitySha256"] = canonical_json_sha256(identity)
-    atomic_json(ledger, value)
+    publish_ledger(ledger, value)
     print(json.dumps(identity, sort_keys=True, separators=(",", ":")))
 
 
@@ -3281,7 +3323,7 @@ def advance(args) -> None:
         if not decision.is_absolute() or not decision_matches(value, ledger, decision):
             fail("commit-applying decision chain is invalid")
     value["phase"] = after
-    atomic_json(ledger, value)
+    publish_ledger(ledger, value)
     print(f"{value['generation']}\t{value['phase']}")
 
 

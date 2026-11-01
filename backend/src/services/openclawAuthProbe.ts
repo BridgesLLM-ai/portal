@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { execFileSync } from 'child_process';
 import { buildOpenClawCliEnv, extractJsonFromCliOutput } from '../utils/openclawCli';
 
@@ -79,7 +80,7 @@ export function probeOpenClawAuthProfile(
   const provider = normalizeId(providerInput, 'provider id');
   const profileId = normalizeId(profileIdInput, 'profile id');
   const boundedProbeTimeout = Math.min(Math.max(Math.floor(probeTimeoutMs), 5_000), 60_000);
-  const raw = execFileSync('openclaw', [
+  const raw = execFileSync(...openClawDiagnosticCommand('openclaw', [
     'models',
     'status',
     '--agent',
@@ -94,7 +95,7 @@ export function probeOpenClawAuthProfile(
     '--probe-max-tokens',
     '8',
     '--json',
-  ], {
+  ]), {
     encoding: 'utf8',
     env: buildOpenClawCliEnv(),
     stdio: ['ignore', 'pipe', 'pipe'],

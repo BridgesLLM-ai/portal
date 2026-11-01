@@ -715,17 +715,36 @@ def native_capture_aliases(root, groups):
     }.get(json.loads((core / 'package.json').read_text()).get('version'))
     if not native or hashlib.sha256((core / 'dist' / native[0]).read_bytes()).hexdigest() != native[1]:
         raise SystemExit('native hardlink runtime identity is not pinned')
+    def official_native_project(project):
+        # Native isPluginNpmProjectDir owns an official package's project and
+        # its generation-specific successors, planned or retained alike:
+        # openclaw-<name>-<sha256(@openclaw/<name>)[:10]>. The installed
+        # manifest in that exact project must name the same package.
+        match = re.fullmatch(r'openclaw-([a-z0-9][a-z0-9._-]{0,127})-([a-f0-9]{10})'
+                             r'(?:__openclaw-generation__g-[a-f0-9]{16})?', project)
+        if not match:
+            return False
+        package = '@openclaw/' + match[1]
+        if hashlib.sha256(package.encode()).hexdigest()[:10] != match[2]:
+            return False
+        manifest = root / 'projects' / project / 'node_modules' / '@openclaw' / match[1] / 'package.json'
+        try:
+            info = manifest.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner or info.st_gid != group
+                    or stat.S_IMODE(info.st_mode) & 0o022 or info.st_size > 1024 * 1024):
+                return False
+            return json.loads(manifest.read_text(encoding='utf-8')).get('name') == package
+        except (OSError, UnicodeError, ValueError):
+            return False
+    admitted = {}
     for members in needed.values():
         for relative, row, identity in members:
             parts = pathlib.PurePosixPath(relative).parts
             if len(parts) < 4 or parts[0] != 'projects' or parts[2] != 'node_modules':
                 raise SystemExit('external aliases on an unowned managed npm path')
-            allowed = ['openclaw-' + name + '-' + hashlib.sha256(('@openclaw/' + name).encode()).hexdigest()[:10]
-                       for name in ('codex', 'acpx')]
-            # Native isPluginNpmProjectDir owns both the original package project
-            # and its generation-specific successors. Closure rules are identical.
-            if not any(re.fullmatch(re.escape(name) + r'(?:__openclaw-generation__g-[a-f0-9]{16})?', parts[1])
-                       for name in allowed):
+            if parts[1] not in admitted:
+                admitted[parts[1]] = official_native_project(parts[1])
+            if not admitted[parts[1]]:
                 raise SystemExit('external aliases on an unowned managed project')
     captures = state / 'tmp/plugin-captures'
     def directory(path):
@@ -734,6 +753,22 @@ def native_capture_aliases(root, groups):
                 or info.st_uid != owner or info.st_gid != group
                 or stat.S_IMODE(info.st_mode) & 0o022 or path.resolve() != path):
             raise SystemExit('unsafe native capture directory')
+    def confined_capture_link(path, content):
+        # npm deduplication leaves relative directory links inside a captured
+        # package tree. They hold no inode of their own: never followed, and
+        # admitted only when owner-controlled and resolving inside the same
+        # admission content.
+        info = path.lstat()
+        target = os.readlink(path)
+        if (info.st_uid != owner or info.st_gid != group or not target
+                or os.path.isabs(target) or '\x00' in target):
+            raise SystemExit('unsafe native capture link')
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(content.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            raise SystemExit('native capture link escapes its admission content')
+        directory(resolved)
     for path in (state, state / 'tmp', captures):
         directory(path)
     aliases, observed = {}, 0
@@ -758,7 +793,11 @@ def native_capture_aliases(root, groups):
                 if observed > entry_limit:
                     raise SystemExit('native capture alias inventory exceeds bound')
                 for name in dirs:
-                    directory(pathlib.Path(current) / name)
+                    path = pathlib.Path(current) / name
+                    if path.is_symlink():
+                        confined_capture_link(path, content)
+                    else:
+                        directory(path)
                 for name in files:
                     path = pathlib.Path(current) / name
                     info = path.lstat()
@@ -1093,17 +1132,36 @@ def native_capture_aliases(root, groups):
     }.get(json.loads((core / 'package.json').read_text()).get('version'))
     if not native or hashlib.sha256((core / 'dist' / native[0]).read_bytes()).hexdigest() != native[1]:
         raise SystemExit('native hardlink runtime identity is not pinned')
+    def official_native_project(project):
+        # Native isPluginNpmProjectDir owns an official package's project and
+        # its generation-specific successors, planned or retained alike:
+        # openclaw-<name>-<sha256(@openclaw/<name>)[:10]>. The installed
+        # manifest in that exact project must name the same package.
+        match = re.fullmatch(r'openclaw-([a-z0-9][a-z0-9._-]{0,127})-([a-f0-9]{10})'
+                             r'(?:__openclaw-generation__g-[a-f0-9]{16})?', project)
+        if not match:
+            return False
+        package = '@openclaw/' + match[1]
+        if hashlib.sha256(package.encode()).hexdigest()[:10] != match[2]:
+            return False
+        manifest = root / 'projects' / project / 'node_modules' / '@openclaw' / match[1] / 'package.json'
+        try:
+            info = manifest.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner or info.st_gid != group
+                    or stat.S_IMODE(info.st_mode) & 0o022 or info.st_size > 1024 * 1024):
+                return False
+            return json.loads(manifest.read_text(encoding='utf-8')).get('name') == package
+        except (OSError, UnicodeError, ValueError):
+            return False
+    admitted = {}
     for members in needed.values():
         for relative, row, identity in members:
             parts = pathlib.PurePosixPath(relative).parts
             if len(parts) < 4 or parts[0] != 'projects' or parts[2] != 'node_modules':
                 raise SystemExit('external aliases on an unowned managed npm path')
-            allowed = ['openclaw-' + name + '-' + hashlib.sha256(('@openclaw/' + name).encode()).hexdigest()[:10]
-                       for name in ('codex', 'acpx')]
-            # Native isPluginNpmProjectDir owns both the original package project
-            # and its generation-specific successors. Closure rules are identical.
-            if not any(re.fullmatch(re.escape(name) + r'(?:__openclaw-generation__g-[a-f0-9]{16})?', parts[1])
-                       for name in allowed):
+            if parts[1] not in admitted:
+                admitted[parts[1]] = official_native_project(parts[1])
+            if not admitted[parts[1]]:
                 raise SystemExit('external aliases on an unowned managed project')
     captures = state / 'tmp/plugin-captures'
     def directory(path):
@@ -1112,6 +1170,22 @@ def native_capture_aliases(root, groups):
                 or info.st_uid != owner or info.st_gid != group
                 or stat.S_IMODE(info.st_mode) & 0o022 or path.resolve() != path):
             raise SystemExit('unsafe native capture directory')
+    def confined_capture_link(path, content):
+        # npm deduplication leaves relative directory links inside a captured
+        # package tree. They hold no inode of their own: never followed, and
+        # admitted only when owner-controlled and resolving inside the same
+        # admission content.
+        info = path.lstat()
+        target = os.readlink(path)
+        if (info.st_uid != owner or info.st_gid != group or not target
+                or os.path.isabs(target) or '\x00' in target):
+            raise SystemExit('unsafe native capture link')
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(content.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            raise SystemExit('native capture link escapes its admission content')
+        directory(resolved)
     for path in (state, state / 'tmp', captures):
         directory(path)
     aliases, observed = {}, 0
@@ -1136,7 +1210,11 @@ def native_capture_aliases(root, groups):
                 if observed > entry_limit:
                     raise SystemExit('native capture alias inventory exceeds bound')
                 for name in dirs:
-                    directory(pathlib.Path(current) / name)
+                    path = pathlib.Path(current) / name
+                    if path.is_symlink():
+                        confined_capture_link(path, content)
+                    else:
+                        directory(path)
                 for name in files:
                     path = pathlib.Path(current) / name
                     info = path.lstat()
@@ -1563,6 +1641,13 @@ def record_is_owned(record, plan, allow_unverified=False):
     allowed_specs = {f"{package}@{version}" for version in versions}
     observed_specs = [record.get(field) for field in ("spec", "resolvedSpec")
                       if record.get(field) is not None]
+    # Native installs may record the requested spec as the bare package name.
+    # It names this record only through a resolved spec for the same package;
+    # that resolved spec and every version must still pass the checks below.
+    resolved_spec = record.get("resolvedSpec")
+    if (record.get("spec") == package and isinstance(resolved_spec, str)
+            and resolved_spec.startswith(package + "@")):
+        observed_specs = [resolved_spec]
     if allow_unverified:
         return (bool(observed_versions) and all(valid_version(str(version))
                                                 for version in observed_versions)
@@ -1618,6 +1703,48 @@ def native_receipt(value):
     return fields(value, dict(signature=string, sourceDigest=sha,
         nativeArtifacts=records(artifact), nativeNamespaces=records(namespace)))
 
+BUILD_HINT_FIELDS = frozenset(('openclawVersion', 'staticAssets', 'workerEntries', 'bundledDist'))
+
+def persisted_build_projection(build):
+    """The persisted reader's projection of one valid native build-hint set.
+
+    Any unknown field or malformed value returns None and stays strict.
+    """
+    if not isinstance(build, dict) or not build.keys() <= BUILD_HINT_FIELDS:
+        return None
+    if 'openclawVersion' in build and (not isinstance(build['openclawVersion'], str)
+            or re.fullmatch(r'[0-9]{4}\.[0-9]+\.[0-9]+(?:-[0-9]+)?', build['openclawVersion']) is None):
+        return None
+    if 'bundledDist' in build and type(build['bundledDist']) is not bool:
+        return None
+    if 'workerEntries' in build and (not isinstance(build['workerEntries'], list)
+            or not all(isinstance(x, str) for x in build['workerEntries'])):
+        return None
+    if 'staticAssets' in build and (not isinstance(build['staticAssets'], list)
+            or not all(isinstance(x, dict) and set(x) == {'source', 'output'}
+                       and all(isinstance(v, str) for v in x.values()) for x in build['staticAssets'])):
+        return None
+    return {k: v for k, v in build.items() if k == 'bundledDist'}
+
+def derived_build_equivalence(old, new):
+    """Native discovery publishes build hints derived from package.json; the
+    persisted 10.5/10.6 reader keeps only bundledDist. A full set and its own
+    projection describe one package when its package.json identity is unchanged,
+    in either direction. Two different full sets, a changed bundledDist, unknown
+    fields and every other row difference still compare unequal."""
+    left, right = old.get('packageBuild'), new.get('packageBuild')
+    if left == right:
+        return
+    projected = persisted_build_projection(left)
+    package = old.get('packageJson')
+    if (projected is None or projected != persisted_build_projection(right)
+            or projected not in (left, right)
+            or not isinstance(package, dict) or new.get('packageJson') != package
+            or not isinstance(package.get('hash'), str)
+            or re.fullmatch('[a-f0-9]{64}', package['hash']) is None):
+        return
+    old['packageBuild'] = new['packageBuild'] = projected
+
 def foreign_projection(before_raw, after_raw):
     """Permit only the observed 10.5 schema projection and additive native receipt.
 
@@ -1643,20 +1770,7 @@ def foreign_projection(before_raw, after_raw):
         new = current.get(identity)
         if new is None or identity in ids:
             continue
-        # The 10.5 persisted reader projects build hints to bundledDist only.
-        # Permit only known predecessor hints, never arbitrary package metadata.
-        build = old.get('packageBuild')
-        if isinstance(build, dict) and build.keys() <= {'openclawVersion', 'staticAssets', 'workerEntries', 'bundledDist'}:
-            valid = ('openclawVersion' not in build or build['openclawVersion'] in ('2026.10.5', '2026.10.6'))
-            valid = valid and ('bundledDist' not in build or type(build['bundledDist']) is bool)
-            valid = valid and ('workerEntries' not in build or isinstance(build['workerEntries'], list)
-                and all(isinstance(x, str) for x in build['workerEntries']))
-            valid = valid and ('staticAssets' not in build or isinstance(build['staticAssets'], list)
-                and all(isinstance(x, dict) and set(x) == {'source', 'output'}
-                        and all(isinstance(v, str) for v in x.values()) for x in build['staticAssets']))
-            projected = {k: v for k, v in build.items() if k == 'bundledDist'}
-            if valid and new.get('packageBuild') == projected:
-                old['packageBuild'] = projected
+        derived_build_equivalence(old, new)
         if old.get('sourceAdmissions') == new.get('sourceAdmissions'):
             continue
         key = str(old.get('rootDir')) + '\0'

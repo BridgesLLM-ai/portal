@@ -337,8 +337,10 @@ describe('Skills and plugins host mutation boundary', () => {
     expect(plugins.status).toBe(200);
     expect(plugins.body.plugins).toEqual([{ id: 'acpx', version: '2026.7.1-2' }]);
     expect(execFileMock).toHaveBeenLastCalledWith(
-      'openclaw',
-      ['plugins', 'list', '--json'],
+      '/usr/bin/flock',
+      ['--shared', '--nonblock', '--no-fork',
+        '/var/lib/bridgesllm-installer/openclaw-diagnostic-readers.lock',
+        'openclaw', 'plugins', 'list', '--json'],
       expect.objectContaining({ encoding: 'utf-8' }),
       expect.any(Function),
     );

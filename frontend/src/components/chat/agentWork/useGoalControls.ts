@@ -8,6 +8,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  OPENCLAW_MAINTENANCE_NOTICE,
   postGoalControl,
   postGoalStart,
   type GoalMutationOutcome,
@@ -104,7 +105,7 @@ function rejectionMessage(action: GoalOperationAction, code: string, reason: str
         ? 'This device’s clock looks wrong, so the change was refused. Check the clock and try again.'
         : 'This change is not valid. Check the text and try again.';
     case 'CHILD_EXECUTION_UNSUPPORTED': return 'Sub-agent work can’t be started or resumed here. Use the conversation that started it.';
-    case 'OPENCLAW_EXECUTION_MAINTENANCE': return 'OpenClaw is in maintenance, so new work can’t start. You can still edit, pause or clear the goal.';
+    case 'OPENCLAW_EXECUTION_MAINTENANCE': return `${OPENCLAW_MAINTENANCE_NOTICE} Until then new work can’t start; you can still edit, pause or clear the goal.`;
     case 'OPENCLAW_EXECUTION_RECOVERY_REQUIRED': return 'OpenClaw needs recovery before new work can start.';
     case 'OPENCLAW_EXECUTION_UNAVAILABLE': return 'OpenClaw isn’t ready to start new work right now.';
     case 'SESSION_NOT_FOUND': return 'This conversation isn’t available.';

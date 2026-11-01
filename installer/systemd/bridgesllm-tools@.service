@@ -1,0 +1,32 @@
+# BridgesLLM AI tools maintenance run (updater v2). Static template; the
+# installer copies it to /etc/systemd/system/. The Portal starts one instance
+# per run with `systemctl start --no-block bridgesllm-tools@<runId>.service`.
+# The instance name is a lowercase UUID; toolctl reads tool, target and
+# channel from runs/<runId>/request.json and revalidates them against the
+# release's tool policy. Each run lives in its own cgroup, outside both the
+# OpenClaw gateway and the Portal backend, so restarting either of them
+# never interrupts a run.
+[Unit]
+Description=BridgesLLM AI tools maintenance run %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /opt/bridgesllm/portal/installer/tools/bridgesllm-toolctl.py run %i
+# No hand-written deadline on native work (DESIGN P3): no RuntimeMaxSec and no
+# --timeout. Stopping sends SIGTERM to every process in the run's cgroup:
+# OpenClaw's updater restores on SIGTERM; SIGKILL would leave it needing
+# explicit recovery, so systemd must never escalate.
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=no
+TimeoutStopSec=3600
+Restart=no
+Nice=5
+IOSchedulingClass=best-effort
+StandardOutput=journal
+StandardError=journal

@@ -34,8 +34,8 @@ const PRESENTATION_NAME: Readonly<Record<ToolCardKind, string | null>> = {
   search: 'search',
   web: 'web_fetch',
   browser: 'browser',
-  progress: 'update_plan',
-  goal: 'update_plan',
+  progress: 'progress_card',
+  goal: 'create_goal',
   session: 'sessions_spawn',
   media: 'image_generate',
   question: 'ask_user',
@@ -59,7 +59,9 @@ const DIFF_CLASS: Readonly<Record<ToolCardDiffLineKind, string>> = {
 };
 
 function presentationNameFor(model: ToolCardModel): string {
-  return model.brand === 'bridgesllm' ? 'bridgesllm_skill' : PRESENTATION_NAME[model.kind] ?? model.canonicalName;
+  if (model.brand === 'bridgesllm') return 'bridgesllm_skill';
+  // Keep a known native tool's own glyph; card families are a fallback only.
+  return getToolPresentation(model.rawName).key !== 'generic' ? model.rawName : PRESENTATION_NAME[model.kind] ?? model.canonicalName;
 }
 
 function formatDuration(ms: number): string {
@@ -244,14 +246,14 @@ export function ToolCardView({ model, depth = 0 }: { model: ToolCardModel; depth
       aria-expanded={expanded}
       aria-controls={bodyId}
       title={model.rawName}
-      className={`inline-flex max-w-full items-center gap-2 rounded-full border text-[11px] text-slate-400 transition-colors ${nested ? 'px-2.5 py-1' : 'px-3.5 py-1.5'} ${presentation.surfaceClass} ${model.status === 'error' ? 'ring-1 ring-red-500/30' : ''}`}
+      className={`inline-flex min-h-9 max-w-full items-center gap-2 rounded-full border text-[11px] text-slate-400 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-light)] focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 ${nested ? 'px-2.5 py-1' : 'px-3.5 py-1.5'} ${presentation.surfaceClass} ${model.status === 'error' ? 'ring-1 ring-red-500/30' : ''}`}
     >
       <span className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${presentation.iconBadgeClass}`}>
         <ToolGlyph toolName={glyphName} size={model.brand === 'bridgesllm' ? 16 : 11} className={presentation.iconClass} />
       </span>
       <span className="min-w-0 truncate text-slate-200">{model.title}</span>
       {model.status === 'running' ? (
-        <Loader2 size={10} className={`shrink-0 animate-spin ${presentation.iconClass}`} aria-label="Running" />
+        <Loader2 size={10} className={`shrink-0 motion-safe:animate-spin ${presentation.iconClass}`} aria-label="Running" />
       ) : null}
       {model.status === 'error' ? (
         <span className="inline-flex shrink-0 items-center gap-0.5 text-red-300">
@@ -259,8 +261,8 @@ export function ToolCardView({ model, depth = 0 }: { model: ToolCardModel; depth
           Failed
         </span>
       ) : null}
-      {headerChips.map((chip, index) => <Chip key={`${chip.label}-${index}`} chip={chip} />)}
-      {model.durationMs !== null ? <span className="shrink-0 text-slate-500">· {formatDuration(model.durationMs)}</span> : null}
+      <span className="hidden sm:contents">{headerChips.map((chip, index) => <Chip key={`${chip.label}-${index}`} chip={chip} />)}</span>
+      {model.durationMs !== null ? <span className="hidden shrink-0 text-slate-500 sm:inline">· {formatDuration(model.durationMs)}</span> : null}
       <ChevronRight size={10} aria-hidden="true" className={`shrink-0 text-slate-600 transition-transform ${expanded ? 'rotate-90' : ''}`} />
     </button>
   );
@@ -268,7 +270,7 @@ export function ToolCardView({ model, depth = 0 }: { model: ToolCardModel; depth
   const body = (
     <div
       id={bodyId}
-      className="mt-1.5 w-full space-y-2.5 rounded-xl border border-white/[0.06] bg-slate-900/60 px-3 py-2.5 text-left text-[11px] text-slate-300"
+      className="mt-1.5 w-full space-y-2.5 rounded-xl border border-white/[0.06] bg-[var(--color-surface-raised)] px-3 py-2.5 text-left text-[11px] text-slate-300"
     >
       {model.subtitle ? <div className="truncate font-mono text-[10px] text-slate-500" title={model.subtitle}>{model.subtitle}</div> : null}
       {model.chips.length ? (

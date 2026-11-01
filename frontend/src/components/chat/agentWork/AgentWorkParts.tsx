@@ -1,5 +1,5 @@
 import { useEffect, type ReactNode } from 'react';
-import { ArrowUpRight, Ban, CheckCircle2, Circle, Hourglass, Loader2, Square, X, XCircle } from 'lucide-react';
+import { ArrowUpRight, Ban, CheckCircle2, Circle, Hourglass, Loader2, PauseCircle, Square, X, XCircle } from 'lucide-react';
 import type { StopOutcome, WorkSessionRow } from './agentWorkApi';
 import { canStopRow, isNavigableSessionKey, relativeTime, runStatusView, sessionDisplayLabel, type RunTone } from './agentWorkModel';
 import { isStopOutcome, type SessionStopsState } from './useSessionStops';
@@ -15,6 +15,7 @@ const TONE_CLASS: Record<RunTone, string> = {
   waiting: 'border-amber-400/20 bg-amber-400/10 text-amber-200',
   failed: 'border-rose-400/25 bg-rose-500/10 text-rose-200',
   stopped: 'border-white/10 bg-white/[0.04] text-slate-300',
+  resumable: 'border-amber-400/20 bg-amber-400/10 text-amber-200',
   done: 'border-emerald-400/20 bg-emerald-400/10 text-emerald-200',
   idle: 'border-white/10 bg-white/[0.03] text-slate-400',
   unknown: 'border-white/10 bg-white/[0.03] text-slate-300',
@@ -26,6 +27,7 @@ function ToneIcon({ tone }: { tone: RunTone }) {
   if (tone === 'waiting') return <Hourglass {...props} />;
   if (tone === 'failed') return <XCircle {...props} />;
   if (tone === 'stopped') return <Ban {...props} />;
+  if (tone === 'resumable') return <PauseCircle {...props} />;
   if (tone === 'done') return <CheckCircle2 {...props} />;
   return <Circle {...props} />;
 }
@@ -65,6 +67,8 @@ export function SessionRunRow({ row, now, onOpen, openLabel = 'Open', stops }: {
   const updated = relativeTime(row.updatedAt, now);
   const activity = row.activityText ? displayText(row.activityText, 240) : '';
   const error = (tone === 'failed' || tone === 'stopped') && row.lastRunError ? displayText(row.lastRunError, 300) : '';
+  // A resumable interruption explains itself ("Resume to verify state…"); it is guidance, not an error.
+  const resumeNote = tone === 'resumable' && row.lastRunError ? displayText(row.lastRunError, 300) : '';
   const role = row.subagentRole === 'orchestrator' ? 'Coordinator' : row.subagentRole === 'leaf' ? 'Worker' : null;
   const stoppable = Boolean(stops) && canStopRow(row);
   const phase = stops?.phaseOf(row.key) ?? null;
@@ -87,6 +91,7 @@ export function SessionRunRow({ row, now, onOpen, openLabel = 'Open', stops }: {
           </div>
           {activity && <p className="mt-1 line-clamp-2 break-words text-[11px] text-slate-400">{activity}</p>}
           {error && <p className="mt-1 line-clamp-3 break-words text-[11px] text-rose-200/90">{error}</p>}
+          {resumeNote && <p className="mt-1 line-clamp-3 break-words text-[11px] text-amber-100/80">{resumeNote}</p>}
         </div>
         {stoppable && phase === 'stopping' && (
           <span role="status" className={`${ROW_ACTION} text-slate-400`}>

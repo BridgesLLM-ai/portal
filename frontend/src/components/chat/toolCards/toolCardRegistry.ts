@@ -238,6 +238,7 @@ const KIND_BY_NAME: Readonly<Record<string, ToolCardKind>> = {
   ask_user: 'question',
   ask_user_question: 'question',
   request_user_input: 'question',
+  request_user_input_async: 'question',
   parallel: 'parallel',
 };
 

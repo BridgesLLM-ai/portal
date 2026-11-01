@@ -25,13 +25,17 @@ export function latestChatPlan(messages: ChatMessage[]): ChatTask[] {
     const calls = messages[m].toolCalls || [];
     for (let t = calls.length - 1; t >= 0; t -= 1) {
       const call = calls[t];
-      if (call.status === 'error') continue;
+      if (call.status !== 'done') continue;
       const name = call.name.toLowerCase().split(/[./:]|__/).pop()?.replace(/_/g, '');
       if (!['updateplan', 'todowrite', 'writetodos', 'writeplan', 'plan', 'progresscard'].includes(name || '')) continue;
       let args = call.arguments;
       if (typeof args === 'string') { try { args = JSON.parse(args); } catch { continue; } }
       const items = args?.plan ?? args?.todos ?? args?.entries;
-      if (!Array.isArray(items)) continue;
+      if (!Array.isArray(items)) {
+        // A native progress card is a replacement, not a patch of the old plan.
+        if (name === 'progresscard' && args && typeof args === 'object') return [];
+        continue;
+      }
       return items.slice(0, 100).flatMap((item, i) => {
         const name = item?.step ?? item?.content ?? item?.title ?? item?.description;
         if (typeof name !== 'string' || !name.trim()) return [];

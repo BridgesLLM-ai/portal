@@ -1,6 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import DOMPurify from 'dompurify';
-import { Check, Code2, Copy, GitBranch, Loader2 } from 'lucide-react';
+import { Check, Code2, Copy, GitBranch, Loader2, PanelRight } from 'lucide-react';
+import { useAgentWorkspaceTarget } from './workspace/AgentWorkspaceContext';
+import { useAgentWorkspaceStore } from '../../stores/agentWorkspaceStore';
 
 let renderer: Promise<typeof import('mermaid')['default']> | undefined;
 let renderQueue: Promise<unknown> = Promise.resolve();
@@ -64,6 +66,7 @@ export default function MermaidDiagram({ source, isStreaming }: { source: string
   const [error, setError] = useState(false);
   const [copied, setCopied] = useState(false);
   const stableSource = useMemo(() => source.trim(), [source]);
+  const workspace = useAgentWorkspaceTarget();
   useEffect(() => {
     const current = ++generation.current;
     setError(false);
@@ -78,6 +81,8 @@ export default function MermaidDiagram({ source, isStreaming }: { source: string
   return <figure className="my-3 overflow-hidden rounded-xl border border-sky-400/15 bg-[#111827]">
     <figcaption className="flex items-center gap-2 border-b border-white/5 px-3 py-2 text-xs text-slate-400">
       <GitBranch size={14} aria-hidden="true" /><span className="flex-1">Mermaid diagram</span>
+      {workspace && !isStreaming && <button type="button" aria-label="Open diagram in side panel" title="Open beside the chat" className="rounded-md p-1.5 hover:bg-white/5"
+        onClick={() => useAgentWorkspaceStore.getState().openPreview({ kind: 'mermaid', title: 'Diagram', source: stableSource })}><PanelRight size={14} /></button>}
       <button type="button" onClick={() => setSourceVisible(v => !v)} aria-pressed={sourceVisible} aria-label="Show diagram source" className="rounded-md p-1.5 hover:bg-white/5"><Code2 size={14} /></button>
       <button type="button" aria-label="Copy diagram source" className="rounded-md p-1.5 hover:bg-white/5" onClick={() => {
         void navigator.clipboard.writeText(source).then(() => setCopied(true)).catch(() => setCopied(false));

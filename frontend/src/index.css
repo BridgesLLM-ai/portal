@@ -427,3 +427,25 @@ select optgroup {
     animation-duration: 2.4s;
   }
 }
+
+/* Chat working canvas: rows widen for widgets, tables, code and tool cards,
+   while chat prose keeps a readable measure. Colours come from the theme. */
+.chat-markdown > :is(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
+  max-width: 80ch;
+  overflow-wrap: anywhere;
+}
+.chat-markdown :is(pre, table) {
+  max-width: 100%;
+}
+.chat-canvas :is(a, button, summary, [role='button'], [tabindex]:not([tabindex='-1'])):focus-visible {
+  outline: 2px solid var(--accent-light, currentColor);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-canvas *,
+  .chat-canvas *::before,
+  .chat-canvas *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

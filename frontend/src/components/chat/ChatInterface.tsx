@@ -1,7 +1,10 @@
+import ResponseToolsDrawer from './ResponseToolsDrawer';
+import { RESPONSE_FORMAT_LABELS } from '../../utils/chatResponseFormat';
 import { useTextareaDictation } from '../../hooks/useDictation';
 import { WidgetPresentationProvider, useWidgetPresentation } from './richContent/WidgetPresentationContext';
 import { rewriteWidgetDirectives, widgetPresentationFor } from './richContent/widgetPresentation';
 import { ChatWidgetCard } from './richContent/ChatWidgetCard';
+import { ChatCanvasColumn } from './chatCanvas';
 import { AgentWorkButton, AgentWorkStrip, useAgentWorkSurface } from './agentWork/AgentWorkSurface';
 import { openClawTaskConversation } from '../../utils/taskConversation';
 /**
@@ -29,12 +32,18 @@ import { useExecApprovals } from './useExecApprovals';
 import { ExecApprovalModal } from './ExecApprovalModal';
 import MarkdownRenderer, { type HostFileLinkContext } from './MarkdownRenderer';
 import React, { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
+import { lazyWithRecovery } from '../../utils/moduleRecovery';
 import {
   Send, StopCircle, Pencil, Settings, X, ChevronDown,
   Check, RefreshCw, Wrench, Loader2, CheckCircle2, XCircle, ShieldAlert, Radio,
   Sparkles, Copy, RotateCcw, MessageSquare, Code2, Bug, ChevronRight, Clock,
-  Paperclip, Mic, PenSquare, Layers3, Settings2, Activity,
+  Paperclip, Mic, PenSquare, Layers3, Settings2, Activity, Globe,
 } from 'lucide-react';
+import AgentWorkspacePanel from './workspace/AgentWorkspacePanel';
+import WorkspacePanelButton from './workspace/WorkspacePanelButton';
+import { AgentWorkspaceContext } from './workspace/AgentWorkspaceContext';
+import { useAgentWorkspaceStore } from '../../stores/agentWorkspaceStore';
+import { canonicalToolName } from '../../utils/toolPresentation';
 import { motion, AnimatePresence } from 'framer-motion';
 import AgentSelector, { type AgentSelection } from './AgentSelector';
 import PortalGuideButton from './PortalGuideButton';
@@ -118,7 +127,7 @@ import AgentChatDiagnosticsDrawer from './AgentChatDiagnosticsDrawer';
 
 const MESSAGE_WINDOW_SIZE = 80;
 const TOOL_WINDOW_SIZE = 40;
-const LazyAgentZeroSetupPanel = React.lazy(() => import('../settings/AgentZeroSetupPanel'));
+const LazyAgentZeroSetupPanel = lazyWithRecovery(() => import('../settings/AgentZeroSetupPanel'));
 
 export function isAgentChatPositiveApprovalBlocked(approvalId: string): boolean {
   const normalized = String(approvalId || '').trim().toLowerCase();
@@ -623,6 +632,7 @@ export function ModelPicker({
   required = false,
   emptyMessage = 'No selectable models are available.',
   unavailableModelIds = [],
+  customModelSettingsHref,
   onOpen,
   onRetry,
 }: {
@@ -632,6 +642,11 @@ export function ModelPicker({
   loading?: boolean;
   error?: string | null;
   supportsCustomModelInput?: boolean;
+  /**
+   * Where a model outside the list is enabled. When set, "Custom model…" opens
+   * that page instead of applying a typed model ID to the session.
+   */
+  customModelSettingsHref?: string;
   modelCatalogKind?: 'none' | 'declared' | 'dynamic';
   disabled?: boolean;
   allowDefaultModel?: boolean;
@@ -670,7 +685,10 @@ export function ModelPicker({
     if (disabled) setOpen(false);
   }, [disabled]);
 
-  if (models.length === 0 && !supportsCustomModelInput && !loading && !error && !required) return null;
+  // With nothing to pick, the picker still opens to explain models the server
+  // knows but cannot run (an ordinary user has no custom-model entry).
+  if (models.length === 0 && unavailableModelIds.length === 0 && !supportsCustomModelInput
+    && !loading && !error && !required) return null;
 
   const emptySelectionLabel = required ? 'Select model' : 'Default model';
   const includesAccountDependentAstra = models.some(
@@ -782,7 +800,15 @@ export function ModelPicker({
           )}
           {supportsCustomModelInput && (
           <div className="border-t border-white/[0.06] mt-1 pt-1">
-            {custom ? (
+            {customModelSettingsHref ? (
+              <Link
+                to={customModelSettingsHref}
+                onClick={() => setOpen(false)}
+                className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-slate-400 hover:bg-white/[0.04] hover:text-slate-200"
+              >
+                Custom model… enable it in Model Providers
+              </Link>
+            ) : custom ? (
               <div className="px-2 py-1">
                 <input
                   aria-label="Custom model name"
@@ -1851,7 +1877,7 @@ const ToolCallBlock = React.memo(function ToolCallBlock({ tool }: { tool: ToolCa
       </div>
     );
   }
-  if (tool.name === 'show_widget') return <div className="px-4 py-1"><ChatWidgetCard tool={tool} /></div>;
+  if (tool.name === 'show_widget') return <ChatCanvasColumn><ChatWidgetCard tool={tool} /></ChatCanvasColumn>;
   // Every other tool renders through the guarded card registry; unknown or
   // malformed calls degrade to a generic card that still names the tool.
   return <ToolCard tool={tool} />;
@@ -2049,7 +2075,7 @@ function getOpenClawContextSummary({
 
 function MessageSkeleton({ isUser = false }: { isUser?: boolean }) {
   return (
-    <div className={`flex gap-3 px-4 py-3 max-w-3xl mx-auto w-full ${isUser ? 'justify-end' : ''}`}>
+    <div className={`flex gap-3 px-4 py-3 max-w-[88rem] mx-auto w-full ${isUser ? 'justify-end' : ''}`}>
       {!isUser && (
         <div className="w-7 h-7 rounded-full bg-white/[0.06] flex-shrink-0 animate-pulse" />
       )}
@@ -2139,7 +2165,7 @@ const DateSeparator = React.memo(function DateSeparator({ date }: { date: Date }
   }
 
   return (
-    <div className="flex items-center gap-3 px-4 py-3 max-w-3xl mx-auto w-full">
+    <div className="flex items-center gap-3 px-4 py-3 max-w-[88rem] mx-auto w-full">
       <div className="flex-1 border-t border-white/[0.06]" />
       <span className="text-[10px] text-slate-500 font-medium">{label}</span>
       <div className="flex-1 border-t border-white/[0.06]" />
@@ -2284,12 +2310,12 @@ const UserBubble = React.memo(function UserBubble({
 
   return (
     <div
-      className="flex gap-3 px-4 py-3 max-w-3xl mx-auto w-full group animate-user-in items-end"
+      className="flex gap-3 px-4 py-3 max-w-[88rem] mx-auto w-full group animate-user-in items-end"
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
       <div className="flex-1 min-w-0" />
-      <div className="max-w-[78%]">
+      <div className="min-w-0 max-w-[min(78%,72ch)]">
         <div className={`rounded-2xl rounded-br-sm px-4 py-2.5 shadow-lg shadow-blue-600/15 transition-opacity ${message.queued ? 'bg-blue-600/65 opacity-85' : 'bg-blue-600/90'}`}>
           <MarkdownRenderer
             content={message.content}
@@ -2313,6 +2339,13 @@ const UserBubble = React.memo(function UserBubble({
                 Remove
               </button>
             )}
+          </div>
+        )}
+        {message.steerNote && (
+          <div className="mt-1 mr-1 flex justify-end" role="status" aria-live="polite">
+            <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
+              {message.steerNote}
+            </span>
           </div>
         )}
         <AnimatePresence>
@@ -2431,7 +2464,7 @@ export const AssistantBubble = React.memo(function AssistantBubble({
 
   return (
     <div
-      className="flex gap-3 px-4 py-3 max-w-3xl mx-auto w-full animate-fade-in items-end"
+      className="flex gap-3 px-4 py-3 max-w-[88rem] mx-auto w-full animate-fade-in items-end"
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
@@ -2442,7 +2475,7 @@ export const AssistantBubble = React.memo(function AssistantBubble({
           agent.initials
         )}
       </div>
-      <div className="flex-1 min-w-0 max-w-[80%]">
+      <div className="flex-1 min-w-0">
         {hasThinkingPresentation && (
           <AssistantThinkingBubble
             content={visibleThinkingContent}
@@ -2457,7 +2490,7 @@ export const AssistantBubble = React.memo(function AssistantBubble({
           <BoundedToolCallList
             tools={toolCalls}
             messageKey={message.id}
-            className="mb-2 -ml-3 -mr-3"
+            className="mb-2"
             proseFollows={hasVisibleMessageContent}
           />
         )}
@@ -2722,7 +2755,7 @@ const ActivityTimeline = React.memo(function ActivityTimeline({
   return (
     <>
       {windowed.hiddenUnits > 0 ? (
-        <div className="mx-auto flex max-w-3xl justify-center px-4 py-2">
+        <div className="mx-auto flex max-w-[88rem] justify-center px-4 py-2">
           <button
             type="button"
             onClick={() => setRevealedEarlier((current) => current + TIMELINE_WINDOW_SIZE)}
@@ -3950,6 +3983,41 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     }
   }, [ensureProviderModelsLoaded, isRunning, provider]);
 
+  // Agent workspace side panel. It opens itself when the OpenClaw agent starts
+  // using its browser during a live run (on a compact screen it only marks the
+  // side-panel button); history loads never open it, and a user who closed it
+  // (or that tab) keeps it closed for the rest of the run.
+  const workspaceUserId = user?.id || '';
+  useEffect(() => { useAgentWorkspaceStore.getState().bindUser(workspaceUserId); }, [workspaceUserId]);
+  const workspaceOpen = useAgentWorkspaceStore((state) => state.open);
+  const workspaceTab = useAgentWorkspaceStore((state) => state.tab);
+  const workspaceBrowserAvailable = provider === 'OPENCLAW';
+  // Interactive widgets come from OpenClaw or the Portal chat bridge: the same
+  // harnesses whose catalog row reports Portal questions.
+  const workspaceWidgetsSupported = currentProviderCatalogEntry?.capabilities?.supportsAskUser === true;
+  const workspaceSeenTools = useRef<{ scope: string; ids: Set<string> } | null>(null);
+  const workspaceWasRunning = useRef(false);
+  useEffect(() => {
+    const scope = `${provider}:${session}`;
+    const tools = messages.flatMap((message) => message.toolCalls || []);
+    if (!workspaceSeenTools.current || workspaceSeenTools.current.scope !== scope || isLoadingHistory || isSwitchingSession) {
+      workspaceSeenTools.current = { scope, ids: new Set(tools.map((tool) => tool.id)) };
+      workspaceWasRunning.current = isRunning;
+      return;
+    }
+    if (isRunning && !workspaceWasRunning.current) useAgentWorkspaceStore.getState().runStarted();
+    workspaceWasRunning.current = isRunning;
+    const seen = workspaceSeenTools.current.ids;
+    for (const tool of tools) {
+      if (seen.has(tool.id)) continue;
+      seen.add(tool.id);
+      if (workspaceBrowserAvailable && isRunning && canonicalToolName(tool.name) === 'browser') {
+        useAgentWorkspaceStore.getState().show('browser', { automatic: true });
+      }
+    }
+  }, [provider, session, messages, isRunning, isLoadingHistory, isSwitchingSession, workspaceBrowserAvailable]);
+  const workspaceContextValue = useMemo(() => ({ provider, session }), [provider, session]);
+
   const [revealedEarlierMessages, setRevealedEarlierMessages] = useState(0);
   const messageWindow = useMemo(
     () => selectNewestWindow(messages, MESSAGE_WINDOW_SIZE, revealedEarlierMessages),
@@ -4363,7 +4431,6 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
         }
         textarea.dispatchEvent(new Event('input', { bubbles: true }));
         setSlashMatch({ isOpen: false, query: '', selectedIndex: 0, matches: [] });
-        textarea.style.height = 'auto';
       },
       execute: async (parsed) => {
         if (parsed.command.command === '/export') {
@@ -4590,6 +4657,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     [messages, streamSegments]);
 
   return (
+    <AgentWorkspaceContext.Provider value={workspaceContextValue}>
     <WidgetPresentationProvider value={widgetPresentation}>
     <AskQuestionAnswerProvider value={submitAskQuestionAnswer}>
     <AssistantRuntimeProvider runtime={runtime}>
@@ -4642,7 +4710,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   models={availableModels}
                   loading={currentProviderModelsLoading || modelSwitching}
                   error={modelSelectionError || currentProviderModelsError}
-                  supportsCustomModelInput={provider === 'AGENT_ZERO' ? false : supportsCustomModelInput}
+                  // OpenClaw selects only among models this server enabled:
+                  // admins add one in Model Providers; nobody types one here.
+                  supportsCustomModelInput={provider === 'AGENT_ZERO' ? false : provider === 'OPENCLAW' ? isAdmin : supportsCustomModelInput}
+                  customModelSettingsHref={provider === 'OPENCLAW' && isAdmin ? '/settings?tab=ai-providers' : undefined}
                   modelCatalogKind={provider === 'AGENT_ZERO' ? 'dynamic' : modelCatalogKind}
                   disabled={!currentProviderAvailability.canSend || isRunning || modelSwitching || sessionSettingNavigationBusy || newSessionPending}
                   allowDefaultModel={provider !== 'AGENT_ZERO'}
@@ -4755,6 +4826,17 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
               >
                 <RefreshCw size={16} className={isRefreshing ? 'animate-spin' : ''} />
               </button>
+              {workspaceBrowserAvailable && <button
+                type="button"
+                onClick={() => useAgentWorkspaceStore.getState().toggle('browser')}
+                aria-label="Show the agent browser"
+                aria-pressed={workspaceOpen && workspaceTab === 'browser'}
+                className={`p-1.5 rounded-lg transition-colors ${workspaceOpen && workspaceTab === 'browser' ? 'text-sky-300 bg-sky-500/[0.12]' : 'text-slate-400 hover:text-sky-300 hover:bg-sky-500/[0.08]'}`}
+                title="Browser — watch what the agent is doing"
+              >
+                <Globe size={16} aria-hidden="true" />
+              </button>}
+              <WorkspacePanelButton />
               <button
                 onClick={() => setSettingsOpen(true)}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/[0.06] transition-colors"
@@ -4879,7 +4961,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
             <div
               ref={scrollRef}
               data-chat-scroll-container
-              className="flex-1 overflow-y-auto"
+              className="chat-canvas flex-1 overflow-y-auto"
               onScroll={handleChatScroll}
             >
               <ToolActivityScope scope={`agent:${provider}:${session || ''}`} onDisclosureChange={recheckReaderPosition}>
@@ -4989,7 +5071,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   )}
                   {/* Direct message rendering — no counters, fully reactive */}
                   <div className="py-2">
-                  <div className="mx-auto flex min-h-10 max-w-3xl items-center justify-center px-4 py-3" aria-live="polite">
+                  <div className="mx-auto flex min-h-10 max-w-[88rem] items-center justify-center px-4 py-3" aria-live="polite">
                     {olderHistoryError ? (
                       <div className="flex flex-col items-center gap-2 text-center">
                         <span className="text-[11px] text-rose-300">Couldn’t load earlier messages: {olderHistoryError}</span>
@@ -5085,7 +5167,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                           />
                         ) : msg.role === 'system' ? (
                           isCompactionNotice(msg.content) ? null : (
-                            <div className="flex justify-center px-4 py-2 max-w-3xl mx-auto w-full">
+                            <div className="flex justify-center px-4 py-2 max-w-[88rem] mx-auto w-full">
                               <div className="max-w-xl rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-[12px] text-slate-300 whitespace-pre-wrap">
                                 {msg.content}
                               </div>
@@ -5151,7 +5233,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                 ? 'border-amber-500/20 bg-[#0D1130]/50'
                 : 'border-white/[0.06] bg-[#0D1130]/30'
             } backdrop-blur-sm`}>
-              <div className="px-2 sm:px-4 pt-2 pb-3 pb-safe max-w-3xl mx-auto">
+              <div className="chat-canvas px-2 sm:px-4 pt-2 pb-3 pb-safe max-w-[88rem] mx-auto">
                 <AgentWorkStrip surface={agentWork} />
                 {projectWork.activeCards.map(card => <ProjectWorkAttention key={card.id} card={card} active={true} />)}
                 <AgentPendingQuestions questions={pendingUserQuestions} onSettled={settlePendingUserQuestion} />
@@ -5171,7 +5253,11 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   </div>
                 )}
 
-                {/* Composer row: [paperclip] [textarea] [mic] [send] */}
+                {chatState.responseFormat !== 'auto' && <div className="mb-2 flex items-center gap-2 text-xs text-slate-300">
+                  <span className="rounded-full border border-[var(--accent-border)] bg-[var(--accent-bg-subtle)] px-3 py-1">Next reply: {RESPONSE_FORMAT_LABELS[chatState.responseFormat]}</span>
+                  <button type="button" aria-label="Clear response format" onClick={() => chatState.setResponseFormat('auto')} className="p-1 text-slate-400 hover:text-white"><X size={14} /></button>
+                </div>}
+                {/* Composer row: [response tools + attachments] [textarea] [mic] [send] */}
                 <div className={`mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] ${isRunning ? 'text-violet-300/80' : 'text-slate-500'}`}>
                   <span className="inline-flex items-center gap-1" title={providerCommandStatus}><kbd className="px-1 py-0.5 rounded bg-white/[0.05] text-[10px] font-mono text-slate-400">/</kbd> for commands</span>
                   <span className="ml-auto hidden sm:inline">Enter to send · Shift + Enter for a new line</span>
@@ -5187,18 +5273,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                   </p>
                 )}
                 <ComposerPrimitive.Root onSubmitCapture={dictation.stop} className="relative flex items-end gap-1.5 sm:gap-2">
-                  {/* Fix #4: Attachment button (hidden during streaming) */}
-                  {!isRunning && (
-                  <button
-                    type="button"
-                    aria-label="Attach files"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="flex-shrink-0 p-2 sm:p-2.5 rounded-xl text-slate-400 hover:text-slate-200 hover:bg-white/[0.06] transition-colors mb-0.5 touch-target"
-                    title="Attach file"
-                  >
-                    <Paperclip size={18} className="sm:w-[18px] sm:h-[18px] w-4 h-4" />
-                  </button>
-                  )}
+                  <ResponseToolsDrawer onAttach={() => fileInputRef.current?.click()} />
                   <input
                     aria-label="Choose files to attach"
                     ref={fileInputRef}
@@ -5232,7 +5307,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     aria-expanded={slashMatch.isOpen}
                     aria-controls={slashMatch.isOpen ? slashMenuId : undefined}
                     aria-activedescendant={slashMatch.isOpen ? `${slashMenuId}-option-${slashMatch.selectedIndex}` : undefined}
-                    className={`flex-1 resize-none rounded-2xl px-3 sm:px-4 py-2.5 sm:py-3 text-sm placeholder-slate-500 focus:outline-none transition-all duration-300 min-h-[44px] max-h-[200px] overflow-y-auto ${
+                    className={`flex-1 min-w-0 resize-none rounded-2xl px-3 sm:px-4 py-2.5 sm:py-3 text-sm placeholder-slate-500 focus:outline-none transition-colors duration-300 min-h-[44px] max-h-[200px] overflow-y-auto ${
                       isRunning
                         ? 'bg-violet-500/[0.04] border border-violet-500/15 text-white'
                         : `bg-white/[0.06] border border-white/[0.08] text-white focus:ring-1 ${agent.accentRing}`
@@ -5243,9 +5318,8 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
                     submitMode={isMobileDevice ? 'none' : 'enter'}
                     onInput={(e: React.FormEvent<HTMLTextAreaElement>) => {
                       const textarea = e.currentTarget;
-                      // Auto-resize: reset height, then set to scrollHeight
-                      textarea.style.height = 'auto';
-                      textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
+                      // ComposerPrimitive already sizes content + padding + borders.
+                      // Do not overwrite its cached height with borderless scrollHeight.
                       refreshSlashAutocomplete(textarea.value);
                     }}
                     onClick={(e: React.MouseEvent<HTMLTextAreaElement>) => {
@@ -5409,6 +5483,10 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
           </ThreadPrimitive.Root>
         </div>
 
+        <AgentWorkspacePanel provider={provider} session={session} messages={messages}
+          browserAvailable={workspaceBrowserAvailable} widgetsSupported={workspaceWidgetsSupported}
+          onOpenSettings={() => setSettingsOpen(true)} />
+
         {avatarEditorProvider && (
           <ImagePickerCropper
             isOpen={Boolean(avatarEditorProvider)}
@@ -5463,6 +5541,7 @@ export default function ChatInterface({ defaultProvider }: ChatInterfaceProps) {
     </AssistantRuntimeProvider>
     </AskQuestionAnswerProvider>
     </WidgetPresentationProvider>
+    </AgentWorkspaceContext.Provider>
   );
 }
 /** The same actor/request-bound answer form used by the global notification.

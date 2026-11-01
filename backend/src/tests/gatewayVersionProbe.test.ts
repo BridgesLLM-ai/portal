@@ -1,3 +1,5 @@
+import { capabilitiesFromHello } from '../services/openClawCompatibility';
+import { OPENCLAW_REQUIRED_GATEWAY_EVENTS, OPENCLAW_REQUIRED_GATEWAY_METHODS } from '../services/openClawRuntimeContract';
 import { __gatewayVersionProbeTest } from '../routes/gateway';
 import {
   getOpenClawSetupReadiness,
@@ -87,6 +89,18 @@ describe('OpenClaw dashboard version probe', () => {
       }),
       readGatewayToken: () => 'matching-token',
       credentialStoreWritable: () => true,
+      inspectCodexPluginRpc: async () => ({
+        ok: true,
+        data: { ok: true, plugin: { id: 'codex', name: 'Codex', version: '2026.9.1', installed: true, enabled: true }, source: { kind: 'npm', spec: '@openclaw/codex@2026.9.1' } },
+      }),
+      readGatewayHello: async () => ({
+        ok: true as const,
+        capabilities: capabilitiesFromHello({
+          protocol: 4,
+          server: { version: '2026.9.1' },
+          features: { methods: [...OPENCLAW_REQUIRED_GATEWAY_METHODS], events: [...OPENCLAW_REQUIRED_GATEWAY_EVENTS] },
+        }),
+      }),
     };
 
     const readinessPromise = getOpenClawSetupReadiness(
@@ -113,7 +127,6 @@ describe('OpenClaw dashboard version probe', () => {
     expect(calls).toEqual([
       { command: '--version', timeoutMs: 4000 },
       { command: 'gateway status --require-rpc --timeout 10000 --json', timeoutMs: 15000 },
-      { command: 'plugins inspect codex --json', timeoutMs: 60000 },
       { command: 'models auth --agent main list --json', timeoutMs: 25000 },
       { command: 'update status --json --timeout 3', timeoutMs: 9000 },
     ]);
@@ -258,6 +271,11 @@ describe('OpenClaw dashboard version probe', () => {
       }),
       readGatewayToken: () => 'matching-token',
       credentialStoreWritable: () => true,
+      inspectCodexPluginRpc: async () => ({
+        ok: true,
+        data: { ok: true, plugin: { id: 'codex', name: 'Codex', version: '2026.9.1', installed: true, enabled: true }, source: { kind: 'npm', spec: '@openclaw/codex@2026.9.1' } },
+      }),
+      readGatewayHello: async () => ({ ok: false as const, error: 'gateway unreachable in this test' }),
     };
 
     const status = await __gatewayVersionProbeTest.probeOpenClawVersionStatusWithDependencies({

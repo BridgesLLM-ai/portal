@@ -3,10 +3,29 @@ import { getOpenClawCapabilities } from './openClawCompatibility';
 
 export type SessionRow = Record<string, any>;
 export const sessionRowKey = (row: SessionRow): string => String(row?.key || row?.sessionKey || '').trim();
-export const sessionParentKey = (row: SessionRow): string | null => {
-  const value = row?.parentSessionKey ?? row?.spawnedBy;
-  return typeof value === 'string' && value.trim() ? value.trim() : null;
-};
+const nonEmptyString = (value: unknown): string | null => (typeof value === 'string' && value.trim() ? value.trim() : null);
+/**
+ * Lineage for ownership inheritance only: where the row says it came from.
+ * OpenClaw 10.x records `parentSessionKey` on operator-created chats too, so
+ * this is not evidence that a session is a sub-agent.
+ */
+export const sessionParentKey = (row: SessionRow): string | null => nonEmptyString(row?.parentSessionKey) ?? nonEmptyString(row?.spawnedBy);
+/**
+ * A sub-agent is a session another run actually spawned. A direct chat that an
+ * operator created (`kind:'direct'`, `spawnedBy:null`, `spawnDepth:0`) keeps
+ * its goals and controls even though it carries `parentSessionKey`.
+ */
+export function sessionIsSpawnedChild(row: SessionRow): boolean {
+  if (nonEmptyString(row?.spawnedBy) || nonEmptyString(row?.subagentRole)) return true;
+  const depth = Number(row?.spawnDepth);
+  if (Number.isFinite(depth) && depth > 0) return true;
+  if (row?.kind === 'subagent' || row?.createdVia === 'agent') return true;
+  return /:subagent:/.test(sessionRowKey(row));
+}
+/** The spawning parent of a real sub-agent; null for every other session. */
+export const sessionSpawnParentKey = (row: SessionRow): string | null => (
+  sessionIsSpawnedChild(row) ? nonEmptyString(row?.spawnedBy) ?? nonEmptyString(row?.parentSessionKey) : null
+);
 export function validWorkSessionKey(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 2048 && !/[\u0000-\u0020\u007f]/.test(value);
 }
@@ -65,8 +84,8 @@ export function publishSessionWorkChanged(key: unknown, parts: WorkPart[]): void
   for (const listener of listeners) listener(signal);
 }
 export function projectSessionWorkRow(row: SessionRow) {
-  const parentKey = sessionParentKey(row);
-  return { kind: parentKey ? 'subagent' : 'session', key: sessionRowKey(row), parentKey,
+  const parentKey = sessionSpawnParentKey(row);
+  return { kind: sessionIsSpawnedChild(row) ? 'subagent' : 'session', key: sessionRowKey(row), parentKey,
     label: row.label || row.displayName || sessionRowKey(row), status: row.status ?? null,
     sessionId: row.sessionId, lastRunId: row.lastRunId, lastRunError: row.lastRunError,
     updatedAt: row.updatedAt, subagentRole: row.subagentRole, spawnDepth: row.spawnDepth,
@@ -80,7 +99,7 @@ export async function readSessionWork(key: string, authorize: (key: string) => P
   if (!row) return null;
   const rows = await listSessionWorkRows(rpc);
   const children: SessionRow[] = [];
-  for (const child of rows.filter(row => sessionParentKey(row) === key).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))) {
+  for (const child of rows.filter(row => sessionSpawnParentKey(row) === key).sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))) {
     try { await authorize(sessionRowKey(child)); children.push(projectSessionWorkRow(child)); } catch { /* Do not expose foreign children. */ }
     if (children.length === 20) break;
   }

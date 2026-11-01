@@ -1,0 +1,13 @@
+{"update": {"installKind": "package", "packageManager": "npm", "root": "/usr/lib/node_modules/openclaw"},
+ "channel": {"value": "stable", "source": "config", "label": "stable", "config": "stable"},
+ "availability": {"available": true, "latestVersion": "2026.10.9"},
+ "lastRun": {"runId": "7c1d2e3f-0000-4000-8000-000000000001", "createdAtMs": 1792000000000, "updatedAtMs": 1792000600000,
+             "trigger": "cli", "phase": "finished", "status": "succeeded", "reason": null, "origin": {},
+             "target": {"kind": "package", "channel": "stable"}, "before": {"version": "2026.9.6"}, "after": {"version": "2026.9.9"},
+             "steps": [{"step": "requested", "status": "completed", "startedAtMs": 1792000000000, "endedAtMs": 1792000001000},
+                       {"step": "staging", "status": "completed", "startedAtMs": 1792000001000, "endedAtMs": 1792000100000},
+                       {"step": "validating", "status": "completed", "startedAtMs": 1792000100000, "endedAtMs": 1792000300000},
+                       {"step": "activating", "status": "completed", "startedAtMs": 1792000300000, "endedAtMs": 1792000400000},
+                       {"step": "restarting", "status": "completed", "startedAtMs": 1792000400000, "endedAtMs": 1792000500000},
+                       {"step": "verifying", "status": "completed", "startedAtMs": 1792000500000, "endedAtMs": 1792000600000}],
+             "verification": {}, "repair": [], "confirmedAtMs": null, "finishedAtMs": 1792000600000, "downtimeMs": 42000}}

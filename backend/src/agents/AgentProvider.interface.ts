@@ -120,6 +120,8 @@ export interface SenderIdentity {
   revalidateChatImages?(): Promise<void>;
   /** Server-admitted originating Host turn only; never browser-controlled. */
   portalInlineWidgets?: boolean;
+  /** Validated next-response preference from the Agent Chat route; never a tool grant. */
+  portalResponseFormat?: import('../services/chatResponseCapabilities').ChatResponseFormat;
   /** Human-readable label shown in agent context (e.g. "robert@example.com") */
   label: string;
   /** Stable user ID from the auth system */

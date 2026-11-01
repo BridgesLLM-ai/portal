@@ -45,6 +45,8 @@ export interface AgentChatHarnessCatalogEntry {
   version?: string;
   native?: boolean;
   reason?: string;
+  /** Installed but refused only for its version; an update in Maintenance fixes it. */
+  versionRefused?: boolean;
   nativeAuthStatus?: 'not_applicable' | 'authenticated' | 'needs_login' | 'unknown';
   nativeAuthMessage?: string;
   nativeAuthLoginCommand?: string;

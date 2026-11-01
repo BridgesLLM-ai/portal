@@ -79,6 +79,60 @@ describe('native provider adapters', () => {
     await expect(claudeCodeAdapter.finalizeTurn?.(ctx)).rejects.toThrow(diagnostic);
   });
 
+  test('Claude Code 2.1.314+ startup failure: a non-zero exit before any record is a plain, redacted startup error', async () => {
+    const ctx = makeContext();
+    ctx.session.provider = 'CLAUDE_CODE';
+    ctx.exitCode = 1;
+    ctx.stderr = 'Error: --settings could not be read\naccess_token=do-not-expose-this-value\n';
+    // The runner owns non-zero exits; finalizeTurn must not mask them.
+    await expect(claudeCodeAdapter.finalizeTurn?.(ctx)).resolves.toBeUndefined();
+    const diagnostic = claudeCodeAdapter.getErrorMessage?.(ctx) || '';
+    expect(diagnostic).toMatch(/^Claude Code could not start the session: it exited with code 1 before any output\. Error: --settings could not be read/);
+    expect(diagnostic).toContain('access_token=[redacted]');
+    expect(diagnostic).not.toContain('do-not-expose-this-value');
+  });
+
+  test('Claude Code 2.1.309 and older: exit 0 with no output is a startup failure, never an empty answer', async () => {
+    const ctx = makeContext();
+    ctx.session.provider = 'CLAUDE_CODE';
+    ctx.exitCode = 0;
+    claudeCodeAdapter.handleStdoutLine('not json at all', ctx);
+    await expect(claudeCodeAdapter.finalizeTurn?.(ctx))
+      .rejects.toThrow(/^Claude Code could not start the session: it exited without any output\.$/);
+
+    // A started stream that legitimately ends without text still settles.
+    const started = makeContext();
+    started.exitCode = 0;
+    claudeCodeAdapter.handleStdoutLine(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'claude-session-1' }), started);
+    claudeCodeAdapter.handleStdoutLine(JSON.stringify({ type: 'result', result: '' }), started);
+    await expect(claudeCodeAdapter.finalizeTurn?.(started)).resolves.toBeUndefined();
+
+    // After a stream started, a non-zero exit keeps Claude's own diagnostic.
+    started.exitCode = 1;
+    started.stderr = 'stream interrupted';
+    expect(claudeCodeAdapter.getErrorMessage?.(started)).toBe('stream interrupted');
+  });
+
+  test('the Claude startup guard is scoped to the current attempt', async () => {
+    const ctx = makeContext();
+    ctx.exitCode = 0;
+    ctx.state.turnAttempt = 1;
+    claudeCodeAdapter.handleStdoutLine(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'claude-session-1' }), ctx);
+    await expect(claudeCodeAdapter.finalizeTurn?.(ctx)).resolves.toBeUndefined();
+    // The approved retry is a new process; it must produce its own stream.
+    ctx.state.turnAttempt = 2;
+    await expect(claudeCodeAdapter.finalizeTurn?.(ctx)).rejects.toThrow(/exited without any output/);
+  });
+
+  test('Claude 2.1.311 stream-json escapes control and format characters; the JSON parser restores them', () => {
+    const ctx = makeContext();
+    const line = '{"type":"stream_event","event":{"type":"content_block_delta","index":0,'
+      + '"delta":{"type":"text_delta","text":"a\\u007fb\\u0085c\\u200bd\\u2028e"}}}';
+    claudeCodeAdapter.handleStdoutLine(line, ctx);
+    expect(ctx.emitChunk).toHaveBeenCalledWith('a\u007fb\u0085c​d e');
+    expect(ctx.fullText).toBe('a\u007fb\u0085c​d e');
+  });
+
   test('Claude adapter streams deltas and records denied permission requests', async () => {
     const ctx = makeContext();
     claudeCodeAdapter.handleStdoutLine(JSON.stringify({
@@ -531,10 +585,11 @@ describe('native provider adapters', () => {
     expect(invocation.options?.env).toBeUndefined();
 
     // Dropping `options.env` must not reopen the provider spawns with
-    // `invocation.options?.env || buildNativeCliEnvironment(...)`, so the guard
-    // has to survive in that fallback, and the secrets must not.
+    // `invocation.options?.env || buildNativeCliEnvironment(...)`: the secrets
+    // must not survive in that fallback. Antigravity may update itself; a new
+    // version is re-checked from Maintenance (no forced no-update env).
     const spawnEnv = buildNativeCliEnvironment('GEMINI');
-    expect(spawnEnv.AGY_CLI_DISABLE_AUTO_UPDATE).toBe('true');
+    expect(spawnEnv.AGY_CLI_DISABLE_AUTO_UPDATE).toBeUndefined();
     expect(spawnEnv.DATABASE_URL).toBeUndefined();
     expect(spawnEnv.JWT_SECRET).toBeUndefined();
   });

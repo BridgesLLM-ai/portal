@@ -1,6 +1,7 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
+import ModuleUpdateNotice from './components/ModuleUpdateNotice'
 import { ThemeProvider } from './contexts/ThemeContext'
 import './index.css'
 import 'highlight.js/styles/github-dark-dimmed.min.css'
@@ -11,6 +12,7 @@ import './styles/themes.css'
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ThemeProvider>
+      <ModuleUpdateNotice />
       <App />
     </ThemeProvider>
   </React.StrictMode>,

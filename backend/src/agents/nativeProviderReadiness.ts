@@ -10,7 +10,7 @@ import {
   type NativeCliAuthStatus,
 } from './nativeCliAuth';
 import {
-  buildNativeCliEnvironment,
+  buildNativeCliProbeEnvironment,
   resolveNativeCliCredentialPaths,
 } from './providers/native/NativeCliEnvironment';
 import {
@@ -278,7 +278,7 @@ function execFileBounded(
       encoding: 'utf8',
       env: provider === 'HERMES' || provider === 'OPENCODE'
         ? buildAcpHarnessEnvironment(provider)
-        : buildNativeCliEnvironment(provider),
+        : buildNativeCliProbeEnvironment(provider),
       timeout: timeoutMs,
       maxBuffer: 256 * 1024,
     }, (error, stdout, stderr) => {

@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { execFile } from 'child_process';
 import { AI_PROVIDER_MAP } from '../config/aiProviders';
 import { getOpenClawSetupReadiness, type OpenClawSetupReadiness } from '../services/openclawSetupReadiness';
@@ -219,6 +220,9 @@ function aliasFromTags(tags: unknown): string | null {
  * is explained rather than simply absent.
  */
 let lastOpenClawUnavailableModelIds: string[] = [];
+// Bumped by every parse of a catalog that reported at least one known model,
+// available or not: a refresh can tell "OpenClaw answered" from "no answer".
+let openClawCatalogAnswers = 0;
 
 export function readLastOpenClawUnavailableModelIds(): string[] {
   return [...lastOpenClawUnavailableModelIds];
@@ -265,28 +269,35 @@ export function parseOpenClawModelsListPayload(payload: any): ProviderModelDescr
   }
 
   if (unavailable.size > 0 || deduped.size > 0) {
+    openClawCatalogAnswers += 1;
     lastOpenClawUnavailableModelIds = Array.from(unavailable).sort();
   }
   return Array.from(deduped.values());
 }
 
-async function listOpenClawModelsFromGateway(): Promise<ProviderModelDescriptor[]> {
+/** One catalog read. `answered`: OpenClaw returned a model list, even an empty one. */
+type OpenClawCatalogRead = { answered: boolean; models: ProviderModelDescriptor[] };
+
+async function listOpenClawModelsFromGateway(): Promise<OpenClawCatalogRead> {
   try {
     const result = await listGatewayModels();
-    if (!result.ok) return [];
-    return parseOpenClawModelsListPayload({ models: result.models || [] });
+    if (!result.ok) return { answered: false, models: [] };
+    return {
+      answered: Array.isArray(result.models),
+      models: parseOpenClawModelsListPayload({ models: result.models || [] }),
+    };
   } catch (error: any) {
     console.warn(`[providerModels] OpenClaw gateway model catalog unavailable: ${error?.message || error}`);
-    return [];
+    return { answered: false, models: [] };
   }
 }
 
-function listOpenClawModelsFromCli(): Promise<ProviderModelDescriptor[]> {
+function listOpenClawModelsFromCli(args: string[] = ['models', 'list', '--json']): Promise<OpenClawCatalogRead> {
   return new Promise((resolve) => {
     // `openclaw models list --json` measures ~4s on an idle 2-core appliance;
     // the old 5s budget flaked under ordinary load and silently degraded the
     // catalog. The cache absorbs the longer worst case.
-    execFile('openclaw', ['models', 'list', '--json'], {
+    execFile(...openClawDiagnosticCommand('openclaw', args), {
       encoding: 'utf8',
       timeout: 20_000,
       env: buildOpenClawCliEnv(),
@@ -294,13 +305,17 @@ function listOpenClawModelsFromCli(): Promise<ProviderModelDescriptor[]> {
     }, (error, stdout) => {
       if (error) {
         console.warn(`[providerModels] OpenClaw CLI model catalog unavailable: ${(error as any)?.message || error}`);
-        resolve([]);
+        resolve({ answered: false, models: [] });
         return;
       }
       try {
-        resolve(parseOpenClawModelsListPayload(JSON.parse(String(stdout || ''))));
+        const payload = JSON.parse(String(stdout || ''));
+        resolve({
+          answered: Array.isArray(payload) || Array.isArray(payload?.models),
+          models: parseOpenClawModelsListPayload(payload),
+        });
       } catch {
-        resolve([]);
+        resolve({ answered: false, models: [] });
       }
     });
   });
@@ -365,9 +380,32 @@ async function resolveOpenClawModels(): Promise<ProviderModelDescriptor[]> {
     for (const id of fallbacks) addModel(id);
   }
 
-  let cliModels = await listOpenClawModelsFromGateway();
-  if (cliModels.length === 0) cliModels = await listOpenClawModelsFromCli();
+  const answersBefore = openClawCatalogAnswers;
+  const gateway = await listOpenClawModelsFromGateway();
+  let cliModels = gateway.models;
+  let answeredEmpty = gateway.answered && cliModels.length === 0;
+  if (cliModels.length === 0) {
+    const cli = await listOpenClawModelsFromCli();
+    cliModels = cli.models;
+    if (cli.answered && cli.models.length === 0) answeredEmpty = true;
+  }
   const liveDiscovery = cliModels.length > 0;
+  if (!liveDiscovery && (answeredEmpty || openClawCatalogAnswers !== answersBefore)) {
+    // OpenClaw answered and can run none of the models it knows (no provider
+    // connected): either every model is marked unavailable or, as OpenClaw
+    // 2026.10.6 answers, the list is empty. The picker offers nothing this
+    // server cannot run, rather than the declared catalog, and reports the
+    // hidden models instead: from OpenClaw's full catalog when no answer named
+    // them, else the models this server configures.
+    if (openClawCatalogAnswers === answersBefore) {
+      await listOpenClawModelsFromCli(['models', 'list', '--all', '--json']);
+      if (openClawCatalogAnswers === answersBefore) {
+        lastOpenClawUnavailableModelIds = Array.from(deduped.keys()).sort();
+      }
+    }
+    openClawModelCache = reconcileOpenClawCatalogCache(openClawModelCache, { at: Date.now(), models: [], live: true });
+    return openClawModelCache.models;
+  }
   if (!liveDiscovery) {
     for (const model of Array.from(deduped.values())) {
       if (!cliModels.some((entry) => entry.id === model.id)) cliModels.push(model);

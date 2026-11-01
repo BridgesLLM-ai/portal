@@ -1,5 +1,9 @@
+import { getOpenClawCapabilities } from './openClawCompatibility';
+
 /** stable2026.9.9 show_widget projection. Never infer handles from arbitrary tool text. */
 export const WIDGET_REFERENCE_SCHEMA = 'bridgesllm.widget-ref.v1';
+/** Native session-board name of a pinned widget, as OpenClaw resolves it. */
+export const BOARD_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 export const MAX_WIDGET_HTML_BYTES = 10 * 1024 * 1024;
 const validId = (value: unknown): value is string => typeof value === 'string'
   && value.length > 0 && value.length <= 256 && /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/.test(value);
@@ -10,6 +14,15 @@ export interface ChatWidgetReference {
   mode: 'inline' | 'dashboard' | 'unsupported';
   /** Display-only correlation with native assistant markup; never a document access key. */
   presentationRef?: string;
+  /**
+   * Board name of a pinned widget: the identity its newer versions keep. Set
+   * only while the Gateway offers live widgets; never a document access key.
+   */
+  boardName?: string;
+}
+function liveBoardName(value: unknown): { boardName: string } | Record<string, never> {
+  return typeof value === 'string' && BOARD_NAME_PATTERN.test(value) && getOpenClawCapabilities().liveWidgets
+    ? { boardName: value } : {};
 }
 function resultObject(raw: any): any {
   if (!raw || raw.isError === true) return null;
@@ -29,10 +42,11 @@ export function nativeWidgetBinding(toolName: unknown, toolCallId: unknown, raw:
   if (value.kind === 'canvas' && value.presentation?.target === 'assistant_message'
     && value.presentation?.sandbox === 'scripts' && validId(value.view?.id)
     && value.view.url === `/__openclaw__/canvas/documents/${value.view.id}/index.html`) {
-    return { ref: { ...ref, mode: 'inline' as const, presentationRef: value.view.id as string }, docId: value.view.id as string };
+    return { ref: { ...ref, mode: 'inline' as const, presentationRef: value.view.id as string, ...liveBoardName(value.view.boardWidgetName) },
+      docId: value.view.id as string };
   }
   if (['pinned', 'pending', 'rejected', 'partial'].includes(value.status) && typeof value.boardWidgetName === 'string')
-    return { ref: { ...ref, mode: 'dashboard' as const } };
+    return { ref: { ...ref, mode: 'dashboard' as const, ...liveBoardName(value.boardWidgetName) } };
   return { ref };
 }
 export function projectWidgetToolResult(toolName: unknown, toolCallId: unknown, raw: unknown): string | undefined {

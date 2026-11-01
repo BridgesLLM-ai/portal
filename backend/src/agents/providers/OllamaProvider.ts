@@ -43,6 +43,7 @@ import {
 } from '../../services/nativeOllamaTransport';
 import { NativeChatTurnTools } from './native/NativeChatTurnTools';
 import { CHAT_BRIDGE_SERVER_NAME, CHAT_BRIDGE_TOOL_NAMES, type ChatBridgeToolName } from '../chatBridge/contract';
+import { withSenderResponsePreference } from '../../services/chatResponseCapabilities';
 import { CHAT_BRIDGE_TOOLS } from '../chatBridge/mcpServer';
 
 const OLLAMA_HOST_TURN_TIMEOUT_MS = 10 * 60_000;
@@ -715,7 +716,7 @@ export class OllamaProvider implements AgentProvider {
         assertImageInputModality(value.capabilities?.includes('vision') ? ['text', 'image'] : ['text']);
         return session.model!;
       } });
-      const prompt = buildTranscriptPrompt(session.messages, photos?.message || message);
+      const prompt = buildTranscriptPrompt(session.messages, withSenderResponsePreference(photos?.message || message, 'OLLAMA', sender));
       // Portal chat tools only for models whose own /api/show advertises tools.
       const toolCapable = await this.modelAdvertisesTools(resolved, session.model);
       if (toolCapable) {

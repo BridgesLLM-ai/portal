@@ -122,6 +122,10 @@ function SessionControlsHarness() {
   return (
     <div>
       <output data-testid="note-result">{noteResult}</output>
+      <output data-testid="response-format">{chat.responseFormat}</output>
+      <output data-testid="response-queue">{JSON.stringify(chat.messageQueue)}</output>
+      <button type="button" onClick={() => chat.setResponseFormat('widget')}>Select widget format</button>
+      <button type="button" onClick={() => chat.setResponseFormat('code')}>Select code format</button>
       <button type="button" onClick={() => {
         void chat.injectNote('  synthetic note  ').then(() => setNoteResult('saved'))
           .catch((error) => setNoteResult(error.message));
@@ -262,6 +266,47 @@ describe('ChatStateProvider session-control ownership', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it('response format reaches WS and survives a correlated conflict queue', async () => {
+    const user = userEvent.setup(); await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    act(() => { socket.open(); socket.emit({ type: 'connected' }); });
+    await user.click(screen.getByRole('button', { name: 'Select widget format' }));
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+    await waitFor(() => expect(socket.sent.some(frame => frame.type === 'send')).toBe(true));
+    const sent = socket.sent.find(frame => frame.type === 'send')!;
+    expect(sent.responseFormat).toBe('widget');
+    expect(screen.getByTestId('response-format')).toHaveTextContent('auto');
+    act(() => socket.emit({ type: 'active_turn_conflict', sessionKey: 'agent:main:first', clientMessageId: sent.clientMessageId }));
+    await waitFor(() => expect(screen.getByTestId('response-queue')).toHaveTextContent('"responseFormat":"widget"'));
+  });
+
+  it('response format reaches REST fallback even after composer selection resets', async () => {
+    const encoder = new TextEncoder(); let read = false;
+    const fetch = vi.fn(async () => ({ ok: true, body: { getReader: () => ({
+      read: async () => {
+        if (read) return { done: true };
+        read = true;
+        return { done: false, value: encoder.encode('data: ' + JSON.stringify({ type: 'done', content: 'Preview ready' }) + '\n\n') };
+      }, cancel: vi.fn(async () => undefined),
+    }) } }));
+    vi.stubGlobal('fetch', fetch);
+    const user = userEvent.setup(); await renderReadyHarness();
+    await user.click(screen.getByRole('button', { name: 'Select code format' }));
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    const body = JSON.parse((fetch.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.responseFormat).toBe('code');
+    expect(screen.getByTestId('response-format')).toHaveTextContent('auto');
+  });
+
+  it('response format cannot leak to a different selected chat', async () => {
+    const user = userEvent.setup(); await renderReadyHarness();
+    await user.click(screen.getByRole('button', { name: 'Select widget format' }));
+    expect(screen.getByTestId('response-format')).toHaveTextContent('widget');
+    await user.click(screen.getByRole('button', { name: 'Switch session' }));
+    await waitFor(() => expect(screen.getByTestId('response-format')).toHaveTextContent('auto'));
   });
 
   it.each([false, true])('routes notes through the broker with direct preference %s and awaits acknowledgment', async (directPreference) => {
@@ -4506,6 +4551,56 @@ describe('ChatStateProvider session-control ownership', () => {
     }
   });
 
+  it('does not resurrect a graduated heading from a delayed cumulative reasoning snapshot', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    act(() => socket.open());
+    const emit = (payload: Record<string, unknown>) => act(() => socket.emit({
+      sessionKey: 'agent:main:first', runId: 'heading-replay', ...payload,
+    }));
+
+    emit({ type: 'thinking', subject: 'Inspect configuration', content: 'Read the configuration.', replace: true });
+    emit({ type: 'tool_start', toolName: 'read', toolCallId: 'read-config' });
+    emit({ type: 'tool_end', toolName: 'read', toolCallId: 'read-config', result: 'configuration' });
+    // This is a newer snapshot delivery, not a duplicate transport sequence.
+    // Its body has already graduated, so its heading must not create a new card.
+    emit({ type: 'thinking', subject: 'Inspect configuration', content: 'Read the configuration.', replace: true });
+    emit({ type: 'text', content: 'Configuration checked.' });
+    emit({ type: 'done', content: 'Configuration checked.' });
+
+    const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { role: string }) => message.role === 'assistant');
+    expect(assistant.segments.filter((segment: { kind: string }) => segment.kind === 'thinking'))
+      .toEqual([expect.objectContaining({
+        subject: 'Inspect configuration', text: 'Read the configuration.',
+      })]);
+  });
+
+  it('preserves repeated headings on new delta thoughts and subject-only reasoning', async () => {
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    act(() => socket.open());
+    const emit = (payload: Record<string, unknown>) => act(() => socket.emit({
+      sessionKey: 'agent:main:first', runId: 'heading-new-events', ...payload,
+    }));
+    emit({ type: 'thinking', subject: 'Checking', content: 'Check.', replace: true });
+    emit({ type: 'tool_start', toolName: 'read', toolCallId: 'read-first' });
+    emit({ type: 'tool_end', toolName: 'read', toolCallId: 'read-first', result: 'first' });
+    emit({ type: 'thinking', subject: 'Checking', content: 'Check.' });
+    emit({ type: 'tool_start', toolName: 'read', toolCallId: 'read-second' });
+    emit({ type: 'tool_end', toolName: 'read', toolCallId: 'read-second', result: 'second' });
+    emit({ type: 'thinking', subject: 'Checking', content: '', replace: true });
+    emit({ type: 'done', content: 'All checked.' });
+    const assistant = JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .find((message: { role: string }) => message.role === 'assistant');
+    expect(assistant.segments.filter((segment: { kind: string }) => segment.kind === 'thinking'))
+      .toEqual([
+        expect.objectContaining({ subject: 'Checking', text: 'Check.' }),
+        expect.objectContaining({ subject: 'Checking', text: 'Check.' }),
+        expect.objectContaining({ subject: 'Checking', text: '' }),
+      ]);
+  });
+
   it('graduates changed thinking subjects and restores both phases from reconnect history', async () => {
     const user = userEvent.setup();
     await renderReadyHarness();
@@ -4828,6 +4923,141 @@ describe('ChatStateProvider session-control ownership', () => {
       session: 'agent:main:first',
       expectedRunId: 'run-steer',
       message: 'Yes',
+    });
+  });
+
+  describe('stock OpenClaw chat.send steering', () => {
+    const steerRows = () => JSON.parse(screen.getByTestId('messages').textContent || '[]')
+      .filter((message: { id: string }) => message.id.startsWith('active-steer:'));
+
+    async function steerWhileRunning(
+      steerResponse: Record<string, unknown>,
+      beforeAck?: (socket: PendingWebSocket) => void,
+    ) {
+      const user = userEvent.setup();
+      await renderReadyHarness();
+      await waitFor(() => expect(chatMocks.pendingQuestions).toHaveBeenCalledWith('agent:main:first'));
+      const socket = PendingWebSocket.instances[0];
+      act(() => {
+        socket.emit({ type: 'text', sessionKey: 'agent:main:first', runId: 'run-observed', content: 'Working' });
+      });
+      let requestId = '';
+      chatMocks.clientPost.mockImplementation(async (url: string, body?: Record<string, unknown>) => {
+        if (url !== '/gateway/session-steer') return { data: { ok: true } };
+        requestId = String(body?.requestId);
+        beforeAck?.(socket);
+        return {
+          data: {
+            ok: true,
+            sessionKey: 'agent:main:first',
+            requestId: body?.requestId,
+            mode: 'native-steer',
+            outcome: 'unconfirmed',
+            interruptedActiveRun: false,
+            replayed: false,
+            ...steerResponse,
+          },
+        };
+      });
+      // History after the reply keeps the steered prompt under its Portal identity.
+      chatMocks.clientGet.mockImplementation(async (url: string) => {
+        if (url === '/gateway/history') return { data: {
+          activeStream: { active: false },
+          messages: requestId ? [{ id: `active-steer:${requestId}`, role: 'user', content: 'Yes', timestamp: new Date().toISOString() }] : [],
+          pagination: { beforeCursor: null, hasMoreBefore: false },
+        } };
+        if (url === '/gateway/stream-status') return { data: { active: false } };
+        return { data: {} };
+      });
+      await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+      await waitFor(() => expect(steerRows()).toHaveLength(1));
+      return socket;
+    }
+
+    it('says the message joined the running reply only after that reply ends without a run of its own', async () => {
+      const socket = await steerWhileRunning({ steerRunId: 'oc-steer-joined' });
+      expect(steerRows()[0]).toMatchObject({ content: 'Yes', steerNote: 'Sent while the reply was running' });
+      expect(screen.getByTestId('status-text')).toHaveTextContent('');
+
+      // Date stays real: a faked clock moved 5 s ahead leaks into later tests.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          // The injected text's transcript echo may carry the steer's own id: not a run.
+          socket.emit({
+            type: 'user_message', sessionKey: 'agent:main:first', runId: 'oc-steer-joined',
+            messageId: 'echo-of-steer', content: 'Yes',
+          });
+          // A run-id-less terminal frame from another session settles nothing here.
+          socket.emit({ type: 'stream_ended', sessionKey: 'agent:main:second' });
+        });
+        await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+        expect(steerRows()[0].steerNote).toBe('Sent while the reply was running');
+        act(() => {
+          socket.emit({ type: 'done', sessionKey: 'agent:main:first', runId: 'run-observed', content: 'Working, then done.' });
+        });
+        await act(async () => { await vi.advanceTimersByTimeAsync(4_999); });
+        expect(steerRows()[0].steerNote).toBe('Sent while the reply was running');
+        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+        expect(steerRows()[0].steerNote).toBe('Added to the running reply');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('says it became a new message when OpenClaw runs it under its own run id', async () => {
+      const socket = await steerWhileRunning({ steerRunId: 'oc-steer-new' });
+      // Date stays real: a faked clock moved 5 s ahead leaks into later tests.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          socket.emit({ type: 'done', sessionKey: 'agent:main:first', runId: 'run-observed', content: 'Done.' });
+          socket.emit({ type: 'text', sessionKey: 'agent:main:first', runId: 'oc-steer-new', content: 'Answering the new message' });
+        });
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+        expect(steerRows()[0].steerNote).toBe('Sent as a new message — the reply had already finished');
+        // The settle window of the finished reply never overrides observed evidence.
+        await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+        expect(steerRows()[0].steerNote).toBe('Sent as a new message — the reply had already finished');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('says it became a new message when its run started before the acknowledgement arrived', async () => {
+      await steerWhileRunning({ steerRunId: 'oc-steer-early' }, (socket) => {
+        socket.emit({ type: 'done', sessionKey: 'agent:main:first', runId: 'run-observed', content: 'Done.' });
+        socket.emit({ type: 'text', sessionKey: 'agent:main:first', runId: 'oc-steer-early', content: 'New turn' });
+      });
+      await waitFor(() => expect(steerRows()[0]?.steerNote)
+        .toBe('Sent as a new message — the reply had already finished'));
+    });
+
+    it('reports an interrupted reply instead of claiming the message joined it', async () => {
+      await steerWhileRunning({ steerRunId: 'oc-steer-interrupt', interruptedActiveRun: true });
+      expect(steerRows()[0].steerNote).toBe('Sent as a new message — the running reply was stopped');
+    });
+
+    it('refuses a stock steering response that claims a specific run', async () => {
+      const user = userEvent.setup();
+      await renderReadyHarness();
+      await waitFor(() => expect(chatMocks.pendingQuestions).toHaveBeenCalledWith('agent:main:first'));
+      const socket = PendingWebSocket.instances[0];
+      act(() => {
+        socket.emit({ type: 'text', sessionKey: 'agent:main:first', runId: 'run-observed', content: 'Working' });
+      });
+      chatMocks.clientPost.mockImplementation(async (url: string, body?: Record<string, unknown>) => {
+        if (url !== '/gateway/session-steer') return { data: { ok: true } };
+        return { data: {
+          ok: true, sessionKey: 'agent:main:first', requestId: body?.requestId, mode: 'native-steer',
+          steerRunId: 'oc-steer-claim', runId: 'run-other', interruptedActiveRun: false,
+        } };
+      });
+      await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+      expect(await screen.findByTestId('status-text')).toHaveTextContent(
+        'Portal did not confirm steering for this exact active run.',
+      );
+      expect(steerRows()).toHaveLength(0);
     });
   });
 
@@ -5162,5 +5392,136 @@ describe('ChatStateProvider session-control ownership', () => {
     expect(screen.getByTestId('messages')).toHaveTextContent('Overlay partial answer');
     expect(screen.getByTestId('thinking')).toHaveTextContent('Overlay reasoning remains visible');
     expect(screen.getByTestId('messages')).toHaveTextContent('overlay-tool');
+  });
+
+  it.each([-120_000, 120_000])('keeps live run activity after its prompt with gateway clock skew %i', async (clockSkew) => {
+    const serverNow = Date.now() + clockSkew;
+    let durablePromptReady = false;
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') return { data: {
+        activeStream: durablePromptReady
+          ? { active: true, runId: 'clock-skew-run', phase: 'thinking', startedAt: serverNow }
+          : { active: false },
+        messages: durablePromptReady ? [{
+          id: 'clock-skew-prompt', role: 'user', content: 'Check the latest project',
+          timestamp: new Date(serverNow).toISOString(),
+        }] : [],
+        pagination: { beforeCursor: null, hasMoreBefore: false },
+      } };
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+      socket.emit({
+        type: 'user_message', sessionKey: 'agent:main:first', runId: 'clock-skew-run',
+        messageId: 'clock-skew-prompt', messageTimestamp: serverNow,
+        content: 'Check the latest project',
+      });
+      socket.emit({
+        type: 'thinking', sessionKey: 'agent:main:first', runId: 'clock-skew-run',
+        content: 'Inspecting the project',
+      });
+    });
+    await waitFor(() => {
+      const rows = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+      expect(rows.map((row: { role: string }) => row.role)).toEqual(['user', 'assistant']);
+    });
+    durablePromptReady = true;
+    act(() => {
+      socket.emit({
+        type: 'history_changed', sessionKey: 'agent:main:first',
+        reason: 'prompt-persisted-with-server-clock',
+      });
+    });
+    await waitFor(() => {
+      expect(chatMocks.clientGet.mock.calls.filter(([url]) => url === '/gateway/history').length).toBeGreaterThanOrEqual(2);
+      expect(screen.getByTestId('history-loading')).toHaveTextContent('idle');
+    });
+    const rows = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+    expect(rows.map((row: { role: string }) => row.role)).toEqual(['user', 'assistant']);
+    expect(rows[0].id).toBe('clock-skew-prompt');
+  });
+
+  it('keeps a queued follow-up after the live reply when the gateway clock is ahead', async () => {
+    const serverNow = Date.now() + 120_000;
+    let durablePromptReady = false;
+    chatMocks.clientGet.mockImplementation(async (url: string) => {
+      if (url === '/gateway/history') return { data: {
+        activeStream: durablePromptReady
+          ? { active: true, runId: 'queued-skew-run', phase: 'thinking', startedAt: serverNow }
+          : { active: false },
+        messages: durablePromptReady ? [{
+          id: 'queued-skew-prompt', role: 'user', content: 'Summarize the open issues',
+          timestamp: new Date(serverNow).toISOString(),
+        }] : [],
+        pagination: { beforeCursor: null, hasMoreBefore: false },
+      } };
+      if (url === '/gateway/stream-status') return { data: { active: false } };
+      return { data: {} };
+    });
+    const user = userEvent.setup();
+    await renderReadyHarness();
+    const socket = PendingWebSocket.instances[0];
+    act(() => {
+      socket.open();
+      socket.emit({ type: 'connected' });
+      socket.emit({
+        type: 'user_message', sessionKey: 'agent:main:first', runId: 'queued-skew-run',
+        messageId: 'queued-skew-prompt', messageTimestamp: serverNow,
+        content: 'Summarize the open issues',
+      });
+    });
+    await waitFor(() => expect(screen.getByTestId('messages')).toHaveTextContent('Summarize the open issues'));
+    // The follow-up is queued before the resumed reply row exists, so the local
+    // tail reads prompt, queued follow-up, reply. The reply belongs to the prompt.
+    await user.click(screen.getByRole('button', { name: 'Answer pending with Yes' }));
+    await waitFor(() => expect(socket.sent.some((frame) => frame.type === 'send')).toBe(true));
+    const sendFrame = socket.sent.find((frame) => frame.type === 'send');
+    act(() => {
+      socket.emit({
+        type: 'active_turn_conflict',
+        sessionKey: 'agent:main:first',
+        clientMessageId: sendFrame?.clientMessageId,
+      });
+    });
+    await act(async () => {});
+    act(() => {
+      socket.emit({
+        type: 'stream_resume', sessionKey: 'agent:main:first', runId: 'queued-skew-run',
+        phase: 'thinking', content: 'Reading the issue list', turnEvents: [],
+      });
+    });
+    await waitFor(() => expect(screen.getByTestId('queue-count')).toHaveTextContent('1'));
+    const liveRows = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+    expect(liveRows.map((row: { role: string; queued?: boolean }) => [row.role, row.queued === true])).toEqual([
+      ['user', false],
+      ['user', true],
+      ['assistant', false],
+    ]);
+
+    durablePromptReady = true;
+    act(() => {
+      socket.emit({
+        type: 'history_changed', sessionKey: 'agent:main:first',
+        reason: 'prompt-persisted-with-server-clock',
+      });
+    });
+    await waitFor(() => {
+      expect(chatMocks.clientGet.mock.calls.filter(([url]) => url === '/gateway/history').length).toBeGreaterThanOrEqual(2);
+      expect(screen.getByTestId('history-loading')).toHaveTextContent('idle');
+    });
+    const rows = JSON.parse(screen.getByTestId('messages').textContent || '[]');
+    expect(rows.map((row: { role: string; queued?: boolean }) => [row.role, row.queued === true])).toEqual([
+      ['user', false],
+      ['assistant', false],
+      ['user', true],
+    ]);
+    expect(rows[0].id).toBe('queued-skew-prompt');
+    expect(rows[2].content).toBe('Yes');
+    expect(screen.getByTestId('queue-count')).toHaveTextContent('1');
   });
 });

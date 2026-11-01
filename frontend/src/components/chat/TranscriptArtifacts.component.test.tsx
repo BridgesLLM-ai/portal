@@ -53,11 +53,28 @@ describe('assistant JSON interaction boundary', () => {
     rerender(<AssistantJson raw='{"x":1}' />);
     expect(screen.getByRole('region', { name: 'JSON tree' })).toBeInTheDocument();
   });
-  it.each(['{"x":', ' '.repeat(JSON_TREE_LIMITS.characters) + '{}', '['.repeat(18) + '0' + ']'.repeat(18)])('preserves unsupported/oversized/overdeep raw %j', async (raw) => {
+  it.each([
+    ['incomplete', '{"x":'],
+    ['oversized', ' '.repeat(JSON_TREE_LIMITS.characters) + '{}'],
+    ['overdeep', '['.repeat(18) + '0' + ']'.repeat(18)],
+  ])('preserves %s JSON as exact raw', async (_label, raw) => {
     render(<AssistantJson raw={raw} />);
     expect(screen.getByRole('button', { name: 'Tree' })).toBeDisabled();
     fireEvent.click(screen.getByRole('button', { name: 'Copy original JSON' }));
     await waitFor(() => expect(copy).toHaveBeenCalledWith(raw));
+  });
+  it.each(['null', 'true', '900719925474099312345', '"escaped\\u0041"', '[1,]'])('renders standalone JSON scalar or unsupported container %s', (raw) => {
+    mount(raw, { assistantArtifacts: true });
+    expect(screen.getByRole('button', { name: 'Copy original JSON' })).toBeInTheDocument();
+  });
+  it.each([
+    '[1] First point\n[2] Second point',
+    '- first item\n- second item',
+    '2 things changed.',
+    '"Quoted" opening line.',
+  ])('keeps finished prose that only starts like JSON as Markdown %j', (raw) => {
+    mount(raw, { assistantArtifacts: true });
+    expect(screen.queryByRole('button', { name: 'Copy original JSON' })).not.toBeInTheDocument();
   });
   it('renders hostile JSON strings as text, never HTML', () => {
     const { container } = render(<AssistantJson raw='{"__proto__":"<img src=x onerror=alert(1)>"}' />);

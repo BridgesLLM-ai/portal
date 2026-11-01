@@ -40,6 +40,28 @@ function LocationProbe() {
   return <output data-testid="route">{`${location.pathname}${location.search}`}</output>;
 }
 
+describe('MarkdownRenderer downloadable responses', () => {
+  it('downloads exact completed code as a file, without calling a host file API', async () => {
+    const create = vi.mocked(URL.createObjectURL);
+    create.mockClear();
+    create.mockReturnValue('blob:download-fixture');
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    const user = userEvent.setup();
+    render(<MemoryRouter><MarkdownRenderer content={'```csv\nname,count\nalpha,3\n```'} /></MemoryRouter>);
+    await user.click(screen.getByRole('button', { name: 'Download code' }));
+    expect(create).toHaveBeenCalledTimes(1);
+    const blob = create.mock.calls[0][0] as Blob;
+    expect(blob.type).toBe('text/plain;charset=utf-8');
+    const content = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = reject; reader.readAsText(blob);
+    });
+    expect(content).toBe('name,count\nalpha,3');
+    expect(click).toHaveBeenCalledTimes(1);
+    expect((click.mock.contexts[0] as HTMLAnchorElement).download).toBe('response.csv');
+    click.mockRestore();
+  });
+});
+
 describe('MarkdownRenderer workspace links', () => {
   beforeEach(() => {
     window.sessionStorage.clear();

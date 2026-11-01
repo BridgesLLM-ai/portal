@@ -155,36 +155,79 @@ describe('retained OpenClaw 2026.7.1 privacy-safe session retirement', () => {
     writeRegistry(registry);
   }
 
-  test('accepts only exact supported runtime tuples', () => {
+  function current(version: string, overrides: Partial<OpenClawSetupReadiness> = {}): OpenClawSetupReadiness {
+    return readiness('current-2026.9.1', {
+      corePackageVersion: version, version, runningVersion: version,
+      codexPluginVersion: version, codexPluginInstallSpec: `@openclaw/codex@${version}`,
+      ...overrides,
+    });
+  }
+
+  test('keeps the retained 2026.7.1 tuple exact', () => {
     expect(resolveExactOpenClawRetirementRuntimeFamily(readiness('legacy-2026.7.1')))
       .toBe('legacy-2026.7.1');
-    expect(resolveExactOpenClawRetirementRuntimeFamily(readiness('current-2026.9.1')))
-      .toBe('current-2026.9.1');
-    expect(() => resolveExactOpenClawRetirementRuntimeFamily(readiness(null)))
-      .toThrow(/exact Portal-qualified/i);
-    expect(() => resolveExactOpenClawRetirementRuntimeFamily(readiness(
-      'legacy-2026.7.1',
-      { runningVersion: '2026.9.1' },
-    ))).toThrow(/exact Portal-qualified/i);
-    expect(() => resolveExactOpenClawRetirementRuntimeFamily(readiness(
-      'current-2026.9.1',
-      { corePackageVersion: '2026.7.1-2' },
-    ))).toThrow(/exact Portal-qualified/i);
+    for (const override of [
+      { runningVersion: '2026.9.1' }, { version: '2026.7.2' }, { corePackageVersion: '2026.7.1-3' },
+      { codexPluginVersion: '2026.7.1' }, { codexPluginInstallSpec: '@openclaw/codex@latest' },
+    ]) expect(() => resolveExactOpenClawRetirementRuntimeFamily(readiness('legacy-2026.7.1', override)))
+      .toThrow(/exact retained 2026\.7\.1/i);
   });
 
-  test('admits 9.2 retirement only when the core, gateway, CLI and plugin match', () => {
-    const status = readiness('current-2026.9.1', {
-      corePackageVersion: '2026.9.2', version: '2026.9.2', runningVersion: '2026.9.2',
-      codexPluginVersion: '2026.9.2', codexPluginInstallSpec: '@openclaw/codex@2026.9.2',
-    });
-    expect(resolveExactOpenClawRetirementRuntimeFamily(status)).toBe('current-2026.9.1');
-    for (const override of [
-      { runningVersion: '2026.9.1' }, { codexPluginVersion: '2026.9.1' },
-      { codexPluginInstallSpec: '@openclaw/codex@latest' },
-      { corePackageVersion: '2026.9.3', version: '2026.9.3', runningVersion: '2026.9.3',
-        codexPluginVersion: '2026.9.3', codexPluginInstallSpec: '@openclaw/codex@2026.9.3' },
-    ]) expect(() => resolveExactOpenClawRetirementRuntimeFamily({ ...status, ...override }))
-      .toThrow(/exact Portal-qualified/i);
+  test('admits the current family from the floor upward when core, CLI, Gateway and plugin match', () => {
+    for (const version of ['2026.9.1', '2026.9.2', '2026.9.3', '2026.9.9', '2026.9.36', '2026.10.6', '2026.10.9']) {
+      expect(resolveExactOpenClawRetirementRuntimeFamily(current(version))).toBe('current-2026.9.1');
+    }
+    // A package republish may report its release from the CLI, Gateway and plugin.
+    expect(resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.9-1', {
+      version: '2026.10.9', runningVersion: '2026.10.9',
+      codexPluginVersion: '2026.10.9', codexPluginInstallSpec: '@openclaw/codex@2026.10.9',
+    }))).toBe('current-2026.9.1');
+  });
+
+  test('refuses below-floor, unreadable, deny-listed and strict-mode versions with a plain reason', () => {
+    for (const version of ['2026.8.30', '2026.9.0', '2026.9.1-beta.1']) {
+      expect(() => resolveExactOpenClawRetirementRuntimeFamily(current(version)))
+        .toThrow(new RegExp(`${version.replace(/\./g, '\\.')} is older than the supported floor 2026\\.9\\.1`));
+    }
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.9', { corePackageVersion: null })))
+      .toThrow(/version unknown could not be read/i);
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(current('2026.7.1-2')))
+      .toThrow(/older than the supported floor/i);
+    const denylist = [{ version: '2026.10.9', reason: 'session delete drops the archive receipt' }];
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.9'), { denylist }))
+      .toThrow(/2026\.10\.9 is refused by the Portal: session delete drops the archive receipt/);
+    expect(resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.6'), { denylist }))
+      .toBe('current-2026.9.1');
+    const env = { PORTAL_OPENCLAW_STRICT_TUPLES: '1' };
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.9'), { env }))
+      .toThrow(/Strict tested-release mode admits only .*detected 2026\.10\.9/);
+    expect(resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.6'), { env }))
+      .toBe('current-2026.9.1');
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(readiness(null)))
+      .toThrow(/not ready for user retirement/i);
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.9', { testedPairReady: false })))
+      .toThrow(/not ready for user retirement/i);
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.9', { authenticatedRpc: false })))
+      .toThrow(/not ready for user retirement/i);
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.9', { testedRuntimeFamily: undefined })))
+      .toThrow(/not a runtime family the Portal can retire users on/i);
+  });
+
+  test('refuses a mixed core, CLI, Gateway or plugin tuple on every current release', () => {
+    for (const version of ['2026.9.9', '2026.10.6', '2026.10.9']) {
+      for (const [override, reason] of [
+        [{ runningVersion: '2026.9.1' }, /Gateway 2026\.9\.1 does not match the installed core/],
+        [{ runningVersion: null }, /Gateway unknown does not match/],
+        [{ version: '2026.10.10' }, /CLI 2026\.10\.10 does not match the installed core/],
+        [{ codexPluginVersion: '2026.9.1' }, /Codex plugin .* does not match the installed core/],
+        [{ codexPluginInstallSpec: '@openclaw/codex@latest' }, /Codex plugin @openclaw\/codex@latest does not match/],
+        [{ codexPluginInstallSpec: null }, /Codex plugin .* does not match/],
+      ] as Array<[Partial<OpenClawSetupReadiness>, RegExp]>) {
+        expect(() => resolveExactOpenClawRetirementRuntimeFamily(current(version, override))).toThrow(reason);
+      }
+    }
+    expect(() => resolveExactOpenClawRetirementRuntimeFamily(current('2026.10.9-1', { runningVersion: '2026.10.9-2' })))
+      .toThrow(/Gateway 2026\.10\.9-2 does not match/);
   });
 
   test('deletes canonical, returned archive, reset, checkpoint, and trajectory residue while preserving unrelated bytes', async () => {

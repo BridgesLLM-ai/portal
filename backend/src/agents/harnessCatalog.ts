@@ -1,4 +1,5 @@
-import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import { PORTAL_TOOL_FLOORS, PORTAL_TOOL_RECOMMENDED, PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import { OPENCLAW_RUNTIME_FLOOR } from '../services/openClawRuntimeContract';
 import { AGENT_ZERO_VERSION } from './providers/agentZero/AgentZeroConnectorContract';
 import type {
   AgentExecutionScope,
@@ -37,12 +38,16 @@ export type LegacyProviderAdapterFamily = 'openclaw-gateway' | 'native-cli' | 'a
 /** @deprecated Use HarnessTransport, or LegacyProviderAdapterFamily for old provider payloads. */
 export type HarnessAdapterFamily = LegacyProviderAdapterFamily;
 export type HarnessReleaseStage = 'stable' | 'planned' | 'developer-preview';
-export type HarnessVersionPolicyKind = 'unmanaged' | 'soft-pin' | 'exact-pin' | 'blocked-until-pinned';
+export type HarnessVersionPolicyKind = 'unmanaged' | 'soft-pin' | 'exact-pin' | 'floor-pin' | 'blocked-until-pinned';
 export type HarnessHostStreamOwnership = 'provider' | 'route' | 'none';
 
 export interface HarnessVersionPolicy {
   readonly kind: HarnessVersionPolicyKind;
   readonly testedVersion?: string;
+  /** `floor-pin`: lowest admitted version; newer ones are admitted and probed by capability. */
+  readonly floorVersion?: string;
+  /** Proposed upgrade target. `proposed` means no qualification run has proven it yet. */
+  readonly recommended?: Readonly<{ version: string; status: 'proposed' | 'proven' }>;
   readonly reason?: string;
 }
 
@@ -181,6 +186,25 @@ function capabilities(input: Omit<HarnessCapabilities,
   };
 }
 
+/**
+ * Below the floor the harness is refused; at or above it the harness is
+ * admitted and must still pass its protocol handshake before every session.
+ */
+function floorPin(
+  floorVersion: string,
+  testedVersion: string,
+  recommendedVersion: string,
+  reason?: string,
+): HarnessVersionPolicy {
+  return {
+    kind: 'floor-pin',
+    floorVersion,
+    testedVersion,
+    recommended: { version: recommendedVersion, status: PORTAL_TOOL_RECOMMENDED.status },
+    ...(reason ? { reason } : {}),
+  };
+}
+
 const HOST_ONLY = ['HOST_OPERATOR'] as const;
 const HOST_AND_PROJECT = ['HOST_OPERATOR', 'PROJECT_SANDBOX'] as const;
 
@@ -277,7 +301,8 @@ const definitions: HarnessDefinition[] = [
       executable: 'openclaw',
       args: [],
       versionArgs: ['--version'],
-      versionPolicy: { kind: 'exact-pin', testedVersion: PORTAL_TOOL_VERSIONS.openClaw },
+      // Readiness proves the runtime by capability; the tested version is the recommendation.
+      versionPolicy: { kind: 'floor-pin', floorVersion: OPENCLAW_RUNTIME_FLOOR, testedVersion: PORTAL_TOOL_VERSIONS.openClaw },
     },
     auth: {
       owner: 'model-provider-account',
@@ -436,7 +461,7 @@ const definitions: HarnessDefinition[] = [
       executable: 'grok',
       args: ['--no-auto-update', 'agent', 'stdio'],
       versionArgs: ['--no-auto-update', '--version'],
-      versionPolicy: { kind: 'exact-pin', testedVersion: PORTAL_TOOL_VERSIONS.grokBuild },
+      versionPolicy: floorPin(PORTAL_TOOL_FLOORS.grokBuild, PORTAL_TOOL_VERSIONS.grokBuild, PORTAL_TOOL_RECOMMENDED.versions.grokBuild),
     },
     auth: {
       owner: 'harness-local-login',
@@ -551,7 +576,7 @@ const definitions: HarnessDefinition[] = [
       executable: 'agy',
       args: ['--print'],
       versionArgs: ['--version'],
-      versionPolicy: { kind: 'exact-pin', testedVersion: PORTAL_TOOL_VERSIONS.antigravity },
+      versionPolicy: floorPin(PORTAL_TOOL_FLOORS.antigravity, PORTAL_TOOL_VERSIONS.antigravity, PORTAL_TOOL_RECOMMENDED.versions.antigravity),
     },
     auth: {
       owner: 'harness-local-login',
@@ -604,7 +629,7 @@ const definitions: HarnessDefinition[] = [
       executable: 'ollama',
       args: [],
       versionArgs: ['--version'],
-      versionPolicy: { kind: 'exact-pin', testedVersion: PORTAL_TOOL_VERSIONS.ollama },
+      versionPolicy: floorPin(PORTAL_TOOL_FLOORS.ollama, PORTAL_TOOL_VERSIONS.ollama, PORTAL_TOOL_RECOMMENDED.versions.ollama),
     },
     auth: {
       owner: 'none',
@@ -659,11 +684,12 @@ const definitions: HarnessDefinition[] = [
       executable: 'hermes',
       args: ['acp'],
       versionArgs: ['acp', '--version'],
-      versionPolicy: {
-        kind: 'exact-pin',
-        testedVersion: PORTAL_TOOL_VERSIONS.hermes,
-        reason: 'Pinned to Hermes v0.22.2 (0.22.2), commit d923a5eb487a17c0a68801bba9ef0f56c81040a8, canonical source-tree SHA-256 6bd8d88ce4758357d926967676130eff96427515163608a7c51e4f459891cc89.',
-      },
+      versionPolicy: floorPin(
+        PORTAL_TOOL_FLOORS.hermes,
+        PORTAL_TOOL_VERSIONS.hermes,
+        PORTAL_TOOL_RECOMMENDED.versions.hermes,
+        'Tested on Hermes v0.22.2 (0.22.2), commit d923a5eb487a17c0a68801bba9ef0f56c81040a8, canonical source-tree SHA-256 6bd8d88ce4758357d926967676130eff96427515163608a7c51e4f459891cc89.',
+      ),
     },
     auth: {
       owner: 'harness-local-login',
@@ -719,11 +745,12 @@ const definitions: HarnessDefinition[] = [
       executable: 'opencode',
       args: ['acp', '--pure', '--hostname', '127.0.0.1', '--port', '0', '--no-mdns'],
       versionArgs: ['--version'],
-      versionPolicy: {
-        kind: 'exact-pin',
-        testedVersion: PORTAL_TOOL_VERSIONS.openCode,
-        reason: 'Pinned to OpenCode v1.19.4; official glibc Linux x64 baseline asset opencode-linux-x64-baseline.tar.gz SHA-256 1697ef40558d378bd2f72efa8fafe1bed1f0e664f09247b9357556b95dbc7cbc.',
-      },
+      versionPolicy: floorPin(
+        PORTAL_TOOL_FLOORS.openCode,
+        PORTAL_TOOL_VERSIONS.openCode,
+        PORTAL_TOOL_RECOMMENDED.versions.openCode,
+        'Tested on OpenCode v1.19.4; official glibc Linux x64 baseline asset opencode-linux-x64-baseline.tar.gz SHA-256 1697ef40558d378bd2f72efa8fafe1bed1f0e664f09247b9357556b95dbc7cbc.',
+      ),
     },
     auth: {
       owner: 'harness-local-login',

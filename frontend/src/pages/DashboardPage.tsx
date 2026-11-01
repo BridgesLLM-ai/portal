@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense, useContext } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, Suspense, useContext } from 'react';
+import { lazyWithRecovery } from '../utils/moduleRecovery';
 import { motion, AnimatePresence, type Variants } from 'framer-motion';
 import { UNSAFE_NavigationContext } from 'react-router-dom';
 // Link removed — onboarding cards removed
@@ -38,7 +39,7 @@ import {
   ShieldAlert, Wrench, CheckCircle2, ChevronDown,
 } from 'lucide-react';
 
-const LazyDashboardCharts = lazy(() => import('../components/dashboard/DashboardCharts'));
+const LazyDashboardCharts = lazyWithRecovery(() => import('../components/dashboard/DashboardCharts'));
 
 type OpenClawVersionStatus = {
   installedVersion: string | null;

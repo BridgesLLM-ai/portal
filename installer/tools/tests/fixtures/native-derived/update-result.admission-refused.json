@@ -1,0 +1,5 @@
+{"status": "error", "mode": "unknown", "reason": "gateway-service-ownership",
+ "failedStep": {"name": "gateway-service-ownership", "command": "openclaw update", "cwd": "/", "durationMs": 0, "exitCode": 1,
+                "stderrTail": "The Gateway service is owned by another account.", "failureFacts": []},
+ "steps": [{"name": "gateway-service-ownership", "command": "openclaw update", "cwd": "/", "durationMs": 0, "exitCode": 1}],
+ "durationMs": 0}

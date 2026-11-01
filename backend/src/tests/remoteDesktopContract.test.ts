@@ -356,12 +356,14 @@ describe('Remote Desktop release contract', () => {
     expect(skill).not.toContain('There is no per-app embed allowlist in Settings yet');
     expect(skill).not.toContain('exception is operator-owned Caddy configuration');
     expect(guide).toContain(
-      '[Open the handoff](/root/.openclaw/workspace-main/audit/HANDOFF-project-chat-and-backups.md)',
+      '[Open the handoff](/home/example/agent-workspace/notes/handoff.md)',
     );
     expect(guide).toContain(
-      '[Open the Project handoff](/workspace/project/audit/HANDOFF-project-chat-and-backups.md)',
+      '[Open the Project handoff](/workspace/project/notes/handoff.md)',
     );
     expect(guide).toContain('[Open uploaded report](/api/files/abc123)');
+    // The example paths are neutral: no host-specific workspace or handoff name ships.
+    expect(guide).not.toMatch(/\/root\/|workspace-main|HANDOFF-/);
     expect(guide).toContain('Never substitute a signed');
     expect(inventory).toContain('portal/skills/bridgesllm-portal/SKILL.md');
     expect(inventory).toContain('portal/skills/bridgesllm-portal/references/files-and-projects.md');

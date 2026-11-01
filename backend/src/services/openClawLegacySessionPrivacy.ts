@@ -4,9 +4,13 @@ import os from 'os';
 import path from 'path';
 import {
   getOpenClawSetupReadiness,
-  QUALIFIED_OPENCLAW_NATIVE_PATCHES,
   type OpenClawSetupReadiness,
 } from './openclawSetupReadiness';
+import {
+  openClawCurrentFamilyRefusal,
+  openClawRuntimeMatchesPackage,
+  type OpenClawReleaseDenylist,
+} from './openClawRuntimeContract';
 
 export type OpenClawRetirementRuntimeFamily =
   | 'legacy-2026.7.1'
@@ -59,7 +63,6 @@ type BoundFile = Readonly<{
 const LEGACY_CORE_VERSION = '2026.7.1-2';
 const LEGACY_RUNTIME_VERSIONS = new Set(['2026.7.1', LEGACY_CORE_VERSION]);
 const LEGACY_CODEX_VERSION = '2026.7.1-1';
-const CURRENT_VERSIONS = new Set(QUALIFIED_OPENCLAW_NATIVE_PATCHES);
 const SAFE_AGENT_ID = /^[a-z0-9][a-z0-9_-]{0,127}$/;
 const SAFE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ARCHIVE_TIMESTAMP = String.raw`\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d{3})?Z`;
@@ -109,37 +112,64 @@ function validRuntimeVersion(
   return typeof value === 'string' && expected.has(value);
 }
 
+/** Test seam: the policy the current family is judged against (defaults: process env, shipped deny-list). */
+export type OpenClawRetirementRuntimePolicy = Readonly<{
+  env?: NodeJS.ProcessEnv;
+  denylist?: OpenClawReleaseDenylist;
+}>;
+
 /**
- * Re-validates the exact tuple rather than trusting a family label copied from
- * one probe. Retirement is destructive, so a mixed CLI/package/Gateway tuple
- * is an integrity failure even when another feature could limp along.
+ * Re-validates the tuple rather than trusting a family label copied from one
+ * probe. Retirement is destructive, so a mixed CLI/package/Gateway tuple is an
+ * integrity failure even when another feature could limp along.
+ *
+ * The retained 2026.7.1 tuple stays exact. The current family is admitted by
+ * the runtime contract (floor, deny-list, strict rollback) because its purge
+ * no longer depends on a patched core: retirement probes each agent store's
+ * purge capability (OC-PURGE) before it mutates anything and refuses when the
+ * answer is not one it knows.
  */
 export function resolveExactOpenClawRetirementRuntimeFamily(
   readiness: OpenClawSetupReadiness,
+  policy: OpenClawRetirementRuntimePolicy = {},
 ): OpenClawRetirementRuntimeFamily {
-  if (
-    readiness.testedPairReady === true
-    && readiness.authenticatedRpc === true
-    && readiness.testedRuntimeFamily === 'legacy-2026.7.1'
-    && readiness.corePackageVersion === LEGACY_CORE_VERSION
-    && validRuntimeVersion(readiness.version, LEGACY_RUNTIME_VERSIONS)
-    && validRuntimeVersion(readiness.runningVersion, LEGACY_RUNTIME_VERSIONS)
-    && readiness.codexPluginVersion === LEGACY_CODEX_VERSION
-    && readiness.codexPluginInstallSpec === `@openclaw/codex@${LEGACY_CODEX_VERSION}`
-  ) return 'legacy-2026.7.1';
+  if (readiness.testedPairReady !== true || readiness.authenticatedRpc !== true) {
+    fail('OpenClaw is not ready for user retirement: the installed core, CLI, Gateway and Codex plugin were not proven to match over an authenticated Gateway connection');
+  }
+  if (readiness.testedRuntimeFamily === 'legacy-2026.7.1') {
+    if (
+      readiness.corePackageVersion === LEGACY_CORE_VERSION
+      && validRuntimeVersion(readiness.version, LEGACY_RUNTIME_VERSIONS)
+      && validRuntimeVersion(readiness.runningVersion, LEGACY_RUNTIME_VERSIONS)
+      && readiness.codexPluginVersion === LEGACY_CODEX_VERSION
+      && readiness.codexPluginInstallSpec === `@openclaw/codex@${LEGACY_CODEX_VERSION}`
+    ) return 'legacy-2026.7.1';
+    fail('OpenClaw does not match the exact retained 2026.7.1 retirement runtime tuple');
+  }
+  if (readiness.testedRuntimeFamily !== 'current-2026.9.1') {
+    fail('OpenClaw is not a runtime family the Portal can retire users on');
+  }
 
+  const core = readiness.corePackageVersion ?? '';
+  const refusal = openClawCurrentFamilyRefusal(core, policy.env, policy.denylist);
+  if (refusal) fail(`OpenClaw is not admitted for user retirement: ${refusal}`);
+  if (!openClawRuntimeMatchesPackage(readiness.version, core)) {
+    fail(`OpenClaw CLI ${readiness.version || 'unknown'} does not match the installed core ${core}`);
+  }
+  if (!openClawRuntimeMatchesPackage(readiness.runningVersion, core)) {
+    fail(`OpenClaw Gateway ${readiness.runningVersion || 'unknown'} does not match the installed core ${core}; restart the Gateway`);
+  }
+  // `@openclaw/codex` is published in lockstep with core; a `-N` republish may
+  // carry its own version or its release's (same rule as setup readiness).
+  const codexVersions = new Set([core, core.replace(/-\d{1,4}$/, '')]);
   if (
-    readiness.testedPairReady === true
-    && readiness.authenticatedRpc === true
-    && readiness.testedRuntimeFamily === 'current-2026.9.1'
-    && validRuntimeVersion(readiness.corePackageVersion, CURRENT_VERSIONS)
-    && readiness.version === readiness.corePackageVersion
-    && readiness.runningVersion === readiness.corePackageVersion
-    && readiness.codexPluginVersion === readiness.corePackageVersion
-    && readiness.codexPluginInstallSpec === `@openclaw/codex@${readiness.corePackageVersion}`
-  ) return 'current-2026.9.1';
-
-  fail('OpenClaw does not match an exact Portal-qualified retirement runtime tuple');
+    typeof readiness.codexPluginVersion !== 'string'
+    || !codexVersions.has(readiness.codexPluginVersion)
+    || readiness.codexPluginInstallSpec !== `@openclaw/codex@${readiness.codexPluginVersion}`
+  ) {
+    fail(`The OpenClaw Codex plugin ${readiness.codexPluginInstallSpec || readiness.codexPluginVersion || 'unknown'} does not match the installed core ${core}`);
+  }
+  return 'current-2026.9.1';
 }
 
 export async function attestOpenClawRetirementRuntimeFamily(): Promise<OpenClawRetirementRuntimeFamily> {

@@ -131,6 +131,41 @@ describe('Agent Work panel', () => {
     expect(onOpen).toHaveBeenCalledWith(CHILD);
   });
 
+  it('renders measured native progress without a plan and clears it on authoritative replacement', async () => {
+    payloads.set(KEY, work(KEY, { goal: null, children: [], progress: {
+      sessionKey: KEY, revision: 5, updatedAt: Date.now(), steps: [],
+      markdown: '<progress aria-label="Files reviewed · 12/30" value="12" max="30"></progress>\nChecked **twelve** files.',
+    } }));
+    render(<Harness session={KEY} socket={fakeSocket().manager} />);
+    const strip = await screen.findByRole('button', { name: /^Agent work: Progress update/ });
+    const user = userEvent.setup();
+    await user.click(strip);
+    const panel = await screen.findByRole('dialog', { name: 'Agent work' });
+    const meter = within(panel).getByRole('progressbar', { name: 'Files reviewed · 12/30' });
+    expect(meter).toHaveAttribute('value', '12');
+    expect(meter).toHaveAttribute('max', '30');
+    expect(within(panel).queryByRole('progressbar', { name: 'Reported progress' })).toBeNull();
+    expect(within(panel).getByText('twelve').tagName).toBe('STRONG');
+    expect(panel).not.toHaveTextContent('<progress');
+    payloads.set(KEY, work(KEY, { goal: null, children: [], progress: null }));
+    await user.click(within(panel).getByRole('button', { name: 'Refresh agent work' }));
+    await waitFor(() => expect(within(panel).queryByRole('progressbar')).toBeNull());
+    expect(screen.queryByRole('button', { name: /^Agent work: Progress update/ })).toBeNull();
+    expect(within(panel).getByText(/No progress card yet/)).toBeInTheDocument();
+  });
+
+  it('keeps measured work and checklist counts distinct, ignoring invalid markup', async () => {
+    const native = work();
+    native.progress.markdown = '<progress aria-label="Tests finished · 12/30" value="12" max="30" onload="alert(1)"></progress>\n<img src="https://example.invalid/tracker">Tests finished are not tests passed.';
+    payloads.set(KEY, native);
+    render(<Harness session={KEY} socket={fakeSocket().manager} />);
+    const panel = await openPanel();
+    expect(within(panel).getByRole('progressbar', { name: 'Reported progress' })).toHaveAttribute('value', '1');
+    expect(within(panel).getByRole('progressbar', { name: 'Tests finished · 12/30' })).toHaveAttribute('value', '12');
+    expect(panel.querySelector('[onload], img')).toBeNull();
+    expect(panel).toHaveTextContent('Tests finished are not tests passed.');
+  });
+
   it('pauses with a closed body and shows the readback goal, not the receipt', async () => {
     mocks.post.mockResolvedValue({ status: 200, data: { v: 1, result: { status: 'updated', goal: goal('active') }, goal: goal('paused', { lastStatusNote: 'waiting' }) } });
     const socket = fakeSocket();
@@ -204,7 +239,7 @@ describe('Agent Work panel', () => {
     await user.click(await within(panel).findByRole('button', { name: 'Set a goal' }));
     await user.type(within(panel).getByLabelText('What should the agent achieve?'), 'Ship the release notes');
     await user.click(within(panel).getByRole('button', { name: 'Start goal' }));
-    await waitFor(() => expect(within(panel).getByRole('alert')).toHaveTextContent('OpenClaw is in maintenance'));
+    await waitFor(() => expect(within(panel).getByRole('alert')).toHaveTextContent('OpenClaw is being updated. Chat resumes shortly.'));
     const [url, body] = mocks.post.mock.calls[0];
     expect(url).toBe(`/agent-work/sessions/${encodeURIComponent(KEY)}/goal/start`);
     expect(Object.keys(body).sort()).toEqual(['idempotencyKey', 'issuedAtMs', 'objective']);

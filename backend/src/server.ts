@@ -55,9 +55,10 @@ import {
 import aiRoutes from './routes/ai';
 import terminalRoutes from './routes/terminal';
 // Legacy Guacamole routes removed — noVNC/Xtigervnc is the active remote desktop stack.
-import gatewayRoutes, { attachPortalWebSocket, authorizeChatWidgetSession, mutateAgentSessionWork } from './routes/gateway';
+import gatewayRoutes, { attachPortalWebSocket, authorizeChatWidgetSession, authorizeUnstartedChatWorkSession, mutateAgentSessionWork } from './routes/gateway';
 import { createAgentWorkRouter } from './routes/agentWork';
 import { createChatWidgetsRouter } from './routes/chatWidgets';
+import { attachAgentWorkspaceBrowserStream, createAgentWorkspaceRouter } from './routes/agentWorkspace';
 import { pauseNativeGoalsAfterRestart } from './services/nativeSessionWork';
 import { nativeChatBridgeRootDirectory } from './agents/providers/NativeSessionStore';
 import alertsRoutes from './routes/alerts';
@@ -442,6 +443,7 @@ import { authenticateToken, browserAuthRedirect } from './middleware/auth';
 import { requireAdmin } from './middleware/requireAdmin';
 import { mountGlobalApiRateLimit } from './middleware/rateLimitPolicy';
 import { scheduleOpenClawExecutionAdmissionPrewarm } from './services/openClawExecutionAdmission';
+import { startToolsReconcileAtPortalStart } from './services/toolsStatus';
 
 // noVNC architecture (March 2026 fix):
 // - Static files served directly by Express from vendored /static/novnc/ (version-pinned)
@@ -1455,8 +1457,9 @@ app.use('/api/terminal', terminalRoutes);
 // which requires a signed-in user for everything it owns.
 app.use('/api/gateway/ask-user', askUserPluginRoutes);
 app.use('/api/gateway', gatewayRoutes);
-app.use('/api/agent-work', createAgentWorkRouter({ authorize: authorizeChatWidgetSession, mutate: mutateAgentSessionWork }));
+app.use('/api/agent-work', createAgentWorkRouter({ authorize: authorizeChatWidgetSession, authorizeUnstarted: authorizeUnstartedChatWorkSession, mutate: mutateAgentSessionWork }));
 app.use('/api/chat-widgets', createChatWidgetsRouter(authorizeChatWidgetSession));
+app.use('/api/agent-workspace', createAgentWorkspaceRouter(authorizeChatWidgetSession));
 app.use('/api/alerts', alertsRoutes);
 app.use('/api/system/stats', systemStatsRoutes);
 app.use('/api/system/maintenance', systemMaintenanceRoutes);
@@ -2088,6 +2091,7 @@ export const startServer = async () => {
     // Attach agent browser live-view WebSocket
     attachAgentBrowserWebSocket(httpServer);
     attachSharedBrowserDesktop(httpServer);
+    attachAgentWorkspaceBrowserStream(httpServer, authorizeChatWidgetSession);
     await startPortalSharedBrowserBroker().catch(error => {
       console.error('[shared-browser] Opt-in broker unavailable:', error.message);
     });
@@ -2148,6 +2152,8 @@ export const startServer = async () => {
       // the real listener is healthy; the asynchronous worker then joins that
       // canonical operation -> backup lock order without delaying readiness.
       scheduleProjectDependencyRepairPinRetirement();
+      // Updater v2: settle interrupted AI tools runs once per start (no-block).
+      startToolsReconcileAtPortalStart();
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error);

@@ -1,8 +1,8 @@
 import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios';
-import { useAuthStore } from '../contexts/AuthContext';
+import { getAuthSessionGeneration, useAuthStore } from '../contexts/AuthContext';
 import { captureError } from '../utils/errorHandler';
 import { diagnosticEndpoint } from '../utils/diagnosticEndpoint';
-import { withAuthRefreshConvergence } from '../utils/authRefreshConvergence';
+import { authRefreshGenerationIsCurrent, withAuthRefreshConvergence } from '../utils/authRefreshConvergence';
 import {
   PORTAL_AUTHORIZATION_VERSION_HEADER,
   StaleWorkspaceAuthorizationResponseError,
@@ -123,7 +123,6 @@ let refreshPromise: Promise<void> | null = null;
 
 // Track consecutive network failures to distinguish transient from persistent issues
 let consecutiveNetworkFailures = 0;
-const MAX_NETWORK_FAILURES_BEFORE_LOGOUT = 3;
 
 // Last successful auth timestamp for debugging
 let lastSuccessfulAuth = Date.now();
@@ -148,6 +147,9 @@ async function refreshSession(): Promise<boolean> {
     return true;
   }
 
+  const generation = getAuthSessionGeneration();
+  const actor = useAuthStore.getState().user?.id;
+  const refreshGenerationCurrent = authRefreshGenerationIsCurrent();
   refreshPromise = withAuthRefreshConvergence(async () => {
     await axios.post(`${API_URL}/auth/refresh`, {}, {
       withCredentials: true,
@@ -156,6 +158,16 @@ async function refreshSession(): Promise<boolean> {
     // Reset network failure counter on success
     consecutiveNetworkFailures = 0;
     lastSuccessfulAuth = Date.now();
+  }).catch((error) => {
+    if (generation === getAuthSessionGeneration()
+        && actor === useAuthStore.getState().user?.id
+        && refreshGenerationCurrent()
+        && shouldLogoutOnRefreshFailure(error as AxiosError)) {
+      isHandlingAuthFailure = true;
+      try { useAuthStore.getState().silentLogout(); }
+      finally { isHandlingAuthFailure = false; }
+    }
+    throw error;
   }).finally(() => {
     refreshPromise = null;
   });
@@ -198,16 +210,13 @@ function shouldLogoutOnRefreshFailure(error: AxiosError): boolean {
     return true;
   }
 
-  // For transient errors, only logout after multiple consecutive failures
+  // Transport/server failures do not prove that credentials were revoked.
   if (isTransientNetworkError(error)) {
     consecutiveNetworkFailures++;
-    debugLog(`[Auth] Transient network error during refresh (${consecutiveNetworkFailures}/${MAX_NETWORK_FAILURES_BEFORE_LOGOUT})`);
-    
-    if (consecutiveNetworkFailures >= MAX_NETWORK_FAILURES_BEFORE_LOGOUT) {
-      debugLog('[Auth] Too many consecutive network failures — logging out');
-      return true;
-    }
-    
+    debugLog(`[Auth] Transient network error during refresh (${consecutiveNetworkFailures})`);
+
+    // A transport/server outage is not evidence that the login was revoked.
+
     // Don't logout yet, let the original request fail but keep session
     return false;
   }
@@ -293,16 +302,8 @@ client.interceptors.response.use(
         // Refresh returned false (transient failure, not logging out)
         return Promise.reject(error);
       } catch (refreshError) {
-        // Determine if we should logout
-        if (shouldLogoutOnRefreshFailure(refreshError as AxiosError)) {
-          isHandlingAuthFailure = true;
-          try {
-            // Use silentLogout to clear local state without API calls
-            useAuthStore.getState().silentLogout();
-          } finally {
-            isHandlingAuthFailure = false;
-          }
-        }
+        // The shared refresh promise owns the guarded sign-out exactly once,
+        // for both foreground requests and background heartbeat callers.
         return Promise.reject(refreshError);
       }
     }
@@ -404,7 +405,7 @@ export function startSessionHeartbeat() {
       try {
         await refreshSession();
       } catch {
-        debugLog('[Session] Proactive refresh failed, will retry on next heartbeat');
+        debugLog('[Session] Proactive refresh failed; definitive failures invalidate the captured session');
       }
     }
   }, HEARTBEAT_INTERVAL);

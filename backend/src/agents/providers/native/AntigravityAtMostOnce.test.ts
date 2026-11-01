@@ -151,10 +151,10 @@ function expectSingleSanitizedInvocation(): void {
   expect(options).toEqual(expect.objectContaining({
     detached: true,
     env: expect.objectContaining({
-      AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       NO_COLOR: '1',
     }),
   }));
+  expect(options.env).not.toHaveProperty('AGY_CLI_DISABLE_AUTO_UPDATE');
   expect(options.env).not.toHaveProperty('DATABASE_URL');
   expect(options.env).not.toHaveProperty('JWT_SECRET');
   expect(options.env).not.toHaveProperty('OPENAI_API_KEY');

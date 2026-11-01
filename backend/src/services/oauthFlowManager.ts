@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import * as pty from 'node-pty';
 import * as os from 'os';
 import * as path from 'path';
@@ -21,7 +22,11 @@ import {
   invalidateNativeCliAuthStatus,
 } from '../agents/nativeCliAuth';
 import { invalidateNativeProviderReadiness } from '../agents/nativeProviderReadiness';
-import { buildNativeCliEnvironment, resolveNativeCliCredentialPaths } from '../agents/providers/native/NativeCliEnvironment';
+import {
+  buildNativeCliEnvironment,
+  buildNativeCliProbeEnvironment,
+  resolveNativeCliCredentialPaths,
+} from '../agents/providers/native/NativeCliEnvironment';
 import {
   buildAcpHarnessEnvironment,
   resolveAcpHarnessCredentialPaths,
@@ -1306,7 +1311,7 @@ function isProviderAuthUrl(provider: string, url: string): boolean {
 }
 
 function spawnOpenClawPty(args: string[], extraEnv?: Record<string, string>) {
-  return pty.spawn(OPENCLAW_BIN, args, {
+  return pty.spawn(...openClawDiagnosticCommand(OPENCLAW_BIN, args), {
     name: 'xterm-256color',
     cols: 120,
     rows: 40,
@@ -1363,7 +1368,8 @@ function shellEscape(arg: string): string {
 }
 
 function runOpenClawViaScript(args: string[], timeoutMs: number, extraEnv?: Record<string, string>): string {
-  const command = [OPENCLAW_BIN, ...args].map(shellEscape).join(' ');
+  const [executable, leasedArgs] = openClawDiagnosticCommand(OPENCLAW_BIN, args);
+  const command = [executable, ...leasedArgs].map(shellEscape).join(' ');
   try {
     return execSync(`script -qefc ${shellEscape(command)} /dev/null`, {
       cwd: process.cwd(),
@@ -3318,7 +3324,7 @@ function checkAntigravityCredentials(): boolean {
   try {
     execFileSync('agy', ['models'], {
       encoding: 'utf8',
-      env: buildNativeCliEnvironment('GEMINI'),
+      env: buildNativeCliProbeEnvironment('GEMINI'),
       timeout: 8000,
       stdio: ['ignore', 'ignore', 'ignore'],
     });
@@ -3397,7 +3403,7 @@ function getAntigravityReauthArgs(antigravityBin: string): string[] | null {
   try {
     const help = execFileSync(antigravityBin, ['--help'], {
       encoding: 'utf8',
-      env: buildNativeCliEnvironment('GEMINI'),
+      env: buildNativeCliProbeEnvironment('GEMINI'),
       timeout: 5000,
       maxBuffer: 512 * 1024,
       stdio: ['ignore', 'pipe', 'pipe'],

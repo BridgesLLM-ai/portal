@@ -548,6 +548,8 @@ describe('ProjectChatPanel rendered provider contract', () => {
     render(<ProjectChatPanel projectName="alpha" onClose={vi.fn()} />);
 
     expect(await screen.findByText('Transcript loaded before the provider handshake.')).toBeVisible();
+    // Project chat shares the Agent Chat working-canvas scope (focus outlines, reduced motion).
+    expect(screen.getByText('Transcript loaded before the provider handshake.').closest('.chat-canvas')).not.toBeNull();
     expect(await screen.findByText('OpenClaw Project agent verified and ready')).toBeVisible();
     await waitFor(() => expect(projectMocks.agentPoll).toHaveBeenCalled());
     expect(projectMocks.chatHistory).toHaveBeenCalledTimes(1);

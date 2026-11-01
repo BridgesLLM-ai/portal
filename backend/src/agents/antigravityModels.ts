@@ -1,5 +1,5 @@
 import { execFile } from 'child_process';
-import { buildNativeCliEnvironment } from './providers/native/NativeCliEnvironment';
+import { buildNativeCliProbeEnvironment } from './providers/native/NativeCliEnvironment';
 import { isUnqualifiedNativeBinaryProvider } from '../config/unqualifiedNativeBinaryLane';
 
 export interface AntigravityModelDescriptor { id: string; displayName: string; }
@@ -26,7 +26,7 @@ export function listAntigravityModelsFromCli(): Promise<AntigravityModelDescript
   const startedGeneration = generation;
   const pending = new Promise<AntigravityModelDescriptor[]>((resolve) => {
     execFile('agy', ['models'], {
-      env: buildNativeCliEnvironment('GEMINI'), timeout: 12_000, maxBuffer: 512 * 1024,
+      env: buildNativeCliProbeEnvironment('GEMINI'), timeout: 12_000, maxBuffer: 512 * 1024,
     }, (error, stdout) => {
       const models = error ? [] : parseAntigravityModelList(String(stdout || ''));
       if (startedGeneration === generation) cache = { expiresAt: Date.now() + (models.length ? 60_000 : 3_000), models };

@@ -62,6 +62,8 @@ export type MaintenanceStatus = {
   };
   backup?: { path: string; createdAt: string; ageHours: number } | null;
   reboot?: { required: boolean; packages: string[] };
+  /** Present when the per-tool AI updater is installed; the old all-tools action is then hidden. */
+  toolsUpdater?: { installed: boolean };
 };
 
 type MaintenanceStatusRequestOptions = {

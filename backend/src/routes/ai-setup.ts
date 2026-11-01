@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { requireAdmin } from '../middleware/requireAdmin';
 import { ProviderActivationService } from '../services/providerActivation';
 import { ProviderSetupWizard } from '../services/providerSetupWizard';
@@ -1930,7 +1931,7 @@ export function getExpectedXaiProbeModel(provider: string, setDefault: boolean |
 }
 
 function runOpenClaw(args: string[], timeout = 30000) {
-  const raw = execFileSync(OPENCLAW_BIN, args, {
+  const raw = execFileSync(...openClawDiagnosticCommand(OPENCLAW_BIN, args), {
     timeout,
     encoding: 'utf8',
     env: buildOpenClawCliEnv(),
@@ -1943,7 +1944,7 @@ function runOpenClaw(args: string[], timeout = 30000) {
 
 export function runOpenClawWithSecretInput(args: string[], secret: string, timeout = 30000): void {
   try {
-    execFileSync(OPENCLAW_BIN, args, {
+    execFileSync(...openClawDiagnosticCommand(OPENCLAW_BIN, args), {
       timeout,
       env: buildOpenClawCliEnv(),
       input: `${secret}\n`,

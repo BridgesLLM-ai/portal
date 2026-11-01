@@ -1,5 +1,6 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
+import { readFileSync } from 'node:fs'
 
 function matchesAny(id: string, needles: string[]): boolean {
   return needles.some((needle) => id.includes(needle))
@@ -33,8 +34,12 @@ export default defineConfig(({ mode }) => {
     }
   }
 
+  // The open tab compares this with /health to tell a Portal update from a broken build.
+  const portalBuildVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
+
   return {
     plugins: [react()],
+    define: { __PORTAL_BUILD_VERSION__: JSON.stringify(portalBuildVersion) },
     server: {
       port: 5173,
       host: '0.0.0.0',
@@ -43,6 +48,7 @@ export default defineConfig(({ mode }) => {
         '/api': {
           target: 'http://127.0.0.1:4001',
           changeOrigin: true,
+          ws: true,
         },
         '/assets': {
           target: 'http://127.0.0.1:4001',

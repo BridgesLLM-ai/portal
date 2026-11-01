@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, lazy, Suspense } from 'react';
+import { useCallback, useEffect, useRef, useState, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from './contexts/AuthContext';
 import { canUseInteractivePortal, isElevated } from './utils/authz';
@@ -15,67 +15,24 @@ import {
   synchronizePortalIconLinks,
 } from './utils/portalBranding';
 import { usePortalUpdateSessionRecovery } from './hooks/usePortalUpdateSessionRecovery';
+import { lazyWithRecovery } from './utils/moduleRecovery';
 
-const MODULE_RELOAD_PREFIX = 'portal-module-reload:';
 const SETUP_STATUS_TIMEOUT_MS = 8_000;
 
-function isModuleLoadFailure(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error ?? '');
-  return /importing a module script failed|failed to fetch dynamically imported module|error loading dynamically imported module|unable to preload css|loading chunk \d+ failed/i.test(message);
-}
-
-function getReloadMarker(key: string) {
-  return `${MODULE_RELOAD_PREFIX}${key}`;
-}
-
-function lazyWithModuleRetry<T extends { default: React.ComponentType<any> }>(
-  key: string,
-  loader: () => Promise<T>
-) {
-  return lazy(async () => {
-    try {
-      const module = await loader();
-      try {
-        window.sessionStorage.removeItem(getReloadMarker(key));
-      } catch {
-        // Session storage may be unavailable in strict/private browser modes.
-      }
-      return module;
-    } catch (error) {
-      if (typeof window !== 'undefined' && isModuleLoadFailure(error)) {
-        try {
-          const marker = getReloadMarker(key);
-          if (window.sessionStorage.getItem(marker) !== '1') {
-            window.sessionStorage.setItem(marker, '1');
-            const url = new URL(window.location.href);
-            url.searchParams.set('reload', Date.now().toString());
-            window.location.replace(url.toString());
-            return new Promise<T>(() => {});
-          }
-        } catch {
-          window.location.reload();
-          return new Promise<T>(() => {});
-        }
-      }
-      throw error;
-    }
-  });
-}
-
-const DesktopPage = lazyWithModuleRetry('DesktopPage', () => import('./pages/DesktopPage'));
-const PortalLayoutShell = lazyWithModuleRetry('PortalLayoutShell', () => import('./components/PortalLayoutShell'));
-const DashboardPage = lazyWithModuleRetry('DashboardPage', () => import('./pages/DashboardPage'));
-const SetupWizardPage = lazyWithModuleRetry('SetupWizardPage', () => import('./pages/SetupWizardPage'));
-const LandingPage = lazyWithModuleRetry('LandingPage', () => import('./pages/LandingPage'));
-const DocsPage = lazyWithModuleRetry('DocsPage', () => import('./pages/DocsPage'));
-const AppsPage = lazyWithModuleRetry('AppsPage', () => import('./pages/AppsPage'));
-const FilesPage = lazyWithModuleRetry('FilesPage', () => import('./pages/FilesPage'));
-const AgentChatPage = lazyWithModuleRetry('AgentChatPage', () => import('./pages/AgentChatPage'));
-const SettingsPage = lazyWithModuleRetry('SettingsPage', () => import('./pages/SettingsPage'));
-const AdminPage = lazyWithModuleRetry('AdminPage', () => import('./pages/AdminPage'));
-const MailPage = lazyWithModuleRetry('MailPage', () => import('./pages/MailPage'));
-const AgentToolsPage = lazyWithModuleRetry('AgentToolsPage', () => import('./pages/AgentToolsPage'));
-const TasksPage = lazyWithModuleRetry('TasksPage', () => import('./pages/TasksPage'));
+const DesktopPage = lazyWithRecovery(() => import('./pages/DesktopPage'));
+const PortalLayoutShell = lazyWithRecovery(() => import('./components/PortalLayoutShell'));
+const DashboardPage = lazyWithRecovery(() => import('./pages/DashboardPage'));
+const SetupWizardPage = lazyWithRecovery(() => import('./pages/SetupWizardPage'));
+const LandingPage = lazyWithRecovery(() => import('./pages/LandingPage'));
+const DocsPage = lazyWithRecovery(() => import('./pages/DocsPage'));
+const AppsPage = lazyWithRecovery(() => import('./pages/AppsPage'));
+const FilesPage = lazyWithRecovery(() => import('./pages/FilesPage'));
+const AgentChatPage = lazyWithRecovery(() => import('./pages/AgentChatPage'));
+const SettingsPage = lazyWithRecovery(() => import('./pages/SettingsPage'));
+const AdminPage = lazyWithRecovery(() => import('./pages/AdminPage'));
+const MailPage = lazyWithRecovery(() => import('./pages/MailPage'));
+const AgentToolsPage = lazyWithRecovery(() => import('./pages/AgentToolsPage'));
+const TasksPage = lazyWithRecovery(() => import('./pages/TasksPage'));
 
 function buildLoginRedirectTarget(location: ReturnType<typeof useLocation>) {
   const target = `${location.pathname}${location.search}${location.hash}`;

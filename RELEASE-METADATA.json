@@ -1,13 +1,13 @@
 {
   "schema": 1,
-  "version": "5.1.0",
-  "releasedAt": "2026-10-23",
+  "version": "5.2.0",
+  "releasedAt": "2026-11-01",
   "releaseClass": "feature",
   "highlights": [
-    "Current compatible AI tools, retained-state upgrades, and account-ready model suggestions after sign-in.",
-    "Richer Chat with grouped tool activity, visual image input, agent work controls, and sandboxed interactive widgets.",
-    "Owner-controlled App credentials, reviewed backup cleanup, and shared-browser handover.",
-    "Modernized editor, terminal, charts, document rendering, and application dependencies.",
-    "More reliable streaming and Project downloads, with stronger credential handling and runtime verification."
+    "Update compatible AI tools one at a time from Admin > Maintenance, with verified downloads, swap-back, Re-check and Stop.",
+    "OpenClaw updates through its own updater, with checks before and after and a typed confirmation.",
+    "Works with newer OpenClaw releases, including 2026.10, instead of refusing versions it has not seen.",
+    "Agent Chat workspace, live browser panel, live pinned widgets and steering on stock OpenClaw.",
+    "No sign-out during a brief outage, a private Tasks feed, and steadier transcript order."
   ]
 }

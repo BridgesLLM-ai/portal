@@ -88,6 +88,7 @@ describe('Agent Chat exact-run steering route', () => {
 
   test('steers the exact active run after positive OpenClaw execution admission', async () => {
     const steer = jest.spyOn(persistentGatewayWs, 'steerSessionMessage').mockResolvedValue({
+      mode: 'exact-run',
       interruptedActiveRun: false,
       replayed: false,
       requestId: 'steer-r1',
@@ -111,16 +112,45 @@ describe('Agent Chat exact-run steering route', () => {
       'run-r1',
       'Keep investigating.',
       'steer-r1',
+      true, // an Owner keeps OpenClaw chat-command authority
     );
     expect(response.status).not.toHaveBeenCalled();
     expect(response.json).toHaveBeenCalledWith({
       ok: true,
       sessionKey,
+      mode: 'exact-run',
       interruptedActiveRun: false,
       replayed: false,
       requestId: 'steer-r1',
       runId: 'run-r1',
     });
+  });
+
+  test('reports stock chat.send steering as unconfirmed, without claiming the observed run', async () => {
+    jest.spyOn(persistentGatewayWs, 'steerSessionMessage').mockResolvedValue({
+      mode: 'native-steer',
+      outcome: 'unconfirmed',
+      interruptedActiveRun: false,
+      replayed: false,
+      requestId: 'steer-r2',
+      steerRunId: 'oc-run-r2',
+    });
+    const response = responseDouble();
+
+    await routeHandler()({
+      body: {
+        session: sessionKey,
+        expectedRunId: 'run-r1',
+        message: 'Use the newer file.',
+        requestId: 'steer-r2',
+      },
+      user: { userId, role: 'OWNER' },
+    }, response);
+
+    expect(response.status).not.toHaveBeenCalled();
+    const body = response.json.mock.calls[0][0];
+    expect(body).toMatchObject({ ok: true, mode: 'native-steer', outcome: 'unconfirmed', steerRunId: 'oc-run-r2' });
+    expect(body).not.toHaveProperty('runId');
   });
 
   test('fails closed before steering while supervised maintenance is active', async () => {

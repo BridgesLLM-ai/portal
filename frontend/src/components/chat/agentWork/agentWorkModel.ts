@@ -6,7 +6,7 @@ import { isExactStopKey, type GoalControlAction, type ProgressCard, type Session
 import { displayText } from '../toolCards/safeDisplay';
 import { openClawTaskConversation } from '../../../utils/taskConversation';
 
-export type RunTone = 'running' | 'waiting' | 'failed' | 'stopped' | 'done' | 'idle' | 'unknown';
+export type RunTone = 'running' | 'waiting' | 'failed' | 'stopped' | 'resumable' | 'done' | 'idle' | 'unknown';
 
 export interface RunStatusView {
   tone: RunTone;
@@ -23,7 +23,10 @@ export function runStatusView(status: string | null | undefined): RunStatusView 
     case 'queued': return { tone: 'waiting', label: 'Waiting to start' };
     case 'failed': return { tone: 'failed', label: 'Failed' };
     case 'timeout': return { tone: 'failed', label: 'Timed out' };
-    case 'interrupted': return { tone: 'stopped', label: 'Interrupted' };
+    // OpenClaw reports `interrupted` only for resumable interruptions: a Gateway
+    // restart, or (10.7+) a tool call that timed out with an unknown outcome.
+    // The run did not fail; resuming continues it.
+    case 'interrupted': return { tone: 'resumable', label: 'Interrupted, can resume' };
     case 'killed': return { tone: 'stopped', label: 'Stopped' };
     case 'done': return { tone: 'done', label: 'Finished' };
     default: return { tone: 'unknown', label: displayText(status, 40) || 'Status unavailable' };
@@ -118,7 +121,7 @@ export function progressCounts(progress: ProgressCard | null) {
 }
 
 export function runCounts(rows: WorkSessionRow[]) {
-  const counts = { total: rows.length, running: 0, waiting: 0, failed: 0, stopped: 0, done: 0, idle: 0, unknown: 0 };
+  const counts = { total: rows.length, running: 0, waiting: 0, failed: 0, stopped: 0, resumable: 0, done: 0, idle: 0, unknown: 0 };
   for (const row of rows) counts[runStatusView(row.status).tone] += 1;
   return counts;
 }

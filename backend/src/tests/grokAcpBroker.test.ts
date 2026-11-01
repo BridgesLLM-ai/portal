@@ -231,6 +231,8 @@ describe('Grok Build ACP stdio broker', () => {
   test.each([
     ['wrong protocol', { protocolVersion: 2 }, /protocol mismatch/],
     ['wrong version', { _meta: { agentVersion: '0.2.104' } }, /agent mismatch/],
+    ['a version below the floor', { _meta: { agentVersion: '1.0.61' } }, /agent mismatch: version 1\.0\.61 is older than the Portal's supported floor 1\.0\.62/],
+    ['no reported version', { _meta: {} }, /agent mismatch: the installed version unknown could not be read/],
     ['missing session loading', { agentCapabilities: { loadSession: false } }, /persisted-session loading/],
   ])('fails closed on %s', async (_label, overrides, errorPattern) => {
     const process = fakeAcpProcess((message, runtime) => {

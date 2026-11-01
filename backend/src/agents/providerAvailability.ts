@@ -1,7 +1,10 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { execFile, execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import { harnessVersionIsNewerThanTested, harnessVersionRefusal } from './harnessVersionPolicy';
+import { missingAntigravityHeadlessFlags } from './providers/native/adapters/antigravityHeadlessFlags';
 import {
   isNativeBinaryProvider,
   isUnqualifiedNativeBinaryProvider,
@@ -47,7 +50,7 @@ import {
   loadSelectableAgentZeroOAuthModels,
 } from './providers/agentZero/AgentZeroOAuthModelCatalog';
 import { localOllamaCliEnvironment } from '../services/ollamaPullManager';
-import { buildNativeCliEnvironment } from './providers/native/NativeCliEnvironment';
+import { buildNativeCliEnvironment, buildNativeCliProbeEnvironment } from './providers/native/NativeCliEnvironment';
 import { buildAcpHarnessEnvironment } from './providers/native/acp/AcpHarnessEnvironment';
 import {
   getCachedOpenClawExecutionAdmission,
@@ -82,6 +85,9 @@ export interface ProviderAvailability {
   // Soft-pinned providers stay usable but must never silently claim the
   // tested version.
   versionDrift?: { tested: string; installed: string };
+  // Installed but refused only for its version (below the floor, or off an
+  // exact pin): an update fixes it, not a login or a provider setting.
+  versionRefused?: true;
   linkedOpenClawProviders?: Array<{
     id: string;
     configured: boolean;
@@ -101,6 +107,11 @@ interface ProviderProbeDefinition {
   // Soft pin: the provider stays usable on mismatch, but independently
   // changed package drift is reported in the availability payload and reason.
   driftTestedVersion?: string;
+  // Floor pin: versions below the floor are refused; newer ones are admitted
+  // and their features are gated by the runtime's own capability probes.
+  floorVersion?: string;
+  // Floor pin: the version the Portal tested; newer installs are labelled unproven.
+  floorTestedVersion?: string;
   capabilities: ProviderCapabilitySummary;
 }
 
@@ -118,6 +129,12 @@ const DEFINITIONS = Object.freeze(Object.fromEntries(
         ? versionPolicy.testedVersion
         : undefined,
       driftTestedVersion: versionPolicy.kind === 'soft-pin'
+        ? versionPolicy.testedVersion
+        : undefined,
+      floorVersion: versionPolicy.kind === 'floor-pin'
+        ? versionPolicy.floorVersion
+        : undefined,
+      floorTestedVersion: versionPolicy.kind === 'floor-pin'
         ? versionPolicy.testedVersion
         : undefined,
       capabilities: harness.capabilities,
@@ -157,7 +174,7 @@ function packageVersionRemediation(name: AgentProviderName): string {
 
 function providerProbeEnvironment(command: string): NodeJS.ProcessEnv {
   if (command === 'grok') return buildNativeCliEnvironment('GROK');
-  if (command === 'agy') return buildNativeCliEnvironment('GEMINI');
+  if (command === 'agy') return buildNativeCliProbeEnvironment('GEMINI');
   if (command === 'claude') return buildNativeCliEnvironment('CLAUDE_CODE');
   if (command === 'codex') return buildNativeCliEnvironment('CODEX');
   if (command === 'hermes') return buildAcpHarnessEnvironment('HERMES');
@@ -172,7 +189,7 @@ function tryExec(command: string, args: string[]): string | null {
   if (cached && Date.now() - cached.at < PROBE_CACHE_TTL_MS) return cached.value;
   let value: string | null = null;
   try {
-    value = execFileSync(command, args, {
+    value = execFileSync(...openClawDiagnosticCommand(command, args), {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: providerProbeEnvironment(command),
@@ -197,7 +214,7 @@ function tryExecAsync(command: string, args: string[]): Promise<string | null> {
 
   const epoch = probeCacheEpoch;
   const pending = new Promise<string | null>((resolve) => {
-    const child = execFile(command, args, {
+    const child = execFile(...openClawDiagnosticCommand(command, args), {
       encoding: 'utf8',
       env: providerProbeEnvironment(command),
       timeout: 8000,
@@ -500,12 +517,23 @@ function buildAgentZeroAvailability(
   };
 }
 
+/**
+ * Antigravity newer than the tested version: its `--help` (no network, no
+ * credentials) must still list the adapter's headless flags. Only then is the
+ * help text needed, so the extra exec is skipped for the tested version.
+ */
+function needsHeadlessFlagScan(name: AgentProviderName, version: string | undefined): boolean {
+  return name === 'GEMINI'
+    && harnessVersionIsNewerThanTested(extractCliVersion(version), DEFINITIONS[name].floorTestedVersion);
+}
+
 function buildDetectedProviderAvailability(
   name: AgentProviderName,
   command: string | undefined,
   version: string | undefined,
   nativeReadiness?: NativeProviderReadiness,
   linkedProviderStatusesOverride?: NonNullable<ProviderAvailability['linkedOpenClawProviders']>,
+  headlessHelp?: string | null,
 ): ProviderAvailability {
   const def = DEFINITIONS[name];
   const installed = Boolean(command);
@@ -588,6 +616,43 @@ function buildDetectedProviderAvailability(
       command,
       version,
       reason: `Installed CLI is outside the Portal-tested version (${def.exactTestedVersion}). Portal refuses this runtime. ${packageVersionRemediation(name)}`,
+      versionRefused: true,
+      nativeAuthStatus: nativeAuth?.status,
+      nativeAuthMessage: nativeAuth?.message,
+      nativeAuthLoginCommand: nativeAuth?.loginCommand,
+      requiresSeparateNativeLogin: nativeAuth?.requiresSeparateLogin,
+      linkedOpenClawProviders: linkedProviderStatuses,
+      capabilities: def.capabilities,
+    };
+  }
+
+  // OpenClaw returned above with its own CalVer contract; every floor-pinned
+  // harness that reaches this point is semver with a per-harness deny-list.
+  const versionRefusal = def.floorVersion
+    ? harnessVersionRefusal(name, extractCliVersion(version), def.floorVersion)
+    : null;
+  const floorRefusal = versionRefusal
+    ? `Portal refuses this ${requireHarnessDefinition(name).displayName} runtime: ${versionRefusal}.`
+    : null;
+  const missingFlags = needsHeadlessFlagScan(name, version)
+    ? (typeof headlessHelp === 'string' ? missingAntigravityHeadlessFlags(headlessHelp) : null)
+    : [];
+  const capabilityRefusal = missingFlags === null
+    ? `Portal could not read this Antigravity version's --help to confirm the headless flags it uses; version ${extractCliVersion(version)} is newer than the Portal-tested ${DEFINITIONS[name].floorTestedVersion} and stays refused until they are confirmed.`
+    : missingFlags.length
+      ? `Antigravity ${extractCliVersion(version)} no longer lists the headless flags the Portal uses (${missingFlags.join(', ')}); Portal refuses this runtime.`
+      : null;
+  if (floorRefusal || capabilityRefusal) {
+    return {
+      name,
+      installed: true,
+      implemented: true,
+      usable: false,
+      native: def.native,
+      command,
+      version,
+      reason: `${floorRefusal || capabilityRefusal} ${packageVersionRemediation(name)}`,
+      ...(floorRefusal ? { versionRefused: true as const } : {}),
       nativeAuthStatus: nativeAuth?.status,
       nativeAuthMessage: nativeAuth?.message,
       nativeAuthLoginCommand: nativeAuth?.loginCommand,
@@ -606,9 +671,16 @@ function buildDetectedProviderAvailability(
     && installedVersion !== def.driftTestedVersion
     ? { tested: def.driftTestedVersion, installed: installedVersion }
     : undefined;
+  // A floor-pinned harness newer than the tested version is admitted, but the
+  // owner should know it is unproven; its handshake is checked per session.
+  const newerThanTested = harnessVersionIsNewerThanTested(installedVersion, def.floorTestedVersion)
+    ? { tested: def.floorTestedVersion!, installed: installedVersion }
+    : undefined;
   const driftNote = versionDrift
     ? ` Installed ${def.commands[0]} ${versionDrift.installed} has drifted from the Portal-tested ${versionDrift.tested}; Portal refuses the drifted runtime. ${packageVersionRemediation(name)}`
-    : '';
+    : newerThanTested
+      ? ` Installed ${def.commands[0]} ${newerThanTested.installed} is newer than the Portal-tested ${newerThanTested.tested}; it is admitted because it meets the floor and its protocol handshake is verified before every session, but this version is not yet proven.`
+      : '';
   const reason = authBlocked
     ? linkedConfigured.length
       ? `${nativeAuth?.message} OpenClaw is configured for ${linkedConfigured.join(', ')}, but those credentials are not copied into this CLI.`
@@ -616,14 +688,14 @@ function buildDetectedProviderAvailability(
     : def.capabilities.requiresGateway
       ? 'Uses OpenClaw gateway transport'
       : name === 'GROK'
-        ? `${nativeAuth?.message || 'Grok Build is authenticated on this server.'} Uses the pinned Grok Build ${PORTAL_TOOL_VERSIONS.grokBuild} ACP transport with native text, thought, tool, permission, cancellation, and persisted-session events.`
+        ? `${nativeAuth?.message || 'Grok Build is authenticated on this server.'} Uses the Grok Build ACP transport (Portal-tested ${PORTAL_TOOL_VERSIONS.grokBuild}) with native text, thought, tool, permission, cancellation, and persisted-session events.`
         : name === 'HERMES' || name === 'OPENCODE'
-          ? `${nativeAuth?.message || `${requireHarnessDefinition(name).displayName} is authenticated on this server.`} Uses the exact-pinned ACP stdio transport with attested identity/version, native text, reasoning, tool, permission, cancellation, dynamic model, and persisted-session events.`
+          ? `${nativeAuth?.message || `${requireHarnessDefinition(name).displayName} is authenticated on this server.`} Uses the floor-pinned ACP stdio transport with attested identity/version, native text, reasoning, tool, permission, cancellation, dynamic model, and persisted-session events.`
         : (nativeAuth?.message || 'Runs natively via local provider CLI');
   // Hermes reaches the Portal Chat Bridge only with its MCP extra. Label the
   // reduced feature set honestly instead of advertising questions it ignores.
   const bridgeFeatureGap = name === 'HERMES'
-    ? hermesBridgeFeatureGap(readHermesRuntimeAttestation())
+    ? hermesBridgeFeatureGap(readHermesRuntimeAttestation({ version: installedVersion || undefined }))
     : null;
 
   return {
@@ -635,7 +707,7 @@ function buildDetectedProviderAvailability(
     command,
     version,
     reason: `${reason}${driftNote}${bridgeFeatureGap ? ` ${bridgeFeatureGap}` : ''}`,
-    versionDrift,
+    versionDrift: versionDrift || newerThanTested,
     nativeAuthStatus: nativeAuth?.status,
     nativeAuthMessage: nativeAuth?.message,
     nativeAuthLoginCommand: nativeAuth?.loginCommand,
@@ -671,7 +743,8 @@ function buildProviderAvailability(
   }
   const command = resolveCommand(def.commands);
   const version = command ? detectVersion(command, def.versionArgs) : undefined;
-  return buildDetectedProviderAvailability(name, command, version, nativeReadiness);
+  const headlessHelp = command && needsHeadlessFlagScan(name, version) ? tryExec(command, ['--help']) : undefined;
+  return buildDetectedProviderAvailability(name, command, version, nativeReadiness, undefined, headlessHelp);
 }
 
 async function buildProviderAvailabilityAsync(
@@ -687,10 +760,11 @@ async function buildProviderAvailabilityAsync(
   const def = DEFINITIONS[name];
   const command = await resolveCommandAsync(def.commands);
   const version = command ? await detectVersionAsync(command, def.versionArgs) : undefined;
+  const headlessHelp = command && needsHeadlessFlagScan(name, version) ? await tryExecAsync(command, ['--help']) : undefined;
   // Aggregate discovery must not synchronously invoke OpenClaw's auth-store
   // CLI for each native row. Native auth remains authoritative for usability;
   // linked OpenClaw profile hints are populated by their dedicated settings API.
-  return buildDetectedProviderAvailability(name, command, version, nativeReadiness, []);
+  return buildDetectedProviderAvailability(name, command, version, nativeReadiness, [], headlessHelp);
 }
 
 export function getProviderAvailability(name: AgentProviderName): ProviderAvailability {

@@ -9,13 +9,18 @@ import {
 import type { NativeSessionData } from '../agents/providers/NativeSessionStore';
 import type { AdminUserRetirementManifestV1 } from './adminUserRetirementLedger';
 import {
+  readAdminUserRetirementOpenClawPrivacy,
   retireAdminUserExternalState,
+  summarizeAdminUserRetirementOpenClawPrivacy,
   verifyAdminUserExternalStateAbsence,
 } from './adminUserRetirementExternalState';
 import {
   digestAdminUserRetirementSnapshot,
 } from './adminUserRetirementManifest';
-import { buildOpenClawRetirementIdentityAttestation } from './openClawLegacySessionPrivacy';
+import {
+  buildOpenClawRetirementIdentityAttestation,
+  OpenClawLegacySessionPrivacyError,
+} from './openClawLegacySessionPrivacy';
 import { getProjectChatProviderAdapter } from './projectChatProviderRegistry';
 import {
   captureAdminUserRetirementManagedPath,
@@ -37,9 +42,11 @@ describe('admin user external-state retirement adapters', () => {
   let gatewayPresent: boolean;
   let appRuntimePresent: boolean;
   let renewLease: jest.Mock;
+  let settings: Map<string, string>;
 
   beforeEach(() => {
     sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-retirement-external-'));
+    settings = new Map();
     managedRoot = path.join(sandbox, 'uploads');
     managedTarget = path.join(managedRoot, 'user-target-user');
     fs.mkdirSync(managedTarget, { recursive: true, mode: 0o700 });
@@ -254,7 +261,13 @@ describe('admin user external-state retirement adapters', () => {
       twoFactorChallenge: authDelegate('twoFactorChallenge'),
       passwordResetToken: authDelegate('passwordResetToken'),
       systemSetting: {
-        findUnique: jest.fn(async () => null),
+        findUnique: jest.fn(async ({ where }: any) => (
+          settings.has(where.key) ? { key: where.key, value: settings.get(where.key) } : null
+        )),
+        upsert: jest.fn(async ({ where, create, update }: any) => {
+          settings.set(where.key, settings.has(where.key) ? update.value : create.value);
+          return { key: where.key, value: settings.get(where.key) };
+        }),
       },
     };
     database.$transaction = jest.fn(async (operation: (tx: any) => Promise<unknown>) => (
@@ -296,6 +309,16 @@ describe('admin user external-state retirement adapters', () => {
           : null
       )),
       attestOpenClawRuntimeFamily: jest.fn(async () => 'current-2026.9.1' as const),
+      // Stock OpenClaw: the closed sessions.delete schema rejects both purge parameters.
+      probeOpenClawSessionPurge: jest.fn(async () => ({
+        result: 'rejected' as const,
+        detail: 'closed sessions.delete params schema',
+      })),
+      forgetOpenClawSessionMemory: jest.fn(async () => ({
+        status: 'forgotten' as const,
+        previewArtifacts: 3,
+        remainingArtifacts: 0,
+      })),
       forgetApp: jest.fn(async () => {
         appRuntimePresent = false;
       }),
@@ -362,16 +385,158 @@ describe('admin user external-state retirement adapters', () => {
     expect(terminateSession).toHaveBeenCalledWith('codex-target-user-1');
     expect(deps.deleteGatewaySession).toHaveBeenCalledWith(
       'agent:portal:host-session',
-      expect.objectContaining({
+      {
         agentId: 'portal',
         expectedSessionId: 'gateway-transcript-1',
-        deleteTranscriptWithoutArchive: true,
+        deleteTranscript: true,
+      },
+    );
+  });
+
+  test('stock OpenClaw deletes with an archive, keeps the receipt, and never unlinks the archive', async () => {
+    const sessionsDir = path.join(sandbox, 'openclaw', 'agents', 'portal', 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const archivedPath = path.join(
+      sessionsDir,
+      'gateway-transcript-1.jsonl.deleted.2026-10-30T00-00-00.000Z',
+    );
+    fs.writeFileSync(archivedPath, '{"type":"session"}\n');
+    const hardDeleteLegacyOpenClawSession = jest.fn(async () => undefined);
+    const deps = dependencies({
+      hardDeleteLegacyOpenClawSession,
+      deleteGatewaySession: jest.fn(async () => {
+        gatewayPresent = false;
+        return { ok: true, deleted: true, archived: [archivedPath] };
       }),
-    );
-    expect(deps.deleteGatewaySession).not.toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ deleteTranscript: true }),
-    );
+    });
+
+    await expect(retireAdminUserExternalState(manifest, runnerContext(), deps))
+      .resolves.toBeUndefined();
+
+    expect(deps.probeOpenClawSessionPurge.mock.calls).toEqual([
+      ['purgeTranscript', 'portal'],
+      ['deleteTranscriptWithoutArchive', 'portal'],
+    ]);
+    expect(deps.deleteGatewaySession).toHaveBeenCalledTimes(1);
+    expect(deps.deleteGatewaySession).toHaveBeenCalledWith('agent:portal:host-session', {
+      agentId: 'portal',
+      expectedSessionId: 'gateway-transcript-1',
+      deleteTranscript: true,
+    });
+    expect(hardDeleteLegacyOpenClawSession).not.toHaveBeenCalled();
+    expect(fs.readFileSync(archivedPath, 'utf8')).toBe('{"type":"session"}\n');
+    expect(deps.forgetOpenClawSessionMemory).toHaveBeenCalledWith({
+      agentId: 'portal',
+      sessionId: 'gateway-transcript-1',
+      sessionKey: 'agent:portal:host-session',
+    });
+    await expect(readAdminUserRetirementOpenClawPrivacy('retirement-1', database)).resolves.toEqual([{
+      agentSessionId: manifest.agentSessions[0].id,
+      agentId: 'portal',
+      sessionId: 'gateway-transcript-1',
+      purgeMode: 'stock-archive',
+      session: 'deleted',
+      transcript: 'archive-retained',
+      archiveCount: 1,
+      memory: { status: 'forgotten', previewArtifacts: 3, remainingArtifacts: 0 },
+    }]);
+    expect(summarizeAdminUserRetirementOpenClawPrivacy(
+      await readAdminUserRetirementOpenClawPrivacy('retirement-1', database),
+    )).toMatchObject({
+      sessions: 1,
+      transcriptsPurged: 0,
+      transcriptArchivesRetained: 1,
+      memoryForgotten: 1,
+      memoryFailed: 0,
+      archiveRetentionNote: expect.stringMatching(/archive retention/),
+    });
+  });
+
+  test('a failed memory forget is recorded while retirement still completes', async () => {
+    const cases: Array<[jest.Mock, string]> = [
+      [jest.fn(async () => ({ status: 'failed', failedStep: 'apply', detail: 'exit 1' })), 'apply'],
+      [jest.fn(async () => {
+        throw new Error('spawn openclaw ENOENT');
+      }), 'preview'],
+    ];
+    for (const [forget, failedStep] of cases) {
+      settings.clear();
+      gatewayPresent = true;
+      appRuntimePresent = true;
+      const deps = dependencies({ forgetOpenClawSessionMemory: forget });
+      await expect(retireAdminUserExternalState(manifest, runnerContext(), deps))
+        .resolves.toBeUndefined();
+      const [recorded] = (await readAdminUserRetirementOpenClawPrivacy('retirement-1', database))!;
+      expect(recorded).toMatchObject({ session: 'deleted', transcript: 'archive-retained' });
+      expect(recorded.memory).toMatchObject({ status: 'failed', failedStep });
+    }
+  });
+
+  test('a resumed retirement keeps the first receipt instead of claiming a purge', async () => {
+    const acceptPatched = jest.fn(async (parameter: string) => ({
+      result: parameter === 'deleteTranscriptWithoutArchive' ? 'accepted' as const : 'rejected' as const,
+      detail: 'test',
+    }));
+    gatewayPresent = false;
+    const deps = dependencies({
+      probeOpenClawSessionPurge: acceptPatched,
+      deleteGatewaySession: jest.fn(async () => ({ ok: true, deleted: false, archived: [] })),
+    });
+    await expect(retireAdminUserExternalState(manifest, runnerContext(), deps))
+      .resolves.toBeUndefined();
+    const [recorded] = (await readAdminUserRetirementOpenClawPrivacy('retirement-1', database))!;
+    expect(recorded).toMatchObject({
+      purgeMode: 'patched-purge',
+      session: 'already-absent',
+      transcript: 'unverified-after-resume',
+    });
+  });
+
+  test('a proven upstream purge option is sent alone and must leave no archive', async () => {
+    const acceptUpstream = jest.fn(async (parameter: string) => ({
+      result: parameter === 'purgeTranscript' ? 'accepted' as const : 'rejected' as const,
+      detail: 'test',
+    }));
+    const deps = dependencies({ probeOpenClawSessionPurge: acceptUpstream });
+
+    await expect(retireAdminUserExternalState(manifest, runnerContext(), deps))
+      .resolves.toBeUndefined();
+
+    expect(acceptUpstream.mock.calls).toEqual([['purgeTranscript', 'portal']]);
+    expect(deps.deleteGatewaySession).toHaveBeenCalledWith('agent:portal:host-session', {
+      agentId: 'portal',
+      expectedSessionId: 'gateway-transcript-1',
+      purgeParameter: 'purgeTranscript',
+    });
+
+    gatewayPresent = true;
+    appRuntimePresent = true;
+    const archiving = dependencies({
+      probeOpenClawSessionPurge: acceptUpstream,
+      deleteGatewaySession: jest.fn(async () => {
+        gatewayPresent = false;
+        return { ok: true, deleted: true, archived: ['/root/.openclaw/agents/portal/sessions/x.deleted'] };
+      }),
+    });
+    await expect(retireAdminUserExternalState(manifest, runnerContext(), archiving))
+      .rejects.toThrow(/produced an archive during atomic hard deletion/i);
+  });
+
+  test('an unconfirmed purge capability refuses before any external mutation', async () => {
+    for (const probe of [
+      jest.fn(async () => ({ result: 'unknown' as const, detail: 'UNAVAILABLE: restarting' })),
+      jest.fn(async () => {
+        throw new Error('socket closed');
+      }),
+    ]) {
+      const deps = dependencies({ probeOpenClawSessionPurge: probe });
+      await expect(retireAdminUserExternalState(manifest, runnerContext(), deps))
+        .rejects.toThrow(/purge capability could not be confirmed/i);
+      expect(deps.forgetApp).not.toHaveBeenCalled();
+      expect(deps.stopApp).not.toHaveBeenCalled();
+      expect(deps.terminateNativeSession).not.toHaveBeenCalled();
+      expect(deps.deleteGatewaySession).not.toHaveBeenCalled();
+    }
   });
 
   test('dispatches retained 7.1 through archive-then-hard-delete and keeps 9.1-only fields off the RPC', async () => {
@@ -456,10 +621,31 @@ describe('admin user external-state retirement adapters', () => {
       manifest,
       runnerContext(),
       unknownDependencies,
-    )).rejects.toThrow(/could not be attested exactly/i);
+    )).rejects.toThrow(/could not be attested exactly$/i);
     expect(unknownDependencies.deleteGatewaySession).not.toHaveBeenCalled();
 
+    // The gate's own refusal reaches the owner in plain words; nothing is mutated.
+    const belowFloorDependencies = dependencies({
+      attestOpenClawRuntimeFamily: jest.fn(async () => {
+        throw new OpenClawLegacySessionPrivacyError(
+          'OpenClaw is not admitted for user retirement: OpenClaw 2026.8.30 is older than the supported floor 2026.9.1.',
+        );
+      }),
+    });
+    await expect(retireAdminUserExternalState(
+      manifest,
+      runnerContext(),
+      belowFloorDependencies,
+    )).rejects.toThrow(/could not be attested exactly: OpenClaw is not admitted for user retirement: OpenClaw 2026\.8\.30 is older than the supported floor/);
+    expect(belowFloorDependencies.deleteGatewaySession).not.toHaveBeenCalled();
+    expect(belowFloorDependencies.probeOpenClawSessionPurge).not.toHaveBeenCalled();
+
     const archiveDependencies = dependencies({
+      // A host still running the retired Portal core patch.
+      probeOpenClawSessionPurge: jest.fn(async (parameter: string) => ({
+        result: parameter === 'deleteTranscriptWithoutArchive' ? 'accepted' as const : 'rejected' as const,
+        detail: 'test',
+      })),
       deleteGatewaySession: jest.fn(async () => {
         gatewayPresent = false;
         return {

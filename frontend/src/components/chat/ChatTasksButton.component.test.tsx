@@ -72,11 +72,11 @@ describe('Current native progress cards', () => {
     expect(screen.queryByRole('dialog', { name: 'Chat tasks' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Tasks, all completed' })).toHaveFocus();
   });
-  it('supports namespaced progress tools, retains a plan on note-only updates, and honors a clear', () => {
+  it('supports namespaced progress tools, replaces a plan on note-only updates, and honors a clear', () => {
     const progress = structuredClone(messages);
     progress[0].toolCalls![0].name = 'functions__progress_card';
     progress[0].toolCalls!.push({ id: 'note', name: 'tools.progress_card', status: 'done', startedAt: 2, arguments: { markdown: 'Still working' } });
-    expect(latestChatPlan(progress)).toHaveLength(3);
+    expect(latestChatPlan(progress)).toHaveLength(0);
     progress[0].toolCalls!.push({ id: 'clear', name: 'progress_card', status: 'done', startedAt: 3, arguments: { plan: [] } });
     expect(latestChatPlan(progress)).toEqual([]);
   });

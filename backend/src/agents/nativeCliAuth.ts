@@ -8,7 +8,7 @@ import {
 } from '../config/unqualifiedNativeBinaryLane';
 import type { AgentProviderName } from './AgentProvider.interface';
 import { getAgentZeroAuthReadinessSnapshot } from './providers/agentZero/AgentZeroAuthSession';
-import { buildNativeCliEnvironment, resolveNativeCliCredentialPaths } from './providers/native/NativeCliEnvironment';
+import { buildNativeCliProbeEnvironment, resolveNativeCliCredentialPaths } from './providers/native/NativeCliEnvironment';
 
 export type NativeCliAuthState = 'not_applicable' | 'authenticated' | 'needs_login' | 'unknown';
 
@@ -253,7 +253,7 @@ function runAntigravityModelsAsync(): Promise<{ ok: boolean; output: string }> {
   return new Promise((resolve) => {
     const child = execFile('agy', ['models'], {
       encoding: 'utf8',
-      env: buildNativeCliEnvironment('GEMINI'),
+      env: buildNativeCliProbeEnvironment('GEMINI'),
       timeout: 8000,
       maxBuffer: 1024 * 1024 * 2,
     }, (error, stdout, stderr) => {

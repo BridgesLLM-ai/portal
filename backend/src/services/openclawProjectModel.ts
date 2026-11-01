@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { execFile } from 'child_process';
 import {
   getSessionInfo,
@@ -314,7 +315,7 @@ function runOpenClawModelsJson(args: string[]): Promise<{
   error?: string;
 }> {
   return new Promise((resolve) => {
-    execFile('/usr/bin/openclaw', ['models', ...args], {
+    execFile(...openClawDiagnosticCommand('/usr/bin/openclaw', ['models', ...args]), {
       encoding: 'utf8',
       timeout: 20_000,
       maxBuffer: 8 * 1024 * 1024,

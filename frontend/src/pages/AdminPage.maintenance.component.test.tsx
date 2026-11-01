@@ -27,6 +27,19 @@ vi.mock('../api/maintenance', () => ({
   },
 }));
 
+vi.mock('../api/maintenanceTools', () => ({
+  maintenanceToolsAPI: {
+    getStatus: vi.fn(async () => ({
+      schema: 'bridgesllm.tools.status.v1', generatedAt: '2026-10-30T12:00:00.000Z',
+      policy: { valid: true, revision: 1, sha256: null, error: null, defaultChannel: 'stable', channels: ['stable'] },
+      runner: { installed: false, reason: 'This installation does not include the per-tool AI updater yet.' },
+      recovery: null, activeRun: null, tools: [], history: [],
+      summary: { status: 'ok', text: 'All installed AI tools are up to date.', counts: {} },
+    })),
+    startRun: vi.fn(),
+  },
+}));
+
 vi.mock('../api/agentJobs', () => ({
   agentJobsAPI: { list: adminMocks.listJobs },
 }));

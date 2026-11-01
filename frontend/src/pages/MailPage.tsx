@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, lazy, Suspense, useContext, useRef } from 'react';
+import { useState, useEffect, useCallback, Suspense, useContext, useRef } from 'react';
+import { lazyWithRecovery } from '../utils/moduleRecovery';
 import { copyTextToClipboard } from '../utils/clipboardCopy';
 import { AnimatePresence, motion } from 'framer-motion';
 import { Link, UNSAFE_NavigationContext, useNavigate } from 'react-router-dom';
@@ -18,8 +19,8 @@ import type {
 import AnchoredPopover from '../components/AnchoredPopover';
 import ViewportModal from '../components/ViewportModal';
 
-const LazyEmailDetail = lazy(() => import('../components/mail/EmailDetail'));
-const LazyComposeModal = lazy(() => import('../components/mail/ComposeModal'));
+const LazyEmailDetail = lazyWithRecovery(() => import('../components/mail/EmailDetail'));
+const LazyComposeModal = lazyWithRecovery(() => import('../components/mail/ComposeModal'));
 
 // ── Main Mail Page ────────────────────────────────────────────
 

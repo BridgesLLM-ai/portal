@@ -30,18 +30,18 @@ Choose **Install** on a new server, or **Update / Repair** when Portal is alread
 
 Ubuntu 22.04+ or Debian 12+ · 3.5 GB RAM (4 GB+ recommended) · 35 GB disk · root or sudo. A domain unlocks HTTPS, mail, and public share links.
 
-## Current release: 5.1.0
+## Current release: 5.2.0
 
-Portal 5.1 updates the AI toolchain and core application while keeping personal provider sign-in, local models, Projects, Apps, mail, and Remote Desktop together.
+Portal 5.2 reworks how compatible AI tools update while keeping personal provider sign-in, local models, Projects, Apps, mail, and Remote Desktop together.
 
-- **Current AI tools and useful model suggestions.** Compatible-tools maintenance installs the release's pinned runtime set. After sign-in, suggestions come from models the runtime actually reports ready; selecting a default remains your choice.
-- **Richer Chat.** Grouped tool activity, visual image attachments for capable models, agent work controls, and sandboxed interactive widgets stay connected to the active conversation.
+- **AI tools that update one at a time, and useful model suggestions.** **Admin > Maintenance** updates each compatible AI tool on its own, with verified downloads and swap-back; OpenClaw updates through its own updater, and the Portal accepts OpenClaw 2026.9.1 and newer releases that provide the gateway features it needs. After sign-in, suggestions come from models the runtime actually reports ready; selecting a default remains your choice.
+- **Richer Chat.** Clear tool activity and progress cards, optional response preferences, and a side workspace keep widgets, code, diagrams and documents connected to the conversation. Floating widgets stay available as you navigate.
 - **Shared browsing.** Hand the shared browser between yourself and your agent, with visible control ownership.
 - **App credentials without readable values.** The owner can add or replace named credentials and restart an App to apply them; saved values are never displayed back in the Portal.
 - **Practical backup controls.** Set schedules and storage limits, review cleanup candidates, and preserve protected backups.
 - **A refreshed workspace.** Updated editor, terminal, charts, document rendering, and dependency families retain the existing upload and Project workflows.
 
-Read the complete [5.1.0 changelog](CHANGELOG.md#510---2026-10-23), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
+Read the complete [5.2.0 changelog](CHANGELOG.md#520---2026-11-01), [update and compatibility guide](docs/UPDATING.md), and [documentation index](docs/README.md). Historical release notes describe their own versions, not the current installation contract.
 
 ## What you get
 
@@ -107,12 +107,12 @@ Either path authenticates the signed release and exact installer, checks backup 
 
 Ordinary Portal updates preserve OpenClaw core, native CLI versions, provider credentials, and runtime data. **Exception:** on supported OpenClaw 9.1/9.2/9.3 installations, an obsolete question plugin is replaced with the compatible native plugin before Portal promotion. That bounded repair may briefly restart the gateway; it is not a core or provider upgrade. Already-compatible installations and the retained 2026.7.1 lane are unchanged by that repair.
 
-The separate Owner-only **Update Compatible AI Tools** action installs the exact tools qualified for the Portal release. It does not follow upstream `latest`. The core bundle is transactional; subsequent optional-harness updates have separate checkpoints and are not one all-or-nothing transaction. Fresh installs provision the release-qualified tools on a supported host.
+AI tools update separately, one at a time, from **Admin > Maintenance**: one card per tool, Owner-only runs, and a confirmation before every update. OpenClaw is updated by its own updater with the Portal's checks before and after; chats pause only during its restart step. Other tool updates never restart the gateway (Ollama restarts its own service). An interrupted run shows a repair button. Fresh installs start on the release's tested versions and update from Maintenance.
 
 ### Before updating
 
 - **Back up and verify first.** Review the [backup scope and recovery guide](docs/BACKUP_AND_RECOVERY.md); use a VPS snapshot for whole-server recovery.
-- **Portal first, compatible tools second.** Review [current pins, Node requirements, downtime, and recovery](docs/UPDATING.md). The Node version supported by Portal alone is not necessarily sufficient for the newer OpenClaw bundle.
+- **Portal first, AI tools second.** Review [the Maintenance page, Node requirements, downtime, and recovery](docs/UPDATING.md). The Node version supported by Portal alone is not necessarily sufficient for a newer OpenClaw.
 - **Provider access remains account-dependent.** Installing a runtime does not sign in, grant model entitlement, or change your chosen default model.
 - **Do not bypass interrupted-update records.** Resolve the reported condition; do not delete journals, fences, or provider authentication to make a retry pass.
 - **Native DeepSeek remains unavailable.** DeepSeek API models through supported providers are a separate path from the disabled native harness.

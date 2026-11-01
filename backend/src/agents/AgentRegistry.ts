@@ -44,6 +44,8 @@ export interface RegisteredProviderInfo {
   nativeAuthMessage?: string;
   nativeAuthLoginCommand?: string;
   requiresSeparateNativeLogin?: boolean;
+  /** Installed but refused only for its version; an update in Maintenance fixes it. */
+  versionRefused?: true;
   capabilities: ProviderCapabilitySummary;
 }
 
@@ -163,6 +165,7 @@ function registeredProviderInfo(
     nativeAuthMessage: availability.nativeAuthMessage,
     nativeAuthLoginCommand: availability.nativeAuthLoginCommand,
     requiresSeparateNativeLogin: availability.requiresSeparateNativeLogin,
+    ...(availability.versionRefused ? { versionRefused: true as const } : {}),
     capabilities: availability.capabilities,
   };
 }

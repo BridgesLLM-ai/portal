@@ -1411,6 +1411,23 @@ const ToolCallPill = React.memo(function ToolCallPill({ tool }: { tool: ToolCall
   return <ToolCard tool={tool} />;
 });
 
+/**
+ * Project Chat does not admit inline widgets. A show_widget call still keeps
+ * its own visible row at its original position and says it was not rendered.
+ */
+function ProjectWidgetBoundary({ tool }: { tool: ToolCall }) {
+  const title = typeof tool.arguments?.title === 'string' ? tool.arguments.title.trim().slice(0, 80) : '';
+  return (
+    <div data-project-widget-boundary={tool.id}>
+      <ToolCallPill tool={tool} />
+      <p className="px-3 pb-1 text-center text-[10px] text-slate-500">
+        {title ? `Widget “${title}”: ` : ''}
+        Inline widgets aren&apos;t available in Project Chat, so this widget isn&apos;t shown here.
+      </p>
+    </div>
+  );
+}
+
 function renderProjectGroupMember(tool: ToolCall): React.ReactNode {
   return <ToolCallPill tool={tool} />;
 }
@@ -1422,7 +1439,11 @@ function renderProjectActivityUnit<B>(
   renderBoundary: (value: B, key: string) => React.ReactNode,
 ): React.ReactNode {
   if (unit.kind === 'boundary') return renderBoundary(unit.value, unit.key);
-  if (unit.kind === 'tool') return <ToolCallPill key={`${keyPrefix}-${unit.key}`} tool={unit.tool} />;
+  if (unit.kind === 'tool') {
+    return unit.reason === 'widget'
+      ? <ProjectWidgetBoundary key={`${keyPrefix}-${unit.key}`} tool={unit.tool} />
+      : <ToolCallPill key={`${keyPrefix}-${unit.key}`} tool={unit.tool} />;
+  }
   return (
     <ToolActivityGroup
       key={`${keyPrefix}-${unit.key}`}
@@ -7175,8 +7196,8 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
       transition={{ duration: 0.15 }}
       className={isMobile
-        ? 'flex h-full w-full flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
-        : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/95 backdrop-blur-sm'}
+        ? 'chat-canvas flex h-full w-full flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
+        : 'chat-canvas min-w-0 border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/95 backdrop-blur-sm'}
     >
       <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
@@ -7255,8 +7276,8 @@ export default function ProjectChatPanel({ projectName, onClose, onProjectPrepar
       exit={isMobile ? { opacity: 0, x: '100%' } : { width: 0, opacity: 0 }}
       transition={{ duration: 0.15 }}
       className={isMobile
-        ? 'flex h-full w-full flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
-        : 'border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/95 backdrop-blur-sm'}
+        ? 'chat-canvas flex h-full w-full flex-col overflow-hidden bg-[#080B20]/98 backdrop-blur-sm'
+        : 'chat-canvas min-w-0 border-l border-white/5 flex flex-col overflow-hidden flex-shrink-0 bg-[#080B20]/95 backdrop-blur-sm'}
       onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
       onDragLeave={() => setDragOver(false)}
       onDrop={handleDrop}

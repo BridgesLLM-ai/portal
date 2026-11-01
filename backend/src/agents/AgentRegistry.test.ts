@@ -278,6 +278,20 @@ describe('AgentRegistry fail-soft provider catalog', () => {
     });
   });
 
+  test('carries a version refusal to the harness catalog only when availability reports one', async () => {
+    mockedGetProviderCatalogAvailabilityAsync.mockImplementation(async (name) => (name === 'OLLAMA'
+      ? { ...availability(name), usable: false, versionRefused: true as const,
+        reason: "Portal refuses this Ollama runtime: version 0.33.3 is older than the Portal's supported floor 0.40.6." }
+      : availability(name)));
+
+    const harnesses = await AgentRegistry.listHarnessesAsync();
+
+    expect(harnesses.find((harness) => harness.harnessId === 'OLLAMA')).toMatchObject({
+      availabilityState: 'ready', installed: true, usable: false, versionRefused: true,
+    });
+    expect(harnesses.find((harness) => harness.harnessId === 'CODEX')).not.toHaveProperty('versionRefused');
+  });
+
   test('returns fast rows while one probe hangs and another fails', async () => {
     jest.useFakeTimers();
     let resolveGemini!: (value: ReturnType<typeof availability>) => void;

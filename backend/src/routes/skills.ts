@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { Router, type Application, type Request as ExpressRequest, type Response } from 'express';
 // These routes use scalar :parameters; named wildcard handlers declare arrays explicitly.
 type Request = ExpressRequest<Record<string, string>>;
@@ -48,7 +49,7 @@ function runCli(
   environmentOverrides: NodeJS.ProcessEnv = {},
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(command, args, {
+    execFile(...openClawDiagnosticCommand(command, args), {
       timeout,
       encoding: 'utf-8',
       maxBuffer: 10 * 1024 * 1024,

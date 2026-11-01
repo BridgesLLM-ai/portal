@@ -28,6 +28,39 @@ import {
   type NativeHostCliStatusTool,
 } from '../services/nativeHostCliStatus';
 import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import {
+  OPENCLAW_UPDATE_CONFIRMATION,
+  RUNNABLE_TOOLS,
+  TOOLS_REQUEST_SCHEMA,
+  TOOLS_RUN_ACTIONS_BY_TOOL,
+  TOOLS_RUN_TARGETS,
+  NEWEST_NOT_OFFERED_MESSAGE,
+  newestOffered,
+  ToolsStatusService,
+  allowedRunActions,
+  buildToolsStatus,
+  isToolsRunAction,
+  isToolsRunTool,
+  compareVersions,
+  markToolsRunLaunchFailed,
+  readToolPolicy,
+  readToolsRunReport,
+  readToolsRunnerState,
+  readToolsSnapshot,
+  startToolsReconcile,
+  systemdToolsRunLauncher,
+  systemdToolsRunStopper,
+  TOOLS_RUN_ID_PATTERN,
+  toolsStatusService,
+  writeToolsRunRequest,
+  type ToolsRunLauncher,
+  type ToolsRunStopper,
+  type ToolsRunRequest,
+  type ToolsStatus,
+  type ToolStatusItem,
+  type ToolsUnitStarter,
+} from '../services/toolsStatus';
+import { getCompatibleAiPrerequisites, type CompatibleAiPrerequisites } from '../services/compatibleAiPrerequisites';
 
 type MaintenanceSeverity = 'healthy' | 'info' | 'warning' | 'critical';
 type MaintenanceActionRisk = 'safe' | 'scheduled' | 'manual';
@@ -757,8 +790,13 @@ type OpenClawCompatibilitySnapshot = Pick<OpenClawSetupReadiness,
   | 'blockers'
 >;
 
+/**
+ * `aiTool`: the AI tools list's OpenClaw item. Its floor and deny-list verdict is the one source of truth for
+ * "update required" (F6): a contract-compatible pair below the minimum is never "OK" here.
+ */
 export function buildOpenClawMaintenanceComponent(
   readiness: OpenClawCompatibilitySnapshot,
+  aiTool: Pick<ToolStatusItem, 'status' | 'statusReason' | 'floor' | 'heldForLaterRelease'> | null = null,
 ): MaintenanceCompatibilityComponent {
   const pairBlockerCodes = new Set([
     'not-installed',
@@ -766,6 +804,8 @@ export function buildOpenClawMaintenanceComponent(
     'cli-runtime-mismatch',
     'gateway-rpc-unavailable',
     'gateway-runtime-mismatch',
+    'gateway-contract-mismatch',
+    'gateway-contract-unverified',
     'codex-plugin-mismatch',
     'codex-plugin-inspect-timeout',
   ]);
@@ -779,10 +819,18 @@ export function buildOpenClawMaintenanceComponent(
     `Codex ${readiness.codexPluginVersion || 'unknown'}`,
   ].join(' · ');
   const supportedSummary = [
+    ...(aiTool ? [`minimum ${aiTool.floor}`] : []),
     `core ${readiness.testedCorePackageVersion}`,
     `runtime ${readiness.testedRuntimeVersion}`,
     `Codex ${readiness.testedCodexPluginVersion}`,
   ].join(' · ');
+  const updateRequired = readiness.installed && aiTool && (aiTool.status === 'below-floor' || aiTool.status === 'blocked')
+    // While the OpenClaw core update is held for a later Portal release, its reason already says so: no "Update it".
+    ? `${aiTool.statusReason.replace(/^Update required: /, '').replace(/\.?$/, '.')}${aiTool.heldForLaterRelease ? '' : ' Update it under AI tools.'}`
+    : null;
+  const pairNote = readiness.testedPairReady
+    ? 'Installed core, CLI, running gateway, and Codex plugin are one supported release with the Portal contract.'
+    : (pairBlockers.join(' ') || 'The installed OpenClaw pair could not be verified.');
 
   return {
     id: 'openclaw',
@@ -790,23 +838,37 @@ export function buildOpenClawMaintenanceComponent(
     installedVersion: readiness.installed ? installedSummary : null,
     supportedVersion: supportedSummary,
     policy: 'known-compatible',
-    status: !readiness.installed ? 'unknown' : (readiness.testedPairReady ? 'ok' : 'blocked'),
-    note: readiness.testedPairReady
-      ? 'Installed core, running gateway, and Codex plugin match the exact Portal-tested pair.'
-      : (pairBlockers.join(' ') || 'The installed OpenClaw pair could not be verified.'),
+    status: !readiness.installed ? 'unknown' : (readiness.testedPairReady && !updateRequired ? 'ok' : 'blocked'),
+    note: updateRequired
+      ? `${readiness.testedPairReady ? 'Portal contract OK, but ' : `${pairNote} `}${updateRequired}`
+      : pairNote,
   };
 }
 
+/**
+ * Floor/capability wording (updater v2, b.1): a verified install at or above the
+ * policy floor is compatible. Without a readable policy the release's tested
+ * version is the only reference, as before.
+ */
 export function buildNativeCliMaintenanceComponent(
   toolId: NativeHostCliStatusTool,
   label: string,
   expectedVersion: string,
   observed: NativeHostCliStatus,
+  versions: { floor: string; tested: string } | null = null,
 ): MaintenanceCompatibilityComponent {
-  const exact = observed.executionEligible
-    && observed.state === 'verified'
-    && observed.observedVersion === expectedVersion;
-  const status: MaintenanceCompatibilityComponent['status'] = exact
+  const verified = observed.executionEligible && observed.state === 'verified';
+  let meetsFloor = false;
+  if (verified && observed.observedVersion) {
+    try {
+      meetsFloor = versions
+        ? compareVersions(observed.observedVersion, versions.floor) >= 0
+        : observed.observedVersion === expectedVersion;
+    } catch {
+      meetsFloor = false;
+    }
+  }
+  const status: MaintenanceCompatibilityComponent['status'] = meetsFloor
     ? 'ok'
     : observed.state === 'indeterminate'
       ? 'unknown'
@@ -815,12 +877,14 @@ export function buildNativeCliMaintenanceComponent(
     id: toolId,
     label,
     installedVersion: observed.observedVersion,
-    supportedVersion: `Exact Portal-qualified ${expectedVersion}`,
+    supportedVersion: versions ? `Minimum ${versions.floor} · tested ${versions.tested}` : `Tested ${expectedVersion}`,
     policy: 'known-compatible',
     status,
-    note: exact
-      ? `The complete root-owned ${label} package tree matches the Portal admission catalog.`
-      : `Portal cannot admit this ${label} package as the exact ${expectedVersion} compatibility target (${observed.reasonCode || observed.state}).`,
+    note: meetsFloor
+      ? `The installed ${label} is verified and meets the Portal's minimum version and required checks.`
+      : verified && observed.observedVersion
+        ? `${label} ${observed.observedVersion} is older than the Portal's minimum ${versions?.floor || expectedVersion}.`
+        : `Portal could not verify the installed ${label} (${observed.reasonCode || observed.state}).`,
   };
 }
 
@@ -831,12 +895,37 @@ const COMPATIBILITY_BUNDLE_COMPONENT_IDS = new Set([
   'clawhub',
 ]);
 
+export function buildCompatibleAiNodeComponent(prerequisite: CompatibleAiPrerequisites): MaintenanceCompatibilityComponent {
+  return {
+    id: 'node-ai-prerequisite',
+    label: 'Node.js prerequisite for AI tools',
+    installedVersion: prerequisite.nodeVersion,
+    supportedVersion: prerequisite.requiredNodeRange,
+    policy: 'manual-review',
+    status: prerequisite.ready ? 'ok' : (prerequisite.code === 'NODE_CHECK_UNAVAILABLE' ? 'unknown' : 'blocked'),
+    note: prerequisite.message,
+  };
+}
+
 export function buildCompatibleAiToolsIssue(
   compatibility: MaintenanceCompatibility,
 ): MaintenanceIssue | null {
   const mismatches = compatibility.components.filter((component) => (
     COMPATIBILITY_BUNDLE_COMPONENT_IDS.has(component.id) && component.status !== 'ok'
   ));
+  const node = compatibility.components.find((component) => component.id === 'node-ai-prerequisite');
+  if (node && node.status !== 'ok') {
+    return {
+      id: 'compatible-ai-tools-prerequisite-required',
+      title: 'Resolve the Node.js prerequisite before updating AI tools',
+      detail: node.note,
+      severity: 'warning',
+      category: 'updates',
+      recommendation: node.note,
+      downtimeExpected: false,
+      automationSafe: false,
+    };
+  }
   if (mismatches.length === 0) return null;
   return {
     id: 'compatible-ai-tools-update-required',
@@ -855,6 +944,11 @@ export function buildCompatibleAiToolsIssue(
 
 async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
   const root = portalRoot();
+  const toolPolicy = readToolPolicy();
+  const policyVersions = (toolId: string) => {
+    const entry = toolPolicy?.tools.find((tool) => tool.id === toolId);
+    return entry ? { floor: entry.floor, tested: entry.newestProven.version } : null;
+  };
   const [
     openClawReadiness,
     caddyVersion,
@@ -863,6 +957,8 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
     codexStatus,
     claudeStatus,
     clawhubStatus,
+    aiPrerequisites,
+    openClawAiTool,
   ] = await Promise.all([
     // A diagnostic surface: keep the one-minute freshness it always had rather
     // than the long-lived result the chat request paths are served.
@@ -873,6 +969,9 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
     getNativeHostCliStatus('codex'),
     getNativeHostCliStatus('claude-code'),
     getNativeHostCliStatus('clawhub'),
+    getCompatibleAiPrerequisites(),
+    // The AI tools list's own OpenClaw verdict (F6); without it the pair check stands alone, as before.
+    toolsStatusService.get().then((tools) => tools.tools.find((tool) => tool.id === 'openclaw') || null, () => null),
   ]);
 
   // A pending Caddy update only exists when apt's candidate differs from the
@@ -893,24 +992,28 @@ async function getCompatibilityState(): Promise<MaintenanceCompatibility> {
     summary: 'Automation is limited to known-safe maintenance. Broad package and managed-component upgrades require a generated plan before execution.',
     components: [
       buildPortalMaintenanceComponent(portalCompatibilitySnapshot(root)),
-      buildOpenClawMaintenanceComponent(openClawReadiness),
+      buildCompatibleAiNodeComponent(aiPrerequisites),
+      buildOpenClawMaintenanceComponent(openClawReadiness, openClawAiTool),
       buildNativeCliMaintenanceComponent(
         'codex',
         'Codex CLI',
         PORTAL_TOOL_VERSIONS.codexCli,
         codexStatus,
+        policyVersions('codex'),
       ),
       buildNativeCliMaintenanceComponent(
         'claude-code',
         'Claude Code',
         PORTAL_TOOL_VERSIONS.claudeCode,
         claudeStatus,
+        policyVersions('claude-code'),
       ),
       buildNativeCliMaintenanceComponent(
         'clawhub',
         'ClawHub CLI',
         PORTAL_TOOL_VERSIONS.clawhub,
         clawhubStatus,
+        policyVersions('clawhub'),
       ),
       {
         id: 'stalwart',
@@ -1534,7 +1637,10 @@ async function collectMaintenanceStatus() {
     : [];
 
   const issues: MaintenanceIssue[] = [];
-  const compatibleAiToolsIssue = buildCompatibleAiToolsIssue(compatibility);
+  // With the per-tool updater installed, each AI tool card carries its own state
+  // and update; the old all-tools bundle item would offer a second update path.
+  const toolsRunner = readToolsRunnerState();
+  const compatibleAiToolsIssue = toolsRunner.installed ? null : buildCompatibleAiToolsIssue(compatibility);
   if (compatibleAiToolsIssue) issues.push(compatibleAiToolsIssue);
 
   if (apt.available && apt.cacheAgeHours !== null && apt.cacheAgeHours > 48) {
@@ -1701,7 +1807,8 @@ async function collectMaintenanceStatus() {
     services,
     reboot: { required: rebootRequired, packages: rebootPackages },
     compatibility,
-    actions: Object.values(ACTIONS).map(({ command: _command, title: _title, ...action }) => action),
+    actions: publicMaintenanceActions(toolsRunner.installed),
+    toolsUpdater: { installed: toolsRunner.installed },
     issues,
   };
 }
@@ -1815,8 +1922,13 @@ const maintenanceRefreshCoordinator = new MaintenanceRefreshCoordinator(collectM
   onError: (error) => console.error('[system-maintenance] background refresh failed:', error),
 });
 
-function publicMaintenanceActions(): MaintenanceAction[] {
-  return Object.values(ACTIONS).map(({ command: _command, title: _title, ...action }) => action);
+/** The old all-tools action is hidden once the per-tool updater is installed (one update path). */
+export const LEGACY_AI_TOOLS_ACTION_ID = 'update-compatible-ai-tools';
+
+function publicMaintenanceActions(toolsRunnerInstalled = readToolsRunnerState().installed): MaintenanceAction[] {
+  return Object.values(ACTIONS)
+    .filter((action) => !(toolsRunnerInstalled && action.id === LEGACY_AI_TOOLS_ACTION_ID))
+    .map(({ command: _command, title: _title, ...action }) => action);
 }
 
 export function maintenanceActionCanRun(role: string | null | undefined, action: Pick<MaintenanceAction, 'requiresOwner'>): boolean {
@@ -1905,6 +2017,388 @@ export function createMaintenanceStatusHandler(
 
 router.get('/', createMaintenanceStatusHandler());
 
+// ---------------------------------------------------------------------------
+// Updater v2: per-tool status and runs (DESIGN g.1, a.3). Status is read from
+// the files the root-side runner writes; a run is queued as a private request
+// and executed by bridgesllm-tools@<runId>.service, outside this process.
+// ---------------------------------------------------------------------------
+
+export function createToolsStatusHandler(
+  service: ToolsStatusService = toolsStatusService,
+): (req: Request, res: Response) => Promise<void> {
+  return async (req: Request, res: Response) => {
+    try {
+      const force = ['1', 'true', 'yes'].includes(String(req.query.refresh || '').toLowerCase());
+      res.json(await service.get(force));
+    } catch (error: any) {
+      console.error('[system-maintenance] tools status failed:', error);
+      res.status(500).json({ error: 'AI tools status could not be read.' });
+    }
+  };
+}
+
+export type ToolsRunHandlerDependencies = {
+  statusService?: ToolsStatusService;
+  launcher?: ToolsRunLauncher;
+  acquireAdmission?: typeof acquireMaintenanceActionAdmission;
+  inspectBackup?: () => Promise<MaintenanceBackupAdmissionResult>;
+  newRunId?: () => string;
+  nowMs?: () => number;
+  portalVersion?: () => string | null;
+};
+
+export function createToolsRunHandler(
+  dependencies: ToolsRunHandlerDependencies = {},
+): (req: Request, res: Response) => Promise<void> {
+  const statusService = dependencies.statusService || toolsStatusService;
+  const launcher = dependencies.launcher || systemdToolsRunLauncher;
+  const acquireAdmission = dependencies.acquireAdmission || acquireMaintenanceActionAdmission;
+  const inspectBackup = dependencies.inspectBackup || (() => inspectMaintenanceBackupAdmission());
+  const newRunId = dependencies.newRunId || (() => crypto.randomUUID());
+  const nowMs = dependencies.nowMs || Date.now;
+  const portalVersion = dependencies.portalVersion || (() => portalCompatibilitySnapshot(portalRoot()).packageVersion);
+
+  return async (req: Request, res: Response) => {
+    try {
+      if (!isOwnerRole(req.user?.role)) {
+        res.status(403).json({ error: 'Owner access is required for maintenance actions that change the server.' });
+        return;
+      }
+      const body = (req.body && typeof req.body === 'object') ? req.body : {};
+      const tool = String(body.tool || '');
+      const action = body.action === undefined ? 'update' : String(body.action);
+      const target = body.target === undefined ? 'recommended' : String(body.target);
+      if (!isToolsRunAction(action)) {
+        res.status(400).json({ error: 'Unknown tools action.', code: 'TOOLS_ACTION_INVALID' });
+        return;
+      }
+      if (!(TOOLS_RUN_TARGETS as readonly string[]).includes(target)) {
+        res.status(400).json({ error: 'Choose the recommended or the newest version.', code: 'TOOLS_TARGET_INVALID' });
+        return;
+      }
+      if (action === 'install' && target !== 'recommended') {
+        res.status(400).json({ error: 'Install installs the recommended version only.', code: 'TOOLS_TARGET_INVALID' });
+        return;
+      }
+      if (!isToolsRunTool(tool) || !RUNNABLE_TOOLS.has(tool)) {
+        res.status(400).json({ error: 'This Portal version cannot update that tool yet.', code: 'TOOL_NOT_SUPPORTED' });
+        return;
+      }
+      if (!TOOLS_RUN_ACTIONS_BY_TOOL[tool].includes(action)) {
+        res.status(400).json({ error: `That action is not available for ${tool}.`, code: 'TOOLS_ACTION_INVALID' });
+        return;
+      }
+      // 5.2.0: only the npm CLIs update to the newest release (toolctl refuses it for the others too).
+      if (action === 'update' && target === 'newest' && !newestOffered(tool)) {
+        res.status(400).json({ error: NEWEST_NOT_OFFERED_MESSAGE, code: 'NEWEST_NOT_OFFERED' });
+        return;
+      }
+      const acknowledgements = body.acknowledgements === undefined || body.acknowledgements === null ? {} : body.acknowledgements;
+      const nodeRuntime = typeof acknowledgements === 'object' ? (acknowledgements as any).nodeRuntime : undefined;
+      if (typeof acknowledgements !== 'object' || Array.isArray(acknowledgements)
+        || (nodeRuntime !== undefined && typeof nodeRuntime !== 'boolean')
+        || (nodeRuntime === true && !(tool === 'openclaw' && action === 'update'))) {
+        res.status(400).json({ error: 'The Node.js update can only be added to an OpenClaw update.', code: 'TOOLS_ACKNOWLEDGEMENT_INVALID' });
+        return;
+      }
+      const core = tool === 'openclaw';
+      if (!core && body.channel !== undefined && body.channel !== null) {
+        res.status(400).json({ error: 'Only OpenClaw has update channels.', code: 'TOOLS_CHANNEL_INVALID' });
+        return;
+      }
+      if (action === 'update' && core) {
+        if (!isTypedConfirmationMatch(OPENCLAW_UPDATE_CONFIRMATION, body.confirmation)) {
+          res.status(400).json({
+            error: `Type ${OPENCLAW_UPDATE_CONFIRMATION} to confirm this server change.`,
+            confirmationPhrase: OPENCLAW_UPDATE_CONFIRMATION,
+          });
+          return;
+        }
+        if (body.maintenanceWindowAcknowledged !== true) {
+          res.status(400).json({
+            error: 'Acknowledge that an approved maintenance window is active before starting this action.',
+            code: 'MAINTENANCE_WINDOW_REQUIRED',
+            requiresMaintenanceWindow: true,
+          });
+          return;
+        }
+      } else if (action === 'update' || action === 'install' || action === 'recover-native') {
+        // g.2: a CLI update or install (no OpenClaw restart) and the repair run need a single explicit confirm.
+        if (body.confirmed !== true) {
+          res.status(400).json({ error: 'Confirm this server change first.', code: 'CONFIRMATION_REQUIRED' });
+          return;
+        }
+      }
+
+      const runRefusal = (current: ToolsStatus): { status: number; payload: Record<string, unknown> } | null => {
+        if (current.activeRun) {
+          return { status: 409, payload: { error: 'Another maintenance operation is running.', code: 'MAINTENANCE_BUSY', activeRun: current.activeRun } };
+        }
+        if (current.recovery && !allowedRunActions(tool, current).includes(action)) {
+          return { status: 409, payload: { error: `${current.recovery.title} ${current.recovery.action.label} first.`, code: 'RECOVERY_REQUIRED', recovery: current.recovery } };
+        }
+        if (!current.recovery && action === 'recover-native') {
+          return { status: 409, payload: { error: 'OpenClaw has no recovery waiting.', code: 'NOTHING_TO_RECOVER' } };
+        }
+        const item = current.tools.find((candidate) => candidate.id === tool);
+        if (!item || !item.runActions.includes(action)) {
+          return {
+            status: 409,
+            payload: { error: `That is not available for ${item?.label || tool} right now. ${item?.statusReason || ''}`.trim(), code: 'TOOLS_ACTION_UNAVAILABLE' },
+          };
+        }
+        return null;
+      };
+
+      const status = await statusService.get(true);
+      if (!status.policy.valid) {
+        res.status(503).json({ error: 'This Portal\'s tool policy could not be read.', code: 'TOOLS_POLICY_INVALID' });
+        return;
+      }
+      if (!status.runner.installed) {
+        res.status(503).json({
+          error: `${status.runner.reason || 'The per-tool AI updater is not installed.'} Use Update Compatible AI Tools instead.`,
+          code: 'TOOLS_RUNNER_NOT_INSTALLED',
+        });
+        return;
+      }
+      const refusal = runRefusal(status);
+      if (refusal) {
+        res.status(refusal.status).json(refusal.payload);
+        return;
+      }
+      const channel = !core
+        ? null
+        : body.channel === undefined || body.channel === null ? status.policy.defaultChannel : String(body.channel);
+      if (core && (!channel || !status.policy.channels.includes(channel))) {
+        res.status(400).json({ error: 'Choose an OpenClaw channel this Portal offers.', code: 'TOOLS_CHANNEL_INVALID' });
+        return;
+      }
+
+      const admission = await acquireAdmission();
+      try {
+        let backup: ToolsRunRequest['backup'] = null;
+        if (action === 'update' && core) {
+          const backupAdmission = await inspectBackup();
+          if (!backupAdmission.backup) {
+            res.status(409).json(maintenanceBackupRejectionPayload(backupAdmission));
+            return;
+          }
+          backup = { path: backupAdmission.backup.path, receiptDigest: backupAdmission.backup.receiptDigest };
+        }
+        // Re-read the files under admission, bypassing the cache: a ledger
+        // opened or a run queued since the first read still wins (P7).
+        const paths = statusService.paths;
+        const fresh = buildToolsStatus(readToolsSnapshot(paths, nowMs()));
+        const freshRefusal = runRefusal(fresh);
+        if (freshRefusal) {
+          statusService.invalidate();
+          res.status(freshRefusal.status).json(freshRefusal.payload);
+          return;
+        }
+
+        const runId = newRunId();
+        const requestedAt = new Date(nowMs()).toISOString();
+        const request: ToolsRunRequest = {
+          schema: TOOLS_REQUEST_SCHEMA,
+          runId,
+          tool,
+          action,
+          target: target as ToolsRunRequest['target'],
+          channel,
+          requestedBy: req.user!.userId,
+          requestedAt,
+          portalVersion: portalVersion(),
+          policySha256: status.policy.sha256,
+          acknowledgements: {
+            confirmation: action === 'update' || action === 'install' || action === 'recover-native',
+            maintenanceWindow: action === 'update' && core,
+            ...(core && action === 'update' ? { nodeRuntime: nodeRuntime === true } : {}),
+          },
+          backup,
+        };
+        const queued = writeToolsRunRequest(paths, request);
+        statusService.invalidate();
+        try {
+          await launcher(runId);
+        } catch (error: any) {
+          markToolsRunLaunchFailed(paths, runId, String(error?.message || error), new Date(nowMs()).toISOString());
+          statusService.invalidate();
+          res.status(503).json({
+            error: `The ${action === 'install' ? 'installation' : 'update'} could not be started. Nothing was changed.`,
+            code: 'TOOLS_RUN_LAUNCH_FAILED',
+            runId,
+          });
+          return;
+        }
+        res.status(202).json({
+          runId,
+          run: queued,
+          request: { tool, action, target, channel, requestedAt, acknowledgements: request.acknowledgements },
+          preflight: { maintenanceWindowAcknowledged: action === 'update' && core, backup },
+        });
+      } finally {
+        admission.release();
+      }
+    } catch (error: any) {
+      console.error('[system-maintenance] tools run failed:', error);
+      if (error instanceof MaintenanceAdmissionError) {
+        res.status(error.statusCode).json({ error: error.message, code: error.code, activeJob: error.activeJob });
+        return;
+      }
+      res.status(500).json({ error: 'Failed to start the AI tools run.' });
+    }
+  };
+}
+
+/** g.4 report link: owner-only, one run's status record and evidence file names. */
+export function createToolsRunReportHandler(
+  service: ToolsStatusService = toolsStatusService,
+): (req: Request, res: Response) => void {
+  return (req: Request, res: Response) => {
+    if (!isOwnerRole(req.user?.role)) {
+      res.status(403).json({ error: 'Owner access is required to read update reports.' });
+      return;
+    }
+    const report = readToolsRunReport(service.paths, String(req.params.runId || ''));
+    if (!report) {
+      res.status(404).json({ error: 'That update report was not found.', code: 'TOOLS_RUN_NOT_FOUND' });
+      return;
+    }
+    res.json(report);
+  };
+}
+
+/**
+ * Stop the running tools update (owner-only). Refused, with nothing stopped, while the run is in a step a
+ * stop must not interrupt (`activeRun.stopRefusal`, from the run status just read again).
+ */
+export function createToolsRunStopHandler(
+  dependencies: { statusService?: ToolsStatusService; stopper?: ToolsRunStopper } = {},
+): (req: Request, res: Response) => Promise<void> {
+  const statusService = dependencies.statusService || toolsStatusService;
+  const stopper = dependencies.stopper || systemdToolsRunStopper;
+  return async (req: Request, res: Response) => {
+    try {
+      if (!isOwnerRole(req.user?.role)) {
+        res.status(403).json({ error: 'Owner access is required to stop an update.' });
+        return;
+      }
+      const runId = String(req.params.runId || '');
+      if (!TOOLS_RUN_ID_PATTERN.test(runId)) {
+        res.status(404).json({ error: 'That update was not found. Nothing was stopped.', code: 'TOOLS_RUN_NOT_FOUND' });
+        return;
+      }
+      const run = (await statusService.get(true)).activeRun;
+      if (!run || run.runId !== runId) {
+        res.status(409).json({ error: 'That update is not running. Nothing was stopped.', code: 'TOOLS_RUN_NOT_ACTIVE' });
+        return;
+      }
+      if (run.stopRefusal) {
+        res.status(409).json({ error: `${run.stopRefusal} Nothing was stopped.`, code: 'TOOLS_STOP_UNAVAILABLE', step: run.phase });
+        return;
+      }
+      await stopper(runId);
+      statusService.invalidate();
+      res.status(202).json({ runId, stopping: true });
+    } catch (error: any) {
+      console.error('[system-maintenance] tools stop failed:', error);
+      res.status(503).json({ error: 'The stop request could not be sent. Nothing was stopped.', code: 'TOOLS_STOP_FAILED' });
+    }
+  };
+}
+
+/**
+ * "Check interrupted update" (owner-only): a tools run whose runner is gone stays open until toolctl reconcile
+ * settles it, which otherwise runs only at boot and at Portal start. Starts the same reconcile unit, argv only,
+ * and only while that is the open recovery (read again under admission).
+ */
+export function createToolsReconcileHandler(
+  dependencies: {
+    statusService?: ToolsStatusService;
+    acquireAdmission?: typeof acquireMaintenanceActionAdmission;
+    starter?: ToolsUnitStarter;
+    nowMs?: () => number;
+  } = {},
+): (req: Request, res: Response) => Promise<void> {
+  const statusService = dependencies.statusService || toolsStatusService;
+  const acquireAdmission = dependencies.acquireAdmission || acquireMaintenanceActionAdmission;
+  const nowMs = dependencies.nowMs || Date.now;
+  return async (req: Request, res: Response) => {
+    try {
+      if (!isOwnerRole(req.user?.role)) {
+        res.status(403).json({ error: 'Owner access is required for maintenance actions that change the server.' });
+        return;
+      }
+      const admission = await acquireAdmission();
+      try {
+        const fresh = buildToolsStatus(readToolsSnapshot(statusService.paths, nowMs()));
+        if (!fresh.runner.installed) {
+          res.status(503).json({
+            error: `${fresh.runner.reason || 'The per-tool AI updater is not installed.'} Nothing was started.`,
+            code: 'TOOLS_RUNNER_NOT_INSTALLED',
+          });
+          return;
+        }
+        if (fresh.recovery?.action.id !== 'reconcile-tools-run') {
+          statusService.invalidate();
+          res.status(409).json({ error: 'No interrupted AI tools update is waiting to be checked.', code: 'NOTHING_TO_RECONCILE', recovery: fresh.recovery });
+          return;
+        }
+        await startToolsReconcile(dependencies.starter);
+        statusService.invalidate();
+        res.status(202).json({ started: true, runId: fresh.recovery.runId ?? null });
+      } finally {
+        admission.release();
+      }
+    } catch (error: any) {
+      console.error('[system-maintenance] tools reconcile failed:', error);
+      if (error instanceof MaintenanceAdmissionError) {
+        res.status(error.statusCode).json({ error: error.message, code: error.code, activeJob: error.activeJob });
+        return;
+      }
+      res.status(503).json({ error: 'The check could not be started. Nothing was changed.', code: 'TOOLS_RECONCILE_START_FAILED' });
+    }
+  };
+}
+
+/**
+ * A tools run executes in its own unit after its admission is released, so the AgentJob admission cannot see it:
+ * other maintenance waits for it here, read fresh from the run files. That read is local and bounded, and each file
+ * read in it already reads as absent on error, so a read that still throws leaves the state unknown: fail closed.
+ */
+export function toolsRunBusyRefusal(
+  readStatus: () => ToolsStatus = () => buildToolsStatus(readToolsSnapshot(toolsStatusService.paths, Date.now())),
+): { status: 409 | 503; payload: Record<string, unknown> } | null {
+  let activeRun: ToolsStatus['activeRun'];
+  try {
+    activeRun = readStatus().activeRun;
+  } catch (error) {
+    console.error('[system-maintenance] tools status could not be read before a maintenance action:', error);
+    return {
+      status: 503,
+      payload: { error: 'AI tools status could not be read, so this action was not started. Try again in a minute.', code: 'TOOLS_STATUS_UNAVAILABLE' },
+    };
+  }
+  if (!activeRun) return null;
+  return {
+    status: 409,
+    payload: {
+      error: activeRun.stale
+        ? 'An AI tools update stopped unexpectedly and has not been checked yet. Check the interrupted update under AI tools first.'
+        : 'An AI tools update is running. Start this action after it finishes.',
+      code: 'MAINTENANCE_BUSY',
+      activeRun,
+    },
+  };
+}
+
+router.get('/tools', createToolsStatusHandler());
+router.get('/tools/runs/:runId', createToolsRunReportHandler());
+router.post('/tools/runs/:runId/stop', createToolsRunStopHandler());
+router.post('/tools/run', createToolsRunHandler());
+router.post('/tools/reconcile', createToolsReconcileHandler());
+
 router.post('/actions/:actionId', async (req: Request, res: Response) => {
   try {
     const actionId = String(req.params.actionId || '').trim();
@@ -1916,6 +2410,14 @@ router.post('/actions/:actionId', async (req: Request, res: Response) => {
 
     if (!maintenanceActionCanRun(req.user?.role, action)) {
       res.status(403).json({ error: 'Owner access is required for maintenance actions that change the server.' });
+      return;
+    }
+
+    if (actionId === LEGACY_AI_TOOLS_ACTION_ID && readToolsRunnerState().installed) {
+      res.status(409).json({
+        error: 'This server updates each AI tool from its own card under AI tools. The all-tools update is retired here.',
+        code: 'PER_TOOL_UPDATER_INSTALLED',
+      });
       return;
     }
 
@@ -1938,6 +2440,12 @@ router.post('/actions/:actionId', async (req: Request, res: Response) => {
 
     const admission = await acquireMaintenanceActionAdmission();
     try {
+      const toolsBusy = toolsRunBusyRefusal();
+      if (toolsBusy) {
+        res.status(toolsBusy.status).json(toolsBusy.payload);
+        return;
+      }
+
       if ((actionId === 'refresh-package-cache' || actionId === 'apply-security-updates')) {
         const apt = await getAptState();
         if (!apt.available) {
@@ -1950,6 +2458,18 @@ router.post('/actions/:actionId', async (req: Request, res: Response) => {
         }
         if (actionId === 'apply-security-updates' && !apt.unattendedUpgradeAvailable) {
           res.status(400).json({ error: 'unattended-upgrade is not installed; security updates require manual review.' });
+          return;
+        }
+      }
+
+      if (actionId === 'update-compatible-ai-tools') {
+        const prerequisite = await getCompatibleAiPrerequisites();
+        if (!prerequisite.ready) {
+          res.status(prerequisite.code === 'NODE_CHECK_UNAVAILABLE' ? 503 : 409).json({
+            error: prerequisite.message,
+            code: prerequisite.code,
+            prerequisite,
+          });
           return;
         }
       }

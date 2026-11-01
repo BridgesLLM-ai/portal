@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import { parseHarnessVersion } from './harnessVersionPolicy';
 
 // Written by installer/hermes-runtime.sh (hermes_attestation) next to the
 // pinned virtualenv. Questions, widgets and goals reach Hermes through the
@@ -41,14 +42,19 @@ export function parseHermesRuntimeAttestation(
 export function readHermesRuntimeAttestation(options: {
   attestationPath?: string;
   readFile?: (filePath: string) => string;
+  /** The installed Hermes version (floor-pinned); defaults to the tested one. */
+  version?: string;
 } = {}): HermesRuntimeAttestationState {
-  const attestationPath = options.attestationPath || hermesRuntimeAttestationPath();
+  const version = options.version ?? PORTAL_TOOL_VERSIONS.hermes;
+  // The version names a directory: only a plain version string may do that.
+  if (!parseHarnessVersion(version) || version.startsWith('v')) return 'unreadable';
+  const attestationPath = options.attestationPath || hermesRuntimeAttestationPath(undefined, version);
   try {
     const content = options.readFile
       ? options.readFile(attestationPath)
       : fs.readFileSync(attestationPath, 'utf8');
     if (Buffer.byteLength(content, 'utf8') > MAX_ATTESTATION_BYTES) return 'unreadable';
-    return parseHermesRuntimeAttestation(content);
+    return parseHermesRuntimeAttestation(content, version);
   } catch {
     return 'unreadable';
   }

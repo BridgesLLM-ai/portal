@@ -3,6 +3,16 @@ import { constants } from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
 import rawCatalog from '../config/nativeHostCliAdmissionCatalog.v1.json';
+import {
+  NATIVE_HOST_CLI_ADMISSION_RECORD_MAX_BYTES,
+  NATIVE_HOST_CLI_ADMISSION_RECORD_ROOT,
+  NATIVE_HOST_CLI_ADMISSION_RECORD_SCHEMA,
+  NativeHostCliAdmissionRecordError,
+  nativeHostCliAdmissionRecordsEnabled,
+  nativeHostCliRecordVersionRefusal,
+  parseNativeHostCliAdmissionRecord,
+  type NativeHostCliAdmissionRecord,
+} from './nativeHostCliAdmissionRecord';
 
 export type NativeHostCliId = 'codex' | 'claude-code' | 'clawhub';
 
@@ -44,6 +54,8 @@ export type NativeHostCliIdentity = Readonly<{
   version: string;
   fingerprint: string;
   checkedAt: string;
+  /** Present only when a root-owned admission record, not the catalog, admitted the tree. */
+  admittedBy?: 'admission-record';
 }>;
 
 type CatalogLimits = Readonly<{
@@ -142,6 +154,22 @@ type AdmissionContext = Readonly<{
   ancestorFloor: string;
   now: () => Date;
   hooks?: AdmissionHooks;
+  /** Directory of root-owned admission records; null turns the second accept path off. */
+  recordRoot?: string | null;
+}>;
+
+/** The tree facts one accept path vouches for: a catalog platform entry or an admission record. */
+type TreeAuthority = Readonly<{
+  kind: 'catalog' | 'record';
+  label: string;
+  treeSha256: string;
+  criticalFiles: Readonly<Record<string, string>>;
+  hardlinkGroups: readonly (readonly string[])[];
+  platformPackageRelative: string | null;
+  platformPackageName: string | null;
+  platformPackageVersion: string | null;
+  platformBinRelative: string | null;
+  record: NativeHostCliAdmissionRecord | null;
 }>;
 
 const HEX_SHA256 = /^[a-f0-9]{64}$/;
@@ -153,6 +181,9 @@ const PUBLIC_DEFAULT_EXECUTABLES: Readonly<Record<NativeHostCliId, string>> = Ob
   clawhub: '/usr/bin/clawhub',
 });
 const NATIVE_CLI_BUNDLE_TRANSACTION_ROOT = '/var/lib/bridgesllm-installer/native-cli-bundle-v1';
+/** toolctl's per-tool launch fence (DESIGN a.5 L2), present only around an update's swap. */
+const TOOLS_FENCE_ROOT = '/var/lib/bridgesllm/tools/fence';
+const RECHECK_HINT = 'Run Re-check for it in Maintenance';
 
 function fail(
   code: NativeHostCliAdmissionErrorCode,
@@ -191,6 +222,24 @@ async function assertNativeCliBundleIdle(): Promise<void> {
       'Native CLI execution is paused while the Portal compatibility bundle is being reconciled.',
     );
   }
+}
+
+function toolsFencePath(toolId: NativeHostCliId): string {
+  const testOverride = process.env.NODE_ENV === 'test' ? process.env.BRIDGESLLM_TOOLS_FENCE_ROOT : undefined;
+  const root = typeof testOverride === 'string' && path.isAbsolute(testOverride) && path.normalize(testOverride) === testOverride
+    ? testOverride
+    : TOOLS_FENCE_ROOT;
+  return path.join(root, toolId);
+}
+
+async function assertToolSwapIdle(toolId: NativeHostCliId): Promise<void> {
+  try {
+    await fs.lstat(toolsFencePath(toolId));
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return;
+    fail('MAINTENANCE_ACTIVE', `${toolId} is paused because its update state cannot be safely inspected.`, error);
+  }
+  fail('MAINTENANCE_ACTIVE', `${toolId} is being switched to another version right now. Try again in a few seconds.`);
 }
 
 async function attachObservedVersion<T>(
@@ -746,6 +795,93 @@ function runtimePlatformKey(): string {
   return `linux-${process.arch}-gnu`;
 }
 
+/**
+ * Second accept path: a version the catalog does not list may be admitted by
+ * a root-owned, 0600, single-link admission record for this tool. No record,
+ * a disabled path, or a version outside the record policy is UNSUPPORTED; a
+ * record for another version is drift; an unsafe or malformed record is an
+ * invalid admission authority. The record is read, never written, here.
+ */
+async function readAdmissionRecord(
+  context: AdmissionContext,
+  observedVersion: string,
+): Promise<NativeHostCliAdmissionRecord> {
+  const unsupported = `${context.toolId} ${observedVersion} is not an admitted version`;
+  if (!context.recordRoot) fail('UNSUPPORTED_VERSION', `${unsupported}.`);
+  const refusal = nativeHostCliRecordVersionRefusal(context.toolId, observedVersion);
+  if (refusal) fail('UNSUPPORTED_VERSION', `${unsupported}: ${refusal}.`);
+  const recordPath = path.join(context.recordRoot, `${context.toolId}.json`);
+  let recordStat: BigStat;
+  try {
+    recordStat = await lstatBig(recordPath);
+  } catch (error: any) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      fail('UNSUPPORTED_VERSION', `${unsupported} yet: it is not in the Portal's catalog and has not been checked against its official release. ${RECHECK_HINT}.`, error);
+    }
+    fail('IO_ERROR', `${context.toolId} admission record could not be inspected.`, error);
+  }
+  const unsafe = (why: string): never => fail('CATALOG_INVALID', `${context.toolId} admission record is unsafe: ${why}. ${RECHECK_HINT} to write a fresh one.`);
+  try {
+    await assertSafeAncestorChain(context.recordRoot, context.ancestorFloor, context.requiredUid, context.requiredGid);
+  } catch (error) {
+    if (error instanceof NativeHostCliAdmissionError && error.code === 'DRIFT_DETECTED') {
+      unsafe(`its directory ${context.recordRoot} is not a safe root-owned path`);
+    }
+    throw error;
+  }
+  if (!recordStat.isFile() || recordStat.isSymbolicLink()) unsafe('it is not a regular file');
+  if (recordStat.uid !== BigInt(context.requiredUid) || recordStat.gid !== BigInt(context.requiredGid)) unsafe('it is not root-owned');
+  if ((numericMode(recordStat) & 0o077) !== 0) unsafe('it is readable or writable by other users');
+  if (recordStat.nlink !== 1n) unsafe('it has more than one hard link');
+  if (recordStat.size > BigInt(NATIVE_HOST_CLI_ADMISSION_RECORD_MAX_BYTES)) unsafe('it is too large');
+
+  let handle: Awaited<ReturnType<typeof fs.open>>;
+  try {
+    handle = await fs.open(recordPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+  } catch (error: any) {
+    if (error?.code === 'ELOOP') unsafe('it became a symlink');
+    fail('IO_ERROR', `${context.toolId} admission record could not be opened.`, error);
+  }
+  let bytes: Buffer;
+  try {
+    const opened = await handle.stat({ bigint: true }) as unknown as BigStat;
+    if (!sameStat(recordStat, opened) || !opened.isFile()) fail('RACE_DETECTED', `${context.toolId} admission record changed before it was read.`);
+    bytes = Buffer.alloc(Number(opened.size));
+    let position = 0;
+    while (position < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, position, bytes.length - position, position);
+      if (bytesRead <= 0) break;
+      position += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true }) as unknown as BigStat;
+    if (position !== bytes.length || !sameStat(opened, after)) {
+      fail('RACE_DETECTED', `${context.toolId} admission record changed while it was read.`);
+    }
+  } finally {
+    await handle.close();
+  }
+
+  let record: NativeHostCliAdmissionRecord;
+  try {
+    record = parseNativeHostCliAdmissionRecord(JSON.parse(bytes.toString('utf8')), {
+      toolId: context.toolId,
+      packageName: context.definition.packageName,
+      packageRoot: context.definition.packageRoot,
+      platform: context.platformKey,
+    });
+  } catch (error) {
+    const why = error instanceof NativeHostCliAdmissionRecordError ? error.message : 'it is not valid JSON';
+    fail('CATALOG_INVALID', `${context.toolId} admission record is invalid: ${why}. ${RECHECK_HINT} to write a fresh one.`, error);
+  }
+  if (record.version !== observedVersion) {
+    fail(
+      'DRIFT_DETECTED',
+      `${context.toolId} changed to ${observedVersion} since it was last checked (${record.version}). ${RECHECK_HINT} to re-qualify it.`,
+    );
+  }
+  return record;
+}
+
 async function attestWithContext(context: AdmissionContext): Promise<NativeHostCliIdentity> {
   const expectedLink = context.definition.executables[context.executablePath];
   if (expectedLink === undefined) {
@@ -811,20 +947,41 @@ async function attestWithContext(context: AdmissionContext): Promise<NativeHostC
   }
   const observedVersion = packageJson.version;
   return attachObservedVersion(observedVersion, async () => {
+    // The catalog is the first accept path and is consulted exactly as before;
+    // only a version it does not list at all may fall through to a record.
     const version = context.definition.versions[observedVersion];
-    if (!version) {
-      fail('UNSUPPORTED_VERSION', `${context.toolId} ${observedVersion} is not an admitted version.`);
+    let authority: TreeAuthority;
+    if (version) {
+      if (version.admission === 'status-only') {
+        fail('STATUS_ONLY_VERSION', version.statusReason ?? `${context.toolId} ${observedVersion} is status-only.`);
+      }
+      if (!expectedBinMapping(packageJson, context.definition.binName, context.definition.binRelative)) {
+        fail('DRIFT_DETECTED', `${context.toolId} package bin mapping does not match the catalog.`);
+      }
+      const platform = version.platforms[context.platformKey];
+      if (!platform) {
+        fail('UNSUPPORTED_PLATFORM', `${context.toolId} ${observedVersion} is not admitted on ${context.platformKey}.`);
+      }
+      authority = { ...platform, kind: 'catalog', label: 'the signed catalog', record: null };
+    } else {
+      const record = await readAdmissionRecord(context, observedVersion);
+      if (!expectedBinMapping(packageJson, context.definition.binName, context.definition.binRelative)) {
+        fail('DRIFT_DETECTED', `${context.toolId} package bin mapping does not match the catalog.`);
+      }
+      authority = {
+        treeSha256: record.treeSha256,
+        criticalFiles: record.criticalFiles,
+        hardlinkGroups: record.hardlinkGroups,
+        platformPackageRelative: record.platformPackageRelative,
+        platformPackageName: record.platformPackageName,
+        platformPackageVersion: record.platformPackageVersion,
+        platformBinRelative: record.platformBinRelative,
+        kind: 'record',
+        label: 'its admission record',
+        record,
+      };
     }
-    if (version.admission === 'status-only') {
-      fail('STATUS_ONLY_VERSION', version.statusReason ?? `${context.toolId} ${observedVersion} is status-only.`);
-    }
-    if (!expectedBinMapping(packageJson, context.definition.binName, context.definition.binRelative)) {
-      fail('DRIFT_DETECTED', `${context.toolId} package bin mapping does not match the catalog.`);
-    }
-    const platform = version.platforms[context.platformKey];
-    if (!platform) {
-      fail('UNSUPPORTED_PLATFORM', `${context.toolId} ${observedVersion} is not admitted on ${context.platformKey}.`);
-    }
+    const platform = authority;
 
     const snapshot = await snapshotTree(
       context.definition.packageRoot,
@@ -833,12 +990,14 @@ async function attestWithContext(context: AdmissionContext): Promise<NativeHostC
       context.requiredGid,
     );
     if (snapshot.digest !== platform.treeSha256) {
-      fail('DRIFT_DETECTED', `${context.toolId} package tree does not match the signed catalog.`);
+      fail('DRIFT_DETECTED', platform.kind === 'record'
+        ? `${context.toolId} ${observedVersion} files changed since they were last checked. ${RECHECK_HINT} to re-qualify them.`
+        : `${context.toolId} ${observedVersion} files differ from the release the Portal lists for this version. ${RECHECK_HINT} to compare them with the official release, or update it.`);
     }
     for (const [relativePath, expectedDigest] of Object.entries(platform.criticalFiles)) {
       const entry = snapshot.entries.get(relativePath);
       if (!entry || entry.kind !== 'file' || entry.sha256 !== expectedDigest) {
-        fail('DRIFT_DETECTED', `${context.toolId} critical package member ${relativePath} does not match the catalog.`);
+        fail('DRIFT_DETECTED', `${context.toolId} critical package member ${relativePath} does not match ${platform.label}.`);
       }
     }
 
@@ -861,7 +1020,7 @@ async function attestWithContext(context: AdmissionContext): Promise<NativeHostC
       if (
         platformPackageJson.name !== platform.platformPackageName
         || platformPackageJson.version !== platform.platformPackageVersion
-      ) fail('DRIFT_DETECTED', `${context.toolId} platform package identity does not match the catalog.`);
+      ) fail('DRIFT_DETECTED', `${context.toolId} platform package identity does not match ${platform.label}.`);
       if (platform.platformBinRelative === null) {
         fail('CATALOG_INVALID', `${context.toolId} platform binary authority is incomplete.`);
       }
@@ -888,7 +1047,7 @@ async function attestWithContext(context: AdmissionContext): Promise<NativeHostC
     }
 
     const fingerprint = createHash('sha256').update(JSON.stringify({
-      schema: CATALOG.schema,
+      schema: platform.record ? NATIVE_HOST_CLI_ADMISSION_RECORD_SCHEMA : CATALOG.schema,
       toolId: context.toolId,
       executablePath: context.executablePath,
       executableTarget: firstLink,
@@ -896,6 +1055,10 @@ async function attestWithContext(context: AdmissionContext): Promise<NativeHostC
       version: observedVersion,
       platform: context.platformKey,
       treeSha256: snapshot.digest,
+      ...(platform.record ? {
+        recordIntegrity: platform.record.source.integrity,
+        recordAdmittedAt: platform.record.admittedAt,
+      } : {}),
     })).digest('hex');
     return Object.freeze({
       toolId: context.toolId,
@@ -904,7 +1067,54 @@ async function attestWithContext(context: AdmissionContext): Promise<NativeHostC
       version: observedVersion,
       fingerprint,
       checkedAt: context.now().toISOString(),
+      ...(platform.kind === 'record' ? { admittedBy: 'admission-record' as const } : {}),
     });
+  });
+}
+
+/** Tree facts and root source the shipped catalog vouches for, if it fully admits `version` here. */
+export type NativeHostCliCatalogFacts = Readonly<{
+  packageName: string;
+  packageRoot: string;
+  platform: string;
+  treeSha256: string;
+  criticalFiles: Readonly<Record<string, string>>;
+  hardlinkGroups: readonly (readonly string[])[];
+  platformPackageRelative: string | null;
+  platformPackageName: string | null;
+  platformPackageVersion: string | null;
+  platformBinRelative: string | null;
+  rootTarball: string;
+  rootIntegrity: string;
+}>;
+
+/** Read-only view of the catalog for the catalog -> record migration (DESIGN h.3). */
+export function nativeHostCliCatalogFacts(
+  toolId: NativeHostCliId,
+  version: string,
+  platformKey: string = runtimePlatformKey(),
+): NativeHostCliCatalogFacts | null {
+  const definition = ALLOWED_TOOL_IDS.has(toolId) ? CATALOG.tools[toolId] : undefined;
+  const entry = definition && Object.prototype.hasOwnProperty.call(definition.versions, version)
+    ? definition.versions[version]
+    : undefined;
+  if (!definition || !entry || entry.admission !== 'full') return null;
+  const platform = entry.platforms[platformKey];
+  const rootSource = platform?.sources.find((source) => source.placement === '');
+  if (!platform || !rootSource || rootSource.integrity !== entry.rootIntegrity) return null;
+  return Object.freeze({
+    packageName: definition.packageName,
+    packageRoot: definition.packageRoot,
+    platform: platformKey,
+    treeSha256: platform.treeSha256,
+    criticalFiles: platform.criticalFiles,
+    hardlinkGroups: platform.hardlinkGroups,
+    platformPackageRelative: platform.platformPackageRelative,
+    platformPackageName: platform.platformPackageName,
+    platformPackageVersion: platform.platformPackageVersion,
+    platformBinRelative: platform.platformBinRelative,
+    rootTarball: rootSource.tarball,
+    rootIntegrity: entry.rootIntegrity,
   });
 }
 
@@ -921,6 +1131,7 @@ export async function attestNativeHostCli(
   }
   try {
     await assertNativeCliBundleIdle();
+    await assertToolSwapIdle(toolId);
     return await attestWithContext(Object.freeze({
       toolId,
       executablePath,
@@ -931,6 +1142,7 @@ export async function attestNativeHostCli(
       requiredGid: 0,
       ancestorFloor: path.parse(executablePath).root,
       now: () => new Date(),
+      recordRoot: nativeHostCliAdmissionRecordsEnabled() ? NATIVE_HOST_CLI_ADMISSION_RECORD_ROOT : null,
     }));
   } catch (error) {
     if (error instanceof NativeHostCliAdmissionError) throw error;
@@ -942,6 +1154,7 @@ export const __nativeHostCliAdmissionTest = Object.freeze({
   parseCatalog,
   snapshotTree,
   attestWithContext,
+  readAdmissionRecord,
   canonicalTreeLine,
   verifyHardlinks,
   runtimePlatformKey,

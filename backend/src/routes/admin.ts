@@ -24,6 +24,10 @@ import {
   readAdminUserRetirement,
   retireAdminUserAccount,
 } from '../services/adminUserRetirementRuntime';
+import {
+  readAdminUserRetirementOpenClawPrivacy,
+  summarizeAdminUserRetirementOpenClawPrivacy,
+} from '../services/adminUserRetirementExternalState';
 import path from 'path';
 import {
   AVATARS_DIR,
@@ -608,6 +612,9 @@ router.get(
           status: retirement.status,
           lastErrorCode: retirement.lastErrorCode,
           manuallyRetryable: retirement.status === 'BLOCKED',
+          openClawPrivacy: summarizeAdminUserRetirementOpenClawPrivacy(
+            await readAdminUserRetirementOpenClawPrivacy(retirement.id).catch(() => null),
+          ),
         } : null,
       });
     } catch (error) {
@@ -681,6 +688,9 @@ router.delete('/users/:id', requireOwner, async (req: Request, res: Response, ne
         status: retirement.status,
         completed: retirement.status === 'COMPLETE',
         idempotent: durable?.status === 'COMPLETE',
+        openClawPrivacy: summarizeAdminUserRetirementOpenClawPrivacy(
+          await readAdminUserRetirementOpenClawPrivacy(retirement.id).catch(() => null),
+        ),
       },
     });
   } catch (error) {

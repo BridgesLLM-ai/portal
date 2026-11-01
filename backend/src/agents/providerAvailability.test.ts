@@ -21,6 +21,23 @@ import {
   nativeAuthBlocksProviderUsage,
 } from './providerAvailability';
 import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import { AGENT_ZERO_VERSION } from './providers/agentZero/AgentZeroConnectorContract';
+
+/** ACP harness probes run with their isolated profile root; give them a scratch one. */
+function withAcpProfileRoot<T>(executable: string, run: () => T): T {
+  const key = executable === 'hermes' ? 'PORTAL_HERMES_HOME' : executable === 'opencode' ? 'PORTAL_OPENCODE_HOME' : null;
+  if (!key) return run();
+  const previous = process.env[key];
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'portal-provider-availability-'));
+  process.env[key] = root;
+  try {
+    return run();
+  } finally {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
 
 describe('providerAvailability', () => {
   const mockedExecFileSync = jest.mocked(execFileSync);
@@ -166,7 +183,7 @@ describe('providerAvailability', () => {
     expect(provider.usable).toBe(false);
     expect(provider.capabilities).toMatchObject({
       adapterFamily: 'agent-zero-connector',
-      adapterKey: 'agent-zero-v2.11-connector',
+      adapterKey: `agent-zero-v${AGENT_ZERO_VERSION}-connector`,
       supportedExecutionScopes: ['HOST_OPERATOR', 'PROJECT_SANDBOX'],
     });
     expect(provider.reason).toMatch(/stays disabled until the managed runtime is ready/);
@@ -177,8 +194,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -238,8 +255,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -275,8 +292,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -359,8 +376,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -418,8 +435,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -471,8 +488,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -513,8 +530,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -551,8 +568,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -613,8 +630,8 @@ describe('providerAvailability', () => {
       installed: true,
       running: true,
       ready: true,
-      version: '2.11',
-      expectedVersion: '2.11',
+      version: AGENT_ZERO_VERSION,
+      expectedVersion: AGENT_ZERO_VERSION,
       pinnedImage: true,
       loopbackOnly: true,
       persistentData: true,
@@ -656,7 +673,7 @@ describe('providerAvailability', () => {
     expect(provider.nativeAuthStatus).not.toBe('not_applicable');
   });
 
-  test('Hermes and OpenCode expose exact-pinned dynamic ACP contracts', () => {
+  test('Hermes and OpenCode expose floor-pinned dynamic ACP contracts', () => {
     expect(getProviderAvailability('HERMES').capabilities).toMatchObject({
       adapterKey: 'hermes-acp',
       modelCatalogKind: 'dynamic',
@@ -765,8 +782,8 @@ describe('providerAvailability', () => {
     mockedExecFileSync.mockImplementation(((invokedCommand: string, args: string[]) => {
       if (invokedCommand === 'bash' && args[1]?.includes(`command -v ${command}`)) return `/usr/local/bin/${command}`;
       if (path.basename(invokedCommand) === command && args.includes('--version')) {
-        if (provider === 'HERMES') return 'hermes 0.20.4';
-        if (provider === 'OPENCODE') return 'opencode 1.18.19';
+        if (provider === 'HERMES') return `hermes ${PORTAL_TOOL_VERSIONS.hermes}`;
+        if (provider === 'OPENCODE') return `opencode ${PORTAL_TOOL_VERSIONS.openCode}`;
         if (provider === 'CLAUDE_CODE') return `claude ${PORTAL_TOOL_VERSIONS.claudeCode}`;
         return `codex ${PORTAL_TOOL_VERSIONS.codexCli}`;
       }
@@ -844,9 +861,9 @@ describe('providerAvailability', () => {
   });
 
   test.each([
-    ['HERMES', 'hermes', '0.20.5', '0.20.4'],
-    ['OPENCODE', 'opencode', '1.18.20', '1.18.19'],
-  ] as const)('%s availability rejects an installed version outside its exact pin', (
+    ['HERMES', 'hermes', '0.22.1', PORTAL_TOOL_VERSIONS.hermes],
+    ['OPENCODE', 'opencode', '1.19.3', PORTAL_TOOL_VERSIONS.openCode],
+  ] as const)('%s availability rejects an installed version below its floor', (
     provider,
     command,
     installedVersion,
@@ -862,13 +879,13 @@ describe('providerAvailability', () => {
     }) as any);
     try {
       __resetProviderAvailabilityForTests();
-      const availability = getProviderAvailability(provider);
+      const availability = withAcpProfileRoot(command, () => getProviderAvailability(provider));
       expect(availability).toMatchObject({
         installed: true,
         implemented: true,
         usable: false,
       });
-      expect(availability.reason).toContain(testedVersion);
+      expect(availability.reason).toContain(`older than the Portal's supported floor ${testedVersion}`);
       expect(availability.reason).toContain(
         "Use this runtime's dedicated Portal setup or maintenance path",
       );
@@ -949,5 +966,112 @@ describe('providerAvailability', () => {
       mockedExecFileSync.mockImplementation(actualExecFileSync as any);
       __resetProviderAvailabilityForTests();
     }
+  });
+
+  describe('floor-pinned harnesses', () => {
+    const actualExecFileSync = jest.requireActual<typeof import('child_process')>('child_process').execFileSync;
+
+    function withHost(
+      executable: string,
+      answers: Record<string, string | Error>,
+      run: (calls: string[][]) => void,
+    ): void {
+      const calls: string[][] = [];
+      mockedExecFileSync.mockImplementation(((command: string, args: string[]) => {
+        calls.push([command, ...args]);
+        if (command === 'bash' && args[1]?.includes(`command -v ${executable}`)) return `/usr/bin/${executable}`;
+        if (path.basename(command) === executable) {
+          const answer = answers[args.join(' ')];
+          if (answer instanceof Error) throw answer;
+          if (typeof answer === 'string') return answer;
+        }
+        return '';
+      }) as any);
+      try {
+        __resetProviderAvailabilityForTests();
+        withAcpProfileRoot(executable, () => run(calls));
+      } finally {
+        mockedExecFileSync.mockImplementation(actualExecFileSync as any);
+        __resetProviderAvailabilityForTests();
+      }
+    }
+
+    test('marks only a version refusal as fixable by an update (TEST F7: Ollama 0.33.3 below its floor)', () => {
+      withHost('ollama', { '--version': 'ollama version is 0.33.3' }, () => {
+        const provider = getProviderAvailability('OLLAMA');
+        expect(provider.usable).toBe(false);
+        expect(provider.versionRefused).toBe(true);
+        expect(provider.reason).toMatch(/^Portal refuses this Ollama runtime: version 0\.33\.3 is older than the Portal's supported floor/);
+      });
+      withHost('ollama', { '--version': `ollama version is ${PORTAL_TOOL_VERSIONS.ollama}` }, () => {
+        const provider = getProviderAvailability('OLLAMA');
+        expect(provider.usable).toBe(true);
+        expect(provider).not.toHaveProperty('versionRefused');
+      });
+      // A refusal that an update alone does not explain stays unmarked.
+      withHost('agy', { '--version': '1.4.12', '--help': new Error('help failed') }, () => {
+        const provider = getProviderAvailability('GEMINI');
+        expect(provider.usable).toBe(false);
+        expect(provider).not.toHaveProperty('versionRefused');
+      });
+    });
+
+    test('refuses an OpenCode below its floor or with an unreadable version, in plain words', () => {
+      withHost('opencode', { '--version': '1.19.3' }, () => {
+        const provider = getProviderAvailability('OPENCODE');
+        expect(provider.usable).toBe(false);
+        expect(provider.reason).toMatch(/^Portal refuses this OpenCode runtime: version 1\.19\.3 is older than the Portal's supported floor 1\.19\.4\./);
+      });
+      withHost('opencode', { '--version': 'opencode dev build' }, () => {
+        const provider = getProviderAvailability('OPENCODE');
+        expect(provider.usable).toBe(false);
+        expect(provider.reason).toMatch(/installed version unknown could not be read/);
+      });
+    });
+
+    test('admits a newer OpenCode by its floor and labels it unproven instead of refusing it', () => {
+      withHost('opencode', { '--version': '1.19.5' }, () => {
+        const provider = getProviderAvailability('OPENCODE');
+        expect(provider.reason).not.toMatch(/Portal refuses/);
+        expect(provider.reason).toContain(`newer than the Portal-tested ${PORTAL_TOOL_VERSIONS.openCode}`);
+        expect(provider.reason).toContain('not yet proven');
+        expect(provider.versionDrift).toEqual({ tested: PORTAL_TOOL_VERSIONS.openCode, installed: '1.19.5' });
+      });
+      withHost('opencode', { '--version': PORTAL_TOOL_VERSIONS.openCode }, () => {
+        const provider = getProviderAvailability('OPENCODE');
+        expect(provider.reason).not.toMatch(/Portal refuses|newer than/);
+        expect(provider.versionDrift).toBeUndefined();
+      });
+    });
+
+    test('admits a newer Antigravity only when its --help still lists every headless flag', () => {
+      const fullHelp = '--print --output-format --print-timeout --add-dir --conversation --model --dangerously-skip-permissions --sandbox';
+      withHost('agy', { '--version': '1.4.12', '--help': fullHelp }, (calls) => {
+        const provider = getProviderAvailability('GEMINI');
+        expect(provider.reason).not.toMatch(/Portal refuses|headless flags/);
+        expect(provider.versionDrift).toEqual({ tested: PORTAL_TOOL_VERSIONS.antigravity, installed: '1.4.12' });
+        expect(calls).toContainEqual(['agy', '--help']);
+      });
+      withHost('agy', { '--version': '1.4.12', '--help': fullHelp.replace(' --sandbox', '') }, () => {
+        const provider = getProviderAvailability('GEMINI');
+        expect(provider.usable).toBe(false);
+        expect(provider.reason).toMatch(/Antigravity 1\.4\.12 no longer lists the headless flags the Portal uses \(--sandbox\); Portal refuses this runtime\./);
+      });
+      withHost('agy', { '--version': '1.4.12', '--help': new Error('help failed') }, () => {
+        const provider = getProviderAvailability('GEMINI');
+        expect(provider.usable).toBe(false);
+        expect(provider.reason).toMatch(/could not read this Antigravity version's --help/);
+      });
+      // The tested version needs no help scan.
+      withHost('agy', { '--version': PORTAL_TOOL_VERSIONS.antigravity }, (calls) => {
+        const provider = getProviderAvailability('GEMINI');
+        expect(provider.reason).not.toMatch(/Portal refuses|headless flags/);
+        expect(calls).not.toContainEqual(['agy', '--help']);
+      });
+      withHost('agy', { '--version': '1.4.2' }, () => {
+        expect(getProviderAvailability('GEMINI').reason)
+          .toMatch(/^Portal refuses this Google Antigravity runtime: version 1\.4\.2 is older than the Portal's supported floor 1\.4\.3\./);
+      });
+    });
   });
 });

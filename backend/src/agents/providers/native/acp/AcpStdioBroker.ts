@@ -4,6 +4,7 @@ import {
   type SpawnOptionsWithoutStdio,
 } from 'child_process';
 import { StringDecoder } from 'string_decoder';
+import { harnessVersionRefusal } from '../../../harnessVersionPolicy';
 import type { OnStatusCallback } from '../../../AgentProvider.interface';
 import { AgentAbortError } from '../../../AgentProvider.interface';
 import type { NativeChatImage } from '../../../../services/chatImages/directChatImages';
@@ -116,7 +117,14 @@ export interface AcpHarnessProfile {
   buildArgs(input: { cwd: string; model: string | null }): string[];
   protocolVersion: number;
   expectedAgentName?: string;
+  /** The version the Portal tested (reported, not required). */
   expectedAgentVersion: string;
+  /**
+   * Lowest admitted agent version. Newer versions are admitted when the rest
+   * of this handshake holds: protocol version, agent identity and every
+   * required capability. Deny-listed versions are refused.
+   */
+  minimumAgentVersion: string;
   agentVersionSource: 'agent-info' | 'meta-agent-version';
   requiredCapabilities: readonly string[];
   authentication: AcpAuthenticationPolicy;
@@ -814,8 +822,9 @@ export class AcpStdioBroker {
     if (this.profile.expectedAgentName && agentName !== this.profile.expectedAgentName) {
       throw new Error(`${this.profile.displayName} ACP agent mismatch: expected ${this.profile.expectedAgentName}, received ${agentName || 'unknown'}`);
     }
-    if (agentVersion !== this.profile.expectedAgentVersion) {
-      throw new Error(`${this.profile.displayName} ACP agent mismatch: expected ${this.profile.expectedAgentVersion}, received ${agentVersion || 'unknown'}`);
+    const versionRefusal = harnessVersionRefusal(this.profile.id, agentVersion, this.profile.minimumAgentVersion);
+    if (versionRefusal) {
+      throw new Error(`${this.profile.displayName} ACP agent mismatch: ${versionRefusal}`);
     }
     const capabilities = isRecord(value.agentCapabilities) ? value.agentCapabilities : {};
     for (const capability of this.profile.requiredCapabilities) {

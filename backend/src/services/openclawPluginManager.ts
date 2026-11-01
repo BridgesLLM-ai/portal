@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import { isDeepStrictEqual } from 'util';
@@ -109,7 +110,7 @@ export function parseOpenClawPluginState(
 }
 
 function runOpenClawPluginCommand(args: string[], timeoutMs = 20_000): string {
-  const raw = execFileSync('openclaw', args, {
+  const raw = execFileSync(...openClawDiagnosticCommand('openclaw', args), {
     encoding: 'utf8',
     env: buildOpenClawCliEnv(),
     stdio: ['ignore', 'pipe', 'pipe'],

@@ -1,0 +1,11 @@
+{"update": {"installKind": "package", "packageManager": "npm", "root": "/usr/lib/node_modules/openclaw"},
+ "channel": {"value": "stable", "source": "config", "label": "stable", "config": "stable"},
+ "availability": {"available": true, "latestVersion": "2026.10.9"},
+ "lastRun": {"runId": "9a8b7c6d-0000-4000-8000-0000000000a4", "createdAtMs": 1792100000000, "updatedAtMs": 1792100300000,
+             "trigger": "cli", "phase": "finished", "status": "failed", "reason": "interrupted",
+             "origin": {"nextAction": "Inspect the update report with: openclaw update status"},
+             "target": {"kind": "package", "channel": "stable", "tag": "2026.10.9"}, "before": {"version": "2026.9.9"}, "after": {},
+             "steps": [{"step": "requested", "status": "completed", "startedAtMs": 1792100000000, "endedAtMs": 1792100001000},
+                       {"step": "staging", "status": "completed", "startedAtMs": 1792100001000, "endedAtMs": 1792100100000},
+                       {"step": "validating", "status": "failed", "startedAtMs": 1792100100000, "endedAtMs": 1792100300000}],
+             "verification": {}, "repair": [], "confirmedAtMs": null, "finishedAtMs": 1792100300000, "downtimeMs": null}}

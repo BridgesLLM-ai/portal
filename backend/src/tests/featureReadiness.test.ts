@@ -506,7 +506,7 @@ describe('probePinnedCliVersion', () => {
     })).resolves.toEqual({ ok: true, message: 'Portal-tested 1.0.5 (verified)' });
   });
 
-  test('local Ollama readiness requires the exact Portal-qualified release', async () => {
+  test('local Ollama readiness admits the floor and newer releases and refuses older ones', async () => {
     mockedExecFile.mockImplementationOnce(((_command: string, _args: string[], options: { env?: Record<string, string> }, callback: Function) => {
       expect(options.env).toMatchObject({ OLLAMA_HOST: 'http://127.0.0.1:11434' });
       callback(null, `ollama version is ${PORTAL_TOOL_VERSIONS.ollama}\n`, '');
@@ -521,7 +521,15 @@ describe('probePinnedCliVersion', () => {
     }) as any);
     await expect(probeLocalOllamaVersion()).resolves.toEqual({
       ok: false,
-      message: `Installed Ollama 0.32.14 has drifted from the Portal-tested ${PORTAL_TOOL_VERSIONS.ollama}.`,
+      message: `Portal refuses this Ollama runtime: version 0.32.14 is older than the Portal's supported floor ${PORTAL_TOOL_VERSIONS.ollama}.`,
+    });
+
+    mockedExecFile.mockImplementationOnce(((_command: string, _args: string[], _options: unknown, callback: Function) => {
+      callback(null, 'ollama version is 0.40.13\n', '');
+    }) as any);
+    await expect(probeLocalOllamaVersion()).resolves.toEqual({
+      ok: true,
+      message: `Ollama 0.40.13 is newer than the Portal-tested ${PORTAL_TOOL_VERSIONS.ollama}; admitted at or above the floor ${PORTAL_TOOL_VERSIONS.ollama}, not yet proven.`,
     });
   });
 

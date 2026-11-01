@@ -137,13 +137,68 @@ opencode_legacy_managed_alias() {
   [[ -f "${resolved}" && ! -L "${resolved}" && "$(stat -c '%u' -- "${resolved}")" == "0" ]]
 }
 
+# Version the binary reports, whatever it is (C-VER output: one plain version).
+opencode_binary_reported_version() {
+  local binary="$1" output
+  output="$(OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_SHARE=1 "${binary}" --version 2>/dev/null)" || return 1
+  [[ "${output}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([[:space:]]*)$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Maintenance (installer/tools/bridgesllm-toolctl.py) installs newer official
+# releases into this same layout after verifying and probing them, and records
+# each one in its admission record. Such a runtime is kept as it is instead of
+# being converged back to the tested version, which acts as the floor here.
+opencode_admission_record() {
+  printf '%s\n' "${OPENCODE_ADMISSION_RECORD:-/var/lib/bridgesllm/tools/admission/opencode.json}"
+}
+
+# Prints the admitted version when the record names exactly this binary
+# (path and sha256) at or above the tested version; fails otherwise.
+opencode_admitted_version() {
+  local resolved="$1" record
+  record="$(opencode_admission_record)"
+  [[ -f "${record}" && ! -L "${record}" ]] || return 1
+  python3 -I - "${record}" "${resolved}" "${OPENCODE_TESTED_VERSION}" <<'PY'
+import hashlib, json, re, sys
+
+record_path, resolved, floor = sys.argv[1:4]
+key = lambda version: tuple(int(part) for part in version.split("."))
+try:
+    with open(record_path, "rb") as handle:
+        record = json.loads(handle.read(65536))
+    version = record["version"]
+    entry = record["executables"]["opencode"]
+    if record["schema"] != "bridgesllm.tools.harness-admission.v1" or record["toolId"] != "opencode" \
+            or not re.fullmatch(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", version) or key(version) < key(floor) \
+            or entry["path"] != resolved:
+        raise ValueError("record does not admit this runtime")
+    digest = hashlib.sha256()
+    with open(resolved, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != entry["sha256"]:
+        raise ValueError("binary differs from the admitted one")
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+print(version)
+PY
+}
+
 verify_opencode_runtime() {
-  local target managed resolved arch expected actual
+  local target managed resolved arch expected actual admitted
   target="$(opencode_target)"
   managed="$(opencode_managed_binary)"
-  [[ -L "${target}" && -x "${managed}" ]] || return 1
+  [[ -L "${target}" ]] || return 1
   resolved="$(readlink -f -- "${target}" 2>/dev/null || true)"
-  [[ "${resolved}" == "${managed}" ]] || return 1
+  if [[ "${resolved}" != "${managed}" ]]; then
+    admitted="$(opencode_admitted_version "${resolved}")" || return 1
+    [[ "${resolved}" == "$(opencode_root)/${admitted}/opencode" ]] || return 1
+    opencode_runtime_publicly_executable "${resolved}" || return 1
+    [[ "$(opencode_binary_reported_version "${target}" || true)" == "${admitted}" ]]
+    return
+  fi
+  [[ -x "${managed}" ]] || return 1
   arch="$(opencode_arch)" || return 1
   expected="$(opencode_binary_sha256 "${arch}")" || return 1
   actual="$(sha256sum "${managed}" | awk '{print $1}')"
@@ -156,11 +211,11 @@ opencode_verify() {
   local target
   target="$(opencode_target)"
   verify_opencode_runtime || {
-    printf 'OpenCode is missing or is not the Portal-tested version %s at %s.\n' \
+    printf 'OpenCode is missing or is neither the Portal-tested version %s nor an admitted newer release at %s.\n' \
       "${OPENCODE_TESTED_VERSION}" "${target}" >&2
     return 1
   }
-  printf 'OpenCode %s is verified at %s.\n' "${OPENCODE_TESTED_VERSION}" "${target}"
+  printf 'OpenCode %s is verified at %s.\n' "$(opencode_binary_reported_version "${target}")" "${target}"
 }
 
 opencode_converge() {
@@ -180,7 +235,7 @@ opencode_converge() {
     }
   fi
   if verify_opencode_runtime; then
-    printf 'OpenCode %s is already verified at %s.\n' "${OPENCODE_TESTED_VERSION}" "${target}"
+    printf 'OpenCode %s is already verified at %s.\n' "$(opencode_binary_reported_version "${target}")" "${target}"
     return 0
   fi
   if [[ -e "${target}" && ! -L "${target}" ]]; then

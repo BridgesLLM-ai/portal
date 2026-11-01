@@ -17,6 +17,7 @@ import { assertExecutionContextBinding } from '../executionScope';
 import { getProviderAvailabilityAsync } from '../providerAvailability';
 import { requestNativeCliApproval } from '../nativeCliApprovals';
 import { withPortalGuideReference } from '../../services/portalOperatingGuide';
+import { withSenderResponsePreference } from '../../services/chatResponseCapabilities';
 import { isElevatedRole } from '../../utils/authz';
 import {
   appendNativeMessage,
@@ -205,7 +206,7 @@ export class GrokProvider extends NativeCliAdapterProvider {
         await sender.revalidateChatImages();
       }
       const result = await broker.prompt(
-        withPortalGuideReference(promptMessage, session.messages.length === 1),
+        withPortalGuideReference(withSenderResponsePreference(promptMessage, 'GROK', sender), session.messages.length === 1),
         chatImages,
       );
       session.metadata = {

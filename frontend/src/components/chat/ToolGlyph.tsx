@@ -1,6 +1,12 @@
 import React from 'react';
 import {
   Bot,
+  LayoutDashboard,
+  PanelTop,
+  ListChecks,
+  HelpCircle,
+  CalendarClock,
+  Target,
   Brain,
   Cloud,
   FileText,
@@ -34,6 +40,12 @@ export default function ToolGlyph({
   switch (presentation.key) {
     case 'bridgesllm':
       return <img src="/favicon-192.png" alt="BridgesLLM" width={size} height={size} className={`shrink-0 object-contain ${className || ''}`} />;
+    case 'widget': return <PanelTop size={size} className={className} />;
+    case 'progress': return <ListChecks size={size} className={className} />;
+    case 'question': return <HelpCircle size={size} className={className} />;
+    case 'schedule': return <CalendarClock size={size} className={className} />;
+    case 'goal': return <Target size={size} className={className} />;
+    case 'dashboard': return <LayoutDashboard size={size} className={className} />;
     case 'read':
       return <FileText size={size} className={className} />;
     case 'write':

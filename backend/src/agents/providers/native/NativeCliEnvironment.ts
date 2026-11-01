@@ -129,8 +129,23 @@ export function buildNativeCliEnvironment(
   }
   if (providerName === 'GROK') env.GROK_DISABLE_AUTOUPDATER = '1';
   if (providerName === 'GEMINI') {
-    env.AGY_CLI_DISABLE_AUTO_UPDATE = 'true';
+    // Antigravity may update itself (updater v2): Maintenance re-checks the new
+    // version instead of the Portal forcing the CLI to stay on its pin.
     env.SSH_CONNECTION = source.SSH_CONNECTION || 'portal-native-check 127.0.0.1 127.0.0.1 0';
   }
+  return env;
+}
+
+/**
+ * The environment of a Portal probe of a native CLI: a version, model-list, login-state or help read that a page
+ * load or status check runs. A probe never lets the vendor replace the program outside a Maintenance run, so
+ * Antigravity's self-update is off here (F10); chat and login sessions keep the updater v2 rule above.
+ */
+export function buildNativeCliProbeEnvironment(
+  providerName: AgentProviderName,
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env = buildNativeCliEnvironment(providerName, source);
+  if (providerName === 'GEMINI') env.AGY_CLI_DISABLE_AUTO_UPDATE = 'true';
   return env;
 }

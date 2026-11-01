@@ -6,7 +6,8 @@ export class AppError extends Error {
   constructor(
     public statusCode: number,
     message: string,
-    public isOperational = true
+    public isOperational = true,
+    public activitySeverity?: 'INFO'
   ) {
     super(message);
     Object.setPrototypeOf(this, AppError.prototype);
@@ -25,7 +26,8 @@ export function errorHandler(
   }
 
   // Log all errors to activity (non-blocking)
-  const severity = (err instanceof AppError && err.statusCode < 500) ? 'ERROR' : 'CRITICAL' as const;
+  const severity = err instanceof AppError && err.activitySeverity === 'INFO'
+    ? 'INFO' : (err instanceof AppError && err.statusCode < 500) ? 'ERROR' : 'CRITICAL';
   logRequestError(err, req, { severity }).catch(() => {});
 
   if (err instanceof AppError) {

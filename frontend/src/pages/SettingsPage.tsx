@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useContext, useMemo, useRef, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, useContext, useMemo, useRef, Suspense } from 'react';
+import { lazyWithRecovery } from '../utils/moduleRecovery';
 import { copyTextToClipboard } from '../utils/clipboardCopy';
 import { Link, UNSAFE_NavigationContext, useNavigate, useSearchParams } from 'react-router-dom';
 import {
@@ -51,12 +52,12 @@ import {
 } from './settingsAdminContract';
 import { resolvePortalLogoUrl } from '../utils/portalBranding';
 
-const LazyBackupsTab = lazy(() => import('../components/settings/BackupsTab'));
-const LazyAiProviderSetup = lazy(() => import('../components/ai-setup/AiProviderSetup'));
-const LazyAgentZeroSetupPanel = lazy(() => import('../components/settings/AgentZeroSetupPanel'));
-const LazyOllamaTailnetSetup = lazy(() => import('../components/settings/OllamaTailnetSetup'));
-const LazyImagePickerCropper = lazy(() => import('../components/ImagePickerCropper'));
-const LazyQRCodeSVG = lazy(async () => {
+const LazyBackupsTab = lazyWithRecovery(() => import('../components/settings/BackupsTab'));
+const LazyAiProviderSetup = lazyWithRecovery(() => import('../components/ai-setup/AiProviderSetup'));
+const LazyAgentZeroSetupPanel = lazyWithRecovery(() => import('../components/settings/AgentZeroSetupPanel'));
+const LazyOllamaTailnetSetup = lazyWithRecovery(() => import('../components/settings/OllamaTailnetSetup'));
+const LazyImagePickerCropper = lazyWithRecovery(() => import('../components/ImagePickerCropper'));
+const LazyQRCodeSVG = lazyWithRecovery(async () => {
   const mod = await import('qrcode.react');
   return { default: mod.QRCodeSVG };
 });

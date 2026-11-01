@@ -10,15 +10,31 @@ export const PORTAL_TOOL_VERSIONS = Object.freeze({
   openCode: '1.19.4',
 });
 
-export const ANTIGRAVITY_NO_UPDATE_ENV = 'AGY_CLI_DISABLE_AUTO_UPDATE=true';
+/**
+ * Lowest version each floor-pinned harness runs at: the versions the Portal
+ * tested. Newer versions are admitted when their protocol handshake holds
+ * (agents/harnessVersionPolicy.ts); older ones are refused.
+ */
+export const PORTAL_TOOL_FLOORS = Object.freeze({
+  antigravity: PORTAL_TOOL_VERSIONS.antigravity,
+  grokBuild: PORTAL_TOOL_VERSIONS.grokBuild,
+  ollama: PORTAL_TOOL_VERSIONS.ollama,
+  hermes: PORTAL_TOOL_VERSIONS.hermes,
+  openCode: PORTAL_TOOL_VERSIONS.openCode,
+});
 
 /**
- * The same guard shaped for `spawn` options rather than a shell prefix. Every
- * managed `agy` launch must carry it. Without it the CLI self-updates, moves
- * off the pinned version declared above, and then fails Portal's own launcher
- * verification — which is how a healthy host came to report a Remote Desktop
- * setup warning it could not act on.
+ * Proposed recommended versions: the newest upstream releases on 2026-10-30.
+ * PROPOSED, NOT PROVEN — no qualification run has passed on them yet, so
+ * nothing installs or admits them because they are listed here.
  */
-export const ANTIGRAVITY_NO_UPDATE_SPAWN_ENV = Object.freeze({
-  AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+export const PORTAL_TOOL_RECOMMENDED = Object.freeze({
+  status: 'proposed' as const,
+  versions: Object.freeze({
+    openCode: '1.19.5',
+    hermes: '0.22.5',
+    grokBuild: '1.0.70',
+    antigravity: '1.4.12',
+    ollama: '0.40.13',
+  }),
 });

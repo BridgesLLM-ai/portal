@@ -1,4 +1,4 @@
-import { useAuthStore } from '../contexts/AuthContext';
+import { captureAuthSessionFence, useAuthStore } from '../contexts/AuthContext';
 import { refreshAuthSessionWithFetch } from './authRefreshConvergence';
 import {
   PORTAL_AUTHORIZATION_VERSION_HEADER,
@@ -78,8 +78,9 @@ let workspaceRefreshPromise: Promise<boolean> | null = null;
 function refreshWorkspaceSession(): Promise<boolean> {
   if (workspaceRefreshPromise) return workspaceRefreshPromise;
   const apiUrl = import.meta.env.VITE_API_URL || '/api';
+  const sessionIsCurrent = captureAuthSessionFence();
   workspaceRefreshPromise = refreshAuthSessionWithFetch(apiUrl, {
-    onDefinitiveFailure: () => useAuthStore.getState().silentLogout(),
+    onDefinitiveFailure: () => { if (sessionIsCurrent()) useAuthStore.getState().silentLogout(); },
   })
     .finally(() => {
       workspaceRefreshPromise = null;

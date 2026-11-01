@@ -2,6 +2,68 @@
 
 All notable changes to BridgesLLM Portal are documented here.
 
+## [5.2.0] - 2026-11-01
+
+### Added
+- **Update AI tools one at a time:** **Admin > Maintenance** has a card for each compatible AI tool (OpenClaw, Codex CLI, Claude Code, ClawHub, OpenCode, Hermes, Grok Build, Antigravity, Ollama and a configured Agent Zero) with its installed, recommended, newest and minimum versions and a plain-language status; every tool except OpenClaw has its own Update button in this release.
+- **Install a missing AI tool:** when Codex CLI, Claude Code, ClawHub, Ollama, OpenCode, Hermes, Grok Build or Antigravity is not installed, its card offers the Owner **Install** with the version this Portal recommends, using the same download verification, checks and record as an update; if a check fails after installing, what was installed is removed again. Agent Zero still needs its own setup first.
+- **Verified downloads with swap-back:** a tool update verifies what it downloads before installing it and keeps the previous version, so a failed check puts the previous version back.
+- **Re-check:** every tool except OpenClaw can be re-checked to confirm its installed version and run its feature checks again; the card says when a re-check could not compare the installed files with the official release.
+- **Stop:** the Owner can stop a running tool update; the Portal refuses, with the reason, while a step that must not be interrupted is running, such as switching Ollama or Agent Zero to the new version or staging Hermes.
+- **Update to newest, by explicit choice:** Codex CLI, Claude Code and ClawHub can install the newest published release after a per-run confirmation that states the lower assurance: the download is checked only against what the publisher provides. Other tools update only to the version this release qualified.
+- **Progress, results and history:** runs continue in their own background service, show plain-language progress you can leave and return to, end with a result and its details, and stay in a history with Owner-only run reports.
+- **Honest results:** an update that finished with some Portal features off shows **Some features off** with the reason and **Retry checks**, never "Up to date", until a later update or Retry checks passes. Other maintenance actions wait while a tool update runs.
+- **Recovery from Maintenance:** a tool's unfinished update is settled with that tool's **Re-check**, and an update whose background service stopped with **Check interrupted update**.
+- **Agent workspace:** keep widgets, downloadable code, diagrams and documents beside the conversation, with closable tabs and floating widgets saved for this browser.
+- **Live browser panel:** view the OpenClaw-managed browser alongside chat; owners can opt into keyboard and pointer input without resizing the remote page.
+- **Optional response preferences:** request a diagram, code, file or interactive widget when the selected harness supports it. Automatic keeps normal chat behavior.
+- **Live pinned widgets:** a widget the agent keeps updating under one name is listed once as a live widget and previews its newest version, on OpenClaw builds that provide the session board.
+- **Steer a running OpenClaw reply:** a message sent while a reply is running now reaches it through stock OpenClaw's own chat steering, and the transcript says whether OpenClaw added it to the running reply or started a new turn with it.
+
+### Changed
+- **Works with newer OpenClaw releases:** the Portal accepts any OpenClaw from 2026.9.1 upward, including the 2026.10 releases, by checking the gateway methods and events it needs instead of matching exact versions; optional features such as goals, progress and inline widgets turn off with a visible reason when the installed OpenClaw lacks them.
+- **Recommended means qualified:** a published release recommends only tool versions its qualification recorded with download digests; where that qualification does not cover your server's machine type, the card marks the recommended version "(not yet qualified)".
+- **OpenClaw updates come in a later release:** Maintenance does not update OpenClaw in 5.2.0. OpenClaw keeps working, and this Portal works with OpenClaw 2026.9.1 and newer; the OpenClaw card shows **Needs a later Portal release** and offers no update.
+- **Servers first installed with Portal 5.0.x:** tools below this release's minimum versions show "Update required" with an Update button, and OpenCode and Hermes under `/opt/bridgesllm/tools` show their version and move to the current layout on their update; the old copy is removed once the new version passes its checks.
+- **Other tools never restart OpenClaw:** updating Codex CLI, Claude Code, ClawHub or another harness replaces only that tool, and Ollama restarts only its own model server.
+- **Tools that update themselves:** a tool that changed itself outside the Portal is no longer treated as broken; its card shows the new version and asks for a Re-check before you rely on it, and a slow version read shows "Checking…" instead of an error.
+- **Your tool updates stick:** a later Portal update or repair keeps a verified Ollama, OpenCode or Hermes version installed from Maintenance instead of returning it to the release's version.
+- **Portal updates stay Portal-only:** a Portal update installs the per-tool updater but changes no AI tool version, and on servers with the per-tool updater the installer's `--maintain-tools` changes nothing and points to Maintenance.
+- **Readable tool activity:** recognizable tool icons and measured progress cards make long-running work easier to follow.
+- **Chat layout:** widgets, tables, code and tool cards get a wider canvas while chat prose keeps a readable line length, and on narrow screens agent activity marks the side-panel button instead of covering the chat.
+
+### Fixed
+- **No sign-out during a brief outage:** a network drop, timeout or server error while the Portal restarts or updates no longer signs anyone out; only a current refusal from the server ends a session, for streaming chat and manual refresh too.
+- **Open tabs survive a Portal update:** a tab opened before an update shows "Portal was updated" with Reload and Keep working instead of reloading itself and dropping unsent drafts.
+- **Transcript order:** a live reply stays below its prompt when the gateway's clock runs ahead, and project work woven into Agent Chat keeps its order.
+- **Cleaner transcripts:** no duplicate empty thought heading after a tool call, and a reply that is a bare JSON value renders as JSON with Copy original.
+- **Agent work status:** interrupted runs show as resumable instead of stopped, and only sessions that were actually spawned count as sub-agents.
+- **Clear notes where chat shows less:** the live browser view says why it stopped and what to do, Project Chat explains that it does not show inline widgets, and an empty Widgets tab names the agent tool-policy setting that hides chat tools.
+- **Widget hints per harness:** the Interactive widget preference names the tool discovery each harness really has, such as Tool Search on OpenClaw, instead of letting the agent report the widget tool missing.
+- **Lighter OpenClaw checks:** the Tasks view no longer calls a task-list method that no OpenClaw release provides and authorizes its rows with far fewer lookups, and the Codex plugin is inspected through the running gateway instead of a cold command-line start.
+- **Claude Code start-up failures:** a failed start is reported clearly on both older and newer Claude Code releases.
+- **Live browser viewer limit:** viewers that are still connecting count toward the limit.
+- **Plugin tool policies:** an unrestricted, empty plugin allowlist is accepted consistently when the Portal's OpenClaw plugins are registered and verified; restrictive lists are preserved.
+- **Recovering an earlier all-tools update:** an interrupted shutdown of the previous all-tools updater enters verified recovery without writing an unreadable journal, and a failed compatibility check keeps its restricted diagnostics instead of deleting them.
+- **No dead-end advice after a failed Re-check:** the card no longer suggests an update that would then be refused as already installed. When the files of Codex CLI, Claude Code or ClawHub no longer match what the Portal installed, Update installs the same release again through the verified path; otherwise the card asks for a Re-check once the cause is fixed.
+- **A failed switch is never "nothing changed":** if a Codex CLI, Claude Code, ClawHub or harness update stops on an error while switching versions, the Portal checks what is installed and puts the previous version back, keeps the new one once it passes its checks, or marks the tool as needing recovery. A failed Agent Zero update is checked against the version Agent Zero actually runs instead of being assumed unchanged.
+- **Antigravity stays put while the Portal checks it:** the Portal's version and model checks run Antigravity with its self-update turned off, so a check cannot replace the program.
+
+- **Codex CLI and Claude Code for every user:** package folders that older installers left readable only by root are corrected during that tool's update or Re-check.
+- **Model picker lists what the server can run:** with no model provider connected (also when OpenClaw answers with an empty model list), the chat model picker lists no models and says how many are hidden, for every user, instead of listing models that then fail.
+### Security
+- **Chat model switches stay within the server's models:** switching a chat's model from the Portal, including through chat settings, no longer adds that model to the server's list of allowed models, and a model that isn't enabled in **Model Providers** is refused with a plain message for every role.
+- **Chat commands are for admins:** OpenClaw chat commands and directives typed by anyone but an Owner or Admin (for example `/model … -g`, a model alias, `/restart` or `/config`) now reach the model as plain text on OpenClaw 2026.9.2 and newer; before, they ran with the Portal's administrator connection and could change server settings such as the default model. On OpenClaw 2026.9.1, a `commands.allowFrom` setting that matches the Portal can still let `/new` or `/reset` start a new conversation; remove such a setting or update OpenClaw.
+- **Tool checks in a locked-down sandbox:** a tool version being checked before it is installed runs as an unprivileged user with no network and no access to the server's control sockets or private files.
+- **Private Tasks feed:** each admin sees only the background tasks of sessions they may open; before, every admin saw every other user's rows.
+- **Removing a user on stock OpenClaw:** deletes the user's OpenClaw chats and asks OpenClaw to forget them from memory search, where deleted chats could previously remain; OpenClaw keeps deleted-chat archives until its own archive retention removes them, and the Portal records them as retained, never as purged.
+
+### Upgrade notes
+- Update Portal first, then update AI tools one at a time from **Admin > Maintenance**. See [Updating Portal and AI tools](docs/UPDATING.md).
+- An unfinished update started by an earlier Portal is still finished with the installer's `--recover`, which this release leaves unchanged.
+- Maintenance can install a missing AI tool except Agent Zero, which needs its own setup; on servers with the per-tool updater the installer's `--maintain-tools` still changes nothing. A fresh install still installs its default set of AI tools.
+- Updating to 5.2.0 does not change your OpenClaw version, and Maintenance does not update OpenClaw in this release; keep OpenClaw 2026.9.1 or newer. A server that started on Portal 5.0.x may still run older harness versions after later Portal updates; update them from their cards.
+
 ## [5.1.0] - 2026-10-23
 
 ### Added

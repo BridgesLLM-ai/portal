@@ -1,0 +1,2 @@
+{"status": "ok", "mode": "repair", "restart": false, "reconciledRuns": ["9a8b7c6d-0000-4000-8000-0000000000a4"],
+ "message": "Gateway is healthy. Reconciled 1 abandoned update run. No maintenance or service restart was needed."}

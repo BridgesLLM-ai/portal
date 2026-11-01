@@ -31,7 +31,9 @@ import MermaidDiagram from './MermaidDiagram';
 import { AssistantJson, MarkdownTable } from './TranscriptArtifacts';
 import { inspectJson, jsonFenceBody } from './jsonPresentation';
 import { marked } from 'marked';
-import { Copy, Check, Eye, EyeOff, Maximize2, Minimize2 } from 'lucide-react';
+import { Copy, Check, Eye, EyeOff, Maximize2, Minimize2, Download, PanelRight } from 'lucide-react';
+import { useAgentWorkspaceTarget } from './workspace/AgentWorkspaceContext';
+import { useAgentWorkspaceStore } from '../../stores/agentWorkspaceStore';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../contexts/AuthContext';
 import client from '../../api/client';
@@ -288,7 +290,7 @@ function getLanguage(className?: string): string {
   return (match?.[1] || '').toLowerCase();
 }
 
-function buildPreviewDocument(code: string, language: string): string | null {
+export function buildPreviewDocument(code: string, language: string): string | null {
   if (!code.trim()) return null;
 
   if (language === 'html') {
@@ -417,6 +419,22 @@ function PreviewableCodeBlock({ className, children, isStreaming = false, ...pro
   const canPreview = Boolean(previewDoc);
   const shouldDefaultToPreview = language === 'html' || language === 'svg';
   const shouldDeferIframe = isStreaming && activeView === 'preview' && ['html', 'svg', 'md', 'markdown'].includes(language);
+  const workspace = useAgentWorkspaceTarget();
+  const openBeside = useCallback(() => {
+    const title = codeText.split('\n').map((line) => line.trim()).find(Boolean)?.replace(/^[#/*\-<!>\s]+/, '').slice(0, 60) || language || 'Code';
+    useAgentWorkspaceStore.getState().openPreview(language === 'md' || language === 'markdown'
+      ? { kind: 'markdown', title, markdown: codeText } : { kind: 'code', title, language, code: codeText });
+  }, [codeText, language]);
+
+  const handleDownload = useCallback(() => {
+    const extensions: Record<string, string> = { html: 'html', svg: 'svg', md: 'md', markdown: 'md',
+      javascript: 'js', js: 'js', typescript: 'ts', ts: 'ts', python: 'py', py: 'py', json: 'json', csv: 'csv', css: 'css', yaml: 'yaml', yml: 'yml' };
+    const url = URL.createObjectURL(new Blob([codeText], { type: 'text/plain;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url; link.download = `response.${extensions[language] || 'txt'}`;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, [codeText, language]);
 
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(codeText).then(() => {
@@ -477,6 +495,16 @@ function PreviewableCodeBlock({ className, children, isStreaming = false, ...pro
             >
               {expanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
               <span className="hidden sm:inline sm:ml-1">{expanded ? 'Collapse' : 'Expand'}</span>
+            </button>
+            {workspace && <button type="button" onClick={openBeside} disabled={isStreaming}
+              aria-label="Open in side panel" title="Open beside the chat"
+              className="inline-flex items-center justify-center h-8 w-8 sm:w-auto sm:px-2.5 rounded-md border border-white/15 text-[11px] text-slate-300 hover:bg-white/[0.08] disabled:opacity-40">
+              <PanelRight size={12} /><span className="hidden sm:inline sm:ml-1">Side panel</span>
+            </button>}
+            <button type="button" onClick={handleDownload} disabled={isStreaming}
+              aria-label="Download code" title={isStreaming ? 'Download after the response completes' : 'Download code'}
+              className="inline-flex items-center justify-center h-8 w-8 sm:w-auto sm:px-2.5 rounded-md border border-white/15 text-[11px] text-slate-300 hover:bg-white/[0.08] disabled:opacity-40">
+              <Download size={12} /><span className="hidden sm:inline sm:ml-1">Download</span>
             </button>
             <button
               onClick={handleCopy}
@@ -798,16 +826,20 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
     if (!assistantArtifacts) return null;
     const fenced = jsonFenceBody(content, isStreaming);
     if (fenced !== null) return fenced;
-    if (!/^\s*[\[{]/.test(content)) return null;
+    if (!/^\s*(?:[\[{"\d-]|true\b|false\b|null\b)/.test(content)) return null;
     const inspected = inspectJson(content);
     // Markdown links also begin with '['. Invalid ordinary prose stays Markdown.
     if (inspected.tree || inspected.reason?.includes('exceeds')) return content;
-    return isStreaming && /^\s*(?:\{\s*(?:"|$)|\[\s*(?:[\[{"\d-]|$))/.test(content) ? content : null;
+    const jsonLikeContainer = /^\s*(?:\{\s*(?:"|}|$)|\[\s*(?:[\[{"\d\]-]|true\b|false\b|null\b|$))/.test(content);
+    // A finished reply such as "[1] First point" is prose, not a broken array:
+    // outside streaming an unparsable '[' container must also end with ']'.
+    const openArrayProse = !isStreaming && /^\s*\[/.test(content) && !/\]\s*$/.test(content);
+    return jsonLikeContainer && !openArrayProse && !/^\s*\[[^\n]*\]\(/.test(content) ? content : null;
   }, [content, isStreaming, assistantArtifacts]);
   if (wholeJson !== null) return <AssistantJson raw={wholeJson} isStreaming={isStreaming} />;
 
   return (
-    <div className={`text-sm text-slate-200 leading-relaxed ${className || ''}`}>
+    <div className={`chat-markdown min-w-0 text-sm text-slate-200 leading-relaxed ${className || ''}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkPortalLinks]}
         rehypePlugins={[rehypeHighlight]}

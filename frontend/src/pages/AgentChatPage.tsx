@@ -2,18 +2,21 @@
  * AgentChatPage — Dedicated page for the Agent Chat UI.
  * Houses the ChatInterface component.
  */
-import { lazy, Suspense } from 'react';
+import { Suspense } from 'react';
+import { lazyWithRecovery } from '../utils/moduleRecovery';
 import { Loader2 } from 'lucide-react';
 import TaskConversationNavigation from '../components/chat/TaskConversationNavigation';
+import WorkspaceFocusNavigation from '../components/chat/workspace/WorkspaceFocusNavigation';
 import { ChatStateProvider } from '../contexts/ChatStateProvider';
 
-const LazyChatInterface = lazy(() => import('../components/chat/ChatInterface'));
+const LazyChatInterface = lazyWithRecovery(() => import('../components/chat/ChatInterface'));
 
 export default function AgentChatPage() {
   return (
     <ChatStateProvider>
       <div className="flex h-full min-h-0 flex-col">
         <TaskConversationNavigation />
+        <WorkspaceFocusNavigation />
         <div className="min-h-0 flex-1">
         <Suspense
           fallback={(

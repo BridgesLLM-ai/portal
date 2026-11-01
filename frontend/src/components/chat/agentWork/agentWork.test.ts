@@ -16,6 +16,7 @@ import {
   canStopRow,
   goalActionStates,
   groupActivity,
+  runCounts,
   runStatusView,
   sessionDisplayLabel,
 } from './agentWorkModel';
@@ -117,6 +118,10 @@ describe('status presentation', () => {
     expect(runStatusView('queued')).toEqual({ tone: 'waiting', label: 'Waiting to start' });
     expect(runStatusView('timeout').tone).toBe('failed');
     expect(runStatusView('killed')).toEqual({ tone: 'stopped', label: 'Stopped' });
+    // 10.7+ reports resumable tool timeouts (and Gateway restarts) as interrupted, not failed.
+    expect(runStatusView('interrupted')).toEqual({ tone: 'resumable', label: 'Interrupted, can resume' });
+    // Counted apart from failures, so an interrupted child never raises the failed badge.
+    expect(runCounts([{ key: 'agent:main:subagent:a', status: 'interrupted' } as any])).toMatchObject({ failed: 0, resumable: 1 });
     expect(runStatusView('paused-for-review')).toEqual({ tone: 'unknown', label: 'paused-for-review' });
   });
   it('offers only the goal controls the status allows', () => {

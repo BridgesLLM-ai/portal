@@ -1,24 +1,84 @@
-/** Exact source-supported contracts; hello methods, not a broad 9.x guess, enable controls. */
-export const OPENCLAW_SOURCE_SUPPORTED_VERSIONS = Object.freeze([
-  '2026.7.1', '2026.7.1-2', '2026.9.1', '2026.9.2', '2026.9.3', '2026.9.6', '2026.9.9', '2026.10.5', '2026.10.6',
-]);
+import {
+  isLegacyOpenClawVersion,
+  OPENCLAW_FEATURE_FLOORS,
+  OPENCLAW_RUNTIME_FLOOR,
+  openClawCurrentFamilyAdmits,
+  openClawReleaseDenial,
+  openClawVersionMeetsFloor,
+} from './openClawRuntimeContract';
+
+/**
+ * What the authenticated hello proves. `supported` is the retained 2026.7.1
+ * tuple or the current family at or above the floor; each optional feature is
+ * then gated on its own methods and says why it is off.
+ */
 export interface OpenClawCapabilities {
   version: string | null;
   supported: boolean;
-  incrementalChat: boolean;
+  protocol: number | null;
   methods: readonly string[];
+  events: readonly string[];
   goals: boolean;
   progress: boolean;
+  inlineWidgets: boolean;
+  /** Live (pinned) widgets: inline widgets plus the session board (`board.get`) for the newest version. */
+  liveWidgets: boolean;
+  /** Reason per optional feature that is off: `goals`, `progress`, `inlineWidgets`, `liveWidgets`. */
+  disabledReasons: Readonly<Partial<Record<'goals' | 'progress' | 'inlineWidgets' | 'liveWidgets', string>>>;
 }
-export function capabilitiesFromHello(hello: any): OpenClawCapabilities {
-  const version = typeof hello?.server?.version === 'string' ? hello.server.version : null;
-  const supported = version !== null && OPENCLAW_SOURCE_SUPPORTED_VERSIONS.includes(version);
-  const methods: string[] = Array.isArray(hello?.features?.methods)
-    ? [...new Set<string>(hello.features.methods.filter((method: unknown): method is string => typeof method === 'string'))]
+
+function uniqueStrings(value: unknown): string[] {
+  return Array.isArray(value)
+    ? [...new Set<string>(value.filter((entry: unknown): entry is string => typeof entry === 'string'))]
     : [];
-  return Object.freeze({ version, supported, incrementalChat: version === '2026.9.9' || version === '2026.10.5' || version === '2026.10.6', methods: Object.freeze(methods),
-    goals: supported && methods.includes('sessions.goal.update') && methods.includes('sessions.goal.clear'),
-    progress: supported && methods.includes('progressCard.get'),
+}
+
+function unsupportedReason(version: string | null): string {
+  if (!version) return 'OpenClaw is not connected.';
+  const denial = openClawReleaseDenial(version);
+  if (denial) return `OpenClaw ${version} is refused by the Portal: ${denial}`;
+  if (!openClawVersionMeetsFloor(version)) return `OpenClaw ${version} is older than the supported floor ${OPENCLAW_RUNTIME_FLOOR}. Update OpenClaw.`;
+  return `OpenClaw ${version} is not admitted while strict tested-release mode is on.`;
+}
+
+export function capabilitiesFromHello(hello: any): OpenClawCapabilities {
+  const version = typeof hello?.server?.version === 'string' && hello.server.version.trim()
+    ? hello.server.version.trim()
+    : null;
+  const supported = version !== null && (isLegacyOpenClawVersion(version) || openClawCurrentFamilyAdmits(version));
+  const methods = uniqueStrings(hello?.features?.methods);
+  const events = uniqueStrings(hello?.features?.events);
+  const protocol = typeof hello?.protocol === 'number' && Number.isInteger(hello.protocol) ? hello.protocol : null;
+  const missing = (required: readonly string[]) => required.filter((method) => !methods.includes(method));
+  const gate = (required: readonly string[], featureFloor?: string): string | null => {
+    if (!supported) return unsupportedReason(version);
+    if (featureFloor && !openClawVersionMeetsFloor(version, featureFloor)) {
+      return `OpenClaw ${version} predates the qualified contract for this feature (${featureFloor} or newer).`;
+    }
+    const absent = missing(required);
+    return absent.length ? `The OpenClaw Gateway does not expose ${absent.join(', ')}.` : null;
+  };
+  const goalsReason = gate(['sessions.goal.update', 'sessions.goal.clear']);
+  const progressReason = gate(['progressCard.get']);
+  const inlineWidgetsReason = gate(['canvas.document.view'], OPENCLAW_FEATURE_FLOORS.inlineWidgets);
+  const liveWidgetsReason = inlineWidgetsReason ?? gate(['board.get']);
+  const disabledReasons: OpenClawCapabilities['disabledReasons'] = Object.freeze({
+    ...(goalsReason ? { goals: goalsReason } : {}),
+    ...(progressReason ? { progress: progressReason } : {}),
+    ...(inlineWidgetsReason ? { inlineWidgets: inlineWidgetsReason } : {}),
+    ...(liveWidgetsReason ? { liveWidgets: liveWidgetsReason } : {}),
+  });
+  return Object.freeze({
+    version,
+    supported,
+    protocol,
+    methods: Object.freeze(methods),
+    events: Object.freeze(events),
+    goals: goalsReason === null,
+    progress: progressReason === null,
+    inlineWidgets: inlineWidgetsReason === null,
+    liveWidgets: liveWidgetsReason === null,
+    disabledReasons,
   });
 }
 let current = capabilitiesFromHello(null);
@@ -51,7 +111,7 @@ export function assembleChatSnapshot(previous: string, payload: any, legacySnaps
   return legacySnapshot;
 }
 
-/** Exact Canvas source contracts qualified by Portal, never a version-range guess. */
-export function supportsOpenClawInlineWidgets(version: unknown): boolean {
-  return version === '2026.9.9' || version === '2026.10.5' || version === '2026.10.6';
+/** Inline widgets: supported runtime, qualified Canvas contract, `canvas.document.view` in the hello. */
+export function supportsOpenClawInlineWidgets(caps: Pick<OpenClawCapabilities, 'inlineWidgets'> | null | undefined): boolean {
+  return caps?.inlineWidgets === true;
 }

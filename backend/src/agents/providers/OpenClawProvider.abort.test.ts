@@ -325,11 +325,12 @@ test.each([false, true])('forwards the server-owned inline-widget flag and image
   const provider = new OpenClawProvider();
   expect(provider.supportsNativeChatImages).toBe(true);
   const send = provider.sendMessage(sessionId, 'make a widget', undefined, undefined, undefined, {
-    label: 'fixture owner', userId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', portalInlineWidgets: true,
+    label: 'fixture owner', userId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', role: 'OWNER', portalInlineWidgets: true,
     ...(photos ? { chatImages: images, chatImageModel: model, revalidateChatImages: revalidate } : {}),
   });
   await new Promise<void>(resolve => setImmediate(resolve));
-  expect(persistentGateway.sendChatMessage.mock.calls[0].slice(5)).toEqual([images, true, model, revalidate]);
+  // The last argument is the Owner's OpenClaw chat-command authority.
+  expect(persistentGateway.sendChatMessage.mock.calls[0].slice(5)).toEqual([images, true, model, revalidate, true]);
   streamEventBus.publish(sessionId, { type: 'done', content: 'created', runId: 'widget-run' });
   await expect(send).resolves.toMatchObject({ fullText: 'created' });
   streamEventBus.clearStream(sessionId);

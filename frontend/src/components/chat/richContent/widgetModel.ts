@@ -10,7 +10,10 @@ export interface WidgetReference {
   mode: 'inline' | 'dashboard' | 'unsupported';
   /** Correlation only. Document fetches still use the attested tool-call route. */
   presentationRef?: string;
+  /** Board name of a live (pinned) widget: newer versions keep it. Present only while the Gateway offers live widgets. */
+  boardName?: string;
 }
+export const BOARD_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 export function parseWidgetReference(name: string, toolCallId: string, result: unknown): WidgetReference | null {
   if (name !== 'show_widget' || typeof result !== 'string' || result.length > 2048) return null;
   try {
@@ -20,8 +23,10 @@ export function parseWidgetReference(name: string, toolCallId: string, result: u
       || !['inline', 'dashboard', 'unsupported'].includes(value.mode)
       || (value.presentationRef !== undefined && (value.mode !== 'inline'
         || typeof value.presentationRef !== 'string' || !/^(?!\.{1,2}$)[A-Za-z0-9._-]{1,256}$/.test(value.presentationRef)))
-      || Object.keys(value).sort().join(',') !== (value.presentationRef === undefined
-        ? 'mode,schema,title,toolCallId' : 'mode,presentationRef,schema,title,toolCallId')) return null;
+      || (value.boardName !== undefined && (value.mode === 'unsupported' || typeof value.boardName !== 'string' || !BOARD_NAME.test(value.boardName)))
+      || Object.keys(value).sort().join(',') !== ['mode', 'schema', 'title', 'toolCallId',
+        ...(value.presentationRef === undefined ? [] : ['presentationRef']),
+        ...(value.boardName === undefined ? [] : ['boardName'])].sort().join(',')) return null;
     return value;
   } catch { return null; }
 }
@@ -54,4 +59,13 @@ export function widgetDocumentPath(session: string, toolCallId: string, provider
   }
   const nativeSession = nativeAgentChatSessionId(provider, session);
   return nativeSession ? `/chat-widgets/native/sessions/${encodeURIComponent(nativeSession)}/tools/${tool}/document` : null;
+}
+
+/**
+ * Owner-checked route for the newest version of a live widget (OpenClaw only):
+ * the same owner check and attested read, looked up by board name.
+ */
+export function liveWidgetDocumentPath(session: string, boardName: string, provider = 'OPENCLAW'): string | null {
+  if (String(provider || '').trim().toUpperCase() !== 'OPENCLAW' || !BOARD_NAME.test(boardName)) return null;
+  return `/chat-widgets/sessions/${encodeURIComponent(session)}/boards/${encodeURIComponent(boardName)}/document`;
 }

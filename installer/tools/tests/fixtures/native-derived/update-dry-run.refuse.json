@@ -1,0 +1,8 @@
+{"runId": "1f2e3d4c-0000-4000-8000-0000000000d2", "run": {"runId": "1f2e3d4c-0000-4000-8000-0000000000d2", "status": "skipped", "phase": "finished", "reason": "dry-run", "steps": []},
+ "dryRun": true, "root": "/usr/lib/node_modules/openclaw", "installKind": "package", "mode": "npm", "updateInstallKind": "package",
+ "switchToGit": false, "switchToPackage": false, "restart": true, "requestedChannel": "stable", "storedChannel": "stable",
+ "effectiveChannel": "stable", "tag": "2026.10.9", "currentVersion": "2026.9.9", "targetVersion": "2026.10.9",
+ "downgradeRisk": false, "actions": ["Run global package manager update with spec 2026.10.9"],
+ "notes": [],
+ "failures": [{"reason": "package-permissions", "message": "The global package directory is not writable by this user.",
+               "failureFacts": []}]}

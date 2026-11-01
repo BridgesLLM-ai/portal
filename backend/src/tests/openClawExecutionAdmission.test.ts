@@ -18,6 +18,10 @@ import {
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import {
+  OPENCLAW_DIAGNOSTIC_BLOCKERS,
+  OPENCLAW_DIAGNOSTICS_QUIESCE_MARKER,
+} from '../utils/openclawDiagnosticLease';
 import type { OpenClawSetupReadiness } from '../services/openclawSetupReadiness';
 import type { OpenClawQuestionPluginReadiness } from '../services/openClawQuestionRuntimeReadiness';
 
@@ -71,6 +75,7 @@ function dependencies(
     inspectAuthorizationFence: absent,
     inspectMaintenanceMarker: absent,
     inspectHostMutationJournal: absent,
+    inspectDiagnosticsQuiesce: absent,
     readMutationEpoch: () => 'epoch-0',
     getReadiness: async () => readiness(),
     getQuestionRuntimeReadiness: async () => questionReadiness(),
@@ -469,6 +474,104 @@ describe('OpenClaw execution admission', () => {
       expect.objectContaining({ testedRuntimeFamily: 'current-2026.9.1' }),
     );
     expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'ready' });
+  });
+
+  describe('L3 split: the diagnostics quiesce marker pauses readiness collection, not chat', () => {
+    it('lives outside the runtime-mutation epoch and blocks every Portal OpenClaw CLI reader', () => {
+      expect(OPENCLAW_DIAGNOSTICS_QUIESCE_MARKER)
+        .toBe('/var/lib/bridgesllm/tools/openclaw-diagnostics-quiesce.v1.json');
+      expect(OPENCLAW_DIAGNOSTIC_BLOCKERS).toContain(OPENCLAW_DIAGNOSTICS_QUIESCE_MARKER);
+      // Publishing it must not look like a runtime mutation, or chat would lose
+      // its attestation at the start of every update.
+      expect(__openClawExecutionAdmissionTest.OPENCLAW_MUTATION_EPOCH_DIRECTORIES)
+        .not.toContain(path.dirname(OPENCLAW_DIAGNOSTICS_QUIESCE_MARKER));
+    });
+
+    it('keeps chat on its last positive attestation, never collecting, for a bounded time', async () => {
+      let now = Date.parse('2026-08-22T21:00:00.000Z');
+      let quiesce: OpenClawDurableEvidence = { state: 'absent' };
+      const getReadiness = jest.fn(async () => readiness());
+      const input = dependencies({ getReadiness, inspectDiagnosticsQuiesce: () => quiesce, now: () => now });
+      await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+        .resolves.toMatchObject({ state: 'ready' });
+
+      quiesce = { state: 'present' };
+      now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_MAX_AGE_MS + 60_000;
+      await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+        .resolves.toMatchObject({ state: 'ready' });
+      await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true, forceReadiness: true }))
+        .resolves.toMatchObject({ state: 'ready' });
+      expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'ready' });
+      expect(() => assertOpenClawDispatchNotDurablyBlocked(input, { useSharedCache: true })).not.toThrow();
+      expect(getReadiness).toHaveBeenCalledTimes(1);
+
+      now = Date.parse('2026-08-22T21:00:00.000Z')
+        + __openClawExecutionAdmissionTest.READINESS_ATTESTATION_QUIESCED_MAX_AGE_MS;
+      const waiting = await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+      expect(waiting).toMatchObject({ state: 'maintenance', reason: expect.stringMatching(/being updated/) });
+      expect(new OpenClawExecutionAdmissionError(waiting).retryable).toBe(true);
+      expect(getCachedOpenClawExecutionAdmission(input).state).toBe('maintenance');
+      expect(getReadiness).toHaveBeenCalledTimes(1);
+
+      quiesce = { state: 'absent' };
+      await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+        .resolves.toMatchObject({ state: 'ready' });
+      expect(getReadiness).toHaveBeenCalledTimes(2);
+    });
+
+    it('waits retryably without an attestation, and the maintenance marker still pauses chat', async () => {
+      const getReadiness = jest.fn(async () => readiness());
+      const quiesced = dependencies({ getReadiness, inspectDiagnosticsQuiesce: () => ({ state: 'present' }) });
+      await expect(getOpenClawExecutionAdmission(quiesced, { useSharedCache: true }))
+        .resolves.toMatchObject({ state: 'maintenance', reason: expect.stringMatching(/being updated/) });
+      await expect(getOpenClawExecutionAdmission(quiesced)).resolves.toMatchObject({ state: 'maintenance' });
+      expect(getReadiness).not.toHaveBeenCalled();
+
+      const restartWindow = dependencies({
+        getReadiness,
+        inspectDiagnosticsQuiesce: () => ({ state: 'present' }),
+        inspectMaintenanceMarker: () => ({ state: 'present' }),
+      });
+      await expect(getOpenClawExecutionAdmission(restartWindow, { useSharedCache: true }))
+        .resolves.toMatchObject({ state: 'maintenance', reason: expect.stringMatching(/supervised host maintenance/) });
+      expect(() => assertOpenClawDispatchNotDurablyBlocked(restartWindow, { useSharedCache: true }))
+        .toThrow(OpenClawExecutionAdmissionError);
+    });
+
+    it('never counts a collection the pause made fail against a positive attestation', async () => {
+      let now = Date.parse('2026-08-22T21:00:00.000Z');
+      let quiesce: OpenClawDurableEvidence = { state: 'absent' };
+      const busy = readiness({
+        ready: false,
+        authenticatedRpc: false,
+        blockers: [{ code: 'gateway-rpc-unavailable', message: 'The OpenClaw gateway did not pass an authenticated RPC probe.' }],
+      });
+      const getReadiness = jest
+        .fn<Promise<OpenClawSetupReadiness>, []>()
+        .mockResolvedValueOnce(readiness())
+        .mockImplementationOnce(async () => {
+          quiesce = { state: 'present' }; // toolctl paused diagnostics while this probe ran
+          throw new Error('OpenClaw diagnostics are paused during maintenance or recovery.');
+        })
+        .mockResolvedValue(busy);
+      const input = dependencies({ getReadiness, inspectDiagnosticsQuiesce: () => quiesce, now: () => now });
+      await getOpenClawExecutionAdmission(input, { useSharedCache: true });
+      now += __openClawExecutionAdmissionTest.READINESS_ATTESTATION_REFRESH_AFTER_MS;
+      await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+        .resolves.toMatchObject({ state: 'ready' });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(getReadiness).toHaveBeenCalledTimes(2);
+
+      // After the pause one genuine contended revalidation is tolerated as usual,
+      // because the paused one was never counted.
+      quiesce = { state: 'absent' };
+      now += __openClawExecutionAdmissionTest.READINESS_BACKGROUND_RETRY_MS;
+      await expect(getOpenClawExecutionAdmission(input, { useSharedCache: true }))
+        .resolves.toMatchObject({ state: 'ready' });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(getReadiness).toHaveBeenCalledTimes(3);
+      expect(getCachedOpenClawExecutionAdmission(input)).toMatchObject({ state: 'ready' });
+    });
   });
 
   it('never refreshes an expired readiness attestation in the synchronous final seam', async () => {

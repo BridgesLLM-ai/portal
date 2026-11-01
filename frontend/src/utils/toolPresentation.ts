@@ -13,6 +13,12 @@ export type ToolVisualKind =
   | 'voice'
   | 'session'
   | 'browser'
+  | 'widget'
+  | 'progress'
+  | 'question'
+  | 'schedule'
+  | 'goal'
+  | 'dashboard'
   | 'weather'
   | 'bridgesllm'
   | 'generic';
@@ -138,6 +144,42 @@ const TOOL_PRESENTATIONS: Record<ToolVisualKind, ToolPresentation> = {
     iconBadgeClass: 'border-yellow-400/20 bg-yellow-400/10',
     iconClass: 'text-yellow-300',
   },
+  widget: {
+    key: 'widget', label: 'Widget',
+    surfaceClass: 'bg-violet-400/[0.08] border-violet-400/20 hover:bg-violet-400/[0.14]',
+    iconBadgeClass: 'border-violet-400/25 bg-violet-400/10',
+    iconClass: 'text-violet-300',
+  },
+  progress: {
+    key: 'progress', label: 'Progress',
+    surfaceClass: 'bg-sky-400/[0.08] border-sky-400/20 hover:bg-sky-400/[0.14]',
+    iconBadgeClass: 'border-sky-400/25 bg-sky-400/10',
+    iconClass: 'text-sky-300',
+  },
+  question: {
+    key: 'question', label: 'Question',
+    surfaceClass: 'bg-amber-400/[0.08] border-amber-400/20 hover:bg-amber-400/[0.14]',
+    iconBadgeClass: 'border-amber-400/25 bg-amber-400/10',
+    iconClass: 'text-amber-300',
+  },
+  schedule: {
+    key: 'schedule', label: 'Schedule',
+    surfaceClass: 'bg-orange-400/[0.08] border-orange-400/20 hover:bg-orange-400/[0.14]',
+    iconBadgeClass: 'border-orange-400/25 bg-orange-400/10',
+    iconClass: 'text-orange-300',
+  },
+  goal: {
+    key: 'goal', label: 'Goal',
+    surfaceClass: 'bg-emerald-400/[0.08] border-emerald-400/20 hover:bg-emerald-400/[0.14]',
+    iconBadgeClass: 'border-emerald-400/25 bg-emerald-400/10',
+    iconClass: 'text-emerald-300',
+  },
+  dashboard: {
+    key: 'dashboard', label: 'Dashboard',
+    surfaceClass: 'bg-indigo-400/[0.08] border-indigo-400/20 hover:bg-indigo-400/[0.14]',
+    iconBadgeClass: 'border-indigo-400/25 bg-indigo-400/10',
+    iconClass: 'text-indigo-300',
+  },
   generic: {
     key: 'generic',
     label: 'Tool',
@@ -168,18 +210,17 @@ function parseToolArgs(raw: unknown): Record<string, any> | undefined {
   return undefined;
 }
 
-function canonicalToolName(name: string): string {
-  let text = normalizeToolName(name);
-  // MCP tools arrive as mcp__<server>__<tool>; present the tool itself.
-  const mcpMatch = /^mcp__.+__(.+)$/.exec(text);
-  if (mcpMatch) text = mcpMatch[1];
+export function canonicalToolName(name: string): string {
+  let text = normalizeToolName(name).slice(0, 400);
+  // Tool identity is unchanged upstream. Unwrap transport namespaces only for
+  // presentation: MCP aliases (mcp__<server>__<tool>), dotted/colon prefixes
+  // (functions.read, openclaw:show_widget) and tools.<plugin>__<tool>.
+  text = text.split(/[.:]/).filter(Boolean).pop() || text;
+  text = text.split('__').filter(Boolean).pop() || text;
   // Direct-harness tools use CamelCase (WebFetch, TaskUpdate, TodoWrite…);
   // fold them onto the snake_case names the mapping already knows.
-  text = text.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
-  const trimmed = text.toLowerCase().replace(/-/g, '_');
-  if (!trimmed) return 'tool';
-  const parts = trimmed.split('.').filter(Boolean);
-  return parts[parts.length - 1] || trimmed;
+  return text.replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[-\s]+/g, '_').toLowerCase() || 'tool';
 }
 
 function humanizeCanonicalToolName(name: string): string {
@@ -271,7 +312,7 @@ export function isBridgesLLMTool(name: string, toolArguments?: unknown): boolean
   return ['path', 'file_path', 'filePath', 'resource'].some((key) => {
     const value = record[key];
     return typeof value === 'string' && value.length <= 2048
-      && /(?:^|\/)skills\/bridgesllm(?:[-_][a-z0-9_-]+)?\/(?:SKILL\.md|references\/[a-z0-9_./-]+\.md)$/i.test(value);
+      && /(?:^|\/)(?:skills|workshop-skills|plugin-skills)\/bridgesllm(?:[-_][a-z0-9_-]+)?\/(?:SKILL\.md|references\/[a-z0-9_./-]+\.md)$/i.test(value);
   });
 }
 
@@ -279,14 +320,21 @@ export function getToolPresentation(name: string, toolArguments?: unknown): Tool
   if (isBridgesLLMTool(name, toolArguments)) return TOOL_PRESENTATIONS.bridgesllm;
   const canonical = canonicalToolName(name);
 
-  if (canonical === 'read' || canonical === 'read_file' || canonical === 'list_directory' || canonical === 'read_many_files' || canonical === 'notebook_read'
+  if (['show_widget', 'canvas'].includes(canonical)) return TOOL_PRESENTATIONS.widget;
+  if (['progress_card', 'update_plan', 'todo_write', 'write_todos', 'task_create', 'task_update', 'task_get', 'task_list', 'enter_plan_mode', 'exit_plan_mode'].includes(canonical)) return TOOL_PRESENTATIONS.progress;
+  if (['ask_user', 'ask_user_question', 'request_user_input', 'request_user_input_async'].includes(canonical)) return TOOL_PRESENTATIONS.question;
+  if (['automations', 'cron'].includes(canonical)) return TOOL_PRESENTATIONS.schedule;
+  if (['create_goal', 'update_goal', 'get_goal', 'set_goal', 'goal'].includes(canonical)) return TOOL_PRESENTATIONS.goal;
+  if (['dashboard', 'show_dashboard'].includes(canonical)) return TOOL_PRESENTATIONS.dashboard;
+  if (canonical.startsWith('browser_') || ['computer', 'screen', 'mobile_ui'].includes(canonical)) return TOOL_PRESENTATIONS.browser;
+  if (canonical === 'read' || canonical === 'read_file' || canonical === 'ls' || canonical === 'list_directory' || canonical === 'read_many_files' || canonical === 'notebook_read'
     || canonical === 'view_file' || canonical === 'list_dir') return TOOL_PRESENTATIONS.read;
   if (canonical === 'write' || canonical === 'write_file' || canonical === 'write_to_file') return TOOL_PRESENTATIONS.write;
   if (canonical === 'edit' || canonical === 'edit_file' || canonical === 'patch' || canonical === 'apply_patch' || canonical === 'replace' || canonical === 'multi_edit' || canonical === 'notebook_edit'
     || canonical === 'file_change' || canonical === 'replace_file_content' || canonical === 'multi_replace_file_content') return TOOL_PRESENTATIONS.edit;
   if (canonical === 'process' || canonical === 'bash_output' || canonical === 'task_output' || canonical === 'kill_shell' || canonical === 'task_stop') return TOOL_PRESENTATIONS.process;
-  if (canonical === 'exec' || canonical === 'execute' || canonical === 'bash' || canonical === 'shell' || canonical === 'run_shell_command' || canonical === 'run_command' || canonical === 'skill' || canonical === 'slash_command') return TOOL_PRESENTATIONS.exec;
-  if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query' || canonical === 'find' || canonical === 'finance' || canonical === 'sports' || canonical === 'time' || canonical === 'grep_search' || canonical === 'glob' || canonical === 'grep' || canonical === 'search_file_content' || canonical === 'google_web_search' || canonical === 'tool_search'
+  if (canonical === 'terminal' || canonical === 'exec_command' || canonical === 'exec' || canonical === 'execute' || canonical === 'bash' || canonical === 'shell' || canonical === 'run_shell_command' || canonical === 'run_command' || canonical === 'skill' || canonical === 'slash_command') return TOOL_PRESENTATIONS.exec;
+  if (canonical === 'search' || canonical === 'web_search' || canonical === 'search_query' || canonical === 'image_query' || canonical === 'find' || canonical === 'finance' || canonical === 'sports' || canonical === 'time' || canonical === 'grep_search' || canonical === 'glob' || canonical === 'grep' || canonical === 'search_file_content' || canonical === 'google_web_search' || canonical === 'tool_search' || canonical === 'tool_describe'
     || canonical === 'find_by_name' || canonical === 'search_web' || canonical === 'codebase_search') return TOOL_PRESENTATIONS.search;
   if (canonical === 'web_fetch' || canonical === 'fetch' || canonical === 'open' || canonical === 'click' || canonical === 'screenshot' || canonical === 'read_url_content') return TOOL_PRESENTATIONS.fetch;
   if (canonical === 'browser' || canonical === 'canvas' || canonical === 'nodes') return TOOL_PRESENTATIONS.browser;
@@ -324,6 +372,7 @@ export function getToolPresentation(name: string, toolArguments?: unknown): Tool
     || canonical === 'subagents'
     || canonical === 'agents_list'
     || canonical === 'session_status'
+    || ['sessions', 'agents_wait', 'spawn_agent', 'wait_agent', 'send_input', 'resume_agent', 'close_agent'].includes(canonical)
     || canonical === 'parallel'
     || canonical === 'task'
     || canonical === 'agent'
@@ -505,6 +554,7 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
     canonical === 'ask_user_question'
     || canonical === 'ask_user'
     || canonical === 'request_user_input'
+    || canonical === 'request_user_input_async'
   ) return 'Ask a question';
   if (canonical === 'send_message') return 'Message agent';
   if (canonical === 'push_notification') return 'Send notification';
@@ -567,6 +617,10 @@ export function getToolSummary(tool: { name: string; arguments?: unknown }): str
   if (canonical === 'subagents') return 'Manage agents';
   if (canonical === 'parallel') return 'Run tools in parallel';
 
+  if (canonical === 'show_widget') return typeof args?.title === 'string' ? `Show ${args.title.slice(0, 80)}` : 'Show interactive widget';
+  if (canonical === 'dashboard') return 'Update dashboard';
+  if (canonical === 'automations') return 'Manage automations';
+
   if (canonical === 'weather') {
     const location = typeof args?.location === 'string' ? args.location : null;
     return location ? `Weather ${location}` : 'Check weather';
@@ -606,5 +660,6 @@ export function isAskQuestionTool(toolName: unknown): boolean {
   const canonical = canonicalToolName(toolName);
   return canonical === 'ask_user_question'
     || canonical === 'ask_user'
-    || canonical === 'request_user_input';
+    || canonical === 'request_user_input'
+    || canonical === 'request_user_input_async';
 }

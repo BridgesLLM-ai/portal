@@ -172,6 +172,26 @@ describe('native host CLI admission', () => {
     }
   });
 
+  // The Codex half attests the host's real installed package tree (~0.7 s alone, >5 s under a
+  // loaded parallel run), so this test gets an explicit timeout instead of jest's 5 s default.
+  test('pauses one tool while toolctl swaps its version (per-tool fence)', async () => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), 'native-host-cli-tools-fence-'));
+    const previous = process.env.BRIDGESLLM_TOOLS_FENCE_ROOT;
+    try {
+      await fs.writeFile(path.join(base, 'claude-code'), '{}\n', { mode: 0o600 });
+      process.env.BRIDGESLLM_TOOLS_FENCE_ROOT = base;
+      await expect(attestNativeHostCli('claude-code')).rejects.toMatchObject({
+        code: 'MAINTENANCE_ACTIVE', message: expect.stringMatching(/being switched to another version/),
+      });
+      const other = await attestNativeHostCli('codex').then(() => null, (error: { code?: string }) => error);
+      expect(other?.code).not.toBe('MAINTENANCE_ACTIVE');
+    } finally {
+      if (previous === undefined) delete process.env.BRIDGESLLM_TOOLS_FENCE_ROOT;
+      else process.env.BRIDGESLLM_TOOLS_FENCE_ROOT = previous;
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test('exports stable typed errors and rejects non-catalog executable paths before filesystem access', async () => {
     await expectAdmissionCode(attestNativeHostCli('codex', '/tmp/codex'), 'INVALID_EXECUTABLE_PATH');
     await expect(attestNativeHostCli('codex', '/tmp/codex')).rejects.toMatchObject({

@@ -33,6 +33,11 @@ import {
 import { PROJECT_EGRESS_POLICY_VERSION } from './projectEgressPolicy';
 import { OPENCLAW_PROJECT_EMBEDDED_RUNTIME_MODEL_KEYS } from './openclawProjectModel';
 import {
+  OPENCLAW_FEATURE_FLOORS,
+  openClawCurrentFamilyAdmits,
+  openClawVersionMeetsFloor,
+} from './openClawRuntimeContract';
+import {
   collectOpenClawConfigArrayPaths,
   exactOpenClawAgent,
   persistedOpenClawAgentEntry,
@@ -1116,13 +1121,16 @@ function readAgentContract(config: Record<string, any>): OpenClawAgentConfigCont
 }
 
 /**
- * Runtimes whose write contract for an installer-default config is pinned from
- * package evidence. The installer persists no agents roster; 2026.9.6/9.9 then
- * materializes the implicit main agent in every derived config.get view and
- * persists the keyed agents.entries roster under explicit ownership. No other
- * runtime is bootstrapped: its implicit-main write behavior is not source-supported.
+ * The installer persists no agents roster; from 2026.9.6 OpenClaw materializes
+ * the implicit main agent in every derived config.get view and persists the
+ * keyed agents.entries roster under explicit ownership. Older runtimes are not
+ * bootstrapped. At or above that release the Gateway's own config schema (read
+ * next) is the contract, not the release number.
  */
-const OPENCLAW_IMPLICIT_MAIN_BOOTSTRAP_RUNTIMES: ReadonlySet<string> = new Set(['2026.9.6', '2026.9.9', '2026.10.5', '2026.10.6']);
+function implicitMainBootstrapRuntime(running: string): boolean {
+  return openClawCurrentFamilyAdmits(running)
+    && openClawVersionMeetsFloor(running, OPENCLAW_FEATURE_FLOORS.projectImplicitMainBootstrap);
+}
 const OPENCLAW_OWNER_AGENT_ID = 'main';
 
 function hasOwnKey(value: Record<string, any>, key: string): boolean {
@@ -1176,7 +1184,7 @@ async function attestImplicitMainBootstrapRuntime(
   readRuntimeVersion: OpenClawProjectSandboxDependencies['readRuntimeVersion'],
 ): Promise<string> {
   const running = await readAttestedRuntimeVersion(rpc, readRuntimeVersion);
-  if (!OPENCLAW_IMPLICIT_MAIN_BOOTSTRAP_RUNTIMES.has(running)) {
+  if (!implicitMainBootstrapRuntime(running)) {
     const installed = readRuntimeVersion();
     fail(
       'CONFIG_AGENT_BOOTSTRAP_UNATTESTED',
@@ -1188,17 +1196,20 @@ async function attestImplicitMainBootstrapRuntime(
   const properties = isRecord(agents?.properties) ? agents.properties : {};
   const entry = properties.entries?.additionalProperties;
   const systemAgent = properties.defaults?.properties?.systemAgent;
+  const systemAgentId = isRecord(systemAgent?.properties) ? systemAgent.properties.agentId : undefined;
+  // The properties the bootstrap writes must exist with their types; schema
+  // properties added beside them by a newer OpenClaw are not a reason to refuse.
   if (
     schema.data?.version !== running
     || agents?.type !== 'object'
     || agents.additionalProperties !== false
-    || Object.keys(properties).sort().join(',') !== 'defaults,entries,ownership'
+    || !['defaults', 'entries', 'ownership'].every((key) => hasOwnKey(properties, key))
     || properties.entries?.type !== 'object'
     || !isRecord(entry) || entry.type !== 'object' || !isRecord(entry.properties) || hasOwnKey(entry.properties, 'id')
     || properties.ownership?.const !== 'explicit'
     || systemAgent?.type !== 'object'
-    || !isRecord(systemAgent.properties)
-    || Object.keys(systemAgent.properties).join(',') !== 'agentId'
+    || !isRecord(systemAgentId)
+    || (systemAgentId.type !== undefined && systemAgentId.type !== 'string')
   ) {
     fail('CONFIG_AGENT_BOOTSTRAP_UNATTESTED', 'OpenClaw Gateway schema did not attest the keyed explicit-ownership agent roster');
   }
@@ -1426,7 +1437,7 @@ function expectedCurrentAgentsAfterPatch(
   context: { patched: boolean; coreVersion: string },
 ): Record<string, any> {
   const defaults = desired.defaults;
-  if (!context.patched || !OPENCLAW_IMPLICIT_MAIN_BOOTSTRAP_RUNTIMES.has(context.coreVersion)
+  if (!context.patched || !implicitMainBootstrapRuntime(context.coreVersion)
     || !isRecord(defaults) || Object.prototype.hasOwnProperty.call(defaults, 'heartbeat')
     || defaults.systemAgent?.agentId !== 'main') return desired;
   return { ...desired, defaults: { ...defaults, heartbeat: { agentId: 'main' } } };

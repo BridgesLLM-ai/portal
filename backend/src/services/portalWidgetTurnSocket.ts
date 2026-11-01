@@ -1,4 +1,4 @@
-import { supportsOpenClawInlineWidgets } from './openClawCompatibility';
+import { capabilitiesFromHello, supportsOpenClawInlineWidgets } from './openClawCompatibility';
 import { consumePortalHostTurnAuthority } from './portalHostTurnAuthority';
 import WebSocket from 'ws';
 import { randomUUID } from 'crypto';
@@ -70,8 +70,7 @@ export async function openPortalWidgetTurnSocket(sessionKey: string, onEvent: (e
               : 'Gateway rejected the Portal widget connection';
             close(); reject(new Error(reason)); return;
           }
-          if (!supportsOpenClawInlineWidgets(frame.payload?.server?.version)
-            || !frame.payload?.features?.methods?.includes('canvas.document.view')) {
+          if (!supportsOpenClawInlineWidgets(capabilitiesFromHello(frame.payload))) {
             close(); reject(new Error('Inline widgets require the qualified stable Canvas contract')); return;
           }
           accepted = true; clearTimeout(deadline);

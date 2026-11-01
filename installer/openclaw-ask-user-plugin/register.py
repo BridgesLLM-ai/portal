@@ -33,15 +33,15 @@ def main() -> int:
         print("ask-user plugin: plugins block is not an object")
         return 1
 
-    # Only extend an allowlist that already exists. Creating one where there
-    # was none would turn "allow everything" into "allow exactly this plugin"
-    # and silently disable every other plugin on the host.
+    # Only extend a nonempty allowlist. Missing and empty lists both mean
+    # unrestricted in OpenClaw; populating either silently disables every
+    # other plugin on the host.
     if "allow" in plugins:
         allow = plugins["allow"]
         if not isinstance(allow, list):
             print("ask-user plugin: plugins.allow is not an array")
             return 1
-        if PLUGIN_ID not in allow:
+        if allow and PLUGIN_ID not in allow:
             allow.append(PLUGIN_ID)
 
     if "entries" not in plugins:

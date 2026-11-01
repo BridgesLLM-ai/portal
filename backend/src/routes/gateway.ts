@@ -1,15 +1,23 @@
+import {
+  OpenClawDiagnosticMaintenanceError,
+  isOpenClawDiagnosticsPausedError,
+  openClawDiagnosticCommand,
+  openClawDiagnosticsPausedReason,
+} from '../utils/openclawDiagnosticLease';
 import { parseChatImageReferences, prepareChatImages } from '../services/chatImages/directChatImages';
 import { assertOpenClawImageInput, ChatImageError, hasNativeChatImageModelGate } from '../services/chatImages/chatImageModelPolicy';
 import { withPortalHostTurnAuthority } from '../services/portalHostTurnAuthority';
 import { isCanonicalOpenClawSessionKey } from '../services/openClawCanonicalSessionKey';
 import { expandNativeNestedToolHistory, projectWidgetToolResult } from '../services/chatWidgetProjection';
-import { resolveSessionOwnershipRoot, describeSessionWork, sessionParentKey, subscribeSessionWorkChanges } from '../services/openClawSessionWork';
+import { resolveSessionOwnershipRoot, describeSessionWork, listSessionWorkRows, sessionRowKey, sessionIsSpawnedChild, sessionSpawnParentKey, subscribeSessionWorkChanges, type SessionRow } from '../services/openClawSessionWork';
 import { isOpenClawExecutionCapableGatewayCall } from '../services/openClawExecutionCapableMethods';
 import { bindProjectWorkHostSession, currentProjectWork, trackProjectWorkDispatch } from '../services/projectWorkHost';
 import { adoptProjectWorkDraft } from '../services/projectWorkDraft';
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { requireAdmin, requireOwner } from '../middleware/requireAdmin';
+import { projectPortalAuthoredContent } from '../services/portalResponseContext';
+import { chatResponseCapabilities, parseChatResponseFormat, portalResponsePreference, type ChatResponseFormat } from '../services/chatResponseCapabilities';
 import { requireApproved } from '../middleware/requireApproved';
 import { closeSync, existsSync, fstatSync, openSync, opendirSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'fs';
 import { execFile, execFileSync } from 'child_process';
@@ -65,6 +73,7 @@ import {
   setNativeSessionModel,
 } from '../agents/sessionModelMutation';
 import { getProviderCommandCatalog } from '../agents/providerCommandCatalog';
+import { openClawChatCommandsAllowed } from '../services/openclawChatCommandAuthority';
 import { ExecApprovalRequest } from '../agents/providers/OpenClawProvider';
 import {
   appendNativeMessage,
@@ -83,6 +92,9 @@ import { safeAgentZeroErrorMessage } from '../agents/providers/agentZero/AgentZe
 import {
   gatewayRpcCall,
   patchSessionModel,
+  openClawSessionModelRefusal,
+  isOpenClawModelPolicyRefusal,
+  OPENCLAW_MODEL_NOT_ENABLED_MESSAGE,
   getSessionInfo,
   isGatewayTransportError,
   createSession,
@@ -308,10 +320,23 @@ async function sendHostOperatorProviderMessage(input: HostOperatorProviderSend):
   }
 }
 
+/** Direct Agent Chat lanes only; Project and Portal-owned lanes keep their own surfaces. */
+function isOpenClawInlineWidgetLane(sessionKey: string): boolean {
+  return classifyOpenClawSessionLane(sessionKey) === 'direct'
+    && !/^agent:(?:p4oc-|portal(?:-|:))/i.test(sessionKey);
+}
+
 async function sendUntrackedHostOperatorProviderMessage(
   input: HostOperatorProviderSend,
 ): Promise<AgentSendResult> {
   assertQualifiedNativeBinaryProvider(input.provider.providerName);
+  const responseFormat = input.sender?.portalResponseFormat ?? 'auto';
+  if (responseFormat !== 'auto') {
+    // Revalidate the selected format at dispatch and refuse an unavailable one
+    // before any host run starts, instead of silently falling back.
+    portalResponsePreference(input.message, input.provider.providerName, responseFormat,
+      input.provider.providerName === 'OPENCLAW' ? { openClawWidgetLane: isOpenClawInlineWidgetLane(input.sessionId) } : {});
+  }
   if (parseChatImageReferences(input.message).length) {
     if (!input.provider.supportsNativeChatImages) throw new ChatImageError('IMAGE_TRANSPORT_UNAVAILABLE', 503);
     if (input.provider.providerName === 'OPENCLAW') {
@@ -392,8 +417,7 @@ async function sendAdmittedOpenClawHostOperatorMessage(
   let dispatchAccepted = false;
   const sender: SenderIdentity = {
     ...input.sender!,
-    portalInlineWidgets: classifyOpenClawSessionLane(input.sessionId) === 'direct'
-      && !/^agent:(?:p4oc-|portal(?:-|:))/i.test(input.sessionId),
+    portalInlineWidgets: isOpenClawInlineWidgetLane(input.sessionId),
     onProviderDispatchAccepted: async (upstreamRunId: string) => {
       await markOpenClawHostRunDispatchAccepted(handle, upstreamRunId);
       dispatchAccepted = true;
@@ -1020,11 +1044,20 @@ async function readAgentZeroHistoryPage(params: {
   };
 }
 
-type OpenClawCliResult = { ok: boolean; stdout: string; stderr: string; error?: string };
+type OpenClawCliResult = { ok: boolean; stdout: string; stderr: string; error?: string; diagnosticsPaused?: boolean };
 
 function runOpenClawCli(args: string[], timeoutMs = 8000, extraEnv: NodeJS.ProcessEnv = {}): Promise<OpenClawCliResult> {
+  let command: [string, string[]];
+  try {
+    command = openClawDiagnosticCommand('openclaw', args);
+  } catch (error: any) {
+    // Resolve-only like every other outcome: a lease refused by maintenance
+    // must not reject a probe that may be running in the background.
+    if (!isOpenClawDiagnosticsPausedError(error)) throw error;
+    return Promise.resolve({ ok: false, stdout: '', stderr: '', error: error.message, diagnosticsPaused: true });
+  }
   return new Promise((resolve) => {
-    execFile('openclaw', args, { env: { ...buildOpenClawCliEnv(), ...extraEnv }, timeout: timeoutMs }, (error, stdout, stderr) => {
+    execFile(...command, { env: { ...buildOpenClawCliEnv(), ...extraEnv }, timeout: timeoutMs }, (error, stdout, stderr) => {
       resolve({
         ok: !error,
         stdout: String(stdout || '').trim(),
@@ -1187,6 +1220,9 @@ interface OpenClawVersionStatus {
   checkedAt?: string;
   cached?: boolean;
   lightweight?: boolean;
+  /** Last known value served while OpenClaw diagnostics are paused. */
+  stale?: boolean;
+  staleReason?: string | null;
 }
 
 const OPENCLAW_VERSION_STATUS_TTL_MS = Number(process.env.PORTAL_OPENCLAW_VERSION_STATUS_TTL_MS || 5 * 60 * 1000);
@@ -1257,6 +1293,8 @@ async function probeOpenClawVersionStatusWithDependencies(
     ['update', 'status', '--json', '--timeout', '3'],
     OPENCLAW_UPDATE_STATUS_TIMEOUT_MS,
   );
+  // Maintenance began mid-probe: what was read is not a status to cache.
+  if (updateStatusResult.diagnosticsPaused) throw new OpenClawDiagnosticMaintenanceError();
 
   const installedVersion = readiness.version;
   const packageMetadata = (dependencies.getPackageMetadata || getOpenClawPackageMetadata)();
@@ -1277,6 +1315,8 @@ async function probeOpenClawVersionStatusWithDependencies(
     'cli-runtime-mismatch',
     'gateway-rpc-unavailable',
     'gateway-runtime-mismatch',
+    'gateway-contract-mismatch',
+    'gateway-contract-unverified',
     'codex-plugin-mismatch',
     'codex-plugin-inspect-timeout',
   ].includes(blocker.code));
@@ -1284,7 +1324,7 @@ async function probeOpenClawVersionStatusWithDependencies(
     ? null
     : testedPairBlocker?.message
       || readiness.blockers[0]?.message
-      || 'OpenClaw did not validate one exact tested runtime family.';
+      || 'OpenClaw did not pass the Portal runtime contract.';
 
   const exactVersionMismatch = Boolean(installedVersion && runningVersion && installedVersion !== runningVersion);
   const listenerOlderThanInstall = Boolean(
@@ -1310,9 +1350,9 @@ async function probeOpenClawVersionStatusWithDependencies(
     codexPluginInstallSpec,
     latestVersion: updateStatus?.availability?.latestVersion || updateStatus?.update?.registry?.latestVersion || null,
     updateChannel: updateStatus?.channel?.value || null,
-    testedCorePackageVersion: TESTED_OPENCLAW_CORE_PACKAGE_VERSION,
-    testedRuntimeVersion: TESTED_OPENCLAW_RUNTIME_VERSION,
-    testedCodexPluginVersion: OPENCLAW_CODEX_PLUGIN_VERSION,
+    testedCorePackageVersion: readiness.testedCorePackageVersion,
+    testedRuntimeVersion: readiness.testedRuntimeVersion,
+    testedCodexPluginVersion: readiness.testedCodexPluginVersion,
     testedPairReady,
     testedPairReason,
     mismatch,
@@ -1327,9 +1367,20 @@ async function probeOpenClawVersionStatusWithDependencies(
   };
 }
 
+function staleOpenClawVersionStatus(reason: string): OpenClawVersionStatus {
+  return openClawVersionStatusCache
+    ? { ...openClawVersionStatusCache.status, cached: true, stale: true, staleReason: reason }
+    : { ...getLightweightOpenClawVersionStatus(reason), stale: true, staleReason: reason };
+}
+
 async function getOpenClawVersionStatus(
   options: { force?: boolean; refreshReadiness?: boolean } = {},
 ): Promise<OpenClawVersionStatus> {
+  // While maintenance holds OpenClaw diagnostics, answer with the last known
+  // status marked stale and start no CLI probe at all.
+  const pausedReason = openClawDiagnosticsPausedReason();
+  if (pausedReason) return staleOpenClawVersionStatus(pausedReason);
+
   const now = Date.now();
   const force = options.force === true;
   const cacheFresh = openClawVersionStatusCache && now - openClawVersionStatusCache.checkedAtMs < OPENCLAW_VERSION_STATUS_TTL_MS;
@@ -1351,14 +1402,24 @@ async function getOpenClawVersionStatus(
       : getLightweightOpenClawVersionStatus('OpenClaw version probe already running.');
   }
 
-  openClawVersionStatusProbe = probeOpenClawVersionStatus(options.refreshReadiness === true)
+  const probe = probeOpenClawVersionStatus(options.refreshReadiness === true)
     .then(status => {
       openClawVersionStatusCache = { status, checkedAtMs: Date.now() };
       return status;
     })
+    .catch((error: unknown) => {
+      if (!isOpenClawDiagnosticsPausedError(error)) throw error;
+      return staleOpenClawVersionStatus((error as Error).message);
+    })
     .finally(() => {
       openClawVersionStatusProbe = null;
     });
+  // Without force nobody awaits this probe: its failure is logged here and
+  // must never become an unhandled rejection, which exits the backend.
+  probe.catch((error: unknown) => {
+    console.warn(`[gateway] OpenClaw version probe failed: ${(error as Error)?.message || error}`);
+  });
+  openClawVersionStatusProbe = probe;
 
   if (force) return openClawVersionStatusProbe;
 
@@ -1822,7 +1883,7 @@ async function getOpenClawAskUserRuntimeReadiness(
   if (!pluginLoaded) {
     return failedOpenClawAskUserReadiness(inspection.ok
       ? questionAuthority === 'native'
-        ? 'OpenClaw 2026.9.1 is not running the exact 4.0 steer-only plugin surface.'
+        ? 'OpenClaw is not running the bundled 4.0 runtime-guard plugin with its steer method and no second question authority.'
         : 'OpenClaw 2026.7.1 is not running the exact 3.3 legacy question plugin surface.'
       : `OpenClaw could not inspect the runtime-guard plugin: ${inspection.stderr || inspection.error || 'unknown error'}`, {
       questionAuthority,
@@ -2001,7 +2062,7 @@ async function execFileText(
   extraEnv: NodeJS.ProcessEnv = {},
 ): Promise<{ stdout: string; stderr: string }> {
   return await new Promise((resolve, reject) => {
-    execFile(command, args, {
+    execFile(...openClawDiagnosticCommand(command, args), {
       timeout,
       encoding: 'utf8',
       env: { ...buildOpenClawCliEnv(), ...extraEnv },
@@ -2348,6 +2409,8 @@ export async function assertExistingGatewaySessionAccess(
     providerName?: AgentProviderName | string | undefined;
     database?: ProjectActivityScopeDatabase;
     inspectNativeLineage?: boolean;
+    /** Native lineage read; one request may pass its own memo (Tasks feed). */
+    describe?: (key: string) => Promise<SessionRow | null>;
   },
 ): Promise<void> {
   const providerName = String(options?.providerName || 'OPENCLAW').trim().toUpperCase();
@@ -2396,7 +2459,7 @@ export async function assertExistingGatewaySessionAccess(
       // Stop at a Project boundary even when it has no AgentSession owner.
       // A malformed ancestor cycle must never fall back to OWNER host visibility.
       || await isProjectChatActivitySession(key, database, user.userId)),
-    describe: key => describeSessionWork(key),
+    describe: key => (options?.describe ? options.describe(key) : describeSessionWork(key)),
   });
   if (!root) throw new Error('Admin access required');
   if (root.inherited) {
@@ -2426,7 +2489,7 @@ export async function mutateAgentSessionWork(
     // Children inherit read/stop authority, not a new durable HOST_OPERATOR claim.
     // Start/resume from the owning root's existing send/control path instead.
     const row = await describeSessionWork(key);
-    if (row && sessionParentKey(row)) {
+    if (row && sessionIsSpawnedChild(row)) {
       const error = new Error('Child work must be started from its owning root') as Error & { code: string; statusCode: number };
       error.code = 'CHILD_EXECUTION_UNSUPPORTED'; error.statusCode = 409; throw error;
     }
@@ -7103,6 +7166,7 @@ async function readSessionMessages(
 // Narrow test surface for legacy history compatibility. Keep private helpers
 // private; export only the behavior the /api/gateway/history legacy path uses.
 export const __gatewayHistoryTest = {
+  projectOpenClawGatewayHistoryMessage,
   readSessionMessages,
   readRecentSessionMessages,
   createHistoryReadBudget,
@@ -7494,7 +7558,9 @@ function projectOpenClawGatewayHistoryMessage(message: any): any | null {
   const id = String(message.id || message.__openclaw?.id || '').trim();
 
   if (role === 'user') {
-    const content = extractUserHistoryText(message.content ?? message.text ?? '');
+    const content = projectPortalAuthoredContent(message.content ?? message.text ?? '',
+      message.idempotencyKey ?? message.__openclaw?.idempotencyKey)
+      ?? extractUserHistoryText(message.content ?? message.text ?? '');
     if (!content) return null;
     // The maintenance prompt is the authoritative turn boundary that owns all
     // following reasoning/tool fragments. Preserve it as an internal sentinel
@@ -9195,6 +9261,24 @@ router.get('/providers', authenticateToken, requireAdmin, async (_req: Request, 
   }
 });
 
+/** Next-turn response formats for the selected chat; transport readiness, never a tool grant. */
+router.get('/response-capabilities', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  res.vary('Authorization');
+  res.vary('Cookie');
+  let providerName: AgentProviderName;
+  try { providerName = normalizeProviderName(harnessOrProviderInput(req.query)); }
+  catch { res.status(400).json({ error: 'Unknown harness' }); return; }
+  try {
+    if (providerName !== 'OPENCLAW') { res.json(chatResponseCapabilities(providerName)); return; }
+    // Actor-scoped resolution; the answer depends only on the lane and Gateway caps.
+    const sessionKey = await resolveOpenClawTurnSessionKey(req.query.session, req.query.agentId, req.user!);
+    res.json(chatResponseCapabilities(providerName, { openClawWidgetLane: isOpenClawInlineWidgetLane(sessionKey) }));
+  } catch {
+    res.status(403).json({ error: 'Response tools are unavailable for this chat.' });
+  }
+});
+
 router.get('/models', authenticateToken, async (req: Request, res: Response) => {
   try {
     const providerName = normalizeProviderName(harnessOrProviderInput(req.query));
@@ -9440,11 +9524,6 @@ router.get('/usage-stats', authenticateToken, requireAdmin, async (req: Request,
   }
 });
 
-// Each miss costs the gateway an unbounded sessions.list plus tasks.list. The
-// feed polls every 15s, so a TTL at or below that made every poll a miss.
-const TASKS_ROUTE_CACHE_TTL_MS = 20000;
-let tasksRouteCache: { at: number; payload: any } | null = null;
-let tasksRouteInflight: Promise<any> | null = null;
 
 function normalizeGatewayTaskStatus(status: unknown, endedAt?: unknown): 'running' | 'done' | 'failed' | 'cancelled' | 'unknown' {
   const normalized = typeof status === 'string' ? status.toLowerCase() : '';
@@ -9508,53 +9587,168 @@ export function mapOpenClawTaskSession(session: any) {
   };
 }
 
-async function fetchTasksSnapshot() {
-  const [sessionsResult, ledgerResult] = await Promise.all([
-    gatewayRpcCall('sessions.list', {}, 30000),
-    gatewayRpcCall('tasks.list', { limit: 100 }, 15000).catch((err: any) => ({ ok: false, error: err?.message || String(err) })),
-  ]);
+// Tasks are derived from sub-agent and cron session rows. No audited OpenClaw
+// (9.9, 9.36, 10.6, 10.9) registers a `tasks.list` method, so asking for one
+// only failed and pinned a permanent warning on the feed.
+//
+// Every row is authorized for the requesting actor before it can shape the
+// feed, with the same guard that opening that session uses: the actor's own
+// sessions, their native lineage, and the Owner's existing view of unclaimed
+// host sessions. A refused row is indistinguishable from an absent one, and no
+// projection is cached, so one user's rows are never served to another.
+//
+// Cost: a collapsed cron job is authorized in its display preference order and
+// stops at the first row the actor may see (the row the collapse would pick
+// from all authorized rows), then finds the job's place in the list the same
+// way. Lookups are memoized for this one request only.
+const TASKS_AUTHORIZATION_CONCURRENCY = 4;
 
-  if (!sessionsResult.ok || !sessionsResult.data?.sessions) {
-    throw new Error(sessionsResult.error || 'Gateway unavailable');
-  }
+function taskSessionRunning(session: any): boolean {
+  const status = String(session?.status || '').toLowerCase();
+  return !session?.endedAt && status !== 'done' && status !== 'error';
+}
 
-  const sessions = Array.isArray(sessionsResult.data.sessions) ? sessionsResult.data.sessions : [];
-  const taskSessions = sessions.filter((s: any) => {
-    const key = s.key || s.sessionKey || '';
-    const kind = String(s.kind || '').toLowerCase();
-    return kind === 'subagent' || kind === 'cron' || key.includes(':subagent:') || key.includes(':cron:');
+function taskSessionTime(session: any): number {
+  return Number(session?.endedAt || session?.updatedAt || session?.startedAt || 0);
+}
+
+/** The cron-run collapse rule: a later row replaces the kept one. */
+function taskSessionReplaces(existing: any, session: any): boolean {
+  const existingRunning = taskSessionRunning(existing);
+  const sessionRunning = taskSessionRunning(session);
+  return (!existingRunning && sessionRunning)
+    || (existingRunning === sessionRunning && taskSessionTime(session) >= taskSessionTime(existing));
+}
+
+function isTaskSessionRow(session: any): boolean {
+  const key = sessionRowKey(session);
+  const kind = String(session.kind || '').toLowerCase();
+  return kind === 'subagent' || kind === 'cron' || key.includes(':subagent:') || key.includes(':cron:');
+}
+
+/**
+ * One request's memo of the session-access guard's read-only lookups (owner by
+ * key, foreign claim, Project-chat check, native describe). Built fresh for
+ * every Tasks request and dropped with it: never module-level, never shared
+ * between users or polls. A failed lookup is forgotten so a later row retries.
+ */
+function createSessionAccessLookupMemo(database: ProjectActivityScopeDatabase = prisma) {
+  const results = new Map<string, Promise<unknown>>();
+  const remember = <T>(key: string, load: () => Promise<T>): Promise<T> => {
+    const known = results.get(key) as Promise<T> | undefined;
+    if (known) return known;
+    const pending = load();
+    results.set(key, pending);
+    pending.catch(() => { if (results.get(key) === pending) results.delete(key); });
+    return pending;
+  };
+  const memoDatabase = new Proxy(database, {
+    get(target, model) {
+      const delegate = Reflect.get(target, model);
+      if (typeof model !== 'string' || !delegate || typeof delegate.findFirst !== 'function') return delegate;
+      return new Proxy(delegate, {
+        get(source, method) {
+          if (method === 'findFirst') {
+            return (args: unknown) => remember(`${model}.findFirst:${JSON.stringify(args)}`, async () => source.findFirst(args));
+          }
+          const value = Reflect.get(source, method);
+          return typeof value === 'function' ? value.bind(source) : value;
+        },
+      });
+    },
+  });
+  return {
+    database: memoDatabase,
+    describe: (key: string) => remember(`describe:${key}`, () => describeSessionWork(key)),
+  };
+}
+
+async function mapTasksWithConcurrency<T, R>(items: T[], mapper: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(TASKS_AUTHORIZATION_CONCURRENCY, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function fetchTasksSnapshot(
+  user: JwtPayload,
+  rpc: typeof gatewayRpcCall = gatewayRpcCall,
+  authorize: (
+    sessionKey: string,
+    user: JwtPayload,
+    options: { database: ProjectActivityScopeDatabase; describe: (key: string) => Promise<SessionRow | null> },
+  ) => Promise<void> = assertExistingGatewaySessionAccess,
+) {
+  const sessions = (await listSessionWorkRows(rpc)).filter(isTaskSessionRow);
+  const lookups = createSessionAccessLookupMemo();
+  // Each row is checked at most once per request.
+  const decisions = new Map<number, Promise<boolean>>();
+  const allowed = (index: number): Promise<boolean> => {
+    let decision = decisions.get(index);
+    if (!decision) {
+      decision = (async () => { await authorize(sessionRowKey(sessions[index]), user, lookups); return true; })()
+        .catch(() => false); // Not this actor's row, or not verifiable now: never expose it.
+      decisions.set(index, decision);
+    }
+    return decision;
+  };
+
+  const groups = new Map<string, number[]>();
+  sessions.forEach((session, index) => {
+    const collapseKey = collapseKeyForTaskSession(session);
+    const group = groups.get(collapseKey);
+    if (group) group.push(index);
+    else groups.set(collapseKey, [index]);
+  });
+  const picks = await mapTasksWithConcurrency(Array.from(groups.values()), async (indices) => {
+    if (indices.some(index => Number.isNaN(taskSessionTime(sessions[index])))) {
+      // Times that are not numbers make the collapse order-dependent: check
+      // every row and fold exactly as listed.
+      let first = -1;
+      let kept: any = null;
+      for (const index of indices) {
+        if (!await allowed(index)) continue;
+        if (first < 0) first = index;
+        if (!kept || taskSessionReplaces(kept, sessions[index])) kept = sessions[index];
+      }
+      return first < 0 ? null : { first, session: kept };
+    }
+    // Numeric times: the collapse keeps the most preferred authorized row
+    // (running, then newest, then latest listed), so stop at the first one.
+    const preferred = [...indices].sort((a, b) => (
+      Number(taskSessionRunning(sessions[b])) - Number(taskSessionRunning(sessions[a]))
+      || taskSessionTime(sessions[b]) - taskSessionTime(sessions[a])
+      || b - a
+    ));
+    let winner = -1;
+    for (const index of preferred) {
+      if (await allowed(index)) { winner = index; break; }
+    }
+    if (winner < 0) return null;
+    // The job keeps the list position of its first authorized row.
+    let first = winner;
+    for (const index of indices) {
+      if (index >= winner) break;
+      if (await allowed(index)) { first = index; break; }
+    }
+    return { first, session: sessions[winner] };
   });
 
-  const collapsedTaskSessions = new Map<string, any>();
-  for (const session of taskSessions) {
-    const collapseKey = collapseKeyForTaskSession(session);
-    const existing = collapsedTaskSessions.get(collapseKey);
-    if (!existing) {
-      collapsedTaskSessions.set(collapseKey, session);
-      continue;
-    }
-
-    const existingStatus = String(existing?.status || '').toLowerCase();
-    const sessionStatus = String(session?.status || '').toLowerCase();
-    const existingRunning = !existing?.endedAt && existingStatus !== 'done' && existingStatus !== 'error';
-    const sessionRunning = !session?.endedAt && sessionStatus !== 'done' && sessionStatus !== 'error';
-    const existingTime = Number(existing?.endedAt || existing?.updatedAt || existing?.startedAt || 0);
-    const sessionTime = Number(session?.endedAt || session?.updatedAt || session?.startedAt || 0);
-
-    if ((!existingRunning && sessionRunning) || (existingRunning === sessionRunning && sessionTime >= existingTime)) {
-      collapsedTaskSessions.set(collapseKey, session);
-    }
-  }
+  const collapsedTaskSessions = picks
+    .filter((pick): pick is { first: number; session: any } => Boolean(pick))
+    .sort((a, b) => a.first - b.first)
+    .map(pick => pick.session);
 
   const tasksById = new Map<string, any>();
-  for (const task of Array.from(collapsedTaskSessions.values()).map(mapOpenClawTaskSession)) {
+  for (const task of collapsedTaskSessions.map(mapOpenClawTaskSession)) {
     tasksById.set(task.id, task);
-  }
-
-  if (ledgerResult.ok && Array.isArray((ledgerResult as any).data?.tasks)) {
-    for (const task of (ledgerResult as any).data.tasks.map(mapOpenClawLedgerTask).filter(Boolean)) {
-      tasksById.set(task.id, task);
-    }
   }
 
   const tasks = Array.from(tasksById.values());
@@ -9569,34 +9763,18 @@ async function fetchTasksSnapshot() {
     ok: true,
     tasks,
     fetchedAt: new Date().toISOString(),
-    source: ledgerResult.ok ? 'tasks.list+sessions.list' : 'sessions.list',
-    warning: ledgerResult.ok ? undefined : (ledgerResult as any).error || 'OpenClaw tasks.list unavailable; showing session-derived tasks only',
+    source: 'sessions.list',
   };
 }
 
-// GET /api/gateway/tasks — Query OpenClaw gateway for task/subagent state
-router.get('/tasks', requireAdmin, async (_req: Request, res: Response) => {
-  const now = Date.now();
-  if (tasksRouteCache && now - tasksRouteCache.at < TASKS_ROUTE_CACHE_TTL_MS) {
-    res.json(tasksRouteCache.payload);
-    return;
-  }
-
+// GET /api/gateway/tasks — the requesting actor's sub-agent and cron rows
+router.get('/tasks', requireAdmin, async (req: Request, res: Response) => {
+  // Per-actor payload: no shared or intermediary cache may keep it.
+  res.set('Cache-Control', 'private, no-store');
   try {
-    if (!tasksRouteInflight) {
-      tasksRouteInflight = fetchTasksSnapshot().finally(() => {
-        tasksRouteInflight = null;
-      });
-    }
-    const payload = await tasksRouteInflight;
-    tasksRouteCache = { at: Date.now(), payload };
-    res.json(payload);
+    res.json(await fetchTasksSnapshot(req.user!));
   } catch (err: any) {
     console.error('[gateway] tasks error:', err);
-    if (tasksRouteCache) {
-      res.json({ ...tasksRouteCache.payload, stale: true, warning: err.message || 'Tasks temporarily unavailable' });
-      return;
-    }
     res.json({ ok: false, tasks: [], stale: true, warning: err.message || 'Tasks temporarily unavailable' });
   }
 });
@@ -9748,13 +9926,23 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
       }
 
       let info = await getSessionInfo(sessionKey);
-      if ((!info.ok || !info.data) && sessionKey.includes(':new-')) {
+      const createsFirst = (!info.ok || !info.data) && sessionKey.includes(':new-');
+      if (createsFirst) {
         const created = await createSession(sessionKey);
         if (created.ok) {
           info = await getSessionInfo(created.key || sessionKey);
         }
       }
-      if (!info.ok || !info.data) {
+      // A direct chat the gateway has not stored yet (a fresh server's main
+      // session before its first message) has no row to read. sessions.patch
+      // materializes an ordinary session, as that first message would; only a
+      // gateway that answered "no such row" qualifies, never a failed read.
+      // A ':new-' chat keeps its own create-first path and answers. A
+      // project-shaped sandbox key is Project work, never a direct chat.
+      const unstoredDirectChat = !createsFirst && !info.ok && info.error === 'Session not found'
+        && classifyOpenClawSessionLane(sessionKey) === 'direct'
+        && !isSandboxProjectSessionKeyForUser(sessionKey, req.user!);
+      if ((!info.ok || !info.data) && !unstoredDirectChat) {
         const status = isGatewayTransportError(info.error) ? 502 : 404;
         res.status(status).json({ error: info.error || 'Session not found' });
         return;
@@ -9762,13 +9950,19 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
 
       const resolvedModel = model ? await resolveOpenClawPatchModel(model) : null;
       const runtimeModel = model
-        ? modelForOpenClawSessionPatch(info.data, resolvedModel || model)
+        ? modelForOpenClawSessionPatch(info.data ?? null, resolvedModel || model)
         : null;
       const patched = await patchSessionModel(
         sessionKey,
         model ? runtimeModel || resolvedModel || model : null,
       );
       if (!patched.ok) {
+        // Selection only: a model the host has not enabled is refused here and
+        // enabled by an admin in Model Providers, never declared by this route.
+        if (patched.code === 'MODEL_NOT_ENABLED') {
+          res.status(409).json({ error: patched.error, code: patched.code });
+          return;
+        }
         res.status(502).json({ error: patched.error || 'Failed to patch session model' });
         return;
       }
@@ -9776,7 +9970,7 @@ router.post('/session-model', authenticateToken, requireApproved, async (req: Re
       const refreshed = await getSessionInfo(sessionKey);
       res.json({
         ok: true,
-        session: refreshed.ok ? refreshed.data : info.data,
+        session: refreshed.ok ? refreshed.data : info.data ?? null,
         resolved: patched.resolved || null,
         reset: resetRequested,
       });
@@ -9956,11 +10150,28 @@ router.post('/session-patch', authenticateToken, requireApproved, async (req: Re
       } catch {}
     }
 
+    // Every model this route sends (the requested one, and the session's
+    // recorded override attached to a thinking change) stays within the
+    // server's enabled models for every role, exactly as /session-model does.
+    // A refusal sends nothing, so no other setting changes either.
+    const modelRefusal = openClawSessionModelRefusal(
+      sessionKey,
+      typeof patch.model === 'string' ? patch.model : null,
+    );
+    if (modelRefusal) {
+      res.status(409).json({ error: modelRefusal.error, code: modelRefusal.code });
+      return;
+    }
+
     const result = await withOpenClawSessionMutation(
       sessionKey,
       () => gatewayRpcCall('sessions.patch', patch),
     );
     if (!result.ok) {
+      if (patch.model && isOpenClawModelPolicyRefusal(result.error)) {
+        res.status(409).json({ error: OPENCLAW_MODEL_NOT_ENABLED_MESSAGE, code: 'MODEL_NOT_ENABLED' });
+        return;
+      }
       res.status(502).json({ error: result.error || 'Failed to patch session' });
       return;
     }
@@ -10582,6 +10793,9 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
   const { message, session = 'main', model: requestedModel, agentId } = req.body;
   const requestedHarness = harnessOrProviderInput(req.body);
   if (!message) { res.status(400).json({ error: 'message required' }); return; }
+  let responseFormat: ChatResponseFormat;
+  try { responseFormat = parseChatResponseFormat(req.body?.responseFormat); }
+  catch { res.status(400).json({ error: 'Unknown response format.' }); return; }
 
   let releaseAuthorizationLease: () => void;
   let authorizationLeaseReleaseSafe = true;
@@ -10803,6 +11017,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
             role: req.user.role,
             authorizationVersion: Number(req.user.authorizationVersion ?? 1),
             requestId: routeRunId,
+            portalResponseFormat: responseFormat,
             ...(clientMessageId ? { clientMessageId } : {}),
           }
         : undefined;
@@ -11218,6 +11433,7 @@ router.post('/send', authenticateToken, requireApproved, async (req: Request, re
           role: req.user.role,
           authorizationVersion: Number(req.user.authorizationVersion ?? 1),
           requestId: nonStreamingRunId,
+          portalResponseFormat: responseFormat,
         }
       : undefined;
     const nonStreamingStartedAtMs = Date.now();
@@ -11775,7 +11991,13 @@ router.post('/session-steer', authenticateToken, requireApproved, async (req: Re
     await assertOpenClawExecutionAdmitted();
     const sessionKey = await resolveOpenClawSessionKey(req.body?.session, req.user);
     await assertGatewaySessionAccess(sessionKey, req.user!);
-    const result = await steerSessionMessage(sessionKey, expectedRunId, message, requestId);
+    const result = await steerSessionMessage(
+      sessionKey,
+      expectedRunId,
+      message,
+      requestId,
+      openClawChatCommandsAllowed(req.user!.role),
+    );
     res.json({ ok: true, sessionKey, ...result });
   } catch (error) {
     pendingUserInputRouteError(res, error);
@@ -12083,6 +12305,19 @@ export async function authorizeChatWidgetSession(key: string, user: JwtPayload):
   if (await isProjectChatActivitySession(key, prisma, user.userId) || isSandboxProjectSessionKeyForUser(key, user))
     throw new Error('Project widgets are outside the existing Project contract');
   await assertExistingGatewaySessionAccess(key, user, { inspectNativeLineage: true });
+}
+
+/**
+ * The same refusals without native lineage: the generic host-history contract
+ * this actor already has for the key. Only for a direct chat the gateway has
+ * not stored yet (nothing to attest, nothing to read); the caller checks that.
+ */
+export async function authorizeUnstartedChatWorkSession(key: string, user: JwtPayload): Promise<void> {
+  if (!isCanonicalOpenClawSessionKey(key)) throw new Error('Canonical session key required');
+  await assertGatewayActorIsCurrent(user);
+  if (await isProjectChatActivitySession(key, prisma, user.userId) || isSandboxProjectSessionKeyForUser(key, user))
+    throw new Error('Project widgets are outside the existing Project contract');
+  await assertExistingGatewaySessionAccess(key, user);
 }
 
 async function assertGatewayActorIsCurrent(user: JwtPayload): Promise<void> {
@@ -12594,6 +12829,9 @@ async function handleWsSend(
   const { message, session = 'main', model: requestedModel, agentId } = msg;
   const requestedHarness = harnessOrProviderInput(msg);
   if (!message) { wsSend(ws, { type: 'error', content: 'message required' }); return; }
+  let responseFormat: ChatResponseFormat;
+  try { responseFormat = parseChatResponseFormat(msg?.responseFormat); }
+  catch { wsSend(ws, { type: 'error', content: 'Unknown response format.' }); return; }
 
   let streamKeepalive: ReturnType<typeof setInterval> | null = null;
   let reservedStream: { sessionId: string; runId: string } | null = null;
@@ -12931,6 +13169,7 @@ async function handleWsSend(
         role: user.role,
         authorizationVersion: Number(user.authorizationVersion ?? 1),
         requestId: routeRunId,
+        portalResponseFormat: responseFormat,
         ...(clientMessageId ? { clientMessageId } : {}),
       };
 
@@ -13548,7 +13787,7 @@ function handlePortalWsConnection(ws: WebSocket, user: JwtPayload) {
         }
         await assertExistingGatewaySessionAccess(signal.sessionKey, user);
         const row = await describeSessionWork(signal.sessionKey);
-        const parentKey = row && sessionParentKey(row);
+        const parentKey = row && sessionSpawnParentKey(row);
         if (parentKey) await assertExistingGatewaySessionAccess(parentKey, user);
         await assertGatewayWebSocketActorIsCurrent(user, authorizationBinding);
         if (ws.readyState !== WebSocket.OPEN) return;
@@ -13855,6 +14094,8 @@ function refuseDurablyBlockedDirectTurn(input: {
   assertNotDurablyBlocked?: () => void;
   releaseReservation?: (sessionKey: string, reservationRunId: string) => void;
 }): boolean {
+  // `sessions.steer` is a deprecated alias of chat.send {queueMode:'interrupt'};
+  // only older clients send it, and it must keep the same maintenance refusal.
   if (input.method !== 'chat.send' && input.method !== 'sessions.steer') return false;
   try {
     (input.assertNotDurablyBlocked || assertOpenClawDispatchNotDurablyBlocked)();
@@ -14617,8 +14858,14 @@ export const __gatewayExecutionScopeTest = {
 // Narrow test surface for the dashboard's OpenClaw version checks. The
 // dependency seam lets regression tests prove that CLI processes never overlap
 // without changing production probe inputs or acceptance rules.
+export const __gatewayTasksTest = {
+  fetchTasksSnapshot,
+};
+
 export const __gatewayVersionProbeTest = {
   probeOpenClawVersionStatusWithDependencies,
+  getOpenClawVersionStatus,
+  runOpenClawCli,
   OPENCLAW_VERSION_STATUS_COLD_PROBE_BUDGET_MS,
 };
 

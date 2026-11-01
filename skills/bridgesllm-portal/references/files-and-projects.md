@@ -35,16 +35,15 @@ For a file in the current Agent workspace:
 - Verify that it is an existing regular file and use the absolute path reported
   by the current file tool or workspace. Do not derive a root from an agent
   name or assume that every installation uses the default workspace path.
-- If the verified path is
-  `/root/.openclaw/workspace-main/audit/HANDOFF-project-chat-and-backups.md`,
-  return `[Open the handoff](/root/.openclaw/workspace-main/audit/HANDOFF-project-chat-and-backups.md)`.
-  A bare `audit/HANDOFF-project-chat-and-backups.md` is not a clickable handoff.
+- If the verified path is `/home/example/agent-workspace/notes/handoff.md`,
+  return `[Open the handoff](/home/example/agent-workspace/notes/handoff.md)`.
+  A bare `notes/handoff.md` is not a clickable handoff.
 - Percent-encode spaces in the Markdown destination as `%20`. An optional
   existing-file location suffix such as `#L42C7` or `:42:7` is supported.
 
 For a file created inside Project Chat, use the provider-visible absolute
 Project path after verifying the file exists in that Project. For example:
-`[Open the Project handoff](/workspace/project/audit/HANDOFF-project-chat-and-backups.md)`.
+`[Open the Project handoff](/workspace/project/notes/handoff.md)`.
 Do not expose or invent the Project's host storage path.
 
 Portal binds these links to the exact Agent or Project carried by the chat. On

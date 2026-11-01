@@ -13,20 +13,22 @@ previously qualified ranges: `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`.
 Installing Portal 5.1.x does **not** require replacing a supported Node 22
 interpreter and does not upgrade OpenClaw in the same action.
 
-## OpenClaw 2026.10.6 and compatible-tools maintenance
+## OpenClaw's Node.js requirement
 
-The pinned upstream package requires `>=24.22.1 <25 || >=26.12.1`.
-The minimum Node 24 LTS target is **Node 24.22.1**. Node 22 and Node 25 cannot run this
-OpenClaw release, even when they remain usable for Portal-only updates.
+OpenClaw sets its own Node.js requirement. The OpenClaw version fresh installs
+start on (2026.10.6) requires `>=24.22.1 <25 || >=26.12.1`, so the minimum Node 24
+LTS target is **Node 24.22.1**. Node 22 and Node 25 cannot run it, even when they
+remain usable for Portal-only updates.
 
-The compatible-tools action checks this prerequisite before stopping services
-or staging packages. It never replaces the host interpreter under an unrelated
-OpenClaw rollback journal. On existing hosts below these floors, upgrade Node in a separate
+The OpenClaw update on the Maintenance page checks the new version's requirement
+before changing anything; when a newer Node.js 24 release is needed, its
+confirmation says so and can include it. It never replaces the host interpreter
+under an unrelated OpenClaw rollback journal. Otherwise, upgrade Node in a separate
 host-maintenance window, preserving the installed package for rollback, then
-verify Portal, native module loading, and the retained gateway before running
-compatible-tools maintenance. Do not point a service at an unmanaged second
-interpreter or bypass the engine check. Fresh installation uses the Node 24 LTS
-lane before installing the pinned OpenClaw package.
+verify Portal, native module loading, and the running gateway before updating
+OpenClaw. Do not point a service at an unmanaged second interpreter or bypass the
+engine check. Fresh installation uses the Node 24 LTS lane before installing
+OpenClaw.
 
 ## Repair the Node 22 lane
 

@@ -13,6 +13,7 @@ import { supportsOpenClawInlineWidgets } from '../../services/openClawCompatibil
  *   3. Receive all agent/chat/compaction events and publish to StreamEventBus
  *   4. Handle exec.approval events
  */
+import { projectPortalAuthoredContent } from '../../services/portalResponseContext';
 import WebSocket from 'ws';
 import { createHash } from 'crypto';
 import { buildSignedDevice, getOrCreateDeviceKeys, validateGatewayChallenge } from '../../utils/deviceIdentity';
@@ -22,15 +23,17 @@ import { sanitizeAssistantChunk, sanitizeAssistantText, isControlOnlyAssistantTe
 import { getGatewayToken } from '../../utils/gatewayToken';
 import { redactNativeProviderText } from './native/NativeProviderDiagnostics';
 import { sanitizeThinkingSubject } from '../../utils/thinkingSubject';
-import { portalClientMessageIdFromIdempotencyKey } from './PortalMessageIdentity';
+import { buildPortalOpenClawIdempotencyKey, portalClientMessageIdFromIdempotencyKey } from './PortalMessageIdentity';
 import { questionAuthorityForOpenClawVersion } from '../../services/openClawQuestionRuntimeReadiness';
 import {
   assertOpenClawDispatchNotDurablyBlocked,
   OpenClawExecutionAdmissionError,
 } from '../../services/openClawExecutionAdmission';
 import { isOpenClawExecutionCapableGatewayCall } from '../../services/openClawExecutionCapableMethods';
+import { openClawChatCommandParams } from '../../services/openclawChatCommandAuthority';
 
 import { assembleChatSnapshot, GatewayFrameFence, observeOpenClawHello, clearOpenClawHello, getOpenClawCapabilities } from '../../services/openClawCompatibility';
+import { recordOpenClawHelloSnapshot } from '../../utils/openclawHelloSnapshot';
 import { projectWidgetToolResult } from '../../services/chatWidgetProjection';
 import { openPortalWidgetTurnSocket } from '../../services/portalWidgetTurnSocket';
 import { publishSessionWorkChanged, invalidateSessionWorkRows } from '../../services/openClawSessionWork';
@@ -2678,7 +2681,8 @@ function publishSessionUserMessage(
     : undefined;
   streamEventBus.publish(sessionKey, {
     type: 'user_message',
-    content: text.slice(0, 100_000),
+    content: (projectPortalAuthoredContent(message?.content ?? message?.text ?? '',
+      message?.idempotencyKey ?? message?.__openclaw?.idempotencyKey) ?? text).slice(0, 100_000),
     messageId,
     messageTimestamp: Number.isFinite(rawTimestamp) && rawTimestamp > 0 ? rawTimestamp : Date.now(),
     ...(sourceChannel ? { sourceChannel } : {}),
@@ -3337,6 +3341,7 @@ function connect(): void {
             : [],
         );
         observeOpenClawHello(msg.payload);
+        void recordOpenClawHelloSnapshot(msg.payload);
         gatewayFrameFence.clear();
         lastSeq = 0;
         isAuthenticated = true;
@@ -3735,7 +3740,12 @@ async function persistDispatchThenAcknowledgeRunReservation(
  * now go through the single persistent connection. Events for this session
  * will be received by the same connection and published to StreamEventBus.
  */
-export async function callGatewayRpc(method: string, params: Record<string, any> = {}, timeoutMs = 10000): Promise<any> {
+export async function callGatewayRpc(
+  method: string,
+  params: Record<string, any> = {},
+  timeoutMs = 10000,
+  options: { reserveRun?: boolean } = {},
+): Promise<any> {
   if (!singletonWs || singletonWs.readyState !== WebSocket.OPEN) {
     throw new Error('Persistent WebSocket not connected');
   }
@@ -3753,7 +3763,8 @@ export async function callGatewayRpc(method: string, params: Record<string, any>
 
   const requestId = nextId();
   const rpcSessionKey = typeof params.sessionKey === 'string' ? params.sessionKey.trim() : '';
-  const runReservation = method === 'chat.send' && rpcSessionKey ? requestId : '';
+  // A steering chat.send may join the active run, so it must not reserve a new one.
+  const runReservation = method === 'chat.send' && rpcSessionKey && options.reserveRun !== false ? requestId : '';
   if (runReservation && !reserveLogicalRun(rpcSessionKey, runReservation)) {
     throw new Error(`A different run is already active for ${rpcSessionKey}`);
   }
@@ -3782,7 +3793,7 @@ export async function callGatewayRpc(method: string, params: Record<string, any>
       resolve: (payload: any) => {
         clearTimeout(timeoutTimer);
         const runId = normalizedRunId(payload?.runId) || runReservation;
-        if (method === 'chat.send' && rpcSessionKey) {
+        if (runReservation) {
           if (!acknowledgeRunReservation(rpcSessionKey, runReservation, runId)) {
             reject(new Error(`Stale chat.send response ignored for ${rpcSessionKey}`));
             return;
@@ -4789,6 +4800,7 @@ export async function sendChatMessage(
   portalInlineWidgets = false,
   chatImageModel?: string,
   revalidateChatImages?: () => Promise<void>,
+  allowChatCommands = false,
 ): Promise<{ runId: string }> {
   if (!singletonWs || singletonWs.readyState !== WebSocket.OPEN) {
     throw new Error('Persistent WebSocket not connected');
@@ -4803,8 +4815,8 @@ export async function sendChatMessage(
 
   // Capability belongs to this originating turn socket, not the singleton.
   const widgetCaps = getOpenClawCapabilities();
-  const widgetSocket = portalInlineWidgets && supportsOpenClawInlineWidgets(widgetCaps.version)
-    && widgetCaps.methods.includes('canvas.document.view') ? await openPortalWidgetTurnSocket(sessionKey, (event, payload) => {
+  const widgetSocket = portalInlineWidgets && supportsOpenClawInlineWidgets(widgetCaps)
+    ? await openPortalWidgetTurnSocket(sessionKey, (event, payload) => {
     if (event === 'response') {
       const pending = pendingResponses.get(payload.id);
       if (!pending) return;
@@ -4936,6 +4948,9 @@ export async function sendChatMessage(
           message,
           idempotencyKey,
           deliver: false,
+          // Plain text unless the sender may use OpenClaw chat commands
+          // (services/openclawChatCommandAuthority.ts).
+          ...openClawChatCommandParams(allowChatCommands),
           ...(attachments.length ? { attachments: attachments.map(({ type, mimeType, content, fileName }) =>
             ({ type, mimeType, content, fileName })) } : {}),
         },
@@ -4973,29 +4988,133 @@ export async function injectChatMessage(sessionKey: string, text: string): Promi
   await injectChatMessageWithRpc(sessionKey, text, callGatewayRpc);
 }
 
+export interface ExactRunSteerResult {
+  mode: 'exact-run';
+  interruptedActiveRun: false;
+  replayed: boolean;
+  requestId: string;
+  runId: string;
+}
+
+/**
+ * Stock OpenClaw steering through chat.send {queueMode:'steer'}. OpenClaw adds
+ * the text to whichever run is active in the session when it processes the
+ * request (expectedLeafEntryId is not asserted for steer), or starts a new
+ * turn when none is. Its ack is {runId, status:'started'} in both cases, so the
+ * outcome is unconfirmed here: events under `steerRunId` mean a new turn.
+ */
+export interface NativeSteerResult {
+  mode: 'native-steer';
+  outcome: 'unconfirmed';
+  interruptedActiveRun: boolean;
+  replayed: boolean;
+  requestId: string;
+  steerRunId: string;
+}
+
+export const NATIVE_STEER_RPC_TIMEOUT_MS = 30_000;
+
+/** One idempotency key per (session, request): a retry is deduplicated, never resent. */
+export function nativeSteerIdempotencyKey(sessionKey: string, requestId: string): string {
+  const scope = createHash('sha256').update(`${sessionKey}\0${requestId}`).digest('hex').slice(0, 32);
+  return buildPortalOpenClawIdempotencyKey(`steer-${scope}`, `active-steer:${requestId}`);
+}
+
+export async function steerWithNativeChatSendWithRpc(
+  rpc: PendingUserInputRpc,
+  sessionKey: string,
+  requestId: unknown,
+  text: unknown,
+  allowChatCommands = false,
+): Promise<NativeSteerResult> {
+  const normalizedSessionKey = pendingInputIdentifier(sessionKey, 'sessionKey', 512);
+  const normalizedRequestId = pendingInputIdentifier(requestId, 'requestId', 256);
+  const normalizedText = pendingInputText(text);
+  const payload = await rpc('chat.send', {
+    sessionKey: normalizedSessionKey,
+    message: normalizedText,
+    idempotencyKey: nativeSteerIdempotencyKey(normalizedSessionKey, normalizedRequestId),
+    deliver: false,
+    queueMode: 'steer',
+    // A steer that starts a new turn runs the reply pipeline like a send.
+    ...openClawChatCommandParams(allowChatCommands),
+  }, NATIVE_STEER_RPC_TIMEOUT_MS);
+  const steerRunId = typeof payload?.runId === 'string' ? payload.runId.trim() : '';
+  if (!steerRunId || (payload?.status !== 'started' && payload?.status !== 'in_flight')) {
+    throw new PendingUserInputAnswerError(
+      'INVALID_GATEWAY_RESPONSE',
+      'OpenClaw returned an invalid steering response.',
+      502,
+    );
+  }
+  return {
+    mode: 'native-steer',
+    outcome: 'unconfirmed',
+    interruptedActiveRun: payload.interruptedActiveRun === true,
+    replayed: payload.status === 'in_flight',
+    requestId: normalizedRequestId,
+    steerRunId,
+  };
+}
+
+/**
+ * Capability switch, never a version check. The Portal plugin's exact-run
+ * steer is used when the gateway advertises its method and the plugin finds
+ * its runtime; HOTFIX_UNAVAILABLE means that runtime is absent and nothing was
+ * delivered, so the text goes through stock chat.send steering instead.
+ */
+export async function steerSessionMessageWithRpc(
+  rpc: PendingUserInputRpc,
+  nativeRpc: PendingUserInputRpc,
+  gatewayMethods: readonly string[],
+  sessionKey: string,
+  expectedRunId: unknown,
+  text: string,
+  requestId: string,
+  allowChatCommands = false,
+): Promise<ExactRunSteerResult | NativeSteerResult> {
+  // The exact-run method queues the text into the attested active run as
+  // conversation input (handle.queueMessage); it never reaches OpenClaw's
+  // command parser, so it needs no command authority either way.
+  if (gatewayMethods.includes(ACTIVE_RUN_STEER_GATEWAY_METHOD)) {
+    try {
+      // The browser observed this run before issuing the request. Never
+      // replace that identity with whichever run happens to be active when
+      // HTTP/RPC processing reaches this point: a delayed R1 request must not
+      // steer R2. The exact-run gateway method also uses this identity for
+      // safe receipt replay after R1 has settled.
+      const result = await steerActiveRunWithRpc(rpc, sessionKey, expectedRunId, requestId, text);
+      return {
+        mode: 'exact-run',
+        interruptedActiveRun: false,
+        replayed: result.replayed,
+        requestId: result.requestId,
+        runId: result.runId,
+      };
+    } catch (error) {
+      if (!(error instanceof PendingUserInputAnswerError) || error.code !== 'HOTFIX_UNAVAILABLE') throw error;
+    }
+  }
+  return steerWithNativeChatSendWithRpc(nativeRpc, sessionKey, requestId, text, allowChatCommands);
+}
+
 export async function steerSessionMessage(
   sessionKey: string,
   expectedRunId: unknown,
   text: string,
   requestId = `legacy-steer-${nextId()}`,
-): Promise<{ interruptedActiveRun: false; replayed: boolean; requestId: string; runId: string }> {
-  // The browser observed this run before issuing the request. Never replace
-  // that identity with whichever run happens to be active when HTTP/RPC
-  // processing reaches this point: a delayed R1 request must not steer R2.
-  // The exact-run gateway method also uses this identity for safe receipt
-  // replay after R1 has settled.
-  const result = await steerActiveRun(
+  allowChatCommands = false,
+): Promise<ExactRunSteerResult | NativeSteerResult> {
+  return steerSessionMessageWithRpc(
+    callGatewayRpc,
+    (method, params, timeoutMs) => callGatewayRpc(method, params, timeoutMs, { reserveRun: false }),
+    getOpenClawCapabilities().methods,
     sessionKey,
     expectedRunId,
-    requestId,
     text,
+    requestId,
+    allowChatCommands,
   );
-  return {
-    interruptedActiveRun: false,
-    replayed: result.replayed,
-    requestId: result.requestId,
-    runId: result.runId,
-  };
 }
 
 /**

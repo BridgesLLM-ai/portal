@@ -1,0 +1,8 @@
+{"service": {"label": "systemd", "loaded": true, "loadState": {"status": "loaded"}, "targetRole": "check-target"},
+ "config": {"cli": {}, "daemon": {}},
+ "gateway": {"bindMode": "loopback", "port": 18789, "probeUrl": "ws://127.0.0.1:18789", "version": "2026.9.9"},
+ "port": {"port": 18789, "status": "busy"},
+ "lastError": null,
+ "rpc": {"ok": true, "kind": "read", "capability": "read_only", "server": {"version": "2026.9.9"}, "version": "2026.9.9",
+         "url": "ws://127.0.0.1:18789"},
+ "extraServices": []}

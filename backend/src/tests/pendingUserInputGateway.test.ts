@@ -62,12 +62,14 @@ describe('PersistentGatewayWs dual OpenClaw question authority', () => {
     ['2026.7.1', 'legacy-custom'],
     ['2026.7.1-2', 'legacy-custom'],
     ['2026.9.1', 'native'],
+    // At or above the 2026.9.1 floor every release (and package republish) is native.
+    ['2026.9.1-3', 'native'],
+    ['2026.10.9', 'native'],
+    ['2027.1.0', 'native'],
     ['2026.7.1-3', null],
-    ['2026.9.1-3', null],
     ['2026.8.2', null],
-    ['2027.1.0', null],
     ['', null],
-  ])('maps runtime %s to the exact supported authority', (version, expected) => {
+  ])('maps runtime %s to the supported authority', (version, expected) => {
     expect(pendingUserInputAuthorityForVersion(version)).toBe(expected);
   });
 

@@ -62,11 +62,11 @@ describe('agent harness catalog', () => {
     expect(isAgentHarnessId('openai/gpt-5.6-sol')).toBe(false);
   });
 
-  test('restores exact-pinned host-native chats without advertising project sandbox support', () => {
+  test('restores floor-pinned host-native chats without advertising project sandbox support', () => {
     for (const id of ['GROK', 'GEMINI'] as const) {
       expect(requireHarnessDefinition(id)).toMatchObject({
         implemented: true, selectable: true, releaseStage: 'stable',
-        command: { executable: id === 'GROK' ? 'grok' : 'agy', versionPolicy: { kind: 'exact-pin' } },
+        command: { executable: id === 'GROK' ? 'grok' : 'agy', versionPolicy: { kind: 'floor-pin' } },
         capabilities: { implemented: true, supportedExecutionScopes: ['HOST_OPERATOR'],
           supportsLiveToolEvents: true, supportsProcessRestartResume: true },
       });
@@ -74,7 +74,7 @@ describe('agent harness catalog', () => {
     expect(requireHarnessDefinition('AGENT_ZERO')).toMatchObject({ implemented: true, selectable: true, releaseStage: 'stable' });
   });
 
-  test('truthfully capability-gates exact-pinned host ACP harnesses and the disabled DeepSeek preview', () => {
+  test('truthfully capability-gates floor-pinned host ACP harnesses and the disabled DeepSeek preview', () => {
     const hermes = requireHarnessDefinition('HERMES');
     expect(hermes).toMatchObject({
       transport: 'acp-stdio',
@@ -85,7 +85,7 @@ describe('agent harness catalog', () => {
       command: {
         executable: 'hermes',
         args: ['acp'],
-        versionPolicy: { kind: 'exact-pin', testedVersion: PORTAL_TOOL_VERSIONS.hermes },
+        versionPolicy: { kind: 'floor-pin', floorVersion: PORTAL_TOOL_VERSIONS.hermes, testedVersion: PORTAL_TOOL_VERSIONS.hermes },
       },
       models: {
         selectionMode: 'session',
@@ -161,7 +161,7 @@ describe('agent harness catalog', () => {
       command: {
         executable: 'opencode',
         args: ['acp', '--pure', '--hostname', '127.0.0.1', '--port', '0', '--no-mdns'],
-        versionPolicy: { kind: 'exact-pin', testedVersion: PORTAL_TOOL_VERSIONS.openCode },
+        versionPolicy: { kind: 'floor-pin', floorVersion: PORTAL_TOOL_VERSIONS.openCode, testedVersion: PORTAL_TOOL_VERSIONS.openCode },
       },
       auth: {
         owner: 'harness-local-login',
@@ -219,8 +219,8 @@ describe('agent harness catalog', () => {
     const helper = fs.readFileSync(path.resolve(__dirname, '../../../installer/grok-build-runtime.sh'), 'utf8');
     const grok = requireHarnessDefinition('GROK');
 
-    // The evidence is for exactly the artifact the installer pins.
-    expect(grok.command.versionPolicy).toMatchObject({ kind: 'exact-pin', testedVersion: '1.0.62' });
+    // The evidence is for exactly the artifact the installer pins; that version is also the floor.
+    expect(grok.command.versionPolicy).toMatchObject({ kind: 'floor-pin', floorVersion: '1.0.62', testedVersion: '1.0.62' });
     expect(helper).toContain('readonly GROK_BUILD_TESTED_VERSION="1.0.62"');
     expect(helper).toContain(`readonly GROK_BUILD_SHA256_X86_64="${fixture.provenance.sha256}"`);
     expect(fixture.initialize.protocolVersion).toBe(1);

@@ -1,0 +1,13 @@
+{"status": "error", "mode": "npm", "reason": "update-rolled-back", "steps": [], "durationMs": 1312000,
+ "before": {"version": "2026.9.9"}, "after": {"version": "2026.9.9"},
+ "runId": "9a8b7c6d-0000-4000-8000-0000000000a2",
+ "run": {"runId": "9a8b7c6d-0000-4000-8000-0000000000a2", "createdAtMs": 1792100000000, "updatedAtMs": 1792101312000,
+         "trigger": "cli", "phase": "finished", "status": "rolled-back", "reason": "update-rolled-back",
+         "origin": {"nextAction": "Inspect the update report with: openclaw update status"},
+         "target": {"kind": "package", "channel": "stable", "tag": "2026.10.9"},
+         "before": {"version": "2026.9.9"}, "after": {"version": "2026.9.9"},
+         "steps": [{"step": "requested", "status": "completed"}, {"step": "staging", "status": "completed"},
+                   {"step": "validating", "status": "completed"}, {"step": "activating", "status": "completed"},
+                   {"step": "restarting", "status": "completed"}, {"step": "verifying", "status": "failed"}],
+         "verification": {}, "repair": [], "confirmedAtMs": null, "finishedAtMs": 1792101312000, "downtimeMs": 95000},
+ "reportPath": "/root/.openclaw/update-reports/9a8b7c6d-0000-4000-8000-0000000000a2.md"}

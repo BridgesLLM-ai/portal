@@ -1,0 +1,6 @@
+{"plugin": {"id": "bridgesllm-ask-user", "name": "BridgesLLM Ask User", "version": "4.0.0", "format": "openclaw",
+            "source": "/root/.openclaw/extensions/bridgesllm-ask-user/index.js", "origin": "config",
+            "enabled": true, "activated": true, "status": "loaded"},
+ "shape": "plain-capability", "capabilities": [], "typedHooks": [], "customHooks": [], "tools": [], "diagnostics": [],
+ "gatewayMethods": [], "compatibility": [], "bundleCapabilities": [],
+ "install": {"source": "archive", "version": "4.0.0", "installPath": "/root/.openclaw/extensions/bridgesllm-ask-user"}}

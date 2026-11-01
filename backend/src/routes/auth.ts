@@ -937,7 +937,7 @@ router.post('/refresh', async (req: Request, res: Response, next: NextFunction) 
       // Never emit deletion cookies from a refresh failure. A delayed failure
       // response can arrive after a newer login/rotation and would erase the
       // newer shared browser credentials. The 401 is the local sign-out signal.
-      throw new AppError(401, 'Refresh token required');
+      throw new AppError(401, 'Refresh token required', true, 'INFO');
     }
 
     const payload = verifyRefreshToken(refreshToken);

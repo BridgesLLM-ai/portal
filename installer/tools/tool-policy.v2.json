@@ -1,0 +1,157 @@
+{
+  "schema": "bridgesllm.tools.policy.v2",
+  "policyRevision": 1,
+  "notes": "Floors are hard. newestProven entries with status \"proposed\" are not yet qualified and must never be labelled proven; the qualification suite promotes them to \"qualified\" with recorded digests before release.",
+  "openclaw": {
+    "channels": ["stable", "extended-stable"],
+    "defaultChannel": "stable",
+    "coreAutoUpdateDefault": false,
+    "gatewayService": "openclaw-gateway.service",
+    "coreUpdates": "later-release"
+  },
+  "runtimes": {
+    "node": {
+      "label": "Node.js (OpenClaw gateway runtime)",
+      "floorRule": "target-engines",
+      "managedPath": "/usr/bin/node",
+      "manager": "nodesource-apt"
+    }
+  },
+  "tools": [
+    {
+      "id": "openclaw",
+      "label": "OpenClaw",
+      "category": "core",
+      "source": { "kind": "npm", "package": "openclaw", "provenance": "required" },
+      "floor": "2026.9.1",
+      "newestProven": { "version": "2026.10.9", "status": "proposed", "integrity": null, "qualifiedAt": null },
+      "newestSelector": { "stable": "latest", "extended-stable": "extended-stable" },
+      "denylist": [],
+      "probes": {
+        "required": ["OC-HELLO", "OC-READY", "OC-CONFIG", "OC-PLUG-ASK"],
+        "optional": ["OC-QUESTION", "OC-STEER", "OC-GOALS", "OC-PROGRESS", "OC-CANVAS", "OC-CATALOG", "OC-BROWSER", "OC-CODEX-PLUG"],
+        "conditional": ["OC-PURGE"]
+      },
+      "swapLayout": "native-openclaw-update",
+      "restartsGateway": true
+    },
+    {
+      "id": "codex",
+      "label": "Codex CLI",
+      "category": "cli",
+      "source": { "kind": "npm", "package": "@openai/codex", "platformPackage": "@openai/codex@{version}-linux-x64", "provenance": "required" },
+      "floor": "0.163.0",
+      "newestProven": { "version": "0.166.0", "status": "qualified", "integrity": "sha512-2Szlp1l1cz5TX1ccpX4Zok3DZrot9xeZe0km+6/1v8JmqxADwyJxKBJah4dBymkwtS25j/u6dipJusTOI97Z8Q==", "qualifiedAt": "2026-11-01T07:03:26Z" },
+      "newestSelector": { "default": "latest" },
+      "denylist": [],
+      "probes": { "required": ["C-VER", "C-HEADLESS", "C-APP"], "optional": ["C-OUTPUT"], "conditional": [] },
+      "swapLayout": "npm-global",
+      "restartsGateway": false
+    },
+    {
+      "id": "claude-code",
+      "label": "Claude Code",
+      "category": "cli",
+      "source": { "kind": "npm", "package": "@anthropic-ai/claude-code", "platformPackage": "@anthropic-ai/claude-code-linux-x64@{version}", "provenance": "unavailable", "installScripts": { "postinstall": "node install.cjs" } },
+      "floor": "2.1.300",
+      "floorStatus": "proposed",
+      "newestProven": { "version": "2.1.314", "status": "qualified", "integrity": "sha512-iD58PXZvNCykRm3ZRiV/zJOsejXH/FtLZFtsFqUHxFxBsthOyb+0MINeJ8EsNbSG8ECTsfhzPIZwl8x6NIRkSg==", "qualifiedAt": "2026-11-01T07:04:04Z" },
+      "newestSelector": { "default": "stable" },
+      "denylist": [],
+      "probes": { "required": ["C-VER", "C-HEADLESS", "C-OUTPUT"], "optional": [], "conditional": [] },
+      "swapLayout": "npm-global",
+      "restartsGateway": false
+    },
+    {
+      "id": "clawhub",
+      "label": "ClawHub",
+      "category": "cli",
+      "source": { "kind": "npm", "package": "clawhub", "provenance": "required" },
+      "floor": "0.23.3",
+      "newestProven": { "version": "0.24.1", "status": "qualified", "integrity": "sha512-je0nAOJvXBhA1WaIwLFL+9MKDNQBhu+23N074pvB3s8XCKAOV/QfjgWCr8Co2AGCGO8yE0KmllfUOqPs2CDTlQ==", "qualifiedAt": "2026-11-01T07:04:25Z" },
+      "newestSelector": { "default": "latest" },
+      "denylist": [],
+      "probes": { "required": ["C-VER", "C-HEADLESS"], "optional": [], "conditional": [] },
+      "swapLayout": "npm-global",
+      "restartsGateway": false
+    },
+    {
+      "id": "opencode",
+      "label": "OpenCode",
+      "category": "harness",
+      "source": { "kind": "github-release", "repository": "anomalyco/opencode" },
+      "floor": "1.19.4",
+      "newestProven": { "version": "1.19.5", "status": "qualified", "integrity": {"x86_64": "sha256:17c200fd4b2289954cc01552559f9b6d03ec157b2ddfb5eb54144f491656333d"}, "qualifiedAt": "2026-11-01T07:10:39Z" },
+      "newestSelector": { "default": "latest" },
+      "denylist": [],
+      "probes": { "required": ["C-VER", "C-ACP"], "optional": [], "conditional": [] },
+      "swapLayout": "versioned-dir",
+      "restartsGateway": false
+    },
+    {
+      "id": "hermes",
+      "label": "Hermes",
+      "category": "harness",
+      "source": { "kind": "github-tarball", "repository": "NousResearch/hermes-agent" },
+      "floor": "0.22.2",
+      "newestProven": { "version": "0.22.5", "status": "qualified", "integrity": "sha256-tree:923e6b174d554a6c581fac0b04943bbe6b206a688fe1c6058a454f27341d9f74", "qualifiedAt": "2026-11-01T07:23:14Z" },
+      "newestSelector": { "default": "latest" },
+      "denylist": [],
+      "probes": { "required": ["C-VER", "C-ACP"], "optional": [], "conditional": [] },
+      "swapLayout": "versioned-dir",
+      "restartsGateway": false
+    },
+    {
+      "id": "grok-build",
+      "label": "Grok Build",
+      "category": "harness",
+      "source": { "kind": "vendor", "endpoint": "https://x.ai/cli", "checksums": "unavailable" },
+      "floor": "1.0.62",
+      "newestProven": { "version": "1.0.62", "status": "qualified", "integrity": {"x86_64": "sha256:2a46d9e4d7ebd7a9cff7f95716714b19dad5f21dd2a497822400b1fb128969aa"}, "qualifiedAt": "2026-11-01T07:10:47Z" },
+      "newestSelector": { "default": "vendor-latest" },
+      "denylist": [],
+      "probes": { "required": ["C-VER", "C-ACP"], "optional": [], "conditional": [] },
+      "swapLayout": "versioned-dir",
+      "restartsGateway": false
+    },
+    {
+      "id": "antigravity",
+      "label": "Antigravity",
+      "category": "harness",
+      "source": { "kind": "vendor", "endpoint": "https://storage.googleapis.com/antigravity-public/antigravity-cli/", "checksums": "unavailable" },
+      "floor": "1.4.3",
+      "newestProven": { "version": "1.4.3", "status": "qualified", "integrity": {"x86_64": "sha256:d003c9d47e12f689d3448cad0f614289ccde5fb4c58bf8b4b543a9b514c097bc"}, "qualifiedAt": "2026-11-01T07:10:56Z" },
+      "newestSelector": { "default": "vendor-latest" },
+      "denylist": [],
+      "probes": { "required": ["C-VER"], "optional": [], "conditional": [] },
+      "swapLayout": "versioned-dir",
+      "restartsGateway": false
+    },
+    {
+      "id": "ollama",
+      "label": "Ollama",
+      "category": "runtime",
+      "source": { "kind": "github-release", "repository": "ollama/ollama" },
+      "floor": "0.40.6",
+      "newestProven": { "version": "0.40.13", "status": "qualified", "integrity": {"x86_64": "sha256:c9490e0f520be21271d969e6703f012268b1d39f8b70dd58854e5bfef7a75bb6"}, "qualifiedAt": "2026-11-01T07:25:30Z" },
+      "newestSelector": { "default": "latest" },
+      "denylist": [],
+      "probes": { "required": ["C-VER"], "optional": [], "conditional": [] },
+      "swapLayout": "service-restart",
+      "restartsGateway": false
+    },
+    {
+      "id": "agent-zero",
+      "label": "Agent Zero",
+      "category": "harness",
+      "source": { "kind": "container-image", "repository": "agent0ai/agent-zero" },
+      "floor": "2.14",
+      "newestProven": { "version": "2.14", "status": "qualified", "integrity": {"x86_64": "sha256:307a2ceffc8501ba05a1e7253e8b6e4d656d2e1c3b97f0eb943c18b9c40a30fd"}, "qualifiedAt": "2026-11-01T07:41:09Z" },
+      "newestSelector": { "default": "latest" },
+      "denylist": [],
+      "probes": { "required": ["C-VER"], "optional": [], "conditional": [] },
+      "swapLayout": "managed-container",
+      "restartsGateway": false
+    }
+  ]
+}

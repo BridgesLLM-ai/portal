@@ -15,6 +15,7 @@ import {
   getOpenClawQuestionPluginReadiness,
   type OpenClawQuestionPluginReadiness,
 } from './openClawQuestionRuntimeReadiness';
+import { OPENCLAW_DIAGNOSTICS_QUIESCE_MARKER } from '../utils/openclawDiagnosticLease';
 
 export const OPENCLAW_MUTATION_MAINTENANCE_MARKER =
   '/var/lib/bridgesllm-installer/openclaw-mutation-maintenance-v1.json';
@@ -51,6 +52,14 @@ const READINESS_NEGATIVE_TTL_COLLECTION_MULTIPLE = 2;
 // consecutive background failures, retried no sooner than the retry interval.
 const READINESS_BACKGROUND_RETRY_MS = 20_000;
 const READINESS_BACKGROUND_NEGATIVES_TO_DISPLACE = 2;
+// While toolctl's diagnostics quiesce marker exists (an OpenClaw core update
+// before its restart window), no OpenClaw CLI may start, so readiness cannot be
+// collected; a collection would only report the pause. The installed runtime
+// does not change in that span: the maintenance marker is published before
+// native activation, and its boundary invalidates every attestation. So chat
+// keeps its last positive attestation past the normal age, up to this bound,
+// and without one it waits ('maintenance', retryable) instead of failing.
+const READINESS_ATTESTATION_QUIESCED_MAX_AGE_MS = 3 * 60 * 60_000;
 const MAX_MAINTENANCE_MARKER_BYTES = 2_048;
 const MAX_HOST_MUTATION_JOURNAL_BYTES = 16 * 1024 * 1024;
 
@@ -86,6 +95,12 @@ export interface OpenClawExecutionAdmissionDependencies {
   inspectAuthorizationFence(): OpenClawDurableEvidence;
   inspectMaintenanceMarker(): OpenClawDurableEvidence;
   inspectHostMutationJournal(): OpenClawDurableEvidence;
+  /**
+   * toolctl's diagnostics quiesce marker (L3). Present pauses readiness
+   * collection, never chat. Like the diagnostic lease, anything at the path
+   * counts as present.
+   */
+  inspectDiagnosticsQuiesce(): OpenClawDurableEvidence;
   /**
    * Identity of the directories that hold the maintenance marker and the
    * host-mutation journals. It changes whenever an entry is created or removed
@@ -141,9 +156,13 @@ function readinessAttestationIsPositive(attestation: ReadinessAttestation): bool
   return attestation.readiness?.ready === true && attestation.questionRuntime?.ready === true;
 }
 
-function usableCachedReadinessAttestation(now: number): ReadinessAttestation | null {
+function usableCachedReadinessAttestation(now: number, quiesced = false): ReadinessAttestation | null {
   const cached = readinessAttestationCache;
   if (!cached || cached.generation !== readinessAttestationGeneration) return null;
+  if (quiesced) {
+    return readinessAttestationIsPositive(cached)
+      && now - cached.at < READINESS_ATTESTATION_QUIESCED_MAX_AGE_MS ? cached : null;
+  }
   const maximumAge = readinessAttestationIsPositive(cached)
     ? READINESS_ATTESTATION_MAX_AGE_MS
     : negativeReadinessAttestationTtlMs(cached.collectMs);
@@ -308,6 +327,15 @@ function inspectRootOwnedEvidenceFile(input: {
   }
 }
 
+function inspectMarkerPresence(filePath: string): OpenClawDurableEvidence {
+  try {
+    fs.lstatSync(filePath);
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return Object.freeze({ state: 'absent' });
+  }
+  return Object.freeze({ state: 'present' });
+}
+
 function aggregateDurableEvidence(
   inspections: readonly OpenClawDurableEvidence[],
 ): OpenClawDurableEvidence {
@@ -391,6 +419,7 @@ const defaultDependencies: OpenClawExecutionAdmissionDependencies = Object.freez
     maximumBytes: MAX_MAINTENANCE_MARKER_BYTES,
   }),
   inspectHostMutationJournal: inspectHostMutationJournals,
+  inspectDiagnosticsQuiesce: () => inspectMarkerPresence(OPENCLAW_DIAGNOSTICS_QUIESCE_MARKER),
   readMutationEpoch: () => readMutationEvidenceEpoch(),
   // An attestation now outlives the setup-readiness cache by design, so it is
   // always built from a fresh collection rather than from a cached one. A
@@ -644,7 +673,12 @@ function startReadinessAttestationCollection(
     promise: collect,
   };
   flight.promise = collect.then((result) => {
-    if (generation === readinessAttestationGeneration) {
+    // A collection that failed because diagnostics were paused meanwhile says
+    // nothing about OpenClaw; it must not displace a positive attestation.
+    if (
+      generation === readinessAttestationGeneration
+      && (readinessAttestationIsPositive(result) || !diagnosticsQuiesced(dependencies))
+    ) {
       publishReadinessAttestation(result, flight.policy, dependencies.now());
     }
     return result;
@@ -653,6 +687,25 @@ function startReadinessAttestationCollection(
   });
   readinessAttestationInFlight = flight;
   return flight.promise;
+}
+
+function diagnosticsQuiesced(dependencies: OpenClawExecutionAdmissionDependencies): boolean {
+  return dependencies.inspectDiagnosticsQuiesce().state !== 'absent';
+}
+
+function quiescedAdmission(
+  shared: boolean,
+  checkedAt: number,
+  evidence: OpenClawExecutionAdmissionEvidence,
+): OpenClawExecutionAdmission {
+  const cached = shared ? usableCachedReadinessAttestation(checkedAt, true) : null;
+  if (cached) return readinessAdmission(cached, checkedAt, evidence);
+  return admission(
+    'maintenance',
+    'OpenClaw is being updated, and its readiness cannot be checked again until that update finishes.',
+    checkedAt,
+    evidence,
+  );
 }
 
 function readinessAdmission(
@@ -713,6 +766,9 @@ export async function getOpenClawExecutionAdmission(
     invalidateReadinessForRuntimeMutationEvidence(before, shared, dependencies);
     const beforeAdmission = durableAdmission(before, dependencies.now());
     if (beforeAdmission) return beforeAdmission;
+    if (diagnosticsQuiesced(dependencies)) {
+      return quiescedAdmission(shared, dependencies.now(), before.evidence);
+    }
 
     const attestation = await collectReadinessAttestation(
       dependencies,
@@ -726,6 +782,10 @@ export async function getOpenClawExecutionAdmission(
     invalidateReadinessForRuntimeMutationEvidence(after, shared, dependencies);
     const afterAdmission = durableAdmission(after, dependencies.now());
     if (afterAdmission) return afterAdmission;
+    if (!readinessAttestationIsPositive(attestation) && diagnosticsQuiesced(dependencies)) {
+      // The pause began while readiness was being collected.
+      return quiescedAdmission(shared, dependencies.now(), after.evidence);
+    }
     if (
       !shared
       || attestation.generation === readinessAttestationGeneration
@@ -774,6 +834,7 @@ export function getCachedOpenClawExecutionAdmission(
   const checkedAt = dependencies.now();
   const durable = durableAdmission(snapshot, checkedAt);
   if (durable) return durable;
+  if (diagnosticsQuiesced(dependencies)) return quiescedAdmission(true, checkedAt, snapshot.evidence);
 
   // This seam stays free of probes and of background scheduling: it only
   // consumes an attestation that route admission already established.
@@ -913,6 +974,8 @@ export const __openClawExecutionAdmissionTest = Object.freeze({
   READINESS_NEGATIVE_TTL_COLLECTION_MULTIPLE,
   READINESS_BACKGROUND_RETRY_MS,
   READINESS_BACKGROUND_NEGATIVES_TO_DISPLACE,
+  READINESS_ATTESTATION_QUIESCED_MAX_AGE_MS,
+  OPENCLAW_MUTATION_EPOCH_DIRECTORIES,
   MAX_HOST_MUTATION_JOURNAL_BYTES,
   MAX_MAINTENANCE_MARKER_BYTES,
   aggregateDurableEvidence,

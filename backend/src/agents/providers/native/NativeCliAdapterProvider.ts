@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { withPortalGuideReference } from '../../../services/portalOperatingGuide';
+import { withSenderResponsePreference } from '../../../services/chatResponseCapabilities';
 import { randomUUID } from 'crypto';
 import type {
   AgentMessage,
@@ -1087,7 +1088,10 @@ export abstract class NativeCliAdapterProvider implements AgentProvider {
         ctx = {
           session,
           originalSessionId: portalSessionId,
-          message: withPortalGuideReference(promptMessage, publishToHostBus && session.messages.length === 1),
+          message: withPortalGuideReference(
+            publishToHostBus ? withSenderResponsePreference(promptMessage, this.adapter.providerName, sender) : promptMessage,
+            publishToHostBus && session.messages.length === 1,
+          ),
           onChunk,
           // Legacy adapter tool/progress callbacks must share the same canonical
           // publication path as emitStatus, even when no immediate HTTP callback

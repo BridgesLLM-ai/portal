@@ -20,6 +20,7 @@ import {
 import { isElevated, isOwner } from '../utils/authz';
 import TypedConfirmationDialog from '../components/TypedConfirmationDialog';
 import ViewportModal from '../components/ViewportModal';
+import AiToolsPanel from '../components/maintenance/AiToolsPanel';
 import {
   adminTabIdsForRole,
   isActiveMaintenanceJob,
@@ -579,6 +580,7 @@ function LegacyOpenClawAgentsCard() {
 }
 
 function MaintenanceTab({ owner }: { owner: boolean }) {
+  const { user } = useAuthStore();
   const [status, setStatus] = useState<MaintenanceStatus | null>(null);
   const [jobs, setJobs] = useState<AgentJob[]>([]);
   const [loading, setLoading] = useState(true);
@@ -744,6 +746,7 @@ function MaintenanceTab({ owner }: { owner: boolean }) {
 
   const issues = status?.issues || [];
   const actions = status?.actions || [];
+  const backupAction = actions.find((action) => action.id === 'create-maintenance-backup') || null;
   const maintenanceRetryDelay = maintenanceRetryDelayLabel(status?.retryAfterMs);
 
   return (
@@ -898,6 +901,13 @@ function MaintenanceTab({ owner }: { owner: boolean }) {
           </div>
         </div>
       )}
+
+      <AiToolsPanel
+        owner={owner}
+        currentUserId={user?.id || null}
+        backup={status?.backup || null}
+        onCreateBackup={backupAction ? () => requestAction(backupAction) : undefined}
+      />
 
       <div className="grid gap-4 xl:grid-cols-[1.3fr_1fr]">
         <section className="rounded-xl border border-white/5 bg-white/[0.02] p-4">

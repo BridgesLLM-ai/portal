@@ -10,6 +10,9 @@
 export const OPENCLAW_EXECUTION_CAPABLE_GATEWAY_METHODS: ReadonlySet<string> = new Set([
   'agent',
   'chat.send',
+  // Deprecated OpenClaw alias of chat.send {queueMode:'interrupt'}. The Portal
+  // never sends it; it stays classified so an older client's frame is still
+  // refused during maintenance until OpenClaw removes the alias.
   'sessions.steer',
   'sessions.goal.update',
   'progressCard.refresh',

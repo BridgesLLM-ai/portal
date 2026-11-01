@@ -432,6 +432,43 @@ describe('shared ACP stdio broker', () => {
   });
 
   test.each([
+    ['the recommended 0.22.5', '0.22.5', null],
+    ['a later minor', '0.23.0', null],
+    ['a version below the floor', '0.22.1', /agent mismatch: version 0\.22\.1 is older than the Portal's supported floor 0\.22\.2/],
+    ['an unreadable version', 'main', /agent mismatch: the installed version main could not be read/],
+  ])('judges a Hermes agent reporting %s by its floor and handshake', async (_label, version, refusal) => {
+    const runtime = fakeAcpProcess((message, process) => {
+      if (message.method === 'initialize') {
+        process.send({
+          jsonrpc: '2.0', id: message.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'hermes-agent', version },
+            agentCapabilities: hermesCapabilities(),
+            authMethods: HERMES_AUTH_METHODS,
+          },
+        });
+      } else if (message.method === 'authenticate') {
+        process.send({ jsonrpc: '2.0', id: message.id, result: {} });
+      }
+    });
+    const spawn = spawnRecorder(runtime);
+    const broker = new AcpStdioBroker({
+      profile: HERMES_ACP_PROFILE,
+      cwd: '/workspace',
+      environment: { PATH: '/usr/bin' },
+      spawnImpl: spawn.spawnImpl,
+      controlTimeoutMs: 2_000,
+    });
+    if (refusal) {
+      await expect(broker.attest()).rejects.toThrow(refusal);
+    } else {
+      await expect(broker.attest()).resolves.toMatchObject({ agentName: 'hermes-agent', agentVersion: version, protocolVersion: 1 });
+    }
+    await broker.dispose();
+  });
+
+  test.each([
     ['wrong name', { name: 'impostor', version: HERMES_ACP_VERSION }],
     ['wrong version', { name: 'hermes-agent', version: '0.20.3' }],
   ])('rejects Hermes attestation with %s', async (_label, agentInfo) => {

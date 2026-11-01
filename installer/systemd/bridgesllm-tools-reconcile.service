@@ -1,0 +1,24 @@
+# BridgesLLM AI tools: settle interrupted maintenance runs at boot (updater v2,
+# DESIGN c.6). Static template; the installer copies it to /etc/systemd/system/
+# and enables it. After a power loss or a killed runner no run may look active:
+# `toolctl reconcile` finishes every run whose runner is gone (recovery-required
+# if it was changing the server, failed otherwise) and clears the markers of a
+# run that is final. An OpenClaw update interrupted during OpenClaw's own step
+# is settled from `openclaw update status --json`; if OpenClaw finished it, the
+# Portal's plugin and feature checks run now (they may reinstall Portal plugins
+# and restart the gateway once). It never starts or repeats an update.
+[Unit]
+Description=BridgesLLM AI tools run reconcile
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /opt/bridgesllm/portal/installer/tools/bridgesllm-toolctl.py reconcile
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

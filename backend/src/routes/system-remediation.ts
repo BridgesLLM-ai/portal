@@ -7,7 +7,8 @@ import { isOwnerRole } from '../utils/authz';
 import { isTypedConfirmationMatch } from '../utils/privilegedConfirmation';
 import fs from 'fs';
 import path from 'path';
-import { exec as cpExec } from 'child_process';
+import { exec as cpExec, execFile } from 'child_process';
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import {
   getProjectRuntimeImageRepairStatus,
   launchProjectRuntimeImageRepair,
@@ -164,7 +165,13 @@ async function remediateFileManager(): Promise<{ ok: boolean; message: string; s
 async function remediateAgentTools(): Promise<{ ok: boolean; message: string; steps: StepResult[] }> {
   const steps: StepResult[] = [];
 
-  const openclaw = await runShell('openclaw --version');
+  const openclaw = await new Promise<{ ok: boolean; stdout: string }>((resolve) => {
+    try {
+      execFile(...openClawDiagnosticCommand('openclaw', ['--version']), { timeout: 8000 }, (error, stdout) => {
+        resolve({ ok: !error, stdout: String(stdout || '').trim() });
+      });
+    } catch { resolve({ ok: false, stdout: '' }); }
+  });
   steps.push({
     step: 'OpenClaw CLI',
     ok: openclaw.ok,

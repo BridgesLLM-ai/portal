@@ -1,3 +1,4 @@
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import { execFile } from 'child_process';
 import { buildOpenClawCliEnv, extractJsonFromCliOutput } from '../utils/openclawCli';
 
@@ -39,7 +40,7 @@ function runReadOnlyOpenClaw(
   timeoutMs: number,
 ): Promise<ReadOnlyOpenClawResult> {
   return new Promise((resolve) => {
-    execFile('openclaw', [...args], {
+    execFile(...openClawDiagnosticCommand('openclaw', [...args]), {
       encoding: 'utf8',
       env: buildOpenClawCliEnv(),
       timeout: timeoutMs,

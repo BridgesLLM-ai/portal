@@ -123,6 +123,29 @@ function captureClaudeStructuredError(parsed: any): string | null {
   return redactNativeProviderText(diagnostic, CLAUDE_STRUCTURED_ERROR_MAX_BYTES);
 }
 
+/**
+ * True once the current attempt produced at least one stream-json record.
+ * `-p --output-format stream-json` always opens with a `system` init record,
+ * so a run without any record never started its session.
+ */
+function claudeStreamStarted(ctx: NativeCliTurnContext): boolean {
+  const seen = ctx.state.claudeStreamRecordAttempt;
+  return typeof seen === 'number' && seen === Number(ctx.state.turnAttempt || 0);
+}
+
+/**
+ * Claude Code 2.1.314+ reports a `-p` startup failure as a non-zero exit with
+ * an error; 2.1.309 and older exit 0 with no output at all. Both mean the
+ * session never started, and neither may settle as an empty answer.
+ */
+function claudeStartupFailureMessage(ctx: NativeCliTurnContext): string {
+  const detail = redactNativeProviderText(ctx.stderr.trim(), CLAUDE_STRUCTURED_ERROR_MAX_BYTES);
+  const how = ctx.exitCode === 0
+    ? 'exited without any output'
+    : `exited with code ${ctx.exitCode} before any output`;
+  return `Claude Code could not start the session: it ${how}.${detail ? ` ${detail}` : ''}`;
+}
+
 function getToolUseId(value: any): string | null {
   return typeof value?.tool_use_id === 'string' ? value.tool_use_id
     : typeof value?.toolUseId === 'string' ? value.toolUseId
@@ -380,6 +403,9 @@ export const claudeCodeAdapter: NativeCliProviderAdapter = {
     } catch {
       return;
     }
+    if (parsed && typeof parsed === 'object') {
+      ctx.state.claudeStreamRecordAttempt = Number(ctx.state.turnAttempt || 0);
+    }
 
     const structuredError = captureClaudeStructuredError(parsed);
     if (structuredError) {
@@ -482,6 +508,11 @@ export const claudeCodeAdapter: NativeCliProviderAdapter = {
     if (typeof ctx.state.claudeStructuredError === 'string' && ctx.state.claudeStructuredError) {
       throw new Error(ctx.state.claudeStructuredError);
     }
+    // Older hosts: exit 0 and no output is a startup failure, not an empty answer.
+    // A non-zero exit is reported by the runner through getErrorMessage.
+    if (ctx.exitCode === 0 && !claudeStreamStarted(ctx) && !ctx.fullText) {
+      throw new Error(claudeStartupFailureMessage(ctx));
+    }
     const permissionDenials = (ctx.state.permissionDenials as any[]) || [];
     if (permissionDenials.length > 0) {
       if (ctx.session.executionContext?.scope === 'PROJECT_SANDBOX') {
@@ -516,6 +547,8 @@ export const claudeCodeAdapter: NativeCliProviderAdapter = {
   getErrorMessage: (ctx) => (
     typeof ctx.state.claudeStructuredError === 'string' && ctx.state.claudeStructuredError
       ? ctx.state.claudeStructuredError
-      : ctx.stderr || `Claude CLI exited with code ${ctx.exitCode}`
+      : !claudeStreamStarted(ctx)
+        ? claudeStartupFailureMessage(ctx)
+        : ctx.stderr || `Claude CLI exited with code ${ctx.exitCode}`
   ),
 };

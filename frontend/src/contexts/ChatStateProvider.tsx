@@ -1,3 +1,4 @@
+import type { ChatResponseFormat } from '../utils/chatResponseFormat';
 /**
  * ChatStateProvider — React Context Provider that holds all chat state,
  * processes WS events, and survives route navigation.
@@ -190,6 +191,7 @@ interface PendingWsAbortResult {
 }
 
 interface OutstandingChatDispatch {
+  readonly responseFormat?: ChatResponseFormat;
   readonly clientMessageId: string;
   readonly assistantId: string;
   readonly sessionKey: string;
@@ -212,6 +214,8 @@ export interface ChatMessage {
   createdAt: Date;
   queued?: boolean;
   pendingAck?: boolean;
+  /** Where a message sent during a running OpenClaw reply landed, as far as the Portal observed. */
+  steerNote?: string;
   /** Live echo IDs already reconciled to this durable user row (session-local). */
   liveUserMessageIds?: string[];
   provenance?: string;
@@ -234,6 +238,7 @@ export interface ChatMessage {
 }
 
 export interface MessageQueueItem {
+  responseFormat?: ChatResponseFormat;
   id: string;
   text: string;
   createdAt: number;
@@ -1015,6 +1020,32 @@ function toConcreteOpenClawSessionKey(rawSession: string, rawAgentId?: string | 
 function normalizeRunId(rawRunId: unknown): string | null {
   const runId = typeof rawRunId === 'string' ? rawRunId.trim() : '';
   return runId || null;
+}
+
+// Stock OpenClaw steering (chat.send queueMode "steer") acknowledges an
+// injected message and a new turn identically. The Portal only reports what it
+// then observes: a run under the steer's own run id is a new turn; the reply
+// that was running ending without one means the message joined that reply.
+export const NATIVE_STEER_PENDING_NOTE = 'Sent while the reply was running';
+export const NATIVE_STEER_ADDED_NOTE = 'Added to the running reply';
+export const NATIVE_STEER_NEW_TURN_NOTE = 'Sent as a new message — the reply had already finished';
+export const NATIVE_STEER_INTERRUPTED_NOTE = 'Sent as a new message — the running reply was stopped';
+export const NATIVE_STEER_SETTLE_MS = 5_000;
+const NATIVE_STEER_MAX_WATCHES = 8;
+const NATIVE_STEER_RECENT_RUNS = 32;
+const TERMINAL_STREAM_EVENT_TYPES = new Set(['done', 'error', 'stream_ended']);
+// Only model/tool/run activity proves a run. A user_message echo may carry the
+// steer's own id even when OpenClaw injected the text into the running reply.
+const RUN_ACTIVITY_EVENT_TYPES = new Set([
+  'text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status',
+  'segment_break', 'done', 'error', 'stream_resume', 'run_resumed',
+]);
+
+interface NativeSteerWatch {
+  messageId: string;
+  sessionKey: string;
+  observedRunId: string;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 function resolveCompatibilityToolReplayIdentity(
@@ -2006,6 +2037,12 @@ function mergeLoadedHistoryWithLocalMessages(
   )) || merged.find((message) => (
     message.role === 'user' && message.liveUserMessageIds?.includes(candidate.id)
   ));
+  // A steering note is Portal-side observation; history never carries it.
+  for (const local of currentMessages) {
+    if (local.role !== 'user' || !local.steerNote) continue;
+    const durable = findIdentifiedUser(local);
+    if (durable && !durable.steerNote) durable.steerNote = local.steerNote;
+  }
   const consumedCommittedUserMatches = new Set<ChatMessage>();
   const now = Date.now();
   const latestLoadedTs = loadedMessages.reduce((latest, message) => {
@@ -2344,11 +2381,34 @@ function mergeLoadedHistoryWithLocalMessages(
     });
   };
 
-  const localTail = currentMessages
-    .filter(shouldKeepLocalMessage)
-    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  // The observed transcript order is causal; createdAt is not a shared clock.
+  // A gateway user echo can be minutes ahead of a browser-created assistant
+  // placeholder. Sorting those rows makes the answer jump above its prompt.
+  const localTail = currentMessages.filter(shouldKeepLocalMessage);
 
   const insertLocalChronologically = (localMessage: ChatMessage) => {
+    if (localMessage.role === 'assistant') {
+      const localIndex = currentMessages.indexOf(localMessage);
+      let precedingUser: ChatMessage | undefined;
+      for (let index = localIndex - 1; index >= 0; index -= 1) {
+        if (currentMessages[index].role === 'user' && !currentMessages[index].queued) {
+          precedingUser = currentMessages[index];
+          break;
+        }
+      }
+      const durableUser = precedingUser ? findIdentifiedUser(precedingUser) : undefined;
+      if (durableUser) {
+        const promptIndex = merged.indexOf(durableUser);
+        // Keep unresolved activity inside its known prompt boundary, after
+        // already-reconciled activity but before the next turn. Never infer
+        // this association from equal text or timestamp proximity.
+        const nextPromptIndex = merged.findIndex((message, index) => (
+          index > promptIndex && message.role === 'user'
+        ));
+        merged.splice(nextPromptIndex < 0 ? merged.length : nextPromptIndex, 0, localMessage);
+        return;
+      }
+    }
     const localTs = localMessage.createdAt instanceof Date ? localMessage.createdAt.getTime() : NaN;
     if (!Number.isFinite(localTs)) {
       merged.push(localMessage);
@@ -2507,7 +2567,10 @@ export interface ChatStateContextValue {
   selectedModel: string;
   setSelectedModel: (m: string) => void;
   switchModel: (m: string) => Promise<{ deferred: boolean }>;
-  sendMessage: (text: string) => Promise<void>;
+  /** Next-turn preference only; never enables a tool or grants a permission. */
+  responseFormat: ChatResponseFormat;
+  setResponseFormat: (format: ChatResponseFormat) => void;
+  sendMessage: (text: string, format?: ChatResponseFormat) => Promise<void>;
   injectNote: (text: string, sessionKey?: string) => Promise<void>;
   cancelStream: () => Promise<void>;
   loadHistory: (sessionKey: string, providerName?: string) => Promise<void>;
@@ -2834,6 +2897,7 @@ function getCodexAppServerProgressStatus(stream: unknown, data: any): string | n
 export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   const publicSettings = usePublicSettings();
   const authenticatedUserId = useAuthStore((state) => state.user?.id || '');
+  const responseAuthorization = useAuthStore((state) => `${state.user?.role || ''}:${state.user?.authorizationVersion ?? 1}`);
   const configuredDirectGateway = publicSettings?.useDirectGateway ?? BUILD_TIME_USE_DIRECT_GATEWAY;
   const useDirectGateway = configuredDirectGateway && DIRECT_GATEWAY_AUTHORIZATION_BROKER_READY;
 
@@ -2861,6 +2925,14 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
     return stored;
   });
+  const [responseFormat, setResponseFormatState] = useState<ChatResponseFormat>('auto');
+  const responseFormatRef = useRef<ChatResponseFormat>('auto');
+  const setResponseFormat = useCallback((format: ChatResponseFormat) => {
+    responseFormatRef.current = format;
+    setResponseFormatState(format);
+  }, []);
+  // A selection belongs to one actor and one selected chat; it never follows a switch.
+  useEffect(() => { setResponseFormat('auto'); }, [authenticatedUserId, responseAuthorization, provider, agentId, session, selectedModel, setResponseFormat]);
   const [operationalBanner, setOperationalBanner] = useState<ChatOperationalBanner | null>(null);
   const dismissOperationalBanner = useCallback(() => setOperationalBanner(null), []);
   // Selection setters are called back-to-back when the user changes provider,
@@ -3037,6 +3109,85 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     text: string;
     inFlight: boolean;
   } | null>(null);
+  const nativeSteerWatchesRef = useRef(new Map<string, NativeSteerWatch>());
+  const recentRunActivityRef = useRef(new Set<string>());
+  const setSteerNote = useCallback((messageId: string, steerNote: string) => {
+    setMessages(prev => prev.map(message => (
+      message.id === messageId && message.steerNote !== steerNote ? { ...message, steerNote } : message
+    )));
+  }, []);
+  const clearNativeSteerWatches = useCallback(() => {
+    for (const watch of nativeSteerWatchesRef.current.values()) {
+      if (watch.timer) clearTimeout(watch.timer);
+    }
+    nativeSteerWatchesRef.current.clear();
+  }, []);
+  const settleNativeSteerAsAdded = useCallback((steerRunId: string, watch: NativeSteerWatch) => {
+    if (watch.timer) return;
+    watch.timer = setTimeout(() => {
+      if (nativeSteerWatchesRef.current.get(steerRunId) !== watch) return;
+      // Keep the watch: a late run under the steer's id still corrects this.
+      setSteerNote(watch.messageId, NATIVE_STEER_ADDED_NOTE);
+    }, NATIVE_STEER_SETTLE_MS);
+  }, [setSteerNote]);
+  const observeNativeSteerEvent = useCallback((
+    runId: string | null,
+    type: unknown,
+    eventSessionKey: unknown,
+    fallbackTerminalRunId: string | null,
+  ) => {
+    if (typeof type !== 'string') return;
+    if (runId && RUN_ACTIVITY_EVENT_TYPES.has(type)) {
+      const recent = recentRunActivityRef.current;
+      recent.delete(runId);
+      recent.add(runId);
+      if (recent.size > NATIVE_STEER_RECENT_RUNS) recent.delete(recent.values().next().value as string);
+    }
+    const watches = nativeSteerWatchesRef.current;
+    if (watches.size === 0) return;
+    const own = runId && RUN_ACTIVITY_EVENT_TYPES.has(type) ? watches.get(runId) : undefined;
+    if (own && runId) {
+      if (own.timer) clearTimeout(own.timer);
+      watches.delete(runId);
+      setSteerNote(own.messageId, NATIVE_STEER_NEW_TURN_NOTE);
+      return;
+    }
+    if (!TERMINAL_STREAM_EVENT_TYPES.has(type)) return;
+    for (const [steerRunId, watch] of watches) {
+      // A terminal frame without a run id counts only inside the watched session.
+      const terminalRunId = runId
+        || (eventSessionKey === watch.sessionKey ? fallbackTerminalRunId : null);
+      if (terminalRunId && watch.observedRunId === terminalRunId) settleNativeSteerAsAdded(steerRunId, watch);
+    }
+  }, [setSteerNote, settleNativeSteerAsAdded]);
+  const watchNativeSteer = useCallback((
+    steerRunId: string,
+    messageId: string,
+    sessionKey: string,
+    observedRunId: string,
+    runStillActive: boolean,
+  ) => {
+    const watches = nativeSteerWatchesRef.current;
+    const previous = watches.get(steerRunId);
+    if (previous?.timer) clearTimeout(previous.timer);
+    watches.delete(steerRunId);
+    // With no reply running, OpenClaw starts the new turn at once; its first
+    // events can reach the browser before this HTTP acknowledgement does.
+    if (recentRunActivityRef.current.has(steerRunId)) {
+      setSteerNote(messageId, NATIVE_STEER_NEW_TURN_NOTE);
+      return;
+    }
+    while (watches.size >= NATIVE_STEER_MAX_WATCHES) {
+      const [oldestId, oldest] = watches.entries().next().value as [string, NativeSteerWatch];
+      if (oldest.timer) clearTimeout(oldest.timer);
+      watches.delete(oldestId);
+    }
+    const watch: NativeSteerWatch = { messageId, sessionKey, observedRunId, timer: null };
+    watches.set(steerRunId, watch);
+    // The observed reply may have finished before this acknowledgement arrived.
+    if (!runStillActive) settleNativeSteerAsAdded(steerRunId, watch);
+  }, [setSteerNote, settleNativeSteerAsAdded]);
+  useEffect(() => clearNativeSteerWatches, [clearNativeSteerWatches]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   const appendLocalMessage = useCallback((message: ChatMessage) => {
     messagesRef.current = messagesRef.current.some(existing => existing.id === message.id)
@@ -3250,7 +3401,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     snapshot: any,
     options?: { statusTextWhenNoTool?: string | null; source?: ChatStreamTransport },
   ) => boolean>(() => false);
-  const sendViaSSERef = useRef<(text: string, assistantId: string) => Promise<void>>(async () => {
+  const sendViaSSERef = useRef<(text: string, assistantId: string, format?: ChatResponseFormat) => Promise<void>>(async () => {
     throw new Error('Streaming sender is not ready');
   });
   const drainNextQueuedMessageRef = useRef<() => void>(() => {});
@@ -4493,9 +4644,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     setThinkingContent(nextThinking);
   }, [graduateLiveThinkingSegment]);
 
-  const applyThinkingSubject = useCallback((assistantId: string | null, rawSubject: unknown) => {
+  const applyThinkingSubject = useCallback((
+    assistantId: string | null,
+    rawSubject: unknown,
+    snapshot?: { content: string; replace: boolean; lane?: 'raw' | 'preamble' | 'status' },
+  ) => {
     const subject = sanitizeThinkingSubject(rawSubject);
     if (!subject) return '';
+    const lane = snapshot?.lane || 'raw';
+    if (snapshot?.replace && snapshot.content
+      && snapshot.content === thinkingSnapshotTrackerRef.current.graduated[lane]) {
+      const previousThought = [...streamSegmentsRef.current].reverse().find((segment) => (
+        segment.kind === 'thinking' && segment.lane === lane
+      ));
+      // A cumulative frame can arrive again after a tool has graduated it.
+      // The body projector already discards this represented prefix; apply the
+      // same decision to its heading, or a second empty thought card appears.
+      // Do not collapse deltas, subject-only events, or genuinely new headings.
+      if (previousThought?.subject === subject) return '';
+    }
     if (
       subject !== thinkingSubjectRef.current
       && (thinkingContentRef.current.trim() || thinkingSubjectRef.current)
@@ -4892,20 +5059,15 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
           if (assembledRef.current.trim()) {
             graduateLiveTextSegment(streamingAssistantIdRef.current);
           }
-          applyThinkingSubject(null, event.subject);
           const eventType = event.type === 'assistant_status' ? 'status' : 'thinking';
-          appendThinkingChunk(
-            null,
-            extractThinkingChunk(eventType, event.text, false),
-            {
-              replace: event.replace === true,
-              lane: event?.source?.preambleProgress === true
-                ? 'preamble'
-                : event.type === 'assistant_status'
-                  ? 'status'
-                  : 'raw',
-            },
-          );
+          const thinkingChunk = extractThinkingChunk(eventType, event.text, false);
+          const lane = event?.source?.preambleProgress === true
+            ? 'preamble'
+            : event.type === 'assistant_status' ? 'status' : 'raw';
+          applyThinkingSubject(null, event.subject, {
+            content: thinkingChunk, replace: event.replace === true, lane,
+          });
+          appendThinkingChunk(null, thinkingChunk, { replace: event.replace === true, lane });
           recordReasoningTurnSequence({ turnEvent: event, runId: snapshotRunId });
           continue;
         }
@@ -5901,6 +6063,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const queuedItem = {
         id: attempted.id,
         text: attempted.content,
+        responseFormat: outstanding?.responseFormat,
         createdAt: attempted.createdAt.getTime(),
       };
       messageQueueRef.current = [...messageQueueRef.current, queuedItem];
@@ -5966,7 +6129,9 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     }
 
     const incomingPortalRunId = normalizeRunId(data?.runId);
-    const portalStreamTypes = ['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status', 'stream_status', 'segment_break', 'done', 'error', 'stream_resume', 'stream_ended', 'run_resumed'];
+    // Evidence for a stock-steered message, before any fence drops the event.
+    observeNativeSteerEvent(incomingPortalRunId, data?.type, data?.sessionKey, currentRunIdRef.current);
+    const portalStreamTypes =['text', 'thinking', 'tool_start', 'tool_update', 'tool_end', 'tool_used', 'status', 'stream_status', 'segment_break', 'done', 'error', 'stream_resume', 'stream_ended', 'run_resumed'];
     if (portalStreamTypes.includes(data?.type) && data?.type !== 'stream_status') {
       clearStreamRecoveryTimer();
     }
@@ -6261,10 +6426,13 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
       case 'thinking': {
         if (!assistantId && !isStreamActiveRef.current) break;
-        applyThinkingSubject(assistantId, data.subject);
         const thinkingChunk = extractThinkingChunk('thinking', data.content, assembledRef.current.length > 0);
         const isPreambleThinking = data.preambleProgress === true
           || data?.turnEvent?.source?.preambleProgress === true;
+        applyThinkingSubject(assistantId, data.subject, {
+          content: thinkingChunk, replace: data.replace === true,
+          lane: isPreambleThinking ? 'preamble' : 'raw',
+        });
         if (thinkingChunk && assembledRef.current.trim()) {
           graduateLiveTextSegment(assistantId);
         }
@@ -7952,7 +8120,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Send message via WS (with SSE fallback)
-  const sendMessage = useCallback(async (text: string) => {
+  const sendMessage = useCallback(async (text: string, requestedFormat?: ChatResponseFormat) => {
+    const turnResponseFormat = requestedFormat ?? responseFormatRef.current;
     const normalized = String(text || '').trim();
     if (!normalized) return;
     const hasNativePhotos = normalized.includes('[portal-chat-image:');
@@ -8012,6 +8181,11 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     if (shouldAnswerPendingQuestion) {
+      // Answers and steering stay on the running turn; a format needs a new turn.
+      if (turnResponseFormat !== 'auto') {
+        setStatusText('Response tools apply to a new turn. Clear the selected format to answer or steer.');
+        return;
+      }
       const currentSession = nativeQuestionWaiting
         ? nativeQuestionSession
         : resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main';
@@ -8064,12 +8238,24 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             message: normalized,
             requestId: steer.requestId,
           });
+          // Stock OpenClaw: accepted, but not tied to the observed run. Its
+          // outcome is reported only once the stream shows where it landed.
+          const nativeSteerRunId = data?.ok === true
+            && data?.mode === 'native-steer'
+            && data?.sessionKey === currentSession
+            && data?.requestId === steer.requestId
+            && !('runId' in data)
+            ? normalizeRunId(data?.steerRunId)
+            : null;
           if (
-            data?.ok !== true
-            || data?.sessionKey !== currentSession
-            || data?.requestId !== steer.requestId
-            || data?.runId !== steer.expectedRunId
-            || data?.interruptedActiveRun !== false
+            !nativeSteerRunId
+            && (
+              data?.ok !== true
+              || data?.sessionKey !== currentSession
+              || data?.requestId !== steer.requestId
+              || data?.runId !== steer.expectedRunId
+              || data?.interruptedActiveRun !== false
+            )
           ) {
             throw new Error('Portal did not confirm steering for this exact active run.');
           }
@@ -8078,12 +8264,25 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
             providerRef.current === 'OPENCLAW'
             && resolveOpenClawSessionKey(sessionRef.current || 'main') === currentSession
           ) {
+            const steerMessageId = `active-steer:${steer.requestId}`;
             appendLocalMessage({
-              id: `active-steer:${steer.requestId}`,
+              id: steerMessageId,
               role: 'user',
               content: normalized,
               createdAt: new Date(),
+              ...(nativeSteerRunId
+                ? { steerNote: data.interruptedActiveRun === true ? NATIVE_STEER_INTERRUPTED_NOTE : NATIVE_STEER_PENDING_NOTE }
+                : {}),
             });
+            if (nativeSteerRunId && data.interruptedActiveRun !== true) {
+              watchNativeSteer(
+                nativeSteerRunId,
+                steerMessageId,
+                currentSession,
+                steer.expectedRunId,
+                isStreamActiveRef.current && normalizeRunId(currentRunIdRef.current) === steer.expectedRunId,
+              );
+            }
             setStatusText(null);
           }
         } catch (error: any) {
@@ -8194,7 +8393,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         createdAt: new Date(queuedAt),
         queued: true,
       });
-      const queuedItem = { id: queuedId, text: normalized, createdAt: queuedAt };
+      const queuedItem = { id: queuedId, text: normalized, createdAt: queuedAt, responseFormat: turnResponseFormat };
+      setResponseFormat('auto');
       messageQueueRef.current = [...messageQueueRef.current, queuedItem];
       setMessageQueue(prev => {
         const next = [...prev, queuedItem];
@@ -8208,6 +8408,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     pendingActiveSteerRef.current = null;
     pendingUserQuestionsReadyRef.current = false;
     replacePendingUserQuestions([]);
+
+    setResponseFormat('auto');
 
     // Fence every history/stream-status observation that began before this
     // accepted local turn. A delayed inactive R1 snapshot must never clear R2.
@@ -8262,6 +8464,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     };
     appendLocalMessage(assistantMsg);
     outstandingChatDispatchRef.current = {
+      responseFormat: turnResponseFormat,
       clientMessageId: userMsg.id,
       assistantId,
       sessionKey: resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main',
@@ -8272,7 +8475,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     resetStreamWatchdog();
 
     let directClient = directClientRef.current;
-    if (useDirectGateway && !hasNativePhotos && providerRef.current === 'OPENCLAW') {
+    if (useDirectGateway && turnResponseFormat === 'auto' && !hasNativePhotos && providerRef.current === 'OPENCLAW') {
       setDirectGatewayDemanded(true);
       if (!directClient?.isConnected) {
         setStatusText('Connecting directly to OpenClaw…');
@@ -8280,10 +8483,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    // For OPENCLAW with direct gateway enabled, use the direct client.
+    // Explicit response preferences require the Portal signing seam; direct sends remain Automatic-only.
     // Wait briefly on the first user-initiated run so direct mode does not
     // silently route the initial message through the portal WS fallback.
-    if (useDirectGateway && !hasNativePhotos && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
+    if (useDirectGateway && turnResponseFormat === 'auto' && !hasNativePhotos && providerRef.current === 'OPENCLAW' && directClient?.isConnected) {
       const currentSession = resolveOpenClawSessionKey(sessionRef.current || 'main');
       try {
         streamTransportRef.current = 'direct';
@@ -8399,6 +8602,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       streamTransportRef.current = 'portal';
       const payload: Record<string, unknown> = {
         type: 'send',
+        responseFormat: turnResponseFormat,
         message: normalized,
         clientMessageId: userMsg.id,
         session: resolveOpenClawSessionKey(sessionRef.current || 'main') || 'main',
@@ -8409,7 +8613,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       const sent = manager.send(payload);
       if (!sent) {
         try {
-          await sendViaSSERef.current(normalized, assistantId);
+          await sendViaSSERef.current(normalized, assistantId, turnResponseFormat);
         } catch (err: any) {
           if (outstandingChatDispatchRef.current?.clientMessageId === userMsg.id) {
             outstandingChatDispatchRef.current = null;
@@ -8428,7 +8632,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       // SSE fallback
       try {
         streamTransportRef.current = 'portal';
-        await sendViaSSERef.current(normalized, assistantId);
+        await sendViaSSERef.current(normalized, assistantId, turnResponseFormat);
       } catch (err: any) {
         if (outstandingChatDispatchRef.current?.clientMessageId === userMsg.id) {
           outstandingChatDispatchRef.current = null;
@@ -8443,7 +8647,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
         streamingAssistantIdRef.current = null;
       }
     }
-  }, [appendLocalMessage, applyOpenClawActiveStreamSnapshot, clearPendingTextRender, clearPostTurnHistorySync, handleActiveTurnConflict, markStreamRecovery, normalizeAgentError, preserveLiveTurnThenClear, refreshPendingUserQuestions, replacePendingUserQuestions, resetDirectSnapshotCursor, resetLiveThinkingTimeline, resetStreamWatchdog, resolveOpenClawSessionKey, resolveQuestionSessionKey, schedulePostTurnHistorySync, settlePendingUserQuestion, useDirectGateway, waitForDirectGatewayClient]);
+  }, [appendLocalMessage, applyOpenClawActiveStreamSnapshot, clearPendingTextRender, clearPostTurnHistorySync, handleActiveTurnConflict, markStreamRecovery, normalizeAgentError, preserveLiveTurnThenClear, refreshPendingUserQuestions, replacePendingUserQuestions, resetDirectSnapshotCursor, resetLiveThinkingTimeline, resetStreamWatchdog, resolveOpenClawSessionKey, resolveQuestionSessionKey, schedulePostTurnHistorySync, setResponseFormat, settlePendingUserQuestion, useDirectGateway, waitForDirectGatewayClient]);
 
   const drainNextQueuedMessage = useCallback(() => {
     if (isStreamActiveRef.current || isQueueDrainActiveRef.current) return;
@@ -8458,7 +8662,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       return remaining;
     });
     removeLocalMessageById(next.id);
-    void sendMessage(next.text).finally(() => {
+    void sendMessage(next.text, next.responseFormat).finally(() => {
       isQueueDrainActiveRef.current = false;
       if (!isStreamActiveRef.current && messageQueueRef.current.length > 0) {
         scheduleLatestCallback(drainNextQueuedMessageRef);
@@ -8468,7 +8672,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
   drainNextQueuedMessageRef.current = drainNextQueuedMessage;
 
   // SSE fallback sender
-  const sendViaSSE = useCallback(async (text: string, initialAssistantId: string) => {
+  const sendViaSSE = useCallback(async (text: string, initialAssistantId: string, format: ChatResponseFormat = 'auto') => {
     let assembled = '';
     let assistantId = initialAssistantId;
     let resolveSettled!: () => void;
@@ -8501,6 +8705,7 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
       if (providerRef.current) body.provider = providerRef.current;
       if (modelRef.current) body.model = modelRef.current;
       if (agentIdRef.current) body.agentId = agentIdRef.current;
+      body.responseFormat = format;
 
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 
@@ -8667,8 +8872,10 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
               setLiveRunPhase('thinking', evt.content, { allowProviderStatus: true });
             }
           } else if (evt.type === 'thinking') {
-            applyThinkingSubject(assistantId, evt.subject);
             const thinkingChunk = extractThinkingChunk('thinking', evt.content, assembled.length > 0);
+            applyThinkingSubject(assistantId, evt.subject, {
+              content: thinkingChunk, replace: evt.replace === true, lane: 'raw',
+            });
             if (thinkingChunk && assembledRef.current.trim()) {
               graduateLiveTextSegment(assistantId);
               assembled = '';
@@ -9332,6 +9539,8 @@ export function ChatStateProvider({ children }: { children: React.ReactNode }) {
     selectedModel,
     setSelectedModel,
     switchModel,
+    responseFormat,
+    setResponseFormat,
     sendMessage,
     injectNote,
     cancelStream,

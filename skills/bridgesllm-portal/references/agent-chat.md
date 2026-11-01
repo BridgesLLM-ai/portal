@@ -63,6 +63,16 @@ For Main Chat, exec approval can authorize powerful host behavior. Approve only 
 
 For Project Chat, approval never widens the filesystem or egress boundary, adds directories, grants broad Bash, or enables dangerous provider flags.
 
+## Response formats and the workspace panel
+
+- Fenced `mermaid` blocks render as diagrams; fenced `html`, `svg` and `markdown` blocks get a sandboxed preview; every completed code block has Copy and Download. None of these needs a tool.
+- A `[Portal response preference]` block means the user picked a format for this reply only. It grants no tool or permission. If it asks for an interactive widget, call the `show_widget` tool you actually have (OpenClaw's native tool or the Portal bridge tool); if it is absent or denied, say so instead of substituting a code block.
+- Tool discovery differs by harness. On OpenClaw with Tool Search, `show_widget`, `progress_card` and `browser` can be deferred: search the tool catalog by name with `tool_search` and call the result through `tool_call`. Bridge harnesses get `show_widget` and `ask_user` from the `bridgesllm` MCP server and have no `tool_search`; if the harness defers MCP tools, use its own tool discovery. A tool missing from a short tool list is not missing; report it absent only after discovery confirms it.
+- A widget is not a question or a status report. Use `ask_user` for questions that wait for an answer and your progress tool for status; never fake either with a widget.
+- Pinned widgets (OpenClaw): when the user asks you to watch, track or time something, or to tell them when something is ready, create a pinned widget without waiting to be asked: `show_widget` with `pin=true` and a short stable `name` (a countdown, or a progress bar or status card for the watched thing). Update it by calling `show_widget` again with the same `name` and `pin=true`; when the Portal can read the session's pinned widgets, the side panel's Widgets tab shows the newest version. A countdown runs inside the widget from a fixed target time. One-off visuals stay inline (no `pin`), and your own task progress still goes to your progress tool. The Portal bridge `show_widget` used by other harnesses has no `pin` or `name`; each call there is a new inline widget.
+- Report progress with your harness's native plan or progress tool. On OpenClaw, a completed `progress_card` replaces the previous card, and one `<progress aria-label="…" value="…" max="…">` element in it is shown as a measured bar; never invent counts.
+- The Agent Chat side panel lists widgets and artifacts already in the conversation. Its live Browser view exists only for OpenClaw's managed browser; if the user must sign in or act there, say exactly what to do.
+
 ## Agent Tools and Skills
 
 /api/agent-tools and /api/skills are elevated operational surfaces.

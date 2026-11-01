@@ -8,12 +8,12 @@ import {
   useCallback,
   useRef,
   useMemo,
-  lazy,
   Suspense,
   useContext,
   type ErrorInfo,
   type ReactNode,
 } from 'react';
+import { lazyWithRecovery } from '../utils/moduleRecovery';
 import { UNSAFE_NavigationContext, useLocation, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ErrorCode, useDropzone } from 'react-dropzone';
@@ -82,13 +82,13 @@ import {
   PanelLeftClose, PanelLeft, Command, Lock, Edit3,
   Image, Film, Music, Volume2, ZoomIn, ZoomOut, Mail, SendHorizonal, Users, Gauge
 } from 'lucide-react';
-const LazyMonacoEditor = lazy(() => import('../components/projects/LazyMonacoEditor'));
-const LazyProjectPdfViewer = lazy(() => import('../components/projects/ProjectPdfViewer'));
-const LazyProjectExcelViewer = lazy(() => import('../components/projects/ProjectExcelViewer'));
-const LazyProjectTextPreviewViewer = lazy(() => import('../components/projects/ProjectTextPreviewViewer'));
-const LazyProjectBinaryViewer = lazy(() => import('../components/projects/ProjectBinaryViewer'));
-const LazyMarkdownPreviewFrame = lazy(() => import('../components/projects/MarkdownPreviewFrame'));
-const LazyProjectChatPanel = lazy(() => import('../components/chat/ProjectChatPanel'));
+const LazyMonacoEditor = lazyWithRecovery(() => import('../components/projects/LazyMonacoEditor'));
+const LazyProjectPdfViewer = lazyWithRecovery(() => import('../components/projects/ProjectPdfViewer'));
+const LazyProjectExcelViewer = lazyWithRecovery(() => import('../components/projects/ProjectExcelViewer'));
+const LazyProjectTextPreviewViewer = lazyWithRecovery(() => import('../components/projects/ProjectTextPreviewViewer'));
+const LazyProjectBinaryViewer = lazyWithRecovery(() => import('../components/projects/ProjectBinaryViewer'));
+const LazyMarkdownPreviewFrame = lazyWithRecovery(() => import('../components/projects/MarkdownPreviewFrame'));
+const LazyProjectChatPanel = lazyWithRecovery(() => import('../components/chat/ProjectChatPanel'));
 
 class ProjectChatChunkBoundary extends Component<{
   resetKey: string;

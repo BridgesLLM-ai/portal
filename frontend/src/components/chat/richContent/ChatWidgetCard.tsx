@@ -1,6 +1,9 @@
+import ToolGlyph from '../ToolGlyph';
 import { useWidgetPresentation } from './WidgetPresentationContext';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Maximize2, Minimize2, RefreshCw } from 'lucide-react';
+import { Maximize2, Minimize2, PanelRight, PictureInPicture2, RefreshCw } from 'lucide-react';
+import { useAgentWorkspaceTarget } from '../workspace/AgentWorkspaceContext';
+import { useAgentWorkspaceStore, useFloatingWidgetsStore } from '../../../stores/agentWorkspaceStore';
 import client from '../../../api/client';
 import { useAuthStore } from '../../../contexts/AuthContext';
 import { useChatState, type ToolCall } from '../../../contexts/ChatStateProvider';
@@ -130,15 +133,32 @@ export function ScopedChatWidgetCard({ tool, session, provider = 'OPENCLAW', ena
 
   const title = reference?.title || (typeof tool.arguments?.title === 'string' ? tool.arguments.title.slice(0, 160) : 'Widget');
   const explanatory = tool.status === 'running' ? 'Preparing widget…' : tool.status === 'error' ? 'The widget tool failed.'
-    : reference?.mode === 'dashboard' ? 'Saved to the session dashboard. This result has no inline preview; dashboard management is separate.'
+    : reference?.mode === 'dashboard' ? (reference.boardName
+      ? 'Live widget updated on the session dashboard. The Widgets tab in the side panel shows its newest version.'
+      : 'Saved to the session dashboard. This result has no inline preview; dashboard management is separate.')
     : !enabled ? 'Sign in again to show this widget.'
     : !documentPath ? 'This widget belongs to a conversation that is not saved yet. Reload the chat to show it.'
     : !reference || reference.mode === 'unsupported' ? 'This output has no supported inline Canvas document. It has not been rendered.' : '';
   const displayDocument = canRender && document?.scope === scope && instance;
-  return <section ref={card} aria-label={title} role={expanded ? 'dialog' : undefined} aria-modal={expanded || undefined}
+  // Beside-the-chat and floating copies re-read the same owner-checked document.
+  const workspace = useAgentWorkspaceTarget();
+  const [popNotice, setPopNotice] = useState('');
+  const canPop = Boolean(workspace) && canRender && workspace?.session === session;
+  const popOut = () => {
+    const widget = useFloatingWidgetsStore.getState().popOut({ provider, session, toolCallId: tool.id, title });
+    setPopNotice(widget ? 'Floating over every page. Drag its bar to move it.' : useFloatingWidgetsStore.getState().error);
+  };
+  return <section id={`chat-widget-${tool.id}`} ref={card} aria-label={title} role={expanded ? 'dialog' : undefined} aria-modal={expanded || undefined}
     className={expanded ? 'fixed inset-3 z-[100] flex flex-col overflow-hidden rounded-xl border border-slate-500/40 bg-slate-950 shadow-2xl sm:inset-10' : 'my-3 min-w-0 overflow-hidden rounded-xl border border-slate-500/30 bg-slate-500/5'}>
     <header className="flex min-w-0 items-center gap-2 border-b border-slate-500/20 px-3 py-2">
-      <h3 className="min-w-0 flex-1 truncate text-sm font-semibold">{title}</h3>
+      <span aria-hidden="true" className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-violet-400/20 bg-violet-400/10 text-violet-300"><ToolGlyph toolName="show_widget" size={15} /></span>
+      <div className="min-w-0 flex-1"><h3 className="truncate text-sm font-semibold text-slate-200">{title}</h3><p className="text-[10px] text-slate-400">Interactive result</p></div>
+      {canPop && !expanded && <button type="button" aria-label="Open widget in side panel" title="Open beside the chat"
+        className="rounded-md p-2 hover:bg-slate-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400"
+        onClick={() => useAgentWorkspaceStore.getState().openPreview({ kind: 'widget', title, provider: provider.toUpperCase(), session, toolCallId: tool.id, ...(reference?.boardName ? { boardName: reference.boardName } : {}) })}><PanelRight size={16} /></button>}
+      {canPop && !expanded && <button type="button" aria-label="Pop out widget" title="Pop out — keep it on screen over any page"
+        className="rounded-md p-2 hover:bg-slate-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400"
+        onClick={popOut}><PictureInPicture2 size={16} /></button>}
       {displayDocument && <button type="button" ref={expandButton} aria-label={expanded ? 'Collapse widget' : 'Expand widget'}
         className="rounded-md p-2 hover:bg-slate-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400"
         onClick={() => { setExpanded(value => !value); }}>{expanded ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>}
@@ -153,7 +173,9 @@ export function ScopedChatWidgetCard({ tool, session, provider = 'OPENCLAW', ena
         allow="camera 'none'; microphone 'none'; geolocation 'none'; clipboard-read 'none'; clipboard-write 'none'; fullscreen 'none'"
         className={expanded ? 'min-h-0 w-full flex-1 border-0' : 'w-full max-w-full border-0'}
         style={expanded ? undefined : { height: presentationHeight ?? height }} onError={() => { setStatus('error'); setError('Widget sandbox unavailable. Retry to reload it.'); }} />}
-      <p className="border-t border-slate-500/20 px-3 py-2 text-xs text-slate-400">Local interaction only. Chat prompts and dashboard data/actions are disabled.</p>
+      <p className="border-t border-slate-500/20 px-3 py-2 text-xs text-slate-400">{popNotice || (reference?.boardName
+        ? 'Live widget: this card is the version from this turn; the side panel shows the newest. Local interaction only.'
+        : 'Local interaction only. Chat prompts and dashboard data/actions are disabled.')}</p>
     </>}
   </section>;
 }

@@ -76,6 +76,12 @@ function generationChanged(snapshot: GenerationSnapshot): boolean {
     || browserGeneration() !== snapshot.browser;
 }
 
+/** A failed request must not invalidate credentials established by another tab. */
+export function authRefreshGenerationIsCurrent(): () => boolean {
+  const snapshot = generationSnapshot();
+  return () => !generationChanged(snapshot);
+}
+
 export function publishAuthRefreshSuccess(): void {
   inProcessGeneration += 1;
   if (typeof window !== 'undefined') {
@@ -239,7 +245,8 @@ export async function refreshAuthSessionWithFetch(
       }
     }
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) {
+      // A newer refresh or sign-in in any tab supersedes this refusal.
+      if ((response.status === 401 || response.status === 403) && !generationChanged(snapshot)) {
         notifyDefinitiveFailure(options);
       }
       return false;

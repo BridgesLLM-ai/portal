@@ -20,6 +20,8 @@ import {
   portalCompatibilitySnapshot,
 } from '../routes/system-maintenance';
 import { backupReceiptSigningPayload } from '../services/backup.service';
+import { buildToolsStatus, type ToolPolicy } from '../services/toolsStatus';
+import { OPENCLAW_RUNTIME_FLOOR } from '../services/openClawRuntimeContract';
 
 jest.mock('../config/database', () => ({
   prisma: {
@@ -234,6 +236,26 @@ describe('system maintenance action contract', () => {
     expect(maintenanceWindowAcknowledgementValid(refresh, undefined)).toBe(true);
   });
 
+  test('does not recommend a doomed bundle update when the Node prerequisite fails', () => {
+    const issue = buildCompatibleAiToolsIssue({
+      policy: 'guarded', summary: 'fixture',
+      components: [
+        { id: 'node-ai-prerequisite', label: 'Node.js', installedVersion: 'v24.21.0',
+          supportedVersion: '>=24.22.1 <25 || >=26.12.1', policy: 'manual-review',
+          status: 'blocked', note: 'Update system Node.js before AI tools.' },
+        buildOpenClawMaintenanceComponent(openClawReadiness({
+          testedPairReady: false, runningVersion: '2026.9.9',
+        })),
+      ],
+    });
+    expect(issue).toMatchObject({
+      id: 'compatible-ai-tools-prerequisite-required',
+      automationSafe: false,
+    });
+    expect(issue?.actionId).toBeUndefined();
+    expect(issue?.recommendation).toContain('Node.js');
+  });
+
   test('reports one grouped compatibility-bundle action for any runtime tuple drift', () => {
     const exact = (toolId: 'codex' | 'claude-code' | 'clawhub', version: string) => ({
       toolId,
@@ -272,6 +294,24 @@ describe('system maintenance action contract', () => {
         exact('claude-code', '2.1.260'),
       )],
     })).toBeNull();
+  });
+
+  test('native CLI rows use floor wording: a verified install at or above the minimum is compatible', () => {
+    const verified = (version: string) => ({
+      toolId: 'codex' as const, executablePath: '/usr/bin/codex', state: 'verified' as const, installed: true,
+      executionEligible: true, checkedAt: '2026-10-30T12:00:00.000Z', observedVersion: version, fingerprint: 'a'.repeat(64), reasonCode: null,
+    });
+    const versions = { floor: '0.163.0', tested: '0.166.0' };
+    const newer = buildNativeCliMaintenanceComponent('codex', 'Codex CLI', '0.163.0', verified('0.167.1'), versions);
+    expect(newer).toMatchObject({ status: 'ok', supportedVersion: 'Minimum 0.163.0 · tested 0.166.0' });
+    expect(newer.note).toBe("The installed Codex CLI is verified and meets the Portal's minimum version and required checks.");
+    const old = buildNativeCliMaintenanceComponent('codex', 'Codex CLI', '0.163.0', verified('0.160.0'), versions);
+    expect(old).toMatchObject({ status: 'blocked', note: "Codex CLI 0.160.0 is older than the Portal's minimum 0.163.0." });
+    const unverified = buildNativeCliMaintenanceComponent('codex', 'Codex CLI', '0.163.0', {
+      ...verified('0.166.0'), state: 'status_only', executionEligible: false, reasonCode: 'DRIFT_DETECTED',
+    }, versions);
+    expect(unverified).toMatchObject({ status: 'blocked', note: 'Portal could not verify the installed Codex CLI (DRIFT_DETECTED).' });
+    for (const row of [newer, old, unverified]) expect(`${row.supportedVersion} ${row.note}`).not.toMatch(/exact/i);
   });
 
   test('accepts only a fresh archive that passes integrity verification', async () => {
@@ -488,6 +528,49 @@ describe('system maintenance action contract', () => {
     } finally {
       fs.rmSync(testRoot, { recursive: true, force: true });
     }
+  });
+
+  test('a contract-compatible OpenClaw below the AI tools minimum is never "OK" (one floor verdict, F6)', () => {
+    // The verdict comes from the AI tools list itself, under the shipped policy.
+    const policy: ToolPolicy = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../installer/tools/tool-policy.v2.json'), 'utf8'));
+    const floor = policy.tools.find((tool) => tool.id === 'openclaw')!.floor;
+    // One minimum: the AI tools floor is the runtime contract's (K2 capability predicates above it), so the published
+    // lineage's 2026.9.3 is neither "Update required" nor BLOCKED (5.2.0).
+    expect(floor).toBe(OPENCLAW_RUNTIME_FLOOR);
+    const aiTool = (version: string) => buildToolsStatus({
+      generatedAtMs: Date.parse('2026-10-31T12:00:00Z'), policy, policySha256: 'a'.repeat(64), policyError: null, legacyOpen: [],
+      runs: [], lockOwner: null, history: [], runner: { installed: true, reason: null }, bootId: 'boot-1',
+      installed: { openclaw: { version, admittedAt: null, admission: 'none', source: 'package-json' } },
+    }).tools.find((tool) => tool.id === 'openclaw')!;
+    expect(aiTool('2026.9.3').status).not.toBe('below-floor');
+    expect(buildOpenClawMaintenanceComponent(openClawReadiness(), aiTool('2026.9.3'))).toMatchObject({ status: 'ok' });
+    const below = aiTool('2026.8.30');
+    expect(below.status).toBe('below-floor');
+    // 5.2.0 holds the OpenClaw core update (openclaw.coreUpdates): the note never sends the owner to an update
+    // Maintenance does not offer.
+    expect(policy.openclaw.coreUpdates).toBe('later-release');
+    expect(buildOpenClawMaintenanceComponent(openClawReadiness(), below)).toEqual(expect.objectContaining({
+      status: 'blocked',
+      supportedVersion: `minimum ${floor} · core 2026.7.1-2 · runtime 2026.7.1 · Codex 2026.7.1-1`,
+      note: `Portal contract OK, but OpenClaw 2026.8.30 is older than the minimum ${floor}. Updating OpenClaw from `
+        + 'Maintenance comes in a later Portal release.',
+    }));
+    expect(buildOpenClawMaintenanceComponent(openClawReadiness(), { ...below, heldForLaterRelease: undefined,
+      statusReason: `Update required: OpenClaw 2026.8.30 is older than the minimum ${floor}.` }).note)
+      .toBe(`Portal contract OK, but OpenClaw 2026.8.30 is older than the minimum ${floor}. Update it under AI tools.`);
+    expect(buildOpenClawMaintenanceComponent(openClawReadiness(), aiTool(floor))).toMatchObject({ status: 'ok' });
+    // A deny-listed version, a pair blocker together with the floor, and an absent OpenClaw.
+    expect(buildOpenClawMaintenanceComponent(openClawReadiness(), {
+      status: 'blocked', statusReason: 'OpenClaw 2026.9.5 is blocked: it drops sessions', floor,
+    }).note).toBe('Portal contract OK, but OpenClaw 2026.9.5 is blocked: it drops sessions. Update it under AI tools.');
+    expect(buildOpenClawMaintenanceComponent(openClawReadiness({
+      testedPairReady: false, blockers: [{ code: 'gateway-runtime-mismatch', message: 'The gateway runs 2026.9.2.' }],
+    }), below)).toMatchObject({
+      status: 'blocked',
+      note: `The gateway runs 2026.9.2. OpenClaw 2026.8.30 is older than the minimum ${floor}. Updating OpenClaw from `
+        + 'Maintenance comes in a later Portal release.',
+    });
+    expect(buildOpenClawMaintenanceComponent(openClawReadiness({ installed: false }), below)).toMatchObject({ status: 'unknown' });
   });
 
   test('does not call an arbitrary installed OpenClaw version compatible', () => {

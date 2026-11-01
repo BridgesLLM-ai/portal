@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { PORTAL_TOOL_VERSIONS } from '../config/toolVersions';
+import { COMPATIBLE_AI_NODE_RANGE } from '../services/compatibleAiPrerequisites';
 const root = path.resolve(__dirname, '../../..');
 const installer = fs.readFileSync(path.join(root, 'installer/install.sh'), 'utf8');
 const pin = (name: string): string => {
@@ -16,4 +17,5 @@ test('managed runtime and CLI display pins agree with the installer and exact br
   expect(contract.version).toBe(PORTAL_TOOL_VERSIONS.openClaw);
   expect(contract.commit).toBe(pin('PIN_OPENCLAW_CORE_COMMIT'));
   expect(contract.node).toBe(pin('OPENCLAW_NODE_ENGINE_RANGE'));
+  expect(COMPATIBLE_AI_NODE_RANGE).toBe(contract.node);
 });

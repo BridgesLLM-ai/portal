@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, memo, lazy, Suspense, useRef } from 'react';
+import { useState, useEffect, useCallback, memo, Suspense, useRef } from 'react';
+import { lazyWithRecovery } from '../utils/moduleRecovery';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { usePublicSettings, type PortalFeatureAvailability } from '../hooks/usePublicSettings';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -9,6 +10,7 @@ import OllamaControl from './OllamaControl';
 import ErrorPanel from './ErrorPanel';
 import ErrorBoundary from './ErrorBoundary';
 import PendingQuestionToasts from './PendingQuestionToasts';
+import FloatingWidgetLayer from './workspace/FloatingWidgetLayer';
 import { subscribeErrors, initGlobalErrorHandlers, type StoredError } from '../utils/errorHandler';
 import sounds from '../utils/sounds';
 import UserAvatar from './UserAvatar';
@@ -23,7 +25,7 @@ import {
   LogOut, Menu, X, ChevronRight, Bug, Shield, Mail, Wrench
 } from 'lucide-react';
 
-const TerminalPage = lazy(() => import('../pages/TerminalPage'));
+const TerminalPage = lazyWithRecovery(() => import('../pages/TerminalPage'));
 
 const navItems = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
@@ -505,6 +507,9 @@ export default function Layout() {
         questions={pendingQuestions}
         onSettled={handlePendingQuestionSettled}
       />
+
+      {/* Widgets popped out of Agent Chat float over every page (elevated users, who own Agent Chat). */}
+      {isElevated(user) && <FloatingWidgetLayer />}
 
       {/* Error Panel */}
       <ErrorPanel open={errorPanelOpen} onClose={handleErrorPanelClose} />

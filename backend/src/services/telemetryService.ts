@@ -1,5 +1,6 @@
 import crypto from 'crypto';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
+import { openClawDiagnosticCommand } from '../utils/openclawDiagnosticLease';
 import axios from 'axios';
 import { prisma } from '../config/database';
 import { PORTAL_VERSION } from '../version';
@@ -60,7 +61,9 @@ let cachedDeps: DependencyVersions = {};
 
 function detectCommandVersion(command: string, regex: RegExp): string | undefined {
   try {
-    const output = execSync(command, DETECTION_EXEC_OPTIONS);
+    const output = command === 'openclaw --version 2>/dev/null'
+      ? execFileSync(...openClawDiagnosticCommand('openclaw', ['--version']), DETECTION_EXEC_OPTIONS)
+      : execSync(command, DETECTION_EXEC_OPTIONS);
     const match = output.match(regex);
     return match?.[1]?.trim() || undefined;
   } catch {

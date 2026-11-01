@@ -2,7 +2,8 @@ import fs from 'fs';
 import { exec, execFile } from 'child_process';
 import axios from 'axios';
 import { config } from './env';
-import { PORTAL_TOOL_VERSIONS } from './toolVersions';
+import { PORTAL_TOOL_FLOORS, PORTAL_TOOL_VERSIONS } from './toolVersions';
+import { harnessVersionIsNewerThanTested, harnessVersionRefusal } from '../agents/harnessVersionPolicy';
 import { PRIVILEGED_CONFIRMATION } from '../utils/privilegedConfirmation';
 import {
   OllamaBackendAuthorityError,
@@ -353,10 +354,17 @@ export function probeLocalOllamaVersion(): Promise<{ ok: boolean; message: strin
         resolve({ ok: false, message: `No Ollama version reported (Portal-tested ${PORTAL_TOOL_VERSIONS.ollama}).` });
         return;
       }
-      if (installed !== PORTAL_TOOL_VERSIONS.ollama) {
+      // Floor-pinned: the local API check beside this one and each model's own
+      // /api/show capabilities carry the protocol contract, not the number.
+      const refusal = harnessVersionRefusal('OLLAMA', installed, PORTAL_TOOL_FLOORS.ollama);
+      if (refusal) {
+        resolve({ ok: false, message: `Portal refuses this Ollama runtime: ${refusal}.` });
+        return;
+      }
+      if (harnessVersionIsNewerThanTested(installed, PORTAL_TOOL_VERSIONS.ollama)) {
         resolve({
-          ok: false,
-          message: `Installed Ollama ${installed} has drifted from the Portal-tested ${PORTAL_TOOL_VERSIONS.ollama}.`,
+          ok: true,
+          message: `Ollama ${installed} is newer than the Portal-tested ${PORTAL_TOOL_VERSIONS.ollama}; admitted at or above the floor ${PORTAL_TOOL_FLOORS.ollama}, not yet proven.`,
         });
         return;
       }

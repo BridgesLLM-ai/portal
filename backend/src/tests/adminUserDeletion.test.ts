@@ -229,6 +229,8 @@ describe('atomic user deletion cleanup', () => {
         status: 'COMPLETE',
         completed: true,
         idempotent: false,
+        // No OpenClaw outcome was recorded by the mocked retirement.
+        openClawPrivacy: null,
       },
     });
     expect(next).not.toHaveBeenCalled();
@@ -353,6 +355,7 @@ describe('atomic user deletion cleanup', () => {
         status: 'BLOCKED',
         lastErrorCode: 'EXACT_RETRY_REQUIRED',
         manuallyRetryable: true,
+        openClawPrivacy: null,
       },
     }));
     expect(JSON.stringify(response.json.mock.calls)).not.toContain('private filesystem');

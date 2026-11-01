@@ -3,6 +3,7 @@ import '../../test/setup';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MemoryRouter } from 'react-router-dom';
 import {
   AgentZeroRecoveryCard,
   BlockedAgentChatSendButton,
@@ -187,6 +188,30 @@ describe('Agent Chat model picker', () => {
     expect(onChange).toHaveBeenCalledWith('codex_oauth/gpt-5.5');
   });
 
+  it('sends an OpenClaw admin to Model Providers instead of applying a typed model', async () => {
+    // A typed OpenClaw model is never applied (or enabled) from chat.
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter>
+        <ModelPicker
+          value=""
+          models={['openai/gpt-5.6-sol']}
+          supportsCustomModelInput
+          customModelSettingsHref="/settings?tab=ai-providers"
+          onChange={onChange}
+        />
+      </MemoryRouter>,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Chat model' }));
+    const link = screen.getByRole('link', { name: 'Custom model… enable it in Model Providers' });
+    expect(link).toHaveAttribute('href', '/settings?tab=ai-providers');
+    expect(screen.queryByRole('button', { name: 'Custom model…' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Custom model name' })).not.toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
   it('keeps a catalog failure actionable even when custom ids are not supported', async () => {
     const retry = vi.fn();
     const user = userEvent.setup();
@@ -294,6 +319,32 @@ describe('Agent Chat model picker', () => {
     await user.click(screen.getByRole('button', { name: 'View runtime status' }));
     expect(retry).toHaveBeenCalledTimes(1);
     expect(openSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows no models but still explains the hidden ones when the server can run none', async () => {
+    // OpenClaw 2026.10.6 with no provider connected. An
+    // ordinary user has no custom-model entry, and the picker used to vanish.
+    const user = userEvent.setup();
+    render(
+      <ModelPicker
+        value=""
+        onChange={vi.fn()}
+        models={[]}
+        supportsCustomModelInput={false}
+        unavailableModelIds={['openai/gpt-6.1-sol', 'google/gemini-3-flash-preview']}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Chat model' }));
+    expect(await screen.findByText(/2 models hidden/i)).toHaveTextContent('openai/gpt-6.1-sol');
+    expect(screen.queryByRole('button', { name: /gpt-6\.1-sol/i })).toBeNull();
+  });
+
+  it('renders nothing when there is nothing to pick and nothing hidden', () => {
+    const { container } = render(
+      <ModelPicker value="" onChange={vi.fn()} models={[]} supportsCustomModelInput={false} unavailableModelIds={[]} />,
+    );
+    expect(container).toBeEmptyDOMElement();
   });
 
   it('keeps required model selection visible when no connected models exist', async () => {

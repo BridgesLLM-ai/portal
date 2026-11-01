@@ -213,6 +213,13 @@ export function normalizeSessionWork(value: unknown, expectedKey: string): Sessi
   };
 }
 
+/** `/work` answer for a chat the gateway has not stored yet: exact key, no row. */
+export function isUnstartedSessionWork(value: unknown, expectedKey: string): boolean {
+  const data = record(value);
+  return Boolean(data) && data!.v === 1 && data!.sessionKey === expectedKey
+    && data!.started === false && data!.session === null;
+}
+
 export function normalizeActivity(value: unknown): AgentActivity | null {
   const data = record(value);
   if (!data || data.v !== 1 || !Array.isArray(data.items)) return null;
@@ -260,6 +267,9 @@ export async function fetchSessionWork(key: string, signal?: AbortSignal): Promi
     if (isAbortError(error)) throw error;
     throw classifyReadFailure(error);
   }
+  // The gateway has not stored this chat yet (a fresh main session, or a new
+  // chat before its first turn lands): the same empty state as a missing one.
+  if (isUnstartedSessionWork(data, key)) throw new AgentWorkRequestError('not-found', 200, 'SESSION_NOT_STARTED');
   const work = normalizeSessionWork(data, key);
   // A 200 without the v1 shape is not this API (for example an HTML fallback).
   if (!work) throw new AgentWorkRequestError(record(data)?.v === 1 ? 'unavailable' : 'unsupported', 200);
@@ -303,6 +313,9 @@ export type GoalMutationOutcome =
     /** `undefined` when the response carried no readback. */
     goal: SessionGoal | null | undefined;
   };
+
+/** What chat says while an OpenClaw update holds new work back (`OPENCLAW_EXECUTION_MAINTENANCE`, retryable). */
+export const OPENCLAW_MAINTENANCE_NOTICE = 'OpenClaw is being updated. Chat resumes shortly.';
 
 /** Refusals raised before anything reached OpenClaw; they are definitive. */
 const ADMISSION_REFUSALS = new Set([

@@ -930,6 +930,9 @@ def ensure_package_parent(tool: dict[str, Any], value: dict[str, Any]) -> None:
     if not os.path.lexists(parent):
         fault(f"before-parent-create-{tool['id']}")
         parent.mkdir(mode=0o755)
+        # mkdir's mode is masked by the installer umask (077); the npm scope
+        # directory must be traversable by every user (and the probe's nobody).
+        os.chmod(parent, 0o755)
         os.chown(parent, EXPECTED_UID, EXPECTED_GID)
         fsync_directory(parent.parent)
         tool["createdParentIdentity"] = identity(parent)
@@ -941,6 +944,8 @@ def ensure_package_parent(tool: dict[str, Any], value: dict[str, Any]) -> None:
     if recorded is None:
         if any(parent.iterdir()):
             fail(f"unowned package parent appeared during transaction: {parent}")
+        # Interrupted between mkdir and chmod: the empty parent this run created.
+        os.chmod(parent, 0o755)
         tool["createdParentIdentity"] = identity(parent)
         save_ledger(Path(value["root"]), value)
     elif not identity_matches(parent, recorded, "directory"):

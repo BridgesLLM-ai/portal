@@ -1,0 +1,12 @@
+{"status": "ok", "mode": "npm", "root": "/usr/lib/node_modules/openclaw", "steps": [], "durationMs": 912000,
+ "before": {"version": "2026.9.9"}, "after": {"version": "2026.10.9"},
+ "runId": "9a8b7c6d-0000-4000-8000-0000000000a1",
+ "run": {"runId": "9a8b7c6d-0000-4000-8000-0000000000a1", "createdAtMs": 1792100000000, "updatedAtMs": 1792100912000,
+         "trigger": "cli", "phase": "finished", "status": "succeeded", "reason": null, "origin": {},
+         "target": {"kind": "package", "channel": "stable", "tag": "2026.10.9"},
+         "before": {"version": "2026.9.9"}, "after": {"version": "2026.10.9"},
+         "steps": [{"step": "requested", "status": "completed"}, {"step": "staging", "status": "completed"},
+                   {"step": "validating", "status": "completed"}, {"step": "activating", "status": "completed"},
+                   {"step": "restarting", "status": "completed"}, {"step": "verifying", "status": "completed"}],
+         "verification": {}, "repair": [], "confirmedAtMs": null, "finishedAtMs": 1792100912000, "downtimeMs": 41000},
+ "reportPath": "/root/.openclaw/update-reports/9a8b7c6d-0000-4000-8000-0000000000a1.md"}

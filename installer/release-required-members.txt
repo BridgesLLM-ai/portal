@@ -279,6 +279,13 @@ portal/installer/scripts/bridges-rd-healthcheck.sh
 portal/installer/scripts/bridges-rd-session-guard.sh
 portal/installer/scripts/bridges-rd-window-fit.sh
 portal/installer/scripts/bridges-rd-xtigervnc-start.sh
+portal/installer/plugins/bridgesllm-ask-user-4.0.0.tgz
+portal/installer/plugins/bridgesllm-shared-browser-1.0.0.tgz
+portal/installer/plugins/manifest.json
+portal/installer/systemd/bridgesllm-tools-reconcile.service
+portal/installer/systemd/bridgesllm-tools@.service
+portal/installer/tools/bridgesllm-toolctl.py
+portal/installer/tools/tool-policy.v2.json
 portal/installer/update-transaction-state.py
 portal/installer/update-validation-protocol-v1
 portal/installer/verify-openclaw-2026.9.1-stock-contract.mjs

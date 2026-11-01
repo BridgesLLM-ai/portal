@@ -1,8 +1,10 @@
-import { authorizeChatWidgetSession, mutateAgentSessionWork } from '../routes/gateway';
+import { authorizeChatWidgetSession, authorizeUnstartedChatWorkSession, mutateAgentSessionWork } from '../routes/gateway';
 import { createChatWidgetsRouter } from '../routes/chatWidgets';
+import { createAgentWorkRouter } from '../routes/agentWork';
 import { prisma } from '../config/database';
 import * as rpc from '../utils/openclawGatewayRpc';
 import * as work from '../services/openClawSessionWork';
+import { clearOpenClawHello, observeOpenClawHello } from '../services/openClawCompatibility';
 
 // Keep actual router, authorization, lineage and document reader. Only the
 // persistence/native transport edges are synthetic: no DB/Gateway connection.
@@ -174,4 +176,149 @@ describe('widget route exact native session authorization (WIDGET-SEC-01)', () =
 test('work broker refuses arbitrary methods and foreign parameter scope before any native read', async () => {
   await expect(mutateAgentSessionWork(OWNED, actor as any, 'canvas.document.view', { docId: 'cv_foreign' })).rejects.toMatchObject({ code: 'WORK_OPERATION_INVALID' });
   await expect(mutateAgentSessionWork(OWNED, actor as any, 'chat.send', { sessionKey: `agent:main:portal-${FOREIGN}` })).rejects.toMatchObject({ code: 'WORK_OPERATION_INVALID' });
+});
+
+describe('live widget route: capability gate, owner check and attested newest read', () => {
+  const LIVE = { server: { version: '2026.10.9' }, features: { methods: ['canvas.document.view', 'board.get'] } };
+  const liveReceipt = { ...receipt, view: { ...receipt.view, boardWidgetName: 'timer' } };
+  const liveRows = [{ role: 'assistant', content: [{ type: 'toolCall', id: 'call-owned', name: 'show_widget' }] },
+    { role: 'toolResult', toolCallId: 'call-owned', toolName: 'show_widget', details: liveReceipt }];
+  let history: jest.SpyInstance;
+  let gateway: jest.SpyInstance;
+
+  async function readLive(key: string, boardName = 'timer', query: any = {}) {
+    const router = createChatWidgetsRouter(authorizeChatWidgetSession);
+    const layer = router.stack.find((entry: any) => entry.route?.path === '/sessions/:key/boards/:boardName/document') as any;
+    const res: any = { statusCode: 200, body: undefined, headers: {} };
+    res.status = jest.fn((code: number) => { res.statusCode = code; return res; });
+    res.json = jest.fn((body: any) => { res.body = body; return res; });
+    res.set = jest.fn((name: string, value: string) => { res.headers[name] = value; return res; });
+    await layer.route.stack.at(-1).handle({ params: { key, boardName }, query, user: actor }, res);
+    return res;
+  }
+
+  beforeEach(() => {
+    observeOpenClawHello(LIVE);
+    (prisma.user.findUnique as jest.Mock).mockImplementation(async () => ({ role: 'OWNER', accountStatus: 'ACTIVE', isActive: true, authorizationVersion: 1 }));
+    for (const delegate of [prisma.agentSession, prisma.projectChatProviderBinding, prisma.projectChatSession,
+      prisma.projectChatMessage, prisma.projectChatTurn, prisma.legacyOpenClawProjectImport, prisma.legacyOpenClawProjectQuarantine]) {
+      (delegate.findFirst as jest.Mock).mockReset().mockResolvedValue(null);
+    }
+    history = jest.spyOn(rpc, 'getSessionHistory').mockImplementation(async (key: string) =>
+      ({ ok: true, data: { sessionKey: key, sessionId: 'physical-owned', messages: liveRows, hasMore: false } }));
+    gateway = jest.spyOn(rpc, 'gatewayRpcCall').mockImplementation(async (method: string, args: any) => {
+      if (method !== 'canvas.document.view' || args.docId !== 'cv_owned') throw new Error('Unexpected RPC');
+      return { ok: true, data: { html: '<p>live owned</p>' } };
+    });
+    jest.spyOn(work, 'describeSessionWork').mockImplementation(async (key: string) => ({ key, sessionId: 'physical-owned' }));
+  });
+  afterEach(() => { clearOpenClawHello(); jest.restoreAllMocks(); });
+
+  test('the owner reads the newest version by board name through the attested document read', async () => {
+    const res = await readLive(OWNED);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ v: 1, html: '<p>live owned</p>', reference: { toolCallId: 'call-owned', boardName: 'timer', mode: 'inline' },
+      live: { boardName: 'timer', source: 'transcript' } });
+    expect(res.headers['Cache-Control']).toBe('private, no-store');
+  });
+
+  test('a foreign actor is denied before history, Canvas or the board', async () => {
+    const res = await readLive(`agent:main:portal-${FOREIGN}`);
+    expect(res.statusCode).toBe(404);
+    expect(res.body).not.toHaveProperty('html');
+    expect(history).not.toHaveBeenCalled(); expect(gateway).not.toHaveBeenCalled();
+  });
+
+  test('without board.get the route refuses with the plain reason before any read', async () => {
+    observeOpenClawHello({ ...LIVE, features: { methods: ['canvas.document.view'] } });
+    const res = await readLive(OWNED);
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ code: 'WIDGET_LIVE_UNAVAILABLE' });
+    expect(res.body.error).toMatch(/board\.get/);
+    expect(history).not.toHaveBeenCalled();
+  });
+
+  test.each(['Timer', '..', 'a/b', '', 'x'.repeat(65)])('board name %j is rejected before any read', async (name) => {
+    expect((await readLive(OWNED, name)).statusCode).toBe(400);
+    expect(history).not.toHaveBeenCalled();
+  });
+
+  test('query parameters are rejected before any read', async () => {
+    expect((await readLive(OWNED, 'timer', { toolCallId: 'call-owned' })).statusCode).toBe(400);
+    expect(history).not.toHaveBeenCalled();
+  });
+});
+
+describe('work read of a chat the gateway has not stored yet, through the real authorizers', () => {
+  const MAIN = 'agent:main:main';
+  let describe: jest.SpyInstance;
+  let rpcCall: jest.Mock;
+
+  async function readWork(key: string, user: any = actor) {
+    const router = createAgentWorkRouter({ authorize: authorizeChatWidgetSession, authorizeUnstarted: authorizeUnstartedChatWorkSession,
+      mutate: mutateAgentSessionWork, rpc: rpcCall as any });
+    const layer = router.stack.find((entry: any) => entry.route?.path === '/sessions/:key/work') as any;
+    const res: any = { statusCode: 200, body: undefined, headers: {} };
+    res.status = jest.fn((code: number) => { res.statusCode = code; return res; });
+    res.json = jest.fn((body: any) => { res.body = body; return res; });
+    res.set = jest.fn((name: string, value: string) => { res.headers[name] = value; return res; });
+    await layer.route.stack.at(-1).handle({ params: { key }, user }, res);
+    return res;
+  }
+
+  beforeEach(() => {
+    (prisma.user.findUnique as jest.Mock).mockImplementation(async () => ({ role: actor.role, accountStatus: 'ACTIVE', isActive: true, authorizationVersion: 1 }));
+    for (const delegate of [prisma.agentSession, prisma.projectChatProviderBinding, prisma.projectChatSession,
+      prisma.projectChatMessage, prisma.projectChatTurn, prisma.legacyOpenClawProjectImport, prisma.legacyOpenClawProjectQuarantine]) {
+      (delegate.findFirst as jest.Mock).mockReset().mockResolvedValue(null);
+    }
+    // Native lineage (gateway.ts) and the route both see the gateway's answer for an unstored key.
+    describe = jest.spyOn(work, 'describeSessionWork').mockResolvedValue(null);
+    jest.spyOn(rpc, 'gatewayRpcCall').mockImplementation(async (method: string) => { throw new Error(`Unexpected RPC ${method}`); });
+    rpcCall = jest.fn(async (method: string) => {
+      if (method === 'sessions.describe') return { ok: true, data: { session: null } };
+      throw new Error(`Unexpected RPC ${method}`);
+    });
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  test('OWNER opening a fresh main session gets "not started", not a 404', async () => {
+    const res = await readWork(MAIN);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ v: 1, sessionKey: MAIN, started: false, session: null, children: [] });
+  });
+
+  test.each(['AGENT:main:main', 'agent:MAIN:main'])('alias %s of an unstored session is refused (canonical key only)', async key => {
+    const res = await readWork(key);
+    expect(res.statusCode).toBe(404);
+    expect(rpcCall).not.toHaveBeenCalled();
+  });
+
+  test('a non-owner admin still cannot address an unclaimed host session', async () => {
+    (prisma.user.findUnique as jest.Mock).mockImplementation(async () => ({ role: 'ADMIN', accountStatus: 'ACTIVE', isActive: true, authorizationVersion: 1 }));
+    const res = await readWork(MAIN, { ...actor, role: 'ADMIN' });
+    expect(res.statusCode).toBe(404);
+    expect(rpcCall).not.toHaveBeenCalled();
+  });
+
+  test('another user\'s claim on the main session still wins', async () => {
+    (prisma.agentSession.findFirst as jest.Mock).mockResolvedValue({ id: 'claim-1', userId: FOREIGN, externalId: MAIN });
+    const res = await readWork(MAIN);
+    expect(res.statusCode).toBe(404);
+    expect(rpcCall).not.toHaveBeenCalled();
+  });
+
+  test('a foreign Portal actor key is refused before any native read', async () => {
+    const res = await readWork(`agent:main:portal-${FOREIGN}`);
+    expect(res.statusCode).toBe(404);
+    expect(rpcCall).not.toHaveBeenCalled(); expect(describe).not.toHaveBeenCalled();
+  });
+
+  test('a Project session never falls back to the host contract', async () => {
+    (prisma.projectChatProviderBinding.findFirst as jest.Mock).mockImplementation(async ({ where }: any) =>
+      where.OR.some((term: any) => term.sessionKey === PROJECT || term.externalSessionId === PROJECT) ? { id: 'project-binding' } : null);
+    const res = await readWork(PROJECT);
+    expect(res.statusCode).toBe(404);
+    expect(rpcCall).not.toHaveBeenCalled();
+  });
 });

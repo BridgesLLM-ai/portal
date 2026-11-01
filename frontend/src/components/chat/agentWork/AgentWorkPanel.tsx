@@ -2,7 +2,8 @@ import { useEffect, useId, useMemo, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { CheckCircle2, Circle, CornerLeftUp, Loader2, RefreshCw, X } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import MarkdownRenderer from '../MarkdownRenderer';
+import NativeProgressNote from '../NativeProgressNote';
+import { parseNativeProgress } from '../../../utils/nativeProgress';
 import type { WorkCard } from '../ProjectWork';
 import type { ChatTask } from '../../../utils/chatTasks';
 import type { AgentActivity, SessionWork, WorkSessionRow } from './agentWorkApi';
@@ -12,7 +13,7 @@ import type { GoalControlsState } from './useGoalControls';
 import type { SessionStopsState } from './useSessionStops';
 import { GoalSection } from './GoalSection';
 import { RunStatusChip, SessionRunRow, StopNotices, WorkSectionHeading } from './AgentWorkParts';
-import { displayBlock, displayText } from '../toolCards/safeDisplay';
+import { displayText } from '../toolCards/safeDisplay';
 
 /** Re-render relative times without refetching anything. */
 export function useNow(intervalMs = 30_000): number {
@@ -29,7 +30,7 @@ function ProgressSection({ work, fallbackPlan, now }: { work: SessionWork | null
   const live = Boolean(work?.caps.progress);
   const card = live ? work!.progress : null;
   const counts = progressCounts(card);
-  const markdown = card?.markdown ? displayBlock(card.markdown, 8192, 200) : null;
+  const note = parseNativeProgress(card?.markdown);
   const updated = card ? relativeTime(card.updatedAt, now) : null;
   const fallbackDone = fallbackPlan.filter((task) => task.status === 'done').length;
   const aside = live
@@ -63,12 +64,7 @@ function ProgressSection({ work, fallbackPlan, now }: { work: SessionWork | null
               })}
             </ol>
           )}
-          {markdown?.text && (
-            <div className="mt-2 rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2">
-              <MarkdownRenderer content={markdown.text} className="text-xs" />
-              {markdown.truncated && <p className="mt-1 text-[11px] text-slate-500">Shortened for display.</p>}
-            </div>
-          )}
+          {(note.note || note.measure) && <div className="mt-2"><NativeProgressNote progress={note} /></div>}
           {updated && <p className="mt-2 text-[11px] text-slate-500">Updated {updated}</p>}
         </>
       )}

@@ -19,7 +19,7 @@ export interface ErrorLogContext {
   stackTrace?: string;
   componentName?: string;
   context?: string;
-  severity?: 'ERROR' | 'CRITICAL';
+  severity?: 'INFO' | 'ERROR' | 'CRITICAL';
 }
 
 const MAX_ERROR_MESSAGE_LENGTH = 4_000;
@@ -49,12 +49,12 @@ export async function logError(
     if (context.projectName) parts.push(`[${context.projectName}]`);
     if (context.endpoint) parts.push(`${context.endpoint}`);
     parts.push(err.message);
-    const translatedMessage = `❌ ${parts.join(' — ')}`.slice(0, 5_000);
+    const translatedMessage = `${severity === 'INFO' ? 'ℹ️' : '❌'} ${parts.join(' — ')}`.slice(0, 5_000);
 
     // Build metadata with full error context
     const metadata: Record<string, any> = {
       errorMessage: err.message,
-      errorType: 'error',
+      errorType: severity === 'INFO' ? 'info' : 'error',
     };
     if (context.stackTrace || err.stack) metadata.stackTrace = truncate(context.stackTrace || err.stack, MAX_STACK_LENGTH);
     if (err.code) metadata.errorCode = err.code;

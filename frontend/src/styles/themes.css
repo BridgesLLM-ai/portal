@@ -458,3 +458,23 @@
   border: 1px solid var(--accent-border, rgba(99, 102, 241, 0.3));
   color: var(--accent, #6366f1);
 }
+
+/* Native progress reports carry measured values; style the browser meter without
+   replacing its accessible progress semantics or guessing completion. */
+.native-progress-meter {
+  appearance: none;
+  background: var(--color-border-strong);
+  color: var(--color-accent);
+}
+.native-progress-meter::-webkit-progress-bar {
+  border-radius: 999px;
+  background: var(--color-border-strong);
+}
+.native-progress-meter::-webkit-progress-value {
+  border-radius: 999px;
+  background: var(--color-accent);
+}
+.native-progress-meter::-moz-progress-bar {
+  border-radius: 999px;
+  background: var(--color-accent);
+}

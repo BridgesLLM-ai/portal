@@ -16,6 +16,7 @@ import { useSessionStops, type SessionStopsState } from './useSessionStops';
 import { AgentWorkPanel } from './AgentWorkPanel';
 import { goalStatusView, progressCounts, runCounts } from './agentWorkModel';
 import { GoalToneIcon } from './GoalSection';
+import { parseNativeProgress } from '../../../utils/nativeProgress';
 import { displayText } from '../toolCards/safeDisplay';
 
 export interface AgentWorkSurface {
@@ -140,7 +141,7 @@ export function AgentWorkButton({ surface, messages, projectWork, isChatRunning,
         {attention && <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-rose-400" />}
       </button>
       <AnchoredPopover open={open} anchorRef={anchorRef} onDismiss={close} width={420} ariaLabel="Agent work"
-        className="overflow-hidden rounded-2xl border border-white/10 bg-[#11182b] shadow-2xl">
+        className="overflow-hidden rounded-2xl border border-white/10 bg-[var(--color-surface)] shadow-2xl">
         <AgentWorkPanel
           openClaw={openClaw}
           work={work}
@@ -164,11 +165,13 @@ export function AgentWorkStrip({ surface }: { surface: AgentWorkSurface }) {
   const unconfirmed = Boolean(surface.goals.saved) && surface.goals.sending === null;
   if (!surface.enabled || !data) return null;
   const goal = data.goal;
-  if (!goal && !progress.total && !data.children.length && !unconfirmed) return null;
+  const note = parseNativeProgress(data.caps.progress ? data.progress?.markdown : null);
+  const hasNote = Boolean(note.note || note.measure);
+  if (!goal && !progress.total && !hasNote && !data.children.length && !unconfirmed) return null;
   const goalView = goal ? goalStatusView(goal.status) : null;
   const objective = goal ? displayText(goal.objective, 140) : '';
   const parts = [
-    progress.total ? `${progress.completed}/${progress.total} steps` : null,
+    progress.total ? `${progress.completed}/${progress.total} steps` : hasNote ? 'Progress update' : null,
     active ? `${active} sub-agent${active === 1 ? '' : 's'} active` : null,
     counts.failed ? `${counts.failed} failed` : null,
     !active && !counts.failed && data.children.length ? `${data.children.length} sub-agent${data.children.length === 1 ? '' : 's'}` : null,

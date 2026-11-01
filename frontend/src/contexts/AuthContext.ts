@@ -17,7 +17,11 @@ import {
 } from './RouteOperationContext';
 import { clearWorkspaceClientState } from '../utils/clearWorkspaceClientState';
 import { StaleWorkspaceAuthorizationResponseError } from '../utils/workspaceAuthorization';
-import { isDefinitiveAuthRefreshFailure } from '../utils/authRefreshConvergence';
+import {
+  authRefreshGenerationIsCurrent,
+  isDefinitiveAuthRefreshFailure,
+  publishAuthRefreshSuccess,
+} from '../utils/authRefreshConvergence';
 
 const DEBUG_AUTH = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -27,6 +31,15 @@ const debugLog = (...args: unknown[]) => {
 let logoutOperationSequence = 0;
 let sessionRestoreGeneration = 0;
 let sessionRestoreInFlight: Promise<boolean> | null = null;
+
+export function getAuthSessionGeneration(): number { return sessionRestoreGeneration; }
+
+/** True while no sign-in, sign-out or actor change has superseded the captured session. */
+export function captureAuthSessionFence(): () => boolean {
+  const generation = sessionRestoreGeneration;
+  const actor = useAuthStore.getState().user?.id;
+  return () => generation === sessionRestoreGeneration && actor === useAuthStore.getState().user?.id;
+}
 
 function invalidateSessionRestoreAttempts(): void {
   sessionRestoreGeneration += 1;
@@ -169,6 +182,7 @@ export const useAuthStore = create<AuthState>()(
           if ('user' in response) {
             const { user } = response;
             invalidateSessionRestoreAttempts();
+            publishAuthRefreshSuccess();
             set({ user, isAuthenticated: true, isLoading: false, lastSessionRestoreAt: Date.now(), sessionRestoreError: false, sessionRestoreRetryable: false });
             startSessionHeartbeat();
             return {};
@@ -198,6 +212,7 @@ export const useAuthStore = create<AuthState>()(
       },
 
       login: async (email, password) => {
+        invalidateSessionRestoreAttempts();
         set({ isLoading: true, error: null });
         try {
           const response = await authAPI.login(email, password);
@@ -219,6 +234,7 @@ export const useAuthStore = create<AuthState>()(
           // Normal login (no 2FA)
           const { user } = response;
           invalidateSessionRestoreAttempts();
+          publishAuthRefreshSuccess();
           set({
             user,
             isAuthenticated: true,
@@ -251,6 +267,7 @@ export const useAuthStore = create<AuthState>()(
         try {
           const { user } = await authAPI.twoFactorValidate(twoFactorPendingToken, token);
           invalidateSessionRestoreAttempts();
+          publishAuthRefreshSuccess();
           set({
             user,
             isAuthenticated: true,
@@ -481,12 +498,17 @@ export const useAuthStore = create<AuthState>()(
       },
 
       refreshSession: async () => {
+        // The same fences as the shared refresh: a sign-in, sign-out or actor
+        // change in this tab, or a newer refresh here or in another tab, owns
+        // the session now and a stale refusal must not sign it out.
+        const sessionCurrent = captureAuthSessionFence();
+        const refreshGenerationCurrent = authRefreshGenerationIsCurrent();
         try {
           await authAPI.refresh();
           return true;
         } catch (error) {
           debugLog('[Auth] Manual refresh failed:', error);
-          if (isDefinitiveAuthRefreshFailure(error)) {
+          if (isDefinitiveAuthRefreshFailure(error) && sessionCurrent() && refreshGenerationCurrent()) {
             get().silentLogout();
           }
           return false;
